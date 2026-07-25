@@ -312,6 +312,23 @@ export async function runReisePageTests(opts: { log?: boolean } = {}): Promise<T
         }
       }
 
+      // REVIEW N1: the `label` an AI assistant will read verbatim in Fase 6
+      // must name the right REFERENT. The shared proximity helpers say
+      // «3,4 km unna» — away from YOU — which is false for a corridor stop the
+      // caller is nowhere near.
+      for (const st of j.stops) {
+        ok(!/unna/.test(st.label || ""),
+          `n1-api: stop «${st.name}» does not claim proximity («unna»)`);
+        ok(/fra ruten|langs ruten/.test(st.label || ""),
+          `n1-api: …it says «fra ruten» / «langs ruten» instead (got «${st.label}»)`);
+      }
+      for (const g of j.approximate) {
+        for (const i of g.items) {
+          ok(!/\d/.test(i.label || ""),
+            `n1-api: approximate item «${i.name}» label carries no digit`);
+        }
+      }
+
       // Missing endpoints → a 400 a machine can branch on.
       const bad = await invoke(marketplaceRouter, "/reise?from=Oslo", "rettfrabonden.com");
       eq(bad.status, 400, "j10: a missing ?to= is a 400");

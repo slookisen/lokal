@@ -607,11 +607,14 @@ class MarketplaceRegistry {
       // Daniel asked for this repeatedly: «Jeg ønsker også at søkefunksjon
       // skal være inne på "drikkesteder"».
       //
-      // `beverages` is not a new category — it is the THIRD-largest tag in the
-      // live catalogue (measured 2026-07-25 against rettfrabonden.com: 32 of
-      // the first 400 producers, i.e. ~120 of 1 523, incl. Atlungstad
-      // Brenneri, Trysil Bryggeri, Senja Handbryggeri). It had simply never
-      // been reachable: this map had ten food categories and no drink one, so
+      // `beverages` is not a new category — it is already the 8th-largest tag
+      // in the live catalogue (review N7 corrects an earlier "third-largest"
+      // overclaim). Full census 2026-07-25, all 1 523 production producers
+      // enumerated: `beverages` 65 rows, and 133 producers carry some
+      // drink-family category (`beverages` / `beer` / `sider` / `juice` /
+      // `coffee`) — Atlungstad Brenneri, Trysil Bryggeri, Senja Handbryggeri,
+      // Bent Gate Brewing, … It had simply never been reachable: this map had
+      // ten food categories and no drink one, so
       // `øl`, `sider`, `drikke` and `brygg` produced NO category at all and
       // fell through to a nationwide trust-ranked list. Verified live before
       // this change: `q=øl` and `q=drikke` both returned `categories: null`
@@ -626,17 +629,7 @@ class MarketplaceRegistry {
       // not a parser job. The keywords below route to `beverages`, and
       // route-corridor-service.ts's DRINK_CATEGORIES treats the strays as
       // drink too so a corridor search still finds them.
-      "beverages": [
-        "drikke", "drikkevarer", "drikkested", "drikkesteder", "beverages", "drinks",
-        "øl", "ale", "pils", "brygg", "bryggeri", "mikrobryggeri", "håndverksøl",
-        "sider", "cider", "cideri", "eplesider",
-        "vin", "vingård", "vinproduksjon", "musserende",
-        "destilleri", "brenneri", "gårdsbrenneri", "akevitt", "gin", "whisky",
-        "mjød", "mjøderi",
-        "most", "eplemost", "saft", "juice", "eplejuice",
-        "kombucha", "seltzer", "seltzeri",
-        "kaffe", "kaffebrenneri", "gårdskafé", "gardskafe", "gårdskafe",
-      ],
+      "beverages": DRINK_KEYWORDS,
     };
 
     const detectedCategories: string[] = [];
@@ -651,10 +644,32 @@ class MarketplaceRegistry {
         if (norwegianWordBoundary(kw).test(q)) {
           if (!detectedCategories.includes(category)) detectedCategories.push(category);
           // Store the specific product term (not the category keyword like "vegetables")
-          if (!["grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
-                "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
-                "bakervarer", "urter", "herbs", "egg", "eggs",
-                "drikke", "drikkevarer", "beverages", "drinks"].includes(kw)) {
+          // REVIEW N2: NO drink keyword becomes a product term. The
+          // product matcher one level up (discover(), ~:307) tests
+          // `pName.includes(term)`, an unanchored substring test — so `øl`
+          // matched «Pølser», «Grillpølser av storfe», «Kjøttpølse»,
+          // «Spekepølse» and «Møllerens mel»; `vin` matched «Vinterepler» and
+          // «Rødvinseddik»; `saft` matched «Saftig kanelbolle». A product
+          // match scores +0.25, the same as a category match, so on the
+          // flagship query of this whole slice a sausage producer could
+          // outrank a low-trust brewery, carrying the match reason
+          // «Produkter: Grillpølser av storfe».
+          //
+          // Dropping the drink terms from productTerms removes the harm
+          // completely: with no product terms the matcher block is skipped
+          // outright (`if (productTerms && productTerms.length > 0)`), and the
+          // `beverages` CATEGORY filter — which is what Fase 5 is actually
+          // about — does the selecting.
+          //
+          // Deliberately NOT changing `includes()` to norwegianWordBoundary()
+          // here, even though that is the root cause and it makes the adjacent
+          // regex dead code. Norwegian compounds legitimately depend on the
+          // loose test: «bringebærsaft» matches `bringebær`, «geitostkake»
+          // matches `geitost`. Tightening it is a search-relevance change
+          // across all 134 non-drink keywords, unrelated to this dev-request,
+          // and it belongs in its own slice with its own before/after
+          // measurement. Recorded here so it is not lost.
+          if (!PRODUCT_TERM_EXCLUSIONS.has(kw)) {
             productTerms.push(kw);
           }
         }
@@ -1636,6 +1651,32 @@ const PROXIMITY_PATTERNS: RegExp[] = [
   /\baround\s+me\b/,
   /\bmy\s+location\b/,
 ];
+
+// ── Fase 5 drink taxonomy (dev-request 2026-07-25-reisesok…, 5a/5b) ──
+// Exported so the corridor engine, the /reise filters and any future MCP enum
+// read the SAME list rather than drifting copies.
+export const DRINK_KEYWORDS = [
+  "drikke", "drikkevarer", "drikkested", "drikkesteder", "beverages", "drinks",
+  "øl", "ale", "pils", "brygg", "bryggeri", "mikrobryggeri", "håndverksøl",
+  "sider", "cider", "cideri", "eplesider",
+  "vin", "vingård", "vinproduksjon", "musserende",
+  "destilleri", "brenneri", "gårdsbrenneri", "akevitt", "gin", "whisky",
+  "mjød", "mjøderi",
+  "most", "eplemost", "saft", "juice", "eplejuice",
+  "kombucha", "seltzer", "seltzeri",
+  "kaffe", "kaffebrenneri", "gårdskafé", "gardskafe", "gårdskafe",
+];
+
+// Keywords that identify a CATEGORY but must never be searched as a product
+// name. The first group is the pre-existing list (category words like
+// «grønnsaker» are not products); the second is every drink keyword — see
+// REVIEW N2 at the push site for the measured false positives.
+const PRODUCT_TERM_EXCLUSIONS = new Set<string>([
+  "grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
+  "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
+  "bakervarer", "urter", "herbs", "egg", "eggs",
+  ...DRINK_KEYWORDS,
+]);
 
 // ── Norwegian-aware word boundary ────────────────────────────────────
 // dev-request 2026-07-25-reisesok…, Fase 5b.

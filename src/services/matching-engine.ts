@@ -343,12 +343,22 @@ export class MatchingEngine {
 
   // ─── Utilities ─────────────────────────────────────────────
 
-  // dev-request 2026-07-25-reisesok…, Fase 2a: this was the THIRD byte-identical
-  // copy of the great-circle formula (the others: geocoding-service.ts's
-  // exported haversineDistanceKm and marketplace-registry.ts's private
-  // haversine()). All three now delegate to the single pure implementation in
-  // services/geo-distance.ts. `x ** 2` vs `x * x` and R = 6371 were already
-  // identical, so this is behaviour-preserving to the bit.
+  // dev-request 2026-07-25-reisesok…, Fase 2a: this was the third copy of the
+  // great-circle formula (the others: geocoding-service.ts's exported
+  // haversineDistanceKm and marketplace-registry.ts's private haversine()).
+  // All three now delegate to the single pure implementation in
+  // services/geo-distance.ts.
+  //
+  // CORRECTION (review N3): this copy was NOT bit-identical to the survivor, as
+  // an earlier version of this comment claimed. Measured over 200 000
+  // Norway-bbox pairs, 33.59 % differ — by at most 6.821e-13 km, i.e. under a
+  // nanometre (~2.5 ULP). And the cause was not the `x ** 2` this comment
+  // originally blamed (V8 folds that — 0/200 000 divergence); it was this
+  // file's `toRad` writing `(deg * Math.PI) / 180` where the others wrote
+  // `deg * (Math.PI / 180)`, which differ on 19.63 % of inputs because
+  // `Math.PI / 180` is rounded before the multiply. Nothing here reads finer
+  // than 0.1 km, so no observable behaviour moves — but the claim was wrong and
+  // is now a measured bound instead (route-corridor.test.ts, h2).
   //
   // Kept as a private method (rather than inlining the import at the two call
   // sites) so this class's shape is unchanged.

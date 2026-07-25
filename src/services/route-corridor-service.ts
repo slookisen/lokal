@@ -15,8 +15,9 @@
 //   → RouteProvider.fetchRoute()                            [network, cached]
 //   → prepareRoute(): Douglas-Peucker ~500 m + projection   [pure, cached]
 //   → corridorBoundingBox() → SQL BETWEEN prefilter         [SQLite, indexed]
-//   → measureAgainstRoute() per candidate                   [pure, ~3.6 ms]
-//   → precision split, sort by along_km, spaceOutAlongRoute [pure]
+//   → measureAgainstRoute() per candidate                   [pure, 0.8 ms]
+//   → precision split, sort by along_km                     [pure]
+//   → pickBestPerCluster() → spaceOutAlongRoute()           [pure]
 //
 // ════════════════════════════════════════════════════════════════════
 // THE HONESTY RULE — read this before changing anything below
@@ -45,10 +46,16 @@
 // PLACE (a fact we do know, from its centroid) and carrying no number of their
 // own — see buildApproximateGroups() and its comment.
 //
-// The label text comes from the EXISTING honesty helpers —
-// geo-precision.ts's formatRfbDistanceLabel / shouldSuppressDistance and
-// experience-store.ts's formatDistanceLabel — not from a parallel rule invented
-// here. One vocabulary, one place to fix it.
+// Labels: ONE rule about when a number may appear, TWO phrasings, because the
+// referent differs (review N1). An imprecise row delegates to the existing
+// helpers — geo-precision.ts's formatRfbDistanceLabel and
+// experience-store.ts's formatDistanceLabel — whose centroid branch
+// («i Hamar-området», never a number) is referent-neutral and is exactly the
+// honesty rule we want reused. A precise row does NOT: those helpers render
+// PROXIMITY («3,4 km unna» — away from YOU), and a corridor stop is measured
+// off the ROUTE, which the caller is nowhere near. formatCorridorLabel() writes
+// «3,4 km fra ruten» instead, matching what both /reise pages already say.
+// Fase 6 hands this string to an AI assistant verbatim.
 //
 // ════════════════════════════════════════════════════════════════════
 // SECOND HONESTY RULE — detour_km is not a driving distance
@@ -70,6 +77,7 @@ import {
   corridorBoundingBox,
   measureAgainstRoute,
   spaceOutAlongRoute,
+  pickBestPerCluster,
   type LatLng,
   type Polyline,
   type PreparedRoute,
@@ -268,7 +276,7 @@ export function resolveRouteProvider(
   return straightLineProvider();
 }
 
-// ── Polyline cache ───────────────────────────────────────────────────
+// ── Route cache ──────────────────────────────────────────────────────
 //
 // Keyed on the rounded endpoint coordinates rather than the raw query strings,
 // so «oslo til bodø», «Oslo→Bodø» and «fra oslo til bodo» share one entry once
@@ -277,20 +285,50 @@ export function resolveRouteProvider(
 // collide.
 //
 // TTL 24 h: road geometry changes on the timescale of roadworks, and a stale
-// polyline degrades gracefully (a closed side road shifts a detour by a few
+// route degrades gracefully (a closed side road shifts a detour by a few
 // hundred metres) — nothing here justifies re-billing Mapbox per request. The
-// prepared/simplified form is cached WITH it, because simplification costs
-// 10-21 ms and is pure, so re-deriving it per request would triple the query
-// time we worked to get down to 3.6 ms.
+// prepared/simplified form is cached, because simplification costs 10-21 ms and
+// is pure, so re-deriving it per request would undo the work that got the query
+// down to 0.8 ms.
+//
+// ══ WHAT IS DELIBERATELY *NOT* CACHED: the raw polyline ═════════════
+// REVIEW B1. The first version of this cache stored the whole RouteResult,
+// raw polyline included, for 24 h. That polyline is read EXACTLY ONCE — by
+// prepareRoute() below — and never again: corridorSearch() only ever reads
+// kind/provider/distanceKm/durationMinutes off the route, and the vertex count
+// comes from prepared.sourcePointCount. So a 33 246-point Oslo→Bodø geometry
+// was being pinned for a day for nothing.
+//
+// Measured under forced GC with the real prepareRoute(), 20 distinct real
+// Oslo→Bodø routes:
+//     with the raw polyline     2.57 MB/entry  →  515 MB at the old cap of 200
+//     without it                0.19 MB/entry  →    5 MB at the new cap of 25
+// a 13× reduction per entry and ~100× overall.
+//
+// That mattered because the cache is reachable from an UNAUTHENTICATED page.
+// The JSON endpoints sit under app.use("/api", generalLimiter) (index.ts:389),
+// but the SSR /reise handlers did not — a crawler walking 200 distinct
+// ?from=X&to=Y pairs could fill the cache to cap and pin half a gigabyte in a
+// process that also serves rettfrabonden.com and finn-tannlege.com. Both SSR
+// pages are now behind generalLimiter too (index.ts), so this is belt AND
+// braces: a smaller belt, and a buckle on the door.
+//
+// Eviction is LRU with an expiry sweep, not FIFO. Under FIFO an EXPIRED entry
+// still held a slot until it happened to reach the front, so a stale entry
+// could evict a fresh, actively-used one. Now: sweep what is dead first, and
+// only if that frees nothing, drop the least-recently-USED.
+type CachedRouteMeta = Omit<RouteResult, "polyline">;
 
 interface CachedRoute {
-  route: RouteResult;
+  /** Route metadata WITHOUT the polyline. See the B1 note above. */
+  meta: CachedRouteMeta;
   prepared: PreparedRoute;
   expiresAt: number;
 }
 
 const ROUTE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const ROUTE_CACHE_MAX = 200;
+/** ~5 MB at the measured 0.19 MB/entry. Was 200 (≈515 MB). See review B1. */
+const ROUTE_CACHE_MAX = 25;
 const routeCache = new Map<string, CachedRoute>();
 
 function routeCacheKey(providerId: string, from: LatLng, to: LatLng, via?: LatLng[]): string {
@@ -298,9 +336,14 @@ function routeCacheKey(providerId: string, from: LatLng, to: LatLng, via?: LatLn
   return [providerId, f(from), ...(via || []).map(f), f(to)].join("|");
 }
 
-/** Test-only: empty the polyline cache so cases do not leak into each other. */
+/** Test-only: empty the route cache so cases do not leak into each other. */
 export function __clearRouteCacheForTesting(): void {
   routeCache.clear();
+}
+
+/** Test-only: inspect the cache without exporting the Map itself. */
+export function __peekRouteCacheForTesting(): Array<{ key: string; entry: CachedRoute }> {
+  return [...routeCache.entries()].map(([key, entry]) => ({ key, entry }));
 }
 
 export async function getPreparedRoute(
@@ -309,24 +352,38 @@ export async function getPreparedRoute(
   to: LatLng,
   via?: LatLng[],
   now: number = Date.now(),
-): Promise<{ route: RouteResult; prepared: PreparedRoute; cached: boolean }> {
+): Promise<{ route: CachedRouteMeta; prepared: PreparedRoute; cached: boolean }> {
   const key = routeCacheKey(provider.id, from, to, via);
   const hit = routeCache.get(key);
   if (hit && hit.expiresAt > now) {
-    return { route: hit.route, prepared: hit.prepared, cached: true };
+    // LRU touch: re-inserting moves the key to the end of the Map's insertion
+    // order, so the eviction scan below always drops the least-recently-USED
+    // rather than the oldest-created.
+    routeCache.delete(key);
+    routeCache.set(key, hit);
+    return { route: hit.meta, prepared: hit.prepared, cached: true };
   }
 
   const route = await provider.fetchRoute(from, to, via);
   const prepared = prepareRoute(route.polyline);
+  // `polyline` is dropped here and never stored. Everything downstream needs
+  // is either on `meta` or already inside `prepared`.
+  const { polyline: _discardedPolyline, ...meta } = route;
 
+  // Sweep expired entries first — under the old FIFO scheme a dead entry could
+  // hold a slot and evict a live one.
   if (routeCache.size >= ROUTE_CACHE_MAX) {
-    // Cheap FIFO eviction — Map preserves insertion order.
-    const oldest = routeCache.keys().next();
-    if (!oldest.done) routeCache.delete(oldest.value);
+    for (const [k, v] of routeCache) if (v.expiresAt <= now) routeCache.delete(k);
   }
-  routeCache.set(key, { route, prepared, expiresAt: now + ROUTE_CACHE_TTL_MS });
+  // Still full → drop least-recently-used until there is room.
+  while (routeCache.size >= ROUTE_CACHE_MAX) {
+    const lru = routeCache.keys().next();
+    if (lru.done) break;
+    routeCache.delete(lru.value);
+  }
+  routeCache.set(key, { meta, prepared, expiresAt: now + ROUTE_CACHE_TTL_MS });
 
-  return { route, prepared, cached: false };
+  return { route: meta, prepared, cached: false };
 }
 
 // ── Candidates ───────────────────────────────────────────────────────
@@ -462,6 +519,24 @@ export const DRINK_PRODUCER_TYPES = new Set([
 
 /** Experience categories that are food/drink stops rather than sights. */
 export const DRINK_EXPERIENCE_CATEGORIES = new Set(["mat_drikke", "gardssalg", "gardssalg_smaking"]);
+
+/**
+ * Review N5: gårdssalg rows are drink producers unless their `producer_type`
+ * says otherwise. NULL/blank (43 of 50 production rows) counts as drink,
+ * because the vertical is a drink catalogue; a recognised non-drink type does
+ * not. Extend NON_DRINK_PRODUCER_TYPES as the taxonomy grows.
+ */
+export const NON_DRINK_PRODUCER_TYPES = new Set([
+  "gardsbutikk", "gårdsbutikk", "gardsutsalg", "gårdsutsalg",
+  "bakeri", "ysteri", "meieri", "slakteri", "reko", "annet",
+]);
+
+export function isGardssalgDrinkType(producerType: string | null | undefined): boolean {
+  const t = String(producerType || "").trim().toLowerCase();
+  if (!t) return true;                                    // unknown → drink
+  if (DRINK_PRODUCER_TYPES.has(t)) return true;           // known drink → drink
+  return !NON_DRINK_PRODUCER_TYPES.has(t);                // known non-drink → not
+}
 
 function isDrinkRow(source: CorridorSource, categories: string[], producerType?: string | null): boolean {
   if (producerType && DRINK_PRODUCER_TYPES.has(producerType.toLowerCase())) return true;
@@ -604,32 +679,73 @@ export function loadGardssalgCandidates(
     fylke: (r.fylke ?? null) as string | null,
     categories: r.producer_type ? [String(r.producer_type)] : [],
     url: `${EXPERIENCES_BASE_URL}/kategori/gardssalg/produsent/${r.slug}`,
-    // Every gårdssalg row in this catalogue is a drink producer by definition —
-    // that is what the vertical IS (bryggeri / cideri / vingård / destilleri /
-    // mjøderi / seltzeri). producer_type is unpopulated on 43 of 50 rows in
-    // production, so keying `isDrink` off it alone would hide most of them from
-    // the very filter Daniel asked for. Data gap noted, not patched here.
-    isDrink: true,
+    // REVIEW N5. The rule is: a gårdssalg row is a drink producer UNLESS its
+    // producer_type says otherwise.
+    //
+    // The earlier blanket `true` was right about today's catalogue and wrong
+    // about its own WHERE clause: that clause also admits `rfb_seed_source =
+    // 'rfb-seed'` rows, which carry no producer_type constraint at all, so the
+    // first non-drink RFB-seeded row would have silently become a drink stop.
+    //
+    // Why not simply key off producer_type: it is unpopulated on 43 of 50
+    // production rows, so requiring it would hide 86 % of the catalogue from
+    // the very filter Daniel asked for. Hence "unknown counts as drink"
+    // (matching what the vertical IS — bryggeri / cideri / vingård /
+    // destilleri / mjøderi / seltzeri) but a KNOWN non-drink type is believed.
+    // The data gap is noted, not patched here.
+    isDrink: isGardssalgDrinkType(r.producer_type),
   }));
 }
 
 // ── Labels ───────────────────────────────────────────────────────────
 
 /**
- * The honest label for one row. Delegates to the vertical's EXISTING helper —
- * geo-precision.ts's formatRfbDistanceLabel for RFB, experience-store.ts's
- * formatDistanceLabel for the experiences side — rather than inventing corridor
- * phrasing, so there is one rule and one place to change it.
+ * REVIEW N1 — the referent, not just the number.
  *
- * `detourKm` is passed only for precise rows; the helpers refuse to print a
- * number for anything else anyway, which is the belt to this braces.
+ * The shared helpers (geo-precision.ts's formatRfbDistanceLabel,
+ * experience-store.ts's formatDistanceLabel) render PROXIMITY: «3,4 km unna»,
+ * i.e. "away from you". In a corridor the same number means something else
+ * entirely — "off the route you are driving" — and the caller is nowhere near
+ * it. The number was true and the sentence was wrong, and Fase 6 hands this
+ * string to an AI assistant verbatim, so the mistake would have been repeated
+ * out loud.
+ *
+ * So the split is:
+ *
+ *   PRECISE row, real road route  → corridor phrasing, written here, because
+ *                                   no existing helper expresses this referent:
+ *                                   «3,4 km fra ruten» — matching the wording
+ *                                   both /reise pages already use.
+ *   PRECISE row, straight-line    → detourKm is null (we refuse to claim an
+ *                                   offset from a line that is not the road),
+ *                                   so: «langs ruten», no number.
+ *   IMPRECISE row                 → delegate to the shared helpers unchanged.
+ *                                   Their centroid branch is referent-neutral
+ *                                   («i Hamar-området», never a number) and is
+ *                                   exactly the honesty rule we want reused.
+ *
+ * That is still one rule about WHEN a number may appear — isCorridorPrecise()
+ * and the helpers agree, and the belt-and-braces holds: even if a centroid row
+ * reached the first branch, detourKm would be null for it.
  */
+export function formatCorridorLabel(detourKm: number | null | undefined): string {
+  if (typeof detourKm === "number" && Number.isFinite(detourKm)) {
+    const km = detourKm.toLocaleString("nb-NO", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    return `${km} km fra ruten`;
+  }
+  return "langs ruten";
+}
+
 function labelFor(c: CorridorCandidate, detourKm: number | null): string | null {
+  if (isCorridorPrecise(c.precision)) return formatCorridorLabel(detourKm);
+  // Imprecise: the shared centroid phrasing, unchanged. These helpers never
+  // print a km figure for a non-'address' precision, which is why they are the
+  // right thing to reuse here and the wrong thing to reuse above.
   if (c.source === "rfb") {
-    return formatRfbDistanceLabel(detourKm, c.precision, c.place);
+    return formatRfbDistanceLabel(null, c.precision, c.place);
   }
   const p = c.precision === "address" ? "address" : c.precision === null ? null : "kommune";
-  return formatDistanceLabel(detourKm, p as any, c.place);
+  return formatDistanceLabel(null, p as any, c.place);
 }
 
 // ── Approximate grouping ─────────────────────────────────────────────
@@ -722,6 +838,33 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
+/**
+ * REVIEW N4, second half. A fixed 25 km separation is tuned for a long haul and
+ * strangles a short one: measured, a 36 km route with 12 candidates returned
+ * 2 — «Oslo til Drammen» could never yield more than two suggestions, and the
+ * SSR pages expose no control to loosen it (only the JSON API does).
+ *
+ * Scale it so any route can carry up to ~8 stops, while never EXCEEDING what
+ * the caller asked for. Long routes are therefore bit-for-bit unchanged
+ * (485 km / 8 = 60.6 → min(25, 60.6) = 25), and short ones stop being empty
+ * (36 km / 8 = 4.5 km).
+ *
+ * Uses the provider's driving distance when we have one, and the simplified arc
+ * length otherwise — in straight-line mode we refuse to claim a distance, but
+ * we still need a length to scale against.
+ */
+export const CORRIDOR_TARGET_STOPS = 8;
+
+export function resolveSeparationKm(
+  requestedKm: number,
+  routeDistanceKm: number | null | undefined,
+  preparedLengthKm: number,
+): number {
+  const lengthKm = routeDistanceKm != null && routeDistanceKm > 0 ? routeDistanceKm : preparedLengthKm;
+  if (!(lengthKm > 0)) return requestedKm;
+  return Math.min(requestedKm, lengthKm / CORRIDOR_TARGET_STOPS);
+}
+
 export async function corridorSearch(opts: CorridorSearchOptions): Promise<CorridorSearchResult> {
   const notes: string[] = [];
   const maxDetourKm = clamp(opts.maxDetourKm ?? DEFAULT_MAX_DETOUR_KM, 1, 100);
@@ -764,7 +907,10 @@ export async function corridorSearch(opts: CorridorSearchOptions): Promise<Corri
     else notes.push(`Vi fant ikke stoppet «${v}», så det er ikke med i ruten.`);
   }
 
-  let routed: { route: RouteResult; prepared: PreparedRoute; cached: boolean };
+  // CachedRouteMeta, not RouteResult: the raw polyline is consumed by
+  // prepareRoute() inside getPreparedRoute() and never stored (review B1).
+  // Nothing below reads it — this type makes that a compile-time guarantee.
+  let routed: { route: CachedRouteMeta; prepared: PreparedRoute; cached: boolean };
   try {
     routed = await getPreparedRoute(
       provider,
@@ -828,6 +974,19 @@ export async function corridorSearch(opts: CorridorSearchOptions): Promise<Corri
   // so a generous cut is the conservative choice.
   const impreciseDetourKm = maxDetourKm + 30;
 
+  // REVIEW N9: `prepared` is the SIMPLIFIED polyline, so its arc length is a
+  // little shorter than the provider's true driving distance (Douglas-Peucker
+  // cuts corners; measured drift 1.95 %-7.6 %, i.e. up to ~25 km on Oslo→Bodø).
+  // The page prints «etter N km» from along_km next to «1 182 km kjøring» from
+  // route.distanceKm — two numbers about the same journey that did not agree.
+  // Rescale along_km onto the provider's distance so they do. Only when we HAVE
+  // a real distance: in straight-line mode distanceKm is null (we refuse to
+  // claim one), and 1.0 leaves along_km as the honest simplified arc length.
+  const alongScale =
+    route.distanceKm != null && prepared.lengthKm > 0
+      ? route.distanceKm / prepared.lengthKm
+      : 1;
+
   for (const c of candidates) {
     const hit = measureAgainstRoute({ lat: c.lat, lng: c.lng }, prepared);
     if (!hit) continue;
@@ -841,22 +1000,40 @@ export async function corridorSearch(opts: CorridorSearchOptions): Promise<Corri
       precise.push({
         ...c,
         detourKm,
-        alongKm: hit.alongKm,
+        alongKm: hit.alongKm * alongScale,
         label: labelFor(c, detourKm),
       });
     } else {
       if (hit.detourKm > impreciseDetourKm) continue;
-      imprecise.push({ candidate: c, alongKm: hit.alongKm });
+      imprecise.push({ candidate: c, alongKm: hit.alongKm * alongScale });
     }
   }
 
   precise.sort((a, b) => a.alongKm - b.alongKm);
 
-  const spaced = spaceOutAlongRoute(precise, {
+  // ── REVIEW N4: pick the BEST of each cluster, not the first ─────────
+  // The greedy separation pass keeps whatever it sees first, so one mediocre
+  // stop suppressed every better one behind it. pickBestPerCluster() elects the
+  // lowest-detour member of each along-track cluster first; spaceOutAlongRoute()
+  // then enforces the hard separation and the per-place quota on the winners.
+  //
+  // In straight-line mode detourKm is null for every row (we refuse to claim an
+  // offset from a line that is not the road), so the score is Infinity across
+  // the board and the pass degenerates to "keep the first of each cluster" —
+  // the previous behaviour, which is the right fallback when there is genuinely
+  // no basis to prefer one over another.
+  const effectiveSeparationKm = resolveSeparationKm(minSeparationKm, route.distanceKm, prepared.lengthKm);
+  const bestOfCluster = pickBestPerCluster(precise, {
+    alongKm: (s) => s.alongKm,
+    score: (s) => s.detourKm ?? Infinity,
+    minSeparationKm: effectiveSeparationKm,
+  });
+
+  const spaced = spaceOutAlongRoute(bestOfCluster, {
     alongKm: (s) => s.alongKm,
     groupKey: (s) => s.place,
     maxPerGroup: maxPerPlace,
-    minSeparationKm,
+    minSeparationKm: effectiveSeparationKm,
   }).slice(0, limit);
 
   const approximate = buildApproximateGroups(imprecise, maxPerPlace);

@@ -21,16 +21,42 @@
 // the ~10 existing OpplevAgent call sites are untouched; the formula itself now
 // lives here once.
 //
-// Numerical note: all three originals used R = 6371 km and the same
-// atan2/asin-equivalent haversine, so consolidating is behaviour-preserving to
-// the last bit for the two atan2 variants. matching-engine.ts's variant used
-// `** 2` instead of `x * x` — identical IEEE-754 result for a finite double —
-// and the same `2 * atan2(√a, √(1-a))`, so it too is bit-identical.
+// Numerical note (CORRECTED — review N3; the first version of this comment got
+// both the verdict and the cause wrong):
+//
+// All three originals used R = 6371 and the same 2·atan2(√a, √(1−a)) haversine.
+// geocoding-service.ts's and marketplace-registry.ts's copies ARE bit-identical
+// to this one — measured 0.00 % divergence over 200 000 Norway-bbox pairs.
+// matching-engine.ts's copy is NOT: 33.59 % of pairs differ, by at most
+// 6.821e-13 km (sub-nanometre, ~2.5 ULP).
+//
+// The cause is NOT `Math.sin(x) ** 2` vs `Math.sin(x) * Math.sin(x)`, which the
+// original comment blamed. V8 folds those to the same result — measured
+// 0/200 000 divergence. The cause is FLOATING-POINT ASSOCIATIVITY in the
+// degrees→radians conversion:
+//
+//     (deg * Math.PI) / 180        matching-engine.ts
+//     deg * (Math.PI / 180)        the other two, and this file
+//
+// which differ on 19.63 % of inputs across 58-71 °N, because `Math.PI / 180` is
+// itself rounded before the multiply. Four toRad calls per haversine is what
+// lifts 19.63 % per call to 33.59 % per pair.
+//
+// Nothing in this codebase reads a distance finer than 0.1 km
+// (formatDistanceLabel rounds to one decimal), so no observable behaviour
+// moves. route-corridor.test.ts asserts the measured BOUND rather than a
+// bit-identity that does not hold.
 
 /** Mean Earth radius in kilometres — the value all three originals used. */
 export const EARTH_RADIUS_KM = 6371;
 
-/** Degrees → radians. */
+/**
+ * Degrees → radians.
+ *
+ * `deg * (Math.PI / 180)`, matching what geocoding-service.ts and
+ * marketplace-registry.ts always did. See the associativity note above before
+ * "simplifying" this to `(deg * Math.PI) / 180`.
+ */
 export function toRadians(deg: number): number {
   return deg * (Math.PI / 180);
 }

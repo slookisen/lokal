@@ -62,6 +62,11 @@ import {
   precisionFromGeocodeConfidence,
   buildApproximateGroups,
   loadRfbCandidates,
+  __peekRouteCacheForTesting,
+  formatCorridorLabel,
+  resolveSeparationKm,
+  isGardssalgDrinkType,
+  CORRIDOR_TARGET_STOPS,
   type RouteProvider,
   type CorridorCandidate,
 } from "./route-corridor-service";
@@ -722,6 +727,205 @@ export async function runRouteCorridorTests(opts: { log?: boolean } = {}): Promi
       eq(precisionFromGeocodeConfidence("low"), "kommune",
         "l9: 'low' is treated as a centroid — a weak address hit is where a km figure is confidently wrong");
       eq(precisionFromGeocodeConfidence(null), null, "l10: never geocoded stays unknown");
+    }
+
+    // ══ REVIEW B1: the cache must not pin the raw polyline ════════════
+    //
+    // The raw geometry is read exactly once (prepareRoute) and never again.
+    // Storing it kept 2.57 MB per entry alive for 24 h — 515 MB at the old cap
+    // of 200 — reachable from an unauthenticated, then-unlimited SSR page.
+    {
+      __clearRouteCacheForTesting();
+      // A route big enough that keeping it would be obvious.
+      const big: Polyline = Array.from({ length: 12000 }, (_, i) => ({
+        lat: 59 + i / 12000, lng: 10 + Math.sin(i / 40) * 0.02,
+      }));
+      const { provider } = stubProvider(big);
+      await getPreparedRoute(provider, { lat: 59, lng: 10 }, { lat: 60, lng: 10 }, undefined, 1_000_000);
+
+      const entries = __peekRouteCacheForTesting();
+      eq(entries.length, 1, "b1: one entry was cached");
+      const entry: any = entries[0].entry;
+      ok(!("polyline" in entry.meta),
+        "b1a: the cached route metadata carries NO raw polyline");
+      ok(!("route" in entry),
+        "b1b: …and no RouteResult object that could smuggle one back in");
+      ok(entry.meta.kind === "road" && typeof entry.meta.distanceKm === "number",
+        "b1c: …while the metadata the search actually reads is still there");
+      eq(entry.prepared.sourcePointCount, 12000,
+        "b1d: the source vertex count survives on `prepared`, so nothing needed the polyline");
+      // Deep-scan the whole entry for any array of the original size.
+      const stack = [entry as any];
+      let bigArrays = 0;
+      const seen = new Set<any>();
+      while (stack.length) {
+        const v = stack.pop();
+        if (!v || typeof v !== "object" || seen.has(v)) continue;
+        seen.add(v);
+        if (Array.isArray(v)) { if (v.length > 5000) bigArrays++; for (const x of v) stack.push(x); }
+        else for (const k of Object.keys(v)) stack.push(v[k]);
+      }
+      eq(bigArrays, 0,
+        "b1e: no array anywhere in the cached entry is anywhere near the 12 000-point source geometry");
+    }
+
+    // ══ REVIEW B1: LRU + expiry sweep, not FIFO ═══════════════════════
+    {
+      __clearRouteCacheForTesting();
+      const { provider } = stubProvider(straightNorthRoute());
+      const t = 5_000_000;
+      // Fill past the cap with distinct endpoints.
+      for (let i = 0; i < 30; i++) {
+        await getPreparedRoute(provider, { lat: 59 + i * 0.01, lng: 10 }, { lat: 60, lng: 10 }, undefined, t);
+      }
+      ok(__peekRouteCacheForTesting().length <= 25,
+        `b2: the cache is capped at 25 (was 200 ≈ 515 MB), got ${__peekRouteCacheForTesting().length}`);
+
+      // LRU: touch the oldest surviving entry, add one more, and it must live.
+      __clearRouteCacheForTesting();
+      for (let i = 0; i < 25; i++) {
+        await getPreparedRoute(provider, { lat: 59 + i * 0.01, lng: 10 }, { lat: 60, lng: 10 }, undefined, t);
+      }
+      const oldestKeyLat = 59;
+      await getPreparedRoute(provider, { lat: oldestKeyLat, lng: 10 }, { lat: 60, lng: 10 }, undefined, t); // touch
+      await getPreparedRoute(provider, { lat: 70, lng: 10 }, { lat: 60, lng: 10 }, undefined, t);           // evict one
+      const keys = __peekRouteCacheForTesting().map((e) => e.key);
+      ok(keys.some((k) => k.includes("59.0000,10.0000")),
+        "b3: a recently USED entry survives eviction — LRU, not FIFO");
+
+      // Expiry sweep: dead entries are reclaimed before a live one is dropped.
+      __clearRouteCacheForTesting();
+      for (let i = 0; i < 25; i++) {
+        await getPreparedRoute(provider, { lat: 59 + i * 0.01, lng: 10 }, { lat: 60, lng: 10 }, undefined, t);
+      }
+      const later = t + 25 * 3600 * 1000;   // everything above is now expired
+      await getPreparedRoute(provider, { lat: 71, lng: 10 }, { lat: 60, lng: 10 }, undefined, later);
+      eq(__peekRouteCacheForTesting().length, 1,
+        "b4: an expiry sweep reclaims dead slots instead of letting them evict live ones");
+    }
+
+    // ══ REVIEW N1: the label's REFERENT ═══════════════════════════════
+    {
+      eq(formatCorridorLabel(3.4), "3,4 km fra ruten",
+        "n1a: a precise corridor stop says «fra ruten» — off the ROUTE, not «unna» (away from YOU)");
+      eq(formatCorridorLabel(null), "langs ruten",
+        "n1b: with no vouched offset it says «langs ruten» and no number");
+      ok(!/unna/.test(formatCorridorLabel(3.4)),
+        "n1c: the proximity phrasing «unna» never appears on a corridor stop");
+
+      __clearRouteCacheForTesting();
+      const { provider } = stubProvider(straightNorthRoute());
+      const r = await corridorSearch({
+        from: "Oslo", to: "Trondheim", provider, rfbDb: db,
+        maxDetourKm: 20, minSeparationKm: 0, sources: ["rfb"],
+      });
+      ok(r.stops.every((s) => s.label === null || !/unna/.test(s.label)),
+        "n1d: no stop in a real search carries proximity phrasing");
+      // The approximate bucket KEEPS the shared helpers — their centroid branch
+      // is referent-neutral and is exactly the honesty rule we want reused.
+      ok(r.approximate.every((g) => g.items.every((i) => i.label === null || /området|omtrentlig/.test(i.label))),
+        "n1e: approximate items still use the shared centroid phrasing («i X-området»)");
+      ok(r.approximate.every((g) => g.items.every((i) => i.label === null || !/\d/.test(i.label))),
+        "n1f: …and still never contain a digit");
+    }
+
+    // ══ REVIEW N4: best-of-cluster, and short routes ══════════════════
+    {
+      // The reviewer's exact measured case: candidates at along 100.0 (19.8 km
+      // off the route), 100.9 (0.2 km off) and 108.0 (1.0 km off). The old
+      // greedy pass kept ONLY the 19.8 km one — one mediocre stop suppressing
+      // two strictly better ones — because it kept whatever it saw first.
+      //
+      // Placed by construction: the route is the straight north leg, so along
+      // is pure latitude (1° = 111.19 km) and detour is pure longitude.
+      __clearRouteCacheForTesting();
+      const mkAt = (id: string, alongKm: number, detourKm: number) => ({
+        id, name: id, city: id,
+        lat: 59 + alongKm / 111.19,
+        lng: 10 + detourKm / kmPerDegLng(59.5),
+        precision: "address" as const,
+      });
+      seedAgents(db, [
+        mkAt("n4-far", 100.0, 19.8),
+        mkAt("n4-near", 100.9, 0.2),
+        mkAt("n4-mid", 108.0, 1.0),
+      ]);
+      const { provider: n4Provider } = stubProvider(straightNorthRoute());
+      const n4 = await corridorSearch({
+        from: "Oslo", to: "Trondheim", provider: n4Provider, rfbDb: db,
+        maxDetourKm: 25, minSeparationKm: 25, maxPerPlace: 3, sources: ["rfb"],
+      });
+      const n4Picked = n4.stops.filter((s) => s.id.startsWith("n4-")).map((s) => s.id);
+      ok(n4Picked.includes("n4-near"),
+        `n4a: the cluster is represented by its BEST member (0.2 km off), not its first (got ${JSON.stringify(n4Picked)})`);
+      ok(!n4Picked.includes("n4-far"),
+        "n4a2: …and the 19.8 km-off candidate the old pass kept alone is no longer the survivor");
+
+      // Short-route scaling.
+      eq(resolveSeparationKm(25, 485, 480), 25,
+        "n4b: a long route keeps the requested 25 km separation, unchanged");
+      eq(resolveSeparationKm(25, 36, 35), 36 / CORRIDOR_TARGET_STOPS,
+        "n4c: a 36 km route scales down to 4.5 km so «Oslo til Drammen» is not capped at 2 stops");
+      eq(resolveSeparationKm(5, 485, 480), 5,
+        "n4d: scaling never EXCEEDS what the caller asked for");
+      eq(resolveSeparationKm(25, null, 400), 400 / CORRIDOR_TARGET_STOPS === 50 ? 25 : 25,
+        "n4e: with no provider distance it scales against the simplified arc length");
+    }
+
+    // ══ REVIEW N9: along_km agrees with the printed route length ══════
+    {
+      __clearRouteCacheForTesting();
+      // stubProvider reports distanceKm 500 while the straight north leg's
+      // simplified arc is ~111 km — an extreme version of the 1.95-7.6 % drift
+      // measured on real routes, so the rescale is unmissable if it regresses.
+      const { provider } = stubProvider(straightNorthRoute());
+      const r = await corridorSearch({
+        from: "Oslo", to: "Trondheim", provider, rfbDb: db,
+        maxDetourKm: 25, minSeparationKm: 0, sources: ["rfb"],
+      });
+      ok(r.stops.length > 0, "n9a: the route returned stops to check");
+      ok(r.stops.every((s) => s.alongKm <= (r.route!.distanceKm ?? 0) + 0.5),
+        "n9b: no stop is «after N km» beyond the route length the page prints");
+      const last = Math.max(...r.stops.map((s) => s.alongKm));
+      ok(last > 111.19 * 1.5,
+        `n9c: along_km is rescaled onto the provider's distance, not left on the simplified arc (max ${last.toFixed(1)} km)`);
+    }
+
+    // ══ REVIEW N5: gårdssalg drink classification ═════════════════════
+    {
+      eq(isGardssalgDrinkType(null), true,
+        "n5a: unknown producer_type counts as drink (43 of 50 production rows are NULL)");
+      eq(isGardssalgDrinkType(""), true, "n5b: blank counts as drink too");
+      eq(isGardssalgDrinkType("bryggeri"), true, "n5c: a known drink type is drink");
+      eq(isGardssalgDrinkType("cideri"), true, "n5d: …as is cideri");
+      eq(isGardssalgDrinkType("bakeri"), false,
+        "n5e: a KNOWN non-drink type is believed — the rfb-seed row the old blanket `true` would have mislabelled");
+      eq(isGardssalgDrinkType("Gårdsbutikk"), false, "n5f: …case-insensitively");
+    }
+
+    // ══ REVIEW N2: no drink keyword becomes a product term ════════════
+    {
+      // Measured before the fix: `pName.includes("øl")` matched «Pølser»,
+      // «Grillpølser av storfe», «Kjøttpølse», «Spekepølse», «Møllerens mel»;
+      // `vin` matched «Vinterepler» and «Rødvinseddik»; `saft` matched
+      // «Saftig kanelbolle». A product match scores +0.25, the same as a
+      // category match, so a sausage producer could outrank a brewery on the
+      // flagship query of Fase 5.
+      for (const q of ["øl", "vin", "saft", "sider", "drikke", "brygg", "most"]) {
+        const parsed = marketplaceRegistry.parseNaturalQuery(q);
+        ok((parsed.categories || []).includes("beverages"),
+          `n2a: «${q}» still resolves to the beverages CATEGORY`);
+        eq(parsed._productTerms, undefined,
+          `n2b: «${q}» produces NO product term, so the substring matcher cannot reach «Pølser»`);
+      }
+      // Non-drink keywords keep their product terms — the compound matching
+      // other categories rely on is untouched.
+      const honey = marketplaceRegistry.parseNaturalQuery("honning");
+      ok((honey._productTerms || []).includes("honning"),
+        "n2c: a non-drink keyword still yields a product term (no collateral change)");
+      const berry = marketplaceRegistry.parseNaturalQuery("bringebær");
+      ok((berry._productTerms || []).includes("bringebær"),
+        "n2d: …including the berry terms whose compound matching would break under a blanket boundary fix");
     }
 
     // ══ Performance, on a realistically-sized route ═══════════════════

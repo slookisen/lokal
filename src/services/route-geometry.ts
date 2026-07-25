@@ -143,9 +143,18 @@ function perpendicularDistanceDeg(p: LatLng, a: LatLng, b: LatLng): number {
 }
 
 /**
- * Tolerance that corresponds to roughly `metres` of positional error.
- * ~0.005° ≈ 500 m, the value the benchmark used to go from 33 246 points to
- * 349 with an identical hit set.
+ * Tolerance corresponding to roughly `metres` of positional error, expressed in
+ * DEGREES — which the simplifier compares against a perpendicular distance also
+ * measured in degrees.
+ *
+ * Review N8: that makes the tolerance ANISOTROPIC. A degree of latitude is
+ * ~111.19 km everywhere, but a degree of longitude is only ~47 km at 65 °N, so
+ * 0.005° is ~556 m north-south and ~235 m east-west up there. "~500 m" is
+ * therefore an upper bound, not a constant: read it as "at most ~556 m, less on
+ * the east-west axis". Correcting it properly would mean projecting before
+ * simplifying, which costs more than the error is worth — the whole point of
+ * the tolerance is that it is far below the 20 km corridor width, and the
+ * measured hit set on the real Oslo→Bodø route is identical either way.
  */
 export function toleranceForMetres(metres: number): number {
   return metres / (KM_PER_DEG_LAT * 1000);
@@ -365,6 +374,73 @@ export function measureAgainstRoute(point: LatLng, prepared: PreparedRoute): Cor
  * against a kommune quota (we must not let 40 rows with an unknown kommune all
  * collapse into one bucket).
  */
+/**
+ * REVIEW N4. Collapse each along-track cluster to its BEST member, before the
+ * separation pass below decides what survives.
+ *
+ * Why this exists: {@link spaceOutAlongRoute} keeps whatever it sees FIRST, so
+ * one mediocre stop suppresses every better one behind it. Measured case —
+ * candidates at along 100.0 (19.8 km off the route), 100.9 (0.2 km off) and
+ * 108.0 (1.0 km off) collapsed to the 19.8 km one alone.
+ *
+ * Why LEADER clustering and not a fixed grid: bucketing by
+ * `floor(along / minSep)` looks equivalent and is not — a cluster straddling a
+ * bucket edge is split and its members never get compared. Verified against the
+ * three candidates above: grid bucketing put 100.0 and 100.9 in different
+ * buckets and re-elected the 19.8 km stop. Leader clustering has no grid to
+ * straddle — a cluster opens at its first member and closes as soon as an item
+ * is `minSeparationKm` beyond THAT member.
+ *
+ * Why not single-linkage (compare against the previous member): it chains.
+ * Twenty stops each 24 km apart would become one 480 km "cluster" and nineteen
+ * would be thrown away. Anchoring on the first member bounds every cluster to
+ * `minSeparationKm` wide.
+ *
+ * `score` is lower-is-better (detour km). Ties keep input order, so the output
+ * is stable for a given route. Items are assumed sorted by `alongKm`.
+ *
+ * This does NOT by itself guarantee the minimum separation — two adjacent
+ * clusters can each elect a winner near their shared boundary. Run
+ * {@link spaceOutAlongRoute} afterwards for that; this pass only decides WHICH
+ * member represents each cluster.
+ */
+export function pickBestPerCluster<T>(
+  items: T[],
+  opts: {
+    alongKm: (item: T) => number;
+    /** Lower is better. Infinity means "no basis to prefer" — keeps input order. */
+    score: (item: T) => number;
+    minSeparationKm: number;
+  },
+): T[] {
+  if (items.length === 0 || opts.minSeparationKm <= 0) return items.slice();
+
+  const out: T[] = [];
+  let clusterStart = opts.alongKm(items[0]);
+  let best = items[0];
+  let bestScore = opts.score(items[0]);
+
+  for (let i = 1; i < items.length; i++) {
+    const item = items[i];
+    const along = opts.alongKm(item);
+    if (along - clusterStart >= opts.minSeparationKm) {
+      out.push(best);
+      clusterStart = along;
+      best = item;
+      bestScore = opts.score(item);
+      continue;
+    }
+    const s = opts.score(item);
+    // Strict `<` so ties keep the earlier (further-along-first) item — stable.
+    if (s < bestScore) {
+      best = item;
+      bestScore = s;
+    }
+  }
+  out.push(best);
+  return out;
+}
+
 export function spaceOutAlongRoute<T>(
   items: T[],
   opts: {

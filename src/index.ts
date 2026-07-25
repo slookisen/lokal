@@ -395,6 +395,19 @@ app.use("/api", generalLimiter);
 // shared across both — intentional, this is still just "general API-ish
 // traffic" from one visitor's perspective.)
 app.use("/ut", generalLimiter);
+// dev-request 2026-07-25-reisesok…, review B1: the SSR /reise pages (seo.ts and
+// experiences-seo.ts) are the only HTML routes that can trigger two geocodes,
+// an outbound Mapbox call and a route-cache insert — and they live outside
+// /api, so they inherited no limiter at all. A crawler walking distinct
+// ?from=X&to=Y pairs would fill the route cache to its cap and burn free-tier
+// Mapbox quota, in a process that also serves finn-tannlege.com and
+// opplevagent.no. Mounted before the routers below so it actually wraps them.
+// Same shared instance/quota as the "/api" mount above — from a visitor's
+// perspective this is the same "general API-ish" traffic, and /reise is a query
+// surface, not a document. `/en/reise` gets it too, via the same prefix on the
+// localized mount.
+app.use("/reise", generalLimiter);
+app.use("/en/reise", generalLimiter);
 
 // ─── Routes ──────────────────────────────────────────────────
 // Public contact form — mounted first so it's available on all 3 platform hosts.
