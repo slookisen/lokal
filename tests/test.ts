@@ -33532,3 +33532,30 @@ runSerial(async () => {
     failures.push("opplevelser-experience-provenance: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0
+// fixes 0a + 0c: kommune-centroid lookups now go to Kartverket's Kommuneinfo
+// REGISTER instead of Stedsnavn's fuzzy free-text search (which resolved
+// «Flakstad» to the Navnegard «Flagstad» near Hamar, putting every Lofoten
+// provider 780 km off and making OpplevAgent report Nusfjord as 26.2 km from
+// Elverum), and lookupKartverket() no longer falls back to navn[0] when no
+// acceptable navneobjekttype matched (which geocoded «blåskjell Kautokeino»
+// to a holiday cabin in Larvik, 1 400 km wrong). Pure module — the Kartverket
+// fetch is injected via __setGeocodingFetchForTesting, no DB, no network —
+// but registered through runSerial() so its counts fold into the summary the
+// same way as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0a+0c (geocoding honesty) ──");
+  try {
+    const { runGeocodingHonestyTests } = require("../src/services/geocoding-honesty.test") as
+      typeof import("../src/services/geocoding-honesty.test");
+    const gh = await runGeocodingHonestyTests({ log: false });
+    passed += gh.passed;
+    failed += gh.failed;
+    for (const f of gh.failures) failures.push("geocoding-honesty: " + f);
+    console.log(`  geocoding-honesty: ${gh.passed} passed, ${gh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("geocoding-honesty: unexpected error: " + String(err?.message || err));
+  }
+});
