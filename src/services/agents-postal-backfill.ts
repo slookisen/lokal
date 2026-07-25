@@ -476,6 +476,17 @@ export async function resolvePostalCode(
     // inline number is simply discarded — never written on its own authority.
   }
 
+  /**
+   * Final consistency check for the tiers BELOW the inline one.
+   *
+   * If the address text carried a postnummer that Kartverket could not confirm,
+   * and a later tier then proposes a DIFFERENT one, the record disagrees with
+   * itself. That is not a case to resolve by picking the more authoritative
+   * source — one of the two is wrong about where this producer is, and we have
+   * no way to tell which. Refuse.
+   */
+  const agreesWithInline = (postal: string): boolean => !inlinePostal || postal === inlinePostal;
+
   // ── 2. Place candidates ───────────────────────────────────────────
   const places = placeCandidates(city, trailingPlaces);
 
@@ -528,6 +539,12 @@ export async function resolvePostalCode(
       // one might still be the wrong town; refuse.
       return { status: "ambiguous", detail: `resolved ${distinct[0]} but ${detailParts.join("; ")}` };
     }
+    if (!agreesWithInline(distinct[0])) {
+      return {
+        status: "ambiguous",
+        detail: `place lookup gave ${distinct[0]} but the address text says ${inlinePostal}`,
+      };
+    }
     const best = resolutions[0].probe;
     return {
       status: "resolved",
@@ -561,6 +578,12 @@ export async function resolvePostalCode(
       const r = await probeKartverket(variant, "", null, fetchImpl);
       await sleep(THROTTLE_MS);
       if (r.status === "resolved") {
+        if (!agreesWithInline(r.postal_code)) {
+          return {
+            status: "ambiguous",
+            detail: `globally unique address is ${r.postal_code} but the address text says ${inlinePostal}`,
+          };
+        }
         return {
           status: "resolved",
           postal_code: r.postal_code,

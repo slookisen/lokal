@@ -229,6 +229,17 @@ export function runAgentsPostalBackfillTests(opts: { log?: boolean } = {}): Prom
         assertEq(r8.status, "ambiguous",
           "g10: a scraped inline postnummer that Kartverket contradicts is DISCARDED, never written");
 
+        // An inline number that Kartverket cannot confirm must not be silently
+        // OVERRIDDEN by a weaker tier: the record then disagrees with itself
+        // and we have no way to tell which half is wrong.
+        // "Gamlevegen 4, 1234 Etsted" — no hit for `Gamlevegen 4 1234`, but the
+        // place lookup finds the street in Etsted at 5678.
+        routes.set("Gamlevegen 4 Etsted", body([addr("5678", "ETSTED", "ETSTED", "1111", "Gamlevegen 4")]));
+        routes.set("Gamlevegen 4", body([addr("5678", "ETSTED", "ETSTED", "1111", "Gamlevegen 4")]));
+        const r8b = await pb.resolvePostalCode("Gamlevegen 4, 1234 Etsted", "Etsted", deps);
+        assertEq(r8b.status, "ambiguous",
+          "g10b: an unconfirmed inline postnummer is not overridden by a later tier proposing a different one");
+
         // G4 — two place candidates that disagree.
         routes.set("Drammensveien 201 Mjøndalen", body([addr("3050", "MJØNDALEN", "DRAMMEN", "3301", "Drammensveien 201")]));
         routes.set("Drammensveien 201 Drammen", body([addr("3040", "DRAMMEN", "DRAMMEN", "3301", "Drammensveien 201")]));
