@@ -325,6 +325,8 @@ function homeStrings(lang: Lang) {
     searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: hvalsafari, Oslo, mat …", searchBtn: "Finn opplevelser",
     hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ". Agenter kan kalle ", hintPost2: " direkte.",
     quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
+    // dev-request 2026-07-25-reisesok fix 0f(ii): homepage «Nær meg».
+    nearMeBtn: "Nær meg", nearMeRadiusLabel: "Søkeradius", nearMeLoading: "Henter posisjon…", nearMeDenied: "Posisjon avslått",
     trustAria: "Tillit og datakilder", trustBrreg: "Tilbydere verifisert mot Brønnøysundregistrene", trustFresh: "Innhold oppdatert fortløpende", trustMachine: "Maskinlesbar for AI-agenter",
     counterAria: "Opplevagent i tall",
     counterPageviews: "Sidevisninger", counterRealVisitors: "Ekte besøkende", counterAiSearch: "AI-søk", counterCrawlers: "Crawlere &amp; bots",
@@ -359,6 +361,7 @@ function homeStrings(lang: Lang) {
     searchAria: "Find experiences", searchLabel: "Describe what you want to do, or type a place", searchPlaceholder: "Search: whale safari, Oslo, food …", searchBtn: "Find experiences",
     hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ". Agents can call ", hintPost2: " directly.",
     quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
+    nearMeBtn: "Near me", nearMeRadiusLabel: "Search radius", nearMeLoading: "Locating…", nearMeDenied: "Location denied",
     trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
     counterAria: "Opplevagent in numbers",
     counterPageviews: "Page views", counterRealVisitors: "Real visitors", counterAiSearch: "AI search", counterCrawlers: "Crawlers &amp; bots",
@@ -826,6 +829,45 @@ ${ldScripts}
           <button type="submit">${S.searchBtn}</button>
         </form>
         <p class="discover-hint">${S.hintPre}<a href="/opplevelser" style="color:#fff;text-decoration:underline">${S.hintLink}</a>${S.hintPost}<code>GET /api/opplevelser/discover</code>${S.hintPost2}</p>
+        <!-- dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
+             fix 0f(ii): OpplevAgent's «Nær meg» affordance existed on /sok and
+             on the browse pages, but NOT on the homepage — so the first thing
+             a visitor sees offered no way to search by position without
+             typing a place name first (navigator.geolocation grep = 0 on both
+             homepages). Same progressive-enhancement contract as
+             renderNearMeBox(): the block removes itself when the browser has
+             no geolocation API, and nothing else on the page changes. -->
+        <div class="home-nearme" style="margin-top:12px">
+          <button type="button" id="homeGeoBtn" style="padding:10px 18px;border-radius:var(--r-pill,999px);border:1.5px solid rgba(255,255,255,.55);background:rgba(255,255,255,.10);color:#fff;font-weight:650;font-size:.88rem;cursor:pointer">\u{1F4CD} ${S.nearMeBtn}</button>
+          <select id="home-radius" aria-label="${S.nearMeRadiusLabel}" style="margin-left:8px;padding:8px 6px;border-radius:8px;border:1.5px solid rgba(255,255,255,.45);background:rgba(255,255,255,.12);color:#fff;font-size:.82rem;cursor:pointer">
+            <option value="25" style="color:#18130d">25 km</option>
+            <option value="50" selected style="color:#18130d">50 km</option>
+            <option value="100" style="color:#18130d">100 km</option>
+            <option value="200" style="color:#18130d">200 km</option>
+          </select>
+        </div>
+        <script>
+        (function(){
+          var b = document.getElementById('homeGeoBtn');
+          if (!b) return;
+          if (!('geolocation' in navigator)) { b.parentNode.style.display = 'none'; return; }
+          b.addEventListener('click', function(){
+            var original = b.innerHTML;
+            b.textContent = '\u23F3 ${S.nearMeLoading}';
+            b.disabled = true;
+            navigator.geolocation.getCurrentPosition(function(pos){
+              var sel = document.getElementById('home-radius');
+              var r = (sel && sel.value) || '50';
+              window.location.href = '/sok?lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude +
+                '&radius_km=' + encodeURIComponent(r) + '&sort=distance';
+            }, function(){
+              b.textContent = '\u274C ${S.nearMeDenied}';
+              b.disabled = false;
+              setTimeout(function(){ b.innerHTML = original; }, 2500);
+            }, { enableHighAccuracy: false, timeout: 8000 });
+          });
+        })();
+        </script>
         <div class="quick" role="list" aria-label="${S.quickAria}">
           <a role="listitem" href="/fylke/Oslo">Oslo</a>
           <a role="listitem" href="/fylke/Troms%20og%20Finnmark">Troms og Finnmark</a>

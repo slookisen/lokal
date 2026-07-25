@@ -26,6 +26,7 @@ import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
+import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -397,42 +398,62 @@ router.post("/discover", (req: Request, res: Response) => {
 // Example: GET /search?q=ferske+økologiske+grønnsaker+nær+Grünerløkka
 
 router.get("/search", async (req: Request, res: Response) => {
-  const q = req.query.q as string;
-  if (!q) {
-    res.status(400).json({ success: false, error: "Mangler ?q= parameter" });
+  const frontendLat = parseFloat(req.query.lat as string);
+  const frontendLng = parseFloat(req.query.lng as string);
+  const hasBrowserCoords = isValidLatLng(frontendLat, frontendLng);
+
+  // dev-request 2026-07-25 fix 0f: `q` is OPTIONAL when lat+lng are supplied.
+  // Coordinates alone ("what is near me?") is a complete, valid search — this
+  // endpoint used to hard-400 without ?q=, so proximity search was impossible
+  // without first typing a place name.
+  const q = typeof req.query.q === "string" ? req.query.q : "";
+  if (!q && !hasBrowserCoords) {
+    res.status(400).json({
+      success: false,
+      error: "Mangler ?q= parameter (eller ?lat=&lng= for nærhetssøk)",
+    });
     return;
   }
 
   // Parse natural language into structured query (categories, tags, product terms)
   const parsed = marketplaceRegistry.parseNaturalQuery(q);
+  // dev-request 2026-07-25 fix 0e: «nær meg» is an intent, not noise.
+  const proximityIntent = !!(parsed as any)._proximityIntent;
 
   // ── Location resolution (priority order) ──
   // 1. Frontend geolocation (user clicked "Nær meg")
   // 2. Location extracted from query text via geocoding ("tomat i Nesbyen")
   // 3. No location → results from whole country
 
-  const frontendLat = parseFloat(req.query.lat as string);
-  const frontendLng = parseFloat(req.query.lng as string);
   const heleNorge = req.query.heleNorge === "true"; // explicit opt-out of geo filter
 
   let geoSource = "none";
+  let geoPlaceLabel: string | undefined;
 
   if (!heleNorge) {
-    if (!isNaN(frontendLat) && !isNaN(frontendLng)) {
+    if (hasBrowserCoords) {
       // User's browser geolocation
       parsed.location = { lat: frontendLat, lng: frontendLng };
-      parsed.maxDistanceKm = parseFloat(req.query.radius as string) || 30;
+      parsed.maxDistanceKm = resolveSearchRadiusKm(req.query.radius);
       geoSource = "browser";
-    } else if (!parsed.location) {
+      geoPlaceLabel = "din posisjon";
+    } else if (!parsed.location && q) {
       // Try to extract place name from query and geocode it
       const geoResult = await geocodingService.extractAndGeocode(q);
       if (geoResult) {
         parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
         parsed.maxDistanceKm = geoResult.radiusKm;
         geoSource = geoResult.source;
+        geoPlaceLabel = formatPlaceLabel(geoResult.name);
       }
     }
   }
+
+  // dev-request 2026-07-25 fix 0e: the user asked for "near me" but we have no
+  // position — say so instead of silently returning a nationwide trust-ranked
+  // list. Clients (web, MCP, any AI assistant) can act on this by asking for
+  // or supplying coordinates.
+  const needsLocation = proximityIntent && !parsed.location && !heleNorge;
 
   // Preserve internal fields through schema parsing (Zod strips unknown fields)
   const productTerms = parsed._productTerms;
@@ -457,8 +478,21 @@ router.get("/search", async (req: Request, res: Response) => {
 
   // Don't expand if we got results from a name-based search — those are exact matches
   const wasNameMatch = nameQuery && results.length > 0 && results[0]?.matchReasons?.some((r: string) => r.startsWith("Navnematch"));
+
+  // dev-request 2026-07-25 fix 0b: track what the auto-expand actually did.
+  // Before this, the expansion built a NEW query object and never touched
+  // `parsed`, so line ~579 still reported geoFiltered:true after the geo
+  // filter had been dropped entirely. Live proof 2026-07-25: `honning Vadsø`
+  // returned Tønsberg / Melhus / Røros with geoFiltered:true,
+  // geoSource:"hardcoded" and no note whatsoever.
+  let appliedRadiusKm = parsed.maxDistanceKm;
+  let geoDropped = false;
+
   if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
-    for (const expandedRadius of RADIUS_STEPS) {
+    // Only ever WIDEN. RADIUS_STEPS is a fixed ladder, so a caller who asked
+    // for 90 km used to be silently narrowed to 50 km on the first step.
+    const steps = RADIUS_STEPS.filter(r => r > (parsed.maxDistanceKm ?? 0));
+    for (const expandedRadius of steps) {
       if (results.length >= MIN_RESULTS) break;
       const expandedQuery = DiscoveryQuerySchema.parse({
         ...parsed,
@@ -468,6 +502,7 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (expandedQuery as any)._productTerms = productTerms;
       results = marketplaceRegistry.discover(expandedQuery);
+      appliedRadiusKm = expandedRadius;
     }
 
     // Last resort: no geo filter at all (show whole country)
@@ -481,6 +516,8 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
       results = marketplaceRegistry.discover(noGeoQuery);
+      geoDropped = true;
+      appliedRadiusKm = undefined;
     }
   }
 
@@ -572,12 +609,29 @@ router.get("/search", async (req: Request, res: Response) => {
   }
 
   const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
+  const geoFiltered = !!parsed.location && !heleNorge && !geoDropped;
+
   res.json({
     success: true,
     query: safeQuery,
-    parsed: { ...parsed, _nameQuery: nameQuery || undefined },
-    geoFiltered: !!parsed.location && !heleNorge,
-    geoSource,
+    // When geo was dropped, the echoed `parsed` must not claim a location
+    // either — it is the block AI clients read to explain the result set.
+    parsed: {
+      ...parsed,
+      location: geoDropped ? undefined : parsed.location,
+      maxDistanceKm: geoDropped ? undefined : appliedRadiusKm,
+      _nameQuery: nameQuery || undefined,
+      _proximityIntent: proximityIntent || undefined,
+    },
+    geoFiltered,
+    geoSource: geoDropped ? "none" : geoSource,
+    // Honest radius actually applied (may be wider than the one requested,
+    // because of the auto-expand ladder above).
+    geoRadiusKm: geoFiltered ? appliedRadiusKm : undefined,
+    // Same shape discoverExperiencesRelaxed() already uses on OpplevAgent.
+    relaxed_filters: geoDropped ? ["geo"] : undefined,
+    needs_location: needsLocation || undefined,
+    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation }),
     count: enrichedResults.length,
     results: enrichedResults,
     conversations,

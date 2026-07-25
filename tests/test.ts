@@ -32990,3 +32990,30 @@ runSerial(async () => {
     failures.push("geocoding-honesty: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0
+// fixes 0b / 0d / 0e / 0f — the four ways GET /api/marketplace/search misled
+// users in production on 2026-07-25:
+//   0b  `honning Vadsø` dropped the geo filter and still reported
+//       geoFiltered:true / geoSource:"hardcoded" with no note.
+//   0d  `gårdsutsalg i Agder` returned Sørum (277 km) / Stange (318 km) /
+//       Stavanger above the one real Agder producer, all at a flat 0.750.
+//   0e  `nær meg` parsed to nothing (all stopwords) → nationwide list.
+//   0f  Proximity search was impossible without typing text (hard 400).
+// Own in-memory DB (swaps the shared getDb() singleton) + a stubbed geocoder
+// fetch — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0b/0d/0e/0f (marketplace search honesty) ──");
+  try {
+    const { runMarketplaceSearchHonestyTests } = require("../src/routes/marketplace-search-honesty.test") as
+      typeof import("../src/routes/marketplace-search-honesty.test");
+    const msh = await runMarketplaceSearchHonestyTests({ log: false });
+    passed += msh.passed;
+    failed += msh.failed;
+    for (const f of msh.failures) failures.push("marketplace-search-honesty: " + f);
+    console.log(`  marketplace-search-honesty: ${msh.passed} passed, ${msh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-search-honesty: unexpected error: " + String(err?.message || err));
+  }
+});
