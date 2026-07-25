@@ -27,8 +27,107 @@
 //            stored). Writes geo_precision='city' (or 'kommune' when the hit
 //            is an administrative area), which the honesty rule
 //            (geo-precision.ts, 1c) then renders WITHOUT a km figure.
+//   Tier C — the producer NAME's place suffix. See the census below.
 //
-// Two invariants:
+// ═══════════════════════════════════════════════════════════════════
+// THROUGHPUT + COVERAGE FOLLOW-UP (2026-07-25 evening)
+// ═══════════════════════════════════════════════════════════════════
+// Daniel, looking at the queue a few hours after this worker shipped:
+//   «Det ser ut som veldig mange fortsatt står med ukjent opphav. Vi burde
+//    lage en pr som forbedrer og fikser dette.»
+//
+// He was right twice over, and the two reasons are different.
+//
+// ── Measured live, 2026-07-25T22:17Z ───────────────────────────────
+// POST /admin/agents/geocode-batch {limit:1, dry_run:true} reported:
+//     active 1595 · address_precision 146 · centroid 4 ·
+//     unknown_precision 1445 · missing_coordinates 502 · pending 1022
+// and a full per-row census (GET /admin/agents/dump for all 1 595 active rows
+// + GET /admin/agents/:id/knowledge for each) cross-tabulated as:
+//
+//     address + postnummer .................. 1148   Tier-A eligible
+//     address, NO postnummer ................   61   postal-backfill's queue
+//                                                    (47 already carry the
+//                                                     postnummer inline in the
+//                                                     address text)
+//     no address, has city ..................  134
+//     no address, no city ...................  253
+//                                              ────
+//                                              1595
+//
+// REASON 1 — CADENCE, not the API. 1 022 pending ÷ 50 rows/hour ≈ 20.4 HOURS,
+// while a dry-run probe resolved «Matgalleriet Molde» → address/high in
+// 432 ms. Fixed by the adaptive cadence (backfill-scheduler.ts): 60 s between
+// ticks while a backlog exists, decaying back to hourly by itself once it is
+// drained. ~3 000 rows/hour instead of 50, and the whole backlog drains in
+// well under an hour. Bounded by ONE process-wide 2 req/s budget shared with
+// the postal-backfill worker (kartverket-budget.ts) — the "not yet shared"
+// follow-up that worker's header flagged, which stopped being optional the
+// moment this one got 60× faster.
+//
+// REASON 2 — A STRUCTURALLY UNREACHABLE COHORT. unknown_precision 1445 but
+// pending only 1022: ~423 rows the selector could never even pick. Derived
+// from the census + the exact `pending` formula:
+//     • ~61  have a street address but no postnummer. NOT stuck — this is the
+//            postal-backfill worker's queue, and the two workers COOPERATE
+//            (it clears geocode_attempted_at, and now geocode_attempts, when
+//            it lands a postnummer, so the row jumps to the head of THIS
+//            worker's queue instead of waiting a full rotation).
+//     • ~110 have a city AND already carry a seed coordinate. Tier B refuses
+//            to touch a row that already has a position — swapping an
+//            untagged seed coordinate for a city centroid is a guess dressed
+//            as an improvement. That refusal stands. What changes is that
+//            they are now COUNTED and NAMED in the queue status instead of
+//            sitting in "unknown, might be fixable" for ever.
+//     • ~253 have neither address nor city. These are the ones Tier C exists
+//            for.
+//
+// ── Tier C — the place suffix RFB's own naming convention already carries ──
+// 244 of those 253 rows are named «<Producer> — <Place>»: "Straumbotn Gård —
+// Rana", "Bakeverkstedet Salten — Misvær", "Dalheim Gård og Gårdsysteri —
+// Kvæfjord". That suffix is a real signal and it was measured before it was
+// trusted: all 194 DISTINCT suffix tokens in that cohort were run against
+// LIVE Kartverket through this repo's own hardened geocodingService.geocode()
+// (type allowlist + hovednavn similarity guard + ambiguity refusal), and
+// **174 of 194 (89.7 %) resolved**. The 20 that do not (Fenstad, Røyse,
+// Fiskum, Hell, Sørum, Krokkleiva, …) are the guard refusing rather than
+// guessing, which is the behaviour we want.
+//
+// Tier C NEVER invents a coordinate and never licenses a km figure: it can
+// only ever write 'city' or 'kommune' precision, the tiers geo-precision.ts's
+// honesty rule renders as «i X-området». And it only runs on rows that have
+// NO coordinates at all, exactly like Tier B.
+//
+// ONE MEASURED DESIGN DECISION, because the obvious version was wrong.
+// Compound suffixes ("Sparbu, Steinkjer", "Mevika, Gildeskål", "Husøy i
+// Senja") need splitting. Splitting and taking the FIRST resolvable token was
+// tried first and is UNSAFE: «Mevika, Gildeskål» resolved via "Mevika" to a
+// Boligfelt at 61.78/5.27 in Vestland — Gildeskål is in Nordland, ~600 km
+// away. That is precisely the fabricated-precision failure this dev-request
+// exists to remove, reproduced by the code meant to help. Taking the LAST
+// token first — the administrative container — fixes it (Gildeskål →
+// 67.006/13.944, correct) and costs nothing elsewhere: re-measured over all
+// 31 compound/refused tokens, last-first recovers 17 including every case
+// first-first recovered, and gets Mevika right. So: last token first.
+//
+// Tokens that normalizeCityLabel() rejects as documented pollution (fylke
+// names, multi-kommune regions, "Norge" — "Vesterålen", "Sunnmøre", "Jæren",
+// "Rogaland", "Trøndelag", "Agder" all appeared in this cohort) are dropped
+// before we spend a request on them.
+//
+// ── Parking: an honest terminal state instead of an infinite retry ──
+// The two changes above interact badly if left alone. A row Kartverket will
+// never resolve used to be retried about twice a day; at a 60 s cadence a full
+// rotation is ~20 minutes, so it would be retried ~70 times a DAY, for ever,
+// against a free unauthenticated API — and Tier C adds ~250 more rows that can
+// do that. agents.geocode_attempts counts consecutive attempts that produced
+// no position; past AGENTS_GEOCODE_MAX_ATTEMPTS the row is PARKED: not
+// selected, and reported in the queue status under its own heading. The
+// counter resets the instant a position IS written, and the postal-backfill
+// worker resets it when it lands the postnummer that was blocking the row, so
+// parking is never a one-way door for a row whose DATA improves.
+//
+// Three invariants:
 //   • NEVER DOWNGRADE. A tick that only manages a centroid must leave an
 //     existing better-precision row untouched (isPrecisionUpgrade()).
 //     Tier B additionally refuses to move a row that already has any
@@ -40,16 +139,24 @@
 //     rotation fix (dev-request 2026-07-19): a selector keyed on a column the
 //     failure paths don't write re-picks the identical batch forever
 //     (measured there: 3 consecutive calls, identical processed=13 batch).
+//   • NEVER RETRY FOR EVER. Every attempt that produces no position bumps
+//     agents.geocode_attempts; the selector drops rows past the cap. A row we
+//     cannot place ends in a named terminal state, not in a loop.
 //
 // Dry-run: deps.dryRun = true performs the same lookups and reports what WOULD
-// change, but takes no write — not even the attempt stamp. Safe to point at
-// prod.
+// change, but takes no write — not even the attempt stamp or the attempt
+// counter. Safe to point at prod.
 //
-// Rate limiting: geocodeOne() sleeps THROTTLE_MS (350 ms) after every
-// Kartverket request including the successful one, so a tick is naturally
-// paced at ≥350 ms/row; Tier B additionally sleeps between rows because
-// geocodingService has no throttle of its own (it is normally called once per
-// user request, not in a loop).
+// Rate limiting: TWO layers, and they answer different questions.
+//   • Pacing WITHIN a row: geocodeOne() sleeps THROTTLE_MS (350 ms) after every
+//     Kartverket request including the successful one; Tier B/C sleep between
+//     rows because geocodingService has no throttle of its own.
+//   • A CEILING across everything: kartverket-budget.ts, a process-wide 2 req/s
+//     token bucket now SHARED with agents-postal-backfill.ts. Tier A draws
+//     tokens by handing geocodeOne a budgeted fetch, so all four steps of its
+//     retry ladder are counted exactly rather than estimated; Tier B/C reserve
+//     their worst case (2) before calling geocodingService, whose HTTP does not
+//     go through an injectable seam.
 //
 // Disable via env var RFB_DISABLE_AGENTS_GEOCODE=1 (used in tests / dev).
 
@@ -57,9 +164,42 @@ import { getDb } from "../database/init";
 import { geocodeOne, type GeocodeDeps } from "./dental-geocode-worker";
 import { geocodingService } from "./geocoding-service";
 import { isPrecisionUpgrade, type GeoPrecision } from "./geo-precision";
+import { normalizeCityLabel } from "./city-normalizer";
+import { budgetedFetch, takeKartverketBudget, KARTVERKET_MAX_RPS } from "./kartverket-budget";
+import {
+  startBackfillScheduler,
+  type BackfillSchedulerDeps,
+  type BackfillSchedulerHandle,
+} from "./backfill-scheduler";
 
-// Tier B's inter-row pacing (Tier A is paced by geocodeOne's own throttle).
+// Tier B/C's inter-row pacing (Tier A is paced by geocodeOne's own throttle).
 const CENTROID_THROTTLE_MS = 350;
+
+/**
+ * Consecutive no-progress attempts before a row is PARKED (stops being
+ * selected, gets counted under its own heading in the queue status).
+ *
+ * 5, not 3: the cadence is now ~20 minutes per full rotation, so five attempts
+ * is roughly an hour and a half of trying. A transient Kartverket outage would
+ * have to span five separate rotations to park a resolvable row, and even then
+ * `unpark` on the admin endpoint puts it back. The counter resets to 0 on any
+ * successful write, so a row only accumulates while it genuinely is not moving.
+ */
+export const AGENTS_GEOCODE_MAX_ATTEMPTS = 5;
+
+/**
+ * Cadence. A backfill wants "fast while there is work, quiet when there is
+ * not" — see backfill-scheduler.ts for why a fixed hourly setInterval was the
+ * wrong shape and what it measured at.
+ *
+ * 60 s × 50 rows ≈ 3 000 rows/hour, i.e. the 1 022-row backlog measured on
+ * 2026-07-25 drains in ~21 minutes instead of ~20 hours. The rate ceiling is
+ * enforced separately and independently by kartverket-budget.ts, so these
+ * numbers can never on their own put us above KARTVERKET_MAX_RPS.
+ */
+export const AGENTS_GEOCODE_BACKLOG_INTERVAL_MS = 60_000;
+export const AGENTS_GEOCODE_IDLE_INTERVAL_MS = 60 * 60_000;
+export const AGENTS_GEOCODE_BOOT_DELAY_MS = 30_000;
 
 export type AgentsGeocodeDeps = GeocodeDeps & {
   /** Report what would change; write nothing (not even the attempt stamp). */
@@ -88,8 +228,16 @@ export type AgentsGeocodeResult = {
   address_low: number;
   /** Rows placed (or would be placed) at a city/kommune centroid. */
   centroid_precision: number;
+  /** …of which came from Tier C, the place suffix in the producer's name. */
+  name_suffix_precision: number;
   /** Rows where every lookup missed — stamped, retried much later. */
   no_match: number;
+  /**
+   * Rows whose attempt counter reached AGENTS_GEOCODE_MAX_ATTEMPTS during this
+   * tick and are therefore now PARKED (no longer selected). Logged per tick so
+   * "the queue stopped shrinking" is always attributable to something named.
+   */
+  parked_now: number;
   /** Rows where a result existed but was not an upgrade (never downgrade). */
   skipped_no_upgrade: number;
   errors: number;
@@ -109,7 +257,69 @@ type CandidateRow = {
   geo_precision: string | null;
   address: string | null;
   postal_code: string | null;
+  geocode_attempts: number | null;
 };
+
+// ── Tier C — the place suffix in the producer's own name ────────────
+
+/**
+ * The naming convention RFB's discovery pipeline writes: «<Producer> — <Place>».
+ * Em dash and en dash both occur in live data; a plain hyphen deliberately does
+ * NOT, because hyphens are common INSIDE Norwegian names ("Midt-Telemark",
+ * "Øvre-Ål", "Bent Gate Brewing") and splitting on them would manufacture
+ * garbage tokens.
+ */
+const NAME_PLACE_SUFFIX = /[—–]\s*([^—–]+)\s*$/;
+
+/**
+ * True when a name carries a dash — i.e. when Tier C has anything to try. Kept
+ * next to the SQL predicate it mirrors (see SELECTABLE_TIER_C) so the two
+ * cannot drift: SQL over-selects (any dash anywhere), this function is the
+ * precise test, and a row the SQL let through but this rejects simply becomes
+ * a stamped no_match and rotates out.
+ */
+export function hasNamePlaceSuffix(name: string | null | undefined): boolean {
+  return NAME_PLACE_SUFFIX.test(name || "");
+}
+
+/**
+ * Place candidates mined from a producer name, in the order they should be
+ * tried.
+ *
+ * LAST TOKEN FIRST, and that ordering is a measured safety property rather
+ * than a preference. Compound suffixes ("Sparbu, Steinkjer", "Mevika,
+ * Gildeskål", "Husøy i Senja") are "<locality>, <container>". Trying the
+ * locality first resolved «Mevika, Gildeskål» to a Boligfelt in VESTLAND,
+ * ~600 km from Gildeskål in Nordland — a confident, precise, wrong point, the
+ * exact failure class this dev-request exists to remove. Trying the container
+ * first gives Gildeskål kommune (67.006/13.944), and re-measured across all 31
+ * compound tokens in the live cohort it recovers a strict superset of what
+ * locality-first recovered.
+ *
+ * Every candidate is passed through normalizeCityLabel() first, which drops the
+ * documented pollution classes — "Norge", fylke names, multi-kommune region
+ * labels. All six of "Vesterålen", "Sunnmøre", "Jæren", "Rogaland",
+ * "Trøndelag" and "Agder" appear as name suffixes in the live cohort and are
+ * dropped here rather than costing a request to discover they are too coarse.
+ */
+export function placeSuffixCandidates(name: string | null | undefined): string[] {
+  const m = NAME_PLACE_SUFFIX.exec(name || "");
+  if (!m) return [];
+  const raw = m[1].trim();
+  if (!raw) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  // " i " is a separator too: "Husøy i Senja" → Senja (measured recovery).
+  for (const part of raw.split(/[/|,]| og | i /i).map((s) => s.trim()).filter(Boolean).reverse()) {
+    const norm = normalizeCityLabel(part);
+    if (!norm || norm.length < 2) continue;
+    const key = norm.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(norm);
+  }
+  return out.slice(0, 2);
+}
 
 // ── Strictly-increasing attempt stamps ──────────────────────────────
 // datetime('now') has 1-second granularity, and a tick with a warm geocode
@@ -170,18 +380,90 @@ export function parseDryRunFlag(raw: unknown): { ok: true; dryRun: boolean } | {
   };
 }
 
-/**
- * Work-queue counts for the admin endpoint / ops. Cheap: one table scan.
- */
-export function agentsGeocodeQueueStatus(): {
+// ── The selector, as SQL fragments shared by the tick and the status ──
+// The candidate query and the queue-status query used to state the same
+// eligibility rule twice. That is exactly how `pending` comes to mean something
+// different from "what the worker will actually pick" — the drift Daniel would
+// be reading past. They are now ONE source of truth, interpolated into both.
+
+/** Nothing below 'address' is the ceiling; an address-precision row cannot improve. */
+const IMPROVABLE = `(a.geo_precision IS NULL OR a.geo_precision <> 'address')`;
+const NOT_PARKED = `COALESCE(a.geocode_attempts, 0) < ${AGENTS_GEOCODE_MAX_ATTEMPTS}`;
+const PARKED = `COALESCE(a.geocode_attempts, 0) >= ${AGENTS_GEOCODE_MAX_ATTEMPTS}`;
+const NO_COORDS = `(a.lat IS NULL OR a.lng IS NULL)`;
+const HAS_ADDRESS = `(k.address IS NOT NULL AND TRIM(k.address) <> '')`;
+const HAS_POSTAL = `(k.postal_code IS NOT NULL AND TRIM(k.postal_code) <> '')`;
+const HAS_CITY = `(a.city IS NOT NULL AND TRIM(a.city) <> '')`;
+/** Over-selects on purpose — placeSuffixCandidates() is the precise test. */
+const HAS_NAME_DASH = `(a.name LIKE '%' || CHAR(8212) || '%' OR a.name LIKE '%' || CHAR(8211) || '%')`;
+
+const TIER_A = `(${HAS_ADDRESS} AND ${HAS_POSTAL})`;
+const TIER_B = `(${NO_COORDS} AND ${HAS_CITY})`;
+const TIER_C = `(${NO_COORDS} AND ${HAS_NAME_DASH})`;
+const SELECTABLE = `${IMPROVABLE} AND ${NOT_PARKED} AND (${TIER_A} OR ${TIER_B} OR ${TIER_C})`;
+
+export type AgentsGeocodeQueueStatus = {
   active: number;
   address_precision: number;
   centroid_precision: number;
   unknown_precision: number;
   missing_coordinates: number;
+  /** Rows this worker will select — the drain queue. */
   pending: number;
   never_attempted: number;
-} {
+  /**
+   * Which ladder tier each pending row will be tried on (first match wins,
+   * same order the tick uses). Answers "what KIND of work is left".
+   */
+  pending_by_tier: { address: number; city_centroid: number; name_suffix: number };
+  /**
+   * Rows below address precision that this worker will NOT select, broken down
+   * by why. This is the honest answer to "what is left that never will finish".
+   */
+  unreachable: {
+    total: number;
+    /** Has a street address but no postnummer — agents-postal-backfill's queue, not stuck. */
+    awaiting_postal_backfill: number;
+    /**
+     * Carries a coordinate of UNKNOWN provenance (geo_precision NULL — a seed
+     * value) and has no address to improve on it. We will not overwrite it with
+     * a centroid, because it might be the real farm; we cannot confirm it,
+     * because there is no address. This is the genuinely stuck cohort.
+     */
+    seed_coordinates_no_address: number;
+    /**
+     * Placed honestly at city/kommune precision BY THIS WORKER and cannot go
+     * further without a street address. Counted apart from the seed cohort
+     * above on purpose: "we know this to city level" and "we do not know what
+     * this coordinate is" are different states and only one of them is a
+     * problem. Tier C moves rows from `no_usable_signal` into HERE.
+     */
+    placed_at_centroid_no_address: number;
+    /** No address, no city, no place suffix in the name — nothing to geocode from. */
+    no_usable_signal: number;
+    /** Tried AGENTS_GEOCODE_MAX_ATTEMPTS times without ever resolving. */
+    parked_after_retries: number;
+  };
+  /** "Will this finish, and when?" — derived, not stored. */
+  drain: {
+    batch_limit: number;
+    tick_interval_seconds: number;
+    rows_per_hour: number;
+    eta_hours: number | null;
+    max_requests_per_second: number;
+  };
+};
+
+/**
+ * Work-queue counts for the admin endpoint / ops. Cheap: one table scan.
+ *
+ * Daniel watches this output directly, so it is built to answer his two
+ * questions without a follow-up round-trip: **will this finish** (`drain`) and
+ * **what is left that never will** (`unreachable`, broken down by cause).
+ */
+export function agentsGeocodeQueueStatus(
+  batchLimit: number = GEOCODE_BATCH_LIMIT_DEFAULT
+): AgentsGeocodeQueueStatus {
   const db = getDb();
   const row = db
     .prepare(
@@ -190,30 +472,121 @@ export function agentsGeocodeQueueStatus(): {
          COUNT(*) FILTER (WHERE a.geo_precision = 'address') AS address_precision,
          COUNT(*) FILTER (WHERE a.geo_precision IN ('postal','city','kommune')) AS centroid_precision,
          COUNT(*) FILTER (WHERE a.geo_precision IS NULL) AS unknown_precision,
-         COUNT(*) FILTER (WHERE a.lat IS NULL OR a.lng IS NULL) AS missing_coordinates,
+         COUNT(*) FILTER (WHERE ${NO_COORDS}) AS missing_coordinates,
          COUNT(*) FILTER (WHERE a.geocode_attempted_at IS NULL) AS never_attempted,
+
+         COUNT(*) FILTER (WHERE ${SELECTABLE}) AS pending,
+         COUNT(*) FILTER (WHERE ${SELECTABLE} AND ${TIER_A}) AS pending_tier_a,
+         COUNT(*) FILTER (WHERE ${SELECTABLE} AND NOT ${TIER_A} AND ${TIER_B}) AS pending_tier_b,
+         COUNT(*) FILTER (WHERE ${SELECTABLE} AND NOT ${TIER_A} AND NOT ${TIER_B} AND ${TIER_C})
+           AS pending_tier_c,
+
+         COUNT(*) FILTER (WHERE ${IMPROVABLE} AND NOT (${SELECTABLE})) AS unreachable_total,
+         COUNT(*) FILTER (WHERE ${IMPROVABLE} AND ${PARKED}) AS parked,
          COUNT(*) FILTER (
-           WHERE (a.geo_precision IS NULL OR a.geo_precision <> 'address')
-             AND (
-               (k.address IS NOT NULL AND TRIM(k.address) <> ''
-                AND k.postal_code IS NOT NULL AND TRIM(k.postal_code) <> '')
-               OR ((a.lat IS NULL OR a.lng IS NULL) AND a.city IS NOT NULL AND TRIM(a.city) <> '')
-             )
-         ) AS pending
+           WHERE ${IMPROVABLE} AND NOT (${SELECTABLE}) AND NOT ${PARKED}
+             AND ${HAS_ADDRESS} AND NOT ${HAS_POSTAL}
+         ) AS awaiting_postal,
+         COUNT(*) FILTER (
+           WHERE ${IMPROVABLE} AND NOT (${SELECTABLE}) AND NOT ${PARKED}
+             AND NOT (${HAS_ADDRESS} AND NOT ${HAS_POSTAL})
+             AND NOT ${NO_COORDS} AND a.geo_precision IS NULL
+         ) AS seed_coords_no_address,
+         COUNT(*) FILTER (
+           WHERE ${IMPROVABLE} AND NOT (${SELECTABLE}) AND NOT ${PARKED}
+             AND NOT (${HAS_ADDRESS} AND NOT ${HAS_POSTAL})
+             AND NOT ${NO_COORDS} AND a.geo_precision IS NOT NULL
+         ) AS placed_centroid_no_address,
+         COUNT(*) FILTER (
+           WHERE ${IMPROVABLE} AND NOT (${SELECTABLE}) AND NOT ${PARKED}
+             AND NOT (${HAS_ADDRESS} AND NOT ${HAS_POSTAL})
+             AND ${NO_COORDS}
+         ) AS no_usable_signal
        FROM agents a
        LEFT JOIN agent_knowledge k ON k.agent_id = a.id
        WHERE a.is_active = 1`
     )
     .get() as any;
+
+  const pending = row?.pending ?? 0;
+  const limit = Math.max(1, batchLimit);
+  const tickSeconds = Math.round(AGENTS_GEOCODE_BACKLOG_INTERVAL_MS / 1000);
+  // Rows/hour is the CADENCE ceiling, not a promise: a tick that takes longer
+  // than the interval simply pushes the next one out (the scheduler re-arms
+  // after the tick finishes, never during it), so real throughput can only be
+  // lower. Reported as an upper bound, which is the useful direction for an ETA.
+  const rowsPerHour = Math.round((limit * 3600) / Math.max(1, tickSeconds));
   return {
     active: row?.active ?? 0,
     address_precision: row?.address_precision ?? 0,
     centroid_precision: row?.centroid_precision ?? 0,
     unknown_precision: row?.unknown_precision ?? 0,
     missing_coordinates: row?.missing_coordinates ?? 0,
-    pending: row?.pending ?? 0,
+    pending,
     never_attempted: row?.never_attempted ?? 0,
+    pending_by_tier: {
+      address: row?.pending_tier_a ?? 0,
+      city_centroid: row?.pending_tier_b ?? 0,
+      name_suffix: row?.pending_tier_c ?? 0,
+    },
+    unreachable: {
+      total: row?.unreachable_total ?? 0,
+      awaiting_postal_backfill: row?.awaiting_postal ?? 0,
+      seed_coordinates_no_address: row?.seed_coords_no_address ?? 0,
+      placed_at_centroid_no_address: row?.placed_centroid_no_address ?? 0,
+      no_usable_signal: row?.no_usable_signal ?? 0,
+      parked_after_retries: row?.parked ?? 0,
+    },
+    drain: {
+      batch_limit: limit,
+      tick_interval_seconds: tickSeconds,
+      rows_per_hour: rowsPerHour,
+      eta_hours: pending === 0 ? 0 : Math.round((pending / rowsPerHour) * 100) / 100,
+      max_requests_per_second: KARTVERKET_MAX_RPS,
+    },
   };
+}
+
+/** True while the worker still has rows to select — the scheduler's cadence input. */
+export function agentsGeocodeHasBacklog(): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.is_active = 1 AND ${SELECTABLE}`
+    )
+    .get() as any;
+  return (row?.n ?? 0) > 0;
+}
+
+/**
+ * Clear the parking counter so parked rows are retried.
+ *
+ * Manual escape hatch for the case parking is designed to survive but cannot
+ * detect: a Kartverket outage long enough to burn five rotations, or a data
+ * import that fixed the underlying records without going through the
+ * postal-backfill worker (which resets the counter itself). Returns the number
+ * of rows it would clear; `dryRun` makes it count without writing.
+ */
+export function unparkAgentsGeocode(dryRun: boolean): number {
+  const db = getDb();
+  const n = (db
+    .prepare(`SELECT COUNT(*) AS n FROM agents a WHERE a.is_active = 1 AND ${PARKED} AND ${IMPROVABLE}`)
+    .get() as any)?.n ?? 0;
+  if (!dryRun && n > 0) {
+    // No alias in an UPDATE target, so the shared fragments are re-stated here
+    // in their unaliased form. Kept adjacent to the SELECT above so a change to
+    // the parking rule is obvious in one screen.
+    db.prepare(
+      `UPDATE agents SET geocode_attempts = 0, geocode_attempted_at = NULL
+        WHERE is_active = 1
+          AND COALESCE(geocode_attempts, 0) >= ${AGENTS_GEOCODE_MAX_ATTEMPTS}
+          AND (geo_precision IS NULL OR geo_precision <> 'address')`
+    ).run();
+  }
+  return n;
 }
 
 function emptyStats(dryRun: boolean): AgentsGeocodeResult {
@@ -225,7 +598,9 @@ function emptyStats(dryRun: boolean): AgentsGeocodeResult {
     address_medium: 0,
     address_low: 0,
     centroid_precision: 0,
+    name_suffix_precision: 0,
     no_match: 0,
+    parked_now: 0,
     skipped_no_upgrade: 0,
     errors: 0,
     duration_ms: 0,
@@ -280,17 +655,12 @@ async function runAgentsGeocodeTick(
   const candidates = db
     .prepare(
       `SELECT a.id AS id, a.name AS name, a.lat AS lat, a.lng AS lng, a.city AS city,
-              a.geo_precision AS geo_precision,
+              a.geo_precision AS geo_precision, a.geocode_attempts AS geocode_attempts,
               k.address AS address, k.postal_code AS postal_code
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.is_active = 1
-          AND (a.geo_precision IS NULL OR a.geo_precision <> 'address')
-          AND (
-                (k.address IS NOT NULL AND TRIM(k.address) <> ''
-                 AND k.postal_code IS NOT NULL AND TRIM(k.postal_code) <> '')
-             OR ((a.lat IS NULL OR a.lng IS NULL) AND a.city IS NOT NULL AND TRIM(a.city) <> '')
-          )
+          AND ${SELECTABLE}
         ORDER BY (a.geocode_attempted_at IS NOT NULL), a.geocode_attempted_at ASC, a.id ASC
         LIMIT ?`
     )
@@ -301,16 +671,22 @@ async function runAgentsGeocodeTick(
   // window where the old value is lost but the new one is not yet written.
   // Tier A replaces seed coordinates in place, so without this the
   // dev-request's "kan stoppes" rollback restores nothing.
+  //
+  // geocode_attempts is reset to 0 here and INCREMENTED on the attempt-only
+  // path below: the counter measures consecutive NON-progress, so any write of
+  // a real position clears it and a row can never be parked while it is
+  // actually improving.
   const updatePosition = db.prepare(
     `UPDATE agents
         SET geocode_prev_lat = lat, geocode_prev_lng = lng,
             lat = ?, lng = ?, geo_precision = ?, geocode_source = ?,
-            geocode_outcome = ?, geocode_attempted_at = ?
+            geocode_outcome = ?, geocode_attempted_at = ?, geocode_attempts = 0
       WHERE id = ?`
   );
   const updateAttemptOnly = db.prepare(
     `UPDATE agents
-        SET geocode_outcome = ?, geocode_attempted_at = ?
+        SET geocode_outcome = ?, geocode_attempted_at = ?,
+            geocode_attempts = COALESCE(geocode_attempts, 0) + 1
       WHERE id = ?`
   );
 
@@ -325,7 +701,15 @@ async function runAgentsGeocodeTick(
 
       // ── Tier A — real street address via the Kartverket adresse ladder ──
       if (address && postal) {
-        const hit = await geocodeOne(address, postal, city, deps);
+        // budgetedFetch wraps the seam EVERY step of geocodeOne's 4-step retry
+        // ladder goes through, so all of them draw from the shared 2 req/s
+        // ceiling. Wrapping here rather than estimating "1 request per row" is
+        // the difference between a bound and a hope: a row that walks the whole
+        // ladder costs four requests, and at limit=200 that is 800.
+        const hit = await geocodeOne(address, postal, city, {
+          ...deps,
+          fetchImpl: budgetedFetch(deps.fetchImpl ?? fetch, sleep),
+        });
         if (hit.confidence !== "no_match") {
           if (isPrecisionUpgrade(row.geo_precision, "address")) {
             stats.address_precision++;
@@ -348,30 +732,28 @@ async function runAgentsGeocodeTick(
       // ── Tier B — city centroid, only for rows with NO position at all ──
       // Deliberately not applied to rows that already have coordinates: an
       // untagged seed coordinate might be the actual farm, and swapping it for
-      // a city centroid would be a guess dressed as an improvement.
-      if (!wrote && (row.lat === null || row.lng === null) && city) {
-        const geo = await geocodingService.geocode(city);
-        await sleep(CENTROID_THROTTLE_MS);
-        if (geo) {
-          const t = (geo.placeType || "").toLowerCase().trim();
-          const precision: GeoPrecision =
-            t === "kommune" || t === "fylke" || t === "annen administrativ inndeling"
-              ? "kommune"
-              : "city";
-          // geo.source is the geocoding-service tier that answered
-          // ("kartverket" = Stedsnavn, "kommuneinfo" = the kommune register,
-          // "hardcoded"/"database"/"cache" = local tables). Recorded verbatim
-          // apart from disambiguating Stedsnavn from the adresse API, since
-          // both would otherwise read "kartverket".
-          const source = geo.source === "kartverket" ? "kartverket_stedsnavn" : geo.source;
-          if (isPrecisionUpgrade(row.geo_precision, precision)) {
-            stats.centroid_precision++;
-            record(row, precision, geo.lat, geo.lng, source, "city_centroid");
-          } else {
-            stats.skipped_no_upgrade++;
-            recordAttemptOnly(row, "skipped_no_upgrade");
+      // a city centroid would be a guess dressed as an improvement. Those rows
+      // are reported as `unreachable.seed_coordinates_no_address` rather than
+      // silently left in the "unknown" bucket.
+      const hasNoPosition = row.lat === null || row.lng === null;
+      if (!wrote && hasNoPosition && city) {
+        if (await placeCentroid(row, city, "city_centroid")) wrote = true;
+      }
+
+      // ── Tier C — the place suffix in the producer's own NAME ────────
+      // «Straumbotn Gård — Rana». Measured: 244 of the 253 live rows with
+      // neither address nor city carry this suffix, and 174 of the 194 distinct
+      // tokens resolve through the SAME hardened geocoder Tier B uses. Same
+      // no-coordinates precondition, same 'city'/'kommune' ceiling — Tier C can
+      // never produce an 'address' tag and therefore can never license a km
+      // figure. See placeSuffixCandidates() for why the LAST token is tried
+      // first (it is a safety property, measured, not a preference).
+      if (!wrote && hasNoPosition) {
+        for (const candidate of placeSuffixCandidates(row.name)) {
+          if (await placeCentroid(row, candidate, "name_suffix_centroid")) {
+            wrote = true;
+            break;
           }
-          wrote = true;
         }
       }
 
@@ -405,6 +787,54 @@ async function runAgentsGeocodeTick(
   stats.duration_ms = Date.now() - start;
   return stats;
 
+  /**
+   * Shared body of Tier B and Tier C: resolve ONE place label through the
+   * Fase-0 hardened geocoder and record the outcome.
+   *
+   * Returns true when the label resolved (whether that produced a write or a
+   * never-downgrade skip), false when it did not — so the caller can try the
+   * next candidate, then the next tier, and finally fall through to the
+   * always-stamp no_match path.
+   *
+   * geocodingService owns its own HTTP and takes no fetch seam, so its worst
+   * case (Stedsnavn, then the Kommuneinfo fallback) is RESERVED against the
+   * shared budget up front. Over-reserving can only slow us down, which is the
+   * safe direction for a courtesy limit against a free API. A cache hit costs
+   * no request at all and still pays the reservation — accepted, because the
+   * alternative is reaching into geocoding-service's internals from here.
+   */
+  async function placeCentroid(
+    row: CandidateRow,
+    placeLabel: string,
+    outcome: string
+  ): Promise<boolean> {
+    await takeKartverketBudget(sleep, 2);
+    const geo = await geocodingService.geocode(placeLabel);
+    await sleep(CENTROID_THROTTLE_MS);
+    if (!geo) return false;
+
+    const t = (geo.placeType || "").toLowerCase().trim();
+    const precision: GeoPrecision =
+      t === "kommune" || t === "fylke" || t === "annen administrativ inndeling"
+        ? "kommune"
+        : "city";
+    // geo.source is the geocoding-service tier that answered
+    // ("kartverket" = Stedsnavn, "kommuneinfo" = the kommune register,
+    // "hardcoded"/"database"/"cache" = local tables). Recorded verbatim
+    // apart from disambiguating Stedsnavn from the adresse API, since
+    // both would otherwise read "kartverket".
+    const source = geo.source === "kartverket" ? "kartverket_stedsnavn" : geo.source;
+    if (isPrecisionUpgrade(row.geo_precision, precision)) {
+      stats.centroid_precision++;
+      if (outcome === "name_suffix_centroid") stats.name_suffix_precision++;
+      record(row, precision, geo.lat, geo.lng, source, outcome);
+    } else {
+      stats.skipped_no_upgrade++;
+      recordAttemptOnly(row, "skipped_no_upgrade");
+    }
+    return true;
+  }
+
   function record(
     row: CandidateRow,
     precision: GeoPrecision,
@@ -427,6 +857,11 @@ async function runAgentsGeocodeTick(
   }
 
   function recordAttemptOnly(row: CandidateRow, outcome: string): void {
+    // The counter this attempt is about to become. Computed from the value the
+    // selector read, so a dry run reports the same parking transition a real
+    // run would perform — without writing it.
+    const attemptsAfter = (row.geocode_attempts ?? 0) + 1;
+    if (attemptsAfter >= AGENTS_GEOCODE_MAX_ATTEMPTS) stats.parked_now++;
     stats.planned.push({
       agent_id: row.id,
       name: row.name ?? "",
@@ -434,9 +869,50 @@ async function runAgentsGeocodeTick(
       to_precision: null,
       lat: null,
       lng: null,
-      outcome,
+      outcome: attemptsAfter >= AGENTS_GEOCODE_MAX_ATTEMPTS ? `${outcome}_parked` : outcome,
     });
     if (dryRun) return;
     updateAttemptOnly.run(outcome, nextAttemptStamp(), row.id);
   }
+}
+
+// ── Scheduling ──────────────────────────────────────────────────────
+
+/**
+ * Register the adaptive tick loop. Replaces the boot `setTimeout` +
+ * hourly `setInterval` pair that used to live inline in src/index.ts.
+ *
+ * The cadence is chosen from the queue itself after every tick — 60 s while
+ * rows remain, an hour once they do not — so the worker is fast exactly while
+ * it has something to do and goes quiet by itself afterwards, with no flag to
+ * remember to unset. Measured motivation is in backfill-scheduler.ts's header.
+ */
+export function startAgentsGeocodeWorker(
+  overrides: Partial<BackfillSchedulerDeps> = {}
+): BackfillSchedulerHandle {
+  return startBackfillScheduler({
+    label: "agents-geocode",
+    backlogDelayMs: AGENTS_GEOCODE_BACKLOG_INTERVAL_MS,
+    idleDelayMs: AGENTS_GEOCODE_IDLE_INTERVAL_MS,
+    bootDelayMs: AGENTS_GEOCODE_BOOT_DELAY_MS,
+    hasBacklog: agentsGeocodeHasBacklog,
+    runTick: async () => {
+      const r = await agentsGeocodeTick(GEOCODE_BATCH_LIMIT_DEFAULT);
+      if (r.skipped_already_running) {
+        // A tick can legitimately outlive its own interval (batch × retry
+        // ladder × HTTP timeout). Saying so explicitly is what separates
+        // "nothing happened this minute" from "the worker is wedged".
+        console.log("[agents-geocode] tick skipped — the previous tick is still running");
+        return;
+      }
+      console.log(
+        `[agents-geocode] tick processed=${r.processed} ` +
+        `address=${r.address_precision} (high=${r.address_high} medium=${r.address_medium} low=${r.address_low}) ` +
+        `centroid=${r.centroid_precision} (name_suffix=${r.name_suffix_precision}) ` +
+        `no_match=${r.no_match} skipped_no_upgrade=${r.skipped_no_upgrade} ` +
+        `parked_now=${r.parked_now} errors=${r.errors} duration_ms=${r.duration_ms}`
+      );
+    },
+    ...overrides,
+  });
 }

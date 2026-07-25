@@ -3158,7 +3158,11 @@ function initSchema(db: Database.Database): void {
   //                          (the adresse-API retry ladder's confidence tiers,
   //                          same vocabulary as dental_agents.
   //                          geocode_confidence), 'city_centroid',
-  //                          'no_match', or 'skipped_no_upgrade'.
+  //                          'name_suffix_centroid' (Tier C — the place suffix
+  //                          in the producer's own name, «Straumbotn Gård —
+  //                          Rana»; centroid-tier like 'city_centroid', so it
+  //                          never licenses a km figure), 'no_match',
+  //                          'skipped_no_upgrade', or 'error'.
   //   geocode_attempted_at : ISO-8601 stamp written on EVERY attempt whatever
   //                          the outcome. This is the ROTATION key — same
   //                          lesson as agent_knowledge.last_enrichment_
@@ -3193,6 +3197,30 @@ function initSchema(db: Database.Database): void {
   //
   // Additive + idempotent ALTERs, same defensive try/catch idiom as every
   // migration above.
+  //   geocode_attempts     : consecutive attempts that produced NO progress
+  //                          (no coordinate written). Reset to 0 the moment a
+  //                          position IS written, and by the postal-code
+  //                          backfill worker when it gives a row the postnummer
+  //                          that was blocking it.
+  //
+  //                          Added by the throughput follow-up (Daniel,
+  //                          2026-07-25: «veldig mange fortsatt står med ukjent
+  //                          opphav»). Two changes made it necessary. The
+  //                          cadence went from hourly to backlog-driven 60 s, so
+  //                          a full rotation of ~1 600 producers now takes ~20
+  //                          minutes instead of ~32 hours; and Tier C made ~250
+  //                          previously-unselectable rows selectable. Together
+  //                          that turns "a row Kartverket will never resolve" —
+  //                          which used to be re-tried about twice a day — into
+  //                          one re-tried ~70 times a day, forever, against a
+  //                          free unauthenticated API. Past
+  //                          AGENTS_GEOCODE_MAX_ATTEMPTS the row is PARKED: no
+  //                          longer selected, and reported in the queue status
+  //                          under its own honest heading rather than sitting in
+  //                          "unknown, might be fixable" for ever. Parking is a
+  //                          statement about our evidence, never about the
+  //                          producer — it writes no coordinate and changes no
+  //                          rendering.
   for (const stmt of [
     `ALTER TABLE agents ADD COLUMN geo_precision TEXT`,
     `ALTER TABLE agents ADD COLUMN geocode_source TEXT`,
@@ -3200,6 +3228,7 @@ function initSchema(db: Database.Database): void {
     `ALTER TABLE agents ADD COLUMN geocode_attempted_at TEXT`,
     `ALTER TABLE agents ADD COLUMN geocode_prev_lat REAL`,
     `ALTER TABLE agents ADD COLUMN geocode_prev_lng REAL`,
+    `ALTER TABLE agents ADD COLUMN geocode_attempts INTEGER NOT NULL DEFAULT 0`,
   ]) {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }

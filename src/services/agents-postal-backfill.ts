@@ -125,16 +125,27 @@
 //   • dry_run is a STRICT boolean — reuses parseDryRunFlag() from the Fase-1a
 //     worker, where `{"dry_run":"true"}` once performed a real prod write
 //   • X-Admin-Key endpoint with a clamped limit (clampGeocodeBatchLimit)
-//   • hourly tick + boot tick registered in src/index.ts
+//   • ADAPTIVE tick registered in src/index.ts via startPostalBackfillWorker()
+//     (backfill-scheduler.ts): 2 min while never-attempted rows remain, hourly
+//     once they do not. Was a boot setTimeout + hourly setInterval; changed by
+//     the 2026-07-25 throughput follow-up so this queue clears in minutes and
+//     hands its results to the geocode worker while that one is still draining.
 //   • disable with RFB_DISABLE_POSTAL_BACKFILL=1
 //
 // Rate limiting: THROTTLE_MS (350 ms) after EVERY Kartverket request, same
-// courtesy pacing as dental-geocode-worker.ts. Volume here is ~200 rows total,
-// once — this worker goes quiet by itself.
+// courtesy pacing as dental-geocode-worker.ts, UNDER a 2 req/s process-wide
+// ceiling now shared with the geocode worker (kartverket-budget.ts). Volume
+// here is ~60 rows at a time — this worker goes quiet by itself.
 
 import { getDb } from "../database/init";
 import { transliterate, stripHouseLetterSuffix, type GeocodeDeps } from "./dental-geocode-worker";
 import { normalizeCityLabel } from "./city-normalizer";
+import { takeKartverketBudget } from "./kartverket-budget";
+import {
+  startBackfillScheduler,
+  type BackfillSchedulerDeps,
+  type BackfillSchedulerHandle,
+} from "./backfill-scheduler";
 
 const KARTVERKET_BASE = "https://ws.geonorge.no/adresser/v1/sok";
 const THROTTLE_MS = 350;
@@ -164,44 +175,29 @@ const MAX_PLACE_CANDIDATES = 3;
  */
 const MAX_PROBES_PER_ROW = 6;
 
+// ── Rate ceiling ────────────────────────────────────────────────────
+// THROTTLE_MS paces requests WITHIN a row, but says nothing about the
+// aggregate: the Fase-1a geocode worker runs alongside this one and their rates
+// add. The token bucket that bounds the two of them TOGETHER now lives in
+// kartverket-budget.ts (takeKartverketBudget, imported above).
+//
+// This file's previous header said sharing that bucket with the geocode worker
+// was "the right follow-up and is deliberately left out"; it stopped being
+// optional when the geocode worker's cadence went from hourly to
+// backlog-driven 60 s. The objection that had blocked the hoist — that wiring
+// dental-geocode-worker.kartverketQuery() onto a bucket would put a real timer
+// inside dental's and experiences' suites — was sidestepped instead: the
+// geocode worker draws tokens by handing geocodeOne() a BUDGETED FETCH, so
+// nothing in those three other code paths changed at all.
+
 /**
- * Process-wide token bucket for Kartverket adresse traffic.
- *
- * THROTTLE_MS paces requests WITHIN a row, but says nothing about the
- * aggregate: the Fase-1a geocode worker runs on the same hourly cadence and the
- * 45 s vs 30 s boot offset does not survive process drift, so the two can
- * overlap and their rates add. This bucket bounds what THIS worker contributes
- * however many rows are in flight.
- *
- * It waits through the injected `sleep` seam, so tests (which always inject a
- * no-op sleep) are unaffected and no suite gets slower.
- *
- * NOT YET SHARED with the geocode worker: its HTTP goes through
- * dental-geocode-worker.kartverketQuery(), which is also on dental's and
- * experiences' hot paths and takes no sleep seam, so wiring it there would put
- * a real timer inside three other suites. Hoisting kartverketQuery onto this
- * bucket is the right follow-up and is deliberately left out of a slice that is
- * already touching a freshly-reviewed file.
+ * Cadence. Same shape and the same reasoning as the geocode worker's, one
+ * notch slower: this queue is ~60 rows, not ~1 000, and every row it resolves
+ * hands work to the geocode worker, so racing it buys nothing.
  */
-const KARTVERKET_MAX_RPS = 2;
-const kartverketBudget = {
-  windowStart: 0,
-  used: 0,
-  async take(sleep: (ms: number) => Promise<void>): Promise<void> {
-    const now = Date.now();
-    if (now - this.windowStart >= 1000) {
-      this.windowStart = now;
-      this.used = 0;
-    }
-    if (this.used >= KARTVERKET_MAX_RPS) {
-      const wait = Math.max(0, 1000 - (now - this.windowStart));
-      await sleep(wait);
-      this.windowStart = Date.now();
-      this.used = 0;
-    }
-    this.used++;
-  },
-};
+export const POSTAL_BACKFILL_BACKLOG_INTERVAL_MS = 120_000;
+export const POSTAL_BACKFILL_IDLE_INTERVAL_MS = 60 * 60_000;
+export const POSTAL_BACKFILL_BOOT_DELAY_MS = 45_000;
 
 export type PostalBackfillDeps = GeocodeDeps & {
   /** Report what would change; write nothing (not even the attempt stamp). */
@@ -566,7 +562,7 @@ export async function resolvePostalCode(
   const probe = async (variant: string, token: string, place: string | null): Promise<PostalProbeResult | null> => {
     if (probesLeft <= 0) return null;
     probesLeft--;
-    await kartverketBudget.take(sleep);
+    await takeKartverketBudget(sleep, 1);
     const r = await probeKartverket(variant, token, place, fetchImpl);
     await sleep(THROTTLE_MS);
     return r;
@@ -1004,8 +1000,13 @@ async function runPostalBackfillTick(
   // Clearing the stamp is honest — the row has never been attempted WITH this
   // data — and is what turns a postnummer into an actual coordinate on the
   // next hour's tick instead of after a full rotation of ~1 500 producers.
+  // geocode_attempts is reset too (throughput follow-up): a row PARKED by the
+  // geocode worker for repeated no-matches has, by definition, just had the
+  // thing that was blocking it fixed. Clearing only the timestamp would put a
+  // freshly-postnummered row back in a queue its own parking rule excludes it
+  // from — the postnummer would be written and then never used.
   const requeueGeocode = db.prepare(
-    `UPDATE agents SET geocode_attempted_at = NULL
+    `UPDATE agents SET geocode_attempted_at = NULL, geocode_attempts = 0
       WHERE id = ? AND (geo_precision IS NULL OR geo_precision <> 'address')`
   );
 
@@ -1112,4 +1113,62 @@ async function runPostalBackfillTick(
 
   stats.duration_ms = Date.now() - start;
   return stats;
+}
+
+// ── Scheduling ──────────────────────────────────────────────────────
+
+/** True while rows remain that this worker could still attempt. */
+export function postalBackfillHasBacklog(): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM agent_knowledge k
+         JOIN agents a ON a.id = k.agent_id
+        WHERE a.is_active = 1
+          AND k.address IS NOT NULL AND TRIM(k.address) <> ''
+          AND (k.postal_code IS NULL OR TRIM(k.postal_code) = '')
+          AND k.postal_backfill_attempted_at IS NULL`
+    )
+    .get() as any;
+  return (row?.n ?? 0) > 0;
+}
+
+/**
+ * Register the adaptive tick loop, replacing the boot `setTimeout` + hourly
+ * `setInterval` pair that used to live inline in src/index.ts.
+ *
+ * NOTE the backlog definition above counts only NEVER-ATTEMPTED rows, not every
+ * row still missing a postnummer. This worker's refusals are mostly permanent
+ * (an address with no house number will never become unique), so "still missing
+ * a postnummer" would be true for ever and the fast cadence would never decay —
+ * a hot loop dressed as a backlog. Attempted-once rows still come round on the
+ * hourly heartbeat, which is the right frequency for re-checking data that only
+ * changes when a producer edits their own profile.
+ */
+export function startPostalBackfillWorker(
+  overrides: Partial<BackfillSchedulerDeps> = {}
+): BackfillSchedulerHandle {
+  return startBackfillScheduler({
+    label: "postal-backfill",
+    backlogDelayMs: POSTAL_BACKFILL_BACKLOG_INTERVAL_MS,
+    idleDelayMs: POSTAL_BACKFILL_IDLE_INTERVAL_MS,
+    bootDelayMs: POSTAL_BACKFILL_BOOT_DELAY_MS,
+    hasBacklog: postalBackfillHasBacklog,
+    runTick: async () => {
+      const r = await postalBackfillTick(POSTAL_BACKFILL_LIMIT_DEFAULT);
+      if (r.skipped_already_running) {
+        console.log("[postal-backfill] tick skipped — the previous tick is still running");
+        return;
+      }
+      console.log(
+        `[postal-backfill] tick processed=${r.processed} ` +
+        `resolved=${r.resolved} (inline=${r.resolved_inline} lookup=${r.resolved_lookup}) ` +
+        `ambiguous=${r.ambiguous} uncorroborated=${r.uncorroborated} ` +
+        `no_match=${r.no_match} unusable=${r.unusable} ` +
+        `errors=${r.errors} duration_ms=${r.duration_ms}`
+      );
+    },
+    ...overrides,
+  });
 }
