@@ -404,10 +404,13 @@ app.use("/ut", generalLimiter);
 // opplevagent.no. Mounted before the routers below so it actually wraps them.
 // Same shared instance/quota as the "/api" mount above — from a visitor's
 // perspective this is the same "general API-ish" traffic, and /reise is a query
-// surface, not a document. `/en/reise` gets it too, via the same prefix on the
-// localized mount.
+// surface, not a document.
+//
+// One mount covers both languages: langMiddleware (mounted at :181, well above
+// this line) rewrites req.url from "/en/reise" to "/reise" before any route or
+// limiter sees it, so an explicit "/en/reise" mount here would be dead code.
+// Verified against i18n/middleware.ts:34-41.
 app.use("/reise", generalLimiter);
-app.use("/en/reise", generalLimiter);
 
 // ─── Routes ──────────────────────────────────────────────────
 // Public contact form — mounted first so it's available on all 3 platform hosts.
