@@ -196,6 +196,14 @@ import {
   buildPageEvidence,
   containsMojibake,
   type PageEvidence,
+  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding follow-up —
+  // crFetchHtml (below) had the SAME resp.text()-forces-UTF-8 bug that
+  // fetchHtml() in search-enrich.ts was fixed for in PR lokal#360; reused
+  // here (not re-implemented) so content-refresh/gardssalg-content-refresh
+  // decode with the page's actual declared charset instead of assuming UTF-8.
+  // (decodeHtmlBytes calls detectHtmlCharset internally — only decodeHtmlBytes
+  // needs to be imported here.)
+  decodeHtmlBytes,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
@@ -719,7 +727,8 @@ async function crFetchHtml(url: string): Promise<string | null> {
       signal: AbortSignal.timeout(CR_FETCH_TIMEOUT_MS),
     });
     if (!resp.ok) return null;
-    return await resp.text();
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    return decodeHtmlBytes(bytes, resp.headers.get("content-type"));
   } catch {
     return null;
   }

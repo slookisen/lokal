@@ -263,7 +263,12 @@ export function runOpplevelserGardssalgRetroScanTests(
         }
         const host = new URL(urlStr).hostname;
         fetchedHosts.push(host);
-        return { ok: true, status: 200, text: async () => "<html><body><p>Placeholder homepage content.</p></body></html>" } as unknown as Response;
+        const placeholderHtml = "<html><body><p>Placeholder homepage content.</p></body></html>";
+        return {
+          ok: true, status: 200, text: async () => placeholderHtml,
+          arrayBuffer: async () => new TextEncoder().encode(placeholderHtml).buffer,
+          headers: { get: () => null },
+        } as unknown as Response;
       }) as typeof fetch;
 
       // ═══════════════════════════════════════════════════════════════════

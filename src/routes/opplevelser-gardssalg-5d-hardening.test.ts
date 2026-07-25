@@ -201,9 +201,12 @@ export function runOpplevelserGardssalg5dHardeningTests(
           throw new Error(`unexpected non-page fetch in 5d content tests: ${urlStr}`);
         }
         fetchedPageUrls.push(urlStr);
+        const html5h = `<html><head><meta property="og:description" content="Aleine gard med gardsbutikk, servering og omvisning for grupper hele sesongen — velkomen innom for smaksprøver av eigen produksjon."></head><body><p>Velkomen.</p></body></html>`;
         return {
           ok: true, status: 200,
-          text: async () => `<html><head><meta property="og:description" content="Aleine gard med gardsbutikk, servering og omvisning for grupper hele sesongen — velkomen innom for smaksprøver av eigen produksjon."></head><body><p>Velkomen.</p></body></html>`,
+          text: async () => html5h,
+          arrayBuffer: async () => new TextEncoder().encode(html5h).buffer,
+          headers: { get: () => null },
         } as unknown as Response;
       }) as unknown as typeof fetch;
 

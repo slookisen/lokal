@@ -625,7 +625,11 @@ export function runOpplevelserGardssalgContentAuditTests(
           }
           const host = new URL(urlStr).hostname;
           if (host === "prov-k-thin.example.no" || host === "prov-k-decent.example.no") {
-            return { ok: true, status: 200, text: async () => gcrHtmlK } as unknown as Response;
+            return {
+              ok: true, status: 200, text: async () => gcrHtmlK,
+              arrayBuffer: async () => new TextEncoder().encode(gcrHtmlK).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
           }
           return { ok: false, status: 404, text: async () => "" } as unknown as Response;
         }) as typeof fetch;
@@ -765,7 +769,11 @@ export function runOpplevelserGardssalgContentAuditTests(
           }
           const u = new URL(urlStr);
           if (u.hostname === "prov-l-duplicate.example.no" && (u.pathname === "/" || u.pathname === "")) {
-            return { ok: true, status: 200, text: async () => DRAOPAR_SHAPE_HTML } as unknown as Response;
+            return {
+              ok: true, status: 200, text: async () => DRAOPAR_SHAPE_HTML,
+              arrayBuffer: async () => new TextEncoder().encode(DRAOPAR_SHAPE_HTML).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
           }
           // Every gårdssalg sub-page candidate (om-oss, besok, smaking, ...)
           // 404s — this producer's real site is exactly one page, same as
@@ -890,10 +898,18 @@ export function runOpplevelserGardssalgContentAuditTests(
           }
           const host = new URL(urlStr).hostname;
           if (host === "prov-m-contaminated.example.no") {
-            return { ok: true, status: 200, text: async () => contaminatedHtmlM } as unknown as Response;
+            return {
+              ok: true, status: 200, text: async () => contaminatedHtmlM,
+              arrayBuffer: async () => new TextEncoder().encode(contaminatedHtmlM).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
           }
           if (host === "prov-m-decent.example.no") {
-            return { ok: true, status: 200, text: async () => decentHtmlM } as unknown as Response;
+            return {
+              ok: true, status: 200, text: async () => decentHtmlM,
+              arrayBuffer: async () => new TextEncoder().encode(decentHtmlM).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
           }
           return { ok: false, status: 404, text: async () => "" } as unknown as Response;
         }) as typeof fetch;

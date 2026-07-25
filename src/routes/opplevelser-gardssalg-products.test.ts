@@ -399,7 +399,11 @@ export function runOpplevelserGardssalgProductsTests(
           host === "prov-pg-existing.example.no" ||
           host === "prov-pg-emptyarr.example.no"
         ) {
-          return { ok: true, status: 200, text: async () => plainPage } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => plainPage,
+            arrayBuffer: async () => new TextEncoder().encode(plainPage).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         return { ok: false, status: 404, text: async () => "" } as unknown as Response;
       }) as typeof fetch;
@@ -525,7 +529,11 @@ export function runOpplevelserGardssalgProductsTests(
         }
         const host = new URL(urlStr).hostname;
         if (host === "prov-pg-none.example.no") {
-          return { ok: true, status: 200, text: async () => plainPage } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => plainPage,
+            arrayBuffer: async () => new TextEncoder().encode(plainPage).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         return { ok: false, status: 404, text: async () => "" } as unknown as Response;
       }) as typeof fetch;

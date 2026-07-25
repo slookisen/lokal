@@ -29867,6 +29867,41 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// crFetchHtml charset fix (mirrors PR lokal#360's fetchHtml() fix in
+// src/services/search-enrich.ts): POST /admin/content-refresh's crFetchHtml
+// now decodes fetched HTML bytes with detectHtmlCharset()/decodeHtmlBytes()
+// instead of forcing UTF-8 via resp.text(). Swaps the shared experiences
+// db-factory getDb() singleton (own dedicated test file, in-memory
+// prod-schema DB) — mirrors the block immediately above, so it must run
+// strictly after it; _expNoYieldBackoffPromise is the current tail of that
+// serial chain.
+let _contentRefreshCharsetResolve: () => void = () => {};
+const _contentRefreshCharsetPromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshCharsetResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_expNoYieldBackoffPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── crFetchHtml charset fix: POST /admin/content-refresh windows-1252/utf-8 decode ──");
+  try {
+    const { runOpplevelserContentRefreshCharsetTests } = require("../src/routes/opplevelser-content-refresh-charset.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-charset.test");
+    const crc = await runOpplevelserContentRefreshCharsetTests({ log: false });
+    passed += crc.passed;
+    failed += crc.failed;
+    for (const f of crc.failures) failures.push("opplevelser-content-refresh-charset: " + f);
+    console.log(`  opplevelser-content-refresh-charset: ${crc.passed} passed, ${crc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-charset: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshCharsetResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (items 1 + 3):
 // `select: "low_quality"` opt-in cohort on POST /admin/homepage-provenance-batch
 // (src/routes/marketplace.ts) — ranks agents worst-first by agents.trust_score
@@ -29876,16 +29911,16 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 // immediately after a successful low_quality re-enrichment. Also covers the
 // matching low_quality_cohort breakdown on GET /admin/outreach-ready-pool/stats.
 // Swaps the shared getDb() singleton (own dedicated test file, in-memory
-// prod-schema DB) — mirrors the experiences-content-refresh-no-yield-backoff
-// block immediately above, so it must run strictly after it;
-// _expNoYieldBackoffPromise is the current tail of that serial chain.
+// prod-schema DB) — mirrors the crFetchHtml-charset-fix block immediately
+// above, so it must run strictly after it; _contentRefreshCharsetPromise is
+// the current tail of that serial chain.
 let _lowQualitySelectorResolve: () => void = () => {};
 const _lowQualitySelectorPromise: Promise<void> = new Promise<void>(r => {
   _lowQualitySelectorResolve = r;
 });
 
 (async () => {
-  await Promise.allSettled([_expNoYieldBackoffPromise]);
+  await Promise.allSettled([_contentRefreshCharsetPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-13: low_quality re-enrichment selector + trust-score refresh ──");
