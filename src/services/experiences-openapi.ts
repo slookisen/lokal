@@ -115,7 +115,7 @@ export function getExperiencesOpenapi(): object {
                             producer_type: "sideri",
                             lat: 60.57,
                             lon: 6.9,
-                            geocode_confidence: "address",
+                            geocode_confidence: "high",
                             booking: { live: false, mode: "paused", note: "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch." },
                             profile_url: "https://opplevagent.no/kategori/gardssalg/produsent/eksempel-sideri--abc123",
                           },
@@ -302,7 +302,16 @@ export function getExperiencesOpenapi(): object {
             producer_type: { type: "string", nullable: true },
             lat: { type: "number", nullable: true },
             lon: { type: "number", nullable: true },
-            geocode_confidence: { type: "string", enum: ["address", "kommune"], nullable: true },
+            geocode_confidence: {
+              type: "string",
+              enum: ["high", "medium", "low", "no_match", "approximate"],
+              nullable: true,
+              description:
+                "Provider-address geocode quality (`experience_providers.geocode_confidence` — distinct from the " +
+                "Experience schema's `geo_precision`, which uses 'address'/'kommune' instead). 'high'/'medium'/'low' " +
+                "come from the address-geocoding step; 'approximate' is a kommune-centroid fallback; 'no_match' means " +
+                "no coordinates could be resolved (lat/lon are null in that case).",
+            },
             booking: {
               type: "object",
               description: "Honest booking status — never claims an active booking flow before the dark-launch gate opens.",
