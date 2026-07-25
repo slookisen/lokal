@@ -638,47 +638,55 @@ export function listPublishedExperiences(
 
 /** Distinct categories that have ≥1 PUBLISHED experience (with counts). Drives
  *  the homepage cards, the /opplevelser facet list, and the sitemap category
- *  URLs — so every linked category page is guaranteed non-empty. */
-export function listPublishedCategories(): Array<{ category: string; count: number }> {
+ *  URLs — so every linked category page is guaranteed non-empty.
+ *  `lastmod` = MAX(updated_at) of the published rows composing this category —
+ *  real per-aggregate freshness for the sitemap (GSC 2026-07 opplevagent
+ *  indekseringsfiks, "sitemap lastmod honesty" — no blanket "today"), same
+ *  MAX(updated_at)-over-the-underlying-rows pattern rfb's city lastmod uses
+ *  (PR #302). Additive column; other callers (facetChips()) ignore it. */
+export function listPublishedCategories(): Array<{ category: string; count: number; lastmod: string | null }> {
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT e.category AS category, COUNT(*) AS count FROM experiences e
+      `SELECT e.category AS category, COUNT(*) AS count, MAX(e.updated_at) AS lastmod FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE e.category IS NOT NULL AND e.category != '' AND ${PUBLISH_GATE_SQL}
        GROUP BY e.category ORDER BY count DESC, e.category ASC`
     )
-    .all() as Array<{ category: string; count: number }>;
+    .all() as Array<{ category: string; count: number; lastmod: string | null }>;
 }
 
-/** Distinct fylker that have ≥1 PUBLISHED experience (with counts). */
-export function listPublishedFylker(): Array<{ fylke: string; count: number }> {
+/** Distinct fylker that have ≥1 PUBLISHED experience (with counts). `lastmod` =
+ *  MAX(updated_at) of the underlying rows — see listPublishedCategories() doc. */
+export function listPublishedFylker(): Array<{ fylke: string; count: number; lastmod: string | null }> {
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT e.fylke AS fylke, COUNT(*) AS count FROM experiences e
+      `SELECT e.fylke AS fylke, COUNT(*) AS count, MAX(e.updated_at) AS lastmod FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE e.fylke IS NOT NULL AND e.fylke != '' AND ${PUBLISH_GATE_SQL}
        GROUP BY e.fylke ORDER BY count DESC, e.fylke ASC`
     )
-    .all() as Array<{ fylke: string; count: number }>;
+    .all() as Array<{ fylke: string; count: number; lastmod: string | null }>;
 }
 
 /** Distinct kommuner that have ≥1 PUBLISHED experience — with the fylke they sit
  *  in + counts. Drives the /kommune/<x> place pages, the kommune cross-links on
  *  /fylke/<x>, and the sitemap kommune URLs, so every linked kommune page is
  *  guaranteed non-empty (zero orphan/dead entries). One row per distinct kommune
- *  name (MAX(fylke) picks a representative fylke for the breadcrumb/up-link). */
-export function listPublishedKommuner(): Array<{ kommune: string; fylke: string | null; count: number }> {
+ *  name (MAX(fylke) picks a representative fylke for the breadcrumb/up-link).
+ *  `lastmod` = MAX(updated_at) of the underlying rows — see
+ *  listPublishedCategories() doc. */
+export function listPublishedKommuner(): Array<{ kommune: string; fylke: string | null; count: number; lastmod: string | null }> {
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT e.kommune AS kommune, MAX(e.fylke) AS fylke, COUNT(*) AS count FROM experiences e
+      `SELECT e.kommune AS kommune, MAX(e.fylke) AS fylke, COUNT(*) AS count, MAX(e.updated_at) AS lastmod FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE e.kommune IS NOT NULL AND e.kommune != '' AND ${PUBLISH_GATE_SQL}
        GROUP BY e.kommune ORDER BY count DESC, e.kommune ASC`
     )
-    .all() as Array<{ kommune: string; fylke: string | null; count: number }>;
+    .all() as Array<{ kommune: string; fylke: string | null; count: number; lastmod: string | null }>;
 }
 
 // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering, item 5:
@@ -837,6 +845,9 @@ export type ProduktByComboRow = {
   total: number;
   providerCount: number;
   minPriceFrom: number | null;
+  // MAX(updated_at) of the underlying published rows in this combo — real
+  // per-aggregate freshness for the sitemap (see listPublishedCategories() doc).
+  lastmod: string | null;
 };
 export function listProduktByCombos(): ProduktByComboRow[] {
   const db = getDb(VERTICAL);
@@ -845,7 +856,8 @@ export function listProduktByCombos(): ProduktByComboRow[] {
       `SELECT e.category AS category, e.kommune AS kommune,
               COUNT(*) AS total,
               COUNT(DISTINCT e.provider_id) AS providerCount,
-              MIN(e.price_from) AS minPriceFrom
+              MIN(e.price_from) AS minPriceFrom,
+              MAX(e.updated_at) AS lastmod
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE e.category IS NOT NULL AND e.category != ''
@@ -857,7 +869,10 @@ export function listProduktByCombos(): ProduktByComboRow[] {
     .all() as ProduktByComboRow[];
 }
 
-/** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts). */
+/** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts).
+ *  `lastmod` = MAX(updated_at) of that provider's own published experiences —
+ *  real per-aggregate freshness for the sitemap (see listPublishedCategories()
+ *  doc). */
 export type PublishedProviderRow = {
   id: string;
   slug: string | null;
@@ -865,13 +880,14 @@ export type PublishedProviderRow = {
   fylke: string | null;
   kommune: string | null;
   count: number;
+  lastmod: string | null;
 };
 export function listPublishedProviders(): PublishedProviderRow[] {
   const db = getDb(VERTICAL);
   return db
     .prepare(
       `SELECT p.id AS id, p.slug AS slug, p.navn AS navn, p.fylke AS fylke, p.kommune AS kommune,
-              COUNT(*) AS count
+              COUNT(*) AS count, MAX(e.updated_at) AS lastmod
        FROM experiences e
        JOIN experience_providers p ON p.id = e.provider_id
        WHERE e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
@@ -1935,10 +1951,16 @@ export type GardssalgProviderRow = {
   // — the mechanism behind the controlled end-to-end booking test. 0/NULL =
   // today's behavior (visible). Only the admin test-provider endpoint sets it 1.
   catalog_hidden: number | null;
+  // Additive (2026-07-25, GSC opplevagent indekseringsfiks, sitemap lastmod
+  // honesty item): the provider row's own updated_at — a real per-row
+  // freshness signal for the /kategori/gardssalg/produsent/<slug> sitemap
+  // entry (same "row.updated_at || today" pattern the /opplevelse/<slug>
+  // sitemap loop already uses), instead of a blanket "today" on every request.
+  updated_at: string | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);

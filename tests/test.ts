@@ -32906,3 +32906,19 @@ runSerial(async () => {
     failures.push("gardssalg-claim routes: unexpected error: " + String(err?.message || err));
   }
 });
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-19-opplevagent-gsc-indekseringsfikser: robots.txt Disallow + sitemap lastmod honesty ──");
+  try {
+    const { runExperiencesSeoGscFixesTests } = require("../src/routes/experiences-seo-gsc-fixes.test") as
+      typeof import("../src/routes/experiences-seo-gsc-fixes.test");
+    const gsc = await runExperiencesSeoGscFixesTests({ log: false });
+    passed += gsc.passed;
+    failed += gsc.failed;
+    for (const f of gsc.failures) failures.push("experiences-seo-gsc-fixes: " + f);
+    console.log(`  experiences-seo-gsc-fixes: ${gsc.passed} passed, ${gsc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-gsc-fixes: unexpected error: " + String(err?.message || err));
+  }
+});
