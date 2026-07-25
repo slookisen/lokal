@@ -30549,7 +30549,7 @@ console.log("\n── mcp-usage-guides: GET /guide-mat-ai (rettfrabonden.com) �
     // the geo-faq-cc/geo-afo blocks' `expSeoSrcAfo.includes(...)` checks).
     const fsGma = require("fs");
     const seoSrcGma = fsGma.readFileSync("src/routes/seo.ts", "utf8");
-    assertTrue(seoSrcGma.includes('const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern"]'),
+    assertTrue(seoSrcGma.includes('const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/proveniens"]'),
       "gma-15: sitemap.xml's corePaths array includes /guide-mat-ai");
 
     console.log("  mcp-usage-guides (rfb): OK (16 tests: route-registered/200-no/canonical-no/faq-no/title-no/real-tools/teknologi-crosslink/200-en/canonical-en/faq-en/title-en/tools-en/faq-builder-valid/faq-count/faq-shape/sitemap-corepaths)");
@@ -30655,6 +30655,340 @@ console.log("\n── mcp-usage-guides: GET /guide-opplevelser-mcp (opplevagent.
   } catch (err) {
     failed++;
     failures.push(`mcp-usage-guides (opplevagent): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ── proveniens-transparens (dev-request 2026-07-25-proveniens-transparens):
+// public "how we verify our data" page on all three domains + additive
+// card/llms.txt links. Purely descriptive of the existing field_provenance /
+// cross-source-validator machinery (see src/services/cross-source-validator.ts)
+// — no new behavior. Forbidden-phrase check is the hard review-blocking
+// constraint from the dev-request: the page must never claim any kind of
+// regulatory compliance/certification.
+console.log("\n── proveniens-transparens: GET /proveniens (all 3 domains) + card/llms.txt links ──");
+const FORBIDDEN_COMPLIANCE_PHRASES = [
+  "AI Act-compliant", "sertifisert", "EU-compliant", "certified", "compliance", "compliant",
+];
+function assertNoForbiddenCompliancePhrases(body: string, label: string): void {
+  for (const phrase of FORBIDDEN_COMPLIANCE_PHRASES) {
+    assertTrue(
+      !body.toLowerCase().includes(phrase.toLowerCase()),
+      `${label}: rendered HTML does not contain forbidden phrase "${phrase}"`
+    );
+  }
+}
+
+// ── rettfrabonden.com: GET /proveniens (seo.ts) ──
+(() => {
+  try {
+    const seoModProv = require("../src/routes/seo");
+    const seoRouterProv = seoModProv.default as any;
+
+    const layerProv = (seoRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/proveniens" && l.route.methods?.get
+    );
+    assertTrue(!!layerProv, "prov-rfb-00: GET /proveniens layer is registered");
+    const handlerProv = layerProv.route.stack[layerProv.route.stack.length - 1].handle;
+
+    function invokeProv(lang: "no" | "en"): { status: number; body: string; headers: Record<string, string> } {
+      let status = 200; let body = "";
+      const headers: Record<string, string> = {};
+      const res: any = {
+        setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+        status: (c: number) => { status = c; return res; },
+        send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      };
+      const req: any = { lang, query: {} };
+      handlerProv(req, res);
+      return { status, body, headers };
+    }
+
+    // ── NO ──
+    const noProv = invokeProv("no");
+    assertEq(noProv.status, 200, "prov-rfb-01: GET /proveniens (no) -> 200");
+    assertTrue(noProv.body.includes('<link rel="canonical" href="https://rettfrabonden.com/proveniens">'),
+      "prov-rfb-02: NO canonical URL present");
+    assertTrue(noProv.body.includes("Slik verifiserer vi dataene våre"), "prov-rfb-03: NO page renders the expected h1");
+    assertTrue(noProv.body.includes("Brønnøysundregistrene"), "prov-rfb-04: NO page names Brønnøysundregistrene as a source");
+    assertTrue(noProv.body.includes("Debio"), "prov-rfb-05: NO page names Debio as a source");
+    assertTrue(noProv.body.includes("Google Places"), "prov-rfb-06: NO page names Google Places as a source");
+    assertTrue(noProv.body.includes("&#10003; Verifisert"), "prov-rfb-07: NO page shows the verified-badge example");
+    // (b) plain SSR HTML — the real page text is present verbatim in the
+    // response body, not behind a client-side shell/hydration marker.
+    assertTrue(!/<div id="root">\s*<\/div>/.test(noProv.body) && !/id="app">\s*<\/noscript>/.test(noProv.body),
+      "prov-rfb-08: NO page is not an empty client-side shell (no #root/#app hydration marker)");
+    assertTrue(noProv.body.length > 3000, "prov-rfb-09: NO page body has substantial server-rendered content");
+    // (c) forbidden compliance/certification phrases
+    assertNoForbiddenCompliancePhrases(noProv.body, "prov-rfb-10");
+
+    // ── EN ──
+    const enProv = invokeProv("en");
+    assertEq(enProv.status, 200, "prov-rfb-11: GET /proveniens (en) -> 200");
+    assertTrue(enProv.body.includes('<link rel="canonical" href="https://rettfrabonden.com/en/proveniens">'),
+      "prov-rfb-12: EN canonical URL present (localizedPath /en prefix)");
+    assertTrue(enProv.body.includes("How we verify our data"), "prov-rfb-13: EN page renders the expected h1");
+    assertTrue(enProv.body.includes("Brønnøysundregistrene") && enProv.body.includes("Debio"),
+      "prov-rfb-14: EN page also names Brønnøysundregistrene + Debio");
+    assertNoForbiddenCompliancePhrases(enProv.body, "prov-rfb-15");
+
+    // ── Sitemap: /proveniens is wired into corePaths ──
+    const sitemapLayerProv = (seoRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/sitemap.xml" && l.route.methods?.get
+    );
+    assertTrue(!!sitemapLayerProv, "prov-rfb-16: router has GET /sitemap.xml layer");
+
+    // ── /:city catch-all must NOT swallow /proveniens (reserved-slug guard) ──
+    const cityLayerProv = (seoRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/:city" && l.route.methods?.get
+    );
+    assertTrue(!!cityLayerProv, "prov-rfb-17: router has GET /:city layer");
+    let cityNextCalledProv = false;
+    const cityHandlerProv = cityLayerProv.route.stack[cityLayerProv.route.stack.length - 1].handle;
+    cityHandlerProv({ params: { city: "proveniens" }, lang: "no" } as any, {} as any, () => { cityNextCalledProv = true; });
+    assertTrue(cityNextCalledProv, "prov-rfb-18: /:city treats 'proveniens' as reserved and calls next()");
+
+    console.log("  proveniens-transparens (rfb): OK (18 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`proveniens-transparens (rfb): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ── finn-tannlege.com: GET /proveniens (dental-seo.ts) ──
+(() => {
+  try {
+    const dentalSeoModProv = require("../src/routes/dental-seo");
+    const dentalSeoRouterProv = dentalSeoModProv.default as any;
+
+    const layerDp = (dentalSeoRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/proveniens" && l.route.methods?.get
+    );
+    assertTrue(!!layerDp, "prov-dental-00: GET /proveniens layer is registered");
+    const handlerDp = layerDp.route.stack[layerDp.route.stack.length - 1].handle;
+
+    let statusDp = 200; let bodyDp = "";
+    const headersDp: Record<string, string> = {};
+    const resDp: any = {
+      setHeader: (k: string, v: string) => { headersDp[k.toLowerCase()] = String(v); },
+      status: (c: number) => { statusDp = c; return resDp; },
+      send: (b: unknown) => { bodyDp = typeof b === "string" ? b : String(b); return resDp; },
+    };
+    handlerDp({} as any, resDp);
+
+    assertEq(statusDp, 200, "prov-dental-01: GET /proveniens -> 200");
+    assertTrue(bodyDp.includes('<link rel="canonical" href="https://finn-tannlege.com/proveniens">'),
+      "prov-dental-02: canonical URL present");
+    assertTrue(bodyDp.includes("Slik verifiserer vi dataene våre"), "prov-dental-03: NO section renders the expected h1");
+    assertTrue(bodyDp.includes('id="en"') && bodyDp.includes("How we verify our data"),
+      "prov-dental-04: EN section present in the same page (id=\"en\" anchor)");
+    assertTrue(bodyDp.includes("Brønnøysundregistrene"), "prov-dental-05: page names Brønnøysundregistrene as a source");
+    // Scope the "no HPR claim" check to the /proveniens <main> content itself, not the
+    // sitewide footer's pre-existing (out-of-scope) "Datakilder" link to Helsedirektoratet/HPR
+    // — this test only guards against the NEW page/llms.txt copy overclaiming an automated
+    // HPR cross-check, not the unrelated footer link that exists on every page.
+    const mainDp = bodyDp.slice(bodyDp.indexOf("<main>"), bodyDp.indexOf("</main>"));
+    assertTrue(!mainDp.includes("HPR") && !mainDp.includes("Helsepersonellregisteret"),
+      "prov-dental-05b: /proveniens page content does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
+    assertTrue(mainDp.includes("redaksjonelt satt status") && mainDp.includes("editorially-set status"),
+      "prov-dental-05c: 'Verified' badge is described as an editorially-set/admin-reviewed status, not an automated registry cross-check");
+    assertTrue(bodyDp.includes("badge-verified"), "prov-dental-06: page shows the Verifisert badge example");
+    assertTrue(bodyDp.length > 2000, "prov-dental-07: page body has substantial server-rendered content (SSR, no JS)");
+    assertNoForbiddenCompliancePhrases(bodyDp, "prov-dental-08");
+
+    // ── Sitemap statics include /proveniens ──
+    const seoSrcDp = require("fs").readFileSync("src/routes/dental-seo.ts", "utf8");
+    assertTrue(seoSrcDp.includes('["/proveniens", "monthly", "0.5"]'),
+      "prov-dental-09: sitemap.xml statics array includes /proveniens");
+
+    // ── llms.txt documents the provenance page ──
+    const layerDpLlms = (dentalSeoRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/llms.txt" && l.route.methods?.get
+    );
+    assertTrue(!!layerDpLlms, "prov-dental-10: router has GET /llms.txt layer");
+    let llmsBodyDp = "";
+    const llmsResDp: any = { setHeader: () => {}, send: (b: unknown) => { llmsBodyDp = String(b); return llmsResDp; } };
+    layerDpLlms.route.stack[layerDpLlms.route.stack.length - 1].handle({} as any, llmsResDp);
+    assertTrue(llmsBodyDp.includes("https://finn-tannlege.com/proveniens"),
+      "prov-dental-11: llms.txt links to /proveniens");
+    assertTrue(llmsBodyDp.includes("Datakvalitet og verifisering"),
+      "prov-dental-12: llms.txt has a data-quality/verification section");
+
+    // ── Agent card: endpoints.provenancePage is additive; existing endpoints untouched ──
+    const dentalCardProv: any = getDentalAgentCard();
+    assertEq(dentalCardProv.endpoints.provenancePage, "https://finn-tannlege.com/proveniens",
+      "prov-dental-13: agent card endpoints.provenancePage is set");
+    assertEq(dentalCardProv.endpoints.rest, "https://finn-tannlege.com/api/tannlege",
+      "prov-dental-14: agent card endpoints.rest is unchanged (additive-only)");
+    assertEq(dentalCardProv.endpoints.llms, "https://finn-tannlege.com/llms.txt",
+      "prov-dental-15: agent card endpoints.llms is unchanged (additive-only)");
+
+    console.log("  proveniens-transparens (dental): OK (17 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`proveniens-transparens (dental): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ── opplevagent.no: GET /proveniens (experiences-seo.ts) ──
+(() => {
+  try {
+    const expSeoModProv = require("../src/routes/experiences-seo");
+    const expSeoRouterProv = expSeoModProv.default as any;
+
+    const layerEp = (expSeoRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/proveniens" && l.route.methods?.get
+    );
+    assertTrue(!!layerEp, "prov-exp-00: GET /proveniens layer is registered");
+    const handlerEp = layerEp.route.stack[layerEp.route.stack.length - 1].handle;
+
+    let statusEp = 200; let bodyEp = "";
+    const headersEp: Record<string, string> = {};
+    const resEp: any = {
+      setHeader: (k: string, v: string) => { headersEp[k.toLowerCase()] = String(v); },
+      status: (c: number) => { statusEp = c; return resEp; },
+      send: (b: unknown) => { bodyEp = typeof b === "string" ? b : String(b); return resEp; },
+    };
+    handlerEp({} as any, resEp);
+
+    assertEq(statusEp, 200, "prov-exp-01: GET /proveniens -> 200");
+    assertTrue(bodyEp.includes("Slik verifiserer vi dataene våre"), "prov-exp-02: NO section renders the expected h1");
+    assertTrue(bodyEp.includes('id="en"') && bodyEp.includes("How we verify our data"),
+      "prov-exp-03: EN section present in the same page (id=\"en\" anchor)");
+    assertTrue(bodyEp.includes("Brønnøysundregistrene"), "prov-exp-04: page names Brønnøysundregistrene as a source");
+    assertTrue(bodyEp.includes("Brreg-verifisert") || bodyEp.includes("Brreg-verified"),
+      "prov-exp-05: page shows the Brreg-verified badge example");
+    // PUBLISH_GATE_SQL (experience-store.ts) requires (p.id IS NULL OR p.brreg_active = 1)
+    // and gates every public-facing query — an unconfirmed provider's experiences (and its
+    // own provider page) are absent from the site, not merely unbadged. The page must say so,
+    // not the inverted "remain listed / not hidden" claim.
+    assertTrue(!bodyEp.includes("de skjules ikke") && !bodyEp.includes("they are not hidden"),
+      "prov-exp-05b: page does NOT claim unconfirmed-provider experiences remain visible without the badge (PUBLISH_GATE_SQL excludes them from every public query)");
+    assertTrue(bodyEp.includes("publiseres ikke") && bodyEp.includes("not published"),
+      "prov-exp-05c: page correctly states unconfirmed-provider experiences are not published until the provider is Brreg-confirmed");
+    assertTrue(bodyEp.length > 1500, "prov-exp-06: page body has substantial server-rendered content (SSR, no JS)");
+    assertNoForbiddenCompliancePhrases(bodyEp, "prov-exp-07");
+
+    // ── Sitemap paths[] includes /proveniens ──
+    const seoSrcEp = require("fs").readFileSync("src/routes/experiences-seo.ts", "utf8");
+    assertTrue(seoSrcEp.includes('{ p: "/proveniens", freq: "monthly", pri: "0.5" }'),
+      "prov-exp-08: sitemap.xml paths[] includes /proveniens");
+
+    // ── llms.txt documents the provenance page ──
+    const layerEpLlms = (expSeoRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/llms.txt" && l.route.methods?.get
+    );
+    assertTrue(!!layerEpLlms, "prov-exp-09: router has GET /llms.txt layer");
+    let llmsBodyEp = "";
+    const llmsResEp: any = { setHeader: () => {}, send: (b: unknown) => { llmsBodyEp = String(b); return llmsResEp; } };
+    layerEpLlms.route.stack[layerEpLlms.route.stack.length - 1].handle({} as any, llmsResEp);
+    assertTrue(llmsBodyEp.includes("opplevagent.no/proveniens"),
+      "prov-exp-10: llms.txt links to /proveniens");
+    assertTrue(llmsBodyEp.includes("Datakvalitet og verifisering"),
+      "prov-exp-11: llms.txt has a data-quality/verification section");
+
+    // ── Agent card: endpoints.provenancePage is additive; existing endpoints untouched ──
+    const expCardProv: any = getExperiencesAgentCard();
+    assertEq(expCardProv.endpoints.provenancePage, "https://opplevagent.no/proveniens",
+      "prov-exp-12: agent card endpoints.provenancePage is set");
+    assertEq(expCardProv.endpoints.rest, "https://opplevagent.no/api/opplevelser",
+      "prov-exp-13: agent card endpoints.rest is unchanged (additive-only)");
+    assertEq(expCardProv.endpoints.llms, "https://opplevagent.no/llms.txt",
+      "prov-exp-14: agent card endpoints.llms is unchanged (additive-only)");
+
+    console.log("  proveniens-transparens (experiences): OK (16 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`proveniens-transparens (experiences): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ── rettfrabonden.com: /a2a card + getRegistryCard() + discovery.ts llms.txt
+// (these read the RFB `agents`/`listings` tables via getDb() — same DB-swap
+// pattern as the a2a-card-v1-signing slice 1 block above, so this cannot
+// leak an isolated test DB into whatever resumes after it). ──
+(() => {
+  const { getDb: getRfbDbForProvTest, __setDbForTesting: setRfbDbForProvTest } =
+    require("../src/database/init") as typeof import("../src/database/init");
+  let priorDbProv: ReturnType<typeof getRfbDbForProvTest> | undefined;
+  try {
+    priorDbProv = getRfbDbForProvTest();
+  } catch {
+    priorDbProv = undefined;
+  }
+  try {
+    buildTestDb();
+
+    // ── /a2a card ──
+    const a2aModProv = require("../src/routes/a2a");
+    const a2aRouterProv = a2aModProv.default as any;
+    const layerA2aProv = (a2aRouterProv.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/a2a" && l.route.methods?.get
+    );
+    assertTrue(!!layerA2aProv, "prov-rfb-card-00: GET /a2a layer is registered");
+    let a2aCardBodyProv: any = null;
+    const a2aCardResProv: any = { json: (b: unknown) => { a2aCardBodyProv = b; return a2aCardResProv; } };
+    layerA2aProv.route.stack[layerA2aProv.route.stack.length - 1].handle({} as any, a2aCardResProv);
+    assertEq(a2aCardBodyProv.provenancePageUrl, "https://rettfrabonden.com/proveniens",
+      "prov-rfb-card-01: /a2a card has additive provenancePageUrl");
+    assertEq(a2aCardBodyProv.documentationUrl, "https://rettfrabonden.com/docs",
+      "prov-rfb-card-02: /a2a card documentationUrl is unchanged (additive-only)");
+    assertEq(a2aCardBodyProv.securitySchemes.apiKey.name, "X-API-Key",
+      "prov-rfb-card-03: /a2a card securitySchemes.apiKey is unchanged (additive-only)");
+
+    // ── getRegistryCard() (.well-known/agent-card.json) ──
+    const registryCardProv: any = marketplaceRegistry.getRegistryCard("https://rettfrabonden.com");
+    assertEq(registryCardProv.provenancePageUrl, "https://rettfrabonden.com/proveniens",
+      "prov-rfb-card-04: getRegistryCard() has additive provenancePageUrl");
+    assertEq(registryCardProv.documentationUrl, "https://rettfrabonden.com/docs",
+      "prov-rfb-card-05: getRegistryCard() documentationUrl is unchanged (additive-only)");
+    assertEq(registryCardProv.protocolVersion, "1.0.0",
+      "prov-rfb-card-06: getRegistryCard() protocolVersion is unchanged (additive-only)");
+
+    // ── discovery.ts /llms.txt links to /proveniens ──
+    // Source-grep approach (same pattern as PR-73's llms.txt-expansion block
+    // above: "Booting an express server here would race the m2 owner-portal
+    // in-memory DB singleton") rather than invoking the live handler, which
+    // depends on marketplaceRegistry stats not exercised by this fixture.
+    const fsProvLlms = require("fs") as typeof import("fs");
+    const discSrcProv = fsProvLlms.readFileSync("src/routes/discovery.ts", "utf8");
+    assertTrue(discSrcProv.includes("${BASE_URL}/proveniens"),
+      "prov-rfb-card-07: llms.txt template links to /proveniens");
+    const dataQualitySectionIdxProv = discSrcProv.indexOf("## Datakvalitet og verifisering");
+    assertTrue(dataQualitySectionIdxProv !== -1,
+      "prov-rfb-card-08: llms.txt template has a data-quality/verification section");
+    // Scope the forbidden-phrase check to just the new section's source text
+    // (not the whole file — an unrelated, pre-existing sentence elsewhere in
+    // discovery.ts's llms.txt factually describes Debio-certified producers,
+    // which is not a claim about this platform's own regulatory status).
+    const dataQualitySectionSrcProv = dataQualitySectionIdxProv !== -1
+      ? discSrcProv.slice(dataQualitySectionIdxProv, dataQualitySectionIdxProv + 1600)
+      : "";
+    assertNoForbiddenCompliancePhrases(dataQualitySectionSrcProv, "prov-rfb-card-09");
+
+    console.log("  proveniens-transparens (rfb cards + llms.txt): OK (12 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`proveniens-transparens (rfb cards + llms.txt): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (priorDbProv !== undefined) setRfbDbForProvTest(priorDbProv);
+  }
+})();
+
+// ── i18n locale keys used by the RFB /proveniens page exist in both locales ──
+(() => {
+  try {
+    const noLocaleProv = require("../src/i18n/locales/no.json");
+    const enLocaleProv = require("../src/i18n/locales/en.json");
+    assertTrue(!!noLocaleProv.provenance?.title && !!noLocaleProv.provenance?.description,
+      "prov-i18n-01: no.json has provenance.title + provenance.description");
+    assertTrue(!!enLocaleProv.provenance?.title && !!enLocaleProv.provenance?.description,
+      "prov-i18n-02: en.json has provenance.title + provenance.description");
+    assertNoForbiddenCompliancePhrases(noLocaleProv.provenance.title + " " + noLocaleProv.provenance.description, "prov-i18n-03");
+    assertNoForbiddenCompliancePhrases(enLocaleProv.provenance.title + " " + enLocaleProv.provenance.description, "prov-i18n-04");
+    console.log("  proveniens-transparens (i18n locale keys): OK (6 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`proveniens-transparens (i18n locale keys): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
 

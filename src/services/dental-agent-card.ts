@@ -142,6 +142,11 @@ export function getDentalAgentCard(): object {
       mcp: `${url}/mcp`,
       openapi: `${url}/openapi.json`,
       llms: `${url}/llms.txt`,
+      // dev-request 2026-07-25-proveniens-transparens: additive link to the
+      // public "how we verify our data" page (per-field source/date via
+      // field_provenance, already live server-side — docs only, no new
+      // behavior).
+      provenancePage: `${url}/proveniens`,
     },
     "x-distribution": [
       {

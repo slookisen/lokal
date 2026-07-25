@@ -110,6 +110,11 @@
     "description": "Personvernerklæring for Rett fra Bonden. Hva vi samler inn, hvordan vi bruker det, og dine rettigheter.",
     "page_title": "Personvern"
   },
+  "provenance": {
+    "title": "Slik verifiserer vi dataene våre — Rett fra Bonden",
+    "description": "Hvordan Rett fra Bonden kryssjekker produsentdata mot Brønnøysundregistrene, Debio og andre kilder, felt for felt — og hva som skjer når noe ikke kan bekreftes.",
+    "page_title": "Slik verifiserer vi dataene våre"
+  },
   "city": {
     "title": "Lokal mat i {city} — Rett fra Bonden",
     "description": "Finn {count} matprodusenter i {city}. Gårder, markeder og gårdsbutikker med kontaktinfo og åpningstider.",

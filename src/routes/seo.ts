@@ -2461,6 +2461,164 @@ router.get("/personvern", (req: Request, res: Response) => {
 
 
 // ═══════════════════════════════════════════════════════════════
+// GET /proveniens — How we verify our data (transparency page)
+//
+// Public, SSR, bilingual explainer for the field_provenance /
+// cross-source-validator machinery that already runs internally (see
+// src/services/cross-source-validator.ts). Purely descriptive — no new
+// behavior. Mirrors the /om + /personvern page-building pattern in this
+// file (const *_CSS block, lang-branched content string, shell() call).
+//
+// IMPORTANT: this page must never claim regulatory compliance or
+// certification of any kind (no "AI Act-compliant", "certified",
+// "EU-compliant", etc.) — it describes what the verification pipeline
+// actually does, nothing more. See tests/test.ts for the assertion that
+// guards this.
+// ═══════════════════════════════════════════════════════════════
+
+const PROV_CSS = `
+  .prov-hero { background: linear-gradient(135deg, var(--green-50) 0%, #f0f7f4 100%); padding: 64px 24px 48px; text-align: center; }
+  .prov-hero h1 { font-size: 2.4rem; font-weight: 800; color: var(--charcoal); letter-spacing: -1.2px; margin-bottom: 16px; }
+  .prov-hero p { font-size: 1.1rem; color: var(--g500); max-width: 640px; margin: 0 auto; line-height: 1.7; }
+  .prov-sec { max-width: 760px; margin: 0 auto; padding: 40px 24px; }
+  .prov-sec h2 { font-size: 1.4rem; font-weight: 800; color: var(--charcoal); margin-bottom: 14px; }
+  .prov-sec p { font-size: 0.98rem; color: var(--g700); line-height: 1.8; margin-bottom: 14px; }
+  .prov-sec ul, .prov-sec ol { margin: 8px 0 16px 20px; }
+  .prov-sec li { font-size: 0.95rem; color: var(--g700); line-height: 1.75; margin-bottom: 6px; }
+  .prov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 18px; margin: 24px 0; }
+  .prov-card { background: var(--white); border: 1px solid var(--g100); border-radius: var(--r-lg); padding: 22px; }
+  .prov-card-icon { font-size: 1.6rem; margin-bottom: 8px; display: block; }
+  .prov-card h3 { font-size: 0.98rem; font-weight: 700; margin-bottom: 6px; }
+  .prov-card p { font-size: 0.86rem; color: var(--g500); margin-bottom: 0; }
+  .prov-note { background: var(--green-50); border-left: 4px solid var(--green-700); border-radius: 0 12px 12px 0; padding: 20px 24px; margin: 28px 0; }
+  .prov-note p { font-size: 0.92rem; color: var(--green-900); margin-bottom: 0; }
+  .prov-badge-demo { display: inline-flex; align-items: center; gap: 6px; background: var(--green-50); border: 1px solid var(--green-700); color: var(--green-700); border-radius: 999px; padding: 4px 12px; font-size: 0.82rem; font-weight: 700; }
+  @media (max-width: 768px) {
+    .prov-hero h1 { font-size: 1.7rem; }
+    .prov-grid { grid-template-columns: 1fr; }
+  }
+`;
+
+router.get("/proveniens", (req: Request, res: Response) => {
+  const lang = req.lang;
+  const brand = `<span translate="no">${getConfig().display_name}</span>`;
+  const en = lang === "en";
+  const content = en ? `
+  <section class="prov-hero">
+    <h1>How we verify our data</h1>
+    <p>${brand} doesn't just scrape a website and publish whatever it finds. Every important field is cross-checked against independent sources, tracked with where it came from and when — this page explains exactly how, in plain language.</p>
+  </section>
+
+  <section class="prov-sec">
+    <h2>What "verified" means here</h2>
+    <p>Behind every ${getConfig().domain_dictionary.entity} profile is a record of, for each individual field, which source supplied that value and when it was last confirmed — not just a single "verified: yes/no" flag for the whole profile. We call this field-level provenance.</p>
+    <p>This matters because a producer's address might be confirmed while their phone number is still awaiting a second source, or vice versa. Verification happens field by field, not all-or-nothing.</p>
+
+    <h2>The sources we cross-check against</h2>
+    <div class="prov-grid">
+      <div class="prov-card">
+        <span class="prov-card-icon">&#127974;</span>
+        <h3>Brønnøysundregistrene</h3>
+        <p>Norway's official business register — legal name, organisation number, registered address and business status.</p>
+      </div>
+      <div class="prov-card">
+        <span class="prov-card-icon">&#127793;</span>
+        <h3>Debio</h3>
+        <p>Norway's organic-certification registry (finnoko.debio.no) — checked for producers associated with an organic certification claim.</p>
+      </div>
+      <div class="prov-card">
+        <span class="prov-card-icon">&#128205;</span>
+        <h3>Google Places</h3>
+        <p>Public listing data — address, phone and opening hours as reported to Google.</p>
+      </div>
+      <div class="prov-card">
+        <span class="prov-card-icon">&#127760;</span>
+        <h3>The producer's own site</h3>
+        <p>A producer's own homepage or official Facebook page — the preferred source for product and description text.</p>
+      </div>
+    </div>
+    <p>A producer can also confirm a field directly (we call this owner-attested); that counts on its own, without needing a second source.</p>
+
+    <h2>How a field becomes "confirmed"</h2>
+    <p>For the fields customers rely on most to actually find and contact a ${getConfig().domain_dictionary.entity} &mdash; address and phone number &mdash; we require at least two independent, higher-quality sources to agree on the same value (for example, the business register and the producer's own homepage, or Google Places and an official Facebook page) before we treat it as confirmed. Minor formatting differences (like "+47 911 22 333" vs. "91122333") don't count as a disagreement.</p>
+    <p>A value reported by only one source is not treated as unconfirmed data-quality risk-free &mdash; it's flagged for a human to check, rather than silently marked as verified.</p>
+    <p><strong>AI guesses are never enough on their own.</strong> Values inferred by heuristics &mdash; a guessed product category, a seasonal assumption, a generic web-search snippet &mdash; are explicitly excluded from counting as evidence. They can surface as a starting point during data collection, but they can never by themselves make a field "confirmed".</p>
+
+    <h2>Catching mismatched entities</h2>
+    <p>Two different companies sometimes share a building, or one enrichment pass accidentally pulls in details from a neighbouring business. We run a domain-coherence check that compares a producer's listed website and email against their profile URL, so that data belonging to one company doesn't end up attached to a different one's profile.</p>
+
+    <h2>What happens when data can't be confirmed yet</h2>
+    <p>Producers whose key fields have cleared cross-source agreement show a <span class="prov-badge-demo">&#10003; Verified</span> badge and are prioritised in search results. Producers whose data is still awaiting a second confirming source remain fully listed &mdash; they are not hidden &mdash; just without that badge, while the field in question sits in a review queue for a human to check rather than being presented as confirmed.</p>
+
+    <div class="prov-note">
+      <p>As expectations around AI transparency and data provenance keep growing in Europe, we think showing our actual verification work &mdash; rather than a marketing claim &mdash; is good practice. This page describes what our verification pipeline genuinely does today; it is not a claim that we meet any particular law or regulatory standard.</p>
+    </div>
+
+    <p>Curious about the rest of the platform? See <a href="${localizedPath("/teknologi", lang)}">how it works technically</a> or <a href="${localizedPath("/om", lang)}">why we're building this</a>.</p>
+  </section>` : `
+  <section class="prov-hero">
+    <h1>Slik verifiserer vi dataene våre</h1>
+    <p>${brand} skraper ikke bare en nettside og publiserer det vi finner. Hvert viktige felt kryssjekkes mot uavhengige kilder, og vi lagrer hvor verdien kom fra og når den sist ble bekreftet &mdash; denne siden forklarer nøyaktig hvordan, på vanlig norsk.</p>
+  </section>
+
+  <section class="prov-sec">
+    <h2>Hva "verifisert" betyr her</h2>
+    <p>Bak hver ${getConfig().domain_dictionary.entity}-profil ligger det, for hvert enkelt felt, en oversikt over hvilken kilde som ga oss verdien og når den sist ble bekreftet &mdash; ikke bare ett samlet "verifisert: ja/nei"-flagg for hele profilen. Vi kaller dette felt-nivå proveniens.</p>
+    <p>Dette betyr at en produsents adresse kan være bekreftet mens telefonnummeret fortsatt venter på en ny kilde, eller omvendt. Verifisering skjer felt for felt, ikke alt-eller-ingenting.</p>
+
+    <h2>Kildene vi kryssjekker mot</h2>
+    <div class="prov-grid">
+      <div class="prov-card">
+        <span class="prov-card-icon">&#127974;</span>
+        <h3>Brønnøysundregistrene</h3>
+        <p>Norges offisielle foretaksregister &mdash; juridisk navn, organisasjonsnummer, registrert adresse og forretningsstatus.</p>
+      </div>
+      <div class="prov-card">
+        <span class="prov-card-icon">&#127793;</span>
+        <h3>Debio</h3>
+        <p>Norges register for økologisk sertifisering (finnoko.debio.no) &mdash; sjekkes for produsenter som oppgir økologisk sertifisering.</p>
+      </div>
+      <div class="prov-card">
+        <span class="prov-card-icon">&#128205;</span>
+        <h3>Google Places</h3>
+        <p>Offentlig oppføringsdata &mdash; adresse, telefon og åpningstider slik de er rapportert til Google.</p>
+      </div>
+      <div class="prov-card">
+        <span class="prov-card-icon">&#127760;</span>
+        <h3>Produsentens egen side</h3>
+        <p>Produsentens egen hjemmeside eller offisielle Facebook-side &mdash; foretrukket kilde for produkt- og beskrivelsestekst.</p>
+      </div>
+    </div>
+    <p>En produsent kan også bekrefte et felt direkte (vi kaller dette eierbekreftet); det teller alene, uten at det trengs en ny kilde i tillegg.</p>
+
+    <h2>Slik blir et felt "bekreftet"</h2>
+    <p>For feltene kundene er mest avhengige av for faktisk å finne og kontakte en ${getConfig().domain_dictionary.entity} &mdash; adresse og telefonnummer &mdash; krever vi at minst to uavhengige kilder av høy kvalitet er enige om samme verdi (for eksempel foretaksregisteret og produsentens egen hjemmeside, eller Google Places og en offisiell Facebook-side) før vi behandler feltet som bekreftet. Små formateringsforskjeller (som "+47 911 22 333" vs. "91122333") regnes ikke som uenighet.</p>
+    <p>En verdi som bare én kilde har oppgitt, blir ikke stemplet som bekreftet &mdash; den flagges for at et menneske skal sjekke den, i stedet for å bli stille markert som verifisert.</p>
+    <p><strong>KI-gjetninger er aldri nok alene.</strong> Verdier utledet av heuristikk &mdash; en gjettet produktkategori, en sesongantakelse, et generisk søkeresultat &mdash; telles eksplisitt ikke som bevis. De kan være et utgangspunkt under datainnsamling, men kan aldri alene gjøre et felt "bekreftet".</p>
+
+    <h2>Fanger opp forvekslede selskaper</h2>
+    <p>To ulike selskaper deler noen ganger bygning, eller en berikelsesrunde henter ved en feil inn detaljer fra en nabobedrift. Vi kjører en domenesammenheng-sjekk som sammenligner en produsents oppgitte nettside og e-post mot profil-URL-en, slik at data som tilhører ett selskap ikke havner på et annet selskaps profil.</p>
+
+    <h2>Hva skjer når data ikke kan bekreftes ennå</h2>
+    <p>Produsenter der de viktigste feltene har bestått kryssjekkingen, viser et <span class="prov-badge-demo">&#10003; Verifisert</span>-merke og prioriteres i søkeresultatene. Produsenter der dataene fortsatt venter på en ny bekreftende kilde, forblir fullt synlige på plattformen &mdash; de skjules ikke &mdash; bare uten det merket, mens feltet det gjelder ligger i en gjennomgangskø for at et menneske skal sjekke det, i stedet for å vises som bekreftet.</p>
+
+    <div class="prov-note">
+      <p>Etter hvert som forventningene til åpenhet rundt KI og datagrunnlag øker i Europa, mener vi at å vise selve verifiseringsarbeidet vårt &mdash; fremfor en markedsføringspåstand &mdash; er god praksis. Denne siden beskriver hva verifiseringsløpet vårt faktisk gjør i dag; det er ikke en påstand om sertifisering eller samsvar med noe bestemt regelverk.</p>
+    </div>
+
+    <p>Nysgjerrig på resten av plattformen? Se <a href="${localizedPath("/teknologi", lang)}">hvordan det fungerer teknisk</a> eller <a href="${localizedPath("/om", lang)}">hvorfor vi bygger dette</a>.</p>
+  </section>`;
+
+  res.send(shell(
+    t(lang, "provenance.title"),
+    t(lang, "provenance.description"),
+    content,
+    { canonical: `${BASE_URL}${localizedPath("/proveniens", lang)}`, extraCss: PROV_CSS, lang, pathForAlternate: "/proveniens" }
+  ));
+});
+
+
+// ═══════════════════════════════════════════════════════════════
 // GET /:city — City page
 // ═══════════════════════════════════════════════════════════════
 
@@ -2665,6 +2823,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "openapi.json" || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
       || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
       || citySlug === "personvern" || citySlug === "privacy" || citySlug === "privacy-policy"
+      || citySlug === "proveniens"
       || citySlug === "terms" || citySlug === "terms-of-service" || citySlug === "tos" || citySlug === "vilkar"
       || citySlug === "llms.txt" || citySlug === "llms-full.txt"
       || citySlug === `${INDEXNOW_KEY}.txt`
@@ -4760,8 +4919,8 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">`;
 
-    const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern"];
-    const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/guide-mat-ai": "0.6", "/personvern": "0.5" };
+    const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern", "/proveniens"];
+    const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/guide-mat-ai": "0.6", "/personvern": "0.5", "/proveniens": "0.6" };
     const coreFreq: Record<string, string> = { "/": "daily" };
 
     function addEntry(path: string, freq: string, priority: string, lastmod: string) {

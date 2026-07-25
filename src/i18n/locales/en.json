@@ -110,6 +110,11 @@
     "description": "Privacy policy for Rett fra Bonden. What we collect, how we use it, and your rights.",
     "page_title": "Privacy"
   },
+  "provenance": {
+    "title": "How we verify our data — Rett fra Bonden",
+    "description": "How Rett fra Bonden cross-checks producer data against Brønnøysundregistrene, Debio and other sources, field by field — and what happens when something can't be confirmed.",
+    "page_title": "How we verify our data"
+  },
   "city": {
     "title": "Local food in {city} — Rett fra Bonden",
     "description": "Find {count} food producers in {city}. Farms, markets and farm shops with contact info and opening hours.",

@@ -672,6 +672,12 @@ class MarketplaceRegistry {
         { url: `${baseUrl}/api/marketplace`, transport: "HTTP+JSON" },
       ],
       documentationUrl: `${baseUrl}/docs`,
+      // dev-request 2026-07-25-proveniens-transparens: additive link to the
+      // public "how we verify our data" page (field_provenance / cross-source
+      // agreement machinery, already live server-side — docs only, no new
+      // behavior). Kept in parity with src/routes/a2a.ts's /a2a card per the
+      // same-parity convention already documented above for the v1.0 fields.
+      provenancePageUrl: `${baseUrl}/proveniens`,
       defaultInputModes: ["text/plain", "application/json"],
       defaultOutputModes: ["application/json"],
 
