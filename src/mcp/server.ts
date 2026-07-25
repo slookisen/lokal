@@ -44,14 +44,34 @@ server.tool(
   "Search for local food in Norway using natural language. Supports Norwegian and English. " +
   "Find fresh vegetables, organic produce, meat, fish, dairy, honey, bread, berries, eggs, and herbs " +
   "from 350+ local farms and producers across Oslo, Bergen, Trondheim, and more. " +
+  "USE THIS FOR PROXIMITY / 'near me' / 'nær meg' QUESTIONS: if you know the user's coordinates, " +
+  "pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; " +
+  "query may then be empty. " +
   "Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'local eggs'.",
   {
-    query: z.string().describe("Naturlig språk søk etter lokal mat (norsk eller engelsk)"),
+    query: z.string().default("").describe("Naturlig språk søk etter lokal mat (norsk eller engelsk). Kan være tom når lat/lng er oppgitt."),
+    lat: z.number().min(-90).max(90).optional().describe("Brukerens breddegrad (WGS84) for nærhetssøk"),
+    lng: z.number().min(-180).max(180).optional().describe("Brukerens lengdegrad (WGS84). Må oppgis sammen med lat."),
+    radius_km: z.number().min(1).max(500).optional().describe("Søkeradius i km rundt lat/lng. Standard 30."),
     limit: z.number().min(1).max(50).default(10).describe("Maks antall resultater"),
   },
-  async ({ query, limit }) => {
+  async ({ query, lat, lng, radius_km, limit }) => {
     try {
-      const url = `${API_BASE}/api/marketplace/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+      // dev-request 2026-07-25-reisesok fix 0g(i): forward the caller's
+      // position so the REST endpoint can do a real proximity search. Keeps
+      // this stdio server's signature aligned with the hosted /mcp tool.
+      const params = new URLSearchParams();
+      if (query) params.set("q", query);
+      if (typeof lat === "number" && typeof lng === "number") {
+        params.set("lat", String(lat));
+        params.set("lng", String(lng));
+        if (typeof radius_km === "number") params.set("radius", String(radius_km));
+      }
+      if (!params.has("q") && !params.has("lat")) {
+        return { content: [{ type: "text", text: "Oppgi enten `query` eller `lat` + `lng`. / Supply either `query` or `lat` + `lng`." }] };
+      }
+      params.set("limit", String(limit));
+      const url = `${API_BASE}/api/marketplace/search?${params.toString()}`;
       const response = await fetch(url);
       const data = (await response.json()) as any;
 
@@ -59,9 +79,19 @@ server.tool(
         return { content: [{ type: "text", text: `Søk feilet: ${data.error}` }] };
       }
 
+      // fix 0e: the search asked for "near me" but the server has no position.
+      if (data.needs_location) {
+        return { content: [{ type: "text", text: `📍 ${data.note}` }] };
+      }
+
       // Format results for Claude
-      let text = `🥬 **Lokal mat-søk: "${query}"**\n`;
+      let text = query
+        ? `🥬 **Lokal mat-søk: "${query}"**\n`
+        : `🥬 **Lokal mat nær deg**\n`;
       text += `Forstått som: ${formatParsed(data.parsed)}\n`;
+      // fix 0b: never let the caller believe a nationwide fallback was a
+      // local hit — the server now says so, so repeat it verbatim.
+      if (data.note) text += `⚠️ ${data.note}\n`;
       text += `Fant ${data.count} resultater:\n\n`;
 
       for (const r of data.results) {
