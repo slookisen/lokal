@@ -100,16 +100,18 @@ export async function runAdminAgentsRecentlyEnrichedTests(opts: { log?: boolean 
     name: string;
     url: string;
     is_active?: number;
+    city?: string | null;
   }): void {
     testDb
       .prepare(
-        `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
-         VALUES (@id, @name, 'test agent', 'test-provider', 'test@example.no', @url, 'producer', @api_key, @is_active)`
+        `INSERT INTO agents (id, name, description, provider, contact_email, url, city, role, api_key, is_active)
+         VALUES (@id, @name, 'test agent', 'test-provider', 'test@example.no', @url, @city, 'producer', @api_key, @is_active)`
       )
       .run({
         id: row.id,
         name: row.name,
         url: row.url,
+        city: row.city ?? null,
         api_key: `key-${row.id}`,
         is_active: row.is_active ?? 1,
       });
@@ -173,7 +175,7 @@ export async function runAdminAgentsRecentlyEnrichedTests(opts: { log?: boolean 
     }
 
     // ── Fixtures for (c)-(j) ─────────────────────────────────────────────
-    insertAgent({ id: "agent-recent", name: "Nylig Enriched Gård", url: "https://nylig.example.no" });
+    insertAgent({ id: "agent-recent", name: "Nylig Enriched Gård", url: "https://nylig.example.no", city: "Stjørdal" });
     insertKnowledge({
       agent_id: "agent-recent",
       last_enriched_at: daysAgoIso(1),
@@ -269,9 +271,14 @@ export async function runAdminAgentsRecentlyEnrichedTests(opts: { log?: boolean 
       assertTrue(Array.isArray(row.field_provenance.address), "g6: field_provenance.address survives the round-trip");
       assertEq(
         Object.keys(row).sort(),
-        ["field_provenance", "id", "last_enriched_at", "name", "website"].sort(),
+        ["field_provenance", "id", "last_enriched_at", "location_city", "name", "website"].sort(),
         "g7: row has exactly the documented fields",
       );
+      // location_city (dev-request 2026-07-27-kvalitetsporter-uten-signal,
+      // slice A): the v3-b0 quality harness gates its Brreg match on the
+      // producer's city, and moving its sample off the (2-agent-starved)
+      // outreach pool onto this endpoint means the city has to come from here.
+      assertEq(row.location_city, "Stjørdal", "g10: row carries location_city (from agents.city)");
       assertEq(r.body.success, true, "g8: response carries success:true");
       assertEq(r.body.count, r.body.agents.length, "g9: count matches agents.length");
     }
