@@ -168,6 +168,46 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         content_source: null, content_evidence_url: null,
       });
 
+      // The 2026-W30 case (dev-request 2026-07-27-kvalitetsporter-uten-signal,
+      // slice C): a provider the GENERIC content-refresh enriched. That writer
+      // fills description/category on the provider's EXPERIENCES rows and only
+      // stamps last_enriched_at on the provider — so every provider-level
+      // (gårdssalg) content column here is legitimately null. Before this
+      // slice such a provider came back with nothing checkable, which is why
+      // the weekly spot-check reported "experiences: checked=0" while
+      // enrichment was in fact writing.
+      insertProvider.run({
+        id: "prov-generic-enriched", navn: "Generisk Enriched Opplevelse AS",
+        hjemmeside: "https://generisk.example.no",
+        last_enriched_at: daysAgoIso(1),
+        about_text: null, visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, content_evidence_url: null,
+      });
+      const insertExperience = expDb.prepare(
+        `INSERT INTO experiences
+           (id, provider_id, title, description, category, subcategory, booking_url,
+            content_source, enrichment_state, updated_at)
+         VALUES
+           (@id, @provider_id, @title, @description, @category, @subcategory, @booking_url,
+            @content_source, @enrichment_state, @updated_at)`,
+      );
+      insertExperience.run({
+        id: "exp-enriched-1", provider_id: "prov-generic-enriched",
+        title: "Guidet fjelltur", description: "Guidet tur til toppen med lokal fjellfører.",
+        category: "natur_friluft", subcategory: null,
+        booking_url: "https://generisk.example.no/booking",
+        content_source: "provider_site", enrichment_state: "enriched",
+        updated_at: daysAgoIso(1),
+      });
+      // A raw (un-enriched) row on the same provider must NOT be served — the
+      // spot-check judges written content, and nothing was written here.
+      insertExperience.run({
+        id: "exp-raw-1", provider_id: "prov-generic-enriched",
+        title: "Uberiket opplevelse", description: null, category: null, subcategory: null,
+        booking_url: null, content_source: null, enrichment_state: "raw",
+        updated_at: daysAgoIso(1),
+      });
+
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // ── (a) 403 without X-Admin-Key ─────────────────────────────────────
@@ -256,6 +296,30 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       const malformedRow = (shapeResp.body.providers as any[]).find((p) => p.id === "prov-malformed-products");
       assertTrue(!!malformedRow, "g1: prov-malformed-products row present");
       assertEq(malformedRow.products, [], "g2: malformed products JSON -> []");
+
+      // ── (h) enriched_experiences — the slice-C fix ────────────────────────
+      // Regression proof for the 2026-W30 spot-check outcome
+      // ("experiences: checked=0 mismatch=0 rate=N/A verdict=insufficient_sample
+      //  — all 10 sampled providers have null content fields").
+      const genericRow = (shapeResp.body.providers as any[]).find((p) => p.id === "prov-generic-enriched");
+      assertTrue(!!genericRow, "h1: a provider enriched only by the GENERIC content-refresh is sampled");
+      assertEq(genericRow.about_text, null, "h2: its provider-level (gårdssalg) content is legitimately null");
+      assertTrue(Array.isArray(genericRow.enriched_experiences), "h3: enriched_experiences is an array");
+      assertEq(genericRow.enriched_experiences.length, 1, "h4: exactly the ENRICHED experiences row is served, not the raw one");
+      assertEq(genericRow.enriched_experiences[0].id, "exp-enriched-1", "h5: the enriched row is the one returned");
+      assertEq(
+        genericRow.enriched_experiences[0].description,
+        "Guidet tur til toppen med lokal fjellfører.",
+        "h6: the description the generic writer actually wrote is now checkable",
+      );
+      assertEq(genericRow.enriched_experiences[0].category, "natur_friluft", "h7: category is checkable too");
+      assertEq(genericRow.enriched_experiences[0].content_source, "provider_site", "h8: content_source travels with it");
+      assertTrue(
+        !genericRow.enriched_experiences.some((e: any) => e.id === "exp-raw-1"),
+        "h9: a raw (never-written) experiences row is NOT offered for checking — it would inflate 'checked' with nothing",
+      );
+      // The pre-existing gårdssalg-enriched provider keeps working unchanged.
+      assertTrue(Array.isArray(row.enriched_experiences), "h10: gårdssalg-enriched provider also carries the field (empty, no regression)");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-providers-recently-enriched: unexpected error: " + String(err?.stack || err?.message || err));

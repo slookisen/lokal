@@ -4944,8 +4944,15 @@ router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res:
 // Auth: requireAdmin (same X-Admin-Key convention as the rest of this file).
 // Returns: 200 { success, count, providers: [{ id, name, website,
 //   last_enriched_at, about_text, visit_text, opening_hours_text,
-//   products, content_source, content_evidence_url, field_provenance: null,
-//   provenance_model: "none" }] }
+//   products, content_source, content_evidence_url, enriched_experiences,
+//   field_provenance: null, provenance_model: "none" }] }
+//
+// `enriched_experiences` carries the provider's own enriched EXPERIENCES rows
+// (description/category/booking_url — what applyExperienceContent writes).
+// The provider-level content columns above are the gårdssalg writer's fields;
+// a provider enriched only by the generic content-refresh has all of those
+// null, which is why the spot-check needs both. See the inline comment at the
+// query below.
 router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, res: Response) => {
   try {
     const expDb = getExpDb("experiences");
@@ -4986,6 +4993,32 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         content_evidence_url: string | null;
       }>;
 
+    // enriched_experiences: the fields this vertical's MAIN enrichment pass
+    // actually writes (dev-request 2026-07-27-kvalitetsporter-uten-signal,
+    // slice C).
+    //
+    // Without this the weekly field-truth spot-check had nothing to look at.
+    // It reads the provider-level columns above (about_text / visit_text /
+    // opening_hours_text / products) — but those are the GÅRDSSALG writer's
+    // fields (applyProviderContent). The generic content-refresh that runs
+    // twice a day writes `description`/`category`/`booking_url` and friends
+    // onto the provider's EXPERIENCES rows (applyExperienceContent), and only
+    // stamps `last_enriched_at` on the provider.
+    //
+    // So a provider could be genuinely, correctly enriched and still come back
+    // from this endpoint with every checkable field null — which is exactly
+    // what the 2026-W30 spot-check reported: "experiences: checked=0 ...
+    // all 10 sampled providers have null content fields". The sample was real;
+    // the projection was looking in the wrong table.
+    const expRowsStmt = expDb.prepare(
+      `SELECT id, title, description, category, subcategory, booking_url,
+              content_source, updated_at
+         FROM experiences
+        WHERE provider_id = ? AND enrichment_state = 'enriched'
+        ORDER BY updated_at DESC
+        LIMIT 10`
+    );
+
     const providers = rows.map((r) => {
       let products: unknown[] = [];
       if (r.products) {
@@ -4993,6 +5026,13 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           const parsed = JSON.parse(r.products);
           if (Array.isArray(parsed)) products = parsed;
         } catch { /* malformed → empty */ }
+      }
+      let enrichedExperiences: unknown[] = [];
+      try {
+        enrichedExperiences = expRowsStmt.all(r.id) as unknown[];
+      } catch {
+        /* best-effort: a provider with no experiences rows is still a valid
+           sample row for the gårdssalg content fields above */
       }
       return {
         id: r.id,
@@ -5005,6 +5045,7 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         products,
         content_source: r.content_source,
         content_evidence_url: r.content_evidence_url,
+        enriched_experiences: enrichedExperiences,
         field_provenance: null,
         provenance_model: "none",
       };
