@@ -279,8 +279,13 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       assertEq(okCall.parsed.status, "reserved", "a3: response status is 'reserved' (never auto-confirmed)");
       assertEq(okCall.parsed.confirmation_required, true, "a4: response explicitly flags confirmation_required:true");
       assertTrue(
-        typeof okCall.parsed.message === "string" && /bekreft|confirm/i.test(okCall.parsed.message),
-        "a5: response message explicitly tells the caller to confirm via the emailed link"
+        typeof okCall.parsed.message === "string" && /produsent(en)?|producer/i.test(okCall.parsed.message),
+        "a5: response message explains the PRODUCER (not the guest) must respond — confirm, suggest another time, or decline — before the booking is final"
+      );
+      assertTrue(
+        typeof okCall.parsed.message === "string" &&
+          !/guest (must click|clicks)|gjesten (må selv |selv )?(klikke|bekrefter)/i.test(okCall.parsed.message),
+        "a5b: response message does NOT falsely claim the guest must click a link to finalize the booking"
       );
       assertTrue(typeof okCall.parsed.booking_ref === "string" && okCall.parsed.booking_ref.length > 0, "a6: response carries a booking_ref");
       assertTrue(!("confirm_token" in okCall.parsed), "a7: response NEVER carries confirm_token (no self-confirm path via the tool)");

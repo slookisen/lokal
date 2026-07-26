@@ -84,8 +84,10 @@ import {
 //                         route does it.
 // This tool NEVER calls resolveBooking/producerRespondConfirm/any confirm-
 // token verification logic — those are untouched. A booking created here can
-// only ever become confirmed via the guest clicking the emailed link, same as
-// every other channel.
+// only ever become confirmed once the PRODUCER responds (confirms, proposes
+// another time, or declines) via their own emailed respond-link, same as
+// every other channel — the guest's emailed link is a read-only status page
+// and cannot finalize anything.
 import {
   isBookingPaused,
   createBooking,
@@ -271,7 +273,7 @@ export const BookGardssalgInputSchema = {
     "Full name of the person the reservation is for. Example: 'Kari Nordmann'"
   ),
   guest_email: z.string().describe(
-    "Guest's email address — REQUIRED. The booking stays pending until this address receives and clicks a confirmation link; no booking is ever finalized without it. Example: 'kari@example.no'"
+    "Guest's email address — REQUIRED. Receives a confirmation-of-request email plus a read-only status link; the booking stays pending until the PRODUCER responds (confirms, proposes another time, or declines) — the guest's link cannot finalize anything. Example: 'kari@example.no'"
   ),
   guest_phone: z.string().optional().describe(
     "Optional guest phone number."
@@ -805,8 +807,10 @@ function registerExperienceTools(
   // comment above for the full reuse list. This tool can only ever produce
   // the same 'reserved'/pending draft state the web form produces; it never
   // calls, and this file never imports, any confirm-token verification
-  // logic — a booking becomes real only once the guest clicks the link in
-  // their confirmation email (existing, untouched flow).
+  // logic — a booking becomes real only once the PRODUCER responds (confirm /
+  // suggest another time / decline) via their own emailed respond-link
+  // (existing, untouched flow). The guest's emailed link is read-only status,
+  // never a confirm action.
   server.registerTool(
     "book_gardssalg",
     {
@@ -814,14 +818,15 @@ function registerExperienceTools(
       description:
         "Submit a booking REQUEST for a Norwegian gårdssalg (farm-sale) producer discovered via " +
         "discover_gardssalg. Send inn en reservasjonsforespørsel for et gårdssalg-besøk. " +
-        "IMPORTANT: this NEVER creates a confirmed booking — it creates a PENDING draft, exactly like " +
-        "the producer's own website form, and the guest must click a confirmation link emailed to " +
-        "guest_email before the reservation becomes real. No payment is involved (pickup/visit, pay " +
-        "on arrival, as today). Only producers with an active booking status (see discover_gardssalg's " +
-        "booking.live field) can be booked — a paused/not-yet-onboarded producer is rejected with a " +
-        "clear message, never a silent failure. " +
-        "VIKTIG: oppretter ALDRI en bekreftet booking — kun en avventende forespørsel; gjesten må selv " +
-        "bekrefte via e-post. " +
+        "IMPORTANT: this NEVER creates a confirmed booking — it creates a PENDING request, exactly " +
+        "like the producer's own website form. The PRODUCER reviews the request and responds " +
+        "(confirms, proposes another time, or declines); guest_email only receives a read-only " +
+        "status link, never anything that can finalize the booking. No payment is involved " +
+        "(pickup/visit, pay on arrival, as today). Only producers with an active booking status " +
+        "(see discover_gardssalg's booking.live field) can be booked — a paused/not-yet-onboarded " +
+        "producer is rejected with a clear message, never a silent failure. " +
+        "VIKTIG: oppretter ALDRI en bekreftet booking — kun en avventende forespørsel; produsenten " +
+        "mottar forespørselen og svarer (bekrefter, foreslår nytt tidspunkt eller avslår). " +
         "Required: provider_id (from discover_gardssalg), slot_at (requested date/time), party_size, " +
         "guest_name, guest_email. Optional: experience_id, guest_phone, notes. " +
         "Example: book a table for 4 at provider '3f1b2c4d-...' for '2026-08-15T13:00' for " +
@@ -943,7 +948,8 @@ function registerExperienceTools(
         // comment): that credential belongs to the PRODUCER's attendance-
         // resolution flow, and handing it to the calling agent would let it
         // resolve its own booking. This tool has no way to confirm a
-        // booking — only the guest's own emailed confirm-link click can.
+        // booking — only the PRODUCER's own response (via their emailed
+        // respond-link) can do that.
         return {
           content: [{
             type: "text" as const,
@@ -956,11 +962,13 @@ function registerExperienceTools(
               confirmation_required: true,
               message:
                 `Reservasjonsforespørsel mottatt (${booking.booking_ref}) — status: PENDING/AVVENTER. ` +
-                `Bekreftelse er sendt til ${booking.guest_email}; reservasjonen blir IKKE endelig før gjesten ` +
-                `selv bekrefter via lenken i den e-posten. / ` +
+                `En bekreftelse på forespørselen er sendt til ${booking.guest_email}; produsenten er varslet ` +
+                `og svarer på e-post (bekrefter, foreslår nytt tidspunkt eller avslår) — reservasjonen blir ` +
+                `IKKE endelig før produsenten har svart. / ` +
                 `Reservation request received (${booking.booking_ref}) — status: PENDING. A confirmation ` +
-                `email has been sent to ${booking.guest_email}; the booking only becomes final once the ` +
-                `guest clicks the link in that email — it can never be confirmed by this tool.`,
+                `email has been sent to ${booking.guest_email}; the producer has been notified and will ` +
+                `respond by email (confirm, propose another time, or decline) — the booking only becomes ` +
+                `final once the producer responds, and this tool can never confirm it itself.`,
             }, null, 2),
           }],
         };
@@ -1107,7 +1115,7 @@ a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decor
 <li><code>list_experience_categories</code> — alle kategorier med antall opplevelser</li>
 <li><code>get_experience</code> — hent én opplevelse med full profil</li>
 <li><code>discover_gardssalg</code> — finn gårdssalg-produsenter etter fylke, kommune, produsenttype, nær-meg og bookingstatus</li>
-<li><code>book_gardssalg</code> — send inn en reservasjonsforespørsel hos en gårdssalg-produsent (kun avventende/pending — gjesten må selv bekrefte via e-post, ingen betaling)</li>
+<li><code>book_gardssalg</code> — send inn en reservasjonsforespørsel hos en gårdssalg-produsent (kun avventende/pending — produsenten svarer via e-post, ingen betaling)</li>
 </ul>
 <p><strong>For utviklere — eksempel (cURL):</strong></p>
 <pre>curl -X POST https://opplevagent.no/mcp \\

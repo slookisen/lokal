@@ -1422,11 +1422,13 @@ guest_email (guest_phone og notes valgfritt).
 VIKTIG: verktøyet oppretter ALDRI en bekreftet booking — kun samme avventende
 ("reserved"/pending) rad som nettskjemaet på produsentens profilside
 produserer, via nøyaktig samme valideringskjede, database-tabell og
-bekreftelses-e-post-flyt. Gjesten må selv klikke bekreftelseslenken i
-e-posten sin før reservasjonen blir endelig — ingen AI-agent kan bekrefte en
-booking på gjestens vegne. En produsent uten aktiv bookingstatus (se
-discover_gardssalgs \`booking.live\`) avvises med en tydelig melding, aldri en
-stille feil. Ingen betaling — pickup/oppmøte, som i dag.
+bekreftelses-e-post-flyt. Produsenten mottar forespørselen og svarer på
+e-post (bekrefter, foreslår nytt tidspunkt eller avslår) — reservasjonen
+blir IKKE endelig før produsenten har svart, og ingen AI-agent kan bekrefte
+en booking på gjestens eller produsentens vegne. En produsent uten aktiv
+bookingstatus (se discover_gardssalgs \`booking.live\`) avvises med en
+tydelig melding, aldri en stille feil. Ingen betaling — pickup/oppmøte, som
+i dag.
 
 ## Lisens
 
