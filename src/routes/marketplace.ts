@@ -6044,4 +6044,57 @@ router.post("/admin/agents/geocode-seed-audit", async (req: Request, res: Respon
   }
 });
 
+// ─── POST /admin/agents/geocode-seed-reclassify ──────────────────────
+// dev-request 2026-07-26-geokoding-ukjent-opphav-dekningsloft. Daniel's
+// decision, 2026-07-26: the seed rows that are demonstrably city centroids
+// should say so instead of carrying a NULL that reads as "unknown".
+//
+// The companion of /admin/agents/geocode-seed-audit above: the audit measures
+// the distribution, this one acts on the ONE bucket the measurement justifies.
+// Same selector, so the audit's numbers describe exactly this pass's target.
+//
+// It writes on agreement ONLY (stored coordinate within 1 km of the row's own
+// city centroid). Disagreement is deliberately inert — see the block comment on
+// reclassifySeedCoordinates() for the two live rows (Fosen, Os) that a
+// "disagreement means the data is wrong" rule would have destroyed.
+//
+// Body: { limit?: number (1-500, default 50), dry_run?: boolean (default false) }
+// The dry_run parser is the STRICT one shared with geocode-batch and
+// postal-backfill — `{"dry_run":"true"}` performed a real production write once
+// already, and a third copy of that decision is a third chance to get it wrong.
+//
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/geocode-seed-reclassify", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+
+  const { reclassifySeedCoordinates, parseDryRunFlag } =
+    require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+
+  const dry = parseDryRunFlag(body.dry_run);
+  if (!dry.ok) {
+    res.status(400).json({ success: false, error: dry.error });
+    return;
+  }
+
+  const raw = typeof body.limit === "number" && Number.isFinite(body.limit) ? Math.floor(body.limit) : 50;
+  const limit = Math.max(1, Math.min(500, raw));
+
+  try {
+    const result = await reclassifySeedCoordinates(limit, { dryRun: dry.dryRun });
+    res.json({ success: true, data: { ...result, limit } });
+  } catch (err: any) {
+    console.error("[seed-reclassify] admin run failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Seed reclassify failed" });
+  }
+});
+
 export default router;
