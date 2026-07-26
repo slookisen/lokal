@@ -2897,6 +2897,20 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_places_api_call_log_called_at ON places_api_call_log(called_at)`);
 
+  // ─── Mapbox Directions monthly allowance (services/mapbox-budget.ts) ───
+  // Daniel, 2026-07-26: «jeg fant ingen måte å sette pristak under billing.»
+  // There is none — Mapbox offers usage alerts, not a ceiling. This counter IS
+  // the ceiling, which is why it lives in the database rather than in memory:
+  // an in-memory counter resets on every deploy, and we deploy several times a
+  // day. Declared HERE rather than lazily in the service (review note N3) so
+  // the table exists from first boot and schema tooling can see it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mapbox_monthly_usage (
+      month TEXT PRIMARY KEY,
+      calls INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+
   // ─── dev-request 2026-07-06-rfb-fjern-debio-norsk-gardsmat ─────────────
   // Daniel-confirmed: no public surface (homepage "Marked-nettverk",
   // /api/marketplace/umbrellas, MCP lokal_list_umbrellas, search, sitemap)

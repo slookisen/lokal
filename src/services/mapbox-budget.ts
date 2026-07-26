@@ -55,6 +55,15 @@ import { getDb } from "../database/init";
  */
 export const MAPBOX_MONTHLY_CAP_DEFAULT = 80_000;
 
+/**
+ * Mapbox's free Directions allowance. Named so the default above can be
+ * asserted AGAINST it rather than against itself — review B3 showed every
+ * existing assertion compared the default to `MAPBOX_MONTHLY_CAP_DEFAULT`, so
+ * raising it to 800 000 (above the free tier, i.e. a default that GUARANTEES a
+ * bill) kept the whole suite green.
+ */
+export const MAPBOX_FREE_TIER_MONTHLY = 100_000;
+
 /** Resolved from the environment on each call so a `fly secrets set` takes effect without a redeploy of this module's constants. */
 export function resolveMapboxMonthlyCap(env: NodeJS.ProcessEnv = process.env): number {
   const raw = (env.MAPBOX_MONTHLY_CALL_CAP || "").trim();
@@ -68,26 +77,41 @@ export function resolveMapboxMonthlyCap(env: NodeJS.ProcessEnv = process.env): n
     );
     return MAPBOX_MONTHLY_CAP_DEFAULT;
   }
-  return Math.floor(n);
+  // REVIEW N7: no upper sanity check means a fat-fingered `fly secrets set`
+  // ("1e12", "0x1F4") is accepted silently. We do not REFUSE it — an operator
+  // may legitimately raise the cap on a paid plan — but a cap above the free
+  // tier is worth one line in the log, because that is the moment the module
+  // stops being a guarantee that the bill is zero.
+  const cap = Math.floor(n);
+  if (cap > MAPBOX_FREE_TIER_MONTHLY) {
+    console.warn(
+      `[mapbox-budget] cap ${cap} exceeds the Mapbox free tier (${MAPBOX_FREE_TIER_MONTHLY}) — routing may now incur charges`,
+    );
+  }
+  return cap;
 }
 
 /** UTC calendar month key, e.g. "2026-07". */
 export function monthKey(now: number): string {
-  const d = new Date(now);
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  // Sliced from the ISO-8601 string rather than assembled from date methods.
+  // REVIEW N5: the previous getUTCFullYear/getUTCMonth version had a
+  // getFullYear/getMonth mutant that SURVIVED, because under the CI runner's
+  // TZ=UTC the two are identical — the test could only have caught it by
+  // forcing a timezone. toISOString() is UTC by definition, so the local-time
+  // variant this module must never use no longer exists to be mutated into.
+  // Removing the hazard beats testing around it.
+  return new Date(now).toISOString().slice(0, 7);
 }
 
-let schemaReady = false;
-function ensureSchema(db: any): void {
-  if (schemaReady) return;
-  db.exec(
-    `CREATE TABLE IF NOT EXISTS mapbox_monthly_usage (
-       month TEXT PRIMARY KEY,
-       calls INTEGER NOT NULL DEFAULT 0
-     )`,
-  );
-  schemaReady = true;
-}
+// The table is declared in database/init.ts alongside places_api_call_log
+// (review note N3). An earlier version created it lazily behind a module-level
+// `schemaReady` memo, which was a live landmine in tests/test.ts: that memo was
+// not keyed to the DB handle, so a block that swapped the singleton after this
+// module had run got "no such table" (review note N4, reproduced). Declaring it
+// with the rest of the schema removes the memo, the reset seam, and the hazard.
+
+/** Month whose exhaustion has already been logged — see REVIEW N1. */
+let lastWarnedMonth: string | null = null;
 
 export type MapboxBudgetState = {
   month: string;
@@ -100,13 +124,16 @@ export type MapboxBudgetState = {
 /** Read-only. Never increments — safe to call from a status endpoint. */
 export function mapboxBudgetState(now: number = Date.now()): MapboxBudgetState {
   const db = getDb();
-  ensureSchema(db);
   const month = monthKey(now);
   const cap = resolveMapboxMonthlyCap();
   const row = db.prepare(`SELECT calls FROM mapbox_monthly_usage WHERE month = ?`).get(month) as
     | { calls: number }
     | undefined;
   const used = row?.calls ?? 0;
+  // The Math.max clamp is unreachable while tryConsumeMapboxCall is the only
+  // writer (its conditional UPDATE cannot push `used` past `cap`). It is kept
+  // for the day something else writes this table, and is recorded here as an
+  // ACCEPTED surviving mutant rather than left looking like tested behaviour.
   return { month, used, cap, remaining: Math.max(0, cap - used), exhausted: used >= cap };
 }
 
@@ -124,7 +151,6 @@ export function mapboxBudgetState(now: number = Date.now()): MapboxBudgetState {
  */
 export function tryConsumeMapboxCall(now: number = Date.now()): boolean {
   const db = getDb();
-  ensureSchema(db);
   const month = monthKey(now);
   const cap = resolveMapboxMonthlyCap();
 
@@ -136,18 +162,25 @@ export function tryConsumeMapboxCall(now: number = Date.now()): boolean {
     .run(month, cap);
 
   const granted = res.changes > 0;
-  if (!granted) {
-    // Log once per exhausted call rather than once per month: the operator
-    // needs to see this in the logs at the moment routes start degrading, not
-    // buried in whichever request happened to cross the line.
+  if (!granted && lastWarnedMonth !== month) {
+    // REVIEW N1: log the TRANSITION, not every subsequent call. The earlier
+    // version warned once per refusal, and once the cap bites the degraded
+    // path is the FAST path — a reviewer's 5000-refusal probe emitted 4950
+    // lines. At 300 req/15 min/IP that is ~28 800 lines/day from one IP, on a
+    // machine that also serves finn-tannlege.com and opplevagent.no. The
+    // operator's need is met by knowing WHEN routing started degrading.
+    lastWarnedMonth = month;
     console.warn(
-      `[mapbox-budget] monthly cap reached for ${month} (cap ${cap}) — falling back to straight-line routing`,
+      `[mapbox-budget] monthly cap reached for ${month} (cap ${cap}) — falling back to straight-line routing until the month rolls over`,
     );
   }
   return granted;
 }
 
-/** Test seam: forget the CREATE TABLE memo so a fresh in-memory DB gets one. */
+/**
+ * Retained as a no-op so existing callers keep compiling. The memo it used to
+ * clear is gone — see the note above `mapboxBudgetState`.
+ */
 export function __resetMapboxBudgetSchemaForTesting(): void {
-  schemaReady = false;
+  /* schema now lives in initSchema; nothing to reset */
 }

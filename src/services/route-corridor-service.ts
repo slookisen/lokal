@@ -434,7 +434,18 @@ export async function getPreparedRoute(
     if (lru.done) break;
     routeCache.delete(lru.value);
   }
-  routeCache.set(key, { meta, prepared, expiresAt: now + ROUTE_CACHE_TTL_MS });
+  // REVIEW B4: never cache a capped fallback. It is keyed under the MAPBOX id
+  // (cappedProvider keeps `id: primary.id`), so a 24 h TTL would keep serving a
+  // straight line — under a note that promises «ekte kjørerute er tilbake ved
+  // månedsskiftet» — for up to 24 h INTO the new month, when real routing is in
+  // fact available again. A sentence the code does not honour is the same
+  // defect class this file's THE HONESTY RULE exists to prevent.
+  //
+  // Not caching it costs nothing: regenerating a straight line is arithmetic,
+  // and the whole point of the capped state is that we are not calling out.
+  if (meta.provider !== CAPPED_STRAIGHT_LINE_PROVIDER) {
+    routeCache.set(key, { meta, prepared, expiresAt: now + ROUTE_CACHE_TTL_MS });
+  }
 
   return { route: meta, prepared, cached: false };
 }
