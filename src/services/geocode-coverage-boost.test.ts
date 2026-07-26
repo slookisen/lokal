@@ -53,14 +53,27 @@
  *              we cannot distinguish a wrong coordinate from a wrong lookup,
  *              and the test exists to keep us from pretending we can.
  *
- *              Mutation-tested: 7 mutants, 6 killed. ONE SURVIVOR, recorded
- *              rather than hidden — dropping `AND geo_precision IS NULL` from
- *              the UPDATE leaves the suite green, because the selector already
- *              guarantees it. That clause only bites on a read-then-write race
- *              inside a single tick, which this harness cannot stage. It is
- *              defence-in-depth with no independently observable behaviour;
- *              the honest options were to document it or delete the guard, and
- *              deleting a correct guard to satisfy a metric is the worse one.
+ *              MUTATION COVERAGE — the first claim here was WRONG, and the
+ *              correction matters more than the number. The author ran 7
+ *              mutants, killed 6, and wrote "ONE SURVIVOR". An independent
+ *              reviewer ran 14 and found EIGHT survivors: the 1 km threshold
+ *              could be widened to 10 km or even 25 km with this suite fully
+ *              green, `is_active` was unpinned, and the error counter and the
+ *              rate-budget call were untested. A mutation score is only as
+ *              honest as the mutant list, and a short list flatters itself.
+ *
+ *              After rc11-rc14, of the reviewer's 14: 12 killed, 2 survive.
+ *                • `km <= T` → `km < T`. Differs only at EXACTLY 1.000 km, a
+ *                  set no float fixture reaches reliably. Not killable without
+ *                  a test that lies about what it measures.
+ *                • Dropping `AND geo_precision IS NULL` from the UPDATE. The
+ *                  selector already guarantees it; the clause only bites on a
+ *                  read-then-write race inside one tick, which this harness
+ *                  cannot stage. Defence-in-depth with no independently
+ *                  observable behaviour.
+ *              Both are recorded rather than papered over. Deleting a correct
+ *              guard, or writing a fixture that pretends to test float
+ *              equality, to move a metric — those are the worse options.
  *
  * MUTATION-TESTED. Every guarantee claimed above was verified by breaking the
  * source and confirming this suite goes red — 28 mutants, 28 killed, listed
@@ -841,13 +854,23 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
       }
 
       // ═══════════════════════════════════════════════════════════════
-      // rc1-rc10 — seed-coordinate RECLASSIFICATION (Daniel, 2026-07-26)
+      // rc1-rc14 — seed-coordinate RECLASSIFICATION (Daniel, 2026-07-26)
       //
       // The rule is one-sided on purpose: agreement writes, disagreement does
-      // not. rc4/rc5 are the two live rows that killed the first design —
-      // «Gjerdrum» resolving to a Grend 79.6 km away, and a Boligfelt-only
-      // name. Under a "far means wrong, so null it" rule both would have had a
-      // correct coordinate deleted. Here they must come out UNTOUCHED.
+      // not. rc6 is the row that killed the first design — the Fosen/Os shape,
+      // where a same-named place elsewhere makes a CORRECT coordinate look far
+      // from "its city". Under a "far means wrong, so null it" rule it would
+      // have had a correct coordinate deleted. It must come out UNTOUCHED.
+      //
+      // (An earlier version of this comment credited rc4/rc5 and described a
+      // Gjerdrum Grend and a Boligfelt — copy-pasted from the tc block. rc4 is
+      // the agreement case and rc5 is an ordinary disagreement. Corrected after
+      // review: in this repo the comments ARE the documentation.)
+      //
+      // rc11-rc14 exist because an independent reviewer ran 14 mutants against
+      // the first version of this block and EIGHT survived. The threshold that
+      // the entire safety argument rests on was not pinned by anything: it
+      // could be widened from 1 km to 25 km with the suite still green.
       // ═══════════════════════════════════════════════════════════════
       {
         const dbR = new Database(":memory:");
@@ -889,6 +912,17 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
         seedR({ id: "rc-samename", name: "Samme navn, annet sted", lat: 63.745, lng: 10.233, city: "Gildeskål" });
         // City that resolves to nothing at all.
         seedR({ id: "rc-unresolvable", name: "Ukjent sted", lat: 60.0, lng: 10.0, city: "Ingenstedet" });
+        // REVIEW B1 — the 1..30 km gap was entirely untested, so the threshold
+        // could be widened to 25 km with CI green. Rana centroid is
+        // 66.31/14.14; these sit ~1.5 km and ~5.6 km from it, i.e. inside the
+        // audit's `near_centroid` band that must NOT be stamped.
+        seedR({ id: "rc-just-over", name: "Like utenfor", lat: 66.3235, lng: 14.14, city: "Rana" });
+        seedR({ id: "rc-near-band", name: "I nærbåndet", lat: 66.3603, lng: 14.14, city: "Rana" });
+        // REVIEW NOTE 4 — the is_active clause was unpinned (M14 survived).
+        db.prepare(`SELECT 1`).get();
+        insA.run({ id: "rc-inactive", name: "Deaktivert", api_key: "k-rc-inactive",
+                   lat: 66.3125, lng: 14.1405, city: "Rana", gp: null });
+        dbR.prepare(`UPDATE agents SET is_active = 0 WHERE id = 'rc-inactive'`).run();
         // Must never be selected: already has a precision.
         seedR({ id: "rc-has-precision", name: "Alt stemplet", lat: 66.3125, lng: 14.1405, city: "Rana", gp: "address" });
         // Must never be selected: has a street address to improve on instead.
@@ -912,8 +946,8 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
           "rc2: …but it still REPORTS the one row it would stamp");
 
         const run = await worker.reclassifySeedCoordinates(50, {}, noSleep);
-        assertEq(run.examined, 4,
-          "rc3: the selector skips the address-precision row AND the row with a street address");
+        assertEq(run.examined, 6,
+          "rc3: the selector skips the address-precision row, the row with a street address, and the inactive row");
         assertEq(gpOf("rc-agree").geo_precision, "city",
           "rc4: agreement (≤1 km from its own city centroid) stamps 'city' — a measurement, not a guess");
         assertEq(gpOf("rc-disagree").geo_precision, null,
@@ -930,8 +964,8 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
           "rc6b: …and its correct coordinate survives untouched");
         assertEq(gpOf("rc-unresolvable").geo_precision, null,
           "rc7: an unresolvable city is the ABSENCE of evidence, never a reason to write");
-        assertEq(run.left_alone_disagreement, 2,
-          "rc8: both non-agreeing rows are counted, so 'left alone' is visible rather than silent");
+        assertEq(run.left_alone_disagreement, 4,
+          "rc8: every non-agreeing row is counted, so 'left alone' is visible rather than silent");
         assertEq(gpOf("rc-has-precision").geo_precision, "address",
           "rc9: an address-precision row is never downgraded");
 
@@ -939,6 +973,27 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
         const second = await worker.reclassifySeedCoordinates(50, {}, noSleep);
         assertEq(second.reclassified, 0,
           "rc10: idempotent — a stamped row leaves the selector, so a re-run stamps nothing");
+
+        // ── REVIEW B1: pin the threshold itself ──
+        assertEq(gpOf("rc-just-over").geo_precision, null,
+          "rc11: 1.5 km is NOT agreement — the 1 km line is where the docs say it is, not merely near it");
+        assertEq(gpOf("rc-near-band").geo_precision, null,
+          "rc12: 5.6 km — the audit's `near_centroid` band must never be stamped; those rows are plausibly the real farm");
+
+        // ── REVIEW NOTE 4: inactive rows are not the catalogue ──
+        assertEq(
+          (dbR.prepare(`SELECT geo_precision FROM agents WHERE id='rc-inactive'`).get() as any).geo_precision,
+          null,
+          "rc13: a deactivated producer is never stamped");
+
+        // ── REVIEW B2: the rollback key is actually written ──
+        const prov = dbR
+          .prepare(`SELECT geocode_source, geocode_outcome FROM agents WHERE id='rc-agree'`)
+          .get() as any;
+        assertEq(prov.geocode_source, "seed_reclassify",
+          "rc14: the stamp records WHERE it came from — without this the documented rollback would also un-stamp the worker's own correct 'city' rows");
+        assertEq(prov.geocode_outcome, "seed_reclassify_city",
+          "rc14b: …and the outcome, matching every other geo_precision write in this file");
 
         dbR.close();
         initMod.__setDbForTesting(db as any);

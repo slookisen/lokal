@@ -1103,7 +1103,7 @@ export async function auditSeedCoordinates(
     const km = centroid ? auditHaversineKm(r.lat, r.lng, centroid.lat, centroid.lng) : null;
     const verdict: SeedCoordinateAuditRow["verdict"] =
       km === null ? "city_unresolvable"
-        : km <= 1 ? "is_centroid"
+        : km <= RECLASSIFY_AGREEMENT_KM ? "is_centroid"
         : km <= 10 ? "near_centroid"
         : "far_from_centroid";
     out[verdict === "city_unresolvable" ? "city_unresolvable" : verdict]++;
@@ -1170,8 +1170,27 @@ export async function auditSeedCoordinates(
 // while its city says Sandeid) need a different detector — "parked on a known
 // default point" — which does not fire on Fosen or Os. Out of scope here.
 
-/** Agreement threshold, km. Shared with auditSeedCoordinates' `is_centroid`. */
+/**
+ * Agreement threshold, km.
+ *
+ * REVIEW NOTE 1: the first version of this comment claimed the constant was
+ * "shared with auditSeedCoordinates' is_centroid" while the audit hardcoded
+ * `km <= 1` — so changing this number would silently desynchronise the audit's
+ * is_centroid count from what the reclassifier actually acts on. The audit now
+ * uses the constant, which is what the comment always said.
+ *
+ * Do NOT widen this to the audit's `near_centroid` band (1-10 km). Those rows
+ * are, in the audit's own words, "plausibly the real farm" — stamping them
+ * 'city' suppresses a true distance and replaces it with «i X-området».
+ * rc11/rc12 pin 1.5 km and 5 km as NOT stamped precisely so that widening the
+ * constant turns CI red instead of quietly relabelling ~20 producers.
+ */
 export const RECLASSIFY_AGREEMENT_KM = 1;
+
+/** Written to geocode_source by this pass. The rollback key — see REVIEW B2. */
+export const SEED_RECLASSIFY_SOURCE = "seed_reclassify";
+/** Written to geocode_outcome by this pass. */
+export const SEED_RECLASSIFY_OUTCOME = "seed_reclassify_city";
 
 export type SeedReclassifyRow = {
   agent_id: string;
@@ -1200,7 +1219,16 @@ export type SeedReclassifyResult = {
  * is never acted on.
  *
  * Idempotent: the selector requires geo_precision IS NULL, so a stamped row is
- * never revisited. Reversible: `UPDATE agents SET geo_precision = NULL WHERE …`.
+ * never revisited.
+ *
+ * Reversible, and now actually so (REVIEW B2) — the pass marks its own writes:
+ *
+ *   UPDATE agents
+ *      SET geo_precision = NULL, geocode_source = NULL, geocode_outcome = NULL
+ *    WHERE geocode_source = 'seed_reclassify';
+ *
+ * That statement touches ONLY rows this pass stamped. It cannot reach the
+ * Tier-B/C worker's own legitimate 'city' rows, which carry their own source.
  */
 export async function reclassifySeedCoordinates(
   limit: number = 50,
@@ -1237,8 +1265,22 @@ export async function reclassifySeedCoordinates(
     errors: 0, duration_ms: 0, rows: [],
   };
 
+  // REVIEW B2: stamp PROVENANCE, not just precision. The docstring promises
+  // reversibility, and without a marker the promise cannot be kept: a row
+  // stamped here would be indistinguishable from one the Tier-B/C worker
+  // legitimately stamped 'city' via precisionForPlaceType(), so the rollback
+  // UPDATE would un-stamp the worker's correct writes too. Every other
+  // geo_precision write in this file records where it came from (see :733-737);
+  // this one now does the same.
+  //
+  // geocode_attempted_at is deliberately NOT touched — it drives the rotation
+  // ordering, and this pass is not a geocode attempt.
   const stamp = db.prepare(
-    `UPDATE agents SET geo_precision = 'city' WHERE id = ? AND geo_precision IS NULL`
+    `UPDATE agents
+        SET geo_precision  = 'city',
+            geocode_source = '${SEED_RECLASSIFY_SOURCE}',
+            geocode_outcome = '${SEED_RECLASSIFY_OUTCOME}'
+      WHERE id = ? AND geo_precision IS NULL`
   );
 
   for (const r of rows) {
@@ -1252,6 +1294,18 @@ export async function reclassifySeedCoordinates(
     } catch (err) {
       // A lookup failure is not evidence about the coordinate — it is the
       // absence of evidence. Never let it become a reason to write.
+      //
+      // REVIEW NOTE 3, recorded rather than quietly left misleading: this
+      // branch is currently UNREACHABLE. geocodePlaceForBackfill swallows
+      // every network error internally (geocoding-service.ts:830, :882 both
+      // catch → return null) and takeKartverketBudget cannot throw. So a real
+      // run reports errors: 0 however many lookups timed out, and those rows
+      // land in left_alone_unresolvable instead. An operator reading
+      // `errors: 0, left_alone_unresolvable: 30` must NOT conclude the 30 were
+      // genuine "city not in the register" cases — they may equally be 30
+      // timeouts. Distinguishing them needs a change in the geocoder, not
+      // here; the guard stays because the day that changes, this must not
+      // start writing.
       out.errors++;
       console.error(`[seed-reclassify] lookup failed for ${r.id}:`, err);
     }
@@ -1260,7 +1314,13 @@ export async function reclassifySeedCoordinates(
 
     let outcome: SeedReclassifyRow["outcome"];
     let to: "city" | null = null;
-    if (km === null) {
+    // REVIEW NOTE 2: a NaN/Infinity distance comes from a malformed lookup, not
+    // from two sources conflicting. Filing it under "disagreement" would emit a
+    // row with distance_km: null under a heading that means "we have two
+    // numbers and they differ", and would inflate the counter read as the
+    // genuine-conflict count. Absence of evidence belongs with the other
+    // absence of evidence.
+    if (km === null || !Number.isFinite(km)) {
       outcome = "left_alone_unresolvable";
       out.left_alone_unresolvable++;
     } else if (km <= RECLASSIFY_AGREEMENT_KM) {
