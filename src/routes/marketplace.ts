@@ -27,6 +27,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
+import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
@@ -459,6 +460,37 @@ router.get("/search", async (req: Request, res: Response) => {
     return;
   }
 
+  // ── Fase 3c: route intent, exposed rather than acted on ───────────
+  // The HTML page (/sok) REDIRECTS on a recognised route. This JSON endpoint
+  // must not: an agent that asked for search results and got a 302 to a travel
+  // page would simply break. So the route is reported alongside the ordinary
+  // results, and the caller decides. The ordinary search still runs in full,
+  // which is also the fall-through when the route turns out not to be one.
+  let routeSuggestion: {
+    from: string; to: string; separation_km: number; url: string;
+  } | undefined;
+  if (q) {
+    try {
+      const ri = await resolveRouteIntent(q, {
+        // STRICT whole-string resolver — see the contract in route-intent.ts.
+        geocode: async (place: string) => {
+          const g = await geocodingService.geocodePlaceForBackfill(place);
+          return g ? { lat: g.lat, lng: g.lng } : null;
+        },
+      });
+      if (ri.ok) {
+        routeSuggestion = {
+          from: ri.route.from.query,
+          to: ri.route.to.query,
+          separation_km: ri.route.separation_km,
+          url: reiseUrlFor(ri.route, "/api/marketplace/reise"),
+        };
+      }
+    } catch (err) {
+      console.error("[route-intent] search detection failed, falling through:", err);
+    }
+  }
+
   // Parse natural language into structured query (categories, tags, product terms)
   const parsed = marketplaceRegistry.parseNaturalQuery(q);
   // dev-request 2026-07-25 fix 0e: «nær meg» is an intent, not noise.
@@ -690,6 +722,10 @@ router.get("/search", async (req: Request, res: Response) => {
     },
     geoFiltered,
     geoSource: geoDropped ? "none" : geoSource,
+    // Fase 3c: present ONLY when both endpoints resolved and are far enough
+    // apart to be a journey. Absent is the normal case. Callers that ignore it
+    // keep the exact behaviour they had before this field existed.
+    route_suggestion: routeSuggestion,
     // Honest radius actually applied (may be wider than the one requested,
     // because of the auto-expand ladder above).
     geoRadiusKm: geoFiltered ? appliedRadiusKm : undefined,

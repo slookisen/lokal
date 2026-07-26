@@ -17,6 +17,7 @@
 
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
+import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService } from "../services/knowledge-service";
 import { getConfig } from "../config/vertical-config";
 import { geocodingService } from "../services/geocoding-service";
@@ -1369,6 +1370,36 @@ router.get("/sok", async (req: Request, res: Response) => {
   // was no way to search purely by position.
   if (!q && !hasBrowserCoords) { res.redirect(localizedPath("/", lang)); return; }
   const searchRadiusKm = resolveSearchRadiusKm(req.query.radius);
+
+  // ── Fase 3a: route intent in the ONE search box ───────────────────
+  // «oslo til bodø» typed here used to be parsed as a place search in Oslo —
+  // three ordinary hits, no hint that /reise even exists. Recognise the route
+  // and send the visitor to the page that answers it.
+  //
+  // EVERY failure path continues to ordinary search below. `resolveRouteIntent`
+  // returns a reason rather than throwing precisely so that a route we cannot
+  // resolve becomes a normal search instead of a dead end — Daniel's «uten
+  // missforståelser» cuts both ways, and a wrong redirect is the worse error.
+  if (q && !hasBrowserCoords) {
+    try {
+      const ri = await resolveRouteIntent(q, {
+        // STRICT whole-string resolver, never extractAndGeocode — see the
+        // contract in route-intent.ts. The extractor turned «rakfisk fra
+        // Valdres til Oslo» into a route.
+        geocode: async (place: string) => {
+          const g = await geocodingService.geocodePlaceForBackfill(place);
+          return g ? { lat: g.lat, lng: g.lng } : null;
+        },
+      });
+      if (ri.ok) {
+        res.redirect(302, `${localizedPath("/reise", lang)}?from=${encodeURIComponent(ri.route.from.query)}&to=${encodeURIComponent(ri.route.to.query)}`);
+        return;
+      }
+    } catch (err) {
+      // A geocoder outage must not take the search box down with it.
+      console.error("[route-intent] /sok detection failed, falling through:", err);
+    }
+  }
 
   try {
     const parsed = marketplaceRegistry.parseNaturalQuery(q);
