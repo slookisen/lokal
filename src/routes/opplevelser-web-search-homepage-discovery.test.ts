@@ -139,6 +139,13 @@ export function runOpplevelserWebSearchHomepageDiscoveryTests(
       insertProvider.run({ id: "ws-catalog-owner", navn: "Katalogeier Gård", org_nr: null, listing_url: null, hjemmeside: "https://tatt-av-noen-ws.no", content_source: null, kommune: "Voss", producer_type: null });
       // ws-good: residual, for the fully-valid apply-then-requeue test.
       insertProvider.run({ id: "ws-good", navn: "Ekte Reststrøm Gård", org_nr: null, listing_url: null, hjemmeside: null, content_source: null, kommune: "Voss", producer_type: null });
+      // ws-cross-a / ws-cross-b: two SEPARATE residual providers, for the
+      // cross-provider host_already_queued_elsewhere regression test —
+      // TWO DIFFERENT requests (not two items in one batch, which
+      // queuedThisRun already catches) each submitting a candidate_url on
+      // the SAME host for a DIFFERENT provider_id.
+      insertProvider.run({ id: "ws-cross-a", navn: "Kryssvert Gård A", org_nr: null, listing_url: null, hjemmeside: null, content_source: null, kommune: "Voss", producer_type: null });
+      insertProvider.run({ id: "ws-cross-b", navn: "Kryssvert Gård B", org_nr: null, listing_url: null, hjemmeside: null, content_source: null, kommune: "Voss", producer_type: null });
 
       // ── ws-1: auth gate on BOTH new routes. ─────────────────────────────
       {
@@ -373,6 +380,45 @@ export function runOpplevelserWebSearchHomepageDiscoveryTests(
         assertEq(row.hjemmeside, "https://ekte-reststrom-nettside.no", "ws-14b: hjemmeside persisted via the shared writeProviderHjemmeside helper");
         const qRow = expDb.prepare(`SELECT status FROM experience_homepage_review_queue WHERE provider_id='ws-good'`).get() as any;
         assertEq(qRow.status, "approved", "ws-14c: queue row flipped to approved");
+      }
+      // ── ws-15: cross-provider host_already_queued_elsewhere — a host
+      //    PENDING in the queue for a DIFFERENT provider from an EARLIER,
+      //    SEPARATE request must reject a later request for that same host,
+      //    even though queuedThisRun (same-request-only) never sees it.
+      //    Mirrors listing-homepage-discovery's / brreg-website-discovery's
+      //    identical queuedElsewhereCount guard.
+      //
+      //    NB the guard's own SQL is `candidate_url LIKE '%' || host`, which
+      //    only matches when the STORED candidate_url literally ENDS with
+      //    the host (same characteristic as the sibling legs' identical
+      //    query) — so the first submission's candidate_url is host-only
+      //    (no path) to land a matchable row; the second carries a path to
+      //    prove the match is host-based, not exact-URL-based. ───────────
+      {
+        const first = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { candidates: [{ provider_id: "ws-cross-a", candidate_url: "https://kryssvert-ws.no", name_verified: true }], apply: true },
+        });
+        assertEq(first.body.queued_count, 1, "ws-15a: first request (ws-cross-a) queues successfully");
+        const qA = expDb.prepare(`SELECT * FROM experience_homepage_review_queue WHERE provider_id='ws-cross-a'`).get() as any;
+        assertTrue(!!qA, "ws-15b: ws-cross-a landed in the review queue");
+        assertEq(qA?.status, "pending", "ws-15c: ws-cross-a's queue row is pending");
+
+        const second = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { candidates: [{ provider_id: "ws-cross-b", candidate_url: "https://kryssvert-ws.no/kontakt", name_verified: true }], apply: true },
+        });
+        const rej = (second.body.rejected as any[]).find((x) => x.provider_id === "ws-cross-b");
+        assertTrue(
+          !!rej && rej.reason === "host_already_queued_elsewhere",
+          "ws-15d: SECOND request, DIFFERENT provider, same host, host PENDING for ws-cross-a → host_already_queued_elsewhere",
+        );
+        assertEq(second.body.queued_count, 0, "ws-15e: second request queues nothing");
+
+        const qHost = expDb.prepare(`SELECT COUNT(*) c FROM experience_homepage_review_queue WHERE candidate_url LIKE '%kryssvert-ws.no%'`).get() as any;
+        assertEq(qHost.c, 1, "ws-15f: only ONE row total lands in the queue for this host");
+        const qB = expDb.prepare(`SELECT 1 FROM experience_homepage_review_queue WHERE provider_id='ws-cross-b'`).get() as any;
+        assertTrue(!qB, "ws-15g: ws-cross-b never got a queue row of its own");
       }
     } catch (err: any) {
       failed++;

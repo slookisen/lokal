@@ -3295,6 +3295,18 @@ router.post("/admin/homepage-review-queue/submit", requireAdmin, (req: Request, 
       rejected.push({ provider_id: pid, reason: "host_already_in_catalog" });
       continue;
     }
+    const queuedElsewhereCount = (
+      expDb
+        .prepare(
+          `SELECT COUNT(*) AS n FROM experience_homepage_review_queue
+            WHERE status = 'pending' AND provider_id != ? AND candidate_url LIKE ?`
+        )
+        .get(pid, "%" + host) as { n: number }
+    ).n;
+    if (queuedElsewhereCount > 0 || queuedThisRun.has(host)) {
+      rejected.push({ provider_id: pid, reason: "host_already_queued_elsewhere" });
+      continue;
+    }
 
     const ownPendingOrApproved = expDb
       .prepare(
