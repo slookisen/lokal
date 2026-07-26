@@ -3114,6 +3114,257 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
   });
 });
 
+// ─── GET /api/opplevelser/admin/providers/homepage-open-uncovered (admin) ──
+// POST /api/opplevelser/admin/homepage-review-queue/submit (admin) ──────────
+//
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
+// Daniel's decision, step 2, evidence-leg (d) — the RESIDUAL cohort: providers
+// with NEITHER org_nr NOR listing_url set, so neither leg (a)'s
+// listing_url-driven candidate set NOR leg (b)'s org_nr-driven candidate set
+// ever selects them. There is no server-side web-search/LLM capability in
+// this app (and none is added here) — an external process (a human, or an
+// orchestrator session) does the actual research and submits results. These
+// two routes are the plumbing only:
+//   - GET .../homepage-open-uncovered surfaces the residual cohort (read-only,
+//     rotates through the cohort via web_search_homepage_attempted_at, same
+//     cursor idiom as legs (a)/(b)).
+//   - POST .../homepage-review-queue/submit accepts already-researched
+//     {provider_id, candidate_url, name_verified} triples and, after the SAME
+//     guard checks legs (a)/(b) already enforce (locked content_source,
+//     already-has-website, directory/aggregator host, host-already-in-
+//     catalog, already-queued-for-provider) PLUS a hard name_verified===true
+//     requirement (the API-boundary enforcement that the external caller
+//     actually confirmed the provider's name on the candidate site — this
+//     route has no way to verify that itself), upserts survivors into
+//     experience_homepage_review_queue with reason 'web_search_candidate' and
+//     a conservative confidence (0.6 — lower than leg (b)'s 1.0 Brreg-
+//     registry confidence, since this is unverified-by-structured-data).
+//     NEVER writes hjemmeside directly — adoption goes through the EXISTING
+//     listing-homepage-review-approve lever, unmodified (it keys off
+//     provider_id/candidate_url against the shared queue table, not off
+//     reason, so it already works generically for this leg's rows too).
+//
+// Non-goals (this slice): no web-search/LLM call from application code (the
+// caller is expected to have already done that research), no new approve
+// route, no Google Places calls, no new KNOWN_DIRECTORY_HOSTS entries added
+// speculatively.
+const HOMEPAGE_OPEN_UNCOVERED_DEFAULT_LIMIT = 30;
+const HOMEPAGE_OPEN_UNCOVERED_MAX_LIMIT = 30;
+router.get("/admin/providers/homepage-open-uncovered", requireAdmin, (req: Request, res: Response) => {
+  let limit = parseInt((req.query.limit as string) || "", 10);
+  if (!Number.isFinite(limit)) limit = HOMEPAGE_OPEN_UNCOVERED_DEFAULT_LIMIT;
+  if (limit > HOMEPAGE_OPEN_UNCOVERED_MAX_LIMIT) {
+    res.status(400).json({ error: `limit too large (max ${HOMEPAGE_OPEN_UNCOVERED_MAX_LIMIT} per call)` });
+    return;
+  }
+  if (limit < 1) limit = HOMEPAGE_OPEN_UNCOVERED_DEFAULT_LIMIT;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const rows = expDb
+      .prepare(
+        `SELECT id, navn, kommune, producer_type
+           FROM experience_providers
+          WHERE hjemmeside IS NULL AND org_nr IS NULL AND listing_url IS NULL
+            AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          ORDER BY (web_search_homepage_attempted_at IS NOT NULL), web_search_homepage_attempted_at ASC, created_at ASC
+          LIMIT ?`
+      )
+      .all(limit) as Array<{ id: string; navn: string; kommune: string | null; producer_type: string | null }>;
+
+    const candidates = rows.map((r) => ({
+      id: r.id,
+      navn: r.navn,
+      kommune: r.kommune,
+      producer_type: r.producer_type,
+    }));
+
+    res.json({ candidates });
+  } catch (err) {
+    console.error("[opplevelser] admin/providers/homepage-open-uncovered failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+const HRQ_SUBMIT_BATCH_CAP = 30;
+router.post("/admin/homepage-review-queue/submit", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { candidates?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.candidates) || body.candidates.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'candidates' array of {provider_id, candidate_url, name_verified}" });
+    return;
+  }
+  if (body.candidates.length > HRQ_SUBMIT_BATCH_CAP) {
+    res.status(400).json({ error: `Too many candidates (max ${HRQ_SUBMIT_BATCH_CAP} per call)` });
+    return;
+  }
+
+  const expDb = getExpDb("experiences");
+  const batchTag = `web-search-homepage-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  // Normalized-host set for host_already_in_catalog — same construction
+  // pattern as legs (a)/(b) above: computed ONCE per request, reused across
+  // the whole batch, vertical-agnostic (dedups against ALL
+  // experience_providers.hjemmeside, not just this vertical's rows).
+  const catalogHosts = new Set<string>();
+  for (const row of expDb
+    .prepare(`SELECT hjemmeside FROM experience_providers WHERE hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''`)
+    .all() as Array<{ hjemmeside: string }>) {
+    const h = hostFromUrlLike(row.hjemmeside);
+    if (h) catalogHosts.add(h);
+  }
+  // Hosts queued (apply-mode only) for a DIFFERENT provider WITHIN this same
+  // run — mirrors legs (a)/(b)'s queuedThisRun guard.
+  const queuedThisRun = new Set<string>();
+
+  const seen = new Set<string>();
+  const wouldQueue: Array<{ provider_id: string; navn: string; candidate_url: string; host: string }> = [];
+  const queued: Array<{ provider_id: string; navn: string; candidate_url: string; host: string }> = [];
+  const rejected: Array<{ provider_id: string; reason: string }> = [];
+  // Providers whose attempt should be stamped — every candidate this route
+  // actually processed (survived or rejected for a substantive reason),
+  // EXCEPT invalid_item/duplicate_in_request/not_found, which never resolved
+  // to a real, attributable attempt on a real provider row.
+  const toStamp: string[] = [];
+
+  for (const raw of body.candidates as unknown[]) {
+    const c = raw as { provider_id?: unknown; candidate_url?: unknown; name_verified?: unknown };
+    const pid = typeof c?.provider_id === "string" ? c.provider_id.trim() : "";
+    const url = typeof c?.candidate_url === "string" ? c.candidate_url.trim() : "";
+    if (!pid || !url) {
+      rejected.push({ provider_id: pid || "(missing)", reason: "invalid_item" });
+      continue;
+    }
+    if (seen.has(pid)) {
+      rejected.push({ provider_id: pid, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(pid);
+
+    const provider = expDb
+      .prepare(`SELECT id, navn, hjemmeside, org_nr, listing_url, content_source FROM experience_providers WHERE id = ?`)
+      .get(pid) as
+      | { id: string; navn: string; hjemmeside: string | null; org_nr: string | null; listing_url: string | null; content_source: string | null }
+      | undefined;
+    if (!provider) {
+      rejected.push({ provider_id: pid, reason: "not_found" });
+      continue;
+    }
+
+    // From here on, this is a real provider row — every outcome (survive or
+    // reject) is an attributable attempt, so the cursor stamp applies.
+    toStamp.push(pid);
+
+    if (c?.name_verified !== true) {
+      rejected.push({ provider_id: pid, reason: "name_not_verified" });
+      continue;
+    }
+    if (provider.hjemmeside && provider.hjemmeside.trim() !== "") {
+      rejected.push({ provider_id: pid, reason: "already_has_website" });
+      continue;
+    }
+    if (provider.content_source === "manual" || provider.content_source === "claim") {
+      rejected.push({ provider_id: pid, reason: "locked_content_source" });
+      continue;
+    }
+
+    // Not one of the dev-request's own listed rejection reasons — a defensive
+    // fallback for a candidate_url so degenerate hostFromUrlLike can't derive
+    // a host at all (e.g. "https://"). Deliberately its OWN reason (not
+    // "invalid_item", which is reserved for the missing/blank-field
+    // structural check above) since this candidate DID name a real,
+    // unlocked, name-verified provider — a meaningful, stampable attempt.
+    const host = hostFromUrlLike(url);
+    if (!host) {
+      rejected.push({ provider_id: pid, reason: "invalid_candidate_url" });
+      continue;
+    }
+    if (isDirectoryOrAggregatorHost(host)) {
+      rejected.push({ provider_id: pid, reason: "directory_or_aggregator_host" });
+      continue;
+    }
+    if (catalogHosts.has(host) || queuedThisRun.has(host)) {
+      rejected.push({ provider_id: pid, reason: "host_already_in_catalog" });
+      continue;
+    }
+    const queuedElsewhereCount = (
+      expDb
+        .prepare(
+          `SELECT COUNT(*) AS n FROM experience_homepage_review_queue
+            WHERE status = 'pending' AND provider_id != ? AND candidate_url LIKE ?`
+        )
+        .get(pid, "%" + host) as { n: number }
+    ).n;
+    if (queuedElsewhereCount > 0 || queuedThisRun.has(host)) {
+      rejected.push({ provider_id: pid, reason: "host_already_queued_elsewhere" });
+      continue;
+    }
+
+    const ownPendingOrApproved = expDb
+      .prepare(
+        `SELECT 1 FROM experience_homepage_review_queue WHERE provider_id = ? AND status IN ('pending','approved')`
+      )
+      .get(pid);
+    if (ownPendingOrApproved) {
+      rejected.push({ provider_id: pid, reason: "already_queued_for_provider" });
+      continue;
+    }
+
+    // Survived every guard.
+    if (dryRun) {
+      wouldQueue.push({ provider_id: pid, navn: provider.navn, candidate_url: url, host });
+    } else {
+      const evidence = { source: "web_search", host };
+      try {
+        upsertListingHomepageReviewQueue(expDb, {
+          provider_id: pid,
+          provider_name: provider.navn,
+          candidate_url: url,
+          final_url: url,
+          evidence: JSON.stringify(evidence),
+          confidence: 0.6,
+          batch_id: batchTag,
+          reason: "web_search_candidate",
+        });
+        queuedThisRun.add(host);
+        queued.push({ provider_id: pid, navn: provider.navn, candidate_url: url, host });
+      } catch {
+        /* queue write is best-effort; the run itself must not fail on it */
+        rejected.push({ provider_id: pid, reason: "queue_write_failed" });
+      }
+    }
+  }
+
+  // Stamping is a DB write, so — same dry-run-is-truly-read-only discipline
+  // as legs (a)/(b) above — it only lands in apply mode. A dry-run call is a
+  // pure preview: it must leave the cursor exactly where it was so a
+  // dry-run-first workflow doesn't accidentally advance rows past the caller
+  // before anything is actually queued.
+  if (!dryRun && toStamp.length > 0) {
+    const stampStmt = expDb.prepare(
+      `UPDATE experience_providers SET web_search_homepage_attempted_at = datetime('now') WHERE id = ?`
+    );
+    for (const id of toStamp) stampStmt.run(id);
+  }
+
+  res.json({
+    dry_run: dryRun,
+    would_queue_count: wouldQueue.length,
+    would_queue: wouldQueue,
+    queued_count: queued.length,
+    queued,
+    rejected,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-address-enrichment (admin) ───────
 //
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3.

@@ -27661,6 +27661,33 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of bwd.failures) failures.push("opplevelser-brreg-website-discovery: " + f);
     console.log(`  opplevelser-brreg-website-discovery: ${bwd.passed} passed, ${bwd.failed} failed`);
 
+    // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+    // hygiene, Daniel's decision, step 2, evidence-leg (d): the RESIDUAL
+    // cohort — providers with NEITHER org_nr NOR listing_url set, so neither
+    // leg (a)'s nor leg (b)'s candidate-set predicate ever selects them.
+    // GET /admin/providers/homepage-open-uncovered surfaces that cohort
+    // read-only (cursor-rotated via web_search_homepage_attempted_at) for an
+    // external researcher (human or orchestrator session) to look up — there
+    // is no server-side web-search/LLM capability in this app — and POST
+    // /admin/homepage-review-queue/submit accepts already-researched
+    // {provider_id, candidate_url, name_verified} triples, screens them
+    // through the SAME directory/aggregator-host + already-catalogued-host +
+    // already-queued-for-provider guards legs (a)/(b) already enforce (plus
+    // a hard name_verified===true requirement), and parks survivors in the
+    // SAME experience_homepage_review_queue (reason: 'web_search_candidate')
+    // — never written directly to hjemmeside. The EXISTING
+    // listing-homepage-review-approve route adopts this reason unmodified.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block for the same reason.
+    console.log("\n── opplevelser-web-search-homepage-discovery: steg 2, bevis-ben (d) — restkohort ──");
+    const { runOpplevelserWebSearchHomepageDiscoveryTests } = require("../src/routes/opplevelser-web-search-homepage-discovery.test") as
+      typeof import("../src/routes/opplevelser-web-search-homepage-discovery.test");
+    const wshd = await runOpplevelserWebSearchHomepageDiscoveryTests(false);
+    passed += wshd.passed;
+    failed += wshd.failed;
+    for (const f of wshd.failures) failures.push("opplevelser-web-search-homepage-discovery: " + f);
+    console.log(`  opplevelser-web-search-homepage-discovery: ${wshd.passed} passed, ${wshd.failed} failed`);
+
     // dev-request 2026-07-20-gardssalg-mcp-discoverability: the gårdssalg
     // vertical had zero presence in the agent-facing MCP surface —
     // list_experience_categories never mentioned it, and there was no tool
