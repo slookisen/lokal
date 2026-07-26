@@ -733,6 +733,23 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN brreg_website_discovery_attempted_at TEXT");
   } catch { /* already present */ }
 
+  // Per-provider attempt stamp for web-search homepage discovery (step 2,
+  // evidence-leg (d)) — its OWN column, independent of legs (a)/(b) above:
+  // the residual cohort this leg targets (no org_nr AND no listing_url) never
+  // qualifies as a candidate for either leg (a)'s listing_url-driven fetch or
+  // leg (b)'s org_nr-driven Brreg lookup), so it needs its own anti-
+  // starvation rotation cursor rather than reusing either sibling column.
+  // There is no server-side web-search/LLM capability in this app — GET
+  // /admin/providers/homepage-open-uncovered (src/routes/opplevelser.ts)
+  // surfaces the residual cohort for an external researcher (human or
+  // orchestrator session) to look up, and POST /admin/homepage-review-queue/
+  // submit stamps this column once a candidate has been submitted (queued or
+  // rejected) so the same rows aren't repeatedly resurfaced. Same idempotent
+  // ALTER TABLE idiom as its two siblings.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN web_search_homepage_attempted_at TEXT");
+  } catch { /* already present */ }
+
   // ─── gardssalg_claims (dev-request 2026-07-21-opplevagent-claim-flyt-
   // drikkeprodusenter) ──────────────────────────────────────────────────────
   // Producer owner-claim flow for gårdssalg profiles on opplevagent.no.
