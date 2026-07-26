@@ -44,6 +44,23 @@
  *              column spot-check, and including the new `unpark` write path.
  *   co1-co3    The two workers COOPERATE: postal-backfill resetting the parking
  *              counter when it lands the postnummer that was blocking a row.
+ *   rc1-rc10   Seed-coordinate RECLASSIFICATION (Daniel, 2026-07-26). The rule
+ *              is deliberately ONE-SIDED: agreement writes, disagreement does
+ *              not. rc6 pins the Fosen/Os shape — a same-named place elsewhere
+ *              makes a CORRECT row look far from "its city", so a "far means
+ *              wrong, null it" rule would have deleted two correct production
+ *              coordinates. rc5 and rc6 exercise the same branch on purpose:
+ *              we cannot distinguish a wrong coordinate from a wrong lookup,
+ *              and the test exists to keep us from pretending we can.
+ *
+ *              Mutation-tested: 7 mutants, 6 killed. ONE SURVIVOR, recorded
+ *              rather than hidden — dropping `AND geo_precision IS NULL` from
+ *              the UPDATE leaves the suite green, because the selector already
+ *              guarantees it. That clause only bites on a read-then-write race
+ *              inside a single tick, which this harness cannot stage. It is
+ *              defence-in-depth with no independently observable behaviour;
+ *              the honest options were to document it or delete the guard, and
+ *              deleting a correct guard to satisfy a metric is the worse one.
  *
  * MUTATION-TESTED. Every guarantee claimed above was verified by breaking the
  * source and confirming this suite goes red — 28 mutants, 28 killed, listed
@@ -820,6 +837,110 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
           "co3: …and it is pending again, now on Tier A");
 
         db3.close();
+        initMod.__setDbForTesting(db as any);
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // rc1-rc10 — seed-coordinate RECLASSIFICATION (Daniel, 2026-07-26)
+      //
+      // The rule is one-sided on purpose: agreement writes, disagreement does
+      // not. rc4/rc5 are the two live rows that killed the first design —
+      // «Gjerdrum» resolving to a Grend 79.6 km away, and a Boligfelt-only
+      // name. Under a "far means wrong, so null it" rule both would have had a
+      // correct coordinate deleted. Here they must come out UNTOUCHED.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const dbR = new Database(":memory:");
+        initMod.__setDbForTesting(dbR as any);
+        initMod.__initSchemaForTesting(dbR as any);
+        geo.__clearGeocodeCacheForTesting();
+        budget.__resetKartverketBudgetForTesting();
+
+        const insA = dbR.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key,
+                               lat, lng, city, is_active, geo_precision, geocode_attempts)
+           VALUES (@id, @name, 'Lokal matprodusent', 'test', 'a@b.no', 'https://example.no',
+                   'producer', @api_key, @lat, @lng, @city, 1, @gp, 0)`
+        );
+        const insK = dbR.prepare(
+          `INSERT INTO agent_knowledge (agent_id, address, postal_code) VALUES (?, ?, ?)`
+        );
+        const seedR = (o: { id: string; name: string; lat: number | null; lng: number | null;
+                            city: string | null; gp?: string | null; address?: string | null }) => {
+          insA.run({ id: o.id, name: o.name, api_key: `k-${o.id}`,
+                     lat: o.lat, lng: o.lng, city: o.city, gp: o.gp ?? null });
+          if (o.address !== undefined) insK.run(o.id, o.address, null);
+        };
+        const gpOf = (id: string) =>
+          (dbR.prepare(`SELECT geo_precision, lat, lng FROM agents WHERE id = ?`).get(id) as any);
+
+        // Agrees with the Rana kommune centroid (66.31/14.14) to ~0.3 km.
+        seedR({ id: "rc-agree", name: "Sentroide-produsent", lat: 66.3125, lng: 14.1405, city: "Rana" });
+        // Same city, but 30 km off — a real position, not the centroid.
+        seedR({ id: "rc-disagree", name: "Ekte gårdsposisjon", lat: 66.05, lng: 14.30, city: "Rana" });
+        // The Fosen/Os shape, measured live: the city string names a place that
+        // EXISTS somewhere else too, the lookup confidently returns the other
+        // one, and the row therefore looks far from "its city" while sitting
+        // exactly where it belongs. («Fosen» resolved to a Fosen in Rogaland,
+        // 557 km from the Trøndelag peninsula the producer is actually on;
+        // «Os» resolved to Os i Østerdalen, 400 km from Os in Bjørnafjorden.)
+        // Here: city «Gildeskål» resolves to the Nordland kommune, while the
+        // producer sits ~400 km south.
+        seedR({ id: "rc-samename", name: "Samme navn, annet sted", lat: 63.745, lng: 10.233, city: "Gildeskål" });
+        // City that resolves to nothing at all.
+        seedR({ id: "rc-unresolvable", name: "Ukjent sted", lat: 60.0, lng: 10.0, city: "Ingenstedet" });
+        // Must never be selected: already has a precision.
+        seedR({ id: "rc-has-precision", name: "Alt stemplet", lat: 66.3125, lng: 14.1405, city: "Rana", gp: "address" });
+        // Must never be selected: has a street address to improve on instead.
+        seedR({ id: "rc-has-address", name: "Har adresse", lat: 66.3125, lng: 14.1405, city: "Rana", address: "Storgata 1" });
+
+        // The injected no-op sleep is not just speed. getDb() is a shared
+        // singleton and this suite runs many blocks unawaited: a REAL 350 ms
+        // centroid throttle holds the loop open long enough for another block
+        // to swap the singleton mid-run, and the worker's next statement then
+        // executes against someone else's database. Observed as
+        // «no such column: a.city» in the full suite while the standalone run
+        // was green — the criterion-3 hazard from dev-request
+        // 2026-07-25-testsuite-ikke-deterministisk-delte-globaler, hit live.
+        // Same convention as the co1-co3 block above.
+        const before = hashDb(dbR);
+        const noSleep = { sleep: async () => {} };
+        const dry = await worker.reclassifySeedCoordinates(50, { dryRun: true }, noSleep);
+        assertEq(hashDb(dbR), before,
+          "rc1: dry_run writes NOTHING — whole-DB hash byte-identical, not a column spot-check");
+        assertEq(dry.reclassified, 1,
+          "rc2: …but it still REPORTS the one row it would stamp");
+
+        const run = await worker.reclassifySeedCoordinates(50, {}, noSleep);
+        assertEq(run.examined, 4,
+          "rc3: the selector skips the address-precision row AND the row with a street address");
+        assertEq(gpOf("rc-agree").geo_precision, "city",
+          "rc4: agreement (≤1 km from its own city centroid) stamps 'city' — a measurement, not a guess");
+        assertEq(gpOf("rc-disagree").geo_precision, null,
+          "rc5: disagreement writes NOTHING — 30 km off may be the real farm, and we cannot tell");
+        // rc6 exercises the SAME branch as rc5, and that is the point being
+        // pinned. We cannot tell "the coordinate is wrong" from "the lookup is
+        // wrong" — Fosen and Os proved that live — so the policy is to treat
+        // them identically and write in neither case. A future change that
+        // starts acting on disagreement breaks this test, which is what it is
+        // for.
+        assertEq(gpOf("rc-samename").geo_precision, null,
+          "rc6: same-name-different-place (the Fosen/Os shape) is left alone — a wrong LOOKUP must never be read as a wrong COORDINATE");
+        assertEq(gpOf("rc-samename").lat, 63.745,
+          "rc6b: …and its correct coordinate survives untouched");
+        assertEq(gpOf("rc-unresolvable").geo_precision, null,
+          "rc7: an unresolvable city is the ABSENCE of evidence, never a reason to write");
+        assertEq(run.left_alone_disagreement, 2,
+          "rc8: both non-agreeing rows are counted, so 'left alone' is visible rather than silent");
+        assertEq(gpOf("rc-has-precision").geo_precision, "address",
+          "rc9: an address-precision row is never downgraded");
+
+        // Idempotence: the stamped row must not be revisited.
+        const second = await worker.reclassifySeedCoordinates(50, {}, noSleep);
+        assertEq(second.reclassified, 0,
+          "rc10: idempotent — a stamped row leaves the selector, so a re-run stamps nothing");
+
+        dbR.close();
         initMod.__setDbForTesting(db as any);
       }
     } finally {

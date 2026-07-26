@@ -1125,3 +1125,164 @@ export async function auditSeedCoordinates(
   out.duration_ms = Date.now() - start;
   return out;
 }
+
+// ── Seed-coordinate reclassification (Daniel, 2026-07-26) ────────────
+//
+// Daniel's decision: the ~110 rows carrying a coordinate of unknown provenance
+// plus a city, with no street address, should stop claiming more precision than
+// they have. Measured over the full population (110/110) by auditSeedCoordinates
+// above: 82 sit within 1 km of their own city's centroid — median 0.205 km,
+// max 0.81 km. Those are centroids wearing a NULL precision.
+//
+// What stamping 'city' actually changes, end to end: marketplace-registry's
+// resultLocation() withholds distanceKm for centroid-precision rows and emits
+// distanceLabel instead, so the card renders «Sortland · omtrentlig posisjon»
+// rather than an invented «2,4 km». Ranking is untouched — a centroid is still
+// our best position estimate; this governs what we SAY.
+//
+// ── THE RULE, AND WHY IT IS ONE-SIDED ───────────────────────────────
+//
+// Only agreement writes. Disagreement writes nothing.
+//
+// The first design for this pass was "rows far from their own city are wrong,
+// so null the coordinate and let the geocoder redo them". Tested against the
+// live rows before coding, that would have DESTROYED correct data:
+//
+//   «Fosen» → Kartverket returns 59.30583/5.34083, a Fosen in ROGALAND. The
+//             producer sits at 63.745/10.233 — the Fosen peninsula in Trøndelag,
+//             which is right. Verdict said 557 km; the lookup was wrong.
+//   «Os»    → returns 62.49649/11.22331, Os i Østerdalen. The producer is
+//             REKO-ringen Os BERGEN at 60.188/5.472 — Os in Bjørnafjorden,
+//             which is right. Verdict said 400 km; the lookup was wrong.
+//
+// Both are the Flakstad/Frøya ambiguity class, and a bare city string carries no
+// signal to disambiguate with. Nulling on "far" would have deleted two correct
+// coordinates and re-derived them from the very lookup that produced the false
+// verdict. So:
+//
+//   ≤1 km  → the stored value and an independent lookup AGREE. Agreement is
+//            evidence: two sources landing on the same point is a measurement.
+//            Stamp 'city'.
+//   >1 km  → they disagree. Disagreement identifies a conflict but not which
+//            side is wrong. Write NOTHING. The honest NULL stays.
+//
+// Genuinely-wrong rows (Rotfesta da sits on exactly 59.91/10.75, Oslo centre,
+// while its city says Sandeid) need a different detector — "parked on a known
+// default point" — which does not fire on Fosen or Os. Out of scope here.
+
+/** Agreement threshold, km. Shared with auditSeedCoordinates' `is_centroid`. */
+export const RECLASSIFY_AGREEMENT_KM = 1;
+
+export type SeedReclassifyRow = {
+  agent_id: string;
+  name: string;
+  city: string;
+  distance_km: number | null;
+  /** 'city' when stamped (or would be); null when deliberately left alone. */
+  to_precision: "city" | null;
+  outcome: "reclassified" | "left_alone_disagreement" | "left_alone_unresolvable";
+};
+
+export type SeedReclassifyResult = {
+  dry_run: boolean;
+  examined: number;
+  reclassified: number;
+  left_alone_disagreement: number;
+  left_alone_unresolvable: number;
+  errors: number;
+  duration_ms: number;
+  rows: SeedReclassifyRow[];
+};
+
+/**
+ * Stamp geo_precision='city' on seed rows whose stored coordinate agrees with
+ * their own city's centroid. See the block comment above for why disagreement
+ * is never acted on.
+ *
+ * Idempotent: the selector requires geo_precision IS NULL, so a stamped row is
+ * never revisited. Reversible: `UPDATE agents SET geo_precision = NULL WHERE …`.
+ */
+export async function reclassifySeedCoordinates(
+  limit: number = 50,
+  opts: { dryRun?: boolean } = {},
+  deps: AgentsGeocodeDeps = {}
+): Promise<SeedReclassifyResult> {
+  const start = Date.now();
+  const dryRun = opts.dryRun === true;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const db = getDb();
+
+  // Same selector as auditSeedCoordinates — deliberately identical, so the
+  // audit's numbers describe exactly the set this pass will act on.
+  const rows = db
+    .prepare(
+      `SELECT a.id AS id, a.name AS name, a.city AS city, a.lat AS lat, a.lng AS lng
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.is_active = 1
+          AND a.geo_precision IS NULL
+          AND a.lat IS NOT NULL AND a.lng IS NOT NULL
+          AND ${HAS_CITY}
+          AND NOT ${HAS_ADDRESS}
+        ORDER BY a.id ASC
+        LIMIT ?`
+    )
+    .all(Math.max(1, Math.min(500, Math.floor(limit)))) as Array<{
+      id: string; name: string | null; city: string; lat: number; lng: number;
+    }>;
+
+  const out: SeedReclassifyResult = {
+    dry_run: dryRun, examined: 0, reclassified: 0,
+    left_alone_disagreement: 0, left_alone_unresolvable: 0,
+    errors: 0, duration_ms: 0, rows: [],
+  };
+
+  const stamp = db.prepare(
+    `UPDATE agents SET geo_precision = 'city' WHERE id = ? AND geo_precision IS NULL`
+  );
+
+  for (const r of rows) {
+    out.examined++;
+    let centroid: { lat: number; lng: number } | null = null;
+    try {
+      await takeKartverketBudget(sleep, 2);
+      const g = await geocodingService.geocodePlaceForBackfill(r.city.trim());
+      await sleep(CENTROID_THROTTLE_MS);
+      if (g) centroid = { lat: g.lat, lng: g.lng };
+    } catch (err) {
+      // A lookup failure is not evidence about the coordinate — it is the
+      // absence of evidence. Never let it become a reason to write.
+      out.errors++;
+      console.error(`[seed-reclassify] lookup failed for ${r.id}:`, err);
+    }
+
+    const km = centroid ? auditHaversineKm(r.lat, r.lng, centroid.lat, centroid.lng) : null;
+
+    let outcome: SeedReclassifyRow["outcome"];
+    let to: "city" | null = null;
+    if (km === null) {
+      outcome = "left_alone_unresolvable";
+      out.left_alone_unresolvable++;
+    } else if (km <= RECLASSIFY_AGREEMENT_KM) {
+      outcome = "reclassified";
+      to = "city";
+      out.reclassified++;
+      if (!dryRun) stamp.run(r.id);
+    } else {
+      outcome = "left_alone_disagreement";
+      out.left_alone_disagreement++;
+    }
+
+    out.rows.push({
+      agent_id: r.id,
+      name: r.name ?? "",
+      city: r.city,
+      distance_km: km === null ? null : Math.round(km * 100) / 100,
+      to_precision: to,
+      outcome,
+    });
+  }
+
+  out.duration_ms = Date.now() - start;
+  return out;
+}
