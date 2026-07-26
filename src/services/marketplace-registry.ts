@@ -1224,6 +1224,15 @@ class MarketplaceRegistry {
     return result.changes > 0;
   }
 
+  /**
+   * Fase 3a veto for WEAK (dash) route markers. See hasProducerNamedIn().
+   * Reads through getAllAgents() so it always sees the live catalogue rather
+   * than a snapshot that could go stale mid-process.
+   */
+  hasProducerNamed(candidate: string): boolean {
+    return hasProducerNamedIn(this.getAllAgents().map((a) => a.name), candidate);
+  }
+
   getAllAgents(): RegisteredAgent[] {
     const db = getDb();
     const rows = db.prepare("SELECT * FROM agents ORDER BY created_at DESC").all() as any[];
@@ -1717,6 +1726,24 @@ const NORWEGIAN_WORD_CHAR = "0-9A-Za-zÀ-ÖØ-öø-ÿ_";
 export function norwegianWordBoundary(keyword: string): RegExp {
   const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|[^${NORWEGIAN_WORD_CHAR}])${escaped}(?:$|[^${NORWEGIAN_WORD_CHAR}])`);
+}
+
+/**
+ * Fase 3a veto: does the catalogue contain a producer with (essentially) this
+ * name? Only consulted for WEAK route markers — the dash form, which is our own
+ * `Navn — Sted` naming convention. Without it, «Bent Gate Brewing — Gjerdrum»
+ * would be read as a route from a brewery to a municipality.
+ *
+ * Comparison is on the normalised full string, not a substring: a producer
+ * whose name merely CONTAINS a place must not veto a genuine route.
+ */
+export function hasProducerNamedIn(names: Iterable<string>, candidate: string): boolean {
+  const norm = (s: string) =>
+    (s || "").toLowerCase().normalize("NFC").replace(/[\s\-–—]+/g, " ").replace(/[?!.,;:]+/g, "").trim();
+  const c = norm(candidate);
+  if (!c) return false;
+  for (const n of names) if (norm(n) === c) return true;
+  return false;
 }
 
 export function isProximityIntent(query: string): boolean {

@@ -33871,6 +33871,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 3 —
+// route intent in the single search box. Pure module + injected geocode seam,
+// so no DB and no network: safe to run alongside anything.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 3 (ruteintensjon i ett-felt-søket) ──");
+  try {
+    const { runRouteIntentTests } = require("../src/services/route-intent.test") as
+      typeof import("../src/services/route-intent.test");
+    const ri = await runRouteIntentTests({ log: false });
+    passed += ri.passed;
+    failed += ri.failed;
+    for (const f of ri.failures) failures.push("route-intent: " + f);
+    console.log(`  route-intent: ${ri.passed} passed, ${ri.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("route-intent: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1b —
 // experiences were 100 % geo_precision='kommune' (zero at address level), so
 // everything in Bodø reported distance_km 0. Steps E/F of
