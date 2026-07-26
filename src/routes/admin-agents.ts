@@ -155,7 +155,11 @@ function requireAdmin(req: Request, res: Response): boolean {
 //
 // Response:
 //   { success: true, count: <total before pagination>,
-//     agents: [{ id, name, updated_at, status, vertical }] }
+//     agents: [{ id, name, updated_at, status, vertical, umbrella_type }] }
+//   umbrella_type (2026-07-26, dev-request umbrella-floor-chronic-regression-investigation):
+//   diagnostic-only passthrough of the existing agents.umbrella_type column (string, e.g.
+//   "venue", or null for ordinary non-umbrella agents) — lets callers identify which
+//   inactive rows are umbrella agents without a new endpoint.
 router.get("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -240,7 +244,7 @@ router.get("/", (req: Request, res: Response) => {
 
     const rows = db
       .prepare(
-        `SELECT id, name, last_seen_at, is_active, is_verified, vertical_id
+        `SELECT id, name, last_seen_at, is_active, is_verified, vertical_id, umbrella_type
          FROM agents
          WHERE ${whereSql}
          ORDER BY last_seen_at DESC
@@ -253,6 +257,7 @@ router.get("/", (req: Request, res: Response) => {
         is_active: number;
         is_verified: number;
         vertical_id: string | null;
+        umbrella_type: string | null;
       }>;
 
     const agents = rows.map((r) => ({
@@ -266,6 +271,7 @@ router.get("/", (req: Request, res: Response) => {
             ? "pending"
             : "active",
       vertical: r.vertical_id ?? "rfb",
+      umbrella_type: r.umbrella_type ?? null,
     }));
 
     res.json({ success: true, count: total, agents });

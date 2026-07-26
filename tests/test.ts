@@ -14554,7 +14554,8 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
       last_seen_at TEXT NOT NULL,
       is_active INTEGER DEFAULT 1,
       is_verified INTEGER DEFAULT 0,
-      vertical_id TEXT DEFAULT 'rfb'
+      vertical_id TEXT DEFAULT 'rfb',
+      umbrella_type TEXT
     );
   `);
   const initMod93 = require("../src/database/init");
@@ -14570,21 +14571,23 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
   const HOURS = (n: number) => n * 60 * 60 * 1000;
 
   // 4 recent (within 24h), 1 stale (3 days old).
+  // pr93-a3 seeded with umbrella_type='venue' (mirrors the real inactive-venue-agent
+  // shape this field exists to help diagnose); all others null (ordinary agents).
   pr93Db.prepare(
-    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run("pr93-a1", "Active Verified", ISO(NOW - HOURS(1)),  1, 1, "rfb");
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id, umbrella_type) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a1", "Active Verified", ISO(NOW - HOURS(1)),  1, 1, "rfb", null);
   pr93Db.prepare(
-    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run("pr93-a2", "Active Pending",  ISO(NOW - HOURS(2)),  1, 0, "rfb");
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id, umbrella_type) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a2", "Active Pending",  ISO(NOW - HOURS(2)),  1, 0, "rfb", null);
   pr93Db.prepare(
-    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run("pr93-a3", "Inactive",        ISO(NOW - HOURS(3)),  0, 1, "tannlege");
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id, umbrella_type) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a3", "Inactive",        ISO(NOW - HOURS(3)),  0, 1, "tannlege", "venue");
   pr93Db.prepare(
-    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run("pr93-a4", "Active Recent",   ISO(NOW - HOURS(4)),  1, 1, "rfb");
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id, umbrella_type) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a4", "Active Recent",   ISO(NOW - HOURS(4)),  1, 1, "rfb", null);
   pr93Db.prepare(
-    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run("pr93-a5", "Old Stale",       ISO(NOW - HOURS(72)), 1, 1, "rfb");
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id, umbrella_type) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a5", "Old Stale",       ISO(NOW - HOURS(72)), 1, 1, "rfb", null);
 
   const expressMod93 = (await import("express")).default;
   const adminAgentsMod = await import("../src/routes/admin-agents");
@@ -14667,6 +14670,7 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
       assertEq(r.body.agents[0].id, "pr93-a3", "pr93-5: returns pr93-a3");
       assertEq(r.body.agents[0].status, "inactive", "pr93-5: derived status=inactive");
       assertEq(r.body.agents[0].vertical, "tannlege", "pr93-5: vertical=tannlege");
+      assertEq(r.body.agents[0].umbrella_type, "venue", "pr93-5: umbrella_type=venue passed through");
     }
 
     // ── pr93-6: status=pending filter (active+unverified) ───────
@@ -14739,6 +14743,20 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
       assertTrue(typeof a.updated_at === "string", "pr93-13: agent.updated_at is string");
       assertTrue(typeof a.status === "string",     "pr93-13: agent.status is string");
       assertTrue(typeof a.vertical === "string",   "pr93-13: agent.vertical is string");
+      // pr93-a1 (this row) was seeded with umbrella_type=null → field present, value null.
+      assertTrue("umbrella_type" in a,             "pr93-13: agent.umbrella_type key present");
+      assertEq(a.umbrella_type, null,               "pr93-13: agent.umbrella_type is null for non-umbrella agent");
+    }
+
+    // ── pr93-14: umbrella_type diagnostic slice (dev-request
+    //    umbrella-floor-chronic-regression-investigation) — inactive+wide-window
+    //    query surfaces both umbrella and non-umbrella rows, umbrella_type intact ──
+    {
+      const cutoff = ISO(NOW - HOURS(24 * 7));
+      const r = await req93(`/admin/agents?status=inactive&updated_since=${encodeURIComponent(cutoff)}`, PR93_KEY);
+      assertEq(r.status, 200, "pr93-14: status=inactive+wide window → 200");
+      assertEq(r.body.count, 1, "pr93-14: count=1 (only pr93-a3 is inactive)");
+      assertEq(r.body.agents[0].umbrella_type, "venue", "pr93-14: umbrella_type=venue for the inactive venue row");
     }
   } finally {
     if (prevAdminKey93 === undefined) delete process.env.ADMIN_KEY;
