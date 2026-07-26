@@ -27679,6 +27679,29 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmd.failures) failures.push("opplevelser-gardssalg-mcp-discoverability: " + f);
     console.log(`  opplevelser-gardssalg-mcp-discoverability: ${gmd.passed} passed, ${gmd.failed} failed`);
 
+    // dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): the new
+    // book_gardssalg MCP tool (src/routes/experiences-mcp.ts) — a THIN
+    // wrapper over the EXISTING booking chain (BookingInputSchema,
+    // createBooking(), sendBookingConfirmation()/sendProducerNotification(),
+    // all in src/services/booking-store.ts) that POST /api/opplevelser/book
+    // already uses. Verifies: pending row + confirm_token created on success;
+    // non-live / not-dispatched producers rejected with a clear message, no
+    // row created; input validation reused (not forked) from
+    // BookingInputSchema; and no bypass path — only the confirm_token read
+    // directly from the DB (never returned by the tool) can resolve the
+    // booking via the existing, untouched resolveBooking()/confirm-token flow.
+    // Same in-memory-DB + real-MCP-session-over-HTTP pattern as
+    // opplevelser-gardssalg-mcp-discoverability.test.ts, runs sequentially
+    // inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-mcp-booking: book_gardssalg tool ──");
+    const { runOpplevelserGardssalgMcpBookingTests } = require("../src/routes/opplevelser-gardssalg-mcp-booking.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-booking.test");
+    const gmbk = await runOpplevelserGardssalgMcpBookingTests({ log: false });
+    passed += gmbk.passed;
+    failed += gmbk.failed;
+    for (const f of gmbk.failures) failures.push("opplevelser-gardssalg-mcp-booking: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-booking: ${gmbk.passed} passed, ${gmbk.failed} failed`);
+
     // dev-request 2026-07-19-gardssalg-agent-flater: REST GET /api/opplevelser/
     // discover?category=gardssalg_smaking always got zero direct hits (gårdssalg
     // rows live in experience_providers, not `experiences`), and its zero-hit

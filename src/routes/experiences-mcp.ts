@@ -11,7 +11,7 @@
  *
  * ChatGPT / Claude Desktop: paste https://opplevagent.no/mcp as the MCP URL.
  *
- * Tools exposed (4):
+ * Tools exposed (5):
  *   discover_experiences         — filter-based discovery (fylke, category, weather, …)
  *   list_experience_categories   — all categories with experience counts
  *   get_experience               — fetch one experience by UUID
@@ -19,6 +19,20 @@
  *                                  (farm-sale drink producer) vertical, which
  *                                  has zero rows in `experiences` (dev-request
  *                                  2026-07-20-gardssalg-mcp-discoverability)
+ *   book_gardssalg                — submit a booking REQUEST for a gårdssalg
+ *                                  producer (dev-request 2026-07-21-mcp-
+ *                                  booking-tool). A THIN wrapper over the SAME
+ *                                  createBooking()/sendBookingConfirmation()/
+ *                                  sendProducerNotification() chain the web
+ *                                  form (POST /api/opplevelser/book) uses —
+ *                                  same table, same confirm-token lifecycle,
+ *                                  same gates. ALWAYS returns a pending/draft
+ *                                  result; this tool can never itself confirm
+ *                                  a booking — only the producer's response
+ *                                  (confirm / suggest another time / decline,
+ *                                  existing, untouched flow) can do that. The
+ *                                  guest's emailed link is a read-only status
+ *                                  link, never a confirm-action.
  *
  * Defensive: if the experiences DB is not open (ENABLE_EXPERIENCES not set),
  * every tool returns a graceful "ingen data / not available" text result —
@@ -43,19 +57,46 @@ import {
   getExperienceById,
   searchGardssalgProviders,
   countGardssalgProviders,
+  getProviderById,
   type DiscoverFilter,
   type GardssalgSearchFilter,
 } from "../services/experience-store";
-// Only isBookingPaused is called directly here — this tool's query already
-// excludes catalog_hidden=1 rows entirely (see searchGardssalgProviders'
-// base WHERE clause), so catalog_hidden is always absent/undefined at this
+// isBookingPaused: used both by discover_gardssalg (this tool's query already
+// excludes catalog_hidden=1 rows entirely — see searchGardssalgProviders'
+// base WHERE clause — so catalog_hidden is always absent/undefined at that
 // call site; isBookingPaused(providerBookingLive) with catalog_hidden
 // undefined falls straight to the "real providers: still need the global
 // master switch" branch — identical behavior to a normal (non-hidden)
-// provider passed explicitly. bookingDispatchEnabled() itself is already
-// folded into that check and isn't called separately anywhere else in this
-// codebase alongside isBookingPaused (see experiences-seo.ts/opplevelser.ts).
-import { isBookingPaused } from "../services/booking-store";
+// provider passed explicitly) AND by book_gardssalg below (there
+// catalog_hidden IS passed, from getProviderById's full row, exactly like
+// POST /api/opplevelser/book does).
+//
+// book_gardssalg (dev-request 2026-07-21-mcp-booking-tool) reuses — never
+// forks — the exact same booking chain as the web form:
+//   BookingInputSchema  — the SAME zod validation POST /api/opplevelser/book
+//                         runs (src/routes/opplevelser.ts) via .safeParse().
+//   createBooking()     — the SAME DB write (gardssalg_bookings), confirm-
+//                         token + respond-token issuance. Never reimplemented
+//                         here. Only the optional `source` argument (added
+//                         additively, default unchanged "opplevagent") is new
+//                         — purely an analytics channel stamp, no behavior
+//                         change to validation, gating, or token lifecycle.
+//   sendBookingConfirmation() / sendProducerNotification() — the SAME guest +
+//                         producer emails, fire-and-forget exactly as the web
+//                         route does it.
+// This tool NEVER calls resolveBooking/producerRespondConfirm/any confirm-
+// token verification logic — those are untouched. A booking created here can
+// only ever become confirmed once the PRODUCER responds (confirms, proposes
+// another time, or declines) via their own emailed respond-link, same as
+// every other channel — the guest's emailed link is a read-only status page
+// and cannot finalize anything.
+import {
+  isBookingPaused,
+  createBooking,
+  BookingInputSchema,
+  sendBookingConfirmation,
+  sendProducerNotification,
+} from "../services/booking-store";
 
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
@@ -206,6 +247,41 @@ export const DiscoverGardssalgInputSchema = {
 export const GetExperienceInputSchema = {
   id: z.string().uuid().describe(
     "UUID of the experience to fetch. Example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'"
+  ),
+};
+
+// dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): input for
+// book_gardssalg. Deliberately LOOSE here (basic types + describe() only,
+// no .email()/.int()/.min()/.max() business rules) — the authoritative
+// validation is BookingInputSchema (services/booking-store.ts), run via
+// .safeParse() inside the handler below, so the actual rules live in exactly
+// one place and can never drift between the web form and this tool. Field
+// names match BookingInput 1:1 so the handler can hand the parsed object
+// straight to BookingInputSchema without any renaming/remapping step.
+export const BookGardssalgInputSchema = {
+  provider_id: z.string().describe(
+    "The gårdssalg producer's id, from a discover_gardssalg result (NOT the profile slug). Example: '3f1b2c4d-...'"
+  ),
+  experience_id: z.string().optional().describe(
+    "Optional experience UUID if this booking is for a specific listed experience rather than a general gårdssalg visit."
+  ),
+  slot_at: z.string().describe(
+    "Requested visit date/time, local (Europe/Oslo), format 'YYYY-MM-DDTHH:MM'. Example: '2026-08-15T13:00'. This is a REQUEST — the producer may confirm, suggest another time, or decline."
+  ),
+  party_size: z.number().describe(
+    "Number of people in the group (1-50). Example: 4"
+  ),
+  guest_name: z.string().describe(
+    "Full name of the person the reservation is for. Example: 'Kari Nordmann'"
+  ),
+  guest_email: z.string().describe(
+    "Guest's email address — REQUIRED. Receives a confirmation-of-request email plus a read-only status link; the booking stays pending until the PRODUCER responds (confirms, proposes another time, or declines) — the guest's link cannot finalize anything. Example: 'kari@example.no'"
+  ),
+  guest_phone: z.string().optional().describe(
+    "Optional guest phone number."
+  ),
+  notes: z.string().optional().describe(
+    "Optional free-text note to the producer (e.g. dietary needs, arrival details)."
   ),
 };
 
@@ -726,6 +802,186 @@ function registerExperienceTools(
       }
     }
   );
+
+  // Tool 5: book_gardssalg (dev-request 2026-07-21-mcp-booking-tool, Daniel
+  // GO 2026-07-21). A THIN wrapper over the EXACT SAME booking chain
+  // POST /api/opplevelser/book uses (opplevelser.ts) — see the import
+  // comment above for the full reuse list. This tool can only ever produce
+  // the same 'reserved'/pending draft state the web form produces; it never
+  // calls, and this file never imports, any confirm-token verification
+  // logic — a booking becomes real only once the PRODUCER responds (confirm /
+  // suggest another time / decline) via their own emailed respond-link
+  // (existing, untouched flow). The guest's emailed link is read-only status,
+  // never a confirm action.
+  server.registerTool(
+    "book_gardssalg",
+    {
+      title: "Request a gårdssalg booking (pending — email confirmation required)",
+      description:
+        "Submit a booking REQUEST for a Norwegian gårdssalg (farm-sale) producer discovered via " +
+        "discover_gardssalg. Send inn en reservasjonsforespørsel for et gårdssalg-besøk. " +
+        "IMPORTANT: this NEVER creates a confirmed booking — it creates a PENDING request, exactly " +
+        "like the producer's own website form. The PRODUCER reviews the request and responds " +
+        "(confirms, proposes another time, or declines); guest_email only receives a read-only " +
+        "status link, never anything that can finalize the booking. No payment is involved " +
+        "(pickup/visit, pay on arrival, as today). Only producers with an active booking status " +
+        "(see discover_gardssalg's booking.live field) can be booked — a paused/not-yet-onboarded " +
+        "producer is rejected with a clear message, never a silent failure. " +
+        "VIKTIG: oppretter ALDRI en bekreftet booking — kun en avventende forespørsel; produsenten " +
+        "mottar forespørselen og svarer (bekrefter, foreslår nytt tidspunkt eller avslår). " +
+        "Required: provider_id (from discover_gardssalg), slot_at (requested date/time), party_size, " +
+        "guest_name, guest_email. Optional: experience_id, guest_phone, notes. " +
+        "Example: book a table for 4 at provider '3f1b2c4d-...' for '2026-08-15T13:00' for " +
+        "'Kari Nordmann' <kari@example.no>.",
+      inputSchema: BookGardssalgInputSchema,
+      annotations: {
+        title: "Request a gårdssalg booking",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ provider_id, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes }) => {
+      try {
+        // Build a candidate object matching BookingInput's own field names
+        // and hand it straight to BookingInputSchema.safeParse() — the SAME
+        // zod schema POST /api/opplevelser/book runs. This is the ONLY place
+        // the actual business rules (email format, party_size 1-50, string
+        // length caps, …) are enforced; BookGardssalgInputSchema above is
+        // deliberately loose so those rules are never duplicated/forked.
+        const candidate: Record<string, unknown> = {
+          provider_id,
+          slot_at,
+          party_size,
+          guest_name,
+          guest_email,
+        };
+        if (experience_id) candidate.experience_id = experience_id;
+        if (guest_phone) candidate.guest_phone = guest_phone;
+        if (notes) candidate.notes = notes;
+
+        const parsed = BookingInputSchema.safeParse(candidate);
+        if (!parsed.success) {
+          const issues = parsed.error.issues
+            .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+            .join("; ");
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                pending: false,
+                error: "invalid_input",
+                message: `Ugyldig forespørsel: ${issues}. / Invalid request: ${issues}.`,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // ─── Same gate as POST /api/opplevelser/book (dark-launch-stop) ───
+        // Only booking_live=1 producers, AND (for real, non-hidden providers)
+        // only while BOOKING_DISPATCH_ENABLED="true" globally — see
+        // isBookingPaused() in services/booking-store.ts, never re-derived
+        // here. An unknown provider_id falls through the same path (no row
+        // -> booking_live undefined -> "not live"), same as the web form.
+        const provider = getProviderById(parsed.data.provider_id) as
+          | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
+          | null;
+        if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                pending: false,
+                rejected: true,
+                reason: "not_live",
+                message:
+                  "Reservasjoner er ikke aktive ennå for denne produsenten — kommer snart. / " +
+                  "Bookings are not open yet for this producer — coming soon.",
+              }, null, 2),
+            }],
+          };
+        }
+
+        let booking;
+        try {
+          // "mcp" only stamps the channel column for analytics — createBooking()
+          // is the exact same function (same DB table, same confirm-token +
+          // respond-token issuance) the web form calls; nothing here reimplements it.
+          booking = createBooking(parsed.data, "mcp");
+        } catch (err: any) {
+          console.error("[book_gardssalg] createBooking failed", err);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                pending: false,
+                error: "internal_error",
+                message: "Kunne ikke opprette påmelding. / Could not create the booking request.",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Fire-and-forget — the SAME two sends POST /api/opplevelser/book
+        // triggers, never blocking the tool response on either.
+        sendBookingConfirmation(booking).catch((e) =>
+          console.error("[book_gardssalg] confirmation email failed", booking.booking_ref, e),
+        );
+        sendProducerNotification(booking, provider?.epost ?? null).catch((e) =>
+          console.error("[book_gardssalg] producer notification failed", booking.booking_ref, e),
+        );
+
+        try {
+          logExperiencesInteraction({
+            skill: "book_gardssalg",
+            queryText: booking.booking_ref,
+            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+          });
+        } catch { /* fail-open: never affects the tool result */ }
+
+        // NB: deliberately NEVER returns confirm_token/confirm_url — exactly
+        // like POST /api/opplevelser/book's own response (see that handler's
+        // comment): that credential belongs to the PRODUCER's attendance-
+        // resolution flow, and handing it to the calling agent would let it
+        // resolve its own booking. This tool has no way to confirm a
+        // booking — only the PRODUCER's own response (via their emailed
+        // respond-link) can do that.
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              pending: true,
+              status: booking.status,
+              booking_ref: booking.booking_ref,
+              source: booking.source,
+              confirmation_required: true,
+              message:
+                `Reservasjonsforespørsel mottatt (${booking.booking_ref}) — status: PENDING/AVVENTER. ` +
+                `En bekreftelse på forespørselen er sendt til ${booking.guest_email}; produsenten er varslet ` +
+                `og svarer på e-post (bekrefter, foreslår nytt tidspunkt eller avslår) — reservasjonen blir ` +
+                `IKKE endelig før produsenten har svart. / ` +
+                `Reservation request received (${booking.booking_ref}) — status: PENDING. A confirmation ` +
+                `email has been sent to ${booking.guest_email}; the producer has been notified and will ` +
+                `respond by email (confirm, propose another time, or decline) — the booking only becomes ` +
+                `final once the producer responds, and this tool can never confirm it itself.`,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: `Bookingfeil: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
 }
 
 // ─── Session management ──────────────────────────────────────
@@ -861,6 +1117,7 @@ a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decor
 <li><code>list_experience_categories</code> — alle kategorier med antall opplevelser</li>
 <li><code>get_experience</code> — hent én opplevelse med full profil</li>
 <li><code>discover_gardssalg</code> — finn gårdssalg-produsenter etter fylke, kommune, produsenttype, nær-meg og bookingstatus</li>
+<li><code>book_gardssalg</code> — send inn en reservasjonsforespørsel hos en gårdssalg-produsent (kun avventende/pending — produsenten svarer via e-post, ingen betaling)</li>
 </ul>
 <p><strong>For utviklere — eksempel (cURL):</strong></p>
 <pre>curl -X POST https://opplevagent.no/mcp \\

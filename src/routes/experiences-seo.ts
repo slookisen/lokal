@@ -1412,6 +1412,24 @@ rad har navn/fylke/kommune/producer_type/lat/lon/geocode_confidence/profile_url
 og et \`booking\`-felt ({live, mode, note}) som ærlig speiler dark-launch-status
 — aldri en påstått aktiv booking før reservasjoner faktisk er åpnet.
 
+### Booking via MCP (book_gardssalg)
+
+MCP-verktøy: book_gardssalg — send inn en reservasjonsforespørsel for en
+gårdssalg-produsent (provider_id fra discover_gardssalg), samme to-stegs
+håndtrykk som over. Krever provider_id, slot_at, party_size, guest_name,
+guest_email (guest_phone og notes valgfritt).
+
+VIKTIG: verktøyet oppretter ALDRI en bekreftet booking — kun samme avventende
+("reserved"/pending) rad som nettskjemaet på produsentens profilside
+produserer, via nøyaktig samme valideringskjede, database-tabell og
+bekreftelses-e-post-flyt. Produsenten mottar forespørselen og svarer på
+e-post (bekrefter, foreslår nytt tidspunkt eller avslår) — reservasjonen
+blir IKKE endelig før produsenten har svart, og ingen AI-agent kan bekrefte
+en booking på gjestens eller produsentens vegne. En produsent uten aktiv
+bookingstatus (se discover_gardssalgs \`booking.live\`) avvises med en
+tydelig melding, aldri en stille feil. Ingen betaling — pickup/oppmøte, som
+i dag.
+
 ## Lisens
 
 Provider-data verifiseres mot Brønnøysundregistrene (CC0). Innhold gjengis
