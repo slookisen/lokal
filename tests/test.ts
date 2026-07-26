@@ -16939,7 +16939,7 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     globalThis.fetch = (async () => {
       throw new Error("tnb-3: fetch must NOT be called for an empty candidate set");
     }) as unknown as typeof fetch;
-    {
+    try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, undefined); // no body → dry_run defaults true
       assertEq(r.status, 200, "tnb-3a: correct key, no body → 200");
       assertEq(r.body.success, true, "tnb-3b: success: true");
@@ -16947,6 +16947,11 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
       assertEq(r.body.candidates, 0, "tnb-3d: candidates: 0 (nothing seeded yet)");
       assertTrue(Array.isArray(r.body.sample) && r.body.sample.length === 0,
         "tnb-3e: sample: [] on an empty candidate set — the LLM was never called");
+    } finally {
+      // Restore immediately: this stub throws on ANY fetch call, so leaving it
+      // installed on globalThis past tnb-3's own assertions would poison fetch
+      // for other test blocks running concurrently (they don't await this IIFE).
+      globalThis.fetch = prevFetchTNB;
     }
 
     // ── Seed: one canonical candidate row (canonical_id NULL, title_no NULL)
@@ -16979,36 +16984,43 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
       };
     }) as unknown as typeof fetch;
     process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
-    {
-      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: true });
-      assertEq(r.status, 200, "tnb-4a: dry_run with stubbed success → 200");
-      assertEq(r.body.dry_run, true, "tnb-4b: dry_run: true echoed back");
-      assertEq(r.body.candidates, 1, "tnb-4c: candidates: 1 (the merged-away row is excluded)");
-      assertTrue(Array.isArray(r.body.sample) && r.body.sample.length === 1,
-        "tnb-4d: sample has exactly the 1 candidate");
-      assertEq(r.body.sample[0].id, idCanonicalTNB, "tnb-4e: sampled row is the canonical candidate");
-      assertEq(r.body.sample[0].proposed_title_no, STUBBED_TITLE_NO, "tnb-4f: proposed_title_no matches the stubbed LLM response");
-      assertEq(titleNoOf(idCanonicalTNB), null, "tnb-4g: dry_run writes NOTHING — title_no still NULL in the DB");
-    }
+    // tnb-4/5/6 share this one override by design (tnb-5 re-runs for-real against
+    // the same stub, tnb-6 re-runs again expecting 0 candidates) — restore once,
+    // right after tnb-6, rather than leaving it live for the rest of the block.
+    try {
+      {
+        const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: true });
+        assertEq(r.status, 200, "tnb-4a: dry_run with stubbed success → 200");
+        assertEq(r.body.dry_run, true, "tnb-4b: dry_run: true echoed back");
+        assertEq(r.body.candidates, 1, "tnb-4c: candidates: 1 (the merged-away row is excluded)");
+        assertTrue(Array.isArray(r.body.sample) && r.body.sample.length === 1,
+          "tnb-4d: sample has exactly the 1 candidate");
+        assertEq(r.body.sample[0].id, idCanonicalTNB, "tnb-4e: sampled row is the canonical candidate");
+        assertEq(r.body.sample[0].proposed_title_no, STUBBED_TITLE_NO, "tnb-4f: proposed_title_no matches the stubbed LLM response");
+        assertEq(titleNoOf(idCanonicalTNB), null, "tnb-4g: dry_run writes NOTHING — title_no still NULL in the DB");
+      }
 
-    // ── tnb-5: REAL run (dry_run: false) with the same stubbed success →
-    //    writes title_no through a transaction. ─────────────────────────
-    {
-      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
-      assertEq(r.status, 200, "tnb-5a: real run with stubbed success → 200");
-      assertEq(r.body.dry_run, false, "tnb-5b: dry_run: false echoed back");
-      assertEq(r.body.written, 1, "tnb-5c: written: 1");
-      assertEq(r.body.skipped, 0, "tnb-5d: skipped: 0");
-      assertEq(titleNoOf(idCanonicalTNB), STUBBED_TITLE_NO, "tnb-5e: title_no WAS written to the DB");
-    }
+      // ── tnb-5: REAL run (dry_run: false) with the same stubbed success →
+      //    writes title_no through a transaction. ─────────────────────────
+      {
+        const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
+        assertEq(r.status, 200, "tnb-5a: real run with stubbed success → 200");
+        assertEq(r.body.dry_run, false, "tnb-5b: dry_run: false echoed back");
+        assertEq(r.body.written, 1, "tnb-5c: written: 1");
+        assertEq(r.body.skipped, 0, "tnb-5d: skipped: 0");
+        assertEq(titleNoOf(idCanonicalTNB), STUBBED_TITLE_NO, "tnb-5e: title_no WAS written to the DB");
+      }
 
-    // ── tnb-6: a second real run now finds 0 candidates (idempotent —
-    //    canonical_id IS NULL AND title_no IS NULL no longer matches). ─────
-    {
-      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
-      assertEq(r.status, 200, "tnb-6a: idempotent re-run → 200");
-      assertEq(r.body.candidates, 0, "tnb-6b: candidates: 0 (already backfilled)");
-      assertEq(r.body.written, 0, "tnb-6c: written: 0");
+      // ── tnb-6: a second real run now finds 0 candidates (idempotent —
+      //    canonical_id IS NULL AND title_no IS NULL no longer matches). ─────
+      {
+        const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
+        assertEq(r.status, 200, "tnb-6a: idempotent re-run → 200");
+        assertEq(r.body.candidates, 0, "tnb-6b: candidates: 0 (already backfilled)");
+        assertEq(r.body.written, 0, "tnb-6c: written: 0");
+      }
+    } finally {
+      globalThis.fetch = prevFetchTNB;
     }
 
     // ── tnb-7: a NEW candidate + a stubbed FAILED (non-ok) LLM response —
@@ -17021,12 +17033,14 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     globalThis.fetch = (async () => {
       return { ok: false, status: 500, json: async () => ({ error: "boom" }) };
     }) as unknown as typeof fetch;
-    {
+    try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
       assertEq(r.status, 200, "tnb-7a: real run with stubbed HTTP failure → 200 (does not throw/500)");
       assertEq(r.body.written, 0, "tnb-7b: written: 0 — nothing fabricated");
       assertEq(r.body.skipped, 1, "tnb-7c: skipped: 1 — the failed row is skipped, not guessed");
       assertEq(titleNoOf(idFailTNB), null, "tnb-7d: title_no stays NULL for the row whose LLM call failed");
+    } finally {
+      globalThis.fetch = prevFetchTNB;
     }
 
     // ── tnb-8: same candidate, this time a stubbed UNPARSEABLE response body
@@ -17039,11 +17053,13 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
         json: async () => { throw new Error("not json"); },
       };
     }) as unknown as typeof fetch;
-    {
+    try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
       assertEq(r.status, 200, "tnb-8a: real run with unparseable LLM body → 200 (does not throw/500)");
       assertEq(r.body.written, 0, "tnb-8b: written: 0 — nothing fabricated");
       assertEq(titleNoOf(idFailTNB), null, "tnb-8c: title_no still NULL — unparseable response never guessed");
+    } finally {
+      globalThis.fetch = prevFetchTNB;
     }
 
     // ── tnb-9: same candidate, this time a stubbed 200 OK response whose
@@ -17059,12 +17075,14 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
         json: async () => ({ content: { unexpected: "shape" } }),
       };
     }) as unknown as typeof fetch;
-    {
+    try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
       assertEq(r.status, 200, "tnb-9a: real run with non-array content shape → 200 (does not throw/500)");
       assertEq(r.body.written, 0, "tnb-9b: written: 0 — nothing fabricated");
       assertEq(r.body.skipped, 1, "tnb-9c: skipped: 1 — the malformed-shape row is skipped, not guessed");
       assertEq(titleNoOf(idFailTNB), null, "tnb-9d: title_no stays NULL for the row whose LLM response had a non-array content field");
+    } finally {
+      globalThis.fetch = prevFetchTNB;
     }
 
     dbFactoryTNB.__resetDbFactoryForTesting();
