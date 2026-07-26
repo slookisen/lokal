@@ -192,7 +192,14 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
   };
 }
 
-export function createBooking(input: BookingInput): GardssalgBooking {
+// `source` stamps the channel a booking came in through, for analytics only
+// — it never changes validation, the DB table, the confirm-token lifecycle,
+// or anything else about the flow below. Defaults to "opplevagent" (the web
+// form's channel, unchanged for both existing call sites — opplevelser.ts's
+// POST /api/opplevelser/book and experiences-seo.ts's no-JS SSR fallback —
+// which never pass a second argument). experiences-mcp.ts's book_gardssalg
+// tool is the only caller that passes "mcp".
+export function createBooking(input: BookingInput, source: string = "opplevagent"): GardssalgBooking {
   const db = getDb(VERTICAL);
 
   // Inherit commission_rate from provider if not explicitly set
@@ -216,7 +223,7 @@ export function createBooking(input: BookingInput): GardssalgBooking {
     guest_phone:   input.guest_phone ?? null,
     booking_ref:   generateBookingRef(),
     confirm_token: generateConfirmToken(),
-    source:        "opplevagent",
+    source,
     status:        "reserved",
     resolved_by:   null,
     resolved_at:   null,
