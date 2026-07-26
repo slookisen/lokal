@@ -99,7 +99,6 @@ import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator"
 import { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX } from "../utils/meta-description";
 // PR-24a: homepage CONTENT extractors (PR-22) + write helpers (PURE).
 import {
-  isSafeFetchUrl,
   extractVisibleText,
   extractBusinessTypeTokens,
   extractProductMentions,
@@ -107,6 +106,7 @@ import {
   mapToPlatformCategories,
   meetsAboutQualityBar,
 } from "../services/search-enrich";
+import { fetchPage, discoverContentLinks, type FetchPageResult } from "../services/fetch-page";
 
 const router = Router();
 
@@ -1129,21 +1129,26 @@ const HCR_UA = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
 // crawl's /om-oss, plus /about and /produkter per spec).
 const HCR_CONTENT_PATHS: readonly string[] = ["/om-oss", "/about", "/produkter"];
 
-/** Fetch one URL's HTML server-side (SSRF-guarded). Returns null on any failure. */
+/**
+ * Fetch one URL's HTML server-side, classified (dev-request
+ * 2026-07-27-fetch-infrastruktur-diagnose, P0-1).
+ *
+ * Two bugs fixed by delegating to the shared fetchPage():
+ *  1. This helper still called `await resp.text()` — the exact
+ *     always-decode-as-UTF-8 bug that was fixed in search-enrich's fetchHtml()
+ *     (PR lokal#360) and in opplevelser's crFetchHtml() (PR lokal#365) but
+ *     never in this third copy, so every windows-1252/iso-8859-1 producer page
+ *     this endpoint read had its æ/ø/å corrupted before extraction.
+ *  2. Every failure collapsed to `null`, which is why Phase 4c's run reports
+ *     could only ever say "fetch_failed" without a cause.
+ */
+async function hcrFetchPage(url: string): Promise<FetchPageResult> {
+  return fetchPage(url, { userAgent: HCR_UA, timeoutMs: HCR_FETCH_TIMEOUT_MS });
+}
+
 async function hcrFetchHtml(url: string): Promise<string | null> {
-  if (!isSafeFetchUrl(url)) return null;
-  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-  try {
-    const resp = await fetch(fetchUrl, {
-      redirect: "follow",
-      headers: { "User-Agent": HCR_UA, Accept: "text/html,application/xhtml+xml" },
-      signal: AbortSignal.timeout(HCR_FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) return null;
-    return await resp.text();
-  } catch {
-    return null;
-  }
+  const r = await hcrFetchPage(url);
+  return r.ok ? r.html : null;
 }
 
 /**
@@ -1152,24 +1157,34 @@ async function hcrFetchHtml(url: string): Promise<string | null> {
  * the homepage), with sub-page HTML appended for the token/product scans. Returns
  * null only if the primary homepage cannot be fetched.
  */
-async function hcrFetchHomepageContent(
-  homepageUrl: string,
-): Promise<{ primaryHtml: string; combinedHtml: string; fetchUrl: string } | null> {
+type HcrFetchOutcome =
+  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
+  | { ok: false; reason: string; persistence: string; status: number | null };
+
+async function hcrFetchHomepageContent(homepageUrl: string): Promise<HcrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
-  const primaryHtml = await hcrFetchHtml(fetchUrl);
-  if (primaryHtml === null) return null;
+  const primary = await hcrFetchPage(fetchUrl);
+  if (!primary.ok) {
+    return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
+  }
+  const primaryHtml = primary.html;
   let combinedHtml = primaryHtml;
+  // Link-driven sub-page crawl with the legacy fixed paths as fallback — see
+  // buildPageEvidence in services/search-enrich.ts for the measurement that
+  // motivated it (12/12 404s on the fixed guesses across three live sites).
   try {
     const u = new URL(fetchUrl);
     const base = `${u.protocol}//${u.host}`;
-    for (const path of HCR_CONTENT_PATHS) {
-      const sub = await hcrFetchHtml(`${base}${path}`);
+    const discovered = discoverContentLinks(primaryHtml, u.toString(), HCR_CONTENT_PATHS.length);
+    const targets = discovered.length > 0 ? discovered : HCR_CONTENT_PATHS.map((p) => `${base}${p}`);
+    for (const target of targets) {
+      const sub = await hcrFetchHtml(target);
       if (sub) combinedHtml += "\n" + sub;
     }
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
 }
 
 type HcrTargetRow = {
@@ -1289,15 +1304,24 @@ homepageContentRefreshRouter.post(
       }
 
       // Fetch homepage content server-side.
-      let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+      let fetched: HcrFetchOutcome;
       try {
         fetched = await hcrFetchHomepageContent(t.homepage_url);
       } catch (e: any) {
         errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
         return;
       }
-      if (!fetched) {
-        errors.push({ agent_id: agentId, error: `fetch_failed for ${t.homepage_url}` });
+      if (!fetched.ok) {
+        // Report the CLASSIFIED reason, not a bare "fetch_failed" (dev-request
+        // 2026-07-27-fetch-infrastruktur-diagnose, P0-1). `persistence` tells a
+        // reader whether this URL is genuinely dead ("permanent") or merely
+        // uncooperative right now ("transient") — the distinction that decides
+        // whether parking the producer would be correct or would strand a live
+        // one for 30 days.
+        errors.push({
+          agent_id: agentId,
+          error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.homepage_url}`,
+        });
         return;
       }
       const { primaryHtml, combinedHtml, fetchUrl } = fetched;
