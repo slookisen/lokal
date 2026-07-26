@@ -1383,11 +1383,13 @@ router.get("/sok", async (req: Request, res: Response) => {
   if (q && !hasBrowserCoords) {
     try {
       const ri = await resolveRouteIntent(q, {
+        // STRICT whole-string resolver, never extractAndGeocode — see the
+        // contract in route-intent.ts. The extractor turned «rakfisk fra
+        // Valdres til Oslo» into a route.
         geocode: async (place: string) => {
-          const g = await geocodingService.extractAndGeocode(place);
+          const g = await geocodingService.geocodePlaceForBackfill(place);
           return g ? { lat: g.lat, lng: g.lng } : null;
         },
-        isKnownProducerName: (name: string) => marketplaceRegistry.hasProducerNamed(name),
       });
       if (ri.ok) {
         res.redirect(302, `${localizedPath("/reise", lang)}?from=${encodeURIComponent(ri.route.from.query)}&to=${encodeURIComponent(ri.route.to.query)}`);

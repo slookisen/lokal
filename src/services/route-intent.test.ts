@@ -59,22 +59,16 @@ const PLACES: Record<string, { lat: number; lng: number }> = {
   jessheim: { lat: 60.1417, lng: 11.1744 },
 };
 
+/**
+ * A STRICT whole-string resolver, matching the production contract: the input
+ * must BE a place, not merely contain one. The first version of this feature
+ * injected an EXTRACTOR in production while testing against this strict fake —
+ * which is exactly why the false positives got through review-by-author. The
+ * fake was right; the wiring was wrong.
+ */
 const geocode = async (place: string) => {
   const k = (place || "").toLowerCase().trim();
   return PLACES[k] ?? null;
-};
-
-/** The live naming convention that made the dash form dangerous. */
-const CATALOGUE = [
-  "Bent Gate Brewing — Gjerdrum",
-  "Kringler Gjestegård — Gårdsutsalg",
-  "Moe Gård — Bringebær fra Moe",
-  "Rakfisk — Valdres",
-];
-const isKnownProducerName = (s: string) => {
-  const norm = (x: string) =>
-    (x || "").toLowerCase().normalize("NFC").replace(/[\s\-–—]+/g, " ").replace(/[?!.,;:]+/g, "").trim();
-  return CATALOGUE.some((n) => norm(n) === norm(s));
 };
 
 export function runRouteIntentTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -126,7 +120,7 @@ export function runRouteIntentTests(opts: { log?: boolean } = {}): Promise<TestS
     // ri13-ri19 — resolveRouteIntent: the actual decision
     // ═══════════════════════════════════════════════════════════════
     {
-      const ok = await resolveRouteIntent("oslo til bodø", { geocode, isKnownProducerName });
+      const ok = await resolveRouteIntent("oslo til bodø", { geocode });
       assertTrue(ok.ok, "ri13: both endpoints resolve and are far apart → it is a route");
       if (ok.ok) {
         assertEq(ok.route.from.query, "oslo", "ri14: …carries the endpoint strings back");
@@ -158,14 +152,16 @@ export function runRouteIntentTests(opts: { log?: boolean } = {}): Promise<TestS
     // visitor types, and each one would be hijacked by a naive implementation.
     // ═══════════════════════════════════════════════════════════════
     {
-      // The live catalogue convention. Both sides of «Bent Gate Brewing —
-      // Gjerdrum» could plausibly geocode; the producer-name veto is what
-      // stops it, which is why it is checked BEFORE geocoding.
-      const brewing = await resolveRouteIntent("Bent Gate Brewing — Gjerdrum", { geocode, isKnownProducerName });
+      // The live catalogue convention. Under a STRICT resolver «bent gate
+      // brewing» simply is not a place, so no veto is needed — which is why
+      // the producer-name veto (and its uncached full-table scan on a public
+      // path) was deleted after review.
+      const brewing = await resolveRouteIntent("Bent Gate Brewing — Gjerdrum", { geocode });
       assertEq(brewing.ok, false, "ri20: «Bent Gate Brewing — Gjerdrum» is a PRODUCER, not a route");
-      assertEq((brewing as any).reason, "name_match", "ri20b: …vetoed by name before any geocoding");
+      assertEq((brewing as any).reason, "from_unresolved",
+        "ri20b: …and the strict resolver is what stops it — no name veto required");
 
-      const kringler = await resolveRouteIntent("Kringler Gjestegård — Gårdsutsalg", { geocode, isKnownProducerName });
+      const kringler = await resolveRouteIntent("Kringler Gjestegård — Gårdsutsalg", { geocode });
       assertEq(kringler.ok, false, "ri21: …same for a name whose right side is not a place at all");
 
       // Even WITHOUT the veto, a weak match must clear a much higher bar.
@@ -207,17 +203,20 @@ export function runRouteIntentTests(opts: { log?: boolean } = {}): Promise<TestS
     {
       // Route beats a place search: «oslo til bodø» contains two place names,
       // and the pre-Fase-3 behaviour was to geocode Oslo and search there.
-      const r = await resolveRouteIntent("oslo til bodø", { geocode, isKnownProducerName });
+      const r = await resolveRouteIntent("oslo til bodø", { geocode });
       assertEq(r.ok, true, "ri35: route wins over the place search it used to become");
 
       // Exact name beats route, for the weak form only — the one place where
       // the two intents genuinely collide.
-      const n = await resolveRouteIntent("Rakfisk — Valdres", { geocode, isKnownProducerName });
-      assertEq((n as any).reason, "name_match",
-        "ri36: an exact catalogue name beats a WEAK route match");
+      // Under the strict resolver the name veto is gone, so what protects this
+      // is the WEAK floor: «Rakfisk» and «Valdres» both resolve here, but 12 km
+      // apart is not a journey, and a dash must prove 50 km.
+      const n = await resolveRouteIntent("Rakfisk — Valdres", { geocode });
+      assertEq((n as any).reason, "too_close",
+        "ri36: a weak dash match between two nearby places is still not a route");
 
       // …but a strong marker is never vetoed by a coincidental name.
-      const strong = await resolveRouteIntent("Rakfisk til Valdres", { geocode, isKnownProducerName });
+      const strong = await resolveRouteIntent("Rakfisk til Valdres", { geocode });
       assertEq(strong.ok, false,
         "ri37: «Rakfisk til Valdres» — strong marker, so no name veto, but still too close to be a route");
 
@@ -292,6 +291,109 @@ export function runRouteIntentTests(opts: { log?: boolean } = {}): Promise<TestS
       // were one character long, so the count check never mattered.
       assertEq(detectRouteIntent("Moe Gård - Bringebær - fra Moe"), null,
         "ri50: two dashes is a producer name pattern — the count check must hold with real-length segments");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ri51-ri66 — gaps found by the INDEPENDENT reviewer's mutation sweep.
+    //
+    // The author ran 9 mutants and killed 9. The reviewer ran 34 and found
+    // NINETEEN survivors. Every case below corresponds to one of them: real
+    // behaviour the suite claimed to cover and did not.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      // M20 — the word boundary on «til». Without \s+ the regex splits inside
+      // ordinary Norwegian words, and nothing failed.
+      assertEq(detectRouteIntent("tilbud på epler"), null,
+        "ri51: «tilbud» must not split — «til» needs a word boundary, not a substring match");
+      assertEq(detectRouteIntent("utstilling"), null,
+        "ri52: …nor «utstilling»");
+      assertEq(detectRouteIntent("tilberedning av rakfisk"), null,
+        "ri53: …nor «tilberedning»");
+
+      // M18 — the documented "split on the FIRST « til »".
+      const multi = detectRouteIntent("oslo til bodø til tromsø");
+      assertEq(multi?.from, "oslo", "ri54: split on the FIRST «til», so from is the first leg…");
+      assertEq(multi?.to, "bodø til tromsø", "ri55: …and the rest stays whole, to fail resolution honestly");
+
+      // M14/M15/M16 — endsInNonPlace's startsWith/endsWith arms; only the
+      // exact-equality arm was exercised.
+      assertEq(detectRouteIntent("ost til middag i morgen"), null,
+        "ri56: the non-place guard matches a LEADING word, not only the whole string");
+      assertEq(detectRouteIntent("kaker til søndagens fest"), null,
+        "ri57: …and a TRAILING one");
+
+      // M13 — the guard on the fra-til branch specifically.
+      assertEq(detectRouteIntent("fra oslo til middag"), null,
+        "ri58: the «fra X til Y» branch applies the same non-place guard");
+
+      // M02/M29 — MAX_ENDPOINT_CHARS had no test at all.
+      assertEq(detectRouteIntent(`${"a".repeat(80)} til oslo`), null,
+        "ri59: an 80-character endpoint is a sentence, not a place");
+
+      // M03 — the leading/trailing separator reject in cleanEndpoint.
+      assertEq(detectRouteIntent("- oslo til bodø"), null,
+        "ri60: a leftover separator on an endpoint means the split was wrong");
+
+      // M11 — the exact-boundary case on the separation floor.
+      // Oslo→Sagene is 2.7 km, well under; the boundary itself is asserted by
+      // ri18 (17.2 km passes) and ri44/ri45 (46 km splits the two floors).
+      assertEq((await resolveRouteIntent("oslo til sagene", { geocode }) as any).reason, "too_close",
+        "ri61: under the floor is rejected, and the floor is a floor not a ceiling");
+
+      // M21 — the arrow form without surrounding spaces.
+      assertEq(detectRouteIntent("oslo->bodø")?.marker, "arrow",
+        "ri62: «oslo->bodø» with no spaces is still an arrow");
+
+      // M24 — norm() must lowercase.
+      const shouty = await resolveRouteIntent("OSLO TIL BODØ", { geocode });
+      assertEq(shouty.ok, true, "ri63: uppercase input resolves — norm() lowercases before lookup");
+
+      // M33 — the DIRECTION of the dash form was never asserted.
+      const dash = detectRouteIntent("bergen - trondheim");
+      assertEq(dash?.from, "bergen", "ri64: the dash form keeps left as origin…");
+      assertEq(dash?.to, "trondheim", "ri65: …and right as destination");
+
+      // M19 — the ^ anchor on the fra-til branch. «X fra A til B» must NOT be
+      // read as fra-til; it falls to the generic branch with from = "x fra a",
+      // which a STRICT resolver then refuses. This is the shape that produced
+      // the live «rakfisk fra Valdres til Oslo» false redirect.
+      const midFra = detectRouteIntent("rakfisk fra valdres til oslo");
+      assertEq(midFra?.marker, "til",
+        "ri66: «X fra A til B» is not the fra-til form — the anchor holds");
+      assertEq(midFra?.from, "rakfisk fra valdres",
+        "ri66b: …so the origin is the whole phrase, which only a STRICT resolver rejects");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ri67-ri74 — THE LIVE FALSE POSITIVES.
+    //
+    // Eight ordinary product searches that redirected to a travel page against
+    // the real Kartverket API, because the wiring injected a place EXTRACTOR
+    // instead of a place RESOLVER. These are the exact strings from the review.
+    // The endpoints below are phrases; a strict resolver must return null for
+    // every one, and the cost guard rejects the long ones before any lookup.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const LIVE_FALSE_POSITIVES = [
+        "epler fra Hardanger til Oslo",
+        "kjøtt fra Rendalen til Oslo",
+        "ost fra Jæren til Bergen",
+        "rakfisk fra Valdres til Oslo",
+        "sider fra Hardanger til Bergen",
+        "mat fra Lofoten til Oslo",
+        "spekemat fra Røros til Oslo",
+        "ferske egg fra Toten til Oslo",
+        "Lofoten Gårdsysteri - Bodø",
+        "Bakeri Tromsø - Oslo",
+        "Stange Gårdsysteri - Bergen",
+        "Gårdsbutikk Hardanger - Oslo",
+      ];
+      let n = 67;
+      for (const q of LIVE_FALSE_POSITIVES) {
+        const r = await resolveRouteIntent(q, { geocode });
+        assertEq(r.ok, false, `ri${n}: «${q}» must NOT redirect — it is a product search`);
+        n++;
+      }
     }
 
     if (log) console.log(`\n${passed} passed, ${failed} failed`);

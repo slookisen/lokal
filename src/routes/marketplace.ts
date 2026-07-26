@@ -472,11 +472,11 @@ router.get("/search", async (req: Request, res: Response) => {
   if (q) {
     try {
       const ri = await resolveRouteIntent(q, {
+        // STRICT whole-string resolver — see the contract in route-intent.ts.
         geocode: async (place: string) => {
-          const g = await geocodingService.extractAndGeocode(place);
+          const g = await geocodingService.geocodePlaceForBackfill(place);
           return g ? { lat: g.lat, lng: g.lng } : null;
         },
-        isKnownProducerName: (name: string) => marketplaceRegistry.hasProducerNamed(name),
       });
       if (ri.ok) {
         routeSuggestion = {

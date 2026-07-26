@@ -70,8 +70,8 @@ const MAX_ENDPOINT_CHARS = 60;
  * «grønnsaker til middag», «gaver til jul». A place name never follows «til»
  * in these.
  *
- * This list is a cheap first cut; the real guard is that both sides must
- * geocode. It exists so the common cases never even reach the geocoder.
+ * This list is a cheap first cut. It exists so the common cases never even
+ * reach the geocoder — the real guard is the STRICT resolver contract below.
  */
 const TIL_NOT_A_PLACE = [
   "middag", "frokost", "lunsj", "kvelds", "helga", "helgen", "jul", "påske",
@@ -210,18 +210,52 @@ export type RouteRejection =
   | "no_intent"
   | "from_unresolved"
   | "to_unresolved"
-  | "too_close"
-  | "name_match";
+  | "too_close";
+
+/**
+ * Norwegian place names run to three words at most in practice («Bø i
+ * Telemark», «Vang på Hedmarken», «Nes på Hedmark»). Longer is a phrase.
+ * Rejected WITHOUT a network call — see REVIEW B5.
+ */
+export const MAX_ENDPOINT_WORDS = 3;
+
+function wordCount(s: string): number {
+  return (s || "").trim().split(/\s+/).filter(Boolean).length;
+}
 
 /**
  * Decide whether a detected intent is really a route.
  *
- * `geocode` is injected rather than imported so this stays testable without a
- * network seam and so both platforms can pass their own hardened lookup.
- * `isKnownProducerName` lets the caller veto a weak (dash) match that is
- * actually a producer in the catalogue — the «Bent Gate Brewing — Gjerdrum»
- * case. It is only consulted for weak markers, so a deliberate «Oslo til
- * Bodø» is never vetoed by a coincidental name.
+ * ── THE `geocode` CONTRACT — READ THIS BEFORE WIRING A CALL SITE ────
+ *
+ * `geocode` MUST be a strict place RESOLVER: given a string, it answers "is
+ * this string, in its entirety, the name of a place?" It must NOT be a place
+ * EXTRACTOR that scans the string for a place-ish token and returns the first
+ * hit.
+ *
+ * This is not a stylistic preference. The first version of this PR injected
+ * `geocodingService.extractAndGeocode`, which walks every 3-word, 2-word and
+ * 1-word combination of its input and returns the first that resolves. That
+ * defeated the entire reluctance the module is built on, one layer down, and
+ * an independent reviewer demonstrated it live against the real Kartverket API:
+ *
+ *   «rakfisk fra Valdres til Oslo»  → from = "rakfisk fra valdres"
+ *                                   → extractor finds "valdres" → REDIRECT
+ *
+ * That query means "can I get Valdres rakfisk in Oslo?" — the most on-brand
+ * search this marketplace has — and it was being answered with a driving
+ * corridor. Eight for eight on ordinary product searches.
+ *
+ * Both call sites now inject `geocodingService.geocodePlaceForBackfill`, the
+ * hardened whole-string lookup introduced in #370. Measured on the reviewer's
+ * own failing set: every one of them resolves to NULL under the strict
+ * resolver, while «oslo», «bodø», «valdres» and «hardanger» all still resolve.
+ *
+ * As a consequence the producer-name veto is GONE. It existed to stop
+ * «Bent Gate Brewing — Gjerdrum» becoming a route; under a strict resolver
+ * "bent gate brewing" simply does not resolve, so the veto had nothing left to
+ * do — and removing it also removes an uncached full-table scan (~21 ms with
+ * 1600 agents) from an unauthenticated, unrate-limited public path.
  *
  * Returns a rejection reason rather than throwing: EVERY rejection path must
  * end in "fall through to ordinary search", and a caller that cannot see why
@@ -230,18 +264,20 @@ export type RouteRejection =
 export async function resolveRouteIntent(
   query: string,
   deps: {
+    /** MUST be a strict whole-string resolver. See the contract above. */
     geocode: (place: string) => Promise<{ lat: number; lng: number } | null>;
-    isKnownProducerName?: (s: string) => boolean;
   },
 ): Promise<{ ok: true; route: ResolvedRoute } | { ok: false; reason: RouteRejection }> {
   const intent = detectRouteIntent(query);
   if (!intent) return { ok: false, reason: "no_intent" };
 
-  // Veto FIRST for weak markers — cheaper than two geocodes, and it is the
-  // case that actually occurs in production.
-  if (intent.weak && deps.isKnownProducerName?.(query)) {
-    return { ok: false, reason: "name_match" };
-  }
+  // Cost guard, before any network call. Norwegian place names are one to
+  // three words («Bø i Telemark», «Vang på Hedmarken»); anything longer is a
+  // phrase, and a phrase that reaches the resolver costs a request to prove
+  // what its shape already told us. REVIEW B5: this path runs on the site's
+  // hottest page, and every English «to» and every « - » query pays for it.
+  if (wordCount(intent.from) > MAX_ENDPOINT_WORDS) return { ok: false, reason: "from_unresolved" };
+  if (wordCount(intent.to) > MAX_ENDPOINT_WORDS) return { ok: false, reason: "to_unresolved" };
 
   const from = await deps.geocode(intent.from);
   if (!from) return { ok: false, reason: "from_unresolved" };
