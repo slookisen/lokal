@@ -28,9 +28,11 @@
  *                                  same table, same confirm-token lifecycle,
  *                                  same gates. ALWAYS returns a pending/draft
  *                                  result; this tool can never itself confirm
- *                                  a booking — only the guest's own emailed
- *                                  confirm-link click (existing, untouched
- *                                  flow) can do that.
+ *                                  a booking — only the producer's response
+ *                                  (confirm / suggest another time / decline,
+ *                                  existing, untouched flow) can do that. The
+ *                                  guest's emailed link is a read-only status
+ *                                  link, never a confirm-action.
  *
  * Defensive: if the experiences DB is not open (ENABLE_EXPERIENCES not set),
  * every tool returns a graceful "ingen data / not available" text result —
