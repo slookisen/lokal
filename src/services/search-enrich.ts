@@ -28,6 +28,7 @@ import {
   DISTINCTIVE_SPECIALIST_TOKENS,
   BENIGN_BUSINESS_TOKENS,
 } from "./cross-source-validator";
+import { fetchPage, discoverContentLinks, type FetchPageResult } from "./fetch-page";
 
 // ─── name stemming ───────────────────────────────────────────────────────────
 
@@ -1741,104 +1742,18 @@ export function extractBookingUrl(
   return { value: null, snippet: null };
 }
 
-/** SSRF guard: allow only http(s) to public hosts; block localhost, link-local,
- * private/CGNAT ranges and cloud-metadata (169.254.0.0/16). Domain names are allowed
- * (DNS-rebinding is out of scope for this admin-gated, dry-run-by-default endpoint). */
-export function isSafeFetchUrl(raw: string): boolean {
-  let u: URL;
-  try {
-    u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
-  } catch {
-    return false;
-  }
-  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".internal") ||
-    host.endsWith(".local")
-  )
-    return false;
-  if (host.includes(":")) {
-    // IPv6 literal: block loopback (::1), unique-local (fc00::/7), link-local (fe80::/10)
-    if (host === "::1" || /^f[cd]/.test(host) || /^fe[89ab]/.test(host)) return false;
-    return true;
-  }
-  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const o = m.slice(1, 5).map(Number);
-    if (o.some((x) => x > 255)) return false;
-    const [a, b] = o;
-    if (a === 0 || a === 10 || a === 127) return false;
-    if (a === 169 && b === 254) return false; // link-local incl. cloud metadata
-    if (a === 172 && b! >= 16 && b! <= 31) return false;
-    if (a === 192 && b === 168) return false;
-    if (a === 100 && b! >= 64 && b! <= 127) return false; // CGNAT
-  }
-  return true;
-}
-
-/**
- * Detect a fetched HTML page's declared character encoding from (in order of
- * precedence, matching the HTML5 "determining the character encoding"
- * algorithm's priority): the HTTP `Content-Type` charset parameter, then a
- * `<meta charset=...>` / `<meta http-equiv="Content-Type" content="...
- * charset=...">` tag sniffed from the first 1024 bytes. Falls back to
- * "utf-8" when neither declares one (the HTML5 spec falls back to
- * windows-1252 for legacy/unlabelled pages, but defaulting to utf-8 here is
- * the safer choice for THIS pipeline: the overwhelming majority of scraped
- * producer sites are UTF-8, and wrongly assuming windows-1252 would corrupt
- * far more of them than it would fix). PURE — no network/IO, byte-array in.
- *
- * Root cause (2026-07-25, dev-request 2026-07-21-opplevagent-norske-tegn-
- * encoding): fetchHtml() previously called `resp.text()`, which per the
- * WHATWG Fetch spec ALWAYS UTF-8-decodes the response body regardless of
- * what charset the server actually declares. Small/older gårdssalg producer
- * sites still commonly serve `Content-Type: text/html; charset=iso-8859-1`
- * (or an equivalent `<meta>` tag, windows-1252 in practice) — decoding those
- * bytes as UTF-8 corrupts every æ/ø/å into mojibake or drops it entirely
- * (invalid byte sequences become U+FFFD), and that corrupted text was then
- * extracted verbatim (extractVisibleText/extractTitle, no LLM step) straight
- * into the producer's stored profile content. This function's job is to
- * decode with the PAGE's actual encoding instead of assuming UTF-8.
- */
-export function detectHtmlCharset(
-  bytes: Uint8Array,
-  contentTypeHeader: string | null | undefined,
-): string {
-  const headerMatch = contentTypeHeader?.match(/charset\s*=\s*["']?([\w-]+)/i);
-  if (headerMatch) return headerMatch[1].toLowerCase();
-
-  // Sniff only the first 1024 bytes (where a <meta charset> tag must appear
-  // per HTML5 spec) as Latin-1 — a lossless 1:1 byte→codepoint mapping, so
-  // the ASCII-range markup bytes we're matching against (`<meta`, `charset=`,
-  // quotes) decode identically regardless of the page's real encoding.
-  const head = Buffer.from(bytes.subarray(0, 1024)).toString("latin1");
-  const metaCharset = head.match(/<meta[^>]+charset\s*=\s*["']?([\w-]+)/i);
-  if (metaCharset) return metaCharset[1].toLowerCase();
-
-  return "utf-8";
-}
-
-/**
- * Decode a raw HTML response body with its actual declared encoding (see
- * detectHtmlCharset). Unknown/unsupported charset labels (typos, obscure
- * legacy names Node's TextDecoder doesn't ship) fall back to utf-8 rather
- * than throwing — a best-effort decode beats dropping the page entirely.
- * PURE — no network/IO.
- */
-export function decodeHtmlBytes(
-  bytes: Uint8Array,
-  contentTypeHeader: string | null | undefined,
-): string {
-  const charset = detectHtmlCharset(bytes, contentTypeHeader);
-  try {
-    return new TextDecoder(charset).decode(bytes);
-  } catch {
-    return new TextDecoder("utf-8").decode(bytes);
-  }
-}
+// ── SSRF guard + charset decoding: MOVED to services/fetch-page.ts ─────────
+// (dev-request 2026-07-27-fetch-infrastruktur-diagnose, P0-1). They now live
+// beside the classified fetcher that uses them, so fetch-page.ts needs no
+// import edge back into this module — the circular-import shape that already
+// bit this repo once (lokal#218). Re-exported verbatim here so every existing
+// caller (routes/admin-knowledge.ts, routes/opplevelser.ts, the test suites)
+// keeps importing them from where it always has.
+export {
+  isSafeFetchUrl,
+  detectHtmlCharset,
+  decodeHtmlBytes,
+} from "./fetch-page";
 
 // ─── mojibake detection (dev-request 2026-07-21-opplevagent-norske-tegn-
 // encoding, criterion 3 — databackfill of ALREADY-corrupted text) ───────────
@@ -1910,21 +1825,20 @@ export function mojibakeSnippet(text: string | null | undefined, window = 40): s
   return s.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Fetch one page, classified (dev-request 2026-07-27-fetch-infrastruktur-
+ * diagnose, P0-1). The SSRF guard, charset-correct decode, one-shot retry for
+ * transient faults and the empty-body check all live in fetchPage() now; this
+ * wrapper keeps the string-or-null shape the extractors below expect while
+ * `fetchPageClassified` exposes the reason to callers that report on it.
+ */
+async function fetchPageClassified(url: string): Promise<FetchPageResult> {
+  return fetchPage(url, { userAgent: UA, timeoutMs: FETCH_TIMEOUT_MS });
+}
+
 async function fetchHtml(url: string): Promise<string | null> {
-  if (!isSafeFetchUrl(url)) return null;
-  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-  try {
-    const resp = await fetch(fetchUrl, {
-      redirect: "follow",
-      headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) return null;
-    const bytes = new Uint8Array(await resp.arrayBuffer());
-    return decodeHtmlBytes(bytes, resp.headers.get("content-type"));
-  } catch {
-    return null;
-  }
+  const r = await fetchPageClassified(url);
+  return r.ok ? r.html : null;
 }
 
 /**
@@ -1947,11 +1861,21 @@ export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidenc
   // better aboutSummary/productMentions -> fewer domain_incoherent/kvalitets-
   // gate failures from thin homepage-only crawls — dev-request
   // 2026-06-30-open-stuck-verification-bucket, Step 2).
+  // Sub-page crawl, LINK-DRIVEN (dev-request 2026-07-27-fetch-infrastruktur-
+  // diagnose, P0-1). This used to guess the fixed paths /kontakt, /om-oss and
+  // /produkter. Measured on three live producer sites 2026-07-26, those
+  // guesses returned 404 twelve times out of twelve — pure waste, and they
+  // still missed the real Norwegian paths (/om-garden, /kontakt-oss,
+  // /vare-produkter). We now follow links the primary page actually exposes,
+  // and fall back to the legacy guesses only when it exposes none (single-page
+  // sites and JS-rendered navs), so the fetch budget stays the same or lower.
   try {
     const u = new URL(/^https?:\/\//i.test(primaryUrl) ? primaryUrl : `https://${primaryUrl}`);
     const base = `${u.protocol}//${u.host}`;
-    for (const path of ["/kontakt", "/om-oss", "/produkter"]) {
-      const subHtml = await fetchHtml(`${base}${path}`);
+    const discovered = discoverContentLinks(primaryHtml, u.toString(), 3);
+    const targets = discovered.length > 0 ? discovered : ["/kontakt", "/om-oss", "/produkter"].map((p) => `${base}${p}`);
+    for (const target of targets) {
+      const subHtml = await fetchHtml(target);
       if (subHtml) {
         for (const e of extractEmails(subHtml)) emails.add(e);
         for (const p of extractPhones(subHtml)) phones.add(p);

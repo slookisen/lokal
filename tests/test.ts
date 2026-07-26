@@ -514,6 +514,27 @@ console.log("\n── orch-pr-10: search-enrich pure decision logic ──");
   console.log(`  search-enrich: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-27-fetch-infrastruktur-diagnose (P0-1): the shared,
+// CLASSIFIED page fetcher (services/fetch-page.ts) that all three enrichment
+// pipelines now go through. Registered via runSerial() because the block swaps
+// globalThis.fetch to drive fetchPage() against mocked responses — serializing
+// it keeps that swap from overlapping any other async block's fetch use.
+runSerial(async () => {
+  console.log("\n── fetch-page: classified fetch (reason + persistence + retry) ──");
+  try {
+    const { runFetchPageTests } = require("../src/services/fetch-page.test") as
+      typeof import("../src/services/fetch-page.test");
+    const r = await runFetchPageTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("fetch-page: " + f);
+    console.log(`  fetch-page: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("fetch-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07: experience filter tags (derived, additive-only) ──
 // Daniel confirmed "tags/filters only, no new categories" for experiences.
 // Pins deriveExperienceTags() (services/experience-tags.ts) against the
