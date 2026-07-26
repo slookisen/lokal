@@ -5820,12 +5820,29 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
 // important part — so a run can be REHEARSED against prod first.
 //
 // Body (all optional):
-//   { limit?: number (1-200, default 50), dry_run?: boolean (default false) }
+//   { limit?: number (1-200, default 50),
+//     dry_run?: boolean (default false),
+//     unpark?: boolean (default false) }
 //
 // dry_run: true performs the identical Kartverket lookups and reports the
 // changes it WOULD make in `planned`, but takes no write at all — not even the
 // attempt timestamp. Verify with the `status` block: it is captured before and
 // after, and a dry run must leave it byte-identical.
+//
+// unpark: true first clears the retry counter on rows the worker parked after
+// AGENTS_GEOCODE_MAX_ATTEMPTS fruitless attempts, so they are selected again.
+// For the case parking is meant to survive but cannot detect from inside — a
+// Kartverket outage long enough to burn several rotations, or an import that
+// fixed the underlying records without going through the postal-backfill worker
+// (which resets the counter itself). Honours dry_run: it reports how many it
+// WOULD clear and writes nothing.
+//
+// status_before / status_after answer the two questions Daniel actually asks of
+// this queue without a follow-up: `drain` (batch size, cadence, rows/hour, ETA,
+// and the hard request-rate ceiling) says whether it will finish, and
+// `unreachable` — split into awaiting_postal_backfill /
+// seed_coordinates_no_address / no_usable_signal / parked_after_retries — says
+// what is left that never will, and why.
 //
 // Auth: X-Admin-Key, same getAdminKey() convention as every other admin
 // endpoint in this file.
@@ -5838,10 +5855,11 @@ router.post("/admin/agents/geocode-batch", async (req: Request, res: Response) =
     return;
   }
 
-  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown; unpark?: unknown };
 
   const {
     agentsGeocodeTick, agentsGeocodeQueueStatus, clampGeocodeBatchLimit, parseDryRunFlag,
+    unparkAgentsGeocode,
   } = require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
 
   const limit = clampGeocodeBatchLimit(body.limit);
@@ -5856,17 +5874,40 @@ router.post("/admin/agents/geocode-batch", async (req: Request, res: Response) =
   }
   const dryRun = dry.dryRun;
 
-  try {
+  // `unpark` clears the retry counter on rows the worker gave up on, so they
+  // are selected again. It is a WRITE, so it goes through the exact same strict
+  // boolean parser — a truthy string must not be able to mutate prod through the
+  // back door of a second flag while `dry_run` is being careful about the front
+  // one. Under dry_run it counts and writes nothing, like everything else here.
+  const unparkParsed = parseDryRunFlag(body.unpark);
+  if (!unparkParsed.ok) {
+    res.status(400).json({
+      success: false,
+      error: unparkParsed.error.replace(/^dry_run/, "unpark"),
+    });
+    return;
+  }
+  // parseDryRunFlag's success shape names its payload `dryRun`; here it carries
+  // the `unpark` boolean. Aliased rather than reused verbatim so the call below
+  // does not read as `unpark ? unpark(dryRun) : 0`.
+  const wantUnpark = unparkParsed.dryRun;
 
-    const before = agentsGeocodeQueueStatus();
+  try {
+    // status_before is captured BEFORE the unpark, so it is the true pre-state
+    // of the whole request: `unreachable.parked_after_retries` in `before` and
+    // `unparked` then tell the same story from two sides.
+    const before = agentsGeocodeQueueStatus(limit);
+    const unparked = wantUnpark ? unparkAgentsGeocode(dryRun) : 0;
+
     const result = await agentsGeocodeTick(limit, { dryRun });
-    const after = agentsGeocodeQueueStatus();
+    const after = agentsGeocodeQueueStatus(limit);
 
     res.json({
       success: true,
       data: {
         ...result,
         limit,
+        unparked,
         status_before: before,
         status_after: after,
       },
@@ -5948,6 +5989,58 @@ router.post("/admin/agents/postal-backfill", async (req: Request, res: Response)
   } catch (err: any) {
     console.error("[postal-backfill] admin batch failed:", err);
     res.status(500).json({ success: false, error: err?.message || "Postal backfill failed" });
+  }
+});
+
+// ─── POST /admin/agents/geocode-seed-audit ───────────────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a
+// throughput follow-up — review adjudication (c).
+//
+// MEASURES, NEVER WRITES. The geocode worker reports a cohort of producers
+// (~110 measured on prod) carrying a coordinate of UNKNOWN provenance plus a
+// city, with no street address to improve on it. The worker refuses to
+// overwrite those, which is right — but "reclassify them as centroid precision
+// on an inference, or leave them alone" is a false choice. This endpoint takes
+// the third option: geocode each row's own city and compare it to the
+// coordinate already stored.
+//
+//   <=1 km   the stored value demonstrably IS the city centroid. Tagging it
+//            'city' would be recording a measurement, not making a guess.
+//   1-10 km  same place, but not the centroid point itself.
+//   >10 km   the stored coordinate means something else — plausibly the real
+//            farm. It keeps its honest NULL.
+//
+// The reclassification decision stays with Daniel; this gives him the
+// distribution to make it on. There is deliberately NO write path in this
+// handler or in auditSeedCoordinates(), so there is nothing for a dry_run flag
+// to get wrong: the endpoint cannot mutate anything, which is a stronger
+// guarantee than promising not to.
+//
+// Body: { limit?: number (1-500, default 50) }
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/geocode-seed-audit", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown };
+  const raw = typeof body.limit === "number" && Number.isFinite(body.limit) ? Math.floor(body.limit) : 50;
+  const limit = Math.max(1, Math.min(500, raw));
+
+  const { auditSeedCoordinates } =
+    require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+
+  try {
+    const audit = await auditSeedCoordinates(limit);
+    res.json({ success: true, data: { ...audit, limit } });
+  } catch (err: any) {
+    console.error("[seed-audit] admin run failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Seed audit failed" });
   }
 });
 

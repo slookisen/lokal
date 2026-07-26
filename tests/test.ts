@@ -33773,6 +33773,36 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a
+// THROUGHPUT + COVERAGE follow-up. Daniel, hours after Fase 1a shipped:
+// «Det ser ut som veldig mange fortsatt står med ukjent opphav. Vi burde lage
+// en pr som forbedrer og fikser dette.» Measured live: 1 022 pending ÷ 50
+// rows/HOUR ≈ 20 hours, plus 423 rows the selector could not reach at all.
+// Covers Tier C (the «Navn — Sted» place suffix, 174 of 194 live tokens
+// resolve, container-token-first because locality-first put «Mevika,
+// Gildeskål» ~600 km wrong), parking (an honest terminal state instead of an
+// infinite retry, now that a full rotation is ~20 min rather than ~32 h), the
+// process-wide 2 req/s Kartverket budget now SHARED by both RFB backfill
+// workers, the adaptive scheduler's ALWAYS-RESCHEDULE invariant, the
+// unreachable-by-reason breakdown (asserted to be a true partition), and
+// dry-run purity verified with a WHOLE-DB hash. Own in-memory DB + both
+// network seams injected; runs via runSerial() like its siblings.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a follow-up (geokoding-dekning + gjennomstrømning) ──");
+  try {
+    const { runGeocodeCoverageBoostTests } = require("../src/services/geocode-coverage-boost.test") as
+      typeof import("../src/services/geocode-coverage-boost.test");
+    const gcb = await runGeocodeCoverageBoostTests({ log: false });
+    passed += gcb.passed;
+    failed += gcb.failed;
+    for (const f of gcb.failures) failures.push("geocode-coverage-boost: " + f);
+    console.log(`  geocode-coverage-boost: ${gcb.passed} passed, ${gcb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("geocode-coverage-boost: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1b —
 // experiences were 100 % geo_precision='kommune' (zero at address level), so
 // everything in Bodø reported distance_km 0. Steps E/F of

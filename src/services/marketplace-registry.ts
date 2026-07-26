@@ -1519,7 +1519,13 @@ class MarketplaceRegistry {
       location: row.lat != null && row.lng != null ? {
         lat: row.lat,
         lng: row.lng,
-        city: row.city || "Oslo",
+        // geo_place_label before the legacy "Oslo" default. The geocode
+        // worker's Tier C places ~250 producers that have NO `city` at all, and
+        // the bare default would have labelled every one of them «i
+        // Oslo-området» — a confidently wrong statement about a producer in
+        // Rana, which is strictly worse than saying nothing. Order matters:
+        // a curated `city` still wins over the worker's derived label.
+        city: row.city || row.geo_place_label || "Oslo",
         radiusKm: row.radius_km,
       } : undefined,
       // dev-request 2026-07-25 Fase 1: coordinate provenance, written by
@@ -1527,6 +1533,7 @@ class MarketplaceRegistry {
       // row from a DB that predates the migration and one the worker has not
       // reached yet are the same thing to the honesty rule: unknown.
       geoPrecision: row.geo_precision ?? null,
+      geoPlaceLabel: row.geo_place_label ?? null,
     };
   }
 

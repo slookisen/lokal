@@ -1170,37 +1170,21 @@ if (
 // Disable on dev / CI with RFB_DISABLE_AGENTS_GEOCODE=1. No ENABLE_* gate —
 // unlike dental/experiences the RFB DB is always open (it IS the main DB).
 // Manual/batched runs + dry-run: POST /api/marketplace/admin/agents/geocode-batch.
+//
+// THROUGHPUT FOLLOW-UP (2026-07-25 evening, Daniel: «veldig mange fortsatt står
+// med ukjent opphav»): the boot-setTimeout + hourly-setInterval pair that used
+// to be written out here is replaced by the worker's own ADAPTIVE scheduler.
+// The hourly cadence meant 1 022 pending rows ÷ 50 per tick ≈ 20 HOURS, while
+// a single row resolved in 432 ms — the schedule was the bottleneck, not the
+// API. startAgentsGeocodeWorker() ticks every 60 s while a backlog exists and
+// decays to the same hourly heartbeat once it is drained, so there is nothing
+// to turn off afterwards. Rate is bounded independently by the shared 2 req/s
+// budget in services/kartverket-budget.ts; the log line moved into the worker
+// so the tick's shape and its logging cannot drift apart.
 if (process.env.RFB_DISABLE_AGENTS_GEOCODE !== "1") {
-  const logAgentsGeocode = (label: string, r: {
-    processed: number; address_precision: number; address_high: number;
-    address_medium: number; address_low: number; centroid_precision: number;
-    no_match: number; skipped_no_upgrade: number; errors: number; duration_ms: number;
-  }) => {
-    console.log(
-      `[agents-geocode] ${label} processed=${r.processed} ` +
-      `address=${r.address_precision} (high=${r.address_high} medium=${r.address_medium} low=${r.address_low}) ` +
-      `centroid=${r.centroid_precision} no_match=${r.no_match} ` +
-      `skipped_no_upgrade=${r.skipped_no_upgrade} errors=${r.errors} duration_ms=${r.duration_ms}`
-    );
-  };
-
-  setTimeout(async () => {
-    try {
-      const { agentsGeocodeTick } = await import("./services/agents-geocode-worker");
-      logAgentsGeocode("boot-tick", await agentsGeocodeTick(50));
-    } catch (err) {
-      console.error("[agents-geocode] boot-tick failed:", err);
-    }
-  }, 30_000);
-
-  setInterval(async () => {
-    try {
-      const { agentsGeocodeTick } = await import("./services/agents-geocode-worker");
-      logAgentsGeocode("tick", await agentsGeocodeTick(50));
-    } catch (err) {
-      console.error("[agents-geocode] tick failed:", err);
-    }
-  }, 60 * 60_000);
+  void import("./services/agents-geocode-worker")
+    .then((m) => { m.startAgentsGeocodeWorker(); })
+    .catch((err) => console.error("[agents-geocode] scheduler failed to start:", err));
 }
 
 // ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
@@ -1224,46 +1208,17 @@ if (process.env.RFB_DISABLE_AGENTS_GEOCODE !== "1") {
 //
 // Disable on dev / CI with RFB_DISABLE_POSTAL_BACKFILL=1.
 // Manual/batched runs + dry-run: POST /api/marketplace/admin/agents/postal-backfill.
+//
+// Same adaptive scheduler as the geocode worker above (2 min while there are
+// never-attempted rows, hourly otherwise). The boot delay stays at 45 s — 15 s
+// behind the geocode worker — but that offset is now decoration rather than
+// protection: both workers draw from ONE 2 req/s budget
+// (services/kartverket-budget.ts), so overlapping is bounded by construction
+// instead of by hoping two timers stay out of phase.
 if (process.env.RFB_DISABLE_POSTAL_BACKFILL !== "1") {
-  const logPostalBackfill = (label: string, r: {
-    processed: number; resolved: number; resolved_inline: number; resolved_lookup: number;
-    ambiguous: number; uncorroborated: number; no_match: number; unusable: number;
-    errors: number; duration_ms: number; skipped_already_running: boolean;
-  }) => {
-    // Review item 7: log the single-flight no-op explicitly. A tick can
-    // legitimately run for many minutes (probe budget × batch × HTTP timeout),
-    // so "nothing happened this hour" has to be distinguishable in the log from
-    // "the worker is wedged".
-    if (r.skipped_already_running) {
-      console.log(`[postal-backfill] ${label} skipped — the previous tick is still running`);
-      return;
-    }
-    console.log(
-      `[postal-backfill] ${label} processed=${r.processed} ` +
-      `resolved=${r.resolved} (inline=${r.resolved_inline} lookup=${r.resolved_lookup}) ` +
-      `ambiguous=${r.ambiguous} uncorroborated=${r.uncorroborated} ` +
-      `no_match=${r.no_match} unusable=${r.unusable} ` +
-      `errors=${r.errors} duration_ms=${r.duration_ms}`
-    );
-  };
-
-  setTimeout(async () => {
-    try {
-      const { postalBackfillTick } = await import("./services/agents-postal-backfill");
-      logPostalBackfill("boot-tick", await postalBackfillTick(50));
-    } catch (err) {
-      console.error("[postal-backfill] boot-tick failed:", err);
-    }
-  }, 45_000);
-
-  setInterval(async () => {
-    try {
-      const { postalBackfillTick } = await import("./services/agents-postal-backfill");
-      logPostalBackfill("tick", await postalBackfillTick(50));
-    } catch (err) {
-      console.error("[postal-backfill] tick failed:", err);
-    }
-  }, 60 * 60_000);
+  void import("./services/agents-postal-backfill")
+    .then((m) => { m.startPostalBackfillWorker(); })
+    .catch((err) => console.error("[postal-backfill] scheduler failed to start:", err));
 }
 
 // ─── booking-flyt-v1 slice 2 (dev-request 2026-07-14-booking-flyt-v1):
