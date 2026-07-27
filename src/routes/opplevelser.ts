@@ -732,31 +732,32 @@ function isPlaceholderHomepageHost(host: string): boolean {
   // means "under" need not be listed — `under-arbeid` is caught by "arbeid" —
   // so round 5's conservative omissions still stand.
   //
-  // Only the LAST split word is checked, not "any position" (oppfølging,
-  // dev-request 2026-07-27-384-placeholder-regel-etterslep, funn 1 — carried
-  // forward out of #384 round 8 as a non-blocking minor). "Any position" hard-
-  // rejected real-looking REGISTERED domains whose FIRST component is a status
-  // word used as a modifier rather than the placeholder itself:
-  // `arbeid-helse.no`, `hjemmeside-design.no`, `null-utslipp.no`,
-  // `todo-as.no` (pinned accepted in alias-30). No measured production harm —
-  // none of the four is a producer, and re-running the 335-real-producer-host
-  // sweep this PR's own review used shows 0 affected either way — but the
-  // blast radius of a false reject is exactly the bug #384 exists to fix, so a
-  // free narrowing (no known true-positive lost) is worth taking anyway.
-  //
-  // "Last", not "first" (considered and rejected): every one of the six known
-  // compounds — `ingen-hjemmeside`, `kommer-snart`, `under-arbeid`,
-  // `ikke-oppgitt`/`ikke_oppgitt`, `ingen_nettside` — puts the placeholder
-  // status NOUN last (hjemmeside/snart/arbeid/oppgitt/nettside is the head of
-  // the Norwegian compound) and a plausible qualifier (ingen/ikke/under/kommer)
-  // first. "First position only" would have let `under-arbeid.no` through,
-  // since "under" is deliberately NOT listed (round-5 comment above) — breaking
-  // alias-28 unchanged. "Whole label collapse only" (dropping the split
-  // entirely) would have let all six through, since only "ikkeoppgitt" is
-  // hard-coded as a single collapsed word. "Last word" is the one rule that
-  // keeps all six existing negatives red AND accepts all four named domains —
-  // verified by mutation: reverting to "any position" flips alias-30 red while
-  // alias-28/29 stay green; this rule flips neither.
+  // "Any position" is kept — NOT narrowed to "last split word only" (oppfølging,
+  // dev-request 2026-07-27-384-placeholder-regel-etterslep, funn 1). A "last
+  // word only" narrowing was tried in an earlier commit on this same PR to stop
+  // hard-rejecting real-looking REGISTERED domains whose FIRST component is a
+  // status word used as a modifier rather than the placeholder itself:
+  // `arbeid-helse.no`, `hjemmeside-design.no`, `null-utslipp.no`, `todo-as.no`.
+  // An independent fresh-context review of that commit found it reintroduces a
+  // real, previously-nonexistent false-accept regression: any qualifier-first
+  // junk compound whose TRAILING word is one of the ~14 status NOUNS still
+  // reads as a placeholder to a human, but if that trailing word happens NOT to
+  // be one of the ~14 words in PLACEHOLDER_DOMAIN_LABELS, "last word only"
+  // waves it through — even though the LEADING word is a dead giveaway.
+  // Concretely, `ukjent-produsent.no`, `mangler-info.no`, `ingen-svar.no`,
+  // `snart-ferdig.no`, `eksempel-gaard.no`, `tbd-gaarden.no` were all correctly
+  // rejected under "any position" (they still are, pinned in alias-30c below)
+  // but would have silently started being ACCEPTED under "last word only" —
+  // each one starts with a genuine PLACEHOLDER_DOMAIN_LABELS word (ukjent,
+  // mangler, ingen, snart, eksempel, tbd) followed by a trailing word that is
+  // not separately listed. That false-accept surface is unbounded — any junk
+  // qualifier + any noun — whereas the four named domains this PR wanted to
+  // rescue are a closed, measured set (0 of 335 real producer hosts affected
+  // either way). So "any position" stays: the four domains above remain
+  // rejected (pinned in alias-30, re-purposed to assert `null` rather than
+  // accept), and the false-accept class the narrowing would have opened is
+  // pinned rejected too (alias-30c) so nobody re-attempts the same "last word"
+  // narrowing blind in a future round without a test going red.
   //
   // The underscore half of `[-_]` here is DEAD CODE for this function's only
   // caller (oppfølging, finding 4): looksLikeHomepageValue() below calls this
@@ -788,8 +789,7 @@ function isPlaceholderHomepageHost(host: string): boolean {
   // both to accepted with the rest of the suite unaffected.
   const isPlaceholderLabel = (label: string): boolean => {
     if (PLACEHOLDER_DOMAIN_LABELS.has(label.replace(/[-_]/g, ""))) return true;
-    const words = label.split(/[-_]+/).filter(Boolean);
-    return words.length > 0 && PLACEHOLDER_DOMAIN_LABELS.has(words[words.length - 1]!);
+    return label.split(/[-_]+/).filter(Boolean).some((w) => PLACEHOLDER_DOMAIN_LABELS.has(w));
   };
   return registrableDomain(bare).split(".").some(isPlaceholderLabel);
 }

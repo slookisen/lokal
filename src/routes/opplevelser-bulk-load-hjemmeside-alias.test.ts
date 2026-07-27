@@ -509,24 +509,58 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
   }
 
   // ── Finding 1 (dev-request 2026-07-27-384-placeholder-regel-etterslep) ──
-  // The round-7 word-split rejected a label if ANY hyphen/underscore-split word
-  // matched, at any position — hard-rejecting real-looking registered domains
-  // whose FIRST component is a status word used as a modifier. Narrowed to the
-  // LAST split word only (see the comment on isPlaceholderLabel for why LAST,
-  // not FIRST or "whole label only"). Measured: 0 of 335 real producer hosts
-  // affected either way, but a false reject has the same shape as #384's bug.
+  // The round-7 word-split rejects a label if ANY hyphen/underscore-split word
+  // matches, at any position — hard-rejecting real-looking registered domains
+  // whose FIRST component is a status word used as a modifier:
+  // `arbeid-helse.no`, `hjemmeside-design.no`, `null-utslipp.no`, `todo-as.no`.
+  //
+  // A "last split word only" narrowing was tried in an earlier commit on this
+  // PR specifically to accept those four (0 of 335 real producer hosts
+  // affected either way, by measurement). An INDEPENDENT fresh-context
+  // code-review of that commit rejected it: narrowing to "last word only"
+  // reintroduces a real, previously-nonexistent false-accept regression, wider
+  // than the false-reject it fixes. Any qualifier-first junk compound whose
+  // TRAILING word is not itself one of the ~14 PLACEHOLDER_DOMAIN_LABELS nouns
+  // now sails through even though the LEADING word is a dead giveaway —
+  // `ukjent-produsent.no`, `mangler-info.no`, `ingen-svar.no`,
+  // `snart-ferdig.no`, `eksempel-gaard.no`, `tbd-gaarden.no` all start with a
+  // genuine placeholder word (ukjent/mangler/ingen/snart/eksempel/tbd) and
+  // would have flipped from rejected to accepted. That surface is unbounded —
+  // any junk qualifier followed by any noun — while the four rescued domains
+  // are a closed, measured set. So "any position" is KEPT (isPlaceholderLabel
+  // unchanged from round 7), and this finding is closed via path (b) of the
+  // dev-request's acceptance criteria (measured justification for keeping the
+  // existing rule) rather than path (a) (narrowing it). Documented here in
+  // full, in the style of this file's other 7 review rounds, so nobody
+  // re-attempts the same "last word" narrowing blind in a future round —
+  // a future attempt should hit alias-30c below and go red immediately.
   {
-    for (const good of ["arbeid-helse.no", "hjemmeside-design.no", "null-utslipp.no", "todo-as.no"]) {
-      const solo = BulkRowSchema.parse({ ...base, hjemmeside: good });
-      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), good,
-        `alias-30/${good}: a real-looking domain whose FIRST hyphen component is a status word (used as a modifier) is now accepted — only the LAST component is checked`);
+    // The four domains that motivated the narrowing attempt remain rejected —
+    // this is the KEPT decision, not a regression: no known real producer uses
+    // this "status-word-as-modifier" shape, and re-litigating it costs nothing
+    // (verified: 0/335 real producer hosts hit this path either way).
+    for (const junk of ["arbeid-helse.no", "hjemmeside-design.no", "null-utslipp.no", "todo-as.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-30/${junk}: a real-looking domain whose FIRST hyphen component is a status word is still rejected — "any position" was kept over "last word only" (see isPlaceholderHomepageHost comment)`);
     }
-    // The narrowing must not cost any of the six known compounds: the status
-    // word sits LAST in every one of them, which "last word" still catches.
+    // The six known compounds stay rejected regardless of any/last/first —
+    // the status word sits LAST in every one, so this alone never
+    // distinguished the two rules; kept as a stability check.
     for (const junk of ["ingen-hjemmeside.no", "kommer-snart.no", "under-arbeid.no", "ikke-oppgitt.no", "ikke_oppgitt.no", "ingen_nettside.no"]) {
       const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
       assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
-        `alias-30b/${junk}: still rejected under "last word only" — the status word is the LAST component here too`);
+        `alias-30b/${junk}: still rejected under "any position" — the status word is the LAST component here too, so this fixture alone cannot distinguish the two rules`);
+    }
+    // The false-accept class "last word only" would have opened, closed here
+    // by name so a future re-narrowing goes red instead of shipping silently.
+    // Each starts with a genuine PLACEHOLDER_DOMAIN_LABELS word followed by a
+    // trailing word that is NOT separately listed — exactly the shape "last
+    // word only" misses and "any position" catches for free.
+    for (const junk of ["ukjent-produsent.no", "mangler-info.no", "ingen-svar.no", "snart-ferdig.no", "eksempel-gaard.no", "tbd-gaarden.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-30c/${junk}: rejected via "any position" (LEADING word is the placeholder) — a "last word only" rule would wrongly accept this, which is the regression path (a) narrowing was rejected for`);
     }
   }
 
