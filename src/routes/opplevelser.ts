@@ -31,6 +31,7 @@ import {
   getProviderContentTarget,
   getExperiencesForProvider,
   applyExperienceContent,
+  harvestProvenanceOf,
   markProviderEnriched,
   markProviderContentAttempted,
   // enrichment-metode slice 1 (2026-07-16): dead-homepage parking
@@ -1052,7 +1053,13 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
               duration_min: r.duration_min ?? null,
               price_from: r.price_from ?? null,
               booking_url: r.booking_url ?? null,
-            });
+              // This content came from the HARVEST ROW — i.e. the third-party
+              // listing page at r.evidence_url, not the provider's own site.
+              // Recording that is the whole point: without it the row is
+              // indistinguishable from homepage-extracted content, and the
+              // weekly spot-check judges it against the homepage and scores a
+              // mismatch that is not an error.
+            }, harvestProvenanceOf(r.evidence_url));
           }
           skipped++;
           continue;
@@ -1388,7 +1395,9 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     } else {
       for (const a of toApply) {
         try {
-          const fields = applyExperienceContent(a.id, candidateObj);
+          // fetched.fetchUrl is the page this content was extracted from — the
+          // same URL the per-field provenance above records as source_url.
+          const fields = applyExperienceContent(a.id, candidateObj, fetched.fetchUrl);
           for (const f of fields) writtenFields.add(f);
         } catch (e: any) {
           errors.push({ provider_id: providerId, error: `write_failed ${a.id}: ${e?.message ?? String(e)}` });
@@ -5723,19 +5732,79 @@ router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res:
 // Auth: requireAdmin (same X-Admin-Key convention as the rest of this file).
 // Returns: 200 { success, count, providers: [{ id, name, website,
 //   last_enriched_at, about_text, visit_text, opening_hours_text,
-//   products, content_source, content_evidence_url, field_provenance: null,
-//   provenance_model: "none" }] }
+//   products, content_source, content_evidence_url, enriched_experiences,
+//   field_provenance: null, provenance_model: "none" }] }
+//
+// `enriched_experiences` carries the provider's own enriched EXPERIENCES rows:
+// `{ id, title, description, category, subcategory, booking_url,
+// content_source, evidence_url, discovery_source, content_field_evidence,
+// updated_at }`, at most 10 per provider, ordered
+// `updated_at DESC` — a provider with more enriched rows than that IS
+// truncated, which matters to a consumer computing `checked`. Note the order is
+// LAST TOUCHED, not last enriched: the geocode worker, the title_no backfill
+// and the dedup pass all bump `updated_at` without writing content, so which 10
+// of >10 rows you get is not strictly "the 10 most recently enriched"
+// (round-4 review).
+//
+// Excluded, so that every row served is content the enrichment pass wrote from
+// the page the consumer is about to fetch:
+//   - `content_source` 'manual' or 'claim' — the two owner/claim-authored
+//     values the schema defines (`curator` is not one of them);
+//   - `verification_status = 'verified'` — note this is the EXPERIENCE-level
+//     column, not `enrichment_state`, whose 'verified' rung IS served;
+//   - rows the dedup pass merged away (`canonical_id IS NOT NULL`);
+//   - PER FIELD: a judged field (`description`/`category`/`booking_url`) whose
+//     recorded source in `content_field_evidence` is on a different registrable
+//     domain than the homepage is set to `null`, and the row is dropped only
+//     when nothing judgeable is left. This is per FIELD, not per row, because
+//     the writer fills only blank fields and a row's fields therefore come from
+//     different sources at different times. `content_source` cannot answer this
+//     at all — see the long comment at the filter.
+//
+// On the merged-away exclusion, one thing worth stating so a later reader does
+// not over-read it: "exists on no user-visible surface" is TRUE of every row
+// this endpoint serves, since PUBLISH_GATE_SQL requires
+// `verification_status = 'verified'` and this query requires the opposite —
+// the two sets are disjoint (round-4 review). The exclusion stands on the
+// lock-model grounds stated at the query, not on publishability.
+//
+// Provider-level keys, each ABSENT rather than false/0 when it does not apply:
+// `enriched_experiences_filtered` (rows dropped for provenance),
+// `enriched_experiences_fields_blanked` (individual fields nulled),
+// `enriched_experiences_window_exhausted` (more rows exist than the read window
+// and fewer than 10 survived), `homepage_is_aggregator` (the PROVIDER's own
+// registered homepage is a DMO page, which inverts the provenance comparison).
+//
+// On a query fault the provider carries `enriched_experiences_error: true`
+// alongside an empty list — score that as `skipped`, never as "nothing was
+// written". The key is ABSENT (not `false`) on success.
+// The provider-level content columns above are the gårdssalg writer's fields;
+// a provider enriched only by the generic content-refresh has all of those
+// null, which is why the spot-check needs both. See the inline comment at the
+// query below.
 router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, res: Response) => {
   try {
     const expDb = getExpDb("experiences");
 
     const DEFAULT_SINCE_DAYS = 7;
-    let since = new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    // Compared against `last_enriched_at`, which is only ever written as
+    // SQLite `datetime('now')` — "2026-07-20 23:59:59", a SPACE separator.
+    // A JS `.toISOString()` gives "2026-07-20T00:00:00.000Z", and SQLite
+    // string-compares the two: ' ' (0x20) < 'T' (0x54), so
+    //   '2026-07-20 23:59:59' >= '2026-07-20T00:00:00.000Z'  ->  0
+    // Every provider enriched on the boundary calendar day was excluded
+    // regardless of the time of day, making the effective window 6 days plus a
+    // fraction instead of 7 (round-4 review). Pre-existing, but it thins
+    // exactly the sample this endpoint change exists to enlarge, so it is
+    // fixed here rather than filed away. Emitting the same shape SQLite writes
+    // makes the comparison mean what it reads as.
+    const toSqliteDatetime = (d: Date): string => d.toISOString().slice(0, 19).replace("T", " ");
+    let since = toSqliteDatetime(new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000));
     const sinceParam = req.query.since;
     if (typeof sinceParam === "string" && sinceParam.trim()) {
       const parsed = new Date(sinceParam);
       if (!isNaN(parsed.getTime())) {
-        since = parsed.toISOString();
+        since = toSqliteDatetime(parsed);
       }
     }
 
@@ -5765,6 +5834,105 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         content_evidence_url: string | null;
       }>;
 
+    // enriched_experiences: the fields this vertical's MAIN enrichment pass
+    // actually writes (dev-request 2026-07-27-kvalitetsporter-uten-signal,
+    // slice C).
+    //
+    // Without this the weekly field-truth spot-check had nothing to look at.
+    // It reads the provider-level columns above (about_text / visit_text /
+    // opening_hours_text / products) — but those are the GÅRDSSALG writer's
+    // fields (applyProviderContent). The generic content-refresh that runs
+    // twice a day writes `description`/`category`/`booking_url` and friends
+    // onto the provider's EXPERIENCES rows (applyExperienceContent), and only
+    // stamps `last_enriched_at` on the provider.
+    //
+    // So a provider could be genuinely, correctly enriched and still come back
+    // from this endpoint with every checkable field null — which is exactly
+    // what the 2026-W30 spot-check reported: "experiences: checked=0 ...
+    // all 10 sampled providers have null content fields". The sample was real;
+    // the projection was looking in the wrong table.
+    // `IN ('enriched','verified')`, not `= 'enriched'`: init-experiences.ts
+    // documents the ladder as raw → matched → enriched → verified. Nothing
+    // writes 'verified' to `experiences` today, so this is a no-op now — but
+    // the day a verifier pass starts stamping it, an `= 'enriched'` filter
+    // would make those rows vanish from this projection and report `checked=0`
+    // silently. That is the very failure mode this endpoint change exists to
+    // remove; it should not be re-armed for a future state (independent review).
+    // Prepared once, outside the row loop — but guarded: if the statement
+    // itself cannot be prepared, the provider-level content is still worth
+    // serving, so degrade to the error flag rather than 500-ing the whole
+    // sample (round-2 review, nit).
+    // Bounded read: 50 providers x this window. Named so the value and the
+    // window-exhausted signal below cannot drift apart.
+    const EXP_ROW_WINDOW = 50;
+    let expRowsStmt: ReturnType<typeof expDb.prepare> | null = null;
+    try {
+      expRowsStmt = expDb.prepare(
+      `SELECT id, title, description, category, subcategory, booking_url,
+              content_source, evidence_url, discovery_source,
+              content_field_evidence, updated_at
+         FROM experiences
+        WHERE provider_id = ?
+          AND enrichment_state IN ('enriched', 'verified')
+          -- Merged-away rows must never surface (round-3 review, BLOCKING).
+          -- canonical_id IS NOT NULL means the dedup pass folded this row
+          -- into another one, and the convention — stated at
+          -- experience-store.ts:461-464 and enforced by PUBLISH_GATE_SQL
+          -- (:474), listCategories (:1392), the corridor pages
+          -- (route-corridor-service.ts:621) and the dedup candidate loader
+          -- (experience-dedup.ts:499) — is that such a row appears on NO
+          -- user-visible surface again. This projection was the only read of
+          -- experiences that omitted it.
+          --
+          -- Not cosmetic, and worse than a plain leak: runDedupPass() stamps
+          -- the loser rows with canonical_id AND bumps
+          -- updated_at = datetime('now') (experience-dedup.ts:562-563), so
+          -- under the ORDER BY updated_at DESC LIMIT 10 below the
+          -- freshly-merged-away duplicates sort ABOVE the live rows and can
+          -- fill the whole window. The spot-check would then judge rows that
+          -- no longer exist anywhere, against the provider's homepage.
+          AND canonical_id IS NULL
+          -- Lock guard: the same two-part clause as
+          -- experience-store.ts:1708-1709, which is the one genuine precedent
+          -- for it (round-3 review — round 2's comment also cited :2222/:2360/
+          -- :2859, but those are the content_source half ALONE and they
+          -- query experience_providers, guarding applyProviderContent, whose
+          -- lock model deliberately has no verification_status). The canonical
+          -- definition is isExperienceContentLocked (:1775-1782).
+          --
+          -- applyExperienceContent() provably REFUSES to write owner- or
+          -- claim-authored or already-verified rows, so serving them here
+          -- would hand the weekly spot-check content that never came from the
+          -- homepage it is about to judge against. That matters concretely:
+          -- §8.4 of the platform-verifier SKILL sets
+          -- controller/enrichment-write-pause.yaml → enabled: true at
+          -- error_rate > 0.10, so a couple of owner-written rows in a
+          -- 10-provider sample could pause enrichment writes for the whole
+          -- vertical over mismatches that are not errors at all.
+          --
+          -- NULL-guarded, unlike :1708 (round-3 review): SQL three-valued
+          -- logic makes NULL != 'verified' evaluate to NULL, which excludes
+          -- the row — while isExperienceContentLocked treats a NULL
+          -- verification_status as UNLOCKED, i.e. a row applyExperienceContent
+          -- would happily enrich. Hiding exactly those rows is the false
+          -- checked=0 this endpoint exists to remove. Latent today
+          -- (createExperience coalesces to 'pending_verify'), cheap forever.
+          AND (verification_status IS NULL OR verification_status != 'verified')
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+        ORDER BY updated_at DESC
+        -- Over-fetch, then filter, then slice to 10 in JS (round-5 review).
+        -- The provenance filter below cannot be expressed in SQL (it compares
+        -- registrable domains), and running it AFTER a LIMIT 10 meant a
+        -- provider with 10 fresh harvest-sourced rows and 5 good older ones
+        -- returned ZERO — a brand-new route to the checked=0 this endpoint
+        -- exists to remove. 50 is a bounded read (50 providers x 50 rows) and
+        -- the response is still capped at 10.
+        LIMIT ${EXP_ROW_WINDOW + 1}`
+      );
+    } catch (err) {
+      console.error("[opplevelser] providers/recently-enriched: could not prepare enriched_experiences query", err);
+    }
+
     const providers = rows.map((r) => {
       let products: unknown[] = [];
       if (r.products) {
@@ -5773,6 +5941,128 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           if (Array.isArray(parsed)) products = parsed;
         } catch { /* malformed → empty */ }
       }
+      let enrichedExperiences: unknown[] = [];
+      let enrichedExperiencesError = false;
+      let enrichedExperiencesFiltered = 0;
+      let enrichedExperiencesFieldsBlanked = 0;
+      let enrichedExperiencesWindowExhausted = false;
+      let homepageIsAggregator = false;
+      try {
+        const raw = expRowsStmt
+          ? (expRowsStmt.all(r.id) as Array<Record<string, unknown>>)
+          : [];
+        // PER-FIELD provenance screen (round-6 review, BLOCKING).
+        //
+        // Round 4 established the harm: applyExperienceContent stamps
+        // `content_source = 'provider_site'` unconditionally, so aggregator text
+        // reaches the spot-check labelled as homepage content, scores a false
+        // `mismatch`, and trips §8.4's write-pause.
+        //
+        // Round 5 showed my filter used `evidence_url`, which is DISCOVERY
+        // provenance. Round 6 showed the replacement — one `content_evidence_url`
+        // per ROW — was wrong too: applyExperienceContent writes only BLANK
+        // fields, so one row's fields come from different sources at different
+        // times and a row-level column records only the last writer. It
+        // mislabelled in both directions, reopening both earlier harms.
+        //
+        // The consumer judges PER FIELD, so screen per field. A judged field
+        // whose recorded source is on a different registrable domain than the
+        // provider's homepage is blanked, and a row left with no judged field is
+        // dropped entirely — there is nothing left to check on it.
+        //
+        // Unknown provenance (no map entry, or a row written before the column
+        // existed) is KEPT, which is the pre-change behavior: never invent an
+        // exclusion from missing data.
+        const JUDGED_FIELDS = ["description", "category", "booking_url"] as const;
+        const homepageHost = r.hjemmeside ? hostFromUrlLike(r.hjemmeside) : null;
+        const homepageDomain = homepageHost ? registrableDomain(homepageHost) : null;
+
+        let fieldsBlanked = 0;
+        const kept: Array<Record<string, unknown>> = [];
+        for (const row of raw) {
+          let evidence: Record<string, string> = {};
+          const rawMap = row.content_field_evidence;
+          if (typeof rawMap === "string" && rawMap) {
+            try {
+              const parsed = JSON.parse(rawMap);
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                evidence = parsed as Record<string, string>;
+              }
+            } catch { /* malformed -> treat as unknown, i.e. keep */ }
+          }
+          const out: Record<string, unknown> = { ...row };
+          // The map is an INPUT to this screen, not part of its output. Serving
+          // it leaked a raw JSON string into the response — a second, differently
+          // shaped copy of a decision the blanking already encodes, which the
+          // consumer would have to parse to use and could then disagree with
+          // (round-8 review, MINOR 3).
+          delete out.content_field_evidence;
+          let judgeable = 0;
+          for (const field of JUDGED_FIELDS) {
+            if (out[field] === null || out[field] === undefined || out[field] === "") continue;
+            const src = evidence[field];
+            if (!src || !homepageDomain) { judgeable++; continue; }   // unknown -> keep
+            const srcHost = hostFromUrlLike(src);
+            // A source that does not parse to a host is NOT the homepage
+            // (round-7 review, M4). It used to be kept as "unknown", which made
+            // the harvest sentinel — and any malformed entry — read as
+            // judgeable homepage content. Absence of an entry still means
+            // unknown; a PRESENT entry we cannot match is a mismatch.
+            if (srcHost && registrableDomain(srcHost) === homepageDomain) { judgeable++; continue; }
+            out[field] = null;      // written from somewhere else — not checkable here
+            fieldsBlanked++;
+          }
+          if (judgeable > 0) kept.push(out);
+        }
+        enrichedExperiencesFiltered = Math.min(raw.length, EXP_ROW_WINDOW) - Math.min(kept.length, EXP_ROW_WINDOW);
+        enrichedExperiencesFieldsBlanked = fieldsBlanked;
+        enrichedExperiences = kept.slice(0, 10);
+        // Rows the 50-row window could not reach. Without this a provider with
+        // more than 50 rows can still come back short or empty with no way for
+        // the consumer to tell that from "enrichment wrote nothing" — the old
+        // LIMIT-10 cliff moved outward rather than removed (round-6 review).
+        // Read one MORE than the window, so this is "there really are more rows"
+        // and not merely "the window happened to fill" (round-7 review, M5).
+        // The distinction is expensive: A2A §8.3 tells the cron to score the
+        // whole provider `skipped` on this flag, so a provider with exactly 50
+        // rows and 9 good ones would have thrown away nine judgeable rows — and
+        // `checked < 5 -> insufficient_sample` means that can manufacture the
+        // very `checked=0` this change exists to remove.
+        if (raw.length > EXP_ROW_WINDOW && kept.length < 10) {
+          enrichedExperiencesWindowExhausted = true;
+        }
+        // A provider whose OWN hjemmeside is an aggregator inverts the screen:
+        // every source domain matches it, so aggregator text is judged against
+        // the aggregator page it came from and scores `ok`, INFLATING the signal
+        // rather than measuring it. The consumer cannot see that from the rows.
+        if (homepageHost && isDirectoryOrAggregatorHost(homepageHost)) {
+          homepageIsAggregator = true;
+        }
+        if (!expRowsStmt) enrichedExperiencesError = true;
+      } catch (err) {
+        enrichedExperiencesError = true;
+        // NOT the zero-rows case — `.all()` returns [] for that and never
+        // throws (an earlier version of this comment claimed otherwise;
+        // independent review corrected it). Reaching here means a real query
+        // fault, e.g. SQLITE_BUSY under the `journal_mode = DELETE` fallback
+        // while a content-refresh writes. That must be LOUD: silently
+        // returning [] makes the weekly spot-check read "enrichment wrote
+        // nothing" — reintroducing the exact false `checked=0` signal this
+        // projection exists to eliminate.
+        console.error(
+          `[opplevelser] providers/recently-enriched: enriched_experiences query failed for provider ${r.id}`,
+          err,
+        );
+      }
+      // The console.error alone was not enough (round-2 review, blocking): the
+      // only consumer is a cron routine doing `curl -fsS` (platform-verifier
+      // §8.2) which never sees server logs, so a query fault still reached it
+      // as a clean 200 with an empty list — i.e. exactly the false "enrichment
+      // wrote nothing" reading this projection exists to eliminate. The flag
+      // below is the consumer-visible half: the spot-check can score the
+      // provider as `skipped` instead of counting a phantom `checked=0`.
+      // Failing the whole request would be worse — one bad provider would
+      // destroy an otherwise usable 10-provider sample.
       return {
         id: r.id,
         name: r.navn,
@@ -5784,6 +6074,22 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         products,
         content_source: r.content_source,
         content_evidence_url: r.content_evidence_url,
+        enriched_experiences: enrichedExperiences,
+        ...(enrichedExperiencesError ? { enriched_experiences_error: true } : {}),
+        // Round-5 review: an empty list caused by the provenance filter was
+        // indistinguishable from "enrichment wrote nothing" — the same argument
+        // that made a bare console.error unacceptable in round 2, applied to the
+        // filter path this time. Emitted only when it actually happened.
+        ...(enrichedExperiencesFiltered > 0
+          ? { enriched_experiences_filtered: enrichedExperiencesFiltered }
+          : {}),
+        ...(enrichedExperiencesFieldsBlanked > 0
+          ? { enriched_experiences_fields_blanked: enrichedExperiencesFieldsBlanked }
+          : {}),
+        ...(enrichedExperiencesWindowExhausted
+          ? { enriched_experiences_window_exhausted: true }
+          : {}),
+        ...(homepageIsAggregator ? { homepage_is_aggregator: true } : {}),
         field_provenance: null,
         provenance_model: "none",
       };

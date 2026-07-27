@@ -3816,7 +3816,7 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
 // point is a spot-check, not the same agents every run.
 //
 // Auth: X-Admin-Key (same pattern as /admin/agents/dump above).
-// Returns: 200 { success, count, agents: [{ id, name, website,
+// Returns: 200 { success, count, agents: [{ id, name, website, location_city,
 //   last_enriched_at, field_provenance }] }
 router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
@@ -3845,6 +3845,7 @@ router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
 
     const rows = db.prepare(`
       SELECT a.id as id, a.name as name, a.url as website,
+             a.city as location_city,
              k.last_enriched_at as last_enriched_at, k.field_provenance as field_provenance
       FROM agents a
       JOIN agent_knowledge k ON k.agent_id = a.id
@@ -3867,6 +3868,15 @@ router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
         id: r.id,
         name: r.name,
         website: r.website,
+        // location_city: additive (dev-request 2026-07-27-kvalitetsporter-
+        // uten-signal, slice A). The v3-b0 quality harness needs a city to
+        // gate its Brreg match ("is this Brreg hit really THIS producer?").
+        // It used to get one from the outreach-pool rows it sampled — but
+        // that pool has been stuck at 2 agents for three weeks, which is
+        // exactly why the harness could only ever compute wrong_contact_rate
+        // over n=2. Moving its sample here removes the starvation; carrying
+        // the city along keeps the match gate as strict as it was.
+        location_city: r.location_city ?? null,
         last_enriched_at: r.last_enriched_at,
         field_provenance: fieldProvenance,
       };

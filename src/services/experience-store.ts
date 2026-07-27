@@ -1489,7 +1489,13 @@ export function bulkInsertExperiences(
               duration_min: row.duration_min ?? null,
               price_from: row.price_from ?? null,
               booking_url: row.booking_url ?? null,
-            });
+            // Harvest-row content: its provenance is the third-party listing at
+            // row.evidence_url, never the provider's homepage (round-5 review).
+            // When the row carries no evidence_url, `null` would have meant
+            // "unknown", which the endpoint keeps and serves as judgeable —
+            // re-opening the round-4 leak for exactly those rows. We DO know
+            // this is harvest-sourced, so say so (round-7 review, M4).
+            }, harvestProvenanceOf(row.evidence_url));
             updated++;
           } else {
             skipped++;
@@ -1793,6 +1799,35 @@ export function isExperienceContentLocked(row: {
  * attributes: subcategory, activity_tags, season, indoor_outdoor, duration_min,
  * price_from, booking_url — all written only to EMPTY + UNLOCKED experiences.
  */
+/** Recorded as a field's source when content comes from a harvest row that
+ *  carries no `evidence_url`. Deliberately not a URL: it must not resolve to
+ *  the provider's homepage, so the projection blanks the field rather than
+ *  serving harvest text as homepage-sourced. */
+export const HARVEST_PROVENANCE_SENTINEL = "harvest:no-evidence-url";
+
+/** Recorded when a caller passes a source URL that is present but BLANK. A
+ *  caller handing us a string is claiming to know where the content came from;
+ *  if the string is empty the claim is empty too, and treating that as "no
+ *  provenance at all" silently skipped the stamp — after which the projection
+ *  reads the field as unknown-therefore-keep and serves it as homepage-sourced.
+ *  Failing closed to a non-URL sentinel blanks it instead. An explicit `null`
+ *  stays different: it says the caller has no provenance concept, not that it
+ *  had one and lost it. (Independent review round 8, BLOCKING — reached via
+ *  `evidence_url: z.string().optional().nullable()`, where "" validates, so
+ *  `?? SENTINEL` fell through and "" arrived here.) */
+export const BLANK_PROVENANCE_SENTINEL = "unknown:blank-source-url";
+
+/** The provenance value for content lifted from a harvest ROW. Both harvest
+ *  call sites go through this rather than repeating the expression, so the
+ *  `?.trim() ||` cannot be right in one place and `??` in the other — which is
+ *  how it stood when review found it. Only one of the two call sites is
+ *  reachable from a test without a Brreg-mocking route harness, so making them
+ *  share one function is what lets the tested one stand for both; a reviewer
+ *  checks the untested site by confirming it calls this, one readable line. */
+export function harvestProvenanceOf(evidenceUrl: string | null | undefined): string {
+  return evidenceUrl?.trim() || HARVEST_PROVENANCE_SENTINEL;
+}
+
 export function applyExperienceContent(
   experienceId: string,
   candidate: {
@@ -1805,14 +1840,36 @@ export function applyExperienceContent(
     duration_min?: number | null;
     price_from?: number | null;
     booking_url?: string | null;
-  }
+  },
+  // Where this CONTENT came from — the URL actually fetched and extracted from.
+  // Round-5 review of dev-request 2026-07-27-kvalitetsporter-uten-signal: this
+  // writer stamps `content_source = 'provider_site'` unconditionally, but its
+  // three callers are not equivalent. The twice-daily content-refresh really did
+  // fetch the provider's homepage; the two bulk-load paths hand it a THIRD-PARTY
+  // HARVEST ROW on a re-harvest that scored richer. Both used to end up labelled
+  // 'provider_site' with nothing in the row to tell them apart, so a spot-check
+  // that judges the text against the provider's homepage scores a false
+  // `mismatch` on the harvest-written ones — and §8.4 pauses enrichment writes
+  // for the whole vertical above a 10% error rate.
+  //
+  // `experiences.evidence_url` cannot answer this: it is DISCOVERY provenance,
+  // written once at createExperience() and never updated. Mirrors
+  // experience_providers.content_evidence_url, stamped by applyProviderContent.
+  // Optional: omitting it leaves the column untouched (NULL = unknown, never
+  // treated as a mismatch), so no caller is forced to lie.
+  // REQUIRED, not optional (round-6 review). As an optional parameter every
+  // one of the three call sites could drop its argument with the whole suite
+  // green: NULL means "unknown", unknown means "served", and the aggregator
+  // leak reopens silently. Making it required turns three untested guards into
+  // compile errors. Pass null explicitly when there genuinely is no source.
+  sourceUrl: string | null
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
       `SELECT id, description, category, subcategory, activity_tags, season,
               indoor_outdoor, duration_min, price_from, booking_url,
-              content_source, verification_status
+              content_source, content_field_evidence, verification_status
          FROM experiences WHERE id = ?`
     )
     .get(experienceId) as ExperienceContentRow | undefined;
@@ -1879,6 +1936,65 @@ export function applyExperienceContent(
 
   sets.push("content_source = 'provider_site'");
   sets.push("enrichment_state = 'enriched'");
+
+  // PER-FIELD provenance, not one URL for the row (round-6 review, BLOCKING).
+  //
+  // The round-5 version stamped a single `content_evidence_url` for the whole
+  // row on every write. But this function writes only fields that are currently
+  // BLANK, so one row's fields are routinely filled by different sources at
+  // different times — and a row-level column records only the most recent one.
+  // That mislabels in both directions, reopening the exact harms rounds 4 and 5
+  // were about:
+  //
+  //   harvest writes description (aggregator), then a homepage refresh writes
+  //   `season` -> the whole row now reads as homepage-sourced, so the
+  //   aggregator description is judged against the homepage and scores a false
+  //   `mismatch`, which trips the §8.4 write-pause;
+  //
+  //   homepage writes description, then a re-harvest writes `booking_url`
+  //   -> the row now reads as aggregator-sourced and is dropped, though its
+  //   description really is homepage content: a fresh route to `checked=0`.
+  //
+  // Both orderings are ordinary production sequences. And the consumer judges
+  // PER FIELD (description / category / booking_url, platform-verifier §8.3),
+  // so a single row-level value cannot answer the question being asked.
+  //
+  // The `isBlank` gate above is what makes a per-field map cheap AND stable: a
+  // field only appears in `written` when it was blank and is being filled now,
+  // so recording this call's source for exactly those keys is always correct.
+  // MERGE into any existing map rather than replacing it — that is the whole
+  // point; replacing is what the row-level column did.
+  //
+  // Deliberately no "never overwrite an existing key" guard. I wrote one, and
+  // mutation testing showed it both unreachable (a field in `written` was blank,
+  // so a stale key for it means the value was cleared out-of-band) and wrong in
+  // the one case that can reach it: a re-filled field genuinely came from the
+  // new source. A guard that cannot be falsified and would be incorrect if it
+  // could is worse than no guard.
+  // Normalize at the boundary rather than trusting each call site to do it.
+  // Two of them used `?? SENTINEL`, which only falls through on null/undefined,
+  // so a blank `evidence_url` reached this line and skipped the stamp entirely.
+  // Fixing the call sites fixes those two; normalizing here closes the class.
+  const stampUrl =
+    typeof sourceUrl === "string" ? sourceUrl.trim() || BLANK_PROVENANCE_SENTINEL : null;
+  if (stampUrl && written.length > 0) {
+    let evidence: Record<string, string> = {};
+    const priorRaw = (row as { content_field_evidence?: string | null }).content_field_evidence;
+    if (priorRaw) {
+      try {
+        const parsed = JSON.parse(priorRaw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          evidence = parsed as Record<string, string>;
+        }
+      } catch { /* malformed -> start fresh rather than throw on a content write */ }
+    }
+    for (const field of written) {
+      evidence[field] = stampUrl;
+    }
+    sets.push("content_field_evidence = @content_field_evidence");
+    params.content_field_evidence = JSON.stringify(evidence);
+  }
+
   sets.push("updated_at = datetime('now')");
 
   db.prepare(`UPDATE experiences SET ${sets.join(", ")} WHERE id = @id`).run(params);

@@ -359,6 +359,53 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Content provenance for experiences rows (dev-request 2026-07-27-
+  // kvalitetsporter-uten-signal, round-5 review) ────────────────────────────
+  // `experiences.evidence_url` is DISCOVERY provenance: it records the page the
+  // harvester found the listing on, is written once at createExperience(), and
+  // is never touched again. applyExperienceContent() — the writer that fills
+  // description/category/booking_url — stamps `content_source = 'provider_site'`
+  // unconditionally and writes no URL at all, so nothing in the row says where
+  // the CONTENT came from.
+  //
+  // That gap is not theoretical. applyExperienceContent has three callers: the
+  // twice-daily content-refresh, which fetched the provider's homepage, and two
+  // bulk-load paths that hand it a THIRD-PARTY HARVEST ROW on a re-harvest that
+  // scored richer. Both end up labelled 'provider_site'. A weekly spot-check
+  // that fetches the homepage and judges the text against it therefore scores a
+  // false `mismatch` on the harvest-written rows — and §8.4 of the
+  // platform-verifier SKILL pauses enrichment writes for the whole vertical
+  // above a 10% error rate.
+  //
+  // An earlier attempt to infer this from `evidence_url` was wrong in BOTH
+  // directions and was caught in review: it hid homepage-refreshed rows that
+  // still carried their original aggregator discovery URL (a fresh route to the
+  // `checked=0` this dev-request exists to remove), while still admitting the
+  // re-harvest case it was written for, whose evidence_url is untouched.
+  //
+  // `experience_providers` already solved this exact problem with
+  // `content_evidence_url`, stamped by applyProviderContent(). This mirrors it
+  // for experiences rather than inventing a second convention. NULL means
+  // "written before this column existed" — treated as unknown, never as a
+  // mismatch.
+  // PER-FIELD, not one URL for the row: applyExperienceContent only fills BLANK
+  // fields, so a row's fields come from different sources at different times and
+  // a single column records only the last writer (round-6 review). The consumer
+  // judges per field, so the map is what the question actually needs.
+  // JSON object: { "<field>": "<url the value was extracted from>" }.
+  // Only the per-field map. A row-level `content_evidence_url` was added here
+  // during round 5 and superseded by the map in round 6; keeping the ALTER left
+  // a column nothing writes, projected on every row as a permanent `null`
+  // BESIDE a meaningful same-named key on the provider object — two identical
+  // names at two levels, one always null, in a response an LLM reads
+  // (round-7 review). Dropped rather than left as decoration.
+  const experienceContentProvenanceCols = [
+    "ALTER TABLE experiences ADD COLUMN content_field_evidence TEXT",
+  ];
+  for (const stmt of experienceContentProvenanceCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ─── Dedup / canonical-merge columns (dev-request 2026-07-04-opplevagent-
   // dedup-og-norske-titler, item 1, 2026-07-10) ─────────────────────────────
   // Same real-world experience was harvested from multiple sources into
