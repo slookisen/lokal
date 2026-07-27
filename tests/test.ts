@@ -514,6 +514,26 @@ console.log("\n── orch-pr-10: search-enrich pure decision logic ──");
   console.log(`  search-enrich: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-27-harvest-hjemmeside-feltnavn-tapes: the harvest
+// SKILL sends `hjemmeside`, BulkRowSchema only accepted `website`, and
+// z.object() strips unknown keys silently — so every harvested homepage was
+// discarded at the door and the provider could never be content-enriched.
+runSerial(() => {
+  console.log("\n── bulk-load: hjemmeside/website alias ──");
+  try {
+    const { runBulkLoadHjemmesideAliasTests } = require("../src/routes/opplevelser-bulk-load-hjemmeside-alias.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-hjemmeside-alias.test");
+    const r = runBulkLoadHjemmesideAliasTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-hjemmeside-alias: " + f);
+    console.log(`  bulk-load-hjemmeside-alias: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-hjemmeside-alias: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07: experience filter tags (derived, additive-only) ──
 // Daniel confirmed "tags/filters only, no new categories" for experiences.
 // Pins deriveExperienceTags() (services/experience-tags.ts) against the
