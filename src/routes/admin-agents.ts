@@ -1205,6 +1205,24 @@ router.post("/brreg-description-fallback", async (req: Request, res: Response) =
 const AGENTS_ORGNR_BACKFILL_DEFAULT_LIMIT = 25;
 const AGENTS_ORGNR_BACKFILL_MAX_LIMIT = 100;
 
+// ─── injectable fetch seam for this route's own Brreg calls ────────────
+// findOrgnumberByName/verifyOrgNumber (brreg-client.ts) already accept an
+// explicit fetchImpl parameter (defaulting to the real global `fetch`), but
+// this route was calling them with no third argument — meaning the ONLY way
+// to stub Brreg I/O for this route in a test was reassigning
+// `globalThis.fetch` itself, which is exactly the anti-pattern already fixed
+// once for tests/test.ts's pr-56/pr-76 blocks (commit 8152553,
+// "testsuite-determinism-3"): a global monkey-patch installed by one test
+// block can silently poison a real fetch() call made by a DIFFERENT,
+// concurrently-running block. Mirrors geocoding-service.ts's
+// `__setGeocodingFetchForTesting` seam exactly — production code never
+// calls the setter, so behavior is unchanged outside tests.
+let agentsOrgNrBackfillFetchImpl: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
+
+export function __setAgentsOrgNrBackfillFetchForTesting(impl?: typeof fetch): void {
+  agentsOrgNrBackfillFetchImpl = impl || ((...args: Parameters<typeof fetch>) => fetch(...args));
+}
+
 // Marker written into agents_org_nr_audit.source_url by a (future) rollback
 // endpoint — mirrors GARDSSALG_ROLLBACK_MARKER (experience-store.ts). No
 // endpoint writes this yet in this slice (see the init.ts migration's doc
@@ -1568,12 +1586,33 @@ router.post("/org-nr-backfill", async (req: Request, res: Response) => {
       let sourceType: string;
       try {
         const localHit = findLocalOrgnrCandidate(searchName, t.postal_code);
-        if (localHit) {
+        if (localHit && localHit.confidence >= 1.0) {
+          // A local hit already at the rubric's max tier can never be beaten
+          // by a live Brreg name-search (same rubric, same 1.0 ceiling) — so
+          // calling Brreg too would be pure network waste. "Cheaper source
+          // first" per this file's own header comment.
           hit = localHit;
           sourceType = `local_json_${localHit.local_source}`;
         } else {
-          hit = await findOrgnumberByName(searchName, t.postal_code);
-          sourceType = "brreg_name_search";
+          // Local hit is either absent or below the max tier — it must not
+          // unconditionally shadow a possibly-better live Brreg match (a
+          // sub-1.0 local hit can never itself cause an unsafe auto-write,
+          // since agentOrgNrAutoWriteEligible below still requires
+          // confidence === 1.0, but it CAN wrongly suppress a genuine Brreg
+          // exact match and put a weaker candidate in front of a human
+          // reviewer). Take whichever of the two scores higher; a tie keeps
+          // the free local hit.
+          const brregHit = await findOrgnumberByName(searchName, t.postal_code, agentsOrgNrBackfillFetchImpl);
+          if (brregHit && (!localHit || brregHit.confidence > localHit.confidence)) {
+            hit = brregHit;
+            sourceType = "brreg_name_search";
+          } else if (localHit) {
+            hit = localHit;
+            sourceType = `local_json_${localHit.local_source}`;
+          } else {
+            hit = null;
+            sourceType = "brreg_name_search";
+          }
         }
       } catch (e: any) {
         errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
@@ -1619,7 +1658,7 @@ router.post("/org-nr-backfill", async (req: Request, res: Response) => {
         // file is a 2026-05-14 snapshot; a business it names may have gone
         // bankrupt/deregistered since).
         try {
-          const ver = await verifyOrgNumber(hit.orgnumber);
+          const ver = await verifyOrgNumber(hit.orgnumber, agentsOrgNrBackfillFetchImpl);
           if (!ver.exists || !ver.active) vetoReason = "brreg_not_active";
         } catch {
           vetoReason = "brreg_verify_failed";

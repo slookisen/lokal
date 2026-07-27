@@ -58,12 +58,32 @@ const DATA_FILE = path.join(__dirname, "..", "data", "local-orgnr-candidates.jso
 
 let cache: LocalOrgnrCandidateRecord[] | null = null;
 
+// Defence-in-depth against a future re-vendor reintroducing the same class
+// of bug this file's org_nr normalization once fixed: 699/4408 rows in the
+// 2026-07-27 vendored extract carried a spaced org_nr (e.g. "920 846 432"
+// instead of "920846432") straight from the Lokalmat/Debio source data.
+// Left unnormalized, such a record could pass name+postal corroboration but
+// fail the live Brreg liveness check (Brreg 404s on a space-containing URL),
+// landing a permanently-stuck review-queue entry: the review-approve route
+// strips whitespace from a human's SUBMITTED org_nr before comparing it, but
+// would be comparing against an unstripped candidate_orgnr, so no input a
+// human types could ever match. Stripping every non-digit character here
+// (not just whitespace) means the vendored file's own orgnr values never
+// need to be perfectly clean for correct behavior — this is the load-time
+// backstop, in addition to the vendored file itself being normalized.
+function normalizeOrgnr(raw: string): string {
+  return raw.replace(/\D/g, "");
+}
+
 function loadRecords(): LocalOrgnrCandidateRecord[] {
   if (cache) return cache;
   try {
     const raw = fs.readFileSync(DATA_FILE, "utf-8");
     const parsed = JSON.parse(raw);
-    cache = Array.isArray(parsed?.candidates) ? (parsed.candidates as LocalOrgnrCandidateRecord[]) : [];
+    const rawRecords = Array.isArray(parsed?.candidates) ? (parsed.candidates as LocalOrgnrCandidateRecord[]) : [];
+    cache = rawRecords.map((r) =>
+      r && typeof r.orgnr === "string" ? { ...r, orgnr: normalizeOrgnr(r.orgnr) } : r,
+    );
   } catch (err) {
     // Fail-safe, mirrors every brreg-client.ts fetch function's convention:
     // a missing/corrupt vendored file must never crash the backfill route —
@@ -118,12 +138,19 @@ export function findLocalOrgnrCandidate(name: string, postalCode?: string | null
 
   for (const r of records) {
     if (!r || typeof r.orgnr !== "string" || typeof r.name !== "string") continue;
+    // Normalize again here (in addition to loadRecords' own normalization)
+    // so a record injected straight into the cache via
+    // __setLocalOrgnrCandidatesForTesting (bypassing loadRecords entirely)
+    // can never carry an un-normalized orgnr into a hit either — same
+    // digits-only rule, applied at every point this file reads r.orgnr.
+    const orgnr = normalizeOrgnr(r.orgnr);
+    if (!orgnr) continue;
     const score = scoreNameMatch(cleanName, r.name, postalCode ?? null, r.postal_code ?? null);
     if (score <= 0) continue;
-    if (score === 1.0) exactOrgnrs.add(r.orgnr);
+    if (score === 1.0) exactOrgnrs.add(orgnr);
     if (!best || score > best.confidence) {
       best = {
-        orgnumber: r.orgnr,
+        orgnumber: orgnr,
         name: r.name,
         confidence: score,
         brreg_postal: r.postal_code,

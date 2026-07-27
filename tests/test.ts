@@ -34408,6 +34408,8 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-billing: unexpected error: " + String(err?.message || err));
+  }
+});
 
 // dev-request 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr, Steg 2:
 // POST /admin/agents/org-nr-backfill + GET /admin/agents/org-nr-review-queue

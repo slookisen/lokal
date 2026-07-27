@@ -73,8 +73,17 @@
  *   (t) route: errors[] populated (write_failed: prefix) on a write failure,
  *       200 status (never a 500).
  *
- * All Brreg I/O is stubbed via a monkey-patched global.fetch (mirrors
- * admin-agents-brreg-catalog-sweep.test.ts exactly). The local-JSON
+ * All Brreg I/O is stubbed via admin-agents.ts's own injectable fetch seam
+ * (__setAgentsOrgNrBackfillFetchForTesting) — deliberately NOT a
+ * monkey-patched `globalThis.fetch` (admin-agents-brreg-catalog-sweep.test.ts
+ * and admin-agents-brreg-description-fallback.test.ts do that, but both of
+ * those are chained onto strictly-sequential singleton-swap promises; this
+ * suite runs via runSerial(), which does NOT prevent OTHER, non-runSerial
+ * blocks — e.g. tests/test.ts's gardssalg-content-refresh IIFE — from running
+ * concurrently with it. A global fetch reassignment here would poison any
+ * real fetch() call such a concurrent block makes for the duration of this
+ * suite; see commit 8152553, "testsuite-determinism-3", which fixed the same
+ * anti-pattern for tests/test.ts's pr-56/pr-76 blocks). The local-JSON
  * candidate file is swapped for a small deterministic in-memory fixture set
  * via __setLocalOrgnrCandidatesForTesting, so this suite never depends on
  * (or is broken by future edits to) the real ~4.4k-row vendored file.
@@ -173,7 +182,7 @@ export async function runAdminAgentsOrgNrBackfillTests(opts: { log?: boolean } =
   })();
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
-  const prevFetch = globalThis.fetch;
+  let resetOrgNrBackfillFetch: (() => void) | undefined;
 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -216,7 +225,6 @@ export async function runAdminAgentsOrgNrBackfillTests(opts: { log?: boolean } =
     __initSchemaForTesting(testDb as any);
     process.env.ADMIN_KEY = ADMIN_KEY;
     delete process.env.ANALYTICS_ADMIN_KEY;
-    globalThis.fetch = stubFetch();
 
     // Fresh require of admin-agents.ts + its brreg-client/local-orgnr-
     // candidates dependency graph, mirroring the sibling brreg-* suites'
@@ -236,14 +244,32 @@ export async function runAdminAgentsOrgNrBackfillTests(opts: { log?: boolean } =
       agentOrgNrAutoWriteEligible,
       applyAgentOrgNr,
       agentOrgNrWasRolledBack,
+      __setAgentsOrgNrBackfillFetchForTesting,
     } = adminAgentsModule;
+
+    // Injectable seam (admin-agents.ts), NOT globalThis.fetch — see the file
+    // header doc comment for why a global monkey-patch is unsafe here.
+    __setAgentsOrgNrBackfillFetchForTesting(stubFetch());
+    resetOrgNrBackfillFetch = () => __setAgentsOrgNrBackfillFetchForTesting(undefined);
 
     const localCandidates = require("../services/local-orgnr-candidates") as typeof import("../services/local-orgnr-candidates");
     // Deterministic fixture set — the suite must never depend on (or be
     // broken by future edits to) the real ~4.4k-row vendored file.
+    //
+    // "980 000 004"/"980 000 007" and the "980 000 004"-duplicate below use a
+    // spaced org_nr on purpose (the real vendored file had 699/4408 rows
+    // formatted like "920 846 432" instead of "920846432") — regression
+    // coverage for the space-normalization fix: a spaced orgnr must (a) still
+    // be approvable via the review-queue path once a human types the clean
+    // digits, and (b) never double-count as an ambiguous exact_tie against
+    // its own unspaced duplicate.
     localCandidates.__setLocalOrgnrCandidatesForTesting([
       { orgnr: "980000001", name: "Lokal Fixture Gård AS", postal_code: "1450", city: "Nesoddtangen", source: "lokalmat" },
       { orgnr: "980000002", name: "Debio Fixture Meieri AS", postal_code: "2000", city: "Lillestrøm", source: "debio" },
+      { orgnr: "980 000 004", name: "Spaced Review Bakeri AS", postal_code: "4000", city: "Bergen", source: "debio" },
+      { orgnr: "980 000 007", name: "Spaced Dedup Fisk AS", postal_code: "7000", city: "Bodø", source: "lokalmat" },
+      { orgnr: "980000007", name: "Spaced Dedup Fisk AS", postal_code: "7000", city: "Bodø", source: "debio" },
+      { orgnr: "980000006", name: "Weak First Token Fiskeri AS", postal_code: "6000", city: "Tromsø", source: "lokalmat" },
     ]);
 
     function getHandler(method: "get" | "post", path: string) {
@@ -643,6 +669,74 @@ export async function runAdminAgentsOrgNrBackfillTests(opts: { log?: boolean } =
       assertTrue(!readQueueRow("route-review"), "s10: queue entry cleared after a confirmed approve-write");
     }
 
+    // ── (u) spaced-orgnr local hit lands in the review queue with a CLEAN
+    // (digits-only) candidate_orgnr, and a human can approve it by typing
+    // the clean number — regression coverage for the vendored-data space
+    // bug (699/4408 real rows were formatted like "920 846 432"). No postal/
+    // city corroboration on the agent side, so this is NOT auto-write
+    // eligible even at confidence 1.0 -> must land in the review queue.
+    insertAgent({ id: "route-spaced-review", name: "Spaced Review Bakeri AS", createdAt: "2026-02-01 00:00:00" });
+    {
+      const res = await callBackfill({ agentIds: ["route-spaced-review"], apply: true });
+      assertTrue(
+        res.body.unresolved.some((u: any) => u.agent_id === "route-spaced-review" && u.reason === "needs_human_review"),
+        "u1: spaced local hit with no corroboration -> needs_human_review, not auto-written",
+      );
+      const qRow = readQueueRow("route-spaced-review");
+      assertTrue(!!qRow, "u2: upserted into the review queue");
+      assertEq(qRow.candidate_orgnr, "980000004", "u3: queued candidate_orgnr is digits-only, spaces stripped");
+
+      // A human typing the clean, spaceless org_nr must be able to approve
+      // it — before the fix, the queue stored the RAW spaced value, and the
+      // approve route's own whitespace-stripped comparison against an
+      // unstripped candidate_orgnr could never match, permanently stranding
+      // the entry as mismatch_with_queued_candidate.
+      const approveRes = await callApprove(
+        { approvals: [{ agent_id: "route-spaced-review", org_nr: "980000004" }], apply: true },
+      );
+      assertEq(approveRes.body.approved_count, 1, "u4: clean digits-only org_nr approves successfully");
+      assertEq(readAgent("route-spaced-review").org_nr, "980000004", "u5: org_nr actually written, no spaces");
+      assertTrue(!readQueueRow("route-spaced-review"), "u6: queue entry cleared after approval");
+    }
+
+    // ── (v) a business vendored TWICE — once spaced, once not — must not
+    // double-count as an ambiguous exact_tie against itself. Both fixture
+    // rows share postal_code "7000"/city "Bodø", so the agent's postal_code
+    // corroborates and this candidate IS auto-write eligible; if exact_ties
+    // were (wrongly) 2, this would instead be vetoed as
+    // ambiguous_exact_name_ties and never written.
+    insertAgent({ id: "route-spaced-dedup", name: "Spaced Dedup Fisk AS", postalCode: "7000", createdAt: "2026-02-01 00:00:00" });
+    detailFixtures.set("980000007", { status: 200, body: activeDetail("980000007", "Spaced Dedup Fisk AS") });
+    {
+      const res = await callBackfill({ agentIds: ["route-spaced-dedup"], apply: true });
+      assertTrue(
+        !res.body.unresolved.some((u: any) => u.agent_id === "route-spaced-dedup" && u.reason === "ambiguous_exact_name_ties"),
+        "v1: spaced + unspaced duplicate of the SAME org_nr does NOT spuriously trip ambiguous_exact_name_ties",
+      );
+      assertEq(readAgent("route-spaced-dedup").org_nr, "980000007", "v2: auto-written with the clean, digits-only org_nr");
+    }
+
+    // ── (w) Brreg-beats-weak-local-hit: a sub-1.0 local hit must not
+    // unconditionally shadow a better (1.0, exact) live Brreg match. Blocker
+    // 3 regression: admin-agents.ts used to take ANY local hit unconditionally
+    // with zero confidence comparison against Brreg.
+    insertAgent({ id: "route-local-vs-brreg", name: "Weak First Token AS", postalCode: "6000", createdAt: "2026-02-01 00:00:00" });
+    searchFixtures.set("navn=Weak%20First%20Token%20AS", {
+      status: 200,
+      body: { _embedded: { enheter: [searchHit("970000080", "Weak First Token AS", "6000", "Tromsø")] } },
+    });
+    detailFixtures.set("970000080", { status: 200, body: activeDetail("970000080", "Weak First Token AS") });
+    {
+      const searchCallsBefore = searchCallCount;
+      const res = await callBackfill({ agentIds: ["route-local-vs-brreg"], apply: true });
+      const changed = res.body.changed.find((c: any) => c.agent_id === "route-local-vs-brreg");
+      assertTrue(!!changed, "w1: route-local-vs-brreg auto-written");
+      assertEq(changed.org_nr, "970000080", "w2: the exact (1.0) Brreg hit wins, NOT the sub-1.0 local fixture (980000006)");
+      assertEq(changed.source, "brreg_name_search", "w3: source tagged brreg_name_search, not local_json_lokalmat");
+      assertEq(readAgent("route-local-vs-brreg").org_nr, "970000080", "w4: written org_nr matches the winning Brreg hit");
+      assertTrue(searchCallCount > searchCallsBefore, "w5: Brreg WAS called despite a local hit existing (sub-1.0, so it doesn't short-circuit)");
+    }
+
     // ── (t) errors[]: write failure during apply ───────────────────────────
     insertAgent({ id: "route-write-fail", name: "Route Write Fail AS", postalCode: "1601", createdAt: "2026-02-01 00:00:00" });
     searchFixtures.set("navn=Route%20Write%20Fail%20AS", {
@@ -663,7 +757,7 @@ export async function runAdminAgentsOrgNrBackfillTests(opts: { log?: boolean } =
     failed++;
     failures.push("admin-agents-org-nr-backfill: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
-    globalThis.fetch = prevFetch;
+    if (resetOrgNrBackfillFetch) resetOrgNrBackfillFetch();
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
