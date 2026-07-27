@@ -34051,3 +34051,29 @@ runSerial(async () => {
     failures.push("category-sanity-report: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-19-field-provenance-legacy-shape-audit: GET
+// /admin/agent-audit/field-provenance-legacy-shape (src/routes/admin-agent-audit.ts) —
+// read-only audit finding agent_knowledge/dental_agents rows still holding a
+// field_provenance field in the legacy wrapped `{sources:[...]}` shape that
+// lokal PR #298's mergeFieldProvenance() fix now unwraps-and-preserves
+// instead of silently wiping. Own harness: rfb side via
+// __setDbForTesting/__initSchemaForTesting (src/database/init.ts), dental
+// side via DENTAL_DB_PATH=":memory:" + db-factory.__resetDbFactoryForTesting()
+// (mirrors dental-agent-put-field-provenance.test.ts). Runs via runSerial()
+// like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-19-field-provenance-legacy-shape-audit: field-provenance-legacy-shape ──");
+  try {
+    const { runAdminAgentAuditFieldProvenanceLegacyShapeTests } = require("../src/routes/admin-agent-audit-field-provenance-legacy-shape.test") as
+      typeof import("../src/routes/admin-agent-audit-field-provenance-legacy-shape.test");
+    const fpls = await runAdminAgentAuditFieldProvenanceLegacyShapeTests({ log: false });
+    passed += fpls.passed;
+    failed += fpls.failed;
+    for (const f of fpls.failures) failures.push("field-provenance-legacy-shape: " + f);
+    console.log(`  field-provenance-legacy-shape: ${fpls.passed} passed, ${fpls.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("field-provenance-legacy-shape: unexpected error: " + String(err?.message || err));
+  }
+});

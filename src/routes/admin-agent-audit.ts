@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { getDb as getVerticalDb } from "../database/db-factory";
 
 const router = Router();
 
@@ -98,6 +99,105 @@ router.get("/", requireAdmin, (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("[admin-agent-audit] Error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "internal_error",
+      message: "An error occurred.",
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// GET /admin/agent-audit/field-provenance-legacy-shape
+// ─────────────────────────────────────────────────────────────────
+// Read-only audit (dev-request 2026-07-19-field-provenance-legacy-shape-audit,
+// filed after the code-reviewer on lokal PR #298 recommended checking for
+// other rows in the same legacy shape as the one #298 fixed going forward).
+//
+// PR #298 fixed mergeFieldProvenance() (src/routes/admin-knowledge.ts) so a
+// field_provenance field already stored in the legacy wrapped
+// `{ sources: [...] }` shape (as opposed to the on-disk bare-array shape) is
+// unwrapped-and-preserved on the next merge instead of being silently wiped
+// to `[]`. That fix only prevents FUTURE wipes — this endpoint finds rows
+// that may already hold the wrapped shape from before the fix, across both
+// tables that carry a field_provenance column (agent_knowledge = rfb,
+// dental_agents = dental), so they can be reviewed/normalized in a
+// separately-scoped follow-up. Never writes.
+//
+// A field's value counts as "legacy wrapped shape" using the exact same
+// check mergeFieldProvenance() itself uses to decide whether to unwrap
+// rather than filter-away: a non-array object with an array `.sources`
+// property.
+//
+// Response:
+//   { success: true,
+//     scanned: { agent_knowledge: <total rows>, dental_agents: <total rows> },
+//     wrapped_shape_count: <n>,
+//     findings: [{ table, id, field }] }
+router.get("/field-provenance-legacy-shape", requireAdmin, (req: Request, res: Response) => {
+  function isWrappedLegacyShape(val: unknown): boolean {
+    return (
+      val !== null &&
+      typeof val === "object" &&
+      !Array.isArray(val) &&
+      Array.isArray((val as { sources?: unknown }).sources)
+    );
+  }
+
+  function scanTable(
+    db: ReturnType<typeof getVerticalDb>,
+    table: "agent_knowledge" | "dental_agents",
+    idColumn: string,
+  ): { totalRows: number; findings: Array<{ table: string; id: string; field: string }> } {
+    const totalRows = (
+      db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }
+    ).c;
+
+    const rows = db
+      .prepare(
+        `SELECT ${idColumn} AS id, field_provenance FROM ${table}
+         WHERE field_provenance IS NOT NULL AND field_provenance NOT IN ('', '{}', '[]')`,
+      )
+      .all() as Array<{ id: string; field_provenance: string }>;
+
+    const findings: Array<{ table: string; id: string; field: string }> = [];
+    for (const row of rows) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.field_provenance);
+      } catch {
+        console.warn(
+          `[admin-agent-audit] field-provenance-legacy-shape: unparseable field_provenance on ${table}/${row.id}, skipping`,
+        );
+        continue;
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+
+      for (const [field, val] of Object.entries(parsed as Record<string, unknown>)) {
+        if (isWrappedLegacyShape(val)) {
+          findings.push({ table, id: row.id, field });
+        }
+      }
+    }
+    return { totalRows, findings };
+  }
+
+  try {
+    const rfbResult = scanTable(getVerticalDb("rfb"), "agent_knowledge", "agent_id");
+    const dentalResult = scanTable(getVerticalDb("dental"), "dental_agents", "id");
+    const findings = [...rfbResult.findings, ...dentalResult.findings];
+
+    return res.json({
+      success: true,
+      scanned: {
+        agent_knowledge: rfbResult.totalRows,
+        dental_agents: dentalResult.totalRows,
+      },
+      wrapped_shape_count: findings.length,
+      findings,
+    });
+  } catch (error) {
+    console.error("[admin-agent-audit] field-provenance-legacy-shape error:", error);
     return res.status(500).json({
       success: false,
       error: "internal_error",
