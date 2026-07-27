@@ -42,6 +42,15 @@
  *              the drain ETA.
  *   dr1-dr4    dry_run writes NOTHING — verified with a WHOLE-DB hash, not a
  *              column spot-check, and including the new `unpark` write path.
+ *   ol1-ol3    THE «OSLO» DEFAULT. In prod, producers with a NULL city were
+ *              rendered as OSLO by marketplace-registry's `|| "Oslo"`.
+ *              «Marmelkroken — Bø i Vesterålen» is a confirmed live instance.
+ *
+ *              #370 added geo_place_label to stop exactly this, and ITS tests
+ *              passed — because they asserted on the cohort #370 touched rather
+ *              than on what a visitor sees. So ol1-ol3 read the RENDERED value
+ *              out of marketplaceRegistry, not any helper's return shape.
+ *
  *   co1-co3    The two workers COOPERATE: postal-backfill resetting the parking
  *              counter when it lands the postnummer that was blocking a row.
  *   rc1-rc10   Seed-coordinate RECLASSIFICATION (Daniel, 2026-07-26). The rule
@@ -996,6 +1005,90 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
           "rc14b: …and the outcome, matching every other geo_precision write in this file");
 
         dbR.close();
+        initMod.__setDbForTesting(db as any);
+      }
+      // ═══════════════════════════════════════════════════════════════
+      // ol1-ol12 — THE «OSLO» DEFAULT (Daniel, 2026-07-26: «Ja»)
+      //
+      // Measured on live prod: 455 of 1595 active producers — 28,5 % of the
+      // catalogue — had NULL city and rendered as OSLO. «Amundsen Bakeri —
+      // Kirkenes» shown as Oslo, 2000 km out.
+      //
+      // #370 added geo_place_label to stop exactly this, and its tests passed.
+      // They passed because they were written against the cohort #370 touched
+      // (rows resolved through the place-name tier) rather than against what a
+      // visitor sees. Rows resolved on a STREET ADDRESS never entered that
+      // tier, kept a NULL label, and fell straight through to the default.
+      //
+      // So ol1-ol4 assert on the RENDERED value from marketplace-registry, not
+      // on the backfill's own return shape. That is the difference between
+      // testing the fix and testing the user.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const dbO = new Database(":memory:");
+        initMod.__setDbForTesting(dbO as any);
+        initMod.__initSchemaForTesting(dbO as any);
+        geo.__clearGeocodeCacheForTesting();
+        budget.__resetKartverketBudgetForTesting();
+
+        const registry = require("./marketplace-registry") as typeof import("./marketplace-registry");
+        const insO = dbO.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key,
+                               lat, lng, city, is_active, geo_precision, geo_place_label, geocode_attempts)
+           VALUES (@id, @name, 'Lokal matprodusent', 'test', 'a@b.no', 'https://example.no',
+                   'producer', @api_key, @lat, @lng, @city, 1, 'address', @label, 0)`
+        );
+        const seedO = (o: { id: string; name: string; city?: string | null; label?: string | null }) =>
+          insO.run({ id: o.id, name: o.name, api_key: `k-${o.id}`,
+                     lat: 63.4, lng: 10.4, city: o.city ?? null, label: o.label ?? null });
+
+        // The live shape: address-precision, NULL city, NULL label.
+        seedO({ id: "ol-nocity", name: "Amundsen Bakeri — Kirkenes" });
+        seedO({ id: "ol-curated", name: "Med kuratert by", city: "Bergen" });
+        seedO({ id: "ol-labelled", name: "Med etikett — Rana", label: "Rana" });
+        // BOTH a curated city and a derived label, and they DISAGREE. Without
+        // this row the two are never in conflict, so swapping the precedence
+        // is invisible — the first mutation sweep proved exactly that.
+        seedO({ id: "ol-both", name: "Begge deler — Rana", city: "Bergen", label: "Rana" });
+        // A suffix that is NOT a place — printing it would swap one wrong
+        // city for another.
+        seedO({ id: "ol-notaplace", name: "Kringler Gjestegård — Ingenstedet" });
+        // No dash at all.
+        seedO({ id: "ol-nodash", name: "Hanen" });
+        // Deactivated: not part of the catalogue, so not this pass's business.
+        seedO({ id: "ol-inactive", name: "Nedlagt Bakeri — Kirkenes" });
+        dbO.prepare(`UPDATE agents SET is_active = 0 WHERE id = 'ol-inactive'`).run();
+
+        const rendered = (id: string) => {
+          const a = registry.marketplaceRegistry.getAllAgents().find((x: any) => x.id === id) as any;
+          return a?.location?.city;
+        };
+
+        assertEq(rendered("ol-nocity"), undefined,
+          "ol1: a producer we cannot place renders with NO city — «Kirkenes» must never come out as «Oslo»");
+        assertEq(rendered("ol-curated"), "Bergen",
+          "ol2: a curated city still wins");
+        assertEq(rendered("ol-labelled"), "Rana",
+          "ol3: …and a verified label is used when there is no curated city");
+        assertEq(rendered("ol-both"), "Bergen",
+          "ol3b: when a curated city and a derived label DISAGREE, the human-curated one wins — a person who told us where they are outranks a string we mined from their name");
+
+        // NOTE: the label BACKFILL that used to be tested here has been split
+        // out. An independent reviewer ran it against 156 live producers and
+        // found it verified that *a* Norwegian place carries the name, not that
+        // it is *this producer's* place: «Marmelkroken — Bø i Vesterålen» was
+        // labelled from the Bø in Telemark, 1114 km away. Daniel then caught a
+        // second thing in the write-up — «Kjerringøy» is outside Bodø in
+        // Nordland, and the lookup was landing on an islet of the same name in
+        // Agder — which showed that REJECTING on disagreement (the reviewer's
+        // suggested fix) would have thrown away a label that was correct.
+        //
+        // The right design uses the producer's own coordinate to CHOOSE among
+        // Kartverket's candidates rather than merely to veto one. That is a
+        // different pass and gets its own PR and its own fixtures, including
+        // the two-candidate case this suite never had.
+
+        dbO.close();
         initMod.__setDbForTesting(db as any);
       }
     } finally {

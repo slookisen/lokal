@@ -1519,13 +1519,24 @@ class MarketplaceRegistry {
       location: row.lat != null && row.lng != null ? {
         lat: row.lat,
         lng: row.lng,
-        // geo_place_label before the legacy "Oslo" default. The geocode
-        // worker's Tier C places ~250 producers that have NO `city` at all, and
-        // the bare default would have labelled every one of them «i
-        // Oslo-området» — a confidently wrong statement about a producer in
-        // Rana, which is strictly worse than saying nothing. Order matters:
-        // a curated `city` still wins over the worker's derived label.
-        city: row.city || row.geo_place_label || "Oslo",
+        // ── NO DEFAULT. Measured 2026-07-26: the `|| "Oslo"` that used to sit
+        // at the end of this expression was announcing **455 of 1595 producers
+        // (28,5 % of the catalogue)** as being in Oslo. Not approximately —
+        // literally «Amundsen Bakeri — Kirkenes» rendered as Oslo, 2000 km out,
+        // and «Lillehammer Bryggeri — Lillehammer» likewise.
+        //
+        // The geo_place_label fallback added in #370 was supposed to have
+        // stopped this. It only covered the cohort the geocode worker resolved
+        // through its place-name tier; every row resolved on a street address,
+        // and every row never reached, still has NULL city and fell straight
+        // through to the default. The fix was tested against the cohort it was
+        // written for rather than against what a visitor sees.
+        //
+        // `undefined` is the honest answer when we do not know. Every consumer
+        // already handles it — seo.ts's cardLocationText() falls back to `""`
+        // and simply omits the line. An omitted city costs a visitor nothing;
+        // a wrong one costs the producer their credibility and ours.
+        city: row.city || row.geo_place_label || undefined,
         radiusKm: row.radius_km,
       } : undefined,
       // dev-request 2026-07-25 Fase 1: coordinate provenance, written by
