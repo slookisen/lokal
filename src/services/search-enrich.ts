@@ -1847,8 +1847,9 @@ async function fetchHtml(url: string): Promise<string | null> {
  * primary page). This is the DEFAULT `crawl` dependency for enrichOneAgent.
  */
 export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidence | null> {
-  const primaryHtml = await fetchHtml(primaryUrl);
-  if (primaryHtml === null) return null;
+  const primary = await fetchPageClassified(primaryUrl);
+  if (!primary.ok) return null;
+  const primaryHtml = primary.html;
 
   const emails = new Set<string>(extractEmails(primaryHtml));
   const phones = new Set<string>(extractPhones(primaryHtml));
@@ -1870,7 +1871,14 @@ export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidenc
   // and fall back to the legacy guesses only when it exposes none (single-page
   // sites and JS-rendered navs), so the fetch budget stays the same or lower.
   try {
-    const u = new URL(/^https?:\/\//i.test(primaryUrl) ? primaryUrl : `https://${primaryUrl}`);
+    // Base = the FINAL url after redirects, not the requested one.
+    // discoverContentLinks keeps same-host links only, and a homepage that
+    // redirects across hosts (apex→www, renamed domain) usually emits ABSOLUTE
+    // self-links on the NEW host — stock WordPress does, via home_url(). Judging
+    // those against the pre-redirect host rejects every one of them, silently
+    // collapsing discovery back to the fixed-path guessing this replaced, aimed
+    // at a host that no longer serves the site.
+    const u = new URL(primary.finalUrl || (/^https?:\/\//i.test(primaryUrl) ? primaryUrl : `https://${primaryUrl}`));
     const base = `${u.protocol}//${u.host}`;
     const discovered = discoverContentLinks(primaryHtml, u.toString(), 3);
     const targets = discovered.length > 0 ? discovered : ["/kontakt", "/om-oss", "/produkter"].map((p) => `${base}${p}`);

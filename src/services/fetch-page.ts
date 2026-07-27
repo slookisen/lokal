@@ -116,9 +116,13 @@ export type FetchFailureReason =
  *                parking strike — this is the class that was wrongly parking
  *                live producers.
  * - `blocked`    the site answered deliberately and negatively (401/403, or a
- *                200 with no content). Retrying is pointless, but so is
- *                silently parking it as "dead": these need a human or a
- *                different acquisition route, so they get their own bucket.
+ *                200 with no content). Retrying is pointless — the same answer
+ *                comes back — so callers DO count a parking strike here, same
+ *                as `permanent`. It gets its own name rather than being folded
+ *                into `permanent` because the remedy differs: a dead domain is
+ *                gone for good, whereas a login-wall or an error stub may need
+ *                a human or a different acquisition route. Only `transient`
+ *                is strike-exempt.
  */
 export type FetchPersistence = "permanent" | "transient" | "blocked";
 
@@ -155,9 +159,12 @@ export function classifyHttpStatus(status: number): FetchFailureReason | null {
   if (status === 429) return "http_429";
   if (status >= 500) return "http_5xx";
   if (status >= 400) return "http_4xx";
-  // 3xx should never reach here (redirect: "follow"), but classify defensively
-  // rather than silently reporting success.
-  return "http_4xx";
+  // A 3xx should never reach here (redirect: "follow" resolves them), but if one
+  // escapes — a redirect loop hitting the cap, a 304 from a conditional request —
+  // report it as `unknown` rather than mislabelling it `http_4xx`. In a module
+  // whose whole premise is that the reported reason must be truthful, a wrong
+  // name is worse than an unspecific one.
+  return "unknown";
 }
 
 /**
@@ -273,10 +280,19 @@ export function isUnusableBody(
   contentType: string | null | undefined,
 ): FetchFailureReason | null {
   const ct = (contentType ?? "").toLowerCase().split(";")[0]!.trim();
-  if (ct && !/^(text\/html|application\/xhtml\+xml|text\/plain)$/.test(ct)) {
+  const hasMarkup = /<[a-z!\/][^>]*>/i.test(html);
+
+  // Only types we positively know are NOT markup are rejected on the header
+  // alone. An unrecognised or missing content-type falls through to the markup
+  // sniff instead: small Norwegian hosts do serve real HTML as
+  // `application/octet-stream` or `application/x-httpd-php`, and the previous
+  // allowlist-only rule turned every such page into `not_html` → a parking
+  // strike, where the old code fetched and extracted it fine.
+  if (ct && /^(image|video|audio|font)\//.test(ct)) return "not_html";
+  if (ct && /^application\/(pdf|zip|gzip|octet-stream|json|xml)$/.test(ct) && !hasMarkup) {
     return "not_html";
   }
-  const hasMarkup = /<[a-z!\/][^>]*>/i.test(html);
+
   if (!hasMarkup) return "empty_body";
   return null;
 }
@@ -631,13 +647,3 @@ export async function fetchPage(url: string, opts: FetchPageOptions): Promise<Fe
   );
 }
 
-/**
- * Back-compat shim: the string-or-null shape the three legacy helpers had.
- * New code should call `fetchPage()` and act on the classified reason; this
- * exists so the refactor of existing call sites stays behaviour-preserving
- * where the caller genuinely has nothing to do with the reason.
- */
-export async function fetchPageHtml(url: string, opts: FetchPageOptions): Promise<string | null> {
-  const r = await fetchPage(url, opts);
-  return r.ok ? r.html : null;
-}

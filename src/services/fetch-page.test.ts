@@ -362,6 +362,49 @@ export async function runFetchPageTests(opts: { log?: boolean } = {}): Promise<T
       assertEq(r.ok && r.finalUrl, "https://tkmidt.no/", "fetchPage: the final URL is reported for the wrong-entity guard");
     }
     {
+      // Review finding (round 1, blocking #2): the discovery base must be the
+      // FINAL url. A homepage that redirects across hosts and emits ABSOLUTE
+      // self-links on the new host (stock WordPress via home_url()) would have
+      // every link rejected by the same-host test if judged against the
+      // pre-redirect host — silently collapsing discovery back to fixed-path
+      // guessing aimed at a host that no longer serves the site.
+      const html = `<a href="https://www.gard.no/om-oss">Om oss</a><a href="https://www.gard.no/kontakt">Kontakt</a>`;
+      assertEq(
+        discoverContentLinks(html, "https://gard.no/", 3),
+        [],
+        "redirect-1: absolute links on the POST-redirect host are (correctly) rejected against the PRE-redirect host — this is why callers must pass finalUrl",
+      );
+      assertEq(
+        discoverContentLinks(html, "https://www.gard.no/", 3),
+        ["https://www.gard.no/kontakt", "https://www.gard.no/om-oss"],
+        "redirect-2: the same links resolve when the base is the FINAL url",
+      );
+    }
+    {
+      // Review finding (round 1, non-blocking #5): an unrecognised content-type
+      // must fall through to the markup sniff, not hard-fail. Small Norwegian
+      // hosts serve real HTML as application/octet-stream.
+      assertEq(
+        isUnusableBody("<html><body><p>Gårdsbutikk med økologiske grønnsaker</p></body></html>", "application/octet-stream"),
+        null,
+        "ct-1: real HTML mislabelled application/octet-stream is usable (was a parking strike)",
+      );
+      assertEq(
+        isUnusableBody("<html><body><p>Gårdsbutikk</p></body></html>", "application/x-httpd-php"),
+        null,
+        "ct-2: real HTML served as application/x-httpd-php is usable",
+      );
+      assertEq(isUnusableBody("%PDF-1.4 binary", "application/pdf"), "not_html", "ct-3: a real PDF is still not_html");
+      assertEq(isUnusableBody("\x89PNG binary", "image/png"), "not_html", "ct-4: an image is still not_html");
+      assertEq(isUnusableBody("{\"a\":1}", "application/json"), "not_html", "ct-5: markup-free JSON is still not_html");
+    }
+    {
+      // Review finding (round 1, minor #10): a 3xx escaping redirect:"follow"
+      // must not be mislabelled http_4xx.
+      assertEq(classifyHttpStatus(304), "unknown", "3xx-1: an escaped 304 is reported as unknown, not mislabelled http_4xx");
+      assertEq(classifyHttpStatus(307), "unknown", "3xx-2: an escaped 307 is reported as unknown");
+    }
+    {
       // The core contract, stated as a test.
       const fetchImpl = (async () => {
         throw Object.assign(new TypeError("fetch failed"), { cause: { code: "EHOSTUNREACH" } });

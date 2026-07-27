@@ -768,8 +768,16 @@ async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutco
   let combinedHtml = primaryHtml;
   // Link-driven sub-page crawl with CR_CONTENT_PATHS as fallback — see
   // buildPageEvidence in services/search-enrich.ts for the measurement.
+  //
+  // Resolve against the FINAL url, not the requested one. discoverContentLinks
+  // keeps same-host links only, and a homepage that redirects across hosts
+  // (apex→www, renamed domain) typically emits ABSOLUTE self-links on the new
+  // host — stock WordPress does, via home_url(). Judging those against the
+  // pre-redirect host would reject every one of them, silently collapsing the
+  // discovery back to the fixed-path guessing this replaced, against a host
+  // that no longer serves the site.
   try {
-    const u = new URL(fetchUrl);
+    const u = new URL(primary.finalUrl || fetchUrl);
     const base = `${u.protocol}//${u.host}`;
     const discovered = discoverContentLinks(primaryHtml, u.toString(), CR_CONTENT_PATHS.length);
     const targets = discovered.length > 0 ? discovered : CR_CONTENT_PATHS.map((p) => `${base}${p}`);
@@ -848,14 +856,11 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       fetched = await crFetchHomepageContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
-      // Dead-homepage parking (enrichment-metode slice 1): count the failure;
-      // 3 strikes park the provider 30d (apply mode only — dry-run never writes).
-      if (apply) {
-        try {
-          const p = recordProviderHomepageFetchResult(providerId, false);
-          if (p.parked_now) parkedNow.push(providerId);
-        } catch { /* best-effort */ }
-      }
+      // NO parking strike here. fetchPage() never throws — it returns a
+      // classified failure — so reaching this catch means an INTERNAL fault on
+      // our side (a malformed stored URL, a bug), which is no evidence at all
+      // that the producer's site is dead. Striking on it would park a provider
+      // for 30 days for our own error.
       return;
     }
     if (!fetched.ok) {
@@ -1082,16 +1087,19 @@ const GARDSSALG_MAX_PAGES = 5; // homepage + up to 4 sub-pages
  * be fetched. A 404/failure on any candidate sub-page costs nothing extra —
  * crFetchHtml already returns null on any failure, so it's just skipped.
  */
-async function crFetchGardssalgContent(
-  homepageUrl: string
-): Promise<{ primaryHtml: string; combinedHtml: string; fetchUrl: string } | null> {
+async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
-  const primaryHtml = await crFetchHtml(fetchUrl);
-  if (primaryHtml === null) return null;
+  const primary = await crFetchPage(fetchUrl);
+  if (!primary.ok) {
+    return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
+  }
+  const primaryHtml = primary.html;
   let combinedHtml = primaryHtml;
   let pagesFetched = 1;
   try {
-    const u = new URL(fetchUrl);
+    // Final url, not the requested one — a cross-host redirect otherwise leaves
+    // the whole sub-page crawl pointed at a host that no longer serves the site.
+    const u = new URL(primary.finalUrl || fetchUrl);
     // Slice 5d: sub-page candidates resolve relative to the STORED URL's
     // section, not the host root. For the normal case (hjemmeside is the
     // site root) this is identical to the old `${protocol}//${host}` base;
@@ -1119,7 +1127,7 @@ async function crFetchGardssalgContent(
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
 }
 
 const GS_CR_DEFAULT_LIMIT = 25;
@@ -1224,24 +1232,30 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     }
 
     // Fetch homepage + gårdssalg sub-pages server-side (SSRF-guarded).
-    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    let fetched: CrFetchOutcome;
     try {
       fetched = await crFetchGardssalgContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
-      // Dead-homepage parking (enrichment-metode slice 1): count the failure;
-      // 3 strikes park the provider 30d (apply mode only — dry-run never writes).
-      if (apply) {
-        try {
-          const p = recordProviderHomepageFetchResult(providerId, false);
-          if (p.parked_now) parkedNow.push(providerId);
-        } catch { /* best-effort */ }
-      }
+      // NO parking strike here. fetchPage() never throws — it returns a
+      // classified failure — so reaching this catch means an INTERNAL fault on
+      // our side (a malformed stored URL, a bug), which is no evidence at all
+      // that the producer's site is dead. Striking on it would park a provider
+      // for 30 days for our own error.
       return;
     }
-    if (!fetched) {
-      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
-      if (apply) {
+    if (!fetched.ok) {
+      errors.push({
+        provider_id: providerId,
+        error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}`,
+      });
+      // Persistence-gated parking — SAME rule as /admin/content-refresh above.
+      // These gårdssalg routes write the very same counter
+      // (experience_providers.homepage_fetch_attempts) and are excluded by the
+      // very same providerParkingExclusionSql(), so leaving them striking on a
+      // transient 503 would have re-created the mis-parking this whole change
+      // exists to eliminate — on the same rows, just via a different route.
+      if (apply && fetched.persistence !== "transient") {
         try {
           const p = recordProviderHomepageFetchResult(providerId, false);
           if (p.parked_now) parkedNow.push(providerId);
@@ -1714,19 +1728,22 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
       return;
     }
 
-    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    let fetched: CrFetchOutcome;
     try {
       fetched = await crFetchGardssalgContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
-      if (apply) {
-        try { recordProviderHomepageFetchResult(providerId, false); } catch { /* best-effort */ }
-      }
+      // NO parking strike — see the note on the other fetch catches: an
+      // exception here is our fault, not the site's.
       return;
     }
-    if (!fetched) {
-      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
-      if (apply) {
+    if (!fetched.ok) {
+      errors.push({
+        provider_id: providerId,
+        error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}`,
+      });
+      // Persistence-gated parking — same counter, same rule as the two routes above.
+      if (apply && fetched.persistence !== "transient") {
         try { recordProviderHomepageFetchResult(providerId, false); } catch { /* best-effort */ }
       }
       return;

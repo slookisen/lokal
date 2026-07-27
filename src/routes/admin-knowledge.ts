@@ -1171,9 +1171,10 @@ async function hcrFetchHomepageContent(homepageUrl: string): Promise<HcrFetchOut
   let combinedHtml = primaryHtml;
   // Link-driven sub-page crawl with the legacy fixed paths as fallback — see
   // buildPageEvidence in services/search-enrich.ts for the measurement that
-  // motivated it (12/12 404s on the fixed guesses across three live sites).
+  // motivated it (12/12 404s on the fixed guesses across three live sites),
+  // and for why the base must be the FINAL url after redirects.
   try {
-    const u = new URL(fetchUrl);
+    const u = new URL(primary.finalUrl || fetchUrl);
     const base = `${u.protocol}//${u.host}`;
     const discovered = discoverContentLinks(primaryHtml, u.toString(), HCR_CONTENT_PATHS.length);
     const targets = discovered.length > 0 ? discovered : HCR_CONTENT_PATHS.map((p) => `${base}${p}`);
