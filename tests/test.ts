@@ -34269,3 +34269,69 @@ runSerial(async () => {
     failures.push("field-provenance-legacy-shape-normalize: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-13-billing-skjelett-moerkt (L4, Daniel-authorized
+// 2026-07-20 — daniel-responses/2026-07-20-go-billing-skjelett-moerkt.md):
+// dark Stripe test-mode subscription skeleton for "Produsent-Premium"
+// (199/499 kr/mnd placeholders), entirely behind BILLING_ENABLED (default
+// OFF). Three own harnesses, run serially so they never interleave with
+// each other's shared in-memory DB / process.env.ADMIN_KEY mutations:
+//   - billing-provider.test.ts    : live-guard + OFFLINE webhook signature
+//                                    verification (real `stripe` package,
+//                                    zero network access).
+//   - billing-service.test.ts     : subscription state machine (create ->
+//                                    active -> upgrade -> cancel) +
+//                                    webhook-idempotency ledger, against an
+//                                    injected fake Stripe client.
+//   - admin-billing.test.ts       : HTTP-layer — router-mounting flag +
+//                                    live-guard (criteria 3 + 4), admin
+//                                    auth, full lifecycle + demo entitlement
+//                                    gates (criterion 2) through the actual
+//                                    route handlers, webhook HTTP route.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-billing-skjelett-moerkt: billing-provider (live-guard + offline webhook signature verification) ──");
+  try {
+    const { runBillingProviderTests } = require("../src/services/billing-provider.test") as
+      typeof import("../src/services/billing-provider.test");
+    const bp = runBillingProviderTests({ log: false });
+    passed += bp.passed;
+    failed += bp.failed;
+    for (const f of bp.failures) failures.push("billing-provider: " + f);
+    console.log(`  billing-provider: ${bp.passed} passed, ${bp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("billing-provider: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-billing-skjelett-moerkt: billing-service (subscription state machine + webhook idempotency) ──");
+  try {
+    const { runBillingServiceTests } = require("../src/services/billing-service.test") as
+      typeof import("../src/services/billing-service.test");
+    const bs = await runBillingServiceTests({ log: false });
+    passed += bs.passed;
+    failed += bs.failed;
+    for (const f of bs.failures) failures.push("billing-service: " + f);
+    console.log(`  billing-service: ${bs.passed} passed, ${bs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("billing-service: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-billing-skjelett-moerkt: admin-billing (router mounting, admin auth, lifecycle, entitlement gates, webhook) ──");
+  try {
+    const { runAdminBillingTests } = require("../src/routes/admin-billing.test") as
+      typeof import("../src/routes/admin-billing.test");
+    const ab = await runAdminBillingTests({ log: false });
+    passed += ab.passed;
+    failed += ab.failed;
+    for (const f of ab.failures) failures.push("admin-billing: " + f);
+    console.log(`  admin-billing: ${ab.passed} passed, ${ab.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-billing: unexpected error: " + String(err?.message || err));
+  }
+});
