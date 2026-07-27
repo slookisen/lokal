@@ -731,6 +731,62 @@ function isPlaceholderHomepageHost(host: string): boolean {
   // built out of status words is a placeholder however it is spelled. It also
   // means "under" need not be listed — `under-arbeid` is caught by "arbeid" —
   // so round 5's conservative omissions still stand.
+  //
+  // "Any position" is kept — NOT narrowed to "last split word only" (oppfølging,
+  // dev-request 2026-07-27-384-placeholder-regel-etterslep, funn 1). A "last
+  // word only" narrowing was tried in an earlier commit on this same PR to stop
+  // hard-rejecting real-looking REGISTERED domains whose FIRST component is a
+  // status word used as a modifier rather than the placeholder itself:
+  // `arbeid-helse.no`, `hjemmeside-design.no`, `null-utslipp.no`, `todo-as.no`.
+  // An independent fresh-context review of that commit found it reintroduces a
+  // real, previously-nonexistent false-accept regression: any qualifier-first
+  // junk compound whose TRAILING word is one of the ~14 status NOUNS still
+  // reads as a placeholder to a human, but if that trailing word happens NOT to
+  // be one of the ~14 words in PLACEHOLDER_DOMAIN_LABELS, "last word only"
+  // waves it through — even though the LEADING word is a dead giveaway.
+  // Concretely, `ukjent-produsent.no`, `mangler-info.no`, `ingen-svar.no`,
+  // `snart-ferdig.no`, `eksempel-gaard.no`, `tbd-gaarden.no` were all correctly
+  // rejected under "any position" (they still are, pinned in alias-30c below)
+  // but would have silently started being ACCEPTED under "last word only" —
+  // each one starts with a genuine PLACEHOLDER_DOMAIN_LABELS word (ukjent,
+  // mangler, ingen, snart, eksempel, tbd) followed by a trailing word that is
+  // not separately listed. That false-accept surface is unbounded — any junk
+  // qualifier + any noun — whereas the four named domains this PR wanted to
+  // rescue are a closed, measured set (0 of 335 real producer hosts affected
+  // either way). So "any position" stays: the four domains above remain
+  // rejected (pinned in alias-30, re-purposed to assert `null` rather than
+  // accept), and the false-accept class the narrowing would have opened is
+  // pinned rejected too (alias-30c) so nobody re-attempts the same "last word"
+  // narrowing blind in a future round without a test going red.
+  //
+  // The underscore half of `[-_]` here is DEAD CODE for this function's only
+  // caller (oppfølging, finding 4): looksLikeHomepageValue() below calls this
+  // function BEFORE its own per-label DNS-shape regex
+  // (`/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/`), which has no `_` in its
+  // character class and therefore rejects EVERY label this function could ever
+  // see that contains one — regardless of what this function decides. Every
+  // label `isPlaceholderLabel` examines is also one of `host`'s own labels (the
+  // registrable domain is a suffix of the host), so whichever check runs first
+  // is redundant with the other whenever `_` is present. Verified by mutation:
+  // dropping `_` from BOTH regexes here (collapse to `-` only) leaves the full
+  // suite green — `ikke_oppgitt.no`/`ingen_nettside.no` (alias-28) still yield
+  // null, via the DNS-shape regex instead. Only dropping `_` from THIS function
+  // AND relaxing the DNS-shape regex to also allow `_` is what turns those two
+  // fixtures red — proof the DNS-shape regex, not this split, is what pins
+  // them today (their comment in the test file has been corrected to say so).
+  // Left in rather than removed: harmless, cheap, and a future caller of this
+  // now-still-unexported function that skips the DNS-shape regex would need it.
+  //
+  // The COLLAPSE branch below (label.replace(/[-_]/g, "") producing a match)
+  // had no falsifying fixture of its own either (finding 5): every existing
+  // negative that reaches it — `ikke-oppgitt`, `finnes-ikke` — also has its
+  // LAST split word independently in the set ("oppgitt", "ikke"), so the split
+  // branch below always caught them too and the collapse branch's removal
+  // never went red. Pinned by alias-32 with `your-domain.no`/`your-company.no`:
+  // "domain" and "company" are deliberately NOT in PLACEHOLDER_DOMAIN_LABELS
+  // (only the collapsed "yourdomain"/"yourcompany" are), so only the collapse
+  // branch rejects them — verified by mutation, deleting this line alone flips
+  // both to accepted with the rest of the suite unaffected.
   const isPlaceholderLabel = (label: string): boolean => {
     if (PLACEHOLDER_DOMAIN_LABELS.has(label.replace(/[-_]/g, ""))) return true;
     return label.split(/[-_]+/).filter(Boolean).some((w) => PLACEHOLDER_DOMAIN_LABELS.has(w));
@@ -789,7 +845,10 @@ function looksLikeHomepageValue(v: string): boolean {
   if (!labels.every((l) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(l))) return false;
   const tld = labels[labels.length - 1]!;
   // Punycode TLDs (xn--…) are vanishingly rare for Norwegian producers but are
-  // legitimate, so admit them explicitly rather than by accident.
+  // legitimate, so admit them explicitly rather than by accident. Pinned by
+  // alias-32 (finding 5, dev-request 2026-07-27-384-placeholder-regel-etterslep)
+  // — had no falsifying fixture before; verified by mutation that deleting this
+  // alternative flips it to rejected with no other fixture affected.
   return /^[a-z]{2,}$/.test(tld) || /^xn--[a-z0-9-]{2,}$/.test(tld);
 }
 

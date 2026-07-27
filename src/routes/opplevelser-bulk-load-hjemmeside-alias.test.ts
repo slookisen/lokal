@@ -432,10 +432,14 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
   // hard-coded, and that is the one compound with a test. The other two named
   // in the source comment sailed through and, after the precedence flip, beat a
   // real `website` — a regression vs origin/main in this PR's own defect class.
+  //
+  // NOTE (finding 4, dev-request 2026-07-27-384-placeholder-regel-etterslep):
+  // this block is HYPHEN compounds — the round-7 word-split fix. The two
+  // UNDERSCORE values below were moved out into their own block beneath it:
+  // they do not actually pin the same code path (see that block's comment).
   {
     for (const junk of [
-      "ingen-hjemmeside.no", "kommer-snart.no", "under-arbeid.no",
-      "ikke-oppgitt.no", "ikke_oppgitt.no", "ingen_nettside.no",
+      "ingen-hjemmeside.no", "kommer-snart.no", "under-arbeid.no", "ikke-oppgitt.no",
     ]) {
       const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
       assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
@@ -450,6 +454,158 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
       assertEq(firstNonAggregatorWebsite([solo as BulkRow]), good,
         `alias-29/${good}: a hyphenated REAL domain is untouched — the word rule must not become a new false rejection`);
     }
+  }
+
+  // ── Underscore compounds — comment corrected (finding 4) ────────────────
+  // These two used to sit in the round-7 hyphen block above and were described
+  // as pinning the SAME word-split fix. They do not: isPlaceholderHomepageHost
+  // is called BEFORE looksLikeHomepageValue's own per-label DNS-shape regex
+  // (`/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/`), which has no `_` in its
+  // character class and independently rejects ANY label containing one. Proven
+  // by mutation: removing `_` support from isPlaceholderLabel's collapse AND
+  // split (leaving only `-`) does not turn these red — the DNS-shape regex
+  // catches them regardless. Only removing `_` from BOTH isPlaceholderLabel
+  // AND the DNS-shape regex turns them red, which is what actually pins them:
+  // the DNS-shape regex, not this word-split. Kept here as a (redundant but
+  // harmless) belt-and-suspenders check on the observable behavior — the
+  // accurate claim is in the source comment on isPlaceholderLabel.
+  {
+    for (const junk of ["ikke_oppgitt.no", "ingen_nettside.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-28c/${junk}: rejected — by the DNS-shape regex's blanket underscore ban, not by the word-split`);
+      const mixed = BulkRowSchema.parse({ ...base, hjemmeside: junk, website: "https://trollaktiv.no" });
+      assertEq(firstNonAggregatorWebsite([mixed as BulkRow]), "https://trollaktiv.no",
+        `alias-28d/${junk}: …and never beats a real \`website\``);
+    }
+  }
+
+  // ── Finding 2 (dev-request 2026-07-27-384-placeholder-regel-etterslep) ──
+  // Mutation sweep (delete one word from PLACEHOLDER_DOMAIN_LABELS at a time,
+  // run this file, restore) showed 20 of the 28 words individually deletable
+  // with the suite green: they were only ever reached through OTHER,
+  // independent screens — PLACEHOLDER_EMAIL_DOMAINS (a separate list, checked
+  // first, for the `.com` sentinels), the dot-less/no-TLD junk screen (for the
+  // bare English words used as raw junk strings, e.g. "null", "TBD"), or as the
+  // non-last word of a hyphenated compound whose LAST word already carries the
+  // assertion. None of that means the word is wrong to list — round 5's
+  // rationale for each still holds — it means no fixture ever exercised THIS
+  // list for that specific word. One minimal standalone domain per word closes
+  // that gap. (The other 8 — ukjent, snart, hjemmeside, nettside, eksempel,
+  // arbeid, yourdomain, yourcompany — already had a discriminating fixture
+  // elsewhere in this file before this finding was filed.)
+  {
+    const soloWords = [
+      "ikke", "ikkeoppgitt", "oppgitt", "ingen", "mangler", "kommer",
+      "nettsted", "tilgjengelig", "finnesikke",
+      "example", "unknown", "none", "null", "undefined", "placeholder", "tbd",
+      "insert", "dummy", "todo", "notfound",
+    ];
+    for (const w of soloWords) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: `${w}.no` });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-33/${w}: PLACEHOLDER_DOMAIN_LABELS entry "${w}" is individually falsifiable — deleting it from the set flips this red`);
+    }
+  }
+
+  // ── Finding 1 (dev-request 2026-07-27-384-placeholder-regel-etterslep) ──
+  // The round-7 word-split rejects a label if ANY hyphen/underscore-split word
+  // matches, at any position — hard-rejecting real-looking registered domains
+  // whose FIRST component is a status word used as a modifier:
+  // `arbeid-helse.no`, `hjemmeside-design.no`, `null-utslipp.no`, `todo-as.no`.
+  //
+  // A "last split word only" narrowing was tried in an earlier commit on this
+  // PR specifically to accept those four (0 of 335 real producer hosts
+  // affected either way, by measurement). An INDEPENDENT fresh-context
+  // code-review of that commit rejected it: narrowing to "last word only"
+  // reintroduces a real, previously-nonexistent false-accept regression, wider
+  // than the false-reject it fixes. Any qualifier-first junk compound whose
+  // TRAILING word is not itself one of the ~14 PLACEHOLDER_DOMAIN_LABELS nouns
+  // now sails through even though the LEADING word is a dead giveaway —
+  // `ukjent-produsent.no`, `mangler-info.no`, `ingen-svar.no`,
+  // `snart-ferdig.no`, `eksempel-gaard.no`, `tbd-gaarden.no` all start with a
+  // genuine placeholder word (ukjent/mangler/ingen/snart/eksempel/tbd) and
+  // would have flipped from rejected to accepted. That surface is unbounded —
+  // any junk qualifier followed by any noun — while the four rescued domains
+  // are a closed, measured set. So "any position" is KEPT (isPlaceholderLabel
+  // unchanged from round 7), and this finding is closed via path (b) of the
+  // dev-request's acceptance criteria (measured justification for keeping the
+  // existing rule) rather than path (a) (narrowing it). Documented here in
+  // full, in the style of this file's other 7 review rounds, so nobody
+  // re-attempts the same "last word" narrowing blind in a future round —
+  // a future attempt should hit alias-30c below and go red immediately.
+  {
+    // The four domains that motivated the narrowing attempt remain rejected —
+    // this is the KEPT decision, not a regression: no known real producer uses
+    // this "status-word-as-modifier" shape, and re-litigating it costs nothing
+    // (verified: 0/335 real producer hosts hit this path either way).
+    for (const junk of ["arbeid-helse.no", "hjemmeside-design.no", "null-utslipp.no", "todo-as.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-30/${junk}: a real-looking domain whose FIRST hyphen component is a status word is still rejected — "any position" was kept over "last word only" (see isPlaceholderHomepageHost comment)`);
+    }
+    // The six known compounds stay rejected regardless of any/last/first —
+    // the status word sits LAST in every one, so this alone never
+    // distinguished the two rules; kept as a stability check.
+    for (const junk of ["ingen-hjemmeside.no", "kommer-snart.no", "under-arbeid.no", "ikke-oppgitt.no", "ikke_oppgitt.no", "ingen_nettside.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-30b/${junk}: still rejected under "any position" — the status word is the LAST component here too, so this fixture alone cannot distinguish the two rules`);
+    }
+    // The false-accept class "last word only" would have opened, closed here
+    // by name so a future re-narrowing goes red instead of shipping silently.
+    // Each starts with a genuine PLACEHOLDER_DOMAIN_LABELS word followed by a
+    // trailing word that is NOT separately listed — exactly the shape "last
+    // word only" misses and "any position" catches for free.
+    for (const junk of ["ukjent-produsent.no", "mangler-info.no", "ingen-svar.no", "snart-ferdig.no", "eksempel-gaard.no", "tbd-gaarden.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-30c/${junk}: rejected via "any position" (LEADING word is the placeholder) — a "last word only" rule would wrongly accept this, which is the regression path (a) narrowing was rejected for`);
+    }
+  }
+
+  // ── Finding 3 (dev-request 2026-07-27-384-placeholder-regel-etterslep) ──
+  // authorityOf()'s `^//` strip was unpinned: the existing alias-26 fixture for
+  // the protocol-relative userinfo-swap class uses `visitbergen.com`, which is
+  // independently on both KNOWN_DIRECTORY_HOSTS and HARVEST_SOURCE_HOSTS — so
+  // the assertion (null) is satisfied by isAggregatorWebsite()/
+  // isHarvestSourceHost() whether or not the `^//` strip works at all. Verified
+  // by mutation: removing the strip leaves alias-26's `visitbergen.com` case
+  // green (still null, via the OTHER screen) but flips THIS fixture red (the
+  // candidate gets stored verbatim) because neither host here is on any
+  // aggregator/harvest-source/placeholder list — the `^//` strip is the ONLY
+  // thing rejecting it.
+  {
+    const row = BulkRowSchema.parse({ ...base, hjemmeside: "//annenurl.no@gardsbruket.no" });
+    assertEq(
+      firstNonAggregatorWebsite([row as BulkRow]),
+      null,
+      "alias-31: a protocol-relative userinfo swap is rejected by authorityOf's `^//` strip alone — neither host is on any other screen list",
+    );
+  }
+
+  // ── Finding 5 (dev-request 2026-07-27-384-placeholder-regel-etterslep) ──
+  // Two branches inside isPlaceholderHomepageHost/looksLikeHomepageValue had no
+  // falsifying fixture: (a) the label-COLLAPSE branch
+  // (`label.replace(/[-_]/g, "")` producing a match) and (b) the punycode-TLD
+  // acceptance path (`/^xn--[a-z0-9-]{2,}$/.test(tld)`). Both verified by
+  // mutation: commenting out either branch flips exactly these assertions red
+  // (and nothing else in the suite), then restoring both flips them back green.
+  {
+    // (a) collapse branch. "domain"/"company" are deliberately NOT in
+    // PLACEHOLDER_DOMAIN_LABELS (only the collapsed "yourdomain"/"yourcompany"
+    // are) — so the LAST-word split check (which "your-domain"/"your-company"
+    // would otherwise hit) cannot reject these; only the collapse check can.
+    for (const junk of ["your-domain.no", "your-company.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-32a/${junk}: rejected via the label-COLLAPSE branch only — neither split word is separately listed`);
+    }
+    // (b) punycode-TLD branch. A synthetic but shape-valid punycode TLD; no
+    // other branch admits a non-alphabetic TLD.
+    const punycode = BulkRowSchema.parse({ ...base, hjemmeside: "storgarden.xn--abc12" });
+    assertEq(firstNonAggregatorWebsite([punycode as BulkRow]), "storgarden.xn--abc12",
+      "alias-32b: a punycode TLD (xn--…) is accepted via its own dedicated branch, not the alphabetic-TLD check");
   }
 
   // ── Round-5 review: the parsers, once more ──────────────────────────────
