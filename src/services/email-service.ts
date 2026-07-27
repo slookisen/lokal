@@ -1,6 +1,10 @@
 import nodemailer, { Transporter } from 'nodemailer';
 import { slugify } from "../utils/slug";
 import { getConfig } from "../config/vertical-config";
+// dev-request 2026-07-26-booking-test-send-guard — per-transaction test-mode
+// redirect, applied at the single send boundary below so no call site can
+// bypass it.
+import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard";
 
 // Simple logger — replace with winston/pino in production
 const logger = {
@@ -23,6 +27,16 @@ export interface EmailOptions {
   replyTo?: string;
   listUnsubscribe?: string;
   attachments?: EmailAttachment[];
+  /**
+   * dev-request 2026-07-26-booking-test-send-guard. When true, this email
+   * belongs to a transaction explicitly flagged as a test: it is redirected
+   * to TEST_SEND_REDIRECT_EMAIL and visibly marked, and if that address is
+   * NOT configured nothing is sent at all (fail-closed — never a fallback to
+   * `to`). The flag can only originate from an admin-gated call; it is not
+   * part of any public input schema. Omitted/false leaves this method's
+   * behaviour bit-for-bit unchanged.
+   */
+  isTestSend?: boolean;
 }
 
 export class EmailService {
@@ -191,6 +205,42 @@ export class EmailService {
   }
 
   async sendEmail(options: EmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    // ── Test-send guard (dev-request 2026-07-26-booking-test-send-guard) ──
+    // Applied FIRST, ahead of the dry-run short-circuit and every other
+    // branch below, so there is no code path on which a test-flagged email
+    // reaches its real recipient. Fail-closed: an unconfigured redirect
+    // address sends nothing and reports why, rather than falling back to
+    // `options.to`. Untouched when isTestSend is absent/false.
+    if (options.isTestSend) {
+      try {
+        const redirected = applyTestSendRedirect({
+          to: options.to,
+          subject: options.subject,
+          htmlContent: options.htmlContent,
+          textContent: options.textContent,
+        });
+        logger.warn('Test-send redirect applied', {
+          intendedRecipient: options.to,
+          redirectedTo: redirected.to,
+          subject: redirected.subject,
+        });
+        options = { ...options, ...redirected };
+      } catch (err) {
+        const error =
+          err instanceof TestSendNotConfiguredError
+            ? err.code
+            : err instanceof Error
+              ? err.message
+              : 'test_send_redirect_failed';
+        logger.error('Test-send BLOCKED — nothing sent', {
+          intendedRecipient: options.to,
+          subject: options.subject,
+          error,
+        });
+        return { success: false, error };
+      }
+    }
+
     if (!this.isConfigured) {
       logger.info('DRY RUN: Would send email', {
         to: options.to,
@@ -296,14 +346,17 @@ export class EmailService {
     to: string;
     providerName: string;
     verifyUrl: string;
+    /** dev-request 2026-07-26-booking-test-send-guard — see EmailOptions. */
+    isTestSend?: boolean;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
-    const { to, providerName, verifyUrl } = opts;
+    const { to, providerName, verifyUrl, isTestSend } = opts;
     return await this.sendEmail({
       to,
       subject: `Logg inn på eierportalen for ${providerName} — Opplevagent`,
       htmlContent: buildGardssalgClaimMagicLinkHtml(providerName, verifyUrl),
       textContent: buildGardssalgClaimMagicLinkText(providerName, verifyUrl),
       replyTo: "kontakt@opplevagent.no",
+      isTestSend,
     });
   }
 

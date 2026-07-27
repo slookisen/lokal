@@ -27803,6 +27803,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gob.failures) failures.push("opplevelser-gardssalg-orgnr-backfill: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-backfill: ${gob.passed} passed, ${gob.failed} failed`);
 
+    // dev-request 2026-07-26-booking-test-send-guard: per-transaction test
+    // flag that redirects EVERY outgoing email of that one transaction to
+    // TEST_SEND_REDIRECT_EMAIL (services/send-guard.ts, applied inside
+    // EmailService.sendEmail so no call site can bypass it). Unblocks the
+    // live-E2E acceptance criterion on two already-deployed dev-requests
+    // (mcp-booking-verktoy, claim-flyt). Asserts at the real send boundary
+    // via an injected transporter — notably that the PRODUCER notification
+    // (the email carrying the actionable tokens) is the one redirected, and
+    // that the flag cannot be smuggled in through a public payload. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-booking-send-guard: test-mode send redirect ──");
+    const { runOpplevelserBookingSendGuardTests } = require("../src/routes/opplevelser-booking-send-guard.test") as
+      typeof import("../src/routes/opplevelser-booking-send-guard.test");
+    const bsg = await runOpplevelserBookingSendGuardTests({ log: false });
+    passed += bsg.passed;
+    failed += bsg.failed;
+    for (const f of bsg.failures) failures.push("opplevelser-booking-send-guard: " + f);
+    console.log(`  opplevelser-booking-send-guard: ${bsg.passed} passed, ${bsg.failed} failed`);
+
     // dev-request 2026-07-26-brreg-kontakt-backfill: fetchBrregContact()
     // (src/services/brreg-client.ts) reads epostadresse/telefon/mobil out of
     // the SAME GET /enheter/{orgNr} response the other org-nr lookups already

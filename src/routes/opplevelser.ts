@@ -228,6 +228,16 @@ import { fetchBrregWebsite } from "../services/brreg-client";
 // out of that SAME GET /enheter/{orgNr} response (fields no code read until
 // now). See POST /admin/gardssalg-contact-backfill below.
 import { fetchBrregContact } from "../services/brreg-client";
+// dev-request 2026-07-26-booking-test-send-guard — the two admin-gated test
+// drivers below (POST /admin/booking-test-send, POST /admin/claim-test-send)
+// are the ONLY call sites that may set the per-transaction test flag.
+import { testSendRedirectAddress } from "../services/send-guard";
+import { issueClaimMagicLink, getClaimProviderById } from "../services/gardssalg-claim";
+import { emailService } from "../services/email-service";
+
+// Same derivation as gardssalg-claim.ts's own constant — the verify URL must
+// point at the host that serves the claim routes.
+const OPPLEVAGENT_CLAIM_BASE_URL = (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "");
 // dev-request 2026-07-19-agg-website-leak — reuse the curated DMO/aggregator
 // host classifier (same one admin-knowledge.ts's classifyWebsite() uses) so a
 // harvest row's `website` is never blindly trusted as a provider's OWN
@@ -3559,6 +3569,157 @@ router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Req
     skipped_locked: skippedLocked,
     unresolved,
     errors,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/booking-test-send (admin) ─────────────────
+// ─── POST /api/opplevelser/admin/claim-test-send   (admin) ─────────────────
+//
+// dev-request 2026-07-26-booking-test-send-guard.
+//
+// The ONLY two call sites in the codebase that can set the per-transaction
+// test flag. Both are behind requireAdmin (X-Admin-Key). The public booking
+// entry points — POST /api/opplevelser/book and the book_gardssalg MCP tool —
+// both parse their payload with BookingInputSchema, which has no such field
+// and (being zod) strips unknown keys, so there is no field name a public
+// caller could smuggle to reach `createBooking`'s third argument. Likewise the
+// public claim route calls issueClaimMagicLink() with one argument.
+//
+// Both routes check the redirect address BEFORE creating anything, so an
+// unconfigured TEST_SEND_REDIRECT_EMAIL produces a clear 400 and no DB row at
+// all — rather than a row whose emails then silently fail closed downstream.
+// (The downstream fail-closed in email-service.ts still stands; this is the
+// belt to its braces, and gives the operator an actionable error.)
+//
+// These exist to run acceptance criterion 6 on two OTHER dev-requests:
+// 2026-07-21-opplevagent-mcp-booking-verktoy (MCP booking E2E) and
+// 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter (claim E2E).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: Response) => {
+  const redirect = testSendRedirectAddress();
+  if (!redirect) {
+    return res.status(400).json({
+      success: false,
+      error: "test_send_redirect_not_configured",
+      message:
+        "TEST_SEND_REDIRECT_EMAIL is not configured. Refusing to create a test booking " +
+        "rather than risk a send to a real recipient.",
+    });
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const source = typeof body.source === "string" && body.source.trim() !== "" ? body.source.trim() : "mcp";
+
+  const parsed = BookingInputSchema.safeParse(body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      error: "invalid_input",
+      issues: parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`),
+    });
+  }
+
+  // Same gate as the public path — a test must not bypass booking_live /
+  // BOOKING_DISPATCH_ENABLED, or it would not be testing the real flow.
+  const provider = getProviderById(parsed.data.provider_id) as
+    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
+    | null;
+  if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
+    return res.status(409).json({ success: false, error: "not_live", provider_id: parsed.data.provider_id });
+  }
+
+  let booking;
+  try {
+    booking = createBooking(parsed.data, source, { isTest: true });
+  } catch (e: any) {
+    return res.status(500).json({ success: false, error: "create_failed", message: e?.message ?? String(e) });
+  }
+
+  // AWAITED here (unlike the fire-and-forget public path) so the operator gets
+  // the actual send outcome back in the response — that IS the test result.
+  const sends: Array<{ kind: string; ok: boolean; error?: string }> = [];
+  try {
+    await sendBookingConfirmation(booking);
+    sends.push({ kind: "guest_confirmation", ok: true });
+  } catch (e: any) {
+    sends.push({ kind: "guest_confirmation", ok: false, error: e?.message ?? String(e) });
+  }
+  try {
+    await sendProducerNotification(booking, provider?.epost ?? null);
+    sends.push({ kind: "producer_notification", ok: true });
+  } catch (e: any) {
+    sends.push({ kind: "producer_notification", ok: false, error: e?.message ?? String(e) });
+  }
+
+  res.json({
+    success: true,
+    test_mode: true,
+    redirected_to: redirect,
+    booking_ref: booking.booking_ref,
+    booking_id: booking.booking_id,
+    source: booking.source,
+    is_test: booking.is_test,
+    intended_recipients: {
+      guest: booking.guest_email,
+      producer: provider?.epost ?? null,
+    },
+    sends,
+  });
+});
+
+router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response) => {
+  const redirect = testSendRedirectAddress();
+  if (!redirect) {
+    return res.status(400).json({
+      success: false,
+      error: "test_send_redirect_not_configured",
+      message:
+        "TEST_SEND_REDIRECT_EMAIL is not configured. Refusing to issue a test claim link " +
+        "rather than risk a send to a real recipient.",
+    });
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    return res.status(400).json({ success: false, error: "provider_id_required" });
+  }
+
+  const result = issueClaimMagicLink(providerId, null, { isTest: true });
+  if (!result.ok) {
+    return res.status(result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : 403).json({
+      success: false,
+      error: result.error,
+    });
+  }
+
+  const verifyUrl = `${OPPLEVAGENT_CLAIM_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${result.claim.token}`;
+  const provider = getClaimProviderById(providerId);
+
+  emailService
+    .sendGardssalgClaimMagicLink({
+      to: result.claim.email,
+      providerName: provider?.navn || "din profil",
+      verifyUrl,
+      isTestSend: result.claim.isTest,
+    })
+    .then((r) => {
+      if (!r.success) console.error(`[claim-test-send] send failed for ${providerId}: ${r.error}`);
+    })
+    .catch((e) => console.error("[claim-test-send] send error:", e));
+
+  res.json({
+    success: true,
+    test_mode: true,
+    redirected_to: redirect,
+    claim_id: result.claim.claimId,
+    is_test: result.claim.isTest,
+    intended_recipient: result.claim.email,
+    intended_recipient_masked: result.claim.maskedEmail,
+    email_source: result.claim.source,
+    expires_at: result.claim.expiresAt,
   });
 });
 
