@@ -33960,3 +33960,28 @@ runSerial(async () => {
     failures.push("reise-page: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-27-outreach-blocker-diag (Steg 1): blocker_breakdown
+// diagnostic on GET /admin/outreach-ready-pool/stats — explains WHY the
+// pending_verify/review_required cohort never reaches verified/pool
+// (per-gating-field source_count distribution + Tier, address/phone
+// cross-tab, a split of the existing pool_funnel.url_fresh_and_ok failure
+// count, thin-enrichment breakdown, no-website count, email-first
+// breakdown). Own in-memory prod-schema DB (own dedicated test file, mirrors
+// homepage-provenance-low-quality-selector.test.ts's convention). Runs via
+// runSerial() like the Fase 0/1/2/2c suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-27-outreach-blocker-diag: blocker_breakdown on GET /admin/outreach-ready-pool/stats ──");
+  try {
+    const { runAdminOutreachPoolBlockerBreakdownTests } = require("../src/routes/admin-outreach-pool-blocker-breakdown.test") as
+      typeof import("../src/routes/admin-outreach-pool-blocker-breakdown.test");
+    const bb = await runAdminOutreachPoolBlockerBreakdownTests({ log: false });
+    passed += bb.passed;
+    failed += bb.failed;
+    for (const f of bb.failures) failures.push("outreach-pool-blocker-breakdown: " + f);
+    console.log(`  outreach-pool-blocker-breakdown: ${bb.passed} passed, ${bb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outreach-pool-blocker-breakdown: unexpected error: " + String(err?.message || err));
+  }
+});
