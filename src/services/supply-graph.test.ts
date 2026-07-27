@@ -10,7 +10,7 @@
 
 import Database from "better-sqlite3";
 import { __setDbForTesting, __initSchemaForTesting } from "../database/init";
-import { computeEffectiveAvailability, setProducerAvailability, getSupplyGraphStaleDays } from "./supply-graph";
+import { computeEffectiveAvailability, setProducerAvailability, setProducerAvailabilityByProductId, getSupplyGraphStaleDays } from "./supply-graph";
 
 export interface TestSummary {
   passed: number;
@@ -157,6 +157,41 @@ export function runSupplyGraphTests(opts: { log?: boolean } = {}): TestSummary {
   {
     const result = setProducerAvailability("agent-does-not-exist", "poteter", "in_stock", db);
     assertEq(result, { success: false, reason: "not_found" }, "unknown agent_id → {success:false, reason:'not_found'}");
+  }
+
+  // ── setProducerAvailabilityByProductId (salvage slice, keyed by productId) ──
+  // Mirrors setProducerAvailability's own test structure above, just keyed
+  // differently. Reuses the same fixture DB/agents; adds one more product.
+  insertProduct("prod-a-gulrot", "agent-a", "Gulrøtter", "gulrotter");
+
+  // Happy path: updates the correct row by (id, agent_id).
+  {
+    const result = setProducerAvailabilityByProductId("agent-a", "prod-a-gulrot", "out_of_stock", db);
+    assertTrue(result.success === true, "setProducerAvailabilityByProductId succeeds for a real (agentId, productId) match");
+    if (result.success) {
+      assertEq(result.productId, "prod-a-gulrot", "setProducerAvailabilityByProductId returns the correct productId");
+    }
+
+    const row = db.prepare("SELECT availability, availability_source, availability_updated_at FROM products WHERE id = ?").get("prod-a-gulrot") as any;
+    assertEq(row.availability, "out_of_stock", "agent-a's product row availability was updated (by productId)");
+    assertEq(row.availability_source, "producer_dashboard", "agent-a's product row availability_source set to producer_dashboard (by productId)");
+    assertTrue(!!row.availability_updated_at, "agent-a's product row availability_updated_at was stamped (by productId)");
+  }
+
+  // Not-found id — never throws.
+  {
+    const result = setProducerAvailabilityByProductId("agent-a", "prod-does-not-exist", "in_stock", db);
+    assertEq(result, { success: false, reason: "not_found" }, "unknown productId → {success:false, reason:'not_found'}");
+  }
+
+  // id belongs to a DIFFERENT agent — never touched, not_found returned.
+  {
+    const result = setProducerAvailabilityByProductId("agent-b", "prod-a-gulrot", "in_stock", db);
+    assertEq(result, { success: false, reason: "not_found" }, "productId belonging to a different agent → {success:false, reason:'not_found'} (never touched)");
+
+    const row = db.prepare("SELECT availability, availability_source FROM products WHERE id = ?").get("prod-a-gulrot") as any;
+    assertEq(row.availability, "out_of_stock", "agent-a's product (queried via agent-b) was NOT touched — availability unchanged");
+    assertEq(row.availability_source, "producer_dashboard", "agent-a's product (queried via agent-b) was NOT touched — source unchanged");
   }
 
   return { passed, failed, failures };

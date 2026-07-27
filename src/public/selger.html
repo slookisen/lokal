@@ -602,6 +602,21 @@
             <span id="bulkResult" style="font-size: 0.85rem; color: var(--green);"></span>
           </div>
         </div>
+
+        <!-- ── Tilgjengelighet (dev-request 2026-07-13-supply-graph-v1, salvage
+             slice). NOTE: separate concept from the product list/catalog above
+             (which edits agent_knowledge.products, a free-text JSON list) — this
+             reads/writes the SQL `products` table via the public catalog GET
+             and the producer PATCH availability endpoint. -->
+        <div class="card" style="margin-top: 1rem;">
+          <h3 style="margin-bottom: 0.5rem;">Tilgjengelighet</h3>
+          <p style="font-size: 0.85rem; color: var(--gray-500); margin-bottom: 1rem;">
+            Sett tilgjengelighet for produktene dine i katalogen. Kunder ser dette n&aring;r de handler i handlekurven.
+          </p>
+          <ul class="product-list" id="availabilityList">
+            <li style="text-align: center; color: var(--gray-500); padding: 2rem;">Laster &hellip;</li>
+          </ul>
+        </div>
       </div>
 
       <!-- ── Tab: Opening Hours ── -->
@@ -1464,6 +1479,106 @@
 
       renderStats();
       renderSettings();
+      loadCatalogAvailability();
+    }
+
+    // ═══════════ AVAILABILITY (SQL `products` table, dev-request
+    // 2026-07-13-supply-graph-v1, salvage slice) ═══════════
+    // NOTE: this is a DIFFERENT concept from state.products above — that's
+    // the free-text agent_knowledge.products JSON list edited via the
+    // "Produktkatalog" card. This section reads the public catalog GET
+    // (/api/marketplace/catalog/agents/:id/products) and writes via the
+    // producer-only PATCH availability endpoint.
+    async function loadCatalogAvailability() {
+      if (!state.agentId) return;
+      try {
+        var res = await api('/catalog/agents/' + state.agentId + '/products');
+        state.catalogProducts = (res && res.success && Array.isArray(res.products)) ? res.products : [];
+      } catch (e) {
+        state.catalogProducts = [];
+      }
+      renderCatalogAvailability();
+    }
+
+    function renderCatalogAvailability() {
+      var list = document.getElementById('availabilityList');
+      if (!list) return;
+      var products = state.catalogProducts || [];
+      if (products.length === 0) {
+        list.innerHTML = '<li style="text-align:center;color:var(--gray-500);padding:2rem;">Ingen produkter i katalogen ennå</li>';
+        return;
+      }
+      list.innerHTML = '';
+      products.forEach(function(p) {
+        list.appendChild(buildAvailabilityRow(p));
+      });
+    }
+
+    function buildAvailabilityRow(p) {
+      var li = document.createElement('li');
+      li.className = 'product-item';
+
+      var infoDiv = document.createElement('div');
+      var nameSpan = document.createElement('span');
+      nameSpan.className = 'product-name';
+      nameSpan.textContent = p.name;
+      infoDiv.appendChild(nameSpan);
+
+      var metaSpan = document.createElement('span');
+      metaSpan.className = 'product-meta';
+      var statusLabel = p.availability === 'in_stock' ? 'På lager'
+        : p.availability === 'out_of_stock' ? 'Ikke på lager'
+        : p.availability;
+      metaSpan.textContent = ' • ' + statusLabel;
+      infoDiv.appendChild(metaSpan);
+
+      var actionsDiv = document.createElement('div');
+      actionsDiv.className = 'product-actions';
+
+      var select = document.createElement('select');
+      select.className = 'btn-small';
+      var optIn = document.createElement('option');
+      optIn.value = 'in_stock';
+      optIn.textContent = 'På lager';
+      var optOut = document.createElement('option');
+      optOut.value = 'out_of_stock';
+      optOut.textContent = 'Ikke på lager';
+      select.appendChild(optIn);
+      select.appendChild(optOut);
+      select.value = (p.availability === 'out_of_stock') ? 'out_of_stock' : 'in_stock';
+
+      select.addEventListener('change', function() {
+        setProductAvailability(p.id, select.value, li);
+      });
+
+      actionsDiv.appendChild(select);
+      li.appendChild(infoDiv);
+      li.appendChild(actionsDiv);
+      return li;
+    }
+
+    async function setProductAvailability(productId, availability, li) {
+      try {
+        var res = await api('/agents/' + state.agentId + '/products/' + productId + '/availability', {
+          method: 'PATCH',
+          body: JSON.stringify({ availability: availability })
+        });
+        if (res && res.success) {
+          var idx = (state.catalogProducts || []).findIndex(function(p) { return p.id === productId; });
+          if (idx !== -1) {
+            state.catalogProducts[idx].availability = availability;
+            if (li && li.parentNode) {
+              var updated = buildAvailabilityRow(state.catalogProducts[idx]);
+              li.parentNode.replaceChild(updated, li);
+            }
+          }
+          showAlert('dashAlert', 'Tilgjengelighet lagret!', 'success');
+        } else {
+          showAlert('dashAlert', (res && res.error) || 'Kunne ikke lagre tilgjengelighet', 'error');
+        }
+      } catch (err) {
+        showAlert('dashAlert', 'Feil: ' + escHtml(err.message), 'error');
+      }
     }
 
     function renderDashboard() {

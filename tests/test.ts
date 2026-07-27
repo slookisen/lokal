@@ -33594,6 +33594,47 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-07-13-supply-graph-v1, salvage slice (2026-07-27):
+// PATCH /agents/:id/products/:productId/availability (auth + 404 scoping) +
+// setProducerAvailabilityByProductId(). Own in-memory DB (swaps the shared
+// getDb() singleton) — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-supply-graph-v1 (salvage slice): PATCH availability endpoint ──");
+  try {
+    const { runMarketplaceAvailabilityPatchTests } = require("../src/routes/marketplace-availability-patch.test") as
+      typeof import("../src/routes/marketplace-availability-patch.test");
+    const map = await runMarketplaceAvailabilityPatchTests({ log: false });
+    passed += map.passed;
+    failed += map.failed;
+    for (const f of map.failures) failures.push("marketplace-availability-patch: " + f);
+    console.log(`  marketplace-availability-patch: ${map.passed} passed, ${map.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-availability-patch: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-07-13-supply-graph-v1, salvage slice (2026-07-27):
+// cart-service addCartItem()/submitCart() staleness hardening — gate on
+// EFFECTIVE availability, not the raw column. Own in-memory DB (swaps both
+// the shared getDb() singleton and cart-service's module-local test DB) —
+// runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-supply-graph-v1 (salvage slice): cart-service staleness hardening ──");
+  try {
+    const { runCartServiceSupplyGraphTests } = require("../src/services/cart-service-supply-graph.test") as
+      typeof import("../src/services/cart-service-supply-graph.test");
+    const csg = runCartServiceSupplyGraphTests({ log: false });
+    passed += csg.passed;
+    failed += csg.failed;
+    for (const f of csg.failures) failures.push("cart-service-supply-graph: " + f);
+    console.log(`  cart-service-supply-graph: ${csg.passed} passed, ${csg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cart-service-supply-graph: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter:
 // gårdssalg producer owner-claim flow (magic-link-based, mirrors RFB's
 // owner-portal.ts pattern in a vertical-scoped table). Three suites:

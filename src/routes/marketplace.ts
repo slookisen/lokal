@@ -29,6 +29,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
+import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -1709,6 +1710,68 @@ router.put("/agents/:id/description", (req: Request, res: Response) => {
       name: updated.name,
       description: updated.description,
     },
+  });
+});
+
+// ─── PATCH /agents/:id/products/:productId/availability — producer-set
+// availability (dev-request 2026-07-13-supply-graph-v1, salvage slice) ─────
+// Auth model mirrors PUT /agents/:id/knowledge exactly:
+//   1. X-Admin-Key   → admin/CS-relay
+//   2. X-Claim-Token → producer who has claimed their listing
+//   3. X-API-Key     → agent's own key
+// Body: { availability: string } — any non-empty string, same open contract
+// as the existing `products.availability` column has everywhere else in
+// this codebase (no enum validation exists for it, so none is added here).
+// Writes go through setProducerAvailabilityByProductId(), which scopes the
+// UPDATE to (id AND agent_id) so a producer can never touch another
+// agent's product — 404 when the productId doesn't belong to this agentId.
+router.patch("/agents/:id/products/:productId/availability", (req: Request, res: Response) => {
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const apiKey = (req.headers["x-api-key"] as string) || "";
+  const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
+  const expectedAdminKey = getAdminKey();
+  const agentId = req.params.id as string;
+  const productId = req.params.productId as string;
+
+  let authorized = false;
+
+  if (expectedAdminKey && adminKeyHeader && adminKeyHeader === expectedAdminKey) {
+    authorized = true;
+  }
+  if (!authorized && claimToken) {
+    const claim = knowledgeService.getClaimByToken(claimToken);
+    if (claim && claim.agentId === agentId) authorized = true;
+  }
+  if (!authorized && apiKey) {
+    const a = marketplaceRegistry.getAgentByApiKey(apiKey);
+    if (a && a.id === agentId) authorized = true;
+  }
+
+  if (!authorized) {
+    res.status(403).json({
+      success: false,
+      error: "Ikke autorisert. Bruk X-Admin-Key, X-Claim-Token eller X-API-Key header.",
+    });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const availability = body.availability;
+  if (typeof availability !== "string" || availability.trim().length === 0) {
+    res.status(400).json({ success: false, error: "availability må være en ikke-tom string." });
+    return;
+  }
+
+  const result = setProducerAvailabilityByProductId(agentId, productId, availability);
+  if (!result.success) {
+    res.status(404).json({ success: false, error: "Produkt ikke funnet for denne agenten." });
+    return;
+  }
+
+  res.json({
+    success: true,
+    message: "Tilgjengelighet oppdatert",
+    data: { id: result.productId, availability },
   });
 });
 
