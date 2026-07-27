@@ -3212,6 +3212,226 @@ export function applyGardssalgProviderAddress(
   return written;
 }
 
+// ─── Gårdssalg Brreg contact backfill (dev-request 2026-07-26-brreg-kontakt-
+// backfill) ──────────────────────────────────────────────────────────────────
+//
+// Measured 2026-07-27 over the full live cohort: 344 of 389 gårdssalg
+// providers have NEITHER epost NOR telefon on file, which makes them
+// simultaneously un-contactable (no outreach) and un-claimable (the claim
+// flow derives its magic-link target from an org-linked email). 333 of those
+// have an org_nr; 101 of them (30.3 %) have a contact channel registered in
+// Brreg's own /enheter/{orgNr} response — a field the codebase never read.
+//
+// Unlike selectGardssalgProvidersForAddressEnrichment above, this selector
+// deliberately does NOT exclude catalog_hidden=1 rows. Hidden IS the cohort:
+// 246 of the 257 website-less providers are hidden precisely because we have
+// no content for them, and giving them a contact channel is the only path by
+// which they ever get claimed and published. Writing a fill-only contact
+// field onto a hidden row publishes nothing and sends nothing (sends stay
+// behind their own separate gate).
+
+export type GardssalgContactBackfillTarget = {
+  id: string;
+  navn: string;
+  org_nr: string;
+  content_source: string | null;
+  epost: string | null;
+  telefon: string | null;
+  hjemmeside: string | null;
+};
+
+// Higher than the 48 the sibling gårdssalg admin routes use: this cohort is
+// ~333 rows and criterion 6 calls for a dry-run over ALL of them, so a 48-cap
+// would need 7 round-trips. 100 sequential Brreg lookups is ~25s — comfortably
+// inside the request timeout — and keeps the walk to 4 calls.
+export const GS_CB_HARD_CAP = 100;
+
+const GS_CONTACT_TARGET_COLUMNS = `id, navn, org_nr, content_source, epost, telefon, hjemmeside`;
+
+/**
+ * Auto-select gårdssalg providers eligible for a Brreg contact backfill:
+ * gårdssalg providers (producer_type set OR rfb-seed) WITH an org_nr, NOT
+ * locked (content_source not in manual/claim), and missing AT LEAST ONE of
+ * epost/telefon. Fill-only downstream, so a row missing just one of the two
+ * is still worth a lookup.
+ *
+ * Ordered by created_at ASC then id ASC — a total order, so paging with
+ * `offset` is stable across calls (the dry-run has to walk a ~333-row cohort
+ * in batches, and a non-deterministic tie-break would silently skip rows).
+ * Hard-capped at GS_CB_HARD_CAP per call.
+ */
+export function selectGardssalgProvidersForContactBackfill(
+  limit = 48,
+  offset = 0
+): GardssalgContactBackfillTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(GS_CB_HARD_CAP, limit));
+  const off = Math.max(0, Math.floor(offset));
+  return db
+    .prepare(
+      `SELECT ${GS_CONTACT_TARGET_COLUMNS}
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND org_nr IS NOT NULL AND TRIM(org_nr) != ''
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND ((epost IS NULL OR TRIM(epost) = '') OR (telefon IS NULL OR TRIM(telefon) = ''))
+        ORDER BY created_at ASC, id ASC
+        LIMIT ? OFFSET ?`
+    )
+    .all(cap, off) as GardssalgContactBackfillTarget[];
+}
+
+/** Total size of the contact-backfill cohort — lets the route report how far
+ * a paged dry-run has to walk, instead of the caller guessing. */
+export function countGardssalgProvidersForContactBackfill(): number {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND org_nr IS NOT NULL AND TRIM(org_nr) != ''
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND ((epost IS NULL OR TRIM(epost) = '') OR (telefon IS NULL OR TRIM(telefon) = ''))`
+    )
+    .get() as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
+/**
+ * Resolve an explicit providerId for the contact-backfill route's
+ * `providerIds` override. Scoped to the gårdssalg WHERE clause only — NOT the
+ * blank-contact/lock filters — so an admin can force a lookup for a provider
+ * the auto-selector wouldn't pick (mirrors getGardssalgProviderAddressTarget's
+ * override semantics). Returns null when the provider doesn't exist, isn't a
+ * gårdssalg provider, or has no org_nr.
+ */
+export function getGardssalgProviderContactTarget(providerId: string): GardssalgContactBackfillTarget | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT ${GS_CONTACT_TARGET_COLUMNS}
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get(providerId) as GardssalgContactBackfillTarget | undefined;
+  if (!row || !row.org_nr || row.org_nr.trim().length === 0) return null;
+  return row;
+}
+
+/**
+ * Apply a Brreg contact candidate to ONE gårdssalg provider. Same discipline
+ * as applyGardssalgProviderAddress: NEVER writes if the provider is locked
+ * ('manual'/'claim'); FILL-ONLY (a field is written only when the row's
+ * current value is blank AND the candidate has content — an existing value is
+ * never replaced); one gardssalg_content_audit row per field actually written
+ * with the true pre-write old_value; a {source_url, fetched_at} entry merged
+ * into field_provenance per written field; all in one transaction.
+ *
+ * Scope is epost/telefon ONLY. `hjemmeside` is deliberately NOT written here
+ * even though Brreg returns it in the same response — website adoption has an
+ * established evidence-checked review-queue path
+ * (gardssalg_website_review_queue) and this backfill routes candidates there
+ * instead of bypassing it. Returns the field names actually written (empty
+ * array when there was nothing to write). Idempotent.
+ */
+export function applyGardssalgProviderContact(
+  providerId: string,
+  candidate: { epost?: string | null; telefon?: string | null },
+  evidenceUrl: string,
+  batchId?: string
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, epost, telefon, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        epost: string | null;
+        telefon: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+
+  function isBlank(v: unknown): boolean {
+    return v === null || v === undefined || String(v).trim() === "";
+  }
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: providerId };
+  const written: string[] = [];
+  // Pre-write snapshot — captured BEFORE any write, so the audit trail's
+  // old_value is always the true pre-write value.
+  const oldValues: Record<string, string | null> = {
+    epost: row.epost,
+    telefon: row.telefon,
+  };
+
+  if (isBlank(row.epost) && candidate.epost?.trim()) {
+    sets.push("epost = @epost");
+    params.epost = candidate.epost.trim();
+    written.push("epost");
+  }
+  if (isBlank(row.telefon) && candidate.telefon?.trim()) {
+    sets.push("telefon = @telefon");
+    params.telefon = candidate.telefon.trim();
+    written.push("telefon");
+  }
+
+  if (sets.length === 0) return [];
+
+  sets.push("updated_at = datetime('now')");
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  const fetchedAt = new Date().toISOString();
+  for (const f of written) {
+    provenance[f] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+  }
+  sets.push("field_provenance = @field_provenance");
+  params.field_provenance = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = @id`).run(params);
+    const insertAudit = db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    );
+    for (const f of written) {
+      insertAudit.run({
+        id: uuid(),
+        provider_id: providerId,
+        field_name: f,
+        old_value: oldValues[f] ?? null,
+        new_value: (params[f] as string | undefined) ?? null,
+        source_url: evidenceUrl,
+        batch_id: batchId ?? null,
+      });
+    }
+  });
+  applyWithAudit();
+
+  return written;
+}
+
 // ─── Gårdssalg org_nr backfill (dev-request 2026-07-18-gardssalg-
 // profilkvalitet-foer-outreach, slice 5b) ────────────────────────────────────
 // Slice 4's batch report found 0/74 gårdssalg providers have org_nr set —

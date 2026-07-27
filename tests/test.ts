@@ -27803,6 +27803,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gob.failures) failures.push("opplevelser-gardssalg-orgnr-backfill: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-backfill: ${gob.passed} passed, ${gob.failed} failed`);
 
+    // dev-request 2026-07-26-brreg-kontakt-backfill: fetchBrregContact()
+    // (src/services/brreg-client.ts) reads epostadresse/telefon/mobil out of
+    // the SAME GET /enheter/{orgNr} response the other org-nr lookups already
+    // call — fields no code in the repo read before this. Backs
+    // POST /admin/gardssalg-contact-backfill (fill-only, dry-run default,
+    // audit + provenance, hjemmeside routed to the review queue rather than
+    // written) for the 344-of-389 cohort that is un-contactable AND
+    // un-claimable today. Same in-memory-DB pattern, runs sequentially inside
+    // this same gated block.
+    console.log("\n── opplevelser-gardssalg-contact-backfill: Brreg epost/telefon backfill ──");
+    const { runOpplevelserGardssalgContactBackfillTests } = require("../src/routes/opplevelser-gardssalg-contact-backfill.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-contact-backfill.test");
+    const gcb = await runOpplevelserGardssalgContactBackfillTests({ log: false });
+    passed += gcb.passed;
+    failed += gcb.failed;
+    for (const f of gcb.failures) failures.push("opplevelser-gardssalg-contact-backfill: " + f);
+    console.log(`  opplevelser-gardssalg-contact-backfill: ${gcb.passed} passed, ${gcb.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5d
     // + 5b-integrasjonsherding (2026-07-19-review B1/B2/M1/M2/M3/M5): delt-/
     // katalogdomene-vern på content-refresh (kuratert klassifiserer +
