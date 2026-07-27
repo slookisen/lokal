@@ -9901,7 +9901,7 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
     db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id) VALUES ('ven-grimstad', 'Bondens Marked Grimstad', 'venue', 'lok-agder')").run();
     initMod.__setDbForTesting(db);
 
-    const { matchEventToVenue, runBmEventsScraper } = require("../src/services/bm-events-scraper");
+    const { matchEventToVenue, runBmEventsScraper, __setBmEventsScraperFetchForTesting } = require("../src/services/bm-events-scraper");
 
     // venue_fuzzy: event_name "Lyngdal Sentrum" should match "Bondens marked — Lyngdal"
     // (the prefix is stripped by normaliseForMatch and "lyngdal" remains as needle)
@@ -9946,7 +9946,12 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
       assertEq(r3.agent_id, null, "pr-56: unmatched returns agent_id=null");
 
       // ─── Behavioural: runBmEventsScraper with stubbed fetch ───
-      const realFetch = (globalThis as any).fetch;
+      // Uses the module-level fetch seam (__setBmEventsScraperFetchForTesting)
+      // instead of overwriting globalThis.fetch: concurrently-running test
+      // blocks (this file's async blocks are not serialized) share the one
+      // process-global fetch, so a raw globalThis override here could poison
+      // an unrelated block's real fetch call mid-flight. The injectable seam
+      // only affects bm-events-scraper.ts's own fetchHtml().
       const listingHtml = `<html><body>
         <a href="/markeder/lyngdal-sentrum-2026-05-16">Lyngdal</a>
         <a href="/markeder/bergen-2026-05-30">Bergen</a>
@@ -9957,17 +9962,24 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
       const bergenEventHtml = `<html><head>
         <script type="application/ld+json">{"@type":"Event","name":"Bergen Torg","startDate":"2026-05-30T09:00:00+00:00","endDate":"2026-05-30T15:00:00+00:00","location":{"name":"Bergen"}}</script>
       </head><body>x</body></html>`;
-      (globalThis as any).fetch = async (url: string) => {
+      __setBmEventsScraperFetchForTesting(async (url: string) => {
         let body = "";
         if (url.endsWith("/markeder")) body = listingHtml;
         else if (url.endsWith("lyngdal-sentrum-2026-05-16")) body = lyngdalEventHtml;
         else if (url.endsWith("bergen-2026-05-30")) body = bergenEventHtml;
         else body = "<html></html>";
         return new Response(body, { status: 200, headers: { "content-type": "text/html" } });
-      };
+      });
 
       try {
-        const result = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false });
+        // correctTimes: false — this test asserts on fetched/parsed/upserted only,
+        // never on event_times_checked/corrected, so we skip the lokallag-fasit
+        // time-correction step (PR-125's correctEventTimesFromCanonical). That
+        // step goes through bondensmarked-source.ts's own bmFetch(), a separate,
+        // un-seamed raw-fetch call site outside this test's stub — same
+        // correctTimes:false precedent already used by
+        // bm-events-scrape-job.test.ts for the identical reason.
+        const result = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false, correctTimes: false });
         assertEq(result.fetched, 2, "pr-56: scraper fetched 2 slugs from listing");
         assertEq(result.parsed, 2, "pr-56: scraper parsed both event JSON-LDs");
         assertTrue(result.upserted >= 1, `pr-56: scraper upserted at least 1 row (got ${result.upserted})`);
@@ -9978,12 +9990,12 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
         assertEq(stored?.venue_agent_id, "ven-lyngdal", "pr-56: stored row matched to ven-lyngdal");
 
         // Idempotency: a second run should not duplicate (UNIQUE on event_slug)
-        const result2 = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false });
+        const result2 = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false, correctTimes: false });
         const total = (db.prepare("SELECT COUNT(*) AS c FROM bm_market_events").get() as any).c;
         assertTrue(total <= 2, `pr-56: re-running scraper does not duplicate (total rows=${total})`);
         assertTrue(result2.upserted >= 1, "pr-56: second run still reports upserts (REPLACE)");
       } finally {
-        (globalThis as any).fetch = realFetch;
+        __setBmEventsScraperFetchForTesting();
       }
 
       // ─── Behavioural: public endpoint filters work ───
@@ -13700,8 +13712,10 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   // as PR-69/70/71). Mirrors the fix-pattern used in PR-71 iter-2.
   try { await _m2Promise; } catch { /* m2 owns its own failures */ }
   try { await _pr75Promise; } catch { /* pr-75 owns its own failures */ }
-  // Wait for pr-56 (which also stubs globalThis.fetch) to finish before
-  // we touch fetch — otherwise our stubs collide and pr-56 tests flake.
+  // Wait for pr-56 so console output stays in a stable order. Both blocks
+  // now use their own injectable fetch seam (__setBmEventsScraperFetchForTesting /
+  // __setGeocodingFetchForTesting), so — unlike before — their fetch stubs
+  // can no longer collide even if this await were removed.
   try { await _pr56Promise; } catch { /* ignored; pr-56 owns its own failures */ }
   console.log("\n── PR-76: lokal_geocode MCP tool ──");
   const fs = require("fs");
@@ -13756,7 +13770,7 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   );
 
   // ── Behavioural tests on geocodingService (what the tool handler invokes) ──
-  const { geocodingService } = require("../src/services/geocoding-service");
+  const { geocodingService, __setGeocodingFetchForTesting } = require("../src/services/geocoding-service");
 
   // (8) Hardcoded city: Oslo returns known coords with source 'hardcoded'
   const oslo = await geocodingService.geocode("Oslo");
@@ -13789,8 +13803,13 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   // (11) Not found: stub Kartverket fetch to return empty so we can assert null
   // gracefully (without making a real network call). The geocodingService
   // caches by lowercased name, so use a unique key that hasn't been cached.
-  const realFetch = (globalThis as any).fetch;
-  (globalThis as any).fetch = async (url: string) => {
+  // Uses the module-level __setGeocodingFetchForTesting seam instead of
+  // overwriting globalThis.fetch: this file's async test blocks run
+  // concurrently (not serialized), so a raw globalThis override here could
+  // poison a real fetch call mid-flight in some unrelated, concurrently
+  // running block. The injectable seam only affects geocoding-service.ts's
+  // own Kartverket/Kommuneinfo calls.
+  __setGeocodingFetchForTesting(async (url: string) => {
     if (typeof url === "string" && url.includes("ws.geonorge.no")) {
       return {
         ok: true,
@@ -13799,8 +13818,8 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
         json: async () => ({ navn: [] }),
       };
     }
-    return realFetch ? realFetch(url) : { ok: false, status: 500, statusText: "no fetch", json: async () => ({}) };
-  };
+    return fetch(url);
+  });
   try {
     const bogus = await geocodingService.geocode("InvalidPlace123XYZ");
     assertEq(bogus, null, "pr-76: geocode('InvalidPlace123XYZ') returns null (graceful)");
@@ -13814,7 +13833,7 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
       "pr-76: tool handler returns 'Fant ikke koordinater' text when geocode returns null"
     );
   } finally {
-    (globalThis as any).fetch = realFetch;
+    __setGeocodingFetchForTesting();
   }
 })()
   .then(() => _pr76Resolve())

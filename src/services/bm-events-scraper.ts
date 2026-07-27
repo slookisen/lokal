@@ -8,7 +8,8 @@
 //   - ad-hoc by Daniel from the same admin endpoint
 //
 // All four exported functions are pure (take their inputs explicitly) so
-// tests can drive them with a stubbed global `fetch`.
+// tests can drive them with a stubbed fetch via __setBmEventsScraperFetchForTesting()
+// (see the "Injectable fetch (tests)" seam below — production never calls it).
 //
 // Matching strategy (in priority order):
 //   1. venue_exact     — agents.name (lower) == event location_text (lower)
@@ -53,6 +54,18 @@ const FETCH_CONCURRENCY = 6;
 
 // Per-page timeout. Some bondensmarked.no pages are slow at peak load.
 const FETCH_TIMEOUT_MS = 15000;
+
+// ── Injectable fetch (tests) ──────────────────────────────────────
+// Same seam shape as geocoding-service.ts's fetchImpl: module-level because
+// runBmEventsScraper()/fetchHtml() are called directly by tests and routes,
+// not via a per-call deps object. Production never calls the setter, so the
+// default is the global fetch exactly as before.
+let fetchImpl: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
+
+/** Test-only: swap the fetch used for all bondensmarked.no calls. Pass nothing to restore. */
+export function __setBmEventsScraperFetchForTesting(impl?: typeof fetch): void {
+  fetchImpl = impl || ((...args: Parameters<typeof fetch>) => fetch(...args));
+}
 
 export type BmEventRecord = {
   event_slug: string;
@@ -649,7 +662,7 @@ export async function correctEventTimesFromCanonical(
 // ─── helpers ────────────────────────────────────────────────────
 
 async function fetchHtml(url: string): Promise<string> {
-  const res = await fetch(url, {
+  const res = await fetchImpl(url, {
     redirect: "follow",
     headers: {
       // Identify as a polite scraper. bondensmarked.no does not block on UA
