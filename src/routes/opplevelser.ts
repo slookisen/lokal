@@ -448,7 +448,7 @@ router.get("/categories", (_req: Request, res: Response) => {
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 
-const BulkRowSchema = z.object({
+export const BulkRowSchema = z.object({
   title: z.string().min(1),
   provider_name: z.string().min(1),
   category: z.string().optional().nullable(),
@@ -464,12 +464,40 @@ const BulkRowSchema = z.object({
   evidence_url: z.string().optional().nullable(),
   confidence: z.enum(["high", "medium", "low"]).optional().nullable(),
   website: z.string().optional().nullable(),
+  // `hjemmeside` is an ACCEPTED ALIAS for `website` (dev-request
+  // 2026-07-27-harvest-hjemmeside-feltnavn-tapes).
+  //
+  // The harvest SKILL (scheduled-agents/experiences-harvest.md) has been
+  // telling its agent to send `hjemmeside` — under the heading "Build rows
+  // matching BulkRowSchema EXACTLY" — while this schema only ever accepted
+  // `website`. z.object() strips unknown keys silently, so every harvested
+  // homepage was discarded at the door, with no error and no warning: the
+  // request 200s, the provider is created, and its `hjemmeside` column is
+  // NULL.
+  //
+  // That is not a cosmetic mismatch. `hjemmeside` is the ONLY input to the
+  // provider-CREATE homepage write (firstNonAggregatorWebsite below), and
+  // selectProvidersForContentRefresh() skips providers whose homepage is
+  // empty — so a provider harvested this way can never be content-enriched.
+  // The harvest SKILL already names that exact symptom in its own prose
+  // ("enrichment only deepens providers that HAVE a hjemmeside ... this is
+  // why enrichment was scanning 0") and tried to fix it by instructing the
+  // agent to fill the field — using the name this endpoint ignores.
+  //
+  // Accepting BOTH names here (rather than only correcting the SKILL) is
+  // deliberate: Cloud Routines have repeatedly been observed executing a
+  // STALE copy of their SKILL text (see dev-request
+  // 2026-07-17-brreg-discovery-indexerror-og-stale-dispatch, reproduced three
+  // times), so a fix that depends on new SKILL text reaching the runner would
+  // not take effect reliably. A server-side alias works for old and new
+  // callers alike.
+  hjemmeside: z.string().optional().nullable(),
 });
 const BulkLoadSchema = z.object({
   experiences: z.array(BulkRowSchema).min(1).max(5000),
   apply: z.boolean().optional().default(false),
 });
-type BulkRow = z.infer<typeof BulkRowSchema>;
+export type BulkRow = z.infer<typeof BulkRowSchema>;
 
 // dev-request 2026-07-19-agg-website-leak: a 2026-07-12 harvest run wrote a
 // regional tourism-aggregator/DMO page (a KNOWN_DIRECTORY_HOSTS entry) into
@@ -503,8 +531,14 @@ function isAggregatorWebsite(raw: string): boolean {
 // host, else null. Used for the provider-CREATE `hjemmeside` write only (see
 // below) — order-independent: an aggregator-host row earlier in `rows` is
 // skipped in favor of a later row with a real domain.
-function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
-  return rows.find((r) => r.website && !isAggregatorWebsite(r.website))?.website ?? null;
+export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
+  // `website` and its accepted alias `hjemmeside` (see BulkRowSchema) are
+  // treated identically; `website` wins when a row somehow carries both.
+  for (const r of rows) {
+    const candidate = r.website ?? r.hjemmeside;
+    if (candidate && !isAggregatorWebsite(candidate)) return candidate;
+  }
+  return null;
 }
 
 const MAX_PROVIDERS_PER_CALL = 200;
