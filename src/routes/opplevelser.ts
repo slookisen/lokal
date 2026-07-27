@@ -6615,7 +6615,17 @@ Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der.
 // https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env,
 // x-api-key/anthropic-version headers. One row per call. Returns null (never
 // throws) on any failure so the caller can skip-not-fabricate.
-async function generateTitleNo(candidate: TitleNoCandidate): Promise<string | null> {
+//
+// `fetchImpl` defaults to the real global `fetch`, so production behavior is
+// unchanged; it exists purely as an injection seam so tests can supply a
+// scoped stub (via the Express app instance's "titleNoBackfillFetchImpl"
+// setting, resolved in the route handler below) instead of overwriting
+// `globalThis.fetch`, which would leak into other concurrently-running
+// test blocks.
+async function generateTitleNo(
+  candidate: TitleNoCandidate,
+  fetchImpl: typeof fetch = fetch
+): Promise<string | null> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
 
@@ -6628,7 +6638,7 @@ Sted: ${place || "ukjent"}`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
-    response = await fetch("https://api.anthropic.com/v1/messages", {
+    response = await fetchImpl("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -6668,6 +6678,14 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
   // undefined all mean dry run.
   const dryRun = body.dry_run !== false;
 
+  // Per-app-instance fetch injection seam (see generateTitleNo's doc comment
+  // above): tests set this via `app.set("titleNoBackfillFetchImpl", stub)`
+  // on their OWN Express app instance. Production never sets it, so
+  // `req.app.get(...)` returns undefined and we fall back to the real global
+  // `fetch` — production behavior is unchanged.
+  const fetchImpl =
+    (req.app.get("titleNoBackfillFetchImpl") as typeof fetch | undefined) ?? fetch;
+
   const db = getExpDb("experiences");
   const candidateRows = db
     .prepare(
@@ -6681,7 +6699,7 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
     const sample = candidateRows.slice(0, TITLE_NO_DRY_RUN_SAMPLE);
     const proposals: Array<{ id: string; title: string; proposed_title_no: string | null }> = [];
     for (const row of sample) {
-      const proposed = await generateTitleNo(row);
+      const proposed = await generateTitleNo(row, fetchImpl);
       proposals.push({ id: row.id, title: row.title, proposed_title_no: proposed });
     }
     res.json({
@@ -6696,7 +6714,7 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
   const batch = candidateRows.slice(0, TITLE_NO_BATCH_CAP);
   const generated: Array<{ id: string; title_no: string | null }> = [];
   for (const row of batch) {
-    generated.push({ id: row.id, title_no: await generateTitleNo(row) });
+    generated.push({ id: row.id, title_no: await generateTitleNo(row, fetchImpl) });
   }
 
   const setTitleNo = db.prepare(
