@@ -114,6 +114,16 @@ export interface GardssalgBooking {
   guest_status_token: string | null;       // GUEST read-only status credential
   reminder_sent_at: string | null;
   expired_guest_notified_at: string | null;
+  /**
+   * dev-request 2026-07-26-booking-test-send-guard. 1 = this booking is a
+   * deliberate end-to-end test: every outgoing email for it (guest receipt
+   * AND the producer notification that carries the actionable tokens) is
+   * redirected to TEST_SEND_REDIRECT_EMAIL, and the row is marked so it can
+   * be filtered out of stats. Settable ONLY from an admin-gated call — it is
+   * not a field of BookingInputSchema, so it cannot be smuggled in through
+   * any public booking payload. 0 for every existing and normal booking.
+   */
+  is_test: number;
 }
 
 export const BookingInputSchema = z.object({
@@ -189,6 +199,8 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
     guest_status_token:       (row.guest_status_token as string | null) ?? null,
     reminder_sent_at:         (row.reminder_sent_at as string | null) ?? null,
     expired_guest_notified_at:(row.expired_guest_notified_at as string | null) ?? null,
+    // Legacy rows predate the column; absent -> 0 (a real, non-test booking).
+    is_test:                  Number(row.is_test ?? 0) === 1 ? 1 : 0,
   };
 }
 
@@ -199,7 +211,20 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
 // POST /api/opplevelser/book and experiences-seo.ts's no-JS SSR fallback —
 // which never pass a second argument). experiences-mcp.ts's book_gardssalg
 // tool is the only caller that passes "mcp".
-export function createBooking(input: BookingInput, source: string = "opplevagent"): GardssalgBooking {
+//
+// `opts.isTest` (dev-request 2026-07-26-booking-test-send-guard) marks the
+// booking as a deliberate end-to-end test so every email it triggers is
+// redirected to TEST_SEND_REDIRECT_EMAIL. It is a THIRD ARGUMENT on purpose,
+// deliberately NOT a field of BookingInputSchema: the schema is what both
+// public entry points (POST /api/opplevelser/book and the book_gardssalg MCP
+// tool) parse their untrusted payload with, and zod strips unknown keys — so
+// there is no field name a public caller could smuggle to reach this. Only an
+// admin-gated call site passes it.
+export function createBooking(
+  input: BookingInput,
+  source: string = "opplevagent",
+  opts: { isTest?: boolean } = {},
+): GardssalgBooking {
   const db = getDb(VERTICAL);
 
   // Inherit commission_rate from provider if not explicitly set
@@ -244,6 +269,7 @@ export function createBooking(input: BookingInput, source: string = "opplevagent
     guest_status_token:       generateConfirmToken(),
     reminder_sent_at:         null,
     expired_guest_notified_at: null,
+    is_test:                  opts.isTest === true ? 1 : 0,
   };
 
   db.prepare(`
@@ -251,12 +277,14 @@ export function createBooking(input: BookingInput, source: string = "opplevagent
       booking_id, experience_id, provider_id, slot_at, party_size,
       guest_name, guest_email, guest_phone, booking_ref, confirm_token,
       source, status, commission_rate, notes, created_at,
-      pre_status, respond_token, respond_token_expires_at, guest_status_token
+      pre_status, respond_token, respond_token_expires_at, guest_status_token,
+      is_test
     ) VALUES (
       @booking_id, @experience_id, @provider_id, @slot_at, @party_size,
       @guest_name, @guest_email, @guest_phone, @booking_ref, @confirm_token,
       @source, @status, @commission_rate, @notes, @created_at,
-      @pre_status, @respond_token, @respond_token_expires_at, @guest_status_token
+      @pre_status, @respond_token, @respond_token_expires_at, @guest_status_token,
+      @is_test
     )
   `).run(booking);
 
@@ -473,6 +501,7 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
     htmlContent,
     textContent,
     replyTo: `kontakt@opplevagent.no`,
+    isTestSend: booking.is_test === 1,
     attachments: [
       {
         filename: `gardssalg-${booking.booking_ref}.ics`,
@@ -570,6 +599,10 @@ Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
     htmlContent,
     textContent,
     replyTo: `kontakt@opplevagent.no`,
+    // The PRODUCER email is the one carrying the actionable respond/confirm
+    // tokens — redirecting only the guest receipt would still hit a real
+    // producer with a test. See services/send-guard.ts.
+    isTestSend: booking.is_test === 1,
   });
 }
 
@@ -826,6 +859,7 @@ export async function sendPrevisitConfirmedToGuest(
     : "Gode nyheter — produsenten har bekreftet reservasjonen din:";
   await emailService.sendEmail({
     to: booking.guest_email,
+    isTestSend: booking.is_test === 1,
     subject: `Reservasjonen er bekreftet — ${booking.booking_ref}`,
     htmlContent: `
 <p>Hei ${escEmailHtml(booking.guest_name)},</p>
@@ -850,6 +884,7 @@ export async function sendPrevisitDeclinedToGuest(booking: GardssalgBooking): Pr
   const alternatives = `${APP_URL}/kategori/gardssalg`;
   await emailService.sendEmail({
     to: booking.guest_email,
+    isTestSend: booking.is_test === 1,
     subject: `Reservasjonen kunne dessverre ikke bekreftes — ${booking.booking_ref}`,
     htmlContent: `
 <p>Hei ${escEmailHtml(booking.guest_name)},</p>
@@ -871,6 +906,7 @@ export async function sendSuggestionToGuest(booking: GardssalgBooking): Promise<
   const suggestedFormatted = slotNb(booking.suggested_slot_at);
   await emailService.sendEmail({
     to: booking.guest_email,
+    isTestSend: booking.is_test === 1,
     subject: `Produsenten foreslår et nytt tidspunkt — ${booking.booking_ref}`,
     htmlContent: `
 <p>Hei ${escEmailHtml(booking.guest_name)},</p>
@@ -897,6 +933,7 @@ export async function sendPrevisitExpiredToGuest(booking: GardssalgBooking): Pro
     : `Vi beklager — produsenten har dessverre ikke besvart reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) i tide, så den er nå utløpt.`;
   await emailService.sendEmail({
     to: booking.guest_email,
+    isTestSend: booking.is_test === 1,
     subject: `Forespørselen utløp uten svar — ${booking.booking_ref}`,
     htmlContent: `
 <p>Hei ${escEmailHtml(booking.guest_name)},</p>
@@ -959,6 +996,7 @@ async function sendGatedProducerEmail(
     htmlContent,
     textContent,
     replyTo: "kontakt@opplevagent.no",
+    isTestSend: booking.is_test === 1,
   });
   return true;
 }

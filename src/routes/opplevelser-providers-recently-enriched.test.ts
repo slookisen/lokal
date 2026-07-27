@@ -1002,6 +1002,208 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
           "w8d: …whereas a field with NO entry is genuinely unknown and is kept — which is what makes passing null harmful");
       }
 
+      // ── (w12-w14) round-8 review, BLOCKING: JUDGED_FIELDS was unpinned ────
+      // Every member of that list could be deleted with the suite green.
+      // `booking_url` was pinned by w6c, but `description` and `category` were
+      // not: w6b asserts a homepage-sourced description IS served, which stays
+      // true when description is not judged at all, and w8c asserts a row is
+      // DROPPED, which a removed `description` also causes — the field stops
+      // counting toward `judgeable`. Both mutations were invisible.
+      //
+      // The shape that discriminates: one row per judged field, where THAT
+      // field is aggregator-sourced and a DIFFERENT judged field is
+      // homepage-sourced. The row survives (so it is not the drop path being
+      // observed) and the aggregator field must come back null. Drop the field
+      // from JUDGED_FIELDS and it is served instead.
+      {
+        const store3 = require("../services/experience-store") as typeof import("../services/experience-store");
+        const evidenceOf3 = (id: string): Record<string, string> => {
+          const row = expDb.prepare("SELECT content_field_evidence FROM experiences WHERE id = ?").get(id) as
+            { content_field_evidence: string | null } | undefined;
+          return row?.content_field_evidence ? JSON.parse(row.content_field_evidence) : {};
+        };
+        // Its own provider: on a crowded one these rows can fall outside the
+        // 10-row slice, and then the assertions pass whether or not the field
+        // was blanked — the seventh non-discriminating fixture this session was
+        // exactly that.
+        insertProvider.run({
+          id: "prov-judged", navn: "Dømt AS", hjemmeside: "https://judged.example.no",
+          last_enriched_at: daysAgoIso(1),
+          about_text: null, visit_text: null, opening_hours_text: null, products: null,
+          content_source: null, content_evidence_url: null,
+        });
+        for (const id of ["exp-judged-cat", "exp-judged-desc", "exp-judged-book"]) {
+          insertFull({
+            id, provider_id: "prov-judged",
+            title: `Feltdom ${id}`, description: null, category: null, booking_url: null,
+            subcategory: null, content_source: null, enrichment_state: "raw",
+            canonical_id: null, verification_status: "pending_verify",
+            updated_at: daysAgoIso(2),
+          });
+        }
+        const HOME = "https://judged.example.no/om-oss";
+        const AGG = "https://visitnorway.com/found-here";
+        // category from the aggregator, description from the homepage
+        store3.applyExperienceContent("exp-judged-cat", { description: "Ekte tekst fra egen side." }, HOME);
+        store3.applyExperienceContent("exp-judged-cat", { category: "mat_drikke" }, AGG);
+        // description from the aggregator, category from the homepage
+        store3.applyExperienceContent("exp-judged-desc", { category: "natur_friluft" }, HOME);
+        store3.applyExperienceContent("exp-judged-desc", { description: "AGGREGATOR-TEKST om turen." }, AGG);
+        // booking_url from the aggregator, description from the homepage
+        store3.applyExperienceContent("exp-judged-book", { description: "Ekte tekst nummer to." }, HOME);
+        store3.applyExperienceContent("exp-judged-book", { booking_url: "https://visitnorway.com/book/77" }, AGG);
+
+        const jResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const jProv = (jResp.body.providers as any[]).find((p) => p.id === "prov-judged");
+        assertTrue(!!jProv, "w12a: prov-judged is sampled, so the assertions below are about the slice they claim to be about");
+        const jRows = jProv.enriched_experiences as any[];
+
+        const jCat = jRows.find((e) => e.id === "exp-judged-cat");
+        assertTrue(!!jCat, "w12b: the row survives — its homepage-sourced description is still judgeable, so this is not the drop path");
+        assertEq(jCat.description, "Ekte tekst fra egen side.", "w12c: the homepage-sourced field is served");
+        assertEq(jCat.category, null, "w12d: an aggregator-sourced CATEGORY is blanked — drop `category` from JUDGED_FIELDS and it is served instead");
+
+        const jDesc = jRows.find((e) => e.id === "exp-judged-desc");
+        assertTrue(!!jDesc, "w13a: the row survives on its homepage-sourced category");
+        assertEq(jDesc.category, "natur_friluft", "w13b: the homepage-sourced category is served");
+        assertEq(jDesc.description, null, "w13c: an aggregator-sourced DESCRIPTION is blanked — drop `description` from JUDGED_FIELDS and it is served instead");
+
+        // w14c — the map itself must not be served. It is the screen's input;
+        // emitting it too hands the consumer a raw JSON string encoding the same
+        // decision the blanking already made, in a different shape it would have
+        // to parse and could then disagree with (round-8 review, MINOR 3).
+        for (const row of jRows) {
+          assertEq((row as any).content_field_evidence, undefined,
+            `w14c/${row.id}: the per-field provenance map is an input to the screen, not part of the response`);
+        }
+
+        const jBook = jRows.find((e) => e.id === "exp-judged-book");
+        assertTrue(!!jBook, "w14a: the row survives on its homepage-sourced description");
+        assertEq(jBook.booking_url, null, "w14b: an aggregator-sourced BOOKING_URL is blanked");
+
+        // w15 — a BLANK source string. `BulkRowSchema` declares `evidence_url`
+        // as `z.string().optional().nullable()`, so "" validates and reaches the
+        // writer. `??` only falls through on null/undefined, so "" was passed
+        // straight through, `if (sourceUrl && …)` was falsy, nothing was
+        // stamped, and the read side took the missing entry as unknown → keep →
+        // the aggregator text was served as judgeable homepage content. The
+        // writer now normalizes at its own boundary, so no call site can
+        // reintroduce it (round-8 review, BLOCKING — the same `??`-vs-`||`
+        // mistake #384 was blocked on twice, one field away).
+        insertFull({
+          id: "exp-blank-src", provider_id: "prov-judged",
+          title: "Tom kilde-URL", description: null, category: null, booking_url: null,
+          subcategory: null, content_source: null, enrichment_state: "raw",
+          canonical_id: null, verification_status: "pending_verify",
+          updated_at: daysAgoIso(2),
+        });
+        store3.applyExperienceContent("exp-blank-src", { description: "Ekte tekst tre." }, HOME);
+        store3.applyExperienceContent("exp-blank-src", { category: "kultur_historie" }, "   ");
+        assertEq(evidenceOf3("exp-blank-src").category, store3.BLANK_PROVENANCE_SENTINEL,
+          "w15a: a blank source string is recorded as the blank sentinel, not skipped — skipping it is what let it read as unknown");
+        const jResp2 = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const jProv2 = (jResp2.body.providers as any[]).find((p) => p.id === "prov-judged");
+        const jBlank = (jProv2.enriched_experiences as any[]).find((e) => e.id === "exp-blank-src");
+        assertTrue(!!jBlank, "w15b: the row survives on its homepage-sourced description");
+        assertEq(jBlank.category, null,
+          "w15c: …and the blank-sourced field is BLANKED, not served — the whole point of stamping it");
+
+        // w16 — the harvest CALL SITE, driven for real. The previous round
+        // stated plainly that this binding was untested and rested on the
+        // required-parameter type plus a shared constant, and asked a reviewer
+        // to check it by reading (round-8 review, MINOR 2/4). It is reachable
+        // after all: bulkInsertExperiences() is an ordinary exported function,
+        // and its dedup branch needs only a provider, a kommune on both sides,
+        // and a candidate that outscores the existing row.
+        //
+        // This is what makes `?.trim() ||` at the call site falsifiable. The
+        // writer's own boundary normalization already stops "" from skipping
+        // the stamp, so reverting the call site to `??` no longer leaks — but
+        // it does mislabel harvest content as unknown-blank, and provenance
+        // that lies about where content came from is what these three rounds
+        // have been about.
+        insertProvider.run({
+          id: "prov-harvest-site", navn: "Harvest Kallested AS", hjemmeside: "https://harvestkall.example.no",
+          last_enriched_at: daysAgoIso(1),
+          about_text: null, visit_text: null, opening_hours_text: null, products: null,
+          content_source: null, content_evidence_url: null,
+        });
+        // Its own INSERT: the shared insertFull() has a fixed column list with
+        // no `kommune`, and the dedup matcher needs one on BOTH sides.
+        const insertWithKommune = expDb.prepare(
+          `INSERT INTO experiences
+             (id, provider_id, title, description, category, subcategory, booking_url,
+              kommune, content_source, enrichment_state, canonical_id, verification_status,
+              evidence_url, discovery_source, content_field_evidence, updated_at)
+           VALUES
+             (@id, @provider_id, @title, NULL, NULL, NULL, NULL,
+              @kommune, NULL, 'raw', NULL, 'pending_verify',
+              NULL, NULL, NULL, @updated_at)`,
+        );
+        // A DISTINCT title per case: the matcher keys on provider + kommune +
+        // fuzzy title, so three cases sharing one title all matched the first
+        // row — which the previous case had already enriched, so the candidate
+        // no longer outscored it and the branch under test was never entered.
+        // (w16a passed; w16b/w16c failed for that reason, not the real one.)
+        const seedThin = (id: string, title: string) => {
+          insertWithKommune.run({
+            id, provider_id: "prov-harvest-site",
+            title, kommune: "Voss", updated_at: daysAgoIso(2),
+          });
+        };
+        const richer = (title: string, evidence_url: string | null | undefined) => ({
+          provider_id: "prov-harvest-site",
+          title,
+          kommune: "Voss",
+          category: "mat_drikke",
+          subcategory: "gardsbesok",
+          season: ["sommer"],
+          indoor_outdoor: "outdoor",
+          duration_min: 90,
+          ...(evidence_url === undefined ? {} : { evidence_url }),
+        });
+
+        // The decision itself, directly. Both harvest call sites now call this
+        // one function, so it is the rule — and it is falsifiable without a
+        // route harness. What remains unverified at runtime, stated rather than
+        // implied: that the bulk-load ROUTE's call site calls it. Reaching that
+        // one needs a Brreg-mocking HTTP harness larger than the thing under
+        // test; it is one readable line, and it can no longer hold a different
+        // expression than the tested site because there is only one expression.
+        assertEq(store3.harvestProvenanceOf(""), store3.HARVEST_PROVENANCE_SENTINEL,
+          "w16-unit-a: a blank evidence_url yields the harvest sentinel — `??` would yield \"\"");
+        assertEq(store3.harvestProvenanceOf("   "), store3.HARVEST_PROVENANCE_SENTINEL,
+          "w16-unit-b: …and so does a whitespace-only one");
+        assertEq(store3.harvestProvenanceOf(undefined), store3.HARVEST_PROVENANCE_SENTINEL,
+          "w16-unit-c: …and an absent one");
+        assertEq(store3.harvestProvenanceOf(null), store3.HARVEST_PROVENANCE_SENTINEL,
+          "w16-unit-d: …and an explicit null");
+        assertEq(store3.harvestProvenanceOf("https://visitnorway.com/listing/5"),
+          "https://visitnorway.com/listing/5",
+          "w16-unit-e: …while a real URL is returned as itself");
+
+        seedThin("exp-harvest-blank", "Guidet gårdstur");
+        store3.bulkInsertExperiences([richer("Guidet gårdstur", "") as any]);
+        assertEq(evidenceOf3("exp-harvest-blank").category, store3.HARVEST_PROVENANCE_SENTINEL,
+          "w16a: a harvest row whose evidence_url is BLANK is stamped as harvest-sourced — `??` passes \"\" straight through and mislabels it");
+
+        seedThin("exp-harvest-absent", "Kveldsfiske i fjorden");
+        store3.bulkInsertExperiences([richer("Kveldsfiske i fjorden", undefined) as any]);
+        assertEq(evidenceOf3("exp-harvest-absent").category, store3.HARVEST_PROVENANCE_SENTINEL,
+          "w16b: …and so is one with no evidence_url at all");
+
+        seedThin("exp-harvest-real", "Ostesmaking på setra");
+        store3.bulkInsertExperiences([richer("Ostesmaking på setra", "https://visitnorway.com/listing/5") as any]);
+        assertEq(evidenceOf3("exp-harvest-real").category, "https://visitnorway.com/listing/5",
+          "w16c: …while a real evidence_url is recorded as itself, so the sentinel is not swallowing every case");
+      }
+
       // ── (h28) window_exhausted — round-7 review, BLOCKING: untested ───────
       // Deleting the flag entirely left the full suite green, yet A2A §8.3 tells
       // the cron to branch on it ("score `skipped`, never `checked=0`"). More

@@ -31,7 +31,7 @@ import {
   getProviderContentTarget,
   getExperiencesForProvider,
   applyExperienceContent,
-  HARVEST_PROVENANCE_SENTINEL,
+  harvestProvenanceOf,
   markProviderEnriched,
   markProviderContentAttempted,
   // enrichment-metode slice 1 (2026-07-16): dead-homepage parking
@@ -80,6 +80,15 @@ import {
   getGardssalgProviderAddressTarget,
   applyGardssalgProviderAddress,
   type GardssalgAddressEnrichmentTarget,
+  // dev-request 2026-07-26-brreg-kontakt-backfill — epost/telefon fill-only
+  // backfill from the same GET /enheter/{orgNr} response, for the 344-row
+  // cohort that has no contact channel at all today.
+  selectGardssalgProvidersForContactBackfill,
+  countGardssalgProvidersForContactBackfill,
+  getGardssalgProviderContactTarget,
+  applyGardssalgProviderContact,
+  GS_CB_HARD_CAP,
+  type GardssalgContactBackfillTarget,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
   // org_nr backfill via Brreg name-search + exact-name/postal corroboration
   // (auto-write only when both agree; otherwise the review queue).
@@ -213,12 +222,31 @@ import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "..
 // by org-nr (same GET /enheter/{orgNr} endpoint the three lookups above already
 // call). See POST /admin/brreg-website-discovery below.
 import { fetchBrregWebsite } from "../services/brreg-client";
+// dev-request 2026-07-26-brreg-kontakt-backfill — epostadresse/telefon/mobil
+// out of that SAME GET /enheter/{orgNr} response (fields no code read until
+// now). See POST /admin/gardssalg-contact-backfill below.
+import { fetchBrregContact } from "../services/brreg-client";
+// dev-request 2026-07-26-booking-test-send-guard — the two admin-gated test
+// drivers below (POST /admin/booking-test-send, POST /admin/claim-test-send)
+// are the ONLY call sites that may set the per-transaction test flag.
+import { testSendRedirectAddress } from "../services/send-guard";
+import { issueClaimMagicLink, getClaimProviderById } from "../services/gardssalg-claim";
+import { emailService } from "../services/email-service";
+
+// Same derivation as gardssalg-claim.ts's own constant — the verify URL must
+// point at the host that serves the claim routes.
+const OPPLEVAGENT_CLAIM_BASE_URL = (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "");
 // dev-request 2026-07-19-agg-website-leak — reuse the curated DMO/aggregator
 // host classifier (same one admin-knowledge.ts's classifyWebsite() uses) so a
 // harvest row's `website` is never blindly trusted as a provider's OWN
 // homepage on CREATE. See isAggregatorWebsite()/firstNonAggregatorWebsite()
 // below, near the bulk-load handler that consumes them.
-import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain } from "../services/cross-source-validator";
+import {
+  isDirectoryOrAggregatorHost,
+  hostFromUrlLike,
+  registrableDomain,
+  PLACEHOLDER_EMAIL_DOMAINS,
+} from "../services/cross-source-validator";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
 // Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
 // verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
@@ -449,7 +477,7 @@ router.get("/categories", (_req: Request, res: Response) => {
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 
-const BulkRowSchema = z.object({
+export const BulkRowSchema = z.object({
   title: z.string().min(1),
   provider_name: z.string().min(1),
   category: z.string().optional().nullable(),
@@ -465,12 +493,51 @@ const BulkRowSchema = z.object({
   evidence_url: z.string().optional().nullable(),
   confidence: z.enum(["high", "medium", "low"]).optional().nullable(),
   website: z.string().optional().nullable(),
+  // `hjemmeside` is an ACCEPTED ALIAS for `website` (dev-request
+  // 2026-07-27-harvest-hjemmeside-feltnavn-tapes).
+  //
+  // The harvest SKILL (scheduled-agents/experiences-harvest.md) has been
+  // telling its agent to send `hjemmeside` — under the heading "Build rows
+  // matching BulkRowSchema EXACTLY" — while this schema only ever accepted
+  // `website`. z.object() strips unknown keys silently, so every harvested
+  // homepage was discarded at the door, with no error and no warning: the
+  // request 200s, the provider is created, and its `hjemmeside` column is
+  // NULL.
+  //
+  // That is not a cosmetic mismatch. `firstNonAggregatorWebsite()` below is the
+  // ONLY input to the provider-CREATE homepage write, so the provider is
+  // created with a NULL homepage.
+  //
+  // CORRECTED after independent review — the first version of this comment
+  // claimed such a provider "can never be content-enriched". That is not what
+  // the code does. selectProvidersForContentRefresh()
+  // (services/experience-store.ts) COALESCEs the homepage with the provider's
+  // first non-empty experience `evidence_url`, and its WHERE clause explicitly
+  // admits `hjemmeside IS NULL` rows that have one. Since bulk-load requires an
+  // `evidence_url` for `unverified` providers, most affected providers WERE
+  // still picked up for content-refresh.
+  //
+  // The real harm is subtler and arguably worse: enrichment then fetched and
+  // extracted from the EVIDENCE url — the DMO/listing page the provider was
+  // discovered on — instead of the provider's own site. That is the same
+  // aggregator-as-homepage failure mode dev-request 2026-07-19-agg-website-leak
+  // was filed for, and it is why enrichment runs kept reporting `fetch_failed`
+  // against visitnorway.com / visithelgeland.com URLs.
+  //
+  // Accepting BOTH names here (rather than only correcting the SKILL) is
+  // deliberate: Cloud Routines have repeatedly been observed executing a
+  // STALE copy of their SKILL text (see dev-request
+  // 2026-07-17-brreg-discovery-indexerror-og-stale-dispatch, reproduced three
+  // times), so a fix that depends on new SKILL text reaching the runner would
+  // not take effect reliably. A server-side alias works for old and new
+  // callers alike.
+  hjemmeside: z.string().optional().nullable(),
 });
 const BulkLoadSchema = z.object({
   experiences: z.array(BulkRowSchema).min(1).max(5000),
   apply: z.boolean().optional().default(false),
 });
-type BulkRow = z.infer<typeof BulkRowSchema>;
+export type BulkRow = z.infer<typeof BulkRowSchema>;
 
 // dev-request 2026-07-19-agg-website-leak: a 2026-07-12 harvest run wrote a
 // regional tourism-aggregator/DMO page (a KNOWN_DIRECTORY_HOSTS entry) into
@@ -486,26 +553,359 @@ type BulkRow = z.infer<typeof BulkRowSchema>;
 // a merely-malformed or unparseable URL is NOT rejected here (that's a
 // separate concern from provenance-trust, and over-rejecting would silently
 // drop a real homepage the harvester just formatted oddly).
-function isAggregatorWebsite(raw: string): boolean {
-  let parsed: URL;
+// Parsed with hostFromUrlLike(), NOT with new URL() (round-4 review, blocking).
+// This function and looksLikeHomepageValue() below screen the SAME string, and
+// while they used two different parsers they disagreed on a whole input class —
+// with the aggregator winning every time:
+//
+//   new URL("http://visitnorway.com:99999")  throws (port > 65535)
+//     -> the catch below returned false, i.e. "not an aggregator"
+//   hostFromUrlLike("http://visitnorway.com:99999")  ->  "visitnorway.com"
+//     -> the shape screen passed
+//
+// so `http://visitnorway.com:99999/` was stored as a provider homepage AND
+// discarded the row's real `hjemmeside`. Same for :80443, :abc, :-1, and the
+// visithelgeland.com equivalents. One parser, used by both, closes the class —
+// and removes the fail-open at the same time, since hostFromUrlLike returns a
+// host for anything host-shaped rather than throwing.
+//
+// Still permissive about what it does NOT know: only KNOWN aggregator/directory
+// hosts are rejected. A merely-malformed URL is not this function's business
+// (that is looksLikeHomepageValue's job) — over-rejecting here would silently
+// drop a real homepage the harvester just formatted oddly.
+// Exported for tests (round-6 review): this function is the SOLE classifier
+// for POST /admin/hjemmeside-cleanup-sweep, which irreversibly NULLs a
+// provider's homepage — yet every assertion about it went through
+// firstNonAggregatorWebsite, where looksLikeHomepageValue rejects the
+// interesting inputs first. Five guards therefore survived their own removal
+// with the full suite green. Testing it directly is the only way to pin the
+// behavior the sweep actually depends on.
+export function isAggregatorWebsite(raw: string): boolean {
+  // BOTH parsers, new URL() first (round-5 review). Round 4 replaced new URL()
+  // with hostFromUrlLike() to end their disagreement, and that did close the
+  // invalid-port hole — but it opened two others, because new URL() does things
+  // hostFromUrlLike does not: it percent-decodes the host and treats `\\` as a
+  // path separator. So `http://visitnorway%2Ecom/` and
+  // `http://visitnorway.com\\evil` stopped being recognized as aggregators, and
+  // `http://gard.no\\@visitnorway.com` started being recognized as one — a FALSE
+  // POSITIVE in applyHjemmesideListingSweepToRow, which NULLs the homepage.
+  //
+  // Preferring new URL() and falling back only when it throws keeps every case
+  // it used to catch AND closes the invalid-port hole it could not, with no new
+  // false positive. Two parsers is fine; two parsers that disagree about which
+  // one is authoritative is not.
+  let host: string | null = null;
   try {
-    // Same scheme-fallback convention as admin-knowledge.ts's parsedHostForUrl.
     const withScheme = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
-    parsed = new URL(withScheme);
+    host = new URL(withScheme).hostname.toLowerCase().replace(/^www\./, "");
   } catch {
-    return false;
+    host = hostFromUrlLike(raw);
   }
-  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
   if (!host) return false;
   return isDirectoryOrAggregatorHost(host);
 }
 
-// First row's `website` that is truthy AND not a known aggregator/directory
-// host, else null. Used for the provider-CREATE `hjemmeside` write only (see
-// below) — order-independent: an aggregator-host row earlier in `rows` is
-// skipped in favor of a later row with a real domain.
-function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
-  return rows.find((r) => r.website && !isAggregatorWebsite(r.website))?.website ?? null;
+// Does `v` have the SHAPE of a real homepage — i.e. does it parse to a host
+// with at least two labels and a plausible TLD? Used only to keep placeholder
+// junk out of experience_providers.hjemmeside.
+//
+// Why this exists at all: isAggregatorWebsite() is permissive about
+// unparseable URLs BY DESIGN (a real homepage the harvester formatted oddly
+// must not be dropped), so it passes anything that isn't a KNOWN aggregator
+// host. A placeholder like "n/a" or "TBD" is therefore truthy, survives the
+// aggregator screen, and gets written verbatim — and a junk homepage is worse
+// than a null one, because it satisfies neither branch of
+// selectProvidersForContentRefresh()'s hjemmeside/evidence_url COALESCE.
+//
+// Round-3 review, blocking: the first version of this was `v.includes(".")`,
+// which only catches dot-LESS junk. "n.a", "n.a.", "-.-", "tbd.", "1.2.3.4",
+// "post@gard.no" and "Se nettsiden deres." all passed it, got stored, AND
+// shadowed a real `hjemmeside` in the same row — the third repetition of the
+// exact defect class this function was twice rewritten to fix. The check was
+// calibrated to its own test fixtures rather than to the shape of a hostname.
+//
+// So: screen the PARSED HOST, not the raw string. hostFromUrlLike() already
+// does the parse the rest of this file uses (scheme/path/query/port/userinfo
+// stripped, trailing FQDN root dot removed, IDN → punycode, lowercased), so
+// `gard.no/kontakt`, `https://gard.no?a=b`, `GÅRD.NO`, `gård.no` and
+// `gard.no.` all reduce to the same accepted host, while `http://gardsbutikken
+// /index.html` correctly fails on its dot-less HOST even though its path has a
+// dot. Requiring ≥2 non-empty labels plus an alphabetic (or punycode) TLD of
+// ≥2 chars additionally rejects "n.a", "a.b", "-.-" and bare IPv4 literals.
+//
+// isPlausibleUrlish() below carries the length + no-whitespace half of the
+// same contract and is the sanctioned guard for the OTHER writer of this
+// column (PATCH /admin/providers/:id/hjemmeside, which 400s on failure) —
+// reuse it rather than growing a second, weaker validator for one column
+// (round-3 review). Declarations hoist, so the forward reference is fine.
+//
+// Round-4 review, blocking: `@` was rejected anywhere in the string, on the
+// reasoning that hostFromUrlLike() strips userinfo so "post@gard.no" would
+// reduce to a valid host. True for the AUTHORITY — but `@` is perfectly legal
+// in a path, query or fragment, and the blanket test dropped
+// "https://gard.no/kontakt?epost=post@gard.no", "https://gard.no/@gardsbutikk"
+// and "https://gard.no/side#a@b" to null. `origin/main` stored all three. A
+// false rejection is not a lesser sin here: it is this PR's own failure mode
+// (a real producer homepage silently lost) reintroduced with a new cause. So
+// the check now looks only at the authority, which still rejects a bare
+// "post@gard.no" and the "https://gard.no@visitnorway.com" userinfo swap.
+function authorityOf(v: string): string {
+  // The `^\/\/` strip mirrors cross-source-validator's stripProtocol (round-5
+  // review). Without it the two disagreed on a protocol-relative value:
+  // "//gard.no@visitbergen.com" had no `@` in what THIS function called the
+  // authority, so the guard passed, while hostFromUrlLike read the host as
+  // `visitbergen.com` — the same two-parsers-disagreeing class one layer down.
+  const afterScheme = v.replace(/^[a-z0-9+.-]+:\/\//i, "").replace(/^\/\//, "");
+  return afterScheme.split("/")[0]!.split("?")[0]!.split("#")[0]!;
+}
+
+// Registrable-domain placeholders that parse perfectly but are never anyone's
+// homepage (round-4 review, blocking). PLACEHOLDER_EMAIL_DOMAINS is the repo's
+// EXISTING list of exactly these sentinels — "left behind by boilerplate
+// contact forms / CMS themes" — and every one of them sailed through the
+// round-3 host-shape check. Reusing it rather than writing a fourth list is
+// the same "don't reinvent a weaker validator" correction round 3 made.
+//
+// example.com is the one that matters most in practice: it is RFC-2606
+// reserved and is the single most likely thing an LLM harvester emits when
+// told to fill a URL field it does not know.
+// Words that are a placeholder wherever they appear as a domain LABEL, not a
+// producer's name. This replaces a KNOWN_TLDS allowlist that round-5 review
+// dismantled, correctly and at the root: a TLD-RECOGNITION heuristic is not a
+// junk-DETECTION heuristic, and the two are uncorrelated. Measured on the real
+// values —
+//
+//   ukjent.no, nettside.no, eksempel.no   -> recognized TLD, pure junk
+//   storgarden.nu, storgarden.tech        -> unrecognized TLD, real producers
+//
+// — so ranking by TLD promoted the junk and demoted the producers, which is the
+// exact shadowing this function has now been rewritten five times to stop.
+//
+// What the junk actually has in common is the OTHER label: `ikke`.oppgitt,
+// `ingen`.hjemmeside, `kommer`.snart, `null`.null, `ukjent`.no,
+// `nettside`.no. So screen the labels, and keep the list conservative: with the
+// tiering gone this is a HARD reject, and a false reject costs a homepage. Only
+// words that are never a Norwegian producer's own name are listed — "under" and
+// "se" were considered and deliberately left out as too plausible.
+const PLACEHOLDER_DOMAIN_LABELS: ReadonlySet<string> = new Set([
+  // Norwegian
+  "ikke", "ikkeoppgitt", "oppgitt", "ingen", "ukjent", "mangler", "kommer",
+  "snart", "hjemmeside", "nettside", "nettsted", "eksempel", "tilgjengelig",
+  "arbeid", "finnesikke",
+  // English / machine
+  "example", "unknown", "none", "null", "undefined", "placeholder", "tbd",
+  "insert", "yourdomain", "yourcompany", "dummy", "todo", "notfound",
+]);
+
+function isPlaceholderHomepageHost(host: string): boolean {
+  // hostFromUrlLike already strips `www.`; kept only because this function is
+  // also reachable with a hand-built host in tests.
+  const bare = host.replace(/^www\./, "");
+  // registrableDomain() from cross-source-validator handles MULTI_LABEL_SUFFIXES
+  // (co.uk et al.); the local last-two-labels version this replaces returned
+  // "co.uk" for "example.co.uk" and would have defeated any multi-label entry
+  // added to PLACEHOLDER_EMAIL_DOMAINS later (round-5 review — the same
+  // "don't reinvent a weaker validator" correction round 3 made).
+  // One check, not two (round-6 review): a separate `includes(bare)` line was
+  // unfalsifiable — registrableDomain(x) === x for every two-label host, and
+  // PLACEHOLDER_EMAIL_DOMAINS contains no multi-label-suffix entry, so no input
+  // could distinguish them. A guard no test can kill is not a guard.
+  if (PLACEHOLDER_EMAIL_DOMAINS.includes(registrableDomain(bare))) return true;
+  // Only the REGISTRABLE domain's labels, not every label of the host (round-6
+  // review): screening every label rejected ordinary Norwegian hosting
+  // subdomains — `hjemmeside.storgarden.no`, `nettside.storgarden.no` — which
+  // origin/main stored. The junk this list targets sits at the registrable
+  // level.
+  //
+  // A label counts as a placeholder if it COLLAPSES to one of the words, or if
+  // any of its separator-split WORDS is one (round-7 review, BLOCKING). The
+  // previous version only collapsed separators, so it caught `ikke-oppgitt`
+  // solely because "ikkeoppgitt" happened to be hard-coded — and that is the
+  // one hyphenated compound with a test. The other two named in this very
+  // comment block, `ingen-hjemmeside` and `kommer-snart`, sailed through, as
+  // did `under-arbeid`; measured against origin/main all three are stored and,
+  // in `hjemmeside`, now beat a real `website`. Fixture-calibration once more,
+  // inside the screen written to escape fixture-calibration.
+  //
+  // Splitting into words makes the rule general instead of enumerated: a label
+  // built out of status words is a placeholder however it is spelled. It also
+  // means "under" need not be listed — `under-arbeid` is caught by "arbeid" —
+  // so round 5's conservative omissions still stand.
+  const isPlaceholderLabel = (label: string): boolean => {
+    if (PLACEHOLDER_DOMAIN_LABELS.has(label.replace(/[-_]/g, ""))) return true;
+    return label.split(/[-_]+/).filter(Boolean).some((w) => PLACEHOLDER_DOMAIN_LABELS.has(w));
+  };
+  return registrableDomain(bare).split(".").some(isPlaceholderLabel);
+}
+
+// Aggregator/DMO hosts that are harvest SOURCES for this endpoint specifically.
+// Round-5 review, blocking: the harvest SKILL names these six as the pages the
+// agent scrapes, and dev-request 2026-07-19-agg-website-leak documents
+// aggregator URLs genuinely arriving in `website` in production — so
+// `website` = the source listing, `hjemmeside` = the producer's own site is the
+// EXPECTED row shape, not a crafted one. Before this PR the alias was stripped,
+// so there was nothing for a DMO `website` to shadow; accepting the alias turns
+// a documented gap into active data loss.
+//
+// Applied ONLY in firstNonAggregatorWebsite, never inside isAggregatorWebsite
+// (round-6 review, BLOCKING). I first put it in isAggregatorWebsite and wrote a
+// comment claiming it "only decides which of a bulk-load row's own fields
+// becomes the provider's homepage". That was false: isAggregatorWebsite is also
+// the SOLE classifier for POST /admin/hjemmeside-cleanup-sweep, which runs
+// `SET listing_url = ?, hjemmeside = NULL`. Measured on 10 seeded providers,
+// origin/main moved 1 and that version moved 9 — irreversibly NULLing the
+// homepage of every provider on these six hosts AND their subdomains.
+//
+// Which is exactly the "speculative add" the note in cross-source-validator.ts
+// refuses for these same six hosts, reached by a side door. KNOWN_DIRECTORY_HOSTS'
+// own doc warns about it in as many words: "Tourism-board hosts are NOT
+// pattern-matched (false-positive risk on an irreversible NULL)."
+//
+// So the screen lives at the one call site whose harm is actually measured: the
+// bulk-load CREATE path, where `website` = the listing the agent scraped and
+// `hjemmeside` = the producer's own site is the expected row shape.
+const HARVEST_SOURCE_HOSTS: ReadonlySet<string> = new Set([
+  "nordnorge.com", "visittromso.no", "visitbergen.com",
+  "visitoslo.com", "visittrondheim.no", "fjordtours.com",
+]);
+
+function isHarvestSourceHost(raw: string): boolean {
+  const host = hostFromUrlLike(raw);
+  if (!host) return false;
+  return HARVEST_SOURCE_HOSTS.has(registrableDomain(host));
+}
+
+function looksLikeHomepageValue(v: string): boolean {
+  if (!isPlausibleUrlish(v)) return false;
+  if (authorityOf(v).includes("@")) return false;
+  const host = hostFromUrlLike(v);
+  if (!host) return false;
+  if (isPlaceholderHomepageHost(host)) return false;
+  const labels = host.split(".");
+  if (labels.length < 2) return false;
+  // Per-label DNS shape, not just the TLD (round-4 review, minor): "-gard.no"
+  // and "gard-.no" are RFC-invalid and were being stored. 63 is the DNS label
+  // limit; the only other length bound was isPlausibleUrlish's 2048 chars.
+  if (!labels.every((l) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(l))) return false;
+  const tld = labels[labels.length - 1]!;
+  // Punycode TLDs (xn--…) are vanishingly rare for Norwegian producers but are
+  // legitimate, so admit them explicitly rather than by accident.
+  return /^[a-z]{2,}$/.test(tld) || /^xn--[a-z0-9-]{2,}$/.test(tld);
+}
+
+// First row's `website` — or its accepted alias `hjemmeside` — that has the
+// shape of a homepage AND is not a known aggregator/directory host, else null.
+// Used for the provider-CREATE `hjemmeside` write only (see below).
+// Order-independent in both directions: an aggregator/junk value earlier in
+// `rows`, or in the sibling field of the SAME row, is skipped in favor of a
+// later real domain. Returns the candidate VERBATIM (trimmed) — the parsed
+// host is used for screening only, never for the stored value, so a legitimate
+// deep link like `gard.no/gardsbutikk` survives intact.
+export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
+  // `website` and its accepted alias `hjemmeside` (see BulkRowSchema) are
+  // treated identically; `website` wins when a row carries both with content.
+  //
+  // `||` on the TRIMMED value, deliberately not `??` (independent review,
+  // blocking): `??` only falls through on null/undefined, so a row with
+  // `website: ""` — which the schema accepts, and which an LLM harvester
+  // filling every documented key with a placeholder produces routinely —
+  // would shadow a perfectly good `hjemmeside` and yield null. That is the
+  // very failure this alias exists to fix, reintroduced one field over.
+  //
+  // Trimming matters just as much: a whitespace-only `website` is truthy and
+  // survives isAggregatorWebsite() (which is deliberately permissive about
+  // unparseable URLs), so it would be written verbatim into
+  // experience_providers.hjemmeside — and a whitespace homepage is strictly
+  // WORSE than a null one. selectProvidersForContentRefresh() requires
+  // `TRIM(hjemmeside) != ''` for its primary branch and `hjemmeside IS NULL`
+  // for its evidence_url fallback, so a whitespace value satisfies neither and
+  // drops the provider out of content-refresh entirely.
+  // Screen EACH candidate independently — do not pick a winner first and screen
+  // afterwards (round-2 review, blocking). Resolving `website || hjemmeside`
+  // into one value before the aggregator check meant a row carrying an
+  // aggregator `website` alongside a perfectly good `hjemmeside` returned null:
+  // the aggregator won the `||`, failed the screen, and the loop moved to the
+  // NEXT ROW without ever looking at this row's alias. That is the same silent
+  // discard this alias exists to fix, one field over — and mixed-field rows are
+  // exactly what the stale-dispatch rationale above predicts, while
+  // dev-request 2026-07-19-agg-website-leak documents aggregator URLs really
+  // arriving in `website` in production.
+  //
+  // Junk is screened by looksLikeHomepageValue() above — see its comment for
+  // why a bare `includes(".")` was not enough.
+  //
+  // Deliberately NOT case-normalized on the way out, unlike the Brreg-discovery
+  // writer's `.trim().toLowerCase()`: a candidate may carry a path, and paths
+  // are case-sensitive, so lowercasing the whole value can break a working deep
+  // link. Host-level comparisons downstream all go through hostFromUrlLike(),
+  // which lowercases, so the differing case in the column is not load-bearing.
+  //
+  // ── The tiering is GONE (round-5 review, blocking) ──────────────────────
+  // Round 4 replaced a strict screen with a two-tier preference: a candidate
+  // whose TLD was in a KNOWN_TLDS allowlist won outright, anything else was
+  // only a fallback. The stated safety argument was "an omission costs a
+  // preference, never a homepage". Round 5 executed it and showed that is
+  // false — an omission cost a homepage:
+  //
+  //   {website: "storgarden.nu",   hjemmeside: "ikke-oppgitt.no"} -> ikke-oppgitt.no
+  //   {website: "storgarden.tech", hjemmeside: "hjemmeside.com"}  -> hjemmeside.com
+  //
+  // and it inverted row order too, breaking this function's own contract. The
+  // mechanism was wrong at the root: TLD RECOGNITION is not junk DETECTION,
+  // and the two do not correlate. `ukjent.no` is a recognized TLD and pure
+  // junk; `.nu` is a mainstream Nordic ccTLD I had simply not listed.
+  //
+  // So: back to first-passing-candidate, which never lost a homepage, with the
+  // junk signal moved to where the junk actually lives — the domain LABEL (see
+  // PLACEHOLDER_DOMAIN_LABELS). That screens `ikke.oppgitt`, `ukjent.no` and
+  // `nettside.no` alike, and leaves `storgarden.nu` alone.
+  // `hjemmeside` FIRST, not `website` (round-6 review, BLOCKING). The two
+  // fields do not carry equally trustworthy values, and this file asserted both
+  // halves of a contradiction: that `website` = the scraped listing and
+  // `hjemmeside` = the producer's own site is the EXPECTED row shape, and that
+  // `website` wins when both are present. Under `website`-first the fix only
+  // fires when the listing host happens to be on a known list — and review
+  // measured 7 of 12 real Norwegian regional tourism hosts (visitlofoten.com,
+  // hardangerfjord.com, visitrogaland.com, visitnordfjord.no,
+  // visitalesund-geiranger.com, visitvesteralen.com, nasjonaleturistveger.no)
+  // beating the real `hjemmeside` in that shape. The list is admittedly
+  // incomplete, and no list of this kind can be complete.
+  //
+  // Preferring `hjemmeside` needs no list. Being precise about why, because the
+  // simple version of this argument is not quite true:
+  //
+  // The harvest SKILL attaches a strict contract to whichever field it sends —
+  // "the provider's OWN official homepage", never a DMO/aggregator page, and
+  // "if you cannot verify it with certainty, LEAVE IT OPEN — NEVER guess". Its
+  // old text sent `hjemmeside`; A2A#411 renames that to `website`. So a row
+  // from EITHER a stale or a fresh runner carries the strict contract, and each
+  // sends only ONE of the two fields. Precedence therefore never decides a
+  // harvest row at all.
+  //
+  // It decides the MIXED rows, which come from everything else — other
+  // bulk-load callers, hand-assembled payloads, transitional states. And there
+  // the asymmetry is real and measured: dev-request 2026-07-19-agg-website-leak
+  // documents aggregator URLs genuinely arriving in `website` in production,
+  // with no equivalent record for the alias. `website` is also the field a
+  // generic scraper fills by default.
+  //
+  // So on the only rows where it matters, `hjemmeside` is the higher-confidence
+  // value — and a junk or listing value in it is screened below regardless,
+  // which makes this strictly safer than depending on a domain list that this
+  // file already admits is incomplete.
+  for (const r of rows) {
+    for (const candidate of [r.hjemmeside?.trim(), r.website?.trim()]) {
+      if (
+        candidate
+        && looksLikeHomepageValue(candidate)
+        && !isAggregatorWebsite(candidate)
+        && !isHarvestSourceHost(candidate)
+      ) {
+        return candidate;
+      }
+    }
+  }
+  return null;
 }
 
 const MAX_PROVIDERS_PER_CALL = 200;
@@ -659,7 +1059,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
               // indistinguishable from homepage-extracted content, and the
               // weekly spot-check judges it against the homepage and scores a
               // mismatch that is not an error.
-            }, r.evidence_url ?? HARVEST_PROVENANCE_SENTINEL);
+            }, harvestProvenanceOf(r.evidence_url));
           }
           skipped++;
           continue;
@@ -3593,6 +3993,368 @@ router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Req
   });
 });
 
+// ─── POST /api/opplevelser/admin/booking-test-send (admin) ─────────────────
+// ─── POST /api/opplevelser/admin/claim-test-send   (admin) ─────────────────
+//
+// dev-request 2026-07-26-booking-test-send-guard.
+//
+// The ONLY two call sites in the codebase that can set the per-transaction
+// test flag. Both are behind requireAdmin (X-Admin-Key). The public booking
+// entry points — POST /api/opplevelser/book and the book_gardssalg MCP tool —
+// both parse their payload with BookingInputSchema, which has no such field
+// and (being zod) strips unknown keys, so there is no field name a public
+// caller could smuggle to reach `createBooking`'s third argument. Likewise the
+// public claim route calls issueClaimMagicLink() with one argument.
+//
+// Both routes check the redirect address BEFORE creating anything, so an
+// unconfigured TEST_SEND_REDIRECT_EMAIL produces a clear 400 and no DB row at
+// all — rather than a row whose emails then silently fail closed downstream.
+// (The downstream fail-closed in email-service.ts still stands; this is the
+// belt to its braces, and gives the operator an actionable error.)
+//
+// These exist to run acceptance criterion 6 on two OTHER dev-requests:
+// 2026-07-21-opplevagent-mcp-booking-verktoy (MCP booking E2E) and
+// 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter (claim E2E).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: Response) => {
+  const redirect = testSendRedirectAddress();
+  if (!redirect) {
+    return res.status(400).json({
+      success: false,
+      error: "test_send_redirect_not_configured",
+      message:
+        "TEST_SEND_REDIRECT_EMAIL is not configured. Refusing to create a test booking " +
+        "rather than risk a send to a real recipient.",
+    });
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const source = typeof body.source === "string" && body.source.trim() !== "" ? body.source.trim() : "mcp";
+
+  const parsed = BookingInputSchema.safeParse(body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      error: "invalid_input",
+      issues: parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`),
+    });
+  }
+
+  // Same gate as the public path — a test must not bypass booking_live /
+  // BOOKING_DISPATCH_ENABLED, or it would not be testing the real flow.
+  const provider = getProviderById(parsed.data.provider_id) as
+    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
+    | null;
+  if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
+    return res.status(409).json({ success: false, error: "not_live", provider_id: parsed.data.provider_id });
+  }
+
+  let booking;
+  try {
+    booking = createBooking(parsed.data, source, { isTest: true });
+  } catch (e: any) {
+    return res.status(500).json({ success: false, error: "create_failed", message: e?.message ?? String(e) });
+  }
+
+  // AWAITED here (unlike the fire-and-forget public path) so the operator gets
+  // the actual send outcome back in the response — that IS the test result.
+  const sends: Array<{ kind: string; ok: boolean; error?: string }> = [];
+  try {
+    await sendBookingConfirmation(booking);
+    sends.push({ kind: "guest_confirmation", ok: true });
+  } catch (e: any) {
+    sends.push({ kind: "guest_confirmation", ok: false, error: e?.message ?? String(e) });
+  }
+  try {
+    await sendProducerNotification(booking, provider?.epost ?? null);
+    sends.push({ kind: "producer_notification", ok: true });
+  } catch (e: any) {
+    sends.push({ kind: "producer_notification", ok: false, error: e?.message ?? String(e) });
+  }
+
+  res.json({
+    success: true,
+    test_mode: true,
+    redirected_to: redirect,
+    booking_ref: booking.booking_ref,
+    booking_id: booking.booking_id,
+    source: booking.source,
+    is_test: booking.is_test,
+    intended_recipients: {
+      guest: booking.guest_email,
+      producer: provider?.epost ?? null,
+    },
+    sends,
+  });
+});
+
+router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response) => {
+  const redirect = testSendRedirectAddress();
+  if (!redirect) {
+    return res.status(400).json({
+      success: false,
+      error: "test_send_redirect_not_configured",
+      message:
+        "TEST_SEND_REDIRECT_EMAIL is not configured. Refusing to issue a test claim link " +
+        "rather than risk a send to a real recipient.",
+    });
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    return res.status(400).json({ success: false, error: "provider_id_required" });
+  }
+
+  const result = issueClaimMagicLink(providerId, null, { isTest: true });
+  if (!result.ok) {
+    return res.status(result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : 403).json({
+      success: false,
+      error: result.error,
+    });
+  }
+
+  const verifyUrl = `${OPPLEVAGENT_CLAIM_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${result.claim.token}`;
+  const provider = getClaimProviderById(providerId);
+
+  emailService
+    .sendGardssalgClaimMagicLink({
+      to: result.claim.email,
+      providerName: provider?.navn || "din profil",
+      verifyUrl,
+      isTestSend: result.claim.isTest,
+    })
+    .then((r) => {
+      if (!r.success) console.error(`[claim-test-send] send failed for ${providerId}: ${r.error}`);
+    })
+    .catch((e) => console.error("[claim-test-send] send error:", e));
+
+  res.json({
+    success: true,
+    test_mode: true,
+    redirected_to: redirect,
+    claim_id: result.claim.claimId,
+    is_test: result.claim.isTest,
+    intended_recipient: result.claim.email,
+    intended_recipient_masked: result.claim.maskedEmail,
+    email_source: result.claim.source,
+    expires_at: result.claim.expiresAt,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-contact-backfill (admin) ─────────
+//
+// dev-request 2026-07-26-brreg-kontakt-backfill.
+//
+// The outreach-readiness report found 344 of 389 gårdssalg providers with
+// NEITHER epost NOR telefon on file — un-contactable and un-claimable at the
+// same time, i.e. dead rows. Brreg's GET /enheter/{orgNr} response carries the
+// entity's own registered `epostadresse`/`telefon`/`mobil`, which no code in
+// this repo read until fetchBrregContact() (brreg-client.ts). Measured over
+// the full live cohort 2026-07-27: 101 of 333 (30.3 %) have a contact channel
+// there.
+//
+// Write discipline is deliberately identical to the address-enrichment route
+// above and NOT loosened: dry-run by default, admin-gated, fill-only (an
+// existing value is never replaced), manual/claim-locked rows skipped and
+// reported, one audit row + field_provenance entry per written field, fully
+// reversible through the existing content-rollback lever.
+//
+// `hjemmeside` is reported but NEVER written here. Brreg's hjemmeside is
+// self-reported and therefore strong evidence, but website adoption already
+// has an evidence-checked path (gardssalg_website_review_queue + the approve
+// lever), and this route feeds that queue rather than bypassing it.
+//
+// Body: { providerIds?: string[], limit?: number, offset?: number,
+//         apply?: boolean }. `offset` exists because the cohort (~333) is
+// larger than one call's hard cap — the selector's ORDER BY is a total order
+// so paging is stable. Response carries `cohort_total` so the caller knows
+// how far the walk has left to go.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+const GS_CB_DEFAULT_LIMIT = 48;
+
+router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+    apply?: unknown;
+  };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_CB_DEFAULT_LIMIT,
+    GS_CB_HARD_CAP
+  );
+  const offset =
+    typeof body.offset === "number" && body.offset > 0 ? Math.floor(body.offset) : 0;
+
+  let targets: GardssalgContactBackfillTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+          .map((id) => id.trim())
+      )
+    ).slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderContactTarget(id))
+      .filter((t): t is GardssalgContactBackfillTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForContactBackfill(limit, offset);
+  }
+
+  const batchId = `contact-backfill-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+
+  let scanned = 0;
+  let brregHitEpost = 0;
+  let brregHitTelefon = 0;
+  let brregHitAny = 0;
+  const changed: Array<{
+    provider_id: string;
+    fields: string[];
+    epost: string | null;
+    telefon: string | null;
+    source_url: string;
+  }> = [];
+  const websiteCandidates: Array<{ provider_id: string; candidate_url: string }> = [];
+  const skippedLocked: string[] = [];
+  const unresolved: Array<{ provider_id: string; reason: string }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  for (const t of targets) {
+    const providerId = t.id;
+
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      skippedLocked.push(providerId);
+      continue;
+    }
+
+    const epostBlank = !t.epost || t.epost.trim() === "";
+    const telefonBlank = !t.telefon || t.telefon.trim() === "";
+    const hjemmesideBlank = !t.hjemmeside || t.hjemmeside.trim() === "";
+    if (!epostBlank && !telefonBlank && !hjemmesideBlank) {
+      // Only reachable via the explicit providerIds override — nothing this
+      // route could contribute.
+      unresolved.push({ provider_id: providerId, reason: "already_filled" });
+      continue;
+    }
+
+    let contact: Awaited<ReturnType<typeof fetchBrregContact>>;
+    try {
+      contact = await fetchBrregContact(t.org_nr);
+    } catch (e: any) {
+      // fetchBrregContact is documented never-throws; this catch exists so a
+      // contract violation degrades one row instead of the whole batch.
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      continue;
+    }
+    scanned++;
+
+    if (!contact) {
+      unresolved.push({ provider_id: providerId, reason: "brreg_lookup_failed_or_404" });
+      continue;
+    }
+    if (contact.epost) brregHitEpost++;
+    if (contact.telefon) brregHitTelefon++;
+    if (contact.epost || contact.telefon) brregHitAny++;
+
+    // ── hjemmeside: queued for review, never written from here ──
+    if (hjemmesideBlank && contact.hjemmeside) {
+      websiteCandidates.push({ provider_id: providerId, candidate_url: contact.hjemmeside });
+      if (!dryRun) {
+        try {
+          upsertGardssalgWebsiteReviewQueue({
+            provider_id: providerId,
+            provider_name: t.navn,
+            candidate_url: contact.hjemmeside,
+            evidence: `brreg_hjemmeside:${t.org_nr}`,
+            reason: "brreg_registered_hjemmeside",
+            batch_id: batchId,
+          });
+        } catch (e: any) {
+          errors.push({ provider_id: providerId, error: `queue_failed: ${e?.message ?? String(e)}` });
+        }
+      }
+    }
+
+    // ── epost/telefon: fill-only write ──
+    const wouldWriteEpost = epostBlank && !!contact.epost;
+    const wouldWriteTelefon = telefonBlank && !!contact.telefon;
+    if (!wouldWriteEpost && !wouldWriteTelefon) {
+      if (!(hjemmesideBlank && contact.hjemmeside)) {
+        unresolved.push({ provider_id: providerId, reason: "no_brreg_contact" });
+      }
+      continue;
+    }
+
+    const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+
+    if (dryRun) {
+      changed.push({
+        provider_id: providerId,
+        fields: [...(wouldWriteEpost ? ["epost"] : []), ...(wouldWriteTelefon ? ["telefon"] : [])],
+        epost: wouldWriteEpost ? contact.epost : null,
+        telefon: wouldWriteTelefon ? contact.telefon : null,
+        source_url: evidenceUrl,
+      });
+    } else {
+      try {
+        const written = applyGardssalgProviderContact(
+          providerId,
+          { epost: contact.epost, telefon: contact.telefon },
+          evidenceUrl,
+          batchId
+        );
+        if (written.length > 0) {
+          changed.push({
+            provider_id: providerId,
+            fields: written,
+            epost: written.includes("epost") ? contact.epost : null,
+            telefon: written.includes("telefon") ? contact.telefon : null,
+            source_url: evidenceUrl,
+          });
+        } else {
+          // Fresh-read-at-write-time found the fields already non-blank or the
+          // provider now locked — same race class the sibling routes document.
+          unresolved.push({ provider_id: providerId, reason: "already_filled_or_locked_at_write_time" });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    batch_id: batchId,
+    cohort_total: countGardssalgProvidersForContactBackfill(),
+    offset,
+    limit,
+    scanned,
+    brreg_hits: { epost: brregHitEpost, telefon: brregHitTelefon, any: brregHitAny },
+    providers_enriched: changed.length,
+    changed,
+    website_candidates: websiteCandidates,
+    skipped_locked: skippedLocked,
+    unresolved,
+    errors,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-orgnr-backfill (admin) ───────────
 //
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b.
@@ -5229,6 +5991,12 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
             } catch { /* malformed -> treat as unknown, i.e. keep */ }
           }
           const out: Record<string, unknown> = { ...row };
+          // The map is an INPUT to this screen, not part of its output. Serving
+          // it leaked a raw JSON string into the response — a second, differently
+          // shaped copy of a decision the blanking already encodes, which the
+          // consumer would have to parse to use and could then disagree with
+          // (round-8 review, MINOR 3).
+          delete out.content_field_evidence;
           let judgeable = 0;
           for (const field of JUDGED_FIELDS) {
             if (out[field] === null || out[field] === undefined || out[field] === "") continue;

@@ -535,6 +535,26 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-07-27-harvest-hjemmeside-feltnavn-tapes: the harvest
+// SKILL sends `hjemmeside`, BulkRowSchema only accepted `website`, and
+// z.object() strips unknown keys silently — so every harvested homepage was
+// discarded at the door and the provider could never be content-enriched.
+runSerial(() => {
+  console.log("\n── bulk-load: hjemmeside/website alias ──");
+  try {
+    const { runBulkLoadHjemmesideAliasTests } = require("../src/routes/opplevelser-bulk-load-hjemmeside-alias.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-hjemmeside-alias.test");
+    const r = runBulkLoadHjemmesideAliasTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-hjemmeside-alias: " + f);
+    console.log(`  bulk-load-hjemmeside-alias: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-hjemmeside-alias: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07: experience filter tags (derived, additive-only) ──
 // Daniel confirmed "tags/filters only, no new categories" for experiences.
 // Pins deriveExperienceTags() (services/experience-tags.ts) against the
@@ -9922,7 +9942,7 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
     db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id) VALUES ('ven-grimstad', 'Bondens Marked Grimstad', 'venue', 'lok-agder')").run();
     initMod.__setDbForTesting(db);
 
-    const { matchEventToVenue, runBmEventsScraper } = require("../src/services/bm-events-scraper");
+    const { matchEventToVenue, runBmEventsScraper, __setBmEventsScraperFetchForTesting } = require("../src/services/bm-events-scraper");
 
     // venue_fuzzy: event_name "Lyngdal Sentrum" should match "Bondens marked — Lyngdal"
     // (the prefix is stripped by normaliseForMatch and "lyngdal" remains as needle)
@@ -9967,7 +9987,12 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
       assertEq(r3.agent_id, null, "pr-56: unmatched returns agent_id=null");
 
       // ─── Behavioural: runBmEventsScraper with stubbed fetch ───
-      const realFetch = (globalThis as any).fetch;
+      // Uses the module-level fetch seam (__setBmEventsScraperFetchForTesting)
+      // instead of overwriting globalThis.fetch: concurrently-running test
+      // blocks (this file's async blocks are not serialized) share the one
+      // process-global fetch, so a raw globalThis override here could poison
+      // an unrelated block's real fetch call mid-flight. The injectable seam
+      // only affects bm-events-scraper.ts's own fetchHtml().
       const listingHtml = `<html><body>
         <a href="/markeder/lyngdal-sentrum-2026-05-16">Lyngdal</a>
         <a href="/markeder/bergen-2026-05-30">Bergen</a>
@@ -9978,17 +10003,24 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
       const bergenEventHtml = `<html><head>
         <script type="application/ld+json">{"@type":"Event","name":"Bergen Torg","startDate":"2026-05-30T09:00:00+00:00","endDate":"2026-05-30T15:00:00+00:00","location":{"name":"Bergen"}}</script>
       </head><body>x</body></html>`;
-      (globalThis as any).fetch = async (url: string) => {
+      __setBmEventsScraperFetchForTesting(async (url: string) => {
         let body = "";
         if (url.endsWith("/markeder")) body = listingHtml;
         else if (url.endsWith("lyngdal-sentrum-2026-05-16")) body = lyngdalEventHtml;
         else if (url.endsWith("bergen-2026-05-30")) body = bergenEventHtml;
         else body = "<html></html>";
         return new Response(body, { status: 200, headers: { "content-type": "text/html" } });
-      };
+      });
 
       try {
-        const result = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false });
+        // correctTimes: false — this test asserts on fetched/parsed/upserted only,
+        // never on event_times_checked/corrected, so we skip the lokallag-fasit
+        // time-correction step (PR-125's correctEventTimesFromCanonical). That
+        // step goes through bondensmarked-source.ts's own bmFetch(), a separate,
+        // un-seamed raw-fetch call site outside this test's stub — same
+        // correctTimes:false precedent already used by
+        // bm-events-scrape-job.test.ts for the identical reason.
+        const result = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false, correctTimes: false });
         assertEq(result.fetched, 2, "pr-56: scraper fetched 2 slugs from listing");
         assertEq(result.parsed, 2, "pr-56: scraper parsed both event JSON-LDs");
         assertTrue(result.upserted >= 1, `pr-56: scraper upserted at least 1 row (got ${result.upserted})`);
@@ -9999,12 +10031,12 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
         assertEq(stored?.venue_agent_id, "ven-lyngdal", "pr-56: stored row matched to ven-lyngdal");
 
         // Idempotency: a second run should not duplicate (UNIQUE on event_slug)
-        const result2 = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false });
+        const result2 = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false, correctTimes: false });
         const total = (db.prepare("SELECT COUNT(*) AS c FROM bm_market_events").get() as any).c;
         assertTrue(total <= 2, `pr-56: re-running scraper does not duplicate (total rows=${total})`);
         assertTrue(result2.upserted >= 1, "pr-56: second run still reports upserts (REPLACE)");
       } finally {
-        (globalThis as any).fetch = realFetch;
+        __setBmEventsScraperFetchForTesting();
       }
 
       // ─── Behavioural: public endpoint filters work ───
@@ -13721,8 +13753,10 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   // as PR-69/70/71). Mirrors the fix-pattern used in PR-71 iter-2.
   try { await _m2Promise; } catch { /* m2 owns its own failures */ }
   try { await _pr75Promise; } catch { /* pr-75 owns its own failures */ }
-  // Wait for pr-56 (which also stubs globalThis.fetch) to finish before
-  // we touch fetch — otherwise our stubs collide and pr-56 tests flake.
+  // Wait for pr-56 so console output stays in a stable order. Both blocks
+  // now use their own injectable fetch seam (__setBmEventsScraperFetchForTesting /
+  // __setGeocodingFetchForTesting), so — unlike before — their fetch stubs
+  // can no longer collide even if this await were removed.
   try { await _pr56Promise; } catch { /* ignored; pr-56 owns its own failures */ }
   console.log("\n── PR-76: lokal_geocode MCP tool ──");
   const fs = require("fs");
@@ -13777,7 +13811,7 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   );
 
   // ── Behavioural tests on geocodingService (what the tool handler invokes) ──
-  const { geocodingService } = require("../src/services/geocoding-service");
+  const { geocodingService, __setGeocodingFetchForTesting } = require("../src/services/geocoding-service");
 
   // (8) Hardcoded city: Oslo returns known coords with source 'hardcoded'
   const oslo = await geocodingService.geocode("Oslo");
@@ -13810,8 +13844,13 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   // (11) Not found: stub Kartverket fetch to return empty so we can assert null
   // gracefully (without making a real network call). The geocodingService
   // caches by lowercased name, so use a unique key that hasn't been cached.
-  const realFetch = (globalThis as any).fetch;
-  (globalThis as any).fetch = async (url: string) => {
+  // Uses the module-level __setGeocodingFetchForTesting seam instead of
+  // overwriting globalThis.fetch: this file's async test blocks run
+  // concurrently (not serialized), so a raw globalThis override here could
+  // poison a real fetch call mid-flight in some unrelated, concurrently
+  // running block. The injectable seam only affects geocoding-service.ts's
+  // own Kartverket/Kommuneinfo calls.
+  __setGeocodingFetchForTesting(async (url: string) => {
     if (typeof url === "string" && url.includes("ws.geonorge.no")) {
       return {
         ok: true,
@@ -13820,8 +13859,8 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
         json: async () => ({ navn: [] }),
       };
     }
-    return realFetch ? realFetch(url) : { ok: false, status: 500, statusText: "no fetch", json: async () => ({}) };
-  };
+    return fetch(url);
+  });
   try {
     const bogus = await geocodingService.geocode("InvalidPlace123XYZ");
     assertEq(bogus, null, "pr-76: geocode('InvalidPlace123XYZ') returns null (graceful)");
@@ -13835,7 +13874,7 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
       "pr-76: tool handler returns 'Fant ikke koordinater' text when geocode returns null"
     );
   } finally {
-    (globalThis as any).fetch = realFetch;
+    __setGeocodingFetchForTesting();
   }
 })()
   .then(() => _pr76Resolve())
@@ -27845,6 +27884,43 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gob.failures) failures.push("opplevelser-gardssalg-orgnr-backfill: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-backfill: ${gob.passed} passed, ${gob.failed} failed`);
 
+    // dev-request 2026-07-26-booking-test-send-guard: per-transaction test
+    // flag that redirects EVERY outgoing email of that one transaction to
+    // TEST_SEND_REDIRECT_EMAIL (services/send-guard.ts, applied inside
+    // EmailService.sendEmail so no call site can bypass it). Unblocks the
+    // live-E2E acceptance criterion on two already-deployed dev-requests
+    // (mcp-booking-verktoy, claim-flyt). Asserts at the real send boundary
+    // via an injected transporter — notably that the PRODUCER notification
+    // (the email carrying the actionable tokens) is the one redirected, and
+    // that the flag cannot be smuggled in through a public payload. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-booking-send-guard: test-mode send redirect ──");
+    const { runOpplevelserBookingSendGuardTests } = require("../src/routes/opplevelser-booking-send-guard.test") as
+      typeof import("../src/routes/opplevelser-booking-send-guard.test");
+    const bsg = await runOpplevelserBookingSendGuardTests({ log: false });
+    passed += bsg.passed;
+    failed += bsg.failed;
+    for (const f of bsg.failures) failures.push("opplevelser-booking-send-guard: " + f);
+    console.log(`  opplevelser-booking-send-guard: ${bsg.passed} passed, ${bsg.failed} failed`);
+
+    // dev-request 2026-07-26-brreg-kontakt-backfill: fetchBrregContact()
+    // (src/services/brreg-client.ts) reads epostadresse/telefon/mobil out of
+    // the SAME GET /enheter/{orgNr} response the other org-nr lookups already
+    // call — fields no code in the repo read before this. Backs
+    // POST /admin/gardssalg-contact-backfill (fill-only, dry-run default,
+    // audit + provenance, hjemmeside routed to the review queue rather than
+    // written) for the 344-of-389 cohort that is un-contactable AND
+    // un-claimable today. Same in-memory-DB pattern, runs sequentially inside
+    // this same gated block.
+    console.log("\n── opplevelser-gardssalg-contact-backfill: Brreg epost/telefon backfill ──");
+    const { runOpplevelserGardssalgContactBackfillTests } = require("../src/routes/opplevelser-gardssalg-contact-backfill.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-contact-backfill.test");
+    const gcb = await runOpplevelserGardssalgContactBackfillTests({ log: false });
+    passed += gcb.passed;
+    failed += gcb.failed;
+    for (const f of gcb.failures) failures.push("opplevelser-gardssalg-contact-backfill: " + f);
+    console.log(`  opplevelser-gardssalg-contact-backfill: ${gcb.passed} passed, ${gcb.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5d
     // + 5b-integrasjonsherding (2026-07-19-review B1/B2/M1/M2/M3/M5): delt-/
     // katalogdomene-vern på content-refresh (kuratert klassifiserer +
@@ -33538,6 +33614,47 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-07-13-supply-graph-v1, salvage slice (2026-07-27):
+// PATCH /agents/:id/products/:productId/availability (auth + 404 scoping) +
+// setProducerAvailabilityByProductId(). Own in-memory DB (swaps the shared
+// getDb() singleton) — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-supply-graph-v1 (salvage slice): PATCH availability endpoint ──");
+  try {
+    const { runMarketplaceAvailabilityPatchTests } = require("../src/routes/marketplace-availability-patch.test") as
+      typeof import("../src/routes/marketplace-availability-patch.test");
+    const map = await runMarketplaceAvailabilityPatchTests({ log: false });
+    passed += map.passed;
+    failed += map.failed;
+    for (const f of map.failures) failures.push("marketplace-availability-patch: " + f);
+    console.log(`  marketplace-availability-patch: ${map.passed} passed, ${map.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-availability-patch: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-07-13-supply-graph-v1, salvage slice (2026-07-27):
+// cart-service addCartItem()/submitCart() staleness hardening — gate on
+// EFFECTIVE availability, not the raw column. Own in-memory DB (swaps both
+// the shared getDb() singleton and cart-service's module-local test DB) —
+// runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-supply-graph-v1 (salvage slice): cart-service staleness hardening ──");
+  try {
+    const { runCartServiceSupplyGraphTests } = require("../src/services/cart-service-supply-graph.test") as
+      typeof import("../src/services/cart-service-supply-graph.test");
+    const csg = runCartServiceSupplyGraphTests({ log: false });
+    passed += csg.passed;
+    failed += csg.failed;
+    for (const f of csg.failures) failures.push("cart-service-supply-graph: " + f);
+    console.log(`  cart-service-supply-graph: ${csg.passed} passed, ${csg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cart-service-supply-graph: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter:
 // gårdssalg producer owner-claim flow (magic-link-based, mirrors RFB's
 // owner-portal.ts pattern in a vertical-scoped table). Three suites:
@@ -34049,5 +34166,31 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("category-sanity-report: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-19-field-provenance-legacy-shape-audit: GET
+// /admin/agent-audit/field-provenance-legacy-shape (src/routes/admin-agent-audit.ts) —
+// read-only audit finding agent_knowledge/dental_agents rows still holding a
+// field_provenance field in the legacy wrapped `{sources:[...]}` shape that
+// lokal PR #298's mergeFieldProvenance() fix now unwraps-and-preserves
+// instead of silently wiping. Own harness: rfb side via
+// __setDbForTesting/__initSchemaForTesting (src/database/init.ts), dental
+// side via DENTAL_DB_PATH=":memory:" + db-factory.__resetDbFactoryForTesting()
+// (mirrors dental-agent-put-field-provenance.test.ts). Runs via runSerial()
+// like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-19-field-provenance-legacy-shape-audit: field-provenance-legacy-shape ──");
+  try {
+    const { runAdminAgentAuditFieldProvenanceLegacyShapeTests } = require("../src/routes/admin-agent-audit-field-provenance-legacy-shape.test") as
+      typeof import("../src/routes/admin-agent-audit-field-provenance-legacy-shape.test");
+    const fpls = await runAdminAgentAuditFieldProvenanceLegacyShapeTests({ log: false });
+    passed += fpls.passed;
+    failed += fpls.failed;
+    for (const f of fpls.failures) failures.push("field-provenance-legacy-shape: " + f);
+    console.log(`  field-provenance-legacy-shape: ${fpls.passed} passed, ${fpls.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("field-provenance-legacy-shape: unexpected error: " + String(err?.message || err));
   }
 });

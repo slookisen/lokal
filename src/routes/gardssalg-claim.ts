@@ -325,7 +325,16 @@ router.post(
 
     const verifyUrl = `${OPPLEVAGENT_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${result.claim.token}`;
     emailService
-      .sendGardssalgClaimMagicLink({ to: result.claim.email, providerName: provider?.navn || "din profil", verifyUrl })
+      .sendGardssalgClaimMagicLink({
+        to: result.claim.email,
+        providerName: provider?.navn || "din profil",
+        verifyUrl,
+        // Always false on this public route (issueClaimMagicLink above is
+        // called with no opts, so result.claim.isTest can only be false here).
+        // Read from the claim row rather than hardcoded so the admin test
+        // route below shares this exact send path.
+        isTestSend: result.claim.isTest,
+      })
       .then((emailResult) => {
         if (!emailResult.success) {
           console.error(`[gardssalg-claim] Failed to send magic link email for provider ${providerId}`);
