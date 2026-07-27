@@ -199,6 +199,120 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
     }
   }
 
+  // ── Round-4 review: the FOURTH instance, from two separate causes ────────
+  // (a) Placeholder-sentinel DOMAINS. These parse perfectly — two labels, real
+  // TLD — so the round-3 host-shape check waved them through, and they still
+  // discarded the row's real hjemmeside. example.com is the one that matters:
+  // RFC-2606 reserved, and the single most likely thing an LLM harvester emits
+  // for a URL field it does not know. The repo already exported the list
+  // (PLACEHOLDER_EMAIL_DOMAINS); the round-3 check simply did not consult it.
+  {
+    const sentinels = [
+      "https://example.com", "example.org", "example.net", "domain.com",
+      "yourdomain.com", "yourcompany.com", "website.com", "test.com",
+      "company.com", "email.com", "www.example.com", "https://example.com/om-oss",
+    ];
+    for (const v of sentinels) {
+      const row = BulkRowSchema.parse({ ...base, website: v, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-17/${v}: placeholder domain \`${v}\` never shadows a real homepage`,
+      );
+    }
+  }
+
+  // (b) Parser disagreement. isAggregatorWebsite() used `new URL()` while the
+  // shape screen used hostFromUrlLike(). `new URL("http://visitnorway.com:99999")`
+  // THROWS (port > 65535) and the catch returned "not an aggregator", while
+  // hostFromUrlLike happily returned `visitnorway.com` and passed the shape
+  // screen — so a KNOWN aggregator was stored AND the real hjemmeside dropped.
+  // Both functions now use the one parser. Pinned for both aggregator hosts and
+  // several malformed-authority shapes, because the class is the point, not the
+  // individual strings.
+  {
+    const smuggled = [
+      "http://visitnorway.com:99999/",
+      "https://visitnorway.com:80443/x",
+      "visitnorway.com:abc",
+      "visitnorway.com:-1",
+      "http://visitnorway.com:1234567",
+      "http://visithelgeland.com:99999/en/product/abc",
+    ];
+    for (const v of smuggled) {
+      const row = BulkRowSchema.parse({ ...base, website: v, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-18/${v}: a malformed authority must not smuggle a known aggregator past the screen`,
+      );
+      const alone = BulkRowSchema.parse({ ...base, website: v });
+      assertEq(
+        firstNonAggregatorWebsite([alone as BulkRow]),
+        null,
+        `alias-18b/${v}: …nor be stored when it is the only candidate`,
+      );
+    }
+  }
+
+  // (c) Degenerate DNS labels. RFC-invalid leading/trailing hyphens and
+  // over-63-char labels are not hostnames; only the TLD label was being checked.
+  {
+    for (const v of ["-gard.no", "gard-.no", "a".repeat(64) + ".no"]) {
+      const row = BulkRowSchema.parse({ ...base, website: v, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-19/${v.slice(0, 12)}: an RFC-invalid label does not shadow a real homepage`,
+      );
+    }
+  }
+
+  // ── The two-tier preference, and why it is not just a stricter screen ────
+  // An unrecognized TLD must LOSE to a recognized one in the same row, but must
+  // still be STORED when it is the only candidate. Requiring a known TLD
+  // outright would turn every omission from the list into a silently dropped
+  // producer homepage — this PR's own failure mode with a new cause. The harms
+  // are asymmetric (shadowing is pure loss; storing a lone odd value is what
+  // main already did), so the resolution is asymmetric too.
+  {
+    // `.travel` IS on the recognized list, so it must behave like `.no` — it
+    // wins from `website` rather than deferring. (This assertion caught a wrong
+    // fixture in the first draft of this very block, which is the point of
+    // pinning both sides of the tier boundary rather than only the losing one.)
+    {
+      const known = BulkRowSchema.parse({ ...base, website: "https://gard.travel", hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([known as BulkRow]),
+        "https://gard.travel",
+        "alias-20a: a RECOGNIZED but uncommon TLD is tier-1 and keeps `website` precedence",
+      );
+    }
+    const oddButReal = ["gard.gardsbutikk", "gard.bogus", "gard.qqq"];
+    for (const v of oddButReal) {
+      const alone = BulkRowSchema.parse({ ...base, website: v });
+      assertEq(
+        firstNonAggregatorWebsite([alone as BulkRow]),
+        v,
+        `alias-20/${v}: an unrecognized TLD is still stored when nothing better exists — no false rejection`,
+      );
+      const mixed = BulkRowSchema.parse({ ...base, website: v, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([mixed as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-21/${v}: …but it loses to a recognized TLD in the same row`,
+      );
+    }
+    // Across rows too, not just within one.
+    const oddRow = BulkRowSchema.parse({ ...base, website: "gard.bogus" });
+    const realRow = BulkRowSchema.parse({ ...base, title: "Rafting", website: "https://trollaktiv.no" });
+    assertEq(
+      firstNonAggregatorWebsite([oddRow as BulkRow, realRow as BulkRow]),
+      "https://trollaktiv.no",
+      "alias-22: the preference holds across rows — an earlier odd TLD does not win by position",
+    );
+  }
+
   // ── …and the tightening must not cost a single legitimate homepage ──────
   // The other half of the round-3 fix: a shape check that rejects real
   // producer URLs would silently reintroduce the very loss this PR exists to
@@ -218,6 +332,12 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
       "https://trollaktiv.no/a/b?c=d#e",   // path + query + fragment
       "https://trollaktiv.no:8443/",       // explicit port
       "sjokoladefabrikken.co.uk",          // multi-label suffix
+      // Round-4 review, blocking: `@` is legal in a path/query/fragment, and a
+      // blanket rejection dropped all three of these to null — values
+      // origin/main stored. Only the AUTHORITY is screened for `@` now.
+      "https://trollaktiv.no/kontakt?epost=post@trollaktiv.no",
+      "https://trollaktiv.no/@gardsbutikk",
+      "https://trollaktiv.no/side#a@b",
     ];
     for (const v of legit) {
       const row = BulkRowSchema.parse({ ...base, website: v });
