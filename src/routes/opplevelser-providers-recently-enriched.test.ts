@@ -245,13 +245,11 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         `INSERT INTO experiences
            (id, provider_id, title, description, category, subcategory, booking_url,
             content_source, enrichment_state, canonical_id, verification_status,
-            evidence_url, discovery_source, content_evidence_url,
-            content_field_evidence, updated_at)
+            evidence_url, discovery_source, content_field_evidence, updated_at)
          VALUES
            (@id, @provider_id, @title, @description, @category, @subcategory, @booking_url,
             @content_source, @enrichment_state, @canonical_id, @verification_status,
-            @evidence_url, @discovery_source, @content_evidence_url,
-            @content_field_evidence, @updated_at)`,
+            @evidence_url, @discovery_source, @content_field_evidence, @updated_at)`,
       );
       // `content_field_evidence` is a PER-FIELD map (round-6 review): the writer
       // only fills BLANK fields, so one row's fields come from different sources
@@ -265,7 +263,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
           ? JSON.stringify({ description: evidenceFor, category: evidenceFor, booking_url: evidenceFor })
           : null;
         insertExperienceFull.run({
-          evidence_url: null, discovery_source: null, content_evidence_url: null,
+          evidence_url: null, discovery_source: null,
           content_field_evidence: map, ...rest,
         });
       };
@@ -873,6 +871,204 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         assertEq(wRow.description, "Ekte tekst fra egen hjemmeside.", "w6b: the homepage-sourced field is served");
         assertEq(wRow.booking_url, null, "w6c: …and the aggregator-sourced field is blanked, so it is never judged against a page it did not come from");
         assertTrue((wProv.enriched_experiences_fields_blanked ?? 0) > 0, "w6d: the blanked-field count reaches the consumer");
+      }
+
+      // ── (w7-w11) round-7 review, BLOCKING: the fixtures did not discriminate ─
+      {
+        const store2 = require("../services/experience-store") as typeof import("../services/experience-store");
+        const evidenceOf2 = (id: string): Record<string, string> => {
+          const row = expDb.prepare("SELECT content_field_evidence FROM experiences WHERE id = ?").get(id) as
+            { content_field_evidence: string | null } | undefined;
+          return row?.content_field_evidence ? JSON.parse(row.content_field_evidence) : {};
+        };
+
+        // w7 — MULTI-FIELD writes. Every earlier writer test passed a candidate
+        // with exactly ONE field, so `written.length === 1` throughout and
+        // `evidence[written[0]] = sourceUrl` passed the whole suite. Both
+        // production callers are multi-field: the content-refresh passes 8
+        // candidate fields in one call and bulkInsertExperiences passes 9. A
+        // regression that stamped only the first key would leave `category`
+        // unstamped, read as "unknown -> keep", and served as homepage content:
+        // the round-4 false-mismatch harm, re-reachable with green tests.
+        insertFull({
+          id: "exp-multifield-1", provider_id: "prov-generic-enriched",
+          title: "Flerfeltsskriving", description: null, category: null, booking_url: null,
+          subcategory: null, content_source: null, enrichment_state: "raw",
+          canonical_id: null, verification_status: "pending_verify",
+          updated_at: daysAgoIso(2),
+        });
+        store2.applyExperienceContent("exp-multifield-1", {
+          description: "Tekst fra DMO.", category: "natur_friluft",
+          booking_url: "https://visitnorway.com/book/1", subcategory: "fjelltur",
+        }, "https://visitnorway.com/found-here");
+        const mf = evidenceOf2("exp-multifield-1");
+        for (const field of ["description", "category", "booking_url", "subcategory"]) {
+          assertEq(mf[field], "https://visitnorway.com/found-here",
+            `w7/${field}: EVERY field written in one call is stamped, not just the first`);
+        }
+
+        // w8 — the harvest sentinel. A harvest row with no evidence_url used to
+        // stamp `null`, which the endpoint reads as "unknown -> keep" and serves
+        // as judgeable homepage content — re-opening the round-4 leak for
+        // exactly those rows. We know it is harvest-sourced even without a URL.
+        // Own provider: on the shared one these rows fall outside the 10-row
+        // slice, so the assertions below passed whether or not the field was
+        // blanked. (Eighth non-discriminating fixture this session — caught, as
+        // every one of them has been, by re-running the mutation.)
+        insertProvider.run({
+          id: "prov-sentinel", navn: "Sentinel AS", hjemmeside: "https://sentinel.example.no",
+          last_enriched_at: daysAgoIso(1),
+          about_text: null, visit_text: null, opening_hours_text: null, products: null,
+          content_source: null, content_evidence_url: null,
+        });
+        insertFull({
+          id: "exp-nosource-1", provider_id: "prov-sentinel",
+          title: "Harvest uten evidence_url", description: null, category: null, booking_url: null,
+          subcategory: null, content_source: null, enrichment_state: "raw",
+          canonical_id: null, verification_status: "pending_verify",
+          updated_at: daysAgoIso(2),
+        });
+        // w8 — the sentinel MECHANISM, and an honest note about its limit.
+        //
+        // A harvest row with no `evidence_url` used to stamp `null`. The two
+        // halves that make that harmful are testable and tested here:
+        //   (a) `null` stamps nothing at all, so the field has no map entry;
+        //   (b) no map entry is read as "unknown" and KEPT — served to the
+        //       spot-check as judgeable homepage content, which is the round-4
+        //       false-mismatch harm reached one more way.
+        // The sentinel closes it because a source that does not resolve to the
+        // homepage is blanked rather than kept.
+        //
+        // What is NOT runtime-tested, stated rather than papered over: that the
+        // two harvest CALL SITES pass the sentinel instead of `null`. Reaching
+        // them requires the dedup matcher to fire, which needs a kommune on both
+        // sides plus a provider identity — I could not construct it here without
+        // a fixture more elaborate than the thing under test. That binding rests
+        // on the required-parameter type and the shared constant, and a reviewer
+        // should check it by reading the two call sites.
+        insertFull({
+          id: "exp-nullsource-1", provider_id: "prov-sentinel",
+          title: "Skrevet uten kilde", description: null, category: null, booking_url: null,
+          subcategory: null, content_source: null, enrichment_state: "raw",
+          canonical_id: null, verification_status: "pending_verify",
+          updated_at: daysAgoIso(2),
+        });
+        store2.applyExperienceContent("exp-nullsource-1", { description: "Tekst uten kjent kilde." }, null);
+        assertEq(JSON.stringify(evidenceOf2("exp-nullsource-1")), "{}",
+          "w8a: a null source stamps NOTHING — which is exactly why the harvest callers must not pass it");
+        store2.applyExperienceContent("exp-nosource-1",
+          { description: "AGGREGATOR-TEKST uten kilde-URL." }, store2.HARVEST_PROVENANCE_SENTINEL);
+        assertEq(evidenceOf2("exp-nosource-1").description, store2.HARVEST_PROVENANCE_SENTINEL,
+          "w8b: …while the sentinel IS recorded, so the field is attributable");
+        const sentResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const sentProv = (sentResp.body.providers as any[]).find((p) => p.id === "prov-sentinel");
+        assertTrue(!!sentProv, "w8c0: prov-sentinel is sampled, so the assertions below are about the slice they claim to be about");
+        const sentRow = (sentProv.enriched_experiences as any[]).find((e) => e.id === "exp-nosource-1");
+        // Precise, not a disjunction: `!sentRow || …` was satisfied by the row
+        // being absent for ANY reason, so it passed with the guard removed too.
+        // The contract is exact — this row's only judged field is blanked, so
+        // nothing judgeable remains and the row is dropped.
+        assertEq(sentRow, undefined,
+          "w8c: a sentinel-sourced field is BLANKED, so its row is dropped — a present source that cannot be matched to the homepage is a mismatch, not an unknown");
+        // The sentinel parses to a host ("harvest"), so it exercises the
+        // different-domain branch. A map entry that yields NO host at all is a
+        // separate branch, and it is the one that decides whether a PRESENT but
+        // unusable source counts as "unknown" (kept) or "not the homepage"
+        // (blanked). Keeping it was the old behavior and is the harmful reading.
+        insertFull({
+          id: "exp-garbagesource-1", provider_id: "prov-sentinel",
+          title: "Ubrukelig kildeverdi", description: "AGGREGATOR-TEKST med ubrukelig kilde.",
+          category: null, booking_url: null, subcategory: null,
+          content_source: "provider_site", enrichment_state: "enriched",
+          canonical_id: null, verification_status: "pending_verify",
+          content_field_evidence: JSON.stringify({ description: "///" }),
+          updated_at: daysAgoIso(3),
+        });
+        const garbResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const garbProv = (garbResp.body.providers as any[]).find((p) => p.id === "prov-sentinel");
+        assertEq(
+          (garbProv.enriched_experiences as any[]).find((e) => e.id === "exp-garbagesource-1"),
+          undefined,
+          "w8e: a PRESENT source that resolves to no host at all is treated as not-the-homepage and blanked — absence of an entry means unknown, an unusable entry does not",
+        );
+        const nullRow = (sentProv.enriched_experiences as any[]).find((e) => e.id === "exp-nullsource-1");
+        assertTrue(!!nullRow && nullRow.description === "Tekst uten kjent kilde.",
+          "w8d: …whereas a field with NO entry is genuinely unknown and is kept — which is what makes passing null harmful");
+      }
+
+      // ── (h28) window_exhausted — round-7 review, BLOCKING: untested ───────
+      // Deleting the flag entirely left the full suite green, yet A2A §8.3 tells
+      // the cron to branch on it ("score `skipped`, never `checked=0`"). More
+      // rows than the read window, almost all screened out.
+      {
+        insertProvider.run({
+          id: "prov-window", navn: "Over Vinduet AS", hjemmeside: "https://overvinduet.example.no",
+          last_enriched_at: daysAgoIso(1),
+          about_text: null, visit_text: null, opening_hours_text: null, products: null,
+          content_source: null, content_evidence_url: null,
+        });
+        for (let i = 0; i < 60; i++) {
+          insertFull({
+            id: `exp-win-${i}`, provider_id: "prov-window",
+            title: `Rad ${i}`, description: `AGGREGATOR-TEKST ${i}.`,
+            category: "natur_friluft", subcategory: null, booking_url: null,
+            content_source: "provider_site", enrichment_state: "enriched",
+            canonical_id: null, verification_status: "pending_verify",
+            evidenceFor: "https://visitnorway.com/x",
+            updated_at: daysAgoIso(1),
+          });
+        }
+        const winResp2 = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const winRow = (winResp2.body.providers as any[]).find((p) => p.id === "prov-window");
+        assertTrue(!!winRow, "h28a: prov-window is sampled");
+        assertEq(winRow.enriched_experiences_window_exhausted, true,
+          "h28b: more rows than the read window, and fewer than 10 survived — the consumer must score `skipped`, never checked=0");
+        assertTrue(
+          (shapeResp.body.providers as any[]).find((p) => p.id === "prov-generic-enriched")?.enriched_experiences_window_exhausted === undefined,
+          "h28c: …and the flag is absent (not false) for a provider inside the window",
+        );
+        // h28d — EXACTLY the window size, with almost nothing surviving. "The
+        // window filled" is not "there are more rows": A2A §8.3 tells the cron
+        // to score the whole provider `skipped` on this flag, so over-triggering
+        // throws away judgeable rows and can manufacture the very `checked=0`
+        // this change exists to remove. My first fixture used 60 rows, where
+        // both `>=` and `>` are true — it survived its own mutation.
+        insertProvider.run({
+          id: "prov-exact-window", navn: "Nøyaktig Vindu AS", hjemmeside: "https://noyaktig.example.no",
+          last_enriched_at: daysAgoIso(1),
+          about_text: null, visit_text: null, opening_hours_text: null, products: null,
+          content_source: null, content_evidence_url: null,
+        });
+        for (let i = 0; i < 50; i++) {
+          insertFull({
+            id: `exp-exact-${i}`, provider_id: "prov-exact-window",
+            title: `Rad ${i}`, description: `AGGREGATOR-TEKST ${i}.`,
+            category: "natur_friluft", subcategory: null, booking_url: null,
+            content_source: "provider_site", enrichment_state: "enriched",
+            canonical_id: null, verification_status: "pending_verify",
+            evidenceFor: "https://visitnorway.com/x",
+            updated_at: daysAgoIso(1),
+          });
+        }
+        const exactResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const exactRow = (exactResp.body.providers as any[]).find((p) => p.id === "prov-exact-window");
+        assertTrue(!!exactRow, "h28d1: prov-exact-window is sampled");
+        assertTrue(
+          exactRow.enriched_experiences_window_exhausted === undefined,
+          "h28d2: EXACTLY the window size does not set the flag — the window filling is not evidence that more rows exist",
+        );
       }
 
       // ── (h14) LIMIT 10 truncation ───────────────────────────────────────

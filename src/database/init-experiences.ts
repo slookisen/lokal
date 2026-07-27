@@ -393,8 +393,13 @@ export function initExperiencesSchema(db: Database.Database): void {
   // a single column records only the last writer (round-6 review). The consumer
   // judges per field, so the map is what the question actually needs.
   // JSON object: { "<field>": "<url the value was extracted from>" }.
+  // Only the per-field map. A row-level `content_evidence_url` was added here
+  // during round 5 and superseded by the map in round 6; keeping the ALTER left
+  // a column nothing writes, projected on every row as a permanent `null`
+  // BESIDE a meaningful same-named key on the provider object — two identical
+  // names at two levels, one always null, in a response an LLM reads
+  // (round-7 review). Dropped rather than left as decoration.
   const experienceContentProvenanceCols = [
-    "ALTER TABLE experiences ADD COLUMN content_evidence_url TEXT",
     "ALTER TABLE experiences ADD COLUMN content_field_evidence TEXT",
   ];
   for (const stmt of experienceContentProvenanceCols) {

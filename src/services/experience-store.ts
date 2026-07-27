@@ -1491,7 +1491,11 @@ export function bulkInsertExperiences(
               booking_url: row.booking_url ?? null,
             // Harvest-row content: its provenance is the third-party listing at
             // row.evidence_url, never the provider's homepage (round-5 review).
-            }, row.evidence_url ?? null);
+            // When the row carries no evidence_url, `null` would have meant
+            // "unknown", which the endpoint keeps and serves as judgeable —
+            // re-opening the round-4 leak for exactly those rows. We DO know
+            // this is harvest-sourced, so say so (round-7 review, M4).
+            }, row.evidence_url ?? HARVEST_PROVENANCE_SENTINEL);
             updated++;
           } else {
             skipped++;
@@ -1795,6 +1799,12 @@ export function isExperienceContentLocked(row: {
  * attributes: subcategory, activity_tags, season, indoor_outdoor, duration_min,
  * price_from, booking_url — all written only to EMPTY + UNLOCKED experiences.
  */
+/** Recorded as a field's source when content comes from a harvest row that
+ *  carries no `evidence_url`. Deliberately not a URL: it must not resolve to
+ *  the provider's homepage, so the projection blanks the field rather than
+ *  serving harvest text as homepage-sourced. */
+export const HARVEST_PROVENANCE_SENTINEL = "harvest:no-evidence-url";
+
 export function applyExperienceContent(
   experienceId: string,
   candidate: {
