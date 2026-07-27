@@ -3753,7 +3753,7 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
 // point is a spot-check, not the same agents every run.
 //
 // Auth: X-Admin-Key (same pattern as /admin/agents/dump above).
-// Returns: 200 { success, count, agents: [{ id, name, website,
+// Returns: 200 { success, count, agents: [{ id, name, website, location_city,
 //   last_enriched_at, field_provenance }] }
 router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;

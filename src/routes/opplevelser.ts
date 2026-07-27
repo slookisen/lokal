@@ -4992,11 +4992,18 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
     // what the 2026-W30 spot-check reported: "experiences: checked=0 ...
     // all 10 sampled providers have null content fields". The sample was real;
     // the projection was looking in the wrong table.
+    // `IN ('enriched','verified')`, not `= 'enriched'`: init-experiences.ts
+    // documents the ladder as raw → matched → enriched → verified. Nothing
+    // writes 'verified' to `experiences` today, so this is a no-op now — but
+    // the day a verifier pass starts stamping it, an `= 'enriched'` filter
+    // would make those rows vanish from this projection and report `checked=0`
+    // silently. That is the very failure mode this endpoint change exists to
+    // remove; it should not be re-armed for a future state (independent review).
     const expRowsStmt = expDb.prepare(
       `SELECT id, title, description, category, subcategory, booking_url,
               content_source, updated_at
          FROM experiences
-        WHERE provider_id = ? AND enrichment_state = 'enriched'
+        WHERE provider_id = ? AND enrichment_state IN ('enriched', 'verified')
         ORDER BY updated_at DESC
         LIMIT 10`
     );
@@ -5012,9 +5019,19 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
       let enrichedExperiences: unknown[] = [];
       try {
         enrichedExperiences = expRowsStmt.all(r.id) as unknown[];
-      } catch {
-        /* best-effort: a provider with no experiences rows is still a valid
-           sample row for the gårdssalg content fields above */
+      } catch (err) {
+        // NOT the zero-rows case — `.all()` returns [] for that and never
+        // throws (an earlier version of this comment claimed otherwise;
+        // independent review corrected it). Reaching here means a real query
+        // fault, e.g. SQLITE_BUSY under the `journal_mode = DELETE` fallback
+        // while a content-refresh writes. That must be LOUD: silently
+        // returning [] makes the weekly spot-check read "enrichment wrote
+        // nothing" — reintroducing the exact false `checked=0` signal this
+        // projection exists to eliminate.
+        console.error(
+          `[opplevelser] providers/recently-enriched: enriched_experiences query failed for provider ${r.id}`,
+          err,
+        );
       }
       return {
         id: r.id,
