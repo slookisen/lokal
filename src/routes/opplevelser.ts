@@ -220,6 +220,7 @@ import { fetchBrregWebsite } from "../services/brreg-client";
 import {
   isDirectoryOrAggregatorHost,
   hostFromUrlLike,
+  registrableDomain,
   PLACEHOLDER_EMAIL_DOMAINS,
 } from "../services/cross-source-validator";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
@@ -549,9 +550,28 @@ export type BulkRow = z.infer<typeof BulkRowSchema>;
 // (that is looksLikeHomepageValue's job) — over-rejecting here would silently
 // drop a real homepage the harvester just formatted oddly.
 function isAggregatorWebsite(raw: string): boolean {
-  const host = hostFromUrlLike(raw);
+  // BOTH parsers, new URL() first (round-5 review). Round 4 replaced new URL()
+  // with hostFromUrlLike() to end their disagreement, and that did close the
+  // invalid-port hole — but it opened two others, because new URL() does things
+  // hostFromUrlLike does not: it percent-decodes the host and treats `\\` as a
+  // path separator. So `http://visitnorway%2Ecom/` and
+  // `http://visitnorway.com\\evil` stopped being recognized as aggregators, and
+  // `http://gard.no\\@visitnorway.com` started being recognized as one — a FALSE
+  // POSITIVE in applyHjemmesideListingSweepToRow, which NULLs the homepage.
+  //
+  // Preferring new URL() and falling back only when it throws keeps every case
+  // it used to catch AND closes the invalid-port hole it could not, with no new
+  // false positive. Two parsers is fine; two parsers that disagree about which
+  // one is authoritative is not.
+  let host: string | null = null;
+  try {
+    const withScheme = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+    host = new URL(withScheme).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    host = hostFromUrlLike(raw);
+  }
   if (!host) return false;
-  return isDirectoryOrAggregatorHost(host);
+  return isDirectoryOrAggregatorHost(host) || HARVEST_SOURCE_HOSTS.has(registrableDomain(host));
 }
 
 // Does `v` have the SHAPE of a real homepage — i.e. does it parse to a host
@@ -599,7 +619,12 @@ function isAggregatorWebsite(raw: string): boolean {
 // the check now looks only at the authority, which still rejects a bare
 // "post@gard.no" and the "https://gard.no@visitnorway.com" userinfo swap.
 function authorityOf(v: string): string {
-  const afterScheme = v.replace(/^[a-z0-9+.-]+:\/\//i, "");
+  // The `^\/\/` strip mirrors cross-source-validator's stripProtocol (round-5
+  // review). Without it the two disagreed on a protocol-relative value:
+  // "//gard.no@visitbergen.com" had no `@` in what THIS function called the
+  // authority, so the guard passed, while hostFromUrlLike read the host as
+  // `visitbergen.com` — the same two-parsers-disagreeing class one layer down.
+  const afterScheme = v.replace(/^[a-z0-9+.-]+:\/\//i, "").replace(/^\/\//, "");
   return afterScheme.split("/")[0]!.split("?")[0]!.split("#")[0]!;
 }
 
@@ -613,32 +638,71 @@ function authorityOf(v: string): string {
 // example.com is the one that matters most in practice: it is RFC-2606
 // reserved and is the single most likely thing an LLM harvester emits when
 // told to fill a URL field it does not know.
-// TLDs a Norwegian experience provider plausibly uses. Used ONLY to rank two
-// otherwise-valid candidates against each other (see firstNonAggregatorWebsite),
-// never to reject on its own — so an omission costs a preference, not a
-// homepage. Ordered: the measured ones first, then European ccTLDs, then the
-// gTLDs that show up in this sector.
-const KNOWN_TLDS: ReadonlySet<string> = new Set([
-  // measured across 173 real producer/source hosts in A2A's run reports
-  "no", "com", "edu", "info",
-  // European ccTLDs a Norwegian operator might hold
-  "se", "dk", "fi", "is", "de", "nl", "be", "fr", "es", "it", "at", "ch", "uk",
-  "ie", "pt", "pl", "cz", "ee", "lv", "lt", "eu", "gl", "fo",
-  // generic
-  "org", "net", "biz", "name", "pro", "io", "co", "me", "tv", "cc", "ac",
-  // sector-typical new gTLDs
-  "app", "art", "bar", "bio", "camp", "cafe", "club", "design", "dev", "eco",
-  "farm", "fish", "food", "gallery", "green", "guide", "house", "life", "live",
-  "media", "museum", "online", "photo", "restaurant", "ski", "shop", "site",
-  "store", "studio", "tours", "travel", "vin", "wine", "world", "xyz",
+// Words that are a placeholder wherever they appear as a domain LABEL, not a
+// producer's name. This replaces a KNOWN_TLDS allowlist that round-5 review
+// dismantled, correctly and at the root: a TLD-RECOGNITION heuristic is not a
+// junk-DETECTION heuristic, and the two are uncorrelated. Measured on the real
+// values —
+//
+//   ukjent.no, nettside.no, eksempel.no   -> recognized TLD, pure junk
+//   storgarden.nu, storgarden.tech        -> unrecognized TLD, real producers
+//
+// — so ranking by TLD promoted the junk and demoted the producers, which is the
+// exact shadowing this function has now been rewritten five times to stop.
+//
+// What the junk actually has in common is the OTHER label: `ikke`.oppgitt,
+// `ingen`.hjemmeside, `kommer`.snart, `null`.null, `ukjent`.no,
+// `nettside`.no. So screen the labels, and keep the list conservative: with the
+// tiering gone this is a HARD reject, and a false reject costs a homepage. Only
+// words that are never a Norwegian producer's own name are listed — "under" and
+// "se" were considered and deliberately left out as too plausible.
+const PLACEHOLDER_DOMAIN_LABELS: ReadonlySet<string> = new Set([
+  // Norwegian
+  "ikke", "ikkeoppgitt", "oppgitt", "ingen", "ukjent", "mangler", "kommer",
+  "snart", "hjemmeside", "nettside", "nettsted", "eksempel", "tilgjengelig",
+  "arbeid", "finnesikke",
+  // English / machine
+  "example", "unknown", "none", "null", "undefined", "placeholder", "tbd",
+  "insert", "yourdomain", "yourcompany", "dummy", "todo", "notfound",
 ]);
 
 function isPlaceholderHomepageHost(host: string): boolean {
   const bare = host.replace(/^www\./, "");
-  const parts = bare.split(".");
-  const registrable = parts.length > 2 ? parts.slice(-2).join(".") : bare;
-  return PLACEHOLDER_EMAIL_DOMAINS.includes(bare) || PLACEHOLDER_EMAIL_DOMAINS.includes(registrable);
+  // registrableDomain() from cross-source-validator handles MULTI_LABEL_SUFFIXES
+  // (co.uk et al.); the local last-two-labels version this replaces returned
+  // "co.uk" for "example.co.uk" and would have defeated any multi-label entry
+  // added to PLACEHOLDER_EMAIL_DOMAINS later (round-5 review — the same
+  // "don't reinvent a weaker validator" correction round 3 made).
+  if (PLACEHOLDER_EMAIL_DOMAINS.includes(bare)) return true;
+  if (PLACEHOLDER_EMAIL_DOMAINS.includes(registrableDomain(bare))) return true;
+  // Separator-insensitive, the same way PR-126's registrable-domain equality
+  // treats `liagard.no` and `lia-gard.no` as one domain: "ikke-oppgitt" and
+  // "ikkeoppgitt" are the same placeholder, and pinning only one spelling is
+  // the fixture-calibration this screen has now been rewritten twice to escape.
+  return bare
+    .split(".")
+    .some((label) => PLACEHOLDER_DOMAIN_LABELS.has(label.replace(/[-_]/g, "")));
 }
+
+// Aggregator/DMO hosts that are harvest SOURCES for this endpoint specifically.
+// Round-5 review, blocking: the harvest SKILL names these six as the pages the
+// agent scrapes, and dev-request 2026-07-19-agg-website-leak documents
+// aggregator URLs genuinely arriving in `website` in production — so
+// `website` = the source listing, `hjemmeside` = the producer's own site is the
+// EXPECTED row shape, not a crafted one. Before this PR the alias was stripped,
+// so there was nothing for a DMO `website` to shadow; accepting the alias turns
+// a documented gap into active data loss.
+//
+// Kept LOCAL rather than added to KNOWN_DIRECTORY_HOSTS on purpose. That set
+// also gates domainCoherenceCheck's directory-host BYPASS
+// (cross-source-validator.ts), so adding a host there relaxes the verifier's
+// coherence gate for every agent on that domain — a blast radius this PR has no
+// evidence for. The screen below only decides which of a bulk-load row's own
+// fields becomes the provider's homepage, which is precisely the harm measured.
+const HARVEST_SOURCE_HOSTS: ReadonlySet<string> = new Set([
+  "nordnorge.com", "visittromso.no", "visitbergen.com",
+  "visitoslo.com", "visittrondheim.no", "fjordtours.com",
+]);
 
 function looksLikeHomepageValue(v: string): boolean {
   if (!isPlausibleUrlish(v)) return false;
@@ -705,44 +769,33 @@ export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
   // link. Host-level comparisons downstream all go through hostFromUrlLike(),
   // which lowercases, so the differing case in the column is not load-bearing.
   //
-  // ── Why TWO tiers, and not one stricter screen (round-4 review) ──────────
-  // Round 4 showed values that are structurally perfect but semantically junk —
-  // "ikke.oppgitt", "ingen.hjemmeside", "kommer.snart", "under.arbeid",
-  // "null.null" — still winning and still discarding the row's real
-  // `hjemmeside`. What they have in common is a TLD that is a Norwegian or
-  // English WORD rather than a real TLD.
+  // ── The tiering is GONE (round-5 review, blocking) ──────────────────────
+  // Round 4 replaced a strict screen with a two-tier preference: a candidate
+  // whose TLD was in a KNOWN_TLDS allowlist won outright, anything else was
+  // only a fallback. The stated safety argument was "an omission costs a
+  // preference, never a homepage". Round 5 executed it and showed that is
+  // false — an omission cost a homepage:
   //
-  // The obvious fix, "require a known TLD", is a trap: it converts every TLD
-  // missing from the list into a silently dropped producer homepage — this
-  // PR's own failure mode with a new cause, which is exactly what round 4
-  // flagged about the blanket `@` rejection. And a list can never be complete.
+  //   {website: "storgarden.nu",   hjemmeside: "ikke-oppgitt.no"} -> ikke-oppgitt.no
+  //   {website: "storgarden.tech", hjemmeside: "hjemmeside.com"}  -> hjemmeside.com
   //
-  // The harms are not symmetric, so the resolution should not be either.
-  // SHADOWING (junk beats a real sibling) is pure loss. STORING a lone
-  // unrecognized value is what main already did, and is recoverable. So:
-  // prefer a candidate with a recognized TLD, and fall back to any candidate
-  // that merely passes the hard checks. In a mixed row the real domain wins;
-  // in a row where every candidate has an unusual TLD, nothing is lost.
-  // Completeness of KNOWN_TLDS is therefore low-stakes by construction — an
-  // omission costs a preference, never a homepage.
+  // and it inverted row order too, breaking this function's own contract. The
+  // mechanism was wrong at the root: TLD RECOGNITION is not junk DETECTION,
+  // and the two do not correlate. `ukjent.no` is a recognized TLD and pure
+  // junk; `.nu` is a mainstream Nordic ccTLD I had simply not listed.
   //
-  // The list is sized from real data, not guessed: across the 173 distinct
-  // producer/source hosts recorded in A2A's harvest and enrichment reports the
-  // distribution is .no (130), .com (41), .edu (1), .info (1). The entries
-  // beyond those are headroom for the long tail, not observed need.
-  let fallback: string | null = null;
+  // So: back to first-passing-candidate, which never lost a homepage, with the
+  // junk signal moved to where the junk actually lives — the domain LABEL (see
+  // PLACEHOLDER_DOMAIN_LABELS). That screens `ikke.oppgitt`, `ukjent.no` and
+  // `nettside.no` alike, and leaves `storgarden.nu` alone.
   for (const r of rows) {
     for (const candidate of [r.website?.trim(), r.hjemmeside?.trim()]) {
-      if (!candidate || !looksLikeHomepageValue(candidate) || isAggregatorWebsite(candidate)) {
-        continue;
+      if (candidate && looksLikeHomepageValue(candidate) && !isAggregatorWebsite(candidate)) {
+        return candidate;
       }
-      const host = hostFromUrlLike(candidate);
-      const tld = host ? host.split(".").pop()! : "";
-      if (KNOWN_TLDS.has(tld) || tld.startsWith("xn--")) return candidate;
-      if (fallback === null) fallback = candidate;
     }
   }
-  return fallback;
+  return null;
 }
 
 const MAX_PROVIDERS_PER_CALL = 200;

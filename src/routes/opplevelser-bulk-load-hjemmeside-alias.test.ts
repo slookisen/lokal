@@ -268,48 +268,132 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
     }
   }
 
-  // ── The two-tier preference, and why it is not just a stricter screen ────
-  // An unrecognized TLD must LOSE to a recognized one in the same row, but must
-  // still be STORED when it is the only candidate. Requiring a known TLD
-  // outright would turn every omission from the list into a silently dropped
-  // producer homepage — this PR's own failure mode with a new cause. The harms
-  // are asymmetric (shadowing is pure loss; storing a lone odd value is what
-  // main already did), so the resolution is asymmetric too.
+  // ── Round-5 review: the tiering was itself a shadowing engine ───────────
+  // The round-4 design preferred a candidate whose TLD was on a KNOWN_TLDS
+  // allowlist. Its safety claim was "an omission costs a preference, never a
+  // homepage" — false: an omission cost a homepage, because TLD RECOGNITION
+  // and junk DETECTION are uncorrelated. These are the reviewer's executed
+  // counter-examples, and they are the direction the round-4 fixtures never
+  // tested: the UNLISTED-TLD candidate is the REAL one and the recognized-TLD
+  // candidate is the junk.
   {
-    // `.travel` IS on the recognized list, so it must behave like `.no` — it
-    // wins from `website` rather than deferring. (This assertion caught a wrong
-    // fixture in the first draft of this very block, which is the point of
-    // pinning both sides of the tier boundary rather than only the losing one.)
-    {
-      const known = BulkRowSchema.parse({ ...base, website: "https://gard.travel", hjemmeside: "https://trollaktiv.no" });
+    const realVsJunk: Array<[string, string]> = [
+      ["storgarden.nu", "ikke-oppgitt.no"],       // .nu is a mainstream Nordic ccTLD
+      ["storgarden.tech", "hjemmeside.com"],
+      ["storgarden.blog", "nettside.no"],
+      ["storgarden.one", "ukjent.no"],
+      ["storgarden.coop", "eksempel.no"],
+    ];
+    for (const [real, junk] of realVsJunk) {
+      const row = BulkRowSchema.parse({ ...base, website: real, hjemmeside: junk });
       assertEq(
-        firstNonAggregatorWebsite([known as BulkRow]),
-        "https://gard.travel",
-        "alias-20a: a RECOGNIZED but uncommon TLD is tier-1 and keeps `website` precedence",
+        firstNonAggregatorWebsite([row as BulkRow]),
+        real,
+        `alias-23/${real}: a real producer on an uncommon TLD beats \`${junk}\` — a TLD allowlist ranked these backwards`,
+      );
+      const rowSwapped = BulkRowSchema.parse({ ...base, website: junk, hjemmeside: real });
+      assertEq(
+        firstNonAggregatorWebsite([rowSwapped as BulkRow]),
+        real,
+        `alias-23b/${real}: …and in the other field order too`,
+      );
+      const junkAlone = BulkRowSchema.parse({ ...base, website: junk });
+      assertEq(
+        firstNonAggregatorWebsite([junkAlone as BulkRow]),
+        null,
+        `alias-23c/${junk}: \`${junk}\` is junk on its own merits, whatever its TLD`,
+      );
+      const realAlone = BulkRowSchema.parse({ ...base, website: real });
+      assertEq(
+        firstNonAggregatorWebsite([realAlone as BulkRow]),
+        real,
+        `alias-23d/${real}: …and an uncommon TLD is never a reason to reject`,
       );
     }
-    const oddButReal = ["gard.gardsbutikk", "gard.bogus", "gard.qqq"];
-    for (const v of oddButReal) {
+    // Row order must be preserved — the tiering inverted it.
+    const r1 = BulkRowSchema.parse({ ...base, website: "storgarden.tech" });
+    const r2 = BulkRowSchema.parse({ ...base, title: "Rafting", website: "nettside.no" });
+    assertEq(
+      firstNonAggregatorWebsite([r1 as BulkRow, r2 as BulkRow]),
+      "storgarden.tech",
+      "alias-24: the first row's candidate still wins — the tier logic let a later row beat an earlier one",
+    );
+  }
+
+  // ── Round-5 review: the six DMO hosts the harvest SKILL names as SOURCES ─
+  // `website` = the listing page the agent scraped, `hjemmeside` = the
+  // producer's own site is the EXPECTED row shape here, not a crafted one.
+  // Before this PR the alias was stripped so a DMO `website` had nothing to
+  // shadow; accepting the alias turned a documented gap into active loss.
+  // Screened LOCALLY rather than via KNOWN_DIRECTORY_HOSTS, which also gates
+  // the verifier's domain-coherence bypass — a blast radius with no evidence.
+  {
+    const dmoSources = [
+      "https://www.visitbergen.com/things-to-do/x-p123",
+      "https://nordnorge.com/aktivitet/x",
+      "https://visittromso.no/x",
+      "https://visitoslo.com/x",
+      "https://visittrondheim.no/x",
+      "https://fjordtours.com/x",
+    ];
+    for (const src of dmoSources) {
+      const row = BulkRowSchema.parse({ ...base, website: src, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-25/${src.slice(8, 30)}: a harvest SOURCE listing never becomes the provider's homepage`,
+      );
+    }
+  }
+
+  // ── Round-5 review: the parsers, once more ──────────────────────────────
+  // (a) protocol-relative userinfo swap — authorityOf saw no `@` where
+  // hostFromUrlLike read the host as the aggregator. The R4 divergence class,
+  // one layer down, between the NEW pair of parsers.
+  // (b) new URL() percent-decodes the host and treats `\` as a path separator;
+  // hostFromUrlLike does neither. Round 4 dropped new URL() entirely and lost
+  // both catches, so both parsers are used now, new URL() first.
+  {
+    const swaps = [
+      "//gard.no@visitbergen.com",
+      "https://gard.no@visitnorway.com",
+      "http://visitnorway%2Ecom/",
+      "http://visitnorway.com\\evil",
+    ];
+    for (const v of swaps) {
+      const row = BulkRowSchema.parse({ ...base, website: v, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-26/${v}: neither parser may be talked into calling an aggregator a homepage`,
+      );
+    }
+  }
+
+  // ── An unrecognized TLD is stored, full stop ────────────────────────────
+  // No tiering, no fallback slot: first passing candidate wins, exactly as
+  // round 3 behaved. That version never lost a homepage.
+  {
+    for (const v of ["https://gard.travel", "gard.gardsbutikk", "gard.bogus", "gard.qqq"]) {
       const alone = BulkRowSchema.parse({ ...base, website: v });
       assertEq(
         firstNonAggregatorWebsite([alone as BulkRow]),
         v,
-        `alias-20/${v}: an unrecognized TLD is still stored when nothing better exists — no false rejection`,
-      );
-      const mixed = BulkRowSchema.parse({ ...base, website: v, hjemmeside: "https://trollaktiv.no" });
-      assertEq(
-        firstNonAggregatorWebsite([mixed as BulkRow]),
-        "https://trollaktiv.no",
-        `alias-21/${v}: …but it loses to a recognized TLD in the same row`,
+        `alias-20/${v}: an unrecognized TLD is stored — it is not evidence of junk`,
       );
     }
-    // Across rows too, not just within one.
+    const known = BulkRowSchema.parse({ ...base, website: "https://gard.travel", hjemmeside: "https://trollaktiv.no" });
+    assertEq(
+      firstNonAggregatorWebsite([known as BulkRow]),
+      "https://gard.travel",
+      "alias-21: `website` keeps precedence regardless of TLD — precedence is by FIELD, never by TLD",
+    );
     const oddRow = BulkRowSchema.parse({ ...base, website: "gard.bogus" });
     const realRow = BulkRowSchema.parse({ ...base, title: "Rafting", website: "https://trollaktiv.no" });
     assertEq(
       firstNonAggregatorWebsite([oddRow as BulkRow, realRow as BulkRow]),
-      "https://trollaktiv.no",
-      "alias-22: the preference holds across rows — an earlier odd TLD does not win by position",
+      "gard.bogus",
+      "alias-22: …and by ROW order, so an earlier row is never demoted for its TLD",
     );
   }
 
