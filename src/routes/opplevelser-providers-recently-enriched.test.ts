@@ -207,6 +207,36 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         booking_url: null, content_source: null, enrichment_state: "raw",
         updated_at: daysAgoIso(1),
       });
+      // enrichment_state='verified' — the ladder's final rung. Nothing writes it
+      // today, which is exactly why the IN ('enriched','verified') clause needs
+      // a fixture: without one, a revert to `= 'enriched'` passes green
+      // (round-2 review, finding 3).
+      insertExperience.run({
+        id: "exp-verified-1", provider_id: "prov-generic-enriched",
+        title: "Verifisert opplevelse", description: "Verifisert beskrivelse fra hjemmesiden.",
+        category: "kultur_historie", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "verified",
+        updated_at: daysAgoIso(2),
+      });
+      // Owner/claim-authored rows must NEVER be served: applyExperienceContent
+      // refuses to write them, so judging them against the provider's homepage
+      // would score a mismatch that is not an error — and §8.4 pauses
+      // enrichment writes for the whole vertical above a 10% error rate
+      // (round-2 review, blocking finding 2).
+      insertExperience.run({
+        id: "exp-manual-1", provider_id: "prov-generic-enriched",
+        title: "Eierskrevet opplevelse", description: "Tekst produsenten selv skrev.",
+        category: "mat_drikke", subcategory: null, booking_url: null,
+        content_source: "manual", enrichment_state: "enriched",
+        updated_at: daysAgoIso(1),
+      });
+      insertExperience.run({
+        id: "exp-claim-1", provider_id: "prov-generic-enriched",
+        title: "Claim-skrevet opplevelse", description: "Tekst fra claim-flyten.",
+        category: "mat_drikke", subcategory: null, booking_url: null,
+        content_source: "claim", enrichment_state: "enriched",
+        updated_at: daysAgoIso(1),
+      });
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
@@ -305,8 +335,21 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       assertTrue(!!genericRow, "h1: a provider enriched only by the GENERIC content-refresh is sampled");
       assertEq(genericRow.about_text, null, "h2: its provider-level (gårdssalg) content is legitimately null");
       assertTrue(Array.isArray(genericRow.enriched_experiences), "h3: enriched_experiences is an array");
-      assertEq(genericRow.enriched_experiences.length, 1, "h4: exactly the ENRICHED experiences row is served, not the raw one");
-      assertEq(genericRow.enriched_experiences[0].id, "exp-enriched-1", "h5: the enriched row is the one returned");
+      const servedIds = (genericRow.enriched_experiences as any[]).map((e) => e.id).sort();
+      assertEq(servedIds, ["exp-enriched-1", "exp-verified-1"], "h4: exactly the enriched AND verified rows are served — raw, manual and claim are all excluded");
+      assertEq(genericRow.enriched_experiences[0].id, "exp-enriched-1", "h5: ordered updated_at DESC, so the freshest enriched row comes first");
+      assertTrue(
+        (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-verified-1"),
+        "h4b: an enrichment_state='verified' row is served — pins the IN ('enriched','verified') clause against a silent revert",
+      );
+      assertTrue(
+        !(genericRow.enriched_experiences as any[]).some((e) => e.content_source === "manual" || e.content_source === "claim"),
+        "h4c: owner/claim-authored rows are NEVER served — judging them against the homepage would pause the vertical on a non-error",
+      );
+      assertTrue(
+        genericRow.enriched_experiences_error === undefined,
+        "h4d: no error flag on the happy path (the flag is consumer-visible only when the query actually faulted)",
+      );
       assertEq(
         genericRow.enriched_experiences[0].description,
         "Guidet tur til toppen med lokal fjellfører.",

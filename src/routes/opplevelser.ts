@@ -4929,8 +4929,16 @@ router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res:
 //   products, content_source, content_evidence_url, enriched_experiences,
 //   field_provenance: null, provenance_model: "none" }] }
 //
-// `enriched_experiences` carries the provider's own enriched EXPERIENCES rows
-// (description/category/booking_url — what applyExperienceContent writes).
+// `enriched_experiences` carries the provider's own enriched EXPERIENCES rows:
+// `{ id, title, description, category, subcategory, booking_url,
+// content_source, updated_at }`, at most 10 per provider, ordered
+// `updated_at DESC` — a provider with more enriched rows than that IS
+// truncated, which matters to a consumer computing `checked`. Owner/curator/
+// claim-authored and already-verified rows are excluded (same lock guard
+// applyExperienceContent uses), so every row served is genuinely
+// homepage-sourced content. On a query fault the provider carries
+// `enriched_experiences_error: true` alongside an empty list — score that as
+// `skipped`, never as "nothing was written".
 // The provider-level content columns above are the gårdssalg writer's fields;
 // a provider enriched only by the generic content-refresh has all of those
 // null, which is why the spot-check needs both. See the inline comment at the
@@ -4999,14 +5007,37 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
     // would make those rows vanish from this projection and report `checked=0`
     // silently. That is the very failure mode this endpoint change exists to
     // remove; it should not be re-armed for a future state (independent review).
-    const expRowsStmt = expDb.prepare(
+    // Prepared once, outside the row loop — but guarded: if the statement
+    // itself cannot be prepared, the provider-level content is still worth
+    // serving, so degrade to the error flag rather than 500-ing the whole
+    // sample (round-2 review, nit).
+    let expRowsStmt: ReturnType<typeof expDb.prepare> | null = null;
+    try {
+      expRowsStmt = expDb.prepare(
       `SELECT id, title, description, category, subcategory, booking_url,
               content_source, updated_at
          FROM experiences
-        WHERE provider_id = ? AND enrichment_state IN ('enriched', 'verified')
+        WHERE provider_id = ?
+          AND enrichment_state IN ('enriched', 'verified')
+          -- Lock guard, the same clause used at experience-store.ts:1709/2222/
+          -- 2360/2859 (round-2 review, blocking). applyExperienceContent()
+          -- provably REFUSES to write owner/curator/claim-authored or already-
+          -- verified rows (isExperienceContentLocked), so serving them here
+          -- would hand the weekly spot-check content that never came from the
+          -- homepage it is about to judge against. That matters concretely:
+          -- §8.4 of the platform-verifier SKILL sets
+          -- controller/enrichment-write-pause.yaml → enabled: true at
+          -- error_rate > 0.10, so a couple of owner-written rows in a
+          -- 10-provider sample could pause enrichment writes for the whole
+          -- vertical over mismatches that are not errors at all.
+          AND verification_status != 'verified'
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
         ORDER BY updated_at DESC
         LIMIT 10`
-    );
+      );
+    } catch (err) {
+      console.error("[opplevelser] providers/recently-enriched: could not prepare enriched_experiences query", err);
+    }
 
     const providers = rows.map((r) => {
       let products: unknown[] = [];
@@ -5017,9 +5048,12 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         } catch { /* malformed → empty */ }
       }
       let enrichedExperiences: unknown[] = [];
+      let enrichedExperiencesError = false;
       try {
-        enrichedExperiences = expRowsStmt.all(r.id) as unknown[];
+        enrichedExperiences = expRowsStmt ? (expRowsStmt.all(r.id) as unknown[]) : [];
+        if (!expRowsStmt) enrichedExperiencesError = true;
       } catch (err) {
+        enrichedExperiencesError = true;
         // NOT the zero-rows case — `.all()` returns [] for that and never
         // throws (an earlier version of this comment claimed otherwise;
         // independent review corrected it). Reaching here means a real query
@@ -5033,6 +5067,15 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           err,
         );
       }
+      // The console.error alone was not enough (round-2 review, blocking): the
+      // only consumer is a cron routine doing `curl -fsS` (platform-verifier
+      // §8.2) which never sees server logs, so a query fault still reached it
+      // as a clean 200 with an empty list — i.e. exactly the false "enrichment
+      // wrote nothing" reading this projection exists to eliminate. The flag
+      // below is the consumer-visible half: the spot-check can score the
+      // provider as `skipped` instead of counting a phantom `checked=0`.
+      // Failing the whole request would be worse — one bad provider would
+      // destroy an otherwise usable 10-provider sample.
       return {
         id: r.id,
         name: r.navn,
@@ -5045,6 +5088,7 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         content_source: r.content_source,
         content_evidence_url: r.content_evidence_url,
         enriched_experiences: enrichedExperiences,
+        ...(enrichedExperiencesError ? { enriched_experiences_error: true } : {}),
         field_provenance: null,
         provenance_model: "none",
       };
