@@ -17,6 +17,7 @@ import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
 import { recordTrustEvent } from "./trust-event-service";
 import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
+import { computeEffectiveAvailability } from "./supply-graph";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -178,16 +179,35 @@ export function addCartItem(
 
   // Verify product
   const product = db.prepare(`
-    SELECT p.id, p.agent_id, p.availability, p.price_nok
+    SELECT p.id, p.agent_id, p.availability, p.price_nok, p.availability_source, p.availability_updated_at
     FROM products p
     WHERE p.id = ?
   `).get(productId) as
-    | { id: string; agent_id: string; availability: string; price_nok: number | null }
+    | {
+        id: string;
+        agent_id: string;
+        availability: string;
+        price_nok: number | null;
+        availability_source: string;
+        availability_updated_at: string | null;
+      }
     | undefined;
 
   if (!product) return { success: false, status: 404, error: "Product not found" };
-  if (product.availability !== "in_stock") {
-    return { success: false, status: 409, error: `Product is not in stock (availability: ${product.availability})` };
+
+  // dev-request 2026-07-13-supply-graph-v1 (salvage slice): gate on the
+  // EFFECTIVE availability (staleness-checked), not the raw column — a
+  // producer_dashboard-sourced value that's gone stale (>14 days, see
+  // supply-graph.ts) must degrade to 'unknown' and be rejected here, not
+  // silently trusted forever. Enrichment-sourced rows are unaffected.
+  const effectiveAvailability = computeEffectiveAvailability(
+    product.availability,
+    product.availability_updated_at,
+    product.availability_source,
+    new Date()
+  );
+  if (effectiveAvailability !== "in_stock") {
+    return { success: false, status: 409, error: `Product is not in stock (availability: ${effectiveAvailability})` };
   }
 
   // Verify producer eligibility
@@ -385,6 +405,8 @@ export function submitCart(cartId: string): SubmitResult {
       p.name        AS product_name,
       p.unit        AS unit,
       p.availability AS availability,
+      p.availability_source AS availability_source,
+      p.availability_updated_at AS availability_updated_at,
       a.name        AS producer_name
     FROM cart_items ci
     INNER JOIN products p ON p.id = ci.product_id
@@ -400,6 +422,8 @@ export function submitCart(cartId: string): SubmitResult {
     product_name: string;
     unit: string | null;
     availability: string;
+    availability_source: string;
+    availability_updated_at: string | null;
     producer_name: string;
   }>;
 
@@ -407,8 +431,23 @@ export function submitCart(cartId: string): SubmitResult {
     return { success: false, status: 400, error: "Cart is empty" };
   }
 
-  // Re-check availability for every item (mandatory per spec)
-  const unavailable = items.filter(i => i.availability !== "in_stock");
+  // Re-check availability for every item (mandatory per spec). Gate on the
+  // EFFECTIVE availability (dev-request 2026-07-13-supply-graph-v1, salvage
+  // slice) — a stale producer_dashboard 'in_stock' value must be rejected
+  // here too, not just at add-to-cart time. The `availability` field
+  // surfaced in the `unavailable` error array below is the EFFECTIVE value
+  // (e.g. 'unknown'), so callers reading the error see the actual reason.
+  const now = new Date();
+  const withEffective = items.map(i => ({
+    ...i,
+    effectiveAvailability: computeEffectiveAvailability(
+      i.availability,
+      i.availability_updated_at,
+      i.availability_source,
+      now
+    ),
+  }));
+  const unavailable = withEffective.filter(i => i.effectiveAvailability !== "in_stock");
   if (unavailable.length > 0) {
     return {
       success: false,
@@ -417,7 +456,7 @@ export function submitCart(cartId: string): SubmitResult {
       unavailable: unavailable.map(i => ({
         product_id: i.product_id,
         product_name: i.product_name,
-        availability: i.availability,
+        availability: i.effectiveAvailability,
       })),
     };
   }

@@ -130,3 +130,45 @@ export function setProducerAvailability(
     return { success: false, reason: "not_found" };
   }
 }
+
+/**
+ * Producer-facing write path keyed by `productId` instead of
+ * `(agentId, productNameNorm)` — used by
+ * `PATCH /agents/:id/products/:productId/availability`
+ * (dev-request 2026-07-13-supply-graph-v1, salvage slice). Mirrors
+ * setProducerAvailability()'s shape/style/never-throws contract exactly:
+ * verify the product exists AND belongs to `agentId` first, then run the
+ * same scoped UPDATE (WHERE id AND agent_id) so a producer can never touch
+ * another agent's product. Never throws — any lookup/update failure
+ * resolves to `{success:false, reason:'not_found'}`.
+ */
+export function setProducerAvailabilityByProductId(
+  agentId: string,
+  productId: string,
+  availability: string,
+  db?: any
+): SetProducerAvailabilityResult {
+  try {
+    const conn = db ?? getDb();
+
+    const match = conn
+      .prepare("SELECT id FROM products WHERE id = ? AND agent_id = ?")
+      .get(productId, agentId) as { id: string } | undefined;
+    if (!match) return { success: false, reason: "not_found" };
+
+    conn
+      .prepare(
+        `UPDATE products
+            SET availability = ?,
+                availability_updated_at = datetime('now'),
+                availability_source = 'producer_dashboard',
+                updated_at = datetime('now')
+          WHERE id = ? AND agent_id = ?`
+      )
+      .run(availability, match.id, agentId);
+
+    return { success: true, productId: match.id };
+  } catch {
+    return { success: false, reason: "not_found" };
+  }
+}
