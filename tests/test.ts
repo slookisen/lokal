@@ -34242,3 +34242,30 @@ runSerial(async () => {
     failures.push("field-provenance-legacy-shape: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-27-field-provenance-legacy-shape-normalization: POST
+// /admin/agent-audit/field-provenance-legacy-shape-normalize
+// (src/routes/admin-agent-audit.ts) — writer companion to the GET audit
+// directly above. Normalizes dental_agents rows still holding the legacy
+// wrapped `{sources:[...]}` shape to the modern bare-array shape by reusing
+// mergeFieldProvenance() (src/routes/admin-knowledge.ts, unmodified) with an
+// empty incoming payload. Dry-run by default; apply=1 writes. Own harness,
+// same setup shape as the block above. Runs via runSerial() like the suites
+// above.
+runSerial(async () => {
+  console.log(
+    "\n── dev-request 2026-07-27-field-provenance-legacy-shape-normalization: field-provenance-legacy-shape-normalize ──",
+  );
+  try {
+    const { runAdminAgentAuditFieldProvenanceLegacyShapeNormalizeTests } = require("../src/routes/admin-agent-audit-field-provenance-legacy-shape-normalize.test") as
+      typeof import("../src/routes/admin-agent-audit-field-provenance-legacy-shape-normalize.test");
+    const fplsn = await runAdminAgentAuditFieldProvenanceLegacyShapeNormalizeTests({ log: false });
+    passed += fplsn.passed;
+    failed += fplsn.failed;
+    for (const f of fplsn.failures) failures.push("field-provenance-legacy-shape-normalize: " + f);
+    console.log(`  field-provenance-legacy-shape-normalize: ${fplsn.passed} passed, ${fplsn.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("field-provenance-legacy-shape-normalize: unexpected error: " + String(err?.message || err));
+  }
+});
