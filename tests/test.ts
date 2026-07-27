@@ -16826,9 +16826,18 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
 // code requireAdmin uses, which is 403, not 401 — see routes/opplevelser.ts's
 // requireAdmin()), (3) dry_run default with ZERO candidates never requires the
 // LLM to succeed (no ANTHROPIC_API_KEY needed), (4) a stubbed successful
-// globalThis.fetch response writes title_no on a real run (dry_run: false),
-// (5) a stubbed failed/unparseable/non-array-content response leaves
-// title_no NULL — never fabricated — and never throws (500).
+// fetch response writes title_no on a real run (dry_run: false), (5) a
+// stubbed failed/unparseable/non-array-content response leaves title_no
+// NULL — never fabricated — and never throws (500).
+//
+// Fetch stubbing here does NOT touch globalThis.fetch. It uses the
+// dedicated `titleNoBackfillFetchImpl` per-app-instance seam (see
+// generateTitleNo()/the route handler in routes/opplevelser.ts): the stub is
+// installed via `appTNB.set("titleNoBackfillFetchImpl", stub)` on this
+// test's OWN Express app instance and is invisible to every other
+// concurrently-running test block — unlike a `globalThis.fetch` assignment,
+// which lives for the whole process and can poison unrelated in-flight
+// fetches during any `await` before it's restored.
 console.log("\n── orch-pr-titleno: POST /api/opplevelser/admin/experiences-title-no-backfill ──");
 
 let _titleNoBackfillResolve: () => void = () => {};
@@ -16845,7 +16854,6 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
   const prevPathTNB = process.env.EXPERIENCES_DB_PATH;
   const prevAdminKeyTNB = process.env.ADMIN_KEY;
   const prevAnthropicKeyTNB = process.env.ANTHROPIC_API_KEY;
-  const prevFetchTNB = globalThis.fetch;
   let serverTNB: import("http").Server | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
@@ -16902,6 +16910,19 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     });
     appTNB.use("/api/opplevelser", opplevelserTNB.default);
 
+    // Fetch injection seam, scoped to THIS app instance only (see
+    // generateTitleNo() / the route handler in routes/opplevelser.ts). This
+    // is deliberately NOT globalThis.fetch: setting it only affects requests
+    // routed through appTNB, so it can never poison a concurrently-running
+    // test block's own fetch calls, even across the `await` inside
+    // titleNoBackfillReq() below.
+    function setTNBFetchStub(stub: typeof fetch): void {
+      appTNB.set("titleNoBackfillFetchImpl", stub);
+    }
+    function resetTNBFetchStub(): void {
+      appTNB.set("titleNoBackfillFetchImpl", undefined);
+    }
+
     function titleNoBackfillReq(key: string | undefined, body: any): Promise<{ status: number; body: any }> {
       const payload = body === undefined ? "" : JSON.stringify(body);
       const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -16954,9 +16975,9 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     //    LLM ever needing to work. Delete any leaked ANTHROPIC_API_KEY so
     //    this assertion can't accidentally pass via a real network call. ──
     delete process.env.ANTHROPIC_API_KEY;
-    globalThis.fetch = (async () => {
+    setTNBFetchStub((async () => {
       throw new Error("tnb-3: fetch must NOT be called for an empty candidate set");
-    }) as unknown as typeof fetch;
+    }) as unknown as typeof fetch);
     try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, undefined); // no body → dry_run defaults true
       assertEq(r.status, 200, "tnb-3a: correct key, no body → 200");
@@ -16966,10 +16987,11 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
       assertTrue(Array.isArray(r.body.sample) && r.body.sample.length === 0,
         "tnb-3e: sample: [] on an empty candidate set — the LLM was never called");
     } finally {
-      // Restore immediately: this stub throws on ANY fetch call, so leaving it
-      // installed on globalThis past tnb-3's own assertions would poison fetch
-      // for other test blocks running concurrently (they don't await this IIFE).
-      globalThis.fetch = prevFetchTNB;
+      // Restore immediately: this stub throws on ANY fetch call, but it's
+      // installed only on appTNB's own titleNoBackfillFetchImpl setting, not
+      // globalThis.fetch — so even before this reset, it was never visible
+      // to other concurrently-running test blocks' own fetch calls.
+      resetTNBFetchStub();
     }
 
     // ── Seed: one canonical candidate row (canonical_id NULL, title_no NULL)
@@ -16994,13 +17016,13 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     // ── tnb-4: dry_run with a stubbed SUCCESSFUL LLM response — samples the
     //    candidate, proposes a title_no, but writes NOTHING to the DB. ──────
     const STUBBED_TITLE_NO = "Kajakkpadling i Bergensfjorden";
-    globalThis.fetch = (async (_url: any, _init: any) => {
+    setTNBFetchStub((async (_url: any, _init: any) => {
       return {
         ok: true,
         status: 200,
         json: async () => ({ content: [{ type: "text", text: STUBBED_TITLE_NO }] }),
       };
-    }) as unknown as typeof fetch;
+    }) as unknown as typeof fetch);
     process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
     // tnb-4/5/6 share this one override by design (tnb-5 re-runs for-real against
     // the same stub, tnb-6 re-runs again expecting 0 candidates) — restore once,
@@ -17038,7 +17060,7 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
         assertEq(r.body.written, 0, "tnb-6c: written: 0");
       }
     } finally {
-      globalThis.fetch = prevFetchTNB;
+      resetTNBFetchStub();
     }
 
     // ── tnb-7: a NEW candidate + a stubbed FAILED (non-ok) LLM response —
@@ -17048,9 +17070,9 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
       kommune: "Bergen", fylke: "Vestland", category: "fjell_tur",
       verification_status: "verified", confidence: "high",
     });
-    globalThis.fetch = (async () => {
+    setTNBFetchStub((async () => {
       return { ok: false, status: 500, json: async () => ({ error: "boom" }) };
-    }) as unknown as typeof fetch;
+    }) as unknown as typeof fetch);
     try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
       assertEq(r.status, 200, "tnb-7a: real run with stubbed HTTP failure → 200 (does not throw/500)");
@@ -17058,26 +17080,26 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
       assertEq(r.body.skipped, 1, "tnb-7c: skipped: 1 — the failed row is skipped, not guessed");
       assertEq(titleNoOf(idFailTNB), null, "tnb-7d: title_no stays NULL for the row whose LLM call failed");
     } finally {
-      globalThis.fetch = prevFetchTNB;
+      resetTNBFetchStub();
     }
 
     // ── tnb-8: same candidate, this time a stubbed UNPARSEABLE response body
     //    (ok: true but .json() throws) — same never-fabricate, never-throw
     //    contract. ──────────────────────────────────────────────────────
-    globalThis.fetch = (async () => {
+    setTNBFetchStub((async () => {
       return {
         ok: true,
         status: 200,
         json: async () => { throw new Error("not json"); },
       };
-    }) as unknown as typeof fetch;
+    }) as unknown as typeof fetch);
     try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
       assertEq(r.status, 200, "tnb-8a: real run with unparseable LLM body → 200 (does not throw/500)");
       assertEq(r.body.written, 0, "tnb-8b: written: 0 — nothing fabricated");
       assertEq(titleNoOf(idFailTNB), null, "tnb-8c: title_no still NULL — unparseable response never guessed");
     } finally {
-      globalThis.fetch = prevFetchTNB;
+      resetTNBFetchStub();
     }
 
     // ── tnb-9: same candidate, this time a stubbed 200 OK response whose
@@ -17086,13 +17108,13 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     //    not a function on a non-array value. Guards the same never-fabricate,
     //    never-throw contract as tnb-7/tnb-8: the row is skipped (title_no
     //    stays NULL) and the route responds 200, not 500. ────────────────
-    globalThis.fetch = (async () => {
+    setTNBFetchStub((async () => {
       return {
         ok: true,
         status: 200,
         json: async () => ({ content: { unexpected: "shape" } }),
       };
-    }) as unknown as typeof fetch;
+    }) as unknown as typeof fetch);
     try {
       const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
       assertEq(r.status, 200, "tnb-9a: real run with non-array content shape → 200 (does not throw/500)");
@@ -17100,7 +17122,7 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
       assertEq(r.body.skipped, 1, "tnb-9c: skipped: 1 — the malformed-shape row is skipped, not guessed");
       assertEq(titleNoOf(idFailTNB), null, "tnb-9d: title_no stays NULL for the row whose LLM response had a non-array content field");
     } finally {
-      globalThis.fetch = prevFetchTNB;
+      resetTNBFetchStub();
     }
 
     dbFactoryTNB.__resetDbFactoryForTesting();
@@ -17111,7 +17133,6 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     if (serverTNB) {
       await new Promise<void>((resolve) => serverTNB!.close(() => resolve()));
     }
-    globalThis.fetch = prevFetchTNB;
     if (prevPathTNB === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathTNB;
     if (prevAdminKeyTNB === undefined) delete process.env.ADMIN_KEY;
