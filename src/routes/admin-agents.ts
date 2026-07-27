@@ -42,6 +42,13 @@ import {
 // goes through; mergeFieldProvenance is the SAME field_provenance merge
 // every other write path uses.
 import { canCorrectFactualField, mergeFieldProvenance } from "./admin-knowledge";
+// dev-request rfb-kvalitetsgate-parity: RFB's own port of gårdssalg's
+// LLM-judge quality-gate cascade (see judgeRfbAboutCandidate below) reuses
+// ONLY the cheap, deterministic, universal prefilter — length/mangled-
+// Unicode/boilerplate/Norwegian-language check — never the nav-menu-leakage/
+// umbrella-membership regex heuristic layer (meetsAboutQualityBar), which
+// stays exactly as-is for its existing caller (admin-knowledge.ts).
+import { meetsAboutCheapBar } from "../services/search-enrich";
 
 const router = Router();
 
@@ -1214,6 +1221,597 @@ router.get("/category-sanity-report", (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: "category-sanity-report failed", detail: err.message });
   }
+});
+
+// ─── judgeRfbAboutCandidate + meetsRfbAboutQualityBar + POST
+//     /admin/agents/retro-scan (dev-request rfb-kvalitetsgate-parity) ───────
+//
+// RFB (rettfrabonden.com) port of gårdssalg's LLM-judge quality-gate cascade
+// (judgeGardssalgAboutCandidate / meetsGardssalgAboutQualityBar,
+// routes/opplevelser.ts, dev-request 2026-07-20-gardssalg-kvalitetsgate-
+// redesign) + its retroactive re-scan (POST /admin/gardssalg-retro-scan).
+// Two confirmed problems this ports the fix for:
+//
+//   1. NAV_BOILERPLATE_MARKERS (search-enrich.ts) was a flat literal-
+//      substring list that missed real-world skip-link wording variants
+//      ("Jump to ...", "Skip to the content", "Skip to main content", "skip
+//      to navigation") — fixed separately, in search-enrich.ts itself, by a
+//      normalizing NAV_SKIP_OR_JUMP_LINK_RE (see that file). That fix is
+//      shared infrastructure, not specific to this section.
+//   2. RFB had NO retroactive re-scan of already-stored `description`
+//      (agents.description) / `about` (agent_knowledge.about) content — rows
+//      enriched before a marker existed are never re-evaluated. This section
+//      is that retroactive sweep, judging what's ALREADY STORED against a
+//      cascade LLM judge (semantic judgment, not just a marker regex) —
+//      exactly gårdssalg's retro-scan design, ported to RFB's two content
+//      fields instead of gårdssalg's about_text/visit_text pair.
+//
+// SCOPING NOTE: only this retro-scan (a re-judge of ALREADY-STORED content)
+// is wired to the new judge in this slice. The FORWARD write paths that
+// originate description/about text (admin-agents.ts's own brreg-description-
+// fallback above, PATCH /agents/:id and PUT /agents/:id/knowledge in
+// marketplace.ts, and search-enrich's content_signals) are each their own
+// established, separately-reviewed contract — brreg-description-fallback
+// trusts Brreg's registry text by design (no heuristic at all, see that
+// endpoint's own header comment); PATCH/PUT are owner/admin self-edit paths
+// where auto-rejecting a producer's own words via an LLM would be a product
+// change, not a quality-gate port. Wiring the judge into those FORWARD paths
+// is left as an explicit, separately-reviewable follow-up — see this PR's
+// description for the full reasoning.
+//
+// judgeRfbAboutCandidate mirrors judgeGardssalgAboutCandidate's EXACT
+// sentinel/fail-closed contract: direct fetch to
+// https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+// claude-opus-4-8. ANY doubt or failure — missing key, network failure,
+// non-200, unparseable JSON, a response that isn't the exact expected
+// verdict token — resolves to REJECT. Never throws, never silently
+// approves. Placed in this ROUTE file (not services/search-enrich.ts) to
+// preserve that service module's own documented "PURE, no network/IO"
+// invariant — exactly mirroring gårdssalg's own layering (the LLM-calling
+// judge lives in the route file, opplevelser.ts; the pure cheap prefilter it
+// reuses lives in the service file, search-enrich.ts).
+export interface RfbJudgeVerdict {
+  approved: boolean;
+  reasoning: string;
+}
+
+const RFB_JUDGE_APPROVE_TOKEN = "GODKJENN";
+const RFB_JUDGE_REJECT_TOKEN = "AVVIS";
+const RFB_JUDGE_CANDIDATE_CHAR_CAP = 4000;
+// Every fail-closed branch's reasoning below ends in this exact literal
+// suffix — isRfbJudgeInfraFailure() (used by the retro-scan's null-vs-leave
+// decision) tells a genuine AVVIS verdict (real model reasoning) apart from
+// an infra failure by checking for it. Mirrors
+// GARDSSALG_JUDGE_INFRA_FAILURE_SUFFIX exactly (routes/opplevelser.ts).
+const RFB_JUDGE_INFRA_FAILURE_SUFFIX = "avvist fail-closed";
+
+export async function judgeRfbAboutCandidate(
+  candidateText: string,
+  producerName: string,
+  kind: "description" | "about"
+): Promise<RfbJudgeVerdict> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { approved: false, reasoning: `ANTHROPIC_API_KEY mangler — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
+  }
+
+  const sectionLabel =
+    kind === "description"
+      ? "kort produsentbeskrivelse"
+      : "utfyllende «Om produsenten»-tekst";
+  const cappedCandidate = (candidateText || "").slice(0, RFB_JUDGE_CANDIDATE_CHAR_CAP);
+  const prompt = `Du er en kvalitetsdommer for produsentprofiler på Rett fra Bonden, en norsk markedsplattform som kobler forbrukere direkte med lokale matprodusenter. Vurder om kandidatteksten under er egnet til å publiseres som ${sectionLabel} for produsenten "${producerName}".
+
+Kandidattekst:
+${cappedCandidate}
+
+Godkjenn KUN hvis teksten er:
+- sammenhengende, ekte norsk prosa spesifikt om DENNE produsenten (ikke en paraplyorganisasjon/bransjeforening sine mange medlemmer omtalt samlet),
+- fri for lekket navigasjonsmeny-, sidetopp- eller bunntekst-innhold (lenkelister, "hjem"/"kontakt"/"meny"-navigasjon, "skip to content"/"jump to ..."-lenker, cookie-/samtykketekst, "hopp til innhold" og lignende),
+- fri for åpenbart oppstykket, avkuttet eller ødelagt tekst,
+- faktisk informativ om produsenten, ikke bare en generisk floskel.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${RFB_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${RFB_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${RFB_JUDGE_REJECT_TOKEN}.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { approved: false, reasoning: `nettverksfeil under dommer-kall — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` }; // never fabricate
+  }
+
+  if (!response.ok) {
+    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { approved: false, reasoning: `ikke-parsbar JSON fra dommer-API — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { approved: false, reasoning: `uventet svarformat fra dommer-API — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
+  }
+
+  const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const verdictToken = (lines[0] || "").toUpperCase();
+  const reasoning = lines.slice(1).join(" ").trim();
+
+  // Only the EXACT approve token approves. Anything else — the reject
+  // token, an empty response, garbage, a token that merely CONTAINS the
+  // approve word inside a longer sentence — is a reject. Fail-closed on any
+  // ambiguity, never a silent approval.
+  if (verdictToken === RFB_JUDGE_APPROVE_TOKEN) {
+    return { approved: true, reasoning: reasoning || "godkjent av LLM-dommer" };
+  }
+  if (verdictToken === RFB_JUDGE_REJECT_TOKEN) {
+    return { approved: false, reasoning: reasoning || "avvist av LLM-dommer" };
+  }
+  return { approved: false, reasoning: `uventet/tvetydig dommersvar — ${RFB_JUDGE_INFRA_FAILURE_SUFFIX}` };
+}
+
+/**
+ * True iff `verdict.reasoning` is one of judgeRfbAboutCandidate's own
+ * fail-closed sentinel reasons (missing key / network / non-200 /
+ * unparseable JSON / unexpected shape / ambiguous verdict) rather than a
+ * genuine AVVIS verdict from the model. Used by the retro-scan below, which
+ * — unlike every OTHER call site of this judge — must NOT treat an infra
+ * failure the same as a real rejection: for a fresh CANDIDATE, "not
+ * approved" safely means "don't publish it", but for the retro-scan, "not
+ * approved" would otherwise mean "null out content that's already live" — a
+ * destructive action an API outage must never trigger. Mirrors
+ * isJudgeInfraFailure (routes/opplevelser.ts) exactly.
+ */
+export function isRfbJudgeInfraFailure(verdict: RfbJudgeVerdict): boolean {
+  return verdict.reasoning.endsWith(RFB_JUDGE_INFRA_FAILURE_SUFFIX);
+}
+
+/**
+ * The RFB-specific description/about quality gate: the cheap, deterministic
+ * prefilter (meetsAboutCheapBar, search-enrich.ts) FIRST, and the LLM judge
+ * above ONLY when that passes. Cost control: a candidate the cheap filter
+ * would already reject never reaches the LLM at all. Mirrors
+ * meetsGardssalgAboutQualityBar exactly (routes/opplevelser.ts), with
+ * "description"/"about" in place of gårdssalg's "about"/"visit" kind pair.
+ */
+export async function meetsRfbAboutQualityBar(
+  candidateText: string | null | undefined,
+  producerName: string,
+  kind: "description" | "about"
+): Promise<boolean> {
+  if (!meetsAboutCheapBar(candidateText)) return false;
+  const verdict = await judgeRfbAboutCandidate(String(candidateText), producerName, kind);
+  return verdict.approved;
+}
+
+// ─── POST /admin/agents/retro-scan (admin) ──────────────────────────────────
+//
+// The retroactive sweep: for every non-locked RFB agent (umbrella agents are
+// out of SCOPE entirely — they aggregate multiple underlying members, so a
+// single description/about judgment doesn't map onto one producer, mirrors
+// admin-knowledge.ts's homepage-content-refresh and admin-wrong-entity-
+// retro-sweep.ts's own umbrella exclusion), re-judges the CURRENTLY STORED
+// agents.description / agent_knowledge.about against meetsRfbAboutQualityBar's
+// cascade — not a freshly generated candidate, the value already live today.
+// A field that no longer clears it is NULLED (apply mode); a passing field is
+// left completely untouched.
+//
+// "Locked" for RFB: mirrors search-enrich-sweep.ts's / admin-search-enrich.ts's
+// own `a.claimed_at IS NULL` convention — RFB has no gårdssalg-style single
+// content_source enum column; `agents.claimed_at` (set once a producer claims
+// their own agent) is the row-level equivalent of gårdssalg's content_source
+// IN ('manual','claim') lock, and is checked FIRST, before anything else, on
+// a fresh per-row snapshot (defense in depth against a claim landing between
+// selection and write). On TOP of that row-level lock, RFB also has a
+// per-FIELD lock (agent_knowledge.curated_fields) that every other RFB write
+// path (brreg-description-fallback above, admin-knowledge.ts's homepage-
+// content-refresh, owner-portal.ts) already treats as an absolute refusal —
+// this sweep respects it too (a curated-locked field is never nulled, even
+// if it would otherwise fail the gate), which gårdssalg's simpler schema
+// has no equivalent of, so it is an ADDITIVE safety check here, not a gap.
+//
+// FAIL-CLOSED in the OPPOSITE direction from every other call site of this
+// judge, per rfbRetroScanShouldNull's own doc comment below: an infra
+// failure (isRfbJudgeInfraFailure) never nulls a field — only a genuine
+// AVVIS verdict does.
+//
+// No homepage re-fetch (unlike gårdssalg's retro-scan): gårdssalg re-fetches
+// the homepage before judging solely to obtain a fresh, genuinely-verified
+// content_evidence_url for its write-discipline column (and to detect a now-
+// dead homepage via recordProviderHomepageFetchResult). RFB's field_provenance
+// write discipline does not require a fresh evidence_url for a NULL (there is
+// no new value being sourced — the write only ever REMOVES a
+// field_provenance entry, never adds one), and RFB has no equivalent "dead
+// homepage" bookkeeping tied to this specific write. Re-fetching purely to
+// manufacture an evidence_url nothing downstream reads would be exactly the
+// kind of unnecessary complexity this fleet's own conventions ask to avoid.
+//
+// "Re-queue": no new queue mechanism is added. Nulling `description` (which
+// this route stores as '' — agents.description is NOT NULL, so "empty" is
+// always the empty string here, the SAME convention brreg-description-
+// fallback's own candidate WHERE clause already uses) makes the row a
+// candidate for that EXACT existing brreg-description-fallback sweep again
+// (TRIM(a.description) = '' AND org_nr present AND not curated) — verified
+// against that endpoint's own brregDescriptionFallbackCandidateSql() above,
+// not assumed. Nulling `about` (agent_knowledge.about, nullable — set to
+// SQL NULL) does not unconditionally re-feed admin-knowledge.ts's homepage-
+// content-refresh auto-select, whose own WHERE clause requires SOME existing
+// about/products content to already be present as its re-refresh trigger;
+// a row whose about AND products are both blank falls outside that specific
+// auto-select query (a pre-existing property of that query, not introduced
+// here) but remains reachable by re-running homepage-content-refresh with an
+// explicit `agentIds` override, which does not require pre-existing content.
+const RFB_RETRO_SCAN_DEFAULT_LIMIT = 25;
+const RFB_RETRO_SCAN_MAX_LIMIT = 100;
+const RFB_RETRO_SCAN_CONCURRENCY = 3;
+
+interface RfbRetroScanTarget {
+  agent_id: string;
+  name: string;
+  description: string;
+  about: string | null;
+  curated_fields: string | null;
+  field_provenance: string | null;
+  claimed_at: string | null;
+}
+
+/** True iff the parsed curated_fields JSON locks `field` (any truthy value — a
+ * bare `true` [brreg-description-fallback's own convention] or an owner-
+ * portal-style `{locked_at, by}` object both count as locked). Tolerates
+ * malformed/missing JSON (treated as "not locked"), matching the defensive-
+ * parse convention used throughout this file and admin-knowledge.ts. */
+function isRfbFieldCurated(curatedFieldsJson: string | null | undefined, field: "description" | "about"): boolean {
+  if (!curatedFieldsJson) return false;
+  try {
+    const parsed = JSON.parse(curatedFieldsJson);
+    return !!(parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)[field]);
+  } catch {
+    return false;
+  }
+}
+
+function rfbRetroScanAutoSelectSql(): string {
+  return `
+    SELECT a.id AS agent_id, a.name AS name, a.description AS description,
+           k.about AS about, k.curated_fields AS curated_fields,
+           k.field_provenance AS field_provenance, a.claimed_at AS claimed_at
+      FROM agents a
+      LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+     WHERE a.umbrella_type IS NULL
+       AND a.claimed_at IS NULL
+       AND (
+             TRIM(a.description) != ''
+          OR (k.about IS NOT NULL AND TRIM(k.about) != '')
+           )
+  `;
+}
+
+function selectRfbAgentsForRetroScan(db: ReturnType<typeof getDb>, limit: number): RfbRetroScanTarget[] {
+  return db
+    .prepare(`${rfbRetroScanAutoSelectSql()} ORDER BY a.created_at ASC LIMIT ?`)
+    .all(limit) as RfbRetroScanTarget[];
+}
+
+/**
+ * Resolve an explicit agentId for the retro-scan's `agentIds` override.
+ * Scoped to non-umbrella agents ONLY (umbrella agents are out of scope
+ * entirely, see this section's header comment) — NOT the claimed_at lock,
+ * so an explicitly-requested claimed agent still resolves to a target and is
+ * then reported in skipped_locked by the route's own check, mirroring
+ * getGardssalgProviderRetroScanTarget's identical convention. Returns null
+ * when the agent doesn't exist or is an umbrella agent.
+ */
+function getRfbAgentRetroScanTarget(db: ReturnType<typeof getDb>, agentId: string): RfbRetroScanTarget | null {
+  const row = db
+    .prepare(
+      `SELECT a.id AS agent_id, a.name AS name, a.description AS description,
+              k.about AS about, k.curated_fields AS curated_fields,
+              k.field_provenance AS field_provenance, a.claimed_at AS claimed_at,
+              a.umbrella_type AS umbrella_type
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id = ?`
+    )
+    .get(agentId) as (RfbRetroScanTarget & { umbrella_type: string | null }) | undefined;
+  if (!row || row.umbrella_type != null) return null;
+  return row;
+}
+
+/**
+ * Decide whether ONE currently-stored description/about value should be
+ * nulled by the retro-scan: a deterministic meetsAboutCheapBar fail is
+ * confident, real information (never "doubt") and nulls outright; a
+ * cheap-bar pass is then judged by the LLM, and ONLY a genuine (non-infra-
+ * failure) rejection nulls — an infra failure leaves the field untouched
+ * (fail-closed toward NOT destroying data, per this route's own contract).
+ * Blank values are never flagged (nothing to judge). Mirrors
+ * gardssalgRetroScanShouldNull exactly (routes/opplevelser.ts).
+ */
+async function rfbRetroScanShouldNull(
+  value: string | null | undefined,
+  producerName: string,
+  kind: "description" | "about"
+): Promise<{ shouldNull: boolean; reason: string | null }> {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return { shouldNull: false, reason: null };
+  }
+  if (!meetsAboutCheapBar(value)) {
+    return { shouldNull: true, reason: "fails the cheap bar (too short/boilerplate/mangled/foreign)" };
+  }
+  const verdict = await judgeRfbAboutCandidate(value, producerName, kind);
+  if (verdict.approved) return { shouldNull: false, reason: null };
+  if (isRfbJudgeInfraFailure(verdict)) {
+    // Never destroy data on doubt — leave the field exactly as it is.
+    return { shouldNull: false, reason: null };
+  }
+  return { shouldNull: true, reason: verdict.reasoning };
+}
+
+/**
+ * Null a set of description/about fields on ONE RFB agent because the
+ * retro-scan judged the CURRENTLY STORED value as no longer clearing the
+ * RFB quality gate. Re-checks the row-level claimed_at lock AND the
+ * per-field curated_fields lock against a FRESH snapshot immediately before
+ * writing (defense in depth — the caller already checked both, but either
+ * could in principle change between selection and this write, mirroring
+ * brreg-description-fallback's own re-check-before-write convention above).
+ *
+ * `agents.description` is NOT NULL, so "nulling" it means the empty string
+ * — the SAME "blank" convention brreg-description-fallback's own candidate
+ * WHERE clause already uses (TRIM(description) = ''), which is what makes
+ * that endpoint's own re-selection the genuine re-queue path for this field
+ * (see this section's header comment). `agent_knowledge.about` is nullable,
+ * so it is set to SQL NULL.
+ *
+ * field_provenance entries for nulled fields are REMOVED (read-modify-write,
+ * preserves other fields' entries) — a blank field has no source backing it
+ * any more. An `agent_knowledge_audit` row is written per field actually
+ * nulled — mirrors owner-portal.ts's own insert convention exactly
+ * (id/agent_id/field_name/old_value/new_value/changed_by/changed_by_email/
+ * changed_at/notes), with changed_by:'system' (an automated sweep, not an
+ * owner or admin action) and the judge's own reasoning (or the cheap-bar
+ * reason) recorded in `notes` for GET /admin/agent-audit to surface.
+ *
+ * A field already blank, or curated-locked, is left alone (nothing to null);
+ * an agent with nothing to null across the requested fields writes nothing
+ * and returns [].
+ */
+function applyRfbRetroScanNull(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  fields: Array<"description" | "about">,
+  reasons: Record<string, string>
+): string[] {
+  const row = db
+    .prepare(
+      `SELECT a.claimed_at AS claimed_at, a.description AS description,
+              k.about AS about, k.curated_fields AS curated_fields,
+              k.field_provenance AS field_provenance
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id = ?`
+    )
+    .get(agentId) as
+    | {
+        claimed_at: string | null;
+        description: string;
+        about: string | null;
+        curated_fields: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return [];
+  if (row.claimed_at) return []; // claimed since selection — never touch
+
+  const oldValues: Record<string, string | null> = { description: row.description, about: row.about };
+  const written: string[] = [];
+  const auditRows: Array<{ field_name: string; old_value: string | null; new_value: string | null }> = [];
+
+  const tx = db.transaction((): void => {
+    for (const f of fields) {
+      const current = oldValues[f];
+      if (current === null || current === undefined || String(current).trim() === "") continue; // already blank
+      if (isRfbFieldCurated(row.curated_fields, f)) continue; // re-checked right before writing
+
+      if (f === "description") {
+        db.prepare(`UPDATE agents SET description = '' WHERE id = ?`).run(agentId);
+        auditRows.push({ field_name: f, old_value: current, new_value: "" });
+      } else {
+        db.prepare(`UPDATE agent_knowledge SET about = NULL WHERE agent_id = ?`).run(agentId);
+        auditRows.push({ field_name: f, old_value: current, new_value: null });
+      }
+      written.push(f);
+    }
+    if (written.length === 0) return;
+
+    // field_provenance merge — remove the entry for each nulled field.
+    let provenance: Record<string, unknown> = {};
+    if (row.field_provenance) {
+      try {
+        const parsed = JSON.parse(row.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          provenance = parsed as Record<string, unknown>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty rather than clobber the write */
+      }
+    }
+    for (const f of written) delete provenance[f];
+    const nowIso = new Date().toISOString();
+
+    const exists = db.prepare("SELECT 1 AS one FROM agent_knowledge WHERE agent_id = ?").get(agentId);
+    if (!exists) {
+      db.prepare(
+        "INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, ?, ?)",
+      ).run(agentId, JSON.stringify(provenance), nowIso);
+    } else {
+      db.prepare("UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?").run(
+        JSON.stringify(provenance),
+        nowIso,
+        agentId,
+      );
+    }
+
+    const insertAudit = db.prepare(
+      `INSERT INTO agent_knowledge_audit
+         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, ?, ?, ?, 'system', NULL, ?, ?)`
+    );
+    for (const ar of auditRows) {
+      insertAudit.run(
+        require("crypto").randomUUID(),
+        agentId,
+        ar.field_name,
+        ar.old_value,
+        ar.new_value,
+        nowIso,
+        reasons[ar.field_name] ?? null,
+      );
+    }
+  });
+  tx();
+
+  return written;
+}
+
+router.post("/retro-scan", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; apply?: unknown };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : RFB_RETRO_SCAN_DEFAULT_LIMIT,
+    RFB_RETRO_SCAN_MAX_LIMIT,
+  );
+
+  let targets: RfbRetroScanTarget[];
+  if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
+    const ids = (body.agentIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim())
+      .slice(0, limit);
+    targets = ids
+      .map((id) => getRfbAgentRetroScanTarget(db, id))
+      .filter((t): t is RfbRetroScanTarget => t !== null);
+  } else {
+    targets = selectRfbAgentsForRetroScan(db, limit);
+  }
+
+  let scanned = 0;
+  const byField: Record<"description" | "about", { flagged: number; nulled: number }> = {
+    description: { flagged: 0, nulled: 0 },
+    about: { flagged: 0, nulled: 0 },
+  };
+  const changed: Array<{ agent_id: string; fields: string[]; reasons: Record<string, string> }> = [];
+  const skippedLocked: string[] = [];
+  const skippedCurated: Array<{ agent_id: string; fields: string[] }> = [];
+  const errors: Array<{ agent_id: string; error: string }> = [];
+
+  async function processOne(t: RfbRetroScanTarget): Promise<void> {
+    // LOCK check — from the target's own row snapshot, so a claimed agent
+    // never reaches the judge at all (same discipline as gårdssalg's
+    // retro-scan's pre-fetch snapshot check).
+    if (t.claimed_at) {
+      skippedLocked.push(t.agent_id);
+      return;
+    }
+    scanned++;
+
+    try {
+      const [descVerdict, aboutVerdict] = await Promise.all([
+        rfbRetroScanShouldNull(t.description, t.name, "description"),
+        rfbRetroScanShouldNull(t.about, t.name, "about"),
+      ]);
+
+      const wouldNullFields: Array<"description" | "about"> = [];
+      const reasons: Record<string, string> = {};
+      if (descVerdict.shouldNull) {
+        wouldNullFields.push("description");
+        reasons.description = descVerdict.reason!;
+      }
+      if (aboutVerdict.shouldNull) {
+        wouldNullFields.push("about");
+        reasons.about = aboutVerdict.reason!;
+      }
+      if (wouldNullFields.length === 0) return;
+
+      // Per-field curated lock — an absolute refusal, same as every other
+      // RFB write path (see this section's header comment). A curated field
+      // is never even reported as "would null" — it is fully out of scope,
+      // the same way locked ROWS never reach this point at all.
+      const curatedFields = wouldNullFields.filter((f) => isRfbFieldCurated(t.curated_fields, f));
+      const nonCuratedFields = wouldNullFields.filter((f) => !isRfbFieldCurated(t.curated_fields, f));
+      if (curatedFields.length > 0) {
+        skippedCurated.push({ agent_id: t.agent_id, fields: curatedFields });
+      }
+      if (nonCuratedFields.length === 0) return;
+
+      for (const f of nonCuratedFields) byField[f].flagged += 1;
+
+      if (dryRun) {
+        changed.push({ agent_id: t.agent_id, fields: nonCuratedFields, reasons });
+        return;
+      }
+
+      const written = applyRfbRetroScanNull(db, t.agent_id, nonCuratedFields, reasons);
+      if (written.length > 0) {
+        for (const f of written) byField[f as "description" | "about"].nulled += 1;
+        changed.push({ agent_id: t.agent_id, fields: written, reasons });
+      }
+    } catch (e: any) {
+      errors.push({ agent_id: t.agent_id, error: e?.message ?? String(e) });
+    }
+  }
+
+  for (let i = 0; i < targets.length; i += RFB_RETRO_SCAN_CONCURRENCY) {
+    const slice = targets.slice(i, i + RFB_RETRO_SCAN_CONCURRENCY);
+    await Promise.all(slice.map((t) => processOne(t)));
+  }
+
+  res.json({
+    dry_run: dryRun,
+    scanned,
+    by_field: byField,
+    changed,
+    skipped_locked: skippedLocked,
+    skipped_curated: skippedCurated,
+    errors,
+  });
 });
 
 export default router;

@@ -603,6 +603,22 @@ runSerial(() => {
   }
 });
 
+// ── dev-request rfb-kvalitetsgate-parity: RFB's LLM-judge quality-gate
+// cascade (judgeRfbAboutCandidate/meetsRfbAboutQualityBar/
+// isRfbJudgeInfraFailure, routes/admin-agents.ts) — sentinel/fail-closed
+// contract, cascade cost-control, and the calibration fixture set (5
+// required known-bad + >=3 known-good). Mocks the shared globalThis.fetch
+// like every OTHER fetch-mocking test in this file, so — despite touching no
+// DB singleton — it is chained into the SAME serial singleton-swapping order
+// (see the chained IIFE right after _junkEmailReplacePromise, further down
+// this file) rather than run fire-and-forget: a fire-and-forget version of
+// this exact test raced a real concurrent fetch call from an unrelated block
+// during development (a real geonorge.no call landed on this test's mocked
+// globalThis.fetch), confirming globalThis.fetch needs the same ordering
+// discipline as the shared getDb() singleton, not just DB-touching blocks.
+// Actual invocation + await is folded into the _rfbAgentsRetroScanPromise
+// chain link below (runs sequentially before the retro-scan tests there).
+
 // ── dev-request 2026-07: experience filter tags (derived, additive-only) ──
 // Daniel confirmed "tags/filters only, no new categories" for experiences.
 // Pins deriveExperienceTags() (services/experience-tags.ts) against the
@@ -23242,6 +23258,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
+  try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -30365,6 +30382,64 @@ const _junkEmailReplacePromise: Promise<void> = new Promise<void>(r => {
     failures.push("junk-email-replace: unexpected error: " + String(err?.message || err));
   } finally {
     _junkEmailReplaceResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request rfb-kvalitetsgate-parity: (1) the RFB LLM-judge quality-gate
+// cascade's own sentinel/fail-closed/cascade/calibration tests
+// (admin-agents-rfb-quality-judge.test.ts — mocks the shared globalThis.fetch,
+// no DB singleton, but chained here anyway per that file's own header note
+// on why fetch-mocking needs the same serial ordering) followed by (2)
+// POST /admin/agents/retro-scan (src/routes/admin-agents.ts) — the
+// retroactive re-scan of already-stored agents.description /
+// agent_knowledge.about against that same cascade, porting gårdssalg's
+// identical retro-scan design. The retro-scan test owns its own dedicated
+// in-memory prod-schema DB via __setDbForTesting/__initSchemaForTesting
+// (same singleton the brreg-description-fallback/brreg-catalog-sweep blocks
+// above swap) — mirroring those blocks, this whole pair must run strictly
+// after every other singleton-swapping block; _junkEmailReplacePromise is
+// the current tail of that serial chain. The two dev-request test files run
+// SEQUENTIALLY inside this one chain link (not two separate links) since
+// neither needs its own ordering relative to the other, only relative to
+// the rest of the file.
+let _rfbAgentsRetroScanResolve: () => void = () => {};
+const _rfbAgentsRetroScanPromise: Promise<void> = new Promise<void>(r => {
+  _rfbAgentsRetroScanResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_junkEmailReplacePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── rfb-kvalitetsgate-parity: LLM-judge cascade + calibration set ──");
+  try {
+    const { runAdminAgentsRfbQualityJudgeTests } = require("../src/routes/admin-agents-rfb-quality-judge.test") as
+      typeof import("../src/routes/admin-agents-rfb-quality-judge.test");
+    const rqj = await runAdminAgentsRfbQualityJudgeTests({ log: false });
+    passed += rqj.passed;
+    failed += rqj.failed;
+    for (const f of rqj.failures) failures.push("admin-agents-rfb-quality-judge: " + f);
+    console.log(`  admin-agents-rfb-quality-judge: ${rqj.passed} passed, ${rqj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-rfb-quality-judge: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── dev-request rfb-kvalitetsgate-parity: agents/retro-scan (RFB port of gårdssalg retro-scan) ──");
+  try {
+    const { runAdminAgentsRetroScanTests } = require("../src/routes/admin-agents-retro-scan.test") as
+      typeof import("../src/routes/admin-agents-retro-scan.test");
+    const rars = await runAdminAgentsRetroScanTests({ log: false });
+    passed += rars.passed;
+    failed += rars.failed;
+    for (const f of rars.failures) failures.push("admin-agents-retro-scan: " + f);
+    console.log(`  admin-agents-retro-scan: ${rars.passed} passed, ${rars.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-retro-scan: unexpected error: " + String(err?.message || err));
+  } finally {
+    _rfbAgentsRetroScanResolve();
   }
 })();
 

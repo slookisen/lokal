@@ -907,6 +907,114 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     );
   }
 
+  // ── dev-request rfb-nav-marker-generalization: NAV_BOILERPLATE_MARKERS'
+  //    flat literal-substring list caught only the exact phrase "skip to
+  //    content" — missing every other real-world skip-link wording variant
+  //    ("Jump to ...", "Skip to the content" [extra "the"], "Skip to main
+  //    content", "skip to navigation"). Replaced by a normalizing
+  //    NAV_SKIP_OR_JUMP_LINK_RE ("skip to"/"jump to" as a bare bigram,
+  //    regardless of what follows) — see that const's doc comment in
+  //    search-enrich.ts for why the bigram alone is safe to match.
+  //
+  //    This block is the acceptance criterion's explicit regression test:
+  //    it calls meetsAboutQualityBar — the EXACT code path admin-knowledge.ts
+  //    (POST /admin/homepage-content-refresh) calls — and asserts (a) the
+  //    new variants now reject where they used to slip through, and (b)
+  //    every fixture that already passed/failed before this change still
+  //    passes/fails identically (meetsAboutQualityBar's signature and every
+  //    OTHER behavior — cheap bar, isLikelyNavMenuLeakage, umbrella-
+  //    membership check — is untouched). ─────────────────────────────────
+  {
+    // ── (a) newly-caught variants — previously slipped through the old flat
+    //    literal-substring list, must now be REJECTED. ───────────────────
+    const jumpToVariant =
+      "Heim - Skakkelaks Jump to header bar Jump to header Jump to Menu Jump to main Jump to Sidebar Jump to footer widgets Jump to footer credits og meny";
+    assertTrue(
+      !meetsAboutQualityBar(jumpToVariant),
+      "nav-marker-gen: 'Jump to ...' skip-link chrome (not in the old literal list at all) now fails"
+    );
+
+    const skipToTheContentVariant =
+      "Skip to the content Hol Ysteri holder til på Hol i Hallingdal, og lager ost av melk fra egne geiter og kyr gjennom hele sommersesongen for besøkende.";
+    assertTrue(
+      !meetsAboutQualityBar(skipToTheContentVariant),
+      "nav-marker-gen: 'Skip to the content' (extra \"the\" defeats the old exact-substring match) now fails"
+    );
+
+    const skipToMainContentVariant =
+      "Skip to main content Avdem Gård ligger vakkert til i bygda, og selger egenprodusert kjøtt og pølser rett fra gårdsutsalget hver lørdag.";
+    assertTrue(
+      !meetsAboutQualityBar(skipToMainContentVariant),
+      "nav-marker-gen: 'Skip to main content' (extra word defeats the old exact-substring match) now fails"
+    );
+
+    const skipToNavigationVariant =
+      "skip to navigation Velkommen til gården vår hvor vi dyrker bær og grønnsaker og selger dem rett fra egen gårdsbutikk hele sommeren.";
+    assertTrue(
+      !meetsAboutQualityBar(skipToNavigationVariant),
+      "nav-marker-gen: 'skip to navigation' now fails"
+    );
+
+    // ── (b) "top of page"-glued real prose — the literal marker already
+    //    caught this shape before this change; re-asserted here as a
+    //    same-family no-regression pin alongside the new variants above. ──
+    const topOfPageAtlungstadStyle =
+      "Top of page Atlungstad Brenneri ligger ved Mjøsa og har brygget akevitt og brennevin på tradisjonelt vis siden 1855, med omvisning og salg fra gårdsutsalget.";
+    assertTrue(
+      !meetsAboutQualityBar(topOfPageAtlungstadStyle),
+      "nav-marker-gen: 'Top of page' glued to otherwise-real prose (Atlungstad-style) still fails"
+    );
+    const topOfPageSondreBjerkerudStyle =
+      "top of page Søndre Bjerkerud Gård selger egne grønnsaker og bær fra gårdsbutikken, og tilbyr omvisning på gården for skoleklasser hver høst.";
+    assertTrue(
+      !meetsAboutQualityBar(topOfPageSondreBjerkerudStyle),
+      "nav-marker-gen: 'top of page' glued to otherwise-real prose (Søndre Bjerkerud-style) still fails"
+    );
+
+    // ── (c) no-regression: fixtures that already existed BEFORE this change
+    //    keep their exact same pass/fail outcome — meetsAboutQualityBar's
+    //    other behavior (cheap bar, nav-menu-leakage heuristics, umbrella-
+    //    membership check) is byte-for-byte unchanged. Re-uses this file's
+    //    own existing fixtures rather than inventing new ones, so a
+    //    regression in ANY of them is caught here too. ────────────────────
+    const good = "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
+    assertTrue(meetsAboutQualityBar(good), "nav-marker-gen (regression): substantive Norwegian about still passes unchanged");
+    assertTrue(!meetsAboutQualityBar("Gårdsbutikk på Toten."), "nav-marker-gen (regression): <80 chars still fails unchanged");
+    const english = "Welcome to our family farm shop where we sell fresh produce, eggs and homemade jam every weekend.";
+    assertTrue(!meetsAboutQualityBar(english), "nav-marker-gen (regression): English snippet still fails unchanged (not Norwegian, and contains no skip/jump bigram anyway)");
+    const oldExactSkipToContent =
+      "Skip to content Homme Gård selger egenprodusert kjøtt og grønnsaker rett fra gårdsutsalget, åpent hver lørdag formiddag.";
+    assertTrue(
+      !meetsAboutQualityBar(oldExactSkipToContent),
+      "nav-marker-gen (regression): the OLD exact 'skip to content' phrase the flat list already caught still fails (now via the regex)"
+    );
+    const navSkipLink =
+      "Hopp til innhold. Velkommen til gårdsbutikken vår hvor du finner ferske grønnsaker, egg og kjøtt fra egen produksjon.";
+    assertTrue(
+      !meetsAboutQualityBar(navSkipLink),
+      "nav-marker-gen (regression): 'hopp til innhold' literal marker still fails unchanged (kept literal, not generalized)"
+    );
+    const reviewerPassiveProductList =
+      "Nordfjord Ost Sunnmøre Smør Stryn Rømme Geiranger Skyr Loen Youghurt Olden Kefir Briksdal Kremfløte og Hjørundfjord Cottage Cheese produseres her på garden hver eneste dag.";
+    assertTrue(
+      meetsAboutQualityBar(reviewerPassiveProductList),
+      "nav-marker-gen (regression): passive-voice Title-Case product list still passes unchanged (no skip/jump bigram present)"
+    );
+
+    // ── (d) false-positive guard: "hopp til" as ordinary figurative
+    //    Norwegian prose (NOT a skip-link) must NOT be rejected merely for
+    //    containing that bigram — this is exactly why "hopp til" was kept as
+    //    an exact literal PHRASE ("hopp til innhold") rather than folded
+    //    into a generalized "hopp til …" regex the way the English skip/jump
+    //    bigram was. ───────────────────────────────────────────────────────
+    const hoppTilFigurative =
+      "Fra en liten gårdsbutikk har familien tatt et hopp til å bli en av regionens største lokalmatprodusenter, med et bredt utvalg av ost og kjøtt.";
+    assertTrue(
+      meetsAboutQualityBar(hoppTilFigurative),
+      "nav-marker-gen: figurative 'hopp til' (not the skip-link phrase 'hopp til innhold') does NOT false-positive"
+    );
+  }
+
   // ── dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4:
   //    meetsAboutCheapBar — the extracted cheap/universal prefilter shared by
   //    meetsAboutQualityBar (unchanged behavior/callers) and gårdssalg's own
