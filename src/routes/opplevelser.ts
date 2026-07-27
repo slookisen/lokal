@@ -478,14 +478,25 @@ export const BulkRowSchema = z.object({
   // request 200s, the provider is created, and its `hjemmeside` column is
   // NULL.
   //
-  // That is not a cosmetic mismatch. `hjemmeside` is the ONLY input to the
-  // provider-CREATE homepage write (firstNonAggregatorWebsite below), and
-  // selectProvidersForContentRefresh() skips providers whose homepage is
-  // empty — so a provider harvested this way can never be content-enriched.
-  // The harvest SKILL already names that exact symptom in its own prose
-  // ("enrichment only deepens providers that HAVE a hjemmeside ... this is
-  // why enrichment was scanning 0") and tried to fix it by instructing the
-  // agent to fill the field — using the name this endpoint ignores.
+  // That is not a cosmetic mismatch. `firstNonAggregatorWebsite()` below is the
+  // ONLY input to the provider-CREATE homepage write, so the provider is
+  // created with a NULL homepage.
+  //
+  // CORRECTED after independent review — the first version of this comment
+  // claimed such a provider "can never be content-enriched". That is not what
+  // the code does. selectProvidersForContentRefresh()
+  // (services/experience-store.ts) COALESCEs the homepage with the provider's
+  // first non-empty experience `evidence_url`, and its WHERE clause explicitly
+  // admits `hjemmeside IS NULL` rows that have one. Since bulk-load requires an
+  // `evidence_url` for `unverified` providers, most affected providers WERE
+  // still picked up for content-refresh.
+  //
+  // The real harm is subtler and arguably worse: enrichment then fetched and
+  // extracted from the EVIDENCE url — the DMO/listing page the provider was
+  // discovered on — instead of the provider's own site. That is the same
+  // aggregator-as-homepage failure mode dev-request 2026-07-19-agg-website-leak
+  // was filed for, and it is why enrichment runs kept reporting `fetch_failed`
+  // against visitnorway.com / visithelgeland.com URLs.
   //
   // Accepting BOTH names here (rather than only correcting the SKILL) is
   // deliberate: Cloud Routines have repeatedly been observed executing a
@@ -536,9 +547,25 @@ function isAggregatorWebsite(raw: string): boolean {
 // skipped in favor of a later row with a real domain.
 export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
   // `website` and its accepted alias `hjemmeside` (see BulkRowSchema) are
-  // treated identically; `website` wins when a row somehow carries both.
+  // treated identically; `website` wins when a row carries both with content.
+  //
+  // `||` on the TRIMMED value, deliberately not `??` (independent review,
+  // blocking): `??` only falls through on null/undefined, so a row with
+  // `website: ""` — which the schema accepts, and which an LLM harvester
+  // filling every documented key with a placeholder produces routinely —
+  // would shadow a perfectly good `hjemmeside` and yield null. That is the
+  // very failure this alias exists to fix, reintroduced one field over.
+  //
+  // Trimming matters just as much: a whitespace-only `website` is truthy and
+  // survives isAggregatorWebsite() (which is deliberately permissive about
+  // unparseable URLs), so it would be written verbatim into
+  // experience_providers.hjemmeside — and a whitespace homepage is strictly
+  // WORSE than a null one. selectProvidersForContentRefresh() requires
+  // `TRIM(hjemmeside) != ''` for its primary branch and `hjemmeside IS NULL`
+  // for its evidence_url fallback, so a whitespace value satisfies neither and
+  // drops the provider out of content-refresh entirely.
   for (const r of rows) {
-    const candidate = r.website ?? r.hjemmeside;
+    const candidate = r.website?.trim() || r.hjemmeside?.trim() || null;
     if (candidate && !isAggregatorWebsite(candidate)) return candidate;
   }
   return null;

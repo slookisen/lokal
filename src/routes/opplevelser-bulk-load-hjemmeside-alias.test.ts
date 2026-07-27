@@ -78,6 +78,42 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
     assertEq(firstNonAggregatorWebsite([row as BulkRow]), "https://kanonisk.no", "alias-5: `website` wins when both are present (deterministic)");
   }
 
+  // ── Empty / whitespace `website` must NOT shadow a real `hjemmeside` ────
+  // Independent review found both of these as blocking: `??` only falls
+  // through on null/undefined, so `website: ""` yielded null, and a
+  // whitespace-only `website` was written verbatim — worse than null, since
+  // selectProvidersForContentRefresh() requires TRIM(hjemmeside) != '' for its
+  // primary branch and hjemmeside IS NULL for its evidence_url fallback, so a
+  // whitespace value satisfies neither and drops the provider entirely.
+  {
+    const row = BulkRowSchema.parse({ ...base, website: "", hjemmeside: "https://trollaktiv.no" });
+    assertEq(
+      firstNonAggregatorWebsite([row as BulkRow]),
+      "https://trollaktiv.no",
+      "alias-8: an EMPTY-string `website` does not shadow a real `hjemmeside` (the `??`-vs-`||` bug)",
+    );
+  }
+  {
+    const row = BulkRowSchema.parse({ ...base, website: "   ", hjemmeside: "https://trollaktiv.no" });
+    assertEq(
+      firstNonAggregatorWebsite([row as BulkRow]),
+      "https://trollaktiv.no",
+      "alias-9: a WHITESPACE-only `website` does not shadow a real `hjemmeside`, and is never written verbatim",
+    );
+  }
+  {
+    const row = BulkRowSchema.parse({ ...base, website: "  https://trollaktiv.no  " });
+    assertEq(
+      firstNonAggregatorWebsite([row as BulkRow]),
+      "https://trollaktiv.no",
+      "alias-10: a padded URL is trimmed before it reaches the stored homepage",
+    );
+  }
+  {
+    const row = BulkRowSchema.parse({ ...base, website: "", hjemmeside: "" });
+    assertEq(firstNonAggregatorWebsite([row as BulkRow]), null, "alias-11: both blank yields null, never an empty string");
+  }
+
   // ── The aggregator screen still applies to the alias ────────────────────
   // dev-request 2026-07-19-agg-website-leak: a DMO/aggregator page written
   // into a provider's homepage makes every later content-refresh fail. The
