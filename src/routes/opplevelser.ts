@@ -217,7 +217,7 @@ import { fetchBrregWebsite } from "../services/brreg-client";
 // harvest row's `website` is never blindly trusted as a provider's OWN
 // homepage on CREATE. See isAggregatorWebsite()/firstNonAggregatorWebsite()
 // below, near the bulk-load handler that consumes them.
-import { isDirectoryOrAggregatorHost, hostFromUrlLike } from "../services/cross-source-validator";
+import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain } from "../services/cross-source-validator";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
 // Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
 // verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
@@ -652,7 +652,13 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
               duration_min: r.duration_min ?? null,
               price_from: r.price_from ?? null,
               booking_url: r.booking_url ?? null,
-            });
+              // This content came from the HARVEST ROW — i.e. the third-party
+              // listing page at r.evidence_url, not the provider's own site.
+              // Recording that is the whole point: without it the row is
+              // indistinguishable from homepage-extracted content, and the
+              // weekly spot-check judges it against the homepage and scores a
+              // mismatch that is not an error.
+            }, r.evidence_url ?? null);
           }
           skipped++;
           continue;
@@ -988,7 +994,9 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     } else {
       for (const a of toApply) {
         try {
-          const fields = applyExperienceContent(a.id, candidateObj);
+          // fetched.fetchUrl is the page this content was extracted from — the
+          // same URL the per-field provenance above records as source_url.
+          const fields = applyExperienceContent(a.id, candidateObj, fetched.fetchUrl);
           for (const f of fields) writtenFields.add(f);
         } catch (e: any) {
           errors.push({ provider_id: providerId, error: `write_failed ${a.id}: ${e?.message ?? String(e)}` });
@@ -5083,7 +5091,8 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
     try {
       expRowsStmt = expDb.prepare(
       `SELECT id, title, description, category, subcategory, booking_url,
-              content_source, evidence_url, discovery_source, updated_at
+              content_source, evidence_url, discovery_source,
+              content_evidence_url, updated_at
          FROM experiences
         WHERE provider_id = ?
           AND enrichment_state IN ('enriched', 'verified')
@@ -5133,7 +5142,14 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           AND (verification_status IS NULL OR verification_status != 'verified')
           AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
         ORDER BY updated_at DESC
-        LIMIT 10`
+        -- Over-fetch, then filter, then slice to 10 in JS (round-5 review).
+        -- The provenance filter below cannot be expressed in SQL (it compares
+        -- registrable domains), and running it AFTER a LIMIT 10 meant a
+        -- provider with 10 fresh harvest-sourced rows and 5 good older ones
+        -- returned ZERO — a brand-new route to the checked=0 this endpoint
+        -- exists to remove. 50 is a bounded read (50 providers x 50 rows) and
+        -- the response is still capped at 10.
+        LIMIT 50`
       );
     } catch (err) {
       console.error("[opplevelser] providers/recently-enriched: could not prepare enriched_experiences query", err);
@@ -5149,42 +5165,57 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
       }
       let enrichedExperiences: unknown[] = [];
       let enrichedExperiencesError = false;
+      let enrichedExperiencesFiltered = 0;
+      let homepageIsAggregator = false;
       try {
         const raw = expRowsStmt
-          ? (expRowsStmt.all(r.id) as Array<{ evidence_url: string | null }>)
+          ? (expRowsStmt.all(r.id) as Array<{ content_evidence_url: string | null }>)
           : [];
-        // Provenance filter (round-4 review, BLOCKING). `content_source` is NOT
-        // trustworthy provenance for these rows, and no SQL predicate can make
-        // it so: applyExperienceContent() unconditionally stamps
-        // `content_source = 'provider_site'` (experience-store.ts:1880) — even
-        // when its caller is bulkInsertExperiences() (:1482) or POST
-        // /admin/bulk-load, handing it THIRD-PARTY HARVEST-ROW data on a
-        // re-harvest that scored richer than the stored row. So a description
-        // lifted from a visitnorway.com listing lands in the DB labelled
-        // 'provider_site', and every predicate on the query above passes it.
+        // Provenance filter — on content_evidence_url, NOT evidence_url.
         //
-        // That matters because §8.3 tells the verifier to fetch the provider's
-        // homepage and judge each field against it. Aggregator-sourced text —
-        // and a `booking_url` that is off-site BY DESIGN (`booking_type:
-        // 'external'`, init-experiences.ts:99) — will not be supported by the
-        // producer's own page, so it scores as `mismatch`. §8.4 sets
-        // controller/enrichment-write-pause.yaml → enabled: true above a 10%
-        // error rate, and only Daniel can clear it. Same blast radius as the
-        // round-2 lock-guard finding, reached by a different route.
+        // Round-4 review established the harm: applyExperienceContent() stamps
+        // `content_source = 'provider_site'` unconditionally, including when
+        // bulk-load hands it a third-party harvest row, so aggregator text was
+        // served as homepage truth and the weekly spot-check scored a false
+        // `mismatch` — which is what trips §8.4's write-pause.
         //
-        // So: only serve a row whose evidence actually points at the page the
-        // verifier is about to fetch. Dropping is the SAFE direction — an
-        // excluded row thins the sample (`skipped`), while a false `mismatch`
-        // pauses writes for the whole vertical. `evidence_url` and
-        // `discovery_source` are projected too, so the consumer can see the
-        // provenance rather than having to trust `content_source`.
+        // Round-5 review then showed my first fix used the WRONG COLUMN, and was
+        // wrong in both directions. `experiences.evidence_url` is DISCOVERY
+        // provenance: written once at createExperience() and never updated. So
+        // it (a) hid rows the content-refresh had genuinely rewritten from the
+        // homepage but which still carried their original aggregator discovery
+        // URL — a fresh route to the checked=0 this endpoint exists to remove —
+        // while (b) still admitting the re-harvest case it was written for,
+        // whose evidence_url is likewise untouched.
+        //
+        // applyExperienceContent now records where the CONTENT came from, which
+        // is the only column that can answer this. NULL means "written before
+        // that column existed": unknown, so serve it — the pre-change behavior,
+        // never a new exclusion.
+        //
+        // Compared on the REGISTRABLE domain, not the bare host (round-5
+        // review): every other same-site check in this repo does, and bare-host
+        // equality dropped legitimate own-site evidence on `shop.gard.no` vs
+        // `gard.no`.
         const homepageHost = r.hjemmeside ? hostFromUrlLike(r.hjemmeside) : null;
-        enrichedExperiences = raw.filter((row) => {
-          if (!row.evidence_url) return true;          // nothing to contradict
-          if (!homepageHost) return true;              // verifier fetches the evidence url itself
-          const evidenceHost = hostFromUrlLike(row.evidence_url);
-          return !evidenceHost || evidenceHost === homepageHost;
+        const homepageDomain = homepageHost ? registrableDomain(homepageHost) : null;
+        const kept = raw.filter((row) => {
+          if (!row.content_evidence_url) return true;   // unknown provenance
+          if (!homepageDomain) return true;             // verifier fetches the evidence url itself
+          const evidenceHost = hostFromUrlLike(row.content_evidence_url);
+          return !evidenceHost || registrableDomain(evidenceHost) === homepageDomain;
         });
+        enrichedExperiencesFiltered = raw.length - kept.length;
+        enrichedExperiences = kept.slice(0, 10);
+        // A provider whose OWN hjemmeside is an aggregator (documented in
+        // production by dev-request 2026-07-19-agg-website-leak) inverts the
+        // filter: both sides match, so aggregator text is admitted and then
+        // judged against the aggregator page it came from — scoring `ok` and
+        // INFLATING the quality signal this endpoint exists to produce. The
+        // consumer cannot see that from the rows, so say it explicitly.
+        if (homepageHost && isDirectoryOrAggregatorHost(homepageHost)) {
+          homepageIsAggregator = true;
+        }
         if (!expRowsStmt) enrichedExperiencesError = true;
       } catch (err) {
         enrichedExperiencesError = true;
@@ -5223,6 +5254,14 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         content_evidence_url: r.content_evidence_url,
         enriched_experiences: enrichedExperiences,
         ...(enrichedExperiencesError ? { enriched_experiences_error: true } : {}),
+        // Round-5 review: an empty list caused by the provenance filter was
+        // indistinguishable from "enrichment wrote nothing" — the same argument
+        // that made a bare console.error unacceptable in round 2, applied to the
+        // filter path this time. Emitted only when it actually happened.
+        ...(enrichedExperiencesFiltered > 0
+          ? { enriched_experiences_filtered: enrichedExperiencesFiltered }
+          : {}),
+        ...(homepageIsAggregator ? { homepage_is_aggregator: true } : {}),
         field_provenance: null,
         provenance_model: "none",
       };

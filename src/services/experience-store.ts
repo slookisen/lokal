@@ -1489,7 +1489,9 @@ export function bulkInsertExperiences(
               duration_min: row.duration_min ?? null,
               price_from: row.price_from ?? null,
               booking_url: row.booking_url ?? null,
-            });
+            // Harvest-row content: its provenance is the third-party listing at
+            // row.evidence_url, never the provider's homepage (round-5 review).
+            }, row.evidence_url ?? null);
             updated++;
           } else {
             skipped++;
@@ -1805,7 +1807,24 @@ export function applyExperienceContent(
     duration_min?: number | null;
     price_from?: number | null;
     booking_url?: string | null;
-  }
+  },
+  // Where this CONTENT came from — the URL actually fetched and extracted from.
+  // Round-5 review of dev-request 2026-07-27-kvalitetsporter-uten-signal: this
+  // writer stamps `content_source = 'provider_site'` unconditionally, but its
+  // three callers are not equivalent. The twice-daily content-refresh really did
+  // fetch the provider's homepage; the two bulk-load paths hand it a THIRD-PARTY
+  // HARVEST ROW on a re-harvest that scored richer. Both used to end up labelled
+  // 'provider_site' with nothing in the row to tell them apart, so a spot-check
+  // that judges the text against the provider's homepage scores a false
+  // `mismatch` on the harvest-written ones — and §8.4 pauses enrichment writes
+  // for the whole vertical above a 10% error rate.
+  //
+  // `experiences.evidence_url` cannot answer this: it is DISCOVERY provenance,
+  // written once at createExperience() and never updated. Mirrors
+  // experience_providers.content_evidence_url, stamped by applyProviderContent.
+  // Optional: omitting it leaves the column untouched (NULL = unknown, never
+  // treated as a mismatch), so no caller is forced to lie.
+  sourceUrl?: string | null
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
@@ -1879,6 +1898,10 @@ export function applyExperienceContent(
 
   sets.push("content_source = 'provider_site'");
   sets.push("enrichment_state = 'enriched'");
+  if (sourceUrl) {
+    sets.push("content_evidence_url = @content_evidence_url");
+    params.content_evidence_url = sourceUrl;
+  }
   sets.push("updated_at = datetime('now')");
 
   db.prepare(`UPDATE experiences SET ${sets.join(", ")} WHERE id = @id`).run(params);

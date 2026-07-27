@@ -245,14 +245,16 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         `INSERT INTO experiences
            (id, provider_id, title, description, category, subcategory, booking_url,
             content_source, enrichment_state, canonical_id, verification_status,
-            evidence_url, discovery_source, updated_at)
+            evidence_url, discovery_source, content_evidence_url, updated_at)
          VALUES
            (@id, @provider_id, @title, @description, @category, @subcategory, @booking_url,
             @content_source, @enrichment_state, @canonical_id, @verification_status,
-            @evidence_url, @discovery_source, @updated_at)`,
+            @evidence_url, @discovery_source, @content_evidence_url, @updated_at)`,
       );
       const insertFull = (row: Record<string, unknown>) =>
-        insertExperienceFull.run({ evidence_url: null, discovery_source: null, ...row });
+        insertExperienceFull.run({
+          evidence_url: null, discovery_source: null, content_evidence_url: null, ...row,
+        });
       // A row the dedup pass merged away must NEVER be served (round-3 review,
       // BLOCKING). Its updated_at is deliberately the NEWEST of any row on this
       // provider, because that is exactly what runDedupPass() produces: it
@@ -318,6 +320,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
         evidence_url: "https://visitnorway.com/x", discovery_source: "visitnorway",
+        content_evidence_url: "https://visitnorway.com/x",
         updated_at: daysAgoIso(1),
       });
       // …and the control: same shape, but the evidence DOES point at the
@@ -331,8 +334,92 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
         evidence_url: "https://www.generisk.example.no/opplevelser", discovery_source: "provider_site",
+        content_evidence_url: "https://www.generisk.example.no/opplevelser",
         updated_at: daysAgoIso(4),
       });
+      // Round-5 review: the filter's first version compared `evidence_url`,
+      // which is DISCOVERY provenance and is never updated after insert. A row
+      // discovered on an aggregator and later REWRITTEN from the provider's own
+      // homepage therefore got dropped — a brand-new route to the checked=0
+      // this endpoint exists to remove. It must be served.
+      insertFull({
+        id: "exp-rediscovered-1", provider_id: "prov-generic-enriched",
+        title: "Oppdaget på DMO, innhold hentet fra egen side",
+        description: "Beskrivelse hentet fra produsentens egen hjemmeside.",
+        category: "natur_friluft", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "pending_verify",
+        evidence_url: "https://visitnorway.com/oppdaget-her",       // stale discovery URL
+        discovery_source: "visitnorway",
+        content_evidence_url: "https://generisk.example.no/tur",    // where the CONTENT came from
+        updated_at: daysAgoIso(5),
+      });
+      // …and a subdomain of the provider's own site is still the provider's own
+      // site. Bare-host equality dropped this; every other same-site check in
+      // the repo compares registrable domains.
+      insertFull({
+        id: "exp-subdomain-1", provider_id: "prov-generic-enriched",
+        title: "Innhold fra eget subdomene",
+        description: "Beskrivelse hentet fra nettbutikken vår.",
+        category: "mat_drikke", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "pending_verify",
+        content_evidence_url: "https://shop.generisk.example.no/produkt",
+        updated_at: daysAgoIso(6),
+      });
+      // A provider whose OWN hjemmeside is an aggregator — documented in
+      // production by dev-request 2026-07-19-agg-website-leak. Both sides of the
+      // provenance comparison then match, so aggregator text is admitted and
+      // judged against the aggregator page it came from, scoring `ok` and
+      // INFLATING the signal. The consumer cannot see that from the rows.
+      insertProvider.run({
+        id: "prov-aggregator-homepage", navn: "Lekkasje Gård AS",
+        hjemmeside: "https://www.visitnorway.com/gard/lekkasje",
+        last_enriched_at: daysAgoIso(1),
+        about_text: null, visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, content_evidence_url: null,
+      });
+      insertFull({
+        id: "exp-agg-homepage-1", provider_id: "prov-aggregator-homepage",
+        title: "Tekst fra DMO-siden", description: "AGGREGATOR-TEKST fra DMO-siden.",
+        category: "kultur_historie", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "pending_verify",
+        content_evidence_url: "https://www.visitnorway.com/gard/lekkasje",
+        updated_at: daysAgoIso(1),
+      });
+      // The filter used to run AFTER `LIMIT 10`, so a provider whose 10 freshest
+      // rows were all harvest-sourced returned ZERO while good older rows
+      // existed. 12 fresh aggregator-sourced rows + 2 older own-host ones.
+      insertProvider.run({
+        id: "prov-filter-after-limit", navn: "Mange Aggregatorrader AS",
+        hjemmeside: "https://storgard.example.no",
+        last_enriched_at: daysAgoIso(1),
+        about_text: null, visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, content_evidence_url: null,
+      });
+      for (let i = 0; i < 12; i++) {
+        insertFull({
+          id: `exp-fresh-agg-${i}`, provider_id: "prov-filter-after-limit",
+          title: `Aggregatorrad ${i}`, description: `AGGREGATOR-TEKST ${i}.`,
+          category: "natur_friluft", subcategory: null, booking_url: null,
+          content_source: "provider_site", enrichment_state: "enriched",
+          canonical_id: null, verification_status: "pending_verify",
+          content_evidence_url: "https://visitnorway.com/x",
+          updated_at: daysAgoIso(1),
+        });
+      }
+      for (let i = 0; i < 2; i++) {
+        insertFull({
+          id: `exp-older-own-${i}`, provider_id: "prov-filter-after-limit",
+          title: `Egen rad ${i}`, description: `Beskrivelse fra egen side ${i}.`,
+          category: "natur_friluft", subcategory: null, booking_url: null,
+          content_source: "provider_site", enrichment_state: "enriched",
+          canonical_id: null, verification_status: "pending_verify",
+          content_evidence_url: "https://storgard.example.no/tur",
+          updated_at: daysAgoIso(9),
+        });
+      }
       // 11 enriched rows on their own provider, so `LIMIT 10` truncates by
       // exactly one. The doc-comment calls the truncation out as something
       // "which matters to a consumer computing `checked`"; nothing pinned it
@@ -454,8 +541,11 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       const servedIds = (genericRow.enriched_experiences as any[]).map((e) => e.id).sort();
       assertEq(
         servedIds,
-        ["exp-enriched-1", "exp-homepage-sourced-1", "exp-nullverif-1", "exp-verified-1"],
-        "h4: exactly the checkable rows are served — raw, manual, claim, merged-away, verification-locked and aggregator-sourced are all excluded",
+        [
+          "exp-enriched-1", "exp-homepage-sourced-1", "exp-nullverif-1",
+          "exp-rediscovered-1", "exp-subdomain-1", "exp-verified-1",
+        ],
+        "h4: exactly the checkable rows are served — raw, manual, claim, merged-away, verification-locked and aggregator-CONTENT rows are all excluded",
       );
       assertEq(genericRow.enriched_experiences[0].id, "exp-enriched-1", "h5: ordered updated_at DESC, so the freshest enriched row comes first");
       assertTrue(
@@ -528,6 +618,43 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       assertEq(provRow.evidence_url, "https://www.generisk.example.no/opplevelser", "h18a: evidence_url is projected, so the consumer can judge against the right page instead of trusting content_source");
       assertEq(provRow.discovery_source, "provider_site", "h18b: discovery_source is projected alongside it");
 
+      // ── (h20-h24) round-5 review: the filter was on the wrong column ─────
+      assertTrue(
+        (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-rediscovered-1"),
+        "h20: a row DISCOVERED on an aggregator but whose CONTENT came from the homepage is served — filtering on the discovery URL hid exactly the rows enrichment had just rewritten",
+      );
+      assertTrue(
+        (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-subdomain-1"),
+        "h21: content evidence on a SUBDOMAIN of the provider's own site is own-site — compared on the registrable domain, as every other same-site check in this repo does",
+      );
+      const aggHomeRow = (shapeResp.body.providers as any[]).find((p) => p.id === "prov-aggregator-homepage");
+      assertTrue(!!aggHomeRow, "h22a: a provider whose own hjemmeside is an aggregator is still sampled");
+      assertEq(
+        aggHomeRow.homepage_is_aggregator,
+        true,
+        "h22b: …and is flagged, because the provenance comparison cannot catch it — both sides match, so aggregator text would be judged against the aggregator page and score `ok`, inflating the signal",
+      );
+      assertTrue(
+        genericRow.homepage_is_aggregator === undefined,
+        "h22c: the flag is absent (not false) for a normal provider",
+      );
+      const afterLimitRow = (shapeResp.body.providers as any[]).find((p) => p.id === "prov-filter-after-limit");
+      assertTrue(!!afterLimitRow, "h23a: prov-filter-after-limit present");
+      assertEq(
+        (afterLimitRow.enriched_experiences as any[]).map((e: any) => e.id).sort(),
+        ["exp-older-own-0", "exp-older-own-1"],
+        "h23b: 12 fresher aggregator-sourced rows do not starve the 2 good older ones — the filter used to run AFTER LIMIT 10 and returned zero",
+      );
+      assertEq(
+        afterLimitRow.enriched_experiences_filtered,
+        12,
+        "h24: …and the count of filtered rows reaches the consumer, so an empty or short list is never read as 'enrichment wrote nothing'",
+      );
+      assertTrue(
+        (shapeResp.body.providers as any[]).find((p) => p.id === "prov-recent")?.enriched_experiences_filtered === undefined,
+        "h24b: the filtered count is absent when nothing was filtered",
+      );
+
       // ── (h19) the `since` window covers the full 7 days ──────────────────
       // last_enriched_at is written as SQLite datetime('now') ("2026-07-20
       // 23:59:59"); `since` used to be a JS toISOString() ("…T00:00:00.000Z").
@@ -554,6 +681,97 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         assertTrue(
           (winResp.body.providers as any[]).some((p) => p.id === "prov-sqlite-stamp"),
           "h19: a provider enriched on the BOUNDARY day is inside the window — ' ' (0x20) < 'T' (0x54) used to drop the whole day",
+        );
+      }
+
+      // ── (h25-h27) mutations that survived round 5, now pinned ────────────
+      // A guard whose STRICTNESS no test can kill is only half a guard: round 5
+      // weakened the host comparison to a substring match and flipped the
+      // NULL-homepage branch, and both left the suite green.
+      //
+      // h25 — substring matching must not pass. The registrable domain of the
+      // evidence must CONTAIN the provider's as a substring for this to
+      // discriminate: "ikke-gard.no".includes("gard.no") is true, so a
+      // substring comparison admits a completely different registrant. (My
+      // first attempt at this fixture used a .no-vs-.com pair whose registrable
+      // domains do not overlap at all, so it passed under BOTH the correct and
+      // the weakened comparison — it pinned nothing. Caught by re-running the
+      // mutation, not by reading.)
+      insertProvider.run({
+        id: "prov-substring", navn: "Gard AS", hjemmeside: "https://gard.no",
+        last_enriched_at: daysAgoIso(1),
+        about_text: null, visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, content_evidence_url: null,
+      });
+      insertFull({
+        id: "exp-substring-attack-1", provider_id: "prov-substring",
+        title: "Domene som bare inneholder vårt",
+        description: "AGGREGATOR-TEKST fra et domene som bare ligner.",
+        category: "kultur_historie", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "pending_verify",
+        content_evidence_url: "https://ikke-gard.no/x",
+        updated_at: daysAgoIso(7),
+      });
+      // h26 — a provider with NO hjemmeside: the verifier has nothing to compare
+      // against and fetches the evidence URL itself, so the rows must be SERVED,
+      // not dropped. Flipping that branch to `return false` left the suite green
+      // because no fixture had a NULL hjemmeside.
+      insertProvider.run({
+        id: "prov-no-homepage", navn: "Uten Hjemmeside AS", hjemmeside: null,
+        last_enriched_at: daysAgoIso(1),
+        about_text: null, visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, content_evidence_url: null,
+      });
+      insertFull({
+        id: "exp-no-homepage-1", provider_id: "prov-no-homepage",
+        title: "Beriket uten registrert hjemmeside",
+        description: "Beskrivelse skrevet av content-refresh via evidence_url.",
+        category: "mat_drikke", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "pending_verify",
+        content_evidence_url: "https://en-eller-annen.example.no/side",
+        updated_at: daysAgoIso(1),
+      });
+      const strictResp = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        query: { since: daysAgoIso(30), limit: "50" },
+      });
+      const strictSub = (strictResp.body.providers as any[]).find((p) => p.id === "prov-substring");
+      assertTrue(
+        !!strictSub && !(strictSub.enriched_experiences as any[]).some((e) => e.id === "exp-substring-attack-1"),
+        "h25: a domain that merely CONTAINS the provider's is not the provider's — pins the comparison as equality, not substring",
+      );
+      const noHomeRow = (strictResp.body.providers as any[]).find((p) => p.id === "prov-no-homepage");
+      assertTrue(!!noHomeRow, "h26a: a provider with no hjemmeside is still sampled");
+      assertTrue(
+        (noHomeRow.enriched_experiences as any[]).some((e) => e.id === "exp-no-homepage-1"),
+        "h26b: …and its rows are SERVED — with no homepage to compare against, dropping them would be a silent checked=0",
+      );
+      // h27 — the DEFAULT `since` path, not just the explicit one. Round 5
+      // reverted only the default branch to raw ISO and the suite stayed green,
+      // because h19 exercises ?since= only.
+      {
+        // On the BOUNDARY day of the DEFAULT 7-day window — one minute inside
+        // it. A row comfortably inside the window has a different date part and
+        // passes whatever the separator is, which is why the first version of
+        // this assertion survived its own mutation.
+        const sqliteNow = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000 + 60 * 1000)
+          .toISOString().slice(0, 19).replace("T", " ");
+        insertProvider.run({
+          id: "prov-default-window", navn: "Standardvindu AS", hjemmeside: "https://standardvindu.example.no",
+          last_enriched_at: sqliteNow,
+          about_text: "Beriket for en time siden.", visit_text: null,
+          opening_hours_text: null, products: null,
+          content_source: "provider_site", content_evidence_url: null,
+        });
+        const defResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { limit: "50" },     // no `since` — exercises the DEFAULT path
+        });
+        assertTrue(
+          (defResp.body.providers as any[]).some((p) => p.id === "prov-default-window"),
+          "h27: a SQLite-stamped row is inside the DEFAULT 7-day window too — the default branch needs the same format as the explicit one",
         );
       }
 
