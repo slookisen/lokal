@@ -291,13 +291,25 @@ export interface IssuedClaim {
   maskedEmail: string;
   source: "brreg_contact" | "verified_domain_address";
   expiresAt: string;
+  /** dev-request 2026-07-26-booking-test-send-guard — see issueClaimMagicLink. */
+  isTest: boolean;
 }
 
 export type IssueClaimResult =
   | { ok: true; claim: IssuedClaim }
   | { ok: false; error: "provider_not_found" | "not_brreg_verified" | "no_org_linked_email" | "rate_limited" };
 
-export function issueClaimMagicLink(providerId: string, brregContactEmail?: string | null): IssueClaimResult {
+// `opts.isTest` (dev-request 2026-07-26-booking-test-send-guard) marks the
+// claim as a deliberate end-to-end test so the route layer redirects its
+// magic-link email to TEST_SEND_REDIRECT_EMAIL instead of the derived
+// org-linked address. A THIRD ARGUMENT on purpose, not part of any request
+// body the public POST route parses — that route calls this with one
+// argument, so no public caller can reach it.
+export function issueClaimMagicLink(
+  providerId: string,
+  brregContactEmail?: string | null,
+  opts: { isTest?: boolean } = {},
+): IssueClaimResult {
   const provider = getClaimProviderById(providerId);
   if (!provider) return { ok: false, error: "provider_not_found" };
 
@@ -311,11 +323,12 @@ export function issueClaimMagicLink(providerId: string, brregContactEmail?: stri
   const now = new Date();
   const expiresAt = new Date(now.getTime() + CLAIM_MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000);
   const claimId = `gsc_${crypto.randomBytes(8).toString("hex")}`;
+  const isTest = opts.isTest === true ? 1 : 0;
 
   db.prepare(
-    `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
-  ).run(claimId, providerId, derived.email, derived.source, token, now.toISOString(), expiresAt.toISOString());
+    `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at, is_test)
+     VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+  ).run(claimId, providerId, derived.email, derived.source, token, now.toISOString(), expiresAt.toISOString(), isTest);
 
   return {
     ok: true,
@@ -326,6 +339,7 @@ export function issueClaimMagicLink(providerId: string, brregContactEmail?: stri
       maskedEmail: maskEmail(derived.email),
       source: derived.source,
       expiresAt: expiresAt.toISOString(),
+      isTest: isTest === 1,
     },
   };
 }

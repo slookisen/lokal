@@ -535,36 +535,66 @@ export async function fetchBrregBusinessAddress(
 // safe-default discipline (any network/parse error or 404 resolves to
 // null). Does not do fuzzy name matching; the org-nr is already known.
 
-type RawEnhetWebsite = {
+type RawEnhetContact = {
   hjemmeside?: string | null;
+  epostadresse?: string | null;
+  telefon?: string | null;
+  mobil?: string | null;
+};
+
+/**
+ * The self-reported contact block Brreg returns for an org-nr. Every field is
+ * trimmed, with blank/whitespace-only treated as null. `telefon` prefers the
+ * `telefon` field and falls back to `mobil` — Brreg registers them as two
+ * separate optional fields and plenty of sole proprietorships fill in only
+ * the mobile one.
+ */
+export type BrregContact = {
+  hjemmeside: string | null;
+  epost: string | null;
+  telefon: string | null;
 };
 
 // Own small per-process cache keyed by orgNr — deliberately NOT shared with
 // the other three org-nr lookup caches above (each of these functions
 // caches independently, mirroring the file's existing convention).
-const websiteCache: Map<string, string | null> = new Map();
+// Caches the whole contact block, so fetchBrregWebsite() and
+// fetchBrregContact() share one round-trip per org-nr instead of two.
+const contactCache: Map<string, BrregContact | null> = new Map();
 
 export function __clearBrregWebsiteCacheForTesting(): void {
-  websiteCache.clear();
+  contactCache.clear();
+}
+
+function pickBrregContactField(v: unknown): string | null {
+  return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
 }
 
 /**
- * fetchBrregWebsite(orgNr) — direct Brreg lookup by org-nr
- * (GET /enheter/{orgNr}), returning the registered website (`hjemmeside`),
- * trimmed, with an empty string treated as null. Never throws: any
- * network/parse error, 404, or missing/blank field resolves to null — same
- * safe-default convention as verifyOrgNumber/fetchBrregActivityDescription/
- * fetchBrregBusinessAddress. Does not do fuzzy name matching; the org-nr is
- * already known.
+ * fetchBrregContact(orgNr) — direct Brreg lookup by org-nr
+ * (GET /enheter/{orgNr}), returning the entity's own registered contact
+ * block: `hjemmeside`, `epostadresse` and `telefon`/`mobil`. All three come
+ * out of the SAME response the other org-nr lookups in this file already
+ * call, so this is one request, not three.
+ *
+ * Never throws: any network/parse error, 404, or missing/blank field
+ * resolves to null (whole-result null on transport failure, per-field null
+ * on an absent field) — same safe-default convention as verifyOrgNumber/
+ * fetchBrregActivityDescription/fetchBrregBusinessAddress/fetchBrregWebsite.
+ * Does not do fuzzy name matching; the org-nr is already known.
+ *
+ * dev-request 2026-07-26-brreg-kontakt-backfill: `epostadresse`/`telefon`/
+ * `mobil` were present in this response all along and read by no code in the
+ * repo — this is the function that reads them.
  */
-export async function fetchBrregWebsite(
+export async function fetchBrregContact(
   orgNr: string,
   fetchImpl: typeof fetch = fetch,
-): Promise<string | null> {
+): Promise<BrregContact | null> {
   const cleanOrgNr = (orgNr || "").trim();
   if (!cleanOrgNr) return null;
 
-  if (websiteCache.has(cleanOrgNr)) return websiteCache.get(cleanOrgNr) ?? null;
+  if (contactCache.has(cleanOrgNr)) return contactCache.get(cleanOrgNr) ?? null;
 
   const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(cleanOrgNr)}`;
   let res: Response;
@@ -572,31 +602,50 @@ export async function fetchBrregWebsite(
     res = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchImpl);
   } catch (err) {
     console.warn(
-      "[brreg-client] fetchBrregWebsite fetch failed:",
+      "[brreg-client] fetchBrregContact fetch failed:",
       err instanceof Error ? err.message : err,
     );
     return null;
   }
 
   if (res.status === 404) {
-    websiteCache.set(cleanOrgNr, null);
+    contactCache.set(cleanOrgNr, null);
     return null;
   }
   if (!res.ok) return null;
 
-  let json: RawEnhetWebsite;
+  let json: RawEnhetContact;
   try {
-    json = (await res.json()) as RawEnhetWebsite;
+    json = (await res.json()) as RawEnhetContact;
   } catch {
     return null;
   }
 
-  const result =
-    typeof json.hjemmeside === "string" && json.hjemmeside.trim() !== ""
-      ? json.hjemmeside.trim()
-      : null;
-  websiteCache.set(cleanOrgNr, result);
+  const result: BrregContact = {
+    hjemmeside: pickBrregContactField(json.hjemmeside),
+    epost: pickBrregContactField(json.epostadresse),
+    telefon: pickBrregContactField(json.telefon) ?? pickBrregContactField(json.mobil),
+  };
+  contactCache.set(cleanOrgNr, result);
   return result;
+}
+
+/**
+ * fetchBrregWebsite(orgNr) — direct Brreg lookup by org-nr
+ * (GET /enheter/{orgNr}), returning the registered website (`hjemmeside`),
+ * trimmed, with an empty string treated as null. Never throws: any
+ * network/parse error, 404, or missing/blank field resolves to null.
+ *
+ * Now a thin projection of fetchBrregContact() (same endpoint, same cache,
+ * same safe defaults) rather than a second request against the same URL —
+ * observable behaviour for existing callers is unchanged.
+ */
+export async function fetchBrregWebsite(
+  orgNr: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  const contact = await fetchBrregContact(orgNr, fetchImpl);
+  return contact?.hjemmeside ?? null;
 }
 
 // ─── Main entry ────────────────────────────────────────────────────────

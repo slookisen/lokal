@@ -79,6 +79,15 @@ import {
   getGardssalgProviderAddressTarget,
   applyGardssalgProviderAddress,
   type GardssalgAddressEnrichmentTarget,
+  // dev-request 2026-07-26-brreg-kontakt-backfill — epost/telefon fill-only
+  // backfill from the same GET /enheter/{orgNr} response, for the 344-row
+  // cohort that has no contact channel at all today.
+  selectGardssalgProvidersForContactBackfill,
+  countGardssalgProvidersForContactBackfill,
+  getGardssalgProviderContactTarget,
+  applyGardssalgProviderContact,
+  GS_CB_HARD_CAP,
+  type GardssalgContactBackfillTarget,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
   // org_nr backfill via Brreg name-search + exact-name/postal corroboration
   // (auto-write only when both agree; otherwise the review queue).
@@ -212,6 +221,20 @@ import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "..
 // by org-nr (same GET /enheter/{orgNr} endpoint the three lookups above already
 // call). See POST /admin/brreg-website-discovery below.
 import { fetchBrregWebsite } from "../services/brreg-client";
+// dev-request 2026-07-26-brreg-kontakt-backfill — epostadresse/telefon/mobil
+// out of that SAME GET /enheter/{orgNr} response (fields no code read until
+// now). See POST /admin/gardssalg-contact-backfill below.
+import { fetchBrregContact } from "../services/brreg-client";
+// dev-request 2026-07-26-booking-test-send-guard — the two admin-gated test
+// drivers below (POST /admin/booking-test-send, POST /admin/claim-test-send)
+// are the ONLY call sites that may set the per-transaction test flag.
+import { testSendRedirectAddress } from "../services/send-guard";
+import { issueClaimMagicLink, getClaimProviderById } from "../services/gardssalg-claim";
+import { emailService } from "../services/email-service";
+
+// Same derivation as gardssalg-claim.ts's own constant — the verify URL must
+// point at the host that serves the claim routes.
+const OPPLEVAGENT_CLAIM_BASE_URL = (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "");
 // dev-request 2026-07-19-agg-website-leak — reuse the curated DMO/aggregator
 // host classifier (same one admin-knowledge.ts's classifyWebsite() uses) so a
 // harvest row's `website` is never blindly trusted as a provider's OWN
@@ -3578,6 +3601,368 @@ router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Req
     scanned,
     agents_enriched: changed.length,
     changed,
+    skipped_locked: skippedLocked,
+    unresolved,
+    errors,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/booking-test-send (admin) ─────────────────
+// ─── POST /api/opplevelser/admin/claim-test-send   (admin) ─────────────────
+//
+// dev-request 2026-07-26-booking-test-send-guard.
+//
+// The ONLY two call sites in the codebase that can set the per-transaction
+// test flag. Both are behind requireAdmin (X-Admin-Key). The public booking
+// entry points — POST /api/opplevelser/book and the book_gardssalg MCP tool —
+// both parse their payload with BookingInputSchema, which has no such field
+// and (being zod) strips unknown keys, so there is no field name a public
+// caller could smuggle to reach `createBooking`'s third argument. Likewise the
+// public claim route calls issueClaimMagicLink() with one argument.
+//
+// Both routes check the redirect address BEFORE creating anything, so an
+// unconfigured TEST_SEND_REDIRECT_EMAIL produces a clear 400 and no DB row at
+// all — rather than a row whose emails then silently fail closed downstream.
+// (The downstream fail-closed in email-service.ts still stands; this is the
+// belt to its braces, and gives the operator an actionable error.)
+//
+// These exist to run acceptance criterion 6 on two OTHER dev-requests:
+// 2026-07-21-opplevagent-mcp-booking-verktoy (MCP booking E2E) and
+// 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter (claim E2E).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: Response) => {
+  const redirect = testSendRedirectAddress();
+  if (!redirect) {
+    return res.status(400).json({
+      success: false,
+      error: "test_send_redirect_not_configured",
+      message:
+        "TEST_SEND_REDIRECT_EMAIL is not configured. Refusing to create a test booking " +
+        "rather than risk a send to a real recipient.",
+    });
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const source = typeof body.source === "string" && body.source.trim() !== "" ? body.source.trim() : "mcp";
+
+  const parsed = BookingInputSchema.safeParse(body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      error: "invalid_input",
+      issues: parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`),
+    });
+  }
+
+  // Same gate as the public path — a test must not bypass booking_live /
+  // BOOKING_DISPATCH_ENABLED, or it would not be testing the real flow.
+  const provider = getProviderById(parsed.data.provider_id) as
+    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
+    | null;
+  if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null)) {
+    return res.status(409).json({ success: false, error: "not_live", provider_id: parsed.data.provider_id });
+  }
+
+  let booking;
+  try {
+    booking = createBooking(parsed.data, source, { isTest: true });
+  } catch (e: any) {
+    return res.status(500).json({ success: false, error: "create_failed", message: e?.message ?? String(e) });
+  }
+
+  // AWAITED here (unlike the fire-and-forget public path) so the operator gets
+  // the actual send outcome back in the response — that IS the test result.
+  const sends: Array<{ kind: string; ok: boolean; error?: string }> = [];
+  try {
+    await sendBookingConfirmation(booking);
+    sends.push({ kind: "guest_confirmation", ok: true });
+  } catch (e: any) {
+    sends.push({ kind: "guest_confirmation", ok: false, error: e?.message ?? String(e) });
+  }
+  try {
+    await sendProducerNotification(booking, provider?.epost ?? null);
+    sends.push({ kind: "producer_notification", ok: true });
+  } catch (e: any) {
+    sends.push({ kind: "producer_notification", ok: false, error: e?.message ?? String(e) });
+  }
+
+  res.json({
+    success: true,
+    test_mode: true,
+    redirected_to: redirect,
+    booking_ref: booking.booking_ref,
+    booking_id: booking.booking_id,
+    source: booking.source,
+    is_test: booking.is_test,
+    intended_recipients: {
+      guest: booking.guest_email,
+      producer: provider?.epost ?? null,
+    },
+    sends,
+  });
+});
+
+router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response) => {
+  const redirect = testSendRedirectAddress();
+  if (!redirect) {
+    return res.status(400).json({
+      success: false,
+      error: "test_send_redirect_not_configured",
+      message:
+        "TEST_SEND_REDIRECT_EMAIL is not configured. Refusing to issue a test claim link " +
+        "rather than risk a send to a real recipient.",
+    });
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    return res.status(400).json({ success: false, error: "provider_id_required" });
+  }
+
+  const result = issueClaimMagicLink(providerId, null, { isTest: true });
+  if (!result.ok) {
+    return res.status(result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : 403).json({
+      success: false,
+      error: result.error,
+    });
+  }
+
+  const verifyUrl = `${OPPLEVAGENT_CLAIM_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${result.claim.token}`;
+  const provider = getClaimProviderById(providerId);
+
+  emailService
+    .sendGardssalgClaimMagicLink({
+      to: result.claim.email,
+      providerName: provider?.navn || "din profil",
+      verifyUrl,
+      isTestSend: result.claim.isTest,
+    })
+    .then((r) => {
+      if (!r.success) console.error(`[claim-test-send] send failed for ${providerId}: ${r.error}`);
+    })
+    .catch((e) => console.error("[claim-test-send] send error:", e));
+
+  res.json({
+    success: true,
+    test_mode: true,
+    redirected_to: redirect,
+    claim_id: result.claim.claimId,
+    is_test: result.claim.isTest,
+    intended_recipient: result.claim.email,
+    intended_recipient_masked: result.claim.maskedEmail,
+    email_source: result.claim.source,
+    expires_at: result.claim.expiresAt,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-contact-backfill (admin) ─────────
+//
+// dev-request 2026-07-26-brreg-kontakt-backfill.
+//
+// The outreach-readiness report found 344 of 389 gårdssalg providers with
+// NEITHER epost NOR telefon on file — un-contactable and un-claimable at the
+// same time, i.e. dead rows. Brreg's GET /enheter/{orgNr} response carries the
+// entity's own registered `epostadresse`/`telefon`/`mobil`, which no code in
+// this repo read until fetchBrregContact() (brreg-client.ts). Measured over
+// the full live cohort 2026-07-27: 101 of 333 (30.3 %) have a contact channel
+// there.
+//
+// Write discipline is deliberately identical to the address-enrichment route
+// above and NOT loosened: dry-run by default, admin-gated, fill-only (an
+// existing value is never replaced), manual/claim-locked rows skipped and
+// reported, one audit row + field_provenance entry per written field, fully
+// reversible through the existing content-rollback lever.
+//
+// `hjemmeside` is reported but NEVER written here. Brreg's hjemmeside is
+// self-reported and therefore strong evidence, but website adoption already
+// has an evidence-checked path (gardssalg_website_review_queue + the approve
+// lever), and this route feeds that queue rather than bypassing it.
+//
+// Body: { providerIds?: string[], limit?: number, offset?: number,
+//         apply?: boolean }. `offset` exists because the cohort (~333) is
+// larger than one call's hard cap — the selector's ORDER BY is a total order
+// so paging is stable. Response carries `cohort_total` so the caller knows
+// how far the walk has left to go.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+const GS_CB_DEFAULT_LIMIT = 48;
+
+router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+    apply?: unknown;
+  };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_CB_DEFAULT_LIMIT,
+    GS_CB_HARD_CAP
+  );
+  const offset =
+    typeof body.offset === "number" && body.offset > 0 ? Math.floor(body.offset) : 0;
+
+  let targets: GardssalgContactBackfillTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+          .map((id) => id.trim())
+      )
+    ).slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderContactTarget(id))
+      .filter((t): t is GardssalgContactBackfillTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForContactBackfill(limit, offset);
+  }
+
+  const batchId = `contact-backfill-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+
+  let scanned = 0;
+  let brregHitEpost = 0;
+  let brregHitTelefon = 0;
+  let brregHitAny = 0;
+  const changed: Array<{
+    provider_id: string;
+    fields: string[];
+    epost: string | null;
+    telefon: string | null;
+    source_url: string;
+  }> = [];
+  const websiteCandidates: Array<{ provider_id: string; candidate_url: string }> = [];
+  const skippedLocked: string[] = [];
+  const unresolved: Array<{ provider_id: string; reason: string }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  for (const t of targets) {
+    const providerId = t.id;
+
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      skippedLocked.push(providerId);
+      continue;
+    }
+
+    const epostBlank = !t.epost || t.epost.trim() === "";
+    const telefonBlank = !t.telefon || t.telefon.trim() === "";
+    const hjemmesideBlank = !t.hjemmeside || t.hjemmeside.trim() === "";
+    if (!epostBlank && !telefonBlank && !hjemmesideBlank) {
+      // Only reachable via the explicit providerIds override — nothing this
+      // route could contribute.
+      unresolved.push({ provider_id: providerId, reason: "already_filled" });
+      continue;
+    }
+
+    let contact: Awaited<ReturnType<typeof fetchBrregContact>>;
+    try {
+      contact = await fetchBrregContact(t.org_nr);
+    } catch (e: any) {
+      // fetchBrregContact is documented never-throws; this catch exists so a
+      // contract violation degrades one row instead of the whole batch.
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      continue;
+    }
+    scanned++;
+
+    if (!contact) {
+      unresolved.push({ provider_id: providerId, reason: "brreg_lookup_failed_or_404" });
+      continue;
+    }
+    if (contact.epost) brregHitEpost++;
+    if (contact.telefon) brregHitTelefon++;
+    if (contact.epost || contact.telefon) brregHitAny++;
+
+    // ── hjemmeside: queued for review, never written from here ──
+    if (hjemmesideBlank && contact.hjemmeside) {
+      websiteCandidates.push({ provider_id: providerId, candidate_url: contact.hjemmeside });
+      if (!dryRun) {
+        try {
+          upsertGardssalgWebsiteReviewQueue({
+            provider_id: providerId,
+            provider_name: t.navn,
+            candidate_url: contact.hjemmeside,
+            evidence: `brreg_hjemmeside:${t.org_nr}`,
+            reason: "brreg_registered_hjemmeside",
+            batch_id: batchId,
+          });
+        } catch (e: any) {
+          errors.push({ provider_id: providerId, error: `queue_failed: ${e?.message ?? String(e)}` });
+        }
+      }
+    }
+
+    // ── epost/telefon: fill-only write ──
+    const wouldWriteEpost = epostBlank && !!contact.epost;
+    const wouldWriteTelefon = telefonBlank && !!contact.telefon;
+    if (!wouldWriteEpost && !wouldWriteTelefon) {
+      if (!(hjemmesideBlank && contact.hjemmeside)) {
+        unresolved.push({ provider_id: providerId, reason: "no_brreg_contact" });
+      }
+      continue;
+    }
+
+    const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+
+    if (dryRun) {
+      changed.push({
+        provider_id: providerId,
+        fields: [...(wouldWriteEpost ? ["epost"] : []), ...(wouldWriteTelefon ? ["telefon"] : [])],
+        epost: wouldWriteEpost ? contact.epost : null,
+        telefon: wouldWriteTelefon ? contact.telefon : null,
+        source_url: evidenceUrl,
+      });
+    } else {
+      try {
+        const written = applyGardssalgProviderContact(
+          providerId,
+          { epost: contact.epost, telefon: contact.telefon },
+          evidenceUrl,
+          batchId
+        );
+        if (written.length > 0) {
+          changed.push({
+            provider_id: providerId,
+            fields: written,
+            epost: written.includes("epost") ? contact.epost : null,
+            telefon: written.includes("telefon") ? contact.telefon : null,
+            source_url: evidenceUrl,
+          });
+        } else {
+          // Fresh-read-at-write-time found the fields already non-blank or the
+          // provider now locked — same race class the sibling routes document.
+          unresolved.push({ provider_id: providerId, reason: "already_filled_or_locked_at_write_time" });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    batch_id: batchId,
+    cohort_total: countGardssalgProvidersForContactBackfill(),
+    offset,
+    limit,
+    scanned,
+    brreg_hits: { epost: brregHitEpost, telefon: brregHitTelefon, any: brregHitAny },
+    providers_enriched: changed.length,
+    changed,
+    website_candidates: websiteCandidates,
     skipped_locked: skippedLocked,
     unresolved,
     errors,

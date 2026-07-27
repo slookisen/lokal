@@ -652,6 +652,15 @@ export function initExperiencesSchema(db: Database.Database): void {
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_gsb_respond_token ON gardssalg_bookings(respond_token)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_gsb_guest_decision_token ON gardssalg_bookings(guest_decision_token)",
     "CREATE INDEX IF NOT EXISTS idx_gsb_pre_status ON gardssalg_bookings(pre_status)",
+    // dev-request 2026-07-26-booking-test-send-guard: marks a booking (and,
+    // below, a claim) as a deliberate end-to-end test, so every outgoing
+    // email in that one transaction is redirected to TEST_SEND_REDIRECT_EMAIL
+    // and the row can be filtered out of stats/reports. Defaults to 0 —
+    // every existing row and every non-admin booking path is unaffected.
+    // (The matching gardssalg_claims column is added next to that table's own
+    // CREATE below — it is created later in this file than this block runs.)
+    "ALTER TABLE gardssalg_bookings ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_gsb_is_test ON gardssalg_bookings(is_test)",
   ];
   for (const stmt of previsitCols) {
     try { db.exec(stmt); } catch { /* already present */ }
@@ -791,9 +800,17 @@ export function initExperiencesSchema(db: Database.Database): void {
         used_at TEXT,
         revoked_at TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        expires_at TEXT NOT NULL
+        expires_at TEXT NOT NULL,
+        -- dev-request 2026-07-26-booking-test-send-guard: marks a claim as a
+        -- deliberate end-to-end test so its magic-link email is redirected to
+        -- TEST_SEND_REDIRECT_EMAIL. Defaults to 0; only an admin-gated call
+        -- can set it.
+        is_test INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // Same column for DBs created before the guard landed (CREATE TABLE IF NOT
+    // EXISTS above is a no-op for them). Idempotent — error means present.
+    try { db.exec(`ALTER TABLE gardssalg_claims ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0`); } catch { /* already present */ }
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_gardssalg_claims_token ON gardssalg_claims(token)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_provider ON gardssalg_claims(provider_id)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_created ON gardssalg_claims(provider_id, created_at)`);
