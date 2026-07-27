@@ -114,6 +114,18 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
         "https://trollaktiv.no",
         `alias-5b/${dmo.slice(8, 30)}: an UNLISTED regional tourism listing in \`website\` never beats a real \`hjemmeside\``,
       );
+      // The twin. These six hosts are deliberately NOT on any screen list —
+      // that is the point of this block: precedence, not a list, is what
+      // protects the mixed row, because no list can be complete. So alone they
+      // ARE stored, exactly as origin/main stored them. Asserting that keeps the
+      // block honest about what it is claiming, and would fail if someone
+      // "fixed" it by quietly adding these to a screen.
+      const dmoAlias = BulkRowSchema.parse({ ...base, hjemmeside: dmo });
+      assertEq(
+        firstNonAggregatorWebsite([dmoAlias as BulkRow]),
+        dmo,
+        `alias-5c/${dmo.slice(8, 30)}: …while ALONE it is still stored — precedence, not an ever-incomplete list, is what carries the mixed case`,
+      );
     }
   }
 
@@ -249,6 +261,12 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
         "https://trollaktiv.no",
         `alias-17/${v}: placeholder domain \`${v}\` never shadows a real homepage`,
       );
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: v });
+      assertEq(
+        firstNonAggregatorWebsite([solo as BulkRow]),
+        null,
+        `alias-17b/${v}: …and is rejected on its own merits, not merely out-ranked`,
+      );
     }
   }
 
@@ -294,6 +312,12 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
         firstNonAggregatorWebsite([row as BulkRow]),
         "https://trollaktiv.no",
         `alias-19/${v.slice(0, 12)}: an RFC-invalid label does not shadow a real homepage`,
+      );
+      const solo19 = BulkRowSchema.parse({ ...base, hjemmeside: v });
+      assertEq(
+        firstNonAggregatorWebsite([solo19 as BulkRow]),
+        null,
+        `alias-19b/${v.slice(0, 12)}: …and is rejected on its own merits — this is what pins the per-label DNS shape check`,
       );
     }
   }
@@ -373,6 +397,58 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
         "https://trollaktiv.no",
         `alias-25/${src.slice(8, 30)}: a harvest SOURCE listing never becomes the provider's homepage`,
       );
+      // The twin that actually pins isHarvestSourceHost — without it the whole
+      // round-5 blocking fix could be deleted with the full suite green.
+      const soloSrc = BulkRowSchema.parse({ ...base, hjemmeside: src });
+      assertEq(
+        firstNonAggregatorWebsite([soloSrc as BulkRow]),
+        null,
+        `alias-25b/${src.slice(8, 30)}: …and is rejected alone, which is what pins the harvest-source screen at all`,
+      );
+    }
+  }
+
+  // ── Harvest-source SUBDOMAINS — round-7 review, M1 ──────────────────────
+  // isHarvestSourceHost compares the REGISTRABLE domain, but every fixture used
+  // apex or `www.` hosts, which reduce identically — so the reduction itself was
+  // unfalsifiable.
+  {
+    for (const sub of [
+      "https://booking.fjordtours.com/tour/1",
+      "https://en.visitbergen.com/x",
+      "https://www2.visittromso.no/x",
+    ]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: sub });
+      assertEq(
+        firstNonAggregatorWebsite([solo as BulkRow]),
+        null,
+        `alias-27/${sub.slice(8, 34)}: a SUBDOMAIN of a harvest source is screened too — this is what pins the registrable-domain reduction`,
+      );
+    }
+  }
+
+  // ── Hyphenated placeholder compounds — round-7 review, BLOCKING ─────────
+  // The separator collapse only caught `ikke-oppgitt` because "ikkeoppgitt" was
+  // hard-coded, and that is the one compound with a test. The other two named
+  // in the source comment sailed through and, after the precedence flip, beat a
+  // real `website` — a regression vs origin/main in this PR's own defect class.
+  {
+    for (const junk of [
+      "ingen-hjemmeside.no", "kommer-snart.no", "under-arbeid.no",
+      "ikke-oppgitt.no", "ikke_oppgitt.no", "ingen_nettside.no",
+    ]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: junk });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), null,
+        `alias-28/${junk}: a hyphenated placeholder compound is rejected however it is spelled`);
+      const mixed = BulkRowSchema.parse({ ...base, hjemmeside: junk, website: "https://trollaktiv.no" });
+      assertEq(firstNonAggregatorWebsite([mixed as BulkRow]), "https://trollaktiv.no",
+        `alias-28b/${junk}: …and never beats a real \`website\``);
+    }
+    // The other half: hyphenated REAL domains must survive the word split.
+    for (const good of ["lia-gard.no", "mat-og-drikke.no", "snartemo.no", "arbeidsgarden.no"]) {
+      const solo = BulkRowSchema.parse({ ...base, hjemmeside: good });
+      assertEq(firstNonAggregatorWebsite([solo as BulkRow]), good,
+        `alias-29/${good}: a hyphenated REAL domain is untouched — the word rule must not become a new false rejection`);
     }
   }
 
@@ -396,6 +472,12 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
         firstNonAggregatorWebsite([row as BulkRow]),
         "https://trollaktiv.no",
         `alias-26/${v}: neither parser may be talked into calling an aggregator a homepage`,
+      );
+      const solo26 = BulkRowSchema.parse({ ...base, hjemmeside: v });
+      assertEq(
+        firstNonAggregatorWebsite([solo26 as BulkRow]),
+        null,
+        `alias-26b/${v}: …and alone, so the assertion measures the screen and not field precedence`,
       );
     }
   }

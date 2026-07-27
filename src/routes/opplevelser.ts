@@ -674,6 +674,8 @@ const PLACEHOLDER_DOMAIN_LABELS: ReadonlySet<string> = new Set([
 ]);
 
 function isPlaceholderHomepageHost(host: string): boolean {
+  // hostFromUrlLike already strips `www.`; kept only because this function is
+  // also reachable with a hand-built host in tests.
   const bare = host.replace(/^www\./, "");
   // registrableDomain() from cross-source-validator handles MULTI_LABEL_SUFFIXES
   // (co.uk et al.); the local last-two-labels version this replaces returned
@@ -685,20 +687,31 @@ function isPlaceholderHomepageHost(host: string): boolean {
   // PLACEHOLDER_EMAIL_DOMAINS contains no multi-label-suffix entry, so no input
   // could distinguish them. A guard no test can kill is not a guard.
   if (PLACEHOLDER_EMAIL_DOMAINS.includes(registrableDomain(bare))) return true;
-  // Separator-insensitive, the same way PR-126's registrable-domain equality
-  // treats `liagard.no` and `lia-gard.no` as one domain: "ikke-oppgitt" and
-  // "ikkeoppgitt" are the same placeholder, and pinning only one spelling is
-  // the fixture-calibration this screen has now been rewritten twice to escape.
-  // Only the REGISTRABLE domain's labels, not every label of the host
-  // (round-6 review). Screening every label rejected ordinary Norwegian hosting
-  // subdomains — `hjemmeside.storgarden.no`, `nettside.storgarden.no`,
-  // `kommer.storgarden.no` — which origin/main stored. The junk this list
-  // targets always sits at the registrable-domain level (`ikke-oppgitt.no`,
-  // `hjemmeside.com`, `null.null`), so narrowing it loses nothing and stops a
-  // false rejection, which here is the very loss this PR exists to prevent.
-  return registrableDomain(bare)
-    .split(".")
-    .some((label) => PLACEHOLDER_DOMAIN_LABELS.has(label.replace(/[-_]/g, "")));
+  // Only the REGISTRABLE domain's labels, not every label of the host (round-6
+  // review): screening every label rejected ordinary Norwegian hosting
+  // subdomains — `hjemmeside.storgarden.no`, `nettside.storgarden.no` — which
+  // origin/main stored. The junk this list targets sits at the registrable
+  // level.
+  //
+  // A label counts as a placeholder if it COLLAPSES to one of the words, or if
+  // any of its separator-split WORDS is one (round-7 review, BLOCKING). The
+  // previous version only collapsed separators, so it caught `ikke-oppgitt`
+  // solely because "ikkeoppgitt" happened to be hard-coded — and that is the
+  // one hyphenated compound with a test. The other two named in this very
+  // comment block, `ingen-hjemmeside` and `kommer-snart`, sailed through, as
+  // did `under-arbeid`; measured against origin/main all three are stored and,
+  // in `hjemmeside`, now beat a real `website`. Fixture-calibration once more,
+  // inside the screen written to escape fixture-calibration.
+  //
+  // Splitting into words makes the rule general instead of enumerated: a label
+  // built out of status words is a placeholder however it is spelled. It also
+  // means "under" need not be listed — `under-arbeid` is caught by "arbeid" —
+  // so round 5's conservative omissions still stand.
+  const isPlaceholderLabel = (label: string): boolean => {
+    if (PLACEHOLDER_DOMAIN_LABELS.has(label.replace(/[-_]/g, ""))) return true;
+    return label.split(/[-_]+/).filter(Boolean).some((w) => PLACEHOLDER_DOMAIN_LABELS.has(w));
+  };
+  return registrableDomain(bare).split(".").some(isPlaceholderLabel);
 }
 
 // Aggregator/DMO hosts that are harvest SOURCES for this endpoint specifically.
