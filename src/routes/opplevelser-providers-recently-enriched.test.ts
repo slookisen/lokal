@@ -238,6 +238,70 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         updated_at: daysAgoIso(1),
       });
 
+      // Rows needing the two columns the statement above leaves at their
+      // schema defaults (canonical_id NULL, verification_status
+      // 'pending_verify') — round-3 review, findings 1 and 3.
+      const insertExperienceFull = expDb.prepare(
+        `INSERT INTO experiences
+           (id, provider_id, title, description, category, subcategory, booking_url,
+            content_source, enrichment_state, canonical_id, verification_status, updated_at)
+         VALUES
+           (@id, @provider_id, @title, @description, @category, @subcategory, @booking_url,
+            @content_source, @enrichment_state, @canonical_id, @verification_status, @updated_at)`,
+      );
+      // A row the dedup pass merged away must NEVER be served (round-3 review,
+      // BLOCKING). Its updated_at is deliberately the NEWEST of any row on this
+      // provider, because that is exactly what runDedupPass() produces: it
+      // stamps canonical_id and bumps `updated_at = datetime('now')` in the
+      // same UPDATE (experience-dedup.ts:562-563). Under the endpoint's
+      // `ORDER BY updated_at DESC LIMIT 10` a merged-away row therefore sorts
+      // ABOVE the live ones — so dropping `AND canonical_id IS NULL` does not
+      // merely leak this row, it puts it FIRST. h11/h12 below fail on a revert.
+      insertExperienceFull.run({
+        id: "exp-merged-away-1", provider_id: "prov-generic-enriched",
+        title: "Duplikat, foldet inn i exp-enriched-1",
+        description: "Tekst fra en rad som ikke finnes på noen brukerflate lenger.",
+        category: "natur_friluft", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: "exp-enriched-1", verification_status: "pending_verify",
+        updated_at: daysAgoIso(0),
+      });
+      // verification_status NULL: isExperienceContentLocked treats NULL as
+      // UNLOCKED, so applyExperienceContent would enrich this row — but SQL
+      // three-valued logic makes a bare `verification_status != 'verified'`
+      // evaluate to NULL and drop it, i.e. hide precisely the rows that ARE
+      // checkable. Latent today (createExperience coalesces to
+      // 'pending_verify'), pinned so the NULL guard cannot be simplified away.
+      insertExperienceFull.run({
+        id: "exp-nullverif-1", provider_id: "prov-generic-enriched",
+        title: "Opplevelse uten verification_status",
+        description: "Beskrivelse skrevet av generisk content-refresh.",
+        category: "mat_drikke", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: null,
+        updated_at: daysAgoIso(3),
+      });
+      // 11 enriched rows on their own provider, so `LIMIT 10` truncates by
+      // exactly one. The doc-comment calls the truncation out as something
+      // "which matters to a consumer computing `checked`"; nothing pinned it
+      // (round-3 review, finding 4).
+      insertProvider.run({
+        id: "prov-many-experiences", navn: "Mange Opplevelser AS",
+        hjemmeside: "https://mange.example.no",
+        last_enriched_at: daysAgoIso(1),
+        about_text: null, visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, content_evidence_url: null,
+      });
+      for (let i = 0; i < 11; i++) {
+        insertExperience.run({
+          id: `exp-many-${i}`, provider_id: "prov-many-experiences",
+          title: `Opplevelse ${i}`, description: `Beskrivelse ${i}.`,
+          category: "natur_friluft", subcategory: null, booking_url: null,
+          content_source: "provider_site", enrichment_state: "enriched",
+          updated_at: daysAgoIso(i + 1),
+        });
+      }
+
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // ── (a) 403 without X-Admin-Key ─────────────────────────────────────
@@ -336,7 +400,11 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       assertEq(genericRow.about_text, null, "h2: its provider-level (gårdssalg) content is legitimately null");
       assertTrue(Array.isArray(genericRow.enriched_experiences), "h3: enriched_experiences is an array");
       const servedIds = (genericRow.enriched_experiences as any[]).map((e) => e.id).sort();
-      assertEq(servedIds, ["exp-enriched-1", "exp-verified-1"], "h4: exactly the enriched AND verified rows are served — raw, manual and claim are all excluded");
+      assertEq(
+        servedIds,
+        ["exp-enriched-1", "exp-nullverif-1", "exp-verified-1"],
+        "h4: exactly the enriched AND verified rows are served — raw, manual, claim and merged-away are all excluded",
+      );
       assertEq(genericRow.enriched_experiences[0].id, "exp-enriched-1", "h5: ordered updated_at DESC, so the freshest enriched row comes first");
       assertTrue(
         (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-verified-1"),
@@ -363,6 +431,66 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       );
       // The pre-existing gårdssalg-enriched provider keeps working unchanged.
       assertTrue(Array.isArray(row.enriched_experiences), "h10: gårdssalg-enriched provider also carries the field (empty, no regression)");
+
+      // ── (h11-h12) merged-away rows — round-3 review, BLOCKING ────────────
+      assertTrue(
+        !(genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-merged-away-1"),
+        "h11: a row the dedup pass folded into another is NEVER served — it exists on no user-visible surface, so judging it against the homepage is judging a ghost",
+      );
+      assertEq(
+        genericRow.enriched_experiences[0].id,
+        "exp-enriched-1",
+        "h12: …and it does not merely leak, it would sort FIRST — runDedupPass bumps updated_at when it stamps canonical_id, so ORDER BY updated_at DESC puts merged-away rows at the top of the window",
+      );
+
+      // ── (h13) NULL verification_status — round-3 review, finding 3 ───────
+      assertTrue(
+        (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-nullverif-1"),
+        "h13: a row with verification_status NULL IS served — isExperienceContentLocked calls NULL unlocked, so a bare `!= 'verified'` would hide exactly the rows that are checkable",
+      );
+
+      // ── (h14) LIMIT 10 truncation ───────────────────────────────────────
+      const manyRow = (shapeResp.body.providers as any[]).find((p) => p.id === "prov-many-experiences");
+      assertTrue(!!manyRow, "h14a: prov-many-experiences row present");
+      assertEq(
+        manyRow.enriched_experiences.length,
+        10,
+        "h14b: 11 enriched rows truncate to 10 — the cap the doc-comment warns a `checked`-computing consumer about",
+      );
+
+      // ── (i) enriched_experiences_error actually fires ────────────────────
+      // Round-3 review, finding 4: round 2's own blocking fix had only a
+      // negative test (h4d, absent on the happy path), so deleting the flag or
+      // reverting to the bare console.error it replaced passed green. The
+      // consumer here is a `curl -fsS` cron with no stderr to read, which is
+      // the whole reason the flag exists rather than a log line.
+      //
+      // Renaming the table away makes the real `expDb.prepare(...)` inside the
+      // handler throw, which is the exact fault the guard was written for.
+      // There are no views or triggers over this schema, so the rename is a
+      // clean no-op to undo. `experience_providers` is untouched, so the
+      // provider-level half of the response must still be served in full —
+      // that degradation, not a 500, is the contract.
+      expDb.exec("ALTER TABLE experiences RENAME TO experiences_hidden_for_test");
+      let faultResp: RouteResult;
+      try {
+        faultResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+      } finally {
+        expDb.exec("ALTER TABLE experiences_hidden_for_test RENAME TO experiences");
+      }
+      assertEq(faultResp.status, 200, "i1: a broken enriched_experiences query degrades, it does not 500 the whole sample");
+      const faultRow = (faultResp.body.providers as any[]).find((p) => p.id === "prov-generic-enriched");
+      assertTrue(!!faultRow, "i2: the provider is still sampled when the experiences query cannot be prepared");
+      assertEq(faultRow.enriched_experiences_error, true, "i3: enriched_experiences_error:true reaches the consumer — score it as `skipped`, never as 'nothing was written'");
+      assertEq(faultRow.enriched_experiences, [], "i4: …alongside an empty list, so a naive consumer cannot read it as 'zero enriched rows'");
+      assertEq(faultRow.about_text, null, "i5: the provider-level content is still served unchanged (degrade, don't drop)");
+      assertTrue(
+        (faultResp.body.providers as any[]).every((p) => p.enriched_experiences_error === true),
+        "i6: a prepare() fault flags EVERY provider in the sample, not just the first",
+      );
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-providers-recently-enriched: unexpected error: " + String(err?.stack || err?.message || err));

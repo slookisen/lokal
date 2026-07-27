@@ -4968,12 +4968,20 @@ router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res:
 // `{ id, title, description, category, subcategory, booking_url,
 // content_source, updated_at }`, at most 10 per provider, ordered
 // `updated_at DESC` — a provider with more enriched rows than that IS
-// truncated, which matters to a consumer computing `checked`. Owner/curator/
-// claim-authored and already-verified rows are excluded (same lock guard
-// applyExperienceContent uses), so every row served is genuinely
-// homepage-sourced content. On a query fault the provider carries
-// `enriched_experiences_error: true` alongside an empty list — score that as
-// `skipped`, never as "nothing was written".
+// truncated, which matters to a consumer computing `checked`.
+//
+// Excluded, so that every row served is genuinely homepage-sourced content the
+// enrichment pass actually wrote (same lock guard applyExperienceContent uses,
+// see the query): rows with `content_source` 'manual' or 'claim' (the two
+// owner/claim-authored values the schema defines — `curator` is not one of
+// them), rows with `verification_status = 'verified'`, and rows the dedup pass
+// merged away (`canonical_id IS NOT NULL`), which exist on no user-visible
+// surface. Note this is the EXPERIENCE-level `verification_status`, not
+// `enrichment_state` — the latter's 'verified' rung IS served, see below.
+//
+// On a query fault the provider carries `enriched_experiences_error: true`
+// alongside an empty list — score that as `skipped`, never as "nothing was
+// written". The key is ABSENT (not `false`) on success.
 // The provider-level content columns above are the gårdssalg writer's fields;
 // a provider enriched only by the generic content-refresh has all of those
 // null, which is why the spot-check needs both. See the inline comment at the
@@ -5054,10 +5062,34 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
          FROM experiences
         WHERE provider_id = ?
           AND enrichment_state IN ('enriched', 'verified')
-          -- Lock guard, the same clause used at experience-store.ts:1709/2222/
-          -- 2360/2859 (round-2 review, blocking). applyExperienceContent()
-          -- provably REFUSES to write owner/curator/claim-authored or already-
-          -- verified rows (isExperienceContentLocked), so serving them here
+          -- Merged-away rows must never surface (round-3 review, BLOCKING).
+          -- canonical_id IS NOT NULL means the dedup pass folded this row
+          -- into another one, and the convention — stated at
+          -- experience-store.ts:461-464 and enforced by PUBLISH_GATE_SQL
+          -- (:474), listCategories (:1392), the corridor pages
+          -- (route-corridor-service.ts:621) and the dedup candidate loader
+          -- (experience-dedup.ts:499) — is that such a row appears on NO
+          -- user-visible surface again. This projection was the only read of
+          -- experiences that omitted it.
+          --
+          -- Not cosmetic, and worse than a plain leak: runDedupPass() stamps
+          -- the loser rows with canonical_id AND bumps
+          -- updated_at = datetime('now') (experience-dedup.ts:562-563), so
+          -- under the ORDER BY updated_at DESC LIMIT 10 below the
+          -- freshly-merged-away duplicates sort ABOVE the live rows and can
+          -- fill the whole window. The spot-check would then judge rows that
+          -- no longer exist anywhere, against the provider's homepage.
+          AND canonical_id IS NULL
+          -- Lock guard: the same two-part clause as
+          -- experience-store.ts:1708-1709, which is the one genuine precedent
+          -- for it (round-3 review — round 2's comment also cited :2222/:2360/
+          -- :2859, but those are the content_source half ALONE and they
+          -- query experience_providers, guarding applyProviderContent, whose
+          -- lock model deliberately has no verification_status). The canonical
+          -- definition is isExperienceContentLocked (:1775-1782).
+          --
+          -- applyExperienceContent() provably REFUSES to write owner- or
+          -- claim-authored or already-verified rows, so serving them here
           -- would hand the weekly spot-check content that never came from the
           -- homepage it is about to judge against. That matters concretely:
           -- §8.4 of the platform-verifier SKILL sets
@@ -5065,7 +5097,15 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           -- error_rate > 0.10, so a couple of owner-written rows in a
           -- 10-provider sample could pause enrichment writes for the whole
           -- vertical over mismatches that are not errors at all.
-          AND verification_status != 'verified'
+          --
+          -- NULL-guarded, unlike :1708 (round-3 review): SQL three-valued
+          -- logic makes NULL != 'verified' evaluate to NULL, which excludes
+          -- the row — while isExperienceContentLocked treats a NULL
+          -- verification_status as UNLOCKED, i.e. a row applyExperienceContent
+          -- would happily enrich. Hiding exactly those rows is the false
+          -- checked=0 this endpoint exists to remove. Latent today
+          -- (createExperience coalesces to 'pending_verify'), cheap forever.
+          AND (verification_status IS NULL OR verification_status != 'verified')
           AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
         ORDER BY updated_at DESC
         LIMIT 10`
