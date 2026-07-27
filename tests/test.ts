@@ -24,6 +24,54 @@ import conversationUiRouter, {
   renderTranscriptBody,
 } from "../src/routes/conversation-ui";
 
+// ─────────────────────────────────────────────────────────────────────────
+// SHARED GLOBAL STATE — read this before adding a new test block.
+// (dev-request 2026-07-25-testsuite-ikke-deterministisk-delte-globaler,
+// kriterium 5: document which resources are shared and the isolation
+// contract a new block must follow.)
+//
+// All test blocks in this file run in ONE process, and three resources are
+// global to that process rather than scoped to whichever block touches
+// them:
+//   1. globalThis.fetch — some blocks overwrite it to stub network calls.
+//      Because it's process-wide, an `await` inside one block can hand
+//      control to a concurrently-running block that observes or clobbers
+//      the stub (see the pr106 comment near line ~19676 for a real bug this
+//      caused).
+//   2. process.env.ADMIN_KEY / process.env.ANALYTICS_ADMIN_KEY — many
+//      blocks set these to exercise admin-gated routes; same hazard.
+//   3. The DB singleton returned by getDb() (src/database/init.ts),
+//      overridable per-test via __setDbForTesting(). A block that leaves
+//      its DB pinned (or closes it) poisons every later block that calls
+//      getDb().
+//
+// Isolation contract for any new block:
+//   - Restore-in-finally, always: save the previous value before mutating
+//     fetch, ADMIN_KEY/ANALYTICS_ADMIN_KEY, or the DB singleton, and restore
+//     it in a `finally` so it happens even if an assertion throws. Grep this
+//     file for `prevAdminKey` for the established shape.
+//   - Prefer per-call/per-module injection over global mutation where the
+//     code under test already supports it — the fix already shipped for
+//     globalThis.fetch (kriterium 1, PR #371/#385/#388): the title-no-
+//     backfill block ("tnb-*", ~line 16893) installs its stub via
+//     `app.set("titleNoBackfillFetchImpl", stub)` on its own Express app
+//     instance instead of touching globalThis.fetch. Reach for an
+//     equivalent seam before reaching for a global.
+//   - DB: call __setDbForTesting() with your own fresh in-memory DB, per
+//     the pattern used throughout this file (e.g. ~line 1013, ~line 4556),
+//     rather than sharing or closing the ambient singleton — save the prior
+//     handle and restore it (or null) in `finally`.
+//
+// NOT yet fixed — don't assume these are solved:
+//   - ADMIN_KEY still has ~62 direct mutation sites not yet consolidated
+//     onto one seam (kriterium 2, a separate future slice).
+//   - DB-singleton isolation via __setDbForTesting() isn't applied
+//     consistently by every block yet (kriterium 3, a separate future
+//     slice).
+//   A block touching either resource must still follow the restore-in-
+//   finally discipline above by hand until those slices land.
+// ─────────────────────────────────────────────────────────────────────────
+
 let passed = 0;
 let failed = 0;
 const failures: string[] = [];
