@@ -18,6 +18,13 @@ import { getDb } from "../database/init";
 import { dedupeByEmail, DedupeCandidate } from "../services/marketing-dedupe";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
+import {
+  crossSourceAgreement,
+  tierForSource,
+  isInferenceSource,
+  type ProvenanceRecord,
+  type SourceTier,
+} from "../services/cross-source-validator";
 
 const router = Router();
 
@@ -45,6 +52,49 @@ function parseBool(v: unknown, dflt: boolean): boolean {
   if (s === "true" || s === "1" || s === "yes") return true;
   if (s === "false" || s === "0" || s === "no") return false;
   return dflt;
+}
+
+// ─── blocker_breakdown helpers (dev-request 2026-07-27-outreach-blocker-diag,
+// Steg 1) ─────────────────────────────────────────────────────────────────
+//
+// Parse the field_provenance JSON column the SAME defensive way every other
+// call site in this codebase does (admin-domain-coherence.ts,
+// lokal-agent-verifier.ts): string | already-parsed-object | null/missing,
+// all normalized to a plain object.
+function parseFieldProvenance(
+  raw: string | null | undefined
+): Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown> {
+  if (!raw) return {};
+  try {
+    const v = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+// Mirrors the exact "valid" (evidence, non-inference) record extraction that
+// crossSourceAgreement() does internally (cross-source-validator.ts) — same
+// value-presence filter, same isInferenceSource() deny-list — so
+// blocker_breakdown's source_count distribution can never disagree with the
+// verdict the verifier itself computed for the same field.
+function getValidFieldRecords(
+  fieldProvenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>,
+  fieldName: string
+): ProvenanceRecord[] {
+  const raw = fieldProvenance[fieldName];
+  let records: ProvenanceRecord[];
+  if (!raw) {
+    records = [];
+  } else if (Array.isArray(raw)) {
+    records = raw as ProvenanceRecord[];
+  } else if (typeof raw === "object" && raw !== null) {
+    records = [raw as ProvenanceRecord];
+  } else {
+    records = [];
+  }
+  const allValid = records.filter((r) => r && typeof r.value === "string" && r.value.trim() !== "");
+  return allValid.filter((r) => !isInferenceSource(r.source_type));
 }
 
 // GET /admin/outreach-ready-pool/stats — pool size + breakdowns
@@ -172,6 +222,170 @@ router.get("/stats", (req: Request, res: Response) => {
       if (aboutEmpty || productsEmpty) lqThin++;
     }
 
+    // dev-request 2026-07-27-outreach-blocker-diag (Steg 1): blocker_breakdown.
+    // Read-only diagnostic explaining why the pending_verify/review_required
+    // cohort (~930 agents) never reaches verified/pool. Cohort = same
+    // convention as the rest of this file: non-umbrella (a.umbrella_type IS
+    // NULL). Every per-field verdict below is computed with the SAME
+    // crossSourceAgreement() the verifier itself calls (GATING_FIELDS =
+    // address+phone in cross-source-validator.ts) — never re-implemented or
+    // guessed — so these counts cannot drift from the real gate.
+    const blockerCohortRows = db
+      .prepare(
+        `SELECT a.id AS agent_id, k.verification_status, k.verification_review_reason,
+                k.field_provenance, k.email, k.enrichment_status, k.about, k.products,
+                k.address, k.website, a.url AS agent_url
+           FROM agents a
+           INNER JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.umbrella_type IS NULL
+            AND k.verification_status IN ('pending_verify', 'review_required')`
+      )
+      .all() as Array<{
+        agent_id: string;
+        verification_status: string;
+        verification_review_reason: string | null;
+        field_provenance: string | null;
+        email: string | null;
+        enrichment_status: string | null;
+        about: string | null;
+        products: string | null;
+        address: string | null;
+        website: string | null;
+        agent_url: string | null;
+      }>;
+
+    const cohortTotal = blockerCohortRows.length;
+    let cohortPending = 0;
+    let cohortReview = 0;
+
+    type SourceCountDist = {
+      zero: number;
+      one: number;
+      two_plus: number;
+      one_source_tier: Record<SourceTier, number>;
+    };
+    const makeDist = (): SourceCountDist => ({
+      zero: 0,
+      one: 0,
+      two_plus: 0,
+      one_source_tier: { S: 0, A: 0, B: 0, C: 0 },
+    });
+    const gatingFieldSourceCounts: Record<"address" | "phone", SourceCountDist> = {
+      address: makeDist(),
+      phone: makeDist(),
+    };
+
+    let blockedAddressOnly = 0;
+    let blockedPhoneOnly = 0;
+    let blockedBoth = 0;
+    let blockedNeither = 0;
+
+    let bbThinTotal = 0;
+    let bbThinShortAbout = 0;
+    let bbThinNoProducts = 0;
+    let bbThinNoAddress = 0;
+
+    let noWebsiteAtAllCohort = 0;
+    let missingEmailCohort = 0;
+    let reviewRequiredEmailOwnershipUnproven = 0;
+
+    for (const row of blockerCohortRows) {
+      if (row.verification_status === "pending_verify") cohortPending++;
+      else if (row.verification_status === "review_required") cohortReview++;
+
+      const fieldProv = parseFieldProvenance(row.field_provenance);
+
+      let addressBlocked = false;
+      let phoneBlocked = false;
+      for (const field of ["address", "phone"] as const) {
+        const validRecords = getValidFieldRecords(fieldProv, field);
+        const dist = gatingFieldSourceCounts[field];
+        if (validRecords.length === 0) {
+          dist.zero++;
+        } else if (validRecords.length === 1) {
+          dist.one++;
+          dist.one_source_tier[tierForSource(validRecords[0]!.source_type)]++;
+        } else {
+          dist.two_plus++;
+        }
+        const blocked = crossSourceAgreement(fieldProv, field).verdict !== "pool_eligible";
+        if (field === "address") addressBlocked = blocked;
+        else phoneBlocked = blocked;
+      }
+      if (addressBlocked && phoneBlocked) blockedBoth++;
+      else if (addressBlocked) blockedAddressOnly++;
+      else if (phoneBlocked) blockedPhoneOnly++;
+      else blockedNeither++;
+
+      // enrichment_status='thin' breakdown — mirrors computeEnrichmentStatus's
+      // OWN "partial" escape hatch (aboutLen>=80 OR products>=1 OR address) in
+      // lokal-agent-verifier.ts: 'thin' means ALL THREE of these fail
+      // simultaneously, so every sub-count below is expected to equal the
+      // thin total for currently-consistent rows — reported independently
+      // (rather than assumed) so any future drift between this route and
+      // computeEnrichmentStatus is visible rather than silently masked.
+      if (row.enrichment_status === "thin") {
+        bbThinTotal++;
+        const aboutLen = (row.about || "").length;
+        if (aboutLen < 80) bbThinShortAbout++;
+        let productsCount = 0;
+        try {
+          const arr = JSON.parse(row.products || "[]");
+          productsCount = Array.isArray(arr) ? arr.length : 0;
+        } catch {
+          productsCount = 0;
+        }
+        if (productsCount === 0) bbThinNoProducts++;
+        if (!row.address || !row.address.trim()) bbThinNoAddress++;
+      }
+
+      const hasWebsite = !!((row.website && row.website.trim()) || (row.agent_url && row.agent_url.trim()));
+      if (!hasWebsite) noWebsiteAtAllCohort++;
+
+      if (!row.email || !row.email.trim()) missingEmailCohort++;
+
+      if (row.verification_status === "review_required") {
+        let reason: Record<string, unknown> = {};
+        try {
+          reason = JSON.parse(row.verification_review_reason || "{}");
+        } catch {
+          reason = {};
+        }
+        if (reason.email_ownership_unproven === true) reviewRequiredEmailOwnershipUnproven++;
+      }
+    }
+
+    // Item 3: split the EXISTING pool_funnel.url_fresh_and_ok gate's failure
+    // count into 3 causes. Deliberately computed over the SAME cohort that
+    // gate already applies to (verified + rich/partial + email present —
+    // `withEmail` above), NOT the pending_verify/review_required cohort above
+    // — this splits an existing number, it does not introduce a new one, and
+    // the 3-way split's sum must equal (withEmail - urlFreshAndOk) unchanged.
+    // Conditions mirror the funnelBase/withEmail/urlFreshAndOk SQL verbatim.
+    const urlSplitBase = `${funnelBase} AND k.email IS NOT NULL AND k.email != ''`;
+    const urlSplitNoWebsite = db
+      .prepare(
+        `SELECT COUNT(*) AS c ${urlSplitBase}
+           AND (k.website IS NULL OR k.website = '')
+           AND (a.url IS NULL OR a.url = '')`
+      )
+      .get() as { c: number };
+    const urlSplitStale = db
+      .prepare(
+        `SELECT COUNT(*) AS c ${urlSplitBase}
+           AND NOT ((k.website IS NULL OR k.website = '') AND (a.url IS NULL OR a.url = ''))
+           AND (k.url_last_probed IS NULL OR k.url_last_probed <= datetime('now', '-30 days'))`
+      )
+      .get() as { c: number };
+    const urlSplitBadStatus = db
+      .prepare(
+        `SELECT COUNT(*) AS c ${urlSplitBase}
+           AND NOT ((k.website IS NULL OR k.website = '') AND (a.url IS NULL OR a.url = ''))
+           AND k.url_last_probed IS NOT NULL AND k.url_last_probed > datetime('now', '-30 days')
+           AND NOT (k.url_last_status IS NOT NULL AND k.url_last_status >= 200 AND k.url_last_status < 400)`
+      )
+      .get() as { c: number };
+
     res.json({
       success: true,
       pool_size: total?.c ?? 0,
@@ -196,6 +410,91 @@ router.get("/stats", (req: Request, res: Response) => {
         junk_email: lqJunkEmail,
         junk_description: lqJunkDescription,
         thin: lqThin,
+      },
+      // dev-request 2026-07-27-outreach-blocker-diag (Steg 1): diagnostic-only,
+      // additive. Explains WHY the pending_verify/review_required cohort
+      // never reaches verified/pool. Every field/verdict count derives from
+      // the SAME crossSourceAgreement() gate the verifier itself calls —
+      // never guessed, never a separate re-implementation.
+      blocker_breakdown: {
+        cohort_total: cohortTotal,
+        cohort_by_status: {
+          pending_verify: cohortPending,
+          review_required: cohortReview,
+        },
+        // Item 1: per-gating-field (address, phone) source_count distribution.
+        // "one_source_tier" is the Tier (S/A/B/C — see tierForSource in
+        // cross-source-validator.ts) of the single source, for the
+        // source_count===1 bucket only.
+        gating_field_source_counts: gatingFieldSourceCounts,
+        // Item 2: address/phone cross-tab. Sums to cohort_total exactly (every
+        // agent falls into exactly one bucket). "blocked_neither" = blocked by
+        // something other than address/phone cross-source agreement (e.g.
+        // domain-coherence, email_ownership_unproven, website_ownership:
+        // unverified, or thin content) — those reasons are counted in this
+        // same object below, not sub-split further here.
+        address_phone_cross_tab: {
+          blocked_address_only: blockedAddressOnly,
+          blocked_phone_only: blockedPhoneOnly,
+          blocked_both: blockedBoth,
+          blocked_neither: blockedNeither,
+          total: blockedAddressOnly + blockedPhoneOnly + blockedBoth + blockedNeither,
+        },
+        // Item 3: splits the EXISTING pool_funnel.url_fresh_and_ok gate's
+        // failure count into 3 causes. NB: computed over the pool_funnel
+        // `with_email` cohort (verified + rich/partial + email present) —
+        // the SAME cohort that gate already applies to — NOT the
+        // pending_verify/review_required cohort the rest of this object
+        // uses. no_website_at_all + stale_over_30_days + bad_http_status
+        // sums to exactly (with_email - url_fresh_and_ok); the split does
+        // not change pool_funnel's existing totals, only explains the gap.
+        url_freshness_failure_split: {
+          base_cohort: "pool_funnel.with_email (verified + rich/partial + email present) — not the pending_verify/review_required cohort above",
+          base_cohort_total: withEmail?.c ?? 0,
+          passing: urlFreshAndOk?.c ?? 0,
+          failing_total: (withEmail?.c ?? 0) - (urlFreshAndOk?.c ?? 0),
+          no_website_at_all: urlSplitNoWebsite?.c ?? 0,
+          stale_over_30_days: urlSplitStale?.c ?? 0,
+          bad_http_status: urlSplitBadStatus?.c ?? 0,
+        },
+        // Item 4: enrichment_status='thin' within the pending_verify/
+        // review_required cohort, and why (about<80 chars / 0 products / no
+        // address — computeEnrichmentStatus requires ALL THREE to fail for
+        // 'thin', so each sub-count is expected to equal `total`).
+        thin_enrichment: {
+          total: bbThinTotal,
+          short_about: bbThinShortAbout,
+          no_products: bbThinNoProducts,
+          no_address: bbThinNoAddress,
+        },
+        // Item 5: cohort-size number only (no website/agent-url at all).
+        // Feeds a future L4 decision — not acted on in this slice.
+        no_website_at_all_count: noWebsiteAtAllCohort,
+        // Item 6: email-first breakdown (e-post prioritized over telefon —
+        // email is the send channel).
+        email_first_breakdown: {
+          // (a) missing k.email entirely — would not reach the pool even if
+          // fully verified.
+          missing_email: missingEmailCohort,
+          // (b) review_required specifically with an email_ownership_unproven
+          // reason recorded on verification_review_reason (set by the
+          // verifier's Guard #3 — see lokal-agent-verifier.ts).
+          review_required_email_ownership_unproven: reviewRequiredEmailOwnershipUnproven,
+          // (c) of (a)+(b): how many have a Brreg-sourced email that would
+          // resolve it. HONEST NULL: this schema does not store a Brreg
+          // email anywhere (agents.brreg_verified/brreg_flag/brreg_checked_at
+          // are org-status flags only, not a fetched email; there is no
+          // brreg_email column and no live Brreg-lookup integration wired up
+          // in this codebase — see database/init.ts's own
+          // "(brreg: no column exists → skipped; needs real lookup)" note on
+          // the field_provenance backfill migration). Reporting a fabricated
+          // number here would be worse than reporting none — this is
+          // explicitly Steg 2/3 (org_nr acquisition + a real Brreg API call),
+          // not built in this slice.
+          brreg_sourced_email_would_resolve: null,
+          brreg_sourced_email_note:
+            "No stored Brreg email field exists in this schema and no live Brreg-lookup integration is wired up here — out of scope for this slice (Steg 2/3 of the parent dev-request). Not fabricated.",
+        },
       },
     });
   } catch (err: any) {
