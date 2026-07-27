@@ -1114,4 +1114,106 @@ router.post("/brreg-description-fallback", async (req: Request, res: Response) =
   }
 });
 
+// ─── GET /admin/agents/category-sanity-report ───────────────────
+// Criterion 4 of dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann:
+// report-only (never writes) detector for RFB producer rows whose
+// `categories` set looks implausibly broad. Modeled directly on the
+// Skakke Røykeri incident (a smoked-fish producer auto-tagged with
+// categories meat,vegetables,fruit,bakery,honey,fish — six categories
+// spanning unrelated product classes for a business that actually only
+// does smoked fish/meat/game). That one row was fixed by hand; this
+// endpoint is the systemic detector so rows like it surface for review
+// instead of silently existing, since the auto-generated product rows
+// inherit category errors directly from the category set.
+//
+// Query params:
+//   min_categories  positive integer, default 5 (optional)
+//
+// Response:
+//   { success: true, min_categories, scanned_count, flagged_count,
+//     flagged: [{ id, name, org_nr, categories, category_count,
+//                 includes_bakery_and_fish }] }
+//   ordered by category_count DESC (worst offenders first).
+//
+// Scope: RFB producers only — same vertical-scoping idiom as
+// brregSweepCandidateWhereSql() above (COALESCE(vertical_id, 'rfb') =
+// 'rfb'), plus role = 'producer' (this report is about producer category
+// tagging) and is_active = 1 (inactive/deleted rows aren't actionable).
+router.get("/category-sanity-report", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  // min_categories: default 5, must be a positive integer if provided.
+  // Mirrors GET /'s own limit/offset validation style above.
+  let minCategories = 5;
+  if (req.query.min_categories !== undefined) {
+    const n = parseInt(req.query.min_categories as string, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      res.status(400).json({
+        error: "invalid min_categories",
+        detail: "min_categories must be >= 1",
+      });
+      return;
+    }
+    minCategories = n;
+  }
+
+  try {
+    const db = getDb();
+
+    const rows = db
+      .prepare(
+        `SELECT id, name, org_nr, categories FROM agents
+         WHERE COALESCE(vertical_id, 'rfb') = 'rfb'
+           AND role = 'producer'
+           AND is_active = 1`,
+      )
+      .all() as Array<{ id: string; name: string; org_nr: string | null; categories: string | null }>;
+
+    const flagged: Array<{
+      id: string;
+      name: string;
+      org_nr: string | null;
+      categories: string[];
+      category_count: number;
+      includes_bakery_and_fish: boolean;
+    }> = [];
+
+    for (const row of rows) {
+      let categories: unknown;
+      try {
+        categories = JSON.parse(row.categories || "[]");
+      } catch (err) {
+        console.warn(
+          `[admin-agents] category-sanity-report: unparseable categories for agent ${row.id}, excluding from flagged set:`,
+          err instanceof Error ? err.message : err,
+        );
+        continue;
+      }
+
+      if (!Array.isArray(categories) || categories.length < minCategories) continue;
+
+      flagged.push({
+        id: row.id,
+        name: row.name,
+        org_nr: row.org_nr,
+        categories,
+        category_count: categories.length,
+        includes_bakery_and_fish: categories.includes("bakery") && categories.includes("fish"),
+      });
+    }
+
+    flagged.sort((a, b) => b.category_count - a.category_count);
+
+    res.json({
+      success: true,
+      min_categories: minCategories,
+      scanned_count: rows.length,
+      flagged_count: flagged.length,
+      flagged,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "category-sanity-report failed", detail: err.message });
+  }
+});
+
 export default router;
