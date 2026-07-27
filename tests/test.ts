@@ -33985,3 +33985,27 @@ runSerial(async () => {
     failures.push("outreach-pool-blocker-breakdown: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann (criterion 4):
+// GET /admin/agents/category-sanity-report (src/routes/admin-agents.ts) —
+// read-only, report-only detector for RFB producer rows whose `categories`
+// set looks implausibly broad (default >=5 categories), modeled on the
+// real Skakke Røykeri incident. Own require of admin-agents.ts's router,
+// own in-memory DB via __setDbForTesting/__initSchemaForTesting (mirrors
+// admin-agents-brreg-catalog-sweep.test.ts's harness). Runs via runSerial()
+// like the Fase 0/1/2/2c suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann: category-sanity-report (criterion 4) ──");
+  try {
+    const { runAdminAgentsCategorySanityReportTests } = require("../src/routes/admin-agents-category-sanity-report.test") as
+      typeof import("../src/routes/admin-agents-category-sanity-report.test");
+    const csr = await runAdminAgentsCategorySanityReportTests({ log: false });
+    passed += csr.passed;
+    failed += csr.failed;
+    for (const f of csr.failures) failures.push("category-sanity-report: " + f);
+    console.log(`  category-sanity-report: ${csr.passed} passed, ${csr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("category-sanity-report: unexpected error: " + String(err?.message || err));
+  }
+});
