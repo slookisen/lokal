@@ -532,6 +532,9 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("fetch-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-27-harvest-hjemmeside-feltnavn-tapes: the harvest
 // SKILL sends `hjemmeside`, BulkRowSchema only accepted `website`, and
 // z.object() strips unknown keys silently — so every harvested homepage was
