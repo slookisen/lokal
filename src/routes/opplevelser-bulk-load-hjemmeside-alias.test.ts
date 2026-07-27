@@ -156,17 +156,77 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
   // Round-2 review (non-blocking #5): "-" / "n/a" / "TBD" are truthy and
   // survive isAggregatorWebsite()'s permissive unparseable-URL path, so they
   // were written verbatim into the provider's homepage — worse than null.
+  //
+  // Round-3 review (BLOCKING): the first screen here was `v.includes(".")`,
+  // and this list was the ONLY thing it was calibrated against — every junk
+  // value that happens to contain a dot still got stored AND still shadowed a
+  // real `hjemmeside`. The dotted cases below are the reviewer's own
+  // reproduction set, verbatim; they are the reason the screen now looks at the
+  // parsed HOST (≥2 non-empty labels, alphabetic/punycode TLD ≥2 chars) rather
+  // than at the raw string. Do not thin this list — its whole point is that the
+  // check must hold for junk nobody wrote a fixture for.
   {
-    for (const junk of ["-", "n/a", "TBD", "null", "   -   "]) {
+    const junkValues = [
+      // dot-less (what the round-2 screen already caught)
+      "-", "n/a", "TBD", "null", "   -   ", "ukjent", "localhost",
+      // dotted — every one of these passed the round-2 screen and was stored
+      "n.a", "n.a.", "N/A.", "tbd.", "..", ".", "-.-", "www.",
+      // bare IP literals: a real host, never a producer's homepage
+      "1.2.3.4", "0.0.0.0", "192.168.1.1",
+      // single-char TLD / label — syntactically dotted, not a real domain
+      "a.b",
+      // an email address is not a homepage, even though its host parses fine
+      "post@gard.no",
+      // prose: whitespace-bearing, and the last one even contains a real host
+      "Se nettsiden deres.", "ingen hjemmeside, kun facebook.com",
+      // a dot-less HOST whose PATH carries the dot — the raw-string check's
+      // blind spot in the other direction
+      "http://gardsbutikken/index.html",
+    ];
+    for (const junk of junkValues) {
       const row = BulkRowSchema.parse({ ...base, website: junk, hjemmeside: "https://trollaktiv.no" });
       assertEq(
         firstNonAggregatorWebsite([row as BulkRow]),
         "https://trollaktiv.no",
         `alias-14/${junk.trim()}: placeholder \`${junk}\` neither stored nor allowed to shadow a real homepage`,
       );
+      const alone = BulkRowSchema.parse({ ...base, website: junk });
+      assertEq(
+        firstNonAggregatorWebsite([alone as BulkRow]),
+        null,
+        `alias-15/${junk.trim()}: placeholder \`${junk}\` alone yields null, never a stored junk homepage`,
+      );
     }
-    const only = BulkRowSchema.parse({ ...base, website: "n/a" });
-    assertEq(firstNonAggregatorWebsite([only as BulkRow]), null, "alias-15: a placeholder alone yields null, never a stored junk homepage");
+  }
+
+  // ── …and the tightening must not cost a single legitimate homepage ──────
+  // The other half of the round-3 fix: a shape check that rejects real
+  // producer URLs would silently reintroduce the very loss this PR exists to
+  // stop, just with a different cause. Every accepted form is pinned, including
+  // the ones that motivated parsing the host instead of the string.
+  {
+    const legit = [
+      "trollaktiv.no",
+      "https://trollaktiv.no",
+      "http://trollaktiv.no",
+      "https://www.trollaktiv.no",
+      "trollaktiv.no.",                    // trailing FQDN root dot
+      "TROLLAKTIV.NO",                     // uppercase
+      "gård.no",                           // IDN, unicode form
+      "xn--grd-loa.no",                    // …and its punycode form
+      "trollaktiv.no/gardsbutikk",         // deep link
+      "https://trollaktiv.no/a/b?c=d#e",   // path + query + fragment
+      "https://trollaktiv.no:8443/",       // explicit port
+      "sjokoladefabrikken.co.uk",          // multi-label suffix
+    ];
+    for (const v of legit) {
+      const row = BulkRowSchema.parse({ ...base, website: v });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        v,
+        `alias-16/${v}: legitimate homepage \`${v}\` is accepted, and stored VERBATIM (not host-normalized)`,
+      );
+    }
   }
 
   // ── The aggregator screen still applies to the alias ────────────────────
@@ -180,6 +240,26 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
       null,
       "alias-6: an aggregator URL sent as `hjemmeside` is rejected exactly like one sent as `website`",
     );
+
+    // Round-3 review (finding 4): this file's header and the source comment
+    // both cite "visitnorway.com / visithelgeland.com" as the leak being
+    // guarded against — but only visitnorway.com was ever in
+    // KNOWN_DIRECTORY_HOSTS, so the second host in our own motivating example
+    // passed the screen and got stored. It is on the list as of this PR
+    // (cross-source-validator.ts), on the strength of the five fetch_failed
+    // visithelgeland.com homepages in the 2026-07-25 enrichment run. Pinned in
+    // both fields so the claim and the code cannot drift apart again.
+    for (const field of ["website", "hjemmeside"] as const) {
+      const helgeland = BulkRowSchema.parse({
+        ...base,
+        [field]: "https://visithelgeland.com/en/product/guided-kayak-tour-in-heroy/",
+      });
+      assertEq(
+        firstNonAggregatorWebsite([helgeland as BulkRow]),
+        null,
+        `alias-6b/${field}: visithelgeland.com — the OTHER host this PR names — is screened too`,
+      );
+    }
   }
 
   // ── Order-independence across rows, via the alias ──────────────────────

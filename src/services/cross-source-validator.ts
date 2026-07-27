@@ -638,6 +638,26 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   // bulk-load write path; adding the confirmed domain here so the classifier
   // actually catches the incident that motivated the fix (not a speculative add).
   "visitinnlandet.no",
+  // Extended 2026-07-27 (dev-request 2026-07-27-harvest-hjemmeside-feltnavn-tapes,
+  // independent review finding 4): the bulk-load aggregator screen was being
+  // described — in code comments and tests — as guarding against
+  // "visitnorway.com / visithelgeland.com", but only the former was ever on
+  // this list, so the second host in our own motivating example sailed through.
+  // Not a speculative add, same evidence bar as visitinnlandet.no above: the
+  // 2026-07-25 enrichment run recorded fetch_failed against five distinct
+  // visithelgeland.com/en/product/… URLs stored as provider homepages
+  // (2790299b, 4289141d, 137b97ad, 68399325, b6a82118) and named the pattern
+  // itself — "4 visithelgeland.com + 2 visitnorway.com errors in one run =
+  // aggregator-URL rot pattern … these providers need own-homepage URLs, not
+  // aggregator sub-pages".
+  //
+  // Known remaining gap, deliberately NOT closed here: the harvest SKILL names
+  // nordnorge.com, visittromso.no, visitbergen.com, visitoslo.com,
+  // visittrondheim.no and fjordtours.com as sources, and none of them are on
+  // this list either. They are left out because no run report yet shows one of
+  // them stored as a homepage and failing — adding them would be the
+  // speculative add the visitinnlandet.no note above explicitly refuses.
+  "visithelgeland.com",
 ]);
 
 export function isKnownDirectoryHost(host: string): boolean {

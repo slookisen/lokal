@@ -538,10 +538,64 @@ function isAggregatorWebsite(raw: string): boolean {
   return isDirectoryOrAggregatorHost(host);
 }
 
-// First row's `website` that is truthy AND not a known aggregator/directory
-// host, else null. Used for the provider-CREATE `hjemmeside` write only (see
-// below) — order-independent: an aggregator-host row earlier in `rows` is
-// skipped in favor of a later row with a real domain.
+// Does `v` have the SHAPE of a real homepage — i.e. does it parse to a host
+// with at least two labels and a plausible TLD? Used only to keep placeholder
+// junk out of experience_providers.hjemmeside.
+//
+// Why this exists at all: isAggregatorWebsite() is permissive about
+// unparseable URLs BY DESIGN (a real homepage the harvester formatted oddly
+// must not be dropped), so it passes anything that isn't a KNOWN aggregator
+// host. A placeholder like "n/a" or "TBD" is therefore truthy, survives the
+// aggregator screen, and gets written verbatim — and a junk homepage is worse
+// than a null one, because it satisfies neither branch of
+// selectProvidersForContentRefresh()'s hjemmeside/evidence_url COALESCE.
+//
+// Round-3 review, blocking: the first version of this was `v.includes(".")`,
+// which only catches dot-LESS junk. "n.a", "n.a.", "-.-", "tbd.", "1.2.3.4",
+// "post@gard.no" and "Se nettsiden deres." all passed it, got stored, AND
+// shadowed a real `hjemmeside` in the same row — the third repetition of the
+// exact defect class this function was twice rewritten to fix. The check was
+// calibrated to its own test fixtures rather than to the shape of a hostname.
+//
+// So: screen the PARSED HOST, not the raw string. hostFromUrlLike() already
+// does the parse the rest of this file uses (scheme/path/query/port/userinfo
+// stripped, trailing FQDN root dot removed, IDN → punycode, lowercased), so
+// `gard.no/kontakt`, `https://gard.no?a=b`, `GÅRD.NO`, `gård.no` and
+// `gard.no.` all reduce to the same accepted host, while `http://gardsbutikken
+// /index.html` correctly fails on its dot-less HOST even though its path has a
+// dot. Requiring ≥2 non-empty labels plus an alphabetic (or punycode) TLD of
+// ≥2 chars additionally rejects "n.a", "a.b", "-.-" and bare IPv4 literals.
+//
+// isPlausibleUrlish() below carries the length + no-whitespace half of the
+// same contract and is the sanctioned guard for the OTHER writer of this
+// column (PATCH /admin/providers/:id/hjemmeside, which 400s on failure) —
+// reuse it rather than growing a second, weaker validator for one column
+// (round-3 review). Declarations hoist, so the forward reference is fine.
+// `@` is rejected on top: hostFromUrlLike() strips userinfo, so an email
+// address like "post@gard.no" WOULD reduce to a valid host — but the value
+// stored is the raw candidate, and an email in the homepage column is junk.
+function looksLikeHomepageValue(v: string): boolean {
+  if (!isPlausibleUrlish(v)) return false;
+  if (v.includes("@")) return false;
+  const host = hostFromUrlLike(v);
+  if (!host) return false;
+  const labels = host.split(".");
+  if (labels.length < 2) return false;
+  if (labels.some((l) => l.length === 0)) return false;
+  const tld = labels[labels.length - 1]!;
+  // Punycode TLDs (xn--…) are vanishingly rare for Norwegian producers but are
+  // legitimate, so admit them explicitly rather than by accident.
+  return /^[a-z]{2,}$/.test(tld) || /^xn--[a-z0-9-]{2,}$/.test(tld);
+}
+
+// First row's `website` — or its accepted alias `hjemmeside` — that has the
+// shape of a homepage AND is not a known aggregator/directory host, else null.
+// Used for the provider-CREATE `hjemmeside` write only (see below).
+// Order-independent in both directions: an aggregator/junk value earlier in
+// `rows`, or in the sibling field of the SAME row, is skipped in favor of a
+// later real domain. Returns the candidate VERBATIM (trimmed) — the parsed
+// host is used for screening only, never for the stored value, so a legitimate
+// deep link like `gard.no/gardsbutikk` survives intact.
 export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
   // `website` and its accepted alias `hjemmeside` (see BulkRowSchema) are
   // treated identically; `website` wins when a row carries both with content.
@@ -572,17 +626,17 @@ export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
   // dev-request 2026-07-19-agg-website-leak documents aggregator URLs really
   // arriving in `website` in production.
   //
-  // `looksLikeHostname` is a deliberately minimal shape check. A value with no
-  // dot in it cannot be a reachable homepage, but IS truthy and DOES survive
-  // isAggregatorWebsite() (which is permissive about unparseable URLs by
-  // design) — so placeholders like "-", "n/a" or "TBD" would otherwise be
-  // stored verbatim AND shadow a real alias in the same row. A stored junk
-  // homepage is worse than a null one: it satisfies neither branch of
-  // selectProvidersForContentRefresh()'s homepage/evidence_url COALESCE.
-  const looksLikeHostname = (v: string): boolean => v.includes(".");
+  // Junk is screened by looksLikeHomepageValue() above — see its comment for
+  // why a bare `includes(".")` was not enough.
+  //
+  // Deliberately NOT case-normalized on the way out, unlike the Brreg-discovery
+  // writer's `.trim().toLowerCase()`: a candidate may carry a path, and paths
+  // are case-sensitive, so lowercasing the whole value can break a working deep
+  // link. Host-level comparisons downstream all go through hostFromUrlLike(),
+  // which lowercases, so the differing case in the column is not load-bearing.
   for (const r of rows) {
     for (const candidate of [r.website?.trim(), r.hjemmeside?.trim()]) {
-      if (candidate && looksLikeHostname(candidate) && !isAggregatorWebsite(candidate)) {
+      if (candidate && looksLikeHomepageValue(candidate) && !isAggregatorWebsite(candidate)) {
         return candidate;
       }
     }
