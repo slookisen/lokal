@@ -196,15 +196,12 @@ import {
   buildPageEvidence,
   containsMojibake,
   type PageEvidence,
-  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding follow-up —
-  // crFetchHtml (below) had the SAME resp.text()-forces-UTF-8 bug that
-  // fetchHtml() in search-enrich.ts was fixed for in PR lokal#360; reused
-  // here (not re-implemented) so content-refresh/gardssalg-content-refresh
-  // decode with the page's actual declared charset instead of assuming UTF-8.
-  // (decodeHtmlBytes calls detectHtmlCharset internally — only decodeHtmlBytes
-  // needs to be imported here.)
-  decodeHtmlBytes,
 } from "../services/search-enrich";
+// dev-request 2026-07-27-fetch-infrastruktur-diagnose (P0-1) — the shared,
+// CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
+// here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
+// the one-shot transient retry and the empty-body check.
+import { fetchPage, discoverContentLinks, type FetchPageResult } from "../services/fetch-page";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
@@ -816,22 +813,22 @@ const CR_DEFAULT_LIMIT = 25;
 const CR_HARD_CAP = 100;
 const CR_CONCURRENCY = 3;
 
-/** Fetch one URL's HTML server-side (SSRF-guarded). Returns null on any failure. */
+/**
+ * Fetch one URL's HTML server-side, classified (dev-request
+ * 2026-07-27-fetch-infrastruktur-diagnose, P0-1). Delegates to the shared
+ * fetchPage(): same SSRF guard and charset-correct decode as before, plus a
+ * named failure reason, a one-shot retry for transient faults, and empty-body
+ * detection. This vertical is the one whose `http_unreachable_per_run`
+ * guardrail has been in warn-breach (35.3 vs a threshold of 15) for 20+
+ * controller cycles with no way to see what the 35 actually were.
+ */
+async function crFetchPage(url: string): Promise<FetchPageResult> {
+  return fetchPage(url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+}
+
 async function crFetchHtml(url: string): Promise<string | null> {
-  if (!isSafeFetchUrl(url)) return null;
-  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-  try {
-    const resp = await fetch(fetchUrl, {
-      redirect: "follow",
-      headers: { "User-Agent": CR_UA, Accept: "text/html,application/xhtml+xml" },
-      signal: AbortSignal.timeout(CR_FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) return null;
-    const bytes = new Uint8Array(await resp.arrayBuffer());
-    return decodeHtmlBytes(bytes, resp.headers.get("content-type"));
-  } catch {
-    return null;
-  }
+  const r = await crFetchPage(url);
+  return r.ok ? r.html : null;
 }
 
 /**
@@ -840,24 +837,41 @@ async function crFetchHtml(url: string): Promise<string | null> {
  * the homepage), with sub-page HTML appended for the category-token scan. Returns
  * null only if the primary homepage cannot be fetched.
  */
-async function crFetchHomepageContent(
-  homepageUrl: string
-): Promise<{ primaryHtml: string; combinedHtml: string; fetchUrl: string } | null> {
+type CrFetchOutcome =
+  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
+  | { ok: false; reason: string; persistence: string; status: number | null };
+
+async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
-  const primaryHtml = await crFetchHtml(fetchUrl);
-  if (primaryHtml === null) return null;
+  const primary = await crFetchPage(fetchUrl);
+  if (!primary.ok) {
+    return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
+  }
+  const primaryHtml = primary.html;
   let combinedHtml = primaryHtml;
+  // Link-driven sub-page crawl with CR_CONTENT_PATHS as fallback — see
+  // buildPageEvidence in services/search-enrich.ts for the measurement.
+  //
+  // Resolve against the FINAL url, not the requested one. discoverContentLinks
+  // keeps same-host links only, and a homepage that redirects across hosts
+  // (apex→www, renamed domain) typically emits ABSOLUTE self-links on the new
+  // host — stock WordPress does, via home_url(). Judging those against the
+  // pre-redirect host would reject every one of them, silently collapsing the
+  // discovery back to the fixed-path guessing this replaced, against a host
+  // that no longer serves the site.
   try {
-    const u = new URL(fetchUrl);
+    const u = new URL(primary.finalUrl || fetchUrl);
     const base = `${u.protocol}//${u.host}`;
-    for (const path of CR_CONTENT_PATHS) {
-      const sub = await crFetchHtml(`${base}${path}`);
+    const discovered = discoverContentLinks(primaryHtml, u.toString(), CR_CONTENT_PATHS.length);
+    const targets = discovered.length > 0 ? discovered : CR_CONTENT_PATHS.map((p) => `${base}${p}`);
+    for (const target of targets) {
+      const sub = await crFetchHtml(target);
       if (sub) combinedHtml += "\n" + sub;
     }
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
 }
 
 router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Response) => {
@@ -920,24 +934,33 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     }
 
     // Fetch homepage content server-side (SSRF-guarded).
-    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    let fetched: CrFetchOutcome;
     try {
       fetched = await crFetchHomepageContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
-      // Dead-homepage parking (enrichment-metode slice 1): count the failure;
-      // 3 strikes park the provider 30d (apply mode only — dry-run never writes).
-      if (apply) {
-        try {
-          const p = recordProviderHomepageFetchResult(providerId, false);
-          if (p.parked_now) parkedNow.push(providerId);
-        } catch { /* best-effort */ }
-      }
+      // NO parking strike here. fetchPage() never throws — it returns a
+      // classified failure — so reaching this catch means an INTERNAL fault on
+      // our side (a malformed stored URL, a bug), which is no evidence at all
+      // that the producer's site is dead. Striking on it would park a provider
+      // for 30 days for our own error.
       return;
     }
-    if (!fetched) {
-      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
-      if (apply) {
+    if (!fetched.ok) {
+      // Classified reason instead of a bare "fetch_failed" (dev-request
+      // 2026-07-27-fetch-infrastruktur-diagnose, P0-1).
+      errors.push({
+        provider_id: providerId,
+        error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}`,
+      });
+      // PARKING NOW DEPENDS ON PERSISTENCE. A `transient` failure (timeout,
+      // 5xx, 429, connection reset) must NOT count a strike: the 2026-07-26
+      // probe found two of fourteen "dead" producer domains answering HTTP 200
+      // on re-probe the day after they were reported as hard 503s, so counting
+      // those blips was parking live producers for 30 days and then reporting
+      // the resulting empty candidate pool as "exhaustion". Genuinely dead
+      // (`permanent`) and deliberately-refusing (`blocked`) URLs still strike.
+      if (apply && fetched.persistence !== "transient") {
         try {
           const p = recordProviderHomepageFetchResult(providerId, false);
           if (p.parked_now) parkedNow.push(providerId);
@@ -1147,16 +1170,19 @@ const GARDSSALG_MAX_PAGES = 5; // homepage + up to 4 sub-pages
  * be fetched. A 404/failure on any candidate sub-page costs nothing extra —
  * crFetchHtml already returns null on any failure, so it's just skipped.
  */
-async function crFetchGardssalgContent(
-  homepageUrl: string
-): Promise<{ primaryHtml: string; combinedHtml: string; fetchUrl: string } | null> {
+async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
-  const primaryHtml = await crFetchHtml(fetchUrl);
-  if (primaryHtml === null) return null;
+  const primary = await crFetchPage(fetchUrl);
+  if (!primary.ok) {
+    return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
+  }
+  const primaryHtml = primary.html;
   let combinedHtml = primaryHtml;
   let pagesFetched = 1;
   try {
-    const u = new URL(fetchUrl);
+    // Final url, not the requested one — a cross-host redirect otherwise leaves
+    // the whole sub-page crawl pointed at a host that no longer serves the site.
+    const u = new URL(primary.finalUrl || fetchUrl);
     // Slice 5d: sub-page candidates resolve relative to the STORED URL's
     // section, not the host root. For the normal case (hjemmeside is the
     // site root) this is identical to the old `${protocol}//${host}` base;
@@ -1184,7 +1210,7 @@ async function crFetchGardssalgContent(
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
 }
 
 const GS_CR_DEFAULT_LIMIT = 25;
@@ -1289,24 +1315,30 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     }
 
     // Fetch homepage + gårdssalg sub-pages server-side (SSRF-guarded).
-    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    let fetched: CrFetchOutcome;
     try {
       fetched = await crFetchGardssalgContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
-      // Dead-homepage parking (enrichment-metode slice 1): count the failure;
-      // 3 strikes park the provider 30d (apply mode only — dry-run never writes).
-      if (apply) {
-        try {
-          const p = recordProviderHomepageFetchResult(providerId, false);
-          if (p.parked_now) parkedNow.push(providerId);
-        } catch { /* best-effort */ }
-      }
+      // NO parking strike here. fetchPage() never throws — it returns a
+      // classified failure — so reaching this catch means an INTERNAL fault on
+      // our side (a malformed stored URL, a bug), which is no evidence at all
+      // that the producer's site is dead. Striking on it would park a provider
+      // for 30 days for our own error.
       return;
     }
-    if (!fetched) {
-      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
-      if (apply) {
+    if (!fetched.ok) {
+      errors.push({
+        provider_id: providerId,
+        error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}`,
+      });
+      // Persistence-gated parking — SAME rule as /admin/content-refresh above.
+      // These gårdssalg routes write the very same counter
+      // (experience_providers.homepage_fetch_attempts) and are excluded by the
+      // very same providerParkingExclusionSql(), so leaving them striking on a
+      // transient 503 would have re-created the mis-parking this whole change
+      // exists to eliminate — on the same rows, just via a different route.
+      if (apply && fetched.persistence !== "transient") {
         try {
           const p = recordProviderHomepageFetchResult(providerId, false);
           if (p.parked_now) parkedNow.push(providerId);
@@ -1779,19 +1811,22 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
       return;
     }
 
-    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    let fetched: CrFetchOutcome;
     try {
       fetched = await crFetchGardssalgContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
-      if (apply) {
-        try { recordProviderHomepageFetchResult(providerId, false); } catch { /* best-effort */ }
-      }
+      // NO parking strike — see the note on the other fetch catches: an
+      // exception here is our fault, not the site's.
       return;
     }
-    if (!fetched) {
-      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
-      if (apply) {
+    if (!fetched.ok) {
+      errors.push({
+        provider_id: providerId,
+        error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}`,
+      });
+      // Persistence-gated parking — same counter, same rule as the two routes above.
+      if (apply && fetched.persistence !== "transient") {
         try { recordProviderHomepageFetchResult(providerId, false); } catch { /* best-effort */ }
       }
       return;
@@ -6698,7 +6733,17 @@ Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der.
 // https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env,
 // x-api-key/anthropic-version headers. One row per call. Returns null (never
 // throws) on any failure so the caller can skip-not-fabricate.
-async function generateTitleNo(candidate: TitleNoCandidate): Promise<string | null> {
+//
+// `fetchImpl` defaults to the real global `fetch`, so production behavior is
+// unchanged; it exists purely as an injection seam so tests can supply a
+// scoped stub (via the Express app instance's "titleNoBackfillFetchImpl"
+// setting, resolved in the route handler below) instead of overwriting
+// `globalThis.fetch`, which would leak into other concurrently-running
+// test blocks.
+async function generateTitleNo(
+  candidate: TitleNoCandidate,
+  fetchImpl: typeof fetch = fetch
+): Promise<string | null> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
 
@@ -6711,7 +6756,7 @@ Sted: ${place || "ukjent"}`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
-    response = await fetch("https://api.anthropic.com/v1/messages", {
+    response = await fetchImpl("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -6751,6 +6796,14 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
   // undefined all mean dry run.
   const dryRun = body.dry_run !== false;
 
+  // Per-app-instance fetch injection seam (see generateTitleNo's doc comment
+  // above): tests set this via `app.set("titleNoBackfillFetchImpl", stub)`
+  // on their OWN Express app instance. Production never sets it, so
+  // `req.app.get(...)` returns undefined and we fall back to the real global
+  // `fetch` — production behavior is unchanged.
+  const fetchImpl =
+    (req.app.get("titleNoBackfillFetchImpl") as typeof fetch | undefined) ?? fetch;
+
   const db = getExpDb("experiences");
   const candidateRows = db
     .prepare(
@@ -6764,7 +6817,7 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
     const sample = candidateRows.slice(0, TITLE_NO_DRY_RUN_SAMPLE);
     const proposals: Array<{ id: string; title: string; proposed_title_no: string | null }> = [];
     for (const row of sample) {
-      const proposed = await generateTitleNo(row);
+      const proposed = await generateTitleNo(row, fetchImpl);
       proposals.push({ id: row.id, title: row.title, proposed_title_no: proposed });
     }
     res.json({
@@ -6779,7 +6832,7 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
   const batch = candidateRows.slice(0, TITLE_NO_BATCH_CAP);
   const generated: Array<{ id: string; title_no: string | null }> = [];
   for (const row of batch) {
-    generated.push({ id: row.id, title_no: await generateTitleNo(row) });
+    generated.push({ id: row.id, title_no: await generateTitleNo(row, fetchImpl) });
   }
 
   const setTitleNo = db.prepare(
