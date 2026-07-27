@@ -564,9 +564,31 @@ export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
   // `TRIM(hjemmeside) != ''` for its primary branch and `hjemmeside IS NULL`
   // for its evidence_url fallback, so a whitespace value satisfies neither and
   // drops the provider out of content-refresh entirely.
+  // Screen EACH candidate independently — do not pick a winner first and screen
+  // afterwards (round-2 review, blocking). Resolving `website || hjemmeside`
+  // into one value before the aggregator check meant a row carrying an
+  // aggregator `website` alongside a perfectly good `hjemmeside` returned null:
+  // the aggregator won the `||`, failed the screen, and the loop moved to the
+  // NEXT ROW without ever looking at this row's alias. That is the same silent
+  // discard this alias exists to fix, one field over — and mixed-field rows are
+  // exactly what the stale-dispatch rationale above predicts, while
+  // dev-request 2026-07-19-agg-website-leak documents aggregator URLs really
+  // arriving in `website` in production.
+  //
+  // `looksLikeHostname` is a deliberately minimal shape check. A value with no
+  // dot in it cannot be a reachable homepage, but IS truthy and DOES survive
+  // isAggregatorWebsite() (which is permissive about unparseable URLs by
+  // design) — so placeholders like "-", "n/a" or "TBD" would otherwise be
+  // stored verbatim AND shadow a real alias in the same row. A stored junk
+  // homepage is worse than a null one: it satisfies neither branch of
+  // selectProvidersForContentRefresh()'s homepage/evidence_url COALESCE.
+  const looksLikeHostname = (v: string): boolean => v.includes(".");
   for (const r of rows) {
-    const candidate = r.website?.trim() || r.hjemmeside?.trim() || null;
-    if (candidate && !isAggregatorWebsite(candidate)) return candidate;
+    for (const candidate of [r.website?.trim(), r.hjemmeside?.trim()]) {
+      if (candidate && looksLikeHostname(candidate) && !isAggregatorWebsite(candidate)) {
+        return candidate;
+      }
+    }
   }
   return null;
 }

@@ -10,12 +10,21 @@
  * homepage was discarded at the door: HTTP 200, provider created, homepage
  * column NULL, no error anywhere.
  *
- * The consequence is not cosmetic. That column is the ONLY input to the
- * provider-CREATE homepage write, and selectProvidersForContentRefresh() skips
- * providers with an empty homepage — so a provider harvested this way could
- * never be content-enriched. The harvest SKILL names that exact symptom in its
- * own prose ("this is why enrichment was scanning 0") and tried to fix it by
- * telling the agent to fill the field, using the name the endpoint ignored.
+ * The consequence is not cosmetic, but it is NOT the one first claimed here.
+ * An earlier version of this header said such a provider "could never be
+ * content-enriched" — independent review showed that is not what the code does,
+ * and the source comment in opplevelser.ts was corrected. Keeping the retracted
+ * version alive in the regression-proof file would be worse than useless, so:
+ *
+ * selectProvidersForContentRefresh() (services/experience-store.ts) COALESCEs
+ * the homepage with the provider's first non-empty experience `evidence_url`,
+ * and its WHERE explicitly admits `hjemmeside IS NULL` rows that have one. So
+ * affected providers WERE still picked up — and enrichment then fetched and
+ * extracted from the EVIDENCE url, i.e. the DMO/listing page the provider was
+ * discovered on, rather than the provider's own site. That is the same
+ * aggregator-as-homepage failure dev-request 2026-07-19-agg-website-leak was
+ * filed for, and it is why enrichment runs kept reporting `fetch_failed`
+ * against visitnorway.com / visithelgeland.com URLs.
  *
  * These tests pin BOTH names as accepted, so the two sides cannot silently
  * drift apart again.
@@ -112,6 +121,52 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
   {
     const row = BulkRowSchema.parse({ ...base, website: "", hjemmeside: "" });
     assertEq(firstNonAggregatorWebsite([row as BulkRow]), null, "alias-11: both blank yields null, never an empty string");
+  }
+
+  // ── An aggregator in ONE field must not discard a real value in the other ─
+  // Round-2 review, blocking: the candidate used to be resolved before the
+  // aggregator screen, so an aggregator `website` beat a real `hjemmeside` and
+  // the row yielded null.
+  {
+    const row = BulkRowSchema.parse({
+      ...base,
+      website: "https://www.visitnorway.com/listings/the-well-spa/12614/",
+      hjemmeside: "https://trollaktiv.no",
+    });
+    assertEq(
+      firstNonAggregatorWebsite([row as BulkRow]),
+      "https://trollaktiv.no",
+      "alias-12: an aggregator `website` does not discard a real `hjemmeside` in the same row",
+    );
+  }
+  {
+    const row = BulkRowSchema.parse({
+      ...base,
+      website: "https://trollaktiv.no",
+      hjemmeside: "https://www.visitnorway.com/listings/x/1/",
+    });
+    assertEq(
+      firstNonAggregatorWebsite([row as BulkRow]),
+      "https://trollaktiv.no",
+      "alias-13: and the mirror case — a real `website` is not lost to an aggregator alias",
+    );
+  }
+
+  // ── Placeholder junk must never be stored, nor shadow the other field ────
+  // Round-2 review (non-blocking #5): "-" / "n/a" / "TBD" are truthy and
+  // survive isAggregatorWebsite()'s permissive unparseable-URL path, so they
+  // were written verbatim into the provider's homepage — worse than null.
+  {
+    for (const junk of ["-", "n/a", "TBD", "null", "   -   "]) {
+      const row = BulkRowSchema.parse({ ...base, website: junk, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-14/${junk.trim()}: placeholder \`${junk}\` neither stored nor allowed to shadow a real homepage`,
+      );
+    }
+    const only = BulkRowSchema.parse({ ...base, website: "n/a" });
+    assertEq(firstNonAggregatorWebsite([only as BulkRow]), null, "alias-15: a placeholder alone yields null, never a stored junk homepage");
   }
 
   // ── The aggregator screen still applies to the alias ────────────────────
