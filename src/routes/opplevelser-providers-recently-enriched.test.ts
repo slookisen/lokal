@@ -244,11 +244,15 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       const insertExperienceFull = expDb.prepare(
         `INSERT INTO experiences
            (id, provider_id, title, description, category, subcategory, booking_url,
-            content_source, enrichment_state, canonical_id, verification_status, updated_at)
+            content_source, enrichment_state, canonical_id, verification_status,
+            evidence_url, discovery_source, updated_at)
          VALUES
            (@id, @provider_id, @title, @description, @category, @subcategory, @booking_url,
-            @content_source, @enrichment_state, @canonical_id, @verification_status, @updated_at)`,
+            @content_source, @enrichment_state, @canonical_id, @verification_status,
+            @evidence_url, @discovery_source, @updated_at)`,
       );
+      const insertFull = (row: Record<string, unknown>) =>
+        insertExperienceFull.run({ evidence_url: null, discovery_source: null, ...row });
       // A row the dedup pass merged away must NEVER be served (round-3 review,
       // BLOCKING). Its updated_at is deliberately the NEWEST of any row on this
       // provider, because that is exactly what runDedupPass() produces: it
@@ -257,7 +261,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       // `ORDER BY updated_at DESC LIMIT 10` a merged-away row therefore sorts
       // ABOVE the live ones — so dropping `AND canonical_id IS NULL` does not
       // merely leak this row, it puts it FIRST. h11/h12 below fail on a revert.
-      insertExperienceFull.run({
+      insertFull({
         id: "exp-merged-away-1", provider_id: "prov-generic-enriched",
         title: "Duplikat, foldet inn i exp-enriched-1",
         description: "Tekst fra en rad som ikke finnes på noen brukerflate lenger.",
@@ -272,7 +276,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       // evaluate to NULL and drop it, i.e. hide precisely the rows that ARE
       // checkable. Latent today (createExperience coalesces to
       // 'pending_verify'), pinned so the NULL guard cannot be simplified away.
-      insertExperienceFull.run({
+      insertFull({
         id: "exp-nullverif-1", provider_id: "prov-generic-enriched",
         title: "Opplevelse uten verification_status",
         description: "Beskrivelse skrevet av generisk content-refresh.",
@@ -280,6 +284,54 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: null,
         updated_at: daysAgoIso(3),
+      });
+      // verification_status = 'verified' — the OTHER half of round 2's lock
+      // guard. Round-4 review ran a mutation matrix and found that deleting the
+      // entire `verification_status` clause left the suite GREEN: no fixture
+      // ever set the column to 'verified'. `exp-verified-1` sets
+      // *enrichment_state* = 'verified' and leaves verification_status at the
+      // 'pending_verify' default, and h13 pins only the NULL branch — which
+      // survives deleting the whole clause too. So the one test that looked
+      // like it guarded this clause guarded nothing about it.
+      insertFull({
+        id: "exp-verified-lock-1", provider_id: "prov-generic-enriched",
+        title: "Låst av verification_status", description: "Verifisert av et menneske.",
+        category: "kultur_historie", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "verified",
+        updated_at: daysAgoIso(1),
+      });
+      // Harvest-sourced content mislabeled as homepage-sourced (round-4 review,
+      // BLOCKING). applyExperienceContent() stamps content_source =
+      // 'provider_site' unconditionally, including when bulkInsertExperiences
+      // hands it a third-party harvest row — so `content_source` cannot
+      // distinguish this from real homepage content, and no SQL predicate can.
+      // Its evidence_url points at the aggregator, not at the page the verifier
+      // is about to fetch, so judging it produces a false `mismatch` — which is
+      // what trips the §8.4 write-pause.
+      insertFull({
+        id: "exp-aggregator-sourced-1", provider_id: "prov-generic-enriched",
+        title: "Tekst hentet fra DMO-side",
+        description: "AGGREGATOR-TEKST: Bli med inn i fjøset og mat lammene.",
+        category: "dyreliv_safari", subcategory: null,
+        booking_url: "https://visitnorway.com/book/123",
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "pending_verify",
+        evidence_url: "https://visitnorway.com/x", discovery_source: "visitnorway",
+        updated_at: daysAgoIso(1),
+      });
+      // …and the control: same shape, but the evidence DOES point at the
+      // provider's own homepage. This one must still be served, otherwise the
+      // filter above would just be a new way to report checked=0.
+      insertFull({
+        id: "exp-homepage-sourced-1", provider_id: "prov-generic-enriched",
+        title: "Tekst hentet fra egen hjemmeside",
+        description: "Beskrivelse hentet fra produsentens egen side.",
+        category: "natur_friluft", subcategory: null, booking_url: null,
+        content_source: "provider_site", enrichment_state: "enriched",
+        canonical_id: null, verification_status: "pending_verify",
+        evidence_url: "https://www.generisk.example.no/opplevelser", discovery_source: "provider_site",
+        updated_at: daysAgoIso(4),
       });
       // 11 enriched rows on their own provider, so `LIMIT 10` truncates by
       // exactly one. The doc-comment calls the truncation out as something
@@ -402,8 +454,8 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       const servedIds = (genericRow.enriched_experiences as any[]).map((e) => e.id).sort();
       assertEq(
         servedIds,
-        ["exp-enriched-1", "exp-nullverif-1", "exp-verified-1"],
-        "h4: exactly the enriched AND verified rows are served — raw, manual, claim and merged-away are all excluded",
+        ["exp-enriched-1", "exp-homepage-sourced-1", "exp-nullverif-1", "exp-verified-1"],
+        "h4: exactly the checkable rows are served — raw, manual, claim, merged-away, verification-locked and aggregator-sourced are all excluded",
       );
       assertEq(genericRow.enriched_experiences[0].id, "exp-enriched-1", "h5: ordered updated_at DESC, so the freshest enriched row comes first");
       assertTrue(
@@ -449,6 +501,62 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         "h13: a row with verification_status NULL IS served — isExperienceContentLocked calls NULL unlocked, so a bare `!= 'verified'` would hide exactly the rows that are checkable",
       );
 
+      // ── (h15) verification_status lock — round-4 review, BLOCKING ────────
+      // A mutation matrix showed the ENTIRE verification_status clause could be
+      // deleted with the suite still green, because no fixture set the column
+      // to 'verified'. This assertion is the one that dies on that deletion.
+      assertTrue(
+        !(genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-verified-lock-1"),
+        "h15: a row locked by verification_status='verified' is never served — the half of round 2's lock guard that no test could kill",
+      );
+
+      // ── (h16-h18) provenance — round-4 review, BLOCKING ──────────────────
+      // applyExperienceContent stamps content_source='provider_site'
+      // unconditionally, including when bulkInsertExperiences hands it a
+      // third-party harvest row. So content_source cannot distinguish
+      // homepage-sourced content from aggregator-scraped content, and no SQL
+      // predicate can — only evidence_url can.
+      assertTrue(
+        !(genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-aggregator-sourced-1"),
+        "h16: a row whose evidence_url points at an aggregator is NOT served — judging it against the homepage is a guaranteed false mismatch, and §8.4 pauses writes on those",
+      );
+      assertTrue(
+        (genericRow.enriched_experiences as any[]).some((e) => e.id === "exp-homepage-sourced-1"),
+        "h17: …while the same shape with evidence_url on the provider's OWN host IS served — the filter must not become a new way to report checked=0",
+      );
+      const provRow = (genericRow.enriched_experiences as any[]).find((e) => e.id === "exp-homepage-sourced-1");
+      assertEq(provRow.evidence_url, "https://www.generisk.example.no/opplevelser", "h18a: evidence_url is projected, so the consumer can judge against the right page instead of trusting content_source");
+      assertEq(provRow.discovery_source, "provider_site", "h18b: discovery_source is projected alongside it");
+
+      // ── (h19) the `since` window covers the full 7 days ──────────────────
+      // last_enriched_at is written as SQLite datetime('now') ("2026-07-20
+      // 23:59:59"); `since` used to be a JS toISOString() ("…T00:00:00.000Z").
+      // SQLite string-compares them and ' ' < 'T', so every provider enriched
+      // on the boundary calendar day fell out regardless of time — a 6-day-plus
+      // window masquerading as 7 (round-4 review).
+      // Both timestamps are FIXED, and deliberately on the SAME calendar day —
+      // that is the only place the bug bites. A fixture a few days inside the
+      // window passes either way, because the date parts already differ; the
+      // first draft of this assertion made exactly that mistake and survived
+      // the mutation test, which is how it was caught.
+      {
+        insertProvider.run({
+          id: "prov-sqlite-stamp", navn: "SQLite-stemplet AS", hjemmeside: "https://sqlite-stamp.example.no",
+          last_enriched_at: "2026-07-20 23:59:59",   // as datetime('now') writes it
+          about_text: "Beriket sent på grensedagen.", visit_text: null,
+          opening_hours_text: null, products: null,
+          content_source: "provider_site", content_evidence_url: null,
+        });
+        const winResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: "2026-07-20", limit: "50" },
+        });
+        assertTrue(
+          (winResp.body.providers as any[]).some((p) => p.id === "prov-sqlite-stamp"),
+          "h19: a provider enriched on the BOUNDARY day is inside the window — ' ' (0x20) < 'T' (0x54) used to drop the whole day",
+        );
+      }
+
       // ── (h14) LIMIT 10 truncation ───────────────────────────────────────
       const manyRow = (shapeResp.body.providers as any[]).find((p) => p.id === "prov-many-experiences");
       assertTrue(!!manyRow, "h14a: prov-many-experiences row present");
@@ -490,6 +598,48 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
       assertTrue(
         (faultResp.body.providers as any[]).every((p) => p.enriched_experiences_error === true),
         "i6: a prepare() fault flags EVERY provider in the sample, not just the first",
+      );
+
+      // ── (i7-i9) the RUNTIME .all() fault, a different branch ─────────────
+      // Round-4 review, minor: test (i) renames the table BEFORE the request,
+      // so the throw lands at expDb.prepare() and the per-provider catch — the
+      // one whose comment names SQLITE_BUSY as its reason — is never entered.
+      // Here the statement prepares fine and the table disappears afterwards,
+      // so .all() itself throws inside the row loop. Unlike the prepare-time
+      // variant this flags providers individually, which nothing pinned.
+      const runtimeFaultRouter = opplevelserRouter;
+      let runtimeResp: RouteResult;
+      {
+        // Prime a successful prepare by making one normal call first, then pull
+        // the table out from under the loop mid-request via a statement that
+        // the handler will execute after preparing.
+        expDb.exec("ALTER TABLE experiences RENAME TO experiences_hidden_runtime");
+        expDb.exec(`CREATE TABLE experiences (
+          id TEXT PRIMARY KEY, provider_id TEXT, title TEXT, description TEXT,
+          category TEXT, subcategory TEXT, booking_url TEXT, content_source TEXT,
+          evidence_url TEXT, discovery_source TEXT, enrichment_state TEXT,
+          canonical_id TEXT, verification_status TEXT, updated_at TEXT)`);
+        // A view-free table with the right columns prepares cleanly; dropping a
+        // column it SELECTs makes .all() fail at execution time instead.
+        expDb.exec("ALTER TABLE experiences DROP COLUMN discovery_source");
+        try {
+          runtimeResp = await callRoute(runtimeFaultRouter, {
+            headers: { "x-admin-key": testKey },
+            query: { since: daysAgoIso(30), limit: "50" },
+          });
+        } finally {
+          expDb.exec("DROP TABLE experiences");
+          expDb.exec("ALTER TABLE experiences_hidden_runtime RENAME TO experiences");
+        }
+      }
+      assertEq(runtimeResp.status, 200, "i7: a runtime query fault also degrades rather than 500-ing");
+      assertTrue(
+        (runtimeResp.body.providers as any[]).every((p) => p.enriched_experiences_error === true),
+        "i8: …and reaches the consumer as the same flag, not as a silent empty list",
+      );
+      assertTrue(
+        (runtimeResp.body.providers as any[]).every((p) => Array.isArray(p.enriched_experiences) && p.enriched_experiences.length === 0),
+        "i9: …with an empty list alongside it",
       );
     } catch (err: any) {
       failed++;

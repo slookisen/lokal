@@ -4968,16 +4968,29 @@ router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res:
 // `{ id, title, description, category, subcategory, booking_url,
 // content_source, updated_at }`, at most 10 per provider, ordered
 // `updated_at DESC` — a provider with more enriched rows than that IS
-// truncated, which matters to a consumer computing `checked`.
+// truncated, which matters to a consumer computing `checked`. Note the order is
+// LAST TOUCHED, not last enriched: the geocode worker, the title_no backfill
+// and the dedup pass all bump `updated_at` without writing content, so which 10
+// of >10 rows you get is not strictly "the 10 most recently enriched"
+// (round-4 review).
 //
-// Excluded, so that every row served is genuinely homepage-sourced content the
-// enrichment pass actually wrote (same lock guard applyExperienceContent uses,
-// see the query): rows with `content_source` 'manual' or 'claim' (the two
-// owner/claim-authored values the schema defines — `curator` is not one of
-// them), rows with `verification_status = 'verified'`, and rows the dedup pass
-// merged away (`canonical_id IS NOT NULL`), which exist on no user-visible
-// surface. Note this is the EXPERIENCE-level `verification_status`, not
-// `enrichment_state` — the latter's 'verified' rung IS served, see below.
+// Excluded, so that every row served is content the enrichment pass wrote from
+// the page the consumer is about to fetch:
+//   - `content_source` 'manual' or 'claim' — the two owner/claim-authored
+//     values the schema defines (`curator` is not one of them);
+//   - `verification_status = 'verified'` — note this is the EXPERIENCE-level
+//     column, not `enrichment_state`, whose 'verified' rung IS served;
+//   - rows the dedup pass merged away (`canonical_id IS NOT NULL`);
+//   - rows whose `evidence_url` host differs from the provider's homepage host
+//     (applied in JS below, because `content_source` cannot be trusted for
+//     this — see the long comment at the filter).
+//
+// On the merged-away exclusion, one thing worth stating so a later reader does
+// not over-read it: "exists on no user-visible surface" is TRUE of every row
+// this endpoint serves, since PUBLISH_GATE_SQL requires
+// `verification_status = 'verified'` and this query requires the opposite —
+// the two sets are disjoint (round-4 review). The exclusion stands on the
+// lock-model grounds stated at the query, not on publishability.
 //
 // On a query fault the provider carries `enriched_experiences_error: true`
 // alongside an empty list — score that as `skipped`, never as "nothing was
@@ -4991,12 +5004,24 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
     const expDb = getExpDb("experiences");
 
     const DEFAULT_SINCE_DAYS = 7;
-    let since = new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    // Compared against `last_enriched_at`, which is only ever written as
+    // SQLite `datetime('now')` — "2026-07-20 23:59:59", a SPACE separator.
+    // A JS `.toISOString()` gives "2026-07-20T00:00:00.000Z", and SQLite
+    // string-compares the two: ' ' (0x20) < 'T' (0x54), so
+    //   '2026-07-20 23:59:59' >= '2026-07-20T00:00:00.000Z'  ->  0
+    // Every provider enriched on the boundary calendar day was excluded
+    // regardless of the time of day, making the effective window 6 days plus a
+    // fraction instead of 7 (round-4 review). Pre-existing, but it thins
+    // exactly the sample this endpoint change exists to enlarge, so it is
+    // fixed here rather than filed away. Emitting the same shape SQLite writes
+    // makes the comparison mean what it reads as.
+    const toSqliteDatetime = (d: Date): string => d.toISOString().slice(0, 19).replace("T", " ");
+    let since = toSqliteDatetime(new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000));
     const sinceParam = req.query.since;
     if (typeof sinceParam === "string" && sinceParam.trim()) {
       const parsed = new Date(sinceParam);
       if (!isNaN(parsed.getTime())) {
-        since = parsed.toISOString();
+        since = toSqliteDatetime(parsed);
       }
     }
 
@@ -5058,7 +5083,7 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
     try {
       expRowsStmt = expDb.prepare(
       `SELECT id, title, description, category, subcategory, booking_url,
-              content_source, updated_at
+              content_source, evidence_url, discovery_source, updated_at
          FROM experiences
         WHERE provider_id = ?
           AND enrichment_state IN ('enriched', 'verified')
@@ -5125,7 +5150,41 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
       let enrichedExperiences: unknown[] = [];
       let enrichedExperiencesError = false;
       try {
-        enrichedExperiences = expRowsStmt ? (expRowsStmt.all(r.id) as unknown[]) : [];
+        const raw = expRowsStmt
+          ? (expRowsStmt.all(r.id) as Array<{ evidence_url: string | null }>)
+          : [];
+        // Provenance filter (round-4 review, BLOCKING). `content_source` is NOT
+        // trustworthy provenance for these rows, and no SQL predicate can make
+        // it so: applyExperienceContent() unconditionally stamps
+        // `content_source = 'provider_site'` (experience-store.ts:1880) — even
+        // when its caller is bulkInsertExperiences() (:1482) or POST
+        // /admin/bulk-load, handing it THIRD-PARTY HARVEST-ROW data on a
+        // re-harvest that scored richer than the stored row. So a description
+        // lifted from a visitnorway.com listing lands in the DB labelled
+        // 'provider_site', and every predicate on the query above passes it.
+        //
+        // That matters because §8.3 tells the verifier to fetch the provider's
+        // homepage and judge each field against it. Aggregator-sourced text —
+        // and a `booking_url` that is off-site BY DESIGN (`booking_type:
+        // 'external'`, init-experiences.ts:99) — will not be supported by the
+        // producer's own page, so it scores as `mismatch`. §8.4 sets
+        // controller/enrichment-write-pause.yaml → enabled: true above a 10%
+        // error rate, and only Daniel can clear it. Same blast radius as the
+        // round-2 lock-guard finding, reached by a different route.
+        //
+        // So: only serve a row whose evidence actually points at the page the
+        // verifier is about to fetch. Dropping is the SAFE direction — an
+        // excluded row thins the sample (`skipped`), while a false `mismatch`
+        // pauses writes for the whole vertical. `evidence_url` and
+        // `discovery_source` are projected too, so the consumer can see the
+        // provenance rather than having to trust `content_source`.
+        const homepageHost = r.hjemmeside ? hostFromUrlLike(r.hjemmeside) : null;
+        enrichedExperiences = raw.filter((row) => {
+          if (!row.evidence_url) return true;          // nothing to contradict
+          if (!homepageHost) return true;              // verifier fetches the evidence url itself
+          const evidenceHost = hostFromUrlLike(row.evidence_url);
+          return !evidenceHost || evidenceHost === homepageHost;
+        });
         if (!expRowsStmt) enrichedExperiencesError = true;
       } catch (err) {
         enrichedExperiencesError = true;
