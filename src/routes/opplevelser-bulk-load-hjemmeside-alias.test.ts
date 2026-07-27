@@ -30,7 +30,7 @@
  * drift apart again.
  */
 
-import { BulkRowSchema, firstNonAggregatorWebsite, type BulkRow } from "./opplevelser";
+import { BulkRowSchema, firstNonAggregatorWebsite, isAggregatorWebsite, type BulkRow } from "./opplevelser";
 
 export interface TestSummary {
   passed: number;
@@ -81,10 +81,40 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
     assertEq(firstNonAggregatorWebsite([row as BulkRow]), null, "alias-4: a row with no homepage at all yields null, not a crash");
   }
 
-  // ── `website` wins when a row carries both ─────────────────────────────
+  // ── `hjemmeside` wins when a row carries both ──────────────────────────
+  // Round-6 review, BLOCKING: this used to assert `website` wins, while the
+  // source comment simultaneously claimed `website` = the scraped listing and
+  // `hjemmeside` = the producer's own site is the EXPECTED shape. Both cannot
+  // be right. Under `website`-first, 7 of 12 real Norwegian regional tourism
+  // hosts beat the real homepage in that shape, because they are not on any
+  // aggregator list — and no such list can be complete.
+  //
+  // `hjemmeside` needs no list: the harvest SKILL defines it as the provider's
+  // OWN official homepage, never a DMO page, and "if you cannot verify it with
+  // certainty, LEAVE IT OPEN — NEVER guess". `website` carries no such
+  // contract, and 2026-07-19-agg-website-leak documents aggregator URLs
+  // genuinely arriving in it. Still deterministic — just the other way.
   {
     const row = BulkRowSchema.parse({ ...base, website: "https://kanonisk.no", hjemmeside: "https://annen.no" });
-    assertEq(firstNonAggregatorWebsite([row as BulkRow]), "https://kanonisk.no", "alias-5: `website` wins when both are present (deterministic)");
+    assertEq(firstNonAggregatorWebsite([row as BulkRow]), "https://annen.no", "alias-5: `hjemmeside` wins when both are present — it is the field with the strict own-homepage contract");
+  }
+  // …and the unlisted-DMO case that motivated the swap.
+  {
+    for (const dmo of [
+      "https://visitlofoten.com/no/aktiviteter/x",
+      "https://hardangerfjord.com/no/x",
+      "https://visitrogaland.com/x",
+      "https://visitnordfjord.no/x",
+      "https://visitvesteralen.com/x",
+      "https://nasjonaleturistveger.no/x",
+    ]) {
+      const row = BulkRowSchema.parse({ ...base, website: dmo, hjemmeside: "https://trollaktiv.no" });
+      assertEq(
+        firstNonAggregatorWebsite([row as BulkRow]),
+        "https://trollaktiv.no",
+        `alias-5b/${dmo.slice(8, 30)}: an UNLISTED regional tourism listing in \`website\` never beats a real \`hjemmeside\``,
+      );
+    }
   }
 
   // ── Empty / whitespace `website` must NOT shadow a real `hjemmeside` ────
@@ -385,8 +415,8 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
     const known = BulkRowSchema.parse({ ...base, website: "https://gard.travel", hjemmeside: "https://trollaktiv.no" });
     assertEq(
       firstNonAggregatorWebsite([known as BulkRow]),
-      "https://gard.travel",
-      "alias-21: `website` keeps precedence regardless of TLD — precedence is by FIELD, never by TLD",
+      "https://trollaktiv.no",
+      "alias-21: precedence is by FIELD, never by TLD — an uncommon TLD neither wins nor loses on that account",
     );
     const oddRow = BulkRowSchema.parse({ ...base, website: "gard.bogus" });
     const realRow = BulkRowSchema.parse({ ...base, title: "Rafting", website: "https://trollaktiv.no" });
@@ -411,11 +441,22 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
       "trollaktiv.no.",                    // trailing FQDN root dot
       "TROLLAKTIV.NO",                     // uppercase
       "gård.no",                           // IDN, unicode form
-      "xn--grd-loa.no",                    // …and its punycode form
+      "xn--grd-ula.no",                    // …and its ACTUAL punycode form (a comment here once said xn--grd-loa.no; new URL("http://gård.no").hostname disagrees, and the assertion passed anyway because the value is returned verbatim — so the round-trip it claimed to pin was never pinned)
       "trollaktiv.no/gardsbutikk",         // deep link
       "https://trollaktiv.no/a/b?c=d#e",   // path + query + fragment
       "https://trollaktiv.no:8443/",       // explicit port
       "sjokoladefabrikken.co.uk",          // multi-label suffix
+      // Round-6 review: ordinary Norwegian hosting subdomains that happen to
+      // use a word from the placeholder list. Screening EVERY label rejected
+      // all of these; origin/main stored them. The junk always sits at the
+      // registrable-domain level, so only those labels are screened now.
+      "hjemmeside.storgarden.no",
+      "nettside.storgarden.no",
+      "nettsted.storgarden.no",
+      "kommer.storgarden.no",
+      "arbeid.storgarden.no",
+      "ingen.storgarden.no",
+      "www.hjemmeside.storgarden.no",
       // Round-4 review, blocking: `@` is legal in a path/query/fragment, and a
       // blanket rejection dropped all three of these to null — values
       // origin/main stored. Only the AUTHORITY is screened for `@` now.
@@ -475,6 +516,59 @@ export function runBulkLoadHjemmesideAliasTests(opts: { log?: boolean } = {}): T
       "https://trollaktiv.no",
       "alias-7: an earlier aggregator row does not shadow a later real homepage",
     );
+  }
+
+  // ── isAggregatorWebsite, tested DIRECTLY (round-6 review) ───────────────
+  // It is the sole classifier for POST /admin/hjemmeside-cleanup-sweep, which
+  // runs `SET listing_url = ?, hjemmeside = NULL` — irreversible. Every previous
+  // assertion reached it through firstNonAggregatorWebsite, where
+  // looksLikeHomepageValue rejects these inputs first, so the parser preference
+  // was unfalsifiable: reverting it left the whole 10706-test suite green.
+  {
+    // `new URL()` percent-decodes the host and treats `\` as a path separator;
+    // hostFromUrlLike does neither. Preferring new URL() and falling back only
+    // when it throws is what keeps these recognized.
+    for (const v of ["http://visitnorway%2Ecom/", "http://visitnorway.com\\evil", "https://visitnorway.com"]) {
+      assertEq(isAggregatorWebsite(v), true, `agg-1/${v}: recognized as an aggregator by the sweep's classifier`);
+    }
+    // …and hostFromUrlLike is what catches an authority new URL() cannot parse.
+    for (const v of ["http://visitnorway.com:99999/", "visitnorway.com:abc"]) {
+      assertEq(isAggregatorWebsite(v), true, `agg-2/${v}: an unparseable authority still resolves to the aggregator host`);
+    }
+    // The false positive the round-4 single-parser version introduced: this
+    // host IS gard.no, so the sweep must NOT null its homepage.
+    assertEq(isAggregatorWebsite("http://gard.no\\@visitnorway.com"), false, "agg-3: a value whose real host is the producer's own is NOT swept");
+    assertEq(isAggregatorWebsite("https://trollaktiv.no"), false, "agg-4: a plain producer homepage is not an aggregator");
+    // The six harvest-SOURCE hosts must stay OUT of this classifier: putting
+    // them in silently rewired the sweep to null 9 of 10 seeded providers'
+    // homepages instead of 1 (round-6 review, BLOCKING).
+    for (const v of ["https://fjordtours.com/", "https://nordnorge.com/", "https://www.visitbergen.com/",
+                     "https://visittromso.no/", "https://visitoslo.com/", "https://visittrondheim.no/",
+                     "https://booking.fjordtours.com/tour/1"]) {
+      assertEq(isAggregatorWebsite(v), false, `agg-5/${v}: a harvest SOURCE host is screened at CREATE only — never by the destructive sweep`);
+    }
+  }
+
+  // ── The guards that nothing could falsify, now pinned ────────────────────
+  {
+    // isPlausibleUrlish's length bound: the host is fine, the value is not.
+    const huge = BulkRowSchema.parse({ ...base, website: "https://gard.no/" + "a".repeat(3000) });
+    assertEq(firstNonAggregatorWebsite([huge as BulkRow]), null, "guard-1: a 3000-char value is rejected on length, even with a perfectly good host");
+    // PLACEHOLDER_EMAIL_DOMAINS via the registrable domain — `domain` is not in
+    // PLACEHOLDER_DOMAIN_LABELS, so only that check can reject these.
+    // ALONE, and in `hjemmeside` — not paired with a good sibling. Paired, the
+    // assertion is satisfied by field precedence alone and cannot see whether
+    // the sentinel was screened at all: my first version of this block put the
+    // sentinel in `website` next to a real `hjemmeside`, and since `hjemmeside`
+    // is now evaluated first the guard's removal left it green. Caught by
+    // re-running the mutation, not by reading the test. Note `domain` and
+    // `test` are NOT in PLACEHOLDER_DOMAIN_LABELS, so only the
+    // PLACEHOLDER_EMAIL_DOMAINS check can reject these.
+    for (const v of ["domain.com", "shop.domain.com", "www.test.com", "email.com", "company.com"]) {
+      const alone = BulkRowSchema.parse({ ...base, hjemmeside: v });
+      assertEq(firstNonAggregatorWebsite([alone as BulkRow]), null,
+        `guard-2/${v}: a sentinel domain is rejected via its REGISTRABLE domain, subdomain or not`);
+    }
   }
 
   return { passed, failed, failures };

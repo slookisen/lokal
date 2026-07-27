@@ -549,7 +549,14 @@ export type BulkRow = z.infer<typeof BulkRowSchema>;
 // hosts are rejected. A merely-malformed URL is not this function's business
 // (that is looksLikeHomepageValue's job) — over-rejecting here would silently
 // drop a real homepage the harvester just formatted oddly.
-function isAggregatorWebsite(raw: string): boolean {
+// Exported for tests (round-6 review): this function is the SOLE classifier
+// for POST /admin/hjemmeside-cleanup-sweep, which irreversibly NULLs a
+// provider's homepage — yet every assertion about it went through
+// firstNonAggregatorWebsite, where looksLikeHomepageValue rejects the
+// interesting inputs first. Five guards therefore survived their own removal
+// with the full suite green. Testing it directly is the only way to pin the
+// behavior the sweep actually depends on.
+export function isAggregatorWebsite(raw: string): boolean {
   // BOTH parsers, new URL() first (round-5 review). Round 4 replaced new URL()
   // with hostFromUrlLike() to end their disagreement, and that did close the
   // invalid-port hole — but it opened two others, because new URL() does things
@@ -571,7 +578,7 @@ function isAggregatorWebsite(raw: string): boolean {
     host = hostFromUrlLike(raw);
   }
   if (!host) return false;
-  return isDirectoryOrAggregatorHost(host) || HARVEST_SOURCE_HOSTS.has(registrableDomain(host));
+  return isDirectoryOrAggregatorHost(host);
 }
 
 // Does `v` have the SHAPE of a real homepage — i.e. does it parse to a host
@@ -673,13 +680,23 @@ function isPlaceholderHomepageHost(host: string): boolean {
   // "co.uk" for "example.co.uk" and would have defeated any multi-label entry
   // added to PLACEHOLDER_EMAIL_DOMAINS later (round-5 review — the same
   // "don't reinvent a weaker validator" correction round 3 made).
-  if (PLACEHOLDER_EMAIL_DOMAINS.includes(bare)) return true;
+  // One check, not two (round-6 review): a separate `includes(bare)` line was
+  // unfalsifiable — registrableDomain(x) === x for every two-label host, and
+  // PLACEHOLDER_EMAIL_DOMAINS contains no multi-label-suffix entry, so no input
+  // could distinguish them. A guard no test can kill is not a guard.
   if (PLACEHOLDER_EMAIL_DOMAINS.includes(registrableDomain(bare))) return true;
   // Separator-insensitive, the same way PR-126's registrable-domain equality
   // treats `liagard.no` and `lia-gard.no` as one domain: "ikke-oppgitt" and
   // "ikkeoppgitt" are the same placeholder, and pinning only one spelling is
   // the fixture-calibration this screen has now been rewritten twice to escape.
-  return bare
+  // Only the REGISTRABLE domain's labels, not every label of the host
+  // (round-6 review). Screening every label rejected ordinary Norwegian hosting
+  // subdomains — `hjemmeside.storgarden.no`, `nettside.storgarden.no`,
+  // `kommer.storgarden.no` — which origin/main stored. The junk this list
+  // targets always sits at the registrable-domain level (`ikke-oppgitt.no`,
+  // `hjemmeside.com`, `null.null`), so narrowing it loses nothing and stops a
+  // false rejection, which here is the very loss this PR exists to prevent.
+  return registrableDomain(bare)
     .split(".")
     .some((label) => PLACEHOLDER_DOMAIN_LABELS.has(label.replace(/[-_]/g, "")));
 }
@@ -693,16 +710,33 @@ function isPlaceholderHomepageHost(host: string): boolean {
 // so there was nothing for a DMO `website` to shadow; accepting the alias turns
 // a documented gap into active data loss.
 //
-// Kept LOCAL rather than added to KNOWN_DIRECTORY_HOSTS on purpose. That set
-// also gates domainCoherenceCheck's directory-host BYPASS
-// (cross-source-validator.ts), so adding a host there relaxes the verifier's
-// coherence gate for every agent on that domain — a blast radius this PR has no
-// evidence for. The screen below only decides which of a bulk-load row's own
-// fields becomes the provider's homepage, which is precisely the harm measured.
+// Applied ONLY in firstNonAggregatorWebsite, never inside isAggregatorWebsite
+// (round-6 review, BLOCKING). I first put it in isAggregatorWebsite and wrote a
+// comment claiming it "only decides which of a bulk-load row's own fields
+// becomes the provider's homepage". That was false: isAggregatorWebsite is also
+// the SOLE classifier for POST /admin/hjemmeside-cleanup-sweep, which runs
+// `SET listing_url = ?, hjemmeside = NULL`. Measured on 10 seeded providers,
+// origin/main moved 1 and that version moved 9 — irreversibly NULLing the
+// homepage of every provider on these six hosts AND their subdomains.
+//
+// Which is exactly the "speculative add" the note in cross-source-validator.ts
+// refuses for these same six hosts, reached by a side door. KNOWN_DIRECTORY_HOSTS'
+// own doc warns about it in as many words: "Tourism-board hosts are NOT
+// pattern-matched (false-positive risk on an irreversible NULL)."
+//
+// So the screen lives at the one call site whose harm is actually measured: the
+// bulk-load CREATE path, where `website` = the listing the agent scraped and
+// `hjemmeside` = the producer's own site is the expected row shape.
 const HARVEST_SOURCE_HOSTS: ReadonlySet<string> = new Set([
   "nordnorge.com", "visittromso.no", "visitbergen.com",
   "visitoslo.com", "visittrondheim.no", "fjordtours.com",
 ]);
+
+function isHarvestSourceHost(raw: string): boolean {
+  const host = hostFromUrlLike(raw);
+  if (!host) return false;
+  return HARVEST_SOURCE_HOSTS.has(registrableDomain(host));
+}
 
 function looksLikeHomepageValue(v: string): boolean {
   if (!isPlausibleUrlish(v)) return false;
@@ -788,9 +822,48 @@ export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
   // junk signal moved to where the junk actually lives — the domain LABEL (see
   // PLACEHOLDER_DOMAIN_LABELS). That screens `ikke.oppgitt`, `ukjent.no` and
   // `nettside.no` alike, and leaves `storgarden.nu` alone.
+  // `hjemmeside` FIRST, not `website` (round-6 review, BLOCKING). The two
+  // fields do not carry equally trustworthy values, and this file asserted both
+  // halves of a contradiction: that `website` = the scraped listing and
+  // `hjemmeside` = the producer's own site is the EXPECTED row shape, and that
+  // `website` wins when both are present. Under `website`-first the fix only
+  // fires when the listing host happens to be on a known list — and review
+  // measured 7 of 12 real Norwegian regional tourism hosts (visitlofoten.com,
+  // hardangerfjord.com, visitrogaland.com, visitnordfjord.no,
+  // visitalesund-geiranger.com, visitvesteralen.com, nasjonaleturistveger.no)
+  // beating the real `hjemmeside` in that shape. The list is admittedly
+  // incomplete, and no list of this kind can be complete.
+  //
+  // Preferring `hjemmeside` needs no list. Being precise about why, because the
+  // simple version of this argument is not quite true:
+  //
+  // The harvest SKILL attaches a strict contract to whichever field it sends —
+  // "the provider's OWN official homepage", never a DMO/aggregator page, and
+  // "if you cannot verify it with certainty, LEAVE IT OPEN — NEVER guess". Its
+  // old text sent `hjemmeside`; A2A#411 renames that to `website`. So a row
+  // from EITHER a stale or a fresh runner carries the strict contract, and each
+  // sends only ONE of the two fields. Precedence therefore never decides a
+  // harvest row at all.
+  //
+  // It decides the MIXED rows, which come from everything else — other
+  // bulk-load callers, hand-assembled payloads, transitional states. And there
+  // the asymmetry is real and measured: dev-request 2026-07-19-agg-website-leak
+  // documents aggregator URLs genuinely arriving in `website` in production,
+  // with no equivalent record for the alias. `website` is also the field a
+  // generic scraper fills by default.
+  //
+  // So on the only rows where it matters, `hjemmeside` is the higher-confidence
+  // value — and a junk or listing value in it is screened below regardless,
+  // which makes this strictly safer than depending on a domain list that this
+  // file already admits is incomplete.
   for (const r of rows) {
-    for (const candidate of [r.website?.trim(), r.hjemmeside?.trim()]) {
-      if (candidate && looksLikeHomepageValue(candidate) && !isAggregatorWebsite(candidate)) {
+    for (const candidate of [r.hjemmeside?.trim(), r.website?.trim()]) {
+      if (
+        candidate
+        && looksLikeHomepageValue(candidate)
+        && !isAggregatorWebsite(candidate)
+        && !isHarvestSourceHost(candidate)
+      ) {
         return candidate;
       }
     }
