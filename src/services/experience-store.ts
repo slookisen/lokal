@@ -1824,14 +1824,19 @@ export function applyExperienceContent(
   // experience_providers.content_evidence_url, stamped by applyProviderContent.
   // Optional: omitting it leaves the column untouched (NULL = unknown, never
   // treated as a mismatch), so no caller is forced to lie.
-  sourceUrl?: string | null
+  // REQUIRED, not optional (round-6 review). As an optional parameter every
+  // one of the three call sites could drop its argument with the whole suite
+  // green: NULL means "unknown", unknown means "served", and the aggregator
+  // leak reopens silently. Making it required turns three untested guards into
+  // compile errors. Pass null explicitly when there genuinely is no source.
+  sourceUrl: string | null
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
       `SELECT id, description, category, subcategory, activity_tags, season,
               indoor_outdoor, duration_min, price_from, booking_url,
-              content_source, verification_status
+              content_source, content_field_evidence, verification_status
          FROM experiences WHERE id = ?`
     )
     .get(experienceId) as ExperienceContentRow | undefined;
@@ -1898,10 +1903,59 @@ export function applyExperienceContent(
 
   sets.push("content_source = 'provider_site'");
   sets.push("enrichment_state = 'enriched'");
-  if (sourceUrl) {
-    sets.push("content_evidence_url = @content_evidence_url");
-    params.content_evidence_url = sourceUrl;
+
+  // PER-FIELD provenance, not one URL for the row (round-6 review, BLOCKING).
+  //
+  // The round-5 version stamped a single `content_evidence_url` for the whole
+  // row on every write. But this function writes only fields that are currently
+  // BLANK, so one row's fields are routinely filled by different sources at
+  // different times — and a row-level column records only the most recent one.
+  // That mislabels in both directions, reopening the exact harms rounds 4 and 5
+  // were about:
+  //
+  //   harvest writes description (aggregator), then a homepage refresh writes
+  //   `season` -> the whole row now reads as homepage-sourced, so the
+  //   aggregator description is judged against the homepage and scores a false
+  //   `mismatch`, which trips the §8.4 write-pause;
+  //
+  //   homepage writes description, then a re-harvest writes `booking_url`
+  //   -> the row now reads as aggregator-sourced and is dropped, though its
+  //   description really is homepage content: a fresh route to `checked=0`.
+  //
+  // Both orderings are ordinary production sequences. And the consumer judges
+  // PER FIELD (description / category / booking_url, platform-verifier §8.3),
+  // so a single row-level value cannot answer the question being asked.
+  //
+  // The `isBlank` gate above is what makes a per-field map cheap AND stable: a
+  // field only appears in `written` when it was blank and is being filled now,
+  // so recording this call's source for exactly those keys is always correct.
+  // MERGE into any existing map rather than replacing it — that is the whole
+  // point; replacing is what the row-level column did.
+  //
+  // Deliberately no "never overwrite an existing key" guard. I wrote one, and
+  // mutation testing showed it both unreachable (a field in `written` was blank,
+  // so a stale key for it means the value was cleared out-of-band) and wrong in
+  // the one case that can reach it: a re-filled field genuinely came from the
+  // new source. A guard that cannot be falsified and would be incorrect if it
+  // could is worse than no guard.
+  if (sourceUrl && written.length > 0) {
+    let evidence: Record<string, string> = {};
+    const priorRaw = (row as { content_field_evidence?: string | null }).content_field_evidence;
+    if (priorRaw) {
+      try {
+        const parsed = JSON.parse(priorRaw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          evidence = parsed as Record<string, string>;
+        }
+      } catch { /* malformed -> start fresh rather than throw on a content write */ }
+    }
+    for (const field of written) {
+      evidence[field] = sourceUrl;
+    }
+    sets.push("content_field_evidence = @content_field_evidence");
+    params.content_field_evidence = JSON.stringify(evidence);
   }
+
   sets.push("updated_at = datetime('now')");
 
   db.prepare(`UPDATE experiences SET ${sets.join(", ")} WHERE id = @id`).run(params);

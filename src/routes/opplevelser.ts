@@ -5087,12 +5087,15 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
     // itself cannot be prepared, the provider-level content is still worth
     // serving, so degrade to the error flag rather than 500-ing the whole
     // sample (round-2 review, nit).
+    // Bounded read: 50 providers x this window. Named so the value and the
+    // window-exhausted signal below cannot drift apart.
+    const EXP_ROW_WINDOW = 50;
     let expRowsStmt: ReturnType<typeof expDb.prepare> | null = null;
     try {
       expRowsStmt = expDb.prepare(
       `SELECT id, title, description, category, subcategory, booking_url,
               content_source, evidence_url, discovery_source,
-              content_evidence_url, updated_at
+              content_evidence_url, content_field_evidence, updated_at
          FROM experiences
         WHERE provider_id = ?
           AND enrichment_state IN ('enriched', 'verified')
@@ -5149,7 +5152,7 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         -- returned ZERO — a brand-new route to the checked=0 this endpoint
         -- exists to remove. 50 is a bounded read (50 providers x 50 rows) and
         -- the response is still capped at 10.
-        LIMIT 50`
+        LIMIT ${EXP_ROW_WINDOW}`
       );
     } catch (err) {
       console.error("[opplevelser] providers/recently-enriched: could not prepare enriched_experiences query", err);
@@ -5166,53 +5169,79 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
       let enrichedExperiences: unknown[] = [];
       let enrichedExperiencesError = false;
       let enrichedExperiencesFiltered = 0;
+      let enrichedExperiencesFieldsBlanked = 0;
+      let enrichedExperiencesWindowExhausted = false;
       let homepageIsAggregator = false;
       try {
         const raw = expRowsStmt
-          ? (expRowsStmt.all(r.id) as Array<{ content_evidence_url: string | null }>)
+          ? (expRowsStmt.all(r.id) as Array<Record<string, unknown>>)
           : [];
-        // Provenance filter — on content_evidence_url, NOT evidence_url.
+        // PER-FIELD provenance screen (round-6 review, BLOCKING).
         //
-        // Round-4 review established the harm: applyExperienceContent() stamps
-        // `content_source = 'provider_site'` unconditionally, including when
-        // bulk-load hands it a third-party harvest row, so aggregator text was
-        // served as homepage truth and the weekly spot-check scored a false
-        // `mismatch` — which is what trips §8.4's write-pause.
+        // Round 4 established the harm: applyExperienceContent stamps
+        // `content_source = 'provider_site'` unconditionally, so aggregator text
+        // reaches the spot-check labelled as homepage content, scores a false
+        // `mismatch`, and trips §8.4's write-pause.
         //
-        // Round-5 review then showed my first fix used the WRONG COLUMN, and was
-        // wrong in both directions. `experiences.evidence_url` is DISCOVERY
-        // provenance: written once at createExperience() and never updated. So
-        // it (a) hid rows the content-refresh had genuinely rewritten from the
-        // homepage but which still carried their original aggregator discovery
-        // URL — a fresh route to the checked=0 this endpoint exists to remove —
-        // while (b) still admitting the re-harvest case it was written for,
-        // whose evidence_url is likewise untouched.
+        // Round 5 showed my filter used `evidence_url`, which is DISCOVERY
+        // provenance. Round 6 showed the replacement — one `content_evidence_url`
+        // per ROW — was wrong too: applyExperienceContent writes only BLANK
+        // fields, so one row's fields come from different sources at different
+        // times and a row-level column records only the last writer. It
+        // mislabelled in both directions, reopening both earlier harms.
         //
-        // applyExperienceContent now records where the CONTENT came from, which
-        // is the only column that can answer this. NULL means "written before
-        // that column existed": unknown, so serve it — the pre-change behavior,
-        // never a new exclusion.
+        // The consumer judges PER FIELD, so screen per field. A judged field
+        // whose recorded source is on a different registrable domain than the
+        // provider's homepage is blanked, and a row left with no judged field is
+        // dropped entirely — there is nothing left to check on it.
         //
-        // Compared on the REGISTRABLE domain, not the bare host (round-5
-        // review): every other same-site check in this repo does, and bare-host
-        // equality dropped legitimate own-site evidence on `shop.gard.no` vs
-        // `gard.no`.
+        // Unknown provenance (no map entry, or a row written before the column
+        // existed) is KEPT, which is the pre-change behavior: never invent an
+        // exclusion from missing data.
+        const JUDGED_FIELDS = ["description", "category", "booking_url"] as const;
         const homepageHost = r.hjemmeside ? hostFromUrlLike(r.hjemmeside) : null;
         const homepageDomain = homepageHost ? registrableDomain(homepageHost) : null;
-        const kept = raw.filter((row) => {
-          if (!row.content_evidence_url) return true;   // unknown provenance
-          if (!homepageDomain) return true;             // verifier fetches the evidence url itself
-          const evidenceHost = hostFromUrlLike(row.content_evidence_url);
-          return !evidenceHost || registrableDomain(evidenceHost) === homepageDomain;
-        });
+
+        let fieldsBlanked = 0;
+        const kept: Array<Record<string, unknown>> = [];
+        for (const row of raw) {
+          let evidence: Record<string, string> = {};
+          const rawMap = row.content_field_evidence;
+          if (typeof rawMap === "string" && rawMap) {
+            try {
+              const parsed = JSON.parse(rawMap);
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                evidence = parsed as Record<string, string>;
+              }
+            } catch { /* malformed -> treat as unknown, i.e. keep */ }
+          }
+          const out: Record<string, unknown> = { ...row };
+          let judgeable = 0;
+          for (const field of JUDGED_FIELDS) {
+            if (out[field] === null || out[field] === undefined || out[field] === "") continue;
+            const src = evidence[field];
+            if (!src || !homepageDomain) { judgeable++; continue; }   // unknown -> keep
+            const srcHost = hostFromUrlLike(src);
+            if (!srcHost || registrableDomain(srcHost) === homepageDomain) { judgeable++; continue; }
+            out[field] = null;      // written from somewhere else — not checkable here
+            fieldsBlanked++;
+          }
+          if (judgeable > 0) kept.push(out);
+        }
         enrichedExperiencesFiltered = raw.length - kept.length;
+        enrichedExperiencesFieldsBlanked = fieldsBlanked;
         enrichedExperiences = kept.slice(0, 10);
-        // A provider whose OWN hjemmeside is an aggregator (documented in
-        // production by dev-request 2026-07-19-agg-website-leak) inverts the
-        // filter: both sides match, so aggregator text is admitted and then
-        // judged against the aggregator page it came from — scoring `ok` and
-        // INFLATING the quality signal this endpoint exists to produce. The
-        // consumer cannot see that from the rows, so say it explicitly.
+        // Rows the 50-row window could not reach. Without this a provider with
+        // more than 50 rows can still come back short or empty with no way for
+        // the consumer to tell that from "enrichment wrote nothing" — the old
+        // LIMIT-10 cliff moved outward rather than removed (round-6 review).
+        if (raw.length >= EXP_ROW_WINDOW && kept.length < 10) {
+          enrichedExperiencesWindowExhausted = true;
+        }
+        // A provider whose OWN hjemmeside is an aggregator inverts the screen:
+        // every source domain matches it, so aggregator text is judged against
+        // the aggregator page it came from and scores `ok`, INFLATING the signal
+        // rather than measuring it. The consumer cannot see that from the rows.
         if (homepageHost && isDirectoryOrAggregatorHost(homepageHost)) {
           homepageIsAggregator = true;
         }
@@ -5260,6 +5289,12 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
         // filter path this time. Emitted only when it actually happened.
         ...(enrichedExperiencesFiltered > 0
           ? { enriched_experiences_filtered: enrichedExperiencesFiltered }
+          : {}),
+        ...(enrichedExperiencesFieldsBlanked > 0
+          ? { enriched_experiences_fields_blanked: enrichedExperiencesFieldsBlanked }
+          : {}),
+        ...(enrichedExperiencesWindowExhausted
+          ? { enriched_experiences_window_exhausted: true }
           : {}),
         ...(homepageIsAggregator ? { homepage_is_aggregator: true } : {}),
         field_provenance: null,

@@ -388,8 +388,14 @@ export function initExperiencesSchema(db: Database.Database): void {
   // for experiences rather than inventing a second convention. NULL means
   // "written before this column existed" — treated as unknown, never as a
   // mismatch.
+  // PER-FIELD, not one URL for the row: applyExperienceContent only fills BLANK
+  // fields, so a row's fields come from different sources at different times and
+  // a single column records only the last writer (round-6 review). The consumer
+  // judges per field, so the map is what the question actually needs.
+  // JSON object: { "<field>": "<url the value was extracted from>" }.
   const experienceContentProvenanceCols = [
     "ALTER TABLE experiences ADD COLUMN content_evidence_url TEXT",
+    "ALTER TABLE experiences ADD COLUMN content_field_evidence TEXT",
   ];
   for (const stmt of experienceContentProvenanceCols) {
     try { db.exec(stmt); } catch { /* already present */ }

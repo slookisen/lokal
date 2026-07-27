@@ -245,16 +245,30 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         `INSERT INTO experiences
            (id, provider_id, title, description, category, subcategory, booking_url,
             content_source, enrichment_state, canonical_id, verification_status,
-            evidence_url, discovery_source, content_evidence_url, updated_at)
+            evidence_url, discovery_source, content_evidence_url,
+            content_field_evidence, updated_at)
          VALUES
            (@id, @provider_id, @title, @description, @category, @subcategory, @booking_url,
             @content_source, @enrichment_state, @canonical_id, @verification_status,
-            @evidence_url, @discovery_source, @content_evidence_url, @updated_at)`,
+            @evidence_url, @discovery_source, @content_evidence_url,
+            @content_field_evidence, @updated_at)`,
       );
-      const insertFull = (row: Record<string, unknown>) =>
+      // `content_field_evidence` is a PER-FIELD map (round-6 review): the writer
+      // only fills BLANK fields, so one row's fields come from different sources
+      // at different times and a single row-level URL records only the last one.
+      // `evidenceFor` is the shorthand for "all three judged fields came from
+      // here", i.e. what the row-level column used to mean; a fixture that needs
+      // mixed provenance passes `content_field_evidence` directly.
+      const insertFull = (row: Record<string, unknown> & { evidenceFor?: string }) => {
+        const { evidenceFor, ...rest } = row;
+        const map = evidenceFor
+          ? JSON.stringify({ description: evidenceFor, category: evidenceFor, booking_url: evidenceFor })
+          : null;
         insertExperienceFull.run({
-          evidence_url: null, discovery_source: null, content_evidence_url: null, ...row,
+          evidence_url: null, discovery_source: null, content_evidence_url: null,
+          content_field_evidence: map, ...rest,
         });
+      };
       // A row the dedup pass merged away must NEVER be served (round-3 review,
       // BLOCKING). Its updated_at is deliberately the NEWEST of any row on this
       // provider, because that is exactly what runDedupPass() produces: it
@@ -320,7 +334,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
         evidence_url: "https://visitnorway.com/x", discovery_source: "visitnorway",
-        content_evidence_url: "https://visitnorway.com/x",
+        evidenceFor: "https://visitnorway.com/x",
         updated_at: daysAgoIso(1),
       });
       // …and the control: same shape, but the evidence DOES point at the
@@ -334,7 +348,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
         evidence_url: "https://www.generisk.example.no/opplevelser", discovery_source: "provider_site",
-        content_evidence_url: "https://www.generisk.example.no/opplevelser",
+        evidenceFor: "https://www.generisk.example.no/opplevelser",
         updated_at: daysAgoIso(4),
       });
       // Round-5 review: the filter's first version compared `evidence_url`,
@@ -351,7 +365,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         canonical_id: null, verification_status: "pending_verify",
         evidence_url: "https://visitnorway.com/oppdaget-her",       // stale discovery URL
         discovery_source: "visitnorway",
-        content_evidence_url: "https://generisk.example.no/tur",    // where the CONTENT came from
+        evidenceFor: "https://generisk.example.no/tur",    // where the CONTENT came from
         updated_at: daysAgoIso(5),
       });
       // …and a subdomain of the provider's own site is still the provider's own
@@ -364,7 +378,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         category: "mat_drikke", subcategory: null, booking_url: null,
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
-        content_evidence_url: "https://shop.generisk.example.no/produkt",
+        evidenceFor: "https://shop.generisk.example.no/produkt",
         updated_at: daysAgoIso(6),
       });
       // A provider whose OWN hjemmeside is an aggregator — documented in
@@ -385,7 +399,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         category: "kultur_historie", subcategory: null, booking_url: null,
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
-        content_evidence_url: "https://www.visitnorway.com/gard/lekkasje",
+        evidenceFor: "https://www.visitnorway.com/gard/lekkasje",
         updated_at: daysAgoIso(1),
       });
       // The filter used to run AFTER `LIMIT 10`, so a provider whose 10 freshest
@@ -405,7 +419,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
           category: "natur_friluft", subcategory: null, booking_url: null,
           content_source: "provider_site", enrichment_state: "enriched",
           canonical_id: null, verification_status: "pending_verify",
-          content_evidence_url: "https://visitnorway.com/x",
+          evidenceFor: "https://visitnorway.com/x",
           updated_at: daysAgoIso(1),
         });
       }
@@ -416,7 +430,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
           category: "natur_friluft", subcategory: null, booking_url: null,
           content_source: "provider_site", enrichment_state: "enriched",
           canonical_id: null, verification_status: "pending_verify",
-          content_evidence_url: "https://storgard.example.no/tur",
+          evidenceFor: "https://storgard.example.no/tur",
           updated_at: daysAgoIso(9),
         });
       }
@@ -710,7 +724,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         category: "kultur_historie", subcategory: null, booking_url: null,
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
-        content_evidence_url: "https://ikke-gard.no/x",
+        evidenceFor: "https://ikke-gard.no/x",
         updated_at: daysAgoIso(7),
       });
       // h26 — a provider with NO hjemmeside: the verifier has nothing to compare
@@ -730,7 +744,7 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
         category: "mat_drikke", subcategory: null, booking_url: null,
         content_source: "provider_site", enrichment_state: "enriched",
         canonical_id: null, verification_status: "pending_verify",
-        content_evidence_url: "https://en-eller-annen.example.no/side",
+        evidenceFor: "https://en-eller-annen.example.no/side",
         updated_at: daysAgoIso(1),
       });
       const strictResp = await callRoute(opplevelserRouter, {
@@ -773,6 +787,92 @@ export function runOpplevelserProvidersRecentlyEnrichedTests(
           (defResp.body.providers as any[]).some((p) => p.id === "prov-default-window"),
           "h27: a SQLite-stamped row is inside the DEFAULT 7-day window too — the default branch needs the same format as the explicit one",
         );
+      }
+
+      // ── (w1-w6) the WRITER, driven for real — round-6 review, BLOCKING ───
+      // Every fixture above inserts provenance via raw SQL, so the whole write
+      // half of this change survived its own deletion with the suite green:
+      // dropping the `sourceUrl` argument at all three call sites, and deleting
+      // the stamp itself, were all 77/0. Nothing ever called
+      // applyExperienceContent. These do.
+      {
+        const store = require("../services/experience-store") as typeof import("../services/experience-store");
+        const evidenceOf = (id: string): Record<string, string> => {
+          const row = expDb.prepare("SELECT content_field_evidence FROM experiences WHERE id = ?").get(id) as
+            { content_field_evidence: string | null } | undefined;
+          return row?.content_field_evidence ? JSON.parse(row.content_field_evidence) : {};
+        };
+
+        // w1/w2 — the mixed-provenance sequence a row-level column got wrong in
+        // BOTH directions. Harvest fills `description` from an aggregator; a
+        // later homepage refresh fills a DIFFERENT, previously-blank field. The
+        // description's provenance must NOT be relabelled by that second write.
+        insertFull({
+          id: "exp-writer-mixed-1", provider_id: "prov-generic-enriched",
+          title: "Blandet proveniens", description: null, category: null, booking_url: null,
+          subcategory: null, content_source: null, enrichment_state: "raw",
+          canonical_id: null, verification_status: "pending_verify",
+          updated_at: daysAgoIso(2),
+        });
+        store.applyExperienceContent("exp-writer-mixed-1",
+          { description: "AGGREGATOR-TEKST om lammene." }, "https://visitnorway.com/found-here");
+        store.applyExperienceContent("exp-writer-mixed-1",
+          { season: ["sommer"] as any } as any, "https://generisk.example.no/");
+        assertEq(
+          evidenceOf("exp-writer-mixed-1").description,
+          "https://visitnorway.com/found-here",
+          "w1: a later homepage write of a DIFFERENT field does not relabel the aggregator description — the round-4 harm, which a row-level column reopened",
+        );
+        // …and the mirror: homepage first, re-harvest second.
+        insertFull({
+          id: "exp-writer-mixed-2", provider_id: "prov-generic-enriched",
+          title: "Blandet proveniens 2", description: null, category: null, booking_url: null,
+          subcategory: null, content_source: null, enrichment_state: "raw",
+          canonical_id: null, verification_status: "pending_verify",
+          updated_at: daysAgoIso(2),
+        });
+        store.applyExperienceContent("exp-writer-mixed-2",
+          { description: "Ekte tekst fra egen hjemmeside." }, "https://generisk.example.no/");
+        store.applyExperienceContent("exp-writer-mixed-2",
+          { booking_url: "https://visitnorway.com/book/9" }, "https://visitnorway.com/found-here");
+        const m2 = evidenceOf("exp-writer-mixed-2");
+        assertEq(m2.description, "https://generisk.example.no/",
+          "w2: …nor does a later re-harvest relabel genuine homepage content — the round-5 harm, which the same column reopened");
+        assertEq(m2.booking_url, "https://visitnorway.com/found-here",
+          "w3: each field records where IT came from");
+
+        // w4 — the isBlank gate is what makes the map stable: a second write of
+        // an already-filled field is a no-op, so neither the value nor its
+        // recorded source moves. (This is why no "never overwrite a key" guard
+        // is needed — and mutation testing showed such a guard was unreachable
+        // AND wrong in the one case that could reach it.)
+        store.applyExperienceContent("exp-writer-mixed-2",
+          { description: "Forsøk på å skrive over." }, "https://annen.example.no/");
+        const w4row = expDb.prepare("SELECT description FROM experiences WHERE id = ?")
+          .get("exp-writer-mixed-2") as { description: string };
+        assertEq(w4row.description, "Ekte tekst fra egen hjemmeside.", "w4a: a second write of an already-filled field does not change the value");
+        assertEq(evidenceOf("exp-writer-mixed-2").description, "https://generisk.example.no/",
+          "w4b: …so its recorded source does not move either");
+
+        // w5 — a call that writes NOTHING must not stamp anything.
+        const before = JSON.stringify(evidenceOf("exp-writer-mixed-2"));
+        store.applyExperienceContent("exp-writer-mixed-2", { description: "igjen" }, "https://tredje.example.no/");
+        assertEq(JSON.stringify(evidenceOf("exp-writer-mixed-2")), before,
+          "w5: a no-op write leaves the provenance map untouched");
+
+        // w6 — end to end: the projection blanks the aggregator-sourced field of
+        // a mixed row and keeps the homepage-sourced one, rather than dropping
+        // or serving the whole row.
+        const wResp = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: daysAgoIso(30), limit: "50" },
+        });
+        const wProv = (wResp.body.providers as any[]).find((p) => p.id === "prov-generic-enriched");
+        const wRow = (wProv.enriched_experiences as any[]).find((e) => e.id === "exp-writer-mixed-2");
+        assertTrue(!!wRow, "w6a: a mixed-provenance row is served, not dropped — it still has something checkable");
+        assertEq(wRow.description, "Ekte tekst fra egen hjemmeside.", "w6b: the homepage-sourced field is served");
+        assertEq(wRow.booking_url, null, "w6c: …and the aggregator-sourced field is blanked, so it is never judged against a page it did not come from");
+        assertTrue((wProv.enriched_experiences_fields_blanked ?? 0) > 0, "w6d: the blanked-field count reaches the consumer");
       }
 
       // ── (h14) LIMIT 10 truncation ───────────────────────────────────────
