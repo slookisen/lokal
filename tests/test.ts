@@ -34408,5 +34408,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-billing: unexpected error: " + String(err?.message || err));
+
+// dev-request 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr, Steg 2:
+// POST /admin/agents/org-nr-backfill + GET /admin/agents/org-nr-review-queue
+// + POST /admin/agents/org-nr-review-approve (src/routes/admin-agents.ts) —
+// porting the already-reviewed gårdssalg org_nr-backfill mechanism (dev-
+// request 2026-07-18-gardssalg-profilkvalitet-foer-outreach slice 5b) to the
+// `agents` table, plus a NEW local-JSON-first candidate generator (services/
+// local-orgnr-candidates.ts) checked before any Brreg network crawl. Own
+// harness: __setDbForTesting/__initSchemaForTesting (mirrors
+// admin-agents-brreg-catalog-sweep.test.ts's harness exactly). Runs via
+// runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr: agents org-nr-backfill (Steg 2) ──");
+  try {
+    const { runAdminAgentsOrgNrBackfillTests } = require("../src/routes/admin-agents-org-nr-backfill.test") as
+      typeof import("../src/routes/admin-agents-org-nr-backfill.test");
+    const onb = await runAdminAgentsOrgNrBackfillTests({ log: false });
+    passed += onb.passed;
+    failed += onb.failed;
+    for (const f of onb.failures) failures.push("agents-org-nr-backfill: " + f);
+    console.log(`  agents-org-nr-backfill: ${onb.passed} passed, ${onb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-org-nr-backfill: unexpected error: " + String(err?.message || err));
   }
 });

@@ -2779,6 +2779,87 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr ON agents(org_nr) WHERE org_nr IS NOT NULL`);
   } catch { /* partial index unsupported or already created */ }
 
+  // ─── agents_org_nr_audit / agents_org_nr_review_queue (dev-request ─────
+  // 2026-07-26-rfb-outreach-tilsig-blokkerdiagnose-og-orgnr, Steg 2) ────────
+  //
+  // Porting the already-reviewed gårdssalg org_nr-backfill mechanism
+  // (gardssalg_content_audit / gardssalg_orgnr_review_queue, init-
+  // experiences.ts, dev-request 2026-07-18-gardssalg-profilkvalitet-foer-
+  // outreach slice 5b) to the `agents` table, so the same Brreg-name-search
+  // candidate generation + strict write-bar veto chain can backfill org_nr
+  // for the 959 RFB agents stuck in pending_verify/review_required for lack
+  // of a 2nd corroborating address/phone source (GATING_FIELDS,
+  // cross-source-validator.ts) — acquiring org_nr unlocks a DIRECT
+  // Brreg-by-orgnr lookup (fetchBrregBusinessAddress/fetchBrregContact,
+  // brreg-client.ts) as that 2nd source, in a later slice (Steg 3, gated on
+  // this one landing first).
+  //
+  // agents_org_nr_audit mirrors gardssalg_content_audit's shape exactly
+  // (insert-only, field-level changelog) — used by applyAgentOrgNr
+  // (routes/admin-agents.ts) for the write's audit trail AND by
+  // agentOrgNrWasRolledBack's "don't silently re-apply a human-reverted
+  // org_nr" check (a manual `UPDATE agents SET org_nr = NULL ...` per this
+  // dev-request's own Rollback section does not by itself write a
+  // rollback-marker row here — a future rollback ENDPOINT, mirroring
+  // POST /admin/gardssalg-content-rollback, would need to; that endpoint is
+  // NOT built in this slice, so this check's real trigger condition is a
+  // deliberate no-op today, wired ahead of time so a later rollback-endpoint
+  // slice doesn't also have to touch the write-bar).
+  //
+  // agents_org_nr_review_queue mirrors gardssalg_orgnr_review_queue's shape,
+  // with one addition — candidate_source ("brreg_name_search" |
+  // "local_json_lokalmat" | "local_json_debio") — so POST /admin/agents/
+  // org-nr-review-approve can reconstruct an honest evidence_url/provenance
+  // source_type for a human-approved write, since a queued candidate may
+  // have come from either the vendored local-JSON candidate generator
+  // (services/local-orgnr-candidates.ts) or a live Brreg name-search.
+  // UNIQUE(agent_id): a re-run of the backfill route upserts a given
+  // agent's queue row in place rather than accumulating duplicates, same
+  // "refresh, don't pile up" idiom as gardssalg_orgnr_review_queue.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agents_org_nr_audit (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        source_url TEXT,
+        batch_id TEXT,
+        changed_by TEXT NOT NULL DEFAULT 'system',
+        changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr_audit_agent ON agents_org_nr_audit(agent_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr_audit_batch ON agents_org_nr_audit(batch_id)`);
+  } catch (err) {
+    console.error("Migration agents_org_nr_audit failed:", err);
+  }
+
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agents_org_nr_review_queue (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL UNIQUE,
+        agent_name TEXT,
+        candidate_orgnr TEXT,
+        candidate_name TEXT,
+        candidate_confidence REAL,
+        candidate_address TEXT,
+        candidate_source TEXT,
+        reason TEXT NOT NULL,
+        batch_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr_review_queue_reason ON agents_org_nr_review_queue(reason)`);
+  } catch (err) {
+    console.error("Migration agents_org_nr_review_queue failed:", err);
+  }
+
   // ─── Backfill: agents.org_nr from the legacy `org_nr:<value>` tag ───────
   // Existing agent registration (routes/admin-agents.ts) has only ever
   // stored org-nr encoded as a tag string inside the JSON `tags` column.
