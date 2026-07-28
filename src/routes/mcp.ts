@@ -1196,6 +1196,46 @@ router.post("/", async (req: Request, res: Response) => {
 router.get("/", async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !sessions.has(sessionId)) {
+    // Return a human-friendly landing page for browser GET (Accept: text/html, no session).
+    // The MCP POST/session handshake path is unaffected — this branch only fires when
+    // there is no valid session header, which a real MCP client would never send as GET.
+    const accept = req.headers["accept"] || "";
+    if (accept.includes("text/html")) {
+      res.status(200).contentType("text/html").send(`<!doctype html>
+<html lang="no">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rett fra Bonden MCP — Model Context Protocol</title>
+<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 24px;color:#1a1a1a;line-height:1.6}
+h1{font-size:1.5rem;margin-bottom:.25rem}p{margin:.75rem 0}code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:.9em}
+pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:16px;overflow-x:auto;font-size:.85rem}
+a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decoration:none;font-size:.9rem}</style>
+</head>
+<body>
+<h1>Rett fra Bonden MCP-endepunkt</h1>
+<p>Dette er Rett fra Bonden sitt <a href="https://modelcontextprotocol.io" rel="noopener">Model Context Protocol</a>-endepunkt (Streamable HTTP). Det er designet for AI-agenter og MCP-klienter, ikke nettlesere.</p>
+<p><strong>Koble til fra Claude Desktop / ChatGPT:</strong><br>Lim inn denne URL-en som MCP-server:</p>
+<pre>https://rettfrabonden.com/mcp</pre>
+<p><strong>Tilgjengelige verktøy:</strong></p>
+<ul>
+<li><code>lokal_search</code> — fritekstsøk blant produsenter</li>
+<li><code>lokal_discover</code> — finn produsenter etter fylke, kommune, kategori, nær-meg</li>
+<li><code>lokal_info</code> — hent én produsent med full profil</li>
+<li><code>lokal_stats</code> — plattformstatistikk (antall produsenter, kategorier, fylker)</li>
+<li><code>lokal_list_umbrellas</code> / <code>lokal_get_umbrella_members</code> / <code>lokal_get_producer_affiliations</code> — paraplyorganisasjoner</li>
+<li><code>lokal_bm_next_markets</code> — neste bondens marked</li>
+<li><code>lokal_geocode</code> — stedsnavn → koordinater</li>
+<li><code>lokal_cart_create</code> / <code>lokal_cart_add_item</code> / <code>lokal_cart_view</code> / <code>lokal_cart_submit</code> — handlekurv hos produsent</li>
+<li><code>lokal_order_status</code> — status på en avgitt bestilling</li>
+</ul>
+<p><strong>For utviklere — eksempel (cURL):</strong></p>
+<pre>curl -X POST https://rettfrabonden.com/mcp \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'</pre>
+<p>Se også: <a href="/.well-known/agent-card.json">Agent Card</a> · <a href="/openapi.json">OpenAPI 3.1</a> · <a href="/llms.txt">llms.txt</a></p>
+<a class="back" href="/">← Tilbake til Rett fra Bonden</a>
+</body></html>`);
+      return;
+    }
     res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
     return;
   }

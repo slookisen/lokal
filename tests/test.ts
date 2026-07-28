@@ -27870,6 +27870,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmd.failures) failures.push("opplevelser-gardssalg-mcp-discoverability: " + f);
     console.log(`  opplevelser-gardssalg-mcp-discoverability: ${gmd.passed} passed, ${gmd.failed} failed`);
 
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 6:
+    // GET /mcp from a plain browser (no session header) returned a raw 400 JSON
+    // error on the RFB (src/routes/mcp.ts) and dental (src/routes/dental-mcp.ts)
+    // routers, even though it's linked from the human-facing footer on both
+    // domains. experiences-mcp.ts already special-cased Accept: text/html into a
+    // branded 200 HTML landing page; this ports the identical pattern to the
+    // other two verticals. Verifies the new HTML branch, the unchanged 400 JSON
+    // for non-browser callers, and that POST /mcp (the real handshake) is
+    // untouched, for both RFB and dental.
+    console.log("\n── mcp-browser-landing-page: GET /mcp browser landing page (rfb + dental) ──");
+    const { runMcpBrowserLandingPageTests } = require("../src/routes/mcp-browser-landing-page.test") as
+      typeof import("../src/routes/mcp-browser-landing-page.test");
+    const mblp = await runMcpBrowserLandingPageTests({ log: false });
+    passed += mblp.passed;
+    failed += mblp.failed;
+    for (const f of mblp.failures) failures.push("mcp-browser-landing-page: " + f);
+    console.log(`  mcp-browser-landing-page: ${mblp.passed} passed, ${mblp.failed} failed`);
+
     // dev-request 2026-07-21-mcp-booking-tool (Daniel GO 2026-07-21): the new
     // book_gardssalg MCP tool (src/routes/experiences-mcp.ts) — a THIN
     // wrapper over the EXISTING booking chain (BookingInputSchema,
