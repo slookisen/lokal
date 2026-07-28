@@ -434,7 +434,18 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
             "cv40: re-ingesting an 'experiences' thread as 'rfb' is refused — a conversation does not change platform");
           const stray = db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'cv-route-msg-2'").get() as any;
           assertEq(stray?.n, 0,
-            "cv41: …and nothing was half-written — the refusal is whole, so the caller can safely retry the same immutable thread");
+            "cv41: …and no message was half-written — the refusal is whole, so the caller can safely retry the same immutable thread");
+          // cv41b — and no CONTACT either. In the first version the guard sat
+          // BELOW resolveContact, so a refused re-ingest still created the
+          // contact row and orphaned it: the guard reproduced the very "stranded
+          // contact attached to nothing" it exists to prevent. The route comment
+          // claimed "nothing was written", which was true of messages and false
+          // of contacts. This is the assertion that makes the claim honest.
+          const orphan = db.prepare(
+            "SELECT COUNT(*) n FROM crm_contacts WHERE email = 'rute@example.no' AND vertical_id = 'rfb'"
+          ).get() as any;
+          assertEq(orphan?.n, 0,
+            "cv41b: …and no orphan CONTACT was created on the refused platform — the refusal happens before any write, not merely before the messages");
         } finally {
           if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
           else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
@@ -519,6 +530,20 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
           ).get() as any;
           assertEq(msg?.vertical_id, "experiences",
             "cv45: …and so is the message — its INSERT named no vertical_id at all, so it fell on the 'rfb' default while its own thread said experiences");
+
+          // cv46 — the CREATE branch. cv42-cv45 all reuse the contact cv13 made,
+          // so createContactThread never took its `else` path, and hardcoding
+          // 'rfb' into the contact INSERT was invisible to the whole suite. A
+          // brand-new address is the only way to reach that branch.
+          await submit({
+            name: "Nils", email: "helt-ny-gjest@example.no", subject: "NY-KONTAKT-CV46",
+            message: "Første gang jeg skriver", platform: "experiences",
+          });
+          const fresh = db.prepare(
+            "SELECT vertical_id FROM crm_contacts WHERE email = 'helt-ny-gjest@example.no'"
+          ).get() as any;
+          assertEq(fresh?.vertical_id, "experiences",
+            "cv46: a FIRST-TIME address creates its contact on the submitting platform — the create branch, which every other assertion here skips");
         } finally {
           if (prevSkip === undefined) delete process.env.SKIP_TURNSTILE;
           else process.env.SKIP_TURNSTILE = prevSkip;
@@ -556,6 +581,47 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
         } catch { dupRejected = true; }
         assertTrue(dupRejected,
           "cv33: …and a true duplicate is STILL rejected after repeated boots — surviving the boot must not mean losing uniqueness");
+      }
+
+      // cv47-cv49 — THE UPGRADE PATH, which every other test skips.
+      //
+      // Every test DB here is created fresh, so it never has the legacy
+      // idx_crm_contacts_email_unique to drop — which means the migration's most
+      // important real-world action is a no-op under test. A reviewer showed that
+      // deleting the DROP INDEX line survives the entire suite for exactly that
+      // reason, while the live 390 MB database DOES carry that index today.
+      //
+      // This builds the production shape deliberately and upgrades it.
+      {
+        const legacy = new Database(":memory:");
+        try {
+          initMod.__setDbForTesting(legacy as any);
+          initMod.__initSchemaForTesting(legacy as any);
+          // Recreate today's prod shape: the single-column unique index.
+          legacy.exec(`DROP INDEX IF EXISTS idx_crm_contacts_email_vertical_unique`);
+          legacy.exec(`CREATE UNIQUE INDEX idx_crm_contacts_email_unique ON crm_contacts(email)`);
+          const before = (legacy.prepare(
+            `SELECT COUNT(*) n FROM sqlite_master WHERE type='index' AND name='idx_crm_contacts_email_unique'`
+          ).get() as any).n;
+          assertEq(before, 1, "cv47: the legacy production shape is in place before the upgrade");
+
+          initMod.__initSchemaForTesting(legacy as any);   // the upgrade boot
+
+          const names = (legacy.prepare(
+            `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='crm_contacts'`
+          ).all() as any[]).map((r) => r.name);
+          assertTrue(!names.includes("idx_crm_contacts_email_unique"),
+            "cv48: upgrading a database that HAS the legacy index actually drops it — the one action a fresh-DB test can never exercise");
+
+          legacy.prepare(`INSERT INTO crm_contacts (id,type,email,vertical_id) VALUES ('u1','unknown','oppgradert@example.no','rfb')`).run();
+          legacy.prepare(`INSERT INTO crm_contacts (id,type,email,vertical_id) VALUES ('u2','unknown','oppgradert@example.no','experiences')`).run();
+          const n = (legacy.prepare(`SELECT COUNT(*) n FROM crm_contacts WHERE email='oppgradert@example.no'`).get() as any).n;
+          assertEq(n, 2,
+            "cv49: …and cross-vertical contacts become legal on the upgraded database, which is the whole point of the migration");
+        } finally {
+          try { legacy.close(); } catch { /* already closed */ }
+          initMod.__setDbForTesting(db as any);
+        }
       }
 
       // ═══════════════════════════════════════════════════════════════

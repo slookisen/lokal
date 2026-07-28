@@ -943,10 +943,15 @@ function initSchema(db: Database.Database): void {
   // exactly the same row set the single-column one did — it cannot fail on
   // existing data, and there is nothing to de-duplicate first.
   //
-  // Order matters: CREATE the new index BEFORE DROPping the old one, so a crash
-  // between the two statements leaves the table MORE constrained, never less.
-  // Uniqueness on email is what keeps duplicate contacts out; losing it for even
-  // one boot is how duplicates get in.
+  // The two statements run in ONE TRANSACTION, so there is no window between
+  // them at all — SQLite has fully transactional DDL. The first version argued
+  // for a careful ordering instead (CREATE before DROP, so a crash in between
+  // leaves the table more constrained rather than less), but an ordering
+  // argument is only as good as the next person who reorders the lines, and a
+  // mutation swapping them was undetectable by any test: "what happens if the
+  // process dies between two synchronous statements" is not observable from a
+  // test process. BEGIN/COMMIT makes the hazard structurally impossible rather
+  // than merely documented, which is the better of the two.
   //
   // Idempotent ACROSS BOOTS, not merely across DB states — REVIEW B1. This runs
   // on every single boot, so the pair below has to be a no-op on boot 2, 3, 4…
@@ -964,10 +969,16 @@ function initSchema(db: Database.Database): void {
   // crm_contacts first (keep the 'rfb' row, re-point its threads), THEN
   // reverting. Do not treat this as a one-command rollback.
   try {
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_vertical_unique ON crm_contacts(email, vertical_id)`);
-    db.exec(`DROP INDEX IF EXISTS idx_crm_contacts_email_unique`);
+    db.exec(`
+      BEGIN;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_vertical_unique ON crm_contacts(email, vertical_id);
+        DROP INDEX IF EXISTS idx_crm_contacts_email_unique;
+      COMMIT;
+    `);
   } catch {
-    // Already migrated
+    // Already migrated, or the CREATE failed on genuinely duplicate data. Either
+    // way the transaction rolls back, so the table is never left half-migrated.
+    try { db.exec(`ROLLBACK`); } catch { /* no transaction open — nothing to undo */ }
   }
 
   // Dashboards filter analytics by vertical_id (rfb vs dental) — index the

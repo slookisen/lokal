@@ -274,11 +274,10 @@ class CrmService {
   ): { threadId: string; contactId: string; newMessages: number } {
     const db = getDb();
     const v = assertVertical(vertical, "ingestThread");
-    const contact = this.resolveContact(primaryFromEmail, null, v);
-    const contactId = contact.id;
     const threadId = input.threadId;
 
-    // Upsert thread
+    // The thread lookup and the conflict guard run BEFORE resolveContact — see
+    // the note below. Order is load-bearing, not stylistic.
     const existing = db.prepare("SELECT id, vertical_id FROM crm_threads WHERE id = ?").get(threadId) as
       { id: string; vertical_id: string } | undefined;
 
@@ -295,9 +294,14 @@ class CrmService {
     //
     // Refusing is right rather than merely safe: a thread genuinely arriving on
     // the other platform means the triage signal changed, and a human needs to
-    // see that, not have one side silently overwrite the other. The re-ingest
-    // is rejected whole — no messages are written — so the caller retries the
-    // same immutable Gmail thread rather than half-applying it.
+    // see that, not have one side silently overwrite the other.
+    //
+    // The guard sits ABOVE resolveContact deliberately. In the first version it
+    // sat below, and a reviewer measured that the refused re-ingest still created
+    // the contact row and orphaned it — the very "stranded a second contact row
+    // attached to nothing" this guard exists to prevent, reproduced by the guard
+    // itself. The claim "nothing was written" was true of messages and false of
+    // contacts. Now it is true of both: the refusal happens before any write.
     if (existing && existing.vertical_id !== v) {
       throw new Error(
         `[crm] ingestThread: thread ${threadId} already belongs to vertical ` +
@@ -305,6 +309,9 @@ class CrmService {
           `A conversation does not change platform; triage this thread manually.`,
       );
     }
+
+    const contact = this.resolveContact(primaryFromEmail, null, v);
+    const contactId = contact.id;
 
     if (!existing) {
       db.prepare(`
