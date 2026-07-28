@@ -24,6 +24,14 @@
 // (our calls are server-side and carry no Referer, so a URL restriction would
 // break them rather than protect them). What this bounds is OUR spend.
 //
+// Nor does it survive horizontal scaling. The counter lives on the per-machine
+// `lokal_data` volume (fly.toml), so the word "process" above is load-bearing:
+// at `fly scale count 2` the effective ceiling becomes 2 × the cap. With the
+// default that is 160 000 — ABOVE the 100 000 free tier. The 25 % headroom
+// between default and free tier only covers one machine (review note N-e).
+// Before scaling out, lower MAPBOX_MONTHLY_CALL_CAP to cap/N or move the
+// counter to shared storage.
+//
 // ── WHY EXHAUSTION DEGRADES INSTEAD OF FAILING ──────────────────────
 //
 // When the cap is reached the corridor engine falls back to the straight-line
@@ -144,10 +152,19 @@ export function mapboxBudgetState(now: number = Date.now()): MapboxBudgetState {
  * nothing — so a capped month cannot run the counter to absurd values and the
  * `used` figure stays a truthful record of requests actually issued.
  *
- * The read and the write are one statement, so two concurrent requests cannot
- * both see `used = cap - 1` and both proceed. SQLite serialises writes; the
- * conditional UPDATE is what makes that serialisation load-bearing rather than
- * incidental.
+ * The read and the write are one statement, so two callers cannot both see
+ * `used = cap - 1` and both proceed.
+ *
+ * REVIEW N-c — an honest correction to what that buys us TODAY. A reviewer
+ * replaced this with a non-atomic read-then-write and all 263 deterministic
+ * tests stayed green, because in this deployment the two are genuinely
+ * equivalent: `better-sqlite3` is synchronous and Node is single-threaded, so
+ * two `tryConsumeMapboxCall` calls in one process cannot interleave and the
+ * TOCTOU window never opens. The conditional UPDATE only becomes load-bearing
+ * when a SECOND process opens the same file — a maintenance script, `fly ssh
+ * console`, a future worker. It is defence-in-depth that costs nothing, not a
+ * guarantee Node's execution model wasn't already providing. Kept deliberately;
+ * no test distinguishes the two, and a contrived one would prove nothing.
  */
 export function tryConsumeMapboxCall(now: number = Date.now()): boolean {
   const db = getDb();

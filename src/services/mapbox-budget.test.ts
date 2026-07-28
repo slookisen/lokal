@@ -271,6 +271,11 @@ export function runMapboxBudgetTests(opts: { log?: boolean } = {}): Promise<Test
         "mb25: the default cap is the literal 80 000, not merely 'whatever the constant says'");
       assertTrue(budget.MAPBOX_MONTHLY_CAP_DEFAULT < budget.MAPBOX_FREE_TIER_MONTHLY,
         "mb26: …and it sits BELOW the Mapbox free tier, so the cap bites before the bill does");
+      // REVIEW N-a: mb26 compares two constants, so raising MAPBOX_FREE_TIER_MONTHLY
+      // to 1 000 000 kept it green — the same self-referential shape B3 was. The
+      // constant encodes an EXTERNAL vendor fact, so it gets the literal pin mb25 has.
+      assertEq(budget.MAPBOX_FREE_TIER_MONTHLY, 100_000,
+        "mb26b: the free tier is the literal 100 000 Mapbox actually grants — not whatever makes mb26 pass");
 
       // mb27 — the `exhausted` BOUNDARY. `used >= cap` vs `used > cap` differ
       // only at equality, which is exactly the state a brief would report on.
@@ -347,6 +352,117 @@ export function runMapboxBudgetTests(opts: { log?: boolean } = {}): Promise<Test
           "mb29: past the cap the same trip degrades…");
         assertEq(corridor.__peekRouteCacheForTesting().length, 0,
           "mb30: …and the degraded answer is NOT cached, so it cannot outlive the month it belongs to");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // mb31 — REVIEW BL-2: cappedProvider must pass `via` THROUGH.
+      //
+      // The re-review found that dropping the third argument —
+      //     return primary.fetchRoute(from, to, via)
+      //  →  return primary.fetchRoute(from, to)
+      // left all 263 deterministic tests green. `via` is a live query
+      // parameter (reise-api.ts), and mapboxProvider builds its URL from
+      // [from, ...via, to] — so the mutant silently returns the DIRECT
+      // Oslo→Trondheim road for ?via=Lillehammer. Correct-looking JSON,
+      // wrong road, no note, no error. The cache key includes `via`, so the
+      // direct and the via-route occupy separate entries and BOTH lie.
+      //
+      // This wrapper is new in this PR and sits on the only path production
+      // builds a Mapbox provider — structurally the same gap as B1.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        process.env.MAPBOX_MONTHLY_CALL_CAP = "5";
+        budget.__resetMapboxBudgetSchemaForTesting();
+        db.prepare(`DELETE FROM mapbox_monthly_usage`).run();
+
+        let seenUrl = "";
+        const urlCapturingFetch = (async (u: any) => {
+          seenUrl = String(u);
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              routes: [{
+                geometry: { coordinates: [[10.75, 59.91], [10.47, 61.12], [10.4, 63.43]] },
+                distance: 550_000,
+                duration: 30_000,
+              }],
+            }),
+          } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        const provider = corridor.resolveRouteProvider(
+          { ROUTING_PROVIDER: "mapbox", MAPBOX_ACCESS_TOKEN: "x" } as any,
+          urlCapturingFetch,
+        );
+        await provider!.fetchRoute(
+          { lat: 59.91, lng: 10.75 },
+          { lat: 63.43, lng: 10.40 },
+          [{ lat: 61.12, lng: 10.47 }],          // Lillehammer
+        );
+
+        // Mapbox encodes waypoints as `lng,lat;lng,lat;…`, so a from→via→to
+        // request carries exactly two separators. Dropping `via` leaves one.
+        const coordPart = seenUrl.split("/directions/")[1]?.split("?")[0] ?? "";
+        assertEq(coordPart.split(";").length, 3,
+          "mb31: `via` reaches Mapbox through the cap wrapper — dropping the third argument would send the DIRECT route under the via-route's cache key");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // mb32-mb35 — REVIEW BL-1: the two straight-line notes must stay
+      // DISTINGUISHABLE.
+      //
+      // The distinct capped note is this PR's stated user-visible
+      // deliverable and the whole justification for the B4 cache fix — and
+      // it was pinned by nothing. Both deleting the ternary and INVERTING
+      // it left 263/263 green. Inverted, an exhausted month says «vi har
+      // ikke ekte kjørerute her» (so Daniel re-sets a token that was never
+      // the problem) while a genuinely unconfigured install promises «ekte
+      // kjørerute er tilbake ved månedsskiftet» — a promise that will never
+      // come true, on the one install where routing was never set up.
+      //
+      // mb16/mb18/mb23 assert the provider TAG. Nothing asserted the tag
+      // produces a different SENTENCE. Shipping B4's fix while the sentence
+      // it protects is itself unpinned would repeat the finding at one remove.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        // corridorSearch takes PLACE NAMES and geocodes them; "Oslo"/"Bodø"
+        // resolve from the curated tier, so this stays offline.
+        const capped = corridor.cappedProvider(
+          {
+            id: "mapbox",
+            kind: "road" as const,
+            async fetchRoute() { throw new Error("primary must not be reached past the cap"); },
+          } as any,
+          () => false,                            // cap already exhausted
+        );
+
+        corridor.__clearRouteCacheForTesting();
+        const cappedRun = await corridor.corridorSearch({ from: "Oslo", to: "Bodø", provider: capped as any });
+        const cappedNotes = cappedRun.notes.join(" ");
+        assertTrue(/kvote/.test(cappedNotes),
+          "mb32: an exhausted month says the QUOTA is spent…");
+        assertTrue(/månedsskiftet/.test(cappedNotes),
+          "mb33: …and tells the visitor when real routing returns");
+        assertTrue(!/Vi har ikke ekte kjørerute her/.test(cappedNotes),
+          "mb34: …and never reuses the never-configured wording — that sends the operator hunting a token that was never the problem");
+
+        // The CONTRAST case is what kills the inverted ternary. A plain
+        // straight line — no cap involved — must NOT claim a spent quota,
+        // because promising «ekte kjørerute er tilbake ved månedsskiftet» on
+        // an install where routing was never configured is a promise that
+        // will never come true. Asserting only the capped branch would leave
+        // the inversion alive: it produces «kvote» too, just on the wrong side.
+        corridor.__clearRouteCacheForTesting();
+        const plainRun = await corridor.corridorSearch({
+          from: "Oslo", to: "Bodø",
+          provider: corridor.straightLineProvider() as any,
+        });
+        const plainNotes = plainRun.notes.join(" ");
+        assertTrue(/Vi har ikke ekte kjørerute her/.test(plainNotes),
+          "mb35: an unconfigured install says exactly that…");
+        assertTrue(!/kvote/.test(plainNotes) && !/månedsskiftet/.test(plainNotes),
+          "mb36: …and must NOT promise a month rollover that will never fix anything — this is the assertion that makes inverting the note ternary fail CI");
       }
     } finally {
       if (prevCap === undefined) delete process.env.MAPBOX_MONTHLY_CALL_CAP;
