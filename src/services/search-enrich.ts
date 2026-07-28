@@ -1171,9 +1171,29 @@ const GENERIC_ABOUT_MARKERS: readonly string[] = [
 // (not its body prose) gets scraped as the candidate summary — skip-links,
 // breadcrumb "back to top" anchors, etc. Accent-stripped, lowercase substrings,
 // same convention as GENERIC_ABOUT_MARKERS above.
+//
+// "hopp til innhold" is kept as an exact literal phrase (not generalized into
+// a "hopp til …" pattern) deliberately: unlike the English "skip to"/"jump
+// to" bigram below, "hopp til" also occurs in ordinary, unrelated Norwegian
+// prose (e.g. "et hopp til neste nivå" — a figurative "leap to the next
+// level"), so loosening it risks real false-positive rejections.
 const NAV_BOILERPLATE_MARKERS: readonly string[] = [
-  "top of page", "skip to content", "hopp til innhold", "til toppen",
+  "top of page", "hopp til innhold", "til toppen",
 ];
+
+// Normalizing pattern for the English skip-link family: a flat list of
+// literal substrings (the old "skip to content" entry above) kept missing
+// real-world wording/word-order variants one at a time — "skip to the
+// content" (an extra "the"), "skip to main content", "skip to navigation",
+// and "jump to …" (a different verb entirely, e.g. "Jump to header",
+// "Jump to Menu", "Jump to footer widgets") all slipped through the old
+// literal list. "skip to"/"jump to" as a bare English bigram essentially
+// never appears in genuine Norwegian producer prose (which is what the
+// Norwegian-language check just above this in meetsAboutCheapBar already
+// requires be present alongside it), so matching the bigram alone — with no
+// constraint on what follows — is safe and covers every wording variant in
+// one pattern instead of enumerating them.
+const NAV_SKIP_OR_JUMP_LINK_RE = /\b(?:skip to|jump to)\b/;
 
 // Phrases a producer's OWN about/visit text would never use about itself — they
 // only show up when the candidate text was actually scraped from a REGIONAL
@@ -1438,6 +1458,7 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
   // numbered/pipe-separated/flat-token MENU shapes those pages render as (see
   // isLikelyNavMenuLeakage doc comment) — leakage from the site's <nav>, not
   // real venue prose.
+  if (NAV_SKIP_OR_JUMP_LINK_RE.test(lowerAscii)) return false;
   for (const marker of NAV_BOILERPLATE_MARKERS) {
     if (lowerAscii.includes(marker)) return false;
   }
