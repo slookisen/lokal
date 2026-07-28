@@ -125,6 +125,16 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
           assertTrue(!!id.displayName && !!id.replyTo,
             `pi8e[${v}]: …and both fields are populated — a half-configured vertical would send under a blank brand`);
         }
+        // pi8f — reply-to is what preserves the INBOUND discriminator, and
+        // nothing pinned it per vertical: swapping dental's to the opplevagent
+        // address left the suite green. A distinctness set would over-constrain
+        // (rfb and dental legitimately share one address today), so the property
+        // is narrower and exact: opplevagent.no belongs to experiences alone.
+        const onOpplevagent = crmMod.CRM_VERTICALS.filter(
+          (v) => ident.resolveCrmIdentity(v).replyTo.endsWith("@opplevagent.no"),
+        );
+        assertEq(onOpplevagent.join(","), "experiences",
+          "pi8f: EXACTLY ONE vertical replies to opplevagent.no — a second would route another platform's replies through the Opplevagent forwarder and destroy the steg-4 discriminator");
       }
 
       // ═══════════════════════════════════════════════════════════════
@@ -246,10 +256,20 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
             assertEq(wire[0]?.replyTo, "kontakt@opplevagent.no",
               "pi16d: …and the caller's reply-to with it");
 
+            // pi16e — REPORTED FIXED AND WAS NOT. The first version called
+            // sendRaw without `from`; `this.fromAddress` threw because
+            // loadConfigsAtBoot() had not run, sendRaw caught it, nothing
+            // reached the transport, `wire` stayed empty, and the assertion was
+            // trivially true against `undefined`. A vacuous test that I then
+            // described as closed. Booting the config makes the fallback real.
+            const { loadConfigsAtBoot: boot } = require("../config/vertical-config");
+            try { boot(); } catch { /* already loaded */ }
             wire.length = 0;
             await svc.sendRaw({ to: "x@example.no", subject: "S", textContent: "T" });
-            assertTrue(!String(wire[0]?.from ?? "").startsWith('"'),
-              "pi16e: …while omitting `from` still falls back on the configured address — the override adds a case, it does not replace the old one");
+            assertEq(wire.length, 1,
+              "pi16e: omitting `from` still SENDS — the previous version of this assertion passed on an empty wire, which is no assertion at all");
+            assertEq(wire[0]?.from, "kontakt@rettfrabonden.com",
+              "pi16e2: …falling back on the configured address, bare and unquoted — the override adds a case, it does not replace the old one");
           } finally {
             svc.isConfigured = prevConfigured;
             svc.transporter = prevTransporter;
@@ -297,6 +317,89 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
             "pi16g: …branded Opplevagent — before this it was a bare address with NO display name, which is the header from funn 2");
           assertEq(wire2[0]?.replyTo, "kontakt@opplevagent.no",
             "pi16h: …and still replies to the Opplevagent forwarder");
+
+          // ── pi16i-pi16p: ALL SEVEN booking-store senders ──
+          //
+          // pi16f-pi16h cover the CLAIM mail only. A reviewer deleted each of
+          // the seven `from:` lines in booking-store.ts individually and every
+          // one survived — including :610, `sendProducerNotification`, which IS
+          // the GARD-20260718-C5EEN mail Daniel screenshotted. Deleting that one
+          // line left the FULL suite at 11650/3, byte-identical to clean.
+          //
+          // So the fix was correct today and undefended tomorrow on the exact
+          // path that carried the bug into production unnoticed for weeks. Each
+          // sender gets its own assertion; a loop keeps a future eighth sender
+          // from being forgotten only if someone adds it here, so the names are
+          // spelled out deliberately rather than discovered by reflection.
+          // The gated producer senders read `experience_providers` from the
+          // EXPERIENCES database (db-factory, a different file from the rfb one
+          // this harness injects). Point it at a scratch file and seed one
+          // provider, so the gate opens and the shared `from:` line inside
+          // sendGatedProducerEmail is actually reached. Without this the loop
+          // below would silently cover 5 of 7 while reporting all-green.
+          const os = require("os"), fsm = require("fs"), pathm = require("path");
+          const scratchDir = fsm.mkdtempSync(pathm.join(os.tmpdir(), "pi-exp-"));
+          const prevExpDb = process.env.EXPERIENCES_DB_PATH;
+          process.env.EXPERIENCES_DB_PATH = pathm.join(scratchDir, "experiences.db");
+          const dbf = require("../database/db-factory") as any;
+          dbf.__resetDbFactoryForTesting?.();
+          const expDb = dbf.getDb("experiences");
+          expDb.exec(`CREATE TABLE IF NOT EXISTS experience_providers (
+            id TEXT PRIMARY KEY, navn TEXT, epost TEXT, booking_live INTEGER, catalog_hidden INTEGER)`);
+          expDb.prepare(`INSERT OR REPLACE INTO experience_providers (id, navn, epost, booking_live, catalog_hidden)
+                         VALUES ('prov-1','Dobel Gård','produsent@example.no',1,1)`).run();
+          // catalog_hidden = 1 on purpose: that is booking-store's documented
+          // "hidden, admin-created, email-pinned test provider" case, which
+          // dispatches without the global master switch. A real provider
+          // (catalog_hidden = 0) additionally needs bookingDispatchEnabled(),
+          // and flipping a global env just to reach a From header would test
+          // the switch rather than the header.
+
+          const booking = require("./booking-store") as any;
+          const fixture = {
+            booking_id: "pi-bk-1", experience_id: null, provider_id: "prov-1",
+            slot_at: new Date(Date.parse("2026-09-01T10:00:00Z")).toISOString(),
+            party_size: 2, guest_name: "Kari", guest_email: "kari@example.no",
+            guest_phone: null, booking_ref: "GARD-PI-TEST", confirm_token: "tok-1",
+            source: "test", status: "pending", resolved_by: null, resolved_at: null,
+            commission_rate: null, billable: 0, notes: null,
+            created_at: new Date(Date.parse("2026-08-01T10:00:00Z")).toISOString(),
+            respond_token: "rt-1", previsit_status: null, previsit_suggested_at: null,
+            // sendSuggestionToGuest bails without BOTH of these — it returned
+            // early and sent nothing on the first attempt, which the loop
+            // correctly reported as an unpinnable assertion rather than a pass.
+            guest_decision_token: "gdt-1",
+            suggested_slot_at: new Date(Date.parse("2026-09-02T12:00:00Z")).toISOString(),
+            is_test: 0,
+          };
+          const senders: Array<[string, () => Promise<unknown>]> = [
+            ["sendBookingConfirmation (gjestekvittering)", () => booking.sendBookingConfirmation(fixture)],
+            ["sendProducerNotification (FUNN 2 — produsentvarselet)", () => booking.sendProducerNotification(fixture, "produsent@example.no")],
+            ["sendPrevisitConfirmedToGuest", () => booking.sendPrevisitConfirmedToGuest(fixture)],
+            ["sendPrevisitDeclinedToGuest", () => booking.sendPrevisitDeclinedToGuest(fixture)],
+            ["sendSuggestionToGuest", () => booking.sendSuggestionToGuest(fixture)],
+            ["sendPrevisitExpiredToGuest", () => booking.sendPrevisitExpiredToGuest(fixture)],
+            ["sendPrevisitReminderToProducer (gated)", () => booking.sendPrevisitReminderToProducer(fixture)],
+          ];
+          let covered = 0;
+          for (const [label, run] of senders) {
+            wire2.length = 0;
+            try { await run(); } catch { /* a sender may bail on missing DB state — asserted below */ }
+            if (wire2.length === 0) {
+              assertTrue(false, `pi16i[${label}]: sent nothing — this assertion cannot pin a From header it never sees`);
+              continue;
+            }
+            covered++;
+            assertEq(wire2[0]?.from, '"Opplevagent" <kontakt@rettfrabonden.com>',
+              `pi16i[${label}]: branded Opplevagent`);
+          }
+          assertEq(covered, senders.length,
+            `pi16p: ALL ${senders.length} booking senders actually reached the transport (${covered}) — a loop whose fixtures make senders bail would report all-green while pinning nothing`);
+          if (prevExpDb === undefined) delete process.env.EXPERIENCES_DB_PATH;
+          else process.env.EXPERIENCES_DB_PATH = prevExpDb;
+          try { expDb.close(); } catch { /* already closed */ }
+          dbf.__resetDbFactoryForTesting?.();
+          try { fsm.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* best effort */ }
         } finally {
           svc2.isConfigured = prevConf;
           svc2.transporter = prevTrans;
@@ -449,6 +552,47 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
             const conf = (legacy.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_log_cold_outreach_on_send_confirm_v2'`).get() as any)?.sql ?? "";
             assertTrue(conf.includes("NEW.vertical_id"),
               "pi24b: …and so is the CONFIRM trigger, which is the one the marketing agent actually uses — fixing the upgrade path on one trigger and not the other is half a fix");
+
+            // ── pi25-pi27: the column DEFAULT, on a genuinely pre-column table.
+            //
+            // `DEFAULT 'rfb'` is the highest-consequence line in the diff and
+            // nothing exercised it: every test DB creates the column and then
+            // writes rows through the trigger, which stamps explicitly. In
+            // production that default carries ~770 historical sends. Flip it to
+            // 'experiences' and none of them match `o.vertical_id = 'rfb'`, the
+            // pool's NOT EXISTS stops excluding them, and the ENTIRE contacted
+            // history returns to the outreach pool — re-mailing everyone the
+            // 2026-07-11 P0 fix exists to protect.
+            //
+            // So this rebuilds the table WITHOUT the column, the way prod had
+            // it, writes an unstamped row for a pool-eligible agent, and boots.
+            legacy.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
+            legacy.exec(`DROP TABLE IF EXISTS outreach_sent_log`);
+            legacy.exec(`CREATE TABLE outreach_sent_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT, sent_at TEXT,
+              channel TEXT, message_id TEXT, notes TEXT, recipient_email TEXT)`);
+            legacy.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
+                            VALUES ('agent-legacy','Legacy Gård','x','test','legacy@example.no','https://l.example.no','producer','pi-key-2',1)`).run();
+            legacy.prepare(`INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status, url_last_status, url_last_probed)
+                            VALUES ('agent-legacy','legacy@example.no','verified','rich',200,datetime('now'))`).run();
+            legacy.prepare(`INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+                            VALUES ('agent-legacy','legacy@example.no',datetime('now'),'email','legacy-msg-1','historical')`).run();
+
+            initMod.__initSchemaForTesting(legacy as any);   // the upgrade boot
+
+            const legacyRow = legacy.prepare(
+              `SELECT vertical_id FROM outreach_sent_log WHERE message_id = 'legacy-msg-1'`
+            ).get() as any;
+            assertEq(legacyRow?.vertical_id, "rfb",
+              "pi25: an UNSTAMPED historical row reads 'rfb' after the upgrade — every send before the split genuinely was rfb, and this default is what carries that fact");
+            const stillSuppressed = !legacy.prepare(
+              `SELECT 1 FROM outreach_ready_pool WHERE agent_id = 'agent-legacy'`
+            ).get();
+            assertTrue(stillSuppressed,
+              "pi26: …and that producer is STILL excluded from the outreach pool — flipping this default returns the whole contacted history to the pool and re-mails everyone");
+            const cnt = (legacy.prepare(`SELECT COUNT(*) n FROM outreach_sent_log`).get() as any).n;
+            assertEq(cnt, 1,
+              "pi27: …with the historical row preserved, not dropped and recreated by the migration");
           } finally {
             try { legacy.close(); } catch { /* already closed */ }
             initMod.__setDbForTesting(db as any);
