@@ -343,6 +343,19 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
           process.env.EXPERIENCES_DB_PATH = pathm.join(scratchDir, "experiences.db");
           const dbf = require("../database/db-factory") as any;
           dbf.__resetDbFactoryForTesting?.();
+          // REVIEW T5 — assert the redirect took, BEFORE seeding anything.
+          //
+          // Without the env line above, db-factory falls back to
+          // /app/data/experiences.db (db-factory.ts:63) — the production path —
+          // and the CREATE TABLE IF NOT EXISTS + INSERT OR REPLACE below happily
+          // seed a REAL database. A reviewer demonstrated exactly that: mtime
+          // advanced and the fixture provider was present in the live file
+          // afterwards. The suite would have stayed green the whole time.
+          //
+          // Deleting the redirect must fail HERE, loudly, before any write.
+          assertTrue(
+            String(process.env.EXPERIENCES_DB_PATH ?? "").startsWith(scratchDir),
+            `pi16i-guard: EXPERIENCES_DB_PATH points inside the scratch dir (${process.env.EXPERIENCES_DB_PATH}) — without this the seeding below writes to the PRODUCTION experiences database and nothing complains`);
           const expDb = dbf.getDb("experiences");
           expDb.exec(`CREATE TABLE IF NOT EXISTS experience_providers (
             id TEXT PRIMARY KEY, navn TEXT, epost TEXT, booking_live INTEGER, catalog_hidden INTEGER)`);
