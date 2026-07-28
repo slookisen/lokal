@@ -2176,6 +2176,17 @@ export async function meetsRfbAboutQualityBar(
 const RFB_RETRO_SCAN_DEFAULT_LIMIT = 25;
 const RFB_RETRO_SCAN_MAX_LIMIT = 100;
 const RFB_RETRO_SCAN_CONCURRENCY = 3;
+// Sanity ceiling for `offset`, comfortably above the ~1500-row eligible RFB
+// catalog for the foreseeable future. Without an upper bound, a caller-
+// supplied value like 1e19 passes Number.isInteger() (IEEE-754 doubles that
+// large are always "integers") but crashes better-sqlite3's prepared
+// `OFFSET ?` bind with an uncaught `SqliteError: datatype mismatch` — there's
+// no error-handling middleware in src/index.ts, so that surfaces as an
+// unhandled 500 instead of this endpoint's own {error, detail} 400 contract.
+// Explicitly rejecting anything past a generous, named ceiling is better
+// than silently returning an empty page (or crashing) for values nobody
+// legitimate would ever pass.
+const RFB_RETRO_SCAN_OFFSET_MAX = 100_000;
 
 interface RfbRetroScanTarget {
   agent_id: string;
@@ -2218,10 +2229,31 @@ function rfbRetroScanAutoSelectSql(): string {
   `;
 }
 
-function selectRfbAgentsForRetroScan(db: ReturnType<typeof getDb>, limit: number): RfbRetroScanTarget[] {
+function selectRfbAgentsForRetroScan(
+  db: ReturnType<typeof getDb>,
+  limit: number,
+  offset: number,
+): RfbRetroScanTarget[] {
   return db
-    .prepare(`${rfbRetroScanAutoSelectSql()} ORDER BY a.created_at ASC LIMIT ?`)
-    .all(limit) as RfbRetroScanTarget[];
+    .prepare(`${rfbRetroScanAutoSelectSql()} ORDER BY a.created_at ASC LIMIT ? OFFSET ?`)
+    .all(limit, offset) as RfbRetroScanTarget[];
+}
+
+/**
+ * COUNT(*) over the exact same WHERE clause as rfbRetroScanAutoSelectSql()
+ * (no LIMIT/OFFSET) — lets a caller paginating the auto-select path (e.g. a
+ * full-catalog dry-run in batches of `limit`) know how many eligible rows
+ * remain across the whole catalog, not just in this one page. Returned
+ * regardless of which selection path (auto-select or explicit `agentIds`)
+ * was actually used for this call — it's a property of the catalog, not of
+ * the request — so a single cheap COUNT query is run unconditionally rather
+ * than threading a condition through both call sites.
+ */
+function countRfbRetroScanEligible(db: ReturnType<typeof getDb>): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM (${rfbRetroScanAutoSelectSql()})`)
+    .get() as { n: number } | undefined;
+  return row?.n ?? 0;
 }
 
 /**
@@ -2410,7 +2442,7 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   const db = getDb();
-  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; offset?: unknown; apply?: unknown };
 
   const apply =
     body.apply === true ||
@@ -2426,6 +2458,47 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
     RFB_RETRO_SCAN_MAX_LIMIT,
   );
 
+  // offset: default 0 — reproduces today's exact behavior for any caller
+  // that doesn't pass it. Only meaningful for the auto-select path (the
+  // explicit agentIds override below ignores it entirely, same as today),
+  // but is parsed/validated up front, same shape as GET /admin/agents's own
+  // limit/offset validation above ({error, detail}, 400 on invalid).
+  let offset = 0;
+  const rawOffset = body.offset !== undefined ? body.offset : req.query?.offset;
+  if (rawOffset !== undefined) {
+    // Reject non-scalar values (arrays, objects, booleans, …) up front.
+    // Without this, e.g. body.offset === [5] is not typeof "number", falls
+    // through to parseInt(rawOffset as string, 10), which implicitly
+    // stringifies ([5].toString() === "5") and silently parses to 5.
+    if (typeof rawOffset !== "number" && typeof rawOffset !== "string") {
+      res.status(400).json({ error: "invalid offset", detail: "offset must be a non-negative integer" });
+      return;
+    }
+    const n = typeof rawOffset === "number" ? rawOffset : parseInt(rawOffset as string, 10);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > RFB_RETRO_SCAN_OFFSET_MAX) {
+      res.status(400).json({ error: "invalid offset", detail: "offset must be a non-negative integer" });
+      return;
+    }
+    offset = n;
+  }
+
+  // apply=true + offset>0 is unsound: rfbRetroScanAutoSelectSql()'s WHERE
+  // clause depends on the LIVE value of description/about, and apply mode
+  // nulls exactly those columns. A row nulled on an earlier page drops out
+  // of the eligible set and shifts every later row's position, so a caller
+  // paging with fixed offsets across sequential apply:true calls would
+  // silently skip rows at page boundaries. Offset pagination is only safe
+  // for dry-run scans (the actual discovery use case); apply:true with
+  // offset omitted/0 — a normal small-batch write — is unaffected.
+  if (apply && offset > 0) {
+    res.status(400).json({
+      error: "invalid offset",
+      detail:
+        "offset pagination is only safe for dry-run scans — apply mode may not be combined with a nonzero offset, since applying nulls shifts row positions and can silently skip rows on later pages",
+    });
+    return;
+  }
+
   let targets: RfbRetroScanTarget[];
   if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
     const ids = (body.agentIds as unknown[])
@@ -2436,8 +2509,10 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
       .map((id) => getRfbAgentRetroScanTarget(db, id))
       .filter((t): t is RfbRetroScanTarget => t !== null);
   } else {
-    targets = selectRfbAgentsForRetroScan(db, limit);
+    targets = selectRfbAgentsForRetroScan(db, limit, offset);
   }
+
+  const totalEligible = countRfbRetroScanEligible(db);
 
   let scanned = 0;
   const byField: Record<"description" | "about", { flagged: number; nulled: number }> = {
@@ -2513,6 +2588,8 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
   res.json({
     dry_run: dryRun,
     scanned,
+    offset,
+    total_eligible: totalEligible,
     by_field: byField,
     changed,
     skipped_locked: skippedLocked,

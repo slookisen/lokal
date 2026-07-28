@@ -36,6 +36,20 @@
  *   (i) field_provenance entries for nulled fields are removed (read-modify-
  *       write), and an agent_knowledge_audit row is written per nulled field
  *       (changed_by:'system', notes carries the judge's reasoning).
+ *   (j) offset-based pagination on the auto-select path (dev-request
+ *       rfb-retroscan-offset): offset=0 vs offset=N on a fixture with more
+ *       than 2N eligible rows return different, non-overlapping agent sets;
+ *       an invalid offset (negative, or non-numeric) -> 400 with no scan
+ *       performed; `total_eligible` matches an independent COUNT of the
+ *       fixture's eligible rows, unaffected by limit/offset; a call
+ *       with NO offset param is identical to an explicit offset:0 call
+ *       (regression: today's exact default behavior is preserved); post-
+ *       review fix-up: apply:true + offset>0 -> 400 with zero judge/write
+ *       work (apply:true + offset:0/omitted is unaffected); an offset above
+ *       the sanity ceiling (including a huge 1e19 value) -> 400 instead of
+ *       crashing, while offset at/under the ceiling still works; and a
+ *       non-scalar offset (array, e.g. [5], or boolean) -> 400 instead of
+ *       silently coercing through parseInt.
  *
  * Mirrors admin-agents-brreg-description-fallback.test.ts's setup convention
  * exactly (own in-memory prod-schema DB via __setDbForTesting/
@@ -468,6 +482,183 @@ export function runAdminAgentsRetroScanTests(
           !auto.body.changed.some((c: any) => c.agent_id === "rs-blank") && !auto.body.errors.some((e: any) => e.agent_id === "rs-blank"),
           "rs-i1: a row with both description and about blank is never selected by auto-select (nothing to judge)",
         );
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (j) offset-based pagination — dev-request rfb-retroscan-offset.
+      // ═══════════════════════════════════════════════════════════════════
+      clearAll();
+      {
+        function sortByAgentId(arr: any[]): any[] {
+          return [...arr].sort((a, b) =>
+            String(a?.agent_id ?? a).localeCompare(String(b?.agent_id ?? b)),
+          );
+        }
+
+        // 4 eligible RFB agents (non-umbrella, non-claimed, non-blank
+        // description), with STRICTLY increasing created_at so ORDER BY
+        // a.created_at ASC is deterministic — insertAgent() itself relies
+        // on the schema's `datetime('now')` DEFAULT (second-granularity),
+        // which would tie all four together, so these are inserted with an
+        // explicit created_at directly instead of via insertAgent().
+        // All four use CONTAMINATED so every one is deterministically
+        // AVVIS'd by the stubbed judge and therefore shows up in changed[]
+        // — the only way to observe, from the response shape alone, exactly
+        // which rows a given offset/limit page actually selected.
+        const offsetIds = ["off-0", "off-1", "off-2", "off-3"];
+        offsetIds.forEach((id, i) => {
+          testDb.prepare(
+            `INSERT INTO agents (
+              id, name, description, provider, contact_email, url, role, api_key,
+              claimed_at, umbrella_type, org_nr, created_at
+            ) VALUES (?, ?, ?, 't', 'x@example.com', 'https://example.com', 'producer', ?, NULL, NULL, NULL, ?)`,
+          ).run(id, `Offset Gard ${i}`, CONTAMINATED, `key-${id}`, `2026-01-01T00:00:0${i}.000Z`);
+        });
+
+        // An ineligible row (blank description, no `about`) — must NOT
+        // count toward total_eligible, proving the count uses the exact
+        // same WHERE clause as selection, not just "every agent row".
+        testDb.prepare(
+          `INSERT INTO agents (
+            id, name, description, provider, contact_email, url, role, api_key
+          ) VALUES ('off-blank', 'Offset Blank Gard', '', 't', 'x@example.com', 'https://example.com', 'producer', 'key-off-blank')`,
+        ).run();
+
+        const independentEligibleCount = (
+          testDb
+            .prepare(
+              `SELECT COUNT(*) AS n
+                 FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+                WHERE a.umbrella_type IS NULL
+                  AND a.claimed_at IS NULL
+                  AND (TRIM(a.description) != '' OR (k.about IS NOT NULL AND TRIM(k.about) != ''))`,
+            )
+            .get() as { n: number }
+        ).n;
+        assertEq(independentEligibleCount, 4, "rs-j0: sanity — exactly 4 eligible rows in this fixture (the blank one is excluded)");
+
+        // ── offset=0, limit=2 → the two EARLIEST rows ──────────────────
+        const page0 = await callRetroScan({ apply: false, limit: 2, offset: 0 });
+        assertEq(page0.status, 200, "rs-j1: offset=0 page -> 200");
+        assertEq(page0.body.offset, 0, "rs-j2: response echoes offset:0");
+        const page0Ids = sortByAgentId(page0.body.changed).map((c: any) => c.agent_id);
+        assertEq(page0Ids, ["off-0", "off-1"], "rs-j3: offset=0,limit=2 selects the two earliest rows");
+
+        // ── offset=2, limit=2 → the NEXT two rows, non-overlapping ─────
+        const page1 = await callRetroScan({ apply: false, limit: 2, offset: 2 });
+        assertEq(page1.body.offset, 2, "rs-j4: response echoes offset:2");
+        const page1Ids = sortByAgentId(page1.body.changed).map((c: any) => c.agent_id);
+        assertEq(page1Ids, ["off-2", "off-3"], "rs-j5: offset=2,limit=2 selects the next two rows");
+        assertTrue(
+          page0Ids.every((id: string) => !page1Ids.includes(id)),
+          "rs-j6: offset=0 and offset=2 pages return non-overlapping agent sets",
+        );
+
+        // ── total_eligible: matches the independent COUNT, and is
+        //    unaffected by limit/offset (same value on both pages above). ──
+        assertEq(page0.body.total_eligible, independentEligibleCount, "rs-j7: total_eligible matches the independent COUNT");
+        assertEq(page1.body.total_eligible, independentEligibleCount, "rs-j8: total_eligible is unaffected by offset/limit (same on the offset=2 page)");
+
+        // ── invalid offset: negative -> 400, no scan performed ──────────
+        const callsBeforeNeg = anthropicCallCount;
+        const negRes = await callRetroScan({ apply: false, offset: -1 });
+        assertEq(negRes.status, 400, "rs-j9: negative offset -> 400");
+        assertTrue(
+          typeof negRes.body.error === "string" && typeof negRes.body.detail === "string",
+          "rs-j10: 400 body has the {error, detail} shape used elsewhere in this file",
+        );
+        assertEq(anthropicCallCount, callsBeforeNeg, "rs-j11: negative offset performs NO scan (no judge calls made)");
+
+        // ── invalid offset: non-numeric string -> 400, no scan performed ─
+        const callsBeforeNaN = anthropicCallCount;
+        const nanRes = await callRetroScan({ apply: false, offset: "abc" });
+        assertEq(nanRes.status, 400, "rs-j12: non-numeric offset -> 400");
+        assertEq(anthropicCallCount, callsBeforeNaN, "rs-j13: non-numeric offset performs NO scan (no judge calls made)");
+
+        // ── regression: a call with NO offset param behaves identically to
+        //    an explicit offset:0 call (today's exact default behavior). ──
+        const noOffsetRes = await callRetroScan({ apply: false, limit: 2 });
+        const explicitOffset0Res = await callRetroScan({ apply: false, limit: 2, offset: 0 });
+        assertEq(noOffsetRes.status, explicitOffset0Res.status, "rs-j14: no-offset call and explicit offset:0 call return the same status");
+        assertEq(noOffsetRes.body.offset, 0, "rs-j15: no-offset param defaults to offset:0 in the response");
+        assertEq(noOffsetRes.body.scanned, explicitOffset0Res.body.scanned, "rs-j16: no-offset call scans the same count as an explicit offset:0 call");
+        assertEq(noOffsetRes.body.total_eligible, explicitOffset0Res.body.total_eligible, "rs-j17: total_eligible identical too");
+        assertEq(noOffsetRes.body.by_field, explicitOffset0Res.body.by_field, "rs-j18: by_field counts identical too");
+        assertEq(
+          sortByAgentId(noOffsetRes.body.changed),
+          sortByAgentId(explicitOffset0Res.body.changed),
+          "rs-j19: no-offset call selects the exact same agent set (with the same fields/reasons) as an explicit offset:0 call",
+        );
+
+        // ── apply:true + offset>0 is rejected — apply mode nulls exactly
+        //    the columns the auto-select WHERE clause depends on, so paging
+        //    with fixed offsets across sequential apply calls would silently
+        //    skip rows at page boundaries. -> 400, zero judge/write work. ──
+        const callsBeforeApplyOffset = anthropicCallCount;
+        const beforeOff0 = readAgent("off-0");
+        const applyOffsetRes = await callRetroScan({ apply: true, offset: 1 });
+        assertEq(applyOffsetRes.status, 400, "rs-j20: apply:true + offset>0 -> 400");
+        assertTrue(
+          typeof applyOffsetRes.body.error === "string" && typeof applyOffsetRes.body.detail === "string",
+          "rs-j21: 400 body has the {error, detail} shape used elsewhere in this file",
+        );
+        assertEq(anthropicCallCount, callsBeforeApplyOffset, "rs-j22: apply:true + offset>0 performs NO scan (no judge calls made)");
+        assertEq(readAgent("off-0").description, beforeOff0.description, "rs-j23: apply:true + offset>0 performs NO write");
+
+        // apply:true + offset:0 (explicit) is unaffected — still works
+        // exactly as before this fix (a normal small-batch apply write).
+        const applyZeroRes = await callRetroScan({ agentIds: ["off-0"], apply: true, offset: 0 });
+        assertEq(applyZeroRes.status, 200, "rs-j24: apply:true + offset:0 (explicit) still works");
+        assertTrue(
+          applyZeroRes.body.changed.some((c: any) => c.agent_id === "off-0" && c.fields.includes("description")),
+          "rs-j25: apply:true + offset:0 still nulls a failing field exactly as before",
+        );
+
+        // apply:true with offset OMITTED entirely is also unaffected.
+        const applyOmittedRes = await callRetroScan({ agentIds: ["off-1"], apply: true });
+        assertEq(applyOmittedRes.status, 200, "rs-j26: apply:true with offset omitted entirely still works");
+        assertTrue(
+          applyOmittedRes.body.changed.some((c: any) => c.agent_id === "off-1" && c.fields.includes("description")),
+          "rs-j27: apply:true with offset omitted still nulls a failing field exactly as before",
+        );
+
+        // ── offset ceiling: huge values 400 instead of crashing. Before the
+        //    fix, 1e19 passed Number.isInteger() (IEEE-754 doubles that large
+        //    are always "integers") and crashed better-sqlite3's `OFFSET ?`
+        //    bind with an uncaught SqliteError -> unhandled 500. ──
+        const callsBeforeCeiling = anthropicCallCount;
+        const overCeilingRes = await callRetroScan({ apply: false, offset: 100_001 });
+        assertEq(overCeilingRes.status, 400, "rs-j28: offset just above the ceiling (100001) -> 400");
+        assertTrue(
+          typeof overCeilingRes.body.error === "string" && typeof overCeilingRes.body.detail === "string",
+          "rs-j29: 400 body has the {error, detail} shape",
+        );
+
+        const hugeOffsetRes = await callRetroScan({ apply: false, offset: 1e19 });
+        assertEq(hugeOffsetRes.status, 400, "rs-j30: a huge offset (1e19) -> 400, not a crash (the reviewer's actual reproduction)");
+
+        const atCeilingRes = await callRetroScan({ apply: false, offset: 100_000 });
+        assertEq(atCeilingRes.status, 200, "rs-j31: offset AT the ceiling (100000) still works normally");
+        assertEq(atCeilingRes.body.changed.length, 0, "rs-j32: offset at the ceiling returns an empty page, not a crash (no rows that far out)");
+
+        const underCeilingRes = await callRetroScan({ apply: false, offset: 99_999 });
+        assertEq(underCeilingRes.status, 200, "rs-j33: offset just under the ceiling (99999) still works normally");
+
+        assertEq(anthropicCallCount, callsBeforeCeiling, "rs-j34: none of the ceiling-boundary calls made any judge calls (nothing that far out to scan)");
+
+        // ── non-scalar offset (arrays, objects, booleans) rejects instead
+        //    of silently coercing through parseInt. Before the fix,
+        //    offset:[5] was not typeof "number", fell through to
+        //    parseInt(rawOffset as string, 10), which implicitly
+        //    stringified ([5].toString() === "5") and parsed to 5. ──
+        const callsBeforeNonScalar = anthropicCallCount;
+        const arrOffsetRes = await callRetroScan({ apply: false, offset: [5] });
+        assertEq(arrOffsetRes.status, 400, "rs-j35: offset:[5] -> 400 (not silently coerced to 5)");
+        const arrMultiOffsetRes = await callRetroScan({ apply: false, offset: [1, 2, 3] });
+        assertEq(arrMultiOffsetRes.status, 400, "rs-j36: offset:[1,2,3] -> 400 (not silently coerced to 1)");
+        const boolOffsetRes = await callRetroScan({ apply: false, offset: true });
+        assertEq(boolOffsetRes.status, 400, "rs-j37: offset:true -> 400");
+        assertEq(anthropicCallCount, callsBeforeNonScalar, "rs-j38: none of the non-scalar offset calls made any judge calls");
       }
     } catch (err) {
       failed++;
