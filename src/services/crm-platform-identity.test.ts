@@ -267,6 +267,43 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
       }
 
       // ═══════════════════════════════════════════════════════════════
+      // pi16f-pi16h — THE BOOKING PATH, which is where funn 2 was ACTUALLY seen.
+      //
+      // The first version of this branch wired only sendRaw, whose two callers
+      // are both CRM routes. A reviewer measured that the booking notice Daniel
+      // screenshotted goes through sendEmail instead, and still came out as a
+      // bare `kontakt@rettfrabonden.com` with no display name at all. So steg 3
+      // closed funn 2 everywhere except the one place funn 2 was observed.
+      //
+      // Deleting `from:` from the booking call sites has to fail HERE.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const { loadConfigsAtBoot } = require("../config/vertical-config");
+        try { loadConfigsAtBoot(); } catch { /* already loaded */ }
+        const emailMod2 = require("./email-service") as any;
+        const svc2 = emailMod2.emailService;
+        const prevConf = svc2.isConfigured;
+        const prevTrans = svc2.transporter;
+        const wire2: any[] = [];
+        svc2.isConfigured = true;
+        svc2.transporter = { sendMail: async (o: any) => { wire2.push(o); return { messageId: "bw" }; } };
+        try {
+          await svc2.sendGardssalgClaimMagicLink({
+            to: "produsent@example.no", providerName: "Dobel Gård",
+            magicUrl: "https://opplevagent.no/claim/x",
+          });
+          assertEq(wire2.length, 1, "pi16f: the Opplevagent claim mail reaches the transport");
+          assertEq(wire2[0]?.from, '"Opplevagent" <kontakt@rettfrabonden.com>',
+            "pi16g: …branded Opplevagent — before this it was a bare address with NO display name, which is the header from funn 2");
+          assertEq(wire2[0]?.replyTo, "kontakt@opplevagent.no",
+            "pi16h: …and still replies to the Opplevagent forwarder");
+        } finally {
+          svc2.isConfigured = prevConf;
+          svc2.transporter = prevTrans;
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════
       // pi17-pi22 — THE STEG-3 PRECONDITION.
       //
       // outreach_sent_log gates outreach_ready_pool, whose rows are RFB
@@ -376,6 +413,27 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
                   WHERE ct.id = NEW.thread_id AND cc.agent_id IS NOT NULL;
                 END
             `);
+            // The CONFIRM trigger needs a pre-fix shape as well, or its upgrade
+            // assertion is vacuous: a fresh initSchema already created the
+            // stamping version, so nothing would have to be replaced and
+            // deleting its DROP would be invisible. Measured — F4 survived
+            // exactly this way.
+            legacy.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_on_send_confirm_v2`);
+            legacy.exec(`
+              CREATE TRIGGER trg_log_cold_outreach_on_send_confirm_v2
+                AFTER UPDATE OF delivery_status ON crm_messages FOR EACH ROW
+                WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
+                BEGIN
+                  INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+                  SELECT cc.agent_id, LOWER(cc.email), datetime('now'), 'email', NEW.id, 'legacy-confirm'
+                  FROM crm_threads ct JOIN crm_contacts cc ON cc.id = ct.contact_id
+                  WHERE ct.id = NEW.thread_id AND cc.agent_id IS NOT NULL;
+                END
+            `);
+            const beforeConf = (legacy.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_log_cold_outreach_on_send_confirm_v2'`).get() as any)?.sql ?? "";
+            assertTrue(!beforeConf.includes("NEW.vertical_id"),
+              "pi23b: …and so is the CONFIRM trigger's pre-fix shape");
+
             const before = (legacy.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_log_cold_outreach_to_sent_log_v2'`).get() as any)?.sql ?? "";
             assertTrue(!before.includes("NEW.vertical_id"),
               "pi23: the pre-fix production shape is in place — a trigger that does NOT stamp the platform");
