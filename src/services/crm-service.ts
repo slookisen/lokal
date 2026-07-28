@@ -12,9 +12,46 @@ export type ContactType = "producer" | "marketing" | "vendor" | "unknown";
 // experiences = opplevagent.no. All CRM tables carry vertical_id (default
 // 'rfb'). The closed union below is interpolated directly into SQL fragments
 // — never raw user input.
-export type CrmVertical = "rfb" | "dental" | "experiences";
+export const CRM_VERTICALS = ["rfb", "dental", "experiences"] as const;
+export type CrmVertical = (typeof CRM_VERTICALS)[number];
+
+export function isCrmVertical(v: unknown): v is CrmVertical {
+  return typeof v === "string" && (CRM_VERTICALS as readonly string[]).includes(v);
+}
+
+/**
+ * FAIL-CLOSED vertical gate for every CRM WRITE.
+ *
+ * Daniel, 2026-07-27: «Det er ekstremt viktig at rfb og opplevagent.no håndteres
+ * hver for seg og vi ikke begynner å blande henvendelser fra hver av plattformene.»
+ *
+ * Throwing is the whole point. `vertical_id` has a `DEFAULT 'rfb'` at the column
+ * level, so ANY write that omits it silently files the row as Rett fra Bonden —
+ * which is exactly how every row in the CRM ended up tagged 'rfb', including
+ * genuine Opplevagent enquiries. A default here would recreate the damage this
+ * function exists to stop, so there is deliberately no fallback parameter and no
+ * "sensible default": an unroutable message must fail loudly and be triaged by a
+ * human, never be quietly filed under the wrong platform.
+ */
+export function assertVertical(v: unknown, where: string): CrmVertical {
+  if (!isCrmVertical(v)) {
+    throw new Error(
+      `[crm] ${where}: vertical must be one of ${CRM_VERTICALS.join("|")} — got ${JSON.stringify(v)}. ` +
+        `Refusing to default to 'rfb'; a mis-filed platform is the bug this guard exists for.`,
+    );
+  }
+  return v;
+}
+
 function vSql(column: string, vertical?: CrmVertical): string {
-  return vertical ? ` AND ${column} = '${vertical}'` : "";
+  if (vertical === undefined) return "";
+  // Validated at the point of interpolation rather than trusted from the caller.
+  // The value IS a closed union in TypeScript and today's only entry point
+  // (parseVertical in routes/crm.ts) is a strict allowlist — but types do not
+  // exist at runtime, and this builds SQL by string concatenation. One future
+  // caller passing a raw query parameter turns this into injection, and nothing
+  // in the type system would flag it. Cost of the check: one Array.includes.
+  return ` AND ${column} = '${assertVertical(vertical, "vSql")}'`;
 }
 export type ThreadStatus = "new" | "in_progress" | "awaiting_review" | "done" | "archived";
 export type ThreadCategory = "innkommende" | "system" | "marketing" | "leverandor" | "unknown";
@@ -124,14 +161,25 @@ class CrmService {
     return { type: "unknown", agentId: null };
   }
 
-  resolveContact(email: string, hintName?: string | null): { id: string; created: boolean } {
+  /**
+   * Resolve (or create) the contact for `email` ON A SPECIFIC PLATFORM.
+   *
+   * `vertical` is required and scopes BOTH the lookup and the insert. Scoping the
+   * lookup is what makes «adskilte kontakter» real: the same person writing to
+   * rettfrabonden.com and to opplevagent.no gets two rows, two thread histories,
+   * and two independent classifications. Without the scope, the first platform to
+   * see an address would own that contact forever and every later message from the
+   * other platform would be stapled onto its history.
+   */
+  resolveContact(email: string, hintName: string | null | undefined, vertical: CrmVertical): { id: string; created: boolean } {
     const db = getDb();
+    const v = assertVertical(vertical, "resolveContact");
     const lowerEmail = email.trim().toLowerCase();
     const domain = lowerEmail.split("@")[1] ?? "";
 
     const existing = db
-      .prepare("SELECT id, type, agent_id FROM crm_contacts WHERE email = ?")
-      .get(lowerEmail) as { id: string; type: ContactType; agent_id: string | null } | undefined;
+      .prepare("SELECT id, type, agent_id FROM crm_contacts WHERE email = ? AND vertical_id = ?")
+      .get(lowerEmail, v) as { id: string; type: ContactType; agent_id: string | null } | undefined;
 
     if (existing) {
       // Re-evaluate if currently 'unknown' OR stuck with no agent_id link (cheap,
@@ -172,9 +220,9 @@ class CrmService {
     const c = this.classifyEmail(lowerEmail);
     const id = randomUUID();
     db.prepare(`
-      INSERT INTO crm_contacts (id, type, agent_id, email, name, domain)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(id, c.type, c.agentId, lowerEmail, hintName ?? null, domain || null);
+      INSERT INTO crm_contacts (id, type, agent_id, email, name, domain, vertical_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, c.type, c.agentId, lowerEmail, hintName ?? null, domain || null, v);
 
     return { id, created: true };
   }
@@ -219,9 +267,14 @@ class CrmService {
    * Idempotent ingestion: upserts a thread + its messages.
    * Called by the CS-agent each run with whatever new/updated threads it found.
    */
-  ingestThread(input: IngestThreadInput, primaryFromEmail: string): { threadId: string; contactId: string; newMessages: number } {
+  ingestThread(
+    input: IngestThreadInput,
+    primaryFromEmail: string,
+    vertical: CrmVertical,
+  ): { threadId: string; contactId: string; newMessages: number } {
     const db = getDb();
-    const contact = this.resolveContact(primaryFromEmail);
+    const v = assertVertical(vertical, "ingestThread");
+    const contact = this.resolveContact(primaryFromEmail, null, v);
     const contactId = contact.id;
     const threadId = input.threadId;
 
@@ -229,14 +282,15 @@ class CrmService {
     const existing = db.prepare("SELECT id FROM crm_threads WHERE id = ?").get(threadId);
     if (!existing) {
       db.prepare(`
-        INSERT INTO crm_threads (id, contact_id, subject, category, severity)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id)
+        VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         threadId,
         contactId,
         input.subject ?? null,
         input.category ?? "unknown",
-        input.severity ?? "normal"
+        input.severity ?? "normal",
+        v
       );
     } else if (input.subject || input.category || input.severity) {
       // Update fields if provided
@@ -254,8 +308,8 @@ class CrmService {
     let newMessages = 0;
     const insertMsg = db.prepare(`
       INSERT OR IGNORE INTO crm_messages
-        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata, vertical_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     for (const m of input.messages) {
@@ -271,7 +325,8 @@ class CrmService {
         m.bodyHtml ?? null,
         m.snippet ?? null,
         m.sentAt ?? null,
-        JSON.stringify(m.rawMetadata ?? {})
+        JSON.stringify(m.rawMetadata ?? {}),
+        v
       );
       if (result.changes > 0) newMessages++;
     }
@@ -328,10 +383,13 @@ class CrmService {
      * 'sent' is for back-compat callers that genuinely send synchronously.
      */
     deliveryStatus?: "sent" | "queued" | "draft_in_gmail" | "failed";
+    /** Which platform this thread belongs to. Required — see assertVertical. */
+    vertical: CrmVertical;
   }): { threadId: string; contactId: string; messageId: string } {
     const db = getDb();
+    const v = assertVertical(input.vertical, "composeNewThread");
     const lowerTo = input.toEmail.trim().toLowerCase();
-    const contact = this.resolveContact(lowerTo, input.contactName ?? null);
+    const contact = this.resolveContact(lowerTo, input.contactName ?? null, v);
     const contactId = contact.id;
 
     if (input.contactName && contact.created) {
@@ -344,8 +402,8 @@ class CrmService {
     const now = new Date().toISOString();
 
     db.prepare(`
-      INSERT INTO crm_threads (id, contact_id, subject, category, severity, assigned_to, status, last_message_at, last_outbound_at, message_count, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'daniel', 'in_progress', ?, ?, 1, datetime('now'))
+      INSERT INTO crm_threads (id, contact_id, subject, category, severity, assigned_to, status, last_message_at, last_outbound_at, message_count, updated_at, vertical_id)
+      VALUES (?, ?, ?, ?, ?, 'daniel', 'in_progress', ?, ?, 1, datetime('now'), ?)
     `).run(
       threadId,
       contactId,
@@ -354,6 +412,7 @@ class CrmService {
       input.severity ?? "normal",
       now,
       now,
+      v,
     );
 
     const deliveryStatus = input.deliveryStatus ?? "sent";
@@ -363,8 +422,8 @@ class CrmService {
 
     db.prepare(`
       INSERT INTO crm_messages
-        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata, delivery_status)
-      VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', ?, '[]', ?, ?, ?, ?, ?, ?, ?)
+        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata, delivery_status, vertical_id)
+      VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       messageId,
       threadId,
@@ -376,6 +435,7 @@ class CrmService {
       recordedSentAt,
       JSON.stringify({ source: "crm-compose", createdBy: input.createdBy }),
       deliveryStatus,
+      v,
     );
 
     this.logAction({
@@ -480,13 +540,16 @@ class CrmService {
     bodyHtml?: string;
     replyToMessageId?: string | null;
     createdBy: "claude" | "daniel";
+    /** Which platform this send belongs to. Required — see assertVertical. */
+    vertical: CrmVertical;
   }): { id: string } {
     const db = getDb();
+    const v = assertVertical(params.vertical, "enqueueOutbox");
     const id = randomUUID();
     db.prepare(`
       INSERT INTO crm_outbox
-        (id, thread_id, contact_id, intent, to_emails, cc_emails, subject, body_text, body_html, reply_to_message_id, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, thread_id, contact_id, intent, to_emails, cc_emails, subject, body_text, body_html, reply_to_message_id, created_by, vertical_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       params.threadId ?? null,
@@ -498,7 +561,8 @@ class CrmService {
       params.bodyText,
       params.bodyHtml ?? null,
       params.replyToMessageId ?? null,
-      params.createdBy
+      params.createdBy,
+      v
     );
     this.logAction({
       threadId: params.threadId,

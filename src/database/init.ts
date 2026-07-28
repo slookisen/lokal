@@ -626,6 +626,13 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_crm_contacts_type ON crm_contacts(type);
     CREATE INDEX IF NOT EXISTS idx_crm_contacts_agent ON crm_contacts(agent_id);
     CREATE INDEX IF NOT EXISTS idx_crm_contacts_domain ON crm_contacts(domain);
+    -- Superseded by idx_crm_contacts_email_vertical_unique further down this
+    -- file. It still has to be created HERE, on (email) alone, because
+    -- vertical_id does not exist on the table yet at this point — the column is
+    -- added by the ALTER TABLE loop below. So a fresh database gets this index,
+    -- then the migration swaps it for the composite one a few hundred lines
+    -- later, in the same initSchema() pass. Do not "simplify" this into a
+    -- composite index here; it will fail with "no such column: vertical_id".
     CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_unique ON crm_contacts(email);
 
     CREATE TABLE IF NOT EXISTS crm_threads (
@@ -911,6 +918,36 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_vertical_id ON agents(vertical_id)`);
   } catch {
     // Index already exists
+  }
+
+  // ─── crm_contacts uniqueness: (email) → (email, vertical_id) ──
+  //
+  // dev-requests/2026-07-27-crm-plattformadskillelse-opplevagent.md, steg 2.
+  // Daniels valg A, ordrett: «gå for adskilte kontakter.» One person who is a
+  // customer on BOTH rettfrabonden.com and opplevagent.no must be two separate
+  // contacts — not one shared row whose thread history mixes the platforms.
+  // The old UNIQUE(email) made that impossible to even represent: the second
+  // platform's INSERT would fail outright.
+  //
+  // Safe on live data by construction. Every existing row is vertical_id='rfb'
+  // (nothing wrote the column until this PR), so the composite index holds on
+  // exactly the same row set the single-column one did — it cannot fail on
+  // existing data, and there is nothing to de-duplicate first.
+  //
+  // Order matters: CREATE the new index BEFORE DROPping the old one, so a crash
+  // between the two statements leaves the table MORE constrained, never less.
+  // Uniqueness on email is what keeps duplicate contacts out; losing it for even
+  // one boot is how duplicates get in.
+  //
+  // Idempotent, and reversible by swapping the two statements — but that revert
+  // is only safe while no two rows share an email, i.e. until the first genuine
+  // cross-vertical contact exists. After that a revert must de-duplicate first.
+  // Stated here rather than discovered during an incident.
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_vertical_unique ON crm_contacts(email, vertical_id)`);
+    db.exec(`DROP INDEX IF EXISTS idx_crm_contacts_email_unique`);
+  } catch {
+    // Already migrated
   }
 
   // Dashboards filter analytics by vertical_id (rfb vs dental) — index the

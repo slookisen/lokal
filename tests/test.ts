@@ -34176,6 +34176,23 @@ runSerial(async () => {
 // dry-run purity verified with a WHOLE-DB hash. Own in-memory DB + both
 // network seams injected; runs via runSerial() like its siblings.
 runSerial(async () => {
+  console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 1+2 (vertical fail-closed + adskilte kontakter) ──");
+  try {
+    const { runCrmVerticalTests } = require("../src/services/crm-vertical.test") as
+      typeof import("../src/services/crm-vertical.test");
+    const cvt = await runCrmVerticalTests({ log: false });
+    passed += cvt.passed;
+    failed += cvt.failed;
+    for (const f of cvt.failures) failures.push("crm-vertical: " + f);
+    console.log(`  crm-vertical: ${cvt.passed} passed, ${cvt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-vertical: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-vertical: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a follow-up (geokoding-dekning + gjennomstrømning) ──");
   try {
     const { runGeocodeCoverageBoostTests } = require("../src/services/geocode-coverage-boost.test") as
