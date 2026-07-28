@@ -79,6 +79,15 @@ const CRM_PLATFORM_IDENTITIES: Readonly<Record<CrmVertical, CrmPlatformIdentity>
   },
 };
 
+/**
+ * Test seam. Returns the LIVE table so a test can drive crmFromHeader with a
+ * display name we do not ship — the escaping rule has to be provable without
+ * inventing a producer called `Bonde "Ola" Nordmann`. Restore what you change.
+ */
+export function __identityTableForTesting(): Record<CrmVertical, CrmPlatformIdentity> {
+  return CRM_PLATFORM_IDENTITIES as Record<CrmVertical, CrmPlatformIdentity>;
+}
+
 /** The one address Resend has verified. Every platform sends FROM this. */
 export const CRM_SENDER_ADDRESS = "kontakt@rettfrabonden.com";
 

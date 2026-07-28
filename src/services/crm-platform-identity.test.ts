@@ -87,12 +87,44 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
       assertEq(ident.crmFromHeader("experiences"), '"Opplevagent" <kontakt@rettfrabonden.com>',
         "pi8: the From header is RFC 5322 display-name form over the one Resend-verified address");
 
-      // The escaping exists for a name we do not have yet. Testing it against a
-      // real name would only prove today's data; this proves the rule.
+      // pi8b — the escaping, driven through the REAL function.
+      //
+      // The first version of this assertion re-typed the regex inside the test
+      // and compared the result against itself. It never called crmFromHeader,
+      // so deleting the escaping from the shipped function left it green: a
+      // tautology dressed as a test. It is called out here because the failure
+      // mode — an assertion that cannot fail — is the one this whole suite
+      // exists to catch elsewhere.
       {
-        const escaped = "Bonde \"Ola\" Nordmann".replace(/([\\"])/g, "\\$1");
-        assertEq(escaped, 'Bonde \\"Ola\\" Nordmann',
-          "pi8b: a display name containing a quote is escaped — an unescaped one corrupts the From header, which is a deliverability failure, not a cosmetic one");
+        const mod = require("./crm-platform-identity");
+        const table = mod.__identityTableForTesting();
+        const prevName = table.rfb.displayName;
+        try {
+          table.rfb.displayName = 'Bonde "Ola" Nordmann';
+          assertEq(mod.crmFromHeader("rfb"), '"Bonde \\"Ola\\" Nordmann" <kontakt@rettfrabonden.com>',
+            "pi8b: a quote in the display name is escaped by crmFromHeader itself — an unescaped one truncates the From header at the stray quote, which is a deliverability failure, not a cosmetic one");
+          table.rfb.displayName = "Back\\slash";
+          assertEq(mod.crmFromHeader("rfb"), '"Back\\\\slash" <kontakt@rettfrabonden.com>',
+            "pi8c: …and so is a backslash — escaping only the quote leaves a trailing escape that swallows the closing delimiter");
+        } finally {
+          table.rfb.displayName = prevName;
+        }
+      }
+
+      // A3/A4 — every platform must be distinguishable from every other, not
+      // merely experiences-from-rfb. `dental` had zero assertions, so it could
+      // silently inherit another platform's brand. Iterating CRM_VERTICALS means
+      // a fourth vertical is covered the day it is added.
+      {
+        const crmMod = require("./crm-service") as typeof import("./crm-service");
+        const names = crmMod.CRM_VERTICALS.map((v) => ident.resolveCrmIdentity(v).displayName);
+        assertEq(new Set(names).size, crmMod.CRM_VERTICALS.length,
+          `pi8d: every vertical has a DISTINCT display name (${names.join(" / ")}) — a platform must not be able to inherit another's brand`);
+        for (const v of crmMod.CRM_VERTICALS) {
+          const id = ident.resolveCrmIdentity(v);
+          assertTrue(!!id.displayName && !!id.replyTo,
+            `pi8e[${v}]: …and both fields are populated — a half-configured vertical would send under a blank brand`);
+        }
       }
 
       // ═══════════════════════════════════════════════════════════════
@@ -249,6 +281,13 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
       {
         db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
                     VALUES ('agent-doble','Doble Gård','x','test','doble@example.no','https://doble.example.no','producer','pi-key-1',1)`).run();
+        // Make the agent genuinely POOL-ELIGIBLE. Without this the pool assertions
+        // below would read false for reasons that have nothing to do with
+        // suppression — a test that "passes" because its fixture never qualified
+        // proves nothing about the clause under test.
+        db.prepare(`INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status,
+                      url_last_status, url_last_probed)
+                    VALUES ('agent-doble','doble@example.no','verified','rich',200,datetime('now'))`).run();
 
         const mkSend = (vertical: string, msgId: string) => {
           const c = require("./crm-service").crmService.resolveContact("doble@example.no", null, vertical);
@@ -261,31 +300,44 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
             .run(msgId, tid, vertical);
         };
 
-        const rows = () => db.prepare(
-          `SELECT vertical_id FROM outreach_sent_log o JOIN crm_messages m ON m.id = o.message_id`
+        const oslRows = () => db.prepare(
+          `SELECT o.vertical_id AS v, o.recipient_email AS email FROM outreach_sent_log o ORDER BY o.rowid`
         ).all() as any[];
+        const inPool = () => !!db.prepare(
+          `SELECT 1 FROM outreach_ready_pool WHERE agent_id = 'agent-doble'`
+        ).get();
 
+        // ── The design, after review B2 ──
+        //
+        // outreach_sent_log serves TWO purposes the original schema conflated,
+        // and they want OPPOSITE scopes:
+        //
+        //   the 60-day cold-outreach cooldown  → keyed on the recipient EMAIL,
+        //     must stay CROSS-PLATFORM. Mailing the same human as "Rett fra
+        //     Bonden" on Monday and "Opplevagent" on Wednesday is spam however
+        //     clean the data model is.
+        //   the outreach_ready_pool exclusion  → keyed on the RFB agent, must be
+        //     RFB-ONLY. An Opplevagent send must never drop a producer out of
+        //     RFB outreach.
+        //
+        // The first attempt guarded the WRITE, which fixed the pool and silently
+        // deleted the cooldown for every non-rfb vertical — a reviewer measured
+        // the same recipient being cold-mailed twice two days apart. The row is
+        // now always written and STAMPED instead, and the pool scopes its read.
         mkSend("experiences", "pi-msg-exp");
-        assertEq(rows().length, 0,
-          "pi17: an EXPERIENCES send writes NO outreach_sent_log row — it must not suppress an RFB producer");
+        assertEq(oslRows().length, 1,
+          "pi17: an EXPERIENCES send DOES write an outreach_sent_log row — the 60-day cooldown protects the human, not the platform");
+        assertEq(oslRows()[0]?.v, "experiences",
+          "pi17b: …stamped with its own platform, which is what lets the two readers disagree");
+        assertTrue(inPool(),
+          "pi18: …and the RFB producer is STILL in the RFB outreach pool — an Opplevagent send must not suppress them there");
 
         mkSend("rfb", "pi-msg-rfb");
-        assertEq(rows().length, 1,
-          "pi18: …while an RFB send still does — the guard narrows the trigger, it does not disable it");
-        assertEq(rows()[0]?.vertical_id, "rfb",
-          "pi19: …and the row that exists came from the rfb message");
-
-        // The queued→sent confirm path is the one the marketing agent actually
-        // takes, so leaving it unguarded would leave the real hole open.
-        const c2 = require("./crm-service").crmService.resolveContact("doble@example.no", null, "experiences");
-        db.prepare(`INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id)
-                    VALUES ('pi-osl-confirm', ?, 'Utsending','marketing','normal','experiences')`).run(c2.id);
-        db.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, cc_emails,
-                      subject, body_text, sent_at, raw_metadata, delivery_status, vertical_id)
-                    VALUES ('pi-msg-conf','pi-osl-confirm','out','kontakt@rettfrabonden.com','[]','[]','Utsending','x',datetime('now'),'{}','queued','experiences')`).run();
-        db.prepare(`UPDATE crm_messages SET delivery_status = 'sent' WHERE id = 'pi-msg-conf'`).run();
-        assertEq(rows().length, 1,
-          "pi20: the queued→sent CONFIRM path is guarded too — that is the path the marketing agent actually uses");
+        assertEq(oslRows().length, 2,
+          "pi19: an RFB send writes its row too…");
+        assertEq(oslRows()[1]?.v, "rfb", "pi19b: …stamped rfb");
+        assertTrue(!inPool(),
+          "pi20: …and THAT one does drop them out of the pool — the scoping narrows suppression, it does not disable it");
 
         // And the trigger definitions must actually carry the guard in the
         // database, not merely in the source: they are created IF NOT EXISTS,
@@ -293,8 +345,8 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
         // already has them — i.e. on production.
         for (const t of ["trg_log_cold_outreach_to_sent_log_v2", "trg_log_cold_outreach_on_send_confirm_v2"]) {
           const r = db.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?`).get(t) as any;
-          assertTrue(String(r?.sql ?? "").includes("NEW.vertical_id = 'rfb'"),
-            `pi21/pi22: ${t} carries the platform guard IN THE DATABASE — CREATE IF NOT EXISTS makes a source-only edit invisible on an existing DB`);
+          assertTrue(String(r?.sql ?? "").includes("NEW.vertical_id"),
+            `pi21/pi22: ${t} STAMPS the platform onto the row IN THE DATABASE — CREATE IF NOT EXISTS makes a source-only edit invisible on an existing DB`);
         }
 
         // ── pi23-pi24: THE UPGRADE PATH for the triggers ──
@@ -325,14 +377,20 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
                 END
             `);
             const before = (legacy.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_log_cold_outreach_to_sent_log_v2'`).get() as any)?.sql ?? "";
-            assertTrue(!before.includes("NEW.vertical_id = 'rfb'"),
-              "pi23: the pre-fix production shape is in place — a trigger WITHOUT the platform guard");
+            assertTrue(!before.includes("NEW.vertical_id"),
+              "pi23: the pre-fix production shape is in place — a trigger that does NOT stamp the platform");
 
             initMod.__initSchemaForTesting(legacy as any);   // the upgrade boot
 
             const after = (legacy.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_log_cold_outreach_to_sent_log_v2'`).get() as any)?.sql ?? "";
-            assertTrue(after.includes("NEW.vertical_id = 'rfb'"),
-              "pi24: …and booting the new code REPLACES it with the guarded one — without the explicit DROP this whole fix is a no-op in production");
+            assertTrue(after.includes("NEW.vertical_id"),
+              "pi24: …and booting the new code REPLACES it with the stamping one — without the explicit DROP this whole fix is a no-op in production");
+
+            // F4: the CONFIRM trigger — the path the marketing agent actually
+            // takes — had no upgrade assertion at all, so its DROP was deletable.
+            const conf = (legacy.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_log_cold_outreach_on_send_confirm_v2'`).get() as any)?.sql ?? "";
+            assertTrue(conf.includes("NEW.vertical_id"),
+              "pi24b: …and so is the CONFIRM trigger, which is the one the marketing agent actually uses — fixing the upgrade path on one trigger and not the other is half a fix");
           } finally {
             try { legacy.close(); } catch { /* already closed */ }
             initMod.__setDbForTesting(db as any);

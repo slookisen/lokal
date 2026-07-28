@@ -5,6 +5,7 @@ import { getConfig } from "../config/vertical-config";
 // redirect, applied at the single send boundary below so no call site can
 // bypass it.
 import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard";
+import { crmFromHeader } from "./crm-platform-identity";
 
 // Simple logger — replace with winston/pino in production
 const logger = {
@@ -37,6 +38,16 @@ export interface EmailOptions {
    * behaviour bit-for-bit unchanged.
    */
   isTestSend?: boolean;
+  /**
+   * Full RFC 5322 From header, e.g. `"Opplevagent" <kontakt@rettfrabonden.com>`.
+   *
+   * Steg 3 of the CRM platform split. A reviewer measured that wiring only
+   * sendRaw closed funn 2 on paths where funn 2 was never observed: the booking
+   * notice Daniel screenshotted goes through THIS method, and came out as a bare
+   * `kontakt@rettfrabonden.com` with no display name at all while carrying
+   * Opplevagent content. Omitted keeps the previous behaviour exactly.
+   */
+  from?: string;
 }
 
 export class EmailService {
@@ -258,7 +269,7 @@ export class EmailService {
       }
 
       const mailOptions: Record<string, unknown> = {
-        from: this.fromAddress,
+        from: options.from || this.fromAddress,
         to: options.to,
         subject: options.subject,
         html: options.htmlContent,
@@ -356,6 +367,10 @@ export class EmailService {
       htmlContent: buildGardssalgClaimMagicLinkHtml(providerName, verifyUrl),
       textContent: buildGardssalgClaimMagicLinkText(providerName, verifyUrl),
       replyTo: "kontakt@opplevagent.no",
+      // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+      // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+      // Resend verifies one domain — so the display name is what carries it.
+      from: crmFromHeader("experiences"),
       isTestSend,
     });
   }
