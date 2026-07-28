@@ -14,6 +14,7 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { emailService } from "./email-service";
+import { crmFromHeader } from "./crm-platform-identity";
 
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -501,6 +502,10 @@ ${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${stat
     htmlContent,
     textContent,
     replyTo: `kontakt@opplevagent.no`,
+    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+    // Resend verifies one domain — so the display name is what carries it.
+    from: crmFromHeader("experiences"),
     isTestSend: booking.is_test === 1,
     attachments: [
       {
@@ -599,6 +604,10 @@ Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
     htmlContent,
     textContent,
     replyTo: `kontakt@opplevagent.no`,
+    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+    // Resend verifies one domain — so the display name is what carries it.
+    from: crmFromHeader("experiences"),
     // The PRODUCER email is the one carrying the actionable respond/confirm
     // tokens — redirecting only the guest receipt would still hit a real
     // producer with a test. See services/send-guard.ts.
@@ -874,6 +883,10 @@ ${statusFooterHtml(booking)}
 <p>Hilsen<br>Opplevagent</p>`.trim(),
     textContent: `Hei ${booking.guest_name},\n\n${acceptedSuggestion ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet." : "Produsenten har bekreftet reservasjonen din."}\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${guestStatusUrl(booking) ? `\nStatus: ${guestStatusUrl(booking)}` : ""}\n\nHilsen\nOpplevagent`,
     replyTo: "kontakt@opplevagent.no",
+    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+    // Resend verifies one domain — so the display name is what carries it.
+    from: crmFromHeader("experiences"),
   });
 }
 
@@ -894,6 +907,10 @@ ${statusFooterHtml(booking)}
 <p>Hilsen<br>Opplevagent</p>`.trim(),
     textContent: `Hei ${booking.guest_name},\n\nVi beklager — reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) kunne dessverre ikke bekreftes av produsenten denne gangen.\nSe alternative tilbydere: ${alternatives}\n\nHilsen\nOpplevagent`,
     replyTo: "kontakt@opplevagent.no",
+    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+    // Resend verifies one domain — so the display name is what carries it.
+    from: crmFromHeader("experiences"),
   });
 }
 
@@ -918,6 +935,10 @@ ${statusFooterHtml(booking)}
 <p>Hilsen<br>Opplevagent</p>`.trim(),
     textContent: `Hei ${booking.guest_name},\n\nProdusenten kan dessverre ikke ta imot besøket ${originalFormatted}, men foreslår i stedet:\n${suggestedFormatted}\n\nAksepter eller avslå forslaget her (personlig lenke):\n${decisionUrl}\n\nHilsen\nOpplevagent`,
     replyTo: "kontakt@opplevagent.no",
+    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+    // Resend verifies one domain — so the display name is what carries it.
+    from: crmFromHeader("experiences"),
   });
 }
 
@@ -943,6 +964,10 @@ ${statusFooterHtml(booking)}
 <p>Hilsen<br>Opplevagent</p>`.trim(),
     textContent: `Hei ${booking.guest_name},\n\n${reasonHtml}\nSe alternative tilbydere: ${alternatives}\n\nHilsen\nOpplevagent`,
     replyTo: "kontakt@opplevagent.no",
+    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+    // Resend verifies one domain — so the display name is what carries it.
+    from: crmFromHeader("experiences"),
   });
 }
 
@@ -996,6 +1021,10 @@ async function sendGatedProducerEmail(
     htmlContent,
     textContent,
     replyTo: "kontakt@opplevagent.no",
+    // Steg 3 / funn 2: this mail carries Opplevagent content, so it must READ
+    // as Opplevagent in the inbox list. The address stays rettfrabonden.com —
+    // Resend verifies one domain — so the display name is what carries it.
+    from: crmFromHeader("experiences"),
     isTestSend: booking.is_test === 1,
   });
   return true;

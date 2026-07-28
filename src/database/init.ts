@@ -1343,6 +1343,22 @@ function initSchema(db: Database.Database): void {
       db.exec(`ALTER TABLE outreach_sent_log ADD COLUMN recipient_email TEXT`);
     }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_recipient_email ON outreach_sent_log(recipient_email)`);
+    // Which platform the send belonged to. The table serves TWO purposes that the
+    // original schema conflated, and they want opposite scopes:
+    //   • the 60-day cold-outreach cooldown (routes/crm.ts) is keyed on the
+    //     recipient EMAIL and must stay CROSS-PLATFORM — mailing the same human
+    //     as "Rett fra Bonden" on Monday and "Opplevagent" on Wednesday is spam
+    //     however clean our data model is.
+    //   • the outreach_ready_pool exclusion is keyed on the RFB agent and must be
+    //     RFB-ONLY — an Opplevagent send must never drop a producer out of RFB
+    //     outreach.
+    // Without this column the two cannot be told apart, and any fix for one
+    // breaks the other. (Measured: guarding the WRITE fixed the pool and silently
+    // deleted the cooldown for every non-rfb vertical — review B2.)
+    if (!oslCols.some((c) => c.name === "vertical_id")) {
+      db.exec(`ALTER TABLE outreach_sent_log ADD COLUMN vertical_id TEXT NOT NULL DEFAULT 'rfb'`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_vertical ON outreach_sent_log(vertical_id)`);
   } catch (err) {
     console.error("Migration outreach_sent_log failed:", err);
   }
@@ -1381,13 +1397,19 @@ function initSchema(db: Database.Database): void {
   // message_id. Origin: orchestrator PR-38 (2026-06-21); v2 P0 fix 2026-07-11.
   try {
     db.exec(`DROP TRIGGER IF EXISTS trg_log_marketing_send_to_outreach_sent_log`);
+    // The v2 triggers are DROPped before being recreated, not merely guarded by
+    // IF NOT EXISTS. Without the drop, editing the body below has NO EFFECT on
+    // any database that already carries the trigger — i.e. on production — and
+    // the change would look applied while the old definition kept running. That
+    // is exactly how a migration can pass review and do nothing.
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_to_sent_log_v2`);
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_to_sent_log_v2
         AFTER INSERT ON crm_messages
         FOR EACH ROW
         WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
         BEGIN
-          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
           SELECT
             COALESCE(
               cc.agent_id,
@@ -1398,7 +1420,8 @@ function initSchema(db: Database.Database): void {
             COALESCE(NEW.sent_at, datetime('now')),
             'email',
             NEW.id,
-            'auto:cold_outreach_v2'
+            'auto:cold_outreach_v2',
+            NEW.vertical_id
           FROM crm_threads ct
           JOIN crm_contacts cc ON cc.id = ct.contact_id
           WHERE ct.id = NEW.thread_id
@@ -1437,6 +1460,7 @@ function initSchema(db: Database.Database): void {
   // no-op UPDATE can't re-run it; the message_id dedup guard makes a double-fire
   // across both triggers a no-op anyway.
   try {
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_on_send_confirm_v2`);
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_on_send_confirm_v2
         AFTER UPDATE OF delivery_status ON crm_messages
@@ -1445,7 +1469,7 @@ function initSchema(db: Database.Database): void {
           AND NEW.delivery_status = 'sent'
           AND (OLD.delivery_status IS NULL OR OLD.delivery_status != 'sent')
         BEGIN
-          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
           SELECT
             COALESCE(
               cc.agent_id,
@@ -1456,7 +1480,8 @@ function initSchema(db: Database.Database): void {
             COALESCE(NEW.sent_at, datetime('now')),
             'email',
             NEW.id,
-            'auto:cold_outreach_confirm_v2'
+            'auto:cold_outreach_confirm_v2',
+            NEW.vertical_id
           FROM crm_threads ct
           JOIN crm_contacts cc ON cc.id = ct.contact_id
           WHERE ct.id = NEW.thread_id
@@ -1642,7 +1667,7 @@ function initSchema(db: Database.Database): void {
       `).run();
       // Step 2: backfill missing cold outreach (compose-* etc.) by shape.
       const composeBackfill = db.prepare(`
-        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
         SELECT
           COALESCE(
             cc.agent_id,
@@ -1653,7 +1678,8 @@ function initSchema(db: Database.Database): void {
           COALESCE(m.sent_at, datetime('now')),
           'email',
           m.id,
-          'backfill:cold_outreach_v3'
+          'backfill:cold_outreach_v3',
+          m.vertical_id
         FROM crm_messages m
         JOIN crm_threads ct ON ct.id = m.thread_id
         JOIN crm_contacts cc ON cc.id = ct.contact_id
@@ -1737,8 +1763,19 @@ function initSchema(db: Database.Database): void {
            recipient_email backfill. */
         AND NOT EXISTS (
           SELECT 1 FROM outreach_sent_log o
-          WHERE o.agent_id = a.id
-             OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email))
+          /* Platform scope (dev-request 2026-07-27-crm-plattformadskillelse, steg 3
+             precondition). This pool is the RFB outreach pool — its rows are agents
+             in the RFB catalogue. An Opplevagent send resolves to the same producer
+             by EMAIL, so without this line it would drop them out of RFB outreach
+             for good: a silent under-send, where nothing errors and the producer
+             simply stops being contacted.
+             The 60-day cooldown in routes/crm.ts is deliberately NOT scoped this
+             way — see the comment on outreach_sent_log.vertical_id. Suppressing a
+             POOL is per-platform bookkeeping; not cold-mailing the same human twice
+             is a courtesy that does not care which brand is on the envelope. */
+          WHERE o.vertical_id = 'rfb'
+            AND (o.agent_id = a.id
+                 OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email)))
         )
     `);
   } catch (err) {

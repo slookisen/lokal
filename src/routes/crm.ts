@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { z } from "zod";
 import { crmService, CrmVertical, isCrmVertical, CRM_VERTICALS } from "../services/crm-service";
+import { crmFromHeader, resolveCrmIdentity } from "../services/crm-platform-identity";
 import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
@@ -248,6 +249,10 @@ router.post("/threads/:id/send", async (req, res) => {
   if (intent === "resend_send") {
     // Process immediately via SMTP
     try {
+      // Steg 3: brand + reply-to come from the THREAD's platform, same source of
+      // truth as the outbox row. resolveCrmIdentity throws on an unconfigured
+      // vertical rather than falling back on the RFB identity.
+      const identity = resolveCrmIdentity(thread.vertical_id);
       const result = await emailService.sendRaw({
         to: toEmails.join(", "),
         cc: ccEmails?.join(", "),
@@ -255,6 +260,8 @@ router.post("/threads/:id/send", async (req, res) => {
         textContent: bodyText,
         htmlContent: bodyHtml ?? bodyText,
         inReplyToMessageId: replyToMessageId ?? undefined,
+        from: crmFromHeader(thread.vertical_id),
+        replyTo: identity.replyTo,
       });
       if (result.success) {
         crmService.markOutboxResult(queued.id, "completed", result.messageId);
@@ -461,11 +468,14 @@ router.post("/compose", async (req, res) => {
 
     if (intent === "resend_send") {
       try {
+        const composeIdentity = resolveCrmIdentity(vertical);
         const result = await emailService.sendRaw({
           to,
           subject,
           textContent: bodyText,
           htmlContent: bodyHtml ?? bodyText,
+          from: crmFromHeader(vertical),
+          replyTo: composeIdentity.replyTo,
         });
         if (result.success) {
           crmService.markOutboxResult(queued.id, "completed", result.messageId);
