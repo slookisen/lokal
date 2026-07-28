@@ -24621,6 +24621,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
         __initSchemaForTesting(db);
 
         const { threadId, messageId } = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "kunde@example.com",
           subject: "Hei fra Rett fra Bonden",
           bodyText: "Takk for henvendelsen!",
@@ -24668,6 +24669,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
 
         // Two compose-sends: one by claude, one by daniel
         const r1 = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "kunde1@example.com",
           subject: "Claude melding",
           bodyText: "Tekst fra claude",
@@ -24675,6 +24677,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
           deliveryStatus: "sent",
         });
         const r2 = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "kunde2@example.com",
           subject: "Daniel melding",
           bodyText: "Tekst fra daniel",
@@ -24721,6 +24724,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
         // 2. updateMessageDeliveryStatus → 'sent'
         // 3. logAction type='sent' with internalMessageId + channel
         const r = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "fullpath@example.com",
           subject: "Full route test",
           bodyText: "Body",

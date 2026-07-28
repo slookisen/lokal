@@ -215,6 +215,141 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
         assertTrue(threw,
           "cv20: a TRUE duplicate (same email, same platform) is still rejected — the migration relaxed uniqueness, it did not remove it");
       }
+      // ═══════════════════════════════════════════════════════════════
+      // cv21-cv26 — THE ROUTE. Acceptance criterion 1, verbatim:
+      //   «POST /admin/crm/ingest uten vertical → 400, null skriv.»
+      //
+      // cv1-cv20 all drive the SERVICE. That is one layer below the thing the
+      // criterion is about, and a service guard proves nothing about the route
+      // if the route never reaches it — which is exactly how lokal#377's cap
+      // survived being deleted from the production factory with 10 443 tests
+      // green. So these go through the real router with a real request.
+      //
+      // «null skriv» is asserted as a whole-table row count taken BEFORE and
+      // AFTER the rejected call. A 400 that still wrote a row would satisfy a
+      // status-code-only assertion, and a silently-created contact is the
+      // precise damage this dev-request exists to stop.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        // The CRM router authenticates on ANALYTICS_ADMIN_KEY / ADMIN_API_KEY —
+        // deliberately NOT the shared ADMIN_KEY that 62 other test sites fight
+        // over, so this block does not add to that known non-determinism.
+        // Saved and restored regardless.
+        const prevAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+        process.env.ANALYTICS_ADMIN_KEY = "crm-vertical-test-key";
+        try {
+          const crmRoutes = require("../routes/crm") as any;
+          const router = crmRoutes.default ?? crmRoutes.router ?? crmRoutes;
+
+          const post = (body: any): { status: number; body: any } => {
+            let out = { status: 200, body: undefined as any };
+            const req: any = {
+              method: "POST", url: "/ingest", query: {}, body,
+              headers: { "x-admin-key": "crm-vertical-test-key" },
+              // Express handlers read headers via req.get(), not req.headers.
+              get(name: string) { return this.headers[name.toLowerCase()]; },
+            };
+            const res: any = {
+              statusCode: 200,
+              status(c: number) { this.statusCode = c; return this; },
+              json(p: any) { out = { status: this.statusCode, body: p }; return this; },
+            };
+            router.handle(req, res, () => { /* unmatched → leave default */ });
+            return out;
+          };
+
+          const countRows = () =>
+            (db.prepare("SELECT COUNT(*) n FROM crm_contacts").get() as any).n +
+            (db.prepare("SELECT COUNT(*) n FROM crm_threads").get() as any).n +
+            (db.prepare("SELECT COUNT(*) n FROM crm_messages").get() as any).n;
+
+          const baseBody = {
+            threadId: "cv-route-1",
+            primaryFromEmail: "rute@example.no",
+            messages: [{ messageId: "cv-route-msg-1", direction: "in", fromEmail: "rute@example.no" }],
+          };
+
+          const before = countRows();
+          const missing = post({ ...baseBody });
+          assertEq(missing.status, 400, "cv21: /ingest WITHOUT vertical is rejected");
+          assertEq(countRows(), before, "cv22: …and wrote NOTHING — not a contact, not a thread, not a message");
+
+          const unknown = post({ ...baseBody, vertical: "opplevagent" });
+          assertEq(unknown.status, 400, "cv23: an unknown vertical is rejected too — a typo must not become a platform");
+          assertEq(countRows(), before, "cv24: …and also wrote nothing");
+
+          const ok = post({ ...baseBody, vertical: "experiences" });
+          assertEq(ok.status, 200, "cv25: WITH a valid vertical the same call succeeds — the guard rejects the omission, not the endpoint");
+          const t = db.prepare("SELECT vertical_id FROM crm_threads WHERE id = 'cv-route-1'").get() as any;
+          assertEq(t?.vertical_id, "experiences", "cv26: …and the row lands on the platform the caller named");
+
+          // ── cv27-cv29: a REPLY takes its platform from the THREAD ──
+          //
+          // Found by mutation, not by design: rewriting
+          //     vertical: thread.vertical_id
+          //  →  vertical: req.body?.vertical ?? "rfb"
+          // in POST /threads/:id/send left all 32 assertions green. That mutant
+          // is the mixing scenario itself — an Opplevagent conversation answered
+          // under the Rett fra Bonden identity, chosen by whoever sent the
+          // request rather than by the conversation's own history. cv21-cv26
+          // covered /ingest and stopped there, which is the same "tested the
+          // neighbourhood, not the line" shape as lokal#377's B1.
+          const send = (body: any): { status: number; body: any } => {
+            let out = { status: 200, body: undefined as any };
+            const req: any = {
+              method: "POST", url: "/threads/cv-route-1/send", query: {}, body,
+              headers: { "x-admin-key": "crm-vertical-test-key" },
+              get(name: string) { return this.headers[name.toLowerCase()]; },
+            };
+            const res: any = {
+              statusCode: 200,
+              status(c: number) { this.statusCode = c; return this; },
+              json(p: any) { out = { status: this.statusCode, body: p }; return this; },
+            };
+            router.handle(req, res, () => { /* unmatched → leave default */ });
+            return out;
+          };
+
+          // The thread is 'experiences' (cv26). Ask for it to be sent as 'rfb'.
+          const reply = send({
+            intent: "gmail_draft",
+            toEmails: ["rute@example.no"],
+            subject: "Svar",
+            bodyText: "Hei igjen",
+            createdBy: "daniel",
+            vertical: "rfb",
+          });
+          assertEq(reply.status, 200, "cv27: a reply on an existing thread is accepted");
+          const ob = db.prepare(
+            "SELECT vertical_id FROM crm_outbox WHERE thread_id = 'cv-route-1' ORDER BY rowid DESC LIMIT 1"
+          ).get() as any;
+          assertEq(ob?.vertical_id, "experiences",
+            "cv28: …and it is queued on the THREAD's platform, ignoring the 'rfb' the caller asked for — a reply belongs to the conversation it continues");
+          assertTrue(ob?.vertical_id !== "rfb",
+            "cv29: …so a request body can never re-platform an existing conversation");
+
+          // ── cv30: a thread with an unroutable platform refuses to send ──
+          //
+          // Not reachable through the app today (vertical_id is NOT NULL
+          // DEFAULT 'rfb', and every writer now goes through assertVertical),
+          // so this pins a guard against a state only a direct DB write or a
+          // future migration can produce. Written rather than waved away: the
+          // alternative to the guard is guessing a platform for an email that
+          // reaches a real person, and mutation showed nothing else caught its
+          // removal.
+          db.prepare("UPDATE crm_threads SET vertical_id = 'garbage' WHERE id = 'cv-route-1'").run();
+          const broken = send({
+            intent: "gmail_draft", toEmails: ["rute@example.no"],
+            subject: "Svar", bodyText: "x", createdBy: "daniel",
+          });
+          assertEq(broken.status, 409,
+            "cv30: a thread whose vertical is unroutable refuses the send rather than guessing a platform");
+          db.prepare("UPDATE crm_threads SET vertical_id = 'experiences' WHERE id = 'cv-route-1'").run();
+        } finally {
+          if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
+          else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
+        }
+      }
     } finally {
       try { db.close(); } catch { /* already closed */ }
       initMod.__setDbForTesting(prevDb as any);
