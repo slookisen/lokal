@@ -367,6 +367,19 @@ export class EmailService {
     textContent: string;
     htmlContent?: string;
     inReplyToMessageId?: string;
+    /**
+     * Full RFC 5322 From header, e.g. `"Opplevagent" <kontakt@rettfrabonden.com>`.
+     * Steg 3 of the CRM platform split: the ADDRESS is the same for every
+     * platform (Resend verifies one domain), so the display name is what
+     * carries the brand. Omitted keeps the previous behaviour exactly.
+     */
+    from?: string;
+    /**
+     * Where a reply lands. Per-platform, and load-bearing beyond courtesy: it
+     * is what makes an inbound reply arrive through the RIGHT forwarder, which
+     * is the discriminator steg 4 sorts on.
+     */
+    replyTo?: string;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
     if (!this.isConfigured) {
       logger.info('DRY RUN: Would send raw email', { to: options.to, subject: options.subject });
@@ -379,7 +392,8 @@ export class EmailService {
         headers['References'] = options.inReplyToMessageId;
       }
       const mailOptions: any = {
-        from: this.fromAddress,
+        from: options.from || this.fromAddress,
+        ...(options.replyTo ? { replyTo: options.replyTo } : {}),
         to: options.to,
         subject: options.subject,
         text: options.textContent,

@@ -34180,6 +34180,23 @@ runSerial(async () => {
 // dry-run purity verified with a WHOLE-DB hash. Own in-memory DB + both
 // network seams injected; runs via runSerial() like its siblings.
 runSerial(async () => {
+  console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 3 (plattformidentitet ut + outreach-trigger-vakt) ──");
+  try {
+    const { runCrmPlatformIdentityTests } = require("../src/services/crm-platform-identity.test") as
+      typeof import("../src/services/crm-platform-identity.test");
+    const pit = await runCrmPlatformIdentityTests({ log: false });
+    passed += pit.passed;
+    failed += pit.failed;
+    for (const f of pit.failures) failures.push("crm-platform-identity: " + f);
+    console.log(`  crm-platform-identity: ${pit.passed} passed, ${pit.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-platform-identity: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-platform-identity: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 1+2 (vertical fail-closed + adskilte kontakter) ──");
   try {
     const { runCrmVerticalTests } = require("../src/services/crm-vertical.test") as

@@ -1381,11 +1381,26 @@ function initSchema(db: Database.Database): void {
   // message_id. Origin: orchestrator PR-38 (2026-06-21); v2 P0 fix 2026-07-11.
   try {
     db.exec(`DROP TRIGGER IF EXISTS trg_log_marketing_send_to_outreach_sent_log`);
+    // The v2 triggers are DROPped before being recreated, not merely guarded by
+    // IF NOT EXISTS. Without the drop, editing the body below has NO EFFECT on
+    // any database that already carries the trigger — i.e. on production — and
+    // the change would look applied while the old definition kept running. That
+    // is exactly how a migration can pass review and do nothing.
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_to_sent_log_v2`);
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_to_sent_log_v2
         AFTER INSERT ON crm_messages
         FOR EACH ROW
         WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
+          -- Platform guard (dev-request 2026-07-27-crm-plattformadskillelse, steg 3
+          -- precondition). outreach_sent_log is an RFB-ONLY ledger: it gates
+          -- outreach_ready_pool, whose rows are agents in the RFB catalogue. The
+          -- resolution below reaches into agents/agent_knowledge by EMAIL, so
+          -- without this line an Opplevagent send to a producer who is ALSO an RFB
+          -- agent would write a suppression row against that RFB agent_id and drop
+          -- them from RFB outreach permanently. A silent under-send: nothing errors,
+          -- the producer simply stops being contacted and no one notices.
+          AND NEW.vertical_id = 'rfb'
         BEGIN
           INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
           SELECT
@@ -1437,6 +1452,7 @@ function initSchema(db: Database.Database): void {
   // no-op UPDATE can't re-run it; the message_id dedup guard makes a double-fire
   // across both triggers a no-op anyway.
   try {
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_on_send_confirm_v2`);
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_on_send_confirm_v2
         AFTER UPDATE OF delivery_status ON crm_messages
@@ -1444,6 +1460,11 @@ function initSchema(db: Database.Database): void {
         WHEN NEW.direction = 'out'
           AND NEW.delivery_status = 'sent'
           AND (OLD.delivery_status IS NULL OR OLD.delivery_status != 'sent')
+          -- Same RFB-only guard as the INSERT trigger above. This is the path the
+          -- marketing agent actually takes (compose writes 'queued', Resend
+          -- confirmation flips it to 'sent'), so leaving it unguarded would leave
+          -- the real hole open while the other one looked fixed.
+          AND NEW.vertical_id = 'rfb'
         BEGIN
           INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
           SELECT
