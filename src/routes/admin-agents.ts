@@ -27,14 +27,18 @@
 // Auth: X-Admin-Key, mirrors the pattern from admin-runs.ts.
 
 import { Router, Request, Response } from "express";
+import { v4 as uuid } from "uuid";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
 import {
   verifyOrgNumber,
   fetchBrregActivityDescription,
+  findOrgnumberByName,
+  normaliseName,
   BRREG_BASE_URL,
   BRREG_SEARCH_PATH,
   type BrregVerifyResult,
+  type BrregHit,
 } from "../services/brreg-client";
 // Reused, unchanged, from the admin-knowledge factual-field write gate (see
 // POST /brreg-description-fallback below): canCorrectFactualField's
@@ -49,6 +53,14 @@ import { canCorrectFactualField, mergeFieldProvenance } from "./admin-knowledge"
 // umbrella-membership regex heuristic layer (meetsAboutQualityBar), which
 // stays exactly as-is for its existing caller (admin-knowledge.ts).
 import { meetsAboutCheapBar } from "../services/search-enrich";
+// POST /org-nr-backfill below: RFB producer names carry the same "Navn —
+// Sted" display suffix convention gårdssalg does — reuse the existing,
+// already-tested stripper rather than re-implementing it.
+import { parseNameLocationSuffix } from "../services/location-suffix-parser";
+// "Billigere kilde først" — check the vendored Lokalmat/Debio extract before
+// any Brreg network crawl (see local-orgnr-candidates.ts's own header for
+// why this is a checked-in file rather than a runtime cross-repo read).
+import { findLocalOrgnrCandidate, type LocalOrgnrHit } from "../services/local-orgnr-candidates";
 
 const router = Router();
 
@@ -1119,6 +1131,701 @@ router.post("/brreg-description-fallback", async (req: Request, res: Response) =
   } catch (err: any) {
     res.status(500).json({ error: "brreg-description-fallback failed", detail: err.message });
   }
+});
+
+// ─── POST/GET /admin/agents/org-nr-backfill + org-nr-review-queue + ─────────
+//     org-nr-review-approve (dev-request 2026-07-26-rfb-outreach-tilsig- ────
+//     blokkerdiagnose-og-orgnr, Steg 2) ────────────────────────────────────
+//
+// Steg 1 (blocker-diagnose, lokal#381) measured the 959-agent RFB
+// pending_verify/review_required cohort: 454/959 lack 2+ corroborating
+// address sources, 568/959 lack 2+ phone sources (GATING_FIELDS,
+// cross-source-validator.ts). org_nr unlocks a DIRECT Brreg-by-orgnr lookup
+// (fetchBrregBusinessAddress/fetchBrregContact, brreg-client.ts) as a second
+// corroborating source for both — but almost no RFB agent has org_nr set
+// yet (GET /brreg-catalog-sweep above reports candidate_count: 1, a
+// synthetic test row). This is the acquisition step that fills it.
+//
+// Ported from the already-reviewed gårdssalg org_nr-backfill
+// (POST /admin/gardssalg-orgnr-backfill, routes/opplevelser.ts, dev-request
+// 2026-07-18-gardssalg-profilkvalitet-foer-outreach slice 5b) — SAME
+// candidate generator (Brreg name-search, confidence >= 0.9 only) and SAME
+// write-bar veto chain, adapted to this table's own field names and lock
+// signal:
+//
+//   experience_providers.navn            -> agents.name
+//   experience_providers.postnummer      -> agent_knowledge.postal_code
+//   experience_providers.poststed        -> agents.city
+//   content_source IN ('manual','claim') -> agents.claimed_at IS NOT NULL
+//     (the owner-claimed-this-listing lock signal this codebase already
+//     uses to exclude agents from other automated write pipelines — see
+//     `a.claimed_at IS NULL` in admin-search-enrich.ts / search-enrich-
+//     sweep.ts's own candidate-selection WHERE clauses)
+//   gardssalgSearchName() "— Sted" strip -> parseNameLocationSuffix()'s
+//     core_name (services/location-suffix-parser.ts) — RFB producer names
+//     carry the SAME "Navn — Sted" display convention (see route-intent.ts's
+//     doc comment and marketplace.ts:2727's existing em/en-dash strip), and
+//     this helper is already tested against exactly that convention, so it
+//     is reused rather than re-implemented.
+//   gardssalg_content_audit / _orgnr_review_queue -> agents_org_nr_audit /
+//     agents_org_nr_review_queue (src/database/init.ts, same shape, FK'd to
+//     agents(id) instead of experience_providers(id))
+//
+// NEW relative to the gårdssalg original — "billigere kilde først": before
+// any Brreg network call, findLocalOrgnrCandidate() (services/local-orgnr-
+// candidates.ts) checks a vendored extract of two already-scraped discovery
+// files (Lokalmat.no, Debio) for a same-or-better-confidence match. A local
+// hit runs through the EXACT SAME veto chain as a Brreg hit below —
+// including the live verifyOrgNumber() liveness check — since the vendored
+// data is a snapshot (2026-05-14) and a business it names dissolved since
+// must still never claim a row.
+//
+// Vertical/role scoping mirrors brregSweepCandidateWhereSql()'s own
+// COALESCE(vertical_id,'rfb') convention above, plus role='producer' (org_nr
+// identifies a business, not a consumer/logistics/quality/price-intel
+// agent) and umbrella_type IS NULL (mirrors admin-outreach-pool.ts's own
+// non-umbrella scoping for this exact cohort) and is_active = 1.
+//
+// Batch/limit convention: this file's own brreg-description-fallback route
+// (immediately above) is the closest same-file analogue at RFB scale — its
+// default 25 / hard cap 100 is reused verbatim here rather than gårdssalg's
+// 48-total-cohort cap (959 agents is a very different scale to gårdssalg's
+// 74 providers).
+//
+// Writes ONLY agents.org_nr (+ agent_knowledge.field_provenance under the
+// "org_nr" key, mirroring how brreg-description-fallback above already
+// stores an agents-table field's provenance in agent_knowledge — the
+// established cross-table convention in this file) — never agents.url, never
+// any agent_knowledge address/website field. Address/contact enrichment from
+// the newly-acquired org_nr is explicitly Steg 3, gated on this slice
+// landing first (RFB has no org_nr today; the gårdssalg sister dev-request,
+// 2026-07-26-brreg-kontakt-backfill, already built the contact-backfill
+// machinery this will reuse once org_nr exists here).
+
+const AGENTS_ORGNR_BACKFILL_DEFAULT_LIMIT = 25;
+const AGENTS_ORGNR_BACKFILL_MAX_LIMIT = 100;
+
+// ─── injectable fetch seam for this route's own Brreg calls ────────────
+// findOrgnumberByName/verifyOrgNumber (brreg-client.ts) already accept an
+// explicit fetchImpl parameter (defaulting to the real global `fetch`), but
+// this route was calling them with no third argument — meaning the ONLY way
+// to stub Brreg I/O for this route in a test was reassigning
+// `globalThis.fetch` itself, which is exactly the anti-pattern already fixed
+// once for tests/test.ts's pr-56/pr-76 blocks (commit 8152553,
+// "testsuite-determinism-3"): a global monkey-patch installed by one test
+// block can silently poison a real fetch() call made by a DIFFERENT,
+// concurrently-running block. Mirrors geocoding-service.ts's
+// `__setGeocodingFetchForTesting` seam exactly — production code never
+// calls the setter, so behavior is unchanged outside tests.
+let agentsOrgNrBackfillFetchImpl: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
+
+export function __setAgentsOrgNrBackfillFetchForTesting(impl?: typeof fetch): void {
+  agentsOrgNrBackfillFetchImpl = impl || ((...args: Parameters<typeof fetch>) => fetch(...args));
+}
+
+// Marker written into agents_org_nr_audit.source_url by a (future) rollback
+// endpoint — mirrors GARDSSALG_ROLLBACK_MARKER (experience-store.ts). No
+// endpoint writes this yet in this slice (see the init.ts migration's doc
+// comment); the read-side check below exists so the write-bar already
+// respects it the moment one is built.
+const AGENTS_ORGNR_ROLLBACK_MARKER = "internal://rollback";
+
+interface AgentOrgNrBackfillTargetRow {
+  id: string;
+  name: string;
+  org_nr: string | null;
+  claimed_at: string | null;
+  postal_code: string | null;
+  city: string | null;
+}
+
+interface AgentOrgNrReviewQueueEntry {
+  agent_id: string;
+  agent_name?: string | null;
+  candidate_orgnr?: string | null;
+  candidate_name?: string | null;
+  candidate_confidence?: number | null;
+  candidate_address?: string | null;
+  candidate_source?: string | null;
+  reason: string;
+  batch_id?: string | null;
+}
+
+// Shared WHERE clause for both the count and the capped batch query (mirrors
+// brregSweepCandidateWhereSql's "one source of truth for both" convention).
+function agentsOrgNrBackfillCandidateWhereSql(): string {
+  return `
+    a.role = 'producer'
+    AND a.is_active = 1
+    AND a.umbrella_type IS NULL
+    AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+    AND (a.org_nr IS NULL OR TRIM(a.org_nr) = '')
+    AND a.claimed_at IS NULL
+  `;
+}
+
+function agentsOrgNrBackfillSelectSql(): string {
+  return `
+    SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at,
+           k.postal_code AS postal_code, a.city AS city
+      FROM agents a
+      LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+     WHERE ${agentsOrgNrBackfillCandidateWhereSql()}
+  `;
+}
+
+function countAgentsOrgNrBackfillCandidates(db: ReturnType<typeof getDb>): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${agentsOrgNrBackfillSelectSql()})`).get() as { n: number };
+  return row?.n ?? 0;
+}
+
+function fetchAgentsOrgNrBackfillBatch(db: ReturnType<typeof getDb>, cap: number): AgentOrgNrBackfillTargetRow[] {
+  return db
+    .prepare(`${agentsOrgNrBackfillSelectSql()} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .all(cap) as AgentOrgNrBackfillTargetRow[];
+}
+
+// Explicit-agentIds override lookup — scoped to role/vertical only (NOT the
+// blank-org_nr/claimed/active/umbrella filters), mirroring
+// getGardssalgProviderOrgnrTarget's override semantics: an admin can force a
+// lookup attempt on any RFB producer agent; eligibility (lock/already-filled)
+// is still enforced at write time, just reported as a specific `unresolved`
+// reason rather than silently omitted from the target list.
+function getAgentOrgNrBackfillTarget(db: ReturnType<typeof getDb>, agentId: string): AgentOrgNrBackfillTargetRow | null {
+  const row = db
+    .prepare(
+      `SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at,
+              k.postal_code AS postal_code, a.city AS city
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'`,
+    )
+    .get(agentId) as AgentOrgNrBackfillTargetRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * True only when an existing, non-blank postal_code OR city on the agent's
+ * own row agrees with the Brreg/local-JSON hit's own postal fields.
+ * postal_code is compared exactly; city is compared as an EXACT normalised
+ * match against the hit's own poststed field — NOT a substring test against
+ * a formatted address string (a short city name like "Nes" or "Os" is a
+ * substring of unrelated towns like "Sandnes"/"Oslo" — see
+ * gardssalgOrgnrPostalCorroborated's identical doc comment in
+ * experience-store.ts, which this mirrors). A same-postal-code-REGION
+ * mismatch (different first digit) vetoes outright rather than falling
+ * through to the city check. Returns false when the agent has neither
+ * field set, or when the hit has no comparable field for the one signal the
+ * agent does have — "ved tvil: ikke skriv" (Daniel's binding identitetskrav)
+ * means absence of a signal can never pass. Exported for unit tests.
+ */
+export function agentOrgNrPostalCorroborated(
+  target: { postal_code: string | null; city: string | null },
+  hit: { brreg_postal?: string | null; brreg_poststed?: string | null },
+): boolean {
+  const targetPostal = (target.postal_code || "").trim();
+  const hitPostal = (hit.brreg_postal || "").trim();
+  if (targetPostal && hitPostal && targetPostal === hitPostal) return true;
+  if (targetPostal && hitPostal && targetPostal[0] !== hitPostal[0]) return false;
+
+  const targetCity = normaliseName(target.city || "");
+  const hitCity = normaliseName(hit.brreg_poststed || "");
+  if (targetCity && hitCity && targetCity === hitCity) return true;
+
+  return false;
+}
+
+/**
+ * True only when the hit's own name-match confidence is the rubric's exact-
+ * match tier (1.0) AND agentOrgNrPostalCorroborated agrees. This is the ONLY
+ * gate that may ever auto-write an org_nr — anything else must go to the
+ * review queue. Exported for unit tests.
+ */
+export function agentOrgNrAutoWriteEligible(
+  target: { postal_code: string | null; city: string | null },
+  hit: { confidence: number; brreg_postal?: string | null; brreg_poststed?: string | null },
+): boolean {
+  return hit.confidence === 1.0 && agentOrgNrPostalCorroborated(target, hit);
+}
+
+/**
+ * True when this agent's LATEST org_nr audit row is a rollback (an admin
+ * deliberately undid an earlier backfill) — see AGENTS_ORGNR_ROLLBACK_MARKER's
+ * doc comment above for why this is currently a dormant check. Exported for
+ * tests.
+ */
+export function agentOrgNrWasRolledBack(db: ReturnType<typeof getDb>, agentId: string): boolean {
+  const latest = db
+    .prepare(
+      `SELECT source_url FROM agents_org_nr_audit
+        WHERE agent_id = ? AND field_name = 'org_nr'
+        ORDER BY rowid DESC LIMIT 1`,
+    )
+    .get(agentId) as { source_url: string | null } | undefined;
+  return !!latest && latest.source_url === AGENTS_ORGNR_ROLLBACK_MARKER;
+}
+
+/**
+ * Apply a confirmed org_nr candidate to ONE agent. Fill-only + lock-guard +
+ * UNIQUE-conflict discipline mirrors applyGardssalgProviderOrgnr
+ * (experience-store.ts) exactly:
+ *   - never writes if the agent is owner-claimed (claimed_at IS NOT NULL)
+ *   - only writes if the row's own org_nr is currently blank (idempotent)
+ *   - agents.org_nr has no DB-level UNIQUE constraint (unlike
+ *     experience_providers.org_nr), so this re-checks for a conflicting
+ *     row explicitly and skips (returns []) rather than creating a
+ *     duplicate org_nr across two different agents
+ * Provenance is merged into agent_knowledge.field_provenance under the
+ * "org_nr" key via mergeFieldProvenance (admin-knowledge.ts) — the SAME
+ * cross-table convention brreg-description-fallback above already uses for
+ * an agents-table field's provenance (agent_knowledge row auto-created if
+ * missing). Returns the field names actually written (empty array if
+ * nothing to write — never throws for an expected refusal).
+ */
+export function applyAgentOrgNr(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  orgNr: string,
+  evidenceUrl: string,
+  sourceType: string,
+  batchId?: string,
+): string[] {
+  const row = db.prepare(`SELECT id, org_nr, claimed_at FROM agents WHERE id = ?`).get(agentId) as
+    | { id: string; org_nr: string | null; claimed_at: string | null }
+    | undefined;
+  if (!row) return [];
+  if (row.claimed_at) return []; // owner-claimed -> locked, mirrors content_source manual/claim
+
+  const cleanOrgNr = (orgNr || "").trim();
+  // Norwegian org numbers are exactly 9 digits.
+  if (!/^\d{9}$/.test(cleanOrgNr)) return [];
+  if (row.org_nr && row.org_nr.trim() !== "") return []; // fill-only
+
+  const conflict = db.prepare(`SELECT id FROM agents WHERE org_nr = ? AND id != ?`).get(cleanOrgNr, agentId) as
+    | { id: string }
+    | undefined;
+  if (conflict) return [];
+
+  const nowIso = new Date().toISOString();
+
+  const applyWithAudit = db.transaction(() => {
+    // Fill-only + lock guard repeated INSIDE the UPDATE's WHERE — makes the
+    // statement itself unable to clobber a concurrently-set org_nr or a
+    // concurrently-arrived owner claim (integration-review discipline
+    // mirrored from applyGardssalgProviderOrgnr's own repeated guard).
+    const upd = db
+      .prepare(
+        `UPDATE agents SET org_nr = @org_nr
+          WHERE id = @id AND (org_nr IS NULL OR TRIM(org_nr) = '') AND claimed_at IS NULL`,
+      )
+      .run({ id: agentId, org_nr: cleanOrgNr });
+    if (upd.changes === 0) throw new Error("orgnr_filled_concurrently");
+
+    db.prepare(
+      `INSERT INTO agents_org_nr_audit
+         (id, agent_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @agent_id, 'org_nr', @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`,
+    ).run({
+      id: uuid(),
+      agent_id: agentId,
+      old_value: row.org_nr ?? null,
+      new_value: cleanOrgNr,
+      source_url: evidenceUrl,
+      batch_id: batchId ?? null,
+    });
+
+    const kRow = db.prepare(`SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
+      | { field_provenance: string | null }
+      | undefined;
+    let existingProv: Record<string, unknown> = {};
+    if (kRow === undefined) {
+      db.prepare(`INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)`).run(
+        agentId,
+        nowIso,
+      );
+    } else if (kRow.field_provenance) {
+      try {
+        const parsed = JSON.parse(kRow.field_provenance);
+        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+      } catch {
+        /* malformed existing JSON -> treat as empty rather than clobber the write */
+      }
+    }
+
+    const mergedProv = mergeFieldProvenance(existingProv, {
+      org_nr: { sources: [{ source_type: sourceType, value: cleanOrgNr, fetched_at: nowIso, source_url: evidenceUrl }] },
+    });
+    db.prepare(`UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(
+      JSON.stringify(mergedProv),
+      nowIso,
+      agentId,
+    );
+  });
+
+  try {
+    applyWithAudit();
+  } catch (e: any) {
+    if (String(e?.message) === "orgnr_filled_concurrently") return [];
+    throw e;
+  }
+
+  return ["org_nr"];
+}
+
+function upsertAgentOrgNrReviewQueue(db: ReturnType<typeof getDb>, entry: AgentOrgNrReviewQueueEntry): void {
+  db.prepare(
+    `INSERT INTO agents_org_nr_review_queue
+       (id, agent_id, agent_name, candidate_orgnr, candidate_name, candidate_confidence,
+        candidate_address, candidate_source, reason, batch_id, created_at, updated_at)
+     VALUES (@id, @agent_id, @agent_name, @candidate_orgnr, @candidate_name, @candidate_confidence,
+             @candidate_address, @candidate_source, @reason, @batch_id, datetime('now'), datetime('now'))
+     ON CONFLICT(agent_id) DO UPDATE SET
+       agent_name = excluded.agent_name,
+       candidate_orgnr = excluded.candidate_orgnr,
+       candidate_name = excluded.candidate_name,
+       candidate_confidence = excluded.candidate_confidence,
+       candidate_address = excluded.candidate_address,
+       candidate_source = excluded.candidate_source,
+       reason = excluded.reason,
+       batch_id = excluded.batch_id,
+       updated_at = datetime('now')`,
+  ).run({
+    id: uuid(),
+    agent_id: entry.agent_id,
+    agent_name: entry.agent_name ?? null,
+    candidate_orgnr: entry.candidate_orgnr ?? null,
+    candidate_name: entry.candidate_name ?? null,
+    candidate_confidence: entry.candidate_confidence ?? null,
+    candidate_address: entry.candidate_address ?? null,
+    candidate_source: entry.candidate_source ?? null,
+    reason: entry.reason,
+    batch_id: entry.batch_id ?? null,
+  });
+}
+
+function clearAgentOrgNrReviewQueueEntry(db: ReturnType<typeof getDb>, agentId: string): void {
+  db.prepare(`DELETE FROM agents_org_nr_review_queue WHERE agent_id = ?`).run(agentId);
+}
+
+function listAgentOrgNrReviewQueue(
+  db: ReturnType<typeof getDb>,
+): (AgentOrgNrReviewQueueEntry & { id: string; created_at: string; updated_at: string })[] {
+  return db
+    .prepare(`SELECT * FROM agents_org_nr_review_queue ORDER BY updated_at DESC`)
+    .all() as (AgentOrgNrReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
+}
+
+router.post("/org-nr-backfill", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : AGENTS_ORGNR_BACKFILL_DEFAULT_LIMIT,
+    AGENTS_ORGNR_BACKFILL_MAX_LIMIT,
+  );
+
+  try {
+    const db = getDb();
+    const batchId = `agents-orgnr-backfill-${new Date().toISOString().replace(/[^0-9]/g, "")}`;
+    const candidateCount = countAgentsOrgNrBackfillCandidates(db);
+
+    let targets: AgentOrgNrBackfillTargetRow[];
+    if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
+      const ids = Array.from(
+        new Set(
+          (body.agentIds as unknown[])
+            .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+            .map((id) => id.trim()),
+        ),
+      ).slice(0, limit);
+      targets = ids
+        .map((id) => getAgentOrgNrBackfillTarget(db, id))
+        .filter((t): t is AgentOrgNrBackfillTargetRow => t !== null);
+    } else {
+      targets = fetchAgentsOrgNrBackfillBatch(db, limit);
+    }
+
+    let scanned = 0;
+    const changed: Array<{ agent_id: string; org_nr: string; source: string; source_url: string }> = [];
+    const skippedLocked: string[] = [];
+    const unresolved: Array<{ agent_id: string; reason: string }> = [];
+    const errors: Array<{ agent_id: string; error: string }> = [];
+
+    for (const t of targets) {
+      const agentId = t.id;
+
+      if (t.claimed_at) {
+        skippedLocked.push(agentId);
+        continue;
+      }
+      if (t.org_nr && t.org_nr.trim() !== "") {
+        // Only reachable via the explicit agentIds override — the auto-
+        // selector already filters blank-org_nr rows.
+        unresolved.push({ agent_id: agentId, reason: "already_filled" });
+        continue;
+      }
+
+      // Strip the catalog's "Navn — Sted" display suffix before searching —
+      // an exact company-name match must not be demoted to a lower
+      // confidence tier by our own display convention. When stripping
+      // actually changed the name, the write bar below is tightened.
+      const { core_name } = parseNameLocationSuffix(t.name);
+      const searchName = core_name || t.name;
+      const nameWasStripped = searchName !== (t.name || "").replace(/\s+/g, " ").trim();
+
+      let hit: BrregHit | LocalOrgnrHit | null;
+      let sourceType: string;
+      try {
+        const localHit = findLocalOrgnrCandidate(searchName, t.postal_code);
+        if (localHit && localHit.confidence >= 1.0) {
+          // A local hit already at the rubric's max tier can never be beaten
+          // by a live Brreg name-search (same rubric, same 1.0 ceiling) — so
+          // calling Brreg too would be pure network waste. "Cheaper source
+          // first" per this file's own header comment.
+          hit = localHit;
+          sourceType = `local_json_${localHit.local_source}`;
+        } else {
+          // Local hit is either absent or below the max tier — it must not
+          // unconditionally shadow a possibly-better live Brreg match (a
+          // sub-1.0 local hit can never itself cause an unsafe auto-write,
+          // since agentOrgNrAutoWriteEligible below still requires
+          // confidence === 1.0, but it CAN wrongly suppress a genuine Brreg
+          // exact match and put a weaker candidate in front of a human
+          // reviewer). Take whichever of the two scores higher; a tie keeps
+          // the free local hit.
+          const brregHit = await findOrgnumberByName(searchName, t.postal_code, agentsOrgNrBackfillFetchImpl);
+          if (brregHit && (!localHit || brregHit.confidence > localHit.confidence)) {
+            hit = brregHit;
+            sourceType = "brreg_name_search";
+          } else if (localHit) {
+            hit = localHit;
+            sourceType = `local_json_${localHit.local_source}`;
+          } else {
+            hit = null;
+            sourceType = "brreg_name_search";
+          }
+        }
+      } catch (e: any) {
+        errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
+        continue;
+      }
+      scanned++;
+
+      if (!hit) {
+        unresolved.push({ agent_id: agentId, reason: "no_brreg_candidate" });
+        upsertAgentOrgNrReviewQueue(db, {
+          agent_id: agentId,
+          agent_name: t.name,
+          candidate_orgnr: null,
+          candidate_name: null,
+          candidate_confidence: null,
+          candidate_address: null,
+          candidate_source: null,
+          reason: "no_brreg_candidate",
+          batch_id: batchId,
+        });
+        continue;
+      }
+
+      // ── Write-bar veto chain — cheapest checks first, every non-auto-write
+      // outcome lands in the review queue, never silently dropped.
+      let vetoReason: string | null = null;
+      if ((hit.exact_ties ?? (hit.confidence === 1.0 ? 1 : 0)) > 1) {
+        vetoReason = "ambiguous_exact_name_ties";
+      } else if (nameWasStripped && !agentOrgNrPostalCorroborated(t, hit)) {
+        vetoReason = "stripped_name_requires_postal_match";
+      } else {
+        let rolledBack = false;
+        try {
+          rolledBack = agentOrgNrWasRolledBack(db, agentId);
+        } catch {
+          rolledBack = false;
+        }
+        if (rolledBack) vetoReason = "previously_rolled_back";
+      }
+      if (!vetoReason && agentOrgNrAutoWriteEligible(t, hit)) {
+        // Liveness LAST (one extra Brreg call, cached) — ALWAYS against the
+        // live Brreg API, even for a local-JSON-sourced hit (the vendored
+        // file is a 2026-05-14 snapshot; a business it names may have gone
+        // bankrupt/deregistered since).
+        try {
+          const ver = await verifyOrgNumber(hit.orgnumber, agentsOrgNrBackfillFetchImpl);
+          if (!ver.exists || !ver.active) vetoReason = "brreg_not_active";
+        } catch {
+          vetoReason = "brreg_verify_failed";
+        }
+      }
+
+      if (vetoReason || !agentOrgNrAutoWriteEligible(t, hit)) {
+        const reason = vetoReason ?? "needs_human_review";
+        unresolved.push({ agent_id: agentId, reason });
+        upsertAgentOrgNrReviewQueue(db, {
+          agent_id: agentId,
+          agent_name: t.name,
+          candidate_orgnr: hit.orgnumber,
+          candidate_name: hit.name,
+          candidate_confidence: hit.confidence,
+          candidate_address: hit.address ?? null,
+          candidate_source: sourceType,
+          reason,
+          batch_id: batchId,
+        });
+        continue;
+      }
+
+      const evidenceUrl =
+        sourceType === "brreg_name_search"
+          ? `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(hit.orgnumber)}`
+          : `local-json://${(hit as LocalOrgnrHit).local_source}/${encodeURIComponent(hit.orgnumber)}`;
+
+      if (dryRun) {
+        changed.push({ agent_id: agentId, org_nr: hit.orgnumber, source: sourceType, source_url: evidenceUrl });
+      } else {
+        try {
+          const written = applyAgentOrgNr(db, agentId, hit.orgnumber, evidenceUrl, sourceType, batchId);
+          if (written.length > 0) {
+            changed.push({ agent_id: agentId, org_nr: hit.orgnumber, source: sourceType, source_url: evidenceUrl });
+            // A confirmed, applied write supersedes any stale review-queue
+            // entry an earlier run may have left for this agent.
+            clearAgentOrgNrReviewQueueEntry(db, agentId);
+          } else {
+            // Fresh-read-at-write-time found the field already non-blank,
+            // the agent now claimed, or another agent already holds this
+            // exact org_nr — same race class documented on the gårdssalg
+            // original. Bucketed, not silently dropped.
+            unresolved.push({ agent_id: agentId, reason: "already_filled_or_conflict_at_write_time" });
+          }
+        } catch (e: any) {
+          errors.push({ agent_id: agentId, error: `write_failed: ${e?.message ?? String(e)}` });
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      batch_id: batchId,
+      candidate_count: candidateCount,
+      batch_size: targets.length,
+      remaining_count: Math.max(0, candidateCount - targets.length),
+      limit,
+      scanned,
+      agents_enriched: changed.length,
+      changed,
+      skipped_locked: skippedLocked,
+      unresolved,
+      errors,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "org-nr-backfill failed", detail: err.message });
+  }
+});
+
+// ─── GET /admin/agents/org-nr-review-queue ──────────────────────────────────
+// Read-only listing of every RFB agent the backfill route above could NOT
+// auto-confirm an org_nr for — the durable counterpart to that route's
+// per-run `unresolved[]` array. Mirrors GET /admin/gardssalg-orgnr-review-
+// queue (routes/opplevelser.ts) exactly.
+router.get("/org-nr-review-queue", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  const entries = listAgentOrgNrReviewQueue(db);
+  res.json({ count: entries.length, entries });
+});
+
+// ─── POST /admin/agents/org-nr-review-approve ───────────────────────────────
+// The review queue's APPLY lever — mirrors POST /admin/gardssalg-orgnr-
+// review-approve's strict contract exactly: a human may ONLY approve the
+// EXACT (agent_id, org_nr) pair the queue itself carries. The org_nr in the
+// request must equal the queue entry's candidate_orgnr, or the item is
+// rejected (`mismatch_with_queued_candidate`) — this is a confirmation
+// surface, not an arbitrary-write surface. The write still goes through
+// applyAgentOrgNr's fill-only/lock/conflict guards and lands in the same
+// audit/provenance trail as an auto-write.
+//
+// Body: { approvals: [{agent_id, org_nr}], apply? } — dry-run by default.
+router.post("/org-nr-review-approve", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+    res.status(400).json({ error: "Requires approvals: [{agent_id, org_nr}]" });
+    return;
+  }
+
+  const db = getDb();
+  const queue = listAgentOrgNrReviewQueue(db);
+  const byAgent = new Map(queue.map((q) => [q.agent_id, q]));
+
+  const approved: Array<{ agent_id: string; org_nr: string }> = [];
+  const rejected: Array<{ agent_id: string; reason: string }> = [];
+  const seen = new Set<string>();
+
+  for (const raw of body.approvals as unknown[]) {
+    const a = (raw ?? {}) as { agent_id?: unknown; org_nr?: unknown };
+    const agentId = typeof a.agent_id === "string" ? a.agent_id.trim() : "";
+    const orgNr = typeof a.org_nr === "string" ? a.org_nr.replace(/\s+/g, "") : "";
+    if (!agentId || !orgNr) {
+      rejected.push({ agent_id: agentId || "<mangler>", reason: "invalid_item" });
+      continue;
+    }
+    if (seen.has(agentId)) {
+      rejected.push({ agent_id: agentId, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(agentId);
+
+    const entry = byAgent.get(agentId);
+    if (!entry) {
+      rejected.push({ agent_id: agentId, reason: "not_in_review_queue" });
+      continue;
+    }
+    if (!entry.candidate_orgnr || entry.candidate_orgnr.trim() !== orgNr) {
+      rejected.push({ agent_id: agentId, reason: "mismatch_with_queued_candidate" });
+      continue;
+    }
+
+    if (dryRun) {
+      approved.push({ agent_id: agentId, org_nr: orgNr });
+      continue;
+    }
+    try {
+      const source = entry.candidate_source || "brreg_name_search";
+      const evidenceUrl =
+        source === "brreg_name_search"
+          ? `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`
+          : `local-json://${source.replace(/^local_json_/, "")}/${encodeURIComponent(orgNr)}`;
+      const written = applyAgentOrgNr(db, agentId, orgNr, evidenceUrl, `human_review_approved:${source}`);
+      if (written.length > 0) {
+        clearAgentOrgNrReviewQueueEntry(db, agentId);
+        approved.push({ agent_id: agentId, org_nr: orgNr });
+      } else {
+        rejected.push({ agent_id: agentId, reason: "write_refused_filled_locked_or_conflict" });
+      }
+    } catch (e: any) {
+      rejected.push({ agent_id: agentId, reason: `write_failed: ${e?.message ?? String(e)}` });
+    }
+  }
+
+  res.json({ dry_run: dryRun, approved_count: approved.length, approved, rejected });
 });
 
 // ─── GET /admin/agents/category-sanity-report ───────────────────
