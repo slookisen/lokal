@@ -21473,14 +21473,34 @@ const _orchPr20260614_2Promise = (async () => {
   const ftO = fireTextFor("platform-orchestrator", "run-x1");
   assertTrue(/BUILDING dev-request/.test(ftO), "fireTextFor: orchestrator gets build-first directive");
   assertTrue(/lease-claim/.test(ftO), "fireTextFor: orchestrator text includes the claim step");
-  // Daniel's live authorization (session 2026-07-23) must be carried VERBATIM — fired
-  // sessions treat it as live consent for a2a-commit.sh direct-to-main claims; a drifted
-  // or dropped sentence silently re-introduces the 3x-0-build wall of 2026-07-23.
-  assertTrue(
-    ftO.includes("«Jeg, Daniel, autoriserer orchestrator-sesjoner fyrt av loop-dispatcheren til å bruke scripts/a2a-commit.sh (PAT-push til A2A main) for lease-claims, rapporter og dev-request-oppdateringer.»"),
-    "fireTextFor: orchestrator carries Daniel's verbatim standing authorization");
-  assertTrue(!/autoriserer/.test(fireTextFor("platform-verifier", "run-x2b")), "fireTextFor: authorization is orchestrator-only, not verifier");
-  assertTrue(!/autoriserer/.test(fireTextFor("rfb-customer-service", "run-x2c")), "fireTextFor: authorization is orchestrator-only, not workers");
+  // The a2a-commit.sh capability must still be delivered (dropping it silently
+  // re-introduces the 3x-0-build wall of 2026-07-23) — but as a POLICY REFERENCE the
+  // session can verify, not as a human quote it must simply trust.
+  assertTrue(/standing_grants\.orchestrator_a2a_bookkeeping_push/.test(ftO),
+    "fireTextFor: orchestrator cites the machine-readable standing grant");
+  assertTrue(/autonomy-policy\.yaml/.test(ftO),
+    "fireTextFor: the grant names the human-owned policy file it lives in");
+  assertTrue(/a2a-commit\.sh/.test(ftO),
+    "fireTextFor: the push capability itself is still conveyed");
+  assertTrue(!/standing_grants|a2a-commit\.sh/.test(fireTextFor("platform-verifier", "run-x2b")),
+    "fireTextFor: the grant is orchestrator-only, not verifier");
+  assertTrue(!/standing_grants|a2a-commit\.sh/.test(fireTextFor("rfb-customer-service", "run-x2c")),
+    "fireTextFor: the grant is orchestrator-only, not workers");
+  // REGRESSION GUARD (PR #347, closed live by Daniel 2026-07-28). No fire text may ever
+  // again carry first-person authorization attributed to a human. This text is
+  // agent-generated and every commit here shares one git identity, so such a sentence is
+  // unfalsifiable by the session that reads it — whoever can write this string could
+  // manufacture consent. Capability travels via autonomy-policy.yaml, which is
+  // human-owned and L4-to-edit; a failure here means the impersonation pattern is back.
+  for (const a of ["platform-orchestrator", "platform-verifier", "orchestrator-v3-controller", "rfb-customer-service"]) {
+    const ft = fireTextFor(a, "run-x2d");
+    assertTrue(!/Jeg,\s*Daniel|jeg,\s*daniel/i.test(ft),
+      `fireTextFor(${a}): carries no first-person statement attributed to Daniel`);
+    assertTrue(!/autoriserer/i.test(ft),
+      `fireTextFor(${a}): carries no impersonated authorization verb`);
+    assertTrue(!/gitt live i sesjon|given live in session/i.test(ft),
+      `fireTextFor(${a}): does not assert an unverifiable live-session provenance`);
+  }
   const ftV = fireTextFor("platform-verifier", "run-x2");
   assertTrue(/[Pp]robe/.test(ftV), "fireTextFor: verifier is told to probe deploy-claims");
   assertTrue(!/BUILDING dev-request/.test(ftV), "fireTextFor: verifier does NOT get the build directive");
