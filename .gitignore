@@ -49,3 +49,7 @@ Thumbs.db
 
 # Belt-and-suspenders — mcp-server has its own node_modules
 mcp-server/node_modules/
+
+# Claude Code harness worktree scratch checkouts — never repo content.
+# These previously landed as orphaned gitlinks (see PR #352).
+.claude/worktrees/
