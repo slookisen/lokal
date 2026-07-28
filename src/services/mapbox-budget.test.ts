@@ -446,6 +446,15 @@ export function runMapboxBudgetTests(opts: { log?: boolean } = {}): Promise<Test
           "mb33: …and tells the visitor when real routing returns");
         assertTrue(!/Vi har ikke ekte kjørerute her/.test(cappedNotes),
           "mb34: …and never reuses the never-configured wording — that sends the operator hunting a token that was never the problem");
+        // Round 3: mb32-mb34 pin the note's IDENTITY, not its HONESTY. The
+        // reviewer reworded the capped note to actively lie — «men dette er den
+        // faktiske kjøreruten med korrekt avstand langs veien» — while keeping
+        // both keywords, and all 270 tests stayed green. The PLAIN branch is
+        // already protected against exactly this by route-corridor r19 and
+        // reise-page n2, which assert /luftlinje/i on the real content; the
+        // capped branch this PR introduces had no equivalent. Asymmetry closed.
+        assertTrue(/luftlinje/i.test(cappedNotes) && /ingen avstand/.test(cappedNotes),
+          "mb32b: …and still says it is a STRAIGHT LINE claiming no distance — a reworded note must not be able to promise a real road");
 
         // The CONTRAST case is what kills the inverted ternary. A plain
         // straight line — no cap involved — must NOT claim a spent quota,
