@@ -626,7 +626,23 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_crm_contacts_type ON crm_contacts(type);
     CREATE INDEX IF NOT EXISTS idx_crm_contacts_agent ON crm_contacts(agent_id);
     CREATE INDEX IF NOT EXISTS idx_crm_contacts_domain ON crm_contacts(domain);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_unique ON crm_contacts(email);
+    -- NOTE: there is deliberately NO unique index on crm_contacts(email) here.
+    -- Uniqueness is UNIQUE(email, vertical_id) and is created further down this
+    -- file, right after the ALTER TABLE loop that adds vertical_id (the column
+    -- does not exist yet at this point, which is why it cannot be created here).
+    --
+    -- REVIEW B1 — do NOT re-add a UNIQUE(email) index here as a "safe interim".
+    -- An earlier draft of this change did exactly that and it was a CRASH LOOP,
+    -- reproduced: initSchema() runs on EVERY boot, so the DROP further down fired
+    -- every boot too, which meant this line stopped being a no-op from boot 2
+    -- onwards and genuinely rebuilt the index — against data that by then legally
+    -- contained two contacts sharing an email. SQLite validates on CREATE, so it
+    -- threw, out of initSchema(), out of getDb(), and index.ts calls getDb() at
+    -- module top level — the process never reaches app.listen(). The branch
+    -- reverted itself once per boot.
+    --
+    -- The gap this leaves is one synchronous initSchema() pass on a fresh DB,
+    -- before any connection can write. Nothing can insert a duplicate in it.
 
     CREATE TABLE IF NOT EXISTS crm_threads (
       id TEXT PRIMARY KEY,
@@ -911,6 +927,58 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_vertical_id ON agents(vertical_id)`);
   } catch {
     // Index already exists
+  }
+
+  // ─── crm_contacts uniqueness: (email) → (email, vertical_id) ──
+  //
+  // dev-requests/2026-07-27-crm-plattformadskillelse-opplevagent.md, steg 2.
+  // Daniels valg A, ordrett: «gå for adskilte kontakter.» One person who is a
+  // customer on BOTH rettfrabonden.com and opplevagent.no must be two separate
+  // contacts — not one shared row whose thread history mixes the platforms.
+  // The old UNIQUE(email) made that impossible to even represent: the second
+  // platform's INSERT would fail outright.
+  //
+  // Safe on live data by construction. Every existing row is vertical_id='rfb'
+  // (nothing wrote the column until this PR), so the composite index holds on
+  // exactly the same row set the single-column one did — it cannot fail on
+  // existing data, and there is nothing to de-duplicate first.
+  //
+  // The two statements run in ONE TRANSACTION, so there is no window between
+  // them at all — SQLite has fully transactional DDL. The first version argued
+  // for a careful ordering instead (CREATE before DROP, so a crash in between
+  // leaves the table more constrained rather than less), but an ordering
+  // argument is only as good as the next person who reorders the lines, and a
+  // mutation swapping them was undetectable by any test: "what happens if the
+  // process dies between two synchronous statements" is not observable from a
+  // test process. BEGIN/COMMIT makes the hazard structurally impossible rather
+  // than merely documented, which is the better of the two.
+  //
+  // Idempotent ACROSS BOOTS, not merely across DB states — REVIEW B1. This runs
+  // on every single boot, so the pair below has to be a no-op on boot 2, 3, 4…
+  // It is, now that nothing re-creates the single-column index earlier in this
+  // file (see the note in the crm_contacts DDL block). The first draft did
+  // re-create it, and the result was a crash loop the moment one legitimate
+  // cross-vertical contact existed. Reproduced before fixing:
+  //     boot 1  → OK, two contacts sharing an email on two platforms
+  //     boot 2  → THREW: UNIQUE constraint failed: crm_contacts.email
+  //
+  // NOT freely reversible any more, and that is worth stating plainly: a plain
+  // `git revert` of this change restores the UNIQUE(email) index, which will
+  // fail to build against exactly the data steg 2 exists to allow — the same
+  // crash, arrived at deliberately. Reverting safely means de-duplicating
+  // crm_contacts first (keep the 'rfb' row, re-point its threads), THEN
+  // reverting. Do not treat this as a one-command rollback.
+  try {
+    db.exec(`
+      BEGIN;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_vertical_unique ON crm_contacts(email, vertical_id);
+        DROP INDEX IF EXISTS idx_crm_contacts_email_unique;
+      COMMIT;
+    `);
+  } catch {
+    // Already migrated, or the CREATE failed on genuinely duplicate data. Either
+    // way the transaction rolls back, so the table is never left half-migrated.
+    try { db.exec(`ROLLBACK`); } catch { /* no transaction open — nothing to undo */ }
   }
 
   // Dashboards filter analytics by vertical_id (rfb vs dental) — index the

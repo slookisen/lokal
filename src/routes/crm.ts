@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { z } from "zod";
-import { crmService, CrmVertical } from "../services/crm-service";
+import { crmService, CrmVertical, isCrmVertical, CRM_VERTICALS } from "../services/crm-service";
 import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
@@ -52,6 +52,11 @@ const ingestSchema = z.object({
   severity: z.enum(["p0", "p1", "p2", "normal"]).optional(),
   contactName: z.string().nullable().optional(),
   messages: z.array(messageSchema).min(1),
+  // REQUIRED, no default. z.enum rejects a missing or unknown value with a 400
+  // before any write happens — the fail-closed half of the guard in
+  // crm-service.assertVertical. Defaulting to 'rfb' here is precisely how every
+  // existing CRM row ended up tagged 'rfb', Opplevagent enquiries included.
+  vertical: z.enum(CRM_VERTICALS),
 });
 
 const sendSchema = z.object({
@@ -210,13 +215,26 @@ router.post("/threads/:id/send", async (req, res) => {
 
   // Look up contact for logging
   const db = getDb();
-  const thread = db.prepare("SELECT contact_id FROM crm_threads WHERE id = ?").get(threadId) as { contact_id: string } | undefined;
+  const thread = db.prepare("SELECT contact_id, vertical_id FROM crm_threads WHERE id = ?").get(threadId) as
+    { contact_id: string; vertical_id: string } | undefined;
   if (!thread) return res.status(404).json({ error: "thread not found" });
+
+  // The platform comes from the THREAD, never from the request body. A reply
+  // belongs to the conversation it continues; letting a caller pass a vertical
+  // here would allow an rfb thread to be answered as Opplevagent (and would
+  // re-open exactly the mixing this whole change exists to prevent).
+  if (!isCrmVertical(thread.vertical_id)) {
+    return res.status(409).json({
+      error: "thread has no valid vertical",
+      detail: `crm_threads.vertical_id = ${JSON.stringify(thread.vertical_id)} — refusing to guess a platform for an outbound reply`,
+    });
+  }
 
   // Always enqueue (even for resend_send — keeps audit trail)
   const queued = crmService.enqueueOutbox({
     threadId,
     contactId: thread.contact_id,
+    vertical: thread.vertical_id,
     intent,
     toEmails,
     ccEmails,
@@ -286,6 +304,11 @@ const composeSchema = z.object({
   category: z.enum(["innkommende", "marketing", "leverandor", "system", "unknown"]).optional(),
   severity: z.enum(["p0", "p1", "p2", "normal"]).optional(),
   createdBy: z.enum(["claude", "daniel"]),
+  // REQUIRED, no default. z.enum rejects a missing or unknown value with a 400
+  // before any write happens — the fail-closed half of the guard in
+  // crm-service.assertVertical. Defaulting to 'rfb' here is precisely how every
+  // existing CRM row ended up tagged 'rfb', Opplevagent enquiries included.
+  vertical: z.enum(CRM_VERTICALS),
   // Phase 4.10c-2 Steg 3 — explicit override for the recipient-rate-limit guard.
   // Daniel can pass force=true on manual sends (e.g. urgency); claude-actor
   // calls are always rate-limited.
@@ -295,7 +318,7 @@ const composeSchema = z.object({
 router.post("/compose", async (req, res) => {
   const parsed = composeSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy, force } = parsed.data;
+  const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy, force, vertical } = parsed.data;
 
   try {
     // ─── Global outreach kill-switch (P0-2026-07-11) ────────────
@@ -420,11 +443,13 @@ router.post("/compose", async (req, res) => {
       severity: severity ?? "normal",
       createdBy,
       deliveryStatus: "queued",
+      vertical,
     });
 
     const queued = crmService.enqueueOutbox({
       threadId,
       contactId,
+      vertical,
       intent,
       toEmails: [to],
       subject,
@@ -494,16 +519,31 @@ router.post("/ingest", (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
 
-  const result = crmService.ingestThread(
-    {
-      threadId: parsed.data.threadId,
-      subject: parsed.data.subject,
-      category: parsed.data.category,
-      severity: parsed.data.severity,
-      messages: parsed.data.messages,
-    },
-    parsed.data.primaryFromEmail
-  );
+  let result;
+  try {
+    result = crmService.ingestThread(
+      {
+        threadId: parsed.data.threadId,
+        subject: parsed.data.subject,
+        category: parsed.data.category,
+        severity: parsed.data.severity,
+        messages: parsed.data.messages,
+      },
+      parsed.data.primaryFromEmail,
+      parsed.data.vertical
+    );
+  } catch (err: any) {
+    // Review B4: re-ingesting an existing thread under a DIFFERENT platform is
+    // refused by the service. Surface it as 409 rather than letting it fall
+    // through to a generic 500 — the CS agent needs to be able to tell "this
+    // thread needs human triage" from "the backend is broken", and it retries
+    // on 5xx. Nothing was written when this fires.
+    const msg = String(err?.message ?? "ingest failed");
+    if (msg.includes("already belongs to vertical")) {
+      return res.status(409).json({ error: "thread vertical conflict", detail: msg });
+    }
+    return res.status(500).json({ error: msg });
+  }
 
   // If contactName provided and contact was just created, set name
   if (parsed.data.contactName) {

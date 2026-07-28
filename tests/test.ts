@@ -24621,6 +24621,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
         __initSchemaForTesting(db);
 
         const { threadId, messageId } = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "kunde@example.com",
           subject: "Hei fra Rett fra Bonden",
           bodyText: "Takk for henvendelsen!",
@@ -24668,6 +24669,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
 
         // Two compose-sends: one by claude, one by daniel
         const r1 = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "kunde1@example.com",
           subject: "Claude melding",
           bodyText: "Tekst fra claude",
@@ -24675,6 +24677,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
           deliveryStatus: "sent",
         });
         const r2 = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "kunde2@example.com",
           subject: "Daniel melding",
           bodyText: "Tekst fra daniel",
@@ -24721,6 +24724,7 @@ Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
         // 2. updateMessageDeliveryStatus → 'sent'
         // 3. logAction type='sent' with internalMessageId + channel
         const r = crmService.composeNewThread({
+          vertical: "rfb",
           toEmail: "fullpath@example.com",
           subject: "Full route test",
           bodyText: "Body",
@@ -34175,6 +34179,23 @@ runSerial(async () => {
 // unreachable-by-reason breakdown (asserted to be a true partition), and
 // dry-run purity verified with a WHOLE-DB hash. Own in-memory DB + both
 // network seams injected; runs via runSerial() like its siblings.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 1+2 (vertical fail-closed + adskilte kontakter) ──");
+  try {
+    const { runCrmVerticalTests } = require("../src/services/crm-vertical.test") as
+      typeof import("../src/services/crm-vertical.test");
+    const cvt = await runCrmVerticalTests({ log: false });
+    passed += cvt.passed;
+    failed += cvt.failed;
+    for (const f of cvt.failures) failures.push("crm-vertical: " + f);
+    console.log(`  crm-vertical: ${cvt.passed} passed, ${cvt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-vertical: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-vertical: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
 runSerial(async () => {
   console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a follow-up (geokoding-dekning + gjennomstrømning) ──");
   try {

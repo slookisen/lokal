@@ -98,7 +98,7 @@ export function runCrmServiceResolveContactTests(opts: { log?: boolean } = {}): 
       VALUES ('contact-beiarmat', 'producer', NULL, 'post@beiarmat.no', 'Beiarmat')
     `).run();
 
-    const result = crmService.resolveContact("post@beiarmat.no");
+    const result = crmService.resolveContact("post@beiarmat.no", null, "rfb");
     assertEq(result.id, "contact-beiarmat", "stuck producer contact: resolveContact returns the SAME contact id");
     assertEq(result.created, false, "stuck producer contact: not re-created");
 
@@ -115,7 +115,7 @@ export function runCrmServiceResolveContactTests(opts: { log?: boolean } = {}): 
       VALUES ('contact-nomatch', 'producer', NULL, 'nomatch@nowhere.no', 'Nomatch')
     `).run();
 
-    crmService.resolveContact("nomatch@nowhere.no");
+    crmService.resolveContact("nomatch@nowhere.no", null, "rfb");
     const row = db.prepare("SELECT type, agent_id FROM crm_contacts WHERE id = 'contact-nomatch'").get() as any;
     assertEq(row.agent_id, null, "genuinely unresolvable contact: agent_id stays NULL, no false link");
   }
@@ -128,7 +128,7 @@ export function runCrmServiceResolveContactTests(opts: { log?: boolean } = {}): 
       VALUES ('contact-vendor', 'vendor', NULL, 'billing@resend.com', 'Resend', 'resend.com')
     `).run();
 
-    crmService.resolveContact("billing@resend.com");
+    crmService.resolveContact("billing@resend.com", null, "rfb");
     const row = db.prepare("SELECT type, agent_id FROM crm_contacts WHERE id = 'contact-vendor'").get() as any;
     assertEq(row.type, "vendor", "vendor contact: type stays 'vendor'");
     assertEq(row.agent_id, null, "vendor contact: agent_id stays NULL (expected/permanent), no wasted relink attempt");
@@ -149,7 +149,7 @@ export function runCrmServiceResolveContactTests(opts: { log?: boolean } = {}): 
       VALUES ('contact-marketing', 'marketing', NULL, 'press@example.no', 'Press contact', 'example.no')
     `).run();
 
-    crmService.resolveContact("press@example.no");
+    crmService.resolveContact("press@example.no", null, "rfb");
     const row = db.prepare("SELECT type, agent_id FROM crm_contacts WHERE id = 'contact-marketing'").get() as any;
     assertEq(row.type, "marketing", "manually-tagged marketing contact: type is NOT overwritten back to 'producer'");
     assertEq(row.agent_id, null, "manually-tagged marketing contact: agent_id stays NULL, no forced relink");
@@ -165,7 +165,7 @@ export function runCrmServiceResolveContactTests(opts: { log?: boolean } = {}): 
       VALUES ('contact-linked', 'producer', 'agent-other', 'post@other.no', 'Other')
     `).run();
 
-    crmService.resolveContact("post@other.no");
+    crmService.resolveContact("post@other.no", null, "rfb");
     const row = db.prepare("SELECT type, agent_id FROM crm_contacts WHERE id = 'contact-linked'").get() as any;
     assertEq(row.agent_id, "agent-other", "already-linked contact: agent_id unchanged");
   }
@@ -178,7 +178,7 @@ export function runCrmServiceResolveContactTests(opts: { log?: boolean } = {}): 
       VALUES ('contact-unknown-vendor', 'unknown', NULL, 'support@resend.com', 'Resend Support', 'resend.com')
     `).run();
 
-    crmService.resolveContact("support@resend.com");
+    crmService.resolveContact("support@resend.com", null, "rfb");
     const row = db.prepare("SELECT type, agent_id FROM crm_contacts WHERE id = 'contact-unknown-vendor'").get() as any;
     assertEq(row.type, "vendor", "unknown->vendor reclassification still works (regression guard)");
   }

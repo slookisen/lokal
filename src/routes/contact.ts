@@ -134,10 +134,18 @@ function createContactThread(params: {
   const now = new Date().toISOString();
   const lowerEmail = params.email.trim().toLowerCase();
 
-  // Resolve or create contact
+  // Resolve or create contact — SCOPED BY PLATFORM (review B3).
+  //
+  // This lookup used to be `WHERE email = ?` alone. With the contacts table now
+  // keyed UNIQUE(email, vertical_id), an email no longer identifies a row, and
+  // the unscoped version reused whichever platform's contact happened to exist:
+  // a form submitted on opplevagent.no attached its thread to the RETT FRA
+  // BONDEN contact, mixing the two histories on the one endpoint the public can
+  // reach. Measured on the real router before the fix — an `experiences` thread
+  // owned by an `rfb` contact, invisible to listContacts(vertical:'experiences').
   const existing = db
-    .prepare("SELECT id FROM crm_contacts WHERE email = ?")
-    .get(lowerEmail) as { id: string } | undefined;
+    .prepare("SELECT id FROM crm_contacts WHERE email = ? AND vertical_id = ?")
+    .get(lowerEmail, params.platform) as { id: string } | undefined;
 
   let contactId: string;
   if (existing) {
@@ -172,8 +180,8 @@ function createContactThread(params: {
   db.prepare(
     `INSERT INTO crm_messages
        (id, thread_id, direction, from_email, to_emails, cc_emails,
-        subject, body_text, body_html, snippet, sent_at, raw_metadata, delivery_status)
-     VALUES (?, ?, 'in', ?, '[]', '[]', ?, ?, NULL, ?, ?, ?, 'sent')`,
+        subject, body_text, body_html, snippet, sent_at, raw_metadata, delivery_status, vertical_id)
+     VALUES (?, ?, 'in', ?, '[]', '[]', ?, ?, NULL, ?, ?, ?, 'sent', ?)`,
   ).run(
     messageId,
     threadId,
@@ -183,6 +191,10 @@ function createContactThread(params: {
     bodyText.slice(0, 200),
     now,
     JSON.stringify({ source: "kontaktskjema", platform: params.platform }),
+    // Review B3: this INSERT named no vertical_id at all, so every message from
+    // the public contact form fell on the column default 'rfb' — including ones
+    // whose own contact and thread were correctly stamped 'experiences'.
+    params.platform,
   );
 
   // Log action
