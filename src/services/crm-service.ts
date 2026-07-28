@@ -279,7 +279,33 @@ class CrmService {
     const threadId = input.threadId;
 
     // Upsert thread
-    const existing = db.prepare("SELECT id FROM crm_threads WHERE id = ?").get(threadId);
+    const existing = db.prepare("SELECT id, vertical_id FROM crm_threads WHERE id = ?").get(threadId) as
+      { id: string; vertical_id: string } | undefined;
+
+    // REVIEW B4 — a thread cannot change platform on re-ingest.
+    //
+    // vertical_id used to be written only in the `if (!existing)` branch below.
+    // Every thread in production today is 'rfb', and CS ingest is idempotent by
+    // design: it re-sends the same Gmail threadIds every run. So the first run
+    // that correctly triaged an old thread as 'experiences' would have left the
+    // THREAD 'rfb' while stamping its new MESSAGES 'experiences' — half one
+    // platform, half the other — and stranded a second contact row attached to
+    // nothing. Any reply then went out under thread.vertical_id = 'rfb', which is
+    // the M13 scenario reached from the other direction.
+    //
+    // Refusing is right rather than merely safe: a thread genuinely arriving on
+    // the other platform means the triage signal changed, and a human needs to
+    // see that, not have one side silently overwrite the other. The re-ingest
+    // is rejected whole — no messages are written — so the caller retries the
+    // same immutable Gmail thread rather than half-applying it.
+    if (existing && existing.vertical_id !== v) {
+      throw new Error(
+        `[crm] ingestThread: thread ${threadId} already belongs to vertical ` +
+          `${JSON.stringify(existing.vertical_id)}, refusing to re-ingest it as ${JSON.stringify(v)}. ` +
+          `A conversation does not change platform; triage this thread manually.`,
+      );
+    }
+
     if (!existing) {
       db.prepare(`
         INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id)

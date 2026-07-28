@@ -519,17 +519,31 @@ router.post("/ingest", (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
 
-  const result = crmService.ingestThread(
-    {
-      threadId: parsed.data.threadId,
-      subject: parsed.data.subject,
-      category: parsed.data.category,
-      severity: parsed.data.severity,
-      messages: parsed.data.messages,
-    },
-    parsed.data.primaryFromEmail,
-    parsed.data.vertical
-  );
+  let result;
+  try {
+    result = crmService.ingestThread(
+      {
+        threadId: parsed.data.threadId,
+        subject: parsed.data.subject,
+        category: parsed.data.category,
+        severity: parsed.data.severity,
+        messages: parsed.data.messages,
+      },
+      parsed.data.primaryFromEmail,
+      parsed.data.vertical
+    );
+  } catch (err: any) {
+    // Review B4: re-ingesting an existing thread under a DIFFERENT platform is
+    // refused by the service. Surface it as 409 rather than letting it fall
+    // through to a generic 500 — the CS agent needs to be able to tell "this
+    // thread needs human triage" from "the backend is broken", and it retries
+    // on 5xx. Nothing was written when this fires.
+    const msg = String(err?.message ?? "ingest failed");
+    if (msg.includes("already belongs to vertical")) {
+      return res.status(409).json({ error: "thread vertical conflict", detail: msg });
+    }
+    return res.status(500).json({ error: msg });
+  }
 
   // If contactName provided and contact was just created, set name
   if (parsed.data.contactName) {

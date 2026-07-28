@@ -62,11 +62,26 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
       `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`
     );
   }
-  /** Asserts the call throws AND that the message names the offending value. */
-  function assertThrows(fn: () => unknown, label: string): void {
-    try { fn(); assertTrue(false, `${label} — expected a throw, got a return`); }
-    catch { assertTrue(true, label); }
+  /**
+   * Asserts the call throws WITH A MESSAGE MATCHING `expect`.
+   *
+   * The `expect` argument is not optional decoration. The first version of this
+   * helper accepted any throw, and a reviewer showed that cv8 and cv12b then
+   * passed even with `assertVertical` DELETED from resolveContact and
+   * enqueueOutbox — SQLite's own NOT NULL / bind error masqueraded as the guard
+   * firing. Two tests passing for the wrong reason, in a suite whose whole
+   * subject is a guard. Matching on the message is what tells the two apart.
+   */
+  function assertThrows(fn: () => unknown, expect: RegExp, label: string): void {
+    try {
+      fn();
+      assertTrue(false, `${label} — expected a throw, got a return`);
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      assertTrue(expect.test(msg), `${label} (message ${JSON.stringify(msg)} must match ${expect})`);
+    }
   }
+  const GUARD = /vertical must be one of/;
 
   return (async () => {
     const prevDb = initMod.__peekDbForTesting();
@@ -85,11 +100,11 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
       // ═══════════════════════════════════════════════════════════════
       assertEq(crm.assertVertical("rfb", "t"), "rfb", "cv1: a valid vertical passes through unchanged");
       assertEq(crm.assertVertical("experiences", "t"), "experiences", "cv1b: …including the one this whole change exists for");
-      assertThrows(() => crm.assertVertical(undefined, "t"), "cv2: undefined throws — the commonest way a caller forgets");
-      assertThrows(() => crm.assertVertical("", "t"), "cv3: empty string throws");
-      assertThrows(() => crm.assertVertical("opplevagent", "t"), "cv4: a PLAUSIBLE but wrong value throws — this is the one a human would type");
-      assertThrows(() => crm.assertVertical(null, "t"), "cv5: null throws");
-      assertThrows(() => crm.assertVertical("RFB", "t"), "cv6: case variants throw rather than being normalised — SQL comparison is case-sensitive, so accepting 'RFB' here would write a value no read query can find");
+      assertThrows(() => crm.assertVertical(undefined, "t"), GUARD, "cv2: undefined throws — the commonest way a caller forgets");
+      assertThrows(() => crm.assertVertical("", "t"), GUARD, "cv3: empty string throws");
+      assertThrows(() => crm.assertVertical("opplevagent", "t"), GUARD, "cv4: a PLAUSIBLE but wrong value throws — this is the one a human would type");
+      assertThrows(() => crm.assertVertical(null, "t"), GUARD, "cv5: null throws");
+      assertThrows(() => crm.assertVertical("RFB", "t"), GUARD, "cv6: case variants throw rather than being normalised — SQL comparison is case-sensitive, so accepting 'RFB' here would write a value no read query can find");
 
       // The message must name the bad value. A guard that throws
       // `Error: invalid` sends whoever is on call reading source instead of logs.
@@ -110,8 +125,7 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
         const row = db.prepare("SELECT vertical_id, email FROM crm_contacts WHERE id = ?").get(r.id) as any;
         assertEq(row?.vertical_id, "experiences", "cv7: resolveContact writes vertical_id on crm_contacts");
       }
-      assertThrows(
-        () => (crm.crmService as any).resolveContact("x@y.no", null, undefined),
+      assertThrows(() => (crm.crmService as any).resolveContact("x@y.no", null, undefined), GUARD,
         "cv8: resolveContact with no vertical throws instead of creating an 'rfb' contact");
 
       {
@@ -163,11 +177,21 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
         const row = db.prepare("SELECT vertical_id FROM crm_outbox WHERE id = ?").get(o.id) as any;
         assertEq(row?.vertical_id, "experiences", "cv12: enqueueOutbox stamps crm_outbox");
       }
-      assertThrows(
-        () => (crm.crmService as any).enqueueOutbox({
+      assertThrows(() => (crm.crmService as any).enqueueOutbox({
           intent: "resend_send", toEmails: ["a@b.no"], subject: "s", bodyText: "b", createdBy: "daniel",
-        }),
+        }), GUARD,
         "cv12b: enqueueOutbox with no vertical throws — an outbound send is the one place a wrong platform reaches a real person");
+      // REVIEW O2: cv12b only covers the MISSING case, which SQLite's NOT NULL
+      // would reject anyway — so deleting assertVertical from enqueueOutbox
+      // survived the whole suite. A present-but-INVALID string is the case only
+      // the guard can catch, because SQLite will happily store 'opplevagent'.
+      assertThrows(() => (crm.crmService as any).enqueueOutbox({
+          intent: "resend_send", toEmails: ["a@b.no"], subject: "s", bodyText: "b",
+          createdBy: "daniel", vertical: "opplevagent",
+        }), GUARD,
+        "cv12c: …and an INVALID vertical is rejected by the GUARD, not silently stored — SQLite would have accepted that string");
+      assertThrows(() => (crm.crmService as any).resolveContact("z@y.no", null, "opplevagent"), GUARD,
+        "cv12d: same for resolveContact — the guard, not the column type, is what rejects it");
 
       // ═══════════════════════════════════════════════════════════════
       // cv13-cv17 — steg 2, «adskilte kontakter» (Daniels valg A).
@@ -345,10 +369,201 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
           assertEq(broken.status, 409,
             "cv30: a thread whose vertical is unroutable refuses the send rather than guessing a platform");
           db.prepare("UPDATE crm_threads SET vertical_id = 'experiences' WHERE id = 'cv-route-1'").run();
+
+          // ── cv37-cv39: /compose — REVIEW T6, T7, T8 ──
+          //
+          // Zero route-level tests existed for /admin/crm/compose. That one gap
+          // let THREE mutants live: making `vertical` optional with a default of
+          // 'rfb', and hardcoding 'rfb' into either downstream call. It is the
+          // endpoint that actually SENDS mail, so a wrong platform there reaches
+          // a real person under the wrong brand — strictly worse than /ingest.
+          const compose = (body: any): { status: number; body: any } => {
+            let out = { status: 200, body: undefined as any };
+            const req: any = {
+              method: "POST", url: "/compose", query: {}, body,
+              headers: { "x-admin-key": "crm-vertical-test-key" },
+              get(name: string) { return this.headers[name.toLowerCase()]; },
+            };
+            const res: any = {
+              statusCode: 200,
+              status(c: number) { this.statusCode = c; return this; },
+              json(p: any) { out = { status: this.statusCode, body: p }; return this; },
+            };
+            router.handle(req, res, () => { /* unmatched */ });
+            return out;
+          };
+          const composeBody = {
+            to: "compose-rute@example.no", subject: "Emne", bodyText: "Tekst",
+            intent: "gmail_draft", createdBy: "daniel",
+          };
+
+          const cBefore = countRows();
+          const cMissing = compose({ ...composeBody });
+          assertEq(cMissing.status, 400, "cv37: /compose WITHOUT vertical is rejected — it is the endpoint that sends mail");
+          assertEq(countRows(), cBefore, "cv38: …and wrote nothing");
+
+          compose({ ...composeBody, vertical: "experiences" });
+          const cThread = db.prepare(
+            "SELECT t.vertical_id tv, c.vertical_id cv FROM crm_threads t JOIN crm_contacts c ON c.id = t.contact_id WHERE t.subject = 'Emne'"
+          ).get() as any;
+          assertEq(cThread?.tv, "experiences", "cv39: …and with a vertical the thread lands on the named platform");
+          assertEq(cThread?.cv, "experiences", "cv39b: …as does the contact — not hardcoded to rfb on either call");
+
+          // ── cv40-cv41: REVIEW B4 — a thread cannot change platform ──
+          //
+          // CS ingest is idempotent by design and re-sends the same Gmail
+          // threadIds every run. Before the guard, re-ingesting an 'rfb' thread
+          // as 'experiences' left the thread 'rfb', stamped the NEW messages
+          // 'experiences', and stranded a second contact attached to nothing.
+          const conflict = post({
+            threadId: "cv-route-1",
+            vertical: "rfb",
+            primaryFromEmail: "rute@example.no",
+            messages: [{ messageId: "cv-route-msg-2", direction: "in", fromEmail: "rute@example.no" }],
+          });
+          assertEq(conflict.status, 409,
+            "cv40: re-ingesting an 'experiences' thread as 'rfb' is refused — a conversation does not change platform");
+          const stray = db.prepare("SELECT COUNT(*) n FROM crm_messages WHERE id = 'cv-route-msg-2'").get() as any;
+          assertEq(stray?.n, 0,
+            "cv41: …and nothing was half-written — the refusal is whole, so the caller can safely retry the same immutable thread");
         } finally {
           if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
           else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
         }
+      }
+      // ═══════════════════════════════════════════════════════════════
+      // cv42-cv45 — REVIEW B3: POST /api/contact, the PUBLIC form.
+      //
+      // This endpoint is live on all three domains and is the only CRM write
+      // path a stranger can reach. Two defects, both measured on the real
+      // router before the fix:
+      //
+      //   (a) its contact lookup was `WHERE email = ?` with no vertical, so a
+      //       form submitted on opplevagent.no attached its thread to the RETT
+      //       FRA BONDEN contact — an `experiences` thread owned by an `rfb`
+      //       contact, invisible to listContacts(vertical:'experiences'). Under
+      //       the new UNIQUE(email, vertical_id) an email no longer identifies a
+      //       row at all, so the unscoped lookup was not just wrong, it was
+      //       undefined behaviour.
+      //   (b) its crm_messages INSERT named no vertical_id, so every message
+      //       from the form fell on the column default 'rfb' — even when its own
+      //       contact and thread were correctly stamped 'experiences'.
+      //
+      // (a) is also the duplicate-manufacturing path that ARMS the cv31 crash:
+      // form-first then CS-ingest produced two contacts sharing an email.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const prevSkip = process.env.SKIP_TURNSTILE;
+        process.env.SKIP_TURNSTILE = "true";
+        try {
+          const contactRoutes = require("../routes/contact") as any;
+          const contactRouter = contactRoutes.default ?? contactRoutes;
+
+          const submit = async (body: any): Promise<number> => {
+            let status = 0;
+            const req: any = {
+              method: "POST", url: "/", query: {}, body,
+              headers: { host: "opplevagent.no" },
+              get(n: string) { return this.headers[n.toLowerCase()]; },
+              ip: "203.0.113.9",
+            };
+            const res: any = {
+              statusCode: 200,
+              status(c: number) { this.statusCode = c; return this; },
+              json() { status = this.statusCode; return this; },
+            };
+            await new Promise<void>((resolve) => {
+              contactRouter.handle(req, res, () => resolve());
+              setTimeout(resolve, 60);
+            });
+            return status || res.statusCode;
+          };
+
+          // Same address already exists as an RFB contact (created by cv13).
+          const SHARED = "bonde@begge-steder.no";
+          const before = (db.prepare("SELECT COUNT(*) n FROM crm_contacts WHERE email = ?").get(SHARED) as any).n;
+
+          await submit({
+            name: "Kari", email: SHARED, subject: "Booking",
+            message: "Hei, jeg vil booke", platform: "experiences",
+          });
+
+          const after = (db.prepare("SELECT COUNT(*) n FROM crm_contacts WHERE email = ?").get(SHARED) as any).n;
+          assertEq(after, before,
+            "cv42: an experiences form submission reuses the EXISTING experiences contact — it does not manufacture a duplicate that would crash the next boot");
+
+          const th = db.prepare(
+            "SELECT t.vertical_id tv, c.vertical_id cv FROM crm_threads t JOIN crm_contacts c ON c.id = t.contact_id WHERE t.subject LIKE '%Booking%' ORDER BY t.rowid DESC LIMIT 1"
+          ).get() as any;
+          assertEq(th?.tv, "experiences", "cv43: the thread is stamped experiences…");
+          assertEq(th?.cv, "experiences",
+            "cv44: …and is owned by the EXPERIENCES contact, not the rfb one — this is the mixing Daniel named, on the one endpoint the public can reach");
+
+          const msg = db.prepare(
+            "SELECT m.vertical_id FROM crm_messages m JOIN crm_threads t ON t.id = m.thread_id WHERE t.subject LIKE '%Booking%' ORDER BY m.rowid DESC LIMIT 1"
+          ).get() as any;
+          assertEq(msg?.vertical_id, "experiences",
+            "cv45: …and so is the message — its INSERT named no vertical_id at all, so it fell on the 'rfb' default while its own thread said experiences");
+        } finally {
+          if (prevSkip === undefined) delete process.env.SKIP_TURNSTILE;
+          else process.env.SKIP_TURNSTILE = prevSkip;
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // cv31-cv33 — REVIEW B1: initSchema must survive the SECOND boot.
+      //
+      // The first version of this migration re-created UNIQUE(email) in the DDL
+      // block on every boot while dropping it further down, so from boot 2 the
+      // DROP stopped being a no-op — SQLite rebuilt the index and validated it
+      // against data that, by then, legally held two contacts sharing an email.
+      // It threw out of initSchema(), out of getDb(), and index.ts calls getDb()
+      // at module top level: the process never reached app.listen(). A crash
+      // loop on the production database, arriving one restart after the first
+      // genuine cross-vertical contact.
+      //
+      // The suite could not see it because it called __initSchemaForTesting
+      // exactly once. This block calls it again, with the duplicate pair from
+      // cv13-cv17 already in the table.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        let threw: string | null = null;
+        try { initMod.__initSchemaForTesting(db as any); } catch (e: any) { threw = String(e?.message ?? e); }
+        assertEq(threw, null, "cv31: a SECOND initSchema pass on a DB holding a cross-vertical contact pair does not throw");
+
+        try { initMod.__initSchemaForTesting(db as any); } catch (e: any) { threw = String(e?.message ?? e); }
+        assertEq(threw, null, "cv32: …nor a third — this runs on every boot, so it must be idempotent across BOOTS, not just DB states");
+
+        // And the migration must not have quietly stopped protecting anything.
+        let dupRejected = false;
+        try {
+          db.prepare(`INSERT INTO crm_contacts (id, type, email, vertical_id) VALUES ('cv31-dup','unknown','bonde@begge-steder.no','rfb')`).run();
+        } catch { dupRejected = true; }
+        assertTrue(dupRejected,
+          "cv33: …and a true duplicate is STILL rejected after repeated boots — surviving the boot must not mean losing uniqueness");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // cv34-cv36 — REVIEW V1-V3: the READ side.
+      //
+      // vSql() could be reduced to `return ""` — deleting the vertical filter
+      // from listContacts, countContactsByType and getDashboardSummary — and the
+      // entire suite stayed green. The write side was pinned; the half a human
+      // actually looks at was not. These read back the two-platform contact pair
+      // that cv13-cv17 created.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const rfbOnly = crm.crmService.listContacts("unknown", { vertical: "rfb", limit: 500 });
+        const expOnly = crm.crmService.listContacts("unknown", { vertical: "experiences", limit: 500 });
+        const shared = "bonde@begge-steder.no";
+        assertEq(rfbOnly.filter((c: any) => c.email === shared).length, 1,
+          "cv34: listContacts(vertical:'rfb') returns the rfb contact…");
+        assertEq(expOnly.filter((c: any) => c.email === shared).length, 1,
+          "cv35: …and listContacts(vertical:'experiences') the OTHER one — one row each, not both in both");
+        const bothRfb = rfbOnly.filter((c: any) => c.email === shared)[0];
+        const bothExp = expOnly.filter((c: any) => c.email === shared)[0];
+        assertTrue(bothRfb?.id !== bothExp?.id,
+          "cv36: …and they are genuinely different rows, so deleting the vertical filter from vSql cannot pass");
       }
     } finally {
       try { db.close(); } catch { /* already closed */ }
