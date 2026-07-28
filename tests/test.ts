@@ -34210,6 +34210,25 @@ runSerial(async () => {
   }
 });
 
+// Daniel, 2026-07-26: «ja, bygg månedstaket.» Mapbox has no hard spending cap
+// to configure, so this module IS the ceiling. Own in-memory DB, fixed `now`
+// instants, no network.
+runSerial(async () => {
+  console.log("\n── Mapbox-månedstak (ruteberegning) ──");
+  try {
+    const { runMapboxBudgetTests } = require("../src/services/mapbox-budget.test") as
+      typeof import("../src/services/mapbox-budget.test");
+    const mb = await runMapboxBudgetTests({ log: false });
+    passed += mb.passed;
+    failed += mb.failed;
+    for (const f of mb.failures) failures.push("mapbox-budget: " + f);
+    console.log(`  mapbox-budget: ${mb.passed} passed, ${mb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mapbox-budget: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1b —
 // experiences were 100 % geo_precision='kommune' (zero at address level), so
 // everything in Bodø reported distance_km 0. Steps E/F of

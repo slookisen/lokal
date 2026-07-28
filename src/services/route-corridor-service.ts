@@ -257,6 +257,7 @@ export type CorridorFailure =
 export function resolveRouteProvider(
   env: NodeJS.ProcessEnv = process.env,
   fetchImpl: typeof fetch = fetch,
+  deps: { consumeBudget?: () => boolean } = {},
 ): RouteProvider | null {
   const choice = (env.ROUTING_PROVIDER || "mapbox").toLowerCase();
 
@@ -269,11 +270,63 @@ export function resolveRouteProvider(
     }
   } else if (choice === "mapbox") {
     const token = (env.MAPBOX_ACCESS_TOKEN || "").trim();
-    if (token) return mapboxProvider(token, fetchImpl);
+    if (token) {
+      // Mapbox is the only METERED provider — a self-hosted OSRM costs nothing
+      // per call, so it is deliberately left uncapped. See mapbox-budget.ts for
+      // why the ceiling has to live in our code: Mapbox offers usage alerts,
+      // not a hard spending cap.
+      const consume =
+        deps.consumeBudget ??
+        (() => {
+          const { tryConsumeMapboxCall } =
+            require("./mapbox-budget") as typeof import("./mapbox-budget");
+          return tryConsumeMapboxCall();
+        });
+      return cappedProvider(mapboxProvider(token, fetchImpl), consume);
+    }
   }
 
   if ((env.ROUTING_FALLBACK || "straight_line").toLowerCase() === "refuse") return null;
   return straightLineProvider();
+}
+
+/**
+ * Wrap a metered provider so that exhausting its monthly allowance DEGRADES
+ * rather than fails.
+ *
+ * The budget is charged inside fetchRoute(), which getPreparedRoute() only
+ * reaches on a cache MISS — so a cached route is free, and the cap bounds
+ * network calls rather than page views.
+ *
+ * On exhaustion this answers with the straight-line provider's result. The
+ * corridor engine already emits an honest note whenever `kind !== "road"`, so
+ * the visitor is told the ordering is real but the road is not. Returning an
+ * error instead would hand them a failure for a budget decision they had no
+ * part in.
+ *
+ * `kind` stays the PRIMARY provider's kind ("road") because it describes what
+ * this provider is, not what any single call returned; the per-route `kind` on
+ * the result is what downstream reads, and that one is honest per call.
+ */
+/** `provider` value on a straight line produced because the monthly cap was hit. */
+export const CAPPED_STRAIGHT_LINE_PROVIDER = "straight-line-capped";
+
+export function cappedProvider(primary: RouteProvider, consume: () => boolean): RouteProvider {
+  const fallback = straightLineProvider();
+  return {
+    id: primary.id,
+    kind: primary.kind,
+    async fetchRoute(from, to, via) {
+      if (!consume()) {
+        const r = await fallback.fetchRoute(from, to, via);
+        // Tag it. "We have not configured routing" and "we have used this
+        // month's allowance" are different facts, and an operator reading a
+        // screenshot must be able to tell which one they are looking at.
+        return { ...r, provider: CAPPED_STRAIGHT_LINE_PROVIDER };
+      }
+      return primary.fetchRoute(from, to, via);
+    },
+  };
 }
 
 // ── Route cache ──────────────────────────────────────────────────────
@@ -381,7 +434,18 @@ export async function getPreparedRoute(
     if (lru.done) break;
     routeCache.delete(lru.value);
   }
-  routeCache.set(key, { meta, prepared, expiresAt: now + ROUTE_CACHE_TTL_MS });
+  // REVIEW B4: never cache a capped fallback. It is keyed under the MAPBOX id
+  // (cappedProvider keeps `id: primary.id`), so a 24 h TTL would keep serving a
+  // straight line — under a note that promises «ekte kjørerute er tilbake ved
+  // månedsskiftet» — for up to 24 h INTO the new month, when real routing is in
+  // fact available again. A sentence the code does not honour is the same
+  // defect class this file's THE HONESTY RULE exists to prevent.
+  //
+  // Not caching it costs nothing: regenerating a straight line is arithmetic,
+  // and the whole point of the capped state is that we are not calling out.
+  if (meta.provider !== CAPPED_STRAIGHT_LINE_PROVIDER) {
+    routeCache.set(key, { meta, prepared, expiresAt: now + ROUTE_CACHE_TTL_MS });
+  }
 
   return { route: meta, prepared, cached: false };
 }
@@ -930,8 +994,12 @@ export async function corridorSearch(opts: CorridorSearchOptions): Promise<Corri
   const straightLine = route.kind !== "road";
   if (straightLine) {
     notes.push(
-      "Vi har ikke ekte kjørerute her, så dette er luftlinjen mellom stedene — ikke veien. " +
-        "Rekkefølgen stemmer, men vi oppgir ingen avstand til ruten.",
+      route.provider === CAPPED_STRAIGHT_LINE_PROVIDER
+        ? "Vi har brukt opp månedens kvote for ruteberegning, så dette er luftlinjen mellom " +
+            "stedene — ikke veien. Rekkefølgen stemmer, men vi oppgir ingen avstand til ruten. " +
+            "Ekte kjørerute er tilbake ved månedsskiftet."
+        : "Vi har ikke ekte kjørerute her, så dette er luftlinjen mellom stedene — ikke veien. " +
+            "Rekkefølgen stemmer, men vi oppgir ingen avstand til ruten.",
     );
   }
 
