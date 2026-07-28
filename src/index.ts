@@ -73,6 +73,7 @@ import adminSalgskanalRoutes from "./routes/admin-salgskanal";
 import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
+import { mountBillingRoutes } from "./routes/admin-billing";
 import contactRouter from "./routes/contact";
 import contactTrackingRoutes, { redirectRouter as contactRedirectRouter } from "./routes/contact-tracking";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -147,7 +148,18 @@ app.use((req, res, next) => {
 // ─── Security Layer ──────────────────────────────────────────
 app.use(securityHeaders);
 app.use(cors(corsOptions));
-app.use(express.json({ limit: MAX_REQUEST_SIZE }));
+// `verify` stashes the exact raw request bytes on req.rawBody alongside the
+// normal parsed req.body. Added for dev-request 2026-07-13-billing-skjelett-
+// moerkt: Stripe webhook signature verification (routes/admin-billing.ts)
+// needs the raw bytes — its HMAC is computed over them, not over a
+// re-serialization of the parsed JSON — and this is the only place in the
+// request pipeline where the raw stream is still available (the billing
+// router mounts much later, after this global parser has already run).
+// Harmless for every other route: they only ever read req.body as before.
+app.use(express.json({
+  limit: MAX_REQUEST_SIZE,
+  verify: (req: any, _res, buf) => { req.rawBody = buf; },
+}));
 app.use(sanitizeInput);
 
 // AI-crawler allowlist — mark known AI crawler UAs on safe read-only
@@ -683,6 +695,16 @@ if (process.env.CRM_ENABLED !== "0") {
     res.sendFile(path.join(__dirname, "public", "admin-sent-log.html"));
   });
 }
+
+// Billing skeleton (Produsent-Premium, test-mode Stripe) — dev-request
+// 2026-07-13-billing-skjelett-moerkt. Feature-flagged via BILLING_ENABLED
+// env var; default OFF (the OPPOSITE default of CRM_ENABLED above — this is
+// a dark skeleton, not a live feature: flag unset/anything-but-"1" means
+// zero routes mounted, zero behavior change). The flag check (plus the
+// live-Stripe-key guard) lives inside mountBillingRoutes() itself
+// (routes/admin-billing.ts) so it stays unit-testable without booting the
+// whole app — this call is unconditional on purpose.
+mountBillingRoutes(app);
 
 // ─── GET /admin/blocklist (Phase 4.11 — work-order #3 step 4) ─────────
 // Thin alias for /api/marketplace/admin/blocklist so verifier probes don't

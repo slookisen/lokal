@@ -3344,6 +3344,91 @@ function initSchema(db: Database.Database): void {
     );
   } catch { /* index already created */ }
 
+  // ─── dev-request 2026-07-13-billing-skjelett-moerkt ─────────────────────
+  // (L4, Daniel-authorized 2026-07-20 — daniel-responses/2026-07-20-go-
+  // billing-skjelett-moerkt.md): a DARK skeleton for a test-mode Stripe
+  // subscription flow ("Produsent-Premium", 199/499 kr/mnd placeholders),
+  // entirely behind BILLING_ENABLED (default OFF — see mountBillingRoutes()
+  // in src/routes/admin-billing.ts and the flag block in src/index.ts).
+  // These three tables are purely additive/new — no ALTER of any existing
+  // table, same idiom as contact_clicks/consumer_api_keys above (a plain
+  // CREATE TABLE IF NOT EXISTS is itself the safe migration for a table that
+  // never existed before).
+  //
+  // billing_subscriptions: one row per subscription attempt/lifecycle.
+  //   agent_id                : which producer this subscription belongs to.
+  //                             No FK — same convention as contact_clicks/
+  //                             analytics_agent_views (history survives an
+  //                             agent later being deleted).
+  //   plan                    : 'produsent_premium_199' | '..._499' — see
+  //                             BILLING_PLANS in services/billing-service.ts.
+  //   status                  : our narrower status vocabulary (mapped from
+  //                             Stripe's own by mapStripeStatus()) —
+  //                             'incomplete' | 'active' | 'past_due' |
+  //                             'canceled'. 'active' is the only status that
+  //                             grants the demo entitlements below.
+  //   stripe_customer_id / stripe_subscription_id : Stripe's own ids. NEVER
+  //                             a secret key — these are opaque object ids,
+  //                             safe to store.
+  //   current_period_end      : ISO-8601, from the Stripe subscription
+  //                             item's current_period_end (API 2025+ moved
+  //                             this field to item-level — see
+  //                             periodEndFromStripeSub() in
+  //                             services/billing-service.ts).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS billing_subscriptions (
+      id                      TEXT PRIMARY KEY,
+      agent_id                TEXT NOT NULL,
+      plan                    TEXT NOT NULL CHECK(plan IN ('produsent_premium_199','produsent_premium_499')),
+      status                  TEXT NOT NULL DEFAULT 'incomplete' CHECK(status IN ('incomplete','active','past_due','canceled')),
+      stripe_customer_id      TEXT,
+      stripe_subscription_id  TEXT,
+      current_period_end      TEXT,
+      created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_billing_subscriptions_agent_id ON billing_subscriptions(agent_id)`);
+  try {
+    db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_subscriptions_stripe_subscription_id
+         ON billing_subscriptions(stripe_subscription_id) WHERE stripe_subscription_id IS NOT NULL`
+    );
+  } catch { /* partial unique index unsupported on this sqlite build — non-fatal, lookups still work */ }
+
+  // billing_entitlements: the entitlement-check MECHANISM (acceptance
+  // criterion 2). (agent_id, feature_key) -> granted. Wired ONLY to the two
+  // demo/stub feature keys in DEMO_ENTITLEMENT_FEATURES
+  // (services/billing-service.ts) — deliberately NOT wired to any of today's
+  // real dashboard functions. Upserted by syncEntitlementsForStatus() on
+  // every subscription create/upgrade/cancel/webhook-driven status change.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS billing_entitlements (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id    TEXT NOT NULL,
+      feature_key TEXT NOT NULL,
+      granted     INTEGER NOT NULL DEFAULT 0,
+      source      TEXT NOT NULL DEFAULT 'subscription',
+      updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(agent_id, feature_key)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_billing_entitlements_agent_id ON billing_entitlements(agent_id)`);
+
+  // billing_webhook_events: webhook-idempotency ledger. stripe_event_id is
+  // the PRIMARY KEY so a duplicate webhook delivery is a no-op (INSERT
+  // fails), not a double-apply — see handleBillingWebhook() in
+  // services/billing-service.ts, which also pre-checks this table so it can
+  // report `duplicate: true` distinctly rather than relying solely on the
+  // caught constraint violation.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS billing_webhook_events (
+      stripe_event_id TEXT PRIMARY KEY,
+      type            TEXT NOT NULL,
+      received_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
 }
 
 export function closeDb(): void {
