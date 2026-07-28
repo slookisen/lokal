@@ -408,6 +408,15 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
           ).get() as any;
           assertEq(cThread?.tv, "experiences", "cv39: …and with a vertical the thread lands on the named platform");
           assertEq(cThread?.cv, "experiences", "cv39b: …as does the contact — not hardcoded to rfb on either call");
+          // REVIEW T8: cv39/cv39b cover composeNewThread's two rows. The route
+          // makes a SECOND downstream call — enqueueOutbox — and hardcoding
+          // 'rfb' there survived, because nothing read the outbox row. That is
+          // the row the sender actually acts on.
+          const cOut = db.prepare(
+            "SELECT vertical_id FROM crm_outbox WHERE subject = 'Emne' ORDER BY rowid DESC LIMIT 1"
+          ).get() as any;
+          assertEq(cOut?.vertical_id, "experiences",
+            "cv39c: …and so is the OUTBOX row — the one the sender acts on, reached by a separate call the other two assertions never touch");
 
           // ── cv40-cv41: REVIEW B4 — a thread cannot change platform ──
           //
@@ -459,24 +468,30 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
           const contactRoutes = require("../routes/contact") as any;
           const contactRouter = contactRoutes.default ?? contactRoutes;
 
+          // The route is POST /contact (not "/"), and it is async — the first
+          // version of this helper posted to "/" and therefore never reached
+          // the handler at all. Every assertion below then read a DIFFERENT
+          // thread that happened to match its LIKE pattern, and the whole block
+          // passed while testing nothing. Both bugs are named here because the
+          // failure mode — green assertions over an unexecuted route — is the
+          // one this suite exists to catch elsewhere.
           const submit = async (body: any): Promise<number> => {
-            let status = 0;
             const req: any = {
-              method: "POST", url: "/", query: {}, body,
+              method: "POST", url: "/contact", query: {}, body,
               headers: { host: "opplevagent.no" },
               get(n: string) { return this.headers[n.toLowerCase()]; },
               ip: "203.0.113.9",
             };
+            let settle: () => void;
+            const done = new Promise<void>((r) => { settle = r; });
             const res: any = {
               statusCode: 200,
               status(c: number) { this.statusCode = c; return this; },
-              json() { status = this.statusCode; return this; },
+              json() { settle(); return this; },
             };
-            await new Promise<void>((resolve) => {
-              contactRouter.handle(req, res, () => resolve());
-              setTimeout(resolve, 60);
-            });
-            return status || res.statusCode;
+            contactRouter.handle(req, res, () => settle());
+            await done;
+            return res.statusCode;
           };
 
           // Same address already exists as an RFB contact (created by cv13).
@@ -484,7 +499,7 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
           const before = (db.prepare("SELECT COUNT(*) n FROM crm_contacts WHERE email = ?").get(SHARED) as any).n;
 
           await submit({
-            name: "Kari", email: SHARED, subject: "Booking",
+            name: "Kari", email: SHARED, subject: "KONTAKTSKJEMA-CV42",
             message: "Hei, jeg vil booke", platform: "experiences",
           });
 
@@ -493,14 +508,14 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
             "cv42: an experiences form submission reuses the EXISTING experiences contact — it does not manufacture a duplicate that would crash the next boot");
 
           const th = db.prepare(
-            "SELECT t.vertical_id tv, c.vertical_id cv FROM crm_threads t JOIN crm_contacts c ON c.id = t.contact_id WHERE t.subject LIKE '%Booking%' ORDER BY t.rowid DESC LIMIT 1"
+            "SELECT t.vertical_id tv, c.vertical_id cv FROM crm_threads t JOIN crm_contacts c ON c.id = t.contact_id WHERE t.subject LIKE '%KONTAKTSKJEMA-CV42%' ORDER BY t.rowid DESC LIMIT 1"
           ).get() as any;
           assertEq(th?.tv, "experiences", "cv43: the thread is stamped experiences…");
           assertEq(th?.cv, "experiences",
             "cv44: …and is owned by the EXPERIENCES contact, not the rfb one — this is the mixing Daniel named, on the one endpoint the public can reach");
 
           const msg = db.prepare(
-            "SELECT m.vertical_id FROM crm_messages m JOIN crm_threads t ON t.id = m.thread_id WHERE t.subject LIKE '%Booking%' ORDER BY m.rowid DESC LIMIT 1"
+            "SELECT m.vertical_id FROM crm_messages m JOIN crm_threads t ON t.id = m.thread_id WHERE t.subject LIKE '%KONTAKTSKJEMA-CV42%' ORDER BY m.rowid DESC LIMIT 1"
           ).get() as any;
           assertEq(msg?.vertical_id, "experiences",
             "cv45: …and so is the message — its INSERT named no vertical_id at all, so it fell on the 'rfb' default while its own thread said experiences");
