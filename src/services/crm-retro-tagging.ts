@@ -83,8 +83,22 @@ export interface RetroPlan {
   candidates: RetroCandidate[];
   byTier: Record<string, number>;
   byProposedVertical: Record<string, number>;
-  /** Rows with no documentary evidence. They stay put. */
+  /** Rows with no documentary evidence at all. They stay put. */
   undecidable: number;
+  /**
+   * Rows whose evidence CONFIRMS the vertical they already carry.
+   *
+   * This bucket exists because the first version omitted it and the numbers did
+   * not add up: a thread addressed to kontakt@rettfrabonden.com has perfectly
+   * good tier-B evidence for 'rfb', so it is neither a candidate nor
+   * undecidable — and it was being dropped from the report entirely. Reading
+   * "scanned 1419, candidates 7, undecidable 12" left ~1400 threads
+   * unaccounted for, which is the silent-omission failure this dev-request is
+   * about, reproduced in its own report.
+   *
+   * candidates + alreadyCorrect + undecidable === scanned, always.
+   */
+  alreadyCorrect: number;
   /**
    * Identity of this exact plan. `apply` must quote it back, so an apply can
    * never land on a plan Daniel did not read — see applyRetroTagging.
@@ -229,6 +243,7 @@ export function planRetroTagging(opts: { limit?: number } = {}): RetroPlan {
 
   const candidates: RetroCandidate[] = [];
   let undecidable = 0;
+  let alreadyCorrect = 0;
 
   for (const t of threads) {
     // Tier A first: a recorded platform beats a header, because the form knew
@@ -246,8 +261,12 @@ export function planRetroTagging(opts: { limit?: number } = {}): RetroPlan {
       undecidable++;
       continue;
     }
-    // Already correct — not a candidate, and not undecidable either.
-    if (hit.vertical === t.vertical_id) continue;
+    // Already correct — not a candidate, and not undecidable either. Counted
+    // in its own bucket so the three add up to `scanned`.
+    if (hit.vertical === t.vertical_id) {
+      alreadyCorrect++;
+      continue;
+    }
 
     candidates.push({
       threadId: t.id,
@@ -276,6 +295,7 @@ export function planRetroTagging(opts: { limit?: number } = {}): RetroPlan {
     byTier,
     byProposedVertical,
     undecidable,
+    alreadyCorrect,
     planFingerprint: fingerprint(candidates),
   };
 }
