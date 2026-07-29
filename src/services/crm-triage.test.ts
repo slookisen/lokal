@@ -292,8 +292,8 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
 
         const parked = db.prepare("SELECT * FROM crm_untriaged WHERE thread_id = ?").get("tr-ing-unknown") as any;
         assertTrue(!!parked, "tr30: the thread IS durably recorded — parking is what makes the silence audible");
-        assertTrue(String(parked.reason).length > 10, "tr30b: …with a reason a human can act on");
-        assertTrue(String(parked.raw_payload).includes("tr-ing-unknown-m1"),
+        assertTrue(String(parked?.reason).length > 10, "tr30b: …with a reason a human can act on");
+        assertTrue(String(parked?.raw_payload).includes("tr-ing-unknown-m1"),
           "tr30c: …and the full payload, so assignment can replay it without going back to Gmail");
       }
 
@@ -379,7 +379,7 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
         assertEq(r.status, 409, "tr39: re-ingesting a thread under a different platform is still refused with 409 (review B4)");
         const parked = db.prepare("SELECT id, reason FROM crm_untriaged WHERE thread_id = ?").get("tr-ing-legacy") as any;
         assertTrue(!!parked, "tr40: …and it NOW lands in the bucket. Before steg 4 a conflicting thread failed only in the agent's own log — invisible to Daniel");
-        assertTrue(String(parked.reason).includes("already belongs to vertical"),
+        assertTrue(String(parked?.reason).includes("already belongs to vertical"),
           "tr40b: …carrying the conflict as its reason");
         const t = db.prepare("SELECT vertical_id FROM crm_threads WHERE id = ?").get("tr-ing-legacy") as any;
         assertEq(t?.vertical_id, "rfb", "tr40c: …and the existing thread is untouched");
