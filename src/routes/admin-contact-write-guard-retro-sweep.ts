@@ -11,8 +11,12 @@
 //
 // ── dry-run by default, apply is a real write path ──────────────────────────
 // dry_run (the default — no `apply` truthy form present) never writes
-// anything; it reports exactly the same counts an `apply` call would produce.
-// apply=true (see the exact truthy-form list below) performs the actual
+// anything. Its `violations_found`/`skipped_claimed`/`skipped_curated` counts
+// match what an `apply` call would find, but NOT `written` — a dry-run's
+// `written` is always 0 by construction (nothing was written yet), so a
+// dry-run's `written: 0` means "not attempted", not "nothing to fix"; read
+// `violations_found` for that. apply=true (see the exact truthy-form list
+// below) performs the actual
 // writes. Per the dev-request's own instruction ("Apply krever Daniels
 // godkjenning av tallet") apply is never invoked automatically by any
 // upstream automation in this repo — a human decides to flip it after
