@@ -616,6 +616,32 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
           "tr60: an RFB send does NOT increment the cross-platform count — it is the pool's own exclusion, not an overlap");
         assertTrue(!(after2.body?.candidates ?? []).map((c: any) => c.agent_id).includes("tr-cand-clean"),
           "tr60b: …though it does drop them from the pool, by the pre-existing rfb-scoped exclusion");
+
+        // ── tr61-tr63: the same question in mode=second ─────────────
+        //
+        // tr60 alone does NOT pin the `vertical_id != 'rfb'` filter. Measured:
+        // deleting that line left the whole suite green. mode=first reads
+        // outreach_ready_pool, whose exclusion is already rfb-scoped, so an RFB
+        // send removes the row before the cross-platform counter can ever see
+        // it — the assertion was true for a reason that had nothing to do with
+        // the clause under test.
+        //
+        // mode=second does not use the VIEW. There an RFB send inside the
+        // window DOES reach the loop, and without the filter every ordinary
+        // second-touch repeat would be reported as an overlap producer. That is
+        // worse than no counter: a number 4e exists to produce, quietly wrong.
+        {
+          const second = await getCandidates("mode=second&limit=500");
+          assertEq(second.status, 200, "tr61: the gate answers in mode=second");
+          const rep2 = second.body?.cross_platform_cooldown;
+          const named = (rep2?.producers ?? []).map((x: any) => x.agent_id);
+          assertTrue(!named.includes("tr-cand-clean"),
+            "tr62: an RFB send inside the window is NOT reported as cross-platform in mode=second — this is the assertion mode=first could not make");
+          assertEq(rep2?.by_vertical?.rfb, undefined,
+            "tr62b: …and 'rfb' never appears as a SUPPRESSING platform, because suppression by your own platform is not an overlap");
+          assertTrue(named.includes("tr-cand-overlap"),
+            "tr63: …while the genuine Opplevagent overlap IS still reported here, so tr62 is a filter and not a blanket zero");
+        }
       }
 
       // ═══════════════════════════════════════════════════════════════
