@@ -800,6 +800,24 @@ console.log("\n── orch-pr-13: contact-normalizer (address/phone) ──");
   console.log(`  contact-normalizer: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon
+// (slice 1): write-time contact guard — validatePhoneForWrite /
+// stripTrailingContactLabel (contact-normalizer.ts), wired into
+// KnowledgeService.upsertKnowledge(). Closes the gap where a
+// structurally-impossible value (org-nr, date) could be persisted into
+// `phone` because the existing national8/normalizePhone validity check was
+// only ever consulted at comparison/display time, never at write time. ──
+console.log("\n── contact-normalizer-write-guard (validatePhoneForWrite / stripTrailingContactLabel) ──");
+{
+  const { runContactNormalizerWriteGuardTests } = require("../src/services/contact-normalizer-write-guard.test") as
+    typeof import("../src/services/contact-normalizer-write-guard.test");
+  const r = runContactNormalizerWriteGuardTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("contact-normalizer-write-guard: " + f);
+  console.log(`  contact-normalizer-write-guard: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── homepage-provenance-contact-extraction-fix (2026-07-29): the two
 // extractAddress/extractPhone bugs (poststed swallowing a trailing contact
 // label; phone accepting date-shaped/org-number-slice 8-digit runs) that

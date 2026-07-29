@@ -123,6 +123,148 @@ export function isDisplayablePhone(raw: string | null | undefined): raw is strin
   return national8(normalizePhone(raw)) !== null;
 }
 
+// ─── Write-time guards (dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon) ──
+//
+// The above functions (normalizePhone/national8/isDisplayablePhone/phonesMatch)
+// are only ever consulted at COMPARISON or DISPLAY time. They were never in
+// the write path, so nothing stopped a structurally-impossible value —  a
+// 9-digit Norwegian organisasjonsnummer or an 8-digit date — from being
+// persisted into `phone` by KnowledgeService.upsertKnowledge() as if it were
+// a real phone number. Confirmed live regressions (2026-07-27,
+// controller/enrichment-write-pause.yaml):
+//   • "927 011 840" (org-nr) written verbatim as phone for one agent.
+//   • "20100101" (a date) written verbatim as phone for another.
+//   • "Valmen 54, 2460 Osen Telefon" — a scraped field-label ("Telefon")
+//     leaked onto the end of an address string.
+//
+// validatePhoneForWrite/stripTrailingContactLabel are the WRITE-time gate:
+// called once, right before a new value is allowed to reach INSERT/UPDATE,
+// so no matter what new way a future extractor finds to be wrong about a
+// phone/address shape, a structurally-impossible value can never reach the
+// DB. Fail-closed: any failing check rejects the whole value (never a
+// partial/guessed value) — same "false negative is safe, false positive is
+// not" posture as the rest of this module.
+
+/**
+ * Decide whether a raw phone value is safe to WRITE (not just display).
+ *
+ * Returns the ORIGINAL `raw` string unchanged if it passes every check, or
+ * `null` if it should be rejected (caller should then leave the field
+ * blank / fall back to the existing stored value — never store a partial or
+ * "closest guess" value).
+ *
+ * Checks (ANY failing ⇒ reject):
+ *   1. Shape: `raw` must reduce to a valid 8-digit Norwegian national number
+ *      via the EXISTING `national8(normalizePhone(raw))` — no reimplementation.
+ *   2. Not the agent's own org-nr: compares both the full digit-only form
+ *      (not just the reduced 8-digit form) so an org-nr-shaped value is
+ *      caught even before/independent of the shape check, AND the rule-1
+ *      `reduced` (national8) form, so a bare (no `+`/`00`) `47`-prefixed
+ *      value that `normalizePhone` doesn't strip but `national8` still
+ *      reduces to the org-nr's last 8 digits is also caught. Rejects if
+ *      `normalizePhone(raw)` equals `normalizePhone(orgNr)`, OR equals the
+ *      LAST 8 digits of `normalizePhone(orgNr)`, OR `reduced` equals that
+ *      same last-8-digit form. Skipped when `orgNr` is empty/null.
+ *   3. Not a plausible calendar date: if the value reduces to exactly 8
+ *      digits, those 8 digits must NOT parse as a plausible YYYYMMDD date
+ *      (year 1900-2099, valid month/day).
+ */
+export function validatePhoneForWrite(
+  raw: string | null | undefined,
+  orgNr: string | null | undefined,
+): string | null {
+  if (!raw) return null; // (a) nothing to validate
+
+  // (b) Rule 1 — exact-8-digit shape (delegates to the existing, already-
+  // trusted national8/normalizePhone logic; not reimplemented here).
+  const reduced = national8(normalizePhone(raw));
+  if (reduced === null) {
+    console.log(`[contact-write-guard] rejected phone "${raw}": rule1 - does not reduce to a valid 8-digit Norwegian national number`);
+    return null;
+  }
+
+  // (c) Rule 2 — not the agent's own org-nr. Runs independent of rule 1's
+  // result (checked here unconditionally on the digit-only forms) so a value
+  // that ALSO happens to look like a valid 8-digit number is still caught.
+  if (orgNr) {
+    const rawDigits = normalizePhone(raw);
+    const orgDigits = normalizePhone(orgNr);
+    if (orgDigits) {
+      const orgLast8 = orgDigits.length >= 8 ? orgDigits.slice(-8) : orgDigits;
+      if (rawDigits === orgDigits || rawDigits === orgLast8 || reduced === orgLast8) {
+        console.log(`[contact-write-guard] rejected phone "${raw}": rule2 - matches agent's own org-nr`);
+        return null;
+      }
+    }
+  }
+
+  // (d) Rule 3 — not a plausible calendar date (only applicable once we know
+  // the value is exactly 8 digits, i.e. `reduced` came from the 8-digit
+  // branch of national8 rather than the "47"-prefixed 10-digit branch).
+  if (/^\d{8}$/.test(reduced) && looksLikeYyyymmdd(reduced)) {
+    console.log(`[contact-write-guard] rejected phone "${raw}": rule3 - looks like a YYYYMMDD date`);
+    return null;
+  }
+
+  // (e) All checks passed — return the ORIGINAL value unchanged.
+  return raw;
+}
+
+// Days-in-month lookup (non-leap-year safe upper bound; Feb allowed up to 29
+// so a leap-year date like "20240229" is still recognised as date-shaped —
+// this is a conservative WRITE-time reject check, not a calendar validator,
+// so erring toward "looks date-ish" is the safe direction here).
+const DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/**
+ * True when an 8-digit string plausibly parses as YYYYMMDD:
+ * year 1900-2099, month 01-12, day valid for that month.
+ */
+function looksLikeYyyymmdd(digits8: string): boolean {
+  if (!/^\d{8}$/.test(digits8)) return false;
+  const year = parseInt(digits8.slice(0, 4), 10);
+  const month = parseInt(digits8.slice(4, 6), 10);
+  const day = parseInt(digits8.slice(6, 8), 10);
+  if (year < 1900 || year > 2099) return false;
+  if (month < 1 || month > 12) return false;
+  if (day < 1 || day > DAYS_IN_MONTH[month - 1]) return false;
+  return true;
+}
+
+// A trailing standalone contact-field label — matched at the very end of the
+// (trimmed) string, optionally preceded by a colon/comma/whitespace
+// separator. Anchored with `\b` + `$` so "Kontaktveien 3" (label embedded as
+// part of a real street name) is never matched — only a label that is its
+// own trailing token is.
+const TRAILING_CONTACT_LABEL = /[\s,:]+(?:Telefon|Tlf\.?|E-?post|Adresse|Kontakt)[:,]?$/i;
+
+/**
+ * Strip a trailing standalone contact-field label ("Telefon", "Tlf", "Tlf.",
+ * "E-post"/"Epost", "Adresse", "Kontakt" — case-insensitive) from the end of
+ * an address string, if present. Conservative: only strips when the label is
+ * the LAST whitespace/punctuation-delimited token, so it never touches a
+ * label that's part of a real street name ("Kontaktveien 3"). If stripping
+ * would leave the string empty, the original is returned unchanged instead —
+ * an address must never become blank via this function.
+ *
+ * `null`/`undefined` pass through unchanged.
+ */
+export function stripTrailingContactLabel(
+  address: string | null | undefined,
+): string | null | undefined {
+  if (address === null || address === undefined) return address;
+  if (typeof address !== "string") return address;
+
+  const trimmed = address.trim();
+  const match = trimmed.match(TRAILING_CONTACT_LABEL);
+  if (!match) return address;
+
+  const stripped = trimmed.slice(0, match.index).replace(/[\s,:]+$/g, "").trim();
+  if (!stripped) return address; // never let the field go blank
+
+  return stripped;
+}
+
 // ─── Address ─────────────────────────────────────────────────────────────────
 
 /**
