@@ -644,6 +644,48 @@ function initSchema(db: Database.Database): void {
     -- The gap this leaves is one synchronous initSchema() pass on a fresh DB,
     -- before any connection can write. Nothing can insert a duplicate in it.
 
+    -- ─── crm_untriaged — the bucket for mail we CANNOT route ──────────
+    --
+    -- dev-request 2026-07-27-crm-plattformadskillelse, steg 4:
+    --   «Ukjent/tvetydig signal → egen «utriaged»-bøtte for Daniel, ALDRI en gjetning.»
+    --
+    -- Deliberately NOT a vertical. vertical_id is NOT NULL with a closed union
+    -- everywhere else, and adding an 'unknown' member would have been the easy
+    -- move — but then every read that filters by platform has to decide what to
+    -- do with it, and a BUG that writes 'unknown' becomes indistinguishable from
+    -- a genuine untriaged item. Keeping it out of the union means the type system
+    -- still guarantees every row in the CRM proper belongs to a real platform.
+    --
+    -- Why a table at all: without one, an unroutable thread cannot enter the CRM
+    -- (POST /ingest rejects a missing vertical, correctly), so the agent's only
+    -- option is to drop it. That is the silent failure this dev-request exists to
+    -- stop — the mail disappears and nothing anywhere says so. This makes the
+    -- undecidable case VISIBLE and countable instead.
+    --
+    -- Rows leave only by an explicit human assignment, which promotes them into
+    -- the real CRM through the normal ingest path. Nothing here is ever guessed
+    -- into a platform.
+    CREATE TABLE IF NOT EXISTS crm_untriaged (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL UNIQUE,      -- Gmail threadId, so re-parking is idempotent
+      from_email TEXT NOT NULL,
+      subject TEXT,
+      snippet TEXT,
+      -- WHY we could not route it, in the agent's own words. Free text on purpose:
+      -- the useful content is the signal it actually saw, and a closed enum here
+      -- would push the agent to pick the nearest wrong label.
+      reason TEXT NOT NULL,
+      -- The raw routing evidence (delivered-to, wrapper From, Received chain…).
+      -- Kept so a human can re-decide without going back to Gmail.
+      signals TEXT NOT NULL DEFAULT '{}',
+      raw_payload TEXT NOT NULL DEFAULT '{}',   -- the full ingest body, replayed on assign
+      created_at TEXT DEFAULT (datetime('now')),
+      resolved_at TEXT,
+      resolved_vertical TEXT,                    -- set on assignment; NULL while open
+      resolved_by TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_untriaged_open ON crm_untriaged(resolved_at, created_at);
+
     CREATE TABLE IF NOT EXISTS crm_threads (
       id TEXT PRIMARY KEY,
       contact_id TEXT NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
