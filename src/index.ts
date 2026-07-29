@@ -59,6 +59,7 @@ import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
+import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
@@ -621,6 +622,13 @@ app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoher
 // opening-hours). Read-only / dry-run only — no apply mode, zero writes.
 // GET /admin/wrong-entity-retro-sweep
 app.use("/admin/wrong-entity-retro-sweep", adminLimiter, adminWrongEntityRetroSweepRoutes);
+// dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 2: the
+// live-data-cleanup half of PR #405 (that PR's own commit message flagged
+// this as "a separate, non-code operational step, not part of this PR").
+// Clears the ONE hardcoded chimera agent_knowledge row's Bondens-Kolonial-
+// contaminated fields. Dry-run by default; apply=true writes.
+// POST /admin/crm-chimera-agent-clear
+app.use("/admin/crm-chimera-agent-clear", adminLimiter, adminCrmChimeraAgentClearRoutes);
 // dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: moves
 // directory/booking-portal/industry-association URLs out of dental_agents.
 // hjemmeside into the additive directory_url column — dry-run by default,

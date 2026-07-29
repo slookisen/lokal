@@ -34803,3 +34803,28 @@ runSerial(async () => {
     failures.push("produsent-role-gate: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 2:
+// POST /admin/crm-chimera-agent-clear (src/routes/admin-crm-chimera-agent-clear.ts)
+// — clears the ONE hardcoded chimera agent_knowledge row (agent_id
+// 2b5fc7a6-b446-4bea-8c2d-21315c6c6e17)'s Bondens-Kolonial-contaminated
+// fields; the live-data-cleanup half of PR #405, which shipped only the
+// code-guards and left this write path as a separate follow-up. Own
+// harness (__setDbForTesting/__initSchemaForTesting, real router handler
+// pulled off the route stack — mirrors admin-domain-coherence.test.ts's
+// harness). Runs via runSerial() like the suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding: crm-chimera-agent-clear (slice 2) ──");
+  try {
+    const { runAdminCrmChimeraAgentClearTests } = require("../src/routes/admin-crm-chimera-agent-clear.test") as
+      typeof import("../src/routes/admin-crm-chimera-agent-clear.test");
+    const ccc = await runAdminCrmChimeraAgentClearTests({ log: false });
+    passed += ccc.passed;
+    failed += ccc.failed;
+    for (const f of ccc.failures) failures.push("crm-chimera-agent-clear: " + f);
+    console.log(`  crm-chimera-agent-clear: ${ccc.passed} passed, ${ccc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-chimera-agent-clear: unexpected error: " + String(err?.message || err));
+  }
+});
