@@ -148,6 +148,38 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "phone-05: an ordinary isolated 8-digit phone number still extracts correctly (fix doesn't break the common case)",
   );
 
+  // ── Bug 3 (round-2 regression fix): extractPhone — prefix glued directly
+  //    to the digits with no separator ─────────────────────────────────────
+
+  // "+47" glued directly onto the 8 digits, zero separating characters —
+  // this exact shape regressed to null in round 1 (the `before` neighbour
+  // check was inspecting the prefix's own last digit instead of the
+  // character before the whole match).
+  const htmlPlusPrefixGlued = "<html><body><p>Ring +4791234567 na</p></body></html>";
+  assertEq(
+    extractPhone(htmlPlusPrefixGlued),
+    "91234567",
+    "phone-06: a '+47' prefix glued directly to the digits (no separator) still extracts the phone",
+  );
+
+  // "0047" glued directly onto the 8 digits — same shape, different prefix.
+  const htmlZeroPrefixGlued = "<html><body><p>Ring 004791234567 na</p></body></html>";
+  assertEq(
+    extractPhone(htmlZeroPrefixGlued),
+    "91234567",
+    "phone-07: a '0047' prefix glued directly to the digits (no separator) still extracts the phone",
+  );
+
+  // "+47" glued prefix in a different sentence shape (label prefix, no
+  // trailing text) — guards against the fix being overly narrow to one
+  // surrounding context.
+  const htmlPlusPrefixGluedLabel = "<html><body><p>Telefon: +4791234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlPlusPrefixGluedLabel),
+    "91234567",
+    "phone-08: a '+47' prefix glued to the digits after a 'Telefon:' label still extracts the phone",
+  );
+
   return { passed, failed, failures };
 }
 

@@ -5194,7 +5194,7 @@ export function extractPhone(html: string): string | null {
     // matched digit group (m[1]) in the original text.
     const groupStart = m.index + (m[0].length - m[1].length);
     const groupEnd = groupStart + m[1].length;
-    const before = groupStart > 0 ? text[groupStart - 1] : "";
+    const before = m.index > 0 ? text[m.index - 1] : "";
     const after = groupEnd < text.length ? text[groupEnd] : "";
     if (/\d/.test(before) || /\d/.test(after)) continue;
     return digits;
