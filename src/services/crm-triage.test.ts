@@ -66,6 +66,12 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
   return (async () => {
     const prevDb = initMod.__peekDbForTesting();
     const prevAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+    // admin-outreach-candidates reads ADMIN_KEY FIRST and only then falls back
+    // to ANALYTICS_ADMIN_KEY. Setting only the latter left every candidates
+    // call at 403 — and two of the assertions below ("X is not in the list")
+    // passed anyway, against an empty list. That is why tr55b/tr55c assert the
+    // fixtures ARE candidates before anything asserts one is missing.
+    const prevAdminKey2 = process.env.ADMIN_KEY;
     const prevTurnstile = process.env.SKIP_TURNSTILE;
     const db = new Database(":memory:");
     const triage = require("./crm-triage") as typeof import("./crm-triage");
@@ -75,6 +81,7 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
       initMod.__setDbForTesting(db as any);
       initMod.__initSchemaForTesting(db as any);
       process.env.ANALYTICS_ADMIN_KEY = "test-admin-key";
+      process.env.ADMIN_KEY = "test-admin-key";
       process.env.SKIP_TURNSTILE = "true";
 
       const RFB = "kontakt@rettfrabonden.com";
@@ -507,6 +514,111 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
       }
 
       // ═══════════════════════════════════════════════════════════════
+      // tr55-tr60 — kriterium 4e proper: THE CAMPAIGN REPORTS IT.
+      //
+      //   «kampanjen rapporterer «N produsenter hoppet over av kryss-plattform
+      //    cooldown», med den undertrykkende vertical navngitt.
+      //    Skal ikke shippes claim-kampanje uten dette.»
+      //
+      // The 429 above is per-send and after the fact. This is the forewarning:
+      // the gate that hands the campaign its target list must say, up front,
+      // which producers it is holding back and which platform is holding them.
+      //
+      // The fixture is deliberately a producer who IS pool-eligible and IS in
+      // outreach_ready_pool — i.e. one the RFB pool correctly does NOT exclude
+      // (steg 3 scoped that exclusion to vertical_id='rfb'). Without a
+      // pool-eligible fixture the assertions would read "not a candidate" for
+      // reasons that have nothing to do with the clause under test.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const candRoutes = require("../routes/admin-outreach-candidates") as any;
+        const candRouter = candRoutes.default ?? candRoutes;
+        const getCandidates = async (qs: string): Promise<{ status: number; body: any }> => {
+          const query: Record<string, string> = {};
+          for (const kv of qs.split("&").filter(Boolean)) {
+            const [k, v] = kv.split("=");
+            query[k] = decodeURIComponent(v ?? "");
+          }
+          const req: any = {
+            method: "GET", url: `/?${qs}`, originalUrl: `/?${qs}`, path: "/", query, body: {},
+            headers: { "x-admin-key": "test-admin-key" },
+            get(n: string) { return this.headers[n.toLowerCase()]; },
+          };
+          let settle: () => void;
+          const done = new Promise<void>((r) => { settle = r; });
+          const res: any = {
+            statusCode: 200, _body: undefined,
+            status(c: number) { this.statusCode = c; return this; },
+            json(b: any) { this._body = b; settle(); return this; },
+          };
+          candRouter.handle(req, res, () => settle());
+          await done;
+          return { status: res.statusCode, body: res._body };
+        };
+
+        const mkEligible = (id: string, email: string) => {
+          db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
+                      VALUES (?,?, 'x','test', ?, 'https://x.example.no','producer',?,1)`)
+            .run(id, id, email, `key-${id}`);
+          db.prepare(`INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status,
+                        url_last_status, url_last_probed)
+                      VALUES (?,?, 'verified','rich',200,datetime('now'))`).run(id, email);
+        };
+        mkEligible("tr-cand-clean", "ren@gaard.no");
+        mkEligible("tr-cand-overlap", "overlapp2@gaard.no");
+
+        // Baseline FIRST — an assertion that the fixture qualifies at all.
+        // Without it, "the overlap producer is absent" would pass for any
+        // reason, including a fixture that never made it into the pool.
+        {
+          const base = await getCandidates("mode=first&limit=500");
+          assertEq(base.status, 200, "tr55: the candidates gate answers");
+          const ids = (base.body?.candidates ?? []).map((c: any) => c.agent_id);
+          assertTrue(ids.includes("tr-cand-clean"), "tr55b: the clean fixture IS a candidate…");
+          assertTrue(ids.includes("tr-cand-overlap"),
+            "tr55c: …and so is the overlap fixture BEFORE any cross-platform send — this is what makes tr57 meaningful rather than vacuous");
+          assertEq(base.body?.cross_platform_cooldown?.count, 0,
+            "tr56: …and nothing is reported as cross-platform-skipped yet");
+        }
+
+        // Now Opplevagent cold-mails one of them.
+        db.prepare(
+          `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+           VALUES ('tr-cand-overlap','overlapp2@gaard.no', datetime('now','-5 days'), 'email','tr-osl-3','tr','experiences')`,
+        ).run();
+
+        const after = await getCandidates("mode=first&limit=500");
+        assertEq(after.status, 200, "tr56b: the gate still answers 200 — without this, every 'X is absent' below passes against an empty list");
+        const ids = (after.body?.candidates ?? []).map((c: any) => c.agent_id);
+        assertTrue(ids.includes("tr-cand-clean"),
+          "tr57: the untouched producer is still a candidate — the skip is targeted, not a blanket");
+        assertTrue(!ids.includes("tr-cand-overlap"),
+          "tr57b: …and the overlap producer is skipped HERE, where the reason is still known, instead of failing one-by-one at the send path with the cause erased");
+
+        const rep = after.body?.cross_platform_cooldown;
+        assertEq(rep?.count, 1, "tr58: the campaign is told HOW MANY were skipped");
+        assertEq(rep?.by_vertical?.experiences, 1, "tr58b: …broken down by the SUPPRESSING platform, which is the half 4e insists on");
+        assertEq(rep?.producers?.[0]?.agent_id, "tr-cand-overlap", "tr59: …and named, so the campaign can act on them rather than only count them");
+        assertEq(rep?.producers?.[0]?.suppressed_by_vertical, "experiences", "tr59b: …with the platform on the producer row too");
+        assertEq(after.body?.suppressed_counts?.cross_platform_cooldown, 1,
+          "tr59c: …and it appears in suppressed_counts alongside every other reason");
+
+        // An RFB send must NOT be reported as cross-platform. A counter that
+        // counts everything reports every ordinary repeat as an overlap
+        // producer, which is worse than no counter — it looks like data.
+        db.prepare(
+          `INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+           VALUES ('tr-cand-clean','ren@gaard.no', datetime('now','-5 days'), 'email','tr-osl-4','tr','rfb')`,
+        ).run();
+        const after2 = await getCandidates("mode=first&limit=500");
+        assertEq(after2.status, 200, "tr59d: …and still answers 200 here too");
+        assertEq(after2.body?.cross_platform_cooldown?.count, 1,
+          "tr60: an RFB send does NOT increment the cross-platform count — it is the pool's own exclusion, not an overlap");
+        assertTrue(!(after2.body?.candidates ?? []).map((c: any) => c.agent_id).includes("tr-cand-clean"),
+          "tr60b: …though it does drop them from the pool, by the pre-existing rfb-scoped exclusion");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
       // tr51-tr54 — contact.ts: the last fail-open default.
       //
       // POST /api/contact is live on all three domains and is the only CRM
@@ -574,6 +686,8 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
       initMod.__setDbForTesting(prevDb as any);
       if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
       else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
+      if (prevAdminKey2 === undefined) delete process.env.ADMIN_KEY;
+      else process.env.ADMIN_KEY = prevAdminKey2;
       if (prevTurnstile === undefined) delete process.env.SKIP_TURNSTILE;
       else process.env.SKIP_TURNSTILE = prevTurnstile;
     }
