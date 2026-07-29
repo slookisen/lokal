@@ -398,20 +398,35 @@ router.get("/", (req: Request, res: Response) => {
     // fail one at a time at the send path with the cause erased. This can only
     // ever REMOVE candidates that the send path would refuse anyway — it never
     // admits one.
+    //
+    // vertical_id is added to outreach_sent_log by a migration (steg 3), so
+    // every booted database has it. A database that has NOT run that migration
+    // would make this SELECT throw and take the whole gate down with it — the
+    // campaign would get no candidates at all, an outreach outage caused by a
+    // schema detail. So the column is probed rather than assumed.
+    //
+    // The degraded path reports `unavailable: true` instead of `count: 0`.
+    // A confident zero on a database that cannot answer the question is the
+    // same silence 4e exists to remove, one level up.
     const crossPlatformSuppressors = new Map<string, { vertical: string; last_sent_at: string }>();
-    for (const r of db
-      .prepare(
-        `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
-           FROM outreach_sent_log
-          WHERE recipient_email IS NOT NULL AND recipient_email != ''
-            AND sent_at >= ?
-            AND vertical_id IS NOT NULL AND vertical_id != 'rfb'
-          GROUP BY LOWER(recipient_email), vertical_id`,
-      )
-      .all(cutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
-      const prev = crossPlatformSuppressors.get(r.email);
-      if (!prev || r.last_sent_at > prev.last_sent_at) {
-        crossPlatformSuppressors.set(r.email, { vertical: r.vertical_id, last_sent_at: r.last_sent_at });
+    const oslHasVertical = (db.prepare("PRAGMA table_info(outreach_sent_log)").all() as Array<{ name: string }>)
+      .some((c) => c.name === "vertical_id");
+
+    if (oslHasVertical) {
+      for (const r of db
+        .prepare(
+          `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
+             FROM outreach_sent_log
+            WHERE recipient_email IS NOT NULL AND recipient_email != ''
+              AND sent_at >= ?
+              AND vertical_id IS NOT NULL AND vertical_id != 'rfb'
+            GROUP BY LOWER(recipient_email), vertical_id`,
+        )
+        .all(cutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
+        const prev = crossPlatformSuppressors.get(r.email);
+        if (!prev || r.last_sent_at > prev.last_sent_at) {
+          crossPlatformSuppressors.set(r.email, { vertical: r.vertical_id, last_sent_at: r.last_sent_at });
+        }
       }
     }
     const crossPlatformSkipped: Array<{
@@ -723,6 +738,16 @@ router.get("/", (req: Request, res: Response) => {
       // because a silently short list is the failure mode this criterion exists
       // to close.
       cross_platform_cooldown: {
+        // Absent column → the question could not be asked. Say so rather than
+        // answering 0, which reads as "no overlap producers were skipped".
+        ...(oslHasVertical
+          ? {}
+          : {
+              unavailable: true,
+              unavailable_reason:
+                "outreach_sent_log.vertical_id is missing on this database (the steg-3 migration has not run), " +
+                "so the cross-platform breakdown could not be computed. This is NOT a measured zero.",
+            }),
         count: crossPlatformSkipped.length,
         by_vertical: crossPlatformSkipped.reduce<Record<string, number>>((acc, s) => {
           acc[s.suppressed_by_vertical] = (acc[s.suppressed_by_vertical] ?? 0) + 1;

@@ -642,6 +642,35 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
           assertTrue(named.includes("tr-cand-overlap"),
             "tr63: …while the genuine Opplevagent overlap IS still reported here, so tr62 is a filter and not a blanket zero");
         }
+
+        // ── tr64-tr65: a database WITHOUT the steg-3 column ─────────
+        //
+        // vertical_id is migration-added, so every booted database has it. But
+        // a hard dependency on it meant the SELECT threw and took the whole
+        // gate down — measured: the orch-20260614 fixture, which hand-rolls a
+        // minimal outreach_sent_log, turned the entire candidates endpoint into
+        // a 500. In production that shape is an outreach OUTAGE (no candidates
+        // at all) caused by a schema detail.
+        //
+        // It degrades instead — but it must not degrade QUIETLY. A `count: 0`
+        // on a database that cannot answer the question reads as "no overlap
+        // producers were skipped", which is the same silence 4e removes, moved
+        // one level up.
+        {
+          db.exec("ALTER TABLE outreach_sent_log RENAME COLUMN vertical_id TO vertical_id_hidden");
+          try {
+            const degraded = await getCandidates("mode=first&limit=500");
+            assertEq(degraded.status, 200,
+              "tr64: without the steg-3 column the gate still SERVES — a missing migration must not become an outreach outage");
+            assertEq(degraded.body?.cross_platform_cooldown?.unavailable, true,
+              "tr65: …and says the number is UNAVAILABLE rather than reporting a confident 0 it did not measure");
+          } finally {
+            db.exec("ALTER TABLE outreach_sent_log RENAME COLUMN vertical_id_hidden TO vertical_id");
+          }
+          const restored = await getCandidates("mode=first&limit=500");
+          assertEq(restored.body?.cross_platform_cooldown?.unavailable, undefined,
+            "tr65b: …and the flag is absent again once the column is back, so it cannot be permanently stuck on");
+        }
       }
 
       // ═══════════════════════════════════════════════════════════════
