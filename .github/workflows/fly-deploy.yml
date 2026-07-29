@@ -67,6 +67,48 @@ jobs:
         # this permanent removal.
         run: npm test
 
+  test-determinism:
+    name: Test-suite determinism gate (3x same SHA)
+    runs-on: ubuntu-latest
+    # Independent of build-check — runs in parallel, does NOT gate/replace it.
+    # dev-request 2026-07-25-testsuite-ikke-deterministisk-delte-globaler,
+    # kriterium 4: tests/test.ts runs ~90+ test blocks concurrently in one
+    # process sharing mutable globals (globalThis.fetch, process.env.
+    # ADMIN_KEY/ANALYTICS_ADMIN_KEY, the getDb() singleton — see the "SHARED
+    # GLOBAL STATE" comment atop tests/test.ts). A race over one of those can
+    # make the suite fail a DIFFERENT test on different runs of the exact
+    # same commit — same failure COUNT, different failure SET — which is a
+    # strictly worse failure mode than a stable failure, because it defeats
+    # "did this PR introduce a new failure?" triage. This gate does NOT
+    # require the suite to be green (tests/test.ts may have pre-existing,
+    # unrelated failures — see this dev-request's "Motfunn 2026-07-26"
+    # section — and that's out of scope here): it only requires that
+    # whatever the suite does, it does it identically 3 times in a row.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run suite 3x and diff the failure sets
+        run: node scripts/check-test-determinism.js --runs=3
+
+      - name: Upload run logs (always, for debugging pass or fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-determinism-logs
+          path: .determinism-logs/
+          retention-days: 14
+          if-no-files-found: ignore
+
   deploy:
     name: Deploy to Fly.io
     runs-on: ubuntu-latest
