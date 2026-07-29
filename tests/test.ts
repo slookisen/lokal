@@ -34458,6 +34458,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-mcp-2026-spec-server-card: criterion 3 (protocol-era declaration) ──");
+  try {
+    const { runMcpProtocolVersionTests } = require("../src/services/mcp-protocol-version.test") as
+      typeof import("../src/services/mcp-protocol-version.test");
+    const mpv = await runMcpProtocolVersionTests({ log: false });
+    passed += mpv.passed;
+    failed += mpv.failed;
+    for (const f of mpv.failures) failures.push("mcp-protocol-version: " + f);
+    console.log(`  mcp-protocol-version: ${mpv.passed} passed, ${mpv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-protocol-version: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ mcp-protocol-version: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a follow-up (geokoding-dekning + gjennomstrømning) ──");
   try {
     const { runGeocodeCoverageBoostTests } = require("../src/services/geocode-coverage-boost.test") as
