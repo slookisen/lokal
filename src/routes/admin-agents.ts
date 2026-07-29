@@ -163,6 +163,15 @@ function requireAdmin(req: Request, res: Response): boolean {
   return true;
 }
 
+// Minimal shape check — POST /register's only use is to reject obvious
+// garbage before it lands in agents.contact_email / agent_knowledge.email.
+// Not a deliverability check; the caller's own evidence gate (e.g.
+// lokal-agent-discovery Step 3's domain-match rule) is what decides
+// whether an email is trustworthy in the first place.
+function isValidEmailFormat(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
 // ─── GET /admin/agents ────────────────────────────────────────
 // List agents filtered by status + updated_since, paginated.
 //
@@ -300,12 +309,24 @@ router.get("/", (req: Request, res: Response) => {
 });
 
 // ─── POST /admin/agents/register ─────────────────────────────
-// Register a net-new agent discovered by the brreg NACE discovery agent.
+// Register a net-new agent. Originally built for the brreg NACE discovery
+// agent; extended (dev-request 2026-07-28-discovery-registrering-mangler-
+// kontaktfelt-endepunkt) to also serve lokal-agent-discovery, whose
+// candidates are not always Norwegian companies (no org_nr) and whose
+// contact-evidence work (Step 3's strict HIGH-confidence gate) needs an
+// actual write path for email/phone + provenance instead of being
+// discarded at registration.
 //
-// Auth: X-Admin-Key header (same requireAdmin as above).
+// Auth: X-Admin-Key header (same requireAdmin as above) — this IS the trust
+// boundary for contact-field writes: only admin-keyed internal callers can
+// reach this route, and each caller is responsible for its own evidence
+// gate (e.g. lokal-agent-discovery's Step 3) before it ever sends
+// email/phone here. This route's job is purely to persist what it's given
+// — it does not re-derive or second-guess confidence.
 //
 // Dedup logic (in order):
 //   1. org_nr tag match  → { success: false, duplicate: true, existing_id }
+//      (skipped when org_nr is absent — nothing to match on)
 //   2. name+city match   → { success: false, duplicate: true, existing_id }
 //   3. Insert new agent with trust_score 0.3 (lower than owner-claimed 0.5)
 //
@@ -313,6 +334,20 @@ router.get("/", (req: Request, res: Response) => {
 //   vertical_id  → confirmed via ALTER TABLE (Phase 4.6a)
 //   data_source  → on agent_knowledge, NOT agents — excluded
 //   auto_sources → on agent_knowledge, NOT agents — excluded
+//
+// org_nr / source: OPTIONAL (loosened 2026-07-29 — see dev-request above).
+// No in-repo caller of this route requires them mandatory (all callers are
+// external cron-driven SKILL agents hitting this over HTTP); brreg-nace-
+// discovery's own usage is untouched since it always sends both anyway.
+//
+// email / phone: OPTIONAL. When given, persisted to agent_knowledge.email /
+// .phone plus field_provenance (this codebase's established per-write-path
+// provenance convention — see mergeFieldProvenance below), source_type
+// taken from the request's own `source` field (falls back to
+// "agent_registration" when source is absent). `email` (a real, evidence-
+// backed contact — distinct from the A2A-protocol-required placeholder)
+// ALSO becomes agents.contact_email when given, replacing the
+// "kontakt@rettfrabonden.com" placeholder that column otherwise gets.
 router.post("/register", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -327,7 +362,8 @@ router.post("/register", async (req: Request, res: Response) => {
     nace_code,
     categories,
     tags: extraTags,
-    phone: _phone,       // reserved; stored in agent_knowledge, not agents
+    phone,
+    email,
     description,
     lat,
     lng,
@@ -342,18 +378,29 @@ router.post("/register", async (req: Request, res: Response) => {
     categories?: string[];
     tags?: string[];
     phone?: string;
+    email?: string;
     description?: string;
     lat?: number;
     lng?: number;
   };
 
-  if (!name || !url || !city || !vertical_id || !org_nr || !source) {
+  if (!name || !url || !city || !vertical_id) {
     res.status(400).json({
       error: "Missing required fields",
-      detail: "name, url, city, vertical_id, org_nr, source are all required",
+      detail: "name, url, city, vertical_id are all required",
     });
     return;
   }
+
+  const trimmedEmail = typeof email === "string" ? email.trim() : "";
+  if (trimmedEmail && !isValidEmailFormat(trimmedEmail)) {
+    res.status(400).json({
+      error: "Invalid email",
+      detail: "email must be a valid email address",
+    });
+    return;
+  }
+  const trimmedPhone = typeof phone === "string" ? phone.trim() : "";
 
   const VALID_VERTICALS = ["rfb", "dental", "experiences"] as const;
   if (!VALID_VERTICALS.includes(vertical_id as typeof VALID_VERTICALS[number])) {
@@ -369,22 +416,26 @@ router.post("/register", async (req: Request, res: Response) => {
 
     // ── Dedup 1: org_nr tag match ────────────────────────────
     // Tags are stored as a JSON array. We search for the literal
-    // string "org_nr:<value>" inside the TEXT column.
-    const orgNrTag = `org_nr:${org_nr}`;
-    const byOrgNr = db
-      .prepare(
-        `SELECT id FROM agents WHERE tags LIKE ? LIMIT 1`
-      )
-      .get(`%"${orgNrTag}"%`) as { id: string } | undefined;
+    // string "org_nr:<value>" inside the TEXT column. Skipped entirely
+    // when org_nr is absent (non-Norwegian-verifiable candidates) — there
+    // is nothing to match on, and dedup 2 (name+city) still applies.
+    if (org_nr) {
+      const orgNrTag = `org_nr:${org_nr}`;
+      const byOrgNr = db
+        .prepare(
+          `SELECT id FROM agents WHERE tags LIKE ? LIMIT 1`
+        )
+        .get(`%"${orgNrTag}"%`) as { id: string } | undefined;
 
-    if (byOrgNr) {
-      res.json({
-        success: false,
-        duplicate: true,
-        existing_id: byOrgNr.id,
-        message: "Agent with this org_nr already exists",
-      });
-      return;
+      if (byOrgNr) {
+        res.json({
+          success: false,
+          duplicate: true,
+          existing_id: byOrgNr.id,
+          message: "Agent with this org_nr already exists",
+        });
+        return;
+      }
     }
 
     // ── Dedup 2: name + city match (case-insensitive) ────────
@@ -405,7 +456,11 @@ router.post("/register", async (req: Request, res: Response) => {
     }
 
     // ── Build tags array ─────────────────────────────────────
-    const builtTags: string[] = [`org_nr:${org_nr}`, `source:${source}`];
+    // org_nr / source are now optional (see header comment) — only tag
+    // whichever of the two was actually supplied.
+    const builtTags: string[] = [];
+    if (org_nr) builtTags.push(`org_nr:${org_nr}`);
+    if (source) builtTags.push(`source:${source}`);
     if (nace_code) builtTags.push(`nace:${nace_code}`);
     if (extraTags && Array.isArray(extraTags)) builtTags.push(...extraTags);
 
@@ -434,7 +489,16 @@ router.post("/register", async (req: Request, res: Response) => {
     // data_source + auto_sources live on agent_knowledge, not agents — excluded.
     const id = require("crypto").randomUUID();
     const api_key = `brreg_${require("crypto").randomBytes(20).toString("hex")}`;
-    const agentDescription = (description ?? "").trim() || "Oppdaget via Brreg NACE-søk";
+    const agentDescription =
+      (description ?? "").trim() ||
+      (source ? `Oppdaget via ${source}` : "Oppdaget via automatisk registrering");
+
+    // contact_email is A2A-protocol-required (NOT NULL) — historically a
+    // placeholder, "updated when agent claims profile". When the caller
+    // supplies a real, evidence-gated email (see header comment), use it
+    // directly instead of the placeholder; agent_knowledge.email +
+    // field_provenance carry the same value below, with provenance.
+    const contactEmailValue = trimmedEmail || "kontakt@rettfrabonden.com";
 
     db.prepare(
       `INSERT INTO agents (
@@ -459,7 +523,7 @@ router.post("/register", async (req: Request, res: Response) => {
       name,
       agentDescription,
       name,                           // provider = business name
-      "kontakt@rettfrabonden.com",    // placeholder; updated when agent claims profile
+      contactEmailValue,
       url,
       api_key,
       city,
@@ -468,16 +532,61 @@ router.post("/register", async (req: Request, res: Response) => {
       JSON.stringify(categories && Array.isArray(categories) ? categories : []),
       JSON.stringify(builtTags),
       vertical_id,
-      org_nr,
+      org_nr ?? null,
       brreg_verified,
       brreg_flag,
       brreg_checked_at,
     );
 
+    // ── Contact-field enrichment: agent_knowledge.email/.phone + provenance ──
+    // Only runs when at least one of email/phone was actually supplied —
+    // registrations with no contact info at all (the common case for a
+    // strict-evidence discovery agent) never touch agent_knowledge and never
+    // fail because of it. Mirrors the "ensure a knowledge row exists" idiom
+    // used elsewhere in this file (see POST /brreg-description-fallback
+    // above, ~line 1052 pre-edit) via INSERT OR IGNORE + UPDATE, and reuses
+    // mergeFieldProvenance — the SAME field_provenance merge every other
+    // admin write path in this codebase uses — rather than hand-rolling a
+    // new shape.
+    if (trimmedEmail || trimmedPhone) {
+      const nowIso = new Date().toISOString();
+      // source_type: prefer the caller's own `source` (e.g.
+      // "lokal-agent-discovery"); fall back to a generic label when absent
+      // so a provenance record is never written with an empty source_type.
+      const sourceType = source && source.trim() ? source.trim() : "agent_registration";
+
+      db.prepare(
+        `INSERT OR IGNORE INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)`
+      ).run(id, nowIso);
+
+      const existsRow = db
+        .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
+        .get(id) as { field_provenance?: string | null } | undefined;
+      let existingProv: Record<string, unknown> = {};
+      if (existsRow?.field_provenance) {
+        try {
+          const parsed = JSON.parse(existsRow.field_provenance);
+          if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+        } catch {
+          /* tolerate junk, mirrors other call sites */
+        }
+      }
+
+      const incoming: Record<string, Array<{ value: string; source_type: string; fetched_at: string }>> = {};
+      if (trimmedEmail) incoming.email = [{ value: trimmedEmail, source_type: sourceType, fetched_at: nowIso }];
+      if (trimmedPhone) incoming.phone = [{ value: trimmedPhone, source_type: sourceType, fetched_at: nowIso }];
+      const mergedProv = mergeFieldProvenance(existingProv, incoming);
+
+      db.prepare(
+        `UPDATE agent_knowledge SET email = ?, phone = ?, field_provenance = ?, updated_at = ? WHERE agent_id = ?`
+      ).run(trimmedEmail || null, trimmedPhone || null, JSON.stringify(mergedProv), nowIso, id);
+    }
+
     res.status(201).json({
       success: true,
       agent_id: id,
       slug: slugify(name),
+      contact_email: contactEmailValue,
       message: "Agent registered",
     });
   } catch (err: any) {

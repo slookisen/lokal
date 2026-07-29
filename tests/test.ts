@@ -34547,3 +34547,26 @@ runSerial(async () => {
     failures.push("agents-org-nr-backfill: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-28-discovery-registrering-mangler-kontaktfelt-endepunkt:
+// POST /admin/agents/register contact-field write path (org_nr/source now
+// optional, email/phone persisted + agent_knowledge.field_provenance,
+// non-placeholder contact_email when email given) — see
+// admin-agents-register-contact.test.ts header for full coverage list.
+// Own harness (__setDbForTesting/__initSchemaForTesting), runs via
+// runSerial() like the suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-28-discovery-registrering-mangler-kontaktfelt-endepunkt: agents register contact-field write path ──");
+  try {
+    const { runAdminAgentsRegisterContactTests } = require("../src/routes/admin-agents-register-contact.test") as
+      typeof import("../src/routes/admin-agents-register-contact.test");
+    const rc = await runAdminAgentsRegisterContactTests({ log: false });
+    passed += rc.passed;
+    failed += rc.failed;
+    for (const f of rc.failures) failures.push("agents-register-contact: " + f);
+    console.log(`  agents-register-contact: ${rc.passed} passed, ${rc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-register-contact: unexpected error: " + String(err?.message || err));
+  }
+});
