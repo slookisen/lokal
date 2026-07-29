@@ -5141,6 +5141,104 @@ router.get("/bm-events", (req: Request, res: Response) => {
 //
 // orch-pr-122 (2026-06-06)
 
+/** Normalise a Norwegian phone number to digits only (no country code). */
+export function normalisePhone(raw: string): string {
+  return raw
+    .replace(/^\+47/, "")
+    .replace(/^0047/, "")
+    .replace(/^\+/, "")
+    .replace(/[\s\-().]/g, "")
+    .replace(/\D/g, "");
+}
+
+/**
+ * True if an 8-digit string plausibly parses as a calendar date (YYYYMMDD)
+ * with a plausible year/month/day. Used to reject dates (e.g. "20100101")
+ * that regexes for 8-digit phone numbers otherwise happily match.
+ */
+function looksLikeDate(digits: string): boolean {
+  if (digits.length !== 8) return false;
+  const year = parseInt(digits.slice(0, 4), 10);
+  const month = parseInt(digits.slice(4, 6), 10);
+  const day = parseInt(digits.slice(6, 8), 10);
+  return year >= 1900 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+/**
+ * Extract a Norwegian phone number from HTML text.
+ *
+ * homepage-provenance-contact-extraction-fix (2026-07-29): two false-positive
+ * classes reproduced live are now rejected instead of stored:
+ *   1. Calendar-date-shaped 8-digit runs (e.g. "20100101") — checked via
+ *      looksLikeDate() so scanning continues to look for a real phone.
+ *   2. 8-digit runs that are actually a substring of a longer digit sequence
+ *      (e.g. an 8-digit slice of a 9-digit Norwegian org number) — checked by
+ *      inspecting the raw text immediately before/after the matched digit
+ *      group; if either neighbour is itself a digit, the candidate is part
+ *      of a longer run and is skipped rather than returned.
+ */
+export function extractPhone(html: string): string | null {
+  // Strip HTML tags for cleaner matching.
+  const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
+  // Match: optional +47 / 0047 / 47, then 8 digits possibly grouped.
+  const re = /(?:\+47|0047|47[\s\-])?(\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const digits = normalisePhone(m[0]);
+    // Valid Norwegian mobile/landline: 8 digits, not all same.
+    if (digits.length !== 8 || /^(\d)\1{7}$/.test(digits)) continue;
+    // Bug fix 1: reject calendar-date-shaped runs.
+    if (looksLikeDate(digits)) continue;
+    // Bug fix 2: reject a run that is really a substring of a longer digit
+    // sequence (e.g. an org number) by checking the raw neighbours of the
+    // matched digit group (m[1]) in the original text.
+    const groupStart = m.index + (m[0].length - m[1].length);
+    const groupEnd = groupStart + m[1].length;
+    const before = groupStart > 0 ? text[groupStart - 1] : "";
+    const after = groupEnd < text.length ? text[groupEnd] : "";
+    if (/\d/.test(before) || /\d/.test(after)) continue;
+    return digits;
+  }
+  return null;
+}
+
+/** Norwegian contact-block label words that must never be swallowed into a
+ *  poststed (town name) capture — case-insensitive. */
+const ADDRESS_CONTACT_LABELS = new Set([
+  "telefon", "tlf", "phone", "e-post", "epost", "email", "mail", "kontakt", "adresse",
+]);
+
+/**
+ * Extract a Norwegian postal address: street name + number + 4-digit
+ * postal code + poststed. Conservative — only returns a result if both
+ * the postal code and a poststed are found close together.
+ *
+ * homepage-provenance-contact-extraction-fix (2026-07-29): the poststed
+ * group's optional second word (meant for genuine compound town names) must
+ * not be accepted when it is actually the next contact-block label with no
+ * punctuation boundary in between (e.g. "... 2460 Osen Telefon: ..." must
+ * yield poststed "Osen", not "Osen Telefon"). Street/postcode groups are
+ * untouched.
+ */
+export function extractAddress(html: string): string | null {
+  const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  // Pattern: <words> <number> <optional comma/space> <4 digits> <CAPS/title word>
+  const re =
+    /([A-ZÆØÅ][a-zæøåA-ZÆØÅ\s]{2,40}?\s+\d+[A-Za-z]?),?\s+(\d{4})\s+([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)?)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const words = m[3].trim().split(/\s+/);
+    if (words.length > 1 && ADDRESS_CONTACT_LABELS.has(words[words.length - 1].toLowerCase())) {
+      words.pop();
+    }
+    const poststed = words.join(" ");
+    const candidate = `${m[1].trim()}, ${m[2]} ${poststed}`;
+    // Sanity: skip obviously bad matches (< 10 chars of street part).
+    if (m[1].trim().length >= 6) return candidate;
+  }
+  return null;
+}
+
 router.post("/admin/homepage-provenance-batch", async (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
   const expectedKey = getAdminKey();
@@ -5428,52 +5526,6 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       return !genericDomains.has(domain);
     });
     return branded ?? candidates[0] ?? null;
-  }
-
-  /** Normalise a Norwegian phone number to digits only (no country code). */
-  function normalisePhone(raw: string): string {
-    return raw
-      .replace(/^\+47/, "")
-      .replace(/^0047/, "")
-      .replace(/^\+/, "")
-      .replace(/[\s\-().]/g, "")
-      .replace(/\D/g, "");
-  }
-
-  /** Extract a Norwegian phone number from HTML text. */
-  function extractPhone(html: string): string | null {
-    // Strip HTML tags for cleaner matching.
-    const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
-    // Match: optional +47 / 0047 / 47, then 8 digits possibly grouped.
-    const re = /(?:\+47|0047|47[\s\-])?(\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})\b/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const digits = normalisePhone(m[0]);
-      // Valid Norwegian mobile/landline: 8 digits, not all same.
-      if (digits.length === 8 && !/^(\d)\1{7}$/.test(digits)) {
-        return digits;
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Extract a Norwegian postal address: street name + number + 4-digit
-   * postal code + poststed. Conservative — only returns a result if both
-   * the postal code and a poststed are found close together.
-   */
-  function extractAddress(html: string): string | null {
-    const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
-    // Pattern: <words> <number> <optional comma/space> <4 digits> <CAPS/title word>
-    const re =
-      /([A-ZÆØÅ][a-zæøåA-ZÆØÅ\s]{2,40}?\s+\d+[A-Za-z]?),?\s+(\d{4})\s+([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)?)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const candidate = `${m[1].trim()}, ${m[2]} ${m[3].trim()}`;
-      // Sanity: skip obviously bad matches (< 10 chars of street part).
-      if (m[1].trim().length >= 6) return candidate;
-    }
-    return null;
   }
 
   /**
