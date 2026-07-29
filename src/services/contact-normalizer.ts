@@ -156,11 +156,15 @@ export function isDisplayablePhone(raw: string | null | undefined): raw is strin
  * Checks (ANY failing ⇒ reject):
  *   1. Shape: `raw` must reduce to a valid 8-digit Norwegian national number
  *      via the EXISTING `national8(normalizePhone(raw))` — no reimplementation.
- *   2. Not the agent's own org-nr: compares full digit-only forms (not just
- *      the reduced 8-digit form) so an org-nr-shaped value is caught even
- *      before/independent of the shape check. Rejects if `normalizePhone(raw)`
- *      equals `normalizePhone(orgNr)` OR equals the LAST 8 digits of
- *      `normalizePhone(orgNr)`. Skipped when `orgNr` is empty/null.
+ *   2. Not the agent's own org-nr: compares both the full digit-only form
+ *      (not just the reduced 8-digit form) so an org-nr-shaped value is
+ *      caught even before/independent of the shape check, AND the rule-1
+ *      `reduced` (national8) form, so a bare (no `+`/`00`) `47`-prefixed
+ *      value that `normalizePhone` doesn't strip but `national8` still
+ *      reduces to the org-nr's last 8 digits is also caught. Rejects if
+ *      `normalizePhone(raw)` equals `normalizePhone(orgNr)`, OR equals the
+ *      LAST 8 digits of `normalizePhone(orgNr)`, OR `reduced` equals that
+ *      same last-8-digit form. Skipped when `orgNr` is empty/null.
  *   3. Not a plausible calendar date: if the value reduces to exactly 8
  *      digits, those 8 digits must NOT parse as a plausible YYYYMMDD date
  *      (year 1900-2099, valid month/day).
@@ -187,7 +191,7 @@ export function validatePhoneForWrite(
     const orgDigits = normalizePhone(orgNr);
     if (orgDigits) {
       const orgLast8 = orgDigits.length >= 8 ? orgDigits.slice(-8) : orgDigits;
-      if (rawDigits === orgDigits || rawDigits === orgLast8) {
+      if (rawDigits === orgDigits || rawDigits === orgLast8 || reduced === orgLast8) {
         console.log(`[contact-write-guard] rejected phone "${raw}": rule2 - matches agent's own org-nr`);
         return null;
       }

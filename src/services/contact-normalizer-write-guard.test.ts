@@ -120,6 +120,22 @@ export function runContactNormalizerWriteGuardTests(opts: { log?: boolean } = {}
       null,
       "validatePhoneForWrite: rule3-only — plausible YYYYMMDD date, no org-nr conflict",
     );
+
+    // Regression: bare (no "+"/"00") "47"-prefixed 10-digit value whose
+    // national8-reduced form matches the org-nr's last 8 digits.
+    // normalizePhone() only strips "+47"/"0047"/leading "+" — it does NOT
+    // strip a bare "47" prefix, so the full-digit-string comparison
+    // ("4727011840" vs "927011840"/"27011840") never matches on length
+    // alone. But national8() (rule 1's `reduced`) DOES recognise the bare
+    // 10-digit "47xxxxxxxx" shape and reduces it to "27011840", which is
+    // exactly org-nr "927011840"'s last 8 digits — a genuine org-nr
+    // collision in disguise. Rule 2 must catch this via the `reduced`
+    // comparison, not just the raw-digit-string comparison.
+    assertEq(
+      validatePhoneForWrite("4727011840", "927011840"),
+      null,
+      "validatePhoneForWrite: rule2 regression — bare 47-prefixed value reduces to org-nr's last-8-digits",
+    );
   }
 
   // ── Negative control: a genuinely valid phone is NOT rejected ────────────
