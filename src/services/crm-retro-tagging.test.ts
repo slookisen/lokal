@@ -275,6 +275,51 @@ export function runCrmRetroTaggingTests(opts: { log?: boolean } = {}): Promise<T
         );
       }
 
+      // rt31 — the fingerprint must cover the TARGET, not just the row set.
+      //
+      // Measured: a mutant reducing the fingerprint to `${threadId}` alone
+      // passed all 58 assertions. Every existing test changes the SET of
+      // candidates, so a fingerprint keyed on ids only still moved and the gate
+      // still appeared to work. The dangerous change is the other one: same
+      // threads, same count, different DESTINATION.
+      //
+      // Realistic path to it — a later contact-form import adds tier-A evidence
+      // to a thread that until now qualified via tier B, and tier A outranks it.
+      // Daniel approved "move this thread to experiences"; without this
+      // assertion the apply would send it to dental under his approval.
+      {
+        const beforeFp = retro.planRetroTagging().planFingerprint;
+        const beforeCount = retro.planRetroTagging().candidates.length;
+        const beforeTarget = findCandidate(retro.planRetroTagging(), tierB.threadId)?.proposedVertical;
+        assertEq(beforeTarget, "experiences", "rt31: the tier-B thread is currently headed for experiences");
+
+        db.prepare(
+          `INSERT INTO crm_actions (id, thread_id, contact_id, type, actor, payload)
+           VALUES ('rt-act-flip', ?, ?, 'imported', 'system', ?)`,
+        ).run(
+          tierB.threadId, tierB.contactId,
+          JSON.stringify({ source: "kontaktskjema", platform: "dental", name: "Tester" }),
+        );
+
+        const after = retro.planRetroTagging();
+        assertEq(after.candidates.length, beforeCount,
+          "rt31b: the candidate SET is unchanged — same threads, same count");
+        assertEq(findCandidate(after, tierB.threadId)?.proposedVertical, "dental",
+          "rt31c: …but this thread's DESTINATION changed, because tier A now outranks its header");
+        assertTrue(after.planFingerprint !== beforeFp,
+          "rt31d: …and the fingerprint MOVED anyway. A fingerprint over ids alone would not have, and Daniel's 'send it to experiences' would have sent it to dental");
+        assertThrows(
+          () => retro.applyRetroTagging({ approvedFingerprint: beforeFp, approvedCount: beforeCount, approvedBy: "daniel" }),
+          /plan changed since it was approved/,
+          "rt31e: …so the stale approval is refused even though its COUNT still matches exactly",
+        );
+
+        // Put the fixture back so the apply block below tests what it says.
+        db.prepare("DELETE FROM crm_actions WHERE id = 'rt-act-flip'").run();
+        assertEq(retro.planRetroTagging().planFingerprint, beforeFp,
+          "rt31f: …and removing the new evidence restores the original fingerprint, so it tracks state rather than accumulating history");
+      }
+
       // ═══════════════════════════════════════════════════════════════
       // rt32-rt40 — apply moves the whole family, atomically.
       // ═══════════════════════════════════════════════════════════════
