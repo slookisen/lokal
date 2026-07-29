@@ -681,6 +681,66 @@ export function listPublishedExperiences(
   return rows.map(hydrateCardRow);
 }
 
+// dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1
+// (arbeidspunkt 1-3): one map marker's worth of data for /fylke/:fylke.
+// Minimal columns only (not the full ExperienceCardRow) — this feeds a
+// server-injected JSON island for a Leaflet map, not a card render.
+export type ExperienceMapPoint = {
+  slug: string;
+  title: string;
+  title_no: string | null;
+  category: string | null;
+  kommune: string | null;
+  loc_lat: number;
+  loc_lon: number;
+  geo_precision: "address" | "kommune";
+};
+
+/**
+ * Published experiences matching an optional category/fylke/provider filter
+ * that ALSO have a real geocode. Reuses browseWhere()/PUBLISH_GATE_SQL
+ * UNCHANGED (same exact "published" definition as
+ * listPublishedExperiences()/countPublishedExperiences()) and appends the
+ * same `loc_lat IS NOT NULL AND loc_lon IS NOT NULL` predicate used at the
+ * near-me geo filter above (line ~1158) — so the marker count for a given
+ * filter is always <= the card-list count for that SAME filter, never a
+ * divergent definition of "published" or "has coordinates". geo_precision is
+ * additionally constrained NOT NULL so the returned type can be the narrowed
+ * "address" | "kommune" union (never a fabricated precision) — in practice a
+ * non-null loc_lat/loc_lon pair always carries a non-null geo_precision (the
+ * geocode worker sets them together), so this rarely excludes rows in
+ * practice; it exists purely so the caller never has to null-check precision.
+ */
+export function listPublishedExperienceMapPoints(
+  filter: BrowseFilter = {}
+): ExperienceMapPoint[] {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere(filter);
+  const rows = db
+    .prepare(
+      `SELECT e.slug AS slug, e.title AS title, e.title_no AS title_no,
+              e.category AS category, e.kommune AS kommune,
+              e.loc_lat AS loc_lat, e.loc_lon AS loc_lon,
+              e.geo_precision AS geo_precision
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}
+         AND e.loc_lat IS NOT NULL AND e.loc_lon IS NOT NULL AND e.geo_precision IS NOT NULL
+       ${CARD_ORDER}`
+    )
+    .all(params) as Array<{
+      slug: string;
+      title: string;
+      title_no: string | null;
+      category: string | null;
+      kommune: string | null;
+      loc_lat: number;
+      loc_lon: number;
+      geo_precision: "address" | "kommune";
+    }>;
+  return rows;
+}
+
 /** Distinct categories that have ≥1 PUBLISHED experience (with counts). Drives
  *  the homepage cards, the /opplevelser facet list, and the sitemap category
  *  URLs — so every linked category page is guaranteed non-empty.
