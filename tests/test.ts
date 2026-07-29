@@ -34570,3 +34570,26 @@ runSerial(async () => {
     failures.push("agents-register-contact: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, fix 1: role-gate
+// on GET /produsent/:slug (src/routes/seo.ts) — a non-producer, non-umbrella
+// active agent (e.g. the "Rett fra Bonden" house-bucket, role='logistics')
+// must 404 like an unknown slug instead of rendering a public producer page.
+// Own harness (__setDbForTesting/__initSchemaForTesting, real router handler
+// pulled off the route stack — mirrors admin-agents-brreg-catalog-sweep.test.ts's
+// section (g) badge check). Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding: /produsent/:slug role-gate (fix 1) ──");
+  try {
+    const { runProdusentRoleGateTests } = require("../src/routes/produsent-role-gate.test") as
+      typeof import("../src/routes/produsent-role-gate.test");
+    const prg = await runProdusentRoleGateTests({ log: false });
+    passed += prg.passed;
+    failed += prg.failed;
+    for (const f of prg.failures) failures.push("produsent-role-gate: " + f);
+    console.log(`  produsent-role-gate: ${prg.passed} passed, ${prg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("produsent-role-gate: unexpected error: " + String(err?.message || err));
+  }
+});
