@@ -146,44 +146,68 @@ export function isDisplayablePhone(raw: string | null | undefined): raw is strin
 // not" posture as the rest of this module.
 
 /**
- * Decide whether a raw phone value is safe to WRITE (not just display).
- *
- * Returns the ORIGINAL `raw` string unchanged if it passes every check, or
- * `null` if it should be rejected (caller should then leave the field
- * blank / fall back to the existing stored value — never store a partial or
- * "closest guess" value).
- *
- * Checks (ANY failing ⇒ reject):
- *   1. Shape: `raw` must reduce to a valid 8-digit Norwegian national number
- *      via the EXISTING `national8(normalizePhone(raw))` — no reimplementation.
- *   2. Not the agent's own org-nr: compares both the full digit-only form
- *      (not just the reduced 8-digit form) so an org-nr-shaped value is
- *      caught even before/independent of the shape check, AND the rule-1
- *      `reduced` (national8) form, so a bare (no `+`/`00`) `47`-prefixed
- *      value that `normalizePhone` doesn't strip but `national8` still
- *      reduces to the org-nr's last 8 digits is also caught. Rejects if
- *      `normalizePhone(raw)` equals `normalizePhone(orgNr)`, OR equals the
- *      LAST 8 digits of `normalizePhone(orgNr)`, OR `reduced` equals that
- *      same last-8-digit form. Skipped when `orgNr` is empty/null.
- *   3. Not a plausible calendar date: if the value reduces to exactly 8
- *      digits, those 8 digits must NOT parse as a plausible YYYYMMDD date
- *      (year 1900-2099, valid month/day).
+ * The three write-guard rules a phone value is checked against. Shared
+ * identifier set for `classifyPhoneForWrite`'s `failedRules` and for any
+ * caller (e.g. the read-only audit sweep) that needs to report per-rule
+ * breakdowns rather than a single accept/reject bit.
  */
-export function validatePhoneForWrite(
+export type PhoneWriteRule = "shape" | "org_nr_collision" | "date_shape";
+
+export interface PhoneWriteClassification {
+  /** True iff ANY rule failed — i.e. `validatePhoneForWrite` would reject. */
+  rejected: boolean;
+  /** Every rule that failed, in check order (shape, org_nr_collision, date_shape). */
+  failedRules: PhoneWriteRule[];
+}
+
+/**
+ * Classify a raw phone value against every write-guard rule, independently
+ * of the others, so a caller can report WHICH rule(s) failed rather than a
+ * single accept/reject bit.
+ *
+ * This is the SINGLE implementation of the three write-guard rules.
+ * `validatePhoneForWrite` (the write-path gate) is a thin wrapper around
+ * this function's `rejected` bit; the read-only audit sweep
+ * (admin-contact-write-guard-audit.ts) calls this directly for its per-rule
+ * counts. There is exactly one copy of each rule's logic — do not
+ * reimplement any of these checks elsewhere.
+ *
+ * Rules (each evaluated independently; ANY failing ⇒ `rejected: true`):
+ *   1. `shape` — `raw` must reduce to a valid 8-digit Norwegian national
+ *      number via the EXISTING `national8(normalizePhone(raw))` — no
+ *      reimplementation. If it doesn't reduce, rules 2/3 below are still
+ *      evaluated where possible (rule 2's raw-digit-string leg does not
+ *      depend on `reduced`), but rule 3 requires a reduced 8-digit value and
+ *      is skipped (cannot fail) when shape already failed to produce one.
+ *   2. `org_nr_collision` — not the agent's own org-nr: compares both the
+ *      full digit-only form (not just the reduced 8-digit form) so an
+ *      org-nr-shaped value is caught even before/independent of the shape
+ *      check, AND the rule-1 `reduced` (national8) form, so a bare (no
+ *      `+`/`00`) `47`-prefixed value that `normalizePhone` doesn't strip but
+ *      `national8` still reduces to the org-nr's last 8 digits is also
+ *      caught. Fails if `normalizePhone(raw)` equals `normalizePhone(orgNr)`,
+ *      OR equals the LAST 8 digits of `normalizePhone(orgNr)`, OR `reduced`
+ *      equals that same last-8-digit form. Skipped (cannot fail) when
+ *      `orgNr` is empty/null.
+ *   3. `date_shape` — not a plausible calendar date: if the value reduces to
+ *      exactly 8 digits, those 8 digits must NOT parse as a plausible
+ *      YYYYMMDD date (year 1900-2099, valid month/day).
+ */
+export function classifyPhoneForWrite(
   raw: string | null | undefined,
   orgNr: string | null | undefined,
-): string | null {
-  if (!raw) return null; // (a) nothing to validate
+): PhoneWriteClassification {
+  const failedRules: PhoneWriteRule[] = [];
+  if (!raw) return { rejected: true, failedRules }; // nothing to validate; caller treats as reject
 
-  // (b) Rule 1 — exact-8-digit shape (delegates to the existing, already-
-  // trusted national8/normalizePhone logic; not reimplemented here).
+  // Rule 1 — exact-8-digit shape (delegates to the existing, already-trusted
+  // national8/normalizePhone logic; not reimplemented here).
   const reduced = national8(normalizePhone(raw));
   if (reduced === null) {
-    console.log(`[contact-write-guard] rejected phone "${raw}": rule1 - does not reduce to a valid 8-digit Norwegian national number`);
-    return null;
+    failedRules.push("shape");
   }
 
-  // (c) Rule 2 — not the agent's own org-nr. Runs independent of rule 1's
+  // Rule 2 — not the agent's own org-nr. Runs independent of rule 1's
   // result (checked here unconditionally on the digit-only forms) so a value
   // that ALSO happens to look like a valid 8-digit number is still caught.
   if (orgNr) {
@@ -192,21 +216,57 @@ export function validatePhoneForWrite(
     if (orgDigits) {
       const orgLast8 = orgDigits.length >= 8 ? orgDigits.slice(-8) : orgDigits;
       if (rawDigits === orgDigits || rawDigits === orgLast8 || reduced === orgLast8) {
-        console.log(`[contact-write-guard] rejected phone "${raw}": rule2 - matches agent's own org-nr`);
-        return null;
+        failedRules.push("org_nr_collision");
       }
     }
   }
 
-  // (d) Rule 3 — not a plausible calendar date (only applicable once we know
-  // the value is exactly 8 digits, i.e. `reduced` came from the 8-digit
-  // branch of national8 rather than the "47"-prefixed 10-digit branch).
-  if (/^\d{8}$/.test(reduced) && looksLikeYyyymmdd(reduced)) {
-    console.log(`[contact-write-guard] rejected phone "${raw}": rule3 - looks like a YYYYMMDD date`);
+  // Rule 3 — not a plausible calendar date (only applicable once we know the
+  // value is exactly 8 digits, i.e. `reduced` came from the 8-digit branch of
+  // national8 rather than the "47"-prefixed 10-digit branch, or from a
+  // shape-failing value that nonetheless isn't null — guarded by the null
+  // check below).
+  if (reduced !== null && /^\d{8}$/.test(reduced) && looksLikeYyyymmdd(reduced)) {
+    failedRules.push("date_shape");
+  }
+
+  return { rejected: failedRules.length > 0, failedRules };
+}
+
+/**
+ * Decide whether a raw phone value is safe to WRITE (not just display).
+ *
+ * Returns the ORIGINAL `raw` string unchanged if it passes every check, or
+ * `null` if it should be rejected (caller should then leave the field
+ * blank / fall back to the existing stored value — never store a partial or
+ * "closest guess" value).
+ *
+ * Thin wrapper around `classifyPhoneForWrite` — see that function's doc
+ * comment for the exact per-rule logic. This function only adds the
+ * write-path logging and the accept/reject-to-string-or-null translation;
+ * it does not duplicate any rule.
+ */
+export function validatePhoneForWrite(
+  raw: string | null | undefined,
+  orgNr: string | null | undefined,
+): string | null {
+  if (!raw) return null; // nothing to validate
+
+  const { rejected, failedRules } = classifyPhoneForWrite(raw, orgNr);
+  if (rejected) {
+    for (const rule of failedRules) {
+      const reason =
+        rule === "shape"
+          ? "rule1 - does not reduce to a valid 8-digit Norwegian national number"
+          : rule === "org_nr_collision"
+            ? "rule2 - matches agent's own org-nr"
+            : "rule3 - looks like a YYYYMMDD date";
+      console.log(`[contact-write-guard] rejected phone "${raw}": ${reason}`);
+    }
     return null;
   }
 
-  // (e) All checks passed — return the ORIGINAL value unchanged.
+  // All checks passed — return the ORIGINAL value unchanged.
   return raw;
 }
 

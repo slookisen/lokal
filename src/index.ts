@@ -59,6 +59,7 @@ import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
+import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
@@ -622,6 +623,13 @@ app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoher
 // opening-hours). Read-only / dry-run only — no apply mode, zero writes.
 // GET /admin/wrong-entity-retro-sweep
 app.use("/admin/wrong-entity-retro-sweep", adminLimiter, adminWrongEntityRetroSweepRoutes);
+// dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon, criterion 5:
+// read-only measurement sweep over the FULL agent_knowledge table (no cohort
+// filter, all verticals) reporting how many EXISTING rows violate the
+// write-time contact guard's rules (phone shape / org-nr collision / date
+// shape / trailing address contact-label). Zero writes — no apply mode.
+// GET /admin/contact-write-guard-audit
+app.use("/admin/contact-write-guard-audit", adminLimiter, adminContactWriteGuardAuditRoutes);
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 2: the
 // live-data-cleanup half of PR #405 (that PR's own commit message flagged
 // this as "a separate, non-code operational step, not part of this PR").

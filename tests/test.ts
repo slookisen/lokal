@@ -33967,6 +33967,29 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon,
+// criterion 5: GET /admin/contact-write-guard-audit — read-only, full-table
+// (no cohort filter, all verticals) measurement sweep reporting how many
+// EXISTING agent_knowledge rows already violate the write-time contact
+// guard's rules (phone shape / org-nr collision / date shape / trailing
+// address contact-label). Own in-memory DB (swaps the shared getDb()
+// singleton) — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon (crit. 5): contact-write-guard-audit ──");
+  try {
+    const { runAdminContactWriteGuardAuditTests } = require("../src/routes/admin-contact-write-guard-audit.test") as
+      typeof import("../src/routes/admin-contact-write-guard-audit.test");
+    const cwga = await runAdminContactWriteGuardAuditTests({ log: false });
+    passed += cwga.passed;
+    failed += cwga.failed;
+    for (const f of cwga.failures) failures.push("contact-write-guard-audit: " + f);
+    console.log(`  contact-write-guard-audit: ${cwga.passed} passed, ${cwga.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-write-guard-audit: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-13-supply-graph-v1, Slice 1: additive
 // availability_updated_at/availability_source columns on `products` +
 // computeEffectiveAvailability()/setProducerAvailability()
