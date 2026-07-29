@@ -12,10 +12,10 @@
  *
  *   mpv1-mpv6    eraOf is a total ordering on the date-stamped versions, and
  *                the boundary is exactly 2026-07-28.
- *   mpv7-mpv13   The declaration is DERIVED from the SDK. A hardcoded value
- *                cannot survive these — which is the point, since a hardcoded
- *                string is precisely how /.well-known/mcp came to advertise a
- *                version the SDK had already moved past.
+ *   mpv7-mpv13   The declaration matches the SDK's constants. These do NOT
+ *                prove derivation — measured, a hardcode equal to today's SDK
+ *                value passes every one of them. mpv29-mpv31 are what prove
+ *                it, by moving the SDK and checking the declaration follows.
  *   mpv14-mpv17  FAIL-CLOSED: we must never claim an era we cannot serve.
  *                Claiming too LOW is a missed connection; claiming too HIGH
  *                sends a modern client into a -32000 we advertised ourselves.
@@ -208,6 +208,66 @@ export function runMcpProtocolVersionTests(opts: { log?: boolean } = {}): Promis
         "mpv27: …and advertises the CEILING. It published 2025-06-18 — the floor — while prod negotiated up to 2025-11-25");
       assertTrue(Array.isArray(manifest?.mcp_supported_versions) && manifest.mcp_supported_versions.includes("2025-06-18"),
         "mpv27b: …and the full range, so the clients the old string attracted are still explicitly welcome");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // mpv29-mpv31 — DERIVATION, proven by moving the SDK.
+    //
+    // mpv7 compares the declared version to the SDK's LATEST. That is NOT proof
+    // of derivation: measured, a mutant that hardcodes "2025-11-25" — today's
+    // SDK value — passes mpv7 and every other assertion in this file. This
+    // suite's header originally claimed a hardcode could not survive them. It
+    // could, and did.
+    //
+    // A hardcode is indistinguishable from a derivation by VALUE, because the
+    // two agree right up until the SDK moves — which is exactly when the
+    // hardcode starts lying and exactly when nothing else would catch it. So
+    // the only real test is to move the SDK and check the declaration follows.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const sdkPath = require.resolve("@modelcontextprotocol/sdk/types.js");
+      const modPath = require.resolve("./mcp-protocol-version");
+      const sdkMod = require.cache[sdkPath];
+      const realLatest = sdk.LATEST_PROTOCOL_VERSION;
+      const realSupported = sdk.SUPPORTED_PROTOCOL_VERSIONS;
+
+      assertTrue(!!sdkMod, "mpv29: the SDK types module is in the require cache (the seam these assertions need)");
+
+      if (sdkMod) {
+        try {
+          // A version from the OTHER era, so this also proves `era` and
+          // `modernEraSupported` track the SDK rather than the calendar.
+          Object.defineProperty(sdkMod.exports, "LATEST_PROTOCOL_VERSION", {
+            value: "2099-01-01", configurable: true, writable: true, enumerable: true,
+          });
+          Object.defineProperty(sdkMod.exports, "SUPPORTED_PROTOCOL_VERSIONS", {
+            value: ["2099-01-01", "2025-06-18"], configurable: true, writable: true, enumerable: true,
+          });
+          delete require.cache[modPath];
+          const reloaded = require("./mcp-protocol-version") as typeof import("./mcp-protocol-version");
+          const moved = reloaded.mcpProtocolDeclaration();
+
+          assertEq(moved.protocolVersion, "2099-01-01",
+            "mpv30: move the SDK and the advertised version MOVES. A hardcoded literal equal to today's value fails HERE and passes everything else");
+          assertEq(moved.modernEraSupported, true,
+            "mpv31: …and modernEraSupported flips on its own, which is what makes criterion 1's SDK upgrade a one-line change instead of a sweep through every discovery surface");
+        } finally {
+          Object.defineProperty(sdkMod.exports, "LATEST_PROTOCOL_VERSION", {
+            value: realLatest, configurable: true, writable: true, enumerable: true,
+          });
+          Object.defineProperty(sdkMod.exports, "SUPPORTED_PROTOCOL_VERSIONS", {
+            value: realSupported, configurable: true, writable: true, enumerable: true,
+          });
+          delete require.cache[modPath];
+          require("./mcp-protocol-version");
+        }
+      }
+
+      // Restoration is asserted too, or a later reader of this module silently
+      // gets 2099 and the damage surfaces somewhere unrelated.
+      const restored = (require("./mcp-protocol-version") as typeof import("./mcp-protocol-version")).mcpProtocolDeclaration();
+      assertEq(restored.protocolVersion, realLatest,
+        "mpv31b: …and the SDK is restored afterwards, so nothing downstream inherits the stub");
     }
 
     // The guard has to assert it actually TOOK, or deleting the redirect above
