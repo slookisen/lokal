@@ -25,6 +25,13 @@
 
 import express, { Router, Request, Response, NextFunction } from "express";
 import * as QRCode from "qrcode";
+// dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: reads the
+// vendored Leaflet assets (src/public/leaflet/) off disk for the
+// GET /leaflet/* routes below — see their doc comment for why express.static
+// can't be relied on here (the opplevagent.no host-gate in index.ts routes
+// every non-API path into this router before express.static is ever reached).
+import * as fs from "fs";
+import * as path from "path";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
@@ -67,6 +74,11 @@ import {
   type RelatedExperienceRow,
   type ExperienceCardRow,
   type GardssalgProviderRow,
+  // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: the
+  // /fylke/:fylke Leaflet map's marker data — see listPublishedExperienceMapPoints()
+  // doc in experience-store.ts for the exact publish/coords predicate.
+  listPublishedExperienceMapPoints,
+  type ExperienceMapPoint,
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
 import { geocodingService } from "../services/geocoding-service";
@@ -2211,6 +2223,193 @@ const BROWSE_CSS = `
   .foot-inner a{color:var(--ink-soft)}
 `;
 
+// dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: CSS for
+// the /fylke/:fylke Leaflet map section. Deliberately kept OUT of BROWSE_CSS
+// (which EVERY browse page's <style> block embeds unconditionally) and
+// injected via its own <style> tag ONLY when opts.map is set (see
+// renderBrowsePage below) — so /opplevelser, /kategori/*, /kommune/:kommune
+// keep rendering byte-identically to before this feature existed (no unused
+// CSS added to pages that never get a map).
+const FYLKE_MAP_CSS = `
+  .map-section{margin:26px 0 8px}
+  .map-section h2{font-size:1.05rem;font-weight:800;color:var(--fjord-900);margin:0 0 8px}
+  .map-legend{display:flex;flex-wrap:wrap;gap:16px;margin:0 0 10px;font-size:.82rem;color:var(--ink-soft);list-style:none;padding:0}
+  .map-legend .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .map-legend .dot-address{background:var(--fjord-700)}
+  .map-legend .dot-kommune{background:#f5a623;border:1.5px dashed #c2570c}
+  .fylke-map{width:100%;height:420px;border-radius:var(--r-md);border:1px solid var(--line);background:var(--canvas-2);position:relative;overflow:hidden;z-index:0}
+  .fylke-map .map-loading{margin:0;padding:18px;color:var(--mist);font-size:.88rem}
+  .map-attribution-note{font-size:.78rem;color:var(--mist);margin-top:8px}
+  .map-attribution-note a{color:var(--ink-soft)}
+  .map-noscript{margin-top:8px;font-size:.88rem}
+  .map-popup{font-size:.86rem;line-height:1.45;min-width:160px}
+  .map-popup strong{display:block;font-size:.92rem;color:var(--ink);margin-bottom:2px}
+  .map-popup .map-popup-meta{display:block;color:var(--mist);font-size:.8rem}
+  .map-popup .map-popup-approx{display:block;color:#c2570c;font-weight:700;font-size:.78rem;margin-top:4px}
+  .map-popup a{display:inline-block;margin-top:6px;font-weight:700}
+`;
+
+// One marker's worth of data as sent to the client (the JSON data island) —
+// deliberately a smaller/pre-resolved shape than ExperienceMapPoint: title is
+// already resolved to the display title per the page's lang (same title_no
+// fallback convention as renderCard()) and category is already resolved to
+// its human label (catLabel()), so the client init script does zero
+// business-logic duplication — it only renders what the server decided.
+type FylkeMapMarker = {
+  slug: string;
+  title: string;
+  kommune: string | null;
+  categoryLabel: string;
+  lat: number;
+  lon: number;
+  precision: "address" | "kommune";
+};
+
+// Lazy-init script for the /fylke/:fylke map — fires once #fylke-map nears
+// the viewport (IntersectionObserver; falls back to eager init on ancient
+// browsers without it), fetching self-hosted Leaflet (/leaflet/leaflet.js +
+// .css — vendored under src/public/leaflet/, see package.json's "leaflet"
+// dependency) ONLY at that point, never blocking initial page load. No
+// inline event-handler attributes (onclick=/onchange=) anywhere — GUIDEBOOK.md
+// appendix C.44's CSP-strict-browser regression — everything below is
+// addEventListener-driven. geo_precision='kommune' points (kommune-centroid
+// fallback, never an exact address) render as a distinct dashed circle
+// marker, never the default pin, AND get an explicit "Ca. posisjon
+// (kommune)" note in their popup — same honesty discipline as
+// formatDistanceLabel()/the detail-page map-card's geoApprox note.
+const FYLKE_MAP_INIT_JS = `(function () {
+  var mapEl = document.getElementById('fylke-map');
+  var dataEl = document.getElementById('fylke-map-data');
+  if (!mapEl || !dataEl) return;
+  var points = [];
+  try { points = JSON.parse(dataEl.textContent || '[]'); } catch (e) { points = []; }
+  if (!points.length) return;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  var leafletLoading = null;
+  function loadLeaflet() {
+    if (leafletLoading) return leafletLoading;
+    leafletLoading = new Promise(function (resolve, reject) {
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = '/leaflet/leaflet.css';
+      document.head.appendChild(link);
+      var script = document.createElement('script');
+      script.src = '/leaflet/leaflet.js';
+      script.addEventListener('load', function () { resolve(); });
+      script.addEventListener('error', function () { reject(new Error('leaflet-load-failed')); });
+      document.body.appendChild(script);
+    });
+    return leafletLoading;
+  }
+
+  function initMap() {
+    loadLeaflet().then(function () {
+      if (typeof L === 'undefined') return;
+      mapEl.textContent = '';
+      var map = L.map(mapEl);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
+      }).addTo(map);
+
+      var addressIcon = L.icon({
+        iconUrl: '/leaflet/images/marker-icon.png',
+        iconRetinaUrl: '/leaflet/images/marker-icon-2x.png',
+        shadowUrl: '/leaflet/images/marker-shadow.png',
+        iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+      });
+
+      var bounds = [];
+      points.forEach(function (p) {
+        var isApprox = p.precision === 'kommune';
+        var marker = isApprox
+          ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
+          : L.marker([p.lat, p.lon], { icon: addressIcon });
+        var metaBits = [];
+        if (p.kommune) metaBits.push(esc(p.kommune));
+        if (p.categoryLabel) metaBits.push(esc(p.categoryLabel));
+        var popupHtml = '<div class="map-popup"><strong>' + esc(p.title) + '</strong>'
+          + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
+          + (isApprox ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
+          + '<a href="/opplevelse/' + encodeURIComponent(p.slug) + '">Se opplevelsen →</a></div>';
+        marker.bindPopup(popupHtml);
+        marker.addTo(map);
+        bounds.push([p.lat, p.lon]);
+      });
+
+      if (bounds.length === 1) {
+        map.setView(bounds[0], 12);
+      } else {
+        map.fitBounds(bounds, { padding: [28, 28] });
+      }
+    }).catch(function () {
+      mapEl.innerHTML = '<p class="map-loading">Kartet kunne ikke lastes.</p>';
+    });
+  }
+
+  if ('IntersectionObserver' in window) {
+    var obs = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          obs.disconnect();
+          initMap();
+        }
+      });
+    }, { rootMargin: '200px 0px' });
+    obs.observe(mapEl);
+  } else {
+    initMap();
+  }
+})();`;
+
+// Renders the /fylke/:fylke map section: legend + map container + attribution
+// + <noscript> OSM fallback + a JSON data island + the deferred lazy-init
+// script above. Returns "" when there are no geocoded points (honest
+// omission — same discipline as productsBlock/mapBlock elsewhere in this
+// file — never an empty/broken map). Tile source: OSM's standard
+// {s}.tile.openstreetmap.org XYZ raster tiles (see final report for why —
+// short version: simpler/more reliably reachable than Kartverket's WMTS from
+// this sandbox, and Leaflet requests tiles as plain <img> tags, which the
+// existing global CSP imgSrc "https:" already allows — zero CSP changes
+// needed). Correct OSM attribution is rendered both under the map and inside
+// the tile layer itself (attribution control, bottom-right of the map).
+function renderFylkeMapSection(fylke: string, points: ExperienceMapPoint[], lang: Lang): string {
+  if (points.length === 0) return "";
+  const markers: FylkeMapMarker[] = points.map((p) => ({
+    slug: p.slug,
+    title: lang === "no" ? (p.title_no || p.title) : p.title,
+    kommune: p.kommune,
+    categoryLabel: catLabel(p.category),
+    lat: p.loc_lat,
+    lon: p.loc_lon,
+    precision: p.geo_precision,
+  }));
+  const dataJson = JSON.stringify(markers).replace(/<\//g, "<\\/");
+  const addressCount = markers.filter((m) => m.precision === "address").length;
+  const kommuneCount = markers.length - addressCount;
+  // Simple fylke-name-based OSM search link (spec explicitly allows this over
+  // a computed centroid) — a centroid could misleadingly read as "the exact
+  // position of the fylke", which isn't a real point; a name search is
+  // honest about what it is.
+  const osmSearchUrl = `https://www.openstreetmap.org/search?query=${encodeURIComponent(`${fylke}, Norge`)}`;
+
+  return `<section class="map-section" aria-labelledby="fylke-map-h">
+    <h2 id="fylke-map-h">Kart over opplevelser i ${escapeHtml(fylke)}</h2>
+    <p class="map-legend">${addressCount > 0 ? `<span><span class="dot dot-address" aria-hidden="true"></span>Nøyaktig posisjon</span>` : ""}${kommuneCount > 0 ? `<span><span class="dot dot-kommune" aria-hidden="true"></span>Ca. posisjon (kommune)</span>` : ""}</p>
+    <div id="fylke-map" class="fylke-map" role="group" aria-label="Kart over ${markers.length} ${markers.length === 1 ? "opplevelse" : "opplevelser"} i ${escapeHtml(fylke)}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
+    <p class="map-attribution-note">Kartdata © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere</p>
+    <noscript><p class="map-noscript"><a href="${escapeHtml(osmSearchUrl)}" target="_blank" rel="noopener">Åpne kart over ${escapeHtml(fylke)} i OpenStreetMap →</a></p></noscript>
+    <script type="application/json" id="fylke-map-data">${dataJson}</script>
+    <script>${FYLKE_MAP_INIT_JS}</script>
+  </section>`;
+}
+
 // Brand nav + footer shared by every browse page.
 const BROWSE_NAV = `<a class="skip-link" href="#main">Hopp til innhold</a>
 <nav class="site-nav"><div class="nav-inner">
@@ -2323,6 +2522,16 @@ function renderBrowsePage(opts: {
   // pages, and /fylke|/kommune themselves with no geo sort active) omits it,
   // so those pages render byte-identically to before this feature existed.
   distanceMap?: Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>;
+  // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: an
+  // optional Leaflet map section, ONLY ever passed by /fylke/:fylke (this
+  // dev-request's arbeidspunkt 3 — /kategori/gardssalg's map, mini-maps on
+  // detail/producer pages, and marker clustering are separate later slices).
+  // Every other caller (/opplevelser, /kategori/*, /kommune/:kommune,
+  // provider pages) omits it, so those pages render byte-identically to
+  // before this feature existed. `fylke` is used for the section heading +
+  // the <noscript> OSM fallback link; `points` are the (already
+  // publish-gated + coords-filtered) markers to plot.
+  map?: { fylke: string; points: ExperienceMapPoint[] };
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -2430,6 +2639,7 @@ ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta name="twitter:card" content="summary">
 ${ldScripts}
 <style>${BROWSE_CSS}</style>
+${opts.map ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
 </head>
 <body>
 ${BROWSE_NAV}
@@ -2442,6 +2652,7 @@ ${BROWSE_NAV}
   </header>
   ${opts.extraTopHtml || ""}
   ${grid}
+  ${opts.map ? renderFylkeMapSection(opts.map.fylke, opts.map.points, opts.lang) : ""}
   ${pager}
 </main>
 ${browseFooter()}
@@ -4409,6 +4620,21 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     return next();
   }
 
+  // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: map
+  // markers for ALL published experiences in this fylke with a real geocode —
+  // deliberately NOT scoped to the current page/pagination or to an active
+  // "nærmest deg" geo sort (the dev-request spec is explicit: "kart over ALLE
+  // publiserte opplevelser i fylket"). A failure here must never break the
+  // page itself (the card list is the primary content) — defaults to no map
+  // section (renderFylkeMapSection returns "" for an empty array).
+  let mapPoints: ExperienceMapPoint[] = [];
+  try {
+    mapPoints = listPublishedExperienceMapPoints({ fylke });
+  } catch (e) {
+    console.error(`[experiences-seo] /fylke/${fylke} map points failed:`, e);
+    mapPoints = [];
+  }
+
   // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: "nærmest deg
   // først" sort — PROGRESSIVE ENHANCEMENT ONLY. With no valid geo origin (or
   // no explicit sort=distance), resolvePlaceGeoSort's geoActive is false and
@@ -4444,6 +4670,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     pageSize: effectivePageSize,
     extraTopHtml: searchBox("") + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
+    map: { fylke, points: mapPoints },
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -5347,6 +5574,39 @@ export function opplevagentBadgeEmbedSnippet(providerSlug: string, absoluteUrl: 
   const badgeSrc = `${absoluteUrl}/badge/opplevagent.svg`;
   return `<a href="${escapeHtml(profileHref)}" target="_blank" rel="noopener"><img src="${escapeHtml(badgeSrc)}" width="180" height="40" alt="Finn oss på Opplevagent"></a>`;
 }
+
+// ═══════════════════════════════════════════════════════════
+// GET /leaflet/* — self-hosted Leaflet library assets (dev-request
+// 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: /fylke/:fylke map).
+// Same express.static-bypass reason as /favicon.svg above: the opplevagent
+// host-gate in index.ts routes every non-API path straight into this router
+// BEFORE express.static is ever reached, so the vendored files under
+// src/public/leaflet/ (npm "leaflet" dependency, dist files copied in —
+// never CDN-loaded, unlike src/public/agent.html's unpkg.com pattern, which
+// the global Helmet CSP's scriptSrc/styleSrc don't allow — see
+// src/middleware/security.ts) must be served explicitly here. Path-traversal
+// -safe by construction: each route serves ONE fixed, literal filename —
+// never a passthrough of a request param.
+// ═══════════════════════════════════════════════════════════
+const LEAFLET_ASSET_DIR = path.join(__dirname, "..", "public", "leaflet");
+function serveLeafletFile(relPath: string, contentType: string) {
+  return (_req: Request, res: Response, next: NextFunction) => {
+    let data: Buffer;
+    try {
+      data = fs.readFileSync(path.join(LEAFLET_ASSET_DIR, relPath));
+    } catch {
+      return next(); // missing on disk -> 404 catch-all, never a crash
+    }
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.send(data);
+  };
+}
+router.get("/leaflet/leaflet.js", serveLeafletFile("leaflet.js", "text/javascript; charset=utf-8"));
+router.get("/leaflet/leaflet.css", serveLeafletFile("leaflet.css", "text/css; charset=utf-8"));
+router.get("/leaflet/images/marker-icon.png", serveLeafletFile("images/marker-icon.png", "image/png"));
+router.get("/leaflet/images/marker-icon-2x.png", serveLeafletFile("images/marker-icon-2x.png", "image/png"));
+router.get("/leaflet/images/marker-shadow.png", serveLeafletFile("images/marker-shadow.png", "image/png"));
 
 // ═══════════════════════════════════════════════════════════
 // Catch-all 404 — norsk side (forhindrer rfb/dental-innhold på opplevagent-host)

@@ -18454,6 +18454,216 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   dbFactoryP2.__resetDbFactoryForTesting();
 })();
 
+// ── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-request
+// 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: self-hosted Leaflet +
+// server-injected marker JSON island for /fylke/:fylke ONLY). Same isolated
+// :memory: experiences.db + sync mock req/res pattern as the P2 browse-pages
+// block above. Verifies: (1) marker count == the SAME publish+fylke+coords
+// filter as listPublishedExperiences() (never counts unpublished/other-
+// fylke/no-coords rows); (2) each marker's real slug is present so its
+// popup link resolves to a live /opplevelse/:slug page; (3)
+// geo_precision='kommune' markers keep that precision verbatim, distinct
+// from 'address' (never silently promoted — the honesty rule this codebase
+// enforces everywhere else, e.g. formatDistanceLabel()); (4) the <noscript>
+// OSM fallback is present; (5) the map's own JS/CSS load lazily (no eager
+// <script src="/leaflet/leaflet.js"> tag); (6) NO inline onclick=/onchange=
+// handlers; (7) the vendored /leaflet/* asset routes actually serve;
+// (8) a fylke with zero geocoded rows renders no map section at all
+// (honest omission); (9) /opplevelser, /kategori/*, /kommune/:kommune get
+// NO map markup at all (opts.map is ONLY ever passed by /fylke/:fylke).
+console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-request 2026-07-19) ──");
+(() => {
+  const prevPathKart = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathKart = require.resolve("../src/database/db-factory");
+  const expStorePathKart = require.resolve("../src/services/experience-store");
+  const expSeoPathKart = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathKart];
+  delete require.cache[expStorePathKart];
+  delete require.cache[expSeoPathKart];
+
+  const dbFactoryKart = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryKart.__resetDbFactoryForTesting();
+  const expStoreKart = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterKart = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  dbFactoryKart.getDb("experiences");
+  const provKart = expStoreKart.createProvider({
+    navn: "Vestland Opplevelser AS", org_nr: "912345678",
+    fylke: "Vestland", kommune: "Bergen", hjemmeside: "https://example-vestland.no",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+
+  // Address-precision, real coordinates -> must render as a marker.
+  const addrIdKart = expStoreKart.createExperience({
+    title: "Fjordsafari fra Bergen", provider_id: provKart, provider_match_status: "matched",
+    category: "sightseeing_transport", fylke: "Vestland", kommune: "Bergen", indoor_outdoor: "outdoor",
+    loc_lat: 60.39, loc_lon: 5.32, geo_precision: "address",
+    confidence: "high", verification_status: "verified",
+  });
+  // Kommune-precision fallback coordinates -> must render as a DISTINCT marker.
+  const kommIdKart = expStoreKart.createExperience({
+    title: "Fjellvandring i Voss", provider_id: provKart, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Vestland", kommune: "Voss", indoor_outdoor: "outdoor",
+    loc_lat: 60.63, loc_lon: 6.42, geo_precision: "kommune",
+    confidence: "high", verification_status: "verified",
+  });
+  // Published, SAME fylke, but NO coordinates -> must appear in the list, NOT on the map.
+  expStoreKart.createExperience({
+    title: "Sykkeltur uten kartpunkt", provider_id: provKart, provider_match_status: "matched",
+    category: "adrenalin_action", fylke: "Vestland", kommune: "Bergen", indoor_outdoor: "outdoor",
+    confidence: "high", verification_status: "verified",
+  });
+  // Published, coordinates, but a DIFFERENT fylke -> must never leak onto /fylke/Vestland's map.
+  expStoreKart.createExperience({
+    title: "Nordlys i Tromsø by", provider_id: provKart, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms", kommune: "Tromsø", indoor_outdoor: "outdoor",
+    loc_lat: 69.65, loc_lon: 18.96, geo_precision: "address",
+    confidence: "high", verification_status: "verified",
+  });
+  // Unpublished draft, SAME fylke, WITH coordinates -> must never appear on the map (publish gate).
+  expStoreKart.createExperience({
+    title: "Hemmelig kartutkast", provider_id: provKart, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Vestland", kommune: "Bergen",
+    loc_lat: 60.4, loc_lon: 5.3, geo_precision: "address",
+    confidence: "high", verification_status: "pending_verify",
+  });
+
+  const addrSlugKart = (expStoreKart.getExperienceById(addrIdKart) as any).slug as string;
+  const kommSlugKart = (expStoreKart.getExperienceById(kommIdKart) as any).slug as string;
+
+  // invokeSeo — same helper shape as the P2 block above.
+  function invokeSeo(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterKart.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `kart-fylke: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // kart-01: /fylke/Vestland -> 200, includes the map data island + section.
+  const fylkeKart = invokeSeo("/fylke/:fylke", { fylke: "Vestland" }, "/fylke/Vestland");
+  assertEq(fylkeKart.status, 200, "kart-01a: GET /fylke/Vestland -> 200");
+  assertTrue(fylkeKart.body.includes('id="fylke-map"'), "kart-01b: fylke page renders the map container");
+  assertTrue(fylkeKart.body.includes('id="fylke-map-data"'), "kart-01c: fylke page renders the JSON data island");
+
+  // kart-02: extract + parse the data island, verify the EXACT marker set.
+  const dataMatchKart = fylkeKart.body.match(/<script type="application\/json" id="fylke-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchKart, "kart-02a: data island is present and matchable");
+  const markersKart: Array<{ slug: string; title: string; kommune: string | null; categoryLabel: string; lat: number; lon: number; precision: string }> =
+    dataMatchKart ? JSON.parse(dataMatchKart[1]) : [];
+  assertEq(markersKart.length, 2, "kart-02b: exactly 2 markers (address + kommune) — no-coords/other-fylke/unpublished all excluded");
+  const slugsKart = markersKart.map((m) => m.slug).sort();
+  assertEq(JSON.stringify(slugsKart), JSON.stringify([addrSlugKart, kommSlugKart].sort()),
+    "kart-02c: marker slugs are EXACTLY the two coord-bearing published Vestland rows");
+  assertTrue(!markersKart.some((m) => m.title === "Sykkeltur uten kartpunkt"), "kart-02d: no-coords experience never appears on the map");
+  assertTrue(!markersKart.some((m) => m.title === "Nordlys i Tromsø by"), "kart-02e: other-fylke experience never appears on the map");
+  assertTrue(!markersKart.some((m) => m.title === "Hemmelig kartutkast"), "kart-02f: unpublished draft never appears on the map (publish gate holds for markers too)");
+
+  // kart-03: geo_precision is carried through VERBATIM and distinctly, never fabricated.
+  const addrMarkerKart = markersKart.find((m) => m.slug === addrSlugKart)!;
+  const kommMarkerKart = markersKart.find((m) => m.slug === kommSlugKart)!;
+  assertEq(addrMarkerKart.precision, "address", "kart-03a: address-precision marker keeps precision:'address'");
+  assertEq(kommMarkerKart.precision, "kommune", "kart-03b: kommune-precision marker keeps precision:'kommune' (never silently promoted to 'address')");
+  assertEq(addrMarkerKart.lat, 60.39, "kart-03c: marker carries the real lat");
+  assertEq(addrMarkerKart.lon, 5.32, "kart-03d: marker carries the real lon");
+
+  // kart-04: popup click-through — the client init script builds the
+  // /opplevelse/:slug link from marker.slug; verify the exact slug is
+  // present verbatim AND that it resolves to a real, live detail page.
+  const addrDetailKart = invokeSeo("/opplevelse/:slug", { slug: addrSlugKart }, `/opplevelse/${addrSlugKart}`);
+  assertEq(addrDetailKart.status, 200, "kart-04a: the address marker's slug resolves to a real, live detail page");
+  const kommDetailKart = invokeSeo("/opplevelse/:slug", { slug: kommSlugKart }, `/opplevelse/${kommSlugKart}`);
+  assertEq(kommDetailKart.status, 200, "kart-04b: the kommune marker's slug resolves to a real, live detail page");
+
+  // kart-05: card list is UNCHANGED/still primary — the no-coords experience
+  // is excluded from the map but still shows up in the card grid.
+  assertTrue(/Sykkeltur uten kartpunkt/.test(fylkeKart.body), "kart-05a: no-coords experience still appears in the card list");
+  assertTrue(!/Nordlys i Tromsø by/.test(fylkeKart.body), "kart-05b: other-fylke experience is excluded from the fylke page entirely (pre-existing list scoping)");
+
+  // kart-06: <noscript> OSM fallback — JS-off users still get a map-equivalent affordance.
+  const noscriptBlockKart = (fylkeKart.body.match(/<noscript>[\s\S]*?<\/noscript>/) || [""])[0];
+  assertTrue(/openstreetmap\.org\/search\?query=/.test(noscriptBlockKart), "kart-06a: <noscript> block links to an OpenStreetMap search");
+  assertTrue(/Vestland/.test(noscriptBlockKart), "kart-06b: noscript OSM link mentions the fylke by name");
+
+  // kart-07: lazy-init discipline — leaflet.js must NOT be eagerly tagged in
+  // the markup (it's only appendChild'd by the IntersectionObserver callback
+  // at runtime), and the init script must actually use IntersectionObserver.
+  assertTrue(!/<script src="\/leaflet\/leaflet\.js"/.test(fylkeKart.body),
+    "kart-07a: leaflet.js is NOT eagerly tagged in the markup (loaded on-demand only)");
+  assertTrue(/IntersectionObserver/.test(fylkeKart.body), "kart-07b: init script uses IntersectionObserver for lazy init");
+
+  // kart-08: no inline event-handler attributes (GUIDEBOOK.md appendix C.44 regression class).
+  assertTrue(!/\son(click|change)\s*=/.test(fylkeKart.body), "kart-08a: no inline onclick=/onchange= handler attributes anywhere on the page");
+
+  // kart-09: self-hosted asset routes actually serve, with correct content
+  // types — and the page never references the unpkg.com CDN.
+  const leafletJsKart = invokeSeo("/leaflet/leaflet.js", {}, "/leaflet/leaflet.js");
+  assertEq(leafletJsKart.status, 200, "kart-09a: GET /leaflet/leaflet.js -> 200 (self-hosted, not a 404)");
+  assertTrue(/text\/javascript/.test(leafletJsKart.headers["content-type"] || ""), "kart-09b: leaflet.js Content-Type is text/javascript");
+  const leafletCssKart = invokeSeo("/leaflet/leaflet.css", {}, "/leaflet/leaflet.css");
+  assertEq(leafletCssKart.status, 200, "kart-09c: GET /leaflet/leaflet.css -> 200");
+  const leafletIconKart = invokeSeo("/leaflet/images/marker-icon.png", {}, "/leaflet/images/marker-icon.png");
+  assertEq(leafletIconKart.status, 200, "kart-09d: GET /leaflet/images/marker-icon.png -> 200");
+  assertTrue(!/unpkg\.com/.test(fylkeKart.body), "kart-09e: page never references unpkg.com (self-hosted only, no CDN)");
+
+  // kart-10: a fylke with ZERO geocoded published experiences renders NO map
+  // section at all (honest omission, never an empty/broken map) while the
+  // card list still renders normally.
+  const provNoGeoKart = expStoreKart.createProvider({
+    navn: "Agder Utan Kart AS", org_nr: "923456789",
+    fylke: "Agder", kommune: "Kristiansand", brreg_verified: 1, brreg_active: 1,
+    verification_status: "verified",
+  });
+  expStoreKart.createExperience({
+    title: "Havkajakk uten kartpunkt", provider_id: provNoGeoKart, provider_match_status: "matched",
+    category: "adrenalin_action", fylke: "Agder", kommune: "Kristiansand", indoor_outdoor: "outdoor",
+    confidence: "high", verification_status: "verified",
+  });
+  const fylkeNoGeoKart = invokeSeo("/fylke/:fylke", { fylke: "Agder" }, "/fylke/Agder");
+  assertEq(fylkeNoGeoKart.status, 200, "kart-10a: GET /fylke/Agder (no geocoded rows) -> 200");
+  assertTrue(!fylkeNoGeoKart.body.includes('id="fylke-map"'), "kart-10b: no map section rendered when there are zero geocoded published experiences");
+  assertTrue(/Havkajakk uten kartpunkt/.test(fylkeNoGeoKart.body), "kart-10c: the card list still renders normally");
+
+  // kart-11: byte-identical other browse pages — NO map markup leaks onto
+  // /opplevelser, /kategori/*, /kommune/:kommune (opts.map is ONLY ever
+  // passed by /fylke/:fylke's own call site).
+  const idxKart = invokeSeo("/opplevelser", {}, "/opplevelser");
+  assertTrue(
+    !idxKart.body.includes('id="fylke-map"') && !idxKart.body.includes('id="fylke-map-data"') && !/class="map-section"/.test(idxKart.body),
+    "kart-11a: /opplevelser has NO map markup (opts.map omitted)"
+  );
+  const catKart = invokeSeo("/kategori/:category", { category: "sightseeing_transport" }, "/kategori/sightseeing_transport");
+  assertTrue(!catKart.body.includes('id="fylke-map"') && !/class="map-section"/.test(catKart.body),
+    "kart-11b: /kategori/:category has NO map markup");
+  const kommKart = invokeSeo("/kommune/:kommune", { kommune: "Bergen" }, "/kommune/Bergen");
+  assertTrue(!kommKart.body.includes('id="fylke-map"') && !/class="map-section"/.test(kommKart.body),
+    "kart-11c: /kommune/:kommune has NO map markup");
+
+  if (prevPathKart === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathKart;
+  dbFactoryKart.__resetDbFactoryForTesting();
+})();
+
 // ── opplevagent: /fylke + /kommune fold-redirect ambiguity guard ───────────────
 // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering, item 5:
 // a param that ascii-folds to match TWO different live canonical values must
