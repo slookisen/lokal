@@ -800,6 +800,22 @@ console.log("\n── orch-pr-13: contact-normalizer (address/phone) ──");
   console.log(`  contact-normalizer: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── homepage-provenance-contact-extraction-fix (2026-07-29): the two
+// extractAddress/extractPhone bugs (poststed swallowing a trailing contact
+// label; phone accepting date-shaped/org-number-slice 8-digit runs) that
+// paused the `rfb` vertical's enrichment write path. Pure functions of an
+// html string — no DB/fetch involved, so no serial chaining needed. ──
+console.log("\n── homepage-provenance-contact-extraction-fix (address/phone) ──");
+{
+  const { runHomepageProvenanceContactExtractionFixTests } = require("../src/routes/homepage-provenance-contact-extraction-fix.test") as
+    typeof import("../src/routes/homepage-provenance-contact-extraction-fix.test");
+  const r = runHomepageProvenanceContactExtractionFixTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("homepage-provenance-contact-extraction-fix: " + f);
+  console.log(`  homepage-provenance-contact-extraction-fix: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── PR-131: dental-claim-service buildWhereClause (completion-mode fix) ──
 // Pins the completion-mode already-complete exclusion (and pre-existing
 // PR-108/PR-120 exclusions + base filter behaviour) so `npm test` catches
