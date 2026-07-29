@@ -66,12 +66,18 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
   return (async () => {
     const prevDb = initMod.__peekDbForTesting();
     const prevAdminKey = process.env.ANALYTICS_ADMIN_KEY;
-    // admin-outreach-candidates reads ADMIN_KEY FIRST and only then falls back
-    // to ANALYTICS_ADMIN_KEY. Setting only the latter left every candidates
-    // call at 403 — and two of the assertions below ("X is not in the list")
-    // passed anyway, against an empty list. That is why tr55b/tr55c assert the
+    // admin-outreach-candidates reads ADMIN_KEY first and falls back to
+    // ANALYTICS_ADMIN_KEY. Sending only the latter left every candidates call
+    // at 403 — and two of the assertions below ("X is not in the list") passed
+    // anyway, against an empty list. That is why tr55b/tr55c assert the
     // fixtures ARE candidates before anything asserts one is missing.
-    const prevAdminKey2 = process.env.ADMIN_KEY;
+    //
+    // We READ process.env.ADMIN_KEY rather than SETTING it. Writing it here
+    // broke cart-56..cart-63 with 403s: that suite sets ADMIN_KEY once and then
+    // makes async HTTP calls against it, so a second writer between the two
+    // silently invalidates its header. Reading is enough — getAdminKey() falls
+    // through to ANALYTICS_ADMIN_KEY when ADMIN_KEY is unset.
+    const ambientAdminKey = () => process.env.ADMIN_KEY || "test-admin-key";
     const prevTurnstile = process.env.SKIP_TURNSTILE;
     const db = new Database(":memory:");
     const triage = require("./crm-triage") as typeof import("./crm-triage");
@@ -81,7 +87,6 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
       initMod.__setDbForTesting(db as any);
       initMod.__initSchemaForTesting(db as any);
       process.env.ANALYTICS_ADMIN_KEY = "test-admin-key";
-      process.env.ADMIN_KEY = "test-admin-key";
       process.env.SKIP_TURNSTILE = "true";
 
       const RFB = "kontakt@rettfrabonden.com";
@@ -541,7 +546,7 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
           }
           const req: any = {
             method: "GET", url: `/?${qs}`, originalUrl: `/?${qs}`, path: "/", query, body: {},
-            headers: { "x-admin-key": "test-admin-key" },
+            headers: { "x-admin-key": ambientAdminKey() },
             get(n: string) { return this.headers[n.toLowerCase()]; },
           };
           let settle: () => void;
@@ -741,8 +746,6 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
       initMod.__setDbForTesting(prevDb as any);
       if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
       else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
-      if (prevAdminKey2 === undefined) delete process.env.ADMIN_KEY;
-      else process.env.ADMIN_KEY = prevAdminKey2;
       if (prevTurnstile === undefined) delete process.env.SKIP_TURNSTILE;
       else process.env.SKIP_TURNSTILE = prevTurnstile;
     }
