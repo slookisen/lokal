@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.slookisen/finn-tannlege-mcp",
-  "description": "Norwegian dental clinic directory MCP: ~6,900 clinics with Helfo-agreement, specialty, emergency-duty, and chain data.",
+  "description": "Norwegian dental clinic directory MCP: ~6,900 clinics with Helfo-agreement, specialty, duty, chain.",
   "repository": {
     "url": "https://github.com/slookisen/lokal",
     "source": "github",

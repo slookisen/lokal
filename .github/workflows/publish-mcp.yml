@@ -26,27 +26,49 @@ jobs:
             | tar -xz mcp-publisher
           chmod +x mcp-publisher
 
-      - name: Validate mcp-server/server.json
-        run: ./mcp-publisher validate ./mcp-server/server.json
+      # Servers published by this workflow: local dir <-> registry search name, in lockstep.
+      # Add a dir to SERVER_DIRS and its search name at the same index in SERVER_NAMES
+      # to onboard another server.json.
+      - name: Validate all server.json manifests
+        run: |
+          set -e
+          SERVER_DIRS=(mcp-server mcp-server-opplevagent mcp-server-dental)
+          for dir in "${SERVER_DIRS[@]}"; do
+            echo "== Validating $dir/server.json =="
+            ./mcp-publisher validate "./$dir/server.json"
+          done
 
       - name: Authenticate via GitHub OIDC
         run: ./mcp-publisher login github-oidc
 
-      - name: Publish to MCP Registry
-        run: ./mcp-publisher publish ./mcp-server/server.json
-
-      - name: Verify publication
+      - name: Publish all servers to MCP Registry
         run: |
+          set -e
+          SERVER_DIRS=(mcp-server mcp-server-opplevagent mcp-server-dental)
+          for dir in "${SERVER_DIRS[@]}"; do
+            echo "== Publishing $dir/server.json =="
+            ./mcp-publisher publish "./$dir/server.json"
+          done
+
+      - name: Verify publication (all servers)
+        run: |
+          set -e
+          SERVER_DIRS=(mcp-server mcp-server-opplevagent mcp-server-dental)
+          SERVER_NAMES=(io.github.slookisen/lokal-mcp io.github.slookisen/opplevagent-mcp io.github.slookisen/finn-tannlege-mcp)
           sleep 5
-          curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.slookisen/lokal-mcp" \
-            | python3 -c "
+          for i in "${!SERVER_DIRS[@]}"; do
+            dir="${SERVER_DIRS[$i]}"
+            name="${SERVER_NAMES[$i]}"
+            echo "== Verifying $name ($dir/server.json) =="
+            curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=${name}" \
+              | python3 -c "
           import json, sys
           data = json.load(sys.stdin)
           latest = next((s for s in data.get('servers', []) if s['_meta']['io.modelcontextprotocol.registry/official'].get('isLatest')), None)
           if latest:
               v = latest['server']['version']
               print(f'Latest in registry: v{v}')
-              with open('mcp-server/server.json') as f:
+              with open('${dir}/server.json') as f:
                   expected = json.load(f)['version']
               if v == expected:
                   print('✅ Registry matches local server.json version')
@@ -57,3 +79,4 @@ jobs:
               print('❌ No isLatest entry found')
               sys.exit(1)
           "
+          done
