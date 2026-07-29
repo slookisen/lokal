@@ -1,7 +1,7 @@
 import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
-import { isDisplayablePhone } from "./contact-normalizer";
+import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel } from "./contact-normalizer";
 import { isJunkDescription } from "./description-quality";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
@@ -387,6 +387,23 @@ class KnowledgeService {
     const db = getDb();
     const existing = this.getKnowledge(agentId);
     const now = new Date().toISOString();
+
+    // Write-time contact guard (dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon,
+    // slice 1). Validate the INCOMING `data` before it participates in either
+    // the INSERT or the UPDATE/merge branch below — so a rejected/cleaned
+    // value never gets merged in ahead of `existing`'s good value. Only
+    // guards NEW incoming data; `existing` is never touched here.
+    if (data.phone) {
+      const agentRow = db.prepare("SELECT org_nr FROM agents WHERE id = ?").get(agentId) as { org_nr?: string } | undefined;
+      const validatedPhone = validatePhoneForWrite(data.phone, agentRow?.org_nr ?? null);
+      if (validatedPhone === null) {
+        console.log(`[contact-write-guard] agent ${agentId}: rejected phone write, field left blank`);
+      }
+      data = { ...data, phone: validatedPhone ?? undefined };
+    }
+    if (data.address) {
+      data = { ...data, address: stripTrailingContactLabel(data.address) ?? undefined };
+    }
 
     // Normalize products: extract prices from name field before storage
     if (data.products?.length) {
