@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
+import { getConfig } from "../config/vertical-config";
 
 // ─── CRM Service ────────────────────────────────────────────
 // Core inbox-CRM logic.
@@ -114,6 +115,39 @@ class CrmService {
   }
 
   /**
+   * dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, fix 2 (root-cause
+   * guard). classifyEmail()'s email/domain matching has no way to know a matched
+   * `agents` row IS the platform's own record rather than a real producer — that
+   * is exactly how the 2026-05-11 marketing batch e23 templating bug linked 14
+   * different contacts to agent 2b5fc7a6, whose name is literally "Rett fra
+   * Bonden" (the platform's own display_name for the rfb vertical), role
+   * 'logistics'. This is a general rule keyed on name-equals-platform-display-
+   * name for the contact's OWN vertical, not a hardcoded check for that one
+   * agent id.
+   */
+  private isPlatformNameAgent(agentId: string, vertical: CrmVertical): boolean {
+    const db = getDb();
+    const row = db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId) as { name: string } | undefined;
+    if (!row || !row.name) return false;
+    let displayName: string | null = null;
+    try {
+      // vertical-config.ts is cold-loaded at boot (loadConfigsAtBoot), well
+      // before any CRM write can happen — but getConfig() throws if that
+      // hasn't run (e.g. a test harness that didn't load it), hence the guard.
+      displayName = getConfig(vertical).display_name || null;
+    } catch (e) {
+      // Fail OPEN: this guard is defense-in-depth on top of classifyEmail's
+      // existing matching, not the only thing standing between a contact and a
+      // bad link. A vertical-config load hiccup should not take contact
+      // resolution down with it — it should just skip the extra check.
+      console.error(`[crm] isPlatformNameAgent: getConfig(${vertical}) failed, guard skipped:`, e);
+      return false;
+    }
+    if (!displayName) return false;
+    return row.name.trim().toLowerCase() === displayName.trim().toLowerCase();
+  }
+
+  /**
    * Classify an email against the agents table. Used both at create-time
    * and to re-evaluate existing 'unknown' contacts after agents are added/edited.
    *
@@ -122,17 +156,51 @@ class CrmService {
    *   2. Domain match on agents.contact_email
    *   3. Vendor allowlist
    *   4. unknown
+   *
+   * `vertical` scopes the platform-name guard above (fix 2) to the contact's
+   * own platform. `contactIdForLog`, when the contact row already exists,
+   * is attached to the crm_actions row logged on a blocked match so a human
+   * reviewing the CRM can jump straight to the contact; pass null for a
+   * brand-new contact that hasn't been INSERTed yet (crm_actions.contact_id
+   * has an ON DELETE SET NULL FK — logging against a not-yet-existing row
+   * would violate it under foreign_keys=ON).
    */
-  classifyEmail(email: string): { type: ContactType; agentId: string | null } {
+  classifyEmail(
+    email: string,
+    vertical: CrmVertical,
+    contactIdForLog: string | null = null,
+  ): { type: ContactType; agentId: string | null } {
     const db = getDb();
     const lowerEmail = email.trim().toLowerCase();
     const domain = lowerEmail.split("@")[1] ?? "";
+
+    // Returns true (and logs) if `agentId` is the platform's own house-bucket
+    // record for `vertical` — callers must treat that as "no match" and NOT
+    // auto-link, per the guard above.
+    const blockIfPlatformNameAgent = (agentId: string): boolean => {
+      if (!this.isPlatformNameAgent(agentId, vertical)) return false;
+      console.warn(
+        `[crm] classifyEmail: refusing to auto-link ${lowerEmail} to agent ${agentId} — ` +
+          `its name matches the '${vertical}' platform's own display_name ` +
+          `(house-bucket guard, dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding)`,
+      );
+      this.logAction({
+        contactId: contactIdForLog,
+        type: "crm_auto_link_blocked_platform_name_match",
+        actor: "system",
+        payload: { email: lowerEmail, vertical, blocked_agent_id: agentId },
+      });
+      return true;
+    };
 
     // 1. Exact match
     const exact = db
       .prepare("SELECT id FROM agents WHERE LOWER(contact_email) = ? AND is_active = 1 LIMIT 1")
       .get(lowerEmail) as { id: string } | undefined;
-    if (exact) return { type: "producer", agentId: exact.id };
+    if (exact) {
+      if (blockIfPlatformNameAgent(exact.id)) return { type: "unknown", agentId: null };
+      return { type: "producer", agentId: exact.id };
+    }
 
     // 1b. Exact match on agent_knowledge.email — this is the address marketing
     // actually sends outreach to, and it's often different from agents.contact_email
@@ -144,7 +212,10 @@ class CrmService {
         "SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id WHERE LOWER(k.email) = ? AND a.is_active = 1 LIMIT 1"
       )
       .get(lowerEmail) as { id: string } | undefined;
-    if (exactKnowledge) return { type: "producer", agentId: exactKnowledge.id };
+    if (exactKnowledge) {
+      if (blockIfPlatformNameAgent(exactKnowledge.id)) return { type: "unknown", agentId: null };
+      return { type: "producer", agentId: exactKnowledge.id };
+    }
 
     // 2. Domain match (skip generic freemail domains so we don't false-positive)
     const FREEMAIL = new Set(["gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com", "icloud.com", "online.no", "broadpark.no"]);
@@ -152,7 +223,10 @@ class CrmService {
       const byDomain = db
         .prepare("SELECT id FROM agents WHERE LOWER(contact_email) LIKE ? AND is_active = 1 LIMIT 1")
         .get(`%@${domain}`) as { id: string } | undefined;
-      if (byDomain) return { type: "producer", agentId: byDomain.id };
+      if (byDomain) {
+        if (blockIfPlatformNameAgent(byDomain.id)) return { type: "unknown", agentId: null };
+        return { type: "producer", agentId: byDomain.id };
+      }
     }
 
     // 3. Vendor allowlist (exact OR subdomain match)
@@ -206,7 +280,7 @@ class CrmService {
         existing.type === "unknown" ||
         (existing.agent_id === null && existing.type !== "vendor" && existing.type !== "marketing");
       if (needsReclassify) {
-        const c = this.classifyEmail(lowerEmail);
+        const c = this.classifyEmail(lowerEmail, v, existing.id);
         if (c.type !== "unknown") {
           db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ?, last_seen_at = datetime('now') WHERE id = ?")
             .run(c.type, c.agentId, existing.id);
@@ -217,7 +291,12 @@ class CrmService {
       return { id: existing.id, created: false };
     }
 
-    const c = this.classifyEmail(lowerEmail);
+    // contactIdForLog is null here (not existing.id above): this contact row
+    // doesn't exist yet — the INSERT is below — and crm_actions.contact_id is
+    // an ON DELETE SET NULL FK, so logging against a not-yet-existing id would
+    // violate it under foreign_keys=ON. A blocked-match log without a
+    // contact_id still carries the email/vertical/agent_id a human needs.
+    const c = this.classifyEmail(lowerEmail, v, null);
     const id = randomUUID();
     db.prepare(`
       INSERT INTO crm_contacts (id, type, agent_id, email, name, domain, vertical_id)
@@ -233,10 +312,16 @@ class CrmService {
    */
   reclassifyUnknown(): { evaluated: number; reclassified: number } {
     const db = getDb();
-    const rows = db.prepare("SELECT id, email FROM crm_contacts WHERE type = 'unknown'").all() as Array<{ id: string; email: string }>;
+    const rows = db.prepare(
+      "SELECT id, email, COALESCE(vertical_id, 'rfb') AS vertical_id FROM crm_contacts WHERE type = 'unknown'"
+    ).all() as Array<{ id: string; email: string; vertical_id: string }>;
     let reclassified = 0;
     for (const r of rows) {
-      const c = this.classifyEmail(r.email);
+      // Defensive fallback to 'rfb' for any unexpected stored value — this is
+      // a bulk maintenance sweep, not a request-time write, so it deliberately
+      // does not use assertVertical()'s fail-loud behavior here.
+      const vertical: CrmVertical = isCrmVertical(r.vertical_id) ? r.vertical_id : "rfb";
+      const c = this.classifyEmail(r.email, vertical, r.id);
       if (c.type !== "unknown") {
         db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ? WHERE id = ?").run(c.type, c.agentId, r.id);
         reclassified++;
@@ -642,11 +727,11 @@ class CrmService {
     }
     params.push(limit, offset);
 
-    return db.prepare(`
+    const rows = db.prepare(`
       SELECT
         c.id, c.email, c.name, c.domain, c.organization, c.status, c.notes,
         c.first_seen_at, c.last_seen_at, c.agent_id,
-        a.name AS agent_name,
+        a.name AS agent_name, a.role AS agent_role,
         COUNT(DISTINCT t.id) AS thread_count,
         SUM(CASE WHEN t.status = 'new' THEN 1 ELSE 0 END) AS new_count,
         SUM(CASE WHEN t.status = 'awaiting_review' THEN 1 ELSE 0 END) AS awaiting_count,
@@ -660,6 +745,17 @@ class CrmService {
       ORDER BY MAX(t.last_message_at) DESC NULLS LAST, c.last_seen_at DESC
       LIMIT ? OFFSET ?
     `).all(...params) as any[];
+
+    // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, fix 3: flag
+    // any contact whose agent_id points at a non-producer agent record (e.g.
+    // the "Rett fra Bonden" house-bucket, role='logistics') so an admin
+    // UI/CS agent sees the mismatch immediately instead of silently
+    // mis-searching for a "producer" that's actually an internal record.
+    // Additive field only — every existing field above is untouched.
+    for (const row of rows) {
+      row.agent_role_mismatch = !!row.agent_id && !!row.agent_role && row.agent_role !== "producer";
+    }
+    return rows;
   }
 
   countContactsByType(vertical?: CrmVertical): Record<ContactType, number> {
@@ -675,12 +771,16 @@ class CrmService {
   getContactDetail(contactId: string): any {
     const db = getDb();
     const contact = db.prepare(`
-      SELECT c.*, a.name AS agent_name, a.city AS agent_city
+      SELECT c.*, a.name AS agent_name, a.city AS agent_city, a.role AS agent_role
       FROM crm_contacts c
       LEFT JOIN agents a ON a.id = c.agent_id
       WHERE c.id = ?
-    `).get(contactId);
+    `).get(contactId) as any;
     if (!contact) return null;
+
+    // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, fix 3 — see
+    // the matching comment in listContacts() above. Additive field only.
+    contact.agent_role_mismatch = !!contact.agent_id && !!contact.agent_role && contact.agent_role !== "producer";
 
     const threads = db.prepare(`
       SELECT * FROM crm_threads

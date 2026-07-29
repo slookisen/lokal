@@ -4025,8 +4025,46 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // related producers, and the fuzzy fallback. Suggestions on the 404 page
     // should be PRODUCERS (humans typing producer names), not umbrellas, so
     // getActiveAgents()'s filter is correct there.
-    const agent = marketplaceRegistry.getAgentBySlugIncludingUmbrellas(slug);
+    let agent = marketplaceRegistry.getAgentBySlugIncludingUmbrellas(slug);
     const agents = marketplaceRegistry.getActiveAgents();
+
+    // ─── Role gate (dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding) ──
+    // This route serves two intentional kinds of public page: real producers
+    // (role='producer') and umbrella-tagged agents (Phase 5.11 A4.3/A4.4 above —
+    // lokallag/venues/market networks, discriminated by `umbrella_type` being
+    // non-null regardless of `role`). ANY other active agent — role='logistics',
+    // 'consumer', 'quality', 'price-intel', or a legacy row with an unexpected
+    // role — must never get a public producer page just because it's
+    // `is_active=1` and its slugified name happens to match. Concretely: agent
+    // 2b5fc7a6 ("Rett fra Bonden", role='logistics') is a de-facto CRM house
+    // bucket that also inherited a real producer's data via a batch mismatch,
+    // and was rendering live at /produsent/rett-fra-bonden with that data in
+    // its JSON-LD. This is a general rule, not a special case for that one id:
+    // any non-producer, non-umbrella agent is treated exactly like "not
+    // found" below, so the URL 404s / fuzzy-redirects like any unknown slug.
+    //
+    // Legacy rows with role=null are tolerated (same convention as the
+    // producer/umbrella guard in admin-affiliations.ts) — only an EXPLICIT
+    // non-producer role is rejected. Umbrella-tagged agents are exempted from
+    // the role check entirely: they're looked up by the same call but are a
+    // distinct, intentional rendering path (see isUmbrella below).
+    if (agent) {
+      let roleGateUmbrellaType: string | null = null;
+      try {
+        const row = getDb()
+          .prepare("SELECT umbrella_type FROM agents WHERE id = ?")
+          .get(agent.id) as { umbrella_type: string | null } | undefined;
+        roleGateUmbrellaType = row ? row.umbrella_type : null;
+      } catch (e) {
+        console.error("[seo] role-gate umbrella lookup failed:", e);
+      }
+      const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
+      const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
+      if (failsRoleGate) {
+        console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${slug}`);
+        agent = undefined;
+      }
+    }
 
     if (!agent) {
       // Fuzzy fallback so AI-engine traffic that constructs slugs from
