@@ -60,6 +60,7 @@ import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
+import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
@@ -630,6 +631,15 @@ app.use("/admin/wrong-entity-retro-sweep", adminLimiter, adminWrongEntityRetroSw
 // shape / trailing address contact-label). Zero writes — no apply mode.
 // GET /admin/contact-write-guard-audit
 app.use("/admin/contact-write-guard-audit", adminLimiter, adminContactWriteGuardAuditRoutes);
+// dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon, criterion 6:
+// the CORRECTION half of the audit above. Dry-run by default (count + report,
+// no writes); apply=true actually blanks rule-1/2/3 violating phones to NULL
+// and rewrites rule-4 violating addresses to their stripped form — never
+// touching an owner-claimed agent (claimed_at) or a curated_fields-locked
+// field. "Apply krever Daniels godkjenning av tallet" — apply is a real write
+// path but only ever invoked by a human after reviewing a dry-run's numbers.
+// POST /admin/contact-write-guard-retro-sweep
+app.use("/admin/contact-write-guard-retro-sweep", adminLimiter, adminContactWriteGuardRetroSweepRoutes);
 // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 2: the
 // live-data-cleanup half of PR #405 (that PR's own commit message flagged
 // this as "a separate, non-code operational step, not part of this PR").

@@ -33990,6 +33990,30 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon,
+// criterion 6: POST /admin/contact-write-guard-retro-sweep — the correction
+// half of the read-only audit above. Dry-run by default (count + report, no
+// writes); apply=true blanks rule-1/2/3 violating phones to NULL and rewrites
+// rule-4 violating addresses to their stripped form, respecting the SAME
+// claimed_at/curated_fields lock discipline as retro-scan (#380). Own
+// in-memory DB (swaps the shared getDb() singleton) — runs via runSerial()
+// same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon (crit. 6): contact-write-guard-retro-sweep ──");
+  try {
+    const { runAdminContactWriteGuardRetroSweepTests } = require("../src/routes/admin-contact-write-guard-retro-sweep.test") as
+      typeof import("../src/routes/admin-contact-write-guard-retro-sweep.test");
+    const cwgrs = await runAdminContactWriteGuardRetroSweepTests({ log: false });
+    passed += cwgrs.passed;
+    failed += cwgrs.failed;
+    for (const f of cwgrs.failures) failures.push("contact-write-guard-retro-sweep: " + f);
+    console.log(`  contact-write-guard-retro-sweep: ${cwgrs.passed} passed, ${cwgrs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-write-guard-retro-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-13-supply-graph-v1, Slice 1: additive
 // availability_updated_at/availability_source columns on `products` +
 // computeEffectiveAvailability()/setProducerAvailability()
