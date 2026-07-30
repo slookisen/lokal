@@ -129,6 +129,10 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
       // pruning), so dedup MUST also match the gardssalgSearchName-pruned
       // form or discovery re-creates this row as a public duplicate.
       insertProvider.run({ id: "prov-nd-dash", navn: "Fjelldal Brenneri — Saltdal", org_nr: null, catalog_hidden: null, producer_type: "destilleri" });
+      // Existing unkeyed row that TWO distinct Brreg candidates (different
+      // org_nr, same exact name) will both match in ONE sweep — the
+      // ambiguous-match regression fixture (nd-10).
+      insertProvider.run({ id: "prov-nd-ambig", navn: "Ambig Sideri", org_nr: null, catalog_hidden: null, producer_type: "sideri" });
 
       const brregPages: Record<string, any> = {
         "11.010|0": {
@@ -161,6 +165,23 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
               forretningsadresse: { kommune: "BODØ" } },
             { organisasjonsnummer: "911000003", navn: "ANDRE KAPP BRYGGERI AS",
               forretningsadresse: { kommune: "NARVIK" } },
+          ] },
+        },
+        // nd-10: two distinct candidates (different org_nr), same exact
+        // name, spread across two different NACE codes in ONE sweep — both
+        // exact-name-match the SAME existing unkeyed row (prov-nd-ambig).
+        "11.030|0": {
+          page: { totalPages: 1 },
+          _embedded: { enheter: [
+            { organisasjonsnummer: "933333331", navn: "AMBIG SIDERI AS",
+              forretningsadresse: { adresse: ["Sideriveien 1"], postnummer: "5000", poststed: "BERGEN", kommune: "BERGEN" } },
+          ] },
+        },
+        "11.040|0": {
+          page: { totalPages: 1 },
+          _embedded: { enheter: [
+            { organisasjonsnummer: "933333332", navn: "AMBIG SIDERI AS",
+              forretningsadresse: { adresse: ["Sideriveien 2"], postnummer: "5003", poststed: "BERGEN", kommune: "BERGEN" } },
           ] },
         },
       };
@@ -210,7 +231,7 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         assertEq(dashDup?.suggested_orgnr_for_existing, "944444444",
           "nd-2o: dash-dup carries its suggested org_nr");
         const cnt = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers`).get() as any).c;
-        assertEq(cnt, 3, "nd-2m: dry-run created NOTHING");
+        assertEq(cnt, 4, "nd-2m: dry-run created NOTHING");
         const qCnt = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_orgnr_review_queue`).get() as any).c;
         assertEq(qCnt, 0, "nd-2p: dry-run never touches the review queue");
       }
@@ -308,7 +329,7 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         const r2 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { rollbackBatch: batchTag, apply: true } });
         assertEq(r2.body.deleted, 1, "nd-5d: tagged row deleted");
         const cnt = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers`).get() as any).c;
-        assertEq(cnt, 4, "nd-5e: pre-existing rows (incl. dash fixture + nd-6's approve fixture) untouched by batch rollback");
+        assertEq(cnt, 5, "nd-5e: pre-existing rows (incl. dash fixture + ambig fixture + nd-6's approve fixture) untouched by batch rollback");
       }
 
       // ── nd-7: dead-filter completeness + honest cap accounting. ─────────
@@ -322,7 +343,7 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         const deadHit = (r.body.dead as any[]).find((d) => d.org_nr === "911000001");
         assertTrue(!!deadHit, "nd-7f: the tvangsavvikling row is the dead one");
         const cnt = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers`).get() as any).c;
-        assertEq(cnt, 4, "nd-7g: dry-run capped sweep created nothing");
+        assertEq(cnt, 5, "nd-7g: dry-run capped sweep created nothing");
       }
 
       // ── nd-8: rollback lock-guard — claimed rows survive the batch undo. ─
@@ -358,6 +379,40 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         assertEq(rowBad.org_nr, null, "nd-9d: nothing written by rejected formats");
         const r4 = expStore.applyGardssalgProviderOrgnr("prov-nd-hidden", "977777777", "https://data.brreg.no/test");
         assertEq(r4.length, 1, "nd-9e: well-formed 9 digits still write (the gate rejects format, not function)");
+      }
+
+      // ── nd-10: ambiguous name match — two distinct Brreg candidates in
+      //    ONE sweep both exact-match the SAME existing unkeyed row. The
+      //    persisted review-queue row must record the ambiguity, not
+      //    silently overwrite it with whichever candidate ran last. ───────
+      {
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { codes: ["11.030", "11.040"], apply: true } });
+        assertEq(r.body.dry_run, false, "nd-10a: apply mode");
+        const rows = expDb
+          .prepare(`SELECT provider_id, candidate_orgnr, candidate_name, reason, batch_id FROM gardssalg_orgnr_review_queue WHERE provider_id = 'prov-nd-ambig'`)
+          .all() as any[];
+        assertEq(rows.length, 1, "nd-10b: exactly ONE persisted review-queue row for the ambiguous provider_id (upsert, not accumulation)");
+        assertEq(rows[0]?.candidate_orgnr, null, "nd-10c: candidate_orgnr is NULL — never silently claims one of the two org_nrs");
+        assertEq(rows[0]?.reason, "nace_discovery_name_match_ambiguous", "nd-10d: reason flags the ambiguity instead of a confident name match");
+        assertEq(rows[0]?.candidate_name, "AMBIG SIDERI AS", "nd-10e: row still reflects the LATEST (second) candidate's details");
+        assertEq(rows[0]?.batch_id, r.body.batch_tag, "nd-10f: queue entry still tied to this discovery batch");
+        // Response-shape `duplicates` array is untouched by this fix: both
+        // candidates are still reported there, each with its own real
+        // suggested org_nr — only the PERSISTED row is de-conflicted.
+        const dupsForAmbig = (r.body.duplicates as any[]).filter((d) => d.existing_provider_id === "prov-nd-ambig");
+        assertEq(dupsForAmbig.length, 2, "nd-10g: HTTP response still reports BOTH candidates (unchanged response shape)");
+        const dupOrgnrs = dupsForAmbig.map((d) => d.suggested_orgnr_for_existing).sort();
+        assertEq(JSON.stringify(dupOrgnrs), JSON.stringify(["933333331", "933333332"]), "nd-10h: both real org_nrs surfaced in the response duplicates array");
+
+        // ── nd-10i: regression — the EARLIER 1:1 matches (prov-nd-hidden
+        //    turned prov-appr-1 aside; use prov-nd-dash's original apply-mode
+        //    row from nd-3, still in the queue) remain byte-identical: real
+        //    candidate_orgnr, non-ambiguous reason. ───────────────────────
+        const dashRow = expDb
+          .prepare(`SELECT candidate_orgnr, reason FROM gardssalg_orgnr_review_queue WHERE provider_id = 'prov-nd-dash'`)
+          .get() as any;
+        assertEq(dashRow?.candidate_orgnr, "944444444", "nd-10i: unrelated 1:1 match from nd-3 is unaffected — real candidate_orgnr");
+        assertEq(dashRow?.reason, "nace_discovery_name_match", "nd-10j: unrelated 1:1 match keeps the non-ambiguous reason");
       }
     } catch (err: any) {
       failed++;
