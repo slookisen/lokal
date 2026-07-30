@@ -6234,9 +6234,26 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
 // all. by-hjemmeside above cannot do this: it requires a non-blank `pattern`
 // and only ever matches rows with a (non-null) hjemmeside. This route is a
 // plain, paginated, unfiltered (aside from catalog_hidden below) SELECT over
-// the whole table, ordered by id so repeated calls with increasing `offset`
-// walk the table deterministically (navn is not unique and can tie, so it
-// cannot be used as the sole ORDER BY for stable pagination).
+// the whole table, ordered by id so repeated calls walk the table
+// deterministically (navn is not unique and can tie, so it cannot be used as
+// the sole ORDER BY for stable pagination).
+//
+// Pagination is keyset (cursor), NOT offset/limit: the caller passes `after`
+// — the last-seen `id` from the previous page (default "" for the first
+// call) — and the query filters on `id > ?`. OFFSET/LIMIT was rejected:
+// `DELETE FROM experience_providers` exists in production code
+// (rollbackBatch, DELETE /admin/rfb-seed). If a row BEFORE the current
+// OFFSET cursor is deleted between two page fetches of a long-running
+// paginated walk, every subsequent page's OFFSET window silently shifts up
+// by one and the row that would have been the first item of the next page
+// is skipped — never returned in ANY page. Since every row this endpoint
+// enumerates becomes a permanent skip-entry in a persistent blacklist
+// ledger, a silently skipped provider is exactly the failure mode this
+// endpoint must not have. `id` is stable/immutable/unique (TEXT PRIMARY KEY,
+// set once via uuid() at creation in experience-store.ts createProvider(),
+// never UPDATEd), so anchoring the cursor on it is safe even if rows earlier
+// in id-order are deleted mid-walk — a deleted row simply drops out of the
+// enumeration, but nothing else shifts or gets skipped.
 //
 // Excludes catalog_hidden=1 rows — same "(catalog_hidden IS NULL OR
 // catalog_hidden != 1)" clause services/experience-store.ts already uses for
@@ -6246,12 +6263,15 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
 // catalog; it must likewise never end up in a full-catalog enumeration that
 // backs a persistent blacklist ledger.
 //
-// Read-only — a single SELECT plus a COUNT(*) with the identical WHERE
-// clause (so `total` reflects the same catalog_hidden-excluded population as
-// the page itself, letting a caller detect `offset + count >= total`).
-// Response is deliberately minimal — id/navn/hjemmeside/vertical only, same
-// privacy-minimization pattern as by-hjemmeside just above (no epost/
-// telefon/adresse).
+// Read-only — a single SELECT plus a COUNT(*) with the identical
+// catalog_hidden WHERE clause (NOT filtered by `after`) so `total` reflects
+// the full catalog_hidden-excluded population as a progress hint; unlike
+// offset it is not itself part of the pagination cursor, so it carries no
+// skip risk. Response is deliberately minimal — id/navn/hjemmeside/vertical
+// only, same privacy-minimization pattern as by-hjemmeside just above (no
+// epost/telefon/adresse). `next_after` is the last id in the current page
+// (or null once a page comes back empty/short) — the caller keeps calling
+// with `after: next_after` until `next_after` is null.
 const PROVIDERS_ALL_DEFAULT_LIMIT = 200;
 const PROVIDERS_ALL_MAX_LIMIT = 1000;
 const PROVIDERS_ALL_WHERE = "WHERE (catalog_hidden IS NULL OR catalog_hidden != 1)";
@@ -6260,8 +6280,7 @@ router.get("/admin/providers/all", requireAdmin, (req: Request, res: Response) =
   if (!Number.isFinite(limit)) limit = PROVIDERS_ALL_DEFAULT_LIMIT;
   limit = Math.min(PROVIDERS_ALL_MAX_LIMIT, Math.max(1, limit));
 
-  let offset = parseInt((req.query.offset as string) || "", 10);
-  if (!Number.isFinite(offset) || offset < 0) offset = 0;
+  const after = typeof req.query.after === "string" ? req.query.after : "";
 
   try {
     const expDb = getExpDb("experiences");
@@ -6270,10 +6289,11 @@ router.get("/admin/providers/all", requireAdmin, (req: Request, res: Response) =
         `SELECT id, navn, hjemmeside, vertical
            FROM experience_providers
           ${PROVIDERS_ALL_WHERE}
+            AND id > ?
           ORDER BY id ASC
-          LIMIT ? OFFSET ?`
+          LIMIT ?`
       )
-      .all(limit, offset) as Array<{
+      .all(after, limit) as Array<{
         id: string;
         navn: string;
         hjemmeside: string | null;
@@ -6284,11 +6304,13 @@ router.get("/admin/providers/all", requireAdmin, (req: Request, res: Response) =
       .prepare(`SELECT COUNT(*) AS total FROM experience_providers ${PROVIDERS_ALL_WHERE}`)
       .get() as { total: number };
 
+    const next_after = providers.length > 0 ? providers[providers.length - 1].id : null;
+
     res.json({
       success: true,
       count: providers.length,
       total: totalRow.total,
-      offset,
+      next_after,
       limit,
       providers,
     });
