@@ -1,6 +1,8 @@
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
+import { getDb as getVerticalDb } from "../database/db-factory";
 import { getConfig } from "../config/vertical-config";
+import { homepageRegistrableDomain } from "./experience-store";
 
 // ─── CRM Service ────────────────────────────────────────────
 // Core inbox-CRM logic.
@@ -85,6 +87,14 @@ export interface IngestMessageInput {
   rawMetadata?: Record<string, any>;
 }
 
+// Shared by the rfb agents-matching and the experiences provider-matching
+// (steg 6): a freemail domain identifies a person, not an organisation, so a
+// domain-level match on one of these proves nothing and is never attempted.
+const FREEMAIL_DOMAINS = new Set([
+  "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com",
+  "icloud.com", "online.no", "broadpark.no",
+]);
+
 const VENDOR_DOMAINS = new Set([
   "fly.io", "namecheap.com", "google.com", "googlemail.com", "cloudflare.com",
   "github.com", "stripe.com", "vercel.com", "resend.com", "anthropic.com",
@@ -148,19 +158,28 @@ class CrmService {
   }
 
   /**
-   * Classify an email against the agents table. Used both at create-time
-   * and to re-evaluate existing 'unknown' contacts after agents are added/edited.
+   * Classify an email against the contact's OWN vertical's entity table
+   * (steg 6, funn 6). Used both at create-time and to re-evaluate existing
+   * 'unknown'/unlinked contacts after entities are added/edited.
    *
-   * Priority:
-   *   1. Exact match on agents.contact_email (highest confidence)
-   *   2. Domain match on agents.contact_email
-   *   3. Vendor allowlist
-   *   4. unknown
+   * Dispatch by vertical:
+   *   - rfb          → agents table (unchanged legacy path), fills `agentId`
+   *   - experiences  → experience_providers in experiences.db, fills `providerId`
+   *   - dental       → NO entity matching (vendor allowlist only). Dental
+   *                    clinics live in dental.db and the dental CRM lane isn't
+   *                    live; until it is, the honest answer is 'unknown' —
+   *                    matching against RFB agents (the pre-steg-6 behaviour)
+   *                    produced exactly the cross-vertical links funn 6 is about.
    *
-   * `vertical` scopes the platform-name guard above (fix 2) to the contact's
-   * own platform. `contactIdForLog`, when the contact row already exists,
-   * is attached to the crm_actions row logged on a blocked match so a human
-   * reviewing the CRM can jump straight to the contact; pass null for a
+   * Exactly one of agentId/providerId can ever be non-null, and only for the
+   * matching vertical — the schema-level triggers
+   * (trg_crm_contacts_{agent,provider}_vertical_*) enforce the same invariant
+   * on any write that bypasses this function.
+   *
+   * `vertical` also scopes the platform-name guard above (fix 2) to the
+   * contact's own platform. `contactIdForLog`, when the contact row already
+   * exists, is attached to the crm_actions row logged on a blocked match so a
+   * human reviewing the CRM can jump straight to the contact; pass null for a
    * brand-new contact that hasn't been INSERTed yet (crm_actions.contact_id
    * has an ON DELETE SET NULL FK — logging against a not-yet-existing row
    * would violate it under foreign_keys=ON).
@@ -169,10 +188,21 @@ class CrmService {
     email: string,
     vertical: CrmVertical,
     contactIdForLog: string | null = null,
-  ): { type: ContactType; agentId: string | null } {
+  ): { type: ContactType; agentId: string | null; providerId: string | null } {
     const db = getDb();
     const lowerEmail = email.trim().toLowerCase();
     const domain = lowerEmail.split("@")[1] ?? "";
+
+    if (vertical === "experiences") {
+      const p = this.classifyEmailAgainstProviders(lowerEmail, domain);
+      if (p) return { type: "producer", agentId: null, providerId: p };
+      if (this.matchesVendorDomain(domain)) return { type: "vendor", agentId: null, providerId: null };
+      return { type: "unknown", agentId: null, providerId: null };
+    }
+    if (vertical === "dental") {
+      if (this.matchesVendorDomain(domain)) return { type: "vendor", agentId: null, providerId: null };
+      return { type: "unknown", agentId: null, providerId: null };
+    }
 
     // Returns true (and logs) if `agentId` is the platform's own house-bucket
     // record for `vertical` — callers must treat that as "no match" and NOT
@@ -198,8 +228,8 @@ class CrmService {
       .prepare("SELECT id FROM agents WHERE LOWER(contact_email) = ? AND is_active = 1 LIMIT 1")
       .get(lowerEmail) as { id: string } | undefined;
     if (exact) {
-      if (blockIfPlatformNameAgent(exact.id)) return { type: "unknown", agentId: null };
-      return { type: "producer", agentId: exact.id };
+      if (blockIfPlatformNameAgent(exact.id)) return { type: "unknown", agentId: null, providerId: null };
+      return { type: "producer", agentId: exact.id, providerId: null };
     }
 
     // 1b. Exact match on agent_knowledge.email — this is the address marketing
@@ -213,26 +243,85 @@ class CrmService {
       )
       .get(lowerEmail) as { id: string } | undefined;
     if (exactKnowledge) {
-      if (blockIfPlatformNameAgent(exactKnowledge.id)) return { type: "unknown", agentId: null };
-      return { type: "producer", agentId: exactKnowledge.id };
+      if (blockIfPlatformNameAgent(exactKnowledge.id)) return { type: "unknown", agentId: null, providerId: null };
+      return { type: "producer", agentId: exactKnowledge.id, providerId: null };
     }
 
     // 2. Domain match (skip generic freemail domains so we don't false-positive)
-    const FREEMAIL = new Set(["gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com", "icloud.com", "online.no", "broadpark.no"]);
-    if (domain && !FREEMAIL.has(domain)) {
+    if (domain && !FREEMAIL_DOMAINS.has(domain)) {
       const byDomain = db
         .prepare("SELECT id FROM agents WHERE LOWER(contact_email) LIKE ? AND is_active = 1 LIMIT 1")
         .get(`%@${domain}`) as { id: string } | undefined;
       if (byDomain) {
-        if (blockIfPlatformNameAgent(byDomain.id)) return { type: "unknown", agentId: null };
-        return { type: "producer", agentId: byDomain.id };
+        if (blockIfPlatformNameAgent(byDomain.id)) return { type: "unknown", agentId: null, providerId: null };
+        return { type: "producer", agentId: byDomain.id, providerId: null };
       }
     }
 
     // 3. Vendor allowlist (exact OR subdomain match)
-    if (this.matchesVendorDomain(domain)) return { type: "vendor", agentId: null };
+    if (this.matchesVendorDomain(domain)) return { type: "vendor", agentId: null, providerId: null };
 
-    return { type: "unknown", agentId: null };
+    return { type: "unknown", agentId: null, providerId: null };
+  }
+
+  /**
+   * steg 6 — the experiences twin of the rfb agents-matching above. Returns the
+   * experience_providers.id to link, or null for no match.
+   *
+   * Tiers mirror the rfb path's confidence ordering:
+   *   1. Exact match on experience_providers.epost
+   *   2. Domain match on epost (skipping freemail — a shared @gmail.com proves
+   *      nothing about which org the sender belongs to)
+   *   3. Domain match on hjemmeside, verified in JS via homepageRegistrableDomain
+   *      (the SQL LIKE is only a prefilter — 'gard.no' LIKE-matches
+   *      'ikkegard.no', so every candidate is re-checked properly)
+   *
+   * Providers with brreg_active = 0 (konkurs/avvikling) are excluded — the rfb
+   * path's `is_active = 1` analog. NULL (never checked) is allowed through: most
+   * harvested rows haven't had a Brreg check yet, and refusing to link ALL of
+   * them would make this function a no-op in practice.
+   *
+   * Reads experiences.db via db-factory — a different database file, which is
+   * the whole reason this is app-level matching and provider_id has no FK.
+   */
+  private classifyEmailAgainstProviders(lowerEmail: string, domain: string): string | null {
+    let xdb: ReturnType<typeof getVerticalDb>;
+    try {
+      xdb = getVerticalDb("experiences");
+    } catch (e) {
+      // Fail SAFE, not loud: contact resolution must not die because the
+      // experiences volume is briefly unavailable. An unlinked contact
+      // self-heals on its next touch (same re-evaluation as the rfb path).
+      console.error("[crm] classifyEmailAgainstProviders: experiences DB unavailable, no link made:", e);
+      return null;
+    }
+
+    // 1. Exact epost
+    const exact = xdb
+      .prepare("SELECT id FROM experience_providers WHERE LOWER(epost) = ? AND brreg_active IS NOT 0 LIMIT 1")
+      .get(lowerEmail) as { id: string } | undefined;
+    if (exact) return exact.id;
+
+    if (!domain || FREEMAIL_DOMAINS.has(domain)) return null;
+
+    // 2. epost domain
+    const byEpostDomain = xdb
+      .prepare("SELECT id FROM experience_providers WHERE LOWER(epost) LIKE ? AND brreg_active IS NOT 0 LIMIT 1")
+      .get(`%@${domain}`) as { id: string } | undefined;
+    if (byEpostDomain) return byEpostDomain.id;
+
+    // 3. hjemmeside registrable domain — LIKE prefilter, JS verification
+    const candidates = xdb
+      .prepare(
+        `SELECT id, hjemmeside FROM experience_providers
+          WHERE hjemmeside IS NOT NULL AND hjemmeside LIKE ? AND brreg_active IS NOT 0
+          LIMIT 25`,
+      )
+      .all(`%${domain}%`) as Array<{ id: string; hjemmeside: string }>;
+    for (const c of candidates) {
+      if (homepageRegistrableDomain(c.hjemmeside) === domain) return c.id;
+    }
+    return null;
   }
 
   /**
@@ -252,8 +341,10 @@ class CrmService {
     const domain = lowerEmail.split("@")[1] ?? "";
 
     const existing = db
-      .prepare("SELECT id, type, agent_id FROM crm_contacts WHERE email = ? AND vertical_id = ?")
-      .get(lowerEmail, v) as { id: string; type: ContactType; agent_id: string | null } | undefined;
+      .prepare("SELECT id, type, agent_id, provider_id FROM crm_contacts WHERE email = ? AND vertical_id = ?")
+      .get(lowerEmail, v) as
+      | { id: string; type: ContactType; agent_id: string | null; provider_id: string | null }
+      | undefined;
 
     if (existing) {
       // Re-evaluate if currently 'unknown' OR stuck with no agent_id link (cheap,
@@ -276,14 +367,22 @@ class CrmService {
       // contact whose email happens to domain-match a producer). Without this
       // exclusion, a manually-tagged 'marketing' contact would get silently flipped
       // back to 'producer' on its next touch (reviewer finding, 2026-07-11).
+      //
+      // steg 6: "unlinked" is judged against the contact's OWN vertical's
+      // pointer — provider_id for experiences, agent_id for rfb. Judging an
+      // experiences contact by agent_id would make it permanently "unlinked"
+      // (its agent_id is ALWAYS null now, by trigger) and re-run classification
+      // on every single touch.
+      const entityLink = v === "experiences" ? existing.provider_id : existing.agent_id;
       const needsReclassify =
         existing.type === "unknown" ||
-        (existing.agent_id === null && existing.type !== "vendor" && existing.type !== "marketing");
+        (entityLink === null && existing.type !== "vendor" && existing.type !== "marketing");
       if (needsReclassify) {
         const c = this.classifyEmail(lowerEmail, v, existing.id);
         if (c.type !== "unknown") {
-          db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ?, last_seen_at = datetime('now') WHERE id = ?")
-            .run(c.type, c.agentId, existing.id);
+          db.prepare(
+            "UPDATE crm_contacts SET type = ?, agent_id = ?, provider_id = ?, last_seen_at = datetime('now') WHERE id = ?",
+          ).run(c.type, c.agentId, c.providerId, existing.id);
           return { id: existing.id, created: false };
         }
       }
@@ -299,9 +398,9 @@ class CrmService {
     const c = this.classifyEmail(lowerEmail, v, null);
     const id = randomUUID();
     db.prepare(`
-      INSERT INTO crm_contacts (id, type, agent_id, email, name, domain, vertical_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, c.type, c.agentId, lowerEmail, hintName ?? null, domain || null, v);
+      INSERT INTO crm_contacts (id, type, agent_id, provider_id, email, name, domain, vertical_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, c.type, c.agentId, c.providerId, lowerEmail, hintName ?? null, domain || null, v);
 
     return { id, created: true };
   }
@@ -323,17 +422,62 @@ class CrmService {
       const vertical: CrmVertical = isCrmVertical(r.vertical_id) ? r.vertical_id : "rfb";
       const c = this.classifyEmail(r.email, vertical, r.id);
       if (c.type !== "unknown") {
-        db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ? WHERE id = ?").run(c.type, c.agentId, r.id);
+        db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ?, provider_id = ? WHERE id = ?")
+          .run(c.type, c.agentId, c.providerId, r.id);
         reclassified++;
       }
     }
     return { evaluated: rows.length, reclassified };
   }
 
-  setContactType(contactId: string, type: ContactType, agentId?: string | null): void {
+  /**
+   * Manual (admin) classification override.
+   *
+   * steg 6 validation, fail-loud on every branch:
+   *   - agentId is only meaningful on an rfb contact; providerId only on an
+   *     experiences contact. Passing the wrong pointer for the contact's
+   *     vertical throws — the schema triggers would abort the write anyway,
+   *     but a thrown Error here carries a message a human can act on, where
+   *     the trigger's RAISE(ABORT) surfaces as a bare SQLite error.
+   *   - providerId must exist in experience_providers (experiences.db). This
+   *     is the code-level half of the cross-DB "FK" — the schema cannot
+   *     REFERENCES across database files, so existence is checked here, at the
+   *     ONE write path where a human supplies an arbitrary id. (classifyEmail's
+   *     links come out of the providers table itself and can't dangle.)
+   */
+  setContactType(contactId: string, type: ContactType, agentId?: string | null, providerId?: string | null): void {
     const db = getDb();
-    db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ? WHERE id = ?")
-      .run(type, agentId ?? null, contactId);
+    const contact = db
+      .prepare("SELECT COALESCE(vertical_id,'rfb') AS vertical_id FROM crm_contacts WHERE id = ?")
+      .get(contactId) as { vertical_id: string } | undefined;
+    if (!contact) throw new Error(`[crm] setContactType: no contact ${contactId}`);
+
+    if (agentId != null && providerId != null) {
+      throw new Error("[crm] setContactType: a contact links to ONE entity — agentId and providerId are mutually exclusive");
+    }
+    if (agentId != null && contact.vertical_id !== "rfb") {
+      throw new Error(
+        `[crm] setContactType: agentId is an rfb pointer, but contact ${contactId} is '${contact.vertical_id}' — ` +
+          `en kontakt kan aldri peke på en entitet i feil vertical (steg 6)`,
+      );
+    }
+    if (providerId != null) {
+      if (contact.vertical_id !== "experiences") {
+        throw new Error(
+          `[crm] setContactType: providerId is an experiences pointer, but contact ${contactId} is '${contact.vertical_id}' — ` +
+            `en kontakt kan aldri peke på en entitet i feil vertical (steg 6)`,
+        );
+      }
+      const exists = getVerticalDb("experiences")
+        .prepare("SELECT 1 FROM experience_providers WHERE id = ?")
+        .get(providerId);
+      if (!exists) {
+        throw new Error(`[crm] setContactType: provider ${providerId} does not exist in experience_providers`);
+      }
+    }
+
+    db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ?, provider_id = ? WHERE id = ?")
+      .run(type, agentId ?? null, providerId ?? null, contactId);
   }
 
   setContactStatus(contactId: string, status: "active" | "blocked" | "archived"): void {
@@ -730,7 +874,7 @@ class CrmService {
     const rows = db.prepare(`
       SELECT
         c.id, c.email, c.name, c.domain, c.organization, c.status, c.notes,
-        c.first_seen_at, c.last_seen_at, c.agent_id,
+        c.first_seen_at, c.last_seen_at, c.agent_id, c.provider_id,
         a.name AS agent_name, a.role AS agent_role,
         COUNT(DISTINCT t.id) AS thread_count,
         SUM(CASE WHEN t.status = 'new' THEN 1 ELSE 0 END) AS new_count,
@@ -755,7 +899,44 @@ class CrmService {
     for (const row of rows) {
       row.agent_role_mismatch = !!row.agent_id && !!row.agent_role && row.agent_role !== "producer";
     }
+    this.attachProviderInfo(rows);
     return rows;
+  }
+
+  /**
+   * steg 6 — the read-side half of provider_id. `agent_name` comes from a
+   * LEFT JOIN in the SQL above; `provider_name` CANNOT (experience_providers
+   * lives in a different database file, and SQLite doesn't join across open
+   * handles without ATTACH). So linked provider names are fetched app-side in
+   * one batched IN-query per page of results.
+   *
+   * `provider_missing: true` marks a dangling pointer (provider row deleted
+   * after linking — there's no FK to stop that, see the schema comment).
+   * Silent-nothing would leave a linked contact looking identical to an
+   * unlinked one, which is the silence-failure class this dev-request is about.
+   */
+  private attachProviderInfo(rows: any[]): void {
+    const ids = [...new Set(rows.map((r) => r.provider_id).filter(Boolean))] as string[];
+    if (ids.length === 0) return;
+    let names = new Map<string, string>();
+    try {
+      const found = getVerticalDb("experiences")
+        .prepare(
+          `SELECT id, navn FROM experience_providers WHERE id IN (${ids.map(() => "?").join(",")})`,
+        )
+        .all(...ids) as Array<{ id: string; navn: string }>;
+      names = new Map(found.map((p) => [p.id, p.navn]));
+    } catch (e) {
+      // Reads must not die because the experiences DB is briefly unavailable —
+      // provider_name simply comes back null this once.
+      console.error("[crm] attachProviderInfo: experiences DB unavailable:", e);
+      return;
+    }
+    for (const row of rows) {
+      if (!row.provider_id) continue;
+      row.provider_name = names.get(row.provider_id) ?? null;
+      row.provider_missing = !names.has(row.provider_id);
+    }
   }
 
   countContactsByType(vertical?: CrmVertical): Record<ContactType, number> {
@@ -781,6 +962,7 @@ class CrmService {
     // dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, fix 3 — see
     // the matching comment in listContacts() above. Additive field only.
     contact.agent_role_mismatch = !!contact.agent_id && !!contact.agent_role && contact.agent_role !== "producer";
+    this.attachProviderInfo([contact]);
 
     const threads = db.prepare(`
       SELECT * FROM crm_threads
