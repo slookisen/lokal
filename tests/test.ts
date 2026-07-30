@@ -123,8 +123,7 @@ import conversationUiRouter, {
 //     backed out rather than shipped risky:
 //       1. PR-94 (chained off `_pr56Promise.then(...)`, not on the PR-56→
 //          PR-68 line above) also pins the singleton and is still only
-//          gated on PR-56 — it can still race PR-63/65/67/68 and (observed
-//          directly while investigating this) orch-pr-86 further down.
+//          gated on PR-56 — it can still race PR-63/65/67/68 directly.
 //          Making PR-94 additionally await PR-63/65/67/68 is the obvious
 //          fix, but doing so — even alone, even without also making
 //          orch-pr-86 wait on PR-94 — reproducibly broke orch-pr-86's own
@@ -132,6 +131,27 @@ import conversationUiRouter, {
 //          ALSO (accidentally, silently) load-bearing for something
 //          orch-pr-86 depends on that isn't captured by any promise
 //          dependency; that interaction needs its own investigation.
+//          (orch-pr-86 itself is no longer at risk from PR-94 specifically:
+//          PR-74 now awaits _pr94Promise — see the PR-74 entry below — and
+//          orch-pr-86 fully awaits _pr74Promise before it starts, so it's
+//          transitively protected from that one race. The still-open gap
+//          above is PR-94 racing PR-63/65/67/68 directly, unrelated to
+//          orch-pr-86.)
+//       1b. PR-74 (~line 13651) makes a REAL loopback HTTP round-trip
+//          (server.listen + http.request), so its route handler's own
+//          getDb() read happens in a separate event-loop turn from
+//          anything gating it — and this file has ~69 total
+//          __setDbForTesting() call sites (grep it), not just the ad-hoc
+//          family above, so gating PR-74 against every possible racer is
+//          unbounded. Instead of prevention, PR-74's own `call()` helper
+//          (~line 13851) is self-verifying: it re-pins its DB handle
+//          synchronously right before every dispatch, and after each
+//          response retries (with a fresh re-pin, up to 4x) if it detects
+//          contamination (the singleton no longer points at its own
+//          handle, or a 500 status this route never legitimately returns
+//          in these fixtures). This is a reusable pattern for a block that
+//          can't feasibly enumerate every other singleton-toucher it might
+//          race — reach for it before adding another one-off await.
 //       2. The runSerial() chain (below, ~90 blocks from PLATFORM-VERIFIER
 //          on, several of which swap the singleton via required
 //          src/**/*.test.ts helpers) and this ad-hoc family are two
