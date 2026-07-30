@@ -3,6 +3,12 @@ import { z } from "zod";
 import { crmService, CrmVertical, isCrmVertical, CRM_VERTICALS } from "../services/crm-service";
 import { crmFromHeader, resolveCrmIdentity } from "../services/crm-platform-identity";
 import {
+  planRetroTagging,
+  applyRetroTagging,
+  revertRetroTaggingBatch,
+  listRetroBatches,
+} from "../services/crm-retro-tagging";
+import {
   deriveVertical,
   parkUntriaged,
   listUntriaged,
@@ -811,6 +817,74 @@ function safeJson(s: string | null): unknown {
     return { unparseable: s.slice(0, 500) };
   }
 }
+
+// ═══ steg 5 — retro-tagging the mis-filed history ════════════
+//
+// «Dry-run default … Apply krever Daniels godkjenning av tallet … Audit +
+//  reverserbart per rad/batch. ALDRI en blind UPDATE på historikk.»
+//
+// GET is the dry-run and is the only thing that runs by default. There is no
+// `?apply=true` on the read route on purpose: a destructive default one typo
+// away from a read is how blind UPDATEs happen.
+
+// ─── GET /admin/crm/retro-tagging/plan ───────────────────────
+router.get("/retro-tagging/plan", (req, res) => {
+  const limit = parseInt(String(req.query.limit ?? "5000"), 10) || 5000;
+  const full = String(req.query.full ?? "") === "1";
+  const plan = planRetroTagging({ limit });
+  res.json({
+    ...plan,
+    // The per-row list is the point of the dry-run — Daniel has to be able to
+    // spot-check the evidence — but it is capped by default so a 1,400-thread
+    // scan does not return a wall. ?full=1 returns everything.
+    candidates: full ? plan.candidates : plan.candidates.slice(0, 50),
+    candidates_truncated: !full && plan.candidates.length > 50,
+    how_to_apply:
+      "POST /admin/crm/retro-tagging/apply with {approvedFingerprint, approvedCount, approvedBy}. " +
+      "Both must match this plan exactly, or the apply is refused.",
+  });
+});
+
+// ─── POST /admin/crm/retro-tagging/apply ─────────────────────
+router.post("/retro-tagging/apply", (req, res) => {
+  const schema = z.object({
+    approvedFingerprint: z.string().min(1),
+    approvedCount: z.number().int().min(0),
+    approvedBy: z.string().min(1),
+    limit: z.number().int().min(1).max(20000).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+
+  try {
+    const result = applyRetroTagging(parsed.data);
+    return res.json({ success: true, ...result });
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    // 409, not 500: a refused apply is the gate working, not the backend
+    // failing, and the caller must not retry it unchanged.
+    if (msg.includes("plan changed") || msg.includes("approved count")) {
+      return res.status(409).json({ success: false, error: "approval_stale", detail: msg });
+    }
+    return res.status(500).json({ success: false, error: msg });
+  }
+});
+
+// ─── GET /admin/crm/retro-tagging/batches ────────────────────
+router.get("/retro-tagging/batches", (_req, res) => {
+  res.json({ batches: listRetroBatches() });
+});
+
+// ─── POST /admin/crm/retro-tagging/batches/:id/revert ────────
+router.post("/retro-tagging/batches/:id/revert", (req, res) => {
+  try {
+    return res.json({ success: true, batchId: req.params.id, ...revertRetroTaggingBatch(req.params.id) });
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    if (msg.includes("no audit rows")) return res.status(404).json({ success: false, error: msg });
+    return res.status(500).json({ success: false, error: msg });
+  }
+});
 
 // ─── GET /admin/crm/outbox/pending?intent=gmail_draft ────────
 router.get("/outbox/pending", (req, res) => {

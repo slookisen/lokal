@@ -35201,6 +35201,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 5 (retro-tagging, dry-run + godkjenningsgate) ──");
+  try {
+    const { runCrmRetroTaggingTests } = require("../src/services/crm-retro-tagging.test") as
+      typeof import("../src/services/crm-retro-tagging.test");
+    const rtt = await runCrmRetroTaggingTests({ log: false });
+    passed += rtt.passed;
+    failed += rtt.failed;
+    for (const f of rtt.failures) failures.push("crm-retro-tagging: " + f);
+    console.log(`  crm-retro-tagging: ${rtt.passed} passed, ${rtt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-retro-tagging: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-retro-tagging: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a follow-up (geokoding-dekning + gjennomstrømning) ──");
   try {
     const { runGeocodeCoverageBoostTests } = require("../src/services/geocode-coverage-boost.test") as

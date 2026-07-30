@@ -686,6 +686,40 @@ function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_crm_untriaged_open ON crm_untriaged(resolved_at, created_at);
 
+    -- ─── crm_retro_tagging_audit — steg 5's reversibility ─────────────
+    --
+    -- dev-request 2026-07-27-crm-plattformadskillelse, steg 5:
+    --   «Audit + reverserbart per rad/batch. ALDRI en blind UPDATE på historikk.»
+    --
+    -- One row per thread MOVED, written BEFORE the update inside the same
+    -- transaction. from_contact_id is the load-bearing column: steg 2 made
+    -- contacts unique per (email, vertical_id), so a revert that restored only
+    -- vertical_id would leave the thread pointing at the other platform's
+    -- contact — half-reverted, which is worse than not reverted because it
+    -- looks done.
+    --
+    -- message_ids is captured rather than re-derived at revert time: a message
+    -- ingested after the batch must NOT be dragged back by an undo, and
+    -- re-querying by thread_id at revert time would do exactly that.
+    CREATE TABLE IF NOT EXISTS crm_retro_tagging_audit (
+      id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      from_vertical TEXT NOT NULL,
+      to_vertical TEXT NOT NULL,
+      from_contact_id TEXT NOT NULL,
+      to_contact_id TEXT NOT NULL,
+      tier TEXT NOT NULL,
+      evidence TEXT NOT NULL,
+      message_ids TEXT NOT NULL DEFAULT '[]',
+      applied_by TEXT NOT NULL,
+      applied_at TEXT DEFAULT (datetime('now')),
+      reverted_at TEXT,
+      UNIQUE(batch_id, thread_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_retro_batch ON crm_retro_tagging_audit(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_retro_thread ON crm_retro_tagging_audit(thread_id);
+
     CREATE TABLE IF NOT EXISTS crm_threads (
       id TEXT PRIMARY KEY,
       contact_id TEXT NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
