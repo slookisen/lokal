@@ -162,6 +162,13 @@ import {
   scanGardssalgProviderRowForMojibake,
   selectGardssalgMojibakeCandidates,
   type GardssalgMojibakeCandidate,
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2 —
+  // berikelsestriage: the SAME shared classifier selectProvidersForContentRefresh
+  // uses, reused server-side by GET /admin/providers/content-triage below so
+  // the triage and the live selector can never independently drift.
+  classifyProviderContentBucket,
+  type ProviderContentBucket,
+  type BucketableExperienceRow,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -6316,6 +6323,93 @@ router.get("/admin/providers/all", requireAdmin, (req: Request, res: Response) =
     });
   } catch (err) {
     console.error("[opplevelser] admin/providers/all failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/providers/content-triage ────────────────────
+//
+// dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2
+// (berikelsestriage): full-catalog enumeration that additionally classifies
+// EVERY provider into exactly one of three buckets —
+//   enrichable — has a usable hjemmeside, at least one live experience is
+//                genuinely thin (not yet homepage-sourced)
+//   done       — has a usable hjemmeside, nothing left for content-refresh
+//                to do (see classifyProviderContentBucket's own doc comment
+//                for the two edge cases this covers)
+//   waiting    — no usable hjemmeside — never guessed
+// — so a batch triage run (A2A `scripts/experiences-berikelsestriage.py`)
+// never has to re-implement the classification rule itself. `bucket` is
+// computed SERVER-SIDE by `classifyProviderContentBucket`, the SAME shared
+// function `selectProvidersForContentRefresh` (the live enrichment selector)
+// calls — a second, independent Python re-implementation of this rule WOULD
+// drift from the live selector; a single server-computed field cannot.
+//
+// Same keyset (`after`/`next_after`) pagination contract as
+// GET /admin/providers/all just above, for the identical reason (see that
+// route's doc comment: an OFFSET/LIMIT page silently drops a row when a row
+// before the cursor is deleted mid-walk; this table has production DELETE
+// call sites). Same catalog_hidden=1 exclusion.
+//
+// Per-page bucket classification costs one extra `experiences` query per
+// provider row (bounded by `limit`, same as GET .../recently-enriched's
+// per-provider enriched_experiences query) — acceptable for an admin/batch
+// route walked in pages of up to CONTENT_TRIAGE_MAX_LIMIT, not a hot path.
+//
+// Read-only — a single SELECT plus a COUNT(*) (not part of the pagination
+// cursor, a progress hint only, same convention as .../providers/all).
+// Response: 200 { success, count, total, next_after, limit,
+//   providers: [{ id, navn, hjemmeside, bucket }] }
+const CONTENT_TRIAGE_DEFAULT_LIMIT = 200;
+const CONTENT_TRIAGE_MAX_LIMIT = 500;
+router.get("/admin/providers/content-triage", requireAdmin, (req: Request, res: Response) => {
+  let limit = parseInt((req.query.limit as string) || "", 10);
+  if (!Number.isFinite(limit)) limit = CONTENT_TRIAGE_DEFAULT_LIMIT;
+  limit = Math.min(CONTENT_TRIAGE_MAX_LIMIT, Math.max(1, limit));
+
+  const after = typeof req.query.after === "string" ? req.query.after : "";
+
+  try {
+    const expDb = getExpDb("experiences");
+    const providerRows = expDb
+      .prepare(
+        `SELECT id, navn, hjemmeside
+           FROM experience_providers
+          ${PROVIDERS_ALL_WHERE}
+            AND id > ?
+          ORDER BY id ASC
+          LIMIT ?`
+      )
+      .all(after, limit) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+
+    const experiencesStmt = expDb.prepare(
+      `SELECT description, category, content_source, verification_status,
+              content_field_evidence, evidence_url, canonical_id
+         FROM experiences WHERE provider_id = ?`
+    );
+
+    const providers = providerRows.map((p) => {
+      const experiences = experiencesStmt.all(p.id) as BucketableExperienceRow[];
+      const bucket: ProviderContentBucket = classifyProviderContentBucket(p.hjemmeside, experiences);
+      return { id: p.id, navn: p.navn, hjemmeside: p.hjemmeside, bucket };
+    });
+
+    const totalRow = expDb
+      .prepare(`SELECT COUNT(*) AS total FROM experience_providers ${PROVIDERS_ALL_WHERE}`)
+      .get() as { total: number };
+
+    const next_after = providers.length > 0 ? providers[providers.length - 1].id : null;
+
+    res.json({
+      success: true,
+      count: providers.length,
+      total: totalRow.total,
+      next_after,
+      limit,
+      providers,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/providers/content-triage failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

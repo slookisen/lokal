@@ -25,6 +25,15 @@ import {
   // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3:
   // mojibake candidate-scan DETECTION (PURE — no DB, no network).
   scanGardssalgProviderRowForMojibake,
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2 —
+  // berikelsestriage: the shared per-field homepage-provenance classifier
+  // (PURE — no DB, no network) that BOTH selectProvidersForContentRefresh
+  // and GET /admin/providers/content-triage call.
+  parseContentFieldEvidence,
+  homepageRegistrableDomain,
+  isContentFieldHomepageSourced,
+  isExperienceContentGenuinelyThin,
+  classifyProviderContentBucket,
 } from "./experience-store";
 
 export interface TestSummary {
@@ -239,6 +248,221 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
       scanGardssalgProviderRowForMojibake({ about_text: null, visit_text: null, opening_hours_text: null, products: "[]" }),
       [],
       "scan-8: empty products array literal → no matches"
+    );
+  }
+
+  // ── berikelsestriage classification (dev-request 2026-07-29-blacklist-
+  //    backfill-og-berikelsestriage, slice 2) — PURE, no DB. Covers the
+  //    shared per-field homepage-provenance screen and the three-bucket
+  //    classifier both selectProvidersForContentRefresh and
+  //    GET /admin/providers/content-triage call. ──────────────────────────
+  {
+    // parseContentFieldEvidence: defensive parsing, never throws.
+    assertEq(parseContentFieldEvidence(null), {}, "pce-1: null -> {}");
+    assertEq(parseContentFieldEvidence(undefined), {}, "pce-2: undefined -> {}");
+    assertEq(parseContentFieldEvidence("not json"), {}, "pce-3: malformed JSON -> {} (never throws)");
+    assertEq(parseContentFieldEvidence("[]"), {}, "pce-4: a JSON array (wrong shape) -> {}");
+    assertEq(
+      parseContentFieldEvidence(JSON.stringify({ description: "https://x.no/y" })),
+      { description: "https://x.no/y" },
+      "pce-5: a valid JSON object round-trips"
+    );
+
+    // homepageRegistrableDomain
+    assertEq(homepageRegistrableDomain(null), null, "hrd-1: null -> null");
+    assertEq(homepageRegistrableDomain(""), null, "hrd-2: empty string -> null");
+    assertEq(homepageRegistrableDomain("https://www.gardsbutikk.no/om-oss"), "gardsbutikk.no", "hrd-3: strips scheme/www/path");
+
+    // isContentFieldHomepageSourced
+    assertTrue(
+      !isContentFieldHomepageSourced(null, "description", {}, "gard.no"),
+      "icfhs-1: null value -> false (nothing to judge, not 'filled')"
+    );
+    assertTrue(
+      !isContentFieldHomepageSourced("   ", "description", {}, "gard.no"),
+      "icfhs-2: whitespace-only value -> false"
+    );
+    assertTrue(
+      isContentFieldHomepageSourced("Ekte tekst", "description", {}, "gard.no"),
+      "icfhs-3: non-blank value, NO evidence-map entry -> true (unknown provenance is KEPT, not invented as a gap)"
+    );
+    assertTrue(
+      isContentFieldHomepageSourced("Ekte tekst", "description", { description: "https://www.gard.no/om" }, "gard.no"),
+      "icfhs-4: evidence URL on the SAME registrable domain as the homepage -> true"
+    );
+    assertTrue(
+      !isContentFieldHomepageSourced("Aggregert tekst", "description", { description: "https://visitnorway.com/x" }, "gard.no"),
+      "icfhs-5: evidence URL on a DIFFERENT domain (aggregator) -> false — the core aggregator-leak case"
+    );
+    // A non-URL sentinel (e.g. HARVEST_PROVENANCE_SENTINEL, stamped when a
+    // harvest row carries no evidence_url) is PRESENT evidence that does not
+    // parse to the homepage's own host — a mismatch, not "unknown" — so it
+    // must never be treated as homepage-sourced.
+    assertTrue(
+      !isContentFieldHomepageSourced("Aggregert tekst", "description", { description: "harvest:no-evidence-url" }, "gard.no"),
+      "icfhs-6: the harvest-no-evidence-url sentinel is correctly treated as NOT the homepage (never accidentally matches)"
+    );
+    assertTrue(
+      isContentFieldHomepageSourced("Ekte tekst", "description", { description: "not a url" }, null),
+      "icfhs-7: no homepageDomain to compare against (provider has no usable hjemmeside) -> true (unknown, kept)"
+    );
+
+    // isExperienceContentGenuinelyThin
+    assertTrue(
+      !isExperienceContentGenuinelyThin(
+        { content_source: "manual", verification_status: "pending_verify", description: null, category: null, content_field_evidence: null },
+        "gard.no"
+      ),
+      "iecgt-1: LOCKED row (content_source='manual') -> never thin, even with blank content"
+    );
+    assertTrue(
+      !isExperienceContentGenuinelyThin(
+        { content_source: null, verification_status: "verified", description: null, category: null, content_field_evidence: null },
+        "gard.no"
+      ),
+      "iecgt-2: LOCKED row (verification_status='verified') -> never thin"
+    );
+    assertTrue(
+      isExperienceContentGenuinelyThin(
+        { content_source: null, verification_status: "pending_verify", description: null, category: null, content_field_evidence: null },
+        "gard.no"
+      ),
+      "iecgt-3: unlocked, both fields blank -> thin"
+    );
+    assertTrue(
+      !isExperienceContentGenuinelyThin(
+        {
+          content_source: "provider_site", verification_status: "pending_verify",
+          description: "Ekte om-tekst.", category: "mat_drikke",
+          content_field_evidence: JSON.stringify({ description: "https://www.gard.no/om", category: "https://www.gard.no/om" }),
+        },
+        "gard.no"
+      ),
+      "iecgt-4: unlocked, BOTH fields genuinely homepage-sourced -> NOT thin (done)"
+    );
+    // The core acceptance-criterion-3 case: non-blank content_source =
+    // 'provider_site' (stamped unconditionally by applyExperienceContent
+    // regardless of where the content really came from), but the recorded
+    // per-field evidence is a THIRD-PARTY aggregator domain. Must still
+    // count as thin so a real homepage value can eventually overwrite it.
+    assertTrue(
+      isExperienceContentGenuinelyThin(
+        {
+          content_source: "provider_site", verification_status: "pending_verify",
+          description: "Aggregert beskrivelse.", category: "mat_drikke",
+          content_field_evidence: JSON.stringify({ description: "https://visitnorway.com/found-here", category: "https://www.gard.no/om" }),
+        },
+        "gard.no"
+      ),
+      "iecgt-5: content_source='provider_site' + non-blank description, but description's OWN evidence is an aggregator domain -> STILL thin (the bug this fix closes)"
+    );
+    assertTrue(
+      isExperienceContentGenuinelyThin(
+        {
+          content_source: "provider_site", verification_status: "pending_verify",
+          description: "Ekte tekst.", category: null,
+          content_field_evidence: JSON.stringify({ description: "https://www.gard.no/om" }),
+        },
+        "gard.no"
+      ),
+      "iecgt-6: description genuinely homepage-sourced but category still blank -> thin (ANY judged field counts)"
+    );
+
+    // classifyProviderContentBucket
+    assertEq(
+      classifyProviderContentBucket(null, []),
+      "waiting",
+      "cpcb-1: no hjemmeside, no experiences at all -> waiting"
+    );
+    assertEq(
+      classifyProviderContentBucket("   ", [
+        { content_source: null, verification_status: "pending_verify", description: null, category: null, content_field_evidence: null, evidence_url: null, canonical_id: null },
+      ]),
+      "waiting",
+      "cpcb-2: blank hjemmeside, no experience carries an evidence_url fallback -> waiting"
+    );
+    assertEq(
+      classifyProviderContentBucket(null, [
+        { content_source: null, verification_status: "pending_verify", description: null, category: null, content_field_evidence: null, evidence_url: "https://kilde.example/x", canonical_id: null },
+      ]),
+      "enrichable",
+      "cpcb-3: hjemmeside blank BUT an experience carries a usable evidence_url -> homepage derived from it, thin content -> enrichable (mirrors selectProvidersForContentRefresh's own COALESCE fallback)"
+    );
+    assertEq(
+      classifyProviderContentBucket("https://gard.no", []),
+      "done",
+      "cpcb-4: usable hjemmeside but ZERO live experiences -> done (nothing to enrich, documented edge case)"
+    );
+    assertEq(
+      classifyProviderContentBucket("https://gard.no", [
+        { content_source: "manual", verification_status: "pending_verify", description: null, category: null, content_field_evidence: null, evidence_url: null, canonical_id: null },
+      ]),
+      "done",
+      "cpcb-5: usable hjemmeside, only a LOCKED experience with blank content -> done (permanently out of scope, documented edge case)"
+    );
+    assertEq(
+      classifyProviderContentBucket("https://gard.no", [
+        { content_source: null, verification_status: "pending_verify", description: null, category: null, content_field_evidence: null, evidence_url: null, canonical_id: null },
+      ]),
+      "enrichable",
+      "cpcb-6: usable hjemmeside, unlocked blank experience -> enrichable"
+    );
+    // The headline acceptance-criterion-3 scenario at the bucket level.
+    assertEq(
+      classifyProviderContentBucket("https://gard.no", [
+        {
+          content_source: "provider_site", verification_status: "pending_verify",
+          description: "Aggregert beskrivelse.", category: "mat_drikke",
+          content_field_evidence: JSON.stringify({ description: "https://visitnorway.com/found-here", category: "https://www.gard.no/om" }),
+          evidence_url: null, canonical_id: null,
+        },
+      ]),
+      "enrichable",
+      "cpcb-7: content_source='provider_site' non-blank description, but AGGREGATOR-sourced per content_field_evidence -> still enrichable, NOT done"
+    );
+    assertEq(
+      classifyProviderContentBucket("https://gard.no", [
+        {
+          content_source: "provider_site", verification_status: "pending_verify",
+          description: "Ekte tekst.", category: "mat_drikke",
+          content_field_evidence: JSON.stringify({ description: "https://www.gard.no/om", category: "https://www.gard.no/om" }),
+          evidence_url: null, canonical_id: null,
+        },
+      ]),
+      "done",
+      "cpcb-8: both judged fields genuinely homepage-sourced -> done"
+    );
+    // Dedup-merged rows (canonical_id set) must never count either way.
+    assertEq(
+      classifyProviderContentBucket("https://gard.no", [
+        { content_source: null, verification_status: "pending_verify", description: null, category: null, content_field_evidence: null, evidence_url: null, canonical_id: "canon-1" },
+      ]),
+      "done",
+      "cpcb-9: the ONLY experience is dedup-merged away (canonical_id set) -> excluded from 'live', so done (nothing left to check), not enrichable"
+    );
+    // Mixed multi-experience: ANY-thin-live-experience rule.
+    assertEq(
+      classifyProviderContentBucket("https://gard.no", [
+        {
+          content_source: "provider_site", verification_status: "pending_verify",
+          description: "Ekte tekst.", category: "mat_drikke",
+          content_field_evidence: JSON.stringify({ description: "https://www.gard.no/om", category: "https://www.gard.no/om" }),
+          evidence_url: null, canonical_id: null,
+        },
+        { content_source: null, verification_status: "pending_verify", description: null, category: null, content_field_evidence: null, evidence_url: null, canonical_id: null },
+      ]),
+      "enrichable",
+      "cpcb-10: mixed — one experience fully done, another still blank -> enrichable (ANY-thin rule, matches selectProvidersForContentRefresh's own EXISTS semantics)"
+    );
+    // Idempotency: same inputs -> same bucket, always.
+    const idemInput: Parameters<typeof classifyProviderContentBucket> = [
+      "https://gard.no",
+      [{ content_source: null, verification_status: "pending_verify", description: null, category: null, content_field_evidence: null, evidence_url: null, canonical_id: null }],
+    ];
+    assertEq(
+      classifyProviderContentBucket(...idemInput),
+      classifyProviderContentBucket(...idemInput),
+      "cpcb-11: idempotent — calling twice with identical input yields identical bucket"
     );
   }
 
