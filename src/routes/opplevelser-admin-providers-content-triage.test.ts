@@ -27,6 +27,18 @@
  *   (5) enrichable: a provider with hjemmeside + an AGGREGATOR-sourced
  *       non-blank experience (acceptance criterion 3 — the per-field
  *       provenance screen, not a naive "non-blank -> done" check)
+ *   (5b) enrichable: a provider whose experience was created the way the
+ *       LIVE /admin/bulk-load new-experience branch actually does it —
+ *       straight `createExperience({ category: ..., evidence_url: ...,
+ *       discovery_source: "bulk-load", ... })`, never touched by
+ *       applyExperienceContent afterward. This is the exact fix-up
+ *       regression case (independent review, round after slice 2's initial
+ *       approval): createExperience() never wrote content_field_evidence at
+ *       insert time, so this provider's category, sourced straight from a
+ *       harvest row, was silently classified `done` under the old
+ *       "no evidence entry -> unknown, keep as homepage-sourced" default —
+ *       identical to the pre-slice-2 bug, just relocated from the UPDATE
+ *       path to the INSERT path.
  *   (6) done: a provider with hjemmeside + a genuinely homepage-sourced
  *       experience
  *   (7) done: a provider with hjemmeside + zero live experiences
@@ -181,6 +193,46 @@ export function runOpplevelserAdminProvidersContentTriageTests(
         "https://visitnorway.com/found-here",
       );
 
+      // ── (5b) enrichable: hjemmeside + a NEW-EXPERIENCE-BRANCH bulk-load
+      // insert whose DESCRIPTION is later filled from the REAL homepage —
+      // reproduces EXACTLY the fix-up regression the reviewer described,
+      // not just a superficial variant of it. `category` is set the way
+      // POST /admin/bulk-load's live new-experience branch actually does it
+      // (opplevelser.ts): a straight createExperience() call with category
+      // from a harvested row, evidence_url pointing at the third-party
+      // listing, discovery_source: "bulk-load" — crucially with NO
+      // applyExperienceContent() call at all (unlike (5) above), so under
+      // the old code content_field_evidence stayed NULL for `category`
+      // forever. `description` is deliberately BLANK at insert (bulk-load's
+      // BulkRowSchema carries no description field at all — ground-truthed
+      // against the real schema) and is filled AFTERWARD by an ordinary,
+      // later content-refresh pass via a GENUINE homepage sourceUrl. That
+      // second step is required to reproduce the bug at all: with
+      // description left NULL, isExperienceContentGenuinelyThin's
+      // description check alone already forces `enrichable` regardless of
+      // category's provenance, masking the defect. Once description is
+      // genuinely homepage-sourced, applyExperienceContent's fill-only-blank
+      // gate skips category (it is already non-blank from the bulk-load
+      // insert), so category's provenance is decided ENTIRELY by whatever
+      // createExperience() stamped at insert time — exactly the code path
+      // this fix-up changes.
+      const provEnrichableBulkLoad = expStore.createProvider({
+        navn: "Bulklastet Gard AS", org_nr: "900001007",
+        fylke: "Vestland", kommune: "Bergen", hjemmeside: "https://www.bulklastetgard.no",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      const expBulkLoadId = expStore.createExperience({
+        title: "Bulklastet opplevelse", provider_id: provEnrichableBulkLoad, provider_match_status: "matched",
+        fylke: "Vestland", kommune: "Bergen", confidence: "high", verification_status: "needs_review",
+        category: "mat_drikke", evidence_url: "https://visitnorway.com/bulk-harvest-row",
+        discovery_source: "bulk-load",
+      });
+      expStore.applyExperienceContent(
+        expBulkLoadId,
+        { description: "Ekte beskrivelse hentet fra gårdens egen hjemmeside." },
+        "https://www.bulklastetgard.no/om-oss",
+      );
+
       // ── (6) done: hjemmeside + genuinely homepage-sourced content ───────
       const provDone = expStore.createProvider({
         navn: "Ferdig Gard AS", org_nr: "900001004",
@@ -233,10 +285,10 @@ export function runOpplevelserAdminProvidersContentTriageTests(
 
       // ── (8) hidden row excluded ───────────────────────────────────────────
       assertTrue(!byId[provHidden], "5: catalog_hidden=1 row never appears");
-      assertEq(all.body.total, 5, "6: total excludes the catalog_hidden=1 row (5 visible providers)");
-      assertEq(all.body.count, 5, "7: count == total for a single full-window fetch");
+      assertEq(all.body.total, 6, "6: total excludes the catalog_hidden=1 row (6 visible providers)");
+      assertEq(all.body.count, 6, "7: count == total for a single full-window fetch");
 
-      // ── (3)/(4)/(5)/(6)/(7) per-provider bucket assertions ───────────────
+      // ── (3)/(4)/(5)/(5b)/(6)/(7) per-provider bucket assertions ──────────
       assertEq(byId[provWaiting].bucket, "waiting", "8: no hjemmeside, no experiences -> waiting");
       assertEq(byId[provEnrichableBlank].bucket, "enrichable", "9: hjemmeside + blank experience -> enrichable");
       assertEq(
@@ -246,6 +298,11 @@ export function runOpplevelserAdminProvidersContentTriageTests(
       );
       assertEq(byId[provDone].bucket, "done", "11: hjemmeside + genuinely homepage-sourced content -> done");
       assertEq(byId[provDoneEmpty].bucket, "done", "12: hjemmeside + zero live experiences -> done (documented edge case)");
+      assertEq(
+        byId[provEnrichableBulkLoad].bucket,
+        "enrichable",
+        "12b: hjemmeside + a provider whose only experience came through createExperience()'s bulk-load-shaped new-row branch (category from a harvest row, evidence_url set, content_field_evidence never stamped by applyExperienceContent) -> STILL enrichable, NOT done — the fix-up regression case",
+      );
 
       // ── (2) bucket-sum invariant: acceptance criterion 1 ─────────────────
       const buckets = { enrichable: 0, done: 0, waiting: 0 } as Record<string, number>;
@@ -295,7 +352,7 @@ export function runOpplevelserAdminProvidersContentTriageTests(
         query: { limit: "2", after: page3.body.next_after },
       });
       const stitched = [...page1.body.providers, ...page2.body.providers, ...page3.body.providers, ...page4.body.providers];
-      assertEq(stitched.length, 5, "19: pagination across 3 non-empty pages (2+2+1) stitches to exactly 5 rows");
+      assertEq(stitched.length, 6, "19: pagination across 3 non-empty pages (2+2+2) stitches to exactly 6 rows");
       assertEq(page4.body.count, 0, "20: the page after exhaustion is empty");
       assertEq(page4.body.next_after, null, "21: next_after is null once exhausted");
       // Bucket assigned to a given id must be IDENTICAL whether read from the

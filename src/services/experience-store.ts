@@ -350,6 +350,52 @@ export function createExperience(input: Experience): string {
   const id = e.id ?? uuid();
   const slug = e.slug ?? `${slugify(e.title)}--${(e.provider_id ?? id).slice(0, 8)}`;
   const db = getDb(VERTICAL);
+
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2
+  // FIX-UP (post-approval defect, independent review): mirror
+  // applyExperienceContent's per-field provenance discipline at INSERT time
+  // too, not just on UPDATE. Every createExperience() call site today is
+  // either a harvest/bulk-load ingest (POST /admin/bulk-load's new-experience
+  // branch, bulkInsertExperiences()'s new-row branch above) or a hand-curated
+  // admin entry (POST /api/opplevelser) — NONE of them is "we just fetched
+  // and verified the provider's own homepage" the way the twice-daily
+  // content-refresh writer is; that writer only ever UPDATEs an existing row
+  // via applyExperienceContent. So a brand-new row's content fields deserve
+  // exactly the same provenance discipline applyExperienceContent already
+  // applies on every write it makes — including its own bulk-load/re-harvest
+  // MATCH branches two call sites away, which already stamp
+  // harvestProvenanceOf(evidence_url) unconditionally for whatever they
+  // write. Before this fix, content_field_evidence stayed NULL forever on a
+  // freshly-inserted row, and isContentFieldHomepageSourced's "no evidence
+  // entry -> unknown, keep as homepage-sourced" default silently classified
+  // every such provider as `done` for enrichment-selection purposes —
+  // reopening the exact bug this slice exists to fix, just relocated from
+  // the UPDATE path to the INSERT path. Only fields that actually carry a
+  // non-blank value in THIS insert get a provenance entry; a genuinely blank
+  // field needs none — isContentFieldHomepageSourced already treats blank as
+  // "not homepage content" on its own, independent of evidence.
+  const CONTENT_PROVENANCE_FIELDS: Array<[string, unknown]> = [
+    ["description", e.description],
+    ["category", e.category],
+    ["subcategory", e.subcategory],
+    ["activity_tags", e.activity_tags && e.activity_tags.length ? e.activity_tags : null],
+    ["season", e.season && e.season.length ? e.season : null],
+    ["indoor_outdoor", e.indoor_outdoor],
+    ["duration_min", e.duration_min],
+    ["price_from", e.price_from],
+    ["booking_url", e.booking_url],
+  ];
+  const nonBlankContentFields = CONTENT_PROVENANCE_FIELDS.filter(
+    ([, v]) => v !== null && v !== undefined && String(v).trim() !== ""
+  );
+  let contentFieldEvidence: string | null = null;
+  if (nonBlankContentFields.length > 0) {
+    const stampUrl = harvestProvenanceOf(e.evidence_url);
+    const evidence: Record<string, string> = {};
+    for (const [field] of nonBlankContentFields) evidence[field] = stampUrl;
+    contentFieldEvidence = JSON.stringify(evidence);
+  }
+
   db.prepare(`
     INSERT INTO experiences (
       id, provider_id, provider_match_status, title, slug, description,
@@ -359,7 +405,8 @@ export function createExperience(input: Experience): string {
       languages, accessibility, booking_url, booking_type,
       loc_lat, loc_lon, geo_precision, meeting_point, kommune, fylke,
       discovery_source, content_source, evidence_url, confidence,
-      enrichment_state, verification_status, seasonal_valid_from, seasonal_valid_to
+      enrichment_state, verification_status, seasonal_valid_from, seasonal_valid_to,
+      content_field_evidence
     ) VALUES (
       @id, @provider_id, @provider_match_status, @title, @slug, @description,
       @category, @subcategory, @activity_tags, @season, @indoor_outdoor, @weather_dependent,
@@ -368,7 +415,8 @@ export function createExperience(input: Experience): string {
       @languages, @accessibility, @booking_url, @booking_type,
       @loc_lat, @loc_lon, @geo_precision, @meeting_point, @kommune, @fylke,
       @discovery_source, @content_source, @evidence_url, @confidence,
-      @enrichment_state, @verification_status, @seasonal_valid_from, @seasonal_valid_to
+      @enrichment_state, @verification_status, @seasonal_valid_from, @seasonal_valid_to,
+      @content_field_evidence
     )
   `).run({
     id, provider_id: e.provider_id ?? null,
@@ -392,6 +440,7 @@ export function createExperience(input: Experience): string {
     enrichment_state: e.enrichment_state ?? "raw",
     verification_status: e.verification_status ?? "pending_verify",
     seasonal_valid_from: e.seasonal_valid_from ?? null, seasonal_valid_to: e.seasonal_valid_to ?? null,
+    content_field_evidence: contentFieldEvidence,
   });
   return id;
 }
