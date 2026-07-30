@@ -1,1 +1,34 @@
-ewogICIkc2NoZW1hIjogImh0dHBzOi8vc3RhdGljLm1vZGVsY29udGV4dHByb3RvY29sLmlvL3NjaGVtYXMvMjAyNS0xMi0xMS9zZXJ2ZXIuc2NoZW1hLmpzb24iLAogICJuYW1lIjogImlvLmdpdGh1Yi5zbG9va2lzZW4vb3BwbGV2YWdlbnQtbWNwIiwKICAiZGVzY3JpcHRpb24iOiAiTm9yd2VnaWFuIGV4cGVyaWVuY2VzIG1hcmtldHBsYWNlIE1DUDogYWN0aXZpdGllcyBieSBjb3VudHksIGNhdGVnb3J5LCB3ZWF0aGVyLCBzZWFzb24sIGdyb3VwIHNpemUuIiwKICAicmVwb3NpdG9yeSI6IHsKICAgICJ1cmwiOiAiaHR0cHM6Ly9naXRodWIuY29tL3Nsb29raXNlbi9sb2thbCIsCiAgICAic291cmNlIjogImdpdGh1YiIsCiAgICAic3ViZm9sZGVyIjogIm1jcC1zZXJ2ZXItb3BwbGV2YWdlbnQiCiAgfSwKICAidmVyc2lvbiI6ICIwLjEuMiIsCiAgInBhY2thZ2VzIjogWwogICAgewogICAgICAicmVnaXN0cnlUeXBlIjogIm5wbSIsCiAgICAgICJpZGVudGlmaWVyIjogIm9wcGxldmFnZW50LW1jcCIsCiAgICAgICJ2ZXJzaW9uIjogIjAuMS4wIiwKICAgICAgInRyYW5zcG9ydCI6IHsKICAgICAgICAidHlwZSI6ICJzdGRpbyIKICAgICAgfSwKICAgICAgImVudmlyb25tZW50VmFyaWFibGVzIjogWwogICAgICAgIHsKICAgICAgICAgICJuYW1lIjogIk9QUExFVkFHRU5UX1VSTCIsCiAgICAgICAgICAiZGVzY3JpcHRpb24iOiAiT3ZlcnJpZGUgQVBJIGJhc2UgVVJMIChkZWZhdWx0OiBodHRwczovL29wcGxldmFnZW50Lm5vKSIsCiAgICAgICAgICAicmVxdWlyZWQiOiBmYWxzZQogICAgICAgIH0KICAgICAgXQogICAgfQogIF0sCiAgInJlbW90ZXMiOiBbCiAgICB7CiAgICAgICJ0eXBlIjogInN0cmVhbWFibGUtaHR0cCIsCiAgICAgICJ1cmwiOiAiaHR0cHM6Ly9vcHBsZXZhZ2VudC5uby9tY3AiCiAgICB9CiAgXQp9Cg==
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.slookisen/opplevagent-mcp",
+  "description": "Norwegian experiences marketplace MCP: activities by county, category, weather, season, group size.",
+  "repository": {
+    "url": "https://github.com/slookisen/lokal",
+    "source": "github",
+    "subfolder": "mcp-server-opplevagent"
+  },
+  "version": "0.1.2",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "opplevagent-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OPPLEVAGENT_URL",
+          "description": "Override API base URL (default: https://opplevagent.no)",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://opplevagent.no/mcp"
+    }
+  ]
+}
