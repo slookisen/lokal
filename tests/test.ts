@@ -95,12 +95,67 @@ import conversationUiRouter, {
 //     known key that matches what I send" — none needed the SERVER's
 //     expected key to genuinely differ from every other block's, so there
 //     were no category-B (legitimately-different-server-key) exceptions.
+//   - DB-singleton isolation, PARTIALLY (kriterium 3, dev-request
+//     2026-07-25-testsuite-ikke-deterministisk-delte-globaler): the ad-hoc
+//     "_prNN" family of blocks that swap the getDb() singleton via
+//     __setDbForTesting() (PR-56, PR-63, PR-65, PR-67, PR-68 — grep
+//     `_pr(56|63|65|67|68)(Promise|Resolve)`) is a hand-threaded chain of
+//     resolver-handle awaits, not a single serial queue like runSerial()
+//     below. Before this fix, PR-63/PR-65/PR-67/PR-68 were only gated on
+//     PR-56 finishing — they were SIBLINGS of each other, not a chain, so
+//     any two of them could still interleave their own __setDbForTesting()
+//     pins while the other was mid-await. Fixed by adding the missing
+//     pairwise awaits so this specific group is now a true total order:
+//     PR-56 → PR-63 → PR-65 → PR-67 → PR-68 (each additionally awaits every
+//     one before it, not just its original single predecessor). Verified
+//     by mutation test: reintroducing the PR-63/PR-65 sibling gap under an
+//     artificially widened race window (an injected 80ms sleep in PR-63
+//     right after its pin) reproducibly corrupts PR-63's own assertions
+//     (reads back rows from PR-65's DB instead) and cascades into
+//     PR-67/PR-68/PR-74/orch-pr-86 failures; with the fix in place the
+//     same widened window no longer corrupts this group.
 //
 // NOT yet fixed — don't assume this is solved:
-//   - DB-singleton isolation via __setDbForTesting() isn't applied
-//     consistently by every block yet (kriterium 3, a separate future
-//     slice). A block touching it must still follow the restore-in-finally
-//     discipline above by hand until that slice lands.
+//   - DB-singleton isolation, THE REST: two further gaps in the SAME
+//     __setDbForTesting() surface were found but NOT fixed here — both
+//     attempts introduced NEW, reproducible non-determinism elsewhere in
+//     the suite (verified empirically, not just theorized), so they were
+//     backed out rather than shipped risky:
+//       1. PR-94 (chained off `_pr56Promise.then(...)`, not on the PR-56→
+//          PR-68 line above) also pins the singleton and is still only
+//          gated on PR-56 — it can still race PR-63/65/67/68 and (observed
+//          directly while investigating this) orch-pr-86 further down.
+//          Making PR-94 additionally await PR-63/65/67/68 is the obvious
+//          fix, but doing so — even alone, even without also making
+//          orch-pr-86 wait on PR-94 — reproducibly broke orch-pr-86's own
+//          assertions on every run, meaning PR-94's current timing is
+//          ALSO (accidentally, silently) load-bearing for something
+//          orch-pr-86 depends on that isn't captured by any promise
+//          dependency; that interaction needs its own investigation.
+//       2. The runSerial() chain (below, ~90 blocks from PLATFORM-VERIFIER
+//          on, several of which swap the singleton via required
+//          src/**/*.test.ts helpers) and this ad-hoc family are two
+//          separate serialization primitives that never wait on each
+//          other except jointly, at the very end, in the REPORT IIFE's
+//          tail — so a runSerial()-registered block can still start while
+//          an ad-hoc block above is mid-await on the singleton. A barrier
+//          that folds the full ad-hoc-family promise list into
+//          _serialChain right before the first post-ad-hoc runSerial()
+//          call closes this in theory (and passed in isolation), but in
+//          practice the added wall-clock delay shifted this suite's
+//          overall timing enough to trip the SEPARATE, already-documented
+//          "NOT yet fixed" ADMIN_KEY-in-external-files hazard two bullets
+//          below (a `pilot-ordre-loop` run came back with 18 unrelated
+//          403s) — i.e. this file's timing sensitivity is not scoped to
+//          the DB singleton alone, and a fix for the DB singleton can
+//          still surface a different, out-of-scope race just by changing
+//          when things run. Shipping that barrier was judged too risky
+//          for this slice; it needs to land together with (or after) the
+//          ADMIN_KEY-in-external-files fix, not before it.
+//     Until both land, a NEW block that touches __setDbForTesting() must
+//     still follow the restore-in-finally discipline above by hand AND
+//     manually verify its ordering against PR-94 and the runSerial()
+//     chain — don't assume the PR-56→PR-68 chain fix above covers it.
 //   - A hazard the SAME SHAPE as kriterium 2 but in a DIFFERENT population
 //     of files: this file requires and invokes dozens of colocated
 //     src/**/*.test.ts helper suites (grep for `require(".*\.test")` in
@@ -10096,13 +10151,25 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
     db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id, city) VALUES ('lok-bergen', 'Bondens Marked Bergen', 'market_network', 'nat-1', 'Bergen')").run();
     db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id) VALUES ('ven-lyngdal', 'Bondens marked — Lyngdal', 'venue', 'lok-agder')").run();
     db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id) VALUES ('ven-grimstad', 'Bondens Marked Grimstad', 'venue', 'lok-agder')").run();
-    initMod.__setDbForTesting(db);
 
     const { matchEventToVenue, runBmEventsScraper, __setBmEventsScraperFetchForTesting } = require("../src/services/bm-events-scraper");
 
     // venue_fuzzy: event_name "Lyngdal Sentrum" should match "Bondens marked — Lyngdal"
     // (the prefix is stripped by normaliseForMatch and "lyngdal" remains as needle)
     (async () => {
+      // kriterium 3 (dev-request 2026-07-25-testsuite-ikke-deterministisk-
+      // delte-globaler): PR-56 is the first block in the ad-hoc getDb()
+      // singleton chain that does REAL async work (awaits below) after
+      // pinning its own DB. M2 and PR-24 are earlier blocks that ALSO pin
+      // the same singleton with real awaits of their own — wait for both
+      // to fully settle first, or an in-flight continuation of either
+      // could re-pin the singleton out from under this block between its
+      // own awaits below. The pin itself is moved here (from directly
+      // after the seed inserts above) so it happens AFTER these awaits,
+      // not before.
+      try { await _m2Promise; } catch { /* upstream failures already counted */ }
+      try { await _pr24Promise; } catch { /* upstream failures already counted */ }
+      initMod.__setDbForTesting(db);
       const r1 = await matchEventToVenue({
         event_slug: "lyngdal-sentrum-2026-05-16",
         event_name: "Lyngdal Sentrum",
@@ -11673,6 +11740,15 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
 // Async block: must await setImmediate completion to see status transitions.
 {
   (async () => {
+    // kriterium 3: this block later pins its own getDb() singleton handle
+    // (db65, further down) and does real async work against it. PR-56 and
+    // PR-63 are the previous blocks in file order to touch the same
+    // singleton with real awaits of their own (both only wait on PR-56
+    // themselves, so without this they'd race PR-65 too) — wait for both
+    // to fully settle first so an in-flight continuation of either can't
+    // re-pin the singleton mid-flight here.
+    try { await _pr56Promise; } catch { /* upstream failures already counted */ }
+    try { await _pr63Promise; } catch { /* upstream failures already counted */ }
     const jt = require("../src/services/job-tracker");
     jt._clearJobsForTesting();
 
@@ -12746,8 +12822,14 @@ const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; }
     // singleton DB — both blocks pin their own in-memory DB via
     // __setDbForTesting and racing them corrupts PR-56's assertions.
     // PR-56 typically resolves in ~50ms with stubbed fetches.
+    // kriterium 3: PR-63 and PR-65 also pin the singleton and, before this
+    // fix, only waited on PR-56 themselves (siblings, not chained to each
+    // other) — so without also waiting for them here, PR-67 could still
+    // race whichever of the two was still mid-flight.
     (async () => {
       try { await _pr56Promise; } catch { /* failures already tallied */ }
+      try { await _pr63Promise; } catch { /* failures already tallied */ }
+      try { await _pr65Promise; } catch { /* failures already tallied */ }
     const Database67 = require("better-sqlite3");
     const initMod67 = require("../src/database/init");
     const db67 = new Database67(":memory:");
@@ -12924,10 +13006,15 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
 }
 
 // ── Behavioural tests run LAST — wait for the other async DB-using
-//    blocks (PR-56, PR-65) to finish before we steal the global DB.
+//    blocks (PR-56, PR-63, PR-65, PR-67) to finish before we steal the
+//    global DB. kriterium 3: PR-63 and PR-67 added — both pin the same
+//    singleton and, before this fix, weren't in this wait list, so PR-68
+//    could still race whichever of them was mid-flight.
 (async () => {
   try { await _pr56Promise; } catch { /* errors already counted */ }
+  try { await _pr63Promise; } catch { /* errors already counted */ }
   try { await _pr65Promise; } catch { /* errors already counted */ }
+  try { await _pr67Promise; } catch { /* errors already counted */ }
 
   try {
     const Database3 = require("better-sqlite3");
@@ -13543,11 +13630,23 @@ console.log("\n── orch-pr-20260714-mcpcard: rfb agents.txt links MCP Server 
 console.log("\n── PR-74: umbrella-traffic aggregation + endpoint ──");
 const _pr74Promise = (async () => {
   // Wait for all prior async blocks that also steal the global DB singleton.
-  // PR-68 is the last sequential block but the M2 portal IIFE and the PR-21
-  // collection run in parallel — any of them can race PR-74's __setDbForTesting
-  // call. If we skip these awaits, the analytics router executes against
-  // whatever DB happens to be installed at that moment and returns 500s.
+  // PR-68 is the last block of the kriterium-3a total order (PR-56→63→65→67→68,
+  // tests/test.ts header comment ~line 24) but PR-94 pins the singleton
+  // independently of that chain (gated only on PR-56 — see the header comment's
+  // "NOT yet fixed" entry) and the M2 portal IIFE and the PR-21 collection also
+  // run in parallel — any of them can race PR-74's __setDbForTesting call. If we
+  // skip these awaits, the analytics router executes against whatever DB happens
+  // to be installed at that moment and returns 500s.
+  //
+  // kriterium 3a fix note: awaiting _pr94Promise here (added alongside this
+  // slice) is NOT the same as gating PR-94 itself into the 56→68 chain — that
+  // was tried and reverted because it broke orch-pr-86's own assertions
+  // elsewhere. This is the narrower, safe fix: PR-74 waits for PR-94 to finish
+  // touching the singleton before PR-74 pins its own, same as it already does
+  // for every other singleton-touching block. Confirmed no cycle: PR-94's own
+  // body (~line 10306) never awaits _pr74Promise or anything derived from it.
   try { await _pr68Promise; } catch { /* errors counted upstream */ }
+  try { await _pr94Promise; } catch { /* errors counted upstream */ }
   try { await _m2Promise; } catch { /* errors counted upstream */ }
   try { await _pr24Promise; } catch { /* errors counted upstream */ }
   try { await Promise.all(_pr21Promises); } catch { /* errors counted upstream */ }
@@ -13714,7 +13813,22 @@ const _pr74Promise = (async () => {
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
-  function call(urlPath: string): Promise<{ status: number; body: any }> {
+  // kriterium 3a follow-up (2026-07-30): this block's request goes over a REAL
+  // loopback HTTP round-trip (server.listen + http.request), not a same-turn
+  // function call, so the route handler's own getDb() read happens in a
+  // separate event-loop turn from everything above. Preventing every possible
+  // interleaving would mean auditing/gating the ~69 OTHER __setDbForTesting()
+  // call sites in this file (grep it) against this one block — unbounded,
+  // out of scope for this slice (see tests/test.ts header comment). Detect-
+  // and-retry instead, entirely local to this block: re-pin pr74db
+  // synchronously right before every dispatch (closes the common case), and
+  // if the response still shows contamination — a foreign DB was installed
+  // during the request's own flight and produced a 500 this route never
+  // legitimately returns in these fixtures, or the singleton no longer
+  // points at pr74db by the time we check — retry with a fresh re-pin. This
+  // makes the block deterministic (same result every run) without touching
+  // any of the other call sites.
+  async function call(urlPath: string, _retriesLeft = 4): Promise<{ status: number; body: any }> {
     // Re-assert against the residual, out-of-scope external hazard: sibling
     // src/**/*.test.ts helper suites required elsewhere in this file still
     // mutate process.env.ANALYTICS_ADMIN_KEY with their own bespoke values
@@ -13722,7 +13836,8 @@ const _pr74Promise = (async () => {
     // touch it — this pr-74 block used to leak its own value forever with
     // no restore at all, so this re-pin is a net-new hardening).
     process.env.ANALYTICS_ADMIN_KEY = SUITE_ANALYTICS_ADMIN_KEY;
-    return new Promise(resolve => {
+    initMod.__setDbForTesting(pr74db);
+    const result = await new Promise<{ status: number; body: any }>(resolve => {
       const req = httpMod.request({
         host: "127.0.0.1",
         port,
@@ -13741,6 +13856,11 @@ const _pr74Promise = (async () => {
       req.on("error", () => resolve({ status: 0, body: null }));
       req.end();
     });
+    const contaminated = initMod.__peekDbForTesting() !== pr74db || result.status === 500;
+    if (contaminated && _retriesLeft > 0) {
+      return call(urlPath, _retriesLeft - 1);
+    }
+    return result;
   }
 
   // Endpoint 1 — basic shape on default since_hours
