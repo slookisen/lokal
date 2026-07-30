@@ -34115,7 +34115,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   assertTrue((suggestPostPV.redirectTo || "").includes("done=foreslatt"), "pv-08a: suggestion accepted");
   let b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
   assertEq(b3RowPV?.pre_status, "time_suggested", "pv-08b: pre_status → time_suggested");
-  assertEq(b3RowPV?.suggested_slot_at, "2030-09-12T15:00", "pv-08c: suggested_slot_at persisted");
+  assertEq(b3RowPV?.suggested_slot_at, "2030-09-12T13:00:00.000Z",
+    "pv-08c: suggested_slot_at persisted as the UTC INSTANT — the naked form value is Oslo wall time (15:00 CEST = 13:00Z), tz-fix 2026-07-30");
   assertTrue(!!b3RowPV?.guest_decision_token, "pv-08d: guest_decision_token generated");
   assertEq(b3RowPV?.respond_token_used_at, null, "pv-08e: suggest is NOT terminal — respond token not consumed");
   const suggestMailPV = emailCallsPV.find((c) => c.to === "gjest-pv3@example.no");
@@ -34131,11 +34132,37 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
     { body: { action: "foresla", suggested_slot: "2030-09-13T11:00" } });
   b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
-  assertEq(b3RowPV?.suggested_slot_at, "2030-09-13T11:00", "pv-09a: re-suggest replaces the slot");
+  assertEq(b3RowPV?.suggested_slot_at, "2030-09-13T09:00:00.000Z",
+    "pv-09a: re-suggest replaces the slot (stored as UTC instant, 11:00 CEST = 09:00Z)");
   assertTrue(b3RowPV?.guest_decision_token !== firstDecisionTokenPV, "pv-09b: re-suggest rotates the guest token");
   const staleDecisionPV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
     { token: firstDecisionTokenPV }, `/kategori/gardssalg/gjestesvar/${firstDecisionTokenPV}`);
   assertEq(staleDecisionPV.status, 404, "pv-09c: rotated-away decision link → 404, no action possible");
+
+  // ── tz-1..tz-9: Oslo-veggtid → UTC (Daniels E2E-funn 2026-07-30: tiden man
+  //    la inn ble vist to timer senere — naked datetime-local ble lest som UTC).
+  {
+    const tzc = bookStPV.osloDatetimeLocalToUtcIso;
+    assertEq(tzc("2026-08-02T21:00"), "2026-08-02T19:00:00.000Z", "tz-1: sommertid (CEST, +02): 21:00 i Norge er 19:00Z — nøyaktig Daniels repro");
+    assertEq(tzc("2026-01-15T12:00"), "2026-01-15T11:00:00.000Z", "tz-2: vintertid (CET, +01)");
+    assertEq(tzc("2026-03-29T04:00"), "2026-03-29T02:00:00.000Z", "tz-3: rett ETTER vårskiftet (DST-grensen håndteres)");
+    assertEq(tzc("2026-10-25T04:00"), "2026-10-25T03:00:00.000Z", "tz-4: rett etter høstskiftet tilbake til CET");
+    assertEq(tzc("2026-08-02T21:00:30"), "2026-08-02T19:00:30.000Z", "tz-5: sekunder bevares");
+    assertEq(tzc("2026-08-02T21:00:00Z"), null, "tz-6: en streng MED sone er ikke naked — konverteres aldri dobbelt");
+    assertEq(tzc("ikke-en-dato"), null, "tz-7: søppel → null, aldri kast");
+    assertEq(bookStPV.normaliseBookingSlotInput("2026-08-02T14:00:00Z"), "2026-08-02T14:00:00Z",
+      "tz-8: API/MCP-instanter med Z passerer urørt gjennom normalisereren");
+    // createBooking normaliserer det offentlige skjemaets naked verdi.
+    const tzBooking = bookStPV.createBooking(
+      { provider_id: provIdPV, slot_at: "2030-07-01T18:00", party_size: 2, guest_name: "Tz Gjest", guest_email: "tz@example.no" },
+      "tz-test", { isTest: true });
+    assertEq(tzBooking.slot_at, "2030-07-01T16:00:00.000Z", "tz-9: createBooking lagrer gjestens veggtid som UTC-instant (18:00 CEST = 16:00Z)");
+    // Gjør tz-bookingen INERT for followups-tellingene i (8): den deler DB med
+    // resten av blokka, og en ekstra awaiting_provider-rad ville gitt
+    // reminders_sent=2 der pv-15c asserterer nøyaktig 1.
+    dbPV.prepare("UPDATE gardssalg_bookings SET respond_token = NULL WHERE booking_ref = ?")
+      .run(tzBooking.booking_ref);
+  }
   // Guest decision page: GET mutates nothing, shows both times.
   const decisionTokenPV = String(b3RowPV!.guest_decision_token);
   const decisionPagePV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
@@ -34153,7 +34180,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   assertTrue((acceptPostPV.redirectTo || "").includes("done=akseptert"), "pv-11a: accept POST → PRG done=akseptert");
   b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
   assertEq(b3RowPV?.pre_status, "provider_confirmed", "pv-11b: accept → provider_confirmed");
-  assertEq(b3RowPV?.slot_at, "2030-09-13T11:00", "pv-11c: slot_at REPLACED by the accepted suggestion");
+  assertEq(b3RowPV?.slot_at, "2030-09-13T09:00:00.000Z",
+    "pv-11c: slot_at REPLACED by the accepted suggestion (kanonisk UTC-instant, tz-fix 2026-07-30)");
   assertTrue(!!b3RowPV?.respond_token_used_at, "pv-11d: respond token consumed by the terminal outcome");
   assertTrue(emailCallsPV.some((c) => c.to === "gjest-pv3@example.no" && c.subject.includes("bekreftet")),
     "pv-11e: guest gets the confirmed email");
@@ -34380,7 +34408,8 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     "pv-24c: decline is bounded by the same window (followups own the closure)");
   let b12CheckPV = bookStPV.getBookingByRef(String(b12!.booking_ref));
   assertEq(b12CheckPV?.pre_status, "time_suggested", "pv-24d: refused decisions mutate nothing");
-  assertEq(b12CheckPV?.slot_at, "2030-09-10T13:00", "pv-24e: slot_at untouched");
+  assertEq(b12CheckPV?.slot_at, "2030-09-10T11:00:00.000Z",
+    "pv-24e: slot_at untouched (fortsatt den kanoniske UTC-instanten fra opprettelsen)");
 
   // (d) truthful expired page: deadline passed but the followup engine has
   // NOT yet flipped the row — the page may not claim the guest was told.

@@ -242,7 +242,10 @@ export function createBooking(
     booking_id:    uuid(),
     experience_id: input.experience_id ?? null,
     provider_id:   input.provider_id,
-    slot_at:       input.slot_at,
+    // TZ-fix 2026-07-30: a naked datetime-local slot from the public form is
+    // Oslo wall time → stored as the UTC instant. Zone-carrying instants from
+    // API/MCP callers pass through untouched.
+    slot_at:       normaliseBookingSlotInput(input.slot_at),
     party_size:    input.party_size,
     guest_name:    input.guest_name,
     guest_email:   input.guest_email,
@@ -586,10 +589,8 @@ export async function sendProducerNotification(
   ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kommentar fra gjesten:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
 </table>
 ${respondUrl ? `<p><strong>Svar på forespørselen:</strong></p>
-<p><a href="${respondUrl}">Bekreft reservasjonen</a><br>
-<a href="${respondUrl}">Foreslå nytt tidspunkt</a><br>
-<a href="${respondUrl}">Avslå forespørselen</a></p>
-<p>Alle valgene åpner samme svarside, der du bekrefter valget ditt.${deadlineFormatted ? ` Svarfrist: <strong>${deadlineFormatted}</strong> — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.` : ""}</p>` : ""}
+<p><a href="${respondUrl}" style="display:inline-block;background:#1d4e46;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 22px;border-radius:8px">Åpne svarsiden</a></p>
+<p>Der kan du bekrefte, foreslå et nytt tidspunkt eller avslå.${deadlineFormatted ? ` Svarfrist: <strong>${deadlineFormatted}</strong> — uten svar innen fristen utløper forespørselen automatisk og gjesten får beskjed.` : ""}</p>` : ""}
 <p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>
 <p>Etter besøket: <a href="${confirmUrl}">bekreft oppmøte eller ikke-oppmøte her</a>.<br>
 Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
@@ -668,9 +669,62 @@ export function respondTokenState(
 // datetime-local format the booking form itself submits ("2026-09-03T13:00",
 // optionally with seconds), parseable, and in the future. Anchored ($) so
 // trailing garbage never sneaks past the parseability check.
+/**
+ * Convert a naked datetime-local string («YYYY-MM-DDTHH:mm», what the
+ * <input type="datetime-local"> fields on the booking + svar pages submit)
+ * from EUROPE/OSLO WALL TIME to a UTC ISO instant.
+ *
+ * The bug this exists for (Daniel, E2E-test 2026-07-30): the naked string was
+ * stored verbatim, `new Date()` on the server (TZ=UTC) read it as UTC, and
+ * every display formats in Europe/Oslo — so the time a producer TYPED came
+ * out two hours later everywhere. A wall time typed by a Norwegian producer
+ * for a Norwegian farm visit IS Oslo time; this makes that explicit.
+ *
+ * DST-safe via double correction: guess the instant as if the wall time were
+ * UTC, read Oslo's offset at that instant, adjust, then re-read the offset at
+ * the adjusted instant (handles the ±1h boundary days). Pure — exported for
+ * tests.
+ */
+export function osloDatetimeLocalToUtcIso(input: string): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec((input || "").trim());
+  if (!m) return null;
+  const y = +m[1]!, mo = +m[2]!, d = +m[3]!, h = +m[4]!, mi = +m[5]!, sec = +(m[6] ?? "0");
+  const asUtc = Date.UTC(y, mo - 1, d, h, mi, sec);
+  if (!Number.isFinite(asUtc)) return null;
+  const osloOffsetMin = (atMs: number): number => {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Europe/Oslo",
+      timeZoneName: "longOffset",
+    }).formatToParts(new Date(atMs));
+    const tz = parts.find((p) => p.type === "timeZoneName")?.value ?? "GMT+00:00";
+    const om = /GMT([+-])(\d{2}):(\d{2})/.exec(tz);
+    if (!om) return 0;
+    return (om[1] === "-" ? -1 : 1) * (+om[2]! * 60 + +om[3]!);
+  };
+  let instant = asUtc - osloOffsetMin(asUtc) * 60_000;
+  instant = asUtc - osloOffsetMin(instant) * 60_000;
+  const d2 = new Date(instant);
+  return Number.isFinite(d2.getTime()) ? d2.toISOString() : null;
+}
+
+/**
+ * Normalise ANY slot input to the canonical stored form: a naked
+ * datetime-local string is Oslo wall time → UTC ISO; a string that already
+ * carries a zone (Z or ±hh:mm) passes through untouched (API/MCP callers
+ * send proper instants); anything else is returned as-is — this function
+ * normalises, it does not validate. Pure — exported for tests.
+ */
+export function normaliseBookingSlotInput(input: string): string {
+  const naked = osloDatetimeLocalToUtcIso(input);
+  return naked ?? input;
+}
+
 export function isValidSuggestedSlot(slot: string, now: Date = new Date()): boolean {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(slot)) return false;
-  const t = new Date(slot).getTime();
+  // TZ-fix 2026-07-30: the future-check must judge the instant the producer
+  // MEANT (Oslo wall time), not the naked string read as server-local.
+  const iso = osloDatetimeLocalToUtcIso(slot);
+  const t = iso ? new Date(iso).getTime() : NaN;
   return Number.isFinite(t) && t > now.getTime();
 }
 
@@ -778,13 +832,17 @@ export function producerSuggestTime(
     return null;
   }
   if (!isValidSuggestedSlot(suggested_slot_at, now)) return null;
+  // TZ-fix 2026-07-30: the form's naked datetime-local IS Oslo wall time —
+  // store the UTC instant, never the ambiguous naked string. Validation above
+  // deliberately still runs on the RAW input (its regex is the form contract).
+  const storedSlot = normaliseBookingSlotInput(suggested_slot_at);
   const db = getDb(VERTICAL);
   db.prepare(`
     UPDATE gardssalg_bookings
     SET pre_status = 'time_suggested', suggested_slot_at = ?, guest_decision_token = ?
     WHERE respond_token = ? AND pre_status IN ('awaiting_provider','time_suggested')
       AND respond_token_used_at IS NULL AND status = 'reserved'
-  `).run(suggested_slot_at, generateConfirmToken(), respond_token);
+  `).run(storedSlot, generateConfirmToken(), respond_token);
   return getBookingByRespondToken(respond_token);
 }
 
@@ -838,7 +896,11 @@ export function guestDeclineSuggestion(
 
 function slotNb(slot: string | null): string {
   if (!slot) return "";
-  return new Date(slot).toLocaleString("nb-NO", {
+  // Legacy rows stored the naked datetime-local string verbatim; those were
+  // typed as Oslo wall time, so route them through the same converter before
+  // formatting — otherwise old bookings keep the +2h display error forever.
+  const iso = osloDatetimeLocalToUtcIso(slot) ?? slot;
+  return new Date(iso).toLocaleString("nb-NO", {
     dateStyle: "full",
     timeStyle: "short",
     timeZone: "Europe/Oslo",

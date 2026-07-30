@@ -120,6 +120,7 @@ import {
   sendSuggestionToGuest,
   sendGuestDecisionToProducer,
   type GardssalgBooking,
+  osloDatetimeLocalToUtcIso,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
@@ -3742,7 +3743,7 @@ ${BROWSE_CSS}
     ${notLive ? "" : `<p class="microcopy">Du betaler ingenting nå — dette er en reservasjon.</p>`}
     <form class="book-form" method="POST" action="${canonical}" id="book-form">
       <input type="hidden" name="provider_id" value="${escapeHtml(provider.id)}">
-      <label for="slot_at">Dato og tid</label>
+      <label for="slot_at">Dato og tid (norsk tid)</label>
       <input id="slot_at" name="slot_at" type="datetime-local" required>
       <label for="party_size">Antall personer</label>
       <input id="party_size" name="party_size" type="number" min="1" max="50" value="2" required>
@@ -4208,7 +4209,11 @@ const PRE_STATUS_LABEL: Record<string, string> = {
 
 function previsitSlotNb(slot: string | null): string {
   if (!slot) return "";
-  return new Date(slot).toLocaleString("nb-NO", {
+  // TZ-fix 2026-07-30: rows stored before the fix carry the naked
+  // datetime-local string, which was TYPED as Oslo wall time — convert before
+  // formatting so old bookings don't keep the +2h display error forever.
+  const iso = osloDatetimeLocalToUtcIso(slot) ?? slot;
+  return new Date(iso).toLocaleString("nb-NO", {
     dateStyle: "full",
     timeStyle: "short",
     timeZone: "Europe/Oslo",
@@ -4336,14 +4341,19 @@ router.get(
       const confirmBtn = booking.pre_status === "awaiting_provider"
         ? `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="bekreft"><button type="submit" class="act-btn act-primary">Bekreft reservasjonen</button></form>`
         : "";
-      const waitingNote = booking.pre_status === "time_suggested"
-        ? `<div class="bekreft-banner ok" role="status">Forslaget ditt er sendt — venter på svar fra gjesten. Du kan foreslå et annet tidspunkt (erstatter forslaget) eller avslå.</div>`
+      // UX 2026-07-30: after a submit the flash `banner` above already says
+      // «Forslaget er sendt til gjesten …» — repeating it here read as two
+      // near-identical green boxes (Daniels E2E-skjermbilde). The standing
+      // note now only appears when there is NO flash, and leads with what
+      // the producer can still DO.
+      const waitingNote = booking.pre_status === "time_suggested" && done !== "foreslatt"
+        ? `<div class="bekreft-banner ok" role="status">Venter på svar fra gjesten. Du kan foreslå et annet tidspunkt (erstatter forslaget) eller avslå.</div>`
         : "";
       actionsHtml = `${waitingNote}
     ${confirmBtn}
     <form method="POST" action="${postTo}" class="suggest-box">
       <input type="hidden" name="action" value="foresla">
-      <label for="suggested_slot">Foreslå nytt tidspunkt</label>
+      <label for="suggested_slot">Foreslå nytt tidspunkt (norsk tid)</label>
       <input id="suggested_slot" name="suggested_slot" type="datetime-local" required>
       <button type="submit" class="act-btn act-secondary">Send forslag til gjesten</button>
     </form>
