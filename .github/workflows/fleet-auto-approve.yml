@@ -131,7 +131,29 @@ jobs:
             }
 
             // 3. Size cap.
-            const MAX_CHANGED_LINES = 1500;
+            //
+            // Raised 1500 -> 3000 on Daniel's explicit instruction, 2026-07-30.
+            //
+            // What this widens: the fleet can now auto-merge a PR up to 3000
+            // changed lines without Daniel reading it. The cap is not a quality
+            // check — every other gate below still applies (independent
+            // code-reviewer APPROVED, verdict doc on A2A main, all status checks
+            // green, protected paths untouched). It is a blast-radius limit: the
+            // bigger the diff, the more a reviewer can plausibly miss, and the
+            // more a bad merge costs to unwind.
+            //
+            // Why it moved: lokal#410 (CRM steg 4) came in at 1596 lines and had
+            // no path to merge at all. Branch protection requires an approving
+            // review from an identity other than the author, and GitHub does not
+            // let an author approve their own PR — so with the fleet gate refusing
+            // on size, there was no eligible approver in the system. The cap was
+            // not just inconvenient there; it was a deadlock.
+            //
+            // Note this file is itself a PROTECTED path (check 2 above), so a PR
+            // that changes this number can never be auto-approved by the gate it
+            // governs. That is deliberate and worth keeping: raising your own
+            // approval limit is exactly the change that should need a human.
+            const MAX_CHANGED_LINES = 3000;
             const changed = pr.additions + pr.deletions;
             if (changed > MAX_CHANGED_LINES) {
               await note(`diff is ${changed} changed lines (cap ${MAX_CHANGED_LINES}). Needs Daniel, no auto-approve.`);
