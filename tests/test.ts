@@ -18682,6 +18682,255 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
   dbFactoryKart.__resetDbFactoryForTesting();
 })();
 
+// ── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet map (dev-request
+// 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4: the SAME kind
+// of self-hosted-Leaflet + server-injected marker JSON island as the
+// /fylke/:fylke map above, but plotting experience_providers (gårdssalg
+// producers) instead of experiences — gårdssalg has zero rows in the
+// experiences table. Verifies: (1) listGardssalgProviderMapPoints() query
+// correctness — only rows with lat/lon AND a slug, respecting the SAME
+// producer_type/rfb-seed + catalog_hidden gate as
+// listGardssalgProviders()/countGardssalgProviders(); (2) geocode_confidence
+// → marker precision: 'high'/'medium'/'low' render as exact, 'approximate'
+// (and any OTHER/unrecognized confidence value, incl. null) renders as the
+// SAME dashed/approx marker — an approximate or unrecognized-confidence row
+// must NEVER leak through as address-exact; (3) marker click → the real
+// produsent-profil slug resolves 200; (4) the provider card grid is
+// unaffected by geocode state (a provider with no coords still shows in the
+// grid, just not on the map); (5) lazy-init discipline (no eager leaflet.js
+// tag, IntersectionObserver used); (6) zero geocoded providers → no map
+// section at all (honest omission).
+console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet map (dev-request 2026-07-19, arbeidspunkt 4) ──");
+(() => {
+  const prevPathKG = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathKG = require.resolve("../src/database/db-factory");
+  const expStorePathKG = require.resolve("../src/services/experience-store");
+  const expSeoPathKG = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathKG];
+  delete require.cache[expStorePathKG];
+  delete require.cache[expSeoPathKG];
+
+  const dbFactoryKG = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryKG.__resetDbFactoryForTesting();
+  const expStoreKG = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterKG = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  const dbKG = dbFactoryKG.getDb("experiences");
+
+  // Address-precision producer (Step A real Kartverket geocode) -> exact marker.
+  const provExactId = expStoreKG.createProvider({
+    navn: "Fjellro Sideri", org_nr: "912345671",
+    fylke: "Innlandet", kommune: "Lillehammer", poststed: "Lillehammer",
+    lat: 61.11, lon: 10.47, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKG.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("sideri", "high", provExactId);
+
+  // Approximate/centroid-fallback producer (Step D kommune-centroid fallback) -> approx marker.
+  const provApproxId = expStoreKG.createProvider({
+    navn: "Fjordly Bryggeri", org_nr: "912345672",
+    fylke: "Vestland", kommune: "Voss", poststed: "Voss",
+    lat: 60.63, lon: 6.42, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKG.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("bryggeri", "approximate", provApproxId);
+
+  // Reviewer-facing edge case: coordinates present but confidence is NULL/an
+  // unrecognized value (should never happen via the real worker — Step A/D
+  // always pair lat/lon with a confidence tag — but the marker-styling
+  // function must be defensive: an unrecognized/missing confidence must
+  // NEVER render as exact-address; it must fall back to the approx marker).
+  const provUnknownConfId = expStoreKG.createProvider({
+    navn: "Mystisk Mjøderi", org_nr: "912345673",
+    fylke: "Trøndelag", kommune: "Trondheim", poststed: "Trondheim",
+    lat: 63.43, lon: 10.39, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKG.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("mjøderi", provUnknownConfId);
+
+  // Producer_type set but NOT YET geocoded (no lat/lon) -> must show in the
+  // card grid, must NEVER appear on the map.
+  const provNoGeoId = expStoreKG.createProvider({
+    navn: "Ugeokodet Vingård", org_nr: "912345674",
+    fylke: "Agder", kommune: "Kristiansand", poststed: "Kristiansand",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKG.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("vingård", provNoGeoId);
+
+  // Hidden test provider (catalog_hidden=1) WITH coordinates -> must be
+  // excluded from the map even though it has a real geocode, same as it's
+  // excluded from the card grid/count (mirrors listGardssalgProviders()'s gate).
+  const provHiddenId = expStoreKG.createProvider({
+    navn: "Skjult Destilleri", org_nr: "912345675",
+    fylke: "Rogaland", kommune: "Stavanger", poststed: "Stavanger",
+    lat: 58.97, lon: 5.73, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKG.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ?, catalog_hidden = 1 WHERE id = ?")
+    .run("destilleri", "high", provHiddenId);
+
+  expStoreKG.backfillProviderSlugs();
+  const allProviders = expStoreKG.listGardssalgProviders(100, 0);
+  const exactSlug = allProviders.find((p) => p.id === provExactId)!.slug as string;
+  const approxSlug = allProviders.find((p) => p.id === provApproxId)!.slug as string;
+  const unknownConfSlug = allProviders.find((p) => p.id === provUnknownConfId)!.slug as string;
+
+  // kg-store-01: listGardssalgProviderMapPoints() query correctness.
+  const mapPointsKG = expStoreKG.listGardssalgProviderMapPoints();
+  const mapSlugsKG = mapPointsKG.map((p) => p.slug).sort();
+  assertEq(mapSlugsKG.length, 3, "kg-store-01a: exactly 3 producers have coordinates (no-geo + hidden excluded)");
+  assertEq(
+    JSON.stringify(mapSlugsKG),
+    JSON.stringify([exactSlug, approxSlug, unknownConfSlug].sort()),
+    "kg-store-01b: marker slugs are EXACTLY the 3 coord-bearing, non-hidden producers"
+  );
+  assertTrue(!mapSlugsKG.includes((allProviders.find((p) => p.id === provNoGeoId) || {}).slug),
+    "kg-store-01c: the not-yet-geocoded producer never appears in the map points");
+  const hiddenSlugKG = (dbKG.prepare("SELECT slug FROM experience_providers WHERE id = ?").get(provHiddenId) as any).slug;
+  assertTrue(!mapSlugsKG.includes(hiddenSlugKG),
+    "kg-store-01d: the catalog_hidden producer never appears in the map points, even though it has coordinates");
+  const exactPointKG = mapPointsKG.find((p) => p.slug === exactSlug)!;
+  assertEq(exactPointKG.geocode_confidence, "high", "kg-store-01e: geocode_confidence is returned verbatim, never fabricated");
+  assertEq(exactPointKG.lat, 61.11, "kg-store-01f: marker carries the real lat");
+  assertEq(exactPointKG.lon, 10.47, "kg-store-01g: marker carries the real lon");
+
+  // invokeSeo — same shape as the kart-fylke block above.
+  function invokeSeo(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterKG.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `kg-route: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // kg-01: GET /kategori/gardssalg -> 200, includes the map container + data island.
+  const gardKG = invokeSeo("/kategori/gardssalg", {}, "/kategori/gardssalg");
+  assertEq(gardKG.status, 200, "kg-01a: GET /kategori/gardssalg -> 200");
+  assertTrue(gardKG.body.includes('id="gardssalg-map"'), "kg-01b: gardssalg page renders the map container");
+  assertTrue(gardKG.body.includes('id="gardssalg-map-data"'), "kg-01c: gardssalg page renders the JSON data island");
+  assertTrue(/class="map-section"/.test(gardKG.body), "kg-01d: gardssalg page renders the shared map-section markup");
+
+  // kg-02: card grid unaffected — ALL 5 non-hidden producers still show in
+  // the card grid (geocode state is irrelevant to the card list).
+  assertTrue(gardKG.body.includes("Fjellro Sideri"), "kg-02a: exact-geocode producer shows in the card grid");
+  assertTrue(gardKG.body.includes("Fjordly Bryggeri"), "kg-02b: approximate-geocode producer shows in the card grid");
+  assertTrue(gardKG.body.includes("Mystisk Mjøderi"), "kg-02c: unknown-confidence producer shows in the card grid");
+  assertTrue(gardKG.body.includes("Ugeokodet Vingård"), "kg-02d: not-yet-geocoded producer STILL shows in the card grid");
+  assertTrue(!gardKG.body.includes("Skjult Destilleri"), "kg-02e: catalog_hidden producer never shows in the card grid (pre-existing gate)");
+
+  // kg-03: extract + parse the data island, verify the EXACT marker set + precision mapping.
+  const dataMatchKG = gardKG.body.match(/<script type="application\/json" id="gardssalg-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchKG, "kg-03a: data island is present and matchable");
+  const markersKG: Array<{ slug: string; navn: string; producerTypeLabel: string | null; sted: string | null; lat: number; lon: number; approx: boolean }> =
+    dataMatchKG ? JSON.parse(dataMatchKG[1]) : [];
+  assertEq(markersKG.length, 3, "kg-03b: exactly 3 markers (no-geo + hidden excluded)");
+  assertTrue(!markersKG.some((m) => m.navn === "Ugeokodet Vingård"), "kg-03c: not-yet-geocoded producer never appears on the map");
+  assertTrue(!markersKG.some((m) => m.navn === "Skjult Destilleri"), "kg-03d: catalog_hidden producer never appears on the map");
+
+  // kg-04: geocode_confidence -> marker precision, never fabricated/leaked.
+  const exactMarkerKG = markersKG.find((m) => m.slug === exactSlug)!;
+  const approxMarkerKG = markersKG.find((m) => m.slug === approxSlug)!;
+  const unknownMarkerKG = markersKG.find((m) => m.slug === unknownConfSlug)!;
+  assertEq(exactMarkerKG.approx, false, "kg-04a: geocode_confidence='high' renders as an EXACT marker (approx:false)");
+  assertEq(approxMarkerKG.approx, true, "kg-04b: geocode_confidence='approximate' renders as an APPROX marker (approx:true)");
+  assertEq(unknownMarkerKG.approx, true,
+    "kg-04c: a NULL/unrecognized geocode_confidence NEVER leaks through as exact — defaults to the approx marker, same honesty rule as the fylke map's geo_precision handling");
+  assertEq(exactMarkerKG.producerTypeLabel, "Sider", "kg-04d: producer_type is resolved to its human label (sideri -> Sider) in the marker payload");
+
+  // kg-05: popup click-through — the exact marker's slug resolves to the
+  // real produsent-profil page.
+  const profileKG = invokeSeo("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: exactSlug }, `/kategori/gardssalg/produsent/${exactSlug}`);
+  assertEq(profileKG.status, 200, "kg-05a: the exact marker's slug resolves to a real, live produsent-profil page");
+  const profileApproxKG = invokeSeo("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: approxSlug }, `/kategori/gardssalg/produsent/${approxSlug}`);
+  assertEq(profileApproxKG.status, 200, "kg-05b: the approx marker's slug ALSO resolves to a real, live produsent-profil page");
+
+  // kg-06: lazy-init discipline (same as the fylke map).
+  assertTrue(!/<script src="\/leaflet\/leaflet\.js"/.test(gardKG.body),
+    "kg-06a: leaflet.js is NOT eagerly tagged in the markup (loaded on-demand only)");
+  assertTrue(/IntersectionObserver/.test(gardKG.body), "kg-06b: init script uses IntersectionObserver for lazy init");
+  assertTrue(!/\son(click|change)\s*=/.test(gardKG.body), "kg-06c: no inline onclick=/onchange= handler attributes anywhere on the page");
+  assertTrue(!/unpkg\.com/.test(gardKG.body), "kg-06d: page never references unpkg.com (self-hosted only, no CDN)");
+
+  // kg-07: <noscript> OSM fallback present.
+  const noscriptKG = (gardKG.body.match(/<noscript>[\s\S]*?<\/noscript>/) || [""])[0];
+  assertTrue(/openstreetmap\.org\/search\?query=/.test(noscriptKG), "kg-07a: <noscript> block links to an OpenStreetMap search");
+
+  if (prevPathKG === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathKG;
+  dbFactoryKG.__resetDbFactoryForTesting();
+})();
+
+// ── opplevagent kart-gardssalg (no geocoded providers): honest omission ──────
+// A separate isolated DB with ZERO geocoded gårdssalg producers must render
+// NO map section at all (never an empty/broken map), while the card grid
+// still renders normally — same discipline as kart-10 above for /fylke/:fylke.
+console.log("\n── opplevagent kart-gardssalg: no map section when zero geocoded producers ──");
+(() => {
+  const prevPathKGZ = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathKGZ = require.resolve("../src/database/db-factory");
+  const expStorePathKGZ = require.resolve("../src/services/experience-store");
+  const expSeoPathKGZ = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathKGZ];
+  delete require.cache[expStorePathKGZ];
+  delete require.cache[expSeoPathKGZ];
+
+  const dbFactoryKGZ = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryKGZ.__resetDbFactoryForTesting();
+  const expStoreKGZ = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterKGZ = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const dbKGZ = dbFactoryKGZ.getDb("experiences");
+
+  const provNoGeoOnlyId = expStoreKGZ.createProvider({
+    navn: "Ingen Kart Sideri", org_nr: "912345676",
+    fylke: "Innlandet", kommune: "Lillehammer",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKGZ.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", provNoGeoOnlyId);
+  expStoreKGZ.backfillProviderSlugs();
+
+  const layerKGZ = (seoRouterKGZ.stack as any[]).find(
+    (l: any) => l.route && l.route.path === "/kategori/gardssalg" && l.route.methods?.get
+  );
+  assertTrue(!!layerKGZ, "kg-zero: router has GET /kategori/gardssalg layer");
+  let statusKGZ = 200; let bodyKGZ = "";
+  const resKGZ: any = {
+    statusCode: 200,
+    setHeader: () => {},
+    status: (c: number) => { statusKGZ = c; resKGZ.statusCode = c; return resKGZ; },
+    send: (b: unknown) => { bodyKGZ = typeof b === "string" ? b : String(b); return resKGZ; },
+    json: (o: unknown) => { bodyKGZ = JSON.stringify(o); return resKGZ; },
+  };
+  const reqKGZ: any = { path: "/kategori/gardssalg", hostname: "opplevagent.no", params: {}, query: {} };
+  layerKGZ.route.stack[layerKGZ.route.stack.length - 1].handle(reqKGZ, resKGZ, () => {});
+  assertEq(statusKGZ, 200, "kg-zero-a: GET /kategori/gardssalg (no geocoded producers) -> 200");
+  assertTrue(!bodyKGZ.includes('id="gardssalg-map"'), "kg-zero-b: no map section rendered when there are zero geocoded producers");
+  assertTrue(bodyKGZ.includes("Ingen Kart Sideri"), "kg-zero-c: the card list still renders normally");
+
+  if (prevPathKGZ === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathKGZ;
+  dbFactoryKGZ.__resetDbFactoryForTesting();
+})();
+
 // ── opplevagent: /fylke + /kommune fold-redirect ambiguity guard ───────────────
 // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering, item 5:
 // a param that ascii-folds to match TWO different live canonical values must

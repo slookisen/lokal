@@ -2201,6 +2201,65 @@ export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProvid
     .all(limit, offset) as GardssalgProviderRow[];
 }
 
+export type GardssalgProviderMapPoint = {
+  slug: string;
+  navn: string;
+  producer_type: string | null;
+  fylke: string | null;
+  kommune: string | null;
+  poststed: string | null;
+  lat: number;
+  lon: number;
+  // 'high' | 'medium' | 'low' = Step A's real address-level Kartverket geocode;
+  // 'approximate' = Step D's kommune/fylke-centroid fallback (see
+  // GardssalgProviderRow.geocode_confidence's doc comment above and
+  // experiences-geocode-worker.ts Steps A/D); 'no_match' rows never reach
+  // here (they never get a lat/lon at all, so the coordinate predicate below
+  // excludes them). Returned VERBATIM — the caller decides address-vs-
+  // approximate marker styling from it, never a fabricated precision.
+  geocode_confidence: string | null;
+};
+
+/**
+ * Gårdssalg producers (drink producers; see listGardssalgProviders()'s doc
+ * comment for why this queries experience_providers, not experiences) that
+ * have a real geocode — feeds the /kategori/gardssalg map (dev-request
+ * 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4). Reuses the
+ * EXACT SAME "which providers count" gate as listGardssalgProviders()/
+ * countGardssalgProviders() (producer_type set OR rfb-seed; catalog_hidden=1
+ * rows — the hidden booking-flyt-v1 test provider — excluded; parens around
+ * the OR are load-bearing, see those functions' comments) and appends two
+ * predicates on top, same discipline as listPublishedExperienceMapPoints()
+ * appending its coords predicate on top of browseWhere():
+ *   - lat IS NOT NULL AND lon IS NOT NULL — so the marker count for
+ *     /kategori/gardssalg is always <= listGardssalgProviders()'s card count
+ *     for the SAME gate, never a divergent definition of "visible provider".
+ *   - slug IS NOT NULL AND slug != '' — a marker with no produsent-profil
+ *     page to link to isn't useful on a click-through map; every visible
+ *     provider normally gets one via backfillProviderSlugs(), so this rarely
+ *     excludes rows in practice.
+ * geocode_confidence is NOT constrained here (unlike geo_precision on the
+ * experiences map point, which IS NOT NULL there) — this table's Step A/Step
+ * D writes always pair a non-null lat/lon with a non-null geocode_confidence
+ * in practice, but nothing here depends on that; the type keeps it nullable
+ * so a caller must handle "no confidence tag" defensively rather than assume
+ * exact precision.
+ */
+export function listGardssalgProviderMapPoints(): GardssalgProviderMapPoint[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT slug, navn, producer_type, fylke, kommune, poststed, lat, lon, geocode_confidence
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND lat IS NOT NULL AND lon IS NOT NULL
+          AND slug IS NOT NULL AND slug != ''
+        ORDER BY navn`
+    )
+    .all() as GardssalgProviderMapPoint[];
+}
+
 /** Look up a single gårdssalg provider (drink producer) by slug — for the
  *  /kategori/gardssalg/book/<slug> reservation flow and the
  *  /kategori/gardssalg/produsent/<slug> profile page. Mirrors the WHERE clause
