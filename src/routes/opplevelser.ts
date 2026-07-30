@@ -116,6 +116,7 @@ import {
   gardssalgWebsiteCandidateHosts,
   gardssalgPageText,
   gardssalgWebsiteEvidenceMatch,
+  gardssalgContactPageLinks,
   upsertGardssalgWebsiteReviewQueue,
   clearGardssalgWebsiteReviewQueueEntry,
   listGardssalgWebsiteReviewQueue,
@@ -2644,8 +2645,16 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
 // entire purpose is search, this endpoint still has a free tier that works
 // without a key.
 const GS_WD_DEFAULT_LIMIT = 16;
+// v2: max contact-ish subpages fetched per candidate host when the front
+// page carries a partial signal but doesn't verify on its own.
+const GS_WD_SUBPAGES_PER_HOST = 2;
 const GS_WD_HARD_CAP = 48;
-const GS_WD_SEARCH_MAX_CANDIDATES = 5;
+// v2 (Daniels retning 2026-07-30): raised 5 → 10. Measured on the live
+// drikkested cohort: the top organic hits are dominated by directory domains
+// (1881/proff/gulesider/purehelp/untappd) that the exclusion pipeline
+// correctly rejects — at 5 the surviving candidate list was often empty
+// before the real brand domain was ever reached.
+const GS_WD_SEARCH_MAX_CANDIDATES = 10;
 
 async function wdFetchPage(url: string): Promise<{ html: string; finalUrl: string } | null> {
   if (!isSafeFetchUrl(url)) return null;
@@ -2676,7 +2685,16 @@ async function wdFetchPage(url: string): Promise<{ html: string; finalUrl: strin
 async function tryGardssalgCandidateHosts(
   hosts: string[],
   hostCounts: Map<string, number>,
-  target: { org_nr: string | null; navn: string; kommune: string | null; poststed: string | null },
+  target: {
+    org_nr: string | null;
+    navn: string;
+    kommune: string | null;
+    poststed: string | null;
+    telefon?: string | null;
+    mobil?: string | null;
+    adresse?: string | null;
+    postnummer?: string | null;
+  },
   tried: string[],
   excludedHere: Array<{ host: string; reason: string }>,
 ): Promise<{ host: string; finalUrl: string; evidence: ReturnType<typeof gardssalgWebsiteEvidenceMatch> } | null> {
@@ -2705,14 +2723,40 @@ async function tryGardssalgCandidateHosts(
         continue;
       }
     }
-    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), {
+    const evTarget = {
       orgNr: target.org_nr,
       navn: target.navn,
       kommune: target.kommune,
       poststed: target.poststed,
-    });
+      telefon: target.telefon ?? null,
+      mobil: target.mobil ?? null,
+      adresse: target.adresse ?? null,
+      postnummer: target.postnummer ?? null,
+    };
+    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget);
     if (ev.verified) {
       return { host, finalUrl: page.finalUrl, evidence: ev };
+    }
+    // v2: the deciding evidence (org.nr, address, phone) usually lives on
+    // /kontakt or /om-oss, not the front page. When the front page shows at
+    // least ONE partial signal (an unrelated site shows none — crawling it
+    // further is pure waste), follow up to GS_WD_SUBPAGES_PER_HOST contact-
+    // ish same-host links and re-run the SAME evidence match per page. First
+    // verified page wins, and its URL is returned as final_url so the queue
+    // row records where the evidence actually was.
+    const anySignal = ev.name_found || ev.place_found || ev.phone_found || ev.address_found;
+    if (anySignal) {
+      const subpages = gardssalgContactPageLinks(page.html, host, GS_WD_SUBPAGES_PER_HOST);
+      for (const sub of subpages) {
+        const subPage = await wdFetchPage(sub);
+        if (!subPage) continue;
+        const subHost = hostFromUrlLike(subPage.finalUrl) || host;
+        if (subHost.toLowerCase().replace(/^www\./, "") !== host.toLowerCase().replace(/^www\./, "")) continue;
+        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget);
+        if (subEv.verified) {
+          return { host, finalUrl: subPage.finalUrl, evidence: subEv };
+        }
+      }
     }
   }
   return null;
@@ -2817,7 +2861,16 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
       } catch {
         finalOrigin = `https://${hit.host}`;
       }
-      const confidence = hit.evidence.org_nr_found ? 1.0 : 0.9;
+      // v2 graded confidence: org.nr is registry-grade; the provider's own
+      // registered phone on the page is nearly as strong; name+address next;
+      // name+place (the v1 rule) keeps its 0.9.
+      const confidence = hit.evidence.org_nr_found
+        ? 1.0
+        : hit.evidence.phone_found
+          ? 0.95
+          : hit.evidence.address_found
+            ? 0.92
+            : 0.9;
       proposed.push({
         provider_id: t.id,
         navn: t.navn,

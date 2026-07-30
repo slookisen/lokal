@@ -105,7 +105,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         const h2 = expStore.gardssalgWebsiteCandidateHosts("Bjørkegård Sideri — Hardanger");
         assertTrue(h2.includes("bjorkegardsideri.no"), "wd-a3: ø→o/å→a variant, «— Sted» pruned before generation");
         assertTrue(h2.includes("bjoerkegaardsideri.no"), "wd-a4: ø→oe/å→aa variant generated too");
-        assertTrue(h2.length <= 4, "wd-a5: at most 4 candidates");
+        assertTrue(h2.length <= 6, "wd-a5: at most 6 candidates (v2 — .no guesses plus .com variants)");
         const h3 = expStore.gardssalgWebsiteCandidateHosts("Ås AS");
         assertEq(h3.length, 0, "wd-a6: degenerate too-short label yields no candidates");
       }
@@ -502,6 +502,150 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
           expStore.__setGardssalgWebsiteSearchForTesting(null);
         }
       }
+
+      // ═══ Section v2 (Daniels retning 2026-07-30): flere kandidater +
+      //     fler-signal-bevis + kontaktside-crawl ═══════════════════════════
+
+      // ── wd-11: normaliseNorwegianPhone ──────────────────────────────────
+      {
+        assertEq(expStore.normaliseNorwegianPhone("+47 912 34 567"), "91234567", "wd-11a: +47 with spaces normalises to 8 digits");
+        assertEq(expStore.normaliseNorwegianPhone("0047 91 23 45 67"), "91234567", "wd-11b: 0047 prefix stripped");
+        assertEq(expStore.normaliseNorwegianPhone("91234567"), "91234567", "wd-11c: bare 8-digit passes through");
+        assertEq(expStore.normaliseNorwegianPhone("9123456"), null, "wd-11d: 7 digits is not a phone — partials must never match");
+        assertEq(expStore.normaliseNorwegianPhone(null), null, "wd-11e: null in, null out");
+      }
+
+      // ── wd-12: evidence v2 — signals from data we HOLD, not just navn ──
+      {
+        const base = { orgNr: null, navn: "Fjelldal Brenneri", kommune: "Saltdal", poststed: null };
+        // v1 subset preserved: name+place still verifies.
+        const v1 = expStore.gardssalgWebsiteEvidenceMatch("Fjelldal Brenneri ligger i Saltdal", base);
+        assertEq(v1.verified, true, "wd-12a: the v1 rule (name+place) still verifies — widening, never tightening");
+        // phone + name verifies WITHOUT place.
+        const ph = expStore.gardssalgWebsiteEvidenceMatch(
+          "Velkommen til Fjelldal Brenneri. Ring oss: +47 912 34 567",
+          { ...base, kommune: null, telefon: "912 34 567" });
+        assertEq(ph.phone_found, true, "wd-12b: the provider's registered number found despite +47/space formatting");
+        assertEq(ph.verified, true, "wd-12c: phone+name verifies without place");
+        // phone ALONE does not verify.
+        const phAlone = expStore.gardssalgWebsiteEvidenceMatch(
+          "Ringeliste: 912 34 567", { orgNr: null, navn: "Fjelldal Brenneri", kommune: null, poststed: null, telefon: "91234567" });
+        assertEq(phAlone.phone_found, true, "wd-12d: number found…");
+        assertEq(phAlone.verified, false, "wd-12e: …but phone ALONE never verifies (call-list pages)");
+        // a DIFFERENT number must not fire.
+        const phWrong = expStore.gardssalgWebsiteEvidenceMatch(
+          "Fjelldal Brenneri i Saltdal, tlf 999 99 999", { ...base, kommune: null, telefon: "91234567" });
+        assertEq(phWrong.phone_found, false, "wd-12f: a different number on the page is NOT the provider's phone");
+        // name + registered street address verifies.
+        const ad = expStore.gardssalgWebsiteEvidenceMatch(
+          "Fjelldal Brenneri, Bryggeveien 12, Norge", { ...base, kommune: null, adresse: "Bryggeveien 12" });
+        assertEq(ad.address_found, true, "wd-12g: registered address found at token boundaries");
+        assertEq(ad.verified, true, "wd-12h: name+address verifies without kommune");
+        // postnummer strengthens name but NEVER suffices with place alone.
+        const pn = expStore.gardssalgWebsiteEvidenceMatch(
+          "Fjelldal Brenneri, 8250", { ...base, kommune: null, postnummer: "8250" });
+        assertEq(pn.verified, true, "wd-12i: name+postnummer verifies");
+        const pnAlone = expStore.gardssalgWebsiteEvidenceMatch(
+          "Bedrifter i Saltdal 8250", { ...base, navn: "Fjelldal Brenneri", postnummer: "8250" });
+        assertEq(pnAlone.verified, false, "wd-12j: place+postnummer WITHOUT the name never verifies — thousands share a postal code");
+      }
+
+      // ── wd-13: contact-page link extraction ────────────────────────────
+      {
+        const html = `<a href="/kontakt">Kontakt oss</a>
+          <a href="https://annenside.no/kontakt">Kontakt</a>
+          <a href="mailto:x@y.no">Kontakt</a>
+          <a href="/om-oss">Om oss</a>
+          <a href="/produkter">Produkter</a>
+          <a href="/side">Ta kontakt her</a>`;
+        const links = expStore.gardssalgContactPageLinks(html, "fjelldalbrenneri.no");
+        assertTrue(links.includes("https://fjelldalbrenneri.no/kontakt"), "wd-13a: /kontakt by href");
+        assertTrue(links.includes("https://fjelldalbrenneri.no/om-oss"), "wd-13b: /om-oss by href");
+        assertTrue(links.includes("https://fjelldalbrenneri.no/side"), "wd-13c: contact-ish ANCHOR TEXT qualifies a neutral path");
+        assertTrue(!links.some((l) => l.includes("annenside.no")), "wd-13d: cross-host link never followed — only the exclusion pipeline judges other sites");
+        assertTrue(!links.some((l) => l.startsWith("mailto:")), "wd-13e: mailto skipped");
+        assertTrue(links.length <= 3, "wd-13f: capped");
+      }
+
+      // ── wd-14: .com candidate guesses ──────────────────────────────────
+      {
+        const h = expStore.gardssalgWebsiteCandidateHosts("7 Fjell Bryggeri");
+        assertTrue(h.includes("7fjellbryggeri.com"), "wd-14a: .com variant generated (the real 7 Fjell domain tier 1 used to miss)");
+        assertTrue(h.indexOf("7fjellbryggeri.no") < h.indexOf("7fjellbryggeri.com"), "wd-14b: .no still tried before .com");
+      }
+
+      // ── wd-15/16/17: route-level — subpage crawl + graded confidence ───
+      {
+        insertProvider.run({ id: "wd-sub-orgnr", navn: "Kystbrygg Vestland", org_nr: "922000001", kommune: "Askvoll", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
+        insertProvider.run({ id: "wd-sub-none", navn: "Ukjent Kystfjell", org_nr: "922000002", kommune: "Askvoll", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
+        insertProvider.run({ id: "wd-sub-phone", navn: "Telefonbrygg Nord", org_nr: "922000003", kommune: "Bodø", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
+        expDb.prepare(`UPDATE experience_providers SET telefon = '+47 912 34 567' WHERE id = 'wd-sub-phone'`).run();
+
+        const scenarios: Record<string, Array<{ title: string; url: string; description: string }>> = {
+          "Kystbrygg Vestland": [{ title: "Kystbrygg", url: "https://kystbrygg-ekte.no", description: "bryggeri" }],
+          "Ukjent Kystfjell": [{ title: "?", url: "https://helturelatert.no", description: "?" }],
+          "Telefonbrygg Nord": [{ title: "Telefonbrygg", url: "https://telefonbrygg-ekte.no", description: "bryggeri" }],
+        };
+        expStore.__setGardssalgWebsiteSearchForTesting(async (query: string) => {
+          const m = query.match(/^"([^"]+)"/);
+          return scenarios[m ? m[1]! : query] ?? [];
+        });
+
+        const subFetchCalls: string[] = [];
+        const prevFetch3 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const u = String(url);
+          subFetchCalls.push(u);
+          // Front page: name only (no place, no org) + a /kontakt link.
+          if (u === "https://kystbrygg-ekte.no" || u === "https://kystbrygg-ekte.no/") {
+            return { ok: true, status: 200, url: u, text: async () =>
+              '<html><body>Kystbrygg Vestland — håndverksøl. <a href="/kontakt">Kontakt oss</a></body></html>' } as unknown as Response;
+          }
+          // The kontakt subpage carries the org_nr — THE deciding evidence.
+          if (u.startsWith("https://kystbrygg-ekte.no/kontakt")) {
+            return { ok: true, status: 200, url: u, text: async () =>
+              "<html><body>Org.nr 922 000 001 — Askvoll</body></html>" } as unknown as Response;
+          }
+          // Unrelated page: NO signal at all, but a tempting /kontakt link.
+          if (u === "https://helturelatert.no" || u === "https://helturelatert.no/") {
+            return { ok: true, status: 200, url: u, text: async () =>
+              '<html><body>Helt annet innhold. <a href="/kontakt">Kontakt</a></body></html>' } as unknown as Response;
+          }
+          // Phone case: front page has name + the provider's registered number.
+          if (u === "https://telefonbrygg-ekte.no" || u === "https://telefonbrygg-ekte.no/") {
+            return { ok: true, status: 200, url: u, text: async () =>
+              "<html><body>Telefonbrygg Nord — ring +47 912 34 567</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-sub-orgnr", "wd-sub-none", "wd-sub-phone"], apply: true },
+          });
+
+          const subProp = (r.body.proposed as any[]).find((p) => p.provider_id === "wd-sub-orgnr");
+          assertTrue(!!subProp, "wd-15a: front page name-only + org_nr on /kontakt → VERIFIED via subpage crawl (v1 rejected this row)");
+          assertEq(subProp?.evidence?.org_nr_found, true, "wd-15b: the deciding signal is the org_nr from the subpage");
+          assertTrue(String(subProp?.final_url || "").includes("/kontakt"), "wd-15c: final_url records WHERE the evidence actually was");
+          assertEq(subProp?.confidence, 1.0, "wd-15d: org.nr evidence keeps registry-grade confidence");
+
+          assertTrue(!subFetchCalls.some((u) => u.startsWith("https://helturelatert.no/kontakt")),
+            "wd-16a: a front page with ZERO signals never gets its subpages crawled — no signal, no budget");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-sub-none"),
+            "wd-16b: …and the row falls through honestly");
+
+          const phProp = (r.body.proposed as any[]).find((p) => p.provider_id === "wd-sub-phone");
+          assertTrue(!!phProp, "wd-17a: name + the provider's own registered phone verifies on the front page");
+          assertEq(phProp?.evidence?.phone_found, true, "wd-17b: phone signal recorded in evidence");
+          assertEq(phProp?.confidence, 0.95, "wd-17c: phone-verified confidence is 0.95 — between org.nr and name+place");
+        } finally {
+          globalThis.fetch = prevFetch3;
+          expStore.__setGardssalgWebsiteSearchForTesting(null);
+        }
+      }
+
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));

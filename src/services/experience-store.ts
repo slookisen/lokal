@@ -4491,6 +4491,15 @@ export type GardssalgWebsiteDiscoveryTarget = {
   // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — optional
   // keyword appended to the search-based candidate query (e.g. "bryggeri").
   producer_type: string | null;
+  // v2 (Daniels retning 2026-07-30): «finne informasjon vi har som passer
+  // overens (ikke bare navn)» — the provider's OWN registered contact data
+  // become ownership-evidence signals a candidate page can be checked
+  // against. All nullable; a missing value is simply a signal that cannot
+  // fire, never a verification failure.
+  telefon: string | null;
+  mobil: string | null;
+  adresse: string | null;
+  postnummer: string | null;
 };
 
 /**
@@ -4506,7 +4515,8 @@ export function selectGardssalgProvidersForWebsiteDiscovery(limit = 16): Gardssa
   const cap = Math.max(1, Math.min(48, limit));
   return db
     .prepare(
-      `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type
+      `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type,
+              telefon, mobil, adresse, postnummer
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')
@@ -4525,7 +4535,8 @@ export function getGardssalgWebsiteDiscoveryTarget(providerId: string): (Gardssa
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type, hjemmeside
+      `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type, hjemmeside,
+              telefon, mobil, adresse, postnummer
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
@@ -4559,7 +4570,19 @@ export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
       if (!hosts.includes(host)) hosts.push(host);
     }
   }
-  return hosts.slice(0, 4);
+  // v2: breweries in particular brand on .com (measured 2026-07-30: 7 Fjell
+  // Bryggeri's real site is 7fjellbryggeri.com — tier 1 guessed only .no and
+  // missed it). One .com per transliteration, joined label only, appended
+  // AFTER the .no guesses so the cheaper national TLD is still tried first.
+  for (const v of variants) {
+    const clean = v.map((t) => t.replace(/[^a-z0-9]/g, "")).filter(Boolean);
+    if (clean.length === 0) continue;
+    const label = clean.join("");
+    if (label.length < 4 || label.length > 63) continue;
+    const host = `${label}.com`;
+    if (!hosts.includes(host)) hosts.push(host);
+  }
+  return hosts.slice(0, 6);
 }
 
 // ─── Gårdssalg search-based website-discovery candidates (dev-request
@@ -4647,22 +4670,74 @@ export function gardssalgPageText(html: string): string {
 }
 
 /**
- * Ownership evidence for a candidate page. verified requires the provider's
- * org_nr on the page (separators inside digit runs collapsed, and the match
- * must not be embedded in a longer digit run), OR the exact pruned name AND
- * the kommune/poststed both present. Short/generic names (single token under
- * 8 chars — «Sider», «Engel») never verify on name alone. Pure — exported
- * for tests.
+ * Normalise a Norwegian phone number to its 8 significant digits: strips
+ * +47/0047 country prefixes and every non-digit. Returns null when what
+ * remains is not exactly 8 digits — a partial number must never match.
+ * Pure — exported for tests.
+ */
+export function normaliseNorwegianPhone(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let digits = String(raw).replace(/\D/g, "");
+  if (digits.startsWith("0047")) digits = digits.slice(4);
+  else if (digits.startsWith("47") && digits.length === 10) digits = digits.slice(2);
+  return /^\d{8}$/.test(digits) ? digits : null;
+}
+
+/**
+ * Ownership evidence for a candidate page — v2 (Daniels retning 2026-07-30:
+ * «finne informasjon vi har som passer overens (ikke bare navn)»).
+ *
+ * Independent signals, each measured against data WE already hold for the
+ * provider (never inferred from the page):
+ *   org_nr    — 9-digit run, separator-collapsed, not embedded in longer run
+ *   name      — exact pruned name at token boundaries; short/generic single
+ *               tokens («Sider», «Engel») never fire
+ *   place     — kommune/poststed at token boundaries
+ *   phone     — the provider's registered telefon/mobil found among the
+ *               page's digit runs (+47/0047/separators normalised away)
+ *   address   — registered street address at token boundaries (≥6 chars
+ *               normalised, so a bare street name like «Berg» can't fire)
+ *   postnr    — the 4-digit postnummer as its own digit run. Deliberately
+ *               NEVER sufficient (thousands of businesses share one) — it
+ *               only strengthens name.
+ *
+ * verified =
+ *   org_nr
+ *   OR (phone AND (name OR place))   — the provider's own registered number
+ *                                      plus any second signal; phone ALONE
+ *                                      stays insufficient (call-list pages)
+ *   OR (name AND (place OR address OR postnr))
+ *
+ * The v1 rule (org_nr OR name+place) is a strict subset — nothing that
+ * verified before stops verifying; this can only widen, never tighten.
+ * Pure — exported for tests.
  */
 export function gardssalgWebsiteEvidenceMatch(
   pageText: string,
-  target: { orgNr?: string | null; navn: string; kommune?: string | null; poststed?: string | null }
-): { org_nr_found: boolean; name_found: boolean; place_found: boolean; verified: boolean } {
+  target: {
+    orgNr?: string | null;
+    navn: string;
+    kommune?: string | null;
+    poststed?: string | null;
+    telefon?: string | null;
+    mobil?: string | null;
+    adresse?: string | null;
+    postnummer?: string | null;
+  }
+): {
+  org_nr_found: boolean;
+  name_found: boolean;
+  place_found: boolean;
+  phone_found: boolean;
+  address_found: boolean;
+  postnr_found: boolean;
+  verified: boolean;
+} {
   const text = pageText || "";
   let orgFound = false;
   const orgNr = (target.orgNr || "").trim();
+  const digitCollapsed = text.replace(/(\d)[\s. ]+(?=\d)/g, "$1");
   if (/^\d{9}$/.test(orgNr)) {
-    const digitCollapsed = text.replace(/(\d)[\s. ]+(?=\d)/g, "$1");
     orgFound = new RegExp(`(?<!\\d)${orgNr}(?!\\d)`).test(digitCollapsed);
   }
   const normName = normaliseName(gardssalgSearchName(target.navn));
@@ -4681,12 +4756,76 @@ export function gardssalgWebsiteEvidenceMatch(
   const placeFound =
     (normKommune.length >= 3 && boundaryIncludes(normText, normKommune)) ||
     (normPoststed.length >= 3 && boundaryIncludes(normText, normPoststed));
+
+  // phone: the provider's registered number(s) against the page's collapsed
+  // digit runs — «+47 912 34 567» collapses to one run; the optional 47/0047
+  // prefix inside the pattern lets a prefixed page form match a bare stored
+  // form and vice versa, with the same not-embedded guard as org_nr.
+  let phoneFound = false;
+  for (const cand of [normaliseNorwegianPhone(target.telefon), normaliseNorwegianPhone(target.mobil)]) {
+    if (!cand) continue;
+    if (new RegExp(`(?<!\\d)(?:0047|47)?${cand}(?!\\d)`).test(digitCollapsed)) {
+      phoneFound = true;
+      break;
+    }
+  }
+
+  const normAdresse = normaliseName(target.adresse || "");
+  const addressFound = normAdresse.length >= 6 && boundaryIncludes(normText, normAdresse);
+
+  const postnr = (target.postnummer || "").trim();
+  const postnrFound = /^\d{4}$/.test(postnr) && new RegExp(`(?<!\\d)${postnr}(?!\\d)`).test(digitCollapsed);
+
   return {
     org_nr_found: orgFound,
     name_found: nameFound,
     place_found: placeFound,
-    verified: orgFound || (nameFound && placeFound),
+    phone_found: phoneFound,
+    address_found: addressFound,
+    postnr_found: postnrFound,
+    verified:
+      orgFound ||
+      (phoneFound && (nameFound || placeFound)) ||
+      (nameFound && (placeFound || addressFound || postnrFound)),
   };
+}
+
+/**
+ * Contact-ish same-host subpage links from a front page — v2. The evidence
+ * (org.nr, address, phone) usually lives on /kontakt or /om-oss, not the
+ * front page; this picks up to `max` internal links whose href or anchor
+ * text look like contact/about pages. Same-host only — a cross-host link is
+ * a different site, and only the exclusion pipeline may judge those.
+ * Pure — exported for tests.
+ */
+export function gardssalgContactPageLinks(html: string, baseHost: string, max = 3): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /<a\b[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const looksContact = (hrefLower: string, textLower: string): boolean =>
+    /kontakt|contact|om-oss|om_oss|omoss|about|besok|bes%c3%b8k/.test(hrefLower) ||
+    /\bkontakt\b|\bcontact\b|\bom oss\b|\babout\b|\bbesøk\b/.test(textLower);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html || "")) !== null && out.length < max) {
+    const href = (m[1] || "").trim();
+    const anchorText = gardssalgPageText(m[2] || "").toLowerCase();
+    if (!href || /^(mailto:|tel:|javascript:)/i.test(href)) continue;
+    let url: URL;
+    try {
+      url = new URL(href, `https://${baseHost}`);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") continue;
+    const host = url.hostname.toLowerCase().replace(/^www\./, "");
+    if (host !== baseHost.toLowerCase().replace(/^www\./, "")) continue;
+    if (!looksContact(url.pathname.toLowerCase(), anchorText)) continue;
+    const key = url.origin + url.pathname;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(url.toString());
+  }
+  return out;
 }
 
 export type GardssalgWebsiteReviewQueueEntry = {
