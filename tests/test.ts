@@ -29695,6 +29695,28 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
         "https://rettfrabonden.com/produsent/zzz-ikke-eksisterende-produsent-test"
       );
 
+      // Security regression guard (round-1 independent review, fresh context, caught this
+      // before it shipped): `slug`/`citySlug` are unvalidated req.params input concatenated
+      // into the new `canonical` field, which shell() interpolates into a <link href="...">
+      // with NO HTML-attribute escaping. Confirm the fix (encodeURIComponent at all 3 call
+      // sites) actually neutralizes a reflected-XSS payload breaking out of the attribute.
+      const XSS_PAYLOAD = `"><script>alert(1)</script>`;
+      const xssKategoriPage = invoke("/kategori/:slug", { params: { slug: XSS_PAYLOAD }, lang: "no" });
+      assertTrue(
+        !xssKategoriPage.body.includes("<script>alert(1)</script>"),
+        "rfb-404-seo-signals/kategori-xss: malicious slug does not break out of the canonical href attribute"
+      );
+      const xssCityPage = invoke("/:city", { params: { city: XSS_PAYLOAD }, lang: "no" });
+      assertTrue(
+        !xssCityPage.body.includes("<script>alert(1)</script>"),
+        "rfb-404-seo-signals/city-xss: malicious city slug does not break out of the canonical href attribute"
+      );
+      const xssProdusentPage = invoke("/produsent/:slug", { params: { slug: XSS_PAYLOAD }, lang: "no", ip: "127.0.0.1" });
+      assertTrue(
+        !xssProdusentPage.body.includes("<script>alert(1)</script>"),
+        "rfb-404-seo-signals/produsent-xss: malicious producer slug does not break out of the canonical href attribute"
+      );
+
       // Regression guard: the untouched non-404 rendering (shell()'s own
       // default-robots line) must be unchanged for a normal indexable page —
       // spot-checked via source, since this test file has no light-weight
