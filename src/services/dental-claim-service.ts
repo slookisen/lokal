@@ -19,12 +19,36 @@ export type ClaimFilter = {
   has_adresse?: boolean;
   has_lat?: boolean;
   // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
-  // item 2a (2026-07-17): opt-in exclusion of clinics parked by 3 consecutive
+  // item 2a (2026-07-17): exclusion of clinics parked by 3 consecutive
   // extraction failures (30d backoff), mirroring the homepage-parking
   // excludeParked flag (dental-store.ts listDentalAgents) but for the
-  // claim-batch pool instead of the read-side listing. Default/omitted is a
-  // strict no-op -- existing callers (including all other filters here) are
-  // completely unaffected.
+  // claim-batch pool instead of the read-side listing.
+  //
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3
+  // (dental measurement, 2026-07-30): flipped from opt-in to default-ON.
+  // Measured against six consecutive daily dental-agent-enrichment run
+  // reports (2026-07-25..07-30, dental-enrichment-runs/*.md): the SKILL's
+  // completion-mode claim call (the ONLY mode that has run every single day
+  // this week, since the raw+hjemmeside pool has been empty every day) never
+  // set this flag -- only the raw-pool claim (§4.1) and the record-level
+  // recordDentalExtractionResult reporting (§4.4) were wired up. The result
+  // was directly observable and named by the enrichment agent itself:
+  // "Jasleen Kaur Kainth" (Sunntannhelse.no, wrong-entity) was re-claimed and
+  // re-flagged on 2026-07-24, 25, 26, 28 AND 30; "Spongdal Tannklinikk" was
+  // explicitly logged as its "8th attempt" and "Leksvik Tannklinikk" its
+  // "6th attempt" on 2026-07-30 -- all three permanently unenrichable
+  // (county-directory pages / wrong chain, not the clinic's own site), well
+  // past the 3-strike parking threshold this exclusion exists to enforce.
+  // Every OTHER exclusion in this function (is_inactive, thin_site,
+  // completion-mode completeness) is already unconditional-by-default; this
+  // was the one outlier requiring an opt-in the caller silently never sent.
+  // Backward-compatible: explicit `true` is unchanged (still applies the
+  // clause); explicit `false` remains a no-op (opt-out escape hatch for a
+  // caller that deliberately wants to see parked rows, e.g. review tooling);
+  // only the OMITTED case flips from no-op to applied. Env
+  // DENTAL_EXTRACTION_PARKING_DISABLED="true" is an additional global
+  // rollback flag, mirroring DENTAL_HOMEPAGE_PARKING_DISABLED's idiom
+  // (dental-store.ts) for the sibling homepage-parking exclusion.
   excludeParkedExtraction?: boolean;
 };
 
@@ -135,9 +159,8 @@ export function buildWhereClause(
   // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
   // flagging): permanently-closed clinics (is_inactive=1, set via
   // /admin/dental/mark-inactive) must NEVER re-enter the claim pool -- a
-  // closed clinic should never be enriched again. Unlike
-  // excludeParkedExtraction below, this is ALWAYS applied (unconditional,
-  // no opt-in filter flag), mirroring the PR-108 junk-exclusion / PR-120
+  // closed clinic should never be enriched again. This is ALWAYS applied
+  // (unconditional, no opt-out), mirroring the PR-108 junk-exclusion / PR-120
   // thin_site-parking conditions above: no caller can opt out.
   conditions.push("(is_inactive IS NULL OR is_inactive = 0)");
 
@@ -145,8 +168,16 @@ export function buildWhereClause(
   // item 2a: exclude clinics parked by 3 consecutive extraction failures
   // (extraction_unreachable_since set AND within the last 30 days), same
   // backoff window as the homepage-parking twin (dental-store.ts
-  // DENTAL_PARK_BACKOFF_MS). Opt-in only -- omitted/false is a no-op.
-  if (filter.excludeParkedExtraction) {
+  // DENTAL_PARK_BACKOFF_MS).
+  //
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3:
+  // default-ON as of 2026-07-30 (see the ClaimFilter.excludeParkedExtraction
+  // doc comment above for the measured evidence this is based on) -- applied
+  // unless the caller explicitly passes `false` (opt-out, preserved for a
+  // caller that deliberately wants parked rows back, e.g. review tooling) or
+  // the env rollback flag is set.
+  const extractionParkingDisabled = process.env.DENTAL_EXTRACTION_PARKING_DISABLED === "true";
+  if (filter.excludeParkedExtraction !== false && !extractionParkingDisabled) {
     conditions.push(
       "(extraction_unreachable_since IS NULL OR extraction_unreachable_since <= datetime('now','-30 days'))"
     );

@@ -33232,11 +33232,25 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     assertEq(claimedIds.includes(idC), true, "item2a-12: backoff-expired row included by excludeParkedExtraction:true");
     releaseBatch("item2a-worker", [idA, idB, idC]);
 
-    // default/omitted flag is a strict no-op -- the parked row is still claimable.
+    // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3
+    // (2026-07-30): flipped from opt-in to default-ON -- measured evidence
+    // (dental-enrichment-runs/*.md, 2026-07-25..07-30) showed the SKILL's
+    // completion-mode claim call never set this flag, so parked clinics
+    // ("Jasleen Kaur Kainth" re-flagged 5 separate days; "Spongdal
+    // Tannklinikk"/"Leksvik Tannklinikk" explicitly logged as their 8th/6th
+    // attempt) kept recirculating through the pool indefinitely. Omitted is
+    // now APPLIED by default -- the parked row is excluded unless the caller
+    // explicitly opts out with `false`.
     const claimedDefault = claimBatch("item2a-worker2", 10, {});
     const claimedDefaultIds = claimedDefault.map((c: any) => c.id);
-    assertEq(claimedDefaultIds.includes(idA), true, "item2a-13: omitted excludeParkedExtraction is a no-op -- parked row still claimable (regression pin)");
+    assertEq(claimedDefaultIds.includes(idA), false, "item2a-13: omitted excludeParkedExtraction now applies by default -- parked row excluded (slice 3, 2026-07-30)");
     releaseBatch("item2a-worker2", [idA, idB, idC]);
+
+    // explicit false remains the opt-out escape hatch.
+    const claimedOptOut = claimBatch("item2a-worker2b", 10, { excludeParkedExtraction: false });
+    const claimedOptOutIds = claimedOptOut.map((c: any) => c.id);
+    assertEq(claimedOptOutIds.includes(idA), true, "item2a-13b: excludeParkedExtraction:false still opts out -- parked row claimable");
+    releaseBatch("item2a-worker2b", [idA, idB, idC]);
 
     // composition with an existing filter (has_hjemmeside) still works.
     dstore.updateDentalAgent(idB, { hjemmeside: "https://ekte-tannlege.example.no" } as any);
@@ -35450,5 +35464,31 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("crm-chimera-agent-clear: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3
+// (rfb measurement, 2026-07-30): dead-cohort parking for POST
+// /admin/homepage-content-refresh (routes/admin-knowledge.ts) — the route
+// previously never touched homepage_fetch_attempts/homepage_unreachable_since
+// at all, so the same handful of permanently-dead domains occupied the
+// default limit=25 auto-select queue every single day (measured across six
+// consecutive daily enrichment reports). Own harness
+// (__setDbForTesting/__initSchemaForTesting, real router handler pulled off
+// the route stack — mirrors homepage-provenance-selector-parking.test.ts's
+// harness). Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3: homepage-content-refresh dead-cohort parking ──");
+  try {
+    const { runHomepageContentRefreshParkingTests } = require("../src/routes/homepage-content-refresh-parking.test") as
+      typeof import("../src/routes/homepage-content-refresh-parking.test");
+    const hcrp = await runHomepageContentRefreshParkingTests({ log: false });
+    passed += hcrp.passed;
+    failed += hcrp.failed;
+    for (const f of hcrp.failures) failures.push("homepage-content-refresh-parking: " + f);
+    console.log(`  homepage-content-refresh-parking: ${hcrp.passed} passed, ${hcrp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-content-refresh-parking: unexpected error: " + String(err?.message || err));
   }
 });
