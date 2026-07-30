@@ -54,7 +54,12 @@ import { haversineDistanceKm } from "./geocoding-service";
 import { normaliseName } from "./brreg-client";
 // slice 5d — reuse the curated directory/aggregator host classifier + URL→host
 // parser (single source of truth, dev-request 2026-07-19-agg-website-leak).
-import { isDirectoryOrAggregatorHost, hostFromUrlLike } from "./cross-source-validator";
+// registrableDomain: dev-request 2026-07-29-blacklist-backfill-og-
+// berikelsestriage, slice 2 — the per-field homepage-provenance screen
+// (isContentFieldHomepageSourced below) needs the SAME eTLD+1 comparison
+// GET /admin/providers/recently-enriched already uses, not a second
+// reimplementation.
+import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
 // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — search-based
 // website-discovery candidate source. BraveResult is the shape braveSearch()
 // already returns; only the TYPE is needed here (the pure host-extraction
@@ -345,6 +350,52 @@ export function createExperience(input: Experience): string {
   const id = e.id ?? uuid();
   const slug = e.slug ?? `${slugify(e.title)}--${(e.provider_id ?? id).slice(0, 8)}`;
   const db = getDb(VERTICAL);
+
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2
+  // FIX-UP (post-approval defect, independent review): mirror
+  // applyExperienceContent's per-field provenance discipline at INSERT time
+  // too, not just on UPDATE. Every createExperience() call site today is
+  // either a harvest/bulk-load ingest (POST /admin/bulk-load's new-experience
+  // branch, bulkInsertExperiences()'s new-row branch above) or a hand-curated
+  // admin entry (POST /api/opplevelser) — NONE of them is "we just fetched
+  // and verified the provider's own homepage" the way the twice-daily
+  // content-refresh writer is; that writer only ever UPDATEs an existing row
+  // via applyExperienceContent. So a brand-new row's content fields deserve
+  // exactly the same provenance discipline applyExperienceContent already
+  // applies on every write it makes — including its own bulk-load/re-harvest
+  // MATCH branches two call sites away, which already stamp
+  // harvestProvenanceOf(evidence_url) unconditionally for whatever they
+  // write. Before this fix, content_field_evidence stayed NULL forever on a
+  // freshly-inserted row, and isContentFieldHomepageSourced's "no evidence
+  // entry -> unknown, keep as homepage-sourced" default silently classified
+  // every such provider as `done` for enrichment-selection purposes —
+  // reopening the exact bug this slice exists to fix, just relocated from
+  // the UPDATE path to the INSERT path. Only fields that actually carry a
+  // non-blank value in THIS insert get a provenance entry; a genuinely blank
+  // field needs none — isContentFieldHomepageSourced already treats blank as
+  // "not homepage content" on its own, independent of evidence.
+  const CONTENT_PROVENANCE_FIELDS: Array<[string, unknown]> = [
+    ["description", e.description],
+    ["category", e.category],
+    ["subcategory", e.subcategory],
+    ["activity_tags", e.activity_tags && e.activity_tags.length ? e.activity_tags : null],
+    ["season", e.season && e.season.length ? e.season : null],
+    ["indoor_outdoor", e.indoor_outdoor],
+    ["duration_min", e.duration_min],
+    ["price_from", e.price_from],
+    ["booking_url", e.booking_url],
+  ];
+  const nonBlankContentFields = CONTENT_PROVENANCE_FIELDS.filter(
+    ([, v]) => v !== null && v !== undefined && String(v).trim() !== ""
+  );
+  let contentFieldEvidence: string | null = null;
+  if (nonBlankContentFields.length > 0) {
+    const stampUrl = harvestProvenanceOf(e.evidence_url);
+    const evidence: Record<string, string> = {};
+    for (const [field] of nonBlankContentFields) evidence[field] = stampUrl;
+    contentFieldEvidence = JSON.stringify(evidence);
+  }
+
   db.prepare(`
     INSERT INTO experiences (
       id, provider_id, provider_match_status, title, slug, description,
@@ -354,7 +405,8 @@ export function createExperience(input: Experience): string {
       languages, accessibility, booking_url, booking_type,
       loc_lat, loc_lon, geo_precision, meeting_point, kommune, fylke,
       discovery_source, content_source, evidence_url, confidence,
-      enrichment_state, verification_status, seasonal_valid_from, seasonal_valid_to
+      enrichment_state, verification_status, seasonal_valid_from, seasonal_valid_to,
+      content_field_evidence
     ) VALUES (
       @id, @provider_id, @provider_match_status, @title, @slug, @description,
       @category, @subcategory, @activity_tags, @season, @indoor_outdoor, @weather_dependent,
@@ -363,7 +415,8 @@ export function createExperience(input: Experience): string {
       @languages, @accessibility, @booking_url, @booking_type,
       @loc_lat, @loc_lon, @geo_precision, @meeting_point, @kommune, @fylke,
       @discovery_source, @content_source, @evidence_url, @confidence,
-      @enrichment_state, @verification_status, @seasonal_valid_from, @seasonal_valid_to
+      @enrichment_state, @verification_status, @seasonal_valid_from, @seasonal_valid_to,
+      @content_field_evidence
     )
   `).run({
     id, provider_id: e.provider_id ?? null,
@@ -387,6 +440,7 @@ export function createExperience(input: Experience): string {
     enrichment_state: e.enrichment_state ?? "raw",
     verification_status: e.verification_status ?? "pending_verify",
     seasonal_valid_from: e.seasonal_valid_from ?? null, seasonal_valid_to: e.seasonal_valid_to ?? null,
+    content_field_evidence: contentFieldEvidence,
   });
   return id;
 }
@@ -1743,10 +1797,25 @@ export function recordProviderHomepageFetchResult(
   return { found: true, attempts: row.homepage_fetch_attempts, parked, parked_now: parkedNow };
 }
 
+// Over-fetch window for the candidate pre-filter below, same pattern as
+// GET /admin/providers/recently-enriched's EXP_ROW_WINDOW (round-5 review of
+// dev-request 2026-07-27-kvalitetsporter-uten-signal established WHY: the
+// per-field provenance check cannot be expressed in SQL — it parses JSON and
+// compares registrable domains — so it has to run in JS AFTER a broad SQL
+// pre-filter and BEFORE the final LIMIT. Filtering post-LIMIT would mean a
+// page full of aggregator-only candidates returns fewer than `cap` results
+// even when genuinely-thin providers exist further down the ordering.
+const CONTENT_REFRESH_CANDIDATE_WINDOW_MULTIPLIER = 12;
+const CONTENT_REFRESH_CANDIDATE_WINDOW_MAX = 1000;
+
 export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarget[] {
   const db = getDb(VERTICAL);
   const cap = Math.max(1, Math.min(100, limit));
-  const rows = db
+  const candidateWindow = Math.min(
+    CONTENT_REFRESH_CANDIDATE_WINDOW_MAX,
+    Math.max(200, cap * CONTENT_REFRESH_CANDIDATE_WINDOW_MULTIPLIER)
+  );
+  const candidates = db
     .prepare(
       `SELECT p.id AS id, p.navn AS navn,
               COALESCE(
@@ -1769,22 +1838,49 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
                )
           )
           AND EXISTS (
+            -- BROAD pre-filter only: "an unlocked, live experience exists at
+            -- all". Deliberately no longer requires a BLANK field here — that
+            -- was exactly the bug (dev-request 2026-07-29-blacklist-backfill-
+            -- og-berikelsestriage, slice 2): a non-blank but
+            -- aggregator-sourced field must still reach the per-field
+            -- provenance check below (isExperienceContentGenuinelyThin /
+            -- classifyProviderContentBucket — the SAME shared classifier the
+            -- berikelsestriage triage endpoint uses), which SQL alone cannot
+            -- express.
+            -- NULL-guarded on verification_status (round-3-review fix,
+            -- mirrored from GET .../recently-enriched): SQL three-valued
+            -- logic makes "NULL != 'verified'" evaluate to NULL, excluding
+            -- the row, while isExperienceContentLocked treats a NULL
+            -- verification_status as UNLOCKED. Latent today (createExperience
+            -- coalesces to 'pending_verify'), cheap to keep correct.
             SELECT 1 FROM experiences e
              WHERE e.provider_id = p.id
-               AND e.verification_status != 'verified'
+               AND (e.verification_status IS NULL OR e.verification_status != 'verified')
                AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
-               AND (
-                     e.description IS NULL OR TRIM(e.description) = ''
-                  OR e.category    IS NULL OR TRIM(e.category)    = ''
-                   )
+               AND e.canonical_id IS NULL
           )
           ${providerParkingExclusionSql("p")}
           ${noYieldBackoffExclusionSql("p")}
         ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
         LIMIT ?`
     )
-    .all(cap) as Array<{ id: string; navn: string; hjemmeside: string }>;
-  return rows.filter((r) => r.hjemmeside && r.hjemmeside.trim().length > 0);
+    .all(candidateWindow) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+
+  const experiencesStmt = db.prepare(
+    `SELECT description, category, content_source, verification_status,
+            content_field_evidence, evidence_url, canonical_id
+       FROM experiences WHERE provider_id = ?`
+  );
+
+  const out: ContentRefreshTarget[] = [];
+  for (const row of candidates) {
+    if (!row.hjemmeside || !row.hjemmeside.trim()) continue;
+    const experiences = experiencesStmt.all(row.id) as BucketableExperienceRow[];
+    if (classifyProviderContentBucket(row.hjemmeside, experiences) !== "enrichable") continue;
+    out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() });
+    if (out.length >= cap) break;
+  }
+  return out;
 }
 
 /**
@@ -1845,6 +1941,199 @@ export function isExperienceContentLocked(row: {
   if (row.verification_status === "verified") return true;
   if (row.content_source === "manual" || row.content_source === "claim") return true;
   return false;
+}
+
+// ── Berikelsestriage classification (dev-request 2026-07-29-blacklist-
+// backfill-og-berikelsestriage, slice 2) ────────────────────────────────
+//
+// `applyExperienceContent` (below) stamps `content_source = 'provider_site'`
+// UNCONDITIONALLY on every write — both a real homepage fetch AND a
+// harvest/aggregator-sourced re-write (the two bulk-load call sites
+// documented on that function) end up with the identical stamp. So
+// `content_source` alone can never tell "this field really came from the
+// provider's own site" from "this field came from a third-party aggregator
+// row that happened to score richer on a re-harvest". `content_field_evidence`
+// (per FIELD, JSON: field name -> source URL/sentinel) is what CAN answer
+// that — compare its registrable domain against the provider's own
+// hjemmeside. This is the exact per-field provenance screen GET
+// /admin/providers/recently-enriched already runs for the platform-verifier
+// spot-check (dev-request 2026-07-27-kvalitetsporter-uten-signal, slice C,
+// rounds 6-7 review) — pulled out here into standalone functions so BOTH
+// selectProvidersForContentRefresh (the live selector) and the
+// berikelsestriage triage endpoint share exactly one implementation. Two
+// independent re-implementations of "is this genuinely homepage content?"
+// WILL drift; a shared function cannot.
+
+/** Parse `experiences.content_field_evidence` defensively — malformed/absent
+ *  -> {} (never throws). A missing/malformed entry for a field means "unknown
+ *  provenance", not "definitely not the homepage" — see
+ *  isContentFieldHomepageSourced. */
+export function parseContentFieldEvidence(raw: string | null | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, string>;
+    }
+  } catch {
+    /* malformed -> treat as unknown, i.e. keep (same convention as the
+       recently-enriched endpoint's identical parse) */
+  }
+  return {};
+}
+
+/** The provider-level homepage domain a field's evidence is compared
+ *  against — `hostFromUrlLike` + `registrableDomain`, or null when there is
+ *  no usable homepage string at all. */
+export function homepageRegistrableDomain(hjemmeside: string | null | undefined): string | null {
+  if (!hjemmeside) return null;
+  const host = hostFromUrlLike(hjemmeside);
+  return host ? registrableDomain(host) : null;
+}
+
+/**
+ * True when a judged content field's CURRENT value counts as genuinely
+ * homepage-sourced: non-blank, AND (no evidence-map entry for this field —
+ * unknown provenance is KEPT, never invented as a gap, matching
+ * GET .../recently-enriched's identical convention — OR the recorded
+ * evidence URL's registrable domain matches the provider's own homepage
+ * domain). A present evidence entry on a DIFFERENT domain is a mismatch, not
+ * unknown (round-7 review of dev-request 2026-07-27-kvalitetsporter-uten-
+ * signal, M4) — that is precisely the aggregator-leak case this function
+ * exists to catch.
+ */
+export function isContentFieldHomepageSourced(
+  value: string | null | undefined,
+  field: string,
+  evidence: Record<string, string>,
+  homepageDomain: string | null,
+): boolean {
+  if (value === null || value === undefined || String(value).trim() === "") return false;
+  const src = evidence[field];
+  if (!src || !homepageDomain) return true; // unknown provenance -> keep
+  const srcHost = hostFromUrlLike(src);
+  if (srcHost && registrableDomain(srcHost) === homepageDomain) return true;
+  return false; // recorded source is a different domain -> not the homepage
+}
+
+/** The fields `selectProvidersForContentRefresh`'s "thin" gate has always
+ *  judged — description and category. Deliberately NOT widened to
+ *  booking_url/subcategory/etc: those are outside this fix's scope (the
+ *  recently-enriched endpoint's own JUDGED_FIELDS list is a SEPARATE,
+ *  wider set for a different consumer — the weekly spot-check — and this
+ *  constant intentionally does not chase it). */
+export const THIN_CONTENT_JUDGED_FIELDS = ["description", "category"] as const;
+
+/**
+ * True when an experience row is a genuine content-refresh candidate: it is
+ * UNLOCKED (isExperienceContentLocked) AND at least one of
+ * description/category is NOT genuinely homepage-sourced — either truly
+ * blank, or non-blank but recorded (content_field_evidence) as coming from a
+ * different domain than the provider's own homepage (the aggregator-leak
+ * case).
+ *
+ * This is the CORRECTED "thin" predicate (dev-request 2026-07-29-blacklist-
+ * backfill-og-berikelsestriage, slice 2). Before this change,
+ * selectProvidersForContentRefresh's SQL tested only
+ * "description IS NULL OR TRIM='' OR category IS NULL OR TRIM='' " — ANY
+ * non-blank value, regardless of provenance, counted as "not thin". A
+ * description filled by a re-harvest from a third-party aggregator row (see
+ * applyExperienceContent's own doc comment on its two bulk-load call sites)
+ * therefore permanently blocked that row from ever being refreshed from the
+ * provider's REAL homepage — exactly the bug this function fixes.
+ */
+export function isExperienceContentGenuinelyThin(
+  row: {
+    content_source?: string | null;
+    verification_status?: string | null;
+    description?: string | null;
+    category?: string | null;
+    content_field_evidence?: string | null;
+  },
+  homepageDomain: string | null,
+): boolean {
+  if (isExperienceContentLocked(row)) return false;
+  const evidence = parseContentFieldEvidence(row.content_field_evidence);
+  for (const field of THIN_CONTENT_JUDGED_FIELDS) {
+    const value = field === "description" ? row.description : row.category;
+    if (!isContentFieldHomepageSourced(value, field, evidence, homepageDomain)) return true;
+  }
+  return false;
+}
+
+export type ProviderContentBucket = "enrichable" | "done" | "waiting";
+
+export type BucketableExperienceRow = {
+  content_source?: string | null;
+  verification_status?: string | null;
+  description?: string | null;
+  category?: string | null;
+  content_field_evidence?: string | null;
+  evidence_url?: string | null;
+  canonical_id?: string | null;
+};
+
+/**
+ * The berikelsestriage bucket classifier — the SINGLE function BOTH
+ * `selectProvidersForContentRefresh` (the live enrichment selector) and the
+ * triage endpoint (GET /admin/providers/content-triage) call, so the two can
+ * never independently drift on what counts as "genuinely done" (dev-request
+ * 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2: "prefer
+ * classifying bucket membership SERVER-SIDE ... computed by a SHARED
+ * function also used by the live selector").
+ *
+ * Buckets (mirrors the dev-request's table verbatim):
+ *   waiting    — no usable hjemmeside: `hjemmeside` blank AND no live
+ *                experience carries a usable `evidence_url` fallback (the
+ *                SAME fallback selectProvidersForContentRefresh's own SQL
+ *                COALESCE already uses today). Never guessed at.
+ *   enrichable — has a usable hjemmeside AND at least one live, UNLOCKED
+ *                experience is genuinely thin (isExperienceContentGenuinelyThin).
+ *   done       — has a usable hjemmeside AND no live experience is
+ *                genuinely thin. This deliberately covers two edge cases:
+ *                  (a) a provider with a homepage but ZERO live
+ *                      experiences — there is nothing to enrich, so it can
+ *                      never be selected by selectProvidersForContentRefresh
+ *                      either; "done" here means "nothing left to do", not
+ *                      literally "content was filled".
+ *                  (b) a provider whose only live experiences are LOCKED
+ *                      (manual/claim/verified) — those rows are never
+ *                      touched by the automated writer regardless of
+ *                      whether their content is blank, so they are
+ *                      permanently out of scope the same way (a) is.
+ *                Documented rule, not an accident: both are "the automated
+ *                content-refresh writer will never touch this provider
+ *                again", which is exactly what the `done` bucket's
+ *                consequence ("skipped") means.
+ * "Live" experiences exclude dedup-merged rows (`canonical_id IS NOT NULL`)
+ * — the same convention enforced everywhere else `experiences` is read
+ * (PUBLISH_GATE_SQL, listCategories, GET .../recently-enriched, the corridor
+ * pages, the dedup candidate loader).
+ *
+ * Mixed multi-experience providers: "ANY genuinely-thin live experience ->
+ * enrichable" — matching selectProvidersForContentRefresh's own EXISTS
+ * semantics exactly (a provider is selected the moment content-refresh has
+ * ANY work left to do for it, not only once ALL its experiences are thin).
+ */
+export function classifyProviderContentBucket(
+  hjemmeside: string | null | undefined,
+  experiences: BucketableExperienceRow[],
+): ProviderContentBucket {
+  const live = experiences.filter((e) => !e.canonical_id);
+
+  let homepageRaw = hjemmeside && hjemmeside.trim() ? hjemmeside.trim() : null;
+  if (!homepageRaw) {
+    const withEvidence = live.find((e) => e.evidence_url && e.evidence_url.trim());
+    homepageRaw = withEvidence ? withEvidence.evidence_url!.trim() : null;
+  }
+  if (!homepageRaw) return "waiting";
+
+  const homepageDomain = homepageRegistrableDomain(homepageRaw);
+
+  for (const exp of live) {
+    if (isExperienceContentGenuinelyThin(exp, homepageDomain)) return "enrichable";
+  }
+  return "done";
 }
 
 /**
@@ -2199,6 +2488,65 @@ export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProvid
         LIMIT ? OFFSET ?`
     )
     .all(limit, offset) as GardssalgProviderRow[];
+}
+
+export type GardssalgProviderMapPoint = {
+  slug: string;
+  navn: string;
+  producer_type: string | null;
+  fylke: string | null;
+  kommune: string | null;
+  poststed: string | null;
+  lat: number;
+  lon: number;
+  // 'high' | 'medium' | 'low' = Step A's real address-level Kartverket geocode;
+  // 'approximate' = Step D's kommune/fylke-centroid fallback (see
+  // GardssalgProviderRow.geocode_confidence's doc comment above and
+  // experiences-geocode-worker.ts Steps A/D); 'no_match' rows never reach
+  // here (they never get a lat/lon at all, so the coordinate predicate below
+  // excludes them). Returned VERBATIM — the caller decides address-vs-
+  // approximate marker styling from it, never a fabricated precision.
+  geocode_confidence: string | null;
+};
+
+/**
+ * Gårdssalg producers (drink producers; see listGardssalgProviders()'s doc
+ * comment for why this queries experience_providers, not experiences) that
+ * have a real geocode — feeds the /kategori/gardssalg map (dev-request
+ * 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4). Reuses the
+ * EXACT SAME "which providers count" gate as listGardssalgProviders()/
+ * countGardssalgProviders() (producer_type set OR rfb-seed; catalog_hidden=1
+ * rows — the hidden booking-flyt-v1 test provider — excluded; parens around
+ * the OR are load-bearing, see those functions' comments) and appends two
+ * predicates on top, same discipline as listPublishedExperienceMapPoints()
+ * appending its coords predicate on top of browseWhere():
+ *   - lat IS NOT NULL AND lon IS NOT NULL — so the marker count for
+ *     /kategori/gardssalg is always <= listGardssalgProviders()'s card count
+ *     for the SAME gate, never a divergent definition of "visible provider".
+ *   - slug IS NOT NULL AND slug != '' — a marker with no produsent-profil
+ *     page to link to isn't useful on a click-through map; every visible
+ *     provider normally gets one via backfillProviderSlugs(), so this rarely
+ *     excludes rows in practice.
+ * geocode_confidence is NOT constrained here (unlike geo_precision on the
+ * experiences map point, which IS NOT NULL there) — this table's Step A/Step
+ * D writes always pair a non-null lat/lon with a non-null geocode_confidence
+ * in practice, but nothing here depends on that; the type keeps it nullable
+ * so a caller must handle "no confidence tag" defensively rather than assume
+ * exact precision.
+ */
+export function listGardssalgProviderMapPoints(): GardssalgProviderMapPoint[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT slug, navn, producer_type, fylke, kommune, poststed, lat, lon, geocode_confidence
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND lat IS NOT NULL AND lon IS NOT NULL
+          AND slug IS NOT NULL AND slug != ''
+        ORDER BY navn`
+    )
+    .all() as GardssalgProviderMapPoint[];
 }
 
 /** Look up a single gårdssalg provider (drink producer) by slug — for the
