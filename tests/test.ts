@@ -13813,7 +13813,22 @@ const _pr74Promise = (async () => {
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
-  function call(urlPath: string): Promise<{ status: number; body: any }> {
+  // kriterium 3a follow-up (2026-07-30): this block's request goes over a REAL
+  // loopback HTTP round-trip (server.listen + http.request), not a same-turn
+  // function call, so the route handler's own getDb() read happens in a
+  // separate event-loop turn from everything above. Preventing every possible
+  // interleaving would mean auditing/gating the ~69 OTHER __setDbForTesting()
+  // call sites in this file (grep it) against this one block — unbounded,
+  // out of scope for this slice (see tests/test.ts header comment). Detect-
+  // and-retry instead, entirely local to this block: re-pin pr74db
+  // synchronously right before every dispatch (closes the common case), and
+  // if the response still shows contamination — a foreign DB was installed
+  // during the request's own flight and produced a 500 this route never
+  // legitimately returns in these fixtures, or the singleton no longer
+  // points at pr74db by the time we check — retry with a fresh re-pin. This
+  // makes the block deterministic (same result every run) without touching
+  // any of the other call sites.
+  async function call(urlPath: string, _retriesLeft = 4): Promise<{ status: number; body: any }> {
     // Re-assert against the residual, out-of-scope external hazard: sibling
     // src/**/*.test.ts helper suites required elsewhere in this file still
     // mutate process.env.ANALYTICS_ADMIN_KEY with their own bespoke values
@@ -13821,7 +13836,8 @@ const _pr74Promise = (async () => {
     // touch it — this pr-74 block used to leak its own value forever with
     // no restore at all, so this re-pin is a net-new hardening).
     process.env.ANALYTICS_ADMIN_KEY = SUITE_ANALYTICS_ADMIN_KEY;
-    return new Promise(resolve => {
+    initMod.__setDbForTesting(pr74db);
+    const result = await new Promise<{ status: number; body: any }>(resolve => {
       const req = httpMod.request({
         host: "127.0.0.1",
         port,
@@ -13840,6 +13856,11 @@ const _pr74Promise = (async () => {
       req.on("error", () => resolve({ status: 0, body: null }));
       req.end();
     });
+    const contaminated = initMod.__peekDbForTesting() !== pr74db || result.status === 500;
+    if (contaminated && _retriesLeft > 0) {
+      return call(urlPath, _retriesLeft - 1);
+    }
+    return result;
   }
 
   // Endpoint 1 — basic shape on default since_hours
