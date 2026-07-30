@@ -35030,6 +35030,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
+  try {
+    const { runCrmTriageTests } = require("../src/services/crm-triage.test") as
+      typeof import("../src/services/crm-triage.test");
+    const ctt = await runCrmTriageTests({ log: false });
+    passed += ctt.passed;
+    failed += ctt.failed;
+    for (const f of ctt.failures) failures.push("crm-triage: " + f);
+    console.log(`  crm-triage: ${ctt.passed} passed, ${ctt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-triage: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-triage: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a follow-up (geokoding-dekning + gjennomstrømning) ──");
   try {
     const { runGeocodeCoverageBoostTests } = require("../src/services/geocode-coverage-boost.test") as

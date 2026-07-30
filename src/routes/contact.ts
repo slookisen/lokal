@@ -247,11 +247,33 @@ router.post("/contact", async (req: Request, res: Response): Promise<void> => {
     }
 
     // 3. Platform validation
-    const rawPlatform = String(body.platform ?? "").toLowerCase();
+    //
+    // ─── steg 4: the last fail-open default ──────────────────────
+    //
+    // This was `valid ? use it : inferPlatform(req)` — so a PRESENT but unknown
+    // value (`platform: "opplevagent"`, an easy thing for a form to send) fell
+    // silently through to host inference. On a shared host, or behind a proxy
+    // that rewrites Host, that means an Opplevagent enquiry filed as rfb with
+    // nothing anywhere recording that the caller's value was discarded. Same
+    // failure class as the DEFAULT 'rfb' this whole dev-request is about, on the
+    // ONE CRM write path a stranger can reach.
+    //
+    // The distinction that matters is absent vs wrong:
+    //   • absent  → infer from the host. Legitimate: the plain form on
+    //     rettfrabonden.com has never sent the field and must keep working.
+    //   • present but not a known platform → 422. The caller had an opinion and
+    //     it was not one we understand; guessing past it is the bug.
+    const rawPlatform = String(body.platform ?? "").trim().toLowerCase();
     const VALID_PLATFORMS: Platform[] = ["rfb", "experiences", "dental"];
-    const platform: Platform = VALID_PLATFORMS.includes(rawPlatform as Platform)
-      ? (rawPlatform as Platform)
-      : inferPlatform(req);
+    if (rawPlatform !== "" && !VALID_PLATFORMS.includes(rawPlatform as Platform)) {
+      res.status(422).json({
+        success: false,
+        error: "invalid_platform",
+        detail: `platform must be one of ${VALID_PLATFORMS.join("|")} when supplied (omit it to infer from the host)`,
+      });
+      return;
+    }
+    const platform: Platform = rawPlatform !== "" ? (rawPlatform as Platform) : inferPlatform(req);
 
     // 4. Turnstile verification
     const cfToken = String(body.cfTurnstileResponse ?? "");

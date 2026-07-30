@@ -2,6 +2,14 @@ import { Router, Request, Response } from "express";
 import { z } from "zod";
 import { crmService, CrmVertical, isCrmVertical, CRM_VERTICALS } from "../services/crm-service";
 import { crmFromHeader, resolveCrmIdentity } from "../services/crm-platform-identity";
+import {
+  deriveVertical,
+  parkUntriaged,
+  listUntriaged,
+  getUntriaged,
+  markUntriagedResolved,
+  countOpenUntriaged,
+} from "../services/crm-triage";
 import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
@@ -53,11 +61,40 @@ const ingestSchema = z.object({
   severity: z.enum(["p0", "p1", "p2", "normal"]).optional(),
   contactName: z.string().nullable().optional(),
   messages: z.array(messageSchema).min(1),
-  // REQUIRED, no default. z.enum rejects a missing or unknown value with a 400
-  // before any write happens — the fail-closed half of the guard in
-  // crm-service.assertVertical. Defaulting to 'rfb' here is precisely how every
-  // existing CRM row ended up tagged 'rfb', Opplevagent enquiries included.
-  vertical: z.enum(CRM_VERTICALS),
+  // No default, ever. Defaulting to 'rfb' here is precisely how every existing
+  // CRM row ended up tagged 'rfb', Opplevagent enquiries included.
+  //
+  // Optional ONLY because steg 4 added `routingSignals` as the other way to
+  // supply it; the .superRefine below rejects a body carrying NEITHER, so the
+  // steg-1 guarantee ("a call with no vertical is refused and writes nothing")
+  // is unchanged. A caller that sends `vertical` behaves exactly as before.
+  vertical: z.enum(CRM_VERTICALS).optional(),
+  // steg 4: what the agent literally read off the headers. The SERVER derives
+  // the platform from these (crm-triage.deriveVertical) so that "I cannot tell"
+  // is a real outcome rather than an LLM picking the nearest class. .strict()
+  // is load-bearing: a mistyped key would otherwise silently look like "no
+  // signals" and park every thread instead of erroring once, loudly.
+  routingSignals: z
+    .object({
+      deliveredTo: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+      to: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+      cc: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+      xForwardedTo: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+      envelopeTo: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+      received: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+    })
+    .strict()
+    .optional(),
+}).superRefine((data, ctx) => {
+  if (data.vertical === undefined && data.routingSignals === undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["vertical"],
+      message:
+        "supply either `vertical` (rfb|dental|experiences) or `routingSignals` (the recipient headers). " +
+        "There is no default — an unroutable thread is parked for human triage, never filed as rfb.",
+    });
+  }
 });
 
 const sendSchema = z.object({
@@ -385,21 +422,39 @@ router.post("/compose", async (req, res) => {
         // it can wedge a shortened second-touch campaign but cannot cause spam.
         const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
         const cooldownCutoff = new Date(Date.now() - cooldownDays * 86400_000).toISOString();
+        // steg 4, kriterium 4e: read vertical_id too. The cooldown is
+        // deliberately CROSS-platform — both platforms send from the same
+        // address, so to the recipient and their spam filter this is one
+        // sender, and a per-vertical cooldown would let us cold-mail the same
+        // human twice in a week. But that correct choice made the overlap
+        // producers — gårdssalg people who are also RFB agents, i.e. the claim
+        // campaign's best list — vanish behind a generic 429 that named no
+        // cause. Naming the suppressing platform costs one column.
         const priorOutreach = getDb().prepare(`
-          SELECT sent_at FROM outreach_sent_log
+          SELECT sent_at, vertical_id FROM outreach_sent_log
           WHERE recipient_email IS NOT NULL
             AND LOWER(recipient_email) = LOWER(?)
             AND sent_at >= ?
           ORDER BY sent_at DESC
           LIMIT 1
-        `).get(to, cooldownCutoff) as { sent_at: string } | undefined;
+        `).get(to, cooldownCutoff) as { sent_at: string; vertical_id: string } | undefined;
 
         if (priorOutreach) {
+          const byVertical = priorOutreach.vertical_id;
+          const crossPlatform = isCrmVertical(byVertical) && byVertical !== vertical;
           return res.status(429).json({
             success: false,
             error: "cooldown_suppressed",
-            reason: `already sent cold outreach to ${to} on ${priorOutreach.sent_at} — within the ${cooldownDays}-day cooldown (outreach_sent_log, email-keyed)`,
+            reason:
+              `already sent cold outreach to ${to} on ${priorOutreach.sent_at} — within the ${cooldownDays}-day ` +
+              `cooldown (outreach_sent_log, email-keyed)` +
+              (crossPlatform
+                ? `. The suppressing send was on the ${byVertical} platform, not ${vertical} — this is the ` +
+                  `cross-platform cooldown, which is intentional: both platforms send from the same address.`
+                : ""),
             last_sent_at: priorOutreach.sent_at,
+            suppressed_by_vertical: byVertical,
+            cross_platform: crossPlatform,
             cooldown_days: cooldownDays,
             override: "Pass createdBy=daniel and force=true to bypass (manual override)",
           });
@@ -529,6 +584,61 @@ router.post("/ingest", (req, res) => {
   const parsed = ingestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
 
+  // ─── steg 4: resolve the platform, or park ───────────────────
+  //
+  // Three cases, and none of them is a guess:
+  //   • vertical only        → use it (pre-steg-4 behaviour, byte-identical)
+  //   • signals only         → the SERVER derives it; undecidable → park
+  //   • both                 → they must AGREE, otherwise park
+  //
+  // The both-case matters more than it looks. If a caller could send a
+  // `vertical` alongside signals that say otherwise, the caller's value would
+  // win — and the caller is an LLM. That would hand the decision straight back
+  // to the actor this whole module exists to take it away from, through a door
+  // nobody would think to test. Disagreement is a genuine triage event.
+  const signals = parsed.data.routingSignals;
+  let vertical: CrmVertical;
+
+  if (signals !== undefined) {
+    const outcome = deriveVertical(signals);
+
+    const refusal: string | null = !outcome.routed
+      ? outcome.reason
+      : parsed.data.vertical !== undefined && parsed.data.vertical !== outcome.vertical
+        ? `the caller asserted vertical=${JSON.stringify(parsed.data.vertical)} but the recipient headers ` +
+          `derive ${JSON.stringify(outcome.vertical)} (${outcome.matchedAddress} in ${outcome.matchedIn}) — ` +
+          `refusing to let an asserted value override the headers`
+        : null;
+
+    if (refusal !== null || !outcome.routed) {
+      const first = parsed.data.messages[0];
+      const parked = parkUntriaged({
+        threadId: parsed.data.threadId,
+        fromEmail: parsed.data.primaryFromEmail,
+        subject: parsed.data.subject ?? null,
+        snippet: first?.snippet ?? null,
+        reason: refusal ?? "unroutable",
+        signals,
+        rawPayload: parsed.data,
+      });
+      // 202: accepted and durably recorded, but deliberately not filed. Not an
+      // error — the agent did its job — and NOT 4xx, because the agent must not
+      // retry it. `untriaged: true` is the field a caller branches on.
+      return res.status(202).json({
+        untriaged: true,
+        untriagedId: parked.id,
+        alreadyResolved: parked.alreadyResolved,
+        reason: refusal ?? "unroutable",
+        openUntriaged: countOpenUntriaged(),
+      });
+    }
+
+    vertical = outcome.vertical;
+  } else {
+    // superRefine guarantees this branch has a vertical.
+    vertical = parsed.data.vertical as CrmVertical;
+  }
+
   let result;
   try {
     result = crmService.ingestThread(
@@ -540,7 +650,7 @@ router.post("/ingest", (req, res) => {
         messages: parsed.data.messages,
       },
       parsed.data.primaryFromEmail,
-      parsed.data.vertical
+      vertical
     );
   } catch (err: any) {
     // Review B4: re-ingesting an existing thread under a DIFFERENT platform is
@@ -550,7 +660,28 @@ router.post("/ingest", (req, res) => {
     // on 5xx. Nothing was written when this fires.
     const msg = String(err?.message ?? "ingest failed");
     if (msg.includes("already belongs to vertical")) {
-      return res.status(409).json({ error: "thread vertical conflict", detail: msg });
+      // steg 4: a conflicting thread used to fail into the agent's own log and
+      // nowhere else — the dev-request flagged that gap explicitly. It now lands
+      // in the same bucket as everything else undecidable, so it is countable
+      // and appears in Daniel's queue. The 409 status is unchanged: the CS agent
+      // retries on 5xx and must not retry this.
+      const first = parsed.data.messages[0];
+      const parked = parkUntriaged({
+        threadId: parsed.data.threadId,
+        fromEmail: parsed.data.primaryFromEmail,
+        subject: parsed.data.subject ?? null,
+        snippet: first?.snippet ?? null,
+        reason: msg,
+        signals: signals ?? { assertedVertical: vertical },
+        rawPayload: parsed.data,
+      });
+      return res.status(409).json({
+        error: "thread vertical conflict",
+        detail: msg,
+        untriaged: true,
+        untriagedId: parked.id,
+        openUntriaged: countOpenUntriaged(),
+      });
     }
     return res.status(500).json({ error: msg });
   }
@@ -565,6 +696,122 @@ router.post("/ingest", (req, res) => {
   res.json(result);
 });
 
+// ─── GET /admin/crm/untriaged ────────────────────────────────
+//
+// Daniel's queue of mail the server refused to route. Open items only unless
+// ?includeResolved=1. This is the whole point of steg 4: the undecidable case
+// is a countable list somebody looks at, not a message that quietly vanished.
+router.get("/untriaged", (req, res) => {
+  const includeResolved = String(req.query.includeResolved ?? "") === "1";
+  const limit = parseInt(String(req.query.limit ?? "100"), 10) || 100;
+  const rows = listUntriaged({ includeResolved, limit });
+  res.json({
+    open: countOpenUntriaged(),
+    items: rows.map((r) => ({
+      ...r,
+      signals: safeJson(r.signals),
+      raw_payload: undefined, // large; fetch the single item to see it
+      status: r.resolved_at === null ? "open" : r.resolved_vertical ? "assigned" : "dismissed",
+    })),
+  });
+});
+
+// ─── GET /admin/crm/untriaged/:id ────────────────────────────
+router.get("/untriaged/:id", (req, res) => {
+  const row = getUntriaged(req.params.id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json({
+    ...row,
+    signals: safeJson(row.signals),
+    raw_payload: safeJson(row.raw_payload),
+    status: row.resolved_at === null ? "open" : row.resolved_vertical ? "assigned" : "dismissed",
+  });
+});
+
+// ─── POST /admin/crm/untriaged/:id/assign ────────────────────
+//
+// A human names the platform. The stored payload is then replayed through the
+// ORDINARY ingest path — same crmService.ingestThread, same fail-closed guard —
+// so an assigned thread is written by exactly the code that writes a thread
+// that routed cleanly. There is no second, less-exercised way into the CRM.
+//
+// Marking resolved happens only AFTER the ingest succeeds. If the replay throws
+// (a vertical conflict, say), the item stays open and Daniel sees why, rather
+// than the row being closed on a write that never happened.
+router.post("/untriaged/:id/assign", (req, res) => {
+  const schema = z.object({
+    vertical: z.enum(CRM_VERTICALS),
+    resolvedBy: z.string().min(1).default("daniel"),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+
+  const row = getUntriaged(req.params.id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  if (row.resolved_at !== null) {
+    return res.status(409).json({ error: "already resolved", resolved_at: row.resolved_at, resolved_vertical: row.resolved_vertical });
+  }
+
+  const payload = safeJson(row.raw_payload) as any;
+  if (!payload || !Array.isArray(payload.messages) || payload.messages.length === 0) {
+    return res.status(422).json({
+      error: "stored payload is not replayable",
+      detail: "raw_payload has no messages array; assign cannot reconstruct the thread",
+    });
+  }
+
+  let result;
+  try {
+    result = crmService.ingestThread(
+      {
+        threadId: row.thread_id,
+        subject: payload.subject ?? null,
+        category: payload.category,
+        severity: payload.severity,
+        messages: payload.messages,
+      },
+      row.from_email,
+      parsed.data.vertical,
+    );
+  } catch (err: any) {
+    return res.status(409).json({ error: "replay failed — item left open", detail: String(err?.message ?? err) });
+  }
+
+  markUntriagedResolved(req.params.id, parsed.data.vertical, parsed.data.resolvedBy);
+  res.json({ success: true, vertical: parsed.data.vertical, ...result, openUntriaged: countOpenUntriaged() });
+});
+
+// ─── POST /admin/crm/untriaged/:id/dismiss ───────────────────
+//
+// Not everything unroutable belongs in the CRM — spam, newsletters, a bounce.
+// Without this the bucket only grows, and a queue that only grows is one nobody
+// reads, which is the same silence by a slower route. Dismissed is
+// `resolved_at IS NOT NULL AND resolved_vertical IS NULL`; nothing is deleted.
+router.post("/untriaged/:id/dismiss", (req, res) => {
+  const schema = z.object({
+    reason: z.string().min(1),
+    resolvedBy: z.string().min(1).default("daniel"),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+
+  const row = getUntriaged(req.params.id);
+  if (!row) return res.status(404).json({ error: "not found" });
+
+  const ok = markUntriagedResolved(req.params.id, null, `${parsed.data.resolvedBy}: ${parsed.data.reason}`);
+  if (!ok) return res.status(409).json({ error: "already resolved", resolved_at: row.resolved_at });
+  res.json({ success: true, dismissed: true, openUntriaged: countOpenUntriaged() });
+});
+
+function safeJson(s: string | null): unknown {
+  if (!s) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return { unparseable: s.slice(0, 500) };
+  }
+}
+
 // ─── GET /admin/crm/outbox/pending?intent=gmail_draft ────────
 router.get("/outbox/pending", (req, res) => {
   const intent = req.query.intent as string | undefined;
@@ -574,11 +821,44 @@ router.get("/outbox/pending", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
   const items = crmService.listPendingOutbox(intent as any, limit);
   // Parse JSON fields for easy agent consumption
-  const parsed = items.map((i: any) => ({
-    ...i,
-    to_emails: JSON.parse(i.to_emails || "[]"),
-    cc_emails: JSON.parse(i.cc_emails || "[]"),
-  }));
+  //
+  // ─── steg 4, kriterium 4f ────────────────────────────────────
+  //
+  // A measured fact about TODAY, not a future gap: steg 3 put the display name
+  // and reply-to on the `resend_send` path, but `gmail_draft` is the intent the
+  // CS agent actually consumes, and that path goes out through Daniel's own
+  // Gmail — the code cannot set From. It could still tell the agent what the
+  // reply-to should be, and it did not. So the majority of CRM replies leave
+  // with no platform identity at all, and the funn-4 inbound discriminator is
+  // lost on exactly the busiest path.
+  //
+  // The row already carries vertical_id (steg 1) — `SELECT *` returned it and
+  // nobody read it. What was missing is the derived identity, so the agent does
+  // not have to keep its own copy of the mapping (a second source of truth for
+  // which address belongs to which platform is how they drift apart).
+  //
+  // resolveCrmIdentity THROWS on an unconfigured vertical. Catching per-item
+  // rather than per-request is deliberate: one bad row must not blank the whole
+  // queue, and `identity_error` on that row is louder than a missing field.
+  const parsed = items.map((i: any) => {
+    const base = {
+      ...i,
+      to_emails: JSON.parse(i.to_emails || "[]"),
+      cc_emails: JSON.parse(i.cc_emails || "[]"),
+    };
+    try {
+      const identity = resolveCrmIdentity(i.vertical_id);
+      return {
+        ...base,
+        vertical_id: i.vertical_id,
+        from_display_name: identity.displayName,
+        from_header: crmFromHeader(i.vertical_id),
+        reply_to: identity.replyTo,
+      };
+    } catch (err: any) {
+      return { ...base, identity_error: String(err?.message ?? err) };
+    }
+  });
   res.json({ items: parsed });
 });
 

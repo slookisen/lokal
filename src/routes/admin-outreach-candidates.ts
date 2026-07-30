@@ -372,6 +372,70 @@ router.get("/", (req: Request, res: Response) => {
     }
 
     const cutoff = new Date(Date.now() - cooldownDays * 86400 * 1000).toISOString();
+
+    // ── steg 4, kriterium 4e: cross-platform cooldown, named ──────────────────
+    //
+    // dev-request 2026-07-27, 4e: «kampanjen rapporterer «N produsenter hoppet
+    // over av kryss-plattform cooldown», med den undertrykkende vertical
+    // navngitt. Skal ikke shippes claim-kampanje uten dette.»
+    //
+    // The 60-day cooldown is deliberately cross-platform: both platforms send
+    // FROM the same verified address, so to the recipient and their spam filter
+    // this is ONE sender, and a per-vertical cooldown would let us cold-mail the
+    // same human twice in a week. Steg 3 kept that correct by stamping
+    // outreach_sent_log.vertical_id and scoping only the POOL's exclusion to
+    // `o.vertical_id = 'rfb'`.
+    //
+    // The consequence is invisible without this block. This gate serves RFB, so
+    // a producer contacted only via Opplevagent is NOT excluded by the pool VIEW
+    // — they arrive here as a candidate, the campaign mails them, and the
+    // send-path invariant in crm.ts returns a 429 the campaign reports as a
+    // generic failure. The overlap producers (gårdssalg people who are also RFB
+    // agents) are exactly the claim campaign's best target list, so the group
+    // that vanishes is the group that matters most.
+    //
+    // Skip them HERE, where the reason is still known, rather than letting them
+    // fail one at a time at the send path with the cause erased. This can only
+    // ever REMOVE candidates that the send path would refuse anyway — it never
+    // admits one.
+    //
+    // vertical_id is added to outreach_sent_log by a migration (steg 3), so
+    // every booted database has it. A database that has NOT run that migration
+    // would make this SELECT throw and take the whole gate down with it — the
+    // campaign would get no candidates at all, an outreach outage caused by a
+    // schema detail. So the column is probed rather than assumed.
+    //
+    // The degraded path reports `unavailable: true` instead of `count: 0`.
+    // A confident zero on a database that cannot answer the question is the
+    // same silence 4e exists to remove, one level up.
+    const crossPlatformSuppressors = new Map<string, { vertical: string; last_sent_at: string }>();
+    const oslHasVertical = (db.prepare("PRAGMA table_info(outreach_sent_log)").all() as Array<{ name: string }>)
+      .some((c) => c.name === "vertical_id");
+
+    if (oslHasVertical) {
+      for (const r of db
+        .prepare(
+          `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
+             FROM outreach_sent_log
+            WHERE recipient_email IS NOT NULL AND recipient_email != ''
+              AND sent_at >= ?
+              AND vertical_id IS NOT NULL AND vertical_id != 'rfb'
+            GROUP BY LOWER(recipient_email), vertical_id`,
+        )
+        .all(cutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
+        const prev = crossPlatformSuppressors.get(r.email);
+        if (!prev || r.last_sent_at > prev.last_sent_at) {
+          crossPlatformSuppressors.set(r.email, { vertical: r.vertical_id, last_sent_at: r.last_sent_at });
+        }
+      }
+    }
+    const crossPlatformSkipped: Array<{
+      agent_id: string;
+      email: string;
+      suppressed_by_vertical: string;
+      last_sent_at: string;
+    }> = [];
+
     // Most-recent send for a candidate across BOTH keys — agent_id and the
     // immutable recipient_email (populated for every recorded send). Keying on
     // email survives agent_id churn / duplicate producer rows. (null = never
@@ -508,6 +572,17 @@ router.get("/", (req: Request, res: Response) => {
       // agent_id/outreach_sent_log; catches a producer we already emailed even if
       // that send's agent_id link is broken/missing.
       const suppressedForRecentCrmSend = recentlyEmailedAddresses.has(row.email.trim().toLowerCase());
+      // steg 4 / 4e — see the map construction above.
+      const crossPlatformHit = crossPlatformSuppressors.get(row.email.trim().toLowerCase());
+      const suppressedForCrossPlatform = crossPlatformHit !== undefined;
+      if (crossPlatformHit) {
+        crossPlatformSkipped.push({
+          agent_id: row.agent_id,
+          email: row.email,
+          suppressed_by_vertical: crossPlatformHit.vertical,
+          last_sent_at: crossPlatformHit.last_sent_at,
+        });
+      }
 
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
@@ -528,7 +603,8 @@ router.get("/", (req: Request, res: Response) => {
         !suppressedForBlocklist &&
         !suppressedForWebsiteUnverified &&
         !suppressedForInferenceOnly &&
-        !suppressedForRecentCrmSend
+        !suppressedForRecentCrmSend &&
+        !suppressedForCrossPlatform
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -649,6 +725,40 @@ router.get("/", (req: Request, res: Response) => {
         inference_only: inferenceOnlyCount,
         // Step 2b: belt-and-suspenders recipient-email match (agent_id-independent)
         recent_crm_send_email_match: recentCrmSendCount,
+        // steg 4 / 4e: skipped because ANOTHER platform mailed this address
+        // inside the window. Overlaps with contacted_or_cooldown in mode=second
+        // (where lastSentFor already reads every vertical) — the counters are
+        // reasons, not a partition, so they are not expected to sum to the
+        // suppressed total.
+        cross_platform_cooldown: crossPlatformSkipped.length,
+      },
+      // 4e proper: the count alone would still leave "hvorfor" unanswered, so
+      // the suppressing platform is named per producer. Bounded at 100 so a wide
+      // overlap cannot balloon the response; `truncated` says when it bit,
+      // because a silently short list is the failure mode this criterion exists
+      // to close.
+      cross_platform_cooldown: {
+        // Absent column → the question could not be asked. Say so rather than
+        // answering 0, which reads as "no overlap producers were skipped".
+        ...(oslHasVertical
+          ? {}
+          : {
+              unavailable: true,
+              unavailable_reason:
+                "outreach_sent_log.vertical_id is missing on this database (the steg-3 migration has not run), " +
+                "so the cross-platform breakdown could not be computed. This is NOT a measured zero.",
+            }),
+        count: crossPlatformSkipped.length,
+        by_vertical: crossPlatformSkipped.reduce<Record<string, number>>((acc, s) => {
+          acc[s.suppressed_by_vertical] = (acc[s.suppressed_by_vertical] ?? 0) + 1;
+          return acc;
+        }, {}),
+        truncated: crossPlatformSkipped.length > 100,
+        producers: crossPlatformSkipped.slice(0, 100),
+        note:
+          "Skipped because another platform cold-mailed this address inside the cooldown window. " +
+          "The cooldown is cross-platform on purpose: both platforms send from the same address, so " +
+          "the recipient sees one sender. These are not lost — they become eligible when the window passes.",
       },
     });
   } catch (err: any) {
