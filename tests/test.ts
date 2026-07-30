@@ -29625,6 +29625,90 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     }
   }
 
+  // ── C2. dev-request 2026-07-28-rfb-404-indexerbar-og-sitemap-duplikater,
+  //    slice 1: the three RFB 404 pages (/kategori/:slug, /:city, /produsent/:slug)
+  //    must send `robots: noindex, follow` and a SELF-canonical (never the
+  //    shell() BASE_URL-homepage default). Asserted on the actual rendered
+  //    HTML body (what a crawler/GSC would see), NOT on shell()'s call
+  //    arguments — the dev-request explicitly names lokal#394/#370's
+  //    "tested the fix, not the user" failure mode as the thing to avoid here. ──
+  {
+    const seoSrc: string = require("fs").readFileSync(
+      require("path").join(__dirname, "../src/routes/seo.ts"), "utf8"
+    );
+    const seoRouter = require("../src/routes/seo").default as any;
+
+    function findLayer(routePath: string) {
+      return (seoRouter.stack as any[]).find(
+        (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+      );
+    }
+    function invoke(routePath: string, req: any): { status: number; body: string } {
+      const layer = findLayer(routePath);
+      assertTrue(!!layer, `rfb-404-seo-signals: GET ${routePath} layer is registered`);
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+      let status = 200;
+      let body = "";
+      const res: any = {
+        status: (c: number) => { status = c; return res; },
+        send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+        redirect: (_c: number, _l: string) => { status = 301; return res; },
+      };
+      handler(req, res, (_e?: unknown) => {});
+      return { status, body };
+    }
+    function assertSelfCanonicalNoindex(label: string, page: { status: number; body: string }, expectedCanonical: string) {
+      assertEq(page.status, 404, `${label}: responds 404`);
+      assertTrue(
+        page.body.includes(`<meta name="robots" content="noindex, follow">`),
+        `${label}: robots meta is noindex, follow (was: ${(page.body.match(/<meta name="robots" content="([^"]*)">/) || [])[1] || "MISSING"})`
+      );
+      assertTrue(
+        page.body.includes(`<link rel="canonical" href="${expectedCanonical}">`),
+        `${label}: canonical is self (${expectedCanonical}), got: ${(page.body.match(/<link rel="canonical" href="([^"]*)">/) || [])[1] || "MISSING"}`
+      );
+      assertTrue(
+        !page.body.includes(`<link rel="canonical" href="https://rettfrabonden.com">`),
+        `${label}: canonical does NOT point at the bare homepage (the pre-fix bug)`
+      );
+    }
+
+    try {
+      // /kategori/:slug — unknown category
+      const kategoriPage = invoke("/kategori/:slug", { params: { slug: "zzz-ukjent-kategori-test" }, lang: "no" });
+      assertSelfCanonicalNoindex(
+        "rfb-404-seo-signals/kategori", kategoriPage,
+        "https://rettfrabonden.com/kategori/zzz-ukjent-kategori-test"
+      );
+
+      // /:city — no producers for this city slug
+      const cityPage = invoke("/:city", { params: { city: "zzz-ikke-eksisterende-by-test" }, lang: "no" });
+      assertSelfCanonicalNoindex(
+        "rfb-404-seo-signals/city", cityPage,
+        "https://rettfrabonden.com/zzz-ikke-eksisterende-by-test"
+      );
+
+      // /produsent/:slug — unknown producer
+      const produsentPage = invoke("/produsent/:slug", { params: { slug: "zzz-ikke-eksisterende-produsent-test" }, lang: "no", ip: "127.0.0.1" });
+      assertSelfCanonicalNoindex(
+        "rfb-404-seo-signals/produsent", produsentPage,
+        "https://rettfrabonden.com/produsent/zzz-ikke-eksisterende-produsent-test"
+      );
+
+      // Regression guard: the untouched non-404 rendering (shell()'s own
+      // default-robots line) must be unchanged for a normal indexable page —
+      // spot-checked via source, since this test file has no light-weight
+      // route for one elsewhere in this block.
+      assertTrue(
+        seoSrc.includes(`<meta name="robots" content="\${extra?.robots || "index, follow, max-snippet:-1, max-image-preview:large"}">`),
+        "rfb-404-seo-signals: shell()'s normal-page robots default is untouched (regression guard)"
+      );
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-404-seo-signals: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    }
+  }
+
   // ── D. Homepage "Marked-nettverk" section renders only active umbrellas —
   //    Debio/Norsk Gardsmat disappear automatically because the section
   //    queries `is_active = 1`, not a hardcoded umbrella list. ──

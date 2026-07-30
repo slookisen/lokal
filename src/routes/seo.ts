@@ -3197,7 +3197,14 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
         <h1 style="font-size:1.6rem;margin-bottom:12px;">${lang === "en" ? "Unknown category" : "Ukjent kategori"} “${escapeHtml(slug)}”</h1>
         <p><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "See all sales channels" : "Se alle salgskanaler"}</a></p>
       </div>`,
-      { robots: "noindex, follow", lang },
+      {
+        robots: "noindex, follow",
+        lang,
+        // dev-request 2026-07-28-rfb-404-indexerbar-og-sitemap-duplikater: self-canonical,
+        // not the shell() BASE_URL default — a 404 must never claim the homepage as its
+        // canonical URL.
+        canonical: BASE_URL + localizedPath("/kategori/" + slug, lang),
+      },
     ));
   }
 
@@ -3307,7 +3314,15 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
         `<div class="sec" style="text-align:center;padding:80px 24px;">
           <h1 style="font-size:1.8rem;margin-bottom:12px;">Fant ingen produsenter for \u201c${escapeHtml(citySlug)}\u201d</h1>
           <p style="color:var(--g500);"><a href="/">Tilbake til forsiden</a></p>
-        </div>`
+        </div>`,
+        {
+          robots: "noindex, follow",
+          lang,
+          // dev-request 2026-07-28-rfb-404-indexerbar-og-sitemap-duplikater: self-canonical,
+          // not the shell() BASE_URL default — a 404 must never claim the homepage as its
+          // canonical URL.
+          canonical: BASE_URL + localizedPath("/" + citySlug, lang),
+        }
       ));
     }
 
@@ -4120,6 +4135,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           extraCss: `.city-pill{display:inline-block;padding:10px 18px;background:var(--g100);color:var(--g700);border-radius:999px;font-weight:500;text-decoration:none;transition:all .15s;}.city-pill:hover{background:var(--green);color:#fff;}`,
           lang,
           pathForAlternate: "/produsent/" + slug,
+          robots: "noindex, follow",
+          // dev-request 2026-07-28-rfb-404-indexerbar-og-sitemap-duplikater: self-canonical,
+          // not the shell() BASE_URL default — a 404 must never claim the homepage as its
+          // canonical URL.
+          canonical: BASE_URL + localizedPath("/produsent/" + slug, lang),
         }
       ));
     }
