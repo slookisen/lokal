@@ -18742,7 +18742,7 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
     confidence: "high", verification_status: "verified",
   });
   // Published, SAME fylke, but NO coordinates -> must appear in the list, NOT on the map.
-  expStoreKart.createExperience({
+  const noGeoIdKart = expStoreKart.createExperience({
     title: "Sykkeltur uten kartpunkt", provider_id: provKart, provider_match_status: "matched",
     category: "adrenalin_action", fylke: "Vestland", kommune: "Bergen", indoor_outdoor: "outdoor",
     confidence: "high", verification_status: "verified",
@@ -18857,6 +18857,65 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
   const leafletIconKart = invokeSeo("/leaflet/images/marker-icon.png", {}, "/leaflet/images/marker-icon.png");
   assertEq(leafletIconKart.status, 200, "kart-09d: GET /leaflet/images/marker-icon.png -> 200");
   assertTrue(!/unpkg\.com/.test(fylkeKart.body), "kart-09e: page never references unpkg.com (self-hosted only, no CDN)");
+
+  // mini-*: arbeidspunkt 5 — the /opplevelse/:slug detail-page mini-map
+  // (single-entity, one marker, NOT the multi-marker /fylke map above).
+  // Reuses this same DB context (addrIdKart = address-precision,
+  // kommIdKart = kommune-precision, noGeoIdKart = no coordinates at all).
+  const addrSlugMini = (expStoreKart.getExperienceById(addrIdKart) as any).slug as string;
+  const kommSlugMini = (expStoreKart.getExperienceById(kommIdKart) as any).slug as string;
+  const noGeoSlugMini = (expStoreKart.getExperienceById(noGeoIdKart) as any).slug as string;
+
+  // mini-01: address-precision experience -> real Leaflet mini-map, exactly
+  // one point, NOT flagged approximate.
+  const detailAddrMini = invokeSeo("/opplevelse/:slug", { slug: addrSlugMini }, `/opplevelse/${addrSlugMini}`);
+  assertEq(detailAddrMini.status, 200, "mini-01a: GET /opplevelse/:slug (address precision) -> 200");
+  assertTrue(detailAddrMini.body.includes('id="mini-map"'), "mini-01b: address-precision detail page renders the mini-map container");
+  assertTrue(detailAddrMini.body.includes('id="mini-map-data"'), "mini-01c: address-precision detail page renders the mini-map JSON data island");
+  const dataMatchAddrMini = detailAddrMini.body.match(/<script type="application\/json" id="mini-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchAddrMini, "mini-01d: mini-map data island is present and matchable");
+  const pointAddrMini = dataMatchAddrMini ? JSON.parse(dataMatchAddrMini[1]) : null;
+  assertEq(pointAddrMini?.lat, 60.39, "mini-01e: mini-map point carries the real lat");
+  assertEq(pointAddrMini?.lon, 5.32, "mini-01f: mini-map point carries the real lon");
+  assertEq(pointAddrMini?.approx, false, "mini-01g (negative case): an address-precision point is NOT flagged approximate");
+  assertTrue(!detailAddrMini.body.includes('class="mini-map-legend"'), "mini-01h: no 'ca. posisjon' legend rendered for an exact-precision point");
+
+  // mini-02: kommune-precision experience -> SAME mini-map, but visually
+  // marked approximate — never rendered as if it were an exact address pin.
+  const detailKommMini = invokeSeo("/opplevelse/:slug", { slug: kommSlugMini }, `/opplevelse/${kommSlugMini}`);
+  assertEq(detailKommMini.status, 200, "mini-02a: GET /opplevelse/:slug (kommune precision) -> 200");
+  assertTrue(detailKommMini.body.includes('id="mini-map"'), "mini-02b: kommune-precision detail page also renders the mini-map container");
+  const dataMatchKommMini = detailKommMini.body.match(/<script type="application\/json" id="mini-map-data">([\s\S]*?)<\/script>/);
+  const pointKommMini = dataMatchKommMini ? JSON.parse(dataMatchKommMini[1]) : null;
+  assertEq(pointKommMini?.approx, true, "mini-02c (positive case): a kommune-precision point IS flagged approximate");
+  assertTrue(detailKommMini.body.includes('class="mini-map-legend"') && detailKommMini.body.includes("Ca. posisjon (kommune)"),
+    "mini-02d: the 'ca. posisjon (kommune)' legend IS rendered for an approximate point");
+
+  // mini-03 (acceptance criterion 4): the ORIGINAL OpenStreetMap link markup
+  // survives verbatim inside <noscript>, so JS-disabled visitors keep the
+  // exact same way to see the location they had before this feature existed.
+  assertTrue(/<noscript><a class="map-card" href="https:\/\/www\.openstreetmap\.org\/\?mlat=60\.39&mlon=5\.32/.test(detailAddrMini.body),
+    "mini-03a: <noscript> fallback still links to the same OpenStreetMap coordinates as before");
+  assertTrue(detailAddrMini.body.includes("Åpne posisjon i OpenStreetMap"), "mini-03b: <noscript> fallback keeps the original aria-label/link text");
+
+  // mini-04 (acceptance criterion 5): an experience with NO coordinate at
+  // all keeps the untouched no-map fallback — completely unaffected by this
+  // slice.
+  const detailNoGeoMini = invokeSeo("/opplevelse/:slug", { slug: noGeoSlugMini }, `/opplevelse/${noGeoSlugMini}`);
+  assertEq(detailNoGeoMini.status, 200, "mini-04a: GET /opplevelse/:slug (no coordinate) -> 200");
+  assertTrue(!detailNoGeoMini.body.includes('id="mini-map"'), "mini-04b: no mini-map rendered when there is no coordinate at all");
+  assertTrue(detailNoGeoMini.body.includes('class="map-card map-fallback"'), "mini-04c: the pre-existing no-geo fallback markup is unchanged");
+  assertTrue(detailNoGeoMini.body.includes("Nøyaktig posisjon er ikke registrert ennå."), "mini-04d: the pre-existing no-geo fallback copy is unchanged");
+
+  // mini-05: lazy-load discipline — same as kart-07, leaflet.js must not be
+  // eagerly tagged.
+  assertTrue(!/<script src="\/leaflet\/leaflet\.js"><\/script>/.test(detailAddrMini.body),
+    "mini-05a: leaflet.js is NOT eagerly tagged on the detail page (loaded on-demand only)");
+  assertTrue(/IntersectionObserver/.test(detailAddrMini.body), "mini-05b: mini-map init script uses IntersectionObserver for lazy init");
+
+  // mini-06: no inline event-handler attributes (GUIDEBOOK.md appendix C.44
+  // regression class), same discipline as kart-08.
+  assertTrue(!/\son(click|change)\s*=/.test(detailAddrMini.body), "mini-06a: no inline onclick=/onchange= handler attributes on the detail page");
 
   // kart-10: a fylke with ZERO geocoded published experiences renders NO map
   // section at all (honest omission, never an empty/broken map) while the
@@ -27546,6 +27605,25 @@ const _geoStepDPromise = runSerial(async () => {
 
   const profileNoneGEO = invokeSeoGEO("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: String(seededNothingGEO!.slug) }, `/kategori/gardssalg/produsent/${seededNothingGEO!.slug}`);
   assertTrue(profileNoneGEO.body.includes("Nøyaktig posisjon er ikke registrert ennå."), "geo-10: a fully-unresolved position keeps the existing honest 'not registered yet' fallback (no regression)");
+
+  // ── mini-p*: arbeidspunkt 5 — the produsent-profil mini-map. Same three
+  // profiles as geo-08/09/10 above (approximate / exact / none), asserting
+  // the actual Leaflet mini-map markup + precision-honesty discrimination,
+  // not just the <noscript> link copy.
+  assertTrue(profileApproxGEO.body.includes('id="mini-map"'), "mini-p01a: an approximate-position profile renders the mini-map container");
+  const dataMatchApproxMiniP = profileApproxGEO.body.match(/<script type="application\/json" id="mini-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchApproxMiniP, "mini-p01b: mini-map data island is present and matchable");
+  const pointApproxMiniP = dataMatchApproxMiniP ? JSON.parse(dataMatchApproxMiniP[1]) : null;
+  assertEq(pointApproxMiniP?.approx, true, "mini-p01c (positive case): an approximate (geocode_confidence='approximate') provider point IS flagged approximate on the mini-map");
+  assertTrue(profileApproxGEO.body.includes('class="mini-map-legend"'), "mini-p01d: the 'ca. posisjon' legend IS rendered for the approximate profile's mini-map");
+
+  assertTrue(profileExactGEO.body.includes('id="mini-map"'), "mini-p02a: an exact-position profile also renders the mini-map container (no regression)");
+  const dataMatchExactMiniP = profileExactGEO.body.match(/<script type="application\/json" id="mini-map-data">([\s\S]*?)<\/script>/);
+  const pointExactMiniP = dataMatchExactMiniP ? JSON.parse(dataMatchExactMiniP[1]) : null;
+  assertEq(pointExactMiniP?.approx, false, "mini-p02b (negative case): a real address/high-confidence provider point is NOT flagged approximate on the mini-map");
+  assertTrue(!profileExactGEO.body.includes('class="mini-map-legend"'), "mini-p02c: no 'ca. posisjon' legend rendered for the exact profile's mini-map");
+
+  assertTrue(!profileNoneGEO.body.includes('id="mini-map"'), "mini-p03: a fully-unresolved profile renders NO mini-map (untouched no-geo fallback, same as geo-10)");
 
   if (prevPathGEO === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathGEO;

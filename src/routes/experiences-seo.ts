@@ -1890,13 +1890,32 @@ function renderOpplevelseDetail(
     : `<p class="prov-soft">Tilbyder er ikke matchet ennå.</p>`;
 
   // Map block — coords from experience, else provider; graceful no-geo fallback.
-  const lat = numOrNull(exp.loc_lat) ?? numOrNull(provider ? provider.lat : null);
-  const lon = numOrNull(exp.loc_lon) ?? numOrNull(provider ? provider.lon : null);
-  const mapBlock = (lat !== null && lon !== null)
-    ? `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
+  // arbeidspunkt 5: when a real point exists, render a real Leaflet mini-map
+  // (renderMiniMapSection, defined near the /kategori/gardssalg map section
+  // below) instead of just the OSM link; the link itself is preserved
+  // byte-for-byte as the <noscript> fallback so JS-disabled visitors lose
+  // nothing (acceptance criterion 4). The no-geo branch below is completely
+  // untouched (acceptance criterion 5).
+  const expLat = numOrNull(exp.loc_lat);
+  const expLon = numOrNull(exp.loc_lon);
+  const lat = expLat ?? numOrNull(provider ? provider.lat : null);
+  const lon = expLon ?? numOrNull(provider ? provider.lon : null);
+  // Precision honesty: when the point is the experience's own geocode,
+  // geo_precision already says address/kommune. When it's a provider
+  // lat/lon fallback (experience has no own geocode yet), reuse the SAME
+  // isApproxGardssalgConfidence() discipline the gardssalg map / produsent-
+  // profil page use for provider-sourced points (defined below) — never
+  // assume a fallback point is exact just because it lacks its own
+  // geo_precision tag.
+  const geoIsApprox = expLat !== null
+    ? exp.geo_precision === "kommune"
+    : isApproxGardssalgConfidence(provider ? ((provider.geocode_confidence as string | null) ?? null) : null);
+  const osmLinkHtml = `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
          <span><strong>${escapeHtml(place || "Posisjon")}</strong><span class="map-sub">Åpne i kart (OpenStreetMap)</span></span>
-       </a>`
+       </a>`;
+  const mapBlock = (lat !== null && lon !== null)
+    ? renderMiniMapSection({ lat, lon, approx: geoIsApprox, label: place || "Posisjon" }, osmLinkHtml)
     : `<div class="map-card map-fallback">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
          <span><strong>${escapeHtml(place || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
@@ -2081,6 +2100,7 @@ ${ldScripts}
   .foot-inner{max-width:var(--maxw);margin:0 auto;padding:26px 24px;font-size:.84rem;color:var(--mist);display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between}
   .foot-inner a{color:var(--ink-soft)}
 </style>
+${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
@@ -2958,6 +2978,151 @@ function renderGardssalgMapSection(points: GardssalgProviderMapPoint[]): string 
   </section>`;
 }
 
+// ─── Single-entity mini-map (dev-request 2026-07-19-opplevagent-kart-fylke-
+// gardssalg, arbeidspunkt 5) ──────────────────────────────────────────────
+// The "Sted" card on /opplevelse/:slug and on the gårdssalg produsent-profil
+// page each show exactly ONE point (never multiple markers — that's what
+// distinguishes this from the /fylke and /kategori/gardssalg maps above).
+// Self-contained CSS/JS block shared by BOTH of those pages (they don't share
+// a <style>/<script> bundle with each other or with the browse pages above —
+// each is server-rendered independently — so a shared const here means the
+// source has this logic ONCE, even though each page still inlines its own
+// copy at render time, same discipline as FYLKE_MAP_CSS/GARDSSALG_MAP_INIT_JS
+// above). Neither of the two call sites is touched here — this only adds new
+// code; renderFylkeMapSection/renderGardssalgMapSection above are untouched.
+const MINI_MAP_CSS = `
+  .mini-map-wrap{margin-top:2px}
+  .mini-map-legend{display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:.8rem;color:var(--ink-soft)}
+  .mini-map-legend .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#f5a623;border:1.5px dashed #c2570c}
+  .mini-map{width:100%;height:200px;border-radius:var(--r-md);border:1px solid var(--line);background:var(--canvas-2);position:relative;overflow:hidden;z-index:0}
+  .mini-map .map-loading{margin:0;padding:14px;color:var(--mist);font-size:.84rem}
+  .mini-map-attribution{font-size:.74rem;color:var(--mist);margin-top:6px}
+  .mini-map-attribution a{color:var(--ink-soft)}
+  .map-popup{font-size:.86rem;line-height:1.45;min-width:140px}
+  .map-popup strong{display:block;font-size:.9rem;color:var(--ink);margin-bottom:2px}
+  .map-popup .map-popup-approx{display:block;color:#c2570c;font-weight:700;font-size:.76rem;margin-top:4px}
+`;
+
+// A single point's data as sent to the client — same "server pre-resolves
+// everything, client does zero business logic" discipline as
+// FylkeMapMarker/GardssalgMapMarker. `approx` is already the resolved
+// boolean (geo_precision==='kommune' for experiences,
+// isApproxGardssalgConfidence() for provider-sourced points) — the client
+// never re-derives precision honesty.
+type MiniMapPoint = {
+  lat: number;
+  lon: number;
+  approx: boolean;
+  label: string;
+};
+
+// Lazy-init script for a single-point mini-map — same self-hosted-Leaflet,
+// IntersectionObserver-lazy-load, dashed-amber-circleMarker-for-approximate
+// discipline as FYLKE_MAP_INIT_JS/GARDSSALG_MAP_INIT_JS above, simplified to
+// one point (setView instead of fitBounds; no "see full profile" popup link
+// — the popup already IS on that entity's own page, so a self-link would be
+// pointless).
+const MINI_MAP_INIT_JS = `(function () {
+  var mapEl = document.getElementById('mini-map');
+  var dataEl = document.getElementById('mini-map-data');
+  if (!mapEl || !dataEl) return;
+  var point = null;
+  try { point = JSON.parse(dataEl.textContent || 'null'); } catch (e) { point = null; }
+  if (!point || typeof point.lat !== 'number' || typeof point.lon !== 'number') return;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  var leafletLoading = null;
+  function loadLeaflet() {
+    if (leafletLoading) return leafletLoading;
+    leafletLoading = new Promise(function (resolve, reject) {
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = '/leaflet/leaflet.css';
+      document.head.appendChild(link);
+      var script = document.createElement('script');
+      script.src = '/leaflet/leaflet.js';
+      script.addEventListener('load', function () { resolve(); });
+      script.addEventListener('error', function () { reject(new Error('leaflet-load-failed')); });
+      document.body.appendChild(script);
+    });
+    return leafletLoading;
+  }
+
+  function initMap() {
+    loadLeaflet().then(function () {
+      if (typeof L === 'undefined') return;
+      mapEl.textContent = '';
+      var map = L.map(mapEl);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
+      }).addTo(map);
+
+      var marker;
+      if (point.approx) {
+        marker = L.circleMarker([point.lat, point.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 });
+      } else {
+        var addressIcon = L.icon({
+          iconUrl: '/leaflet/images/marker-icon.png',
+          iconRetinaUrl: '/leaflet/images/marker-icon-2x.png',
+          shadowUrl: '/leaflet/images/marker-shadow.png',
+          iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+        });
+        marker = L.marker([point.lat, point.lon], { icon: addressIcon });
+      }
+      var popupHtml = '<div class="map-popup"><strong>' + esc(point.label) + '</strong>'
+        + (point.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
+        + '</div>';
+      marker.bindPopup(popupHtml);
+      marker.addTo(map);
+      map.setView([point.lat, point.lon], 13);
+    }).catch(function () {
+      mapEl.innerHTML = '<p class="map-loading">Kartet kunne ikke lastes.</p>';
+    });
+  }
+
+  if ('IntersectionObserver' in window) {
+    var obs = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          obs.disconnect();
+          initMap();
+        }
+      });
+    }, { rootMargin: '200px 0px' });
+    obs.observe(mapEl);
+  } else {
+    initMap();
+  }
+})();`;
+
+// Renders the "Sted" card's mini-map for a single-entity detail page —
+// legend (only when approx) + map container + attribution + <noscript>
+// fallback + JSON data island + deferred lazy-init script. `osmLinkHtml` is
+// the caller's pre-existing `<a class="map-card" ...>` OSM-link markup,
+// embedded verbatim inside <noscript> so JS-disabled visitors keep exactly
+// the link they had before this feature existed (acceptance criterion 4).
+// Callers are responsible for the lat/lon !== null guard — this function
+// assumes it already has a real point (same convention as
+// renderFylkeMapSection/renderGardssalgMapSection assuming a non-empty
+// points array).
+function renderMiniMapSection(point: MiniMapPoint, osmLinkHtml: string): string {
+  const dataJson = JSON.stringify(point).replace(/<\//g, "<\\/");
+  return `<div class="mini-map-wrap">
+    ${point.approx ? `<p class="mini-map-legend"><span class="dot" aria-hidden="true"></span>Ca. posisjon (kommune)</p>` : ""}
+    <div id="mini-map" class="mini-map" role="group" aria-label="Kart over ${escapeHtml(point.label)}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
+    <p class="mini-map-attribution">Kartdata © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere</p>
+    <noscript>${osmLinkHtml}</noscript>
+    <script type="application/json" id="mini-map-data">${dataJson}</script>
+    <script>${MINI_MAP_INIT_JS}</script>
+  </div>`;
+}
+
 // ─── GET /kategori/gardssalg — Gårdssalg & smaking provider catalog ──────────
 // Gardssalg shows experience_providers (drink producers), not experiences.
 // The generic /kategori/:category route queries the experiences table and returns
@@ -3167,8 +3332,12 @@ router.get(
     const lon = numOrNull(provider.lon);
     // Step D fallback (experiences-geocode-worker.ts): a kommune/fylke
     // centroid, not a real street-address geocode — label it honestly
-    // rather than implying exact-address precision.
-    const geoApprox = provider.geocode_confidence === "approximate";
+    // rather than implying exact-address precision. Reuses the SAME
+    // isApproxGardssalgConfidence() helper the /kategori/gardssalg map uses
+    // (arbeidspunkt 5) instead of a bespoke equality check — a future/
+    // unrecognized confidence value must default to approximate here too,
+    // not silently render as exact.
+    const geoApprox = isApproxGardssalgConfidence(provider.geocode_confidence);
 
     const metaDesc = `Besøk ${provider.navn}${sted ? " i " + sted : ""} — book en smaking eller omvisning direkte hos produsenten på Opplevagent.`;
 
@@ -3254,12 +3423,16 @@ router.get(
       </div>`
       : "";
 
-    // Map block — same OpenStreetMap-link pattern as /opplevelse/:slug.
-    const mapBlock = (lat !== null && lon !== null)
-      ? `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
+    // Map block — arbeidspunkt 5: a real Leaflet mini-map (same
+    // renderMiniMapSection helper /opplevelse/:slug uses) when we have a
+    // point, with the original OpenStreetMap-link markup preserved verbatim
+    // as the <noscript> fallback. The no-geo branch is untouched.
+    const osmLinkHtml = `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
            <span><strong>${escapeHtml(sted || "Posisjon")}</strong><span class="map-sub">${geoApprox ? "Ca. posisjon (kommune) – åpne i kart" : "Åpne i kart (OpenStreetMap)"}</span></span>
-         </a>`
+         </a>`;
+    const mapBlock = (lat !== null && lon !== null)
+      ? renderMiniMapSection({ lat, lon, approx: geoApprox, label: sted || "Posisjon" }, osmLinkHtml)
       : `<div class="map-card map-fallback">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
            <span><strong>${escapeHtml(sted || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
@@ -3372,6 +3545,7 @@ ${BROWSE_CSS}
 .map-sub{font-size:.8rem;color:var(--mist)}
 .map-fallback:hover{border-color:var(--line)}
 </style>
+${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
