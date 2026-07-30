@@ -13630,11 +13630,23 @@ console.log("\n── orch-pr-20260714-mcpcard: rfb agents.txt links MCP Server 
 console.log("\n── PR-74: umbrella-traffic aggregation + endpoint ──");
 const _pr74Promise = (async () => {
   // Wait for all prior async blocks that also steal the global DB singleton.
-  // PR-68 is the last sequential block but the M2 portal IIFE and the PR-21
-  // collection run in parallel — any of them can race PR-74's __setDbForTesting
-  // call. If we skip these awaits, the analytics router executes against
-  // whatever DB happens to be installed at that moment and returns 500s.
+  // PR-68 is the last block of the kriterium-3a total order (PR-56→63→65→67→68,
+  // tests/test.ts header comment ~line 24) but PR-94 pins the singleton
+  // independently of that chain (gated only on PR-56 — see the header comment's
+  // "NOT yet fixed" entry) and the M2 portal IIFE and the PR-21 collection also
+  // run in parallel — any of them can race PR-74's __setDbForTesting call. If we
+  // skip these awaits, the analytics router executes against whatever DB happens
+  // to be installed at that moment and returns 500s.
+  //
+  // kriterium 3a fix note: awaiting _pr94Promise here (added alongside this
+  // slice) is NOT the same as gating PR-94 itself into the 56→68 chain — that
+  // was tried and reverted because it broke orch-pr-86's own assertions
+  // elsewhere. This is the narrower, safe fix: PR-74 waits for PR-94 to finish
+  // touching the singleton before PR-74 pins its own, same as it already does
+  // for every other singleton-touching block. Confirmed no cycle: PR-94's own
+  // body (~line 10306) never awaits _pr74Promise or anything derived from it.
   try { await _pr68Promise; } catch { /* errors counted upstream */ }
+  try { await _pr94Promise; } catch { /* errors counted upstream */ }
   try { await _m2Promise; } catch { /* errors counted upstream */ }
   try { await _pr24Promise; } catch { /* errors counted upstream */ }
   try { await Promise.all(_pr21Promises); } catch { /* errors counted upstream */ }
