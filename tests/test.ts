@@ -35325,6 +35325,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── Daniels GO 2026-07-30: gårdssalg kontakt-utvinning fra hjemmesider ──");
+  try {
+    const { runGardssalgContactExtractionTests } = require("../src/routes/opplevelser-gardssalg-contact-extraction.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-contact-extraction.test");
+    const cx = await runGardssalgContactExtractionTests({ log: false });
+    passed += cx.passed;
+    failed += cx.failed;
+    for (const f of cx.failures) failures.push("gardssalg-contact-extraction: " + f);
+    console.log(`  gardssalg-contact-extraction: ${cx.passed} passed, ${cx.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-contact-extraction: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ gardssalg-contact-extraction: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 6 (kontakt ↔ opplevagent-produsent-kobling) ──");
   try {
     const { runCrmContactProviderLinkTests } = require("../src/services/crm-contact-provider-link.test") as

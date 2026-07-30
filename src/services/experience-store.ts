@@ -4318,6 +4318,13 @@ export function gardssalgSharedDomainReason(host: string | null): string | null 
   const h = host.toLowerCase().replace(/^www\./, "");
   if (isDirectoryOrAggregatorHost(h)) return "blocklisted_directory_domain";
   if (/^visit[a-z0-9-]*\.(no|com)$/.test(h)) return "dmo_visit_domain";
+  // Måling 2026-07-30 (wdv2-kjøringen): to feiltreff-klasser som passerte
+  // navn+sted-beviset — regionale smaks-DMO-er utenfor visit*-mønsteret
+  // (tastehardanger.com foreslått som Måge Siders hjemmeside) og
+  // hobbyblogger (*.blog foreslått for Borøy Ciderhus). En blogg-TLD er
+  // aldri en produsents hjemmeside.
+  if (/^taste[a-z0-9-]*\.(no|com)$/.test(h)) return "dmo_taste_domain";
+  if (h.endsWith(".blog")) return "blog_tld_host";
   return null;
 }
 
@@ -4826,6 +4833,146 @@ export function gardssalgContactPageLinks(html: string, baseHost: string, max = 
     out.push(url.toString());
   }
   return out;
+}
+
+// ─── Gårdssalg kontakt-utvinning fra hjemmeside (Daniels GO 2026-07-30:
+//     «Kjør kontakt-utvinning fra de nye hjemmesidene») ────────────────────
+//
+// 243 av 389 gårdssalg-produsenter er «unreachable» (verken epost eller
+// telefon), og Brreg-kilden er uttømt. Det som FINNES er nå hjemmesider
+// (website-discovery v2) — og kontaktinfoen står på dem. Disse to PURE
+// ekstraktorene leser en side og finner verdier, med proveniens-regler som
+// gjør en feilskriving usannsynlig; skrivingen selv gjenbruker
+// applyGardssalgProviderContact (fill-only, lås-guard, audit, provenance).
+
+/** Junk mailbox prefixes that are never a producer's contact address. */
+const CX_SKIP_LOCALPARTS = /^(noreply|no-reply|postmaster|webmaster|abuse|mailer-daemon|test|example)$/i;
+
+/**
+ * Extract the producer's contact EMAIL from a page.
+ *
+ * Trust order:
+ *   1. mailto: links (explicit, author-intended contact affordance)
+ *   2. addresses in visible text whose registrable domain MATCHES the
+ *      provider's own homepage domain
+ *   3. other text addresses (incl. freemail — common for small farms) ONLY
+ *      when `pageIsContactish` (found on a kontakt/om-oss page, where a
+ *      listed address is overwhelmingly the site's own)
+ *
+ * Junk localparts (noreply/postmaster/…) never match. Pure — exported for
+ * tests.
+ */
+export function extractGardssalgContactEmail(
+  html: string,
+  homepageDomain: string | null,
+  pageIsContactish: boolean,
+): { email: string; source: "mailto" | "text_same_domain" | "text_contact_page" } | null {
+  const candidates: Array<{ email: string; viaMailto: boolean }> = [];
+  const seen = new Set<string>();
+  const push = (raw: string, viaMailto: boolean): void => {
+    const email = raw.trim().toLowerCase().replace(/^mailto:/i, "").split("?")[0]!;
+    if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return;
+    const local = email.split("@")[0]!;
+    if (CX_SKIP_LOCALPARTS.test(local)) return;
+    if (email.endsWith("@example.com") || email.endsWith(".invalid")) return;
+    if (seen.has(email)) return;
+    seen.add(email);
+    candidates.push({ email, viaMailto });
+  };
+  const mailtoRe = /href\s*=\s*["']mailto:([^"'?]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = mailtoRe.exec(html || "")) !== null) push(m[1]!, true);
+  const text = gardssalgPageText(html || "");
+  const textRe = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+  while ((m = textRe.exec(text)) !== null) push(m[0]!, false);
+
+  const mailto = candidates.find((c) => c.viaMailto);
+  if (mailto) return { email: mailto.email, source: "mailto" };
+  if (homepageDomain) {
+    const same = candidates.find((c) => registrableDomain(c.email.split("@")[1]!) === homepageDomain);
+    if (same) return { email: same.email, source: "text_same_domain" };
+  }
+  if (pageIsContactish && candidates.length > 0) {
+    return { email: candidates[0]!.email, source: "text_contact_page" };
+  }
+  return null;
+}
+
+/**
+ * Extract the producer's contact PHONE from a page: Norwegian 8-digit
+ * numbers (first digit 2-7 or 9 — 8xx are toll/special, 0/1 invalid),
+ * +47/0047 prefixes and separators normalised away. A number appearing near
+ * a tlf/telefon/mobil/ring cue wins over a bare digit run; without any cued
+ * match, a bare run is accepted only on a contact-ish page (digit runs on
+ * arbitrary pages are too often order numbers/postal codes glued together).
+ * Pure — exported for tests.
+ */
+export function extractGardssalgContactPhone(
+  html: string,
+  pageIsContactish: boolean,
+): { phone: string; cued: boolean } | null {
+  const text = gardssalgPageText(html || "");
+  const numRe = /(?:\+47|0047)?[\s.]?(?:\d[\s.]?){8}/g;
+  const found: Array<{ phone: string; cued: boolean }> = [];
+  // Not-embedded guard (cx-10, samme disiplin som org.nr-matchingen): en
+  // 8-sifret kandidat som er del av en LENGRE sifferrekke — de første åtte
+  // av et 9-sifret org.nr, et 12-sifret kontonummer — er aldri et telefonnr.
+  const digitAdjacent = (idx: number, dir: -1 | 1): boolean => {
+    let i = idx;
+    while (i >= 0 && i < text.length && /[\s.]/.test(text[i]!)) i += dir;
+    return i >= 0 && i < text.length && /\d/.test(text[i]!);
+  };
+  let m: RegExpExecArray | null;
+  while ((m = numRe.exec(text)) !== null) {
+    const phone = normaliseNorwegianPhone(m[0]!);
+    if (!phone) continue;
+    if (!/^[2-79]/.test(phone)) continue;
+    if (digitAdjacent(m.index - 1, -1) || digitAdjacent(m.index + m[0]!.length, 1)) continue;
+    const before = text.slice(Math.max(0, m.index - 30), m.index).toLowerCase();
+    const cued = /tlf|telefon|mobil|ring|phone|tel[.:\s]/.test(before);
+    found.push({ phone, cued });
+  }
+  const cued = found.find((f) => f.cued);
+  if (cued) return cued;
+  if (pageIsContactish && found.length > 0) return found[0]!;
+  return null;
+}
+
+export type GardssalgContactExtractionTarget = {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+  epost: string | null;
+  telefon: string | null;
+  content_source: string | null;
+};
+
+/**
+ * Cohort for homepage contact extraction: gårdssalg rows WITH a homepage but
+ * MISSING epost and/or telefon, unlocked, not the test provider. Stable total
+ * order (created_at, id) so offset paging walks the whole cohort exactly once
+ * — same idiom as the Brreg contact backfill.
+ */
+export function selectGardssalgProvidersForContactExtraction(
+  limit: number,
+  offset: number,
+): { targets: GardssalgContactExtractionTarget[]; cohortTotal: number } {
+  const db = getDb(VERTICAL);
+  const where = `
+    (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+    AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+    AND ((epost IS NULL OR TRIM(epost) = '') OR (telefon IS NULL OR TRIM(telefon) = ''))
+    AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+    AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`;
+  const cohortTotal = (db.prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${where}`).get() as { n: number }).n;
+  const targets = db
+    .prepare(
+      `SELECT id, navn, hjemmeside, epost, telefon, content_source
+         FROM experience_providers WHERE ${where}
+        ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`
+    )
+    .all(limit, offset) as GardssalgContactExtractionTarget[];
+  return { targets, cohortTotal };
 }
 
 export type GardssalgWebsiteReviewQueueEntry = {
