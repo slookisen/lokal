@@ -47,7 +47,19 @@ jobs:
           SERVER_DIRS=(mcp-server mcp-server-opplevagent mcp-server-dental)
           for dir in "${SERVER_DIRS[@]}"; do
             echo "== Publishing $dir/server.json =="
-            ./mcp-publisher publish "./$dir/server.json"
+            set +e
+            OUTPUT=$(./mcp-publisher publish "./$dir/server.json" 2>&1)
+            STATUS=$?
+            set -e
+            echo "$OUTPUT"
+            if [ "$STATUS" -ne 0 ]; then
+              if echo "$OUTPUT" | grep -q "cannot publish duplicate version"; then
+                echo "== $dir/server.json already published at this version, skipping =="
+              else
+                echo "== ERROR: publish failed for $dir/server.json (exit $STATUS) =="
+                exit 1
+              fi
+            fi
           done
 
       - name: Verify publication (all servers)
