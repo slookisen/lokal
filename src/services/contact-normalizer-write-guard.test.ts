@@ -30,7 +30,7 @@
  */
 
 import Database from "better-sqlite3";
-import { validatePhoneForWrite, stripTrailingContactLabel } from "./contact-normalizer";
+import { validatePhoneForWrite, stripTrailingContactLabel, classifyPhoneForWrite } from "./contact-normalizer";
 
 export interface TestSummary {
   passed: number;
@@ -135,6 +135,85 @@ export function runContactNormalizerWriteGuardTests(opts: { log?: boolean } = {}
       validatePhoneForWrite("4727011840", "927011840"),
       null,
       "validatePhoneForWrite: rule2 regression — bare 47-prefixed value reduces to org-nr's last-8-digits",
+    );
+  }
+
+  // ── classifyPhoneForWrite / validatePhoneForWrite agreement ──────────────
+  //
+  // dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon, criterion
+  // 5: validatePhoneForWrite is now a thin wrapper around
+  // classifyPhoneForWrite (the single, shared, per-rule implementation the
+  // read-only audit sweep also calls). Prove the two agree — accept/reject
+  // AND per-rule attribution — on every fixture above, so there is exactly
+  // one implementation of each rule and no drift between the write-path gate
+  // and the audit path.
+  {
+    function assertAgree(raw: string | null, orgNr: string | null, label: string): void {
+      const validated = validatePhoneForWrite(raw, orgNr);
+      const classified = classifyPhoneForWrite(raw, orgNr);
+      assertEq(
+        validated === null,
+        classified.rejected,
+        `classifyPhoneForWrite/validatePhoneForWrite agree on accept-vs-reject: ${label}`,
+      );
+    }
+
+    // Real breaches.
+    assertAgree("927 011 840", "927011840", "org-nr written as phone");
+    assertAgree("20100101", null, "date-shaped value");
+
+    // Mutation-test fixtures — also assert the SPECIFIC rule attribution so
+    // this test would fail if a future refactor accidentally collapsed two
+    // rules into one gate (the exact bug class the mutation-test check
+    // guards against).
+    assertAgree("9112233", null, "rule1-only 7-digit partial");
+    assertEq(
+      classifyPhoneForWrite("9112233", null).failedRules,
+      ["shape"],
+      "classifyPhoneForWrite: rule1-only fixture fails EXACTLY 'shape', nothing else",
+    );
+
+    assertAgree("27011840", "927011840", "rule2-only org-nr-last-8-digits match");
+    assertEq(
+      classifyPhoneForWrite("27011840", "927011840").failedRules,
+      ["org_nr_collision"],
+      "classifyPhoneForWrite: rule2-only fixture fails EXACTLY 'org_nr_collision', nothing else",
+    );
+
+    assertAgree("19991231", null, "rule3-only plausible date");
+    assertEq(
+      classifyPhoneForWrite("19991231", null).failedRules,
+      ["date_shape"],
+      "classifyPhoneForWrite: rule3-only fixture fails EXACTLY 'date_shape', nothing else",
+    );
+
+    // Regression fixture: bare-47-prefixed value reduces to org-nr's last-8
+    // -digits. Must fail org_nr_collision specifically (not shape — a bare
+    // 47-prefixed 10-digit value DOES reduce via national8's 47-prefix
+    // branch, so shape passes; only org_nr_collision should fire).
+    assertAgree("4727011840", "927011840", "rule2 regression — bare 47-prefixed org-nr collision");
+    assertEq(
+      classifyPhoneForWrite("4727011840", "927011840").failedRules,
+      ["org_nr_collision"],
+      "classifyPhoneForWrite: rule2-regression fixture fails EXACTLY 'org_nr_collision' (shape passes via the 47-prefix branch)",
+    );
+
+    // The org-nr-as-phone breach fails BOTH rule 1 and rule 2 simultaneously
+    // — proves the two rules are independently evaluated, not short-circuited
+    // by one another.
+    const orgnrClassification = classifyPhoneForWrite("927 011 840", "927011840");
+    assertTrue(
+      orgnrClassification.failedRules.includes("shape") && orgnrClassification.failedRules.includes("org_nr_collision"),
+      "classifyPhoneForWrite: org-nr-as-phone breach fails BOTH 'shape' AND 'org_nr_collision' independently",
+    );
+
+    // Negative control agreement: a genuinely valid phone is accepted by
+    // both, with an EMPTY failedRules list.
+    assertAgree("911 22 333", "927011840", "negative control — genuinely valid phone");
+    assertEq(
+      classifyPhoneForWrite("911 22 333", "927011840").failedRules,
+      [],
+      "classifyPhoneForWrite: negative-control valid phone has an EMPTY failedRules list",
     );
   }
 
