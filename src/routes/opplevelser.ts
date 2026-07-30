@@ -117,6 +117,10 @@ import {
   gardssalgPageText,
   gardssalgWebsiteEvidenceMatch,
   gardssalgContactPageLinks,
+  extractGardssalgContactEmail,
+  extractGardssalgContactPhone,
+  selectGardssalgProvidersForContactExtraction,
+  homepageRegistrableDomain,
   upsertGardssalgWebsiteReviewQueue,
   clearGardssalgWebsiteReviewQueueEntry,
   listGardssalgWebsiteReviewQueue,
@@ -4304,6 +4308,130 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
 // how far the walk has left to go.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+// ─── POST /api/opplevelser/admin/gardssalg-contact-extraction (admin) ───────
+//
+// Daniels GO 2026-07-30: «Kjør kontakt-utvinning fra de nye hjemmesidene.»
+//
+// The Brreg contact source is exhausted (measured: fill-only refusals across
+// the whole cohort), but website-discovery v2 just gave the drink cohort real
+// homepages — and the contact info lives on THEM. Per target: fetch the
+// front page, prefer its kontakt/om-oss subpages (gardssalgContactPageLinks —
+// same helper the v2 evidence crawl uses), extract epost + telefon with the
+// provenance rules in extractGardssalgContact{Email,Phone} (mailto first,
+// same-domain text next, freemail only on contact-ish pages; phone only with
+// a tlf-cue or on a contact-ish page). The WRITE is the existing
+// applyGardssalgProviderContact — fill-only, manual/claim-lås respected,
+// audit + field_provenance per field, rollbackable via the standard lever —
+// with the URL the value was actually found on as evidence.
+//
+// Dry-run by default; offset paging over a stable total order (same idiom as
+// gardssalg-contact-backfill); cohort_total in the response so the caller
+// knows how far the walk has left.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+const GS_CX_DEFAULT_LIMIT = 24;
+
+router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true" ||
+    req.query?.apply === "1" || req.query?.apply === "true";
+  const dryRun = !apply;
+  const limit =
+    typeof body.limit === "number" && body.limit > 0 ? Math.min(Math.floor(body.limit), 48) : GS_CX_DEFAULT_LIMIT;
+  const offset = typeof body.offset === "number" && body.offset >= 0 ? Math.floor(body.offset) : 0;
+  const batchId = `contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  const { targets, cohortTotal } = selectGardssalgProvidersForContactExtraction(limit, offset);
+
+  const changed: Array<{ provider_id: string; navn: string; fields: string[]; epost: string | null; telefon: string | null; source_url: string; email_source?: string; phone_cued?: boolean }> = [];
+  const noContactFound: Array<{ provider_id: string; navn: string; pages_tried: number }> = [];
+  const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  for (const t of targets) {
+    try {
+      const front = await wdFetchPage(t.hjemmeside);
+      if (!front) {
+        fetchFailed.push({ provider_id: t.id, navn: t.navn });
+        continue;
+      }
+      const host = hostFromUrlLike(front.finalUrl) || hostFromUrlLike(t.hjemmeside) || "";
+      const homeDomain = homepageRegistrableDomain(t.hjemmeside);
+      // Contact-ish subpages FIRST (that's where the info is authoritative),
+      // front page as fallback.
+      const pages: Array<{ url: string; html: string; contactish: boolean }> = [];
+      for (const sub of gardssalgContactPageLinks(front.html, host, 2)) {
+        const p = await wdFetchPage(sub);
+        if (p) pages.push({ url: p.finalUrl, html: p.html, contactish: true });
+      }
+      pages.push({ url: front.finalUrl, html: front.html, contactish: false });
+
+      const needEmail = !t.epost || t.epost.trim() === "";
+      const needPhone = !t.telefon || t.telefon.trim() === "";
+      let email: ReturnType<typeof extractGardssalgContactEmail> = null;
+      let emailUrl = "";
+      let phone: ReturnType<typeof extractGardssalgContactPhone> = null;
+      let phoneUrl = "";
+      for (const pg of pages) {
+        if (needEmail && !email) {
+          email = extractGardssalgContactEmail(pg.html, homeDomain, pg.contactish);
+          if (email) emailUrl = pg.url;
+        }
+        if (needPhone && !phone) {
+          phone = extractGardssalgContactPhone(pg.html, pg.contactish);
+          if (phone) phoneUrl = pg.url;
+        }
+        if ((!needEmail || email) && (!needPhone || phone)) break;
+      }
+
+      if (!email && !phone) {
+        noContactFound.push({ provider_id: t.id, navn: t.navn, pages_tried: pages.length });
+        continue;
+      }
+
+      const evidenceUrl = emailUrl || phoneUrl;
+      const fields = [...(email ? ["epost"] : []), ...(phone ? ["telefon"] : [])];
+      if (dryRun) {
+        changed.push({
+          provider_id: t.id, navn: t.navn, fields,
+          epost: email?.email ?? null, telefon: phone?.phone ?? null,
+          source_url: evidenceUrl, email_source: email?.source, phone_cued: phone?.cued,
+        });
+      } else {
+        const written = applyGardssalgProviderContact(
+          t.id,
+          { epost: email?.email ?? null, telefon: phone?.phone ?? null },
+          evidenceUrl,
+          batchId,
+        );
+        if (written.length > 0) {
+          changed.push({
+            provider_id: t.id, navn: t.navn, fields: written,
+            epost: email?.email ?? null, telefon: phone?.phone ?? null,
+            source_url: evidenceUrl, email_source: email?.source, phone_cued: phone?.cued,
+          });
+        }
+      }
+    } catch (e: any) {
+      errors.push({ provider_id: t.id, error: e?.message ?? String(e) });
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    batch_id: batchId,
+    cohort_total: cohortTotal,
+    offset,
+    scanned: targets.length,
+    providers_enriched: changed.length,
+    changed,
+    no_contact_found: noContactFound,
+    fetch_failed: fetchFailed,
+    errors,
+  });
+});
 
 const GS_CB_DEFAULT_LIMIT = 48;
 
