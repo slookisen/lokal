@@ -2421,6 +2421,14 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
   const dead: Array<{ org_nr: string; navn: string }> = [];
   const errors: Array<{ code: string; error: string }> = [];
   const seenThisBatch = new Set<string>();
+  // Tracks how many times each existing gårdssalg provider_id has already
+  // been matched-and-queued THIS sweep. Two distinct Brreg candidates in the
+  // same run can exact-name-match the same unkeyed row (across NACE
+  // codes/pages); without this, the second upsertGardssalgOrgnrReviewQueue
+  // call (ON CONFLICT(provider_id) DO UPDATE) silently overwrites the
+  // first's queue row, and the persisted state loses the fact that the
+  // org_nr was ambiguous — a human could approve the wrong one.
+  const nameMatchCountThisBatch = new Map<string, number>();
   let cappedTotal = 0;
 
   for (const code of codes) {
@@ -2490,15 +2498,18 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
                 ]
                   .filter(Boolean)
                   .join(", ") || null;
+              const priorMatches = nameMatchCountThisBatch.get(nameMatch.id) ?? 0;
+              nameMatchCountThisBatch.set(nameMatch.id, priorMatches + 1);
+              const isAmbiguous = priorMatches > 0;
               try {
                 upsertGardssalgOrgnrReviewQueue({
                   provider_id: nameMatch.id,
                   provider_name: nameMatch.navn,
-                  candidate_orgnr: orgnr,
+                  candidate_orgnr: isAmbiguous ? null : orgnr,
                   candidate_name: e.navn,
                   candidate_confidence: 1.0,
                   candidate_address: candidateAddress,
-                  reason: "nace_discovery_name_match",
+                  reason: isAmbiguous ? "nace_discovery_name_match_ambiguous" : "nace_discovery_name_match",
                   batch_id: batchTag,
                 });
               } catch {
