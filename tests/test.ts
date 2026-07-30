@@ -30703,6 +30703,45 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("opplevelser-admin-providers-all: unexpected error: " + String(err?.message || err));
   }
 
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2
+  // (berikelsestriage): GET .../providers/content-triage — full-catalog
+  // enumeration + server-side enrichable/done/waiting classification via the
+  // SAME shared classifyProviderContentBucket() selectProvidersForContentRefresh
+  // uses. Same isolated experiences db-factory handle as the block
+  // immediately above — safe to run in this same sequential slot.
+  console.log("\n── dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage (slice 2): GET admin/providers/content-triage ──");
+  try {
+    const { runOpplevelserAdminProvidersContentTriageTests } = require("../src/routes/opplevelser-admin-providers-content-triage.test") as
+      typeof import("../src/routes/opplevelser-admin-providers-content-triage.test");
+    const apct = await runOpplevelserAdminProvidersContentTriageTests({ log: false });
+    passed += apct.passed;
+    failed += apct.failed;
+    for (const f of apct.failures) failures.push("opplevelser-admin-providers-content-triage: " + f);
+    console.log(`  opplevelser-admin-providers-content-triage: ${apct.passed} passed, ${apct.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-admin-providers-content-triage: unexpected error: " + String(err?.message || err));
+  }
+
+  // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 2:
+  // integration proof that selectProvidersForContentRefresh()'s "thin" gate
+  // now respects per-field content_field_evidence provenance — an
+  // aggregator-sourced non-blank field must not be read as "done". Same
+  // isolated experiences db-factory handle as the block immediately above.
+  console.log("\n── dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage (slice 2): selectProvidersForContentRefresh aggregator-thin fix ──");
+  try {
+    const { runOpplevelserContentRefreshAggregatorThinTests } = require("../src/routes/opplevelser-content-refresh-aggregator-thin.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-aggregator-thin.test");
+    const acat = await runOpplevelserContentRefreshAggregatorThinTests({ log: false });
+    passed += acat.passed;
+    failed += acat.failed;
+    for (const f of acat.failures) failures.push("opplevelser-content-refresh-aggregator-thin: " + f);
+    console.log(`  opplevelser-content-refresh-aggregator-thin: ${acat.passed} passed, ${acat.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-aggregator-thin: unexpected error: " + String(err?.message || err));
+  }
+
   // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
   // Daniel's 2026-07-19 decision, step 1: POST /admin/hjemmeside-cleanup-sweep
   // — classify + move aggregator/DMO hjemmeside values into the new
