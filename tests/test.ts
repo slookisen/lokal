@@ -38,8 +38,10 @@ import conversationUiRouter, {
 //      control to a concurrently-running block that observes or clobbers
 //      the stub (see the pr106 comment near line ~19676 for a real bug this
 //      caused).
-//   2. process.env.ADMIN_KEY / process.env.ANALYTICS_ADMIN_KEY — many
-//      blocks set these to exercise admin-gated routes; same hazard.
+//   2. process.env.ADMIN_KEY / process.env.ANALYTICS_ADMIN_KEY — the server
+//      reads these at request time to validate the X-Admin-Key header on
+//      every admin-gated route; same "an await hands control to a
+//      concurrent block" hazard as #1.
 //   3. The DB singleton returned by getDb() (src/database/init.ts),
 //      overridable per-test via __setDbForTesting(). A block that leaves
 //      its DB pinned (or closes it) poisons every later block that calls
@@ -47,9 +49,8 @@ import conversationUiRouter, {
 //
 // Isolation contract for any new block:
 //   - Restore-in-finally, always: save the previous value before mutating
-//     fetch, ADMIN_KEY/ANALYTICS_ADMIN_KEY, or the DB singleton, and restore
-//     it in a `finally` so it happens even if an assertion throws. Grep this
-//     file for `prevAdminKey` for the established shape.
+//     fetch or the DB singleton, and restore it in a `finally` so it happens
+//     even if an assertion throws.
 //   - Prefer per-call/per-module injection over global mutation where the
 //     code under test already supports it — the fix already shipped for
 //     globalThis.fetch (kriterium 1, PR #371/#385/#388): the title-no-
@@ -57,20 +58,77 @@ import conversationUiRouter, {
 //     `app.set("titleNoBackfillFetchImpl", stub)` on its own Express app
 //     instance instead of touching globalThis.fetch. Reach for an
 //     equivalent seam before reaching for a global.
+//   - ADMIN_KEY / ANALYTICS_ADMIN_KEY: this file's OWN test blocks must not
+//     mutate these — see below, kriterium 2 is fixed for this file. Use
+//     SUITE_ADMIN_KEY / SUITE_ANALYTICS_ADMIN_KEY (defined just below this
+//     comment block) as the value your block sends in its own request's
+//     X-Admin-Key header. If your block wants to prove a wrong/missing key
+//     is rejected, send an explicit wrong literal (e.g. "wrong-key") in the
+//     header. If your block drives an admin-gated route over a real HTTP/
+//     handler round trip (i.e. there's an `await` between "decide the key"
+//     and "the server checks it"), ALSO re-assert
+//     `process.env.ADMIN_KEY = <yourConstant>` synchronously right before
+//     each dispatch — not because another block in THIS file can still
+//     clobber it (none do), but because sibling src/**/*.test.ts helper
+//     suites required elsewhere in this file (see "NOT yet fixed" below)
+//     still can. Grep this file for "residual, out-of-scope external hazard"
+//     for the established comment shape.
 //   - DB: call __setDbForTesting() with your own fresh in-memory DB, per
 //     the pattern used throughout this file (e.g. ~line 1013, ~line 4556),
 //     rather than sharing or closing the ambient singleton — save the prior
 //     handle and restore it (or null) in `finally`.
 //
-// NOT yet fixed — don't assume these are solved:
-//   - ADMIN_KEY still has ~62 direct mutation sites not yet consolidated
-//     onto one seam (kriterium 2, a separate future slice).
+// Fixed:
+//   - ADMIN_KEY / ANALYTICS_ADMIN_KEY, WITHIN THIS FILE'S OWN ~17 test
+//     blocks (kriterium 2, dev-request 2026-07-30-testsuite-determinism-
+//     adminkey): process.env.ADMIN_KEY and process.env.ANALYTICS_ADMIN_KEY
+//     are now assigned exactly ONCE, below, for the whole suite's process
+//     lifetime. The ~45 sites across this file's own ~17 test blocks that
+//     used to reassign one or the other (each to its own invented per-block
+//     key string, then restore-in-finally, or — in a couple of cases —
+//     never restore at all) have all been converted to reference the
+//     canonical SUITE_ADMIN_KEY / SUITE_ANALYTICS_ADMIN_KEY constants in
+//     their own request headers instead. This file's OWN blocks can no
+//     longer race each other over this global, which is what caused the
+//     cart-56..cart-63 family of flaky 403s. Every one of those ~17 sites
+//     turned out to be "prove a wrong/missing key is rejected" or "use some
+//     known key that matches what I send" — none needed the SERVER's
+//     expected key to genuinely differ from every other block's, so there
+//     were no category-B (legitimately-different-server-key) exceptions.
+//
+// NOT yet fixed — don't assume this is solved:
 //   - DB-singleton isolation via __setDbForTesting() isn't applied
 //     consistently by every block yet (kriterium 3, a separate future
-//     slice).
-//   A block touching either resource must still follow the restore-in-
-//   finally discipline above by hand until those slices land.
+//     slice). A block touching it must still follow the restore-in-finally
+//     discipline above by hand until that slice lands.
+//   - A hazard the SAME SHAPE as kriterium 2 but in a DIFFERENT population
+//     of files: this file requires and invokes dozens of colocated
+//     src/**/*.test.ts helper suites (grep for `require(".*\.test")` in
+//     this file), several run concurrently with this file's own blocks via
+//     the runSerial() chain below, and ~71 of those files still mutate
+//     process.env.ADMIN_KEY / ANALYTICS_ADMIN_KEY with their own bespoke,
+//     per-file values (with their own restore-in-finally, but the same
+//     "await window sees a foreign value" hazard this comment describes).
+//     Fixing THAT population is out of scope for kriterium 2 as scoped
+//     (achievable purely inside tests/test.ts) — it would mean editing ~71
+//     other files. The mitigation applied here instead: every block in
+//     THIS file that makes a real async admin-gated HTTP/handler round trip
+//     re-asserts its canonical key value synchronously right before each
+//     dispatch (see the isolation-contract bullet above), which defends
+//     against that external population the same way it used to (accidentally)
+//     defend against this file's own, now-fixed, internal races.
 // ─────────────────────────────────────────────────────────────────────────
+
+// Canonical admin keys for the ENTIRE suite's process lifetime (kriterium 2
+// fix, see comment block above). Assigned ONCE, here, before any test block
+// runs. No code below this line may reassign process.env.ADMIN_KEY or
+// process.env.ANALYTICS_ADMIN_KEY again — every block that needs to
+// exercise an admin-gated route sends one of these two constants in its own
+// request's X-Admin-Key header instead.
+const SUITE_ADMIN_KEY = "suite-canonical-admin-key-20260730";
+const SUITE_ANALYTICS_ADMIN_KEY = "suite-canonical-analytics-admin-key-20260730";
+process.env.ADMIN_KEY = SUITE_ADMIN_KEY;
+process.env.ANALYTICS_ADMIN_KEY = SUITE_ANALYTICS_ADMIN_KEY;
 
 let passed = 0;
 let failed = 0;
@@ -4708,11 +4766,10 @@ function insertTestAgent(
 console.log("\n── rfb-samtaler-slice4: internal-traffic filter (is_internal) ──");
 {
   // ── (a) Pure classifier — the EXACT rules, incl. the deliberate NON-flags ──
-  const prevAdminKey = process.env.ADMIN_KEY;
-  const prevAnalyticsKey = process.env.ANALYTICS_ADMIN_KEY;
-  process.env.ADMIN_KEY = "slice4-secret-admin-key";
-  delete process.env.ANALYTICS_ADMIN_KEY;
-  try {
+  // Uses the suite-wide canonical admin key (never mutates process.env —
+  // see the SHARED GLOBAL STATE / kriterium 2 comment near the top of this
+  // file) as the "valid" key and an explicit wrong literal as the "invalid" one.
+  {
     // Own-only UA markers → internal
     assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "RFB-ContactVerifier/1.0" } })),
       "slice4-classify: RFB-ContactVerifier UA → internal");
@@ -4721,7 +4778,7 @@ console.log("\n── rfb-samtaler-slice4: internal-traffic filter (is_internal)
     assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "loop-dispatcher" } })),
       "slice4-classify: loop-dispatcher UA → internal");
     // Valid admin key → internal (must MATCH the secret, not merely be present)
-    assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "x-admin-key": "slice4-secret-admin-key" } })),
+    assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "x-admin-key": SUITE_ADMIN_KEY } })),
       "slice4-classify: valid X-Admin-Key → internal");
     assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: { "x-admin-key": "wrong-key" } })),
       "slice4-classify: WRONG X-Admin-Key → NOT internal (matches secret, not mere presence)");
@@ -4741,9 +4798,6 @@ console.log("\n── rfb-samtaler-slice4: internal-traffic filter (is_internal)
       "slice4-classify: real browser UA → NOT internal");
     assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: {} })),
       "slice4-classify: no signals → NOT internal (bias to external when unsure)");
-  } finally {
-    if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
-    if (prevAnalyticsKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsKey;
   }
 
   // ── (b)+(c) Write-time flag + public/admin counters (real service path) ──
@@ -6099,11 +6153,16 @@ const _pr24Promise = (async function runPr24Tests() {
     const port3 = typeof addr3 === "object" && addr3 ? addr3.port : 0;
 
     // Set an admin-key for the duration of these tests.
-    const PR24_KEY = "pr24-test-admin-key";
-    const prevAdminKey = process.env.ADMIN_KEY;
-    process.env.ADMIN_KEY = PR24_KEY;
+    // Suite-wide canonical admin key (never mutated — see kriterium 2 comment
+    // near the top of this file).
+    const PR24_KEY = SUITE_ADMIN_KEY;
 
     function pr24Req(method: string, urlPath: string, body?: any, key?: string): Promise<{ status: number; body: any }> {
+      // Re-assert against the residual, out-of-scope external hazard: sibling
+      // src/**/*.test.ts helper suites required elsewhere in this file still
+      // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
+      // 2 only covers this file's own blocks, which no longer touch it).
+      process.env.ADMIN_KEY = PR24_KEY;
       const payload = body ? JSON.stringify(body) : "";
       const headers: Record<string, string> = {};
       if (key !== undefined) headers["x-admin-key"] = key;
@@ -6963,9 +7022,8 @@ const _pr24Promise = (async function runPr24Tests() {
       }
 
     } finally {
-      // Restore admin-key + close server
-      if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
-      else process.env.ADMIN_KEY = prevAdminKey;
+      // Close server (admin key is the suite-wide canonical constant — no
+      // process.env mutation to restore).
       server3.close();
       pr24db.close();
     }
@@ -12939,16 +12997,22 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
       "INSERT INTO agent_knowledge (agent_id, verification_status, last_verified_at) VALUES (?, 'review_required', '2026-05-02T00:00:00Z')"
     ).run("umb-1");
 
-    process.env.ADMIN_KEY = "pr68-test-key";
+    // Admin key is the suite-wide canonical constant — no process.env
+    // mutation needed (kriterium 2).
     const vrqMod = require("../src/routes/admin-verifier-review-queue").default;
 
     function callRoute(query: Record<string, string>): Promise<{ status: number; body: any }> {
+      // Re-assert against the residual, out-of-scope external hazard: sibling
+      // src/**/*.test.ts helper suites required elsewhere in this file still
+      // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
+      // 2 only covers this file's own blocks, which no longer touch it).
+      process.env.ADMIN_KEY = SUITE_ADMIN_KEY;
       return new Promise((resolve) => {
         const req: any = {
           method: "GET",
           url: "/",
           query,
-          headers: { "x-admin-key": "pr68-test-key" },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY },
         };
         const res: any = {
           statusCode: 200,
@@ -12998,13 +13062,16 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
     const adminHanenMod = require("../src/routes/admin-hanen").default;
 
     function callHanenRoute(path: string, body: any): Promise<{ status: number; body: any }> {
+      // Re-assert against the residual, out-of-scope external hazard (see
+      // callRoute() above).
+      process.env.ADMIN_KEY = SUITE_ADMIN_KEY;
       return new Promise((resolve) => {
         const req: any = {
           method: "POST",
           url: path,
           query: {},
           body: body,
-          headers: { "x-admin-key": "pr68-test-key" },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY },
         };
         const res: any = {
           statusCode: 200,
@@ -13624,7 +13691,9 @@ const _pr74Promise = (async () => {
   // ── A2 + A3: combined check via real router ─────────────────────────
   // Inject in-memory DB and load the analytics router fresh, then mount
   // on a tiny Express app to call the actual route handler.
-  process.env.ANALYTICS_ADMIN_KEY = "test-key-pr74";
+  // Admin key is the suite-wide canonical ANALYTICS_ADMIN_KEY constant — no
+  // process.env mutation (kriterium 2; this site used to set it and never
+  // restore it, leaking a bespoke key for the rest of the process).
   const initMod = require("../src/database/init");
   initMod.__setDbForTesting(pr74db);
 
@@ -13646,13 +13715,20 @@ const _pr74Promise = (async () => {
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
   function call(urlPath: string): Promise<{ status: number; body: any }> {
+    // Re-assert against the residual, out-of-scope external hazard: sibling
+    // src/**/*.test.ts helper suites required elsewhere in this file still
+    // mutate process.env.ANALYTICS_ADMIN_KEY with their own bespoke values
+    // (kriterium 2 only covers this file's own blocks, which no longer
+    // touch it — this pr-74 block used to leak its own value forever with
+    // no restore at all, so this re-pin is a net-new hardening).
+    process.env.ANALYTICS_ADMIN_KEY = SUITE_ANALYTICS_ADMIN_KEY;
     return new Promise(resolve => {
       const req = httpMod.request({
         host: "127.0.0.1",
         port,
         path: urlPath,
         method: "GET",
-        headers: { "X-Admin-Key": "test-key-pr74" },
+        headers: { "X-Admin-Key": SUITE_ANALYTICS_ADMIN_KEY },
       }, (res: any) => {
         let buf = "";
         res.on("data", (c: any) => buf += c);
@@ -14138,10 +14214,8 @@ const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolv
   const initMod = require("../src/database/init");
   initMod.__setDbForTesting(pr86Db as any);
 
-  // Seed an admin key.
-  const PR86_ADMIN_KEY = "orch-pr-86-test-key";
-  const prevAdminKey = process.env.ADMIN_KEY;
-  process.env.ADMIN_KEY = PR86_ADMIN_KEY;
+  // Suite-wide canonical admin key (never mutated — kriterium 2).
+  const PR86_ADMIN_KEY = SUITE_ADMIN_KEY;
 
   // Seed two agents:
   //   AGENT_A — phone has 1 homepage garbage + 1 homepage real + 1 google_places
@@ -14201,8 +14275,13 @@ const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolv
     urlPath: string,
     opts: { headers?: Record<string, string>; body?: any } = {}
   ): Promise<{ status: number; body: any; rawBody: string }> {
-    // Re-assert ADMIN_KEY just before sending; other concurrent IIFEs in
-    // this test file mutate process.env.ADMIN_KEY without restoring it.
+    // PR86_ADMIN_KEY is the suite-wide canonical constant — no test block in
+    // THIS file mutates process.env.ADMIN_KEY anymore (kriterium 2). Some
+    // sibling src/**/*.test.ts helper suites required elsewhere in this file
+    // still mutate it with their own bespoke values (out of scope for this
+    // slice, same class of pre-existing hazard as the getDb() singleton /
+    // kriterium 3) — re-assert right before sending defends against that
+    // residual external race.
     process.env.ADMIN_KEY = PR86_ADMIN_KEY;
     return new Promise((resolve, reject) => {
       const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
@@ -14440,9 +14519,8 @@ const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolv
     );
   }
 
-  // Restore admin key env.
-  if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
-  else process.env.ADMIN_KEY = prevAdminKey;
+  // No admin-key env restore needed — PR86_ADMIN_KEY is the suite-wide
+  // canonical constant and was never mutated (kriterium 2).
 
   await new Promise<void>((resolve) => server.close(() => resolve()));
 })()
@@ -14719,9 +14797,8 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
   const initMod93 = require("../src/database/init");
   initMod93.__setDbForTesting(pr93Db as any);
 
-  const PR93_KEY = "orch-pr-93-test-key";
-  const prevAdminKey93 = process.env.ADMIN_KEY;
-  process.env.ADMIN_KEY = PR93_KEY;
+  // Suite-wide canonical admin key (never mutated — kriterium 2).
+  const PR93_KEY = SUITE_ADMIN_KEY;
 
   // Seed rows across the timestamp window.
   const NOW = Date.now();
@@ -14760,7 +14837,10 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
   const port93 = typeof addr93 === "object" && addr93 ? addr93.port : 0;
 
   function req93(urlPath: string, key?: string): Promise<{ status: number; body: any }> {
-    // Re-assert admin key in case a peer IIFE clobbered it.
+    // Re-assert against a residual, out-of-scope external hazard: sibling
+    // src/**/*.test.ts helper suites required elsewhere in this file still
+    // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
+    // 2 only covers THIS file's own blocks, which no longer touch it at all).
     process.env.ADMIN_KEY = PR93_KEY;
     const headers: Record<string, string> = {};
     if (key !== undefined) headers["x-admin-key"] = key;
@@ -14917,8 +14997,7 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
       assertEq(r.body.agents[0].umbrella_type, "venue", "pr93-14: umbrella_type=venue for the inactive venue row");
     }
   } finally {
-    if (prevAdminKey93 === undefined) delete process.env.ADMIN_KEY;
-    else process.env.ADMIN_KEY = prevAdminKey93;
+    // No admin-key env restore needed (kriterium 2 — see PR93_KEY above).
     server93.close();
     pr93Db.close();
   }
@@ -16296,7 +16375,6 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* upstream */ }
 
   const prevPathExp18 = process.env.EXPERIENCES_DB_PATH;
-  const prevAdminKey18 = process.env.ADMIN_KEY;
   let server18: import("http").Server | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
@@ -16374,15 +16452,16 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     const addr18 = server18.address();
     const port18 = typeof addr18 === "object" && addr18 ? addr18.port : 0;
 
-    const ADMIN_KEY_18 = "bulkload-test-admin-key-18";
-    process.env.ADMIN_KEY = ADMIN_KEY_18;
-
-    // NB: process.env.ADMIN_KEY is a shared global that OTHER concurrently-
-    // running async tests mutate at their own await points. To make THIS
-    // test's admin gate deterministic, pin the key SYNCHRONOUSLY at the top
-    // of every request's middleware chain — Express runs middlewares in-order
-    // with no yield, so requireAdmin (mounted just below) always reads our
-    // value, regardless of what another test set between our HTTP calls.
+    // Suite-wide canonical admin key (kriterium 2) — no OTHER block in THIS
+    // file mutates process.env.ADMIN_KEY anymore. Sibling src/**/*.test.ts
+    // helper suites required elsewhere in this file still do (their own
+    // bespoke values, out of scope for this slice — same class of residual
+    // hazard as the getDb() singleton/kriterium 3), so keep pinning the
+    // value SYNCHRONOUSLY at the top of every request's middleware chain —
+    // Express runs middlewares in-order with no yield, so requireAdmin
+    // (mounted just below) always reads our value regardless of what a
+    // sibling suite's own await gap set it to in between our HTTP calls.
+    const ADMIN_KEY_18 = SUITE_ADMIN_KEY;
     app18.use("/api/opplevelser/admin", (_req, _res, next) => {
       process.env.ADMIN_KEY = ADMIN_KEY_18;
       next();
@@ -16756,8 +16835,6 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     }
     if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
-    if (prevAdminKey18 === undefined) delete process.env.ADMIN_KEY;
-    else process.env.ADMIN_KEY = prevAdminKey18;
     _orchPr18BulkLoadResolve();
   }
 })();
@@ -16790,7 +16867,6 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
   try { await _orchPr18BulkLoadPromise; } catch { /* upstream */ }
 
   const prevPathDedup = process.env.EXPERIENCES_DB_PATH;
-  const prevAdminKeyDedup = process.env.ADMIN_KEY;
   let serverDedup: import("http").Server | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
@@ -16869,12 +16945,14 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     const addrDedup = serverDedup.address();
     const portDedup = typeof addrDedup === "object" && addrDedup ? addrDedup.port : 0;
 
-    const ADMIN_KEY_DEDUP = "dedup-backfill-test-admin-key";
-    process.env.ADMIN_KEY = ADMIN_KEY_DEDUP;
-
-    // NB: pin the admin key SYNCHRONOUSLY at the top of every request's
-    // middleware chain (see orch-pr-18's identical comment) so this test's
-    // admin gate stays deterministic against concurrently-running suites.
+    // Suite-wide canonical admin key (kriterium 2). Keep pinning it
+    // SYNCHRONOUSLY at the top of every request's middleware chain (see
+    // orch-pr-18's identical comment) — this no longer defends against
+    // other tests/test.ts blocks (none mutate the env anymore), but sibling
+    // src/**/*.test.ts helper suites required elsewhere in this file still
+    // do, with their own bespoke values (out of scope here, same class as
+    // the getDb()-singleton/kriterium 3 hazard).
+    const ADMIN_KEY_DEDUP = SUITE_ADMIN_KEY;
     appDedup.use("/api/opplevelser/admin", (_req, _res, next) => {
       process.env.ADMIN_KEY = ADMIN_KEY_DEDUP;
       next();
@@ -16968,8 +17046,6 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     }
     if (prevPathDedup === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathDedup;
-    if (prevAdminKeyDedup === undefined) delete process.env.ADMIN_KEY;
-    else process.env.ADMIN_KEY = prevAdminKeyDedup;
     _orchPrDedupBackfillEndpointResolve();
   }
 })();
@@ -17010,7 +17086,6 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
   try { await _orchPrDedupBackfillEndpointPromise; } catch { /* upstream */ }
 
   const prevPathTNB = process.env.EXPERIENCES_DB_PATH;
-  const prevAdminKeyTNB = process.env.ADMIN_KEY;
   const prevAnthropicKeyTNB = process.env.ANTHROPIC_API_KEY;
   let serverTNB: import("http").Server | null = null;
   try {
@@ -17057,11 +17132,12 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     const addrTNB = serverTNB.address();
     const portTNB = typeof addrTNB === "object" && addrTNB ? addrTNB.port : 0;
 
-    const ADMIN_KEY_TNB = "title-no-backfill-test-admin-key";
-    process.env.ADMIN_KEY = ADMIN_KEY_TNB;
-
-    // Pin the admin key SYNCHRONOUSLY at the top of every request's
-    // middleware chain (same reasoning as the dedup-backfill test above).
+    // Suite-wide canonical admin key (kriterium 2). Keep pinning it
+    // synchronously per request (same reasoning as orch-pr-18/dedup above)
+    // to defend against sibling src/**/*.test.ts helper suites, which still
+    // mutate process.env.ADMIN_KEY with their own bespoke values — out of
+    // scope for this slice.
+    const ADMIN_KEY_TNB = SUITE_ADMIN_KEY;
     appTNB.use("/api/opplevelser/admin", (_req, _res, next) => {
       process.env.ADMIN_KEY = ADMIN_KEY_TNB;
       next();
@@ -17293,8 +17369,6 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
     }
     if (prevPathTNB === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathTNB;
-    if (prevAdminKeyTNB === undefined) delete process.env.ADMIN_KEY;
-    else process.env.ADMIN_KEY = prevAdminKeyTNB;
     if (prevAnthropicKeyTNB === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = prevAnthropicKeyTNB;
     _titleNoBackfillResolve();
@@ -21144,11 +21218,11 @@ const _platformVerifierPromise = runSerial(async () => {
   // Exercise the route's gate directly (no HTTP server): build a fake req/res
   // and assert the handler refuses without a valid X-Admin-Key.
   {
-    const prevAdmin = process.env.ADMIN_KEY;
-    const prevAnalytics = process.env.ANALYTICS_ADMIN_KEY;
-    process.env.ADMIN_KEY = "secret-key";
-    delete process.env.ANALYTICS_ADMIN_KEY;
-    // Re-require the route module fresh so it reads the env we just set.
+    // This block only ever exercises the REJECTION paths (missing/empty/
+    // wrong key) — it never needs a correct-key case, so it doesn't touch
+    // process.env at all (kriterium 2): the suite-wide canonical ADMIN_KEY
+    // is already set and truthy, and none of "", missing, or "nope" will
+    // ever match it.
     const routePath = require.resolve("../src/routes/admin-run-platform-verifier");
     delete require.cache[routePath];
     const routerModule = require("../src/routes/admin-run-platform-verifier").default;
@@ -21187,9 +21261,6 @@ const _platformVerifierPromise = runSerial(async () => {
       assertEq(res.statusCode, 403, "pv-auth: wrong X-Admin-Key → 403 (rejected)");
     }
 
-    // restore env
-    if (prevAdmin === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdmin;
-    if (prevAnalytics === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalytics;
     delete require.cache[routePath];
   }
 });
@@ -22069,9 +22140,8 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
   const initMod = require("../src/database/init");
   initMod.__setDbForTesting(orchDb as any);
 
-  const ORCH_ADMIN_KEY = "orch-pr-20260614-3-test-key";
-  const prevAdminKey = process.env.ADMIN_KEY;
-  process.env.ADMIN_KEY = ORCH_ADMIN_KEY;
+  // Suite-wide canonical admin key (never mutated — kriterium 2).
+  const ORCH_ADMIN_KEY = SUITE_ADMIN_KEY;
 
   // ── Helper: seed a pool-eligible agent ───────────────────────────────────────
   function seedPoolAgent(id: string, email: string, name: string) {
@@ -22145,6 +22215,10 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
     urlPath: string,
     opts: { headers?: Record<string, string>; body?: any } = {}
   ): Promise<{ status: number; body: any }> {
+    // Re-assert against the residual, out-of-scope external hazard: sibling
+    // src/**/*.test.ts helper suites required elsewhere in this file still
+    // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
+    // 2 only covers this file's own blocks, which no longer touch it).
     process.env.ADMIN_KEY = ORCH_ADMIN_KEY;
     return new Promise((resolve, reject) => {
       const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
@@ -22532,8 +22606,6 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
 
   // Cleanup
   server3.close();
-  if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
-  else process.env.ADMIN_KEY = prevAdminKey;
 
   _orchPr20260614Resolve();
 })();
@@ -22602,9 +22674,8 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
   const initMod5 = require("../src/database/init");
   initMod5.__setDbForTesting(catDb as any);
 
-  const ADMIN_KEY_5 = "test-catalog-admin-key-phase0";
-  const prevAdminKey5 = process.env.ADMIN_KEY;
-  process.env.ADMIN_KEY = ADMIN_KEY_5;
+  // Suite-wide canonical admin key (never mutated — kriterium 2).
+  const ADMIN_KEY_5 = SUITE_ADMIN_KEY;
 
   // ── Seed data ────────────────────────────────────────────────────────────────
   // agent-verified: verified, no umbrella — should appear in feed
@@ -22662,6 +22733,11 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
     urlPath: string,
     opts: { headers?: Record<string, string>; body?: any } = {}
   ): Promise<{ status: number; body: any }> {
+    // Re-assert against the residual, out-of-scope external hazard: sibling
+    // src/**/*.test.ts helper suites required elsewhere in this file still
+    // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
+    // 2 only covers this file's own blocks, which no longer touch it).
+    process.env.ADMIN_KEY = ADMIN_KEY_5;
     return new Promise((resolve, reject) => {
       const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
       const headers: Record<string, string> = { "x-admin-key": ADMIN_KEY_5, ...(opts.headers || {}) };
@@ -22802,8 +22878,6 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
   }
 
   server5.close();
-  if (prevAdminKey5 === undefined) delete process.env.ADMIN_KEY;
-  else process.env.ADMIN_KEY = prevAdminKey5;
 
   _orchPr20260614_5Resolve();
 })();
@@ -22997,9 +23071,13 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
     "prod-oos", "ag-carrot", "Tomater", "tomater", 25.0, "out_of_stock"
   );
 
-  const ADMIN_KEY_6 = "test-cart-admin-key-phase1";
-  const prevAdminKey6 = process.env.ADMIN_KEY;
-  process.env.ADMIN_KEY = ADMIN_KEY_6;
+  // Suite-wide canonical admin key (never mutated — kriterium 2). This is
+  // the cart-56..cart-63 family: it used to reassign process.env.ADMIN_KEY
+  // to its own bespoke value with no re-assert/pin defense at all, so a
+  // concurrent block's mutation could land mid-await and flip these to a
+  // spurious 403. Referencing the never-mutated canonical constant instead
+  // removes the race entirely.
+  const ADMIN_KEY_6 = SUITE_ADMIN_KEY;
 
   // Build express app with cart routes
   const expressMod6 = await import("express");
@@ -23021,6 +23099,13 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
     urlPath: string,
     opts: { headers?: Record<string, string>; body?: any } = {}
   ): Promise<{ status: number; body: any }> {
+    // Re-assert against the residual, out-of-scope external hazard: sibling
+    // src/**/*.test.ts helper suites required elsewhere in this file still
+    // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
+    // 2 only covers this file's own blocks, which no longer touch it — this
+    // is the cart-56..cart-63 family, which had NO such defense at all
+    // before, so this re-pin is a net-new hardening, not a restore).
+    process.env.ADMIN_KEY = ADMIN_KEY_6;
     return new Promise((resolve, reject) => {
       const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
       const headers: Record<string, string> = { ...(opts.headers || {}) };
@@ -23318,8 +23403,6 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   __setCartTestDb(null);
   __setTrustEventTestDb(null);
   __setOrderNotifyTestDb(null);
-  if (prevAdminKey6 === undefined) delete process.env.ADMIN_KEY;
-  else process.env.ADMIN_KEY = prevAdminKey6;
 
   _orchPr20260614_6Resolve();
 })();
@@ -24623,9 +24706,8 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
     const addr4 = server4.address();
     const port4 = typeof addr4 === "object" && addr4 ? addr4.port : 0;
 
-    const PRUNE_KEY = "prune-test-admin-key-9";
-    const prevKey2 = process.env.ADMIN_KEY;
-    process.env.ADMIN_KEY = PRUNE_KEY;
+    // Suite-wide canonical admin key (never mutated — kriterium 2).
+    const PRUNE_KEY = SUITE_ADMIN_KEY;
 
     function pruneReq(
       method: string,
@@ -24633,6 +24715,11 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
       body?: Record<string, unknown>,
       key?: string
     ): Promise<{ status: number; body: unknown }> {
+      // Re-assert against the residual, out-of-scope external hazard: sibling
+      // src/**/*.test.ts helper suites required elsewhere in this file still
+      // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
+      // 2 only covers this file's own blocks, which no longer touch it).
+      process.env.ADMIN_KEY = PRUNE_KEY;
       const payload = body ? JSON.stringify(body) : "";
       const headers: Record<string, string> = {};
       if (key !== undefined) headers["x-admin-key"] = key;
@@ -24772,7 +24859,6 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
       assertEq(b.offset, 0, "prune-10: response echoes offset=0");
     }
 
-    process.env.ADMIN_KEY = prevKey2;
     await new Promise<void>((resolve) => server4.close(() => resolve()));
   } catch (err) {
     failed++;
@@ -27441,7 +27527,6 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
   try { await _orchPrDedupBackfillEndpointPromise; } catch { /* upstream */ }
 
   const prevPathGCR = process.env.EXPERIENCES_DB_PATH;
-  const prevAdminKeyGCR = process.env.ADMIN_KEY;
   let serverGCR: import("http").Server | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
@@ -27494,8 +27579,12 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     const addrGCR = serverGCR.address();
     const portGCR = typeof addrGCR === "object" && addrGCR ? addrGCR.port : 0;
 
-    const ADMIN_KEY_GCR = "gardssalg-content-refresh-test-admin-key";
-    process.env.ADMIN_KEY = ADMIN_KEY_GCR;
+    // Suite-wide canonical admin key (kriterium 2). Keep pinning it
+    // synchronously per request (same reasoning as orch-pr-18/dedup/TNB
+    // above) to defend against sibling src/**/*.test.ts helper suites,
+    // which still mutate process.env.ADMIN_KEY with their own bespoke
+    // values — out of scope for this slice.
+    const ADMIN_KEY_GCR = SUITE_ADMIN_KEY;
     appGCR.use("/api/opplevelser/admin", (_req, _res, next) => {
       process.env.ADMIN_KEY = ADMIN_KEY_GCR;
       next();
@@ -27630,8 +27719,6 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     }
     if (prevPathGCR === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathGCR;
-    if (prevAdminKeyGCR === undefined) delete process.env.ADMIN_KEY;
-    else process.env.ADMIN_KEY = prevAdminKeyGCR;
     console.log("  gardssalg-content-refresh: OK (auth-gate, lock-check-before-fetch, apply-vs-dry-run attempt stamping, providerIds override, auto-select exclusion)");
     _gardssalgContentRefreshResolve();
   }
@@ -27644,8 +27731,10 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
 // This block uses its own in-memory DB + own express app/HTTP server on an
 // ephemeral port, but — like many other blocks in this file — it DOES pin
 // the shared getDb() singleton (via __setDbForTesting) for the duration of
-// its HTTP requests, and it shares process.env.ANALYTICS_ADMIN_KEY with
-// every other block that exercises analytics.ts admin routes.
+// its HTTP requests. (It used to also share process.env.ANALYTICS_ADMIN_KEY
+// mutation hazards with every other block that exercises analytics.ts admin
+// routes — that's fixed now, kriterium 2: ANALYTICS_ADMIN_KEY is a suite-wide
+// canonical constant no block reassigns.)
 //
 // 2026-07-05 CI fix (3rd attempt — see git history for the two superseded
 // ones): this block used to be a bare fire-and-forget top-level IIFE, NOT
@@ -28452,9 +28541,13 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     const initMod = require("../src/database/init");
     const analyticsMod = await import("../src/routes/analytics");
 
-    const ADMIN_KEY = "tpa-test-admin-key-20260704";
-    const prevAnalyticsKey = process.env.ANALYTICS_ADMIN_KEY;
-    process.env.ANALYTICS_ADMIN_KEY = ADMIN_KEY;
+    // Suite-wide canonical ANALYTICS_ADMIN_KEY (never mutated — kriterium 2).
+    // This block used to invent its own value and set it directly, which is
+    // exactly the pr-74 leak the comment on req() below used to warn about
+    // (pr-74, far earlier in this file, used to set ANALYTICS_ADMIN_KEY and
+    // never restore it) — that leak is now impossible because pr-74 no
+    // longer touches process.env at all.
+    const ADMIN_KEY = SUITE_ANALYTICS_ADMIN_KEY;
 
     const tpaDb = new sqlite(":memory:");
     initMod.__setDbForTesting(tpaDb as any);
@@ -28565,11 +28658,17 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     // req() wraps rawReq() with a defensive retry-on-{401,500}. This suite
     // runs dozens of independent test blocks as CONCURRENT top-level async
     // IIFEs sharing one Node process and one getDb() singleton:
-    //  - At least one other block (pr-74, far earlier in this file) does
-    //    `process.env.ANALYTICS_ADMIN_KEY = "..."` WITHOUT ever restoring
-    //    it, so if that write interleaves after ours, requireAdminAuth
-    //    starts rejecting our X-Admin-Key with 401 for the rest of the
-    //    process even though nothing is wrong with the feature under test.
+    //  - ANALYTICS_ADMIN_KEY used to be a shared-mutation hazard among THIS
+    //    file's own blocks too (pr-74, far earlier in this file, used to set
+    //    it directly and never restore it) — that specific hazard is fixed
+    //    (kriterium 2): ANALYTICS_ADMIN_KEY is the suite-wide canonical
+    //    constant, assigned exactly once for this file's own blocks, and
+    //    pr-74 no longer reassigns it. It is, however, still mutated by
+    //    sibling src/**/*.test.ts helper suites required elsewhere in this
+    //    file (their own bespoke values) — out of scope for this slice, same
+    //    class of residual hazard as the getDb()-singleton one below — so
+    //    re-pinning it every attempt is kept as real, still-needed defense,
+    //    not just cheap insurance.
     //  - Many blocks (including this one) call __setDbForTesting() to pin
     //    the shared getDb() singleton to their own in-memory DB for the
     //    duration of their requests; a fresh HTTP request (unlike our
@@ -28577,11 +28676,10 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     //    reference once via a local `const db = getDb()` and is therefore
     //    immune) calls getDb() anew on each call, so if another block's
     //    __setDbForTesting() write interleaves between our requests, ours
-    //    can transiently hit a DB with no `tasks` table → 500.
-    // Both are pre-existing test-suite-wide hazards around shared mutable
-    // module state, unrelated to the tasks-prune/vacuum behavior this block
-    // actually verifies — re-pinning both globals and retrying is the
-    // correct fix here, not a change to analytics.ts.
+    //    can transiently hit a DB with no `tasks` table → 500. This part is
+    //    the still-unfixed DB-singleton hazard (kriterium 3, out of scope
+    //    for the ADMIN_KEY slice) — re-pinning and retrying remains the
+    //    correct mitigation here, not a change to analytics.ts.
     async function req(
       method: string,
       urlPath: string,
@@ -28737,8 +28835,6 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     assertEq(notFound.status, 404, `${TAG}: GET /ops/jobs/:jobId with unknown id returns 404`);
 
     server.close();
-    if (prevAnalyticsKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
-    else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsKey;
     initMod.__setDbForTesting(null as any);
     console.log(`  ${TAG}: OK (202-not-blocking, 409 concurrency lock cross-endpoint, chunked yielding under concurrent load, correct final counts, filter idempotency, dry-run #137 shape unchanged, 404 on unknown job)`);
   } catch (err) {
@@ -29382,13 +29478,14 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     const prevDbRfb = initModRfb.getDb();
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
-    const prevAdminKeyRfb = process.env.ADMIN_KEY;
-    const prevAnalyticsAdminKeyRfb = process.env.ANALYTICS_ADMIN_KEY;
     try {
       initModRfb.__setDbForTesting(db);
       initModRfb.__initSchemaForTesting(db);
-      process.env.ADMIN_KEY = "rfb-test-admin-key";
-      delete process.env.ANALYTICS_ADMIN_KEY;
+      // Suite-wide canonical admin key (never mutated — kriterium 2). This
+      // block calls the route handler directly/synchronously (no await
+      // between here and the handler() calls below), so it was already
+      // immune to cross-block interleaving, but references the canonical
+      // constant anyway for consistency with the rest of the file.
 
       db.prepare(`
         INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active)
@@ -29429,7 +29526,7 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
       {
         const res = fakeRes();
         handler({
-          headers: { "x-admin-key": "rfb-test-admin-key" },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY },
           body: { agent_id: "producer-f-1", umbrella_id: DEBIO_ID_RFB, source_type: "inferred", evidence },
         } as any, res);
         assertTrue(res.statusCode >= 400 && res.statusCode < 500,
@@ -29442,7 +29539,7 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
       {
         const res = fakeRes();
         handler({
-          headers: { "x-admin-key": "rfb-test-admin-key" },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY },
           body: { agent_id: "producer-f-1", umbrella_id: "hanen-control-f", source_type: "inferred", evidence },
         } as any, res);
         assertEq(res.statusCode, 201, "rfb-autotag-guard: auto-create against an ACTIVE umbrella still succeeds (guard doesn't break normal path)");
@@ -29456,8 +29553,6 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
       failures.push(`rfb-autotag-guard: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
     } finally {
       initModRfb.__setDbForTesting(prevDbRfb);
-      if (prevAdminKeyRfb === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKeyRfb;
-      if (prevAnalyticsAdminKeyRfb === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKeyRfb;
       db.close();
     }
   }
