@@ -30435,6 +30435,25 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("opplevelser-admin-providers-hjemmeside: unexpected error: " + String(err?.message || err));
   }
 
+  // dev-request 2026-07-30-experience-providers-enumerate: GET
+  // .../providers/all — full-catalog enumeration (incl. rows with no
+  // hjemmeside at all) for the persistent, git-committed blacklist ledger.
+  // Same isolated experiences db-factory handle as the block immediately
+  // above — safe to run in this same sequential slot.
+  console.log("\n── dev-request 2026-07-30: GET admin/providers/all (experiences) ──");
+  try {
+    const { runOpplevelserAdminProvidersAllTests } = require("../src/routes/opplevelser-admin-providers-all.test") as
+      typeof import("../src/routes/opplevelser-admin-providers-all.test");
+    const apa = await runOpplevelserAdminProvidersAllTests({ log: false });
+    passed += apa.passed;
+    failed += apa.failed;
+    for (const f of apa.failures) failures.push("opplevelser-admin-providers-all: " + f);
+    console.log(`  opplevelser-admin-providers-all: ${apa.passed} passed, ${apa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-admin-providers-all: unexpected error: " + String(err?.message || err));
+  }
+
   // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
   // Daniel's 2026-07-19 decision, step 1: POST /admin/hjemmeside-cleanup-sweep
   // — classify + move aggregator/DMO hjemmeside values into the new

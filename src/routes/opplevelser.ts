@@ -6226,6 +6226,78 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
   }
 });
 
+// ─── GET /api/opplevelser/admin/providers/all ────────────────────────────────
+//
+// dev-request 2026-07-30-experience-providers-enumerate: the routine's
+// persistent, git-committed blacklist ledger needs to be able to enumerate
+// EVERY row in experience_providers — including rows with no hjemmeside at
+// all. by-hjemmeside above cannot do this: it requires a non-blank `pattern`
+// and only ever matches rows with a (non-null) hjemmeside. This route is a
+// plain, paginated, unfiltered (aside from catalog_hidden below) SELECT over
+// the whole table, ordered by id so repeated calls with increasing `offset`
+// walk the table deterministically (navn is not unique and can tie, so it
+// cannot be used as the sole ORDER BY for stable pagination).
+//
+// Excludes catalog_hidden=1 rows — same "(catalog_hidden IS NULL OR
+// catalog_hidden != 1)" clause services/experience-store.ts already uses for
+// catalog-wide reads (see e.g. listGardssalgProviders/countGardssalgProviders).
+// The booking-flyt-v1 synthetic test provider (≈ line 5282 above) is seeded
+// with catalog_hidden=1 specifically so it never appears in the public
+// catalog; it must likewise never end up in a full-catalog enumeration that
+// backs a persistent blacklist ledger.
+//
+// Read-only — a single SELECT plus a COUNT(*) with the identical WHERE
+// clause (so `total` reflects the same catalog_hidden-excluded population as
+// the page itself, letting a caller detect `offset + count >= total`).
+// Response is deliberately minimal — id/navn/hjemmeside/vertical only, same
+// privacy-minimization pattern as by-hjemmeside just above (no epost/
+// telefon/adresse).
+const PROVIDERS_ALL_DEFAULT_LIMIT = 200;
+const PROVIDERS_ALL_MAX_LIMIT = 1000;
+const PROVIDERS_ALL_WHERE = "WHERE (catalog_hidden IS NULL OR catalog_hidden != 1)";
+router.get("/admin/providers/all", requireAdmin, (req: Request, res: Response) => {
+  let limit = parseInt((req.query.limit as string) || "", 10);
+  if (!Number.isFinite(limit)) limit = PROVIDERS_ALL_DEFAULT_LIMIT;
+  limit = Math.min(PROVIDERS_ALL_MAX_LIMIT, Math.max(1, limit));
+
+  let offset = parseInt((req.query.offset as string) || "", 10);
+  if (!Number.isFinite(offset) || offset < 0) offset = 0;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const providers = expDb
+      .prepare(
+        `SELECT id, navn, hjemmeside, vertical
+           FROM experience_providers
+          ${PROVIDERS_ALL_WHERE}
+          ORDER BY id ASC
+          LIMIT ? OFFSET ?`
+      )
+      .all(limit, offset) as Array<{
+        id: string;
+        navn: string;
+        hjemmeside: string | null;
+        vertical: string;
+      }>;
+
+    const totalRow = expDb
+      .prepare(`SELECT COUNT(*) AS total FROM experience_providers ${PROVIDERS_ALL_WHERE}`)
+      .get() as { total: number };
+
+    res.json({
+      success: true,
+      count: providers.length,
+      total: totalRow.total,
+      offset,
+      limit,
+      providers,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/providers/all failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // Very light "does this look like a URL" sanity check — deliberately NOT a
 // strict domain/TLD validator (the dev-request explicitly says not to
 // overengineer this: this route corrects known-bad values like a leaked
