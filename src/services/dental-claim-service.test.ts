@@ -185,20 +185,61 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
       "item2a-01: excludeParkedExtraction=true adds the 30d backoff exclusion clause"
     );
   }
+  // ── slice3-01..05: default flipped to ON (dev-request 2026-07-29-blacklist-
+  // backfill-og-berikelsestriage, slice 3, 2026-07-30) -- measured against six
+  // consecutive daily reports that the completion-mode claim call (the only
+  // mode running every day) never set excludeParkedExtraction, so clinics
+  // parked by 3 consecutive extraction failures (e.g. "Jasleen Kaur Kainth" /
+  // Sunntannhelse.no, re-flagged 5 separate days; "Spongdal Tannklinikk" and
+  // "Leksvik Tannklinikk", explicitly logged as their 8th/6th attempt) kept
+  // recirculating through the pool indefinitely. ─────────────────────────────
   {
-    // default/omitted is a strict no-op
+    // omitted is now APPLIED (default-on) -- was a no-op pre-slice-3.
     const filterOmitted: ClaimFilter = { enrichment_state: "raw", has_hjemmeside: true };
     const { clause: clauseOmitted } = buildWhereClause(filterOmitted, NOW);
     assertTrue(
-      !norm(clauseOmitted).includes("extraction_unreachable_since"),
-      "item2a-02: omitted excludeParkedExtraction is a no-op (no extraction_unreachable_since clause)"
+      norm(clauseOmitted).includes(
+        "(extraction_unreachable_since IS NULL OR extraction_unreachable_since <= datetime('now','-30 days'))"
+      ),
+      "slice3-01: omitted excludeParkedExtraction now applies the 30d backoff exclusion by default"
     );
-
+  }
+  {
+    // explicit false remains a no-op (opt-out escape hatch preserved).
     const filterFalse: ClaimFilter = { excludeParkedExtraction: false };
     const { clause: clauseFalse } = buildWhereClause(filterFalse, NOW);
     assertTrue(
       !norm(clauseFalse).includes("extraction_unreachable_since"),
-      "item2a-03: excludeParkedExtraction=false is a no-op (regression pin)"
+      "slice3-02: excludeParkedExtraction=false remains a no-op (opt-out escape hatch)"
+    );
+  }
+  {
+    // env rollback flag disables the default-on behavior globally.
+    const prev = process.env.DENTAL_EXTRACTION_PARKING_DISABLED;
+    process.env.DENTAL_EXTRACTION_PARKING_DISABLED = "true";
+    try {
+      const { clause } = buildWhereClause({}, NOW);
+      assertTrue(
+        !norm(clause).includes("extraction_unreachable_since"),
+        "slice3-03: DENTAL_EXTRACTION_PARKING_DISABLED=true reverts to no exclusion, even with the filter omitted"
+      );
+      const { clause: clauseExplicitTrue } = buildWhereClause({ excludeParkedExtraction: true }, NOW);
+      assertTrue(
+        !norm(clauseExplicitTrue).includes("extraction_unreachable_since"),
+        "slice3-04: env rollback flag wins even when the caller explicitly requests excludeParkedExtraction:true"
+      );
+    } finally {
+      if (prev === undefined) delete process.env.DENTAL_EXTRACTION_PARKING_DISABLED;
+      else process.env.DENTAL_EXTRACTION_PARKING_DISABLED = prev;
+    }
+  }
+  {
+    // explicit true is unchanged (still applies, same as pre-slice-3).
+    const filter: ClaimFilter = { excludeParkedExtraction: true };
+    const { clause } = buildWhereClause(filter, NOW);
+    assertTrue(
+      norm(clause).includes("extraction_unreachable_since"),
+      "slice3-05: excludeParkedExtraction=true still applies the clause (regression pin, unchanged)"
     );
   }
   {

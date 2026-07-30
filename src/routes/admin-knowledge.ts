@@ -106,7 +106,7 @@ import {
   mapToPlatformCategories,
   meetsAboutQualityBar,
 } from "../services/search-enrich";
-import { fetchPage, discoverContentLinks, type FetchPageResult } from "../services/fetch-page";
+import { fetchPage, discoverContentLinks, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
 
 const router = Router();
 
@@ -1159,7 +1159,7 @@ async function hcrFetchHtml(url: string): Promise<string | null> {
  */
 type HcrFetchOutcome =
   | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
-  | { ok: false; reason: string; persistence: string; status: number | null };
+  | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
 async function hcrFetchHomepageContent(homepageUrl: string): Promise<HcrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
@@ -1259,6 +1259,29 @@ homepageContentRefreshRouter.post(
       // about/products, whose CONTENT provenance does NOT yet carry a
       // website_homepage source for about/products/description/categories — i.e.
       // their content is still google-sourced (the potentially-wrong ones).
+      //
+      // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3
+      // (rfb measurement, 2026-07-30): this auto-select had NO awareness of
+      // homepage_unreachable_since/homepage_fetch_attempts — the exact
+      // 3-strikes/30-day "dead-cohort parking" mechanism already live for its
+      // sibling selector (POST /admin/homepage-provenance-batch, marketplace.ts)
+      // on the SAME agent_knowledge columns. Measured against six consecutive
+      // daily enrichment reports (2026-07-25..07-30): this endpoint's own
+      // ORDER BY k.updated_at ASC never advances on a failed fetch, so the
+      // SAME handful of permanently-dead domains (rekoringen.no conn_refused,
+      // hjortehagen.no http_401, trondheimkooperativ.no tls_error,
+      // sorligard.no dns_not_found [a DNS failure classified "permanent"],
+      // sikje.no tls_error) occupied the front of the default limit=25 queue
+      // EVERY single day, so only 1-2 of the 25 selected candidates ever had
+      // a fetchable homepage (~4-8% hit rate) while genuinely enrichable
+      // candidates queued behind them and were never reached. Applying the
+      // SAME exclusion clause used by homepage-provenance-batch closes this —
+      // env HOMEPAGE_PARKING_DISABLED="true" is the shared rollback flag (read
+      // at request time, same idiom as marketplace.ts).
+      const parkingDisabled = process.env.HOMEPAGE_PARKING_DISABLED === "true";
+      const parkingExclusion = parkingDisabled
+        ? ""
+        : `AND (k.homepage_unreachable_since IS NULL OR k.homepage_unreachable_since <= datetime('now','-30 days'))`;
       const rows = db
         .prepare(
           `SELECT a.id AS agent_id, a.name AS name,
@@ -1279,6 +1302,7 @@ homepageContentRefreshRouter.post(
                  OR k.field_provenance = '{}'
                  OR k.field_provenance NOT LIKE '%"website_homepage"%'
                   )
+              ${parkingExclusion}
             ORDER BY k.updated_at ASC
             LIMIT ?`,
         )
@@ -1297,6 +1321,65 @@ homepageContentRefreshRouter.post(
     // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).
     const HCR_CONCURRENCY = 3;
 
+    // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3:
+    // this route previously never touched homepage_fetch_attempts /
+    // homepage_unreachable_since at all — a fetch failure here left no trace,
+    // so the SAME dead domain kept being re-selected forever (see the
+    // auto-select comment above for the measured evidence). Strike/park logic
+    // mirrors marketplace.ts's recordHomepageFetchFailure (3-strikes/30-day,
+    // re-stamped on an expired-then-failed-again retry), EXCEPT this route
+    // uses the already-classified `persistence` from services/fetch-page.ts
+    // (which marketplace.ts's own pre-fetchPage-era code does not) to decide
+    // whether a failure should strike at all: per fetch-page.ts's own
+    // documented contract, `transient` failures (timeout/5xx/429/conn_reset/
+    // conn_refused/tls_error — a cert or port blip routinely self-heals)
+    // MUST NOT count a strike, only `permanent` (dns_not_found/404/410) and
+    // `blocked` (401/403/empty_body — retrying is pointless, same answer
+    // every time) do. This is a deliberate, already-established platform
+    // decision (not invented here): "mis-parking a real producer for 30 days
+    // costs us far more than one wasted re-fetch." Concretely, of the six
+    // recurring dead domains in the measured reports, only hjortehagen.no
+    // (http_401 -> blocked) and sorligard.no (dns_not_found -> permanent)
+    // will actually park under this rule; rekoringen.no/trondheimkooperativ.no/
+    // sikje.no/fiskesalg.no are all `transient`-classified and will keep being
+    // retried indefinitely BY DESIGN. Bookkeeping itself is gated on !dryRun,
+    // same as every other write in this route — a preview call must never
+    // mutate state, which keeps behavior unchanged for the write-paused rfb
+    // read-only-mode runs (they only ever call this route without apply=1).
+    const HCR_PARK_AFTER_ATTEMPTS = 3;
+    const HCR_PARK_BACKOFF_MS = 30 * 86_400_000;
+    const parkedNow: string[] = [];
+
+    function recordHcrFetchFailure(agentId: string, persistence: FetchPersistence): void {
+      if (persistence === "transient") return; // never strike on a momentary blip
+      db.prepare(
+        "UPDATE agent_knowledge SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE agent_id = ?",
+      ).run(agentId);
+      const row = db
+        .prepare(
+          "SELECT homepage_fetch_attempts, homepage_unreachable_since FROM agent_knowledge WHERE agent_id = ?",
+        )
+        .get(agentId) as
+        | { homepage_fetch_attempts: number; homepage_unreachable_since: string | null }
+        | undefined;
+      if (row && row.homepage_fetch_attempts >= HCR_PARK_AFTER_ATTEMPTS) {
+        const since = row.homepage_unreachable_since;
+        const expired = since !== null && Date.parse(since) <= Date.now() - HCR_PARK_BACKOFF_MS;
+        if (!since || expired) {
+          db.prepare(
+            "UPDATE agent_knowledge SET homepage_unreachable_since = ? WHERE agent_id = ?",
+          ).run(new Date().toISOString(), agentId);
+          parkedNow.push(agentId);
+        }
+      }
+    }
+
+    function recordHcrFetchSuccess(agentId: string): void {
+      db.prepare(
+        "UPDATE agent_knowledge SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE agent_id = ?",
+      ).run(agentId);
+    }
+
     async function processOne(t: HcrTargetRow): Promise<void> {
       const agentId = t.agent_id;
       if (!t.homepage_url) {
@@ -1309,6 +1392,13 @@ homepageContentRefreshRouter.post(
       try {
         fetched = await hcrFetchHomepageContent(t.homepage_url);
       } catch (e: any) {
+        // Genuinely unexpected exception (not a classified fetch failure —
+        // hcrFetchHomepageContent already catches its own network/parse
+        // errors and returns them as `{ok:false, reason, persistence}`
+        // instead of throwing). No persistence classification is available
+        // here, so this does NOT touch the parking counters — an unexpected
+        // code fault says nothing about whether the homepage itself is
+        // reachable, and striking on it could wrongly park a live site.
         errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
         return;
       }
@@ -1319,12 +1409,14 @@ homepageContentRefreshRouter.post(
         // uncooperative right now ("transient") — the distinction that decides
         // whether parking the producer would be correct or would strand a live
         // one for 30 days.
+        if (!dryRun) recordHcrFetchFailure(agentId, fetched.persistence);
         errors.push({
           agent_id: agentId,
           error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.homepage_url}`,
         });
         return;
       }
+      if (!dryRun) recordHcrFetchSuccess(agentId);
       const { primaryHtml, combinedHtml, fetchUrl } = fetched;
 
       // Run the PR-22 extractors on the fetched HTML.
@@ -1527,6 +1619,7 @@ homepageContentRefreshRouter.post(
       changed,
       skipped_curated: skippedCurated,
       errors,
+      parked_now: parkedNow,
     });
   },
 );
