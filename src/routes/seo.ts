@@ -3197,7 +3197,17 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
         <h1 style="font-size:1.6rem;margin-bottom:12px;">${lang === "en" ? "Unknown category" : "Ukjent kategori"} “${escapeHtml(slug)}”</h1>
         <p><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "See all sales channels" : "Se alle salgskanaler"}</a></p>
       </div>`,
-      { robots: "noindex, follow", lang },
+      {
+        robots: "noindex, follow",
+        lang,
+        // dev-request 2026-07-28-rfb-404-indexerbar-og-sitemap-duplikater: self-canonical,
+        // not the shell() BASE_URL default — a 404 must never claim the homepage as its
+        // canonical URL. encodeURIComponent: `slug` is unvalidated req.params input and
+        // shell() interpolates canonicalUrl into the <link> href with NO HTML-attribute
+        // escaping (seo.ts's own `canonicalUrl` usage) — round-1 independent review
+        // (fresh context) caught a reflected-XSS sink here before this shipped.
+        canonical: BASE_URL + localizedPath("/kategori/" + encodeURIComponent(slug), lang),
+      },
     ));
   }
 
@@ -3307,7 +3317,18 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
         `<div class="sec" style="text-align:center;padding:80px 24px;">
           <h1 style="font-size:1.8rem;margin-bottom:12px;">Fant ingen produsenter for \u201c${escapeHtml(citySlug)}\u201d</h1>
           <p style="color:var(--g500);"><a href="/">Tilbake til forsiden</a></p>
-        </div>`
+        </div>`,
+        {
+          robots: "noindex, follow",
+          lang,
+          // dev-request 2026-07-28-rfb-404-indexerbar-og-sitemap-duplikater: self-canonical,
+          // not the shell() BASE_URL default — a 404 must never claim the homepage as its
+          // canonical URL. encodeURIComponent: `citySlug` is unvalidated req.params input
+          // and shell() interpolates canonicalUrl into the <link> href with NO
+          // HTML-attribute escaping — round-1 independent review (fresh context) caught a
+          // reflected-XSS sink here before this shipped.
+          canonical: BASE_URL + localizedPath("/" + encodeURIComponent(citySlug), lang),
+        }
       ));
     }
 
@@ -4119,7 +4140,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         {
           extraCss: `.city-pill{display:inline-block;padding:10px 18px;background:var(--g100);color:var(--g700);border-radius:999px;font-weight:500;text-decoration:none;transition:all .15s;}.city-pill:hover{background:var(--green);color:#fff;}`,
           lang,
-          pathForAlternate: "/produsent/" + slug,
+          // encodeURIComponent (2026-07-30): `slug` is unvalidated req.params input reaching
+          // this 404 branch WITHOUT having matched any real record — unlike every other
+          // pathForAlternate call site in this file (all in success branches where the slug
+          // already matched a real, pre-sanitized DB row). shell() interpolates
+          // pathForAlternate into hreflang <link> tags with no HTML-attribute escaping, so an
+          // unencoded slug here is a reflected-XSS sink (round-1 independent review, fresh
+          // context, caught this — same class as the `canonical` field below).
+          pathForAlternate: "/produsent/" + encodeURIComponent(slug),
+          robots: "noindex, follow",
+          // dev-request 2026-07-28-rfb-404-indexerbar-og-sitemap-duplikater: self-canonical,
+          // not the shell() BASE_URL default — a 404 must never claim the homepage as its
+          // canonical URL. encodeURIComponent: same reflected-XSS sink as pathForAlternate
+          // above.
+          canonical: BASE_URL + localizedPath("/produsent/" + encodeURIComponent(slug), lang),
         }
       ));
     }
