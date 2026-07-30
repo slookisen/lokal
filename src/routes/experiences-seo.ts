@@ -80,6 +80,11 @@ import {
   // doc in experience-store.ts for the exact publish/coords predicate.
   listPublishedExperienceMapPoints,
   type ExperienceMapPoint,
+  // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4:
+  // the /kategori/gardssalg map's marker data (producers, not experiences —
+  // see listGardssalgProviderMapPoints()'s doc in experience-store.ts).
+  listGardssalgProviderMapPoints,
+  type GardssalgProviderMapPoint,
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
 import { geocodingService } from "../services/geocoding-service";
@@ -2783,6 +2788,176 @@ function drinkBadge(producerType: string | null): string {
     background:${entry.color}1a;color:${entry.color};border:1px solid ${entry.color}44">${entry.label}</span>`;
 }
 
+// dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4:
+// the /kategori/gardssalg Leaflet map. Reuses the fylke map's self-hosted
+// Leaflet routes (/leaflet/*, untouched), tile source (same OSM XYZ tiles),
+// and FYLKE_MAP_CSS verbatim (its class names — .map-section/.fylke-map/
+// .map-popup/etc — are already generic, not fylke-specific, so it's included
+// as-is below rather than copied). The init script/marker JSON shape below
+// is a SEPARATE, parallel copy of FYLKE_MAP_INIT_JS/renderFylkeMapSection
+// rather than a shared refactor of them — this dev-request's own
+// instructions are to leave /fylke/:fylke's code path untouched, and that
+// code is already pinned by its own tests (kart-01..11), so generalizing it
+// would mean editing reviewed, test-pinned code for a marginal DRY win. The
+// genuinely expensive-to-duplicate parts (CSS, tile source, self-hosted
+// Leaflet asset routes) ARE reused as-is; only the small
+// marker-shape/init-script glue is duplicated.
+type GardssalgMapMarker = {
+  slug: string;
+  navn: string;
+  producerTypeLabel: string | null;
+  sted: string | null;
+  lat: number;
+  lon: number;
+  approx: boolean;
+};
+
+// geocode_confidence → marker precision. 'high'/'medium'/'low' are Step A's
+// real address-level Kartverket geocodes (experiences-geocode-worker.ts) —
+// rendered as a normal/exact marker, same as geo_precision==='address' on
+// the fylke map. Everything else — 'approximate' (Step D's kommune/fylke-
+// centroid fallback), 'no_match' (excluded upstream by
+// listGardssalgProviderMapPoints()'s lat/lon predicate — never reaches
+// here), null, or any future/unrecognized value — defaults to the SAME
+// dashed/approx marker + "Ca. posisjon (kommune)" popup note the fylke map
+// uses for geo_precision==='kommune', and the SAME
+// geocode_confidence==='approximate' check the produsent-profil map block
+// already uses (~line 2984) — three independent surfaces reading this one
+// column the same honest way. The inverted "default to approximate unless
+// provably exact" direction is deliberate: an unrecognized confidence tag
+// must never silently render as an exact address.
+function isApproxGardssalgConfidence(confidence: string | null): boolean {
+  return confidence !== "high" && confidence !== "medium" && confidence !== "low";
+}
+
+const GARDSSALG_MAP_INIT_JS = `(function () {
+  var mapEl = document.getElementById('gardssalg-map');
+  var dataEl = document.getElementById('gardssalg-map-data');
+  if (!mapEl || !dataEl) return;
+  var points = [];
+  try { points = JSON.parse(dataEl.textContent || '[]'); } catch (e) { points = []; }
+  if (!points.length) return;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  var leafletLoading = null;
+  function loadLeaflet() {
+    if (leafletLoading) return leafletLoading;
+    leafletLoading = new Promise(function (resolve, reject) {
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = '/leaflet/leaflet.css';
+      document.head.appendChild(link);
+      var script = document.createElement('script');
+      script.src = '/leaflet/leaflet.js';
+      script.addEventListener('load', function () { resolve(); });
+      script.addEventListener('error', function () { reject(new Error('leaflet-load-failed')); });
+      document.body.appendChild(script);
+    });
+    return leafletLoading;
+  }
+
+  function initMap() {
+    loadLeaflet().then(function () {
+      if (typeof L === 'undefined') return;
+      mapEl.textContent = '';
+      var map = L.map(mapEl);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere'
+      }).addTo(map);
+
+      var addressIcon = L.icon({
+        iconUrl: '/leaflet/images/marker-icon.png',
+        iconRetinaUrl: '/leaflet/images/marker-icon-2x.png',
+        shadowUrl: '/leaflet/images/marker-shadow.png',
+        iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+      });
+
+      var bounds = [];
+      points.forEach(function (p) {
+        var marker = p.approx
+          ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
+          : L.marker([p.lat, p.lon], { icon: addressIcon });
+        var metaBits = [];
+        if (p.producerTypeLabel) metaBits.push(esc(p.producerTypeLabel));
+        if (p.sted) metaBits.push(esc(p.sted));
+        var popupHtml = '<div class="map-popup"><strong>' + esc(p.navn) + '</strong>'
+          + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
+          + (p.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
+          + '<a href="/kategori/gardssalg/produsent/' + encodeURIComponent(p.slug) + '">Se produsentprofil →</a></div>';
+        marker.bindPopup(popupHtml);
+        marker.addTo(map);
+        bounds.push([p.lat, p.lon]);
+      });
+
+      if (bounds.length === 1) {
+        map.setView(bounds[0], 12);
+      } else {
+        map.fitBounds(bounds, { padding: [28, 28] });
+      }
+    }).catch(function () {
+      mapEl.innerHTML = '<p class="map-loading">Kartet kunne ikke lastes.</p>';
+    });
+  }
+
+  if ('IntersectionObserver' in window) {
+    var obs = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          obs.disconnect();
+          initMap();
+        }
+      });
+    }, { rootMargin: '200px 0px' });
+    obs.observe(mapEl);
+  } else {
+    initMap();
+  }
+})();`;
+
+// Renders the /kategori/gardssalg map section — legend + map container +
+// attribution + <noscript> OSM-search fallback + JSON data island + deferred
+// lazy-init script, same shape/discipline as renderFylkeMapSection(). Returns
+// "" when there are no geocoded providers (honest omission — never an empty/
+// broken map, same as the fylke map's zero-points case). Tile source: the
+// SAME OSM {s}.tile.openstreetmap.org raster tiles the fylke map already
+// uses (no new third-party network host).
+function renderGardssalgMapSection(points: GardssalgProviderMapPoint[]): string {
+  if (points.length === 0) return "";
+  const markers: GardssalgMapMarker[] = points.map((p) => ({
+    slug: p.slug,
+    navn: p.navn,
+    producerTypeLabel: drinkTypeMeta(p.producer_type)?.label ?? null,
+    sted: [p.poststed, p.kommune, p.fylke].find((v) => !!v) ?? null,
+    lat: p.lat,
+    lon: p.lon,
+    approx: isApproxGardssalgConfidence(p.geocode_confidence),
+  }));
+  const dataJson = JSON.stringify(markers).replace(/<\//g, "<\\/");
+  const exactCount = markers.filter((m) => !m.approx).length;
+  const approxCount = markers.length - exactCount;
+  // Simple name-based OSM search link (same honesty rationale as the fylke
+  // map's <noscript> link — a computed centroid over scattered producers
+  // could misleadingly read as "the exact position", which isn't a real
+  // point; a name search is honest about what it is).
+  const osmSearchUrl = "https://www.openstreetmap.org/search?query=" + encodeURIComponent("gårdssalg, Norge");
+
+  return `<section class="map-section" aria-labelledby="gardssalg-map-h">
+    <h2 id="gardssalg-map-h">Kart over produsenter</h2>
+    <p class="map-legend">${exactCount > 0 ? `<span><span class="dot dot-address" aria-hidden="true"></span>Nøyaktig posisjon</span>` : ""}${approxCount > 0 ? `<span><span class="dot dot-kommune" aria-hidden="true"></span>Ca. posisjon (kommune)</span>` : ""}</p>
+    <div id="gardssalg-map" class="fylke-map" role="group" aria-label="Kart over ${markers.length} ${markers.length === 1 ? "produsent" : "produsenter"}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
+    <p class="map-attribution-note">Kartdata © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere</p>
+    <noscript><p class="map-noscript"><a href="${escapeHtml(osmSearchUrl)}" target="_blank" rel="noopener">Åpne kart over gårdssalgprodusenter i OpenStreetMap →</a></p></noscript>
+    <script type="application/json" id="gardssalg-map-data">${dataJson}</script>
+    <script>${GARDSSALG_MAP_INIT_JS}</script>
+  </section>`;
+}
+
 // ─── GET /kategori/gardssalg — Gårdssalg & smaking provider catalog ──────────
 // Gardssalg shows experience_providers (drink producers), not experiences.
 // The generic /kategori/:category route queries the experiences table and returns
@@ -2793,6 +2968,16 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
   const PAGE_SIZE = 24;
   const providers = listGardssalgProviders(PAGE_SIZE, (page - 1) * PAGE_SIZE);
   const total = countGardssalgProviders();
+  // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4:
+  // ALL geocoded producers across every page (not just this page's slice) —
+  // same "map shows the whole filtered set, not just the current page" as
+  // the fylke map, which is likewise unpaginated (renderPublishedExperienceMapPoints
+  // is passed the full fylke filter, not a page slice). Defensive try/catch
+  // (same discipline as kommuneChips()/facetChips() elsewhere in this file)
+  // so a query hiccup degrades to "no map" rather than a 500 — the provider
+  // grid above is the primary content and must never depend on this.
+  let mapPoints: GardssalgProviderMapPoint[] = [];
+  try { mapPoints = listGardssalgProviderMapPoints(); } catch { mapPoints = []; }
 
   function renderProviderCard(p: GardssalgProviderRow): string {
     const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
@@ -2871,6 +3056,7 @@ ${BROWSE_CSS}
 .hero-sub{opacity:.85;font-size:1rem;max-width:560px;line-height:1.5}
 .legal-note{font-size:.78rem;color:#7a7163;margin-top:40px;padding-top:16px;border-top:1px solid #e4ded0}
 </style>
+${mapPoints.length > 0 ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
@@ -2894,6 +3080,7 @@ ${BROWSE_CSS}
   ${total > 0 ? `<p style="color:#544a3e;font-size:.9rem;margin-top:8px">${total} produsent${total === 1 ? "" : "er"}</p>` : ""}
   ${emptyMsg}
   ${providers.length > 0 ? `<div class="provider-grid">${cards}</div>` : ""}
+  ${renderGardssalgMapSection(mapPoints)}
   ${pagination}
   <p class="legal-note">Vi formidler besøket og smakingen hos produsentene. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
 </main>
