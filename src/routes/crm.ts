@@ -144,10 +144,20 @@ router.post("/contacts/:id/type", (req, res) => {
   const schema = z.object({
     type: z.enum(["producer", "marketing", "vendor", "unknown"]),
     agentId: z.string().nullable().optional(),
+    // steg 6: manual link to an opplevagent-produsent (experience_providers.id).
+    // Only valid on an 'experiences' contact, and mutually exclusive with
+    // agentId — setContactType() enforces both and throws a readable message.
+    providerId: z.string().nullable().optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  crmService.setContactType(req.params.id, parsed.data.type, parsed.data.agentId);
+  try {
+    crmService.setContactType(req.params.id, parsed.data.type, parsed.data.agentId, parsed.data.providerId);
+  } catch (e) {
+    // Vertical-mismatch / nonexistent provider / missing contact — caller
+    // errors, not server faults. The message is written for a human.
+    return res.status(400).json({ error: (e as Error).message });
+  }
   crmService.logAction({ contactId: req.params.id, type: "contact_reclassified", actor: "daniel", payload: parsed.data });
   res.json({ success: true });
 });

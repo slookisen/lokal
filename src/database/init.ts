@@ -1057,6 +1057,116 @@ function initSchema(db: Database.Database): void {
     try { db.exec(`ROLLBACK`); } catch { /* no transaction open — nothing to undo */ }
   }
 
+  // ─── CRM steg 6 — crm_contacts.provider_id (kontakt ↔ opplevagent-produsent) ───
+  //
+  // dev-requests/2026-07-27-crm-plattformadskillelse-opplevagent.md, steg 6 / funn 6.
+  //
+  // Option (a) from the spec: a nullable `provider_id` column NEXT TO `agent_id`,
+  // not option (b)'s generic (vertical_id, entity_id) pair replacing both. The
+  // pair would rewrite every read site that joins on agent_id — listContacts,
+  // getContactDetail, the marketing pool VIEW, and the PR-38 outreach_sent_log
+  // auto-record trigger whose `agent_id IS NOT NULL` guard is load-bearing for
+  // suppression — for zero functional gain over two well-guarded columns.
+  //
+  // provider_id points at experience_providers.id in experiences.db — a DIFFERENT
+  // database file, so it can never be a REFERENCES clause. Row existence is
+  // enforced in code (crm-service validates against the experiences DB before
+  // writing); what the schema CAN enforce is the spec's invariant «en kontakt kan
+  // aldri peke på en entitet i feil vertical», via the triggers below: agent_id
+  // only on rfb contacts, provider_id only on experiences contacts.
+  // COALESCE(vertical_id,'rfb') matches how every reader treats a legacy NULL.
+  try {
+    db.exec(`ALTER TABLE crm_contacts ADD COLUMN provider_id TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_contacts_provider ON crm_contacts(provider_id)`);
+  } catch {
+    // Index already exists
+  }
+
+  // Healing sweep, BEFORE the triggers exist: classifyEmail() used to match every
+  // vertical's contacts against the RFB `agents` table, so an experiences contact
+  // whose email happened to match an RFB producer got agent_id pointing at the
+  // wrong vertical's entity. Clear those links (the contact row itself stays).
+  // Runs every boot; 0 rows affected after the first pass. Each cleared row is
+  // logged to crm_actions so the un-linking shows in the contact's history
+  // rather than happening silently.
+  try {
+    const crossLinked = db
+      .prepare(
+        `SELECT id, email, agent_id, COALESCE(vertical_id,'rfb') AS vertical_id FROM crm_contacts
+          WHERE agent_id IS NOT NULL AND COALESCE(vertical_id,'rfb') != 'rfb'`,
+      )
+      .all() as Array<{ id: string; email: string; agent_id: string; vertical_id: string }>;
+    if (crossLinked.length > 0) {
+      const clear = db.prepare(`UPDATE crm_contacts SET agent_id = NULL WHERE id = ?`);
+      const logIt = db.prepare(
+        `INSERT INTO crm_actions (id, contact_id, type, actor, payload)
+         VALUES (lower(hex(randomblob(16))), ?, 'crm_cross_vertical_agent_link_cleared', 'system', ?)`,
+      );
+      for (const row of crossLinked) {
+        clear.run(row.id);
+        logIt.run(
+          row.id,
+          JSON.stringify({
+            email: row.email,
+            cleared_agent_id: row.agent_id,
+            contact_vertical: row.vertical_id,
+            reason: "steg 6: agent_id må aldri peke på tvers av vertical (funn 6)",
+          }),
+        );
+      }
+      console.log(
+        `[migration] steg 6: cleared ${crossLinked.length} cross-vertical agent_id link(s) on crm_contacts`,
+      );
+    }
+  } catch (e) {
+    console.error(`[migration] steg 6 cross-vertical healing sweep failed:`, e);
+  }
+
+  // The vertical-safety triggers. DROP+CREATE every boot so a future edit to the
+  // trigger body actually lands (CREATE TRIGGER IF NOT EXISTS would silently keep
+  // the old body forever).
+  try {
+    db.exec(`
+      DROP TRIGGER IF EXISTS trg_crm_contacts_agent_vertical_ins;
+      CREATE TRIGGER trg_crm_contacts_agent_vertical_ins
+      BEFORE INSERT ON crm_contacts
+      WHEN NEW.agent_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'rfb'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_agent_id_wrong_vertical');
+      END;
+
+      DROP TRIGGER IF EXISTS trg_crm_contacts_agent_vertical_upd;
+      CREATE TRIGGER trg_crm_contacts_agent_vertical_upd
+      BEFORE UPDATE ON crm_contacts
+      WHEN NEW.agent_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'rfb'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_agent_id_wrong_vertical');
+      END;
+
+      DROP TRIGGER IF EXISTS trg_crm_contacts_provider_vertical_ins;
+      CREATE TRIGGER trg_crm_contacts_provider_vertical_ins
+      BEFORE INSERT ON crm_contacts
+      WHEN NEW.provider_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'experiences'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_provider_id_wrong_vertical');
+      END;
+
+      DROP TRIGGER IF EXISTS trg_crm_contacts_provider_vertical_upd;
+      CREATE TRIGGER trg_crm_contacts_provider_vertical_upd
+      BEFORE UPDATE ON crm_contacts
+      WHEN NEW.provider_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'experiences'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_provider_id_wrong_vertical');
+      END;
+    `);
+  } catch (e) {
+    console.error(`[migration] steg 6 vertical-safety triggers failed:`, e);
+  }
+
   // Dashboards filter analytics by vertical_id (rfb vs dental) — index the
   // analytics tables so the per-vertical WHERE clauses stay cheap.
   for (const [idx, tbl] of [
