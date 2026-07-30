@@ -18,6 +18,7 @@
 
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
+import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 
 const router = Router();
 
@@ -32,8 +33,17 @@ function mcpServerCard() {
   const stats = marketplaceRegistry.getStats();
 
   return {
-    $schema: "https://modelcontextprotocol.io/schemas/2025-11/server-card.schema.json",
+    // $schema deliberately omitted: the URL previously advertised here
+    // (modelcontextprotocol.io/schemas/2025-11/server-card.schema.json) returns
+    // 404, as does every other candidate probed on 2026-07-29 — SEP-1649 has no
+    // published schema document yet. A $schema pointing at a 404 is worse than
+    // none: a validating agent either errors or silently skips validation, and
+    // both look like "we validated" from the outside. schemaVersion still names
+    // the SEP revision this shape follows.
     schemaVersion: "2025-11",
+    // Which protocol era this endpoint actually speaks — derived from the SDK,
+    // never written down. See services/mcp-protocol-version.ts.
+    ...mcpProtocolDeclaration(),
     name: "lokal",
     title: "Lokal — A2A marketplace for local food in Norway",
     version: "1.0.0",

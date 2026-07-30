@@ -16,6 +16,7 @@ import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { getConfig } from "../config/vertical-config";
+import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -421,9 +422,14 @@ router.get("/.well-known/mcp/server-card.json", (_req: Request, res: Response) =
   res.header("Cache-Control", "public, max-age=3600");
   res.header("X-Content-Type-Options", "nosniff");
   res.json({
-    "$schema": "https://modelcontextprotocol.io/schemas/server-card/v1.0",
+    // NOTE: on rettfrabonden.com this route is shadowed by the identically-
+    // pathed one in agent-readiness.ts (verified live 2026-07-29: the served
+    // card has name "lokal", which only that one emits). It is corrected anyway
+    // — a route-order change would otherwise silently start serving a protocol
+    // version that was wrong the whole time, and dead code that lies is the
+    // hardest kind to notice when it wakes up.
     version: "1.0",
-    protocolVersion: "2025-06-18",
+    ...mcpProtocolDeclaration(),
     serverInfo: {
       name: `${getConfig().display_name} — Lokal Mat MCP`,
       version: "1.0.0",
@@ -475,7 +481,12 @@ router.get("/.well-known/mcp", (_req: Request, res: Response) => {
   res.header("Cache-Control", "public, max-age=3600");
   res.header("X-Content-Type-Options", "nosniff");
   res.json({
-    mcp_version: "2025-06-18",
+    // Was hardcoded "2025-06-18" — the FLOOR of what we accept, published as
+    // though it were the ceiling. Measured 2026-07-29: prod negotiates up to
+    // 2025-11-25. The string was true when it was typed and nothing made it
+    // false out loud when the SDK moved past it.
+    mcp_version: mcpProtocolDeclaration().protocolVersion,
+    mcp_supported_versions: mcpProtocolDeclaration().supportedProtocolVersions,
     endpoints: [
       {
         url: `${BASE_URL}/mcp`,

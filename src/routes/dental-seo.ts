@@ -19,6 +19,7 @@ import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
+import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 
 const router = Router();
 
@@ -2429,8 +2430,17 @@ function dentalMcpServerCard() {
   const totalLabel = stats.total > 0 ? stats.total.toLocaleString("nb") : "6,900+";
 
   return {
-    $schema: "https://modelcontextprotocol.io/schemas/2025-11/server-card.schema.json",
+    // $schema deliberately omitted: the URL previously advertised here
+    // (modelcontextprotocol.io/schemas/2025-11/server-card.schema.json) returns
+    // 404, as does every other candidate probed on 2026-07-29 — SEP-1649 has no
+    // published schema document yet. A $schema pointing at a 404 is worse than
+    // none: a validating agent either errors or silently skips validation, and
+    // both look like "we validated" from the outside. schemaVersion still names
+    // the SEP revision this shape follows.
     schemaVersion: "2025-11",
+    // Which protocol era this endpoint actually speaks — derived from the SDK,
+    // never written down. See services/mcp-protocol-version.ts.
+    ...mcpProtocolDeclaration(),
     name: "finn-tannlege",
     title: "Finn-tannlege — Norwegian dental clinic search",
     version: "0.1.0",
