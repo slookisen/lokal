@@ -201,8 +201,8 @@ class TrustScoreService {
     const claimed = this.isAgentClaimed(agentId);
 
     let verificationDetail = "Ikke claima";
-    if (agent?.is_verified) verificationDetail = "Verifisert eier";
-    else if (claimed) verificationDetail = "Claima, ikke verifisert";
+    if (agent?.is_verified) verificationDetail = "Verifisert av eier";
+    else if (claimed) verificationDetail = "Claima, ikke verifisert av eier";
 
     return {
       score,

@@ -35926,3 +35926,28 @@ runSerial(async () => {
     failures.push("rfb-homepage-category-chips: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter:
+// renames the owner-claim "Verifisert" badge to "Verifisert av eier" (no) /
+// "Verified by owner" (en) everywhere it renders (producer cards — all
+// renderer variants — producer profile hero, MCP lokal_info text output),
+// distinct from the untouched agent.brregVerified badge, plus a new
+// GET /verifisert-av-eier browse-all page + homepage button. Own harness
+// (__setDbForTesting/__initSchemaForTesting, real router handlers pulled off
+// the route stack — mirrors produsent-role-gate.test.ts's harness). Runs via
+// runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter: \"Verifisert av eier\" badge rename + browse-all page ──");
+  try {
+    const { runVerifisertAvEierBadgeRenameTests } = require("../src/routes/rfb-verifisert-av-eier-badge-rename.test") as
+      typeof import("../src/routes/rfb-verifisert-av-eier-badge-rename.test");
+    const vae = await runVerifisertAvEierBadgeRenameTests({ log: false });
+    passed += vae.passed;
+    failed += vae.failed;
+    for (const f of vae.failures) failures.push("rfb-verifisert-av-eier-badge-rename: " + f);
+    console.log(`  rfb-verifisert-av-eier-badge-rename: ${vae.passed} passed, ${vae.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-verifisert-av-eier-badge-rename: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -53,6 +53,7 @@
     "discover_label": "Oppdag",
     "discover_title": "Produsenter",
     "discover_sub": "Norske matprodusenter i nettverket",
+    "discover_verified_btn": "Se alle verifisert-av-eier-produsenter →",
     "how_label": "Slik fungerer det",
     "how_title": "Fra søk til gårdsbesøk",
     "how_step1_title": "Søk etter det du vil ha",
@@ -116,7 +117,7 @@
   },
   "producer": {
     "title_suffix": " — Lokal matprodusent i {city}",
-    "verified": "Verifisert",
+    "verified": "Verifisert av eier",
     "trust_score": "Trust Score",
     "categories": "Kategorier",
     "specialties": "Spesialiteter",
