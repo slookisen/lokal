@@ -53,6 +53,7 @@
     "discover_label": "Discover",
     "discover_title": "Producers",
     "discover_sub": "Norwegian food producers in the network",
+    "discover_verified_btn": "See all verified-by-owner producers →",
     "how_label": "How it works",
     "how_title": "From search to farm visit",
     "how_step1_title": "Search for what you want",
@@ -117,7 +118,7 @@
   "producer": {
     "title_suffix": " — Local food producer in {city}",
     "title_suffix_no_city": " — Local food producer in Norway",
-    "verified": "Verified",
+    "verified": "Verified by owner",
     "trust_score": "Trust Score",
     "categories": "Categories",
     "specialties": "Specialties",

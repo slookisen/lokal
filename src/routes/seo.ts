@@ -1258,6 +1258,9 @@ ${umbrellaSectionHtml}
         <div class="sh-label">${escapeHtml(t(lang, "home.discover_label"))}</div>
         <div class="sh-title">${escapeHtml(t(lang, "home.discover_title"))}</div>
         <div class="sh-sub">${escapeHtml(t(lang, "home.discover_sub"))}</div>
+        <div style="margin-top:14px;">
+          <a href="${localizedPath("/verifisert-av-eier", lang)}" class="btn-s">${escapeHtml(t(lang, "home.discover_verified_btn"))}</a>
+        </div>
       </div>
       <div class="feat-grid">${featuredCards}</div>
     </section>
@@ -3245,6 +3248,87 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
   }
 });
 
+// GET /verifisert-av-eier — dev-request
+// 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter: browse-all page
+// for producers with agent.isVerified === true (the owner-claim/manual
+// verification badge, renamed "Verifisert av eier" / "Verified by owner" on
+// this same slice — see producer.verified i18n key). Distinct from
+// agent.brregVerified ("Registrert i Brønnøysund"), which this page does not
+// filter on. Follows the exact /kategori/:slug pattern (hero, live count,
+// empty state, CollectionPage JSON-LD, breadcrumb, producerCard reuse).
+// Registered above router.get("/:city") (below) so it isn't swallowed as an
+// unmatched city-slug — same belt-and-braces reserved-slug entry as
+// /kategori and /reise in that handler.
+router.get("/verifisert-av-eier", (req: Request, res: Response) => {
+  const lang = req.lang;
+
+  try {
+    const agents = marketplaceRegistry.getActiveAgents();
+    const members = agents.filter((a: any) => a.isVerified === true);
+    const n = members.length;
+
+    const countLabel = lang === "en"
+      ? `${n} producer${n === 1 ? "" : "s"}`
+      : `${n} produsent${n === 1 ? "" : "er"}`;
+
+    const h1 = lang === "en" ? "Verified by owner" : "Verifisert av eier";
+    const lede = lang === "en"
+      ? "Producers whose owner has personally claimed and confirmed this profile."
+      : "Produsenter der eieren selv har krevd og bekreftet profilen.";
+
+    const cards = members.map((a: any) => producerCard(a, undefined, lang)).join("");
+    const body = members.length > 0
+      ? `<div class="sk-grid">${cards}</div>`
+      : `<div class="sk-empty"><p>${lang === "en"
+          ? "No verified-by-owner producers yet — this page fills in automatically as producers claim and confirm their profile."
+          : "Ingen verifisert-av-eier-produsenter ennå — siden fylles automatisk etter hvert som produsenter krever og bekrefter profilen sin."}</p></div>`;
+
+    const title = `${h1} — ${countLabel} | ${getConfig().display_name}`;
+    const metaDesc = `${lede} ${countLabel}.`;
+
+    const jsonLd = {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      name: h1,
+      description: lede,
+      url: BASE_URL + localizedPath("/verifisert-av-eier", lang),
+      mainEntity: {
+        "@type": "ItemList",
+        numberOfItems: members.length,
+        itemListElement: members.slice(0, 100).map((a: any, i: number) => ({
+          "@type": "ListItem",
+          position: i + 1,
+          url: BASE_URL + localizedPath("/produsent/" + slugify(a.name), lang),
+          name: a.name,
+        })),
+      },
+    };
+
+    const crumbLabel = lang === "en" ? "Home" : "Forsiden";
+    const content = `
+    <div class="sk-crumbs"><a href="${localizedPath("/", lang)}">${escapeHtml(crumbLabel)}</a> › ${escapeHtml(h1)}</div>
+    <section class="sk-hero">
+      <div class="container">
+        <h1>${escapeHtml(h1)}</h1>
+        <p>${escapeHtml(lede)}</p>
+        <div class="sk-count">${escapeHtml(countLabel)}</div>
+      </div>
+    </section>
+    ${body}`;
+
+    res.send(shell(title, metaDesc, content, {
+      canonical: BASE_URL + localizedPath("/verifisert-av-eier", lang),
+      jsonLd,
+      extraCss: SALGSKANAL_CSS,
+      lang,
+      pathForAlternate: "/verifisert-av-eier",
+    }));
+  } catch (err) {
+    console.error("SEO /verifisert-av-eier error:", err);
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
+  }
+});
+
 router.get("/:city", (req: Request, res: Response, next: any) => {
   const citySlug = (req.params.city as string).toLowerCase();
 
@@ -3266,6 +3350,10 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       // convention (see /sok, /kontakt, /kategori) — a kommune slugging to
       // "reise" must never shadow the corridor page.
       || citySlug === "reise"
+      // dev-request 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter:
+      // /verifisert-av-eier is registered above this catch-all too, but same
+      // belt-and-braces convention as /kategori and /reise above.
+      || citySlug === "verifisert-av-eier"
       || citySlug.includes(".")) {
     return next();
   }
@@ -4577,7 +4665,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Badges
     const badges: string[] = [];
-    if (agent.isVerified) badges.push(`<span class="badge badge-v">&#10003; Verifisert</span>`);
+    if (agent.isVerified) badges.push(`<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`);
     // dev-request 2026-06-30-brreg-verification-gate, catalog-sweep + badge
     // slice: agents.brreg_verified=1 (set at registration time or by the
     // GET/POST /admin/agents/brreg-catalog-sweep backlog sweep) surfaces a

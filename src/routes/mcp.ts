@@ -456,7 +456,7 @@ export function registerTools(
       const sections: string[] = [`# ${agent.name}`];
 
       if (agent.city) {
-        sections.push(`📍 ${agent.city}${agent.trustScore ? `  ·  Trust ${Math.round(agent.trustScore * 100)}%` : ""}${agent.isVerified ? "  ·  ✔ Verifisert" : ""}`);
+        sections.push(`📍 ${agent.city}${agent.trustScore ? `  ·  Trust ${Math.round(agent.trustScore * 100)}%` : ""}${agent.isVerified ? "  ·  ✔ Verifisert av eier" : ""}`);
       }
 
       if (k.about) {
