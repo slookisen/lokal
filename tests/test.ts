@@ -35806,3 +35806,26 @@ runSerial(async () => {
     failures.push("homepage-content-refresh-parking: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-31-rfb-homepage-kategori-konsolidering: merges the 4
+// ad-hoc hero-chips + the standalone big-card "Kategorier" grid into ONE
+// compact pill row (all 10 CATEGORY_MAP categories, live counts), and drops
+// the "Populære byer"/"Popular cities" homepage section entirely (src/routes/seo.ts).
+// Own harness (__setDbForTesting/__initSchemaForTesting, real router handlers
+// pulled off the route stack — mirrors produsent-role-gate.test.ts's harness).
+// Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-31-rfb-homepage-kategori-konsolidering: homepage category-chip consolidation ──");
+  try {
+    const { runHomepageCategoryChipsTests } = require("../src/routes/rfb-homepage-category-chips.test") as
+      typeof import("../src/routes/rfb-homepage-category-chips.test");
+    const hcc = await runHomepageCategoryChipsTests({ log: false });
+    passed += hcc.passed;
+    failed += hcc.failed;
+    for (const f of hcc.failures) failures.push("rfb-homepage-category-chips: " + f);
+    console.log(`  rfb-homepage-category-chips: ${hcc.passed} passed, ${hcc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-homepage-category-chips: unexpected error: " + String(err?.message || err));
+  }
+});
