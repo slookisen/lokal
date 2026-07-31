@@ -5541,7 +5541,37 @@ const _m2Promise = (async function runOwnerPortalTests() {
     const addr = server.address();
     const port = typeof addr === "object" && addr ? addr.port : 0;
 
-    function req(method: string, urlPath: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; headers: any; body: string }> {
+    // kriterium 3 follow-up (dev-request 2026-07-25-testsuite-ikke-
+    // deterministisk-delte-globaler): every req() below goes over a REAL
+    // loopback HTTP round-trip (server.listen + httpMod.request), so the
+    // owner-portal route handlers' lazy getDb() reads happen in a separate
+    // event-loop turn from this block's own pin — any of the ~69 OTHER
+    // __setDbForTesting() call sites in this file can swap the singleton in
+    // that window and turn a valid session into a 302/401 or an existing
+    // agent into a 404. Same self-verifying pattern as PR-74's call() helper
+    // (~line 13950; see also the header comment at the top of this file,
+    // which names it the reusable pattern): re-pin portalDb synchronously
+    // right before every dispatch, and after each response retry (with a
+    // fresh re-pin, up to 4x) on detected contamination. The two signals
+    // are EITHER/OR per call, never OR-ed together (review finding B1 on
+    // the first cut of this slice):
+    //   - expectOk calls (OPT-IN, set only on calls whose fixtures
+    //     legitimately return 200): the STATUS is authoritative. The
+    //     fixture ids these calls hit exist ONLY in portalDb, so a foreign
+    //     DB can never produce the 200 — a non-200 (the 404-on-/eier/:id /
+    //     401-on-valid-session / 302 signatures) means contamination. A
+    //     clean 200 is conversely NEVER retried on a peek-mismatch observed
+    //     after the route already read the right db: the response is
+    //     already proven valid, and re-dispatching valid requests is at
+    //     best wasted work (and for the sibling pr24Req wrapper's
+    //     non-idempotent allow_correct PUTs it flips action "applied" to
+    //     "noop" and breaks the assert — the actual B1 bug).
+    //   - all other calls (the negative paths ASSERTING 401/403/302/404):
+    //     the PEEK is authoritative. They never retry on status — their
+    //     asserts stay exact — only on a directly observed singleton
+    //     mismatch, which a legitimate negative response can never depend
+    //     on (a foreign DB demonstrably turns an expected 403 into a 401).
+    function reqOnce(method: string, urlPath: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; headers: any; body: string }> {
       return new Promise((resolve, reject) => {
         const r = httpMod.request(
           { method, host: "127.0.0.1", port, path: urlPath, headers: opts.headers || {} },
@@ -5560,10 +5590,26 @@ const _m2Promise = (async function runOwnerPortalTests() {
         r.end();
       });
     }
+    async function req(method: string, urlPath: string, opts: { headers?: Record<string, string>; body?: string; expectOk?: boolean } = {}): Promise<{ status: number; headers: any; body: string }> {
+      let resp: { status: number; headers: any; body: string } = { status: 0, headers: {}, body: "" };
+      // 1 initial dispatch + up to 4 contamination retries (PR-74 parity).
+      for (let attempt = 0; attempt <= 4; attempt++) {
+        initMod.__setDbForTesting(portalDb as any);
+        resp = await reqOnce(method, urlPath, opts);
+        // Either/or, see comment above: expectOk → status authoritative
+        // (a foreign DB can never 200 these fixtures); otherwise → peek
+        // authoritative (status must stay exact on negative paths).
+        const contaminated = opts.expectOk === true
+          ? resp.status !== 200
+          : initMod.__peekDbForTesting() !== portalDb;
+        if (!contaminated) break;
+      }
+      return resp;
+    }
 
     // E1.3 — GET /eier/:id form returns 200 with form HTML
     {
-      const resp = await req("GET", `/eier/${TEST_AGENT_ID}`);
+      const resp = await req("GET", `/eier/${TEST_AGENT_ID}`, { expectOk: true });
       assertEq(resp.status, 200, "m2-E1.3: GET /eier/:id returns 200");
       assertTrue(
         resp.body.includes("Send tilgangslenke"),
@@ -5642,6 +5688,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
     {
       const resp = await req("GET", `/eier/${TEST_AGENT_ID}/portal`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(resp.status, 200, "m2-E1.6: portal with valid session returns 200");
       // 7 editable fields per M1 whitelist
@@ -5659,6 +5706,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
       const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/my-audit?limit=10`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(withAuth.status, 200, "m2-C4: my-audit with valid session returns 200");
       const parsed = JSON.parse(withAuth.body);
@@ -5720,6 +5768,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
       const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/owner-stats`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(withAuth.status, 200, "m2-owner-stats: with valid session returns 200");
       const parsed = JSON.parse(withAuth.body);
@@ -5789,6 +5838,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
       ).run("ml_empty", "ingenordre@example.no", emptyToken, "m2-no-orders");
       const empty = await req("GET", `/api/agents/m2-no-orders/orders`, {
         headers: { Cookie: `rfb_owner_session=${emptyToken}` },
+        expectOk: true,
       });
       assertEq(empty.status, 200, "m2-orders: agent with zero orders returns 200 (not an error)");
       const emptyBody = JSON.parse(empty.body);
@@ -5816,6 +5866,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
       const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/orders`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(withAuth.status, 200, "m2-orders: with valid session returns 200");
       const ordersBody = JSON.parse(withAuth.body);
@@ -6246,12 +6297,7 @@ const _pr24Promise = (async function runPr24Tests() {
     // near the top of this file).
     const PR24_KEY = SUITE_ADMIN_KEY;
 
-    function pr24Req(method: string, urlPath: string, body?: any, key?: string): Promise<{ status: number; body: any }> {
-      // Re-assert against the residual, out-of-scope external hazard: sibling
-      // src/**/*.test.ts helper suites required elsewhere in this file still
-      // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
-      // 2 only covers this file's own blocks, which no longer touch it).
-      process.env.ADMIN_KEY = PR24_KEY;
+    function pr24ReqOnce(method: string, urlPath: string, body?: any, key?: string): Promise<{ status: number; body: any }> {
       const payload = body ? JSON.stringify(body) : "";
       const headers: Record<string, string> = {};
       if (key !== undefined) headers["x-admin-key"] = key;
@@ -6277,6 +6323,57 @@ const _pr24Promise = (async function runPr24Tests() {
         if (payload) r.write(payload);
         r.end();
       });
+    }
+
+    // kriterium 3 follow-up (dev-request 2026-07-25-testsuite-ikke-
+    // deterministisk-delte-globaler): the pr24-* AND pr28-* requests below
+    // all dispatch through this helper over a REAL loopback HTTP round-trip,
+    // so the admin-knowledge route's lazy getDb() read can race any of the
+    // ~69 other __setDbForTesting() call sites in this file — a foreign DB
+    // in the await window turns an existing agent into a 404 (or a missing
+    // table into a 500). Same self-verifying pattern as PR-74's call()
+    // helper (~line 13950; the file header names it the reusable pattern):
+    // re-pin pr24db (and the suite-canonical ADMIN_KEY, which sibling
+    // src/**/*.test.ts helper suites still mutate — the residual kriterium-2
+    // hazard) synchronously right before every dispatch, and after each
+    // response retry (fresh re-pin, up to 4x) on detected contamination.
+    // The two signals are EITHER/OR per call, never OR-ed together (review
+    // finding B1 on the first cut of this slice):
+    //   - expectOk calls (OPT-IN, set only on calls whose fixtures
+    //     legitimately return 200): the STATUS is authoritative. These
+    //     fixture agent ids exist ONLY in pr24db, so a foreign DB can never
+    //     produce the 200 — non-200 means contamination. A clean 200 is
+    //     conversely NEVER retried on a peek-mismatch observed after the
+    //     route already read the right db: several of these PUTs are
+    //     non-idempotent (allow_correct corrections report action
+    //     "applied" exactly once — a re-PUT of the identical payload comes
+    //     back "noop"/"unchanged", src/routes/admin-knowledge.ts ~line
+    //     722), so retrying a proven-valid 200 would swap the old race
+    //     window (swap-before-read → 404) for a new one (swap-after-read →
+    //     noop) on the orch-pr-17-B13 / PR-A-E9 asserts. That was B1.
+    //   - all other calls (the negative paths ASSERTING 403/400/404): the
+    //     PEEK is authoritative. They never retry on status — those asserts
+    //     stay exact — only on a directly observed singleton mismatch (a
+    //     foreign DB demonstrably turns expected negatives into different
+    //     negatives, e.g. 403 into 401). These rejected-before-write PUTs
+    //     have no side effects, so a re-dispatch is safe.
+    async function pr24Req(method: string, urlPath: string, body?: any, key?: string, expectOk = false): Promise<{ status: number; body: any }> {
+      let resp: { status: number; body: any } = { status: 0, body: null };
+      // 1 initial dispatch + up to 4 contamination retries (PR-74 parity).
+      for (let attempt = 0; attempt <= 4; attempt++) {
+        process.env.ADMIN_KEY = PR24_KEY;
+        initMod2.__setDbForTesting(pr24db as any);
+        resp = await pr24ReqOnce(method, urlPath, body, key);
+        // Either/or, see comment above (B1): expectOk → status
+        // authoritative (a foreign DB can never 200 these fixtures; and a
+        // valid 200 must not be re-PUT — non-idempotent allow_correct);
+        // otherwise → peek authoritative (negative statuses stay exact).
+        const contaminated = expectOk
+          ? resp.status !== 200
+          : initMod2.__peekDbForTesting() !== pr24db;
+        if (!contaminated) break;
+      }
+      return resp;
     }
 
     function getProv(agentId: string): Record<string, any[]> {
@@ -6329,7 +6426,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-5: PUT returns 200");
         assertEq(resp.body?.success, true, "pr24-5: success=true");
         const prov = getProv("pr24-a");
@@ -6362,7 +6459,7 @@ const _pr24Promise = (async function runPr24Tests() {
             },
           },
         };
-        const resp = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY);
+        const resp = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-6: PUT returns 200");
         const prov = getProv("pr24-a");
         assertEq(prov.address.length, 2, "pr24-6: address has 2 sources after dedup (homepage + google_places)");
@@ -6371,7 +6468,7 @@ const _pr24Promise = (async function runPr24Tests() {
           "pr24-6: address sources are homepage + google_places");
 
         // ── re-PUT identical payload — should be a no-op ─────────────
-        const resp2 = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY);
+        const resp2 = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY, true);
         assertEq(resp2.status, 200, "pr24-6: re-PUT returns 200");
         const prov2 = getProv("pr24-a");
         assertEq(prov2.address.length, 2, "pr24-6: re-PUT identical → still 2 sources (idempotent)");
@@ -6384,7 +6481,7 @@ const _pr24Promise = (async function runPr24Tests() {
           agent_id: "pr24-a",
           about: "Oppdatert beskrivelse.",
           // NO field_provenance key
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-7: PUT returns 200");
         const after = getProv("pr24-a");
         assertEq(JSON.stringify(after), JSON.stringify(before),
@@ -6407,7 +6504,7 @@ const _pr24Promise = (async function runPr24Tests() {
               { value: "OPERATIONAL", source_type: "google_places", fetched_at: "2026-05-11T10:00:00Z" },
             ],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-8: flat-array PUT returns 200");
         const prov = getProv("pr24-b");
         assertEq(prov.address?.length, 2, "pr24-8: address has 2 sources");
@@ -6442,7 +6539,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-10: PUT returns 200");
         const prov = getProv("pr24-b");
         assertEq(prov.phone?.length, 1, "pr24-10: only the one well-formed source survived");
@@ -6606,7 +6703,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(respAddr.status, 200, "pr28-6: address write succeeds against malformed legacy data (no more 500)");
         assertEq(respAddr.body?.success, true, "pr28-6: success=true");
         const provAfterAddr = getProv("pr28-repro");
@@ -6624,7 +6721,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(respPhone.status, 200, "pr28-6: phone write succeeds against malformed legacy data");
         const provAfterPhone = getProv("pr28-repro");
         assertEq(provAfterPhone.phone?.length, 1, "pr28-6: malformed legacy phone dropped, new homepage kept");
@@ -6641,7 +6738,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(respBs.status, 200, "pr28-6: business_status write still succeeds (no regression)");
         const provAfterBs = getProv("pr28-repro");
         // Existing was 1 OPERATIONAL/google_places — re-PUT dedupes → still 1.
@@ -6943,7 +7040,7 @@ const _pr24Promise = (async function runPr24Tests() {
         const resp = await pr24Req("PUT", "/admin/knowledge", {
           agent_id: "pr17-def",
           products: [{ name: "new-products" }],
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "orch-pr-17-B8: default-off PUT → 200");
         assertTrue(resp.body.allow_correct === undefined, "orch-pr-17-B9: default-off response has no allow_correct/corrections");
         const row = pr24db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = 'pr17-def'").get() as any;
@@ -6974,7 +7071,7 @@ const _pr24Promise = (async function runPr24Tests() {
               { value: "multer", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
             ],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "orch-pr-17-B11: allow_correct PUT → 200");
         assertTrue(resp.body.allow_correct === true, "orch-pr-17-B12: response flags allow_correct=true");
         const applied = (resp.body.corrections as any[]).find((c) => c.field === "products");
@@ -7006,7 +7103,7 @@ const _pr24Promise = (async function runPr24Tests() {
               { value: "x", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
             ],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "orch-pr-17-B15: refuse-case PUT → 200");
         const ref = (resp.body.corrections as any[]).find((c) => c.field === "products");
         assertTrue(ref && ref.action === "refused" && ref.reason === "existing_already_two_tierA", "orch-pr-17-B16: products correction refused (existing_already_two_tierA)");
@@ -7035,7 +7132,7 @@ const _pr24Promise = (async function runPr24Tests() {
             description: [{ value: "Besøkshage med stauder og roser.", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
             categories: [{ value: "vegetables", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "PR-A-E1: description/categories PUT → 200");
         assertTrue((resp.body.columns_updated as string[]).includes("description"), "PR-A-E2: response columns_updated includes description");
         assertTrue((resp.body.columns_updated as string[]).includes("categories"), "PR-A-E3: response columns_updated includes categories");
@@ -7074,7 +7171,7 @@ const _pr24Promise = (async function runPr24Tests() {
             description: [{ value: "Andelslandbruk med grønnsaker.", source_type: "website_homepage", source_url: "https://pra-ovr.no", fetched_at: "2026-06-16T00:00:00Z" }],
             categories: [{ value: "vegetables", source_type: "website_homepage", source_url: "https://pra-ovr.no", fetched_at: "2026-06-16T00:00:00Z" }],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "PR-A-E8: homepage-correct PUT → 200");
         const descCorr = (resp.body.corrections as any[]).find((c) => c.field === "description");
         assertTrue(descCorr && descCorr.action === "applied" && descCorr.reason === "ok_homepage_preferred_over_google_places", "PR-A-E9: description correction applied (homepage preferred over google_places)");
@@ -7102,7 +7199,7 @@ const _pr24Promise = (async function runPr24Tests() {
           field_provenance: {
             description: [{ value: "Homepage tried to overwrite curated.", source_type: "website_homepage", source_url: "https://pra-lock.no", fetched_at: "2026-06-16T00:00:00Z" }],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "PR-A-E12: curated-lock PUT → 200");
         const lockCorr = (resp.body.corrections as any[]).find((c) => c.field === "description");
         assertTrue(lockCorr && lockCorr.action === "refused" && lockCorr.reason === "curated_locked", "PR-A-E13: curated description REFUSED (curated_locked, absolute)");
@@ -35804,5 +35901,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("homepage-content-refresh-parking: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-31-rfb-homepage-kategori-konsolidering: merges the 4
+// ad-hoc hero-chips + the standalone big-card "Kategorier" grid into ONE
+// compact pill row (all 10 CATEGORY_MAP categories, live counts), and drops
+// the "Populære byer"/"Popular cities" homepage section entirely (src/routes/seo.ts).
+// Own harness (__setDbForTesting/__initSchemaForTesting, real router handlers
+// pulled off the route stack — mirrors produsent-role-gate.test.ts's harness).
+// Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-31-rfb-homepage-kategori-konsolidering: homepage category-chip consolidation ──");
+  try {
+    const { runHomepageCategoryChipsTests } = require("../src/routes/rfb-homepage-category-chips.test") as
+      typeof import("../src/routes/rfb-homepage-category-chips.test");
+    const hcc = await runHomepageCategoryChipsTests({ log: false });
+    passed += hcc.passed;
+    failed += hcc.failed;
+    for (const f of hcc.failures) failures.push("rfb-homepage-category-chips: " + f);
+    console.log(`  rfb-homepage-category-chips: ${hcc.passed} passed, ${hcc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-homepage-category-chips: unexpected error: " + String(err?.message || err));
   }
 });
