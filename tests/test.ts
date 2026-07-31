@@ -28549,6 +28549,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gplr.failures) failures.push("opplevelser-gardssalg-provider-lookup: " + f);
     console.log(`  opplevelser-gardssalg-provider-lookup: ${gplr.passed} passed, ${gplr.failed} failed`);
 
+    // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+    // slice 1: GET /admin/gardssalg-provider-dedup-audit — read-only
+    // near-duplicate-candidate audit over experience_providers, grouping by
+    // org_nr / registrable website domain / name (scoreNameMatch). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-provider-dedup-audit: admin dedup-candidate audit ──");
+    const { runOpplevelserGardssalgProviderDedupAuditTests } = require("../src/routes/opplevelser-gardssalg-provider-dedup-audit.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-provider-dedup-audit.test");
+    const gpdar = await runOpplevelserGardssalgProviderDedupAuditTests({ log: false });
+    passed += gpdar.passed;
+    failed += gpdar.failed;
+    for (const f of gpdar.failures) failures.push("opplevelser-gardssalg-provider-dedup-audit: " + f);
+    console.log(`  opplevelser-gardssalg-provider-dedup-audit: ${gpdar.passed} passed, ${gpdar.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1:
     // gardssalg_content_audit table + experience_providers.field_provenance
     // column, applyGardssalgProviderContent()'s additive audit/provenance

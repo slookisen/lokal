@@ -264,7 +264,12 @@ import {
 // verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
 // exact-name match to a bankrupt/deregistered org must never claim a row.
 // scoreNameMatch: NACE-discoveryens navne-dedup mot eksisterende gårdssalg-rader.
-import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch } from "../services/brreg-client";
+// normaliseName: dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-
+// av-seeds — bucketing key for GET /admin/gardssalg-provider-dedup-audit below
+// (same normalization scoreNameMatch itself uses internally for its
+// first-token tier, re-exposed here so the audit route can pre-bucket rows
+// instead of comparing every row against every other row).
+import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch, normaliseName } from "../services/brreg-client";
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter — kommune→fylke best-effort
 // ved landing av nye NACE-oppdagede providere.
 import { cityToFylke } from "../services/norway-fylke";
@@ -5942,6 +5947,266 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
   });
 
   res.json({ providers, summary });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-provider-dedup-audit ───────────────
+//
+// dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds, slice
+// 1 of 3 (audit only — no merge lever, no outreach-guard; those are separate
+// future slices). Coverage measurement found that the SAME real-world
+// producer can end up as two distinct experience_providers rows across
+// different seed batches (rfb-seed vs NACE-discovery vs manual), e.g. a
+// sparse row seeded early (often now homepage_unreachable_since-flagged) and
+// a richer row discovered later with full contact info. There is no dedup
+// mechanism for this table today; this is READ-ONLY groundwork for one.
+//
+// NOT the same table/endpoint as GET .../experiences-dedup-audit (the
+// `activities`-table dedup audit) — that endpoint is untouched by this slice.
+//
+// Read-only — a single SELECT, no writes, no UPDATE/DELETE/merge of any row.
+//
+// Grouping signals (a group is any row whose id transitively connects to
+// another row's id via one or more of these — union-find over all three):
+//   1. org_nr        — both sides have a non-blank org_nr and it's equal.
+//   2. domain         — both sides have a hjemmeside and its registrable
+//                       domain (homepageRegistrableDomain — same helper the
+//                       rest of this file's gårdssalg content-refresh/
+//                       provenance code already uses on this exact column)
+//                       is equal.
+//   3. name           — scoreNameMatch (services/brreg-client.ts), the SAME
+//                       name-dedup function this file's own NACE-discovery
+//                       dedup already runs against gårdssalg rows (see
+//                       listGardssalgNameDedupRows() call above), tried both
+//                       on the raw navn and on the "— Sted"-suffix-stripped
+//                       gardssalgSearchName() variant (so "X — By" still
+//                       matches a bare "X"), keeping the higher score:
+//                         score 1.0  -> "name_exact"            (high conf.)
+//                         score 0.95 -> "name_first_token_postal" (high conf.
+//                                       — first word matches AND same postal)
+//                         score 0.80 -> "name_first_token"       (LOW conf.
+//                                       — first word matches alone; e.g.
+//                                       "Himkok" vs "Himkok Rtd" lands here:
+//                                       genuinely ambiguous — could be the
+//                                       same producer re-seeded, or a
+//                                       deliberately distinct product line —
+//                                       surfaced for human judgment, never
+//                                       silently merged or silently dropped)
+//
+// A row-pair comparison is O(n²) in the worst case, so name-matching first
+// buckets rows by the normalised first token of gardssalgSearchName(navn)
+// (exactly the token scoreNameMatch's own first-token tier keys off) and
+// only scores pairs within the same bucket.
+//
+// Privacy: same minimization convention as gardssalg-contact-coverage/
+// gardssalg-provider-lookup above — no raw epost/telefon/hjemmeside value is
+// ever returned, only booleans (has_email/has_phone) and the matching
+// SIGNAL NAMES (not the raw domain string). org_nr is returned raw, matching
+// gardssalg-outreach-readiness's existing precedent (a public Brreg registry
+// number, not a contact channel).
+type GsDedupNameTier = "name_exact" | "name_first_token_postal" | "name_first_token";
+const GS_DEDUP_HIGH_CONF_NAME_TIERS: ReadonlySet<GsDedupNameTier> = new Set([
+  "name_exact",
+  "name_first_token_postal",
+]);
+
+function gsDedupNameTierForScore(score: number): GsDedupNameTier | null {
+  if (score >= 1.0) return "name_exact";
+  if (score >= 0.95) return "name_first_token_postal";
+  if (score >= 0.8) return "name_first_token";
+  return null;
+}
+
+interface GsDedupRow {
+  id: string;
+  navn: string;
+  org_nr: string | null;
+  hjemmeside: string | null;
+  epost: string | null;
+  telefon: string | null;
+  postnummer: string | null;
+  rfb_seed_source: string | null;
+  producer_type: string | null;
+  content_source: string | null;
+  homepage_unreachable_since: string | null;
+}
+
+// Best (highest-tier) name-match between two rows, trying both the raw navn
+// and the dash-suffix-stripped gardssalgSearchName() variant — pure, exported
+// for tests.
+export function gsDedupBestNameTier(a: GsDedupRow, b: GsDedupRow): GsDedupNameTier | null {
+  const raw = scoreNameMatch(a.navn, b.navn, a.postnummer, b.postnummer);
+  const stripped = scoreNameMatch(
+    gardssalgSearchName(a.navn),
+    gardssalgSearchName(b.navn),
+    a.postnummer,
+    b.postnummer,
+  );
+  return gsDedupNameTierForScore(Math.max(raw, stripped));
+}
+
+// Minimal union-find, scoped to this route.
+class GsDedupUnionFind {
+  private parent: number[];
+  constructor(n: number) {
+    this.parent = Array.from({ length: n }, (_, i) => i);
+  }
+  find(x: number): number {
+    while (this.parent[x] !== x) {
+      this.parent[x] = this.parent[this.parent[x]];
+      x = this.parent[x];
+    }
+    return x;
+  }
+  union(a: number, b: number): void {
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra !== rb) this.parent[ra] = rb;
+  }
+}
+
+const gsDedupPresent = (v: string | null): boolean => v !== null && v.trim() !== "";
+
+router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  let rows: GsDedupRow[] = [];
+  try {
+    rows = expDb
+      .prepare(
+        // Same base gårdssalg scoping as the other admin gårdssalg reports
+        // (producer_type set OR seeded via rfb-seed), minus the hidden
+        // booking-flyt-v1 synthetic test provider (excluded the same way
+        // gardssalgSharedHostCounts() excludes it above) — a fixed test row
+        // must never surface as a "duplicate candidate".
+        `SELECT id, navn, org_nr, hjemmeside, epost, telefon, postnummer,
+                rfb_seed_source, producer_type, content_source, homepage_unreachable_since
+           FROM experience_providers
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`
+      )
+      .all() as GsDedupRow[];
+  } catch (err) {
+    console.error("[gardssalg-provider-dedup-audit] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const uf = new GsDedupUnionFind(rows.length);
+
+  // ── Signal 1: org_nr (both sides set, equal) ────────────────────────────
+  const orgNrBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const v = r.org_nr && r.org_nr.trim();
+    if (!v) return;
+    const list = orgNrBuckets.get(v) ?? [];
+    list.push(i);
+    orgNrBuckets.set(v, list);
+  });
+  for (const idxs of orgNrBuckets.values()) {
+    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
+  }
+
+  // ── Signal 2: registrable website domain (both sides set, equal) ───────
+  const domainBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const d = homepageRegistrableDomain(r.hjemmeside);
+    if (!d) return;
+    const list = domainBuckets.get(d) ?? [];
+    list.push(i);
+    domainBuckets.set(d, list);
+  });
+  for (const idxs of domainBuckets.values()) {
+    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
+  }
+
+  // ── Signal 3: name (bucketed by first-token, then scored pairwise) ─────
+  const nameBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const key = normaliseName(gardssalgSearchName(r.navn)).split(" ")[0] ?? "";
+    if (!key) return;
+    const list = nameBuckets.get(key) ?? [];
+    list.push(i);
+    nameBuckets.set(key, list);
+  });
+  for (const idxs of nameBuckets.values()) {
+    for (let x = 0; x < idxs.length; x++) {
+      for (let y = x + 1; y < idxs.length; y++) {
+        if (gsDedupBestNameTier(rows[idxs[x]], rows[idxs[y]])) uf.union(idxs[x], idxs[y]);
+      }
+    }
+  }
+
+  // ── Collect connected components ────────────────────────────────────────
+  const componentsByRoot = new Map<number, number[]>();
+  rows.forEach((_, i) => {
+    const root = uf.find(i);
+    const list = componentsByRoot.get(root) ?? [];
+    list.push(i);
+    componentsByRoot.set(root, list);
+  });
+
+  const toRowOut = (r: GsDedupRow) => ({
+    id: r.id,
+    navn: r.navn,
+    org_nr: r.org_nr,
+    rfb_seed_source: r.rfb_seed_source,
+    producer_type: r.producer_type,
+    content_source: r.content_source,
+    has_email: gsDedupPresent(r.epost),
+    has_phone: gsDedupPresent(r.telefon),
+    unreachable: r.homepage_unreachable_since !== null,
+    homepage_unreachable_since: r.homepage_unreachable_since,
+  });
+
+  const groups: Array<{
+    signals: string[];
+    confidence: "high" | "low";
+    rows: ReturnType<typeof toRowOut>[];
+  }> = [];
+
+  for (const idxs of componentsByRoot.values()) {
+    if (idxs.length < 2) continue;
+    // Re-derive which signal(s) fired for AT LEAST one pair in this group —
+    // groups are small (a handful of rows at most), so re-checking every
+    // pair here (rather than threading evidence through the union-find
+    // above) is cheap and keeps the "why grouped" logic in one place.
+    const signals = new Set<string>();
+    let highConfidence = false;
+    for (let x = 0; x < idxs.length; x++) {
+      for (let y = x + 1; y < idxs.length; y++) {
+        const a = rows[idxs[x]];
+        const b = rows[idxs[y]];
+        const orgA = a.org_nr && a.org_nr.trim();
+        const orgB = b.org_nr && b.org_nr.trim();
+        if (orgA && orgB && orgA === orgB) {
+          signals.add("org_nr");
+          highConfidence = true;
+        }
+        const domA = homepageRegistrableDomain(a.hjemmeside);
+        const domB = homepageRegistrableDomain(b.hjemmeside);
+        if (domA && domB && domA === domB) {
+          signals.add("domain");
+          highConfidence = true;
+        }
+        const tier = gsDedupBestNameTier(a, b);
+        if (tier) {
+          signals.add(tier);
+          if (GS_DEDUP_HIGH_CONF_NAME_TIERS.has(tier)) highConfidence = true;
+        }
+      }
+    }
+    groups.push({
+      signals: Array.from(signals),
+      confidence: highConfidence ? "high" : "low",
+      rows: idxs.map((i) => toRowOut(rows[i])),
+    });
+  }
+
+  res.json({
+    total_providers_scanned: rows.length,
+    groups_found: groups.length,
+    groups,
+  });
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-provider-lookup ────────────────────
