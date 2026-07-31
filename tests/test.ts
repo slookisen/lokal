@@ -28903,6 +28903,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of pgr.failures) failures.push("experiences-seo-place-geo-regression: " + f);
     console.log(`  experiences-seo-place-geo-regression: ${pgr.passed} passed, ${pgr.failed} failed`);
 
+    // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info:
+    // category/fylke-boosted search grouping on /sok + route-intent
+    // detection ported into opplevagent's /sok + homepage hero copy. Same
+    // in-memory-DB pattern (swaps the experiences db-factory singleton), so
+    // it runs sequentially inside this same gated block for the same reason
+    // as the suites above.
+    console.log("\n── experiences-seo-sok-boost: kategori/fylke-boosted search + reiserute route-intent ──");
+    const { runExperiencesSeoSokBoostTests } = require("../src/routes/experiences-seo-sok-boost.test") as
+      typeof import("../src/routes/experiences-seo-sok-boost.test");
+    const sbr = await runExperiencesSeoSokBoostTests({ log: false });
+    passed += sbr.passed;
+    failed += sbr.failed;
+    for (const f of sbr.failures) failures.push("experiences-seo-sok-boost: " + f);
+    console.log(`  experiences-seo-sok-boost: ${sbr.passed} passed, ${sbr.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
     // re-harvest guard, discover-query invariant). Same in-memory-DB pattern,
