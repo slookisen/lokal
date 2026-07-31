@@ -219,15 +219,43 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
       email: "x@example.no",
       umbrella_type: null,
     });
-    assertEq(failEnrichment.ok, false, "coreEligibilityCheck: fails when enrichment_status not in (partial, rich)");
+    assertEq(failEnrichment.ok, false, "coreEligibilityCheck: fails when enrichment_status is 'thin'");
+    assertEq(
+      failEnrichment.failedCondition,
+      "enrichment_status_not_rich",
+      "coreEligibilityCheck: reports the correct failed condition for 'thin'",
+    );
+
+    // dev-request 2026-07-30-outreach-gate-tynne-profiler: 'partial' used to pass
+    // this check (see the retired `passesPartial` case below this block's history)
+    // — it must now fail, mirroring the outreach_ready_pool VIEW's tightened gate.
+    // Mutation pin: reverting the `!== "rich"` condition back to the old
+    // partial-or-rich check makes this assertion fail.
+    const failPartial = coreEligibilityCheck({
+      verification_status: "verified",
+      enrichment_status: "partial",
+      email: "x@example.no",
+      umbrella_type: null,
+    });
+    assertEq(failPartial.ok, false, "coreEligibilityCheck: fails when enrichment_status is 'partial' (tightened 2026-07-30)");
+    assertEq(
+      failPartial.failedCondition,
+      "enrichment_status_not_rich",
+      "coreEligibilityCheck: reports the correct failed condition for 'partial'",
+    );
 
     const failEmail = coreEligibilityCheck({
       verification_status: "verified",
-      enrichment_status: "partial",
+      enrichment_status: "rich",
       email: "",
       umbrella_type: null,
     });
     assertEq(failEmail.ok, false, "coreEligibilityCheck: fails when email is empty");
+    assertEq(
+      failEmail.failedCondition,
+      "email_missing",
+      "coreEligibilityCheck: isolates the email check (row is otherwise fully eligible)",
+    );
 
     const failUmbrella = coreEligibilityCheck({
       verification_status: "verified",
@@ -248,14 +276,6 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     });
     assertEq(passes.ok, true, "coreEligibilityCheck: passes a fully-eligible row");
     assertEq(passes.failedCondition, null, "coreEligibilityCheck: failedCondition is null when it passes");
-
-    const passesPartial = coreEligibilityCheck({
-      verification_status: "verified",
-      enrichment_status: "partial",
-      email: "x@example.no",
-      umbrella_type: null,
-    });
-    assertEq(passesPartial.ok, true, "coreEligibilityCheck: passes with enrichment_status='partial' too");
   } catch (err) {
     failed++;
     failures.push(`gate-integrity (coreEligibilityCheck): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
