@@ -22,6 +22,12 @@
  *                provenance, låst rad hoppes over av skriveren.
  *   cx-20        Eksklusjonslistetillegget fra wdv2-målingen: taste*-DMO og
  *                *.blog avvises som hjemmesidekandidater.
+ *   cx-24        Sitebuilder-placeholder-domener (mysite.com m.fl.) skrives
+ *                aldri — funnet i 2026-07-31-kohorten via u-tilpasset Wix-mal.
+ *   cx-25        epost/telefon er rullbare via content-rollback-leveren
+ *                (audit-rader fantes siden #432; allowlisten manglet feltene).
+ *   cx-26        Rolled-back-veto: en rullet-tilbake epost re-skrives ikke av
+ *                neste kjøring selv om kilden serverer samme adresse (per felt).
  *   cx-21..cx-23 Herdingen etter prod-hendelsen 30.07 (dev-request
  *                2026-07-30-kontakt-utvinning-kjorelaas-og-pacing): kjørelås
  *                gir 409 på samtidig kall og slippes etterpå, default-limit
@@ -274,6 +280,80 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         assertEq(fetchCalls.length, fetchesBefore, "cx-23d: ingen crawl-fetches gjort for den avbrutte kjøringen");
         const e2 = await callRoute({ limit: 1 });
         assertEq(e2.status, 200, "cx-23e: låsen er sluppet også etter en avbrutt kjøring (finally-garantien)");
+      }
+
+      // ═══ cx-24: sitebuilder-placeholder-domener skrives aldri ═══
+      // (2026-07-31-kohorten: u-tilpasset Wix-mal serverte mailto:info@mysite.com
+      // på en ekte produsents side, og mailto er høyeste tillitsnivå — guarden
+      // må derfor sitte i push(), før tillitsordenen i det hele tatt vurderes.)
+      {
+        const ex = expStore.extractGardssalgContactEmail;
+        const r24 = ex('<a href="mailto:info@mysite.com">Kontakt</a>', "nedstrandbryggeri.no", true);
+        assertEq(r24, null, "cx-24: mailto mot placeholder-domene (mysite.com) skrives aldri — selv på kontaktside");
+        const r24b = ex("Skriv til oss: post@yourdomain.com eller ring", "fjellbrygg.no", true);
+        assertEq(r24b, null, "cx-24b: tekst-adresse på placeholder-domene avvises også");
+        const r24c = ex('<a href="mailto:info@mysite.com">x</a> ellers post@fjellbrygg.no', "fjellbrygg.no", false);
+        assertEq(r24c?.email, "post@fjellbrygg.no", "cx-24c: ekte samme-domene-adresse vinner når placeholderen er filtrert bort");
+      }
+
+      // ═══ cx-25: epost/telefon er rullbare via content-rollback-leveren ═══
+      // (Audit-rader har eksistert siden lokal#432; allowlisten manglet feltene,
+      // så en giftig adresse hadde ingen undo. cx-a fikk epost+telefon skrevet av
+      // apply-kjøringen i cx-18 — rull epost tilbake og la telefon stå.)
+      {
+        const callRollback = (rbBody: Record<string, unknown>): Promise<{ status: number; body: any }> => {
+          const req: any = {
+            method: "POST",
+            url: "/admin/gardssalg-content-rollback",
+            originalUrl: "/api/opplevelser/admin/gardssalg-content-rollback",
+            path: "/admin/gardssalg-content-rollback",
+            query: {},
+            body: rbBody,
+            headers: { "x-admin-key": testKey },
+            get(n: string) { return this.headers[n.toLowerCase()]; },
+          };
+          let settle!: () => void;
+          const done = new Promise<void>((r) => { settle = r; });
+          const res: any = {
+            statusCode: 200, _body: undefined,
+            status(c: number) { this.statusCode = c; return this; },
+            json(b: any) { this._body = b; settle(); return this; },
+            send(b: any) { this._body = b; settle(); return this; },
+          };
+          opplevelserRouter.handle(req, res, () => settle());
+          return done.then(() => ({ status: res.statusCode, body: res._body }));
+        };
+
+        const dry = await callRollback({ provider_id: "cx-a", field_name: "epost" });
+        assertEq(dry.status, 200, "cx-25: rollback-planen svarer 200 for epost");
+        assertEq((dry.body?.restorable ?? dry.body?.restored)?.length ?? 0, 1,
+          "cx-25b: epost er nå et kjent, rullbart felt (ikke unknown_field)");
+        const rowBefore = expDb.prepare("SELECT epost, telefon FROM experience_providers WHERE id='cx-a'").get() as any;
+        assertEq(rowBefore.epost, "post@fjellbrygg.no", "cx-25c: dry-run rørte ingenting");
+
+        const applied25 = await callRollback({ provider_id: "cx-a", field_name: "epost", apply: true });
+        assertEq(applied25.status, 200, "cx-25d: rollback apply svarer 200");
+        const rowAfter = expDb.prepare("SELECT epost, telefon FROM experience_providers WHERE id='cx-a'").get() as any;
+        assertEq(rowAfter.epost, null, "cx-25e: epost er rullet tilbake til pre-write-verdien (null)");
+        assertEq(rowAfter.telefon, "91234567", "cx-25f: telefon står urørt — rollbacken er per felt");
+
+        // ═══ cx-26: rolled-back-veto — undo-en un-undoer seg ikke ═══
+        // (lokal#438-review B1: rollback nuller feltet → raden er tilbake i
+        // fill-only-kohorten, og kilden serverer fortsatt samme mailto. Uten
+        // veto ville neste kjøring stille re-skrevet verdien mennesket nettopp
+        // rullet tilbake — org_nr-presedensens «undo that un-undoes itself».)
+        assertEq(expStore.gardssalgContactFieldWasRolledBack("cx-a", "epost"), true,
+          "cx-26: siste audit-rad for cx-a/epost er en rollback");
+        assertEq(expStore.gardssalgContactFieldWasRolledBack("cx-a", "telefon"), false,
+          "cx-26b: telefon er IKKE rullet tilbake — veto-en er per felt");
+        const reRun = await callRoute({ apply: true, limit: 12 });
+        assertEq(reRun.status, 200, "cx-26c: ny apply-kjøring etter rollback svarer 200");
+        const rowVeto = expDb.prepare("SELECT epost, telefon FROM experience_providers WHERE id='cx-a'").get() as any;
+        assertEq(rowVeto.epost, null,
+          "cx-26d: epost forblir null — samme mailto på kilden re-skrives IKKE etter rollback");
+        assertEq(rowVeto.telefon, "91234567", "cx-26e: telefonen (aldri rullet tilbake) står fortsatt");
+        const reWrites = (reRun.body.changed as any[]).filter((c) => c.provider_id === "cx-a");
+        assertEq(reWrites.length, 0, "cx-26f: kjøringen rapporterer heller ingen skriving for cx-a");
       }
     } catch (err: any) {
       failed++;

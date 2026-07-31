@@ -3898,12 +3898,12 @@ export function applyGardssalgProviderContact(
     telefon: row.telefon,
   };
 
-  if (isBlank(row.epost) && candidate.epost?.trim()) {
+  if (isBlank(row.epost) && candidate.epost?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "epost")) {
     sets.push("epost = @epost");
     params.epost = candidate.epost.trim();
     written.push("epost");
   }
-  if (isBlank(row.telefon) && candidate.telefon?.trim()) {
+  if (isBlank(row.telefon) && candidate.telefon?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "telefon")) {
     sets.push("telefon = @telefon");
     params.telefon = candidate.telefon.trim();
     written.push("telefon");
@@ -4183,14 +4183,28 @@ export function applyGardssalgProviderOrgnr(
  * itself. Exported for tests.
  */
 export function gardssalgOrgnrWasRolledBack(providerId: string): boolean {
+  return gardssalgContactFieldWasRolledBack(providerId, "org_nr");
+}
+
+/**
+ * Generalisering av gardssalgOrgnrWasRolledBack til vilkårlig felt (2026-07-31,
+ * lokal#438-review B1): en rollback nuller feltet, som gjør raden kvalifisert
+ * for fill-only-selektorene igjen — uten denne sjekken ville neste kjøring
+ * stille re-skrevet nøyaktig verdien et menneske nettopp rullet tilbake («an
+ * undo that un-undoes itself», org_nr-presedensens egne ord). Konsumeres av
+ * applyGardssalgProviderContact per felt (dekker både contact-extraction og
+ * Brreg-backfill i ett choke point) i tillegg til org_nr-wrapperen over.
+ * NB: kun EKSAKT feltnavn fra kallere — aldri brukerinput rett inn her.
+ */
+export function gardssalgContactFieldWasRolledBack(providerId: string, fieldName: string): boolean {
   const db = getDb(VERTICAL);
   const latest = db
     .prepare(
       `SELECT source_url FROM gardssalg_content_audit
-        WHERE provider_id = ? AND field_name = 'org_nr'
+        WHERE provider_id = ? AND field_name = ?
         ORDER BY rowid DESC LIMIT 1`
     )
-    .get(providerId) as { source_url: string | null } | undefined;
+    .get(providerId, fieldName) as { source_url: string | null } | undefined;
   return !!latest && latest.source_url === GARDSSALG_ROLLBACK_MARKER;
 }
 
@@ -4849,6 +4863,35 @@ export function gardssalgContactPageLinks(html: string, baseHost: string, max = 
 const CX_SKIP_LOCALPARTS = /^(noreply|no-reply|postmaster|webmaster|abuse|mailer-daemon|test|example)$/i;
 
 /**
+ * Sitebuilder-template placeholder domains. A mailto pointing at one of
+ * these is boilerplate the site owner never customised — NOT a contact
+ * address. Found the hard way in the 2026-07-31 cohort run: an
+ * un-customised Wix template served `mailto:info@mysite.com` on a real
+ * producer's site and the extractor trusted it (mailto = highest tier).
+ */
+const CX_PLACEHOLDER_DOMAINS = new Set([
+  "mysite.com",
+  "example.com",
+  "example.no",
+  "yourdomain.com",
+  "yoursite.com",
+  "yourwebsite.com",
+  "domain.com",
+  "email.com",
+  "example.org",
+  "example.net",
+  "test.com",
+  "company.com",
+  "website.com",
+  "yourcompany.com",
+  "wixpress.com",
+  "sentry.io",
+  "wix.com",
+  "squarespace.com",
+  "wordpress.com",
+]);
+
+/**
  * Extract the producer's contact EMAIL from a page.
  *
  * Trust order:
@@ -4874,7 +4917,9 @@ export function extractGardssalgContactEmail(
     if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return;
     const local = email.split("@")[0]!;
     if (CX_SKIP_LOCALPARTS.test(local)) return;
-    if (email.endsWith("@example.com") || email.endsWith(".invalid")) return;
+    if (email.endsWith(".invalid")) return;
+    const dom = email.split("@")[1]!;
+    if (CX_PLACEHOLDER_DOMAINS.has(dom) || CX_PLACEHOLDER_DOMAINS.has(registrableDomain(dom) ?? dom)) return;
     if (seen.has(email)) return;
     seen.add(email);
     candidates.push({ email, viaMailto });
@@ -5147,6 +5192,17 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // skive B (2026-07-19, komplett-foer-synlig) — fill-only hjemmeside adopted
   // from the website-discovery review queue; see applyGardssalgProviderWebsite
   "hjemmeside",
+  // 2026-07-31 (kontakt-utvinning follow-up) — applyGardssalgProviderContact
+  // has written audit rows for these since lokal#432, but this allowlist
+  // never included them, so a bad extracted address (e.g. a sitebuilder
+  // placeholder mailto like info@mysite.com) had no undo lever. The audit
+  // trail already exists; this only lets the planner act on it. Kjent og
+  // akseptert (samme som hjemmeside/adresse): field_provenance-oppføringen
+  // blir stående stale etter rollback (peker på kilde-URL-en mens verdien er
+  // null) — den er visning/audit i experiences, aldri en gate. Re-fill etter
+  // rollback vetoes av gardssalgContactFieldWasRolledBack i skriveren.
+  "epost",
+  "telefon",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
