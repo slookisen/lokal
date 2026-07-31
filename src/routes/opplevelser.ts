@@ -7696,7 +7696,7 @@ Ved minste tvil, svar ${GARDSSALG_JUDGE_REJECT_TOKEN}.`;
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-8",
+        model: "claude-haiku-4-5",
         max_tokens: 200,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -7892,7 +7892,7 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-8",
+        model: "claude-haiku-4-5",
         max_tokens: 400,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -8005,7 +8005,7 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-8",
+        model: "claude-haiku-4-5",
         max_tokens: 400,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -8104,7 +8104,7 @@ Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der.
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-8",
+        model: "claude-haiku-4-5",
         max_tokens: 400,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -8188,7 +8188,7 @@ Sted: ${place || "ukjent"}`;
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-8",
+        model: "claude-haiku-4-5",
         max_tokens: 200,
         messages: [{ role: "user", content: prompt }],
       }),
