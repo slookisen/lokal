@@ -1097,6 +1097,20 @@ console.log("── admin-outreach-candidates (gate-integrity: dedupe tiebreak p
   console.log(`  admin-outreach-candidates-gate-integrity: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── 2026-07-30 dev-request: outreach-gate-tynne-profiler — outreach_ready_pool
+// VIEW tightened to enrichment_status='rich' + GET /admin/outreach-sent-log/audit ──
+console.log("── admin-outreach-gate-tynne-profiler (VIEW tightening + sent-log audit) ──");
+{
+  const { runAdminOutreachGateTynneProfilerTests } =
+    require("../src/routes/admin-outreach-gate-tynne-profiler.test") as
+      typeof import("../src/routes/admin-outreach-gate-tynne-profiler.test");
+  const r = runAdminOutreachGateTynneProfilerTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-gate-tynne-profiler: " + f);
+  console.log(`  admin-outreach-gate-tynne-profiler: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── 2026-07-18 dev-request: admin-blocklist-manual-entry-api — generic
 // { identifier_type, identifier_value, reason? } shape for POST /admin/blocklist,
 // plus the free-mail/ISP + vipps.no website_domain guard ──
@@ -32555,9 +32569,13 @@ console.log("\n── outreach-suppression-P0: compose-leak + email-keyed gate �
 
     const makeEligible = (id: string, email: string) => {
       insertTestAgent(odb, id, "Prod " + id, { email, website: "https://" + id + ".example.no" });
+      // dev-request 2026-07-30-outreach-gate-tynne-profiler: outreach_ready_pool
+      // no longer admits enrichment_status='partial' — 'rich' here so this block
+      // keeps testing what it's actually about (compose-leak / suppression-gate
+      // behavior), independent of the enrichment-depth gate.
       odb.prepare(
         `UPDATE agent_knowledge
-           SET verification_status='verified', enrichment_status='partial',
+           SET verification_status='verified', enrichment_status='rich',
                url_last_status=200, url_last_probed=datetime('now'), email=?
          WHERE agent_id=?`
       ).run(email, id);

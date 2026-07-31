@@ -1900,10 +1900,22 @@ function initSchema(db: Database.Database): void {
   // WO #9 switches over. Filtered by:
   //   - non-null email
   //   - verification_status = 'verified'
-  //   - enrichment_status in ('partial','rich')
+  //   - enrichment_status = 'rich'
   //   - never sent through the new pipeline (outreach_sent_log)
   // NOTE: agents.removed_at does not exist yet (Phase 5.10) — using
   // 1=1 as placeholder so the VIEW resolves on prod today.
+  //
+  // ─── dev-request 2026-07-30-outreach-gate-tynne-profiler ───
+  // Was `enrichment_status IN ('partial', 'rich')`. `partial` profiles are
+  // half-empty by computeEnrichmentStatus's own definition (lokal-agent-
+  // verifier.ts) — an outreach email pointing a producer at their own thin
+  // profile burns the first impression with exactly the producers we want.
+  // Tightened to `= 'rich'` only. Deliberately the simplest lever (Daniel,
+  // 2026-07-30): one condition, enforced at the same single choke point as
+  // the rest of the gate, no new mechanism. Pool size drops as a direct,
+  // expected consequence — the bottleneck moves to enrichment, which is
+  // exactly where dev-request 2026-07-29-blacklist-backfill-og-
+  // berikelsestriage (slice 3) is already refilling it with `rich` profiles.
   try {
     db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
     // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
@@ -1935,7 +1947,7 @@ function initSchema(db: Database.Database): void {
         AND k.email != ''
         AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
         AND k.verification_status = 'verified'
-        AND k.enrichment_status IN ('partial', 'rich')
+        AND k.enrichment_status = 'rich'
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
         AND k.url_last_status IS NOT NULL
         AND k.url_last_status >= 200
