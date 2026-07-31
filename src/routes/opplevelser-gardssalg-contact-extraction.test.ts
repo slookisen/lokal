@@ -22,6 +22,11 @@
  *                provenance, låst rad hoppes over av skriveren.
  *   cx-20        Eksklusjonslistetillegget fra wdv2-målingen: taste*-DMO og
  *                *.blog avvises som hjemmesidekandidater.
+ *   cx-21..cx-23 Herdingen etter prod-hendelsen 30.07 (dev-request
+ *                2026-07-30-kontakt-utvinning-kjorelaas-og-pacing): kjørelås
+ *                gir 409 på samtidig kall og slippes etterpå, default-limit
+ *                er 8, og en frakoblet klient avbryter kjøringen i stedet
+ *                for å fullføre i det stille.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/routes/opplevelser-gardssalg-contact-extraction.test.ts
@@ -72,9 +77,17 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
       const expStore = require("../services/experience-store") as typeof import("../services/experience-store");
-      const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+      const opplevelserModule = require("./opplevelser") as typeof import("./opplevelser");
+      const opplevelserRouter = opplevelserModule.default as any;
+      // Radpause 0 i test: harnesset er timing-sensitivt (runSerial-kjeden i
+      // tests/test.ts), og sekunder med kunstig pause her forskyver urelaterte
+      // suiter inn i kjente races. Yield-semantikken (ekte setTimeout) beholdes.
+      opplevelserModule.__setGsCxRowDelayForTesting(0);
 
-      const callRoute = (routeBody: Record<string, unknown>): Promise<{ status: number; body: any }> => {
+      const callRoute = (
+        routeBody: Record<string, unknown>,
+        reqExtra: Record<string, unknown> = {},
+      ): Promise<{ status: number; body: any }> => {
         const req: any = {
           method: "POST",
           url: "/admin/gardssalg-contact-extraction",
@@ -84,6 +97,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
           body: routeBody,
           headers: { "x-admin-key": testKey },
           get(n: string) { return this.headers[n.toLowerCase()]; },
+          ...reqExtra,
         };
         let settle!: () => void;
         const done = new Promise<void>((r) => { settle = r; });
@@ -159,23 +173,36 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
       }
 
       // ═══ cx-15..cx-19: ruta ende-til-ende ═══
+      // Mocken svarer KUN for denne suitens fixture-domener og 404-er resten av
+      // suitens egne crawl-mål. Loopback-URL-er (127.0.0.1/localhost) sendes
+      // videre til fetchen som var installert da suiten startet: andre
+      // harness-blokker (pr106/tnb/selger-open-tracking) gjør ekte loopback-
+      // HTTP via globalThis.fetch KONKURRENT med denne suitens await-vinduer,
+      // og en mock som 404-er alt (uten headers) er nøyaktig stub-klassen
+      // tests/test.ts-headeren dokumenterer som kilde til interleaving-krasj
+      // («Cannot read properties of undefined (reading 'get')»).
+      const cxMockHeaders = { get: () => null } as unknown as Headers;
       const fetchCalls: string[] = [];
-      globalThis.fetch = (async (url: string | URL | Request) => {
+      globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
         const u = String(url);
+        const host = (() => { try { return new URL(u).hostname; } catch { return ""; } })();
+        if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
+          return (prevFetch as typeof fetch)(url as any, init);
+        }
         fetchCalls.push(u);
         if (u.startsWith("https://fjellbrygg.no/kontakt")) {
-          return { ok: true, status: 200, url: u, text: async () =>
+          return { ok: true, status: 200, url: u, headers: cxMockHeaders, text: async () =>
             '<html><body>Kontakt oss: <a href="mailto:post@fjellbrygg.no">post@fjellbrygg.no</a> — tlf 912 34 567</body></html>' } as unknown as Response;
         }
         if (u === "https://fjellbrygg.no" || u === "https://fjellbrygg.no/") {
-          return { ok: true, status: 200, url: u, text: async () =>
+          return { ok: true, status: 200, url: u, headers: cxMockHeaders, text: async () =>
             '<html><body>Fjellbrygg — håndverksøl. feil@aggregator.no <a href="/kontakt">Kontakt</a></body></html>' } as unknown as Response;
         }
         if (u.startsWith("https://delvis.no")) {
-          return { ok: true, status: 200, url: u, text: async () =>
+          return { ok: true, status: 200, url: u, headers: cxMockHeaders, text: async () =>
             "<html><body>Delvis vingård. Ring 45 67 89 01 for besøk</body></html>" } as unknown as Response;
         }
-        return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        return { ok: false, status: 404, url: u, headers: cxMockHeaders, text: async () => "" } as unknown as Response;
       }) as unknown as typeof fetch;
 
       {
@@ -209,6 +236,44 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
           "cx-20b: *.blog avvises (Borøy-feiltreffet) — en blogg-TLD er aldri en produsents hjemmeside");
         assertEq(expStore.gardssalgSharedDomainReason("fjellbrygg.no"), null,
           "cx-20c: vanlige domener er fortsatt upåvirket");
+      }
+
+      // ═══ cx-21..cx-23: herdingen etter prod-hendelsen 30.07 ═══
+      // (kjørelås → 409, default-limit 8, frakoblings-abort — dev-request
+      // 2026-07-30-kontakt-utvinning-kjorelaas-og-pacing)
+      {
+        // Ti nye kvalifiserte rader — cx-a/cx-f ble fylt av apply-kjøringen
+        // over og er ute av kohorten. Hjemmesidene 404-er i fetch-mocken, så
+        // radene lander i fetch_failed; det er kjøre-mekanikken som testes her.
+        for (let i = 1; i <= 10; i++) {
+          ins.run({ id: `cx-l${i}`, navn: `Låsegard ${i}`, pt: "bryggeri", hj: `https://laasegard${i}.no`, ep: null, tlf: null, cs: null, created: `2026-02-${String(i).padStart(2, "0")}` });
+        }
+
+        // Kjørelåsen settes synkront før første await i handleren, så kall B
+        // fyrt rett etter A ser låsen — nøyaktig scenarioet fra 30.07 der
+        // timede-ut apply-kall stablet seg.
+        const pA = callRoute({});
+        const pB = callRoute({});
+        const b = await pB;
+        assertEq(b.status, 409, "cx-21: samtidig kall nummer to får 409 umiddelbart");
+        assertEq(b.body?.error, "run_in_progress", "cx-21b: …med run_in_progress-feilkoden");
+        const a = await pA;
+        assertEq(a.status, 200, "cx-21c: den første kjøringen fullfører upåvirket av det avviste kallet");
+        assertEq(a.body.scanned, 8, "cx-22: default-limit er 8 (ned fra 24) — pacing-punktet i spec-en");
+        const c = await callRoute({ limit: 1 });
+        assertEq(c.status, 200, "cx-21d: låsen er sluppet etter fullført kjøring — neste kall går gjennom");
+
+        // Frakoblet klient: kjøringen skal avbrytes FØR crawling, ikke
+        // fullføre i det stille (det var de forlatte kjøringene som stablet
+        // seg og mettet event-loopen).
+        const fetchesBefore = fetchCalls.length;
+        const d = await callRoute({ limit: 5 }, { aborted: true });
+        assertEq(d.status, 200, "cx-23: frakoblet klient → kjøringen avbrytes ryddig");
+        assertEq(d.body?.aborted_client_disconnect, true, "cx-23b: …og svaret sier ærlig at den ble avbrutt");
+        assertEq((d.body?.changed as any[])?.length, 0, "cx-23c: ingen rader behandlet etter frakobling");
+        assertEq(fetchCalls.length, fetchesBefore, "cx-23d: ingen crawl-fetches gjort for den avbrutte kjøringen");
+        const e2 = await callRoute({ limit: 1 });
+        assertEq(e2.status, 200, "cx-23e: låsen er sluppet også etter en avbrutt kjøring (finally-garantien)");
       }
     } catch (err: any) {
       failed++;

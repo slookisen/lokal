@@ -4330,7 +4330,27 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
 // knows how far the walk has left.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
-const GS_CX_DEFAULT_LIMIT = 24;
+// Herding (dev-request 2026-07-30-kontakt-utvinning-kjorelaas-og-pacing —
+// leveren hang prod to ganger 30.07):
+//   1. Kjørelås: Express avbryter ikke en handler når klienten kobler fra, så
+//      timede-ut apply-kall STABLET seg og mettet event-loopen. Ett kall om
+//      gangen; nummer to får 409 umiddelbart.
+//   2. Default-limit 24 → 8 + 250ms pause mellom rader (yield til event-loopen
+//      så /health alltid får svare).
+//   3. Klient-frakobling sjekkes mellom rader — en forlatt kjøring avbrytes i
+//      stedet for å fullføre i det stille (det var de forlatte kjøringene som
+//      stablet seg).
+const GS_CX_DEFAULT_LIMIT = 8;
+const GS_CX_ROW_DELAY_MS = 250;
+let gsCxRunning = false;
+// Testene setter radpausen til 0 (fortsatt en ekte setTimeout-yield, bare uten
+// ventetid) — test-harnesset er timing-sensitivt (se tests/test.ts-headeren om
+// runSerial-kjeden), så sekunder med kunstig pause i én suite forskyver
+// urelaterte suiter inn i kjente races. Prod beholder 250ms.
+let gsCxRowDelayMs = GS_CX_ROW_DELAY_MS;
+export function __setGsCxRowDelayForTesting(ms: number | null): void {
+  gsCxRowDelayMs = ms ?? GS_CX_ROW_DELAY_MS;
+}
 
 router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown };
@@ -4341,6 +4361,15 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const limit =
     typeof body.limit === "number" && body.limit > 0 ? Math.min(Math.floor(body.limit), 48) : GS_CX_DEFAULT_LIMIT;
   const offset = typeof body.offset === "number" && body.offset >= 0 ? Math.floor(body.offset) : 0;
+
+  // Kjørelås — sjekket og satt FØR noe arbeid. finally-blokken under er eneste
+  // som slipper den, så en kastet feil aldri etterlater låsen hengende.
+  if (gsCxRunning) {
+    res.status(409).json({ error: "run_in_progress", detail: "en contact-extraction-kjøring pågår allerede — vent til den er ferdig" });
+    return;
+  }
+  gsCxRunning = true;
+  try {
   const batchId = `contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const { targets, cohortTotal } = selectGardssalgProvidersForContactExtraction(limit, offset);
@@ -4350,7 +4379,17 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
+  let clientDisconnected = false;
   for (const t of targets) {
+    // 3: en forlatt kjøring (klient timet ut / koblet fra) skal ikke fullføre
+    // i det stille — det var nøyaktig slik kjøringene stablet seg 30.07.
+    if ((req as any).aborted === true || res.writableEnded || (res as any).destroyed === true) {
+      clientDisconnected = true;
+      break;
+    }
+    // 2: yield til event-loopen mellom rader så helsesjekk/øvrig trafikk
+    // alltid får svare under en kjøring.
+    await new Promise((r) => setTimeout(r, gsCxRowDelayMs));
     try {
       const front = await wdFetchPage(t.hjemmeside);
       if (!front) {
@@ -4426,11 +4465,15 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     offset,
     scanned: targets.length,
     providers_enriched: changed.length,
+    aborted_client_disconnect: clientDisconnected,
     changed,
     no_contact_found: noContactFound,
     fetch_failed: fetchFailed,
     errors,
   });
+  } finally {
+    gsCxRunning = false;
+  }
 });
 
 const GS_CB_DEFAULT_LIMIT = 48;
