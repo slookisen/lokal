@@ -90,6 +90,12 @@ import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags
 import { geocodingService } from "../services/geocoding-service";
 // dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
+// dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 2:
+// route-intent detection for opplevagent's /sok — REUSED, not reimplemented,
+// verbatim from the module rettfrabonden.com's own /sok (src/routes/seo.ts)
+// already relies on. See route-intent.ts's module header for why this must
+// stay a strict whole-string resolver + reluctant heuristic, unmodified.
+import { resolveRouteIntent, detectRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { getDb as getExpDbForReise } from "../database/db-factory";
 import {
   createBooking,
@@ -331,7 +337,7 @@ function gardssalgVisible(): boolean {
 // Homepage UI strings (NO/EN). Phase-1 i18n: only the landing page
 // is genuinely bilingual; browse/detail stay NO-canonical for now.
 // ─────────────────────────────────────────────────────────────
-function homeStrings(lang: Lang) {
+export function homeStrings(lang: Lang) {
   const no = {
     metaTitle: "Opplevagent — Kuratert markedsplass for norske opplevelser",
     metaDesc: "Opplevagent er en kuratert markedsplass for norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Søkbar for AI-agenter etter sted, vær, sesong og gruppestørrelse.",
@@ -346,6 +352,12 @@ function homeStrings(lang: Lang) {
     heroSub: "Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.",
     searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: hvalsafari, Oslo, mat …", searchBtn: "Finn opplevelser",
     hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ". Agenter kan kalle ", hintPost2: " direkte.",
+    // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
+    // Goal 3: the reiserute (route/corridor) capability existed but was
+    // invisible right next to the ONE search box that can now trigger it —
+    // Daniel: «dette nevnes ikke i informasjonen som ligger nær søkefeltet».
+    // Keep this in sync with the `en` object below.
+    hintRoutePre: "\u{1F697} Skal du ut og kjøre? Skriv ", hintRouteLink: "«Oslo til Bergen»", hintRoutePost: " rett i søkefeltet over, så finner vi opplevelser, gårdssalg og drikkesteder langs ruten &mdash; eller sett opp ", hintRouteLink2: "en hel reiserute", hintRoutePost2: " selv.",
     quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
     // dev-request 2026-07-25-reisesok fix 0f(ii): homepage «Nær meg».
     nearMeBtn: "Nær meg", nearMeRadiusLabel: "Søkeradius", nearMeLoading: "Henter posisjon…", nearMeDenied: "Posisjon avslått",
@@ -382,6 +394,8 @@ function homeStrings(lang: Lang) {
     heroSub: "From whale safaris and treehouses to guided mountain hikes, food experiences and laser tag &mdash; a curated overview of Norwegian experiences, built to be discovered and queried by AI agents.",
     searchAria: "Find experiences", searchLabel: "Describe what you want to do, or type a place", searchPlaceholder: "Search: whale safari, Oslo, food …", searchBtn: "Find experiences",
     hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ". Agents can call ", hintPost2: " directly.",
+    // Keep in sync with the `no` object above.
+    hintRoutePre: "\u{1F697} Driving somewhere? Type ", hintRouteLink: "“Oslo to Bergen”", hintRoutePost: " straight into the search box above and we'll surface experiences, farm shops and drink stops along the way &mdash; or set up ", hintRouteLink2: "a full route", hintRoutePost2: " yourself.",
     quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
     nearMeBtn: "Near me", nearMeRadiusLabel: "Search radius", nearMeLoading: "Locating…", nearMeDenied: "Location denied",
     trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
@@ -851,6 +865,13 @@ ${ldScripts}
           <button type="submit">${S.searchBtn}</button>
         </form>
         <p class="discover-hint">${S.hintPre}<a href="/opplevelser" style="color:#fff;text-decoration:underline">${S.hintLink}</a>${S.hintPost}<code>GET /api/opplevelser/discover</code>${S.hintPost2}</p>
+        <!-- dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
+             Goal 3: the hero hint didn't mention reiserute (route/corridor)
+             search at all — Daniel: «dette nevnes ikke i informasjonen som
+             ligger nær søkefeltet». Same search box now also detects a route
+             typed straight in (Goal 2) and redirects to /reise; this line
+             is what makes that capability discoverable rather than hidden. -->
+        <p class="discover-hint discover-hint-route">${S.hintRoutePre}<strong>${S.hintRouteLink}</strong>${S.hintRoutePost}<a href="/reise" style="color:#fff;text-decoration:underline">${S.hintRouteLink2}</a>${S.hintRoutePost2}</p>
         <!-- dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
              fix 0f(ii): OpplevAgent's «Nær meg» affordance existed on /sok and
              on the browse pages, but NOT on the homepage — so the first thing
@@ -2248,6 +2269,9 @@ const BROWSE_CSS = `
   .empty p{font-size:.95rem;max-width:46ch;margin:0 auto}
   .empty .cta{display:inline-block;margin-top:16px;background:var(--fjord-800);color:#fff;font-weight:700;padding:10px 18px;border-radius:var(--r-pill)}
   .empty .cta:hover{text-decoration:none;background:var(--fjord-700)}
+  .search-group{margin-top:8px}
+  .search-group + .search-group{margin-top:28px;padding-top:20px;border-top:1px solid var(--line)}
+  .search-group-label{font-size:.82rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:var(--fjord-700);margin-bottom:4px}
   .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:24px 0 8px;flex-wrap:wrap}
   .pager a,.pager span{font-size:.9rem;font-weight:700}
   .pager .btn{display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:var(--r-pill);background:var(--surface);border:1px solid var(--line);color:var(--fjord-700)}
@@ -2738,16 +2762,91 @@ function facetChips(): string {
 const SEARCH_SVG =
   '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16.5 16.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
 
-function searchBox(currentQ: string): string {
+// dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+// a category/fylke page's search box still posts to the ONE shared /sok
+// results page (unchanged), but carries the current category/fylke along as
+// a hidden field so /sok knows to GROUP (not filter) its full-catalogue
+// matches — hits inside the current category/fylke first, under a distinct
+// label, the rest of the catalogue's matches below. Additive: every existing
+// caller (searchBox("") — /opplevelser, /kommune/:kommune, the homepage
+// hero, and /sok's own re-render of a plain query) passes no boost, so /sok
+// renders its old byte-identical flat, ungrouped list whenever the param is
+// absent. See splitBoostedRows()/SearchBoostContext below and /sok's own
+// handler for the grouping itself.
+export type SearchBoostContext = { category?: string; fylke?: string };
+
+function searchBox(currentQ: string, boost?: SearchBoostContext): string {
+  const boostHidden = boost?.category
+    ? `<input type="hidden" name="category" value="${escapeHtml(boost.category)}">`
+    : boost?.fylke
+    ? `<input type="hidden" name="fylke" value="${escapeHtml(boost.fylke)}">`
+    : "";
   return `<div class="searchbar">
     <form action="/sok" method="GET" role="search" aria-label="Søk i opplevelser">
       <span class="field">${SEARCH_SVG}
         <label for="sok-q" class="skip-link">Søk i opplevelser</label>
         <input id="sok-q" name="q" type="search" autocomplete="off" placeholder="Søk: hvalsafari, Tromsø, mat …" value="${escapeHtml(currentQ)}">
       </span>
+      ${boostHidden}
       <button type="submit">Søk</button>
     </form>
   </div>`;
+}
+
+// Splits full-catalogue search rows (already returned by
+// searchPublishedExperiences(), unfiltered) into the subset that also
+// matches the current category/fylke boost context and the rest — NEVER
+// drops a row, only reorders which group it's shown under. Absent boost (or
+// a boost with neither field set) returns everything as `rest` unchanged, so
+// callers that don't pass a boost context render exactly as before this
+// feature existed.
+function splitBoostedRows(
+  rows: ExperienceCardRow[],
+  boost: SearchBoostContext | undefined
+): { boosted: ExperienceCardRow[]; rest: ExperienceCardRow[] } {
+  if (!boost || (!boost.category && !boost.fylke)) return { boosted: [], rest: rows };
+  const boosted: ExperienceCardRow[] = [];
+  const rest: ExperienceCardRow[] = [];
+  for (const r of rows) {
+    const inBoost =
+      (!!boost.category && r.category === boost.category) ||
+      (!!boost.fylke && r.fylke === boost.fylke);
+    (inBoost ? boosted : rest).push(r);
+  }
+  return { boosted, rest };
+}
+
+// Renders the two-group boosted layout ("Treff i [kategori/fylke]" then
+// "Andre treff i Opplevagent") — see splitBoostedRows() above. A group with
+// zero rows renders NOTHING (no empty heading), so a zero-hit category is
+// never a dead end: the "Andre treff" group alone still shows the rest of
+// the catalogue's matches.
+function renderBoostedResultsHtml(
+  boosted: ExperienceCardRow[],
+  rest: ExperienceCardRow[],
+  boost: SearchBoostContext,
+  lang: Lang,
+  distanceMap: Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>
+): string {
+  const boostLabel = boost.category
+    ? `Treff i ${catLabel(boost.category)}`
+    : `Treff i ${boost.fylke}`;
+  const boostedSection =
+    boosted.length > 0
+      ? `<section class="search-group" aria-label="${escapeHtml(boostLabel)}">
+          <h2 class="search-group-label">${escapeHtml(boostLabel)}</h2>
+          <div class="grid" role="list">${boosted.map((r) => renderCard(r, lang, distanceMap.get(r.slug))).join("")}</div>
+        </section>`
+      : "";
+  const restLabel = "Andre treff i Opplevagent";
+  const restSection =
+    rest.length > 0
+      ? `<section class="search-group" aria-label="${escapeHtml(restLabel)}">
+          <h2 class="search-group-label">${escapeHtml(restLabel)}</h2>
+          <div class="grid" role="list">${rest.map((r) => renderCard(r, lang, distanceMap.get(r.slug))).join("")}</div>
+        </section>`
+      : "";
+  return boostedSection + restSection;
 }
 
 // ─── GET /opplevelser — paginated index of all published experiences ─────────
@@ -4904,6 +5003,25 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
   try {
     total = countPublishedExperiences({ category });
     if (total === 0) return next(); // unknown/empty category → 404 (no orphan page)
+  } catch {
+    return next();
+  }
+
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // a ?q= hit on the category page itself (e.g. a shared/bookmarked search
+  // URL, since this page's own searchBox() actually posts to /sok — see that
+  // handler for the boost-grouping + route-intent detection this redirects
+  // into) is forwarded to /sok with the category carried along as the boost
+  // context, rather than silently ignored. Keeps route-intent detection and
+  // the grouped-results rendering in the ONE place (/sok) instead of
+  // duplicating either here.
+  const boostQ = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (boostQ) {
+    const params = new URLSearchParams({ q: boostQ, category });
+    return res.redirect(302, `/sok?${params.toString()}`);
+  }
+
+  try {
     rows = listPublishedExperiences({ category }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
   } catch {
     return next();
@@ -4963,7 +5081,7 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     total,
     page,
     pageSize: BROWSE_PAGE_SIZE,
-    extraTopHtml: searchBox(""),
+    extraTopHtml: searchBox("", { category }),
     extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -4996,6 +5114,22 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
       }
       return next(); // unknown/empty fylke → 404 (no orphan page)
     }
+  } catch {
+    return next();
+  }
+
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // mirrors /kategori/:category's own redirect above — a ?q= hit on the
+  // fylke page itself forwards to /sok with the fylke carried along as the
+  // boost context, keeping route-intent detection + grouped rendering in the
+  // one place (/sok) rather than duplicated here.
+  const boostQ = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (boostQ) {
+    const params = new URLSearchParams({ q: boostQ, fylke });
+    return res.redirect(302, `/sok?${params.toString()}`);
+  }
+
+  try {
     rows = listPublishedExperiences({ fylke }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
   } catch {
     return next();
@@ -5049,7 +5183,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     total: effectiveTotal,
     page: effectivePage,
     pageSize: effectivePageSize,
-    extraTopHtml: searchBox("") + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
+    extraTopHtml: searchBox("", { fylke }) + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
     map: { fylke, points: mapPoints },
   });
@@ -5614,6 +5748,70 @@ router.get("/sok", async (req: Request, res: Response) => {
   const q = String(req.query.q ?? "").trim();
   const activeTags = EXPERIENCE_TAGS.filter((t) => String(req.query[t] ?? "") === "1");
 
+  // ── dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
+  // Goal 2: route-intent detection in the ONE opplevagent search box. Ported
+  // verbatim from rettfrabonden.com's own /sok (src/routes/seo.ts ~1374-1402)
+  // — same resolveRouteIntent()/reiseUrlFor() (route-intent.ts) and the same
+  // STRICT geocodingService.geocodePlaceForBackfill() whole-string resolver,
+  // reused as-is (never route-intent's own heuristics reimplemented or
+  // loosened here — see that module's header for why).
+  //
+  // «oslo til bergen» typed here used to run an ordinary place/product text
+  // search with no hint that /reise even exists. Recognise the route and
+  // send the visitor straight there instead.
+  //
+  // EVERY failure path below falls through to the ordinary search further
+  // down — resolveRouteIntent() returns a rejection reason rather than
+  // throwing for exactly this reason, and the try/catch guards against a
+  // geocoder outage taking the whole search box down with it. A wrongly
+  // hijacked ordinary search (e.g. a producer/experience name with a dash)
+  // is a worse failure than a missed route, so this must never get more
+  // eager than the shared module already is.
+  //
+  // Skipped when the request already carries browser GPS coordinates (the
+  // "Nær meg" flow re-submits the existing q verbatim alongside lat/lng) —
+  // a coordinate search is already a complete, deliberate search in its own
+  // right and must not be reinterpreted as a route query.
+  //
+  // The `detectRouteIntent(q)` pre-check is a pure, synchronous, no-I/O
+  // shape test (see route-intent.ts's own doc header) — resolveRouteIntent()
+  // runs the SAME check as its own first line, so calling it here changes
+  // no behaviour at all. It exists so the overwhelming majority of ordinary
+  // (non-route-shaped) searches never hit an `await` at all: `await`ing an
+  // async function always defers to a microtask even when nothing inside it
+  // ever does real I/O, and this hot path runs on every non-empty query.
+  if (q && !parseGeoOriginFromQuery(req.query) && detectRouteIntent(q)) {
+    try {
+      const ri = await resolveRouteIntent(q, {
+        // STRICT whole-string resolver, never extractAndGeocode — see the
+        // contract in route-intent.ts.
+        geocode: async (place: string) => {
+          const g = await geocodingService.geocodePlaceForBackfill(place);
+          return g ? { lat: g.lat, lng: g.lng } : null;
+        },
+      });
+      if (ri.ok) {
+        res.redirect(302, reiseUrlFor(ri.route));
+        return;
+      }
+    } catch (err) {
+      // A geocoder outage must not take the search box down with it.
+      console.error("[route-intent] /sok detection failed, falling through:", err);
+    }
+  }
+
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // additive boost-context, passed through from /kategori/:category's and
+  // /fylke/:fylke's own searchBox() as a hidden field. Absent — plain
+  // /opplevelser and the homepage hero search never send these — /sok's
+  // ordering below is byte-identical to before this feature existed.
+  const categoryBoostRaw = typeof req.query.category === "string" ? req.query.category.trim() : "";
+  const fylkeBoostRaw = typeof req.query.fylke === "string" ? req.query.fylke.trim() : "";
+  const boostContext: SearchBoostContext | undefined =
+    categoryBoostRaw || fylkeBoostRaw
+      ? { category: categoryBoostRaw || undefined, fylke: fylkeBoostRaw || undefined }
+      : undefined;
+
   // ── Resolve a geo origin: GPS (lat/lng) takes priority; the typed-place
   //    fallback (`sted`) is only consulted when lat/lng are absent ────────
   // parseGeoOriginFromQuery range-validates against the SAME bounds
@@ -5769,9 +5967,22 @@ router.get("/sok", async (req: Request, res: Response) => {
   // still link to indexable detail pages.
   const url = baseUrl();
   const canonical = `${url}/sok`;
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // when a category/fylke boost context rode along with a text query, group
+  // (never filter) the full-catalogue matches already in `rows` — hits
+  // inside the current category/fylke first under their own label, the rest
+  // of the catalogue's matches below under a distinct one. No boost context
+  // (the overwhelming majority of hits — plain /opplevelser search, the
+  // homepage hero search) renders the exact same flat grid as before.
+  const hasBoost = Boolean(q) && Boolean(boostContext);
   const cards =
     rows.length > 0
-      ? `<div class="grid" role="list">${rows.map((r) => renderCard(r, req.lang, distanceMap.get(r.slug))).join("")}</div>`
+      ? hasBoost
+        ? (() => {
+            const { boosted, rest } = splitBoostedRows(rows, boostContext);
+            return renderBoostedResultsHtml(boosted, rest, boostContext as SearchBoostContext, req.lang, distanceMap);
+          })()
+        : `<div class="grid" role="list">${rows.map((r) => renderCard(r, req.lang, distanceMap.get(r.slug))).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(emptyTitle)}</h2><p>${escapeHtml(emptyBody)}</p><a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
 
   const breadcrumbLd = {
@@ -5812,7 +6023,7 @@ ${BROWSE_NAV}
     <h1>${escapeHtml(h1)}</h1>
     ${hasQuery ? `<p class="count">${rows.length} ${rows.length === 1 ? "treff" : "treff"}</p>` : ""}
   </header>
-  ${searchBox(q)}
+  ${searchBox(q, boostContext)}
   ${renderNearMeBox(q, activeTags, radiusKm)}
   ${geoNote}
   ${renderFilterChips(q, activeTags)}
