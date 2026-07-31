@@ -767,6 +767,24 @@ console.log("\n── experience-tags (derived filter tags) ──");
   console.log(`  experience-tags: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 6:
+// pure clustering algorithm (services/map-clustering.ts) for the two
+// multi-marker Leaflet maps. Pins: dense point sets actually collapse into
+// clusters, sparse/far-apart point sets never falsely merge, and the
+// approx/exact precision-honesty invariant survives clustering (an
+// approximate point can never be grouped with an exact one, even at the
+// identical coordinate).
+console.log("\n── map-clustering (Leaflet marker clustering algorithm) ──");
+{
+  const { runMapClusteringTests } = require("../src/services/map-clustering.test") as
+    typeof import("../src/services/map-clustering.test");
+  const r = runMapClusteringTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("map-clustering: " + f);
+  console.log(`  map-clustering: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: distance/
 // precision label formatting for /sok's «Nær meg» result cards. Pins the
 // honesty rule: an 'address'-precision row gets an exact "X,X km unna", a
@@ -19066,6 +19084,192 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
   dbFactoryKart.__resetDbFactoryForTesting();
 })();
 
+// ── opplevagent kart-cluster: /fylke/:fylke marker clustering (dev-request
+// 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 6: "Klynging ved
+// tette punkter (Oslo/Bergen)"). Uses the SAME real render pipeline as
+// kart-01..11 above (not a synthetic browser simulation) — extracts the
+// actual #fylke-map-data JSON island the live page ships (unchanged shape —
+// clustering never alters the underlying data-island contract), then feeds
+// it through the REAL clusterMapPoints() (src/services/map-clustering.ts —
+// the exact algorithm MAP_CLUSTER_JS mirrors client-side) with the SAME
+// approx-mapping the client init script itself uses
+// (`approx: p.precision === 'kommune'`). This proves, end-to-end against
+// real rendered marker payloads (not just synthetic coordinates in
+// isolation — that's map-clustering.test.ts's job), that: (1) a dense set
+// of points actually collapses into one cluster, (2) far-apart points never
+// falsely merge, (3) an approximate point never merges into a nearby exact
+// cluster (precision-honesty invariant), and (4) the shipped page markup
+// itself carries the clustering wiring while the single-point mini-map page
+// carries NONE of it.
+console.log("\n── opplevagent kart-cluster: /fylke/:fylke marker clustering (dev-request 2026-07-19, arbeidspunkt 6) ──");
+(() => {
+  const prevPathKC = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathKC = require.resolve("../src/database/db-factory");
+  const expStorePathKC = require.resolve("../src/services/experience-store");
+  const expSeoPathKC = require.resolve("../src/routes/experiences-seo");
+  const mapClusterPathKC = require.resolve("../src/services/map-clustering");
+  delete require.cache[dbFactoryPathKC];
+  delete require.cache[expStorePathKC];
+  delete require.cache[expSeoPathKC];
+  delete require.cache[mapClusterPathKC];
+
+  const dbFactoryKC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryKC.__resetDbFactoryForTesting();
+  const expStoreKC = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterKC = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const { clusterMapPoints: clusterMapPointsKC } = require("../src/services/map-clustering") as
+    typeof import("../src/services/map-clustering");
+
+  dbFactoryKC.getDb("experiences");
+  const provKC = expStoreKC.createProvider({
+    navn: "Oslo Opplevelser AS", org_nr: "912345680",
+    fylke: "Oslo", kommune: "Oslo", brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+
+  // 6 experiences tightly packed in central Oslo — a realistic "dense area"
+  // spread, the dev-request's own named example — must engage clustering.
+  const denseCoordsKC: Array<[number, number]> = [
+    [59.9139, 10.7522], [59.9141, 10.7530], [59.9135, 10.7518],
+    [59.9144, 10.7509], [59.9130, 10.7540], [59.9137, 10.7526],
+  ];
+  denseCoordsKC.forEach(([lat, lon], i) => {
+    expStoreKC.createExperience({
+      title: `Oslo sentrum opplevelse ${i + 1}`, provider_id: provKC, provider_match_status: "matched",
+      category: "sightseeing_transport", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+      loc_lat: lat, loc_lon: lon, geo_precision: "address",
+      confidence: "high", verification_status: "verified",
+    });
+  });
+  // 2 exact-precision points FAR from the dense cluster (and from each
+  // other) — sparse points must render as individual markers, never
+  // absorbed into (or forming their own false) cluster.
+  expStoreKC.createExperience({
+    title: "Langt unna nord", provider_id: provKC, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+    loc_lat: 69.6492, loc_lon: 18.9553, geo_precision: "address",
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreKC.createExperience({
+    title: "Langt unna sørvest", provider_id: provKC, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+    loc_lat: 58.1467, loc_lon: 7.9956, geo_precision: "address",
+    confidence: "high", verification_status: "verified",
+  });
+  // 1 APPROXIMATE (kommune-precision) point at the EXACT SAME coordinates as
+  // the dense cluster's center — the precision-honesty invariant requires
+  // this to NEVER merge into the nearby exact cluster.
+  const approxIdKC = expStoreKC.createExperience({
+    title: "Ca. posisjon midt i klyngen", provider_id: provKC, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+    loc_lat: 59.9139, loc_lon: 10.7522, geo_precision: "kommune",
+    confidence: "high", verification_status: "verified",
+  });
+
+  function invokeSeo(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterKC.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `kc-route: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // kc-01: the page renders, and the (unclustered) data island still
+  // carries ALL 9 individual points — requirement 1's contract (SAME
+  // already-injected JSON, byte-shape unchanged) and requirement 4 (no
+  // regression to the existing marker set).
+  const fylkeKC = invokeSeo("/fylke/:fylke", { fylke: "Oslo" }, "/fylke/Oslo");
+  assertEq(fylkeKC.status, 200, "kc-01a: GET /fylke/Oslo -> 200");
+  const dataMatchKC = fylkeKC.body.match(/<script type="application\/json" id="fylke-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchKC, "kc-01b: data island is present and matchable");
+  const markersKC: Array<{ title: string; lat: number; lon: number; precision: string }> =
+    dataMatchKC ? JSON.parse(dataMatchKC[1]) : [];
+  assertEq(markersKC.length, 9, "kc-01c: all 9 points (6 dense + 2 far + 1 approx-at-center) present in the unclustered data island");
+
+  // kc-02: feed the REAL rendered marker payload through the REAL clustering
+  // algorithm, using the exact same approx-mapping MAP_CLUSTER_JS uses
+  // client-side — proves clustering actually ENGAGES end-to-end for a dense
+  // real payload, not just in algorithm-only isolation.
+  const clusterInputKC = markersKC.map((m) => ({ lat: m.lat, lon: m.lon, approx: m.precision === "kommune" }));
+  const groupsKC = clusterMapPointsKC(clusterInputKC);
+  const sizesKC = groupsKC.map((g) => g.members.length).sort((a, b) => a - b);
+  assertEq(groupsKC.length, 4, "kc-02a: 9 real points resolve to exactly 4 groups (1 six-point cluster + 2 far singletons + 1 approx singleton)");
+  assertEq(JSON.stringify(sizesKC), JSON.stringify([1, 1, 1, 6]), "kc-02b: group sizes are exactly [1, 1, 1, 6] — the dense set collapsed, nothing else falsely merged");
+  const denseGroupKC = groupsKC.find((g) => g.members.length === 6)!;
+  assertTrue(!!denseGroupKC && denseGroupKC.approx === false, "kc-02c: the 6-point dense cluster is flagged approx:false (all its members were address-precision)");
+
+  // kc-03: precision-honesty invariant, end-to-end — the approx point sits
+  // at the IDENTICAL coordinate as the dense cluster's center, yet must
+  // remain its own singleton group, never absorbed into the exact cluster.
+  const approxGroupsKC = groupsKC.filter((g) => g.approx === true);
+  assertEq(approxGroupsKC.length, 1, "kc-03a: exactly 1 approx group exists");
+  assertEq(approxGroupsKC[0]?.members.length, 1, "kc-03b: the approx group is a singleton (never merged into the co-located exact cluster)");
+  assertTrue(denseGroupKC.members.length === 6, "kc-03c: the exact cluster's size is unaffected — still exactly its 6 real members, no approx point leaked in");
+
+  // kc-04: sparse points never falsely merge with each other or with the
+  // dense cluster (the two "Langt unna" points are ~1500km+ apart and
+  // nowhere near central Oslo).
+  const farSingletonsKC = groupsKC.filter((g) => g.members.length === 1 && g.approx === false);
+  assertEq(farSingletonsKC.length, 2, "kc-04: both far-apart exact points remain individual singleton groups");
+
+  // kc-05: the shipped page markup itself carries the clustering wiring
+  // (function + constants + CSS classes) — proves the feature is actually
+  // present in the rendered bundle, not just algorithmically correct in
+  // isolation.
+  assertTrue(/function clusterMapPoints\(/.test(fylkeKC.body), "kc-05a: page ships the clusterMapPoints() function");
+  assertTrue(/MAP_CLUSTER_RADIUS_KM/.test(fylkeKC.body), "kc-05b: page ships the clustering radius constant");
+  assertTrue(/MAP_CLUSTER_MIN_SIZE/.test(fylkeKC.body), "kc-05c: page ships the min-cluster-size constant");
+  assertTrue(/cluster-bubble/.test(fylkeKC.body) && /cluster-exact/.test(fylkeKC.body) && /cluster-approx/.test(fylkeKC.body),
+    "kc-05d: page ships the exact/approx cluster bubble CSS classes");
+
+  // kc-06: lazy-load discipline is unaffected by adding clustering — the
+  // clustering code lives inside the SAME lazy IntersectionObserver-gated
+  // init script as before, leaflet.js is still never eagerly tagged.
+  assertTrue(!/<script src="\/leaflet\/leaflet\.js"/.test(fylkeKC.body),
+    "kc-06a: leaflet.js is still NOT eagerly tagged (clustering code loads lazily with the rest of the map bundle)");
+  assertTrue(/IntersectionObserver/.test(fylkeKC.body), "kc-06b: init script (now including clustering) still uses IntersectionObserver for lazy init");
+  assertTrue(!/\son(click|change)\s*=/.test(fylkeKC.body), "kc-06c: no inline onclick=/onchange= handler attributes introduced by clustering");
+  assertTrue(!/unpkg\.com/.test(fylkeKC.body), "kc-06d: no CDN reference introduced by clustering (still self-hosted only)");
+
+  // kc-07: <noscript> OSM fallback is completely unaffected by clustering.
+  const noscriptKC = (fylkeKC.body.match(/<noscript>[\s\S]*?<\/noscript>/) || [""])[0];
+  assertTrue(/openstreetmap\.org\/search\?query=/.test(noscriptKC) && /Oslo/.test(noscriptKC),
+    "kc-07a: <noscript> OSM-search fallback still present and unchanged by clustering");
+
+  // kc-08: the single-point mini-map (arbeidspunkt 5) must carry NONE of
+  // the clustering code — clustering is scoped only to the two multi-marker
+  // maps, per the dev-request's own scoping ("Single-point mini-maps don't
+  // need clustering").
+  const approxSlugKC = (expStoreKC.getExperienceById(approxIdKC) as any).slug as string;
+  const miniKC = invokeSeo("/opplevelse/:slug", { slug: approxSlugKC }, `/opplevelse/${approxSlugKC}`);
+  assertEq(miniKC.status, 200, "kc-08a: GET /opplevelse/:slug (mini-map page) -> 200");
+  assertTrue(miniKC.body.includes('id="mini-map"'), "kc-08b: mini-map still renders normally");
+  assertTrue(!/function clusterMapPoints\(/.test(miniKC.body), "kc-08c: the mini-map page ships NO clustering code (single point never needs it)");
+
+  if (prevPathKC === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathKC;
+  dbFactoryKC.__resetDbFactoryForTesting();
+})();
+
 // ── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet map (dev-request
 // 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4: the SAME kind
 // of self-hosted-Leaflet + server-injected marker JSON island as the
@@ -19260,6 +19464,150 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   if (prevPathKG === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathKG;
   dbFactoryKG.__resetDbFactoryForTesting();
+})();
+
+// ── opplevagent kart-gardssalg-cluster: /kategori/gardssalg marker
+// clustering (dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg,
+// arbeidspunkt 6). Same end-to-end discipline as the kart-cluster block
+// above (real render pipeline + the REAL clusterMapPoints() algorithm, not
+// a synthetic-only check) but for the producer map: a dense set of
+// producers collapses into one cluster, far-apart producers stay
+// individual, and an approximate-confidence producer co-located with the
+// dense exact cluster never merges into it.
+console.log("\n── opplevagent kart-gardssalg-cluster: /kategori/gardssalg marker clustering (dev-request 2026-07-19, arbeidspunkt 6) ──");
+(() => {
+  const prevPathKGC = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathKGC = require.resolve("../src/database/db-factory");
+  const expStorePathKGC = require.resolve("../src/services/experience-store");
+  const expSeoPathKGC = require.resolve("../src/routes/experiences-seo");
+  const mapClusterPathKGC = require.resolve("../src/services/map-clustering");
+  delete require.cache[dbFactoryPathKGC];
+  delete require.cache[expStorePathKGC];
+  delete require.cache[expSeoPathKGC];
+  delete require.cache[mapClusterPathKGC];
+
+  const dbFactoryKGC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryKGC.__resetDbFactoryForTesting();
+  const expStoreKGC = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterKGC = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const { clusterMapPoints: clusterMapPointsKGC } = require("../src/services/map-clustering") as
+    typeof import("../src/services/map-clustering");
+
+  const dbKGC = dbFactoryKGC.getDb("experiences");
+
+  // 5 producers tightly packed in central Bergen (the dev-request's own
+  // second named example) — must engage clustering.
+  const denseCoordsKGC: Array<[number, number]> = [
+    [60.3913, 5.3221], [60.3920, 5.3235], [60.3905, 5.3210], [60.3918, 5.3200], [60.3908, 5.3245],
+  ];
+  denseCoordsKGC.forEach(([lat, lon], i) => {
+    const id = expStoreKGC.createProvider({
+      navn: `Bergen Sentrum Bryggeri ${i + 1}`, org_nr: `9134560${i}0`,
+      fylke: "Vestland", kommune: "Bergen", poststed: "Bergen",
+      lat, lon, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+    });
+    dbKGC.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+      .run("bryggeri", "high", id);
+  });
+  // 1 producer far away (Tromsø-like coordinates) — sparse, must stay an
+  // individual marker, never absorbed into the Bergen cluster.
+  const farIdKGC = expStoreKGC.createProvider({
+    navn: "Nordlys Sideri", org_nr: "912345690",
+    fylke: "Troms", kommune: "Tromsø", poststed: "Tromsø",
+    lat: 69.6492, lon: 18.9553, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKGC.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("sideri", "high", farIdKGC);
+  // 1 APPROXIMATE (geocode_confidence='approximate') producer at the EXACT
+  // SAME coordinates as the dense Bergen cluster's center — must never
+  // merge into the nearby exact cluster (precision-honesty invariant).
+  const approxIdKGC = expStoreKGC.createProvider({
+    navn: "Ca. Posisjon Mjøderi", org_nr: "912345691",
+    fylke: "Vestland", kommune: "Bergen", poststed: "Bergen",
+    lat: 60.3913, lon: 5.3221, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKGC.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("mjøderi", "approximate", approxIdKGC);
+
+  expStoreKGC.backfillProviderSlugs();
+  const approxSlugKGC = (expStoreKGC.listGardssalgProviders(100, 0).find((p) => p.id === approxIdKGC) || {}).slug as string;
+
+  function invokeSeo(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterKGC.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `kgc-route: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // kgc-01: page renders, unclustered data island still carries ALL 7
+  // individual producers (5 dense + 1 far + 1 approx-at-center).
+  const gardKGC = invokeSeo("/kategori/gardssalg", {}, "/kategori/gardssalg");
+  assertEq(gardKGC.status, 200, "kgc-01a: GET /kategori/gardssalg -> 200");
+  const dataMatchKGC = gardKGC.body.match(/<script type="application\/json" id="gardssalg-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchKGC, "kgc-01b: data island is present and matchable");
+  const markersKGC: Array<{ navn: string; lat: number; lon: number; approx: boolean }> =
+    dataMatchKGC ? JSON.parse(dataMatchKGC[1]) : [];
+  assertEq(markersKGC.length, 7, "kgc-01c: all 7 producers present in the unclustered data island");
+
+  // kgc-02: feed the REAL rendered marker payload through the REAL
+  // clustering algorithm (gardssalg markers already carry `approx` directly
+  // — same field the client init script reads) — proves clustering engages
+  // end-to-end for a dense real payload.
+  const clusterInputKGC = markersKGC.map((m) => ({ lat: m.lat, lon: m.lon, approx: m.approx }));
+  const groupsKGC = clusterMapPointsKGC(clusterInputKGC);
+  const sizesKGC = groupsKGC.map((g) => g.members.length).sort((a, b) => a - b);
+  assertEq(groupsKGC.length, 3, "kgc-02a: 7 real points resolve to exactly 3 groups (1 five-point cluster + 1 far singleton + 1 approx singleton)");
+  assertEq(JSON.stringify(sizesKGC), JSON.stringify([1, 1, 5]), "kgc-02b: group sizes are exactly [1, 1, 5] — the dense set collapsed, nothing else falsely merged");
+  const denseGroupKGC = groupsKGC.find((g) => g.members.length === 5)!;
+  assertTrue(!!denseGroupKGC && denseGroupKGC.approx === false, "kgc-02c: the 5-point dense cluster is flagged approx:false");
+
+  // kgc-03: precision-honesty invariant, end-to-end.
+  const approxGroupsKGC = groupsKGC.filter((g) => g.approx === true);
+  assertEq(approxGroupsKGC.length, 1, "kgc-03a: exactly 1 approx group exists");
+  assertEq(approxGroupsKGC[0]?.members.length, 1, "kgc-03b: the approx group is a singleton (never merged into the co-located exact cluster)");
+  assertTrue(denseGroupKGC.members.length === 5, "kgc-03c: the exact cluster's size is unaffected by the co-located approx point");
+
+  // kgc-04: shipped page markup carries the clustering wiring.
+  assertTrue(/function clusterMapPoints\(/.test(gardKGC.body), "kgc-04a: page ships the clusterMapPoints() function");
+  assertTrue(/cluster-bubble/.test(gardKGC.body) && /cluster-exact/.test(gardKGC.body) && /cluster-approx/.test(gardKGC.body),
+    "kgc-04b: page ships the exact/approx cluster bubble CSS classes");
+  assertTrue(!/unpkg\.com/.test(gardKGC.body), "kgc-04c: no CDN reference introduced by clustering");
+  assertTrue(!/<script src="\/leaflet\/leaflet\.js"/.test(gardKGC.body), "kgc-04d: leaflet.js is still NOT eagerly tagged (lazy-load unaffected)");
+
+  // kgc-05: <noscript> OSM fallback unaffected by clustering.
+  const noscriptKGC = (gardKGC.body.match(/<noscript>[\s\S]*?<\/noscript>/) || [""])[0];
+  assertTrue(/openstreetmap\.org\/search\?query=/.test(noscriptKGC), "kgc-05a: <noscript> fallback still present and unchanged by clustering");
+
+  // kgc-06: the produsent-profil mini-map ships NO clustering code.
+  const miniKGC = invokeSeo("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: approxSlugKGC }, `/kategori/gardssalg/produsent/${approxSlugKGC}`);
+  assertEq(miniKGC.status, 200, "kgc-06a: GET produsent-profil (mini-map page) -> 200");
+  assertTrue(miniKGC.body.includes('id="mini-map"'), "kgc-06b: mini-map still renders normally");
+  assertTrue(!/function clusterMapPoints\(/.test(miniKGC.body), "kgc-06c: the produsent-profil mini-map page ships NO clustering code");
+
+  if (prevPathKGC === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathKGC;
+  dbFactoryKGC.__resetDbFactoryForTesting();
 })();
 
 // ── opplevagent kart-gardssalg (no geocoded providers): honest omission ──────

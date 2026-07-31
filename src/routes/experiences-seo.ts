@@ -2307,6 +2307,86 @@ const FYLKE_MAP_CSS = `
   .map-popup .map-popup-meta{display:block;color:var(--mist);font-size:.8rem}
   .map-popup .map-popup-approx{display:block;color:#c2570c;font-weight:700;font-size:.78rem;margin-top:4px}
   .map-popup a{display:inline-block;margin-top:6px;font-weight:700}
+  .map-popup-cluster-list{list-style:none;padding:0;margin:6px 0 0;max-height:160px;overflow-y:auto}
+  .map-popup-cluster-list li{margin:0 0 4px}
+  .map-popup-cluster-list a{display:inline;margin-top:0;font-weight:700}
+  .map-cluster-icon{background:transparent;border:none}
+  .cluster-bubble{display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;font-weight:800;font-size:.82rem;color:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35)}
+  .cluster-exact{background:var(--fjord-700);border:2px solid var(--fjord-900)}
+  .cluster-approx{background:#f5a623;border:2px dashed #c2570c;color:#5c3a00}
+  .map-cluster-note{font-size:.78rem;color:var(--mist);margin-top:8px}
+`;
+
+// dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 6
+// ("Klynging ved tette punkter (Oslo/Bergen)"): shared client-side
+// clustering helper, reused VERBATIM by both FYLKE_MAP_INIT_JS and
+// GARDSSALG_MAP_INIT_JS below — same "reused as-is, not copied" discipline
+// already used for FYLKE_MAP_CSS (see renderGardssalgMapSection's header
+// comment). Operates ENTIRELY on the already-injected marker JSON island —
+// no new API round-trip, no new endpoint (dev-request requirement 1).
+// Mirrors src/services/map-clustering.ts's clusterMapPoints() algorithm —
+// that TS module is what tests/test.ts's runMapClusteringTests() actually
+// unit-tests (this repo's test runner has no headless browser/DOM — same
+// constraint slice 1 flagged for the Lighthouse criterion); keep the two
+// copies in sync by hand if the algorithm ever changes.
+//
+// Precision-honesty invariant (dev-request requirement 3): clusterMapPoints
+// NEVER merges an approx (kommune-centroid) point with an exact-address
+// point, even at the identical coordinate — points are partitioned by
+// their `approx` flag BEFORE clustering, so a cluster's own approx flag is
+// unambiguous. An all-approx cluster bubble keeps the SAME dashed/orange
+// styling + "Ca. posisjon" note a single approx marker already gets; an
+// all-exact cluster is styled distinctly (solid) from both single exact
+// markers AND approx clusters, so a cluster of real addresses is never
+// mistaken for one single precise point either — it visibly reads as "N
+// points here," never as fabricated single-point precision.
+const MAP_CLUSTER_JS = `
+  var MAP_CLUSTER_RADIUS_KM = 3;
+  var MAP_CLUSTER_MIN_SIZE = 2;
+  function mapHaversineKm(lat1, lon1, lat2, lon2) {
+    var R = 6371;
+    var toRad = function (d) { return d * Math.PI / 180; };
+    var dLat = toRad(lat2 - lat1);
+    var dLon = toRad(lon2 - lon1);
+    var a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+      + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+  function mapClusterPartition(pts) {
+    var n = pts.length;
+    var parent = [];
+    for (var i = 0; i < n; i++) parent.push(i);
+    function find(i) { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; }
+    function union(a, b) { var ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; }
+    for (var i = 0; i < n; i++) {
+      for (var j = i + 1; j < n; j++) {
+        if (mapHaversineKm(pts[i].lat, pts[i].lon, pts[j].lat, pts[j].lon) <= MAP_CLUSTER_RADIUS_KM) union(i, j);
+      }
+    }
+    var order = [];
+    var groups = {};
+    for (var i = 0; i < n; i++) {
+      var root = find(i);
+      if (!groups[root]) { groups[root] = []; order.push(root); }
+      groups[root].push(pts[i]);
+    }
+    var result = [];
+    for (var k = 0; k < order.length; k++) {
+      var members = groups[order[k]];
+      var sumLat = 0, sumLon = 0;
+      for (var m = 0; m < members.length; m++) { sumLat += members[m].lat; sumLon += members[m].lon; }
+      result.push({ lat: sumLat / members.length, lon: sumLon / members.length, approx: members[0].approx, members: members });
+    }
+    return result;
+  }
+  function clusterMapPoints(points) {
+    var exact = [];
+    var approx = [];
+    for (var i = 0; i < points.length; i++) {
+      if (points[i].approx) approx.push(points[i]); else exact.push(points[i]);
+    }
+    return mapClusterPartition(exact).concat(mapClusterPartition(approx));
+  }
 `;
 
 // One marker's worth of data as sent to the client (the JSON data island) —
@@ -2351,6 +2431,8 @@ const FYLKE_MAP_INIT_JS = `(function () {
     });
   }
 
+  ${MAP_CLUSTER_JS}
+
   var leafletLoading = null;
   function loadLeaflet() {
     if (leafletLoading) return leafletLoading;
@@ -2385,23 +2467,64 @@ const FYLKE_MAP_INIT_JS = `(function () {
         iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
       });
 
+      // Bounds are computed from the RAW, unclustered points — fitBounds
+      // must always cover the true full extent regardless of how markers
+      // end up visually grouped below.
       var bounds = [];
-      points.forEach(function (p) {
-        var isApprox = p.precision === 'kommune';
-        var marker = isApprox
-          ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
-          : L.marker([p.lat, p.lon], { icon: addressIcon });
-        var metaBits = [];
-        if (p.kommune) metaBits.push(esc(p.kommune));
-        if (p.categoryLabel) metaBits.push(esc(p.categoryLabel));
-        var popupHtml = '<div class="map-popup"><strong>' + esc(p.title) + '</strong>'
-          + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
-          + (isApprox ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
-          + '<a href="/opplevelse/' + encodeURIComponent(p.slug) + '">Se opplevelsen →</a></div>';
-        marker.bindPopup(popupHtml);
-        marker.addTo(map);
-        bounds.push([p.lat, p.lon]);
+      points.forEach(function (p) { bounds.push([p.lat, p.lon]); });
+
+      // arbeidspunkt 6: cluster the SAME already-injected points (no new
+      // fetch) before rendering markers. Each point keeps a reference back
+      // to its original object (\`orig\`) so popups/links render exactly the
+      // same per-point content as before this feature existed.
+      var clusterInput = points.map(function (p) {
+        return { lat: p.lat, lon: p.lon, approx: p.precision === 'kommune', orig: p };
       });
+      var clusterGroups = clusterMapPoints(clusterInput);
+      var anyRealCluster = false;
+
+      clusterGroups.forEach(function (g) {
+        if (g.members.length < MAP_CLUSTER_MIN_SIZE) {
+          var p = g.members[0].orig;
+          var isApprox = p.precision === 'kommune';
+          var marker = isApprox
+            ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
+            : L.marker([p.lat, p.lon], { icon: addressIcon });
+          var metaBits = [];
+          if (p.kommune) metaBits.push(esc(p.kommune));
+          if (p.categoryLabel) metaBits.push(esc(p.categoryLabel));
+          var popupHtml = '<div class="map-popup"><strong>' + esc(p.title) + '</strong>'
+            + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
+            + (isApprox ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
+            + '<a href="/opplevelse/' + encodeURIComponent(p.slug) + '">Se opplevelsen →</a></div>';
+          marker.bindPopup(popupHtml);
+          marker.addTo(map);
+        } else {
+          anyRealCluster = true;
+          var clusterClass = g.approx ? 'cluster-approx' : 'cluster-exact';
+          var clusterIcon = L.divIcon({
+            className: 'map-cluster-icon',
+            html: '<div class="cluster-bubble ' + clusterClass + '">' + g.members.length + '</div>',
+            iconSize: [32, 32]
+          });
+          var clusterMarker = L.marker([g.lat, g.lon], { icon: clusterIcon });
+          var itemsHtml = g.members.map(function (m) {
+            return '<li><a href="/opplevelse/' + encodeURIComponent(m.orig.slug) + '">' + esc(m.orig.title) + '</a></li>';
+          }).join('');
+          var clusterPopupHtml = '<div class="map-popup"><strong>' + g.members.length + ' opplevelser her</strong>'
+            + (g.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune) for alle punktene i denne klyngen</span>' : '')
+            + '<ul class="map-popup-cluster-list">' + itemsHtml + '</ul></div>';
+          clusterMarker.bindPopup(clusterPopupHtml);
+          clusterMarker.addTo(map);
+        }
+      });
+
+      if (anyRealCluster) {
+        var clusterNote = document.createElement('p');
+        clusterNote.className = 'map-cluster-note';
+        clusterNote.textContent = 'Tall i sirkel = antall punkter samlet på ett sted (klynget for lesbarhet).';
+        mapEl.parentNode.insertBefore(clusterNote, mapEl.nextSibling);
+      }
 
       if (bounds.length === 1) {
         map.setView(bounds[0], 12);
@@ -2964,6 +3087,8 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
     });
   }
 
+  ${MAP_CLUSTER_JS}
+
   var leafletLoading = null;
   function loadLeaflet() {
     if (leafletLoading) return leafletLoading;
@@ -2998,22 +3123,63 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
         iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
       });
 
+      // Bounds are computed from the RAW, unclustered points — fitBounds
+      // must always cover the true full extent regardless of how markers
+      // end up visually grouped below.
       var bounds = [];
-      points.forEach(function (p) {
-        var marker = p.approx
-          ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
-          : L.marker([p.lat, p.lon], { icon: addressIcon });
-        var metaBits = [];
-        if (p.producerTypeLabel) metaBits.push(esc(p.producerTypeLabel));
-        if (p.sted) metaBits.push(esc(p.sted));
-        var popupHtml = '<div class="map-popup"><strong>' + esc(p.navn) + '</strong>'
-          + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
-          + (p.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
-          + '<a href="/kategori/gardssalg/produsent/' + encodeURIComponent(p.slug) + '">Se produsentprofil →</a></div>';
-        marker.bindPopup(popupHtml);
-        marker.addTo(map);
-        bounds.push([p.lat, p.lon]);
+      points.forEach(function (p) { bounds.push([p.lat, p.lon]); });
+
+      // arbeidspunkt 6: cluster the SAME already-injected points (no new
+      // fetch) before rendering markers. Each point keeps a reference back
+      // to its original object (\`orig\`) so popups/links render exactly the
+      // same per-point content as before this feature existed.
+      var clusterInput = points.map(function (p) {
+        return { lat: p.lat, lon: p.lon, approx: !!p.approx, orig: p };
       });
+      var clusterGroups = clusterMapPoints(clusterInput);
+      var anyRealCluster = false;
+
+      clusterGroups.forEach(function (g) {
+        if (g.members.length < MAP_CLUSTER_MIN_SIZE) {
+          var p = g.members[0].orig;
+          var marker = p.approx
+            ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
+            : L.marker([p.lat, p.lon], { icon: addressIcon });
+          var metaBits = [];
+          if (p.producerTypeLabel) metaBits.push(esc(p.producerTypeLabel));
+          if (p.sted) metaBits.push(esc(p.sted));
+          var popupHtml = '<div class="map-popup"><strong>' + esc(p.navn) + '</strong>'
+            + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
+            + (p.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
+            + '<a href="/kategori/gardssalg/produsent/' + encodeURIComponent(p.slug) + '">Se produsentprofil →</a></div>';
+          marker.bindPopup(popupHtml);
+          marker.addTo(map);
+        } else {
+          anyRealCluster = true;
+          var clusterClass = g.approx ? 'cluster-approx' : 'cluster-exact';
+          var clusterIcon = L.divIcon({
+            className: 'map-cluster-icon',
+            html: '<div class="cluster-bubble ' + clusterClass + '">' + g.members.length + '</div>',
+            iconSize: [32, 32]
+          });
+          var clusterMarker = L.marker([g.lat, g.lon], { icon: clusterIcon });
+          var itemsHtml = g.members.map(function (m) {
+            return '<li><a href="/kategori/gardssalg/produsent/' + encodeURIComponent(m.orig.slug) + '">' + esc(m.orig.navn) + '</a></li>';
+          }).join('');
+          var clusterPopupHtml = '<div class="map-popup"><strong>' + g.members.length + ' produsenter her</strong>'
+            + (g.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune) for alle punktene i denne klyngen</span>' : '')
+            + '<ul class="map-popup-cluster-list">' + itemsHtml + '</ul></div>';
+          clusterMarker.bindPopup(clusterPopupHtml);
+          clusterMarker.addTo(map);
+        }
+      });
+
+      if (anyRealCluster) {
+        var clusterNote = document.createElement('p');
+        clusterNote.className = 'map-cluster-note';
+        clusterNote.textContent = 'Tall i sirkel = antall punkter samlet på ett sted (klynget for lesbarhet).';
+        mapEl.parentNode.insertBefore(clusterNote, mapEl.nextSibling);
+      }
 
       if (bounds.length === 1) {
         map.setView(bounds[0], 12);
