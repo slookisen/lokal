@@ -1757,7 +1757,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
                 (agent._distanceKm && agent._distanceKm < 99999 ? ' &middot; ' + (agent._distanceKm < 1 ? (agent._distanceKm * 1000).toFixed(0) + ' m' : agent._distanceKm.toFixed(1) + ' km') : '') +
               '</div>' +
             '</div>' +
-            (agent.isVerified ? '<span class="verified-badge">Verifisert</span>' : '') +
+            (agent.isVerified ? '<span class="verified-badge">Verifisert av eier</span>' : '') +
           '</div>' +
           '<div class="agent-categories">' + cats + '</div>' +
           '<div class="trust-score">' +
@@ -2044,7 +2044,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
 
       // Badges
       var badgesHtml = '';
-      if (agent.isVerified) badgesHtml += '<span class="modal-badge verified">&#10003; Verifisert</span>';
+      if (agent.isVerified) badgesHtml += '<span class="modal-badge verified">&#10003; Verifisert av eier</span>';
       badgesHtml += '<span class="modal-badge">' + (agent.role || 'producer') + '</span>';
       (agent.categories || []).slice(0, 3).forEach(function(c) {
         badgesHtml += '<span class="modal-badge">' + formatCategory(c) + '</span>';
@@ -2243,7 +2243,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         '<div class="modal-section-title">Detaljer</div>' +
         '<div class="modal-info-grid">' +
           '<div class="modal-info-item"><div class="modal-info-label">Rolle</div><div class="modal-info-value">' + (agent.role || 'producer') + '</div></div>' +
-          '<div class="modal-info-item"><div class="modal-info-label">Status</div><div class="modal-info-value">' + (agent.isVerified ? 'Verifisert' : 'Ikke verifisert') + '</div></div>' +
+          '<div class="modal-info-item"><div class="modal-info-label">Status</div><div class="modal-info-value">' + (agent.isVerified ? 'Verifisert av eier' : 'Ikke verifisert av eier') + '</div></div>' +
         '</div></div>';
 
       // CTA

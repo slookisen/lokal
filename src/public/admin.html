@@ -101,8 +101,8 @@
         <input type="text" id="filterSearch" placeholder="S&oslash;k etter navn, by..." />
         <select id="filterStatus">
           <option value="all">Alle</option>
-          <option value="verified">Verifisert</option>
-          <option value="unverified">Ikke verifisert</option>
+          <option value="verified">Verifisert av eier</option>
+          <option value="unverified">Ikke verifisert av eier</option>
           <option value="claimed">Har eier</option>
           <option value="unclaimed">Ingen eier</option>
         </select>
@@ -247,7 +247,7 @@
 
       document.getElementById('statsBar').innerHTML =
         '<div class="stat"><div class="stat-num">' + agents.length + '</div><div class="stat-label">Totalt</div></div>' +
-        '<div class="stat"><div class="stat-num">' + verified + '</div><div class="stat-label">Verifisert</div></div>' +
+        '<div class="stat"><div class="stat-num">' + verified + '</div><div class="stat-label">Verifisert av eier</div></div>' +
         '<div class="stat"><div class="stat-num">' + claimed + '</div><div class="stat-label">Har eier</div></div>' +
         '<div class="stat"><div class="stat-num">' + cities.size + '</div><div class="stat-label">Byer</div></div>';
     }
@@ -287,7 +287,7 @@
 
         var tdStatus = document.createElement('td');
         var badges = '';
-        if (a.isVerified) badges += '<span class="badge badge-green">Verifisert</span> ';
+        if (a.isVerified) badges += '<span class="badge badge-green">Verifisert av eier</span> ';
         if (a.isClaimed) badges += '<span class="badge badge-blue">Eier</span>';
         if (!a.isVerified && !a.isClaimed) badges = '<span class="badge badge-gray">Auto</span>';
         tdStatus.innerHTML = badges;

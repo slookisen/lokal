@@ -377,7 +377,7 @@
           <p id="dashAgentCity" style="color: var(--gray-500); font-size: 0.9rem;"></p>
         </div>
         <div style="display: flex; gap: 0.5rem; align-items: center;">
-          <span class="badge badge-green" id="dashVerified" data-i18n="verified">Verifisert</span>
+          <span class="badge badge-green" id="dashVerified" data-i18n="verified">Verifisert av eier</span>
           <span class="badge badge-blue" id="dashDataSource"></span>
         </div>
       </div>
@@ -943,7 +943,7 @@
         login_desc: 'Har du allerede gjort krav p\u00e5 agenten din? Lim inn claim-tokenet ditt for \u00e5 logge inn.',
         token_placeholder: 'claim_...',
         login: 'Logg inn', logout: 'Logg ut',
-        verified: 'Verifisert',
+        verified: 'Verifisert av eier',
         stat_discovered: 'Oppdaget', stat_contacted: 'Kontaktet', stat_chosen: 'Valgt', stat_trust: 'Trust Score',
         tab_profile: 'Profil', tab_products: 'Produkter', tab_hours: '\u00c5pningstider', tab_stats: 'Statistikk', tab_orders: 'Bestillinger', tab_settings: 'Innstillinger',
         profile_info: 'Butikkinformasjon',
@@ -1011,7 +1011,7 @@
         login_desc: 'Already claimed your agent? Paste your claim token to log in.',
         token_placeholder: 'claim_...',
         login: 'Log in', logout: 'Log out',
-        verified: 'Verified',
+        verified: 'Verified by owner',
         stat_discovered: 'Discovered', stat_contacted: 'Contacted', stat_chosen: 'Chosen', stat_trust: 'Trust Score',
         tab_profile: 'Profile', tab_products: 'Products', tab_hours: 'Opening hours', tab_stats: 'Statistics', tab_orders: 'Orders', tab_settings: 'Settings',
         profile_info: 'Shop information',
@@ -2681,7 +2681,7 @@
           data.matches.forEach(function(m) {
             var cats = escHtml((m.categories || []).join(', '));
             var badge = m.isClaimed ? '<span style="background:#e74c3c;color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Eid</span>' :
-                        m.isVerified ? '<span style="background:var(--forest);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Verifisert</span>' :
+                        m.isVerified ? '<span style="background:var(--forest);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Verifisert av eier</span>' :
                         '<span style="background:var(--accent);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">' + escHtml(String(m.similarity)) + '% match</span>';
             var claimBtn = m.isClaimed
               ? '<span style="color:var(--gray-500);font-size:0.85rem;">Denne er allerede eid av noen</span>'

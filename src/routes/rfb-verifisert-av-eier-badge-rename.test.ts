@@ -356,6 +356,56 @@ export async function runVerifisertAvEierBadgeRenameTests(opts: { log?: boolean 
       assertTrue(expSrc.includes("Verifisert tilbyder"), "vertical-isolation: experiences-seo.ts still has its own unrelated \"Verifisert tilbyder\" copy, untouched");
       assertTrue(dentSrc.includes('badges.push(`<span class="badge badge-verified">Verifisert</span>`)'), "vertical-isolation: dental-seo.ts's own \"Verifisert\" badge text is byte-for-byte unchanged");
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // (8) Follow-up fix (CHANGES-REQUESTED review): the same agent.isVerified
+    // badge/status text also hardcoded the OLD "Verifisert"/"Ikke verifisert"
+    // string in four more static public/ HTML surfaces that are NOT touched
+    // by the seo.ts/mcp.ts/i18n changes above — src/public/app.html (the live
+    // GET /app consumer SPA), src/public/selger.html (the owner/seller
+    // dashboard + claim-matching flow), and (lower-priority, noindexed/legacy)
+    // src/public/dashboard.html and src/public/admin.html. Static source
+    // checks, same convention as the vertical-isolation check above.
+    // ══════════════════════════════════════════════════════════════
+    {
+      const appPath = path.join(__dirname, "../public/app.html");
+      const selgerPath = path.join(__dirname, "../public/selger.html");
+      const dashboardPath = path.join(__dirname, "../public/dashboard.html");
+      const adminPath = path.join(__dirname, "../public/admin.html");
+      const appSrc = fs.readFileSync(appPath, "utf8");
+      const selgerSrc = fs.readFileSync(selgerPath, "utf8");
+      const dashboardSrc = fs.readFileSync(dashboardPath, "utf8");
+      const adminSrc = fs.readFileSync(adminPath, "utf8");
+
+      // A bare old "Verifisert" (not followed by " av eier") or bare "Ikke
+      // verifisert" (not followed by " av eier") would mean a stray badge/
+      // status string was missed. "Verifiserte agenter ..." (a different,
+      // unrelated help-text sentence, singular/plural inflection aside) is
+      // intentionally allowed through by this regex — it does not render the
+      // isVerified badge/status itself.
+      const bareVerifisertBadge = /(?<!Ikke )Verifisert(?! av eier| Aktiv| tilbyder|e )/;
+      const bareIkkeVerifisert = /Ikke verifisert(?! av eier)/;
+
+      // app.html — live GET /app consumer SPA.
+      assertTrue(appSrc.includes("Verifisert av eier"), "app.html: producer-card badge now reads \"Verifisert av eier\"");
+      assertTrue(!bareVerifisertBadge.test(appSrc), "app.html: no bare old \"Verifisert\" badge/status string remains");
+      assertTrue(!bareIkkeVerifisert.test(appSrc), "app.html: no bare old \"Ikke verifisert\" status string remains");
+
+      // selger.html — owner/seller dashboard + claim-matching flow.
+      assertTrue(selgerSrc.includes("Verifisert av eier"), "selger.html: NO dict/badge fallback now reads \"Verifisert av eier\"");
+      assertTrue(selgerSrc.includes("Verified by owner"), "selger.html: EN dict entry now reads \"Verified by owner\"");
+      assertTrue(!bareVerifisertBadge.test(selgerSrc), "selger.html: no bare old \"Verifisert\" badge/dict/claim-match string remains");
+
+      // dashboard.html — legacy/noindexed, superseded by app.html, fixed anyway.
+      assertTrue(dashboardSrc.includes("Verifisert av eier"), "dashboard.html: producer-card badge now reads \"Verifisert av eier\"");
+      assertTrue(!bareVerifisertBadge.test(dashboardSrc), "dashboard.html: no bare old \"Verifisert\" badge/status string remains");
+      assertTrue(!bareIkkeVerifisert.test(dashboardSrc), "dashboard.html: no bare old \"Ikke verifisert\" status string remains");
+
+      // admin.html — legacy/noindexed internal admin page, fixed anyway.
+      assertTrue(adminSrc.includes("Verifisert av eier"), "admin.html: filter option/stat-label/row-badge now read \"Verifisert av eier\"");
+      assertTrue(!bareVerifisertBadge.test(adminSrc), "admin.html: no bare old \"Verifisert\" filter/stat/badge string remains");
+      assertTrue(!bareIkkeVerifisert.test(adminSrc), "admin.html: no bare old \"Ikke verifisert\" filter option remains");
+    }
   } catch (err) {
     failed++;
     failures.push(`rfb-verifisert-av-eier-badge-rename: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);

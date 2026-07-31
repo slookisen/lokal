@@ -1638,7 +1638,7 @@ class MarketplaceRegistry {
 
     if (agent.isVerified) {
       score += 0.05;
-      reasons.push("Verifisert");
+      reasons.push("Verifisert av eier");
     }
 
     return { score: Math.min(1, score), reasons };
