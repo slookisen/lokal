@@ -27,7 +27,10 @@
  *       aggregator (hanen.no, never fetched), missing_source (blank
  *       hjemmeside) — and performs ZERO writes
  *   (c) hidden producers (catalog_hidden=1) are excluded from the cohort
- *       entirely — never appear in the GET report
+ *       BY DEFAULT — never appear in a no-scope GET report. Section (h)
+ *       covers the explicit scope=hidden/all opt-ins (Daniel's 2026-08-01
+ *       live override) and that a typo'd scope is a 400, never a silent
+ *       visible-only run
  *   (d) POST .../gardssalg-website-verification-remediation dry-run: zero
  *       writes anywhere (field_provenance, audit table, review queue all
  *       untouched), reports would_enqueue containing only unverified rows
@@ -66,12 +69,22 @@ function callRoute(
   return new Promise((resolve) => {
     const method = opts.method || "GET";
     const url = opts.url || "/admin/gardssalg-website-verification-audit";
+    // Parse the query string ourselves — router.handle() on a hand-built req
+    // never runs express's query middleware, so a hardcoded `query: {}` would
+    // silently swallow `?scope=...` and the scope tests in section (h) would
+    // pass vacuously against the default. (Exactly that happened on first
+    // run: 5 assertions failed because every scoped GET ran as scope-less.)
+    const [pathOnly, queryString] = url.split("?");
+    const query: Record<string, string> = {};
+    if (queryString) {
+      for (const [k, v] of new URLSearchParams(queryString)) query[k] = v;
+    }
     const req: any = {
       method,
       url,
       originalUrl: url,
-      path: url,
-      query: {},
+      path: pathOnly,
+      query,
       headers: opts.headers || {},
       body: opts.body ?? {},
       get() { return undefined; },
@@ -207,10 +220,10 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
             headers: { get: () => null }, url: urlStr,
           } as unknown as Response;
         }
-        // fossmoenfrukt.example.no (hidden — should never actually be
-        // fetched since the cohort excludes it, but return something sane
-        // if the cohort filter regresses so the test fails loudly instead
-        // of hanging).
+        // fossmoenfrukt.example.no (hidden — never fetched by a
+        // DEFAULT-scope call, which is what assertion c3 pins at its point
+        // in the sequence; section (h) later fetches it deliberately via
+        // scope=hidden and expects org.nr evidence to verify it).
         const html = "<html><body><p>Fossmoen Frukt, org.nr 900 111 222.</p></body></html>";
         return {
           ok: true, status: 200, text: async () => html,
@@ -378,6 +391,76 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       assertEq(scopedRes.status, 200, "g1: scoped dry-run -> 200");
       assertEq(scopedRes.body.summary.total, 1, "g2: providerIds override scopes the scan to exactly the requested producer");
       assertEq(scopedRes.body.summary, { verified: 1, unverified: 0, aggregator: 0, missing_source: 0, total: 1 }, "g3: scoped summary reflects only the requested producer");
+
+      // ── (h) visibility scope — Daniel's 2026-08-01 live override: the
+      //     sweep must reach hidden producers too, as an explicit per-call
+      //     opt-in. Default stays "visible" (sections (c)/(e) above already
+      //     pin that the hidden fixture is absent by default — those
+      //     assertions are unchanged and still pass, which IS the
+      //     backwards-compatibility proof). ─────────────────────────────────
+      const hiddenAudit = await callRoute(opplevelserRouter, {
+        method: "GET",
+        url: "/admin/gardssalg-website-verification-audit?scope=hidden",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(hiddenAudit.status, 200, "h1: scope=hidden audit -> 200");
+      assertEq(hiddenAudit.body.scope, "hidden", "h2: response echoes the scope it actually ran with");
+      assertEq(hiddenAudit.body.summary.total, 1, "h3: hidden scope sees exactly the one hidden producer");
+      assertTrue(
+        hiddenAudit.body.rows.some((r: any) => r.provider_id === "prov-hidden-verified"),
+        "h4: the hidden producer IS the row — reachable when explicitly asked for"
+      );
+
+      const allAudit = await callRoute(opplevelserRouter, {
+        method: "GET",
+        url: "/admin/gardssalg-website-verification-audit?scope=all",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(allAudit.status, 200, "h5: scope=all audit -> 200");
+      assertEq(allAudit.body.summary.total, 5, "h6: scope=all sees every seeded producer, hidden included");
+
+      const junkAudit = await callRoute(opplevelserRouter, {
+        method: "GET",
+        url: "/admin/gardssalg-website-verification-audit?scope=al",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(junkAudit.status, 400, "h7: a typo'd scope is a 400, never a silent visible-only scan");
+
+      const junkRemediation = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { scope: "everything" },
+      });
+      assertEq(junkRemediation.status, 400, "h8: POST rejects unknown scope the same way — worse there, it gates writes");
+
+      const hiddenApply = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { scope: "hidden", apply: true, batch_id: "wv-hidden-batch-1" },
+      });
+      assertEq(hiddenApply.status, 200, "h9: scope=hidden apply -> 200");
+      assertEq(hiddenApply.body.scope, "hidden", "h10: apply response echoes scope");
+      assertEq(hiddenApply.body.provenance_written, 1, "h11: exactly the one hidden row gets a provenance stamp");
+      const hiddenProvRow = expDb
+        .prepare(`SELECT field_provenance FROM experience_providers WHERE id = 'prov-hidden-verified'`)
+        .get() as any;
+      const hiddenProv = JSON.parse(hiddenProvRow.field_provenance);
+      assertEq(
+        hiddenProv.hjemmeside_verification?.classification,
+        "verified",
+        "h12: hidden producer's provenance carries the verification stamp — verify-without-publish works"
+      );
+      const visibleUntouched = expDb
+        .prepare(`SELECT field_provenance FROM experience_providers WHERE id = 'prov-missing-source'`)
+        .get() as any;
+      const visibleProv = visibleUntouched.field_provenance ? JSON.parse(visibleUntouched.field_provenance) : {};
+      assertEq(
+        visibleProv.hjemmeside_verification?.classification,
+        "missing_source",
+        "h13: earlier default-scope applies still own the visible rows' stamps — hidden apply did not touch or clear them"
+      );
     } catch (err: any) {
       failed++;
       failures.push(

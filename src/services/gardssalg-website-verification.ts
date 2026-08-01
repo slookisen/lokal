@@ -101,24 +101,49 @@ export type GsWvFetchFn = (homepageUrl: string) => Promise<GsWvFetchResult>;
 //
 // Same base WHERE as GET /admin/gardssalg-outreach-readiness
 // (routes/opplevelser.ts ~line 5966: producer_type IS NOT NULL OR
-// rfb_seed_source = 'rfb-seed') AND catalog_hidden != 1 (this dev-request's
-// own instruction: "hidden producers are never outreach candidates, never
-// expose them via a new sweep either") — using the established null-safe
-// form `(catalog_hidden IS NULL OR catalog_hidden != 1)` every other
-// gårdssalg selector in this codebase uses (a bare `!= 1` would silently
-// also exclude every NULL row, which is not what "hidden producers
-// excluded" means here). No materialized cohort table exists anywhere in
-// this codebase (task spec) — this recomputes live from experience_providers
-// on every call, same discipline as loadGardssalgProducersForConflictScan.
-const GARDSSALG_WEBSITE_VERIFICATION_COHORT_SQL =
-  `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') AND (catalog_hidden IS NULL OR catalog_hidden != 1)`;
+// rfb_seed_source = 'rfb-seed'). No materialized cohort table exists anywhere
+// in this codebase (task spec) — this recomputes live from
+// experience_providers on every call, same discipline as
+// loadGardssalgProducersForConflictScan.
+//
+// VISIBILITY SCOPE: the original slice hard-excluded hidden producers per
+// the dev-request's then-instruction ("hidden producers are never outreach
+// candidates, never expose them via a new sweep either"). Daniel overrode
+// that live 2026-08-01: verification applies to ALL harvested producers,
+// hidden included — «Dette gjelder alle produsenter vi har innhentet, ikke
+// bare dem som er outreach-klare». Verification is not exposure: both routes
+// stay admin-gated, a hidden producer's rows never reach any public surface,
+// and stamping provenance on a hidden row publishes nothing. The DEFAULT
+// stays "visible" so every existing caller (and the fleet's scheduled
+// sweeps) behaves byte-for-byte as before; "hidden"/"all" are explicit
+// per-call opt-ins.
+//
+// The hidden-exclusion clause uses the established null-safe form
+// `(catalog_hidden IS NULL OR catalog_hidden != 1)` every other gårdssalg
+// selector in this codebase uses (a bare `!= 1` would silently also exclude
+// every NULL row, which is not what "hidden producers excluded" means here).
+export type GsWvScope = "visible" | "hidden" | "all";
 
-export function loadGardssalgWebsiteVerificationCohort(db: Database.Database): GsWvProducerRow[] {
+export const GS_WV_SCOPES: readonly GsWvScope[] = ["visible", "hidden", "all"] as const;
+
+const GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL =
+  `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+
+const GS_WV_SCOPE_SQL: Record<GsWvScope, string> = {
+  visible: `${GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL} AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,
+  hidden: `${GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL} AND catalog_hidden = 1`,
+  all: GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL,
+};
+
+export function loadGardssalgWebsiteVerificationCohort(
+  db: Database.Database,
+  scope: GsWvScope = "visible"
+): GsWvProducerRow[] {
   return db
     .prepare(
       `SELECT id, navn, hjemmeside, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer, catalog_hidden
          FROM experience_providers
-        WHERE ${GARDSSALG_WEBSITE_VERIFICATION_COHORT_SQL}`
+        WHERE ${GS_WV_SCOPE_SQL[scope]}`
     )
     .all() as GsWvProducerRow[];
 }
@@ -219,9 +244,10 @@ export function summarizeGardssalgWebsiteVerification(rows: GsWvScanRow[]): GsWv
 export async function runGardssalgWebsiteVerificationScan(
   db: Database.Database,
   fetchFn: GsWvFetchFn,
-  concurrency = 3
+  concurrency = 3,
+  scope: GsWvScope = "visible"
 ): Promise<{ summary: GsWvSummary; rows: GsWvScanRow[] }> {
-  const producers = loadGardssalgWebsiteVerificationCohort(db);
+  const producers = loadGardssalgWebsiteVerificationCohort(db, scope);
   return scanGardssalgWebsiteVerificationRows(producers, fetchFn, concurrency);
 }
 
