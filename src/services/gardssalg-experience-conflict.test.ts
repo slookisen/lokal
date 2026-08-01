@@ -98,7 +98,11 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     assertEq(pairsA[0]?.experience_booking_url, "https://atlungstad.no", "a7: experience_booking_url carried through");
 
     const summaryA = summarizeGardssalgExperienceConflicts(pairsA);
-    assertEq(summaryA, { matched_pairs: 1, conflicting: 1, agreeing: 0, unknown: 0 }, "a8: summary counts");
+    assertEq(
+      summaryA,
+      { matched_pairs: 1, conflicting: 1, agreeing: 0, unknown: 0, ambiguous: 0 },
+      "a8: summary counts"
+    );
 
     // ── (b) a match that AGREES (same registrable domain) ───────────────────
     const agreeProducer: GsExpProducerRow = {
@@ -236,6 +240,131 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "i1: Atlungstad pair present in a mixed multi-producer/multi-experience scan"
     );
     assertEq(multi.length, 1, "i2: cross pairs (Atlungstad x unrelated experience, etc.) never spuriously match");
+
+    // ── (j) Finding 1 — the reproduced Bryggeri false positive: two UNRELATED
+    //     producers and a generic unrelated experience must NOT all match each
+    //     other purely on the shared category word "bryggeri" (a
+    //     `producer_type` enum value). Confirms the genericity gate: a bare
+    //     shared token that is a generic vocabulary word, with no second
+    //     corroborating signal (no host-label match, no whole-title
+    //     similarity), is never trusted alone. ────────────────────────────────
+    const nordfjordBryggeri: GsExpProducerRow = {
+      id: "prod-nordfjord-bryggeri",
+      navn: "Nordfjord Bryggeri",
+      hjemmeside: "https://nordfjordbryggeri.no",
+      catalog_hidden: 0,
+    };
+    const sorlandetBryggeri: GsExpProducerRow = {
+      id: "prod-sorlandet-bryggeri",
+      navn: "Sørlandet Bryggeri",
+      hjemmeside: "https://sorlandetbryggeri.no",
+      catalog_hidden: 0,
+    };
+    const genericBryggeriExperience: GsExpExperienceRow = {
+      id: "exp-generic-bryggeri-omvisning",
+      title: "Norsk Bryggeri Omvisning Sommer",
+      title_no: null,
+      booking_url: "https://visitvestlandet.example/bryggeri",
+      provider_id: null,
+    };
+    const pairsJ = findGardssalgProducerExperienceMatches(
+      [nordfjordBryggeri, sorlandetBryggeri],
+      [genericBryggeriExperience]
+    );
+    assertEq(
+      pairsJ.length,
+      0,
+      "j1: two unrelated Bryggeri producers + a generic Bryggeri experience -> NOT matched at all (Finding 1 fixed)"
+    );
+    const summaryJ = summarizeGardssalgExperienceConflicts(pairsJ);
+    assertEq(
+      summaryJ,
+      { matched_pairs: 0, conflicting: 0, agreeing: 0, unknown: 0, ambiguous: 0 },
+      "j2: zero conflicting pairs produced from the generic-word-only collision — nothing remediable, nothing corrupted"
+    );
+
+    // ── (k) generic-token gate is corroboration-aware, not a blanket veto: a
+    //     shared GENERIC token still counts when corroborated by
+    //     near-identical whole-title wording (mirrors titlesMatch's own
+    //     GENERIC_TOKEN_CORROBORATION_MIN branch). ─────────────────────────────
+    const bareBryggeriProducer: GsExpProducerRow = {
+      id: "prod-bare-bryggeri",
+      navn: "Bryggeri",
+      hjemmeside: "https://barebryggeri.no",
+      catalog_hidden: 0,
+    };
+    const corroboratedExperience: GsExpExperienceRow = {
+      id: "exp-corroborated-bryggeri",
+      title: "Bryggeri",
+      title_no: null,
+      booking_url: "https://wrong-host.example/bryggeri",
+      provider_id: null,
+    };
+    const pairsK = findGardssalgProducerExperienceMatches([bareBryggeriProducer], [corroboratedExperience]);
+    assertEq(pairsK.length, 1, "k1: a generic shared token IS trusted once whole-title similarity corroborates it");
+    assertEq(pairsK[0]?.match_basis, "name_token", "k2: matched via name_token (corroborated)");
+    assertEq(pairsK[0]?.status, "conflict", "k3: still correctly judged conflict once corroborated");
+
+    // ── (l) Finding 2 — same-experience/multiple-producer collision: when one
+    //     experience_id legitimately conflict-matches TWO different
+    //     producer_ids (e.g. a data-quality duplicate producer record, or any
+    //     other genuine ambiguity that survives the Finding-1 gate), BOTH
+    //     pairs are reclassified "ambiguous" — visible in the full pairs list
+    //     (diagnosis), but excluded once a caller filters to
+    //     status==="conflict" (exactly what the remediation route does). ─────
+    const fjellroA: GsExpProducerRow = {
+      id: "prod-fjellro-a",
+      navn: "Fjellro Gård",
+      hjemmeside: "https://fjellro-a.example",
+      catalog_hidden: 0,
+    };
+    const fjellroB: GsExpProducerRow = {
+      id: "prod-fjellro-b",
+      navn: "Fjellro Gård",
+      hjemmeside: "https://fjellro-b.example",
+      catalog_hidden: 0,
+    };
+    const fjellroExperience: GsExpExperienceRow = {
+      id: "exp-fjellro-omvisning",
+      title: "Fjellro Gård — omvisning og smaking",
+      title_no: null,
+      booking_url: "https://neither-of-them.example/fjellro",
+      provider_id: null,
+    };
+    const pairsL = findGardssalgProducerExperienceMatches([fjellroA, fjellroB], [fjellroExperience]);
+    assertEq(pairsL.length, 2, "l1: both producers match the same experience (a genuine collision, not a Finding-1 false positive)");
+    assertTrue(
+      pairsL.every((p) => p.status === "ambiguous"),
+      "l2: both colliding pairs are reclassified 'ambiguous', not left as 'conflict'"
+    );
+    assertTrue(
+      pairsL.some((p) => p.producer_id === "prod-fjellro-a") && pairsL.some((p) => p.producer_id === "prod-fjellro-b"),
+      "l3: both producer_ids are still represented in the diagnosis output"
+    );
+    const remediableL = pairsL.filter((p) => p.status === "conflict");
+    assertEq(remediableL.length, 0, "l4: zero pairs left with status==='conflict' -> remediation (which filters on that) touches neither");
+    const summaryL = summarizeGardssalgExperienceConflicts(pairsL);
+    assertEq(
+      summaryL,
+      { matched_pairs: 2, conflicting: 0, agreeing: 0, unknown: 0, ambiguous: 2 },
+      "l5: summary counts both pairs under 'ambiguous', zero under 'conflicting'"
+    );
+
+    // ── (m) collision guard does not over-trigger: an unrelated third producer
+    //     matching a DIFFERENT experience is unaffected, and a single
+    //     producer/experience conflict pair (no collision) still reports
+    //     plain 'conflict', not 'ambiguous' — regression guard against a
+    //     blanket "any repeated experience_id" bug. ───────────────────────────
+    const pairsM = findGardssalgProducerExperienceMatches(
+      [fjellroA, fjellroB, atlungstadProducer],
+      [fjellroExperience, atlungstadExperience]
+    );
+    const atlungstadInMixed = pairsM.find((p) => p.producer_id === atlungstadProducer.id);
+    assertEq(atlungstadInMixed?.status, "conflict", "m1: an unrelated single-producer conflict pair is untouched by the collision guard");
+    assertTrue(
+      pairsM.filter((p) => p.experience_id === "exp-fjellro-omvisning").every((p) => p.status === "ambiguous"),
+      "m2: the colliding experience is still reclassified correctly inside a larger mixed scan"
+    );
 
     return { passed, failed, failures };
   })();

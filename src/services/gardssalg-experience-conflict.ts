@@ -35,15 +35,32 @@
 //      the experience's title/title_no. Reuses titleTokens() from
 //      experience-dedup.ts (the SAME tokenizer/stopword-list/diacritics-fold/
 //      pluralization-stem this repo's other title-fuzzy-matching already
-//      uses) rather than inventing a second one. Deliberately does NOT reuse
-//      titlesMatch()'s whole-string-similarity fallback branch (the "no
-//      shared token but near-identical wording" case): that branch exists for
-//      re-harvested clones of the SAME title text (experience-dedup.ts's own
-//      problem), which is not this problem's shape — a company name and an
-//      unrelated-looking activity title sharing zero tokens should not be
-//      treated as a match just because they happen to be similarly SHORT
-//      strings, and skipping it also avoids paying titlesMatch's per-pair
-//      Levenshtein cost across the full producer × experience cross product.
+//      uses) rather than inventing a second one.
+//
+//      A bare shared token is NOT sufficient on its own — gårdssalg/drikke
+//      producer names routinely share category words (the `producer_type`
+//      enum vocabulary itself: bryggeri, cideri, vingård, destilleri,
+//      mjøderi, gårdsbutikk, …), so two UNRELATED producers ("Nordfjord
+//      Bryggeri", "Sørlandet Bryggeri") and an unrelated generic experience
+//      ("Norsk Bryggeri Omvisning Sommer") would otherwise all match each
+//      other purely on the word "bryggeri". Mirrors titlesMatch()'s own
+//      rarity/corroboration gate (experience-dedup.ts) rather than inventing
+//      a parallel heuristic: a shared token only counts alone when it is RARE
+//      (isGenericNameToken() below — checked against the producer_type
+//      vocabulary from route-corridor-service.ts AND, the same
+//      corpus-frequency method titlesMatch() uses via
+//      buildProviderCorpusTokenCounts(), how many DISTINCT producers in THIS
+//      scan's own producer list use it). A GENERIC shared token still counts
+//      when corroborated by a second independent signal — also a host_name
+//      match, or whole-title similarity >= GENERIC_TOKEN_CORROBORATION_MIN
+//      (same threshold/method titlesMatch() uses, levenshtein-based).
+//      Deliberately does NOT reuse titlesMatch()'s unconditional whole-
+//      string-similarity fallback branch (the "no shared token at all but
+//      near-identical wording" case): that branch exists for re-harvested
+//      clones of the SAME title text (experience-dedup.ts's own problem),
+//      which is not this problem's shape — a company name and an unrelated-
+//      looking activity title sharing zero tokens should not be treated as a
+//      match just because they happen to be similarly SHORT strings.
 //
 //   3. host_name — the experience's booking_url resolves to a host whose
 //      registrable-domain label (e.g. "atlungstad" out of "atlungstad.no")
@@ -61,7 +78,26 @@
 // comparing registrable domains — producer.hjemmeside is the dev-request's
 // designated source of truth ("produsentens verifiserte hjemmeside er
 // fasit"): "agree" (same registrable domain), "conflict" (both resolve, and
-// differ), or "unknown" (either side is blank/unparseable — never guessed).
+// differ), "unknown" (either side is blank/unparseable — never guessed), or
+// "ambiguous" (see next paragraph).
+//
+// Same-experience/multiple-producer collision -> "ambiguous": because a
+// single `experience_id` can legitimately match more than one producer as
+// "conflict" (rare, but the genericity gate above only makes false positives
+// LESS likely, not impossible — and two real producers CAN legitimately share
+// a name), findGardssalgProducerExperienceMatches() reclassifies every
+// "conflict"-status pair whose experience_id also conflict-matches a
+// DIFFERENT producer_id to "ambiguous" before returning. This is load-bearing
+// for remediation correctness: planGardssalgExperienceConflictRemediation()
+// computes each pair's plan item independently from its own pre-batch SELECT,
+// and applyGardssalgExperienceConflictRemediation() applies items
+// sequentially with no same-batch collision check — without this
+// reclassification, a second write for the same experience_id would silently
+// (and non-deterministically, iteration-order-dependent) overwrite the first,
+// with a stale audit old_value. Both callers key remediation off
+// status==="conflict" only, so "ambiguous" pairs are automatically excluded
+// from the remediation plan while still surfacing in the read-only diagnosis
+// report (GsExpConflictSummary.ambiguous) for a human to resolve.
 //
 // catalog_hidden is NEVER used to exclude a producer from the SCAN (task
 // spec): a hidden producer's conflicting duplicate is still worth knowing
@@ -70,8 +106,9 @@
 import type Database from "better-sqlite3";
 import { v4 as uuid } from "uuid";
 import { hostFromUrlLike, registrableDomain, isDirectoryOrAggregatorHost } from "./cross-source-validator";
-import { titleTokens, normalizeExperienceTitle } from "./experience-dedup";
+import { titleTokens, normalizeExperienceTitle, levenshtein, buildProviderCorpusTokenCounts } from "./experience-dedup";
 import { gardssalgSearchName, isExperienceContentLocked } from "./experience-store";
+import { DRINK_PRODUCER_TYPES, NON_DRINK_PRODUCER_TYPES } from "./route-corridor-service";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -96,7 +133,16 @@ export interface GsExpExperienceRow {
 }
 
 export type GsExpMatchBasis = "provider_link" | "name_token" | "host_name";
-export type GsExpConflictStatus = "conflict" | "agree" | "unknown";
+// "ambiguous" is never assigned by the per-pair status decision itself (the
+// domain-comparison block below only ever produces conflict/agree/unknown) —
+// it is a POST-hoc reclassification applied to a subset of "conflict" pairs
+// once the same-experience/multiple-producer collision check runs (see the
+// module doc comment's "Same-experience/multiple-producer collision" section
+// and findGardssalgProducerExperienceMatches()'s final pass). Mirrors the
+// `provider_match_status='ambiguous'` vocabulary already used elsewhere on
+// the `experiences` schema (see database/init-experiences.ts) rather than
+// inventing a new status word for the same "a human must pick" concept.
+export type GsExpConflictStatus = "conflict" | "agree" | "unknown" | "ambiguous";
 
 export interface GsExpMatchedPair {
   producer_id: string;
@@ -134,8 +180,92 @@ const NAME_TOKEN_MIN_LEN = 5;
 // brand names.
 const HOST_TOKEN_MIN_LEN = 4;
 
+// ─── Generic-token gate (mirrors experience-dedup.ts's titlesMatch()) ──────
+//
+// A bare shared token is trustworthy alone only when it's RARE. "Rare" is
+// decided by two mechanisms, either sufficient to call a token generic —
+// deliberately the SAME two mechanisms this codebase already has (not a
+// third, invented one):
+//
+//   1. producer_type vocabulary — the token is literally one of this
+//      vertical's own category words (DRINK_PRODUCER_TYPES /
+//      NON_DRINK_PRODUCER_TYPES, route-corridor-service.ts — the exact
+//      producer_type enum values, e.g. "bryggeri", "cideri", "vingård").
+//      Normalized through the same normalizeExperienceTitle() diacritics-fold
+//      titleTokens() applies, so "vingård" (a token) matches the vocabulary
+//      entry "vingård" the same way regardless of case/diacritics.
+//
+//   2. corpus frequency — how many DISTINCT producers in the CURRENT scan's
+//      own producer list use the token in their name, via
+//      buildProviderCorpusTokenCounts() (experience-dedup.ts) reused
+//      unchanged: passing producer rows as {title: navn, provider_id: id}
+//      makes its existing "count once per distinct provider" semantics do
+//      exactly the right thing here. Same threshold value/convention as
+//      titlesMatch()'s SHARED_TOKEN_GENERIC_MIN (that constant is not
+//      exported; the value, 5, is the convention being reused, same pattern
+//      as NAME_TOKEN_MIN_LEN above).
+const SHARED_TOKEN_GENERIC_MIN = 5;
+
+// Whole-string closeness required to corroborate a shared token that is
+// GENERIC by either mechanism above — mirrors experience-dedup.ts's
+// GENERIC_TOKEN_CORROBORATION_MIN exactly (same value, same not-exported
+// convention as SHARED_TOKEN_GENERIC_MIN above).
+const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
+
+const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
+  [...DRINK_PRODUCER_TYPES, ...NON_DRINK_PRODUCER_TYPES].map((t) => normalizeExperienceTitle(t))
+);
+
 function producerTokenSet(navn: string): Set<string> {
   return new Set(titleTokens(gardssalgSearchName(navn)));
+}
+
+/** Provider-distinct corpus token counts over the producers in THIS scan
+ *  (not the whole `experiences` table — this signal is about how common a
+ *  word is among gårdssalg producer NAMES, the corpus the false-positive
+ *  class in the module doc comment actually comes from). Reuses
+ *  buildProviderCorpusTokenCounts() (experience-dedup.ts) unchanged by
+ *  feeding it {title, provider_id} rows built from producer.navn/id. */
+function buildProducerCorpusTokenCounts(producers: GsExpProducerRow[]): Map<string, number> {
+  return buildProviderCorpusTokenCounts(
+    producers.map((p) => ({ title: gardssalgSearchName(p.navn), provider_id: p.id }))
+  );
+}
+
+/** True when a shared token is generic (a broad category/brand word) rather
+ *  than distinctive (proper-noun-like) — see the two-mechanism gate above. */
+function isGenericNameToken(token: string, producerCorpusCounts: Map<string, number>): boolean {
+  if (GENERIC_PRODUCER_TYPE_TOKENS.has(token)) return true;
+  return (producerCorpusCounts.get(token) ?? 0) >= SHARED_TOKEN_GENERIC_MIN;
+}
+
+/** Levenshtein-based whole-string similarity, same formula
+ *  levenshteinSimilarity() (experience-dedup.ts, unexported) uses — reuses
+ *  its exported levenshtein() rather than re-implementing edit distance. */
+function wholeStringSimilarity(a: string, b: string): number {
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return 1 - levenshtein(a, b) / maxLen;
+}
+
+/** Best whole-string similarity between the producer's searchable name and
+ *  EITHER of the experience's title/title_no — corroboration signal for a
+ *  generic-only shared token. Mirrors titlesOrTitleNoMatch()'s "try both
+ *  language columns" bridge (experience-dedup.ts), adapted to a similarity
+ *  score (max, not a boolean match) since it feeds a threshold comparison
+ *  here rather than an early-exit boolean check there. */
+function producerExperienceWholeStringSimilarity(
+  producerNavn: string,
+  exp: Pick<GsExpExperienceRow, "title" | "title_no">
+): number {
+  const pn = normalizeExperienceTitle(gardssalgSearchName(producerNavn));
+  const candidates = [exp.title, exp.title_no].filter((t): t is string => !!t && !!t.trim());
+  let best = 0;
+  for (const c of candidates) {
+    const sim = wholeStringSimilarity(pn, normalizeExperienceTitle(c));
+    if (sim > best) best = sim;
+  }
+  return best;
 }
 
 function experienceTokenSet(title: string, titleNo: string | null | undefined): Set<string> {
@@ -146,11 +276,36 @@ function experienceTokenSet(title: string, titleNo: string | null | undefined): 
   return set;
 }
 
-function hasSignificantOverlap(a: Set<string>, b: Set<string>): boolean {
+function sharedSignificantTokens(a: Set<string>, b: Set<string>): string[] {
+  const shared: string[] = [];
   for (const t of a) {
-    if (t.length >= NAME_TOKEN_MIN_LEN && b.has(t)) return true;
+    if (t.length >= NAME_TOKEN_MIN_LEN && b.has(t)) shared.push(t);
   }
-  return false;
+  return shared;
+}
+
+/**
+ * True when the significant tokens shared between a producer and an
+ * experience are trustworthy evidence of a name_token match. A shared token
+ * is sufficient ALONE only when at least one is distinctive (not generic per
+ * isGenericNameToken()). When every shared token is generic, a second
+ * independent signal must corroborate it — hostMatch (the same host_name
+ * signal, computed by the caller) or whole-title similarity >=
+ * GENERIC_TOKEN_CORROBORATION_MIN — mirroring titlesMatch()'s own
+ * rarity/corroboration gate (experience-dedup.ts). See the module doc
+ * comment's "name_token" bullet for the full false-positive scenario this
+ * closes.
+ */
+function nameTokenMatches(
+  sharedTokens: string[],
+  producerCorpusCounts: Map<string, number>,
+  hostMatch: boolean,
+  wholeStringSim: number
+): boolean {
+  if (sharedTokens.length === 0) return false;
+  const hasDistinctiveToken = sharedTokens.some((t) => !isGenericNameToken(t, producerCorpusCounts));
+  if (hasDistinctiveToken) return true;
+  return hostMatch || wholeStringSim >= GENERIC_TOKEN_CORROBORATION_MIN;
 }
 
 /** The normalized first label of a booking_url's registrable domain (e.g.
@@ -183,6 +338,12 @@ export function findGardssalgProducerExperienceMatches(
     expDomain: urlRegistrableDomain(exp.booking_url),
   }));
 
+  // Provider-distinct token frequencies over THIS scan's own producer names —
+  // the genericity signal for the name_token gate above. Computed once
+  // up-front (not per producer/pair) since it's a property of the whole
+  // producer corpus, not of any one pair.
+  const producerCorpusCounts = buildProducerCorpusTokenCounts(producers);
+
   const pairs: GsExpMatchedPair[] = [];
 
   for (const producer of producers) {
@@ -192,13 +353,29 @@ export function findGardssalgProducerExperienceMatches(
     for (const pc of precomputed) {
       const exp = pc.row;
       let basis: GsExpMatchBasis | null = null;
+      const hostMatch = !!(pc.hostLabel && pTokens.has(pc.hostLabel));
 
       if (exp.provider_id && exp.provider_id === producer.id) {
         basis = "provider_link";
-      } else if (hasSignificantOverlap(pTokens, pc.tokens)) {
-        basis = "name_token";
-      } else if (pc.hostLabel && pTokens.has(pc.hostLabel)) {
-        basis = "host_name";
+      } else {
+        const shared = sharedSignificantTokens(pTokens, pc.tokens);
+        if (shared.length > 0) {
+          // Whole-string similarity is only ever needed to corroborate an
+          // all-generic shared-token set — skip the levenshtein cost
+          // otherwise (same "only pay for it when needed" discipline the
+          // module doc comment already calls out for titlesMatch's fallback
+          // branch).
+          const hasDistinctiveToken = shared.some((t) => !isGenericNameToken(t, producerCorpusCounts));
+          const wholeStringSim = hasDistinctiveToken
+            ? 0
+            : producerExperienceWholeStringSimilarity(producer.navn, exp);
+          if (nameTokenMatches(shared, producerCorpusCounts, hostMatch, wholeStringSim)) {
+            basis = "name_token";
+          }
+        }
+        if (!basis && hostMatch) {
+          basis = "host_name";
+        }
       }
 
       if (!basis) continue;
@@ -222,7 +399,37 @@ export function findGardssalgProducerExperienceMatches(
     }
   }
 
+  reclassifyAmbiguousCollisions(pairs);
   return pairs;
+}
+
+/**
+ * Same-experience/multiple-producer collision guard (Finding 2 — see the
+ * module doc comment's "Same-experience/multiple-producer collision"
+ * section). Mutates `pairs` in place: any "conflict"-status pair whose
+ * experience_id ALSO conflict-matches a DIFFERENT producer_id is reclassified
+ * to "ambiguous", so downstream remediation (which only ever plans
+ * status==="conflict" pairs) silently and automatically excludes it, while it
+ * still surfaces in the read-only diagnosis report under its own status.
+ * "agree"/"unknown" pairs are never touched by this — the collision this
+ * guards against only exists on the write path, which only ever looks at
+ * "conflict" pairs.
+ */
+function reclassifyAmbiguousCollisions(pairs: GsExpMatchedPair[]): void {
+  const producersByExperience = new Map<string, Set<string>>();
+  for (const p of pairs) {
+    if (p.status !== "conflict") continue;
+    const producers = producersByExperience.get(p.experience_id) ?? new Set<string>();
+    producers.add(p.producer_id);
+    producersByExperience.set(p.experience_id, producers);
+  }
+  for (const p of pairs) {
+    if (p.status !== "conflict") continue;
+    const producers = producersByExperience.get(p.experience_id);
+    if (producers && producers.size > 1) {
+      p.status = "ambiguous";
+    }
+  }
 }
 
 export interface GsExpConflictSummary {
@@ -230,13 +437,21 @@ export interface GsExpConflictSummary {
   conflicting: number;
   agreeing: number;
   unknown: number;
+  ambiguous: number;
 }
 
 export function summarizeGardssalgExperienceConflicts(pairs: GsExpMatchedPair[]): GsExpConflictSummary {
-  const summary: GsExpConflictSummary = { matched_pairs: pairs.length, conflicting: 0, agreeing: 0, unknown: 0 };
+  const summary: GsExpConflictSummary = {
+    matched_pairs: pairs.length,
+    conflicting: 0,
+    agreeing: 0,
+    unknown: 0,
+    ambiguous: 0,
+  };
   for (const p of pairs) {
     if (p.status === "conflict") summary.conflicting++;
     else if (p.status === "agree") summary.agreeing++;
+    else if (p.status === "ambiguous") summary.ambiguous++;
     else summary.unknown++;
   }
   return summary;
@@ -295,8 +510,11 @@ export function runGardssalgExperienceConflictScan(db: Database.Database): {
 
 // ─── Remediation (Part B — write, dry-run by default) ──────────────────────
 //
-// For every CONFLICTING pair (never "agree"/"unknown" — those are never
-// touched), the producer's verified hjemmeside is authoritative. The
+// For every CONFLICTING pair (never "agree"/"unknown"/"ambiguous" — those are
+// never touched; "ambiguous" pairs are conflict-shaped pairs that collided
+// with another producer over the same experience_id and were deliberately
+// excluded, see reclassifyAmbiguousCollisions() above), the producer's
+// verified hjemmeside is authoritative. The
 // remediation either (a) corrects the experience's booking_url to the
 // producer's hjemmeside, or (b) nulls it out when copying the producer's own
 // hjemmeside would itself be unsafe — namely when that hjemmeside resolves to
