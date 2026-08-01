@@ -66,6 +66,31 @@ import { getDb } from "../database/init";
 
 const router = Router();
 
+// ── Injectable DB seam (tests only) ─────────────────────────────────────────
+// tests/test.ts's "SHARED GLOBAL STATE" comment names the getDb() singleton as
+// one of the three shared mutables that make the suite non-deterministic, and
+// says outright: "Reach for an equivalent seam before reaching for a global."
+// Pinning the singleton with __setDbForTesting() from this route's test block
+// races every OTHER block that reads getDb() across an await — concretely, the
+// orch-pr-86 block drives a real HTTP loopback whose handler resolves getDb()
+// in a later event-loop turn, so a pin held here made it read the wrong DB and
+// 404 on rows it had just inserted (observed on PR #444's determinism gate).
+//
+// So this route resolves its DB through one indirection that a test can
+// override for ITS OWN calls, touching no global at all. Production code never
+// calls the setter, so behavior outside tests is unchanged. Mirrors
+// geocoding-service.ts's __setGeocodingFetchForTesting seam exactly.
+let dbOverrideForTesting: ReturnType<typeof getDb> | null = null;
+
+/** Test-only. Pass null to clear. Never called by production code. */
+export function __setContactEmailWriteDbForTesting(db: ReturnType<typeof getDb> | null): void {
+  dbOverrideForTesting = db;
+}
+
+function resolveDb(): ReturnType<typeof getDb> {
+  return dbOverrideForTesting ?? getDb();
+}
+
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
 }
@@ -236,7 +261,7 @@ router.post("/", (req: Request, res: Response) => {
   }
 
   const batchTag = `contact-email-write-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
-  const db = getDb();
+  const db = resolveDb();
   const results: ResultItem[] = [];
   const seen = new Set<string>();
 

@@ -8,10 +8,16 @@
  * carrying the platform's own address as the producer's contact (36 of them
  * already contacted) and 202 with a DNS-dead domain, all unfixable.
  *
- * Setup mirrors admin-contact-write-guard-retro-sweep.test.ts exactly:
- * better-sqlite3 ":memory:" + __setDbForTesting/__initSchemaForTesting, and
- * the route's handler driven directly through router.handle() with a fake
- * req/res — no HTTP server, no supertest, no network.
+ * Setup: better-sqlite3 ":memory:" + __initSchemaForTesting, with the route
+ * pointed at that DB through its OWN seam (__setContactEmailWriteDbForTesting).
+ * Deliberately does NOT pin the shared getDb() singleton the way the sibling
+ * retro-sweep test does — that pin races any block reading getDb() across an
+ * await, and concretely made orch-pr-86 (real HTTP loopback) 404 on rows it
+ * had just inserted, failing PR #444's determinism gate. This block now
+ * mutates no shared global at all: not the DB singleton, not
+ * process.env.ADMIN_KEY (it sends whatever key is already in effect).
+ * Handler driven directly through router.handle() with a fake req/res —
+ * no HTTP server, no supertest, no network.
  *
  * Covers:
  *   (a) auth gate
@@ -124,14 +130,29 @@ export function runAdminAgentsContactEmailWriteTests(
   }
 
   return (async () => {
-    const prevDb = initMod.getDb();
-    const testKey = "admin-agents-contact-email-write-test-key";
-    const prevAdminKey = process.env.ADMIN_KEY;
-    process.env.ADMIN_KEY = testKey;
+
+    // SHARED-GLOBAL DISCIPLINE (tests/test.ts, "SHARED GLOBAL STATE"): a test
+    // block must NOT mutate process.env.ADMIN_KEY. The suite assigns it once
+    // for the whole process (SUITE_ADMIN_KEY), and this file is exactly the
+    // kind of sibling src/**/*.test.ts helper the suite's own comment names as
+    // the residual hazard — reassigning it here races every other admin-gated
+    // block and shows up as a DIFFERENT test failing on different runs of the
+    // same SHA (the determinism gate's whole purpose).
+    //
+    // So: read whatever key is already in effect and SEND that, mutating
+    // nothing. Only when no key exists at all (this file run standalone,
+    // outside the suite) do we set one — and restore it in `finally`.
+    const ambientKey = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+    const setKeyOurselves = ambientKey === "";
+    if (setKeyOurselves) process.env.ADMIN_KEY = "admin-agents-contact-email-write-standalone-key";
+    const testKey = process.env.ADMIN_KEY as string;
 
     const db = new Database(":memory:");
     try {
-      initMod.__setDbForTesting(db as any);
+      // Schema only — do NOT pin the shared getDb() singleton. The route is
+      // pointed at this DB through its own seam below, so this block races
+      // nothing (see the seam's comment in the route for the concrete failure
+      // it prevents: orch-pr-86 404ing on rows it had just inserted).
       initMod.__initSchemaForTesting(db as any);
 
       const insertAgent = db.prepare(
@@ -177,6 +198,7 @@ export function runAdminAgentsContactEmailWriteTests(
       delete require.cache[require.resolve("./admin-agents-contact-email-write")];
       const routeMod = require("./admin-agents-contact-email-write");
       const router = routeMod.default;
+      routeMod.__setContactEmailWriteDbForTesting(db as any);
 
       function post(body: any, key: string | false = testKey, query?: Record<string, string>): Promise<RouteResult> {
         const headers: Record<string, string> = {};
@@ -332,14 +354,18 @@ export function runAdminAgentsContactEmailWriteTests(
       assertEq(routeMod.isSyntacticallyValidEmail("post@syse"), false, "cew-45: missing TLD rejected");
       assertEq(routeMod.isContactEmailCurated("not json"), false, "cew-46: malformed curated JSON treated as unlocked");
     } finally {
-      if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
-      else process.env.ADMIN_KEY = prevAdminKey;
+      if (setKeyOurselves) delete process.env.ADMIN_KEY;
+      try {
+        const routeMod = require("./admin-agents-contact-email-write");
+        routeMod.__setContactEmailWriteDbForTesting(null);
+      } catch {
+        /* ignore */
+      }
       try {
         db.close();
       } catch {
         /* ignore */
       }
-      initMod.__setDbForTesting(prevDb as any);
     }
 
     return { passed, failed, failures };
