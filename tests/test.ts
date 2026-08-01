@@ -36446,26 +36446,42 @@ runSerial(async () => {
 // agent_claims row as well as claimed_at. Own in-memory DB reached through the
 // route's own seam — mutates NO shared global (not getDb(), not ADMIN_KEY).
 //
-// REGISTERED LAST, DELIBERATELY. This block first sat next to its
-// contact-email sibling mid-chain, and from there the suite went
-// 13354/0 → 13327/1 → 13295/14 on the SAME SHA — the ad-hoc
-// gardssalg-content-refresh IIFE (~line 28425) losing its experiences
-// db-factory handle: "The database connection is not open".
-// That is NOT this block's doing. Substituting a runSerial block whose entire
-// body is `await new Promise(r => setTimeout(r, 400))` — no DB, no env, no
-// require, touching nothing — reproduced the identical 27-test loss at the
-// identical place on 2 of 3 runs of otherwise-clean main (which is itself
-// 13290/0 across 3 runs). Any block added at that position trips it, whatever
-// it does; only the added wall-clock matters.
-// This is precisely the hazard the header documents (kriterium 2, "a fix for
-// the DB singleton can still surface a different, out-of-scope race just by
-// changing when things run") — the ad-hoc family and the runSerial chain are
-// two serialization primitives that only join at the REPORT tail, so delay
-// inserted MID-chain slides a later chain block into an ad-hoc block's open
-// window. Registering at the TAIL adds its wall-clock after that window has
-// closed and shifts nobody. The real fix is the barrier the header describes
-// and judges too risky to land before the ADMIN_KEY-in-external-files fix;
-// this block does not attempt it.
+// ── READ THIS BEFORE BLAMING THIS BLOCK FOR A FLAKY RUN ─────────────────────
+// Adding this block makes the suite intermittently red. It is NOT this block's
+// code. This file cannot currently absorb ANY new runSerial registration —
+// measured, on this machine, 6 runs per configuration unless noted:
+//
+//   clean main, unmodified .................... 7/7 green (13290/0)
+//   clean main + THIS block, mid-chain ........ 13354/0, 13327/1, 13295/14
+//   clean main + THIS block, at the tail ...... 8/11 green (13354/0 when green)
+//   clean main + `setTimeout(400)` mid-chain .. 1/3 green   <-- touches NOTHING
+//   clean main + `setTimeout(2000)` at tail ... 4/6 green   <-- touches NOTHING
+//
+// The last two rows are the control: a runSerial block whose entire body is a
+// sleep — no DB, no env, no require, no fetch — reproduces the same failures at
+// the same rate as this block does. Only the added wall-clock matters. The
+// dominant signature is the ad-hoc gardssalg-content-refresh block (~line
+// 28425) losing its experiences handle ("The database connection is not open",
+// -27 tests); the secondary one is a burst of `pilot-ordre-loop` suppression-
+// gate failures — i.e. BOTH hazards this file's header already documents
+// (kriterium 2's ad-hoc-vs-runSerial split, and the ADMIN_KEY-in-external-files
+// population), firing exactly as the header predicts: "a fix ... can still
+// surface a different, out-of-scope race just by changing when things run."
+//
+// Root cause of the dominant signature, for whoever picks this up:
+// `__resetDbFactoryForTesting()` (src/database/db-factory.ts:113) CLOSES every
+// handle in its map, and the ad-hoc family and the runSerial chain are two
+// serialization primitives that only join at the REPORT tail — so any change
+// in chain length can slide a singleton-toucher into an ad-hoc block's open
+// window. The header describes the barrier that fixes it and judges it too
+// risky to land before the ADMIN_KEY-in-external-files fix. This block does
+// NOT attempt that fix, and a targeted `await _gardssalgContentRefreshPromise`
+// barrier here was tried and measured ineffective (4/6) — it is not the racer.
+// Tail registration was kept because it is the least-perturbing position.
+// If the determinism gate blocks on this, deleting this one registration
+// restores the old timing exactly; the route's 64 tests still run standalone
+// via runAdminAgentsUrlWriteTests(). That is a workaround, not a fix — the
+// suite is one new test block away from red no matter who adds it.
 runSerial(async () => {
   console.log("\n── dev-request 2026-08-01-rfb-agents-url-skrivespak: agents.url write lever ──");
   try {
