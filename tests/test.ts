@@ -29378,6 +29378,38 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of sbr.failures) failures.push("experiences-seo-sok-boost: " + f);
     console.log(`  experiences-seo-sok-boost: ${sbr.passed} passed, ${sbr.failed} failed`);
 
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 1: searchGardssalgProvidersByQuery() (experience-store.ts) — the
+    // free-text producer search backing /sok's new "Produsenter" section.
+    // Store-level unit coverage only (name/kommune/fylke match, catalog_hidden
+    // exclusion, gårdssalg-gate exclusion, æøå, slug-required). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── experience-store-gardssalg-sok: searchGardssalgProvidersByQuery() ──");
+    const { runExperienceStoreGardssalgSokTests } = require("../src/services/experience-store-gardssalg-sok.test") as
+      typeof import("../src/services/experience-store-gardssalg-sok.test");
+    const esgs = await runExperienceStoreGardssalgSokTests({ log: false });
+    passed += esgs.passed;
+    failed += esgs.failed;
+    for (const f of esgs.failures) failures.push("experience-store-gardssalg-sok: " + f);
+    console.log(`  experience-store-gardssalg-sok: ${esgs.passed} passed, ${esgs.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 1 (route level): GET /sok now renders a separate, clearly labeled
+    // "Produsenter" section (never merged with "Opplevelser") when a gårdssalg
+    // producer matches the query — Daniel's own binding acceptance test is
+    // that a producer's own name typed into /sok must hit its profile. Also
+    // covers the zero-producer-match regression (existing experiences section
+    // unaffected). Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block.
+    console.log("\n── experiences-seo-sok-gardssalg: /sok \"Produsenter\" section ──");
+    const { runExperiencesSeoSokGardssalgTests } = require("../src/routes/experiences-seo-sok-gardssalg.test") as
+      typeof import("../src/routes/experiences-seo-sok-gardssalg.test");
+    const essg = await runExperiencesSeoSokGardssalgTests({ log: false });
+    passed += essg.passed;
+    failed += essg.failed;
+    for (const f of essg.failures) failures.push("experiences-seo-sok-gardssalg: " + f);
+    console.log(`  experiences-seo-sok-gardssalg: ${essg.passed} passed, ${essg.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
     // re-harvest guard, discover-query invariant). Same in-memory-DB pattern,
