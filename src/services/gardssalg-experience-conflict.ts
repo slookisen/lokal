@@ -99,26 +99,19 @@
 //      fixed, corpus-size-independent stoplist of common Norwegian
 //      farm/place/business-generic words (GENERIC_FARM_PLACE_WORD_STOPLIST)
 //      before falling back to corpus frequency, closing that gap for both
-//      host_name and name_token. Compounding factor also fixed: the
-//      genericity gate folds the historical "aa" digraph (foldHistoricalAa-
-//      Digraph() below), so "gaard" (a real historical spelling in this
-//      vertical) and "gård" count as the SAME key for both the stoplist
-//      check and corpus-frequency counting instead of silently fragmenting
-//      the corpus count across two spellings.
+//      host_name and name_token. The stoplist lists "gård", "gard" AND
+//      "gaard" as separate literals, so the historical spelling is covered by
+//      enumeration rather than by any clever normalization.
 //
-//      Round-4 review fix-up: that digraph fold is applied ONLY on the
-//      genericity-gate path, and ONLY inside this file. It was originally
-//      written into experience-dedup.ts's SHARED stripDiacritics(), which
-//      also backs the pre-existing harvest-dedup title matcher — widening
-//      that matcher's false-merge surface as a side effect of this PR. Two
-//      reasons the fold belongs here instead, both about direction of harm:
-//      on a genericity gate, over-folding is fail-SAFE *provided both sides
-//      of the count lookup are keyed identically* (see round-5 below — that
-//      proviso is not a detail, it is where this went wrong); on a MATCH
-//      path it is fail-dangerous ("aa" is not always the digraph — "Isaac…"),
-//      because collapsing two genuinely different names onto one shared
-//      token manufactures a match. See foldHistoricalAaDigraph()'s own
-//      comment for the full argument.
+//      Rounds 4-7 tried to cover it by NORMALIZATION instead — folding the
+//      historical "aa" digraph so "gaard" and "gård" would share one key.
+//      That produced three consecutive regressions, one of which shipped to
+//      production, and was then measured against the real 127-producer corpus
+//      to change exactly nothing. It was deleted 2026-08-01; the full record
+//      and the numbers are in the "deleted-fold" note further down, next to
+//      GENERIC_FARM_PLACE_WORD_STOPLIST. Read it before adding any new
+//      transform between how the corpus map is keyed and how this gate looks
+//      keys up — that asymmetry is what went wrong all three times.
 //
 // Once a pair is matched (by any signal), its `status` is decided purely by
 // comparing registrable domains — producer.hjemmeside is the dev-request's
@@ -152,7 +145,7 @@
 import type Database from "better-sqlite3";
 import { v4 as uuid } from "uuid";
 import { hostFromUrlLike, registrableDomain, isDirectoryOrAggregatorHost } from "./cross-source-validator";
-import { titleTokens, normalizeExperienceTitle, levenshtein } from "./experience-dedup";
+import { titleTokens, normalizeExperienceTitle, levenshtein, buildProviderCorpusTokenCounts } from "./experience-dedup";
 import { gardssalgSearchName, isExperienceContentLocked } from "./experience-store";
 import { DRINK_PRODUCER_TYPES, NON_DRINK_PRODUCER_TYPES } from "./route-corridor-service";
 
@@ -243,9 +236,10 @@ const HOST_TOKEN_MIN_LEN = 4;
 //
 //   2. corpus frequency — how many DISTINCT producers in the CURRENT scan's
 //      own producer list use the token in their name, via
-//      buildProducerCorpusTokenCounts() below, which tokenizes and then keys
-//      through the SAME genericGateKey() this gate looks up with (that
-//      identity is load-bearing — see its doc comment). Same threshold
+//      buildProducerCorpusTokenCounts() below, which reuses
+//      buildProviderCorpusTokenCounts() (experience-dedup.ts) unchanged, so
+//      its keys are plain titleTokens() output — the same strings this gate
+//      looks up with, no derivation on either side. Same threshold
 //      value/convention as
 //      titlesMatch()'s SHARED_TOKEN_GENERIC_MIN (that constant is not
 //      exported; the value, 5, is the convention being reused, same pattern
@@ -258,110 +252,54 @@ const SHARED_TOKEN_GENERIC_MIN = 5;
 // convention as SHARED_TOKEN_GENERIC_MIN above).
 const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
 
-/**
- * Fold the historical Norwegian "aa" digraph — the pre-1917-spelling-reform
- * stand-in for "å", still a live spelling in real farm and place names
- * ("gaard"/"gård", "Aarhus"/"Århus") — onto the same "a" that
- * normalizeExperienceTitle()'s own diacritics pass already folds "å" to, so
- * both spellings of one word land on ONE key.
- *
- * This is deliberately applied ONLY on the genericity-gate path
- * (genericGateKey() below: stoplist membership + corpus-frequency counting)
- * and deliberately NOT to the token sets the MATCH decision is read from
- * (producerTokenSet()/experienceTokenSet()/sharedSignificantTokens()). The
- * asymmetry is the entire point, because the two paths fail in opposite
- * directions:
- *
- *   - On the genericity path, over-folding is fail-SAFE — but ONLY under a
- *     precondition that must be stated, because violating it silently is what
- *     shipped a regression to production once already (round 5, see below):
- *     **the corpus map and the gate's lookup must be keyed by the exact same
- *     function applied to the exact same kind of input.** Given that, merging
- *     two spellings onto one key can only make a token look MORE common or
- *     newly hit the stoplist — MORE likely generic, demanding MORE
- *     corroboration — and can never manufacture a match.
- *
- *     Regression introduced in `6dbcad1` (the round-4 review fix-up; the
- *     squash-merge `79adbad` is byte-identical to it for this file) and fixed
- *     here: the two sides
- *     folded at DIFFERENT pipeline positions — the corpus map folded the raw
- *     name before tokenizing, the gate folded after normalization and
- *     stemming. fold∘normalize ≠ normalize∘fold, so on names like "Storåa",
- *     "Sanda-Aker" and "Aaros" the gate looked up a key the map never held,
- *     read `?? 0`, and judged a genuinely common token DISTINCTIVE. That is
- *     the opposite of fail-safe: it reopened the false-positive class rounds
- *     1-3 closed, and on `apply=true` it overwrites a real business's
- *     booking_url. The monotonicity argument was true of the *idea* and false
- *     of the *implementation*, and two independent review rounds accepted it
- *     by reading rather than probing.
- *
- *     The fix is not "keep the two sides in sync" — that is just a second
- *     invariant to maintain. There is now exactly ONE folding path
- *     (genericGateKey applied to titleTokens() output, on both sides), so
- *     there is nothing left that can disagree. Tests (y1-y3) pin it.
- *   - On the match path it would be fail-DANGEROUS, because "aa" is not
- *     always the digraph ("Isaac…", "Haaneset" vs a genuinely distinct
- *     "Haneset"). Folding there could collapse two genuinely different names
- *     onto one shared token and manufacture a `conflict` — exactly the
- *     false-positive class rounds 1-3 of this PR's review closed, and on
- *     `apply=true` that overwrites a real business's booking_url.
- *
- * The cost of not folding on the match path is a missed duplicate (a false
- * NEGATIVE), which surfaces as a row simply not appearing in a read-only
- * diagnosis report — the fail-closed direction this dev-request already
- * mandates elsewhere.
- *
- * It also has to live here rather than in experience-dedup.ts's shared
- * stripDiacritics(): that helper backs the pre-existing harvest-dedup title
- * matcher (dev-request 2026-07-11-dedup-false-positive-remediation, which
- * exists because a defective matching rule over-merged 418 groups / 1361
- * rows in production) — a MATCH path, where per the argument above this fold
- * is precisely the wrong thing. Keeping it local means zero blast radius:
- * experience-dedup.ts stays byte-identical to pre-PR.
- */
-function foldHistoricalAaDigraph(s: string): string {
-  return s.replace(/aa/gi, "a");
-}
-
-/**
- * The key a token is looked up under on the genericity-gate path: normalize,
- * fold the digraph, then RE-APPLY the trailing-"s" stem.
- *
- * The re-stem is not decoration. titleTokens() stems BEFORE this function
- * ever sees the token, so without it `fold∘stem ≠ stem∘fold` and the two
- * spellings of one word fragment onto different keys — the exact opposite of
- * what the fold exists to do:
- *
- *     "Aaros" -> titleTokens -> "aaros" (5 > 4, ends "s") -> stem -> "aaro"
- *                            -> fold  -> "aro"
- *     "Åros"  -> titleTokens -> "aros"  (4, NOT > 4)      -> no stem
- *                            -> fold  -> "aros"     ... "aro" != "aros"
- *
- * Both sides of the count lookup agreed on that key, so the file's own
- * two-sides invariant held — they simply agreed on the WRONG key. The corpus
- * count then split (aro:2, aros:3), neither half reached
- * SHARED_TOKEN_GENERIC_MIN, and a booking_url on "aros.no" read as
- * DISTINCTIVE evidence: a fresh false-positive `conflict` that production and
- * rounds 3-4 all correctly returned zero for. Round-6 review finding; pinned
- * by tests (z1-z2).
- *
- * The threshold is `> 3`, not titleTokens()'s `> 4`, precisely because
- * folding SHORTENS the token: "aros" (4) must still stem to "aro" so it meets
- * the already-stemmed-then-folded "aaro" -> "aro" coming from the other
- * spelling.
- *
- * NOT idempotent — `genericGateKey("aaa")` is "a", not "aa" — because the
- * fold is a plain substring replace. That is fine for every call site here
- * (each applies it exactly once, to either a set literal or a titleTokens()
- * token) but it is not a property to rely on without checking.
- */
-function genericGateKey(token: string): string {
-  const folded = foldHistoricalAaDigraph(normalizeExperienceTitle(token));
-  return folded.length > 3 && folded.endsWith("s") ? folded.slice(0, -1) : folded;
-}
+// ─── The "aa" digraph fold used to live here. It was DELETED 2026-08-01. ───
+//
+// Rounds 3-7 of this PR's review spent four commits on a fold that mapped the
+// historical Norwegian "aa" digraph onto "å" so that "gaard" and "gård" would
+// count as ONE word for the corpus-frequency mechanism below. It produced
+// three consecutive regressions, each introduced by the fix for the previous
+// one, and one of them shipped to production:
+//
+//   1. `6dbcad1` (merged as `79adbad`, live in prod): corpus map folded the
+//      RAW name before tokenizing, the gate folded AFTER normalize+stem.
+//      fold∘normalize != normalize∘fold, so the gate looked up keys the map
+//      never held, read `?? 0`, and judged a token shared by 5 producers
+//      DISTINCTIVE -> false `conflict` -> on apply=true, a real business's
+//      booking_url overwritten.
+//   2. `a72f3a5`: made both sides use one key function. They then agreed on
+//      the WRONG key — titleTokens() stems before the key function runs, so
+//      fold∘stem != stem∘fold and "Aaros"/"Åros" SPLIT instead of merging.
+//   3. `51b8400`: re-stemmed after folding to repair (2).
+//
+// Then it was measured against the REAL production corpus (127 gårdssalg
+// producers, 2026-08-01):
+//
+//   keys reaching SHARED_TOKEN_GENERIC_MIN with the fold:     3
+//   keys reaching SHARED_TOKEN_GENERIC_MIN without the fold:  3
+//   keys the fold ALONE lifts over the threshold:             0
+//
+// Only 5 producer names contain "aa" at all (Haavaldsen Distillery, Store Naa
+// Siderkompani, Harstad Haandtverksbryggeri, Haandbryggeriet, Aass Bryggeri)
+// and NONE has a modern-spelling twin in the corpus, so the fold had nothing
+// to merge. End-to-end pair output was byte-identical with it and without it.
+// The three keys that do reach the threshold are "bryggeri" (25), "distillery"
+// (9), "mikrobryggeri" (7) — and "bryggeri" is a producer_type enum word that
+// mechanism 1 already catches without any corpus counting.
+//
+// So the fold bought exactly nothing and cost three regressions. Deleted.
+// Genericity is decided by the two mechanisms that are spelling-independent
+// and were doing the work all along: the producer_type vocabulary and the
+// curated GENERIC_FARM_PLACE_WORD_STOPLIST (which already lists "gård",
+// "gard" AND "gaard" explicitly — that stoplist, not the fold, is what makes
+// the "gaard" spelling generic, as test (s) demonstrates).
+//
+// If a future corpus genuinely needs two spellings of one word merged, add
+// BOTH spellings to the stoplist. Do not reintroduce a fold: every attempt
+// created an ordering asymmetry between how the corpus map is keyed and how
+// the gate looks keys up. Tests (y1-y3) pin that asymmetry class shut.
 
 const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
-  [...DRINK_PRODUCER_TYPES, ...NON_DRINK_PRODUCER_TYPES].map((t) => genericGateKey(t))
+  [...DRINK_PRODUCER_TYPES, ...NON_DRINK_PRODUCER_TYPES].map((t) => normalizeExperienceTitle(t))
 );
 
 // ─── Round-3 review fix-up: a curated, corpus-SIZE-independent floor ───────
@@ -375,7 +313,8 @@ const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
 // fixed once (round-2), just below whatever producer count the scan happens
 // to have. This list is a fixed floor that does NOT depend on scan size: a
 // token in this set is generic regardless of how rare it happens to look in
-// the current corpus. Keyed through the SAME genericGateKey() pipeline as
+// the current corpus. Normalized through the SAME normalizeExperienceTitle()
+// pipeline as
 // GENERIC_PRODUCER_TYPE_TOKENS above (so the historical "aa"/"å" digraph
 // fold applies here too — "gård", "gard", and "gaard" all collapse to the
 // same entry), same reuse-the-pattern discipline. Not
@@ -393,7 +332,7 @@ const GENERIC_FARM_PLACE_WORD_STOPLIST = new Set(
     "stad", // place/site suffix
     "gods", // manor/estate
     "hus", // house
-  ].map((t) => genericGateKey(t))
+  ].map((t) => normalizeExperienceTitle(t))
 );
 
 function producerTokenSet(navn: string): Set<string> {
@@ -403,37 +342,18 @@ function producerTokenSet(navn: string): Set<string> {
 /** Provider-distinct corpus token counts over the producers in THIS scan
  *  (not the whole `experiences` table — this signal is about how common a
  *  word is among gårdssalg producer NAMES, the corpus the false-positive
- *  class in the module doc comment actually comes from).
- *
- *  Tokenize FIRST, then key each token through genericGateKey() — the exact
- *  same function, applied to the exact same kind of input (a titleTokens()
- *  token), that isGenericNameToken() looks the count up with. That identity
- *  is the whole point and is why this no longer delegates to
- *  buildProviderCorpusTokenCounts() with a pre-folded title string.
- *
- *  The previous version folded the RAW name and let buildProviderCorpus-
- *  TokenCounts() tokenize afterwards, while the gate folded AFTER
- *  normalization and stemming. Two different pipeline positions, so
- *  fold∘normalize ≠ normalize∘fold and the two sides disagreed on real
- *  names: "Storåa" (diacritic-stripping itself CREATES the "aa" the raw
- *  string never had), "Sanda-Aker" (the compound-hyphen join creates it),
- *  "Aaros" (trailing-"s" stemming lands on a different length). The gate then
- *  looked up a key this map never contained, got `?? 0`, and mechanism 3 was
- *  silently dead — reopening the very false-positive class rounds 1-3 closed.
- *  See tests (y1-y3). Fixing it by making the two sides AGREE would just be
- *  a second invariant to maintain; there is now only ONE folding path, so
- *  there is nothing left to disagree.
- *
- *  Counts DISTINCT producers per key (union per producer before counting),
- *  matching buildProviderCorpusTokenCounts()'s own semantics — a producer
- *  whose name carries two spellings of the same word still counts once. */
+ *  class in the module doc comment actually comes from). Reuses
+ *  buildProviderCorpusTokenCounts() (experience-dedup.ts) unchanged by
+ *  feeding it {title, provider_id} rows built from producer.navn/id: its
+ *  existing "count once per distinct provider" semantics are exactly right
+ *  here, and its keys are plain titleTokens() output — the same thing
+ *  isGenericNameToken() looks the count up with, with no key derivation on
+ *  either side that could drift out of step. Keeping it that way is the
+ *  point; see the deleted-fold note above for what happens when it doesn't. */
 function buildProducerCorpusTokenCounts(producers: GsExpProducerRow[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const p of producers) {
-    const keys = new Set(titleTokens(gardssalgSearchName(p.navn)).map((t) => genericGateKey(t)));
-    for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  return counts;
+  return buildProviderCorpusTokenCounts(
+    producers.map((p) => ({ title: gardssalgSearchName(p.navn), provider_id: p.id }))
+  );
 }
 
 /** True when a shared token is generic (a broad category/brand word) rather
@@ -442,15 +362,15 @@ function buildProducerCorpusTokenCounts(producers: GsExpProducerRow[]): Map<stri
  *  independent stoplist (round-3 fix-up, see GENERIC_FARM_PLACE_WORD_STOPLIST
  *  above), or corpus frequency in the current scan.
  *
- *  All three are consulted under genericGateKey() — the digraph-folded key —
- *  so a "gaard"-spelled token is judged by the same evidence as its "gård"
- *  spelling. This is the ONLY path in this file that folds; the match path
- *  reads raw titleTokens() (see foldHistoricalAaDigraph()). */
+ *  The token arrives straight from titleTokens() and is used as-is — no
+ *  per-call key derivation. The generic-word SETS are built by running their
+ *  literals through normalizeExperienceTitle() (they carry diacritics, e.g.
+ *  "vingård"), which is idempotent on an already-normalized token, so both
+ *  sides land on the same string without a second transform to keep in sync. */
 function isGenericNameToken(token: string, producerCorpusCounts: Map<string, number>): boolean {
-  const key = genericGateKey(token);
-  if (GENERIC_PRODUCER_TYPE_TOKENS.has(key)) return true;
-  if (GENERIC_FARM_PLACE_WORD_STOPLIST.has(key)) return true;
-  return (producerCorpusCounts.get(key) ?? 0) >= SHARED_TOKEN_GENERIC_MIN;
+  if (GENERIC_PRODUCER_TYPE_TOKENS.has(token)) return true;
+  if (GENERIC_FARM_PLACE_WORD_STOPLIST.has(token)) return true;
+  return (producerCorpusCounts.get(token) ?? 0) >= SHARED_TOKEN_GENERIC_MIN;
 }
 
 /** Levenshtein-based whole-string similarity, same formula

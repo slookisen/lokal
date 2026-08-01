@@ -32,9 +32,13 @@ import {
   type GsExpProducerRow,
   type GsExpExperienceRow,
 } from "./gardssalg-experience-conflict";
-// Imported ONLY for the round-4 boundary-guard assertions (block (x) below),
-// which pin that this module's digraph fold stayed local and did NOT leak
-// back into the shared harvest-dedup matcher.
+// Imported ONLY for the boundary-guard assertions (block (x) below), which
+// pin that the shared harvest-dedup matcher is not normalizing away spelling
+// differences on this module's behalf. They were written when this file had
+// its own digraph fold and had to prove the fold stayed local; the fold is
+// gone now, but the guards are kept — they are the cheapest tripwire against
+// anyone "helpfully" adding such a fold to the SHARED helper, which is what
+// round 3 did and what the 2026-07-11 over-merge remediation exists to stop.
 import { normalizeExperienceTitle, titlesMatch } from "./experience-dedup";
 
 export interface TestSummary {
@@ -528,18 +532,21 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "r1: 2-producer corpus sharing only the stoplisted word 'tunet' -> NOT matched at all (symmetric name_token case fixed)"
     );
 
-    // ── (s) Round-3 review finding — the "aa"/"å" digraph fold on the
-    //     GENERICITY GATE: a producer spelled with the historical "gaard"
-    //     digraph must be gated exactly like the "gård" spelling in test (q).
+    // ── (s) The historical "gaard" spelling must be gated exactly like the
+    //     "gård" spelling in test (q). The booking_url host is deliberately
+    //     "gaard.no" (NOT "gard.no" as in (q)), so the host label token is
+    //     literally "gaard" and hostMatch against the producer's own "gaard"
+    //     name token is genuinely TRUE — the pair is rejected by the
+    //     genericity gate, not by raw token inequality.
     //
-    //     The booking_url host here is deliberately "gaard.no" (NOT "gard.no"
-    //     as in (q)), so the host label token is literally "gaard" and
-    //     hostMatch against the producer's own "gaard" name token is genuinely
-    //     TRUE — the pair is only rejected because isGenericNameToken() folds
-    //     the digraph before consulting the stoplist. Written this way on
-    //     purpose: with "gard.no" the hostMatch would already be false on raw
-    //     token equality and the test would pass vacuously without exercising
-    //     the gate at all. ────────────────────────────────────────────────────
+    //     WHAT ACTUALLY GATES IT: the "gaard" literal in
+    //     GENERIC_FARM_PLACE_WORD_STOPLIST. Not a digraph fold. Rounds 5-7
+    //     carried a comment here claiming this test proved the fold was
+    //     load-bearing; it never did — measured, (s) returns 0 pairs with the
+    //     fold enabled AND disabled. That false claim is a large part of why
+    //     two independent reviewers believed the fold was doing work, and it
+    //     survived three review rounds. The fold is deleted; this test is
+    //     unchanged and still passes, which is the point. ────────────────────
     const fjellheimGaardSpelling: GsExpProducerRow = {
       id: "prod-fjellheim-gaard-spelling",
       navn: "Fjellheim Gaard",
@@ -590,52 +597,6 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     assertEq(atlungstadPairT?.status, "conflict", "t3: still correctly judged conflict at minimal corpus size — not corpus-size-dependent");
     assertEq(pairsT.length, 1, "t4: no spurious matches introduced by the unrelated fillers");
 
-    // ── (u) Round-3's ACTUAL reason for folding the digraph, isolated: the
-    //     fold exists so one word spelled two ways doesn't fragment its
-    //     corpus-frequency count and slip under SHARED_TOKEN_GENERIC_MIN.
-    //     Two scenarios differing ONLY in how the same 5th/6th producer
-    //     spells the shared word:
-    //       (u1) 4 producers, all the "Åkerhus" spelling -> folded count 4,
-    //            below the threshold of 5 -> token still treated as
-    //            distinctive -> the experience DOES match.
-    //       (u2) 5 producers, 3 "Åkerhus" + 2 "Aakerhus" -> each spelling
-    //            alone is 3 and 2 (both below 5), but they are the SAME word:
-    //            folded count 5 -> generic -> gated, no match.
-    //     Without the fold, (u2) would count 3 and behave like (u1). This is
-    //     the only assertion pair in this file that the fold is load-bearing
-    //     at all — (q)/(r)/(s) would all pass on the stoplist alone. ─────────
-    const akerhusExperience: GsExpExperienceRow = {
-      id: "exp-akerhus-opplevelsesdag",
-      title: "Åkerhus Opplevelsesdag ved Sjøen",
-      title_no: null,
-      booking_url: "https://booking-portal.example/akerhus",
-      provider_id: null,
-    };
-    const akerhusProducer = (n: number, spelling: "å" | "aa"): GsExpProducerRow => ({
-      id: `prod-akerhus-${spelling}-${n}`,
-      // Distinct leading word per producer so the ONLY token they share with
-      // each other (and with the experience) is the Åkerhus/Aakerhus one.
-      navn: `${["Vestre", "Østre", "Nordre", "Søndre"][n]} ${spelling === "å" ? "Åkerhus" : "Aakerhus"}`,
-      hjemmeside: `https://${spelling}akerhus${n}.no`,
-      catalog_hidden: 0,
-    });
-    const pairsU1 = findGardssalgProducerExperienceMatches(
-      [0, 1, 2, 3].map((n) => akerhusProducer(n, "å")),
-      [akerhusExperience]
-    );
-    assertTrue(
-      pairsU1.length > 0,
-      "u1: 4 same-spelling producers -> shared token is below the genericity threshold, still treated as distinctive -> matched"
-    );
-    const pairsU2 = findGardssalgProducerExperienceMatches(
-      [...[0, 1, 2].map((n) => akerhusProducer(n, "å")), ...[3, 0].map((n) => akerhusProducer(n, "aa"))],
-      [akerhusExperience]
-    );
-    assertEq(
-      pairsU2.length,
-      0,
-      "u2: same word split 3+2 across the 'å'/'aa' spellings -> folded corpus count reaches the threshold -> generic -> gated (fold is load-bearing here)"
-    );
 
     // ── (v)(w) Round-4 review finding — the fold must NOT reach the MATCH
     //     path. "aa" is not always the historical digraph, so folding it
@@ -704,21 +665,27 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "x3: shared titlesMatch() still separates 'Isaacpollen'/'Isacpollen'"
     );
 
-    // ── (y) Round-5 REGRESSION, shipped to production in `79adbad` and fixed
-    //     here. The corpus map folded the raw producer name BEFORE
-    //     tokenizing; the gate folded AFTER normalization and stemming. Since
-    //     fold∘normalize ≠ normalize∘fold, the gate looked up keys the corpus
-    //     map never contained, read `?? 0`, and judged a token that 5 distinct
-    //     producers share as DISTINCTIVE — reopening the rounds-1-3
+    // ── (y) The regression that shipped to production in `79adbad`. The
+    //     corpus map was keyed by folding the raw producer name BEFORE
+    //     tokenizing; the gate looked up AFTER normalization and stemming.
+    //     Since fold∘normalize ≠ normalize∘fold, the gate looked up keys the
+    //     corpus map never contained, read `?? 0`, and judged a token that 5
+    //     distinct producers share as DISTINCTIVE — reopening the rounds-1-3
     //     false-positive class, and on apply=true overwriting a real
     //     business's booking_url.
     //
-    //     Three independent ways the two positions diverge, one case each:
+    //     The fold that caused it is now deleted, so these cases pass for the
+    //     simplest possible reason: nothing derives a key on either side any
+    //     more. They are KEPT as the tripwire for that whole class — any
+    //     future transform inserted between how the corpus map is keyed and
+    //     how this gate looks keys up will break at least one of them.
+    //
+    //     Three independent ways such a transform diverges, one case each:
     //       y1 "Storåa"     — diacritic-stripping itself CREATES "aa" ("åa")
     //                          that the raw string never contained.
     //       y2 "Sanda-Aker" — the compound-hyphen join (a-A) creates it.
     //       y3 "Aaros"      — trailing-"s" stemming lands on a different
-    //                          length depending on whether the fold ran first.
+    //                          length depending on whether a fold ran first.
     //
     //     Shape: 5 distinct producers share exactly ONE word, so its corpus
     //     count is 5 == SHARED_TOKEN_GENERIC_MIN -> generic -> needs
@@ -783,55 +750,6 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "y3: 'Aaros' via host_name — trailing-'s' stemming interacts with fold order (was 5 pairs)"
     );
 
-    // ── (z) Round-6 review finding — the MIRROR of (y). Keying both sides
-    //     identically is necessary but not sufficient: they must also agree
-    //     on the RIGHT key. Because titleTokens() stems before genericGateKey()
-    //     runs, folding afterwards splits the two spellings of one word onto
-    //     different keys whenever the modern spelling normalizes to 4 chars
-    //     ending in "s":
-    //
-    //       "Aaros" -> stem -> "aaro" -> fold -> "aro"
-    //       "Åros"  -> (no stem, 4 chars) -> fold -> "aros"
-    //
-    //     The corpus count then splits (aro:2, aros:3), neither half reaches
-    //     SHARED_TOKEN_GENERIC_MIN, and the host label reads as distinctive.
-    //     Reachable ONLY via host_name (4 chars >= HOST_TOKEN_MIN_LEN but <
-    //     NAME_TOKEN_MIN_LEN). genericGateKey()'s re-stem closes it.
-    //
-    //     Both cases return 0 on production and on rounds 3-4 — this class
-    //     was introduced by the fix for (y), not by the original PR. ─────────
-    const spellingSplitScenario = (modern: string, historical: string, host: string): number => {
-      const producers: GsExpProducerRow[] = [
-        ["Vestre", modern],
-        ["Østre", modern],
-        ["Nordre", modern],
-        ["Søndre", historical],
-        ["Indre", historical],
-      ].map(([prefix, word], n) => ({
-        id: `prod-split-${n}`,
-        navn: `${prefix} ${word}`,
-        hjemmeside: n === 0 ? `https://vestre-${modern.toLowerCase()}.example` : null,
-        catalog_hidden: 0,
-      }));
-      const exp: GsExpExperienceRow = {
-        id: "exp-split-host",
-        title: "Kajakktur i Lofoten med guide",
-        title_no: null,
-        booking_url: `https://${host}/aktiviteter/1`,
-        provider_id: null,
-      };
-      return findGardssalgProducerExperienceMatches(producers, [exp]).length;
-    };
-    assertEq(
-      spellingSplitScenario("Åros", "Aaros", "aros.no"),
-      0,
-      "z1: 'Åros'/'Aaros' must land on ONE corpus key — 3+2 reaches the threshold, host label 'aros' stays generic"
-    );
-    assertEq(
-      spellingSplitScenario("Ånes", "Aanes", "anes.no"),
-      0,
-      "z2: same class, second word pair — not a one-off of 'Åros'"
-    );
 
     return { passed, failed, failures };
   })();
