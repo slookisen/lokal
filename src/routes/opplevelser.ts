@@ -181,6 +181,25 @@ import {
 // common-token rule merged some genuinely different experiences), consumed by
 // the two admin endpoints at the bottom of this file.
 import { auditMergedGroups } from "../services/experience-dedup-audit";
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 2 — gårdssalg producer <-> experience/activity cross-table conflict
+// diagnosis (GET /admin/gardssalg-experience-conflict-audit) + remediation
+// (POST /admin/gardssalg-experience-conflict-remediation) + the rollback
+// substrate wired into the EXISTING POST /admin/gardssalg-content-rollback
+// below via its new `entity_type` param. NOT the same thing as lokal#440's
+// GET /admin/gardssalg-provider-dedup-audit above (that one dedupes
+// experience_providers rows against EACH OTHER — same-table dedup; this is a
+// producer-vs-experience cross-table identity check).
+import {
+  runGardssalgExperienceConflictScan,
+  planGardssalgExperienceConflictRemediation,
+  applyGardssalgExperienceConflictRemediation,
+  planExperienceConflictRollback,
+  applyExperienceConflictRollback,
+  type GsExpMatchedPair,
+  type GsExpConflictPlanItem,
+  type GsExpConflictRollbackPlanItem,
+} from "../services/gardssalg-experience-conflict";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
 // category mapper differs (experiences vocab, not the food vocab).
@@ -5036,22 +5055,83 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, (req: Request
 //
 // Response: { success: true, dry_run, restored: [...], skipped: [...] }.
 // Auth: same X-Admin-Key convention (requireAdmin) as the rest of this file.
+//
+// entity_type (dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-
+// foer-outreach, Steg 2 addition): "provider" (default, UNCHANGED behavior —
+// every existing caller omits this and keeps targeting experience_providers
+// via gardssalg_content_audit exactly as before) or "experience" — targets
+// the `experiences` table via experience_provider_conflict_audit instead
+// (the audit trail POST /admin/gardssalg-experience-conflict-remediation
+// writes). Body shape mirrors provider_id/field_name/batch_id exactly, using
+// experience_id in place of provider_id. ONE HTTP surface for both audit
+// trails rather than a second rollback endpoint — per the dev-request's own
+// rollback section ("reverserbart... via gardssalg-content-rollback").
 router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as {
     provider_id?: unknown;
+    experience_id?: unknown;
     field_name?: unknown;
     batch_id?: unknown;
     apply?: unknown;
+    entity_type?: unknown;
   };
 
+  const entityType = body.entity_type === "experience" ? "experience" : "provider";
   const providerId =
     typeof body.provider_id === "string" && body.provider_id.trim() ? body.provider_id.trim() : undefined;
+  const experienceId =
+    typeof body.experience_id === "string" && body.experience_id.trim() ? body.experience_id.trim() : undefined;
   const fieldName =
     typeof body.field_name === "string" && body.field_name.trim() ? body.field_name.trim() : undefined;
   const batchId =
     typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : undefined;
   const apply =
     body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+
+  if (entityType === "experience") {
+    if (!experienceId && !batchId) {
+      res.status(400).json({ error: "Requires experience_id or batch_id" });
+      return;
+    }
+    try {
+      const expDb = getExpDb("experiences");
+      const { restorable, skipped } = planExperienceConflictRollback(expDb, {
+        experience_id: experienceId,
+        batch_id: batchId,
+      });
+
+      if (!apply) {
+        res.json({
+          success: true,
+          dry_run: true,
+          restored: restorable.map((r) => ({
+            experience_id: r.experience_id,
+            field_name: r.field_name,
+            current_value: r.current_value,
+            would_restore_to: r.restore_to,
+          })),
+          skipped,
+        });
+        return;
+      }
+
+      const applied = applyExperienceConflictRollback(expDb, restorable as GsExpConflictRollbackPlanItem[]);
+      res.json({
+        success: true,
+        dry_run: false,
+        restored: applied.map((r) => ({
+          experience_id: r.experience_id,
+          field_name: r.field_name,
+          restored_to: r.restored_to,
+        })),
+        skipped,
+      });
+    } catch (err: any) {
+      console.error("[opplevelser] gardssalg-content-rollback (experience) failed", err);
+      res.status(500).json({ error: "Internal error" });
+    }
+    return;
+  }
 
   if (!providerId && !batchId) {
     res.status(400).json({ error: "Requires provider_id or batch_id" });
@@ -6230,6 +6310,109 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
     groups_found: groups.length,
     groups,
   });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-experience-conflict-audit ─────────
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 2 (Part A — dry-run diagnosis, read-only). See the module doc comment
+// in services/gardssalg-experience-conflict.ts for the full matching design
+// and how this differs from lokal#440's GET /admin/gardssalg-provider-dedup-
+// audit just above (same-table producer dedup — untouched by this endpoint).
+//
+// For every gårdssalg producer (catalog_hidden is noted per-row via
+// `producer_hidden`, never used to exclude a producer from the scan — task
+// spec), finds `experiences` catalog rows that plausibly describe the SAME
+// real-world business and reports whether that experience's booking_url
+// conflicts with, agrees with, or leaves unknown the producer's verified
+// hjemmeside. Pure read: runGardssalgExperienceConflictScan() only SELECTs,
+// no UPDATE/INSERT anywhere on this path.
+router.get("/admin/gardssalg-experience-conflict-audit", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const { pairs, summary } = runGardssalgExperienceConflictScan(expDb);
+    res.json({
+      summary,
+      pairs: pairs.map((p) => ({
+        producer_id: p.producer_id,
+        producer_name: p.producer_name,
+        producer_hidden: p.producer_hidden,
+        producer_hjemmeside: p.producer_hjemmeside,
+        experience_id: p.experience_id,
+        experience_title: p.experience_title,
+        experience_booking_url: p.experience_booking_url,
+        match_basis: p.match_basis,
+        status: p.status,
+      })),
+    });
+  } catch (err) {
+    console.error("[gardssalg-experience-conflict-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-experience-conflict-remediation ──
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 2 (Part B — write, dry-run by default). Re-runs the SAME diagnosis
+// scan as GET .../gardssalg-experience-conflict-audit above (never trusts a
+// client-supplied pair list — same "recompute from live DB state" discipline
+// as POST /admin/gardssalg-content-rollback's own planner), filters to
+// status==="conflict" pairs ONLY (agree/unknown pairs are never written —
+// planGardssalgExperienceConflictRemediation doesn't even see them), and for
+// each: corrects experiences.booking_url to the producer's verified
+// hjemmeside, or nulls it when copying that hjemmeside would itself be
+// unsafe (aggregator/directory host) — see the doc comment on
+// planGardssalgExperienceConflictRemediation (services/gardssalg-experience-
+// conflict.ts) for the exact rule. Never leaves a row in conflict.
+//
+// apply: dry-run by default (same convention as every other admin write
+// route in this file, e.g. POST /admin/gardssalg-content-rollback just
+// below). apply=false/omitted performs zero writes.
+// batch_id: optional caller-supplied tag, stamped on every
+// experience_provider_conflict_audit row this call inserts — the SAME lever
+// POST /admin/gardssalg-content-rollback's batch_id targeting already uses,
+// just against this table (pass entity_type: "experience" there — see that
+// endpoint below).
+//
+// Response: { success: true, dry_run, applied: [...], skipped: [...] }.
+router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+
+  const expDb = getExpDb("experiences");
+  try {
+    const { pairs } = runGardssalgExperienceConflictScan(expDb);
+    const conflicting: GsExpMatchedPair[] = pairs.filter((p) => p.status === "conflict");
+    const { applicable, skipped } = planGardssalgExperienceConflictRemediation(expDb, conflicting);
+
+    if (!apply) {
+      res.json({
+        success: true,
+        dry_run: true,
+        applied: applicable.map((item) => ({
+          experience_id: item.experience_id,
+          producer_id: item.producer_id,
+          current_value: item.old_value,
+          would_write: item.new_value,
+          action: item.action,
+        })),
+        skipped,
+      });
+      return;
+    }
+
+    const applied = applyGardssalgExperienceConflictRemediation(
+      expDb,
+      applicable as GsExpConflictPlanItem[],
+      batchId
+    );
+    res.json({ success: true, dry_run: false, applied, skipped });
+  } catch (err) {
+    console.error("[gardssalg-experience-conflict-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-provider-lookup ────────────────────
