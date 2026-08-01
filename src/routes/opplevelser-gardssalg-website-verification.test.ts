@@ -461,6 +461,52 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         "missing_source",
         "h13: earlier default-scope applies still own the visible rows' stamps — hidden apply did not touch or clear them"
       );
+
+      // ── (i) GET /admin/website-review-queues — the read side both queues
+      //     lacked. Semantics differ per table BY DESIGN and the assertions
+      //     pin exactly that: the gardssalg table has no status column
+      //     (approve DELETES the row, so existing == pending), while the
+      //     homepage table keeps resolved rows behind status='approved'.
+      //     Fixtures piggyback on state earlier sections created: section
+      //     (e)'s apply enqueued prov-unverified-404 into the gardssalg
+      //     queue. ─────────────────────────────────────────────────────────
+      const noKeyQueues = await callRoute(opplevelserRouter, { url: "/admin/website-review-queues" });
+      assertEq(noKeyQueues.status, 403, "i1: GET .../website-review-queues without X-Admin-Key -> 403");
+
+      expDb
+        .prepare(
+          `INSERT INTO experience_homepage_review_queue
+             (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, resolved_at)
+           VALUES
+             ('hq-pend-1', 'prov-missing-source', 'Norumbryggeriet', 'https://norumbryggeriet.example.no', NULL, NULL, 0.8, 'brreg_hjemmeside', 'test-batch', 'pending', datetime('now'), NULL),
+             ('hq-appr-1', 'prov-aggregator', 'Aggregatorgaarden', 'https://aggregatorgaarden.example.no', NULL, NULL, 0.9, 'brreg_hjemmeside', 'test-batch', 'approved', datetime('now'), datetime('now'))`
+        )
+        .run();
+
+      const queuesRes = await callRoute(opplevelserRouter, {
+        url: "/admin/website-review-queues",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(queuesRes.status, 200, "i2: queue listing -> 200");
+      assertEq(
+        queuesRes.body.counts,
+        { gardssalg_pending: 1, homepage_pending: 1 },
+        "i3: counts — one gardssalg row (section (e)'s enqueue), one PENDING homepage row; the approved homepage row is excluded"
+      );
+      assertEq(
+        queuesRes.body.gardssalg[0]?.provider_id,
+        "prov-unverified-404",
+        "i4: the gardssalg entry is the verification sweep's own enqueue, with the fields the approve lever needs"
+      );
+      assertTrue(
+        !!queuesRes.body.gardssalg[0]?.candidate_url,
+        "i5: candidate_url present — the exact pair the approve lever demands"
+      );
+      assertEq(
+        queuesRes.body.homepage[0]?.provider_id,
+        "prov-missing-source",
+        "i6: homepage listing carries the pending row only — status filter is load-bearing (i3 fails if it is dropped, since approved would join)"
+      );
     } catch (err: any) {
       failed++;
       failures.push(
