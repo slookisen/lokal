@@ -62,6 +62,7 @@ import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
+import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
@@ -601,6 +602,9 @@ app.use("/admin/db", adminLimiter, adminDbTableSizesRoutes);
 // adminAgentsRoutes would otherwise swallow "contact-email-write" as an id —
 // the same ordering trap opplevelser.ts documents for its own admin routes.
 app.use("/admin/agents/contact-email-write", adminLimiter, adminAgentsContactEmailWriteRoutes);
+// POST /admin/agents/url-write (dev-request 2026-08-01-rfb-agents-url-skrivespak).
+// Same ordering rule as the sibling above — mount BEFORE /admin/agents.
+app.use("/admin/agents/url-write", adminLimiter, adminAgentsUrlWriteRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import

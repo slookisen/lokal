@@ -36436,3 +36436,48 @@ runSerial(async () => {
     failures.push("rfb-verifisert-av-eier-badge-rename: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-08-01-rfb-agents-url-skrivespak: `agents.url` write lever.
+// Sister to the contact-email block and the same defect class — the homepage
+// column the catalog serves (and enrichment reads a producer's email off) had
+// no UPDATE path in src/, leaving 340 agents showing a shared directory host,
+// 87 a dead own host and 4 pointing at rettfrabonden.com. Additionally closes
+// the owner-lock gap the A0 batch hit: this route locks on a VERIFIED
+// agent_claims row as well as claimed_at. Own in-memory DB reached through the
+// route's own seam — mutates NO shared global (not getDb(), not ADMIN_KEY).
+//
+// REGISTERED LAST, DELIBERATELY. This block first sat next to its
+// contact-email sibling mid-chain, and from there the suite went
+// 13354/0 → 13327/1 → 13295/14 on the SAME SHA — the ad-hoc
+// gardssalg-content-refresh IIFE (~line 28425) losing its experiences
+// db-factory handle: "The database connection is not open".
+// That is NOT this block's doing. Substituting a runSerial block whose entire
+// body is `await new Promise(r => setTimeout(r, 400))` — no DB, no env, no
+// require, touching nothing — reproduced the identical 27-test loss at the
+// identical place on 2 of 3 runs of otherwise-clean main (which is itself
+// 13290/0 across 3 runs). Any block added at that position trips it, whatever
+// it does; only the added wall-clock matters.
+// This is precisely the hazard the header documents (kriterium 2, "a fix for
+// the DB singleton can still surface a different, out-of-scope race just by
+// changing when things run") — the ad-hoc family and the runSerial chain are
+// two serialization primitives that only join at the REPORT tail, so delay
+// inserted MID-chain slides a later chain block into an ad-hoc block's open
+// window. Registering at the TAIL adds its wall-clock after that window has
+// closed and shifts nobody. The real fix is the barrier the header describes
+// and judges too risky to land before the ADMIN_KEY-in-external-files fix;
+// this block does not attempt it.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-01-rfb-agents-url-skrivespak: agents.url write lever ──");
+  try {
+    const { runAdminAgentsUrlWriteTests } = require("../src/routes/admin-agents-url-write.test") as
+      typeof import("../src/routes/admin-agents-url-write.test");
+    const uw = await runAdminAgentsUrlWriteTests({ log: false });
+    passed += uw.passed;
+    failed += uw.failed;
+    for (const f of uw.failures) failures.push("url-write: " + f);
+    console.log(`  url-write: ${uw.passed} passed, ${uw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("url-write: unexpected error: " + String(err?.message || err));
+  }
+});
