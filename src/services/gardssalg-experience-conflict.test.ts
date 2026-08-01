@@ -704,6 +704,85 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "x3: shared titlesMatch() still separates 'Isaacpollen'/'Isacpollen'"
     );
 
+    // ── (y) Round-5 REGRESSION, shipped to production in `79adbad` and fixed
+    //     here. The corpus map folded the raw producer name BEFORE
+    //     tokenizing; the gate folded AFTER normalization and stemming. Since
+    //     fold∘normalize ≠ normalize∘fold, the gate looked up keys the corpus
+    //     map never contained, read `?? 0`, and judged a token that 5 distinct
+    //     producers share as DISTINCTIVE — reopening the rounds-1-3
+    //     false-positive class, and on apply=true overwriting a real
+    //     business's booking_url.
+    //
+    //     Three independent ways the two positions diverge, one case each:
+    //       y1 "Storåa"     — diacritic-stripping itself CREATES "aa" ("åa")
+    //                          that the raw string never contained.
+    //       y2 "Sanda-Aker" — the compound-hyphen join (a-A) creates it.
+    //       y3 "Aaros"      — trailing-"s" stemming lands on a different
+    //                          length depending on whether the fold ran first.
+    //
+    //     Shape: 5 distinct producers share exactly ONE word, so its corpus
+    //     count is 5 == SHARED_TOKEN_GENERIC_MIN -> generic -> needs
+    //     corroboration, of which there is none (neutral booking_url host, no
+    //     near-identical whole-title wording). Only producer 0 carries a
+    //     hjemmeside, so a `conflict` can be reached and the ambiguous-
+    //     collision guard is NOT what produces the expected zero — the
+    //     genericity gate is. Control (aa1) uses a spelling where both
+    //     positions already agreed, and passed before this fix too. ──────────
+    const sharedWordScenario = (word: string): number => {
+      const producers: GsExpProducerRow[] = [0, 1, 2, 3, 4].map((n) => ({
+        id: `prod-shared-${n}`,
+        navn: `${["Vestre", "Østre", "Nordre", "Søndre", "Indre"][n]} ${word}`,
+        hjemmeside: n === 0 ? `https://vestre-${n}.example` : null,
+        catalog_hidden: 0,
+      }));
+      const exp: GsExpExperienceRow = {
+        id: "exp-shared-word",
+        title: `${word} Opplevelsesdag ved Sjøen`,
+        title_no: null,
+        booking_url: "https://en-helt-annen-bedrift.example/booking",
+        provider_id: null,
+      };
+      return findGardssalgProducerExperienceMatches(producers, [exp]).length;
+    };
+    assertEq(sharedWordScenario("Aakerhus"), 0, "aa1: control — spelling where both fold positions already agreed");
+    assertEq(
+      sharedWordScenario("Storåa"),
+      0,
+      "y1: 'Storåa' — 'aa' created by diacritic-stripping; corpus key and gate key must still agree (was 5 pairs)"
+    );
+    assertEq(
+      sharedWordScenario("Sanda-Aker"),
+      0,
+      "y2: 'Sanda-Aker' — 'aa' created by the compound-hyphen join (was 5 pairs)"
+    );
+    // y3: the trailing-"s" stemming divergence ("Aaros" -> corpus key "aros",
+    //     gate key "aro"). It canNOT be reached through name_token — the
+    //     stemmed token "aaro" is 4 chars and NAME_TOKEN_MIN_LEN is 5, so it
+    //     is filtered out before it can ever be shared evidence. It IS
+    //     reachable through host_name, whose HOST_TOKEN_MIN_LEN is 4: a
+    //     booking_url on "aaro.no" exactly equals the producer's own 4-char
+    //     stemmed token. Written against that path deliberately — the
+    //     name_token spelling of this case passes even on the broken code and
+    //     would have been a vacuous test.
+    const aarosProducers: GsExpProducerRow[] = [0, 1, 2, 3, 4].map((n) => ({
+      id: `prod-aaros-${n}`,
+      navn: `${["Vestre", "Østre", "Nordre", "Søndre", "Indre"][n]} Aaros`,
+      hjemmeside: n === 0 ? "https://vestre-aaros.example" : null,
+      catalog_hidden: 0,
+    }));
+    const aaroHostExperience: GsExpExperienceRow = {
+      id: "exp-aaro-host",
+      title: "Kajakktur i Lofoten med guide",
+      title_no: null,
+      booking_url: "https://aaro.no/aktiviteter/123",
+      provider_id: null,
+    };
+    assertEq(
+      findGardssalgProducerExperienceMatches(aarosProducers, [aaroHostExperience]).length,
+      0,
+      "y3: 'Aaros' via host_name — trailing-'s' stemming interacts with fold order (was 5 pairs)"
+    );
+
     return { passed, failed, failures };
   })();
 }

@@ -50,9 +50,9 @@
 //      vocabulary from route-corridor-service.ts, a curated corpus-size-
 //      independent stoplist (GENERIC_FARM_PLACE_WORD_STOPLIST — round-3
 //      review fix-up, see its own doc comment below), AND, the same
-//      corpus-frequency method titlesMatch() uses via
-//      buildProviderCorpusTokenCounts(), how many DISTINCT producers in THIS
-//      scan's own producer list use it — any ONE of these three is
+//      corpus-frequency method titlesMatch() uses — how many DISTINCT
+//      producers in THIS scan's own producer list use it
+//      (buildProducerCorpusTokenCounts() below) — any ONE of these three is
 //      sufficient to call a token generic). A GENERIC shared token still
 //      counts when corroborated by a second independent signal — also a
 //      host_name match, or whole-title similarity >=
@@ -112,8 +112,9 @@
 //      also backs the pre-existing harvest-dedup title matcher — widening
 //      that matcher's false-merge surface as a side effect of this PR. Two
 //      reasons the fold belongs here instead, both about direction of harm:
-//      on a genericity gate, over-folding is fail-SAFE (it can only make a
-//      token look MORE generic, demanding MORE corroboration); on a MATCH
+//      on a genericity gate, over-folding is fail-SAFE *provided both sides
+//      of the count lookup are keyed identically* (see round-5 below — that
+//      proviso is not a detail, it is where this went wrong); on a MATCH
 //      path it is fail-dangerous ("aa" is not always the digraph — "Isaac…"),
 //      because collapsing two genuinely different names onto one shared
 //      token manufactures a match. See foldHistoricalAaDigraph()'s own
@@ -151,7 +152,7 @@
 import type Database from "better-sqlite3";
 import { v4 as uuid } from "uuid";
 import { hostFromUrlLike, registrableDomain, isDirectoryOrAggregatorHost } from "./cross-source-validator";
-import { titleTokens, normalizeExperienceTitle, levenshtein, buildProviderCorpusTokenCounts } from "./experience-dedup";
+import { titleTokens, normalizeExperienceTitle, levenshtein } from "./experience-dedup";
 import { gardssalgSearchName, isExperienceContentLocked } from "./experience-store";
 import { DRINK_PRODUCER_TYPES, NON_DRINK_PRODUCER_TYPES } from "./route-corridor-service";
 
@@ -242,10 +243,10 @@ const HOST_TOKEN_MIN_LEN = 4;
 //
 //   2. corpus frequency — how many DISTINCT producers in the CURRENT scan's
 //      own producer list use the token in their name, via
-//      buildProviderCorpusTokenCounts() (experience-dedup.ts) reused
-//      unchanged: passing producer rows as {title: navn, provider_id: id}
-//      makes its existing "count once per distinct provider" semantics do
-//      exactly the right thing here. Same threshold value/convention as
+//      buildProducerCorpusTokenCounts() below, which tokenizes and then keys
+//      through the SAME genericGateKey() this gate looks up with (that
+//      identity is load-bearing — see its doc comment). Same threshold
+//      value/convention as
 //      titlesMatch()'s SHARED_TOKEN_GENERIC_MIN (that constant is not
 //      exported; the value, 5, is the convention being reused, same pattern
 //      as NAME_TOKEN_MIN_LEN above).
@@ -271,12 +272,31 @@ const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
  * asymmetry is the entire point, because the two paths fail in opposite
  * directions:
  *
- *   - On the genericity path, over-folding is fail-SAFE. Collapsing two
- *     unrelated spellings onto one key can only ever make a token look MORE
- *     common (corpus counts are monotonically non-decreasing under merging)
- *     or newly hit the stoplist — i.e. MORE likely to be judged generic, i.e.
- *     demanding MORE corroboration before a match is trusted. It can never
- *     manufacture a match.
+ *   - On the genericity path, over-folding is fail-SAFE — but ONLY under a
+ *     precondition that must be stated, because violating it silently is what
+ *     shipped a regression to production once already (round 5, see below):
+ *     **the corpus map and the gate's lookup must be keyed by the exact same
+ *     function applied to the exact same kind of input.** Given that, merging
+ *     two spellings onto one key can only make a token look MORE common or
+ *     newly hit the stoplist — MORE likely generic, demanding MORE
+ *     corroboration — and can never manufacture a match.
+ *
+ *     Round-5 regression (shipped in `79adbad`, fixed here): the two sides
+ *     folded at DIFFERENT pipeline positions — the corpus map folded the raw
+ *     name before tokenizing, the gate folded after normalization and
+ *     stemming. fold∘normalize ≠ normalize∘fold, so on names like "Storåa",
+ *     "Sanda-Aker" and "Aaros" the gate looked up a key the map never held,
+ *     read `?? 0`, and judged a genuinely common token DISTINCTIVE. That is
+ *     the opposite of fail-safe: it reopened the false-positive class rounds
+ *     1-3 closed, and on `apply=true` it overwrites a real business's
+ *     booking_url. The monotonicity argument was true of the *idea* and false
+ *     of the *implementation*, and two independent review rounds accepted it
+ *     by reading rather than probing.
+ *
+ *     The fix is not "keep the two sides in sync" — that is just a second
+ *     invariant to maintain. There is now exactly ONE folding path
+ *     (genericGateKey applied to titleTokens() output, on both sides), so
+ *     there is nothing left that can disagree. Tests (y1-y3) pin it.
  *   - On the match path it would be fail-DANGEROUS, because "aa" is not
  *     always the digraph ("Isaac…", "Haaneset" vs a genuinely distinct
  *     "Haneset"). Folding there could collapse two genuinely different names
@@ -353,23 +373,37 @@ function producerTokenSet(navn: string): Set<string> {
 /** Provider-distinct corpus token counts over the producers in THIS scan
  *  (not the whole `experiences` table — this signal is about how common a
  *  word is among gårdssalg producer NAMES, the corpus the false-positive
- *  class in the module doc comment actually comes from). Reuses
- *  buildProviderCorpusTokenCounts() (experience-dedup.ts) unchanged by
- *  feeding it {title, provider_id} rows built from producer.navn/id.
+ *  class in the module doc comment actually comes from).
  *
- *  The digraph fold is applied to the name BEFORE handing it over, so the
- *  map comes back keyed the same way genericGateKey() looks tokens up —
- *  folding here rather than post-processing the returned map keeps
- *  buildProviderCorpusTokenCounts()'s "count once per DISTINCT provider"
- *  semantics intact (merging keys afterwards would double-count a producer
- *  whose own name happens to carry both spellings). */
+ *  Tokenize FIRST, then key each token through genericGateKey() — the exact
+ *  same function, applied to the exact same kind of input (a titleTokens()
+ *  token), that isGenericNameToken() looks the count up with. That identity
+ *  is the whole point and is why this no longer delegates to
+ *  buildProviderCorpusTokenCounts() with a pre-folded title string.
+ *
+ *  The previous version folded the RAW name and let buildProviderCorpus-
+ *  TokenCounts() tokenize afterwards, while the gate folded AFTER
+ *  normalization and stemming. Two different pipeline positions, so
+ *  fold∘normalize ≠ normalize∘fold and the two sides disagreed on real
+ *  names: "Storåa" (diacritic-stripping itself CREATES the "aa" the raw
+ *  string never had), "Sanda-Aker" (the compound-hyphen join creates it),
+ *  "Aaros" (trailing-"s" stemming lands on a different length). The gate then
+ *  looked up a key this map never contained, got `?? 0`, and mechanism 3 was
+ *  silently dead — reopening the very false-positive class rounds 1-3 closed.
+ *  See tests (y1-y3). Fixing it by making the two sides AGREE would just be
+ *  a second invariant to maintain; there is now only ONE folding path, so
+ *  there is nothing left to disagree.
+ *
+ *  Counts DISTINCT producers per key (union per producer before counting),
+ *  matching buildProviderCorpusTokenCounts()'s own semantics — a producer
+ *  whose name carries two spellings of the same word still counts once. */
 function buildProducerCorpusTokenCounts(producers: GsExpProducerRow[]): Map<string, number> {
-  return buildProviderCorpusTokenCounts(
-    producers.map((p) => ({
-      title: foldHistoricalAaDigraph(gardssalgSearchName(p.navn)),
-      provider_id: p.id,
-    }))
-  );
+  const counts = new Map<string, number>();
+  for (const p of producers) {
+    const keys = new Set(titleTokens(gardssalgSearchName(p.navn)).map((t) => genericGateKey(t)));
+    for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
 }
 
 /** True when a shared token is generic (a broad category/brand word) rather
