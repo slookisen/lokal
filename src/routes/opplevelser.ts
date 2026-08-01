@@ -217,7 +217,9 @@ import {
   scanGardssalgWebsiteVerificationRows,
   planGardssalgWebsiteVerificationRemediation,
   applyGardssalgWebsiteVerification,
+  GS_WV_SCOPES,
   type GsWvFetchFn,
+  type GsWvScope,
 } from "../services/gardssalg-website-verification";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
@@ -6448,17 +6450,30 @@ router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (r
 // this file that makes outbound network calls, same as
 // POST .../gardssalg-website-discovery already does; it performs ZERO
 // database writes either way.
-router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (_req: Request, res: Response) => {
+router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
+  // scope=visible (default) | hidden | all — Daniel's 2026-08-01 live
+  // override: verification covers ALL harvested producers, hidden included
+  // (see loadGardssalgWebsiteVerificationCohort's doc comment for why the
+  // default stays "visible" and why verifying hidden rows exposes nothing).
+  // STRICTLY validated: an unknown value is a 400, never a silent fallback —
+  // a caller who typos `scope=al` must not walk away believing they scanned
+  // everything when they scanned the visible cohort.
+  const rawScope = req.query.scope;
+  const scope: GsWvScope = rawScope === undefined ? "visible" : (rawScope as GsWvScope);
+  if (rawScope !== undefined && !GS_WV_SCOPES.includes(scope)) {
+    res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
+    return;
+  }
   try {
     const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
       const fetched = await crFetchGardssalgContent(homepageUrl);
       if (!fetched.ok) return { ok: false, reason: fetched.reason };
       return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
     };
-    const cohort = loadGardssalgWebsiteVerificationCohort(expDb);
+    const cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
     const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
-    res.json({ success: true, summary, rows });
+    res.json({ success: true, scope, summary, rows });
   } catch (err) {
     console.error("[gardssalg-website-verification-audit] failed:", err);
     res.status(500).json({ error: "Internal error" });
@@ -6487,9 +6502,19 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (_
 // own doc comment (services/gardssalg-website-verification.ts) for the full
 // write contract.
 router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown };
+  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown; scope?: unknown };
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+  // Same scope contract and strict validation as the GET audit route above —
+  // and the same reason: a typo silently narrowing an APPLY to the visible
+  // cohort is worse than the read-only case, because the caller then stamps
+  // provenance on a third of the base believing they covered all of it.
+  const rawScope = body.scope;
+  const scope: GsWvScope = rawScope === undefined ? "visible" : (rawScope as GsWvScope);
+  if (rawScope !== undefined && !GS_WV_SCOPES.includes(scope)) {
+    res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
+    return;
+  }
 
   const expDb = getExpDb("experiences");
   try {
@@ -6499,7 +6524,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
     };
 
-    let cohort = loadGardssalgWebsiteVerificationCohort(expDb);
+    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
     if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
       const idSet = new Set(
         (body.providerIds as unknown[])
@@ -6513,7 +6538,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
 
     if (!apply) {
       const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation(rows);
-      res.json({ success: true, dry_run: true, would_enqueue: wouldEnqueue, summary });
+      res.json({ success: true, dry_run: true, scope, would_enqueue: wouldEnqueue, summary });
       return;
     }
 
@@ -6521,6 +6546,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     res.json({
       success: true,
       dry_run: false,
+      scope,
       enqueued: applied.filter((a) => a.enqueued).length,
       provenance_written: applied.length,
       summary,
