@@ -24510,6 +24510,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
   try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
+  try { await _contentRefreshScanWindowPromise; } catch { /* errors already pushed to failures */ }
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
@@ -26869,7 +26870,7 @@ console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to
   // cra-01: before any attempt, both providers have last_content_attempt_at
   // NULL — tiebreak falls to created_at ASC, so the first-created (provA)
   // wins a cap=1 selection. This is pre-existing, expected behavior.
-  const firstPick = expStCRA.selectProvidersForContentRefresh(1);
+  const firstPick = expStCRA.selectProvidersForContentRefresh(1).targets;
   assertEq(firstPick.length, 1, "cra-01a: selectProvidersForContentRefresh(1) returns exactly 1");
   assertEq(firstPick[0]?.id, provA, "cra-01b: with no attempts yet, oldest-created (provA) sorts first");
 
@@ -26888,7 +26889,7 @@ console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to
   // NULL sorts first) over provA (attempted, has a real timestamp). Before
   // this fix, provA (permanently unreachable in production) would have kept
   // winning this slot on every single call, forever.
-  const secondPick = expStCRA.selectProvidersForContentRefresh(1);
+  const secondPick = expStCRA.selectProvidersForContentRefresh(1).targets;
   assertEq(secondPick.length, 1, "cra-04a: second selectProvidersForContentRefresh(1) returns exactly 1");
   assertEq(secondPick[0]?.id, provB, "cra-04b: after provA's attempt is stamped, never-attempted provB sorts first");
 
@@ -31808,6 +31809,43 @@ const _contentRefreshCharsetPromise: Promise<void> = new Promise<void>(r => {
     failures.push("opplevelser-content-refresh-charset: unexpected error: " + String(err?.message || err));
   } finally {
     _contentRefreshCharsetResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// 2026-08-01 selector-window fix: selectProvidersForContentRefresh()
+// (src/services/experience-store.ts) now pages through its SQL candidate
+// window with an advancing OFFSET instead of a single fetch-then-filter
+// pass, so a NULL-attempt clump of non-enrichable rows larger than one
+// window can no longer permanently bury genuinely-enrichable providers
+// behind it (see that function's own doc comment for the full bug). Swaps
+// the shared experiences db-factory getDb() singleton (own dedicated test
+// file, in-memory prod-schema DB) — mirrors the crFetchHtml-charset-fix
+// block immediately above, so it must run strictly after it;
+// _contentRefreshCharsetPromise is the current tail of that serial chain.
+let _contentRefreshScanWindowResolve: () => void = () => {};
+const _contentRefreshScanWindowPromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshScanWindowResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshCharsetPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── 2026-08-01 selector-window fix: selectProvidersForContentRefresh() paginated scan ──");
+  try {
+    const { runOpplevelserContentRefreshScanWindowTests } = require("../src/routes/opplevelser-content-refresh-scan-window.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-scan-window.test");
+    const crsw = await runOpplevelserContentRefreshScanWindowTests({ log: false });
+    passed += crsw.passed;
+    failed += crsw.failed;
+    for (const f of crsw.failures) failures.push("opplevelser-content-refresh-scan-window: " + f);
+    console.log(`  opplevelser-content-refresh-scan-window: ${crsw.passed} passed, ${crsw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-scan-window: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshScanWindowResolve();
   }
 })();
 

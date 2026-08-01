@@ -113,19 +113,19 @@ export function runOpplevelserContentRefreshNoYieldBackoffTests(
         "UPDATE experience_providers SET content_no_yield_streak = 3, last_content_attempt_at = ? WHERE id = ?"
       ).run(daysAgoIso(1), provA);
 
-      const afterA = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const afterA = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(!afterA.includes(provA), "a1: streak=3 + recent last_content_attempt_at -> excluded from selectProvidersForContentRefresh");
 
       // ── (b) same provider, backdated past NO_YIELD_BACKOFF_DAYS -> reappears ──
       db.prepare(
         "UPDATE experience_providers SET last_content_attempt_at = ? WHERE id = ?"
       ).run(daysAgoIso(15), provA);
-      const afterB = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const afterB = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(afterB.includes(provA), "b1: streak=3 but last_content_attempt_at 15 days ago (past default 14-day backoff) -> reappears");
 
       // ── (c) recordProviderContentYield(id, false) x3 -> streak reaches 3 ──
       const provC = seedProvider("c", { hjemmeside: "https://no-yield-c.example" });
-      const beforeC = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const beforeC = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(beforeC.includes(provC), "c0: provC starts eligible (streak defaults to 0)");
 
       let lastChanged = false;
@@ -142,7 +142,7 @@ export function runOpplevelserContentRefreshNoYieldBackoffTests(
       // recent attempt (as processOne() would have, right before the no-yield
       // outcome) to exercise the actual exclusion.
       db.prepare("UPDATE experience_providers SET last_content_attempt_at = ? WHERE id = ?").run(daysAgoIso(1), provC);
-      const afterC = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const afterC = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(!afterC.includes(provC), "c3: after streak=3 + recent attempt, provC is excluded");
 
       // ── (d) existing streak=2, then yielded=true -> resets to 0 ───────────
@@ -159,7 +159,7 @@ export function runOpplevelserContentRefreshNoYieldBackoffTests(
       const provE = seedProvider("e", { hjemmeside: "https://no-yield-e.example" });
       const rowE = db.prepare("SELECT content_no_yield_streak FROM experience_providers WHERE id = ?").get(provE) as { content_no_yield_streak: number };
       assertEq(rowE.content_no_yield_streak, 0, "e1: new provider defaults to content_no_yield_streak = 0");
-      const afterE = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const afterE = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(afterE.includes(provE), "e2: default streak=0 provider is selectable (zero behavior change for the default cohort)");
 
       // recordProviderContentYield on a nonexistent id -> false, no throw.

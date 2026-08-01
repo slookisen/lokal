@@ -39,6 +39,7 @@ import {
   // dev-request 2026-07-20-experiences-no-yield-backoff
   recordProviderContentYield,
   type ContentRefreshTarget,
+  type ContentRefreshStopReason,
   // dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
   // item 3 — multi-page-crawl content enrichment (about/visit/opening-hours)
   selectGardssalgProvidersForContentRefresh,
@@ -1294,7 +1295,11 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   );
 
   // ── Target selection ──────────────────────────────────────────────
+  // stopReason is only meaningful for the auto-select path below (an
+  // explicit providerIds request isn't a scan of the candidate window at
+  // all) — null there.
   let targets: ContentRefreshTarget[];
+  let stopReason: ContentRefreshStopReason | null = null;
   if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
     const ids = (body.providerIds as unknown[])
       .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
@@ -1304,7 +1309,18 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       .map((id) => getProviderContentTarget(id))
       .filter((t): t is ContentRefreshTarget => t !== null);
   } else {
-    targets = selectProvidersForContentRefresh(limit);
+    // selectProvidersForContentRefresh() pages through the SQL candidate
+    // window until `limit` enrichable providers are found, the SQL side is
+    // genuinely exhausted, or the hard scan cap is hit (2026-08-01
+    // selector-window fix) — see that function's doc comment
+    // (src/services/experience-store.ts) for the NULL-clump starvation bug
+    // this replaced. stopReason distinguishes an honest "nothing left"
+    // (real-exhaustion) from "stopped early, there may be more"
+    // (scan_cap_reached) so downstream cron reporting no longer conflates
+    // the two into a false "real-exhaustion".
+    const selection = selectProvidersForContentRefresh(limit);
+    targets = selection.targets;
+    stopReason = selection.stopReason;
   }
 
   let scanned = 0;
@@ -1512,6 +1528,13 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
+    // Why selection stopped this call: "real-exhaustion" only when the SQL
+    // candidate window is genuinely tapped out; "scan_cap_reached" when the
+    // hard CONTENT_REFRESH_HARD_SCAN_CAP scan budget stopped the search
+    // first (more candidates may exist further down the queue);
+    // "cap_reached" is the normal case (found `limit` enrichable providers);
+    // null for an explicit providerIds request (no candidate scan ran).
+    stop_reason: stopReason,
   });
 });
 
