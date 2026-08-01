@@ -35313,6 +35313,29 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-08-01-rfb-contact-email-skrivespak (P0): the write lever
+// for `agents.contact_email`, the column outreach actually sends to. Until
+// this route there was NO update path for it anywhere in src/ (only the
+// registration INSERT), leaving 77 agents with the platform's own address as
+// the producer contact — 36 already contacted — and 202 with a DNS-dead
+// domain, all unfixable. Same lock/audit/dry-run discipline as the retro-sweep
+// above; own in-memory DB (swaps the shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-01-rfb-contact-email-skrivespak (P0): agents.contact_email write lever ──");
+  try {
+    const { runAdminAgentsContactEmailWriteTests } = require("../src/routes/admin-agents-contact-email-write.test") as
+      typeof import("../src/routes/admin-agents-contact-email-write.test");
+    const cew = await runAdminAgentsContactEmailWriteTests({ log: false });
+    passed += cew.passed;
+    failed += cew.failed;
+    for (const f of cew.failures) failures.push("contact-email-write: " + f);
+    console.log(`  contact-email-write: ${cew.passed} passed, ${cew.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-email-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-13-supply-graph-v1, Slice 1: additive
 // availability_updated_at/availability_source columns on `products` +
 // computeEffectiveAvailability()/setProducerAvailability()
