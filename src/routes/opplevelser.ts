@@ -200,6 +200,25 @@ import {
   type GsExpConflictPlanItem,
   type GsExpConflictRollbackPlanItem,
 } from "../services/gardssalg-experience-conflict";
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice — a new,
+// independent sweep that checks each gårdssalg producer's stored hjemmeside
+// against gardssalgWebsiteEvidenceMatch (reused unchanged) and stamps the
+// result onto field_provenance.hjemmeside_verification. GET
+// /admin/gardssalg-website-verification-audit (read-only) + POST
+// /admin/gardssalg-website-verification-remediation (dry-run by default),
+// below. Does NOT gate the existing content-refresh pipeline (deliberately
+// out of scope for this slice) and does NOT duplicate POST
+// /admin/gardssalg-website-discovery (that endpoint finds a REPLACEMENT url
+// for a BLANK hjemmeside; this one only judges whether an EXISTING
+// hjemmeside is verifiably the producer's own).
+import {
+  loadGardssalgWebsiteVerificationCohort,
+  scanGardssalgWebsiteVerificationRows,
+  planGardssalgWebsiteVerificationRemediation,
+  applyGardssalgWebsiteVerification,
+  type GsWvFetchFn,
+} from "../services/gardssalg-website-verification";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
 // category mapper differs (experiences vocab, not the food vocab).
@@ -6411,6 +6430,103 @@ router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (r
     res.json({ success: true, dry_run: false, applied, skipped });
   } catch (err) {
     console.error("[gardssalg-experience-conflict-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-website-verification-audit ────────
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 (scoped-down slice — Part A, read-only). For every producer in the
+// outreach cohort (same base WHERE as GET /admin/gardssalg-outreach-readiness
+// AND catalog_hidden != 1 — see loadGardssalgWebsiteVerificationCohort's own
+// doc comment, services/gardssalg-website-verification.ts), classifies the
+// stored hjemmeside as verified / unverified / aggregator / missing_source.
+// A page IS fetched here (via crFetchGardssalgContent, the SAME SSRF-guarded
+// crawler content-refresh/retro-scan already use) for anything that isn't
+// already missing_source/aggregator — this is the one gårdssalg admin GET in
+// this file that makes outbound network calls, same as
+// POST .../gardssalg-website-discovery already does; it performs ZERO
+// database writes either way.
+router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
+      const fetched = await crFetchGardssalgContent(homepageUrl);
+      if (!fetched.ok) return { ok: false, reason: fetched.reason };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+    };
+    const cohort = loadGardssalgWebsiteVerificationCohort(expDb);
+    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+    res.json({ success: true, summary, rows });
+  } catch (err) {
+    console.error("[gardssalg-website-verification-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-website-verification-remediation ─
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 (scoped-down slice — Part B, write, dry-run by default). Re-runs
+// the SAME classification as GET .../gardssalg-website-verification-audit
+// above by default (recomputes live — never trusts a client-supplied result
+// set for the bulk sweep), with an optional `providerIds` override to
+// re-target specific producers only (same precedent as
+// POST /admin/gardssalg-website-discovery's own providerIds override) —
+// the default/no-body case always recomputes the full live cohort.
+//
+// Dry-run (apply omitted/false): zero DB writes, reports would_enqueue (the
+// "unverified" rows that a real apply would add to the review queue).
+// Apply: for every scanned row (ALL classifications, not just unverified),
+// read-modify-writes field_provenance.hjemmeside_verification + inserts one
+// gardssalg_website_verification_audit row; additionally, for "unverified"
+// rows only, upserts gardssalg_website_review_queue with reason
+// "verification_failed" (skipped if an identical pending entry already
+// exists, for idempotent re-runs) — see applyGardssalgWebsiteVerification's
+// own doc comment (services/gardssalg-website-verification.ts) for the full
+// write contract.
+router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+
+  const expDb = getExpDb("experiences");
+  try {
+    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
+      const fetched = await crFetchGardssalgContent(homepageUrl);
+      if (!fetched.ok) return { ok: false, reason: fetched.reason };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+    };
+
+    let cohort = loadGardssalgWebsiteVerificationCohort(expDb);
+    if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+      const idSet = new Set(
+        (body.providerIds as unknown[])
+          .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+          .map((v) => v.trim())
+      );
+      cohort = cohort.filter((p) => idSet.has(p.id));
+    }
+
+    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+
+    if (!apply) {
+      const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation(rows);
+      res.json({ success: true, dry_run: true, would_enqueue: wouldEnqueue, summary });
+      return;
+    }
+
+    const { applied } = applyGardssalgWebsiteVerification(expDb, rows, batchId);
+    res.json({
+      success: true,
+      dry_run: false,
+      enqueued: applied.filter((a) => a.enqueued).length,
+      provenance_written: applied.length,
+      summary,
+    });
+  } catch (err) {
+    console.error("[gardssalg-website-verification-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

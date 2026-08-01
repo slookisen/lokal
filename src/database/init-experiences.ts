@@ -915,5 +915,43 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_provider_conflict_audit failed:", err);
   }
 
+  // ─── gardssalg_website_verification_audit (dev-request 2026-08-01-
+  // gardssalg-profilkomplett-og-soekbar-foer-outreach, Steg 3, scoped-down
+  // slice) ────────────────────────────────────────────────────────────────
+  // Insert-only, per-check changelog for the gårdssalg website-verification
+  // sweep (GET /admin/gardssalg-website-verification-audit, POST
+  // /admin/gardssalg-website-verification-remediation,
+  // services/gardssalg-website-verification.ts). One row per producer per
+  // apply run: whether the sweep classified the producer's hjemmeside as
+  // verified/unverified/aggregator/missing_source, and the evidence (if any)
+  // gardssalgWebsiteEvidenceMatch produced. Mirrors
+  // experience_provider_conflict_audit's exact shape/indexing convention
+  // (this fleet's established reversible-write audit-trail idiom) — FK'd to
+  // experience_providers (this sweep's own entity), ON DELETE CASCADE so
+  // orphan audit rows are cleaned up if a provider is ever deleted. Not a
+  // rollback lever itself (the write it accompanies —
+  // field_provenance.hjemmeside_verification — is a verification STAMP, not
+  // a content field with a "restore to" concept the way
+  // gardssalg_content_audit's fields are), purely an observability/history
+  // trail.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_website_verification_audit (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        evidence TEXT,
+        batch_id TEXT,
+        checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_website_verification_audit_provider ON gardssalg_website_verification_audit(provider_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_website_verification_audit_batch ON gardssalg_website_verification_audit(batch_id)`);
+  } catch (err) {
+    console.error("Migration gardssalg_website_verification_audit failed:", err);
+  }
+
   console.log("[experiences] schema initialized");
 }
