@@ -55,16 +55,7 @@ function stripDiacritics(s: string): string {
     .replace(/[̀-ͯ]/g, "") // strip NFD combining diacritical marks
     .replace(/ø/g, "o")
     .replace(/æ/g, "ae")
-    .replace(/å/g, "a")
-    // Fold the historical Norwegian "aa" digraph (the pre-1917-spelling-
-    // reform stand-in for "å", still a common real spelling in producer/place
-    // names, e.g. "gaard"/"gård", "Aarhus"/"Århus") to the SAME output "å"
-    // already folds to just above ("a") — so both spellings of the same word
-    // tokenize identically. Case-insensitive since this runs BEFORE the
-    // caller's .toLowerCase(). A plain substring rule, deliberately not
-    // scoped to word-boundaries/position — same "don't over-engineer"
-    // discipline as the rest of this normalizer.
-    .replace(/aa/gi, "a");
+    .replace(/å/g, "a");
 }
 
 /**

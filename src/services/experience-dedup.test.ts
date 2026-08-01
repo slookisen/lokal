@@ -79,28 +79,6 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       "1c: possessive 's stripped down to the bare distinctive token"
     );
 
-    // ── 1d-1g. round-3 gardssalg-experience-conflict review fix-up: the
-    //     historical Norwegian "aa" digraph must fold to the SAME output as
-    //     "å" already does, so "gaard" and "gård" (and mixed-case "Aa")
-    //     tokenize identically instead of silently fragmenting a corpus
-    //     count across two spellings of the same word. ───────────────────────
-    assertEq(
-      normalizeExperienceTitle("Gaard"),
-      normalizeExperienceTitle("Gård"),
-      "1d: 'Gaard' and 'Gård' normalize to the exact same string"
-    );
-    assertEq(normalizeExperienceTitle("Gaard"), "gard", "1e: 'Gaard' normalizes to 'gard' (same as 'gård')");
-    assertEq(
-      titleTokens("Nystul Gaarden Gårdsutsalg"),
-      titleTokens("Nystul Gården Gårdsutsalg"),
-      "1f: whole-title tokenization is identical for the 'aa' and 'å' spellings of the same word"
-    );
-    assertEq(
-      normalizeExperienceTitle("AArhus AA Middag"),
-      "arhus a middag",
-      "1g: digraph fold is case-insensitive ('AA') and does not depend on word position"
-    );
-
     // ── 2. levenshtein: sanity ──
     assertEq(levenshtein("kitten", "sitting"), 3, "2a: classic levenshtein example");
     assertEq(levenshtein("same", "same"), 0, "2b: identical strings -> distance 0");
