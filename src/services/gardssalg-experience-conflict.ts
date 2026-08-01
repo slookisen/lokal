@@ -106,12 +106,14 @@
 //      Rounds 4-7 tried to cover it by NORMALIZATION instead — folding the
 //      historical "aa" digraph so "gaard" and "gård" would share one key.
 //      That produced three consecutive regressions, one of which shipped to
-//      production, and was then measured against the real 127-producer corpus
-//      to change exactly nothing. It was deleted 2026-08-01; the full record
-//      and the numbers are in the "deleted-fold" note further down, next to
-//      GENERIC_FARM_PLACE_WORD_STOPLIST. Read it before adding any new
-//      transform between how the corpus map is keyed and how this gate looks
-//      keys up — that asymmetry is what went wrong all three times.
+//      production, and was measured to change nothing at all on the real
+//      127-producer corpus. It was deleted 2026-08-01. That deletion is NOT
+//      free — it reopens one narrow configuration the fold did gate; see the
+//      "deleted-fold" note further down, next to
+//      GENERIC_FARM_PLACE_WORD_STOPLIST, for the exact case, the numbers and
+//      the mitigation. Read it before adding any new transform between how
+//      the corpus map is keyed and how this gate looks keys up — that
+//      asymmetry is what went wrong all three times.
 //
 // Once a pair is matched (by any signal), its `status` is decided purely by
 // comparing registrable domains — producer.hjemmeside is the dev-request's
@@ -286,17 +288,53 @@ const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
 // (9), "mikrobryggeri" (7) — and "bryggeri" is a producer_type enum word that
 // mechanism 1 already catches without any corpus counting.
 //
-// So the fold bought exactly nothing and cost three regressions. Deleted.
-// Genericity is decided by the two mechanisms that are spelling-independent
-// and were doing the work all along: the producer_type vocabulary and the
-// curated GENERIC_FARM_PLACE_WORD_STOPLIST (which already lists "gård",
-// "gard" AND "gaard" explicitly — that stoplist, not the fold, is what makes
-// the "gaard" spelling generic, as test (s) demonstrates).
+// So on the corpus that actually exists, the fold bought nothing and cost
+// three regressions. Deleted. Genericity is decided by the two mechanisms
+// that are spelling-independent and were doing the work all along: the
+// producer_type vocabulary and the curated GENERIC_FARM_PLACE_WORD_STOPLIST
+// (which lists "gård", "gard" AND "gaard" as three separate literals — that
+// stoplist, not any fold, is what makes the "gaard" spelling generic, as
+// test (s) demonstrates).
 //
-// If a future corpus genuinely needs two spellings of one word merged, add
-// BOTH spellings to the stoplist. Do not reintroduce a fold: every attempt
-// created an ordering asymmetry between how the corpus map is keyed and how
-// the gate looks keys up. Tests (y1-y3) pin that asymmetry class shut.
+// ─── WHAT THE DELETION COSTS (round-8 review finding, accepted) ────────────
+//
+// This is NOT free, and the honest statement is narrower than "the fold
+// bought nothing". The fold DID gate one configuration that is now ungated:
+//
+//   5+ producers sharing ONE place-name across BOTH spellings, e.g.
+//   3x "… Aasen" + 2x "… Åsen". Folded, that counts 5 and trips
+//   SHARED_TOKEN_GENERIC_MIN. Unfolded it splits 3/2, neither half reaches
+//   the threshold, the word is judged DISTINCTIVE, and an unrelated
+//   experience mentioning it becomes a remediable `conflict` — which on
+//   apply=true overwrites a real business's booking_url.
+//
+// Measured across builds with that fixture (only producer 0 carrying a
+// hjemmeside, so the ambiguous-collision guard is not what decides it):
+//
+//   8dcab47 (r2, no fold)   3 pairs / 1 conflict
+//   da06537 (r3)            0
+//   6dbcad1 / 79adbad prod  0
+//   51b8400 (fold, fixed)   0
+//   this build              3 pairs / 1 conflict
+//
+// So this build is faithful to "r2 + stoplist" — it is not a NEW defect, it
+// is the pre-fold behaviour returning — but it IS a reduction against what
+// is running in production today. It was accepted deliberately: the
+// configuration does not occur in the current corpus (only 5 of 127 producer
+// names contain "aa" at all, none with a modern-spelling twin), and the
+// mitigation is cheap, local and already demonstrated.
+//
+// MITIGATION when it does occur: add BOTH spellings of that specific word to
+// GENERIC_FARM_PLACE_WORD_STOPLIST, exactly as "gård"/"gard"/"gaard" already
+// are. Do NOT reintroduce a fold: all three attempts created an ordering
+// asymmetry between how the corpus map is keyed and how the gate looks keys
+// up, and two independent reviewers approved the broken versions by reading
+// the reasoning instead of measuring it.
+//
+// Tests (y1-y3) pin the shipped asymmetry shut. They do NOT catch every
+// possible reintroduction — a same-position fold on both sides passes all of
+// them — so treat them as a tripwire for the specific class that shipped,
+// not as proof that a new transform is safe.
 
 const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
   [...DRINK_PRODUCER_TYPES, ...NON_DRINK_PRODUCER_TYPES].map((t) => normalizeExperienceTitle(t))
@@ -314,17 +352,19 @@ const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
 // to have. This list is a fixed floor that does NOT depend on scan size: a
 // token in this set is generic regardless of how rare it happens to look in
 // the current corpus. Normalized through the SAME normalizeExperienceTitle()
-// pipeline as
-// GENERIC_PRODUCER_TYPE_TOKENS above (so the historical "aa"/"å" digraph
-// fold applies here too — "gård", "gard", and "gaard" all collapse to the
-// same entry), same reuse-the-pattern discipline. Not
+// pipeline as GENERIC_PRODUCER_TYPE_TOKENS above, same reuse-the-pattern
+// discipline. Note that "gård", "gard" and "gaard" are three SEPARATE entries
+// here and stay three separate keys — nothing collapses them, which is
+// exactly the point: the historical spelling is covered by enumerating it,
+// not by normalizing it away. (An earlier version of this comment claimed
+// they "all collapse to the same entry". Measured: they do not.) Not
 // exhaustive by design — a deliberately small, hand-picked list of common
 // farm/place/business-generic words (plus a couple of definite-form
 // variants that plausibly stand alone as a farm-name component, e.g.
 // "tunet"), not an attempt to enumerate every generic Norwegian word.
 const GENERIC_FARM_PLACE_WORD_STOPLIST = new Set(
   [
-    "gård", "gard", "gaard", // indefinite + historical "aa" spelling (folds to the same token as gård/gard anyway, kept explicit for readability)
+    "gård", "gard", "gaard", // indefinite + definite-less + historical "aa" spelling — three DISTINCT keys, each listed because nothing merges them
     "tun", "tunet", // farmyard/homestead — bare + definite form (the reviewer's own repro word)
     "bruk", // "smallholding/works" — also the generic tail of countless place-compounds
     "sæter", "seter", // "sæter"/"seter" (mountain summer farm) — both spellings in real use

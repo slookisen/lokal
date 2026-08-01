@@ -197,7 +197,7 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       provider_id: null,
     };
     const pairsF = findGardssalgProducerExperienceMatches([unrelatedProducer], [unrelatedExperience]);
-    assertEq(pairsF.length, 0, "f1: no shared token, no host-label match, no provider_id link -> not matched at all");
+    assertEq(pairsF.length, 0, "f1: no shared token, no host-label match, no provider_id link -> not matched at all (round-8: no mutation in the sweep kills this one — it documents the negative case rather than guarding a mechanism)");
 
     // ── (g) catalog_hidden producers are STILL scanned, never excluded ──────
     const hiddenProducer: GsExpProducerRow = {
@@ -233,7 +233,7 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       provider_id: null,
     };
     const pairsH = findGardssalgProducerExperienceMatches([titleNoProducer], [titleNoExperience]);
-    assertEq(pairsH.length, 1, "h1: matched via title_no even though the (English) title shares nothing");
+    assertEq(pairsH.length, 1, "h1: matched via title_no even though the (English) title shares nothing. NOTE (round-8): the fixture ALSO matches via host_name, so h1/h3 survive breaking title_no entirely — only h2 pins the signal this block is named for.");
     assertEq(pairsH[0]?.match_basis, "name_token", "h2: name_token signal via title_no");
     assertEq(pairsH[0]?.status, "agree", "h3: same registrable domain -> agree");
 
@@ -412,7 +412,7 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     );
     assertTrue(
       !pairsN.some((p) => p.producer_id === fjellheimGard.id && p.status === "conflict"),
-      "n1: Fjellheim Gård x unrelated Lofoten-kayak experience via generic host label 'gard' -> NOT flagged conflict (round-2 finding fixed)"
+      "n1: Fjellheim Gård x unrelated Lofoten-kayak experience via generic host label 'gard' -> NOT flagged conflict. NOTE (round-8 mutation testing): this assertion alone is MASKED — disable the host genericity gate and the 5 resulting false matches all collide into ambiguous, so 'no conflict' still holds. n2 is the one that actually catches it; keep them together."
     );
     assertEq(
       pairsN.filter((p) => p.producer_id === fjellheimGard.id).length,
@@ -567,7 +567,7 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     assertEq(
       pairsS.filter((p) => p.producer_id === fjellheimGaardSpelling.id).length,
       0,
-      "s1: a REAL hostMatch on the historical 'gaard' spelling is still gated — the genericity gate folds the digraph before the stoplist check"
+      "s1: a REAL hostMatch on the historical 'gaard' spelling is still gated — by the 'gaard' stoplist literal (NOT by any fold; see the block comment)"
     );
 
     // ── (t) Round-3 review finding — Atlungstad true positive re-confirmed
@@ -676,9 +676,18 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     //
     //     The fold that caused it is now deleted, so these cases pass for the
     //     simplest possible reason: nothing derives a key on either side any
-    //     more. They are KEPT as the tripwire for that whole class — any
-    //     future transform inserted between how the corpus map is keyed and
-    //     how this gate looks keys up will break at least one of them.
+    //     more. They are KEPT as a tripwire for the SHIPPED asymmetry —
+    //     verified: reintroducing `6bcad1`'s shape (fold the raw name on the
+    //     corpus side, fold after normalize+stem on the gate side) breaks
+    //     them.
+    //
+    //     They are NOT a general proof of safety, and an earlier version of
+    //     this comment wrongly claimed they were ("any future transform ...
+    //     will break at least one of them"). Measured counter-example:
+    //     reintroducing `a72f3a5`'s shape — the SAME derivation applied to
+    //     both sides — passes all of these. A transform can be symmetric and
+    //     still land on the wrong key. Do not read a green run here as
+    //     licence to add one.
     //
     //     Three independent ways such a transform diverges, one case each:
     //       y1 "Storåa"     — diacritic-stripping itself CREATES "aa" ("åa")
