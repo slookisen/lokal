@@ -28929,6 +28929,36 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
 
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 2: pure matching-logic tests for the gårdssalg producer <->
+    // experience/activity cross-table conflict diagnosis
+    // (findGardssalgProducerExperienceMatches), including the confirmed
+    // Atlungstad case reproduced as a synthetic fixture. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── gardssalg-experience-conflict: producer<->experience matching (pure) ──");
+    const { runGardssalgExperienceConflictTests } = require("../src/services/gardssalg-experience-conflict.test") as
+      typeof import("../src/services/gardssalg-experience-conflict.test");
+    const gecr = await runGardssalgExperienceConflictTests({ log: false });
+    passed += gecr.passed;
+    failed += gecr.failed;
+    for (const f of gecr.failures) failures.push("gardssalg-experience-conflict: " + f);
+    console.log(`  gardssalg-experience-conflict: ${gecr.passed} passed, ${gecr.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 2 (route-level): GET /admin/gardssalg-experience-conflict-audit,
+    // POST /admin/gardssalg-experience-conflict-remediation, and the
+    // entity_type:"experience" extension of POST /admin/gardssalg-content-
+    // rollback — end-to-end through the real HTTP routes + a real DB,
+    // including the Atlungstad case's full dry-run -> apply -> rollback cycle.
+    console.log("\n── opplevelser-gardssalg-experience-conflict: producer<->experience diagnosis + remediation + rollback ──");
+    const { runOpplevelserGardssalgExperienceConflictTests } = require("../src/routes/opplevelser-gardssalg-experience-conflict.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-experience-conflict.test");
+    const ogecr = await runOpplevelserGardssalgExperienceConflictTests({ log: false });
+    passed += ogecr.passed;
+    failed += ogecr.failed;
+    for (const f of ogecr.failures) failures.push("opplevelser-gardssalg-experience-conflict: " + f);
+    console.log(`  opplevelser-gardssalg-experience-conflict: ${ogecr.passed} passed, ${ogecr.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a:
     // source-grounded LLM REWRITE of about_text/visit_text for the
     // "passing-bar-but-short" cohort (current value already non-blank and
