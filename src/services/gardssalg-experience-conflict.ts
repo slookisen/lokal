@@ -281,7 +281,9 @@ const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
  *     newly hit the stoplist — MORE likely generic, demanding MORE
  *     corroboration — and can never manufacture a match.
  *
- *     Round-5 regression (shipped in `79adbad`, fixed here): the two sides
+ *     Regression introduced in `6dbcad1` (the round-4 review fix-up; the
+ *     squash-merge `79adbad` is byte-identical to it for this file) and fixed
+ *     here: the two sides
  *     folded at DIFFERENT pipeline positions — the corpus map folded the raw
  *     name before tokenizing, the gate folded after normalization and
  *     stemming. fold∘normalize ≠ normalize∘fold, so on names like "Storåa",
@@ -321,13 +323,41 @@ function foldHistoricalAaDigraph(s: string): string {
   return s.replace(/aa/gi, "a");
 }
 
-/** The key a token is looked up under on the genericity-gate path — the
- *  normal title normalization plus the digraph fold above. Idempotent on
- *  already-normalized tokens, so it is safe to apply both when BUILDING the
- *  generic-word sets (whose literals still carry diacritics, e.g. "vingård")
- *  and when CHECKING a token that has already been through titleTokens(). */
+/**
+ * The key a token is looked up under on the genericity-gate path: normalize,
+ * fold the digraph, then RE-APPLY the trailing-"s" stem.
+ *
+ * The re-stem is not decoration. titleTokens() stems BEFORE this function
+ * ever sees the token, so without it `fold∘stem ≠ stem∘fold` and the two
+ * spellings of one word fragment onto different keys — the exact opposite of
+ * what the fold exists to do:
+ *
+ *     "Aaros" -> titleTokens -> "aaros" (5 > 4, ends "s") -> stem -> "aaro"
+ *                            -> fold  -> "aro"
+ *     "Åros"  -> titleTokens -> "aros"  (4, NOT > 4)      -> no stem
+ *                            -> fold  -> "aros"     ... "aro" != "aros"
+ *
+ * Both sides of the count lookup agreed on that key, so the file's own
+ * two-sides invariant held — they simply agreed on the WRONG key. The corpus
+ * count then split (aro:2, aros:3), neither half reached
+ * SHARED_TOKEN_GENERIC_MIN, and a booking_url on "aros.no" read as
+ * DISTINCTIVE evidence: a fresh false-positive `conflict` that production and
+ * rounds 3-4 all correctly returned zero for. Round-6 review finding; pinned
+ * by tests (z1-z2).
+ *
+ * The threshold is `> 3`, not titleTokens()'s `> 4`, precisely because
+ * folding SHORTENS the token: "aros" (4) must still stem to "aro" so it meets
+ * the already-stemmed-then-folded "aaro" -> "aro" coming from the other
+ * spelling.
+ *
+ * NOT idempotent — `genericGateKey("aaa")` is "a", not "aa" — because the
+ * fold is a plain substring replace. That is fine for every call site here
+ * (each applies it exactly once, to either a set literal or a titleTokens()
+ * token) but it is not a property to rely on without checking.
+ */
 function genericGateKey(token: string): string {
-  return foldHistoricalAaDigraph(normalizeExperienceTitle(token));
+  const folded = foldHistoricalAaDigraph(normalizeExperienceTitle(token));
+  return folded.length > 3 && folded.endsWith("s") ? folded.slice(0, -1) : folded;
 }
 
 const GENERIC_PRODUCER_TYPE_TOKENS = new Set(

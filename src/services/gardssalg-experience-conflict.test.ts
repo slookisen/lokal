@@ -783,6 +783,56 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "y3: 'Aaros' via host_name — trailing-'s' stemming interacts with fold order (was 5 pairs)"
     );
 
+    // ── (z) Round-6 review finding — the MIRROR of (y). Keying both sides
+    //     identically is necessary but not sufficient: they must also agree
+    //     on the RIGHT key. Because titleTokens() stems before genericGateKey()
+    //     runs, folding afterwards splits the two spellings of one word onto
+    //     different keys whenever the modern spelling normalizes to 4 chars
+    //     ending in "s":
+    //
+    //       "Aaros" -> stem -> "aaro" -> fold -> "aro"
+    //       "Åros"  -> (no stem, 4 chars) -> fold -> "aros"
+    //
+    //     The corpus count then splits (aro:2, aros:3), neither half reaches
+    //     SHARED_TOKEN_GENERIC_MIN, and the host label reads as distinctive.
+    //     Reachable ONLY via host_name (4 chars >= HOST_TOKEN_MIN_LEN but <
+    //     NAME_TOKEN_MIN_LEN). genericGateKey()'s re-stem closes it.
+    //
+    //     Both cases return 0 on production and on rounds 3-4 — this class
+    //     was introduced by the fix for (y), not by the original PR. ─────────
+    const spellingSplitScenario = (modern: string, historical: string, host: string): number => {
+      const producers: GsExpProducerRow[] = [
+        ["Vestre", modern],
+        ["Østre", modern],
+        ["Nordre", modern],
+        ["Søndre", historical],
+        ["Indre", historical],
+      ].map(([prefix, word], n) => ({
+        id: `prod-split-${n}`,
+        navn: `${prefix} ${word}`,
+        hjemmeside: n === 0 ? `https://vestre-${modern.toLowerCase()}.example` : null,
+        catalog_hidden: 0,
+      }));
+      const exp: GsExpExperienceRow = {
+        id: "exp-split-host",
+        title: "Kajakktur i Lofoten med guide",
+        title_no: null,
+        booking_url: `https://${host}/aktiviteter/1`,
+        provider_id: null,
+      };
+      return findGardssalgProducerExperienceMatches(producers, [exp]).length;
+    };
+    assertEq(
+      spellingSplitScenario("Åros", "Aaros", "aros.no"),
+      0,
+      "z1: 'Åros'/'Aaros' must land on ONE corpus key — 3+2 reaches the threshold, host label 'aros' stays generic"
+    );
+    assertEq(
+      spellingSplitScenario("Ånes", "Aanes", "anes.no"),
+      0,
+      "z2: same class, second word pair — not a one-off of 'Åros'"
+    );
+
     return { passed, failed, failures };
   })();
 }
