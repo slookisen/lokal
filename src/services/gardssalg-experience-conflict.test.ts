@@ -366,6 +366,95 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "m2: the colliding experience is still reclassified correctly inside a larger mixed scan"
     );
 
+    // ── (n) Round-2 review finding — host_name genericity gate: the
+    //     reviewer's exact reproduction. "Fjellheim Gård" (hjemmeside
+    //     fjellheimgard.no) is one of several gårdssalg producers whose name
+    //     contains the ordinary word "gård"/"gard" (>=5 DISTINCT producers in
+    //     this scan's own corpus use it, same corpus-frequency mechanism
+    //     isGenericNameToken() already uses for name_token — "gard" is not in
+    //     the producer_type enum, so only the corpus-frequency mechanism, not
+    //     the vocabulary one, catches it here). An unrelated experience
+    //     ("Kajakktur i Lofoten med guide" — zero shared title tokens with
+    //     "Fjellheim Gård") whose booking_url happens to resolve to
+    //     "gard.no" must NOT be flagged as conflict purely because "gard" is
+    //     a token both share — that would silently overwrite an unrelated
+    //     business's booking_url on apply. ───────────────────────────────────
+    const fjellheimGard: GsExpProducerRow = {
+      id: "prod-fjellheim-gard",
+      navn: "Fjellheim Gård",
+      hjemmeside: "https://fjellheimgard.no",
+      catalog_hidden: 0,
+    };
+    const gardCorpusFillers: GsExpProducerRow[] = [
+      { id: "prod-gard-2", navn: "Nordbø Gård", hjemmeside: "https://nordbogard.no", catalog_hidden: 0 },
+      { id: "prod-gard-3", navn: "Solheim Gård", hjemmeside: "https://solheimgard.no", catalog_hidden: 0 },
+      { id: "prod-gard-4", navn: "Vika Gård", hjemmeside: "https://vikagard.no", catalog_hidden: 0 },
+      { id: "prod-gard-5", navn: "Åsen Gård", hjemmeside: "https://asengard.no", catalog_hidden: 0 },
+    ];
+    const lofotenKajakkExperience: GsExpExperienceRow = {
+      id: "exp-lofoten-kajakktur",
+      title: "Kajakktur i Lofoten med guide",
+      title_no: null,
+      booking_url: "https://gard.no/aktiviteter/123",
+      provider_id: null,
+    };
+    const pairsN = findGardssalgProducerExperienceMatches(
+      [fjellheimGard, ...gardCorpusFillers],
+      [lofotenKajakkExperience]
+    );
+    assertTrue(
+      !pairsN.some((p) => p.producer_id === fjellheimGard.id && p.status === "conflict"),
+      "n1: Fjellheim Gård x unrelated Lofoten-kayak experience via generic host label 'gard' -> NOT flagged conflict (round-2 finding fixed)"
+    );
+    assertEq(
+      pairsN.filter((p) => p.producer_id === fjellheimGard.id).length,
+      0,
+      "n2: the pair is excluded from matches entirely (no shared title tokens, and the generic host label 'gard' is not trustworthy evidence)"
+    );
+
+    // ── (o) Round-2 review finding, re-confirmed — the Atlungstad true
+    //     positive MUST still be detected as conflict: its host label
+    //     ("atlungstad") is distinctive (not a producer_type vocabulary word,
+    //     and used by only this ONE producer in the scan's corpus), so the
+    //     new genericity gate must not reject it. Re-run of test (a)'s
+    //     assertions, pinned explicitly here for this finding. ─────────────────
+    const pairsO = findGardssalgProducerExperienceMatches([atlungstadProducer], [atlungstadExperience]);
+    assertEq(pairsO.length, 1, "o1: Atlungstad still matches exactly one pair post-fix");
+    assertEq(pairsO[0]?.match_basis, "host_name", "o2: still matched via host_name — distinctive host label 'atlungstad' is not gated out");
+    assertEq(pairsO[0]?.status, "conflict", "o3: still correctly judged conflict — the true positive is not regressed by the round-2 fix");
+
+    // ── (p) Round-2 review finding — corroboration-path false positive: a
+    //     GENERIC host label must not be allowed to corroborate an
+    //     all-generic shared name_token set either (the same Bryggeri-class
+    //     false positive as Finding 1/test (j), but reached via the
+    //     nameTokenMatches() corroboration branch this time, since hostMatch
+    //     used to be passed through ungated there too). "Vestfjord Bryggeri"
+    //     shares only the generic category word "bryggeri" with "Lokalt
+    //     Bryggeri" (no whole-title similarity corroboration either — the
+    //     two titles are not near-identical), and its booking_url host label
+    //     is ALSO just "bryggeri" (itself a producer_type enum word, hence
+    //     generic) — pre-fix, that ungated hostMatch alone corroborated the
+    //     generic name_token into a false 'conflict'. ─────────────────────────
+    const vestfjordBryggeri: GsExpProducerRow = {
+      id: "prod-vestfjord-bryggeri",
+      navn: "Vestfjord Bryggeri",
+      hjemmeside: "https://vestfjordbryggeri.no",
+      catalog_hidden: 0,
+    };
+    const genericHostBryggeriExperience: GsExpExperienceRow = {
+      id: "exp-lokalt-bryggeri",
+      title: "Lokalt Bryggeri",
+      title_no: null,
+      booking_url: "https://bryggeri.no/info",
+      provider_id: null,
+    };
+    const pairsP = findGardssalgProducerExperienceMatches([vestfjordBryggeri], [genericHostBryggeriExperience]);
+    assertEq(
+      pairsP.length,
+      0,
+      "p1: a generic host label ('bryggeri') can no longer corroborate a generic shared name_token ('bryggeri') into a false conflict"
+    );
+
     return { passed, failed, failures };
   })();
 }

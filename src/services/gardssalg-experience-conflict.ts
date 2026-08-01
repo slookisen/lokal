@@ -74,6 +74,19 @@
 //      (a different business with a similar name) shape the dev-request
 //      names as the reason a naive domain-vs-name heuristic missed it before.
 //
+//      Round-2 review fix-up: a bare exact-token host-label match is subject
+//      to the SAME genericity gate as name_token above (isGenericNameToken())
+//      before being trusted — standalone as a match basis, or as
+//      corroboration for an all-generic name_token set. Common words also
+//      appear in producer names' domain-derived host labels (e.g. "gard" —
+//      "gård"/"gard" is a normal word in this vertical's producer names, not
+//      even in the producer_type enum), so an ungated host_name signal is
+//      just as exploitable a false-positive path as an ungated name_token
+//      one. A GENERIC host label is never accepted, either alone or as
+//      corroboration — it is simply not real evidence. Atlungstad's host
+//      label ("atlungstad") stays distinctive under this gate, so that case
+//      is unaffected.
+//
 // Once a pair is matched (by any signal), its `status` is decided purely by
 // comparing registrable domains — producer.hjemmeside is the dev-request's
 // designated source of truth ("produsentens verifiserte hjemmeside er
@@ -289,8 +302,11 @@ function sharedSignificantTokens(a: Set<string>, b: Set<string>): string[] {
  * experience are trustworthy evidence of a name_token match. A shared token
  * is sufficient ALONE only when at least one is distinctive (not generic per
  * isGenericNameToken()). When every shared token is generic, a second
- * independent signal must corroborate it — hostMatch (the same host_name
- * signal, computed by the caller) or whole-title similarity >=
+ * independent signal must corroborate it — trustworthyHostMatch (the same
+ * host_name signal, computed by the caller — round-2 review fix-up: ALREADY
+ * gated so a generic host label can never corroborate, see
+ * hostMatchIsTrustworthy in findGardssalgProducerExperienceMatches()) or
+ * whole-title similarity >=
  * GENERIC_TOKEN_CORROBORATION_MIN — mirroring titlesMatch()'s own
  * rarity/corroboration gate (experience-dedup.ts). See the module doc
  * comment's "name_token" bullet for the full false-positive scenario this
@@ -299,13 +315,13 @@ function sharedSignificantTokens(a: Set<string>, b: Set<string>): string[] {
 function nameTokenMatches(
   sharedTokens: string[],
   producerCorpusCounts: Map<string, number>,
-  hostMatch: boolean,
+  trustworthyHostMatch: boolean,
   wholeStringSim: number
 ): boolean {
   if (sharedTokens.length === 0) return false;
   const hasDistinctiveToken = sharedTokens.some((t) => !isGenericNameToken(t, producerCorpusCounts));
   if (hasDistinctiveToken) return true;
-  return hostMatch || wholeStringSim >= GENERIC_TOKEN_CORROBORATION_MIN;
+  return trustworthyHostMatch || wholeStringSim >= GENERIC_TOKEN_CORROBORATION_MIN;
 }
 
 /** The normalized first label of a booking_url's registrable domain (e.g.
@@ -354,6 +370,23 @@ export function findGardssalgProducerExperienceMatches(
       const exp = pc.row;
       let basis: GsExpMatchBasis | null = null;
       const hostMatch = !!(pc.hostLabel && pTokens.has(pc.hostLabel));
+      // Round-2 review finding: a bare hostMatch is a plain Set.has() exact-
+      // token check against the producer's own name tokens — it carries no
+      // genericity concept of its own, unlike name_token's shared-token gate
+      // above. Without this, any experience whose booking_url registrable-
+      // domain label happens to equal a generic/common word a producer's name
+      // also contains (e.g. "gard" — a normal word in this vertical's
+      // producer names, not even in the producer_type enum) gets an ungated
+      // conflict match, and an ungated hostMatch could also wrongly
+      // "corroborate" an all-generic name_token set below (resurrecting the
+      // original Bryggeri-class false positive via a second path). Apply the
+      // SAME genericity gate that already protects name_token
+      // (isGenericNameToken() — same producer_type vocabulary + corpus-
+      // frequency check, not a second heuristic): a hostMatch only counts as
+      // trustworthy evidence — standalone OR as corroboration — when the host
+      // label itself is distinctive, not generic.
+      const hostMatchIsTrustworthy =
+        hostMatch && !!pc.hostLabel && !isGenericNameToken(pc.hostLabel, producerCorpusCounts);
 
       if (exp.provider_id && exp.provider_id === producer.id) {
         basis = "provider_link";
@@ -369,11 +402,11 @@ export function findGardssalgProducerExperienceMatches(
           const wholeStringSim = hasDistinctiveToken
             ? 0
             : producerExperienceWholeStringSimilarity(producer.navn, exp);
-          if (nameTokenMatches(shared, producerCorpusCounts, hostMatch, wholeStringSim)) {
+          if (nameTokenMatches(shared, producerCorpusCounts, hostMatchIsTrustworthy, wholeStringSim)) {
             basis = "name_token";
           }
         }
-        if (!basis && hostMatch) {
+        if (!basis && hostMatchIsTrustworthy) {
           basis = "host_name";
         }
       }
