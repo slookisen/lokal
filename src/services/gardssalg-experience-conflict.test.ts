@@ -455,6 +455,125 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "p1: a generic host label ('bryggeri') can no longer corroborate a generic shared name_token ('bryggeri') into a false conflict"
     );
 
+    // ── (q) Round-3 review finding — the curated stoplist, host_name path,
+    //     reproduced with the REVIEWER'S EXACT minimal corpus: only 2
+    //     producers total ("Fjellheim Gård" + one unrelated filler), far
+    //     below SHARED_TOKEN_GENERIC_MIN (5) — so the corpus-frequency
+    //     mechanism alone (round-2's fix) does NOT catch "gard", and pre-
+    //     this-fix the exact round-2 false positive reappears. The new
+    //     corpus-size-independent stoplist (GENERIC_FARM_PLACE_WORD_STOPLIST)
+    //     must catch it regardless of how few producers are in the scan. ────
+    const fjellheimGardMinimal: GsExpProducerRow = {
+      id: "prod-fjellheim-gard-minimal",
+      navn: "Fjellheim Gård",
+      hjemmeside: "https://fjellheimgard.no",
+      catalog_hidden: 0,
+    };
+    const unrelatedFillerMinimal: GsExpProducerRow = {
+      id: "prod-unrelated-filler-minimal",
+      navn: "Nordkyst Sjømat",
+      hjemmeside: "https://nordkystsjomat.no",
+      catalog_hidden: 0,
+    };
+    const gardHostExperienceMinimal: GsExpExperienceRow = {
+      id: "exp-gard-host-minimal",
+      title: "Kajakktur i Lofoten med guide",
+      title_no: null,
+      booking_url: "https://gard.no/aktiviteter/123",
+      provider_id: null,
+    };
+    const pairsQ = findGardssalgProducerExperienceMatches(
+      [fjellheimGardMinimal, unrelatedFillerMinimal],
+      [gardHostExperienceMinimal]
+    );
+    assertEq(
+      pairsQ.filter((p) => p.producer_id === fjellheimGardMinimal.id).length,
+      0,
+      "q1: 2-producer corpus (well below the frequency threshold) — 'gard' host label still gated out by the stoplist, no false conflict"
+    );
+
+    // ── (r) Round-3 review finding — the symmetric name_token case: a
+    //     2-producer corpus sharing a stoplisted word ("tunet") must not be
+    //     trusted as standalone name_token evidence either, at any corpus
+    //     size. No host_name signal and no near-identical whole-title
+    //     wording is present here, so this isolates the name_token path
+    //     specifically. ───────────────────────────────────────────────────────
+    const bakkelyTunet: GsExpProducerRow = {
+      id: "prod-bakkely-tunet",
+      navn: "Bakkely Tunet",
+      hjemmeside: "https://bakkelytunet.no",
+      catalog_hidden: 0,
+    };
+    const tunetFiller: GsExpProducerRow = {
+      id: "prod-tunet-filler",
+      navn: "Nordkyst Sjømat",
+      hjemmeside: "https://nordkystsjomat.no",
+      catalog_hidden: 0,
+    };
+    const tunetExperience: GsExpExperienceRow = {
+      id: "exp-tunet-aktiviteter",
+      title: "Tunet Aktiviteter for hele Familien",
+      title_no: null,
+      booking_url: "https://booking-portal.example/aktivitet",
+      provider_id: null,
+    };
+    const pairsR = findGardssalgProducerExperienceMatches([bakkelyTunet, tunetFiller], [tunetExperience]);
+    assertEq(
+      pairsR.length,
+      0,
+      "r1: 2-producer corpus sharing only the stoplisted word 'tunet' -> NOT matched at all (symmetric name_token case fixed)"
+    );
+
+    // ── (s) Round-3 review finding — the "aa"/"å" digraph fold: a producer
+    //     spelled with the historical "gaard" digraph must be gated by the
+    //     stoplist exactly like the "gård" spelling in test (q) — same
+    //     minimal 2-producer corpus, same unrelated experience, only the
+    //     producer's spelling differs. Proves normalizeExperienceTitle()'s
+    //     digraph fold feeds both the stoplist check and the token-equality
+    //     check consistently end-to-end (not just as an isolated unit). ─────
+    const fjellheimGaardSpelling: GsExpProducerRow = {
+      id: "prod-fjellheim-gaard-spelling",
+      navn: "Fjellheim Gaard",
+      hjemmeside: "https://fjellheimgaard.no",
+      catalog_hidden: 0,
+    };
+    const pairsS = findGardssalgProducerExperienceMatches(
+      [fjellheimGaardSpelling, unrelatedFillerMinimal],
+      [gardHostExperienceMinimal]
+    );
+    assertEq(
+      pairsS.filter((p) => p.producer_id === fjellheimGaardSpelling.id).length,
+      0,
+      "s1: the historical 'gaard' spelling is gated exactly like 'gård' — digraph fold works end-to-end"
+    );
+
+    // ── (t) Round-3 review finding — Atlungstad true positive re-confirmed
+    //     at a MINIMAL corpus size (Atlungstad + 2 unrelated fillers, not a
+    //     large fixture list), proving the true-positive match is not itself
+    //     accidentally corpus-size-dependent after the round-3 stoplist/
+    //     digraph changes. ───────────────────────────────────────────────────
+    const atlungstadFiller1: GsExpProducerRow = {
+      id: "prod-atlungstad-filler-1",
+      navn: "Nordkyst Sjømat",
+      hjemmeside: "https://nordkystsjomat.no",
+      catalog_hidden: 0,
+    };
+    const atlungstadFiller2: GsExpProducerRow = {
+      id: "prod-atlungstad-filler-2",
+      navn: "Bakkely Tunet",
+      hjemmeside: "https://bakkelytunet.no",
+      catalog_hidden: 0,
+    };
+    const pairsT = findGardssalgProducerExperienceMatches(
+      [atlungstadProducer, atlungstadFiller1, atlungstadFiller2],
+      [atlungstadExperience]
+    );
+    const atlungstadPairT = pairsT.find((p) => p.producer_id === atlungstadProducer.id);
+    assertTrue(!!atlungstadPairT, "t1: Atlungstad still matches in a minimal (non-large) 3-producer corpus");
+    assertEq(atlungstadPairT?.match_basis, "host_name", "t2: still matched via host_name at minimal corpus size");
+    assertEq(atlungstadPairT?.status, "conflict", "t3: still correctly judged conflict at minimal corpus size — not corpus-size-dependent");
+    assertEq(pairsT.length, 1, "t4: no spurious matches introduced by the unrelated fillers");
+
     return { passed, failed, failures };
   })();
 }

@@ -47,13 +47,17 @@
 //      rarity/corroboration gate (experience-dedup.ts) rather than inventing
 //      a parallel heuristic: a shared token only counts alone when it is RARE
 //      (isGenericNameToken() below — checked against the producer_type
-//      vocabulary from route-corridor-service.ts AND, the same
+//      vocabulary from route-corridor-service.ts, a curated corpus-size-
+//      independent stoplist (GENERIC_FARM_PLACE_WORD_STOPLIST — round-3
+//      review fix-up, see its own doc comment below), AND, the same
 //      corpus-frequency method titlesMatch() uses via
 //      buildProviderCorpusTokenCounts(), how many DISTINCT producers in THIS
-//      scan's own producer list use it). A GENERIC shared token still counts
-//      when corroborated by a second independent signal — also a host_name
-//      match, or whole-title similarity >= GENERIC_TOKEN_CORROBORATION_MIN
-//      (same threshold/method titlesMatch() uses, levenshtein-based).
+//      scan's own producer list use it — any ONE of these three is
+//      sufficient to call a token generic). A GENERIC shared token still
+//      counts when corroborated by a second independent signal — also a
+//      host_name match, or whole-title similarity >=
+//      GENERIC_TOKEN_CORROBORATION_MIN (same threshold/method titlesMatch()
+//      uses, levenshtein-based).
 //      Deliberately does NOT reuse titlesMatch()'s unconditional whole-
 //      string-similarity fallback branch (the "no shared token at all but
 //      near-identical wording" case): that branch exists for re-harvested
@@ -86,6 +90,21 @@
 //      corroboration — it is simply not real evidence. Atlungstad's host
 //      label ("atlungstad") stays distinctive under this gate, so that case
 //      is unaffected.
+//
+//      Round-3 review fix-up: the round-2 gate's corpus-frequency mechanism
+//      is only as strong as the current scan's producer count — on a small
+//      scan (or the real ~50-producer production corpus), "gard" and words
+//      like it plausibly stay under SHARED_TOKEN_GENERIC_MIN and slip
+//      through ungated regardless. isGenericNameToken() now also checks a
+//      fixed, corpus-size-independent stoplist of common Norwegian
+//      farm/place/business-generic words (GENERIC_FARM_PLACE_WORD_STOPLIST)
+//      before falling back to corpus frequency, closing that gap for both
+//      host_name and name_token. Compounding factor also fixed: title
+//      normalization now folds the historical "aa" digraph the same way it
+//      already folds æ/ø/å, so "gaard" (a real historical spelling in this
+//      vertical) and "gård" count as the SAME token for both the stoplist
+//      check and corpus-frequency counting instead of silently fragmenting
+//      the corpus count across two spellings.
 //
 // Once a pair is matched (by any signal), its `status` is decided purely by
 // comparing registrable domains — producer.hjemmeside is the dev-request's
@@ -229,6 +248,38 @@ const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
   [...DRINK_PRODUCER_TYPES, ...NON_DRINK_PRODUCER_TYPES].map((t) => normalizeExperienceTitle(t))
 );
 
+// ─── Round-3 review fix-up: a curated, corpus-SIZE-independent floor ───────
+//
+// Mechanism 2 above (corpus frequency) is entirely relative to how many
+// producers happen to be in a given scan: with a small scan (or even the
+// real production gårdssalg corpus, only ~50 producers total), an ordinary
+// Norwegian farm/place/business-generic word plausibly appears on FEWER than
+// SHARED_TOKEN_GENERIC_MIN producers and slips through ungated — silently
+// resurrecting the exact "gard" false-positive class this file already
+// fixed once (round-2), just below whatever producer count the scan happens
+// to have. This list is a fixed floor that does NOT depend on scan size: a
+// token in this set is generic regardless of how rare it happens to look in
+// the current corpus. Normalized through the SAME normalizeExperienceTitle()
+// pipeline as GENERIC_PRODUCER_TYPE_TOKENS above (so the historical "aa"/"å"
+// digraph fold applies here too — "gård", "gard", and "gaard" all collapse
+// to the same normalized entry), same reuse-the-pattern discipline. Not
+// exhaustive by design — a deliberately small, hand-picked list of common
+// farm/place/business-generic words (plus a couple of definite-form
+// variants that plausibly stand alone as a farm-name component, e.g.
+// "tunet"), not an attempt to enumerate every generic Norwegian word.
+const GENERIC_FARM_PLACE_WORD_STOPLIST = new Set(
+  [
+    "gård", "gard", "gaard", // indefinite + historical "aa" spelling (folds to the same token as gård/gard anyway, kept explicit for readability)
+    "tun", "tunet", // farmyard/homestead — bare + definite form (the reviewer's own repro word)
+    "bruk", // "smallholding/works" — also the generic tail of countless place-compounds
+    "sæter", "seter", // "sæter"/"seter" (mountain summer farm) — both spellings in real use
+    "dal", // valley
+    "stad", // place/site suffix
+    "gods", // manor/estate
+    "hus", // house
+  ].map((t) => normalizeExperienceTitle(t))
+);
+
 function producerTokenSet(navn: string): Set<string> {
   return new Set(titleTokens(gardssalgSearchName(navn)));
 }
@@ -246,9 +297,13 @@ function buildProducerCorpusTokenCounts(producers: GsExpProducerRow[]): Map<stri
 }
 
 /** True when a shared token is generic (a broad category/brand word) rather
- *  than distinctive (proper-noun-like) — see the two-mechanism gate above. */
+ *  than distinctive (proper-noun-like) — any ONE of three mechanisms is
+ *  sufficient: the producer_type vocabulary, the curated corpus-size-
+ *  independent stoplist (round-3 fix-up, see GENERIC_FARM_PLACE_WORD_STOPLIST
+ *  above), or corpus frequency in the current scan. */
 function isGenericNameToken(token: string, producerCorpusCounts: Map<string, number>): boolean {
   if (GENERIC_PRODUCER_TYPE_TOKENS.has(token)) return true;
+  if (GENERIC_FARM_PLACE_WORD_STOPLIST.has(token)) return true;
   return (producerCorpusCounts.get(token) ?? 0) >= SHARED_TOKEN_GENERIC_MIN;
 }
 
