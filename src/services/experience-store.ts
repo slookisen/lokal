@@ -1684,6 +1684,45 @@ export type ContentRefreshTarget = {
 };
 
 /**
+ * Why selectProvidersForContentRefresh() below is a select-loop instead of a
+ * one-shot SELECT ... LIMIT (2026-08-01, dev-request selector-window fix):
+ *
+ * `last_content_attempt_at` is stamped ONLY on providers that actually get
+ * processed by POST /admin/content-refresh (markProviderContentAttempted,
+ * called unconditionally in apply mode before the fetch). A candidate the SQL
+ * pre-filter below fetches but the JS classifyProviderContentBucket() step
+ * then discards as not-"enrichable" is NEVER stamped — it keeps
+ * last_content_attempt_at IS NULL and therefore sorts first FOREVER under the
+ * NULLs-first `ORDER BY (last_content_attempt_at IS NOT NULL), ...` (see the
+ * content-refresh-attempt-tracking regression guard above this function for
+ * why NULLs-first ordering exists at all). Once that permanently-NULL clump
+ * grows past a single window, it silently buries every genuinely-enrichable
+ * row behind it — the selector then returns 0 candidates and the route
+ * honestly has nothing to say except "nothing found", which downstream cron
+ * reporting mistook for real cohort exhaustion (measured live 2026-07-31:
+ * limit=3 -> window 200 -> scanned=0; limit=25 -> window 300 -> scanned=0;
+ * limit=100 -> window 1000 -> scanned=88 candidates behind the NULL clump).
+ *
+ * Fix: page through the SAME SQL pre-filter/ORDER BY with an advancing
+ * OFFSET, filtering each page in JS, until EITHER (a) `cap` enrichable
+ * providers have been found, (b) the SQL side is genuinely exhausted (a page
+ * returns fewer rows than requested — end of table), or (c) the hard
+ * CONTENT_REFRESH_HARD_SCAN_CAP total-rows-scanned budget is spent (so one
+ * call can never scan the whole catalog). The three outcomes are reported
+ * back as `stopReason` so the route can tell an honest "nothing left"
+ * (real-exhaustion) apart from "stopped early, there may be more"
+ * (scan_cap_reached) instead of conflating both into one silent zero.
+ */
+export type ContentRefreshStopReason = "cap_reached" | "real-exhaustion" | "scan_cap_reached";
+
+export type ContentRefreshSelection = {
+  targets: ContentRefreshTarget[];
+  /** Total SQL candidate rows examined (summed across all pages this call). */
+  scanned: number;
+  stopReason: ContentRefreshStopReason;
+};
+
+/**
  * Auto-select providers eligible for a homepage content-refresh: providers that
  * HAVE a website (hjemmeside) AND own ≥1 experience whose content is THIN
  * (description empty OR category empty) and NOT locked (not verified, not
@@ -1797,74 +1836,84 @@ export function recordProviderHomepageFetchResult(
   return { found: true, attempts: row.homepage_fetch_attempts, parked, parked_now: parkedNow };
 }
 
-// Over-fetch window for the candidate pre-filter below, same pattern as
-// GET /admin/providers/recently-enriched's EXP_ROW_WINDOW (round-5 review of
-// dev-request 2026-07-27-kvalitetsporter-uten-signal established WHY: the
-// per-field provenance check cannot be expressed in SQL — it parses JSON and
-// compares registrable domains — so it has to run in JS AFTER a broad SQL
-// pre-filter and BEFORE the final LIMIT. Filtering post-LIMIT would mean a
-// page full of aggregator-only candidates returns fewer than `cap` results
-// even when genuinely-thin providers exist further down the ordering.
+// Over-fetch window for the candidate pre-filter below (per SQL page), same
+// pattern as GET /admin/providers/recently-enriched's EXP_ROW_WINDOW
+// (round-5 review of dev-request 2026-07-27-kvalitetsporter-uten-signal
+// established WHY: the per-field provenance check cannot be expressed in
+// SQL — it parses JSON and compares registrable domains — so it has to run
+// in JS AFTER a broad SQL pre-filter and BEFORE the final LIMIT. Filtering
+// post-LIMIT would mean a page full of aggregator-only candidates returns
+// fewer than `cap` results even when genuinely-thin providers exist further
+// down the ordering.
 const CONTENT_REFRESH_CANDIDATE_WINDOW_MULTIPLIER = 12;
 const CONTENT_REFRESH_CANDIDATE_WINDOW_MAX = 1000;
 
-export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarget[] {
+// Hard ceiling on total SQL candidate rows examined across ALL pages of a
+// single selectProvidersForContentRefresh() call (2026-08-01 selector-window
+// fix — see the doc comment above ContentRefreshSelection for the bug this
+// paginated loop fixes). Without a bound, a cohort with a very long run of
+// non-enrichable rows ahead of any enrichable one could make one call page
+// through the entire experience_providers table. 5000 is deliberately well
+// above any single-page window (max 1000) so normal cohorts never come
+// close to it, while still being a bounded, sane per-call ceiling.
+export const CONTENT_REFRESH_HARD_SCAN_CAP = 5000;
+
+export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSelection {
   const db = getDb(VERTICAL);
   const cap = Math.max(1, Math.min(100, limit));
-  const candidateWindow = Math.min(
+  const pageSize = Math.min(
     CONTENT_REFRESH_CANDIDATE_WINDOW_MAX,
     Math.max(200, cap * CONTENT_REFRESH_CANDIDATE_WINDOW_MULTIPLIER)
   );
-  const candidates = db
-    .prepare(
-      `SELECT p.id AS id, p.navn AS navn,
-              COALESCE(
-                CASE WHEN p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != ''
-                     THEN TRIM(p.hjemmeside) END,
-                (SELECT TRIM(e2.evidence_url)
-                   FROM experiences e2
-                  WHERE e2.provider_id = p.id
-                    AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
-                  LIMIT 1)
-              ) AS hjemmeside
-         FROM experience_providers p
-        WHERE (
-            (p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != '')
-            OR EXISTS (
-                SELECT 1 FROM experiences e2
-                 WHERE e2.provider_id = p.id
-                   AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
-                   AND p.hjemmeside IS NULL
-               )
-          )
-          AND EXISTS (
-            -- BROAD pre-filter only: "an unlocked, live experience exists at
-            -- all". Deliberately no longer requires a BLANK field here — that
-            -- was exactly the bug (dev-request 2026-07-29-blacklist-backfill-
-            -- og-berikelsestriage, slice 2): a non-blank but
-            -- aggregator-sourced field must still reach the per-field
-            -- provenance check below (isExperienceContentGenuinelyThin /
-            -- classifyProviderContentBucket — the SAME shared classifier the
-            -- berikelsestriage triage endpoint uses), which SQL alone cannot
-            -- express.
-            -- NULL-guarded on verification_status (round-3-review fix,
-            -- mirrored from GET .../recently-enriched): SQL three-valued
-            -- logic makes "NULL != 'verified'" evaluate to NULL, excluding
-            -- the row, while isExperienceContentLocked treats a NULL
-            -- verification_status as UNLOCKED. Latent today (createExperience
-            -- coalesces to 'pending_verify'), cheap to keep correct.
-            SELECT 1 FROM experiences e
-             WHERE e.provider_id = p.id
-               AND (e.verification_status IS NULL OR e.verification_status != 'verified')
-               AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
-               AND e.canonical_id IS NULL
-          )
-          ${providerParkingExclusionSql("p")}
-          ${noYieldBackoffExclusionSql("p")}
-        ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
-        LIMIT ?`
-    )
-    .all(candidateWindow) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+
+  const pageStmt = db.prepare(
+    `SELECT p.id AS id, p.navn AS navn,
+            COALESCE(
+              CASE WHEN p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != ''
+                   THEN TRIM(p.hjemmeside) END,
+              (SELECT TRIM(e2.evidence_url)
+                 FROM experiences e2
+                WHERE e2.provider_id = p.id
+                  AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
+                LIMIT 1)
+            ) AS hjemmeside
+       FROM experience_providers p
+      WHERE (
+          (p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != '')
+          OR EXISTS (
+              SELECT 1 FROM experiences e2
+               WHERE e2.provider_id = p.id
+                 AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
+                 AND p.hjemmeside IS NULL
+             )
+        )
+        AND EXISTS (
+          -- BROAD pre-filter only: "an unlocked, live experience exists at
+          -- all". Deliberately no longer requires a BLANK field here — that
+          -- was exactly the bug (dev-request 2026-07-29-blacklist-backfill-
+          -- og-berikelsestriage, slice 2): a non-blank but
+          -- aggregator-sourced field must still reach the per-field
+          -- provenance check below (isExperienceContentGenuinelyThin /
+          -- classifyProviderContentBucket — the SAME shared classifier the
+          -- berikelsestriage triage endpoint uses), which SQL alone cannot
+          -- express.
+          -- NULL-guarded on verification_status (round-3-review fix,
+          -- mirrored from GET .../recently-enriched): SQL three-valued
+          -- logic makes "NULL != 'verified'" evaluate to NULL, excluding
+          -- the row, while isExperienceContentLocked treats a NULL
+          -- verification_status as UNLOCKED. Latent today (createExperience
+          -- coalesces to 'pending_verify'), cheap to keep correct.
+          SELECT 1 FROM experiences e
+           WHERE e.provider_id = p.id
+             AND (e.verification_status IS NULL OR e.verification_status != 'verified')
+             AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
+             AND e.canonical_id IS NULL
+        )
+        ${providerParkingExclusionSql("p")}
+        ${noYieldBackoffExclusionSql("p")}
+      ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
+      LIMIT ? OFFSET ?`
+  );
 
   const experiencesStmt = db.prepare(
     `SELECT description, category, content_source, verification_status,
@@ -1873,14 +1922,56 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
   );
 
   const out: ContentRefreshTarget[] = [];
-  for (const row of candidates) {
-    if (!row.hjemmeside || !row.hjemmeside.trim()) continue;
-    const experiences = experiencesStmt.all(row.id) as BucketableExperienceRow[];
-    if (classifyProviderContentBucket(row.hjemmeside, experiences) !== "enrichable") continue;
-    out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() });
-    if (out.length >= cap) break;
+  let offset = 0;
+  let totalScanned = 0;
+  let stopReason: ContentRefreshStopReason = "real-exhaustion";
+
+  // Paginate the SQL pre-filter (same ORDER BY, advancing OFFSET) until cap
+  // enrichable providers are found, the SQL side runs out of rows (a page
+  // comes back shorter than requested), or the hard scan-cap budget is
+  // spent — see the doc comment above ContentRefreshSelection for why this
+  // replaced a single fetch-then-filter pass.
+  while (true) {
+    if (totalScanned >= CONTENT_REFRESH_HARD_SCAN_CAP) {
+      stopReason = "scan_cap_reached";
+      break;
+    }
+
+    const fetchSize = Math.min(pageSize, CONTENT_REFRESH_HARD_SCAN_CAP - totalScanned);
+    const page = pageStmt.all(fetchSize, offset) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+
+    totalScanned += page.length;
+    offset += page.length;
+
+    for (const row of page) {
+      if (!row.hjemmeside || !row.hjemmeside.trim()) continue;
+      const experiences = experiencesStmt.all(row.id) as BucketableExperienceRow[];
+      if (classifyProviderContentBucket(row.hjemmeside, experiences) !== "enrichable") continue;
+      out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() });
+      if (out.length >= cap) break;
+    }
+
+    if (out.length >= cap) {
+      stopReason = "cap_reached";
+      break;
+    }
+    if (page.length < fetchSize) {
+      // SQL side returned fewer rows than requested at this offset: there is
+      // genuinely nothing left to page through. Honest exhaustion.
+      stopReason = "real-exhaustion";
+      break;
+    }
+    if (totalScanned >= CONTENT_REFRESH_HARD_SCAN_CAP) {
+      // Full page delivered exactly at the budget boundary — we cannot tell
+      // whether more rows exist beyond it without another fetch, and the
+      // budget forbids that. Report the cap, not an unproven exhaustion.
+      stopReason = "scan_cap_reached";
+      break;
+    }
+    // else: SQL side had more to give and we haven't hit cap/budget — page again.
   }
-  return out;
+
+  return { targets: out, scanned: totalScanned, stopReason };
 }
 
 /**

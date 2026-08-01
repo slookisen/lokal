@@ -94,7 +94,7 @@ export function runOpplevelserContentRefreshAggregatorThinTests(
       });
 
       // (a0) both experiences fully blank -> provider selected.
-      const beforeAny = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const beforeAny = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(beforeAny.includes(provA), "a0: provider with two fully-blank experiences is selected");
 
       // (b) Fill expA1's description via a THIRD-PARTY AGGREGATOR sourceUrl —
@@ -109,7 +109,7 @@ export function runOpplevelserContentRefreshAggregatorThinTests(
       );
       assertTrue(writtenAgg.includes("description") && writtenAgg.includes("category"), "b0: aggregator write actually wrote both fields");
 
-      const afterAggWrite = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const afterAggWrite = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(
         afterAggWrite.includes(provA),
         "b1: THE FIX — provider A is STILL selected after expA1's description/category were filled from an AGGREGATOR (content_source='provider_site' but wrong-domain evidence) — old code would have wrongly treated this as done",
@@ -134,7 +134,7 @@ export function runOpplevelserContentRefreshAggregatorThinTests(
       // Provider A is STILL selected — expA1 remains stuck aggregator-thin
       // (by design: this fix never force-overwrites), and expA2 is still
       // fully blank on top of that.
-      const stillSelected = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const stillSelected = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(stillSelected.includes(provA), "c1: provider A still selected — expA1 remains aggregator-thin (fill-only-blank never force-corrects it) and expA2 is untouched");
 
       // (d) Fill expA2 via the GENUINE homepage — once EVERY live experience
@@ -150,7 +150,7 @@ export function runOpplevelserContentRefreshAggregatorThinTests(
       // expA1 is STILL aggregator-thin, so provider A must STILL be selected
       // — proving the ANY-thin-live-experience rule (mixed case), not an
       // accidental pass.
-      const stillMixed = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const stillMixed = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(stillMixed.includes(provA), "d1: provider A still selected — expA1 (aggregator-thin) alone keeps it eligible even though expA2 is now genuinely done (mixed multi-experience, ANY-thin rule)");
 
       // ── (e): provider B — a LOCKED experience with blank content must
@@ -168,7 +168,7 @@ export function runOpplevelserContentRefreshAggregatorThinTests(
       const dbB = dbFactory.getDb("experiences");
       dbB.prepare("UPDATE experiences SET content_source = 'manual' WHERE id = ?").run(expB1);
 
-      const afterLocked = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const afterLocked = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(!afterLocked.includes(provB), "e1: provider B (only experience is LOCKED, content_source='manual', blank content) is NEVER selected — locked rows are permanently out of scope regardless of blank content");
 
       // (f) a provider whose ONLY aggregator-thin experience is real proof
@@ -189,7 +189,7 @@ export function runOpplevelserContentRefreshAggregatorThinTests(
         { description: "Aggregert tekst.", category: "opplevelse" },
         "https://tripadvisor.com/x",
       );
-      const afterC = expStore.selectProvidersForContentRefresh(50).map((r) => r.id);
+      const afterC = expStore.selectProvidersForContentRefresh(50).targets.map((r) => r.id);
       assertTrue(afterC.includes(provC), "f1: provider C, entirely aggregator-sourced (single experience) -> still selected (enrichable), not silently marked done");
     } catch (err: any) {
       failed++;
