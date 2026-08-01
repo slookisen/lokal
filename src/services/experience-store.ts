@@ -2784,6 +2784,97 @@ export function searchGardssalgProviders(
   return withDistance.slice(0, clampedLimit);
 }
 
+// ─── Gårdssalg free-text search for /sok (dev-request 2026-08-01-gardssalg-
+//     profilkomplett-og-soekbar-foer-outreach, Steg 1) ─────────────────────
+//
+// Measured production bug: /sok's free-text search only ever queried
+// `experiences` (via searchPublishedExperiences() above) — gårdssalg
+// producers live in `experience_providers` (see listGardssalgProviders()'s
+// doc comment for why), so they had ZERO presence in search. 12 of 13
+// outreach-candidate producers returned "Ingen treff" on their own name.
+//
+// Distinct from searchGardssalgProviders(filter, limit) above: that one is
+// the STRUCTURED filter (fylke/kommune/producer_type/geo) backing the REST
+// /api/opplevelser/discover?category=gardssalg_smaking endpoint (via
+// routes/opplevelser.ts) and the discover_gardssalg MCP tool — no free-text
+// query param. This one is free-text-only, for the /sok HTML page's search
+// box, and deliberately does not touch that REST endpoint (out of scope for
+// this slice — see the dev-request).
+//
+// Reuses the EXACT SAME "is this a gårdssalg producer" gate as
+// listGardssalgProviders()/searchGardssalgProviders() (producer_type set OR
+// rfb-seed; catalog_hidden=1 rows excluded — parens around the OR are
+// load-bearing, see those functions' comments) so a hidden producer can
+// never leak into public search, same discipline as everywhere else this
+// gate is used.
+//
+// Matching reuses the SAME tokenised-AND / lower()/LIKE / expandSearchTerm()
+// Norwegian-synonym pattern as searchPublishedExperiences() above (rather
+// than inventing a second matching approach), so æøå and multi-word queries
+// behave consistently across both search surfaces — matched against
+// navn/poststed/kommune/fylke/products (products is a JSON-array-of-strings
+// text column; a plain substring LIKE still finds a product name inside it).
+//
+// Also requires a real slug (same discipline as listGardssalgProviderMapPoints():
+// a result with no /kategori/gardssalg/produsent/<slug> page to link to isn't
+// useful on a search results page) — every visible producer normally has one
+// via backfillProviderSlugs(), so this rarely excludes rows in practice.
+export type GardssalgSearchByQueryRow = {
+  id: string;
+  navn: string;
+  // Never null on a returned row — see the query's slug predicate below.
+  slug: string;
+  fylke: string | null;
+  kommune: string | null;
+  poststed: string | null;
+  producer_type: string | null;
+};
+
+export function searchGardssalgProvidersByQuery(query: string, limit = 30): GardssalgSearchByQueryRow[] {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  // Same tokenisation cap (8 terms) as searchPublishedExperiences() — an
+  // absurdly long query degrades gracefully rather than building an
+  // unbounded WHERE clause.
+  const terms = q.split(/\s+/).filter((t) => t.length > 0).slice(0, 8);
+  if (terms.length === 0) return [];
+  const db = getDb(VERTICAL);
+  const params: Record<string, unknown> = { limit: Math.max(1, Math.min(100, limit)) };
+  const termClauses = terms.map((t, i) => {
+    // Expand Norwegian term into [original, ...english_synonyms] — same
+    // helper searchPublishedExperiences() uses, kept consistent rather than
+    // reimplemented (SEARCH_SYNONYMS is activity-word-shaped, not producer-
+    // name-shaped, so it mostly no-ops here, but a shared helper means the
+    // two search surfaces never silently diverge in behavior).
+    const expanded = expandSearchTerm(t);
+    const fieldClauses = expanded.flatMap((et, ei) => {
+      const key = `t${i}_${ei}`;
+      params[key] = `%${et.toLowerCase()}%`;
+      return [
+        `lower(navn) LIKE @${key}`,
+        `lower(COALESCE(poststed,'')) LIKE @${key}`,
+        `lower(COALESCE(kommune,'')) LIKE @${key}`,
+        `lower(COALESCE(fylke,'')) LIKE @${key}`,
+        `lower(COALESCE(products,'')) LIKE @${key}`,
+      ];
+    });
+    return `(${fieldClauses.join(" OR ")})`;
+  });
+  const rows = db
+    .prepare(
+      `SELECT id, navn, slug, fylke, kommune, poststed, producer_type
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND slug IS NOT NULL AND slug != ''
+          AND ${termClauses.join(" AND ")}
+        ORDER BY navn
+        LIMIT @limit`
+    )
+    .all(params) as GardssalgSearchByQueryRow[];
+  return rows;
+}
+
 // ─── Gårdssalg content-refresh (dev-request 2026-07-03-gardssalg-rike-
 //     profiler-bilder-agentbooking, Fase 1 item 3, 2026-07-10) ──────────────
 //

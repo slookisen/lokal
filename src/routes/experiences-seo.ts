@@ -64,6 +64,13 @@ import {
   backfillProviderSlugs,
   searchPublishedExperiences,
   listGardssalgProviders,
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 1: free-text producer search for /sok (distinct from
+  // searchGardssalgProviders(filter, limit) above, which is the structured
+  // filter used by the REST /discover endpoint) — see its doc comment in
+  // experience-store.ts.
+  searchGardssalgProvidersByQuery,
+  type GardssalgSearchByQueryRow,
   resolveCanonicalSlugForDuplicate,
   // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: «Nær meg» on
   // /sok — reuses the SAME discoverExperiences()/formatDistanceLabel() the
@@ -2242,6 +2249,11 @@ const BROWSE_CSS = `
   .sort-toggle a{color:var(--ink-soft);font-weight:600}
   .sort-toggle a.active{color:var(--teal-500)}
   .geo-note{color:var(--mist);font-size:.82rem;margin:6px 0 0}
+  /* dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+     Steg 1: section labels ("Produsenter" / "Opplevelser") separating /sok's
+     two result kinds — only rendered when a producer match exists. */
+  .sok-section-title{font-size:.9rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--fjord-800);margin:26px 0 4px}
+  .sok-producers{margin-top:6px}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 4px}
   .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.82rem;font-weight:600;border:1px solid var(--line)}
   .chip:hover{text-decoration:none;border-color:var(--teal-400);color:var(--fjord-700)}
@@ -2665,6 +2677,26 @@ function renderCard(
     ${distanceHtml}
     ${desc}
     <span class="c-meta">${tags.join("")}</span>
+  </a>`;
+}
+
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 1: renders one gårdssalg producer hit in /sok's "Produsenter" section.
+// Reuses the SAME generic .card/.c-title/.c-place/.c-meta classes renderCard()
+// above uses (BROWSE_CSS's rules aren't experience-specific) and drinkBadge()
+// (module-scope, already shared with the /kategori/gardssalg grid and
+// produsent-profil page) rather than inventing new styling — visually
+// consistent with the rest of this page and the site's own gårdssalg cards.
+// Always links to the real profile page: searchGardssalgProvidersByQuery()
+// only ever returns rows with a real, non-empty slug (see its own doc
+// comment), so there is no "no link" fallback to handle here.
+function renderSokProducerCard(p: GardssalgSearchByQueryRow): string {
+  const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
+  const badge = drinkBadge(p.producer_type);
+  return `<a class="card" href="/kategori/gardssalg/produsent/${encodeURIComponent(p.slug)}">
+    <span class="c-title">${escapeHtml(p.navn)}</span>
+    ${sted ? `<span class="c-place">${PIN_SVG}${escapeHtml(sted)}</span>` : ""}
+    ${badge ? `<span class="c-meta">${badge}</span>` : ""}
   </a>`;
 }
 
@@ -6031,6 +6063,27 @@ router.get("/sok", async (req: Request, res: Response) => {
     rows = [];
   }
 
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 1: gårdssalg producers (drink producers in experience_providers —
+  // see listGardssalgProviders()'s doc comment) had ZERO presence in /sok's
+  // search; a producer's own name typed here returned "Ingen treff" (12 of
+  // 13 outreach candidates, measured 2026-08-01). Own variable, own
+  // try/catch, entirely separate from `rows`/searchPublishedExperiences()
+  // above — a producer-search failure degrades to "no producer section"
+  // without ever touching the existing experiences search, and the reverse
+  // (a producer hit) never alters `rows`'s own content/order. Only run when
+  // there's an actual text query — tag-filter-only and near-me-only browsing
+  // are experiences-only concepts today (gårdssalg has neither tags nor a
+  // geocoded near-me query on this page), so producerRows stays empty then.
+  let producerRows: GardssalgSearchByQueryRow[] = [];
+  if (q) {
+    try {
+      producerRows = searchGardssalgProvidersByQuery(q, 30);
+    } catch {
+      producerRows = [];
+    }
+  }
+
   // Geo/discoverExperiences() branch lives in its OWN try/catch — deliberately
   // separate from the q/tag search above — so a failure here (a transient
   // discoverExperiences error, or any future exception) can never wipe rows
@@ -6151,6 +6204,29 @@ router.get("/sok", async (req: Request, res: Response) => {
         : `<div class="grid" role="list">${rows.map((r) => renderCard(r, req.lang, distanceMap.get(r.slug))).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(emptyTitle)}</h2><p>${escapeHtml(emptyBody)}</p><a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
 
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 1: rendered as its OWN labeled section ("Produsenter"), never merged
+  // into the experiences `cards` grid above — Daniel's own design guidance in
+  // the dev-request (§"Designvalg som må tas"): a merged single list would
+  // hide the producer↔experience duplicate-entity problem the dev-request's
+  // Funn 2 documents (e.g. Atlungstad existing as both a producer row AND a
+  // conflicting experience row with a different, wrong website) behind
+  // interleaving, whereas two clearly labeled sections keep them visibly
+  // distinct. Only rendered when there's ≥1 match — no empty-state clutter
+  // for the overwhelming majority of searches, which never match a producer
+  // (today, every experience-only search). When there are zero producer
+  // matches, this whole block (including the "Opplevelser" label) is the
+  // empty string, so the page's own experiences section is unchanged from
+  // before this feature existed.
+  const producerSection =
+    producerRows.length > 0
+      ? `<section class="sok-producers" aria-label="Produsenter">
+  <h2 class="sok-section-title">Produsenter</h2>
+  <div class="grid" role="list">${producerRows.map(renderSokProducerCard).join("")}</div>
+</section>
+<h2 class="sok-section-title">Opplevelser</h2>`
+      : "";
+
   const breadcrumbLd = {
     "@context": "https://schema.org",
     "@type": "BreadcrumbList",
@@ -6194,6 +6270,7 @@ ${BROWSE_NAV}
   ${geoNote}
   ${renderFilterChips(q, activeTags)}
   ${sortToggle}
+  ${producerSection}
   ${cards}
 </main>
 ${browseFooter()}
