@@ -28959,6 +28959,37 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ogecr.failures) failures.push("opplevelser-gardssalg-experience-conflict: " + f);
     console.log(`  opplevelser-gardssalg-experience-conflict: ${ogecr.passed} passed, ${ogecr.failed} failed`);
 
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice: pure
+    // classification-logic tests for the gårdssalg website-verification sweep
+    // (classifyGardssalgProducerWebsite et al.), including a negative-control
+    // shared-generic-word fixture. Same in-memory-DB-free pure-function
+    // pattern as gardssalg-experience-conflict's own pure test file above.
+    console.log("\n── gardssalg-website-verification: hjemmeside classification (pure) ──");
+    const { runGardssalgWebsiteVerificationTests } = require("../src/services/gardssalg-website-verification.test") as
+      typeof import("../src/services/gardssalg-website-verification.test");
+    const gwvr = await runGardssalgWebsiteVerificationTests({ log: false });
+    passed += gwvr.passed;
+    failed += gwvr.failed;
+    for (const f of gwvr.failures) failures.push("gardssalg-website-verification: " + f);
+    console.log(`  gardssalg-website-verification: ${gwvr.passed} passed, ${gwvr.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 3 (route-level): GET /admin/gardssalg-website-verification-audit,
+    // POST /admin/gardssalg-website-verification-remediation — end-to-end
+    // through the real HTTP routes + a real DB + a mocked fetch for the
+    // reused crFetchGardssalgContent crawl, including the field_provenance/
+    // audit-table/review-queue write machinery and the idempotent-re-run
+    // guarantee.
+    console.log("\n── opplevelser-gardssalg-website-verification: hjemmeside verification sweep (routes) ──");
+    const { runOpplevelserGardssalgWebsiteVerificationTests } = require("../src/routes/opplevelser-gardssalg-website-verification.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-website-verification.test");
+    const ogwvr = await runOpplevelserGardssalgWebsiteVerificationTests({ log: false });
+    passed += ogwvr.passed;
+    failed += ogwvr.failed;
+    for (const f of ogwvr.failures) failures.push("opplevelser-gardssalg-website-verification: " + f);
+    console.log(`  opplevelser-gardssalg-website-verification: ${ogwvr.passed} passed, ${ogwvr.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a:
     // source-grounded LLM REWRITE of about_text/visit_text for the
     // "passing-bar-but-short" cohort (current value already non-blank and
