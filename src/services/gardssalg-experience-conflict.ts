@@ -353,18 +353,22 @@ const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
 // token in this set is generic regardless of how rare it happens to look in
 // the current corpus. Normalized through the SAME normalizeExperienceTitle()
 // pipeline as GENERIC_PRODUCER_TYPE_TOKENS above, same reuse-the-pattern
-// discipline. Note that "gård", "gard" and "gaard" are three SEPARATE entries
-// here and stay three separate keys — nothing collapses them, which is
-// exactly the point: the historical spelling is covered by enumerating it,
-// not by normalizing it away. (An earlier version of this comment claimed
-// they "all collapse to the same entry". Measured: they do not.) Not
+// discipline. MEASURED (round 9 — after two earlier versions of this very
+// sentence each asserted an untested key count and were each wrong): the
+// three literals "gård"/"gard"/"gaard" produce TWO distinct keys, not one
+// and not three. normalizeExperienceTitle()'s shared diacritics pass folds
+// å→a, so "gård" and "gard" both key as "gard"; "gaard" stays "gaard". The
+// "gard" literal is therefore redundant with "gård" (kept for readability —
+// deleting it changes nothing, and a mutation sweep confirms no test notices
+// it), while "gaard" is the entry doing independent work: it is what covers
+// the historical spelling by enumeration, since nothing else merges it. Not
 // exhaustive by design — a deliberately small, hand-picked list of common
 // farm/place/business-generic words (plus a couple of definite-form
 // variants that plausibly stand alone as a farm-name component, e.g.
 // "tunet"), not an attempt to enumerate every generic Norwegian word.
 const GENERIC_FARM_PLACE_WORD_STOPLIST = new Set(
   [
-    "gård", "gard", "gaard", // indefinite + definite-less + historical "aa" spelling — three DISTINCT keys, each listed because nothing merges them
+    "gård", "gard", "gaard", // keys to TWO entries: gård/gard both -> "gard" (å→a fold), gaard -> "gaard" — the last is the load-bearing one
     "tun", "tunet", // farmyard/homestead — bare + definite form (the reviewer's own repro word)
     "bruk", // "smallholding/works" — also the generic tail of countless place-compounds
     "sæter", "seter", // "sæter"/"seter" (mountain summer farm) — both spellings in real use

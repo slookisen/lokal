@@ -380,8 +380,11 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     //     contains the ordinary word "gård"/"gard" (>=5 DISTINCT producers in
     //     this scan's own corpus use it, same corpus-frequency mechanism
     //     isGenericNameToken() already uses for name_token — "gard" is not in
-    //     the producer_type enum, so only the corpus-frequency mechanism, not
-    //     the vocabulary one, catches it here). An unrelated experience
+    //     the producer_type enum. Round-9 measurement: the STOPLIST and the
+    //     corpus-frequency mechanism each gate "gard" INDEPENDENTLY here —
+    //     disabling either alone still yields 0 pairs; only disabling both
+    //     yields 5 (all ambiguous). This text predates the stoplist and used
+    //     to credit corpus frequency alone.) An unrelated experience
     //     ("Kajakktur i Lofoten med guide" — zero shared title tokens with
     //     "Fjellheim Gård") whose booking_url happens to resolve to
     //     "gard.no" must NOT be flagged as conflict purely because "gard" is
@@ -651,7 +654,7 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     //     the moment anyone moves the fold back into the shared helper. ──────
     assertTrue(
       normalizeExperienceTitle("Gaard") !== normalizeExperienceTitle("Gård"),
-      "x1: the SHARED normalizeExperienceTitle() does NOT fold the digraph — the fold is local to this module's genericity gate"
+      "x1: the SHARED normalizeExperienceTitle() does NOT fold the digraph — no fold exists ANYWHERE any more; this pins the shared helper against ever growing one"
     );
     const emptyCorpus = new Map<string, number>();
     assertEq(
@@ -677,7 +680,7 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
     //     The fold that caused it is now deleted, so these cases pass for the
     //     simplest possible reason: nothing derives a key on either side any
     //     more. They are KEPT as a tripwire for the SHIPPED asymmetry —
-    //     verified: reintroducing `6bcad1`'s shape (fold the raw name on the
+    //     verified: reintroducing `6dbcad1`'s shape (fold the raw name on the
     //     corpus side, fold after normalize+stem on the gate side) breaks
     //     them.
     //
