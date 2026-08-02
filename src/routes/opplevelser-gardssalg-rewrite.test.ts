@@ -484,14 +484,30 @@ export function runOpplevelserGardssalgRewriteTests(
       // route's processOne() ALSO call the (shared, mocked) Anthropic
       // endpoint for a products candidate every run, throwing off this
       // file's anthropicCallCount assertions for an unrelated field.
-      const insertProvider = expDb.prepare(
+      const insertProviderStmt = expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products,
+           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products, field_provenance,
             producer_type, enrichment_state, verification_status, source, confidence)
          VALUES
-           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, '["Placeholder"]',
+           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, '["Placeholder"]', @field_provenance,
             'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
+      // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+      // Steg 3 follow-up: POST /admin/gardssalg-content-refresh now fail-
+      // closed-gates its fetch on field_provenance.hjemmeside_verification.
+      // verified === true. This file is about the rewrite path AFTER a
+      // fetch succeeds, not about that gate (see
+      // opplevelser-gardssalg-fillblank.test.ts for the gate's own dedicated
+      // tests) — so every fixture is stamped verified by default here unless
+      // a call site explicitly overrides field_provenance.
+      const VERIFIED_PROVENANCE_RW = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
+      const insertProvider = {
+        run(params: Record<string, unknown>): void {
+          insertProviderStmt.run({ field_provenance: VERIFIED_PROVENANCE_RW, ...params });
+        },
+      };
 
       const PASSING_BAR_SHORT_86 =
         "Familiedrevet gård på Toten som dyrker grønnsaker og bær, og selger dem i egen butikk.";

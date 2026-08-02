@@ -139,14 +139,27 @@ export function runOpplevelserGardssalg5dHardeningTests(
       // ═══ Fixtures ═══════════════════════════════════════════════════════
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, vertical, hjemmeside, content_source, org_nr, postnummer, poststed, kommune, catalog_hidden, products,
+           (id, navn, vertical, hjemmeside, content_source, org_nr, postnummer, poststed, kommune, catalog_hidden, products, field_provenance,
             producer_type, enrichment_state, verification_status, source, confidence)
          VALUES
-           (@id, @navn, 'experiences', @hjemmeside, NULL, @org_nr, @postnummer, @poststed, NULL, @catalog_hidden, '["x"]',
+           (@id, @navn, 'experiences', @hjemmeside, NULL, @org_nr, @postnummer, @poststed, NULL, @catalog_hidden, '["x"]', @field_provenance,
             'bryggeri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
+      // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+      // Steg 3 follow-up: POST /admin/gardssalg-content-refresh now fail-
+      // closed-gates its fetch on field_provenance.hjemmeside_verification.
+      // verified === true (see isHjemmesideVerified() in routes/opplevelser.ts).
+      // This file's Section B fixtures are about the shared-domain-exclusion
+      // and crawl-base behavior AFTER a fetch is reached (or correctly
+      // excluded before it) — not about the verification gate itself (see
+      // opplevelser-gardssalg-fillblank.test.ts for the gate's own dedicated
+      // tests) — so every fixture is stamped verified by default.
+      const VERIFIED_PROVENANCE_5H = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
       const P = (o: Record<string, unknown>) => insertProvider.run({
-        hjemmeside: null, org_nr: null, postnummer: null, poststed: null, catalog_hidden: null, ...o,
+        hjemmeside: null, org_nr: null, postnummer: null, poststed: null, catalog_hidden: null,
+        field_provenance: VERIFIED_PROVENANCE_5H, ...o,
       });
 
       // 5d content-refresh fixtures

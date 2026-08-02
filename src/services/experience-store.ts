@@ -2903,6 +2903,14 @@ export type GardssalgContentRefreshTarget = {
   // the content-refresh route can gate the products-extraction path on
   // gardssalgProductsEligible() without a second query.
   products: string | null;
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 3 follow-up — raw field_provenance JSON (same defensive-parse
+  // pattern as every other field_provenance read in this file, e.g.
+  // applyGardssalgWebsiteVerification in gardssalg-website-verification.ts),
+  // read here so the content-refresh route can gate its fetch on
+  // field_provenance.hjemmeside_verification.verified === true (PR #448's
+  // website-verification sweep) without a second query.
+  field_provenance: string | null;
 };
 
 /**
@@ -2921,7 +2929,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
   return db
     .prepare(
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
-              about_text, visit_text, opening_hours_text, products
+              about_text, visit_text, opening_hours_text, products, field_provenance
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
@@ -2953,7 +2961,7 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
   const row = db
     .prepare(
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
-              about_text, visit_text, opening_hours_text, products
+              about_text, visit_text, opening_hours_text, products, field_provenance
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
