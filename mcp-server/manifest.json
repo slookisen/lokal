@@ -41,6 +41,46 @@
     {
       "name": "lokal_stats",
       "description": "Get Lokal platform statistics - total agents, cities covered, interactions."
+    },
+    {
+      "name": "lokal_list_umbrellas",
+      "description": "List umbrella organizations on Lokal - market networks like Bondens marked, venues, industry organizations like Hanen, and certifiers like Debio. Optionally filter by type."
+    },
+    {
+      "name": "lokal_get_umbrella_members",
+      "description": "List producers that belong to a specific umbrella organization's network, e.g. all farmers selling at Bondens marked or all Debio-certified producers."
+    },
+    {
+      "name": "lokal_get_producer_affiliations",
+      "description": "List the umbrella organizations a specific producer belongs to - which markets they sell at, certifications they hold, or networks they're part of."
+    },
+    {
+      "name": "lokal_bm_next_markets",
+      "description": "Get upcoming Bondens marked (farmers market) events for a region or a specific venue. Refreshed daily."
+    },
+    {
+      "name": "lokal_geocode",
+      "description": "Resolve a Norwegian place name (city, region, or kommune) to lat/lng coordinates, for use with lokal_discover's distance filters."
+    },
+    {
+      "name": "lokal_cart_create",
+      "description": "Writes data: creates a new anonymous shopping cart and returns a buyer capability token. First step of placing an order. No payment involved."
+    },
+    {
+      "name": "lokal_cart_add_item",
+      "description": "Writes data: adds a product to an existing cart, or updates its quantity. Requires the cart ID and buyer token from lokal_cart_create."
+    },
+    {
+      "name": "lokal_cart_view",
+      "description": "View the current contents and subtotal of a shopping cart. Read-only."
+    },
+    {
+      "name": "lokal_cart_submit",
+      "description": "Writes data: submits the cart to place pickup orders, one per producer. No payment is charged. Sellers who opted in to notifications are emailed and can confirm or decline the order."
+    },
+    {
+      "name": "lokal_order_status",
+      "description": "Check the status and timeline (pending/confirmed/ready/completed) of an order placed via lokal_cart_submit. Read-only."
     }
   ],
   "keywords": [

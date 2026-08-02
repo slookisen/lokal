@@ -384,7 +384,7 @@ export function registerTools(
     "lokal_discover",
     {
       title: "Discover producers by filter",
-      description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance. Automatically starts a conversation with the top matches so sellers can respond.",
+      description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance.",
       inputSchema: {
         categories: z.array(z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
         tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
