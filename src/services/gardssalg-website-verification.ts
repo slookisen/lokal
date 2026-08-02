@@ -126,8 +126,19 @@ export type GsWvScope = "visible" | "hidden" | "all";
 
 export const GS_WV_SCOPES: readonly GsWvScope[] = ["visible", "hidden", "all"] as const;
 
+// The `producer_type != 'test-gardssalg'` leg is the SAME exclusion every
+// other gårdssalg selector in this codebase already carries (experience-store
+// .ts's listing/count queries, gardssalg-experience-conflict.ts's scan cohort,
+// the outreach-readiness route) — this file was written without it. The row it
+// excludes is the single synthetic provider POST /admin/gardssalg/test-provider
+// upserts: it is not a real producer, so a fetch against its (deliberately
+// non-resolving) hjemmeside would file a bogus `verification_failed` entry in
+// the very review queue this vertical is trying to drive to empty. Null-safe
+// form for the same reason as the catalog_hidden clause below — a bare `!=`
+// would drop every producer_type IS NULL row too.
 const GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL =
-  `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+  `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')` +
+  ` AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`;
 
 const GS_WV_SCOPE_SQL: Record<GsWvScope, string> = {
   visible: `${GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL} AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,

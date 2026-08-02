@@ -174,7 +174,11 @@ export function isHjemmesideOwnershipVerified(row: Pick<ClaimProviderRow, "conte
 // Reads the SAME GENERIC_DOMAINS list (exported from gardssalg-rfb-enrich.ts)
 // rather than hand-maintaining a second copy; only the matching rule here is
 // stricter (suffix-aware + trailing-dot-safe), not the underlying data.
-function isClaimableDomain(domain: string): boolean {
+// Exported (not merely module-local) so POST /admin/gardssalg/test-provider's
+// `claimable` flag can pre-validate its ?hjemmeside against the SAME rule the
+// mint below applies, instead of hand-copying it — the second-copy hazard this
+// file's own doc warns about, one layer up.
+export function isClaimableDomain(domain: string): boolean {
   if (!domain) return false;
   const d = domain.replace(/\.+$/, ""); // strip trailing FQDN dot(s), e.g. "gmail.com." -> "gmail.com"
   if (!d || !d.includes(".")) return false; // bare host, not a real domain

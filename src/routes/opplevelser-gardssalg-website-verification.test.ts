@@ -196,6 +196,20 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         org_nr: "900111222", kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
         catalog_hidden: 1, producer_type: "cideri", rfb_seed_source: null, content_source: "provider_site",
       });
+      // The synthetic test provider (POST /admin/gardssalg/test-provider) —
+      // shaped exactly like the real prod row: catalog_hidden=1, a
+      // producer_type of 'test-gardssalg', and a non-resolving hjemmeside. It
+      // must be excluded from EVERY scope, not just the default one, so it
+      // never files a bogus verification_failed queue entry. Deliberately
+      // seeded here rather than in a section of its own: it makes the
+      // pre-existing counts in (c)/(h) load-bearing for the exclusion —
+      // without it, c1 would read 4 (unchanged, hidden) but h3 would read 2
+      // and h6 would read 6, so the fix cannot regress silently.
+      insertProvider.run({
+        id: "prov-test-gardssalg", navn: "TEST — Ikke book", hjemmeside: "https://test-ikke-book.invalid",
+        org_nr: "TEST000000", kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 1, producer_type: "test-gardssalg", rfb_seed_source: null, content_source: null,
+      });
 
       let fetchCallCount = 0;
       const fetchedHosts: string[] = [];
@@ -418,6 +432,22 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       });
       assertEq(allAudit.status, 200, "h5: scope=all audit -> 200");
       assertEq(allAudit.body.summary.total, 5, "h6: scope=all sees every seeded producer, hidden included");
+      // The synthetic test provider is the 6th seeded row and is catalog_hidden=1,
+      // so h3 and h6 above would read 2 and 6 without the producer_type exclusion.
+      // These name what those counts are pinning, and add the direct check that it
+      // is never even fetched — a fetch is what would file the bogus queue entry.
+      assertTrue(
+        !hiddenAudit.body.rows.some((r: any) => r.provider_id === "prov-test-gardssalg"),
+        "h6b: the synthetic test provider is absent from scope=hidden despite being catalog_hidden=1"
+      );
+      assertTrue(
+        !allAudit.body.rows.some((r: any) => r.provider_id === "prov-test-gardssalg"),
+        "h6c: ...and from scope=all — no scope reaches it"
+      );
+      assertTrue(
+        !fetchedHosts.includes("test-ikke-book.invalid"),
+        "h6d: its non-resolving homepage is never fetched, so it can never be enqueued as verification_failed"
+      );
 
       const junkAudit = await callRoute(opplevelserRouter, {
         method: "GET",

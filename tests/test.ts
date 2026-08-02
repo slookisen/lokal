@@ -29001,6 +29001,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ogwvr.failures) failures.push("opplevelser-gardssalg-website-verification: " + f);
     console.log(`  opplevelser-gardssalg-website-verification: ${ogwvr.passed} passed, ${ogwvr.failed} failed`);
 
+    // dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter, AC6:
+    // the `claimable: true` opt-in on POST /admin/gardssalg/test-provider —
+    // the only lever that can write the three fields deriveOrgLinkedEmail()
+    // reads, so the claim flow has a repeatable end-to-end test subject
+    // instead of hand-edited production data. Pins backwards compatibility
+    // for the existing booking-E2E caller, the org_nr pin that stops the
+    // flag reaching a real provider's row, and repeatability after a
+    // completed claim. Same in-memory-DB pattern, same gated block.
+    console.log("\n── opplevelser-gardssalg-test-provider-claimable: claim E2E fixture lever ──");
+    const { runOpplevelserGardssalgTestProviderClaimableTests } = require("../src/routes/opplevelser-gardssalg-test-provider-claimable.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-test-provider-claimable.test");
+    const ogtpc = await runOpplevelserGardssalgTestProviderClaimableTests({ log: false });
+    passed += ogtpc.passed;
+    failed += ogtpc.failed;
+    for (const f of ogtpc.failures) failures.push("opplevelser-gardssalg-test-provider-claimable: " + f);
+    console.log(`  opplevelser-gardssalg-test-provider-claimable: ${ogtpc.passed} passed, ${ogtpc.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a:
     // source-grounded LLM REWRITE of about_text/visit_text for the
     // "passing-bar-but-short" cohort (current value already non-blank and
