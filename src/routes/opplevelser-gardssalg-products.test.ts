@@ -336,14 +336,31 @@ export function runOpplevelserGardssalgProductsTests(
         "Familiedrevet gård på Toten som i fire generasjoner har dyrket poteter, gulrøtter og bær, og som selger alt direkte fra egen gårdsbutikk hver lørdag om sommeren. Gården ligger vakkert til med utsikt over Mjøsa, og tar imot besøkende gjennom hele sesongen.";
       assertTrue(SILENT_LONG_TEXT.length >= 200, "sanity: SILENT_LONG_TEXT is >=200 chars (never eligible for fill/replace/rewrite)");
 
-      const insertProvider = expDb.prepare(
+      const insertProviderStmt = expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products,
+           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products, field_provenance,
             producer_type, enrichment_state, verification_status, source, confidence)
          VALUES
-           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, @products,
+           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, @products, @field_provenance,
             'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
+      // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+      // Steg 3 follow-up: POST /admin/gardssalg-content-refresh now fail-
+      // closed-gates its fetch on field_provenance.hjemmeside_verification.
+      // verified === true (see isHjemmesideVerified() in routes/opplevelser.ts).
+      // This file is about the products-extraction path AFTER a fetch
+      // succeeds, not about that gate (see opplevelser-gardssalg-fillblank.
+      // test.ts for the gate's own dedicated tests) — so every fixture is
+      // stamped verified by default here unless a call site explicitly
+      // overrides field_provenance.
+      const VERIFIED_PROVENANCE_PG = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
+      const insertProvider = {
+        run(params: Record<string, unknown>): void {
+          insertProviderStmt.run({ field_provenance: VERIFIED_PROVENANCE_PG, ...params });
+        },
+      };
 
       insertProvider.run({
         id: "prov-pg-blank", navn: "Prov PG Blank Gard", hjemmeside: "https://prov-pg-blank.example.no",

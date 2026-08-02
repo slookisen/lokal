@@ -1681,6 +1681,47 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
 const GS_CR_DEFAULT_LIMIT = 25;
 const GS_CR_HARD_CAP = 48; // there are only 48 gårdssalg providers total
 
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 follow-up (Funn 4): the content-refresh route below fetches a
+// producer's hjemmeside and trusts it as a content-enrichment SOURCE. That
+// is only safe once PR #448's website-verification sweep
+// (gardssalg-website-verification.ts's applyGardssalgWebsiteVerification)
+// has actually confirmed the hjemmeside belongs to THIS producer — an
+// unrelated business with a similar name, or an aggregator link, must never
+// silently become an "enrichment source". No shared typed FieldProvenance
+// interface exists anywhere in this codebase yet (every other
+// field_provenance read/write inlines its own defensive JSON.parse — see
+// applyGardssalgWebsiteVerification and the field_provenance merge blocks in
+// experience-store.ts), so this is a local, minimal shape scoped to just
+// this one check rather than a new shared abstraction.
+interface HjemmesideVerificationEntry {
+  verified?: unknown;
+  classification?: unknown;
+}
+
+/**
+ * Fail-closed gate: true only when field_provenance.hjemmeside_verification
+ * exists and verified === true. Missing field_provenance, missing/malformed
+ * hjemmeside_verification, malformed JSON, or verified !== true (this
+ * includes classifications "unverified"/"aggregator"/"missing_source", and
+ * rows the verification sweep never scanned at all) -> false. Any ambiguity
+ * resolves to "not verified" — never to "assume verified".
+ */
+function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean {
+  if (!fieldProvenanceRaw) return false;
+  try {
+    const parsed = JSON.parse(fieldProvenanceRaw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const entry = (parsed as Record<string, unknown>).hjemmeside_verification as
+      | HjemmesideVerificationEntry
+      | undefined;
+    if (!entry || typeof entry !== "object") return false;
+    return entry.verified === true;
+  } catch {
+    return false; // malformed existing JSON -> fail closed, never treat as verified
+  }
+}
+
 router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
 
@@ -1747,6 +1788,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // Host counts are computed once per request (cheap, two-digit catalog).
   const excludedSharedDomain: Array<{ provider_id: string; reason: string }> = [];
   const sharedHostCounts = gardssalgSharedHostCounts();
+  // Steg 3 follow-up (Funn 4) — providers whose hjemmeside is not stamped
+  // verified=true by the website-verification sweep. Own named bucket
+  // (never lumped into skipped_locked/excluded_shared_domain) so a run's
+  // report always makes visible how many rows were skipped for this reason.
+  const excludedUnverifiedWebsite: Array<{ provider_id: string; reason: string }> = [];
 
   async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -1776,6 +1822,16 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // locked provider never touches the network at all.
     if (t.content_source === "manual" || t.content_source === "claim") {
       skippedLocked.push(providerId);
+      return;
+    }
+
+    // Website-verification gate — before any fetch, fail-closed: a
+    // hjemmeside the website-verification sweep has not stamped
+    // verified=true (missing, malformed, or classification other than
+    // "verified") must never be trusted as an enrichment source for this
+    // producer. See isHjemmesideVerified()'s doc comment above.
+    if (!isHjemmesideVerified(t.field_provenance)) {
+      excludedUnverifiedWebsite.push({ provider_id: providerId, reason: "unverified_website" });
       return;
     }
 
@@ -2108,6 +2164,10 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // Slice 5d: providers excluded by the shared-/directory-domain guard —
     // additive bucket; every excluded provider is visible, never dropped.
     excluded_shared_domain: excludedSharedDomain,
+    // Steg 3 follow-up (Funn 4): providers excluded because their hjemmeside
+    // is not stamped verified=true by the website-verification sweep —
+    // additive bucket; every excluded provider is visible, never dropped.
+    excluded_unverified_website: excludedUnverifiedWebsite,
   });
 });
 

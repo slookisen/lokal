@@ -28494,6 +28494,17 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     });
     dbGCR.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?")
       .run("sideri", unlockedIdGCR);
+    // Steg 3 follow-up (dev-request 2026-08-01-gardssalg-profilkomplett-og-
+    // soekbar-foer-outreach): the content-refresh route now fail-closed-gates
+    // on field_provenance.hjemmeside_verification.verified === true BEFORE
+    // any fetch. This provider's whole point is reaching (and failing) the
+    // fetch stage, so it must be stamped verified — otherwise it would be
+    // caught by the NEW gate instead, never reaching the fetch this suite
+    // tests.
+    dbGCR.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(
+      JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified", checked_at: new Date().toISOString() } }),
+      unlockedIdGCR
+    );
 
     // ── Mount the REAL router on a minimal Express app. ────────────────
     const expressModGCR = (await import("express")).default;
