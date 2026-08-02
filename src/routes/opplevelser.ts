@@ -1710,7 +1710,7 @@ interface HjemmesideVerificationEntry {
  * rows the verification sweep never scanned at all) -> false. Any ambiguity
  * resolves to "not verified" — never to "assume verified".
  */
-function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean {
+export function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean {
   if (!fieldProvenanceRaw) return false;
   try {
     const parsed = JSON.parse(fieldProvenanceRaw);
@@ -6364,6 +6364,86 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
   });
 
   res.json({ providers, summary });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-verified-drinkproducer-cohort ──────
+//
+// dev-request 2026-08-02-drikkesteder-hjemmeside-verifisert-kohort-berikelse,
+// Step A prerequisite: the cohort of drink-producer providers (producer_type
+// IN DRINK_PRODUCER_TYPES — services/route-corridor-service.ts) whose
+// hjemmeside has already been ownership-verified (isHjemmesideVerified() on
+// field_provenance.hjemmeside_verification, defined above — fails closed on
+// anything short of a literal verified === true). Everything downstream of
+// this list (content-refresh execution, field-concordance check,
+// producer_type backfill, queue draining) is separate, later work.
+//
+// Deliberately NARROWER than the usual gårdssalg base clause used elsewhere
+// in this file (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'):
+// an rfb-seed row with producer_type IS NULL must never appear here, because
+// this cohort is drink-producer-type-specific by definition, not "any
+// gårdssalg row". producer_type values are parameter-bound, never
+// string-interpolated into the SQL.
+//
+// Read-only — a single SELECT, no writes, no LLM call, no outbound fetch;
+// synchronous handler, matching gardssalg-outreach-readiness's handler above.
+import { DRINK_PRODUCER_TYPES } from "../services/route-corridor-service";
+
+router.get("/admin/gardssalg-verified-drinkproducer-cohort", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  const drinkTypes = Array.from(DRINK_PRODUCER_TYPES);
+  const placeholders = drinkTypes.map(() => "?").join(", ");
+
+  let rows: Array<{
+    id: string;
+    navn: string;
+    producer_type: string | null;
+    catalog_hidden: number | null;
+    field_provenance: string | null;
+  }> = [];
+  try {
+    rows = expDb
+      .prepare(
+        `SELECT id, navn, producer_type, catalog_hidden, field_provenance
+           FROM experience_providers
+          WHERE producer_type IN (${placeholders})`
+      )
+      .all(...drinkTypes) as typeof rows;
+  } catch (err) {
+    console.error("[gardssalg-verified-drinkproducer-cohort] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const total_drink_producer_rows = rows.length;
+
+  const verifiedRows = rows.filter((p) => isHjemmesideVerified(p.field_provenance));
+
+  let verified_visible = 0;
+  let verified_hidden = 0;
+
+  const cohort = verifiedRows.map((p) => {
+    const visible = p.catalog_hidden !== 1;
+    if (visible) verified_visible++;
+    else verified_hidden++;
+    return {
+      id: p.id,
+      name: p.navn,
+      producer_type: p.producer_type,
+      visible,
+    };
+  });
+
+  res.json({
+    success: true,
+    summary: {
+      total_drink_producer_rows,
+      verified_visible,
+      verified_hidden,
+      verified_total: verified_visible + verified_hidden,
+    },
+    cohort,
+  });
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-provider-dedup-audit ───────────────

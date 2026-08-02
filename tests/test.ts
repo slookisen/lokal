@@ -28888,6 +28888,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorr.failures) failures.push("opplevelser-gardssalg-outreach-readiness: " + f);
     console.log(`  opplevelser-gardssalg-outreach-readiness: ${gorr.passed} passed, ${gorr.failed} failed`);
 
+    // dev-request 2026-08-02-drikkesteder-hjemmeside-verifisert-kohort-
+    // berikelse, Step A prerequisite: GET
+    // /admin/gardssalg-verified-drinkproducer-cohort — read-only cohort of
+    // drink-producer providers whose hjemmeside is already
+    // ownership-verified. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-verified-drinkproducer-cohort: verified drink-producer cohort ──");
+    const { runOpplevelserGardssalgVerifiedDrinkproducerCohortTests } = require("../src/routes/opplevelser-gardssalg-verified-drinkproducer-cohort.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-verified-drinkproducer-cohort.test");
+    const gvdc = await runOpplevelserGardssalgVerifiedDrinkproducerCohortTests({ log: false });
+    passed += gvdc.passed;
+    failed += gvdc.failed;
+    for (const f of gvdc.failures) failures.push("opplevelser-gardssalg-verified-drinkproducer-cohort: " + f);
+    console.log(`  opplevelser-gardssalg-verified-drinkproducer-cohort: ${gvdc.passed} passed, ${gvdc.failed} failed`);
+
     // dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
     // acceptance criterion 5: GET /admin/gardssalg/bookings-count — read-only
     // count + non-PII listing of existing gardssalg_bookings rows. Same
