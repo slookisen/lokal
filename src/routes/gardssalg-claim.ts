@@ -2,7 +2,7 @@ import express, { Router, Request, Response } from "express";
 import {
   getClaimProviderById,
   getClaimProviderBySlug,
-  deriveOrgLinkedEmail,
+  deriveOrgLinkedEmailWithOutreachLookup,
   issueClaimMagicLink,
   verifyClaimToken,
   verifyGardssalgOwnerSessionToken,
@@ -230,7 +230,13 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
     const provider = getClaimProviderBySlug(slug);
     if (!provider) return res.status(404).send(notFoundPage());
 
-    const derived = deriveOrgLinkedEmail(provider);
+    // Must mirror issueClaimMagicLink()'s own (b-epost) lookup exactly —
+    // otherwise this page could show the "send me a link" form for a
+    // provider whose POST would then fail (or vice versa: show the fallback
+    // for a provider the POST would actually succeed for). Same lazy
+    // wrapper issueClaimMagicLink() uses, so the RFB cross-DB lookup only
+    // ever runs when it could actually change the outcome.
+    const derived = deriveOrgLinkedEmailWithOutreachLookup(provider);
     const backUrl = provider.slug ? `/kategori/gardssalg/produsent/${encodeURIComponent(provider.slug)}` : "/kategori/gardssalg";
 
     const status = String(req.query.status || "");

@@ -206,6 +206,91 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       assertEq(maskEmail("post@bringebaerlandet.no"), "p**t@b******.no", "a10: maskEmail masks local (keeps first+last) + domain (first char only), keeps TLD");
       assertTrue(!maskEmail("post@bringebaerlandet.no").includes("bringebaerlandet"), "a11: maskEmail never leaks the full domain name");
       assertEq(maskEmail("ab@x.no"), "a*@x*.no", "a12: maskEmail handles very short local/domain parts without throwing");
+
+      // ── stored_epost_verified (dev-request 2026-07-30-opplevagent-claim-
+      // epost-og-perfelt-laas, item 1) — pure deriveOrgLinkedEmail coverage.
+      // (b-epost)'s DB lookup is exercised separately, below, via the
+      // opts.epostOutreachDeliveredNoBounce parameter this pure function
+      // takes as an input rather than computing itself.
+
+      // (f1) (c-epost): content_source='manual' + a well-formed stored epost,
+      // no hjemmeside at all -> eligible via stored_epost_verified. Also
+      // covers normalization (trim + lowercase), same as the other tiers.
+      const rF1 = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null, epost: "  Post@BryggeriX.no ",
+      });
+      assertEq(rF1, { eligible: true, email: "post@bryggerix.no", source: "stored_epost_verified" }, "f1: content_source=manual + stored epost (no hjemmeside) -> eligible via stored_epost_verified, normalized");
+
+      // (f2) ACCEPTANCE CRITERION 2 (pure level): a scraped-only epost — no
+      // admin-entered marker, no outreach-delivered signal — must stay
+      // ineligible. This is the negative control the dev-request calls out
+      // by name.
+      const rF2 = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
+        content_source: "provider_site", field_provenance: null, epost: "scraped@somewhere.no",
+      });
+      assertEq(rF2, { eligible: false, reason: "no_org_linked_email" }, "f2: scraped-only epost (not manual, no outreach-delivered signal) -> no_org_linked_email (Acceptance Criterion 2)");
+
+      // (f3) (b-epost): opts.epostOutreachDeliveredNoBounce=true makes an
+      // otherwise-harvested row's epost eligible.
+      const rF3 = deriveOrgLinkedEmail(
+        { org_nr: "912345678", brreg_verified: 1, hjemmeside: null, content_source: "provider_site", field_provenance: null, epost: "outreach@bryggeriy.no" },
+        undefined,
+        { epostOutreachDeliveredNoBounce: true },
+      );
+      assertEq(rF3, { eligible: true, email: "outreach@bryggeriy.no", source: "stored_epost_verified" }, "f3: opts.epostOutreachDeliveredNoBounce=true -> eligible via stored_epost_verified even though content_source is not manual");
+
+      // (f4) The same row with the flag explicitly false -> still ineligible
+      // (guards against the opts object merely being PRESENT being mistaken
+      // for true).
+      const rF4 = deriveOrgLinkedEmail(
+        { org_nr: "912345678", brreg_verified: 1, hjemmeside: null, content_source: "provider_site", field_provenance: null, epost: "outreach@bryggeriy.no" },
+        undefined,
+        { epostOutreachDeliveredNoBounce: false },
+      );
+      assertEq(rF4, { eligible: false, reason: "no_org_linked_email" }, "f4: opts.epostOutreachDeliveredNoBounce=false -> no_org_linked_email, same as omitting opts entirely");
+
+      // (f5) Malformed epost shape (no '@'/domain) must never be offered as
+      // a claim target, even with content_source='manual'.
+      const rF5 = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null, epost: "not-an-email",
+      });
+      assertEq(rF5, { eligible: false, reason: "no_org_linked_email" }, "f5: malformed epost value (no @/domain) -> no_org_linked_email");
+
+      // (f5b) Blank/whitespace-only epost, same guard.
+      const rF5b = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null, epost: "   ",
+      });
+      assertEq(rF5b, { eligible: false, reason: "no_org_linked_email" }, "f5b: blank/whitespace-only epost -> no_org_linked_email even when content_source=manual");
+
+      // (f5c) `epost` omitted entirely — the exact shape every EXISTING
+      // pure-test literal in this file uses (a1-a4i above never pass epost)
+      // — must still compile and behave as "absent", never throw.
+      const rF5c = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(rF5c, { eligible: false, reason: "no_org_linked_email" }, "f5c: epost field omitted entirely -> treated as absent, no crash, no_org_linked_email");
+
+      // (f6) TIER PRIORITY: a qualifying verified_domain_address must win
+      // over stored_epost_verified even when content_source='manual' would
+      // make BOTH tiers match on the very same row.
+      const rF6 = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
+        content_source: "manual", field_provenance: null, epost: "other@klostergarden.no",
+      });
+      assertEq(rF6, { eligible: true, email: "post@klostergarden.no", source: "verified_domain_address" }, "f6: tier priority — verified_domain_address wins over stored_epost_verified when both would apply");
+
+      // (f7) TIER PRIORITY: brreg_contact (the dormant-but-highest tier)
+      // wins over stored_epost_verified too, when supplied.
+      const rF7 = deriveOrgLinkedEmail(
+        { org_nr: "912345678", brreg_verified: 1, hjemmeside: null, content_source: "manual", field_provenance: null, epost: "fallback@bryggeriz.no" },
+        "post@brreg-kilde.no",
+      );
+      assertEq(rF7, { eligible: true, email: "post@brreg-kilde.no", source: "brreg_contact" }, "f7: tier priority — brreg_contact wins over stored_epost_verified when both would apply");
     }
 
     // ── DB-backed tests ──────────────────────────────────────────────────
@@ -217,12 +302,33 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
     const enrichPath = require.resolve("./gardssalg-rfb-enrich");
     for (const p of [dbFactoryPath, claimSvcPath, enrichPath]) delete require.cache[p];
 
+    // stored_epost_verified's (b-epost) sub-case reads outreach_sent_log /
+    // email_bounces from the RFB MAIN db (lokal.db), not experiences.db —
+    // see wasEpostDeliveredOutreachNoBounce()'s doc comment in
+    // gardssalg-claim.ts for why. A standalone, fully-schema'd in-memory RFB
+    // db is created and wired in via gardssalg-claim.ts's OWN
+    // __setRfbDbForTesting() override — deliberately NOT
+    // src/database/init.ts's __setDbForTesting (the shared, module-level
+    // singleton every other suite in tests/test.ts also reads/swaps): doing
+    // that here raced live against a concurrently-running, unrelated suite
+    // in the full test.ts run (oa-home-counters intermittently saw "no such
+    // table: outreach_sent_log") — the exact failure class this test file's
+    // own postmortem comments describe elsewhere ("the exact failure mode
+    // this file's own tasks-prune-async postmortem documents"). This db is
+    // only ever handed directly to gardssalg-claim.ts's own override, never
+    // installed as the global singleton, so it cannot race with anything.
+    const initMod = require("../database/init") as typeof import("../database/init");
+    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+    const rfbDb = new Database(":memory:");
+    initMod.__initSchemaForTesting(rfbDb as any);
+
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
 
       const claimSvc = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
+      claimSvc.__setRfbDbForTesting(rfbDb as any);
       const enrich = require("./gardssalg-rfb-enrich") as typeof import("./gardssalg-rfb-enrich");
 
       const insertProvider = expDb.prepare(`
@@ -268,6 +374,94 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         content_source: "manual", field_provenance: null,
       });
 
+      // ── stored_epost_verified DB-backed fixtures ─────────────────────────
+      // `epost` is a hardcoded NULL literal in insertProvider's own SQL
+      // above (not a bound parameter), so these are set via a follow-up
+      // UPDATE rather than widening that shared statement for every caller.
+      const setEpost = expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?");
+
+      // (c-epost) content_source='manual', no hjemmeside at all -> only the
+      // stored_epost_verified tier can fire here.
+      insertProvider.run({
+        id: "prov-epost-manual", navn: "Manuelt Registrert Gård", slug: "manuelt-registrert-gard",
+        org_nr: "933333333", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null,
+      });
+      setEpost.run("post@epostmanual.no", "prov-epost-manual");
+
+      // (b-epost) content_source='provider_site' (harvested, NOT manual) —
+      // only eligible if the RFB outreach_sent_log/email_bounces lookup
+      // says so. This row's epost WAS delivered outreach, no bounce.
+      insertProvider.run({
+        id: "prov-epost-outreach", navn: "Utsendt Gård", slug: "utsendt-gard",
+        org_nr: "944444444", brreg_verified: 1, hjemmeside: null,
+        content_source: "provider_site", field_provenance: null,
+      });
+      setEpost.run("utsendt@epostoutreach.no", "prov-epost-outreach");
+
+      // Same shape, but the address subsequently bounced -> must NOT be
+      // eligible (the whole point of the "no bounce" half of criterion b).
+      insertProvider.run({
+        id: "prov-epost-bounced", navn: "Sprettet Gård", slug: "sprettet-gard",
+        org_nr: "955555555", brreg_verified: 1, hjemmeside: null,
+        content_source: "provider_site", field_provenance: null,
+      });
+      setEpost.run("sprettet@epostoutreach.no", "prov-epost-bounced");
+
+      // Same shape, but the ONLY outreach_sent_log row for this address is
+      // stamped vertical_id='rfb' (an RFB send, not an Opplevagent one) —
+      // must NOT count as "delivered Opplevagent outreach".
+      insertProvider.run({
+        id: "prov-epost-wrong-vertical", navn: "Feil Plattform Gård", slug: "feil-plattform-gard",
+        org_nr: "966666666", brreg_verified: 1, hjemmeside: null,
+        content_source: "provider_site", field_provenance: null,
+      });
+      setEpost.run("kunrfb@epostoutreach.no", "prov-epost-wrong-vertical");
+
+      // ACCEPTANCE CRITERION 2, at the full issueClaimMagicLink level: a
+      // purely scraped epost (harvested content_source, no outreach row at
+      // all, not manual) must stay on the manual-fallback path end to end.
+      insertProvider.run({
+        id: "prov-epost-scraped-only", navn: "Skrapet Gård", slug: "skrapet-gard",
+        org_nr: "977777777", brreg_verified: 1, hjemmeside: null,
+        content_source: "provider_site", field_provenance: null,
+      });
+      setEpost.run("scraped@nowhere.no", "prov-epost-scraped-only");
+
+      // Seed the RFB-side outreach_sent_log / email_bounces rows the
+      // (b-epost) cases above depend on. agent_id is NOT NULL REFERENCES
+      // agents(id) — a real agents row is inserted too so this fixture holds
+      // even if a future change turns FK enforcement on for this DB.
+      rfbDb.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
+        VALUES ('agent-fixture-osl', 'Fixture Agent', 'x', 'test', 'agent-fixture@example.no', 'https://example.no', 'producer', 'fixture-key-osl', 1)
+      `).run();
+      rfbDb.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, vertical_id)
+        VALUES ('agent-fixture-osl', 'utsendt@epostoutreach.no', datetime('now', '-2 days'), 'email', 'experiences')
+      `).run();
+      rfbDb.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, vertical_id)
+        VALUES ('agent-fixture-osl', 'sprettet@epostoutreach.no', datetime('now', '-2 days'), 'email', 'experiences')
+      `).run();
+      rfbDb.prepare(`
+        INSERT INTO email_bounces (email, bounced_at, bounce_type)
+        VALUES ('sprettet@epostoutreach.no', datetime('now', '-1 days'), 'hard')
+      `).run();
+      rfbDb.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, vertical_id)
+        VALUES ('agent-fixture-osl', 'kunrfb@epostoutreach.no', datetime('now', '-2 days'), 'email', 'rfb')
+      `).run();
+
+      // ── wasEpostDeliveredOutreachNoBounce — direct coverage ─────────────
+      assertTrue(claimSvc.wasEpostDeliveredOutreachNoBounce("utsendt@epostoutreach.no"), "g1: a delivered, non-bounced experiences-vertical send -> true");
+      assertTrue(claimSvc.wasEpostDeliveredOutreachNoBounce("  UTSENDT@EpostOutreach.NO  "), "g1b: same, but case/whitespace-different input -> still true (normalized match)");
+      assertTrue(!claimSvc.wasEpostDeliveredOutreachNoBounce("sprettet@epostoutreach.no"), "g2: a delivered send that later bounced -> false");
+      assertTrue(!claimSvc.wasEpostDeliveredOutreachNoBounce("kunrfb@epostoutreach.no"), "g3: a send stamped vertical_id='rfb' (not 'experiences') -> false, does not count as Opplevagent outreach");
+      assertTrue(!claimSvc.wasEpostDeliveredOutreachNoBounce("never-emailed@nowhere.no"), "g4: no matching outreach_sent_log row at all -> false");
+      assertTrue(!claimSvc.wasEpostDeliveredOutreachNoBounce(null), "g5: null input -> false, never throws");
+      assertTrue(!claimSvc.wasEpostDeliveredOutreachNoBounce(""), "g6: empty-string input -> false, never throws");
+
       // ── issueClaimMagicLink ────────────────────────────────────────────
       const notFound = claimSvc.issueClaimMagicLink("prov-missing");
       assertEq(notFound, { ok: false, error: "provider_not_found" }, "b1: issueClaimMagicLink on a missing provider -> provider_not_found");
@@ -291,6 +485,41 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         assertEq(row.provider_id, "prov-claimable", "b7: inserted row references the right provider");
         assertEq(row.used, 0, "b8: freshly-issued token is not yet used");
       }
+
+      // ── stored_epost_verified — full issueClaimMagicLink integration ────
+
+      // (c-epost) positive: content_source='manual', no verified hjemmeside —
+      // only the stored epost tier can produce this claim.
+      const issuedManualEpost = claimSvc.issueClaimMagicLink("prov-epost-manual");
+      assertTrue(issuedManualEpost.ok === true, "h1: issueClaimMagicLink succeeds for a manual provider via its stored epost");
+      if (issuedManualEpost.ok) {
+        assertEq(issuedManualEpost.claim.email, "post@epostmanual.no", "h2: issued claim targets the provider's OWN stored epost, unchanged");
+        assertEq(issuedManualEpost.claim.source, "stored_epost_verified", "h3: claim.source is stored_epost_verified");
+        const row = expDb.prepare("SELECT email_source FROM gardssalg_claims WHERE token = ?").get(issuedManualEpost.claim.token) as any;
+        assertEq(row.email_source, "stored_epost_verified", "h4: the persisted gardssalg_claims row also carries email_source='stored_epost_verified'");
+      }
+
+      // (b-epost) positive: harvested content_source, but the address was
+      // real, delivered, non-bounced Opplevagent outreach.
+      const issuedOutreachEpost = claimSvc.issueClaimMagicLink("prov-epost-outreach");
+      assertTrue(issuedOutreachEpost.ok === true, "h5: issueClaimMagicLink succeeds for a harvested-content_source provider whose epost received delivered, non-bounced outreach");
+      if (issuedOutreachEpost.ok) {
+        assertEq(issuedOutreachEpost.claim.email, "utsendt@epostoutreach.no", "h6: issued claim targets the outreach-delivered address");
+        assertEq(issuedOutreachEpost.claim.source, "stored_epost_verified", "h7: claim.source is stored_epost_verified");
+      }
+
+      // Negative: same shape, but the address bounced -> no self-service.
+      const bouncedEpost = claimSvc.issueClaimMagicLink("prov-epost-bounced");
+      assertEq(bouncedEpost, { ok: false, error: "no_org_linked_email" }, "h8: a bounced outreach address never becomes a claim target, even though a send WAS logged");
+
+      // Negative: outreach_sent_log row exists but is stamped vertical_id='rfb'.
+      const wrongVerticalEpost = claimSvc.issueClaimMagicLink("prov-epost-wrong-vertical");
+      assertEq(wrongVerticalEpost, { ok: false, error: "no_org_linked_email" }, "h9: an RFB-vertical outreach_sent_log row does not qualify an Opplevagent claim");
+
+      // ACCEPTANCE CRITERION 2, full call chain: purely scraped epost, no
+      // provenance at all -> manual fallback, never self-service.
+      const scrapedOnlyEpost = claimSvc.issueClaimMagicLink("prov-epost-scraped-only");
+      assertEq(scrapedOnlyEpost, { ok: false, error: "no_org_linked_email" }, "h10: Acceptance Criterion 2 — a purely scraped epost (no provenance) stays on the manual fallback end to end");
 
       // ── Rate limiting ──────────────────────────────────────────────────
       claimSvc.issueClaimMagicLink("prov-claimable");
@@ -423,6 +652,11 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
       } catch { /* ignore */ }
+      try {
+        const claimSvc = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
+        claimSvc.__setRfbDbForTesting(null);
+      } catch { /* ignore */ }
+      try { rfbDb.close(); } catch { /* already closed */ }
     }
 
     return { passed, failed, failures };
