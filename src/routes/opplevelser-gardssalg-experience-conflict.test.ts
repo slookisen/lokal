@@ -224,6 +224,32 @@ export function runOpplevelserGardssalgExperienceConflictTests(
         verification_status: "pending_verify",
       });
 
+      // ── An ambiguous collision — TWO producers independently name_token-
+      //    match the SAME experience_id via the shared rare token "nordkapp"
+      //    (used by neither producer_type vocabulary nor the generic
+      //    stoplist, and shared by only these 2 of the fixture's producers —
+      //    well under SHARED_TOKEN_GENERIC_MIN). Both producers' hjemmeside
+      //    domains differ from the experience's booking_url domain, so both
+      //    would independently classify "conflict" before the same-
+      //    experience/multiple-producer reclassification demotes them both
+      //    to "ambiguous" — this is the ambiguous_detail grouping fixture. ──
+      insertProvider.run({
+        id: "prod-ambig-a", navn: "Nordkapp Bryggeri",
+        hjemmeside: "https://nordkappbryggeri.no", catalog_hidden: 0,
+        producer_type: "bryggeri", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertProvider.run({
+        id: "prod-ambig-b", navn: "Nordkapp Sjokolade",
+        hjemmeside: "https://nordkappsjokolade.no", catalog_hidden: 0,
+        producer_type: "gårdsbutikk", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertExperience.run({
+        id: "exp-ambig", provider_id: null,
+        title: "Nordkapp Fyr — Omvisning og kaffestue", title_no: null,
+        booking_url: "https://booking-portal.example/aktivitet/12345", content_source: null,
+        verification_status: "pending_verify",
+      });
+
       // ── A genuinely unrelated producer/experience — must never appear in
       //    any pair list at all. ───────────────────────────────────────────
       insertProvider.run({
@@ -299,6 +325,43 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertTrue(auditRes.body.summary.conflicting >= 3, "b12: summary.conflicting counts Atlungstad + aggregator-home + locked pairs");
       assertTrue(auditRes.body.summary.agreeing >= 1, "b13: summary.agreeing counts the Ciderhuset pair");
 
+      // ── (b14-b18) ambiguous_detail: grouped, additive escalation section ──
+      const ambiguousPairsInResponse = pairs.filter((p) => p.experience_id === "exp-ambig");
+      assertEq(ambiguousPairsInResponse.length, 2, "b14: both Nordkapp producers appear as flat 'exp-ambig' pairs");
+      assertTrue(
+        ambiguousPairsInResponse.every((p) => p.status === "ambiguous"),
+        "b15: both flat 'exp-ambig' pairs are classified 'ambiguous' (same-experience/multiple-producer collision)",
+      );
+
+      assertTrue(Array.isArray(auditRes.body.ambiguous_detail), "b16: response carries an 'ambiguous_detail' array");
+      const nordkappDetail = auditRes.body.ambiguous_detail.find((d: any) => d.experience_id === "exp-ambig");
+      assertTrue(!!nordkappDetail, "b17: ambiguous_detail includes a grouped entry for exp-ambig");
+      assertEq(nordkappDetail?.experience_title, "Nordkapp Fyr — Omvisning og kaffestue", "b17b: grouped entry carries the experience_title");
+      const collidingIds = (nordkappDetail?.colliding_producers ?? []).map((p: any) => p.producer_id).sort();
+      assertEq(collidingIds, ["prod-ambig-a", "prod-ambig-b"], "b18: grouped entry lists BOTH colliding producers (not duplicated, not just one)");
+      const collidingNames = (nordkappDetail?.colliding_producers ?? []).map((p: any) => p.producer_name).sort();
+      assertEq(collidingNames, ["Nordkapp Bryggeri", "Nordkapp Sjokolade"], "b18b: grouped entry carries each colliding producer's name");
+      assertTrue(
+        typeof nordkappDetail?.reason === "string" && nordkappDetail.reason.includes("2 producers"),
+        "b19: reason names the collision count",
+      );
+
+      // Atlungstad (a genuine "conflict", not ambiguous in this fixture —
+      // only one producer matches it) must NOT appear in ambiguous_detail.
+      assertTrue(
+        !auditRes.body.ambiguous_detail.some((d: any) => d.experience_id === "norway-s-oldest-distillery-tours-tastings--68220487"),
+        "b20: the genuinely single-producer Atlungstad conflict is absent from ambiguous_detail",
+      );
+
+      // The ambiguous fixture must never appear in remediation's plan (it's
+      // never a "conflict" pair) — regression guard shared with (c)/(d) below.
+      const nordkappStillUnwritten = getExperienceRow("exp-ambig");
+      assertEq(
+        nordkappStillUnwritten.booking_url,
+        "https://booking-portal.example/aktivitet/12345",
+        "b21: ambiguous pair's booking_url untouched by the scan itself (read-only)",
+      );
+
       // ── (c) POST .../gardssalg-experience-conflict-remediation — dry-run
       //     (apply omitted) performs ZERO writes ──────────────────────────
       const beforeDryRun = getExperienceRow("norway-s-oldest-distillery-tours-tastings--68220487");
@@ -313,10 +376,18 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertEq(dryRunRes.status, 200, "c2: remediation dry-run -> 200");
       assertEq(dryRunRes.body.dry_run, true, "c3: dry_run defaults true");
 
-      const dryRunAtlungstad = dryRunRes.body.applied.find(
+      // Response-form hardening (dev-request 2026-08-01-gardssalg-steg2-
+      // apply-tar-ikke-varig-effekt): dry-run reports its plan under
+      // `planned`, and `applied` MUST be empty — a caller reading
+      // `.applied.length` on a dry-run response must see 0, never the plan
+      // size, so a dry-run can never be misread as a completed write.
+      assertTrue(Array.isArray(dryRunRes.body.planned), "c3b: dry-run response carries a 'planned' array");
+      assertEq(dryRunRes.body.applied, [], "c3c: dry-run response's 'applied' array is EMPTY (not the plan)");
+
+      const dryRunAtlungstad = dryRunRes.body.planned.find(
         (a: any) => a.experience_id === "norway-s-oldest-distillery-tours-tastings--68220487",
       );
-      assertTrue(!!dryRunAtlungstad, "c4: dry-run 'applied' list includes the Atlungstad correction that WOULD be made");
+      assertTrue(!!dryRunAtlungstad, "c4: dry-run 'planned' list includes the Atlungstad correction that WOULD be made");
       assertEq(dryRunAtlungstad?.would_write, "https://atlungstadbrenneri.no", "c5: dry-run reports the correct target hjemmeside");
       assertEq(dryRunAtlungstad?.action, "corrected", "c6: dry-run action is 'corrected' (producer hjemmeside is a safe, non-aggregator host)");
 
@@ -335,6 +406,14 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       });
       assertEq(applyRes.status, 200, "d1: remediation apply -> 200");
       assertEq(applyRes.body.dry_run, false, "d2: dry_run is false on an apply call");
+      assertEq(applyRes.body.planned, [], "d2b: apply response's 'planned' array is empty (symmetry with dry-run's field split)");
+      assertTrue(Array.isArray(applyRes.body.applied) && applyRes.body.applied.length > 0, "d2c: apply response's 'applied' array carries the real writes");
+
+      // Post-apply read-back verification (dev-request 2026-08-01-gardssalg-
+      // steg2-apply-tar-ikke-varig-effekt §3): a clean apply must report a
+      // read-back count from the DB, and zero mismatches.
+      assertEq(applyRes.body.verified_written, applyRes.body.applied.length, "d2d: verified_written from the DB read-back matches the number of items applied");
+      assertEq(applyRes.body.verification_mismatches, [], "d2e: no verification mismatches on a clean apply");
 
       const afterApply = getExperienceRow("norway-s-oldest-distillery-tours-tastings--68220487");
       assertTrue(
@@ -361,6 +440,14 @@ export function runOpplevelserGardssalgExperienceConflictTests(
         "d12: the AGREEING pair's booking_url is completely untouched by apply",
       );
       assertEq(getConflictAuditRows("exp-ciderhuset").length, 0, "d13: no audit row for the agreeing pair — apply never touches agree/unknown pairs");
+
+      const nordkappAfterApply = getExperienceRow("exp-ambig");
+      assertEq(
+        nordkappAfterApply.booking_url,
+        "https://booking-portal.example/aktivitet/12345",
+        "d14: the AMBIGUOUS pair's booking_url is completely untouched by apply — status!=='conflict' is never in the remediation plan",
+      );
+      assertEq(getConflictAuditRows("exp-ambig").length, 0, "d15: no audit row for the ambiguous pair either");
 
       // ── (e) producer hjemmeside is itself an aggregator host -> NULL, never
       //     copy the aggregator link ────────────────────────────────────────

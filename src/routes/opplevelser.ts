@@ -194,6 +194,8 @@ import {
   runGardssalgExperienceConflictScan,
   planGardssalgExperienceConflictRemediation,
   applyGardssalgExperienceConflictRemediation,
+  verifyGardssalgExperienceConflictWrites,
+  buildAmbiguousExperienceDetail,
   planExperienceConflictRollback,
   applyExperienceConflictRollback,
   type GsExpMatchedPair,
@@ -6408,6 +6410,14 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
 // conflicts with, agrees with, or leaves unknown the producer's verified
 // hjemmeside. Pure read: runGardssalgExperienceConflictScan() only SELECTs,
 // no UPDATE/INSERT anywhere on this path.
+// `ambiguous_detail` (dev-request 2026-08-01-gardssalg-steg2-apply-tar-ikke-
+// varig-effekt, gjenstående scope §4): purely additive, derived from the SAME
+// `pairs` array below by grouping status==="ambiguous" rows by experience_id
+// (buildAmbiguousExperienceDetail, services/gardssalg-experience-conflict.ts)
+// — no second scan, no new SQL. Surfaces the "N producers collide on one
+// experience, remediation will never auto-fix this" cases (Atlungstad is the
+// concrete one) that were previously just flat rows indistinguishable from
+// any other pair.
 router.get("/admin/gardssalg-experience-conflict-audit", requireAdmin, (_req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
   try {
@@ -6425,6 +6435,7 @@ router.get("/admin/gardssalg-experience-conflict-audit", requireAdmin, (_req: Re
         match_basis: p.match_basis,
         status: p.status,
       })),
+      ambiguous_detail: buildAmbiguousExperienceDetail(pairs),
     });
   } catch (err) {
     console.error("[gardssalg-experience-conflict-audit] failed:", err);
@@ -6456,7 +6467,18 @@ router.get("/admin/gardssalg-experience-conflict-audit", requireAdmin, (_req: Re
 // just against this table (pass entity_type: "experience" there — see that
 // endpoint below).
 //
-// Response: { success: true, dry_run, applied: [...], skipped: [...] }.
+// Response shape — dry-run vs apply are DELIBERATELY DIFFERENT (dev-request
+// 2026-08-01-gardssalg-steg2-apply-tar-ikke-varig-effekt: a P0 caused in part
+// by a dry-run response being byte-for-byte the same shape as an apply
+// response, so a caller reading `.applied.length` reported "137 corrected"
+// off a call that wrote nothing):
+//   - dry_run=true  -> { success, dry_run: true,  planned: [...], applied: [],       skipped }
+//   - apply=true    -> { success, dry_run: false, planned: [],    applied: [...],    skipped,
+//                        verified_written, verification_mismatches: [...] }
+// `planned` and `applied` share the SAME item shape (experience_id,
+// producer_id, current_value, would_write/new_value, action) — only the key
+// name differs, on purpose, so `.applied.length` reads 0 on a dry-run instead
+// of silently reporting the plan as if it were a completed write.
 router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { apply?: unknown; batch_id?: unknown };
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
@@ -6472,13 +6494,14 @@ router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (r
       res.json({
         success: true,
         dry_run: true,
-        applied: applicable.map((item) => ({
+        planned: applicable.map((item) => ({
           experience_id: item.experience_id,
           producer_id: item.producer_id,
           current_value: item.old_value,
           would_write: item.new_value,
           action: item.action,
         })),
+        applied: [],
         skipped,
       });
       return;
@@ -6489,7 +6512,40 @@ router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (r
       applicable as GsExpConflictPlanItem[],
       batchId
     );
-    res.json({ success: true, dry_run: false, applied, skipped });
+
+    // Post-apply read-back (dev-request 2026-08-01-gardssalg-steg2-apply-tar-
+    // ikke-varig-effekt, gjenstående scope §3): the transaction above already
+    // committed — this re-reads the CURRENT DB state for every row just
+    // written and compares it against what was supposed to land. A write
+    // that did not land, or did not STAY landed, must not be reported as a
+    // plain success.
+    const { verified_written, mismatches } = verifyGardssalgExperienceConflictWrites(expDb, applied);
+    if (mismatches.length > 0) {
+      console.error(
+        "[gardssalg-experience-conflict-remediation] post-apply verification found mismatches:",
+        mismatches
+      );
+      res.status(500).json({
+        success: false,
+        dry_run: false,
+        planned: [],
+        applied,
+        skipped,
+        verified_written,
+        verification_mismatches: mismatches,
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      dry_run: false,
+      planned: [],
+      applied,
+      skipped,
+      verified_written,
+      verification_mismatches: [],
+    });
   } catch (err) {
     console.error("[gardssalg-experience-conflict-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
