@@ -126,7 +126,7 @@ export function runOpplevelserGardssalgQualityJudgeTests(
         assertEq(r.approved, true, "jc-2a: mocked GODKJENN response → approved");
         assertEq(String(capturedUrl), "https://api.anthropic.com/v1/messages", "jc-2b: calls the exact Anthropic messages endpoint");
         const body = JSON.parse(capturedInit.body);
-        assertEq(body.model, "claude-opus-4-8", "jc-2c: model is claude-opus-4-8 (same as generateGardssalgAboutRewrite)");
+        assertEq(body.model, "claude-haiku-4-5", "jc-2c: model is claude-haiku-4-5 (same as generateGardssalgAboutRewrite)");
         assertTrue(typeof body.messages?.[0]?.content === "string" && body.messages[0].content.includes(GOOD_CANDIDATE), "jc-2d: prompt includes the candidate text");
         assertTrue(body.messages[0].content.includes(GOOD_PRODUCER_NAME), "jc-2e: prompt includes the producer name");
         assertEq(capturedInit.headers["x-api-key"], "test-anthropic-judge-key", "jc-2f: x-api-key header carries ANTHROPIC_API_KEY");

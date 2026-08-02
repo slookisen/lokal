@@ -2148,7 +2148,7 @@ Ved minste tvil, svar ${RFB_JUDGE_REJECT_TOKEN}.`;
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-8",
+        model: "claude-haiku-4-5",
         max_tokens: 200,
         messages: [{ role: "user", content: prompt }],
       }),

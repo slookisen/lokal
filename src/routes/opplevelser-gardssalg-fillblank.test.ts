@@ -168,7 +168,7 @@ export function runOpplevelserGardssalgFillblankTests(
         assertEq(r, GOOD_CANDIDATE, "fb-2a: mocked 200 with a good candidate → returned verbatim");
         assertEq(String(capturedUrl), "https://api.anthropic.com/v1/messages", "fb-2b: calls the exact Anthropic messages endpoint");
         const body = JSON.parse(capturedInit.body);
-        assertEq(body.model, "claude-opus-4-8", "fb-2c: model is claude-opus-4-8");
+        assertEq(body.model, "claude-haiku-4-5", "fb-2c: model is claude-haiku-4-5");
         assertTrue(typeof body.messages?.[0]?.content === "string" && body.messages[0].content.includes(NAVN), "fb-2d: prompt includes navn");
         assertTrue(body.messages[0].content.includes(SOURCE_TEXT), "fb-2e: prompt includes the source text");
         assertTrue(body.messages[0].content.includes("INGEN_UTVIDELSE_MULIG"), "fb-2f: prompt includes the escape sentinel instruction");
