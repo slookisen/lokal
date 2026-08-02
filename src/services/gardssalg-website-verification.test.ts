@@ -9,7 +9,12 @@
  * routes/opplevelser-gardssalg-website-verification.test.ts — this file
  * covers only the pure, DB-free classification function
  * (classifyGardssalgProducerWebsite) and its bulk/summary/plan helpers,
- * against an INJECTED fetchFn (no network, no DB).
+ * against an INJECTED fetchFn (no network, no DB) — EXCEPT section (j) below,
+ * which is a small, DB-free-of-network but DB-backed unit test for
+ * loadGardssalgWebsiteVerificationCohort's `cohort` SQL composition (Steg 2,
+ * dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-
+ * gate): a minimal in-memory better-sqlite3 DB with only the columns that
+ * query touches, no HTTP route, no fetch mocking at all.
  *
  * Realistic, varied fixture text/names deliberately used throughout (not
  * just one trivial happy-path string) — the 2026-08-01 Steg 2 incident (137
@@ -23,11 +28,14 @@
  * Run standalone: npx tsx src/services/gardssalg-website-verification.test.ts
  */
 
+import Database from "better-sqlite3";
 import {
   classifyGardssalgProducerWebsite,
   scanGardssalgWebsiteVerificationRows,
   summarizeGardssalgWebsiteVerification,
   planGardssalgWebsiteVerificationRemediation,
+  loadGardssalgWebsiteVerificationCohort,
+  GS_WV_COHORTS,
   type GsWvProducerRow,
   type GsWvFetchFn,
 } from "./gardssalg-website-verification";
@@ -282,6 +290,82 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
         !wouldEnqueue.some((r) => r.provider_id === "p1"),
         "i7: the missing_source row is never enqueued either"
       );
+    }
+
+    // ── (j) cohort axis — loadGardssalgWebsiteVerificationCohort's SQL
+    //     composition (Steg 2, dev-request 2026-08-02-opplevagent-
+    //     hjemmesideverifisering-og-enrichment-gate). Minimal in-memory
+    //     better-sqlite3 DB, only the columns this query touches — no HTTP
+    //     route, no fetch mocking, no network at all. `cohort` is a SEPARATE
+    //     axis from `scope`: this section only ever uses scope="visible"
+    //     (the default) and varies `cohort` alone, so it can't be confused
+    //     with a visibility test. ─────────────────────────────────────────
+    {
+      const db = new Database(":memory:");
+      db.exec(`
+        CREATE TABLE experience_providers (
+          id TEXT PRIMARY KEY,
+          navn TEXT,
+          hjemmeside TEXT,
+          org_nr TEXT,
+          kommune TEXT,
+          poststed TEXT,
+          telefon TEXT,
+          mobil TEXT,
+          adresse TEXT,
+          postnummer TEXT,
+          catalog_hidden INTEGER,
+          producer_type TEXT,
+          rfb_seed_source TEXT
+        );
+      `);
+      const insert = db.prepare(
+        `INSERT INTO experience_providers (id, navn, catalog_hidden, producer_type, rfb_seed_source)
+         VALUES (@id, @navn, @catalog_hidden, @producer_type, @rfb_seed_source)`
+      );
+      // a: a normal gårdssalg producer (producer_type set) — in BOTH cohorts.
+      insert.run({ id: "a-gardssalg", navn: "A Gaard", catalog_hidden: 0, producer_type: "bryggeri", rfb_seed_source: null });
+      // b: an rfb-seed row with no producer_type — the OTHER leg of the
+      // gårdssalg OR-clause — also in BOTH cohorts.
+      insert.run({ id: "b-rfbseed", navn: "B Seed", catalog_hidden: 0, producer_type: null, rfb_seed_source: "rfb-seed" });
+      // c: producer_type IS NULL AND rfb_seed_source != 'rfb-seed' — exactly
+      // the shape the gårdssalg cohort EXCLUDES today, and cohort=all must
+      // newly INCLUDE.
+      insert.run({ id: "c-outside-gardssalg", navn: "C Outside", catalog_hidden: 0, producer_type: null, rfb_seed_source: "manual" });
+      // d: the synthetic test-gardssalg fixture row — must be excluded from
+      // BOTH cohorts (unconditional exclusion, unrelated to which cohort is
+      // selected).
+      insert.run({ id: "d-test-gardssalg", navn: "TEST — Ikke book", catalog_hidden: 0, producer_type: "test-gardssalg", rfb_seed_source: null });
+
+      const defaultCohort = loadGardssalgWebsiteVerificationCohort(db, "visible");
+      assertEq(
+        defaultCohort.map((r) => r.id),
+        ["a-gardssalg", "b-rfbseed"],
+        "j1: cohort omitted entirely defaults to 'gardssalg' — same two rows as explicitly passing it"
+      );
+
+      const explicitGardssalg = loadGardssalgWebsiteVerificationCohort(db, "visible", "gardssalg");
+      assertEq(
+        explicitGardssalg.map((r) => r.id),
+        ["a-gardssalg", "b-rfbseed"],
+        "j2: cohort='gardssalg' explicit — excludes both the outside row and the test-gardssalg row"
+      );
+      assertEq(defaultCohort, explicitGardssalg, "j3: omitting cohort is byte-for-byte identical to passing 'gardssalg' explicitly");
+
+      const allCohort = loadGardssalgWebsiteVerificationCohort(db, "visible", "all");
+      assertEq(
+        allCohort.map((r) => r.id),
+        ["a-gardssalg", "b-rfbseed", "c-outside-gardssalg"],
+        "j4: cohort='all' widens to include the producer_type-IS-NULL/non-rfb-seed row the gårdssalg cohort excluded"
+      );
+      assertTrue(
+        !allCohort.some((r) => r.id === "d-test-gardssalg"),
+        "j5: the synthetic test-gardssalg row stays excluded even under cohort='all' — that exclusion is unconditional"
+      );
+
+      assertEq(GS_WV_COHORTS, ["gardssalg", "all"], "j6: GS_WV_COHORTS lists exactly the two valid values, gardssalg first (the default)");
+
+      db.close();
     }
   })().then(() => ({ passed, failed, failures }));
 }
