@@ -134,7 +134,7 @@ export function runOpplevelserGardssalgRetroScanTests(
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
     const prevFetch = globalThis.fetch;
-    const testKey = "gardssalg-retro-scan-test-key";
+    const testKey = process.env.ADMIN_KEY || "gardssalg-retro-scan-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
     process.env.ANTHROPIC_API_KEY = "test-anthropic-key-retro-scan";

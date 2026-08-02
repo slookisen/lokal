@@ -99,7 +99,7 @@ function callRoute(
   });
 }
 
-const ADMIN_KEY = "test-admin-key-verifier-drain";
+const ADMIN_KEY = process.env.ADMIN_KEY || "test-admin-key-verifier-drain";
 
 export function runAdminRunVerifierDrainObservabilityTests(
   opts: { log?: boolean } = {},

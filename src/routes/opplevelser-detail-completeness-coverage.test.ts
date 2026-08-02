@@ -104,7 +104,7 @@ export function runOpplevelserDetailCompletenessCoverageTests(
   return (async () => {
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
-    const testKey = "detail-completeness-coverage-test-key";
+    const testKey = process.env.ADMIN_KEY || "detail-completeness-coverage-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
 

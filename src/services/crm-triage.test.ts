@@ -86,7 +86,9 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
     try {
       initMod.__setDbForTesting(db as any);
       initMod.__initSchemaForTesting(db as any);
-      process.env.ANALYTICS_ADMIN_KEY = "test-admin-key";
+      // Determinisme (2026-08-02): set-kun-hvis-fraværende — under suiten står
+      // suitens kanoniske analytics-nøkkel her allerede og skal ikke byttes.
+      process.env.ANALYTICS_ADMIN_KEY = process.env.ANALYTICS_ADMIN_KEY || "test-admin-key";
       process.env.SKIP_TURNSTILE = "true";
 
       const RFB = "kontakt@rettfrabonden.com";

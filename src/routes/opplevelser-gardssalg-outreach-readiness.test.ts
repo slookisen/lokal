@@ -104,7 +104,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
   return (async () => {
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
-    const testKey = "gardssalg-outreach-readiness-test-key";
+    const testKey = process.env.ADMIN_KEY || "gardssalg-outreach-readiness-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
 

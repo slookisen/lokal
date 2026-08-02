@@ -147,7 +147,7 @@ export function runAdminOutreachPoolBlockerBreakdownTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "admin-outreach-pool-blocker-breakdown-test-key";
+    const testKey = process.env.ADMIN_KEY || "admin-outreach-pool-blocker-breakdown-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
 

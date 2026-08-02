@@ -91,7 +91,7 @@ export function runAdminBlocklistManualEntryTests(opts: { log?: boolean } = {}):
     }
   }
 
-  const testKey = "admin-blocklist-manual-entry-test-key";
+  const testKey = process.env.ADMIN_KEY || "admin-blocklist-manual-entry-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
   process.env.ADMIN_KEY = testKey;
 

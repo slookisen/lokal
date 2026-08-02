@@ -130,7 +130,7 @@ export function runAdminCrmChimeraAgentClearTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "admin-crm-chimera-agent-clear-test-key";
+    const testKey = process.env.ADMIN_KEY || "admin-crm-chimera-agent-clear-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
 
@@ -338,7 +338,7 @@ export function runAdminCrmChimeraAgentClearTests(
     // ── missing agent_knowledge row -> 404, isolated DB ──────────────────
     {
       const prevDb2 = initMod.getDb();
-      const testKey2 = "admin-crm-chimera-agent-clear-404-test-key";
+      const testKey2 = process.env.ADMIN_KEY || "admin-crm-chimera-agent-clear-404-test-key";
       const prevAdminKey2 = process.env.ADMIN_KEY;
       process.env.ADMIN_KEY = testKey2;
       const db2 = new Database(":memory:");

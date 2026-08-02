@@ -120,7 +120,7 @@ export async function runBrregDescriptionFallbackTests(opts: { log?: boolean } =
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "brreg-description-fallback-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "brreg-description-fallback-test-key";
 
   const fixtures: Map<string, BrregFixture> = new Map();
   let fetchCallCount = 0;

@@ -93,7 +93,7 @@ export async function runAdminAgentsRecentlyEnrichedTests(opts: { log?: boolean 
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "recently-enriched-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "recently-enriched-test-key";
 
   function insertAgent(row: {
     id: string;

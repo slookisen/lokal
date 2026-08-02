@@ -115,7 +115,7 @@ export function runAdminAgentsRetroScanTests(
     testDb.pragma("journal_mode = DELETE");
     testDb.pragma("foreign_keys = OFF");
 
-    const ADMIN_KEY = "admin-agents-retro-scan-test-key";
+    const ADMIN_KEY = process.env.ADMIN_KEY || "admin-agents-retro-scan-test-key";
 
     // CONTAMINATED_ABOUT-equivalent — nav-polluted, real bad shape, passes
     // the cheap bar (long enough, has a Norwegian word) but is chrome, not

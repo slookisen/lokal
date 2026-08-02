@@ -129,7 +129,7 @@ export function runAdminContactWriteGuardAuditTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "admin-contact-write-guard-audit-test-key";
+    const testKey = process.env.ADMIN_KEY || "admin-contact-write-guard-audit-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
 

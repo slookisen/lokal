@@ -122,7 +122,7 @@ export async function runAdminAgentAuditFieldProvenanceLegacyShapeTests(
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   const prevDentalPath = process.env.DENTAL_DB_PATH;
-  const testKey = "field-provenance-legacy-shape-test-key";
+  const testKey = process.env.ADMIN_KEY || "field-provenance-legacy-shape-test-key";
 
   const {
     __setDbForTesting,

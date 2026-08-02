@@ -99,7 +99,7 @@ export function runAdminOutreachCandidatesCrmSendGuardTests(opts: { log?: boolea
     }
   }
 
-  const testKey = "admin-outreach-candidates-crm-send-guard-test-key";
+  const testKey = process.env.ADMIN_KEY || "admin-outreach-candidates-crm-send-guard-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
   process.env.ADMIN_KEY = testKey;
 

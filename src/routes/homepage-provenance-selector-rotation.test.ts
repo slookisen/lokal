@@ -145,7 +145,7 @@ export function runHomepageProvenanceSelectorRotationTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "homepage-provenance-selector-rotation-test-key";
+    const testKey = process.env.ADMIN_KEY || "homepage-provenance-selector-rotation-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
     const prevFetch = (globalThis as any).fetch;

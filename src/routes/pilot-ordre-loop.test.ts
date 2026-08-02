@@ -88,7 +88,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
   const prevAdminKey = process.env.ADMIN_KEY;
 
   const testDb = new Database(":memory:");
-  const ADMIN_KEY = "pilot-ordre-loop-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "pilot-ordre-loop-test-key";
   const DANIEL_EMAIL = "da.fredriksen@gmail.com";
 
   // Captured notification sends (stubbed transport).

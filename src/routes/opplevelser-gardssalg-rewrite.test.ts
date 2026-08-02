@@ -460,7 +460,7 @@ export function runOpplevelserGardssalgRewriteTests(
     // ═══════════════════════════════════════════════════════════════════
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
-    const testKey = "gardssalg-rewrite-test-key";
+    const testKey = process.env.ADMIN_KEY || "gardssalg-rewrite-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
     process.env.ANTHROPIC_API_KEY = "test-anthropic-key-route";

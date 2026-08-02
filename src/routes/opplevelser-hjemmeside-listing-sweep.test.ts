@@ -117,7 +117,7 @@ export function runOpplevelserHjemmesideListingSweepTests(
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
-    const testKey = "hjemmeside-listing-sweep-test-key";
+    const testKey = process.env.ADMIN_KEY || "hjemmeside-listing-sweep-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
     delete process.env.ANALYTICS_ADMIN_KEY;

@@ -94,7 +94,7 @@ export async function runAdminAgentsDeleteTests(opts: { log?: boolean } = {}): P
   // adds — and is called out in the PR report rather than re-verified here.
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "admin-agents-delete-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "admin-agents-delete-test-key";
 
   try {
     __setDbForTesting(testDb as any);
@@ -135,7 +135,9 @@ export async function runAdminAgentsDeleteTests(opts: { log?: boolean } = {}): P
       // admin-agents.test.ts's callRegister() — avoids interleaving with
       // any peer test block sharing process.env.ADMIN_KEY.
       process.env.ADMIN_KEY = ADMIN_KEY;
-      delete process.env.ANALYTICS_ADMIN_KEY;
+      // (2026-08-02) Ikke slett ANALYTICS_ADMIN_KEY her: ADMIN_KEY settes i samme
+      // synkrone tur, så analytics-nøkkelen konsulteres aldri av ruten — og under
+      // suiten raner en sletting konkurrerende analytics-blokker nøkkelen sin.
       const res = fakeRes();
       const headers: Record<string, string> = withKey ? { "x-admin-key": ADMIN_KEY } : {};
       await deleteHandler({ headers, params: { id }, query: {} } as any, res as any);
@@ -144,7 +146,6 @@ export async function runAdminAgentsDeleteTests(opts: { log?: boolean } = {}): P
 
     async function callRegister(body: Record<string, unknown>): Promise<{ status: number; body: any }> {
       process.env.ADMIN_KEY = ADMIN_KEY;
-      delete process.env.ANALYTICS_ADMIN_KEY;
       const res = fakeRes();
       await registerHandler({ headers: { "x-admin-key": ADMIN_KEY }, body, query: {} } as any, res as any);
       return { status: res.statusCode, body: res.body };
@@ -240,7 +241,7 @@ export async function runAdminAgentsDeleteTests(opts: { log?: boolean } = {}): P
     testDb2.pragma("journal_mode = DELETE");
     testDb2.pragma("foreign_keys = ON");
 
-    const ADMIN_KEY2 = "admin-agents-delete-fkon-test-key";
+    const ADMIN_KEY2 = process.env.ADMIN_KEY || "admin-agents-delete-fkon-test-key";
 
     try {
       __setDbForTesting(testDb2 as any);
@@ -269,7 +270,6 @@ export async function runAdminAgentsDeleteTests(opts: { log?: boolean } = {}): P
 
       async function callDelete2(id: string): Promise<{ status: number; body: any }> {
         process.env.ADMIN_KEY = ADMIN_KEY2;
-        delete process.env.ANALYTICS_ADMIN_KEY;
         const res = fakeRes();
         await deleteHandler2({ headers: { "x-admin-key": ADMIN_KEY2 }, params: { id }, query: {} } as any, res as any);
         return { status: res.statusCode, body: res.body };

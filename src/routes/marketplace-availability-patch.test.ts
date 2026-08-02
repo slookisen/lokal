@@ -128,7 +128,7 @@ export function runMarketplaceAvailabilityPatchTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testAdminKey = "marketplace-availability-patch-test-admin-key";
+    const testAdminKey = process.env.ADMIN_KEY || "marketplace-availability-patch-test-admin-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
     process.env.ADMIN_KEY = testAdminKey;

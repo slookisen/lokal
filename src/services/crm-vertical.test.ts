@@ -267,8 +267,13 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
         // Both saved and restored regardless.
         const prevAdminKey = process.env.ADMIN_KEY;
         const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
-        process.env.ADMIN_KEY = "crm-vertical-test-key";
-        process.env.ANALYTICS_ADMIN_KEY = "crm-vertical-test-key";
+        // Determinisme (2026-08-02): adopter suitens kanoniske nøkler når de
+        // finnes — aldri bytt de prosess-globale verdiene midt i en kjøring
+        // (se SHARED GLOBAL STATE-kontrakten i tests/test.ts). Literal kun som
+        // standalone-fallback.
+        const crmVerticalKey = process.env.ADMIN_KEY || "crm-vertical-test-key";
+        process.env.ADMIN_KEY = crmVerticalKey;
+        process.env.ANALYTICS_ADMIN_KEY = process.env.ANALYTICS_ADMIN_KEY || crmVerticalKey;
         try {
           const crmRoutes = require("../routes/crm") as any;
           const router = crmRoutes.default ?? crmRoutes.router ?? crmRoutes;
@@ -277,7 +282,7 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
             let out = { status: 200, body: undefined as any };
             const req: any = {
               method: "POST", url: "/ingest", query: {}, body,
-              headers: { "x-admin-key": "crm-vertical-test-key" },
+              headers: { "x-admin-key": crmVerticalKey },
               // Express handlers read headers via req.get(), not req.headers.
               get(name: string) { return this.headers[name.toLowerCase()]; },
             };
@@ -330,7 +335,7 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
             let out = { status: 200, body: undefined as any };
             const req: any = {
               method: "POST", url: "/threads/cv-route-1/send", query: {}, body,
-              headers: { "x-admin-key": "crm-vertical-test-key" },
+              headers: { "x-admin-key": crmVerticalKey },
               get(name: string) { return this.headers[name.toLowerCase()]; },
             };
             const res: any = {
@@ -389,7 +394,7 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
             let out = { status: 200, body: undefined as any };
             const req: any = {
               method: "POST", url: "/compose", query: {}, body,
-              headers: { "x-admin-key": "crm-vertical-test-key" },
+              headers: { "x-admin-key": crmVerticalKey },
               get(name: string) { return this.headers[name.toLowerCase()]; },
             };
             const res: any = {
