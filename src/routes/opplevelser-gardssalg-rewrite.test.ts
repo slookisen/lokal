@@ -162,7 +162,7 @@ export function runOpplevelserGardssalgRewriteTests(
         assertEq(r, VALID_250, "ru-2a: mocked 200 with a valid 250-char candidate → returned verbatim");
         assertEq(String(capturedUrl), "https://api.anthropic.com/v1/messages", "ru-2b: calls the exact Anthropic messages endpoint");
         const body = JSON.parse(capturedInit.body);
-        assertEq(body.model, "claude-opus-4-8", "ru-2c: model is claude-opus-4-8 (same as generateTitleNo)");
+        assertEq(body.model, "claude-haiku-4-5", "ru-2c: model is claude-haiku-4-5 (same as generateTitleNo)");
         assertTrue(typeof body.messages?.[0]?.content === "string" && body.messages[0].content.includes(CURRENT_VALUE), "ru-2d: prompt includes the current value as context");
         assertTrue(body.messages[0].content.includes(SOURCE_TEXT), "ru-2e: prompt includes the source text");
         assertTrue(body.messages[0].content.includes("INGEN_UTVIDELSE_MULIG"), "ru-2f: prompt includes the escape sentinel instruction");

@@ -150,7 +150,7 @@ export function runOpplevelserGardssalgProductsTests(
         assertEq(r, ["Eplesider", "Eplemost"], "pg-2a: mocked 200 with a valid JSON array → returned");
         assertEq(String(capturedUrl), "https://api.anthropic.com/v1/messages", "pg-2b: calls the exact Anthropic messages endpoint");
         const body = JSON.parse(capturedInit.body);
-        assertEq(body.model, "claude-opus-4-8", "pg-2c: model is claude-opus-4-8");
+        assertEq(body.model, "claude-haiku-4-5", "pg-2c: model is claude-haiku-4-5");
         assertTrue(typeof body.messages?.[0]?.content === "string" && body.messages[0].content.includes(SOURCE_TEXT), "pg-2d: prompt includes the source text");
         assertTrue(body.messages[0].content.includes("INGEN_PRODUKTER_FUNNET"), "pg-2e: prompt includes the escape sentinel instruction");
         assertTrue(body.messages[0].content.includes("Bruk KUN produktnavn som faktisk står i kildeteksten"), "pg-2f: prompt includes the exact grounding instruction");
