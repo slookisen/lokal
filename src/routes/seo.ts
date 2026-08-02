@@ -129,8 +129,8 @@ const CATEGORY_MAP: Record<string, { name: string; emoji: string }> = {
 
 // Badge-label-only translations for platform categories (search-enrich.ts
 // PLATFORM_CATEGORIES) that are intentionally NOT in CATEGORY_MAP above.
-// CATEGORY_MAP also drives the homepage category-tile grid (see catCards
-// below) — adding a browsable tile per category is a separate decision from
+// CATEGORY_MAP also drives the homepage category chip row (see categoryChips
+// below) — adding a browsable chip per category is a separate decision from
 // just translating a card badge, so these stay label-only. Without this,
 // producer-card badges fell back to the raw English key (e.g. "🌱 beverages"
 // on the Kringler Gjestegård card) — dev-request
@@ -889,6 +889,7 @@ const LANDING_CSS = `
   .hero-search input:focus { border-color: var(--green-700); }
   .hero-search button { padding: 16px 28px; background: var(--green-700); color: var(--white); border: 2px solid var(--green-700); border-radius: 0 14px 14px 0; font-weight: 700; font-size: 0.95rem; cursor: pointer; transition: background 0.2s; }
   .hero-search button:hover { background: var(--green-900); border-color: var(--green-900); }
+  .hero-chips-label { text-align: center; font-size: 0.72rem; color: var(--g400); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
   .hero-chips { display: flex; justify-content: center; gap: 7px; flex-wrap: wrap; margin-bottom: 8px; }
   .chip { padding: 5px 13px; background: var(--white); border: 1px solid var(--g200); border-radius: 20px; font-size: 0.78rem; color: var(--g500); text-decoration: none; transition: all 0.2s; }
   .chip:hover { border-color: var(--green-700); color: var(--green-700); background: var(--green-50); text-decoration: none; }
@@ -917,12 +918,6 @@ const LANDING_CSS = `
   .cat-name { font-size: 0.85rem; font-weight: 600; }
   .cat-count { font-size: 0.72rem; color: var(--g500); }
   .sec { max-width: 1100px; margin: 0 auto; padding: 56px 24px; }
-  .cities-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
-  .city-card { background: var(--white); border-radius: var(--r-lg); padding: 20px; display: flex; align-items: center; gap: 14px; border: 1px solid var(--g100); transition: all 0.3s; text-decoration: none; color: var(--charcoal); }
-  .city-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--green-100); text-decoration: none; }
-  .city-icon { width: 44px; height: 44px; background: var(--green-50); border-radius: 11px; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; flex-shrink: 0; }
-  .city-name { font-weight: 700; font-size: 0.95rem; }
-  .city-count { font-size: 0.8rem; color: var(--g500); }
   .feat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
   /* PR-84: Ultra-rich card (positions 1-3 — claimed top producers) */
   .pc-ultra { grid-column: span 1; }
@@ -982,7 +977,6 @@ const LANDING_CSS = `
     .stats-bar { gap: 20px; }
     .stat-n { font-size: 1.4rem; }
     .cats-grid { grid-template-columns: repeat(3, 1fr); }
-    .cities-grid { grid-template-columns: 1fr; }
     .feat-grid { grid-template-columns: 1fr; }
     .how-grid { grid-template-columns: 1fr; gap: 20px; }
     .ai-banner { flex-direction: column; text-align: center; padding: 22px; }
@@ -1033,9 +1027,6 @@ router.get("/", (req: Request, res: Response) => {
       });
     });
 
-    const topCities = Object.entries(cityCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
-    const cityIcons = ["\u{1F3D8}\uFE0F", "\u{1F3DB}\uFE0F", "\u2693", "\u{1F306}", "\u{1F304}", "\u{26F0}\uFE0F", "\u{26F5}", "\u{1F33F}"];
-
     // PR-85: marketplaceRegistry.getActiveAgents() does NOT populate
     // isClaimed (that's only set at API-response time in marketplace.ts:854).
     // For the homepage we need it for sort priority + render-tier decision,
@@ -1059,22 +1050,19 @@ router.get("/", (req: Request, res: Response) => {
       })
       .slice(0, 16);
 
-    const catCards = Object.entries(CATEGORY_MAP)
+    // dev-request 2026-07-31-rfb-homepage-kategori-konsolidering: the old
+    // standalone big-card "Kategorier" grid and the 4 ad-hoc hero chips
+    // (2 of which duplicated categories already in that grid) are merged
+    // into ONE compact pill row, right under the search box, built from
+    // all 10 CATEGORY_MAP categories with live counts. "Gårdsbutikker" is
+    // a salgskanal (sales-channel) entry, not a CATEGORY_MAP food category
+    // — it keeps its own separate buildSalgskanalHomeSection below and is
+    // deliberately not folded in here.
+    const categoryChips = Object.entries(CATEGORY_MAP)
       .map(([_key, val]) => {
         const count = categoryCounts[_key] || 0;
-        return `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(val.name.toLowerCase())}" class="cat-card">
-          <span class="cat-emoji">${val.emoji}</span>
-          <div class="cat-name">${val.name}</div>
-          <div class="cat-count">${count} ${escapeHtml(t(lang, "home.cats_count_suffix"))}</div>
-        </a>`;
+        return `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(val.name.toLowerCase())}" class="chip">${val.emoji} ${escapeHtml(val.name)} (${count})</a>`;
       }).join("");
-
-    const cityCards = topCities.map(([city, count], i) =>
-      `<a href="${localizedPath("/" + slugify(city), lang)}" class="city-card">
-        <div class="city-icon">${cityIcons[i] || "\u{1F33F}"}</div>
-        <div><div class="city-name">${escapeHtml(city)}</div><div class="city-count">${count} ${escapeHtml(t(lang, "home.cats_count_suffix"))}</div></div>
-      </a>`
-    ).join("");
 
     const featuredCards = featured.map((a: any, i: number) => {
       if (i < 3 && a.isClaimed) {
@@ -1215,12 +1203,8 @@ router.get("/", (req: Request, res: Response) => {
           });
         })();
         </script>
-        <div class="hero-chips">
-          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "vegetables oslo" : "gr\u00f8nnsaker oslo")}" class="chip">\u{1F955} ${escapeHtml(t(lang, "home.chip_vegetables_oslo"))}</a>
-          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "honey oslo" : "honning oslo")}" class="chip">\u{1F36F} ${escapeHtml(t(lang, "home.chip_honey_bergen"))}</a>
-          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "organic meat" : "\u00f8kologisk kj\u00f8tt")}" class="chip">\u{1F969} ${escapeHtml(t(lang, "home.chip_organic_meat"))}</a>
-          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "farm shop" : "g\u00e5rdsbutikk")}" class="chip">\u{1F33F} ${escapeHtml(t(lang, "home.chip_farm_shops"))}</a>
-        </div>
+        <div class="hero-chips-label">${escapeHtml(t(lang, "home.cats_label"))}</div>
+        <div class="hero-chips">${categoryChips}</div>
         <div class="ai-assist">
           <p class="ai-assist-label">${escapeHtml(t(lang, "home.ai_assist_label"))}</p>
           <div class="ai-assist-btns">
@@ -1267,22 +1251,6 @@ router.get("/", (req: Request, res: Response) => {
       </div>
     </div>
 
-    <section class="cats-section">
-      <div class="sh" style="max-width:1100px;margin:0 auto 28px;">
-        <div class="sh-label">${escapeHtml(t(lang, "home.cats_label"))}</div>
-        <div class="sh-title">${escapeHtml(t(lang, "home.cats_title"))}</div>
-      </div>
-      <div class="cats-grid">${catCards}</div>
-    </section>
-
-    <section class="sec">
-      <div class="sh">
-        <div class="sh-label">${escapeHtml(t(lang, "home.explore_label"))}</div>
-        <div class="sh-title">${escapeHtml(t(lang, "home.explore_title"))}</div>
-        <div class="sh-sub">${escapeHtml(t(lang, "home.explore_sub"))}</div>
-      </div>
-      <div class="cities-grid">${cityCards}</div>
-    </section>
 ${salgskanalSectionHtml}
 ${umbrellaSectionHtml}
     <section class="sec" style="background:var(--white);">
@@ -1290,6 +1258,9 @@ ${umbrellaSectionHtml}
         <div class="sh-label">${escapeHtml(t(lang, "home.discover_label"))}</div>
         <div class="sh-title">${escapeHtml(t(lang, "home.discover_title"))}</div>
         <div class="sh-sub">${escapeHtml(t(lang, "home.discover_sub"))}</div>
+        <div style="margin-top:14px;">
+          <a href="${localizedPath("/verifisert-av-eier", lang)}" class="btn-s">${escapeHtml(t(lang, "home.discover_verified_btn"))}</a>
+        </div>
       </div>
       <div class="feat-grid">${featuredCards}</div>
     </section>
@@ -3277,6 +3248,87 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
   }
 });
 
+// GET /verifisert-av-eier — dev-request
+// 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter: browse-all page
+// for producers with agent.isVerified === true (the owner-claim/manual
+// verification badge, renamed "Verifisert av eier" / "Verified by owner" on
+// this same slice — see producer.verified i18n key). Distinct from
+// agent.brregVerified ("Registrert i Brønnøysund"), which this page does not
+// filter on. Follows the exact /kategori/:slug pattern (hero, live count,
+// empty state, CollectionPage JSON-LD, breadcrumb, producerCard reuse).
+// Registered above router.get("/:city") (below) so it isn't swallowed as an
+// unmatched city-slug — same belt-and-braces reserved-slug entry as
+// /kategori and /reise in that handler.
+router.get("/verifisert-av-eier", (req: Request, res: Response) => {
+  const lang = req.lang;
+
+  try {
+    const agents = marketplaceRegistry.getActiveAgents();
+    const members = agents.filter((a: any) => a.isVerified === true);
+    const n = members.length;
+
+    const countLabel = lang === "en"
+      ? `${n} producer${n === 1 ? "" : "s"}`
+      : `${n} produsent${n === 1 ? "" : "er"}`;
+
+    const h1 = lang === "en" ? "Verified by owner" : "Verifisert av eier";
+    const lede = lang === "en"
+      ? "Producers whose owner has personally claimed and confirmed this profile."
+      : "Produsenter der eieren selv har krevd og bekreftet profilen.";
+
+    const cards = members.map((a: any) => producerCard(a, undefined, lang)).join("");
+    const body = members.length > 0
+      ? `<div class="sk-grid">${cards}</div>`
+      : `<div class="sk-empty"><p>${lang === "en"
+          ? "No verified-by-owner producers yet — this page fills in automatically as producers claim and confirm their profile."
+          : "Ingen verifisert-av-eier-produsenter ennå — siden fylles automatisk etter hvert som produsenter krever og bekrefter profilen sin."}</p></div>`;
+
+    const title = `${h1} — ${countLabel} | ${getConfig().display_name}`;
+    const metaDesc = `${lede} ${countLabel}.`;
+
+    const jsonLd = {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      name: h1,
+      description: lede,
+      url: BASE_URL + localizedPath("/verifisert-av-eier", lang),
+      mainEntity: {
+        "@type": "ItemList",
+        numberOfItems: members.length,
+        itemListElement: members.slice(0, 100).map((a: any, i: number) => ({
+          "@type": "ListItem",
+          position: i + 1,
+          url: BASE_URL + localizedPath("/produsent/" + slugify(a.name), lang),
+          name: a.name,
+        })),
+      },
+    };
+
+    const crumbLabel = lang === "en" ? "Home" : "Forsiden";
+    const content = `
+    <div class="sk-crumbs"><a href="${localizedPath("/", lang)}">${escapeHtml(crumbLabel)}</a> › ${escapeHtml(h1)}</div>
+    <section class="sk-hero">
+      <div class="container">
+        <h1>${escapeHtml(h1)}</h1>
+        <p>${escapeHtml(lede)}</p>
+        <div class="sk-count">${escapeHtml(countLabel)}</div>
+      </div>
+    </section>
+    ${body}`;
+
+    res.send(shell(title, metaDesc, content, {
+      canonical: BASE_URL + localizedPath("/verifisert-av-eier", lang),
+      jsonLd,
+      extraCss: SALGSKANAL_CSS,
+      lang,
+      pathForAlternate: "/verifisert-av-eier",
+    }));
+  } catch (err) {
+    console.error("SEO /verifisert-av-eier error:", err);
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
+  }
+});
+
 router.get("/:city", (req: Request, res: Response, next: any) => {
   const citySlug = (req.params.city as string).toLowerCase();
 
@@ -3298,6 +3350,10 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       // convention (see /sok, /kontakt, /kategori) — a kommune slugging to
       // "reise" must never shadow the corridor page.
       || citySlug === "reise"
+      // dev-request 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter:
+      // /verifisert-av-eier is registered above this catch-all too, but same
+      // belt-and-braces convention as /kategori and /reise above.
+      || citySlug === "verifisert-av-eier"
       || citySlug.includes(".")) {
     return next();
   }
@@ -4609,7 +4665,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Badges
     const badges: string[] = [];
-    if (agent.isVerified) badges.push(`<span class="badge badge-v">&#10003; Verifisert</span>`);
+    if (agent.isVerified) badges.push(`<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`);
     // dev-request 2026-06-30-brreg-verification-gate, catalog-sweep + badge
     // slice: agents.brreg_verified=1 (set at registration time or by the
     // GET/POST /admin/agents/brreg-catalog-sweep backlog sweep) surfaces a

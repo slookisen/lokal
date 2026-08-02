@@ -865,5 +865,93 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.log(`[experiences] gardssalg_claims init skipped: ${(e as Error).message}`);
   }
 
+  // ─── experience_provider_conflict_audit (dev-request 2026-08-01-gardssalg-
+  // profilkomplett-og-soekbar-foer-outreach, Steg 2) ─────────────────────────
+  // Insert-only, field-level changelog for `experiences.booking_url`
+  // corrections made by the gårdssalg producer<->experience conflict
+  // remediation (POST /admin/gardssalg-experience-conflict-remediation,
+  // routes/opplevelser.ts) — the cross-TABLE counterpart to
+  // gardssalg_content_audit above. NOT the same table: gardssalg_content_audit
+  // is FK'd to experience_providers and is written by the fill-only content
+  // pipeline; this table is FK'd to `experiences` (the catalog/"activities"
+  // table) and is written by a corrective OVERWRITE — the remediation fixes an
+  // experience row whose booking_url was harvested from an unrelated
+  // third-party source and conflicts with the real producer's owner-verified
+  // hjemmeside (the concrete case: producer atlungstad-brenneri--bbe4185d's
+  // hjemmeside is atlungstadbrenneri.no; a same-named-place experience row's
+  // booking_url wrongly pointed at atlungstad.no, a different business).
+  // Reusing gardssalg_content_audit's own row shape directly was considered
+  // and rejected: its provider_id column is NOT NULL + FK'd to
+  // experience_providers(id) ON DELETE CASCADE, and planGardssalgContentRollback
+  // re-verifies content_source by looking that id up in experience_providers —
+  // an experiences.id written into that column would never resolve there, so
+  // the row would silently become unrestorable through that lever. Same shape
+  // (id/entity_id/field_name/old_value/new_value/source_url/batch_id/
+  // changed_by/changed_at), same insert-only/never-mutated discipline, own FK
+  // target — see planExperienceConflictRollback/applyExperienceConflictRollback
+  // (services/gardssalg-experience-conflict.ts), wired into the SAME
+  // POST /admin/gardssalg-content-rollback endpoint via an `entity_type`
+  // switch (default "provider", unchanged) rather than a second HTTP surface —
+  // per the dev-request's own rollback section ("reverserbart... via
+  // gardssalg-content-rollback").
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_provider_conflict_audit (
+        id TEXT PRIMARY KEY,
+        experience_id TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        source_url TEXT,
+        batch_id TEXT,
+        changed_by TEXT NOT NULL DEFAULT 'system',
+        changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (experience_id) REFERENCES experiences(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_conflict_audit_experience ON experience_provider_conflict_audit(experience_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_conflict_audit_batch ON experience_provider_conflict_audit(batch_id)`);
+  } catch (err) {
+    console.error("Migration experience_provider_conflict_audit failed:", err);
+  }
+
+  // ─── gardssalg_website_verification_audit (dev-request 2026-08-01-
+  // gardssalg-profilkomplett-og-soekbar-foer-outreach, Steg 3, scoped-down
+  // slice) ────────────────────────────────────────────────────────────────
+  // Insert-only, per-check changelog for the gårdssalg website-verification
+  // sweep (GET /admin/gardssalg-website-verification-audit, POST
+  // /admin/gardssalg-website-verification-remediation,
+  // services/gardssalg-website-verification.ts). One row per producer per
+  // apply run: whether the sweep classified the producer's hjemmeside as
+  // verified/unverified/aggregator/missing_source, and the evidence (if any)
+  // gardssalgWebsiteEvidenceMatch produced. Mirrors
+  // experience_provider_conflict_audit's exact shape/indexing convention
+  // (this fleet's established reversible-write audit-trail idiom) — FK'd to
+  // experience_providers (this sweep's own entity), ON DELETE CASCADE so
+  // orphan audit rows are cleaned up if a provider is ever deleted. Not a
+  // rollback lever itself (the write it accompanies —
+  // field_provenance.hjemmeside_verification — is a verification STAMP, not
+  // a content field with a "restore to" concept the way
+  // gardssalg_content_audit's fields are), purely an observability/history
+  // trail.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_website_verification_audit (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        evidence TEXT,
+        batch_id TEXT,
+        checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_website_verification_audit_provider ON gardssalg_website_verification_audit(provider_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_website_verification_audit_batch ON gardssalg_website_verification_audit(batch_id)`);
+  } catch (err) {
+    console.error("Migration gardssalg_website_verification_audit failed:", err);
+  }
+
   console.log("[experiences] schema initialized");
 }

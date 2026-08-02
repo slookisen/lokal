@@ -165,14 +165,31 @@ export function runOpplevelserGardssalgContentAuditTests(
       const store = require("../services/experience-store") as typeof import("../services/experience-store");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
-      const insertProvider = expDb.prepare(
+      const insertProviderStmt = expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text,
+           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, field_provenance,
             producer_type, enrichment_state, verification_status, source, confidence)
          VALUES
-           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text,
+           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, @field_provenance,
             'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
+      // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+      // Steg 3 follow-up: POST /admin/gardssalg-content-refresh now fail-
+      // closed-gates its fetch on field_provenance.hjemmeside_verification.
+      // verified === true. This file's fixtures are entirely about the
+      // fill/replace/rollback/audit behavior AFTER a fetch succeeds — not
+      // about that gate itself (see opplevelser-gardssalg-fillblank.test.ts
+      // for the gate's own dedicated tests) — so every fixture is stamped
+      // verified by default here unless a call site explicitly overrides
+      // field_provenance.
+      const VERIFIED_PROVENANCE_K = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
+      const insertProvider = {
+        run(params: Record<string, unknown>): void {
+          insertProviderStmt.run({ field_provenance: VERIFIED_PROVENANCE_K, ...params });
+        },
+      };
 
       insertProvider.run({
         id: "prov-a", navn: "Prov A Sideri", hjemmeside: "https://prov-a.example.no",

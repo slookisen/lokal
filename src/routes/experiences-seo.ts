@@ -64,6 +64,13 @@ import {
   backfillProviderSlugs,
   searchPublishedExperiences,
   listGardssalgProviders,
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 1: free-text producer search for /sok (distinct from
+  // searchGardssalgProviders(filter, limit) above, which is the structured
+  // filter used by the REST /discover endpoint) — see its doc comment in
+  // experience-store.ts.
+  searchGardssalgProvidersByQuery,
+  type GardssalgSearchByQueryRow,
   resolveCanonicalSlugForDuplicate,
   // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: «Nær meg» on
   // /sok — reuses the SAME discoverExperiences()/formatDistanceLabel() the
@@ -90,6 +97,12 @@ import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags
 import { geocodingService } from "../services/geocoding-service";
 // dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
+// dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 2:
+// route-intent detection for opplevagent's /sok — REUSED, not reimplemented,
+// verbatim from the module rettfrabonden.com's own /sok (src/routes/seo.ts)
+// already relies on. See route-intent.ts's module header for why this must
+// stay a strict whole-string resolver + reluctant heuristic, unmodified.
+import { resolveRouteIntent, detectRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { getDb as getExpDbForReise } from "../database/db-factory";
 import {
   createBooking,
@@ -331,7 +344,7 @@ function gardssalgVisible(): boolean {
 // Homepage UI strings (NO/EN). Phase-1 i18n: only the landing page
 // is genuinely bilingual; browse/detail stay NO-canonical for now.
 // ─────────────────────────────────────────────────────────────
-function homeStrings(lang: Lang) {
+export function homeStrings(lang: Lang) {
   const no = {
     metaTitle: "Opplevagent — Kuratert markedsplass for norske opplevelser",
     metaDesc: "Opplevagent er en kuratert markedsplass for norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Søkbar for AI-agenter etter sted, vær, sesong og gruppestørrelse.",
@@ -346,6 +359,12 @@ function homeStrings(lang: Lang) {
     heroSub: "Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.",
     searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: hvalsafari, Oslo, mat …", searchBtn: "Finn opplevelser",
     hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ". Agenter kan kalle ", hintPost2: " direkte.",
+    // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
+    // Goal 3: the reiserute (route/corridor) capability existed but was
+    // invisible right next to the ONE search box that can now trigger it —
+    // Daniel: «dette nevnes ikke i informasjonen som ligger nær søkefeltet».
+    // Keep this in sync with the `en` object below.
+    hintRoutePre: "\u{1F697} Skal du ut og kjøre? Skriv ", hintRouteLink: "«Oslo til Bergen»", hintRoutePost: " rett i søkefeltet over, så finner vi opplevelser, gårdssalg og drikkesteder langs ruten &mdash; eller sett opp ", hintRouteLink2: "en hel reiserute", hintRoutePost2: " selv.",
     quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
     // dev-request 2026-07-25-reisesok fix 0f(ii): homepage «Nær meg».
     nearMeBtn: "Nær meg", nearMeRadiusLabel: "Søkeradius", nearMeLoading: "Henter posisjon…", nearMeDenied: "Posisjon avslått",
@@ -382,6 +401,8 @@ function homeStrings(lang: Lang) {
     heroSub: "From whale safaris and treehouses to guided mountain hikes, food experiences and laser tag &mdash; a curated overview of Norwegian experiences, built to be discovered and queried by AI agents.",
     searchAria: "Find experiences", searchLabel: "Describe what you want to do, or type a place", searchPlaceholder: "Search: whale safari, Oslo, food …", searchBtn: "Find experiences",
     hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ". Agents can call ", hintPost2: " directly.",
+    // Keep in sync with the `no` object above.
+    hintRoutePre: "\u{1F697} Driving somewhere? Type ", hintRouteLink: "“Oslo to Bergen”", hintRoutePost: " straight into the search box above and we'll surface experiences, farm shops and drink stops along the way &mdash; or set up ", hintRouteLink2: "a full route", hintRoutePost2: " yourself.",
     quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
     nearMeBtn: "Near me", nearMeRadiusLabel: "Search radius", nearMeLoading: "Locating…", nearMeDenied: "Location denied",
     trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
@@ -851,6 +872,13 @@ ${ldScripts}
           <button type="submit">${S.searchBtn}</button>
         </form>
         <p class="discover-hint">${S.hintPre}<a href="/opplevelser" style="color:#fff;text-decoration:underline">${S.hintLink}</a>${S.hintPost}<code>GET /api/opplevelser/discover</code>${S.hintPost2}</p>
+        <!-- dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
+             Goal 3: the hero hint didn't mention reiserute (route/corridor)
+             search at all — Daniel: «dette nevnes ikke i informasjonen som
+             ligger nær søkefeltet». Same search box now also detects a route
+             typed straight in (Goal 2) and redirects to /reise; this line
+             is what makes that capability discoverable rather than hidden. -->
+        <p class="discover-hint discover-hint-route">${S.hintRoutePre}<strong>${S.hintRouteLink}</strong>${S.hintRoutePost}<a href="/reise" style="color:#fff;text-decoration:underline">${S.hintRouteLink2}</a>${S.hintRoutePost2}</p>
         <!-- dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
              fix 0f(ii): OpplevAgent's «Nær meg» affordance existed on /sok and
              on the browse pages, but NOT on the homepage — so the first thing
@@ -2221,6 +2249,11 @@ const BROWSE_CSS = `
   .sort-toggle a{color:var(--ink-soft);font-weight:600}
   .sort-toggle a.active{color:var(--teal-500)}
   .geo-note{color:var(--mist);font-size:.82rem;margin:6px 0 0}
+  /* dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+     Steg 1: section labels ("Produsenter" / "Opplevelser") separating /sok's
+     two result kinds — only rendered when a producer match exists. */
+  .sok-section-title{font-size:.9rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--fjord-800);margin:26px 0 4px}
+  .sok-producers{margin-top:6px}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 4px}
   .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.82rem;font-weight:600;border:1px solid var(--line)}
   .chip:hover{text-decoration:none;border-color:var(--teal-400);color:var(--fjord-700)}
@@ -2248,6 +2281,9 @@ const BROWSE_CSS = `
   .empty p{font-size:.95rem;max-width:46ch;margin:0 auto}
   .empty .cta{display:inline-block;margin-top:16px;background:var(--fjord-800);color:#fff;font-weight:700;padding:10px 18px;border-radius:var(--r-pill)}
   .empty .cta:hover{text-decoration:none;background:var(--fjord-700)}
+  .search-group{margin-top:8px}
+  .search-group + .search-group{margin-top:28px;padding-top:20px;border-top:1px solid var(--line)}
+  .search-group-label{font-size:.82rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:var(--fjord-700);margin-bottom:4px}
   .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:24px 0 8px;flex-wrap:wrap}
   .pager a,.pager span{font-size:.9rem;font-weight:700}
   .pager .btn{display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:var(--r-pill);background:var(--surface);border:1px solid var(--line);color:var(--fjord-700)}
@@ -2283,6 +2319,86 @@ const FYLKE_MAP_CSS = `
   .map-popup .map-popup-meta{display:block;color:var(--mist);font-size:.8rem}
   .map-popup .map-popup-approx{display:block;color:#c2570c;font-weight:700;font-size:.78rem;margin-top:4px}
   .map-popup a{display:inline-block;margin-top:6px;font-weight:700}
+  .map-popup-cluster-list{list-style:none;padding:0;margin:6px 0 0;max-height:160px;overflow-y:auto}
+  .map-popup-cluster-list li{margin:0 0 4px}
+  .map-popup-cluster-list a{display:inline;margin-top:0;font-weight:700}
+  .map-cluster-icon{background:transparent;border:none}
+  .cluster-bubble{display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;font-weight:800;font-size:.82rem;color:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35)}
+  .cluster-exact{background:var(--fjord-700);border:2px solid var(--fjord-900)}
+  .cluster-approx{background:#f5a623;border:2px dashed #c2570c;color:#5c3a00}
+  .map-cluster-note{font-size:.78rem;color:var(--mist);margin-top:8px}
+`;
+
+// dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 6
+// ("Klynging ved tette punkter (Oslo/Bergen)"): shared client-side
+// clustering helper, reused VERBATIM by both FYLKE_MAP_INIT_JS and
+// GARDSSALG_MAP_INIT_JS below — same "reused as-is, not copied" discipline
+// already used for FYLKE_MAP_CSS (see renderGardssalgMapSection's header
+// comment). Operates ENTIRELY on the already-injected marker JSON island —
+// no new API round-trip, no new endpoint (dev-request requirement 1).
+// Mirrors src/services/map-clustering.ts's clusterMapPoints() algorithm —
+// that TS module is what tests/test.ts's runMapClusteringTests() actually
+// unit-tests (this repo's test runner has no headless browser/DOM — same
+// constraint slice 1 flagged for the Lighthouse criterion); keep the two
+// copies in sync by hand if the algorithm ever changes.
+//
+// Precision-honesty invariant (dev-request requirement 3): clusterMapPoints
+// NEVER merges an approx (kommune-centroid) point with an exact-address
+// point, even at the identical coordinate — points are partitioned by
+// their `approx` flag BEFORE clustering, so a cluster's own approx flag is
+// unambiguous. An all-approx cluster bubble keeps the SAME dashed/orange
+// styling + "Ca. posisjon" note a single approx marker already gets; an
+// all-exact cluster is styled distinctly (solid) from both single exact
+// markers AND approx clusters, so a cluster of real addresses is never
+// mistaken for one single precise point either — it visibly reads as "N
+// points here," never as fabricated single-point precision.
+const MAP_CLUSTER_JS = `
+  var MAP_CLUSTER_RADIUS_KM = 3;
+  var MAP_CLUSTER_MIN_SIZE = 2;
+  function mapHaversineKm(lat1, lon1, lat2, lon2) {
+    var R = 6371;
+    var toRad = function (d) { return d * Math.PI / 180; };
+    var dLat = toRad(lat2 - lat1);
+    var dLon = toRad(lon2 - lon1);
+    var a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+      + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+  function mapClusterPartition(pts) {
+    var n = pts.length;
+    var parent = [];
+    for (var i = 0; i < n; i++) parent.push(i);
+    function find(i) { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; }
+    function union(a, b) { var ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; }
+    for (var i = 0; i < n; i++) {
+      for (var j = i + 1; j < n; j++) {
+        if (mapHaversineKm(pts[i].lat, pts[i].lon, pts[j].lat, pts[j].lon) <= MAP_CLUSTER_RADIUS_KM) union(i, j);
+      }
+    }
+    var order = [];
+    var groups = {};
+    for (var i = 0; i < n; i++) {
+      var root = find(i);
+      if (!groups[root]) { groups[root] = []; order.push(root); }
+      groups[root].push(pts[i]);
+    }
+    var result = [];
+    for (var k = 0; k < order.length; k++) {
+      var members = groups[order[k]];
+      var sumLat = 0, sumLon = 0;
+      for (var m = 0; m < members.length; m++) { sumLat += members[m].lat; sumLon += members[m].lon; }
+      result.push({ lat: sumLat / members.length, lon: sumLon / members.length, approx: members[0].approx, members: members });
+    }
+    return result;
+  }
+  function clusterMapPoints(points) {
+    var exact = [];
+    var approx = [];
+    for (var i = 0; i < points.length; i++) {
+      if (points[i].approx) approx.push(points[i]); else exact.push(points[i]);
+    }
+    return mapClusterPartition(exact).concat(mapClusterPartition(approx));
+  }
 `;
 
 // One marker's worth of data as sent to the client (the JSON data island) —
@@ -2327,6 +2443,8 @@ const FYLKE_MAP_INIT_JS = `(function () {
     });
   }
 
+  ${MAP_CLUSTER_JS}
+
   var leafletLoading = null;
   function loadLeaflet() {
     if (leafletLoading) return leafletLoading;
@@ -2361,23 +2479,64 @@ const FYLKE_MAP_INIT_JS = `(function () {
         iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
       });
 
+      // Bounds are computed from the RAW, unclustered points — fitBounds
+      // must always cover the true full extent regardless of how markers
+      // end up visually grouped below.
       var bounds = [];
-      points.forEach(function (p) {
-        var isApprox = p.precision === 'kommune';
-        var marker = isApprox
-          ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
-          : L.marker([p.lat, p.lon], { icon: addressIcon });
-        var metaBits = [];
-        if (p.kommune) metaBits.push(esc(p.kommune));
-        if (p.categoryLabel) metaBits.push(esc(p.categoryLabel));
-        var popupHtml = '<div class="map-popup"><strong>' + esc(p.title) + '</strong>'
-          + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
-          + (isApprox ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
-          + '<a href="/opplevelse/' + encodeURIComponent(p.slug) + '">Se opplevelsen →</a></div>';
-        marker.bindPopup(popupHtml);
-        marker.addTo(map);
-        bounds.push([p.lat, p.lon]);
+      points.forEach(function (p) { bounds.push([p.lat, p.lon]); });
+
+      // arbeidspunkt 6: cluster the SAME already-injected points (no new
+      // fetch) before rendering markers. Each point keeps a reference back
+      // to its original object (\`orig\`) so popups/links render exactly the
+      // same per-point content as before this feature existed.
+      var clusterInput = points.map(function (p) {
+        return { lat: p.lat, lon: p.lon, approx: p.precision === 'kommune', orig: p };
       });
+      var clusterGroups = clusterMapPoints(clusterInput);
+      var anyRealCluster = false;
+
+      clusterGroups.forEach(function (g) {
+        if (g.members.length < MAP_CLUSTER_MIN_SIZE) {
+          var p = g.members[0].orig;
+          var isApprox = p.precision === 'kommune';
+          var marker = isApprox
+            ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
+            : L.marker([p.lat, p.lon], { icon: addressIcon });
+          var metaBits = [];
+          if (p.kommune) metaBits.push(esc(p.kommune));
+          if (p.categoryLabel) metaBits.push(esc(p.categoryLabel));
+          var popupHtml = '<div class="map-popup"><strong>' + esc(p.title) + '</strong>'
+            + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
+            + (isApprox ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
+            + '<a href="/opplevelse/' + encodeURIComponent(p.slug) + '">Se opplevelsen →</a></div>';
+          marker.bindPopup(popupHtml);
+          marker.addTo(map);
+        } else {
+          anyRealCluster = true;
+          var clusterClass = g.approx ? 'cluster-approx' : 'cluster-exact';
+          var clusterIcon = L.divIcon({
+            className: 'map-cluster-icon',
+            html: '<div class="cluster-bubble ' + clusterClass + '">' + g.members.length + '</div>',
+            iconSize: [32, 32]
+          });
+          var clusterMarker = L.marker([g.lat, g.lon], { icon: clusterIcon });
+          var itemsHtml = g.members.map(function (m) {
+            return '<li><a href="/opplevelse/' + encodeURIComponent(m.orig.slug) + '">' + esc(m.orig.title) + '</a></li>';
+          }).join('');
+          var clusterPopupHtml = '<div class="map-popup"><strong>' + g.members.length + ' opplevelser her</strong>'
+            + (g.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune) for alle punktene i denne klyngen</span>' : '')
+            + '<ul class="map-popup-cluster-list">' + itemsHtml + '</ul></div>';
+          clusterMarker.bindPopup(clusterPopupHtml);
+          clusterMarker.addTo(map);
+        }
+      });
+
+      if (anyRealCluster) {
+        var clusterNote = document.createElement('p');
+        clusterNote.className = 'map-cluster-note';
+        clusterNote.textContent = 'Tall i sirkel = antall punkter samlet på ett sted (klynget for lesbarhet).';
+        mapEl.parentNode.insertBefore(clusterNote, mapEl.nextSibling);
+      }
 
       if (bounds.length === 1) {
         map.setView(bounds[0], 12);
@@ -2518,6 +2677,26 @@ function renderCard(
     ${distanceHtml}
     ${desc}
     <span class="c-meta">${tags.join("")}</span>
+  </a>`;
+}
+
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 1: renders one gårdssalg producer hit in /sok's "Produsenter" section.
+// Reuses the SAME generic .card/.c-title/.c-place/.c-meta classes renderCard()
+// above uses (BROWSE_CSS's rules aren't experience-specific) and drinkBadge()
+// (module-scope, already shared with the /kategori/gardssalg grid and
+// produsent-profil page) rather than inventing new styling — visually
+// consistent with the rest of this page and the site's own gårdssalg cards.
+// Always links to the real profile page: searchGardssalgProvidersByQuery()
+// only ever returns rows with a real, non-empty slug (see its own doc
+// comment), so there is no "no link" fallback to handle here.
+function renderSokProducerCard(p: GardssalgSearchByQueryRow): string {
+  const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
+  const badge = drinkBadge(p.producer_type);
+  return `<a class="card" href="/kategori/gardssalg/produsent/${encodeURIComponent(p.slug)}">
+    <span class="c-title">${escapeHtml(p.navn)}</span>
+    ${sted ? `<span class="c-place">${PIN_SVG}${escapeHtml(sted)}</span>` : ""}
+    ${badge ? `<span class="c-meta">${badge}</span>` : ""}
   </a>`;
 }
 
@@ -2738,16 +2917,91 @@ function facetChips(): string {
 const SEARCH_SVG =
   '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16.5 16.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
 
-function searchBox(currentQ: string): string {
+// dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+// a category/fylke page's search box still posts to the ONE shared /sok
+// results page (unchanged), but carries the current category/fylke along as
+// a hidden field so /sok knows to GROUP (not filter) its full-catalogue
+// matches — hits inside the current category/fylke first, under a distinct
+// label, the rest of the catalogue's matches below. Additive: every existing
+// caller (searchBox("") — /opplevelser, /kommune/:kommune, the homepage
+// hero, and /sok's own re-render of a plain query) passes no boost, so /sok
+// renders its old byte-identical flat, ungrouped list whenever the param is
+// absent. See splitBoostedRows()/SearchBoostContext below and /sok's own
+// handler for the grouping itself.
+export type SearchBoostContext = { category?: string; fylke?: string };
+
+function searchBox(currentQ: string, boost?: SearchBoostContext): string {
+  const boostHidden = boost?.category
+    ? `<input type="hidden" name="category" value="${escapeHtml(boost.category)}">`
+    : boost?.fylke
+    ? `<input type="hidden" name="fylke" value="${escapeHtml(boost.fylke)}">`
+    : "";
   return `<div class="searchbar">
     <form action="/sok" method="GET" role="search" aria-label="Søk i opplevelser">
       <span class="field">${SEARCH_SVG}
         <label for="sok-q" class="skip-link">Søk i opplevelser</label>
         <input id="sok-q" name="q" type="search" autocomplete="off" placeholder="Søk: hvalsafari, Tromsø, mat …" value="${escapeHtml(currentQ)}">
       </span>
+      ${boostHidden}
       <button type="submit">Søk</button>
     </form>
   </div>`;
+}
+
+// Splits full-catalogue search rows (already returned by
+// searchPublishedExperiences(), unfiltered) into the subset that also
+// matches the current category/fylke boost context and the rest — NEVER
+// drops a row, only reorders which group it's shown under. Absent boost (or
+// a boost with neither field set) returns everything as `rest` unchanged, so
+// callers that don't pass a boost context render exactly as before this
+// feature existed.
+function splitBoostedRows(
+  rows: ExperienceCardRow[],
+  boost: SearchBoostContext | undefined
+): { boosted: ExperienceCardRow[]; rest: ExperienceCardRow[] } {
+  if (!boost || (!boost.category && !boost.fylke)) return { boosted: [], rest: rows };
+  const boosted: ExperienceCardRow[] = [];
+  const rest: ExperienceCardRow[] = [];
+  for (const r of rows) {
+    const inBoost =
+      (!!boost.category && r.category === boost.category) ||
+      (!!boost.fylke && r.fylke === boost.fylke);
+    (inBoost ? boosted : rest).push(r);
+  }
+  return { boosted, rest };
+}
+
+// Renders the two-group boosted layout ("Treff i [kategori/fylke]" then
+// "Andre treff i Opplevagent") — see splitBoostedRows() above. A group with
+// zero rows renders NOTHING (no empty heading), so a zero-hit category is
+// never a dead end: the "Andre treff" group alone still shows the rest of
+// the catalogue's matches.
+function renderBoostedResultsHtml(
+  boosted: ExperienceCardRow[],
+  rest: ExperienceCardRow[],
+  boost: SearchBoostContext,
+  lang: Lang,
+  distanceMap: Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>
+): string {
+  const boostLabel = boost.category
+    ? `Treff i ${catLabel(boost.category)}`
+    : `Treff i ${boost.fylke}`;
+  const boostedSection =
+    boosted.length > 0
+      ? `<section class="search-group" aria-label="${escapeHtml(boostLabel)}">
+          <h2 class="search-group-label">${escapeHtml(boostLabel)}</h2>
+          <div class="grid" role="list">${boosted.map((r) => renderCard(r, lang, distanceMap.get(r.slug))).join("")}</div>
+        </section>`
+      : "";
+  const restLabel = "Andre treff i Opplevagent";
+  const restSection =
+    rest.length > 0
+      ? `<section class="search-group" aria-label="${escapeHtml(restLabel)}">
+          <h2 class="search-group-label">${escapeHtml(restLabel)}</h2>
+          <div class="grid" role="list">${rest.map((r) => renderCard(r, lang, distanceMap.get(r.slug))).join("")}</div>
+        </section>`
+      : "";
+  return boostedSection + restSection;
 }
 
 // ─── GET /opplevelser — paginated index of all published experiences ─────────
@@ -2865,6 +3119,8 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
     });
   }
 
+  ${MAP_CLUSTER_JS}
+
   var leafletLoading = null;
   function loadLeaflet() {
     if (leafletLoading) return leafletLoading;
@@ -2899,22 +3155,63 @@ const GARDSSALG_MAP_INIT_JS = `(function () {
         iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
       });
 
+      // Bounds are computed from the RAW, unclustered points — fitBounds
+      // must always cover the true full extent regardless of how markers
+      // end up visually grouped below.
       var bounds = [];
-      points.forEach(function (p) {
-        var marker = p.approx
-          ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
-          : L.marker([p.lat, p.lon], { icon: addressIcon });
-        var metaBits = [];
-        if (p.producerTypeLabel) metaBits.push(esc(p.producerTypeLabel));
-        if (p.sted) metaBits.push(esc(p.sted));
-        var popupHtml = '<div class="map-popup"><strong>' + esc(p.navn) + '</strong>'
-          + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
-          + (p.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
-          + '<a href="/kategori/gardssalg/produsent/' + encodeURIComponent(p.slug) + '">Se produsentprofil →</a></div>';
-        marker.bindPopup(popupHtml);
-        marker.addTo(map);
-        bounds.push([p.lat, p.lon]);
+      points.forEach(function (p) { bounds.push([p.lat, p.lon]); });
+
+      // arbeidspunkt 6: cluster the SAME already-injected points (no new
+      // fetch) before rendering markers. Each point keeps a reference back
+      // to its original object (\`orig\`) so popups/links render exactly the
+      // same per-point content as before this feature existed.
+      var clusterInput = points.map(function (p) {
+        return { lat: p.lat, lon: p.lon, approx: !!p.approx, orig: p };
       });
+      var clusterGroups = clusterMapPoints(clusterInput);
+      var anyRealCluster = false;
+
+      clusterGroups.forEach(function (g) {
+        if (g.members.length < MAP_CLUSTER_MIN_SIZE) {
+          var p = g.members[0].orig;
+          var marker = p.approx
+            ? L.circleMarker([p.lat, p.lon], { radius: 9, weight: 2, color: '#c2570c', dashArray: '3,3', fillColor: '#f5a623', fillOpacity: 0.55 })
+            : L.marker([p.lat, p.lon], { icon: addressIcon });
+          var metaBits = [];
+          if (p.producerTypeLabel) metaBits.push(esc(p.producerTypeLabel));
+          if (p.sted) metaBits.push(esc(p.sted));
+          var popupHtml = '<div class="map-popup"><strong>' + esc(p.navn) + '</strong>'
+            + (metaBits.length ? '<span class="map-popup-meta">' + metaBits.join(' · ') + '</span>' : '')
+            + (p.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune)</span>' : '')
+            + '<a href="/kategori/gardssalg/produsent/' + encodeURIComponent(p.slug) + '">Se produsentprofil →</a></div>';
+          marker.bindPopup(popupHtml);
+          marker.addTo(map);
+        } else {
+          anyRealCluster = true;
+          var clusterClass = g.approx ? 'cluster-approx' : 'cluster-exact';
+          var clusterIcon = L.divIcon({
+            className: 'map-cluster-icon',
+            html: '<div class="cluster-bubble ' + clusterClass + '">' + g.members.length + '</div>',
+            iconSize: [32, 32]
+          });
+          var clusterMarker = L.marker([g.lat, g.lon], { icon: clusterIcon });
+          var itemsHtml = g.members.map(function (m) {
+            return '<li><a href="/kategori/gardssalg/produsent/' + encodeURIComponent(m.orig.slug) + '">' + esc(m.orig.navn) + '</a></li>';
+          }).join('');
+          var clusterPopupHtml = '<div class="map-popup"><strong>' + g.members.length + ' produsenter her</strong>'
+            + (g.approx ? '<span class="map-popup-approx">Ca. posisjon (kommune) for alle punktene i denne klyngen</span>' : '')
+            + '<ul class="map-popup-cluster-list">' + itemsHtml + '</ul></div>';
+          clusterMarker.bindPopup(clusterPopupHtml);
+          clusterMarker.addTo(map);
+        }
+      });
+
+      if (anyRealCluster) {
+        var clusterNote = document.createElement('p');
+        clusterNote.className = 'map-cluster-note';
+        clusterNote.textContent = 'Tall i sirkel = antall punkter samlet på ett sted (klynget for lesbarhet).';
+        mapEl.parentNode.insertBefore(clusterNote, mapEl.nextSibling);
+      }
 
       if (bounds.length === 1) {
         map.setView(bounds[0], 12);
@@ -4904,6 +5201,25 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
   try {
     total = countPublishedExperiences({ category });
     if (total === 0) return next(); // unknown/empty category → 404 (no orphan page)
+  } catch {
+    return next();
+  }
+
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // a ?q= hit on the category page itself (e.g. a shared/bookmarked search
+  // URL, since this page's own searchBox() actually posts to /sok — see that
+  // handler for the boost-grouping + route-intent detection this redirects
+  // into) is forwarded to /sok with the category carried along as the boost
+  // context, rather than silently ignored. Keeps route-intent detection and
+  // the grouped-results rendering in the ONE place (/sok) instead of
+  // duplicating either here.
+  const boostQ = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (boostQ) {
+    const params = new URLSearchParams({ q: boostQ, category });
+    return res.redirect(302, `/sok?${params.toString()}`);
+  }
+
+  try {
     rows = listPublishedExperiences({ category }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
   } catch {
     return next();
@@ -4963,7 +5279,7 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     total,
     page,
     pageSize: BROWSE_PAGE_SIZE,
-    extraTopHtml: searchBox(""),
+    extraTopHtml: searchBox("", { category }),
     extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -4996,6 +5312,22 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
       }
       return next(); // unknown/empty fylke → 404 (no orphan page)
     }
+  } catch {
+    return next();
+  }
+
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // mirrors /kategori/:category's own redirect above — a ?q= hit on the
+  // fylke page itself forwards to /sok with the fylke carried along as the
+  // boost context, keeping route-intent detection + grouped rendering in the
+  // one place (/sok) rather than duplicated here.
+  const boostQ = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (boostQ) {
+    const params = new URLSearchParams({ q: boostQ, fylke });
+    return res.redirect(302, `/sok?${params.toString()}`);
+  }
+
+  try {
     rows = listPublishedExperiences({ fylke }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
   } catch {
     return next();
@@ -5049,7 +5381,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     total: effectiveTotal,
     page: effectivePage,
     pageSize: effectivePageSize,
-    extraTopHtml: searchBox("") + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
+    extraTopHtml: searchBox("", { fylke }) + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
     map: { fylke, points: mapPoints },
   });
@@ -5614,6 +5946,70 @@ router.get("/sok", async (req: Request, res: Response) => {
   const q = String(req.query.q ?? "").trim();
   const activeTags = EXPERIENCE_TAGS.filter((t) => String(req.query[t] ?? "") === "1");
 
+  // ── dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
+  // Goal 2: route-intent detection in the ONE opplevagent search box. Ported
+  // verbatim from rettfrabonden.com's own /sok (src/routes/seo.ts ~1374-1402)
+  // — same resolveRouteIntent()/reiseUrlFor() (route-intent.ts) and the same
+  // STRICT geocodingService.geocodePlaceForBackfill() whole-string resolver,
+  // reused as-is (never route-intent's own heuristics reimplemented or
+  // loosened here — see that module's header for why).
+  //
+  // «oslo til bergen» typed here used to run an ordinary place/product text
+  // search with no hint that /reise even exists. Recognise the route and
+  // send the visitor straight there instead.
+  //
+  // EVERY failure path below falls through to the ordinary search further
+  // down — resolveRouteIntent() returns a rejection reason rather than
+  // throwing for exactly this reason, and the try/catch guards against a
+  // geocoder outage taking the whole search box down with it. A wrongly
+  // hijacked ordinary search (e.g. a producer/experience name with a dash)
+  // is a worse failure than a missed route, so this must never get more
+  // eager than the shared module already is.
+  //
+  // Skipped when the request already carries browser GPS coordinates (the
+  // "Nær meg" flow re-submits the existing q verbatim alongside lat/lng) —
+  // a coordinate search is already a complete, deliberate search in its own
+  // right and must not be reinterpreted as a route query.
+  //
+  // The `detectRouteIntent(q)` pre-check is a pure, synchronous, no-I/O
+  // shape test (see route-intent.ts's own doc header) — resolveRouteIntent()
+  // runs the SAME check as its own first line, so calling it here changes
+  // no behaviour at all. It exists so the overwhelming majority of ordinary
+  // (non-route-shaped) searches never hit an `await` at all: `await`ing an
+  // async function always defers to a microtask even when nothing inside it
+  // ever does real I/O, and this hot path runs on every non-empty query.
+  if (q && !parseGeoOriginFromQuery(req.query) && detectRouteIntent(q)) {
+    try {
+      const ri = await resolveRouteIntent(q, {
+        // STRICT whole-string resolver, never extractAndGeocode — see the
+        // contract in route-intent.ts.
+        geocode: async (place: string) => {
+          const g = await geocodingService.geocodePlaceForBackfill(place);
+          return g ? { lat: g.lat, lng: g.lng } : null;
+        },
+      });
+      if (ri.ok) {
+        res.redirect(302, reiseUrlFor(ri.route));
+        return;
+      }
+    } catch (err) {
+      // A geocoder outage must not take the search box down with it.
+      console.error("[route-intent] /sok detection failed, falling through:", err);
+    }
+  }
+
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // additive boost-context, passed through from /kategori/:category's and
+  // /fylke/:fylke's own searchBox() as a hidden field. Absent — plain
+  // /opplevelser and the homepage hero search never send these — /sok's
+  // ordering below is byte-identical to before this feature existed.
+  const categoryBoostRaw = typeof req.query.category === "string" ? req.query.category.trim() : "";
+  const fylkeBoostRaw = typeof req.query.fylke === "string" ? req.query.fylke.trim() : "";
+  const boostContext: SearchBoostContext | undefined =
+    categoryBoostRaw || fylkeBoostRaw
+      ? { category: categoryBoostRaw || undefined, fylke: fylkeBoostRaw || undefined }
+      : undefined;
+
   // ── Resolve a geo origin: GPS (lat/lng) takes priority; the typed-place
   //    fallback (`sted`) is only consulted when lat/lng are absent ────────
   // parseGeoOriginFromQuery range-validates against the SAME bounds
@@ -5665,6 +6061,27 @@ router.get("/sok", async (req: Request, res: Response) => {
     }
   } catch {
     rows = [];
+  }
+
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 1: gårdssalg producers (drink producers in experience_providers —
+  // see listGardssalgProviders()'s doc comment) had ZERO presence in /sok's
+  // search; a producer's own name typed here returned "Ingen treff" (12 of
+  // 13 outreach candidates, measured 2026-08-01). Own variable, own
+  // try/catch, entirely separate from `rows`/searchPublishedExperiences()
+  // above — a producer-search failure degrades to "no producer section"
+  // without ever touching the existing experiences search, and the reverse
+  // (a producer hit) never alters `rows`'s own content/order. Only run when
+  // there's an actual text query — tag-filter-only and near-me-only browsing
+  // are experiences-only concepts today (gårdssalg has neither tags nor a
+  // geocoded near-me query on this page), so producerRows stays empty then.
+  let producerRows: GardssalgSearchByQueryRow[] = [];
+  if (q) {
+    try {
+      producerRows = searchGardssalgProvidersByQuery(q, 30);
+    } catch {
+      producerRows = [];
+    }
   }
 
   // Geo/discoverExperiences() branch lives in its OWN try/catch — deliberately
@@ -5769,10 +6186,46 @@ router.get("/sok", async (req: Request, res: Response) => {
   // still link to indexable detail pages.
   const url = baseUrl();
   const canonical = `${url}/sok`;
+  // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 1:
+  // when a category/fylke boost context rode along with a text query, group
+  // (never filter) the full-catalogue matches already in `rows` — hits
+  // inside the current category/fylke first under their own label, the rest
+  // of the catalogue's matches below under a distinct one. No boost context
+  // (the overwhelming majority of hits — plain /opplevelser search, the
+  // homepage hero search) renders the exact same flat grid as before.
+  const hasBoost = Boolean(q) && Boolean(boostContext);
   const cards =
     rows.length > 0
-      ? `<div class="grid" role="list">${rows.map((r) => renderCard(r, req.lang, distanceMap.get(r.slug))).join("")}</div>`
+      ? hasBoost
+        ? (() => {
+            const { boosted, rest } = splitBoostedRows(rows, boostContext);
+            return renderBoostedResultsHtml(boosted, rest, boostContext as SearchBoostContext, req.lang, distanceMap);
+          })()
+        : `<div class="grid" role="list">${rows.map((r) => renderCard(r, req.lang, distanceMap.get(r.slug))).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(emptyTitle)}</h2><p>${escapeHtml(emptyBody)}</p><a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
+
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 1: rendered as its OWN labeled section ("Produsenter"), never merged
+  // into the experiences `cards` grid above — Daniel's own design guidance in
+  // the dev-request (§"Designvalg som må tas"): a merged single list would
+  // hide the producer↔experience duplicate-entity problem the dev-request's
+  // Funn 2 documents (e.g. Atlungstad existing as both a producer row AND a
+  // conflicting experience row with a different, wrong website) behind
+  // interleaving, whereas two clearly labeled sections keep them visibly
+  // distinct. Only rendered when there's ≥1 match — no empty-state clutter
+  // for the overwhelming majority of searches, which never match a producer
+  // (today, every experience-only search). When there are zero producer
+  // matches, this whole block (including the "Opplevelser" label) is the
+  // empty string, so the page's own experiences section is unchanged from
+  // before this feature existed.
+  const producerSection =
+    producerRows.length > 0
+      ? `<section class="sok-producers" aria-label="Produsenter">
+  <h2 class="sok-section-title">Produsenter</h2>
+  <div class="grid" role="list">${producerRows.map(renderSokProducerCard).join("")}</div>
+</section>
+<h2 class="sok-section-title">Opplevelser</h2>`
+      : "";
 
   const breadcrumbLd = {
     "@context": "https://schema.org",
@@ -5812,11 +6265,12 @@ ${BROWSE_NAV}
     <h1>${escapeHtml(h1)}</h1>
     ${hasQuery ? `<p class="count">${rows.length} ${rows.length === 1 ? "treff" : "treff"}</p>` : ""}
   </header>
-  ${searchBox(q)}
+  ${searchBox(q, boostContext)}
   ${renderNearMeBox(q, activeTags, radiusKm)}
   ${geoNote}
   ${renderFilterChips(q, activeTags)}
   ${sortToggle}
+  ${producerSection}
   ${cards}
 </main>
 ${browseFooter()}

@@ -169,8 +169,10 @@ export function coreEligibilityCheck(
   if (row.verification_status !== "verified") {
     return { ok: false, failedCondition: "verification_status_not_verified" };
   }
-  if (row.enrichment_status !== "partial" && row.enrichment_status !== "rich") {
-    return { ok: false, failedCondition: "enrichment_status_not_partial_or_rich" };
+  // dev-request 2026-07-30-outreach-gate-tynne-profiler: mirrors the
+  // outreach_ready_pool VIEW's tightened gate (was partial-or-rich).
+  if (row.enrichment_status !== "rich") {
+    return { ok: false, failedCondition: "enrichment_status_not_rich" };
   }
   if (!row.email || row.email.trim() === "") {
     return { ok: false, failedCondition: "email_missing" };
@@ -335,7 +337,7 @@ router.get("/", (req: Request, res: Response) => {
           k.email IS NOT NULL AND k.email != ''
           AND a.umbrella_type IS NULL
           AND k.verification_status = 'verified'
-          AND k.enrichment_status IN ('partial', 'rich')
+          AND k.enrichment_status = 'rich'
           AND k.url_last_status IS NOT NULL
           AND k.url_last_status >= 200
           AND k.url_last_status < 400
@@ -759,6 +761,108 @@ router.get("/", (req: Request, res: Response) => {
           "Skipped because another platform cold-mailed this address inside the cooldown window. " +
           "The cooldown is cross-platform on purpose: both platforms send from the same address, so " +
           "the recipient sees one sender. These are not lost — they become eligible when the window passes.",
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: String(err?.message || err) });
+  }
+});
+
+// ── GET /admin/outreach-sent-log/audit ────────────────────────────────────────
+//
+// dev-request 2026-07-30-outreach-gate-tynne-profiler, item 2: the missing read
+// path Daniel's observation ("flere outreach-eposter til korte/tynne profiler")
+// couldn't be checked against — outreach_sent_log had no admin-GET at all before
+// this. Read-only measurement tool, same shape as admin-contact-write-guard-
+// audit.ts: full scan, zero writes, no `apply` mode.
+//
+// Joins every outreach_sent_log row to the agent's CURRENT agent_knowledge state
+// (not a point-in-time snapshot — the log doesn't record enrichment_status at
+// send time, so this answers "how thin are the profiles we've sent to, as of
+// now", which is what the acceptance criterion needs: the count of already-sent
+// thin/partial profiles, and confirmation it stops growing after the gate fix).
+// `about_length`/`products_count` are the same raw depth signals
+// computeEnrichmentStatus (lokal-agent-verifier.ts) classifies on — reported
+// alongside the stored enrichment_status rather than recomputed, so a caller can
+// see both "what depth class the row was assigned" and the underlying evidence,
+// instead of this route inventing a second notion of "thin".
+router.get("/audit", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const db = getDb();
+
+    const total_sent_log_rows = (
+      db.prepare(`SELECT COUNT(*) AS c FROM outreach_sent_log`).get() as { c: number }
+    ).c;
+
+    const rows = db
+      .prepare(
+        `SELECT o.id AS sent_log_id,
+                o.agent_id AS agent_id,
+                a.name AS agent_name,
+                o.sent_at AS sent_at,
+                k.enrichment_status AS enrichment_status,
+                k.about AS about,
+                k.products AS products,
+                k.address AS address
+           FROM outreach_sent_log o
+           LEFT JOIN agents a ON a.id = o.agent_id
+           LEFT JOIN agent_knowledge k ON k.agent_id = o.agent_id
+       ORDER BY o.sent_at DESC`,
+      )
+      .all() as Array<{
+        sent_log_id: number;
+        agent_id: string;
+        agent_name: string | null;
+        sent_at: string;
+        enrichment_status: string | null;
+        about: string | null;
+        products: string | null;
+        address: string | null;
+      }>;
+
+    const by_enrichment_status: Record<string, number> = {};
+    const thin_or_partial_sends: Array<{
+      sent_log_id: number;
+      agent_id: string;
+      agent_name: string | null;
+      sent_at: string;
+      enrichment_status: string | null;
+      about_length: number;
+      products_count: number;
+    }> = [];
+
+    for (const row of rows) {
+      const statusKey = row.enrichment_status ?? "null";
+      by_enrichment_status[statusKey] = (by_enrichment_status[statusKey] ?? 0) + 1;
+
+      if (row.enrichment_status !== "rich") {
+        let productsCount = 0;
+        try {
+          const parsed = row.products ? JSON.parse(row.products) : [];
+          productsCount = Array.isArray(parsed) ? parsed.length : 0;
+        } catch {
+          productsCount = 0;
+        }
+        thin_or_partial_sends.push({
+          sent_log_id: row.sent_log_id,
+          agent_id: row.agent_id,
+          agent_name: row.agent_name,
+          sent_at: row.sent_at,
+          enrichment_status: row.enrichment_status,
+          about_length: (row.about || "").length,
+          products_count: productsCount,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      total_sent_log_rows,
+      by_enrichment_status,
+      thin_or_partial_sends: {
+        count: thin_or_partial_sends.length,
+        rows: thin_or_partial_sends,
       },
     });
   } catch (err: any) {

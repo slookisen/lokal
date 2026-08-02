@@ -30,6 +30,13 @@
  * page-content crawl (crFetchGardssalgContent, keyed by hostname) AND the
  * Anthropic API call (keyed by URL containing "api.anthropic.com"), since
  * the sandbox has no live network access to either.
+ *
+ * Section C (dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-
+ * foer-outreach, Steg 3 follow-up, Funn 4): the hjemmeside-verification
+ * fail-closed gate in processOne() — verified=true still enriches (no
+ * regression), verified=false / missing / malformed field_provenance all
+ * skip BEFORE any fetch, reported in the response's own
+ * excluded_unverified_website bucket (reason "unverified_website").
  */
 
 import { generateGardssalgAboutFromSource } from "./opplevelser";
@@ -333,14 +340,30 @@ export function runOpplevelserGardssalgFillblankTests(
       // blank `products` column would make processOne() ALSO call the
       // (shared, mocked) Anthropic endpoint for a products candidate every
       // run, throwing off this file's anthropicCallCount assertions.
-      const insertProvider = expDb.prepare(
+      const insertProviderStmt = expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products,
+           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products, field_provenance,
             producer_type, enrichment_state, verification_status, source, confidence)
          VALUES
-           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, '["Placeholder"]',
+           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, '["Placeholder"]', @field_provenance,
             'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
+      // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+      // Steg 3 follow-up: POST /admin/gardssalg-content-refresh now fail-
+      // closed-gates its fetch on field_provenance.hjemmeside_verification.
+      // verified === true (see isHjemmesideVerified() in routes/opplevelser.ts).
+      // Every fixture in THIS section (blank-fill regression coverage) is
+      // stamped verified by default unless a call site explicitly overrides
+      // field_provenance — section C below (added alongside this gate)
+      // overrides it per-row to exercise the gate itself.
+      const VERIFIED_PROVENANCE_FB = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
+      const insertProvider = {
+        run(params: Record<string, unknown>): void {
+          insertProviderStmt.run({ field_provenance: VERIFIED_PROVENANCE_FB, ...params });
+        },
+      };
 
       const GENERATED_ABOUT =
         "Familiedrevet gård ved fjorden som har drevet gårdssalg i tre generasjoner, med egne epler, bær og syltetøy solgt rett fra gårdsbutikken hver helg om sommeren.";
@@ -557,6 +580,185 @@ export function runOpplevelserGardssalgFillblankTests(
       assertTrue(!sub80Entry, "fb-b5c: prov-fb-sub80 does not appear in changed[] at all — nothing fired for about_text");
       const rowSub80 = getProviderRow("prov-fb-sub80");
       assertEq(rowSub80.about_text, SUB_80_THIN, "fb-b5d: prov-fb-sub80's about_text is completely unchanged");
+
+      // ═══════════════════════════════════════════════════════════════════
+      // Section C — dev-request 2026-08-01-gardssalg-profilkomplett-og-
+      // soekbar-foer-outreach, Steg 3 follow-up (Funn 4): POST /admin/
+      // gardssalg-content-refresh now fail-closed-gates its fetch on
+      // field_provenance.hjemmeside_verification.verified === true (PR #448's
+      // website-verification sweep stamp), inserted in processOne() right
+      // after the existing lock check and BEFORE any fetch — same
+      // pre-fetch-short-circuit discipline as the lock check and the
+      // shared-domain guard. Missing field_provenance, missing/malformed
+      // hjemmeside_verification, malformed field_provenance JSON, or any
+      // classification other than "verified" -> skip, reported in the new
+      // (own, non-lumped) excluded_unverified_website bucket with reason
+      // "unverified_website" — fetch/LLM judge never touched. See
+      // isHjemmesideVerified() in routes/opplevelser.ts for the gate itself.
+      // ═══════════════════════════════════════════════════════════════════
+      const GATE_VERIFIED_STAMP = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
+      const GATE_UNVERIFIED_STAMP = JSON.stringify({
+        hjemmeside_verification: { verified: false, classification: "unverified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
+      // A row PR #448's sweep never reached at all (classification
+      // "missing_source"/"aggregator" reads the same way for this gate —
+      // any non-true `verified` skips — so a bare absent stamp exercises the
+      // "never scanned" case distinctly from an explicit verified:false).
+      const GATE_MISSING_STAMP = null;
+      const GATE_MALFORMED_STAMP = "{not valid json";
+
+      insertProvider.run({
+        id: "prov-gate-verified", navn: "Prov Gate Verified Gard", hjemmeside: "https://prov-gate-verified.example.no",
+        content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
+        field_provenance: GATE_VERIFIED_STAMP,
+      });
+      insertProvider.run({
+        id: "prov-gate-unverified", navn: "Prov Gate Unverified Gard", hjemmeside: "https://prov-gate-unverified.example.no",
+        content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
+        field_provenance: GATE_UNVERIFIED_STAMP,
+      });
+      insertProvider.run({
+        id: "prov-gate-missing", navn: "Prov Gate Missing Gard", hjemmeside: "https://prov-gate-missing.example.no",
+        content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
+        field_provenance: GATE_MISSING_STAMP,
+      });
+      insertProvider.run({
+        id: "prov-gate-malformed", navn: "Prov Gate Malformed Gard", hjemmeside: "https://prov-gate-malformed.example.no",
+        content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
+        field_provenance: GATE_MALFORMED_STAMP,
+      });
+
+      let gateFetchCallCount = 0;
+      const GATE_ABOUT_TEXT_CANDIDATE =
+        "Gardsbutikk ved sjøen som selger egne grønnsaker, bær og syltetøy rett fra garden hver lørdag om sommeren, med lang tradisjon i familien.";
+      assertTrue(GATE_ABOUT_TEXT_CANDIDATE.length >= 80, "sanity: GATE_ABOUT_TEXT_CANDIDATE clears the quality-bar floor");
+      const gateVerifiedHtml = `<html><head><meta property="og:description" content="${GATE_ABOUT_TEXT_CANDIDATE}"></head><body><p>Velkommen innom.</p></body></html>`;
+
+      // Any host reached by this mock OTHER than prov-gate-verified's is a
+      // test bug (the gate should have skipped it before any fetch) — throw
+      // loudly rather than silently returning a fake response, so a
+      // regression in the gate's placement shows up as a hard failure, not a
+      // quietly-passing assertion.
+      globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+        const urlStr = String(url);
+        if (urlStr.includes("api.anthropic.com")) {
+          gateFetchCallCount++;
+          const body = init?.body ? JSON.parse(init.body) : {};
+          const prompt: string = body?.messages?.[0]?.content ?? "";
+          if (prompt.includes("kvalitetsdommer")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nRen, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ content: [{ type: "text", text: GATE_ABOUT_TEXT_CANDIDATE }] }),
+          } as unknown as Response;
+        }
+        const host = new URL(urlStr).hostname;
+        gateFetchCallCount++;
+        if (host === "prov-gate-verified.example.no") {
+          return {
+            ok: true, status: 200, text: async () => gateVerifiedHtml,
+            arrayBuffer: async () => new TextEncoder().encode(gateVerifiedHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
+        }
+        throw new Error(
+          `gate test: fetch must NOT be called for host "${host}" — the hjemmeside-verification gate should have skipped this provider before any fetch`
+        );
+      }) as typeof fetch;
+
+      // ── gate-a: verified=true → unaffected — still reaches the fetch and
+      //    enriches exactly as before this gate existed (no regression). ────
+      {
+        const before = gateFetchCallCount;
+        const r = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-gate-verified"], apply: true },
+        });
+        assertEq(r.status, 200, "gate-a1: verified=true provider call -> 200");
+        assertTrue(gateFetchCallCount > before, "gate-a2: verified=true -> fetch WAS attempted (no regression)");
+        const entry = r.body.changed.find((c: any) => c.provider_id === "prov-gate-verified");
+        assertTrue(!!entry, "gate-a3: verified=true provider appears in changed[] — still enriches as before");
+        assertTrue(
+          !r.body.excluded_unverified_website.some((e: any) => e.provider_id === "prov-gate-verified"),
+          "gate-a4: verified=true provider is NOT reported in excluded_unverified_website"
+        );
+        const row = getProviderRow("prov-gate-verified");
+        assertEq(row.about_text, GATE_ABOUT_TEXT_CANDIDATE, "gate-a5: verified=true provider's about_text was actually written (enrichment completed)");
+      }
+
+      // ── gate-b: verified=false (classification "unverified") → skipped
+      //    BEFORE any fetch, reported in excluded_unverified_website, not
+      //    lumped into errors/skipped_locked. ─────────────────────────────
+      {
+        const before = gateFetchCallCount;
+        const r = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-gate-unverified"], apply: true },
+        });
+        assertEq(r.status, 200, "gate-b1: verified=false provider call -> 200");
+        assertEq(gateFetchCallCount, before, "gate-b2: verified=false -> fetch NEVER attempted (gate short-circuits before any fetch)");
+        assertTrue(
+          r.body.excluded_unverified_website.some((e: any) => e.provider_id === "prov-gate-unverified" && e.reason === "unverified_website"),
+          "gate-b3: verified=false provider reported in excluded_unverified_website with reason 'unverified_website'"
+        );
+        assertTrue(!r.body.changed.some((c: any) => c.provider_id === "prov-gate-unverified"), "gate-b4: verified=false provider does NOT appear in changed[]");
+        assertTrue(!r.body.errors.some((e: any) => e.provider_id === "prov-gate-unverified"), "gate-b5: verified=false provider does NOT appear in errors[] — a distinct skip bucket, not lumped in");
+        const row = getProviderRow("prov-gate-unverified");
+        assertEq(row.about_text, null, "gate-b6: verified=false provider's about_text is completely unchanged (still blank)");
+      }
+
+      // ── gate-c: field_provenance entirely absent (never scanned by the
+      //    verification sweep at all) → fail-closed, skipped exactly like
+      //    an explicit verified=false. ─────────────────────────────────────
+      {
+        const before = gateFetchCallCount;
+        const r = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-gate-missing"], apply: true },
+        });
+        assertEq(r.status, 200, "gate-c1: missing-provenance provider call -> 200");
+        assertEq(gateFetchCallCount, before, "gate-c2: missing field_provenance -> fetch NEVER attempted (fail-closed)");
+        assertTrue(
+          r.body.excluded_unverified_website.some((e: any) => e.provider_id === "prov-gate-missing" && e.reason === "unverified_website"),
+          "gate-c3: missing-provenance provider reported in excluded_unverified_website"
+        );
+        assertTrue(!r.body.changed.some((c: any) => c.provider_id === "prov-gate-missing"), "gate-c4: missing-provenance provider does NOT appear in changed[]");
+        const row = getProviderRow("prov-gate-missing");
+        assertEq(row.about_text, null, "gate-c5: missing-provenance provider's about_text is completely unchanged");
+      }
+
+      // ── gate-d: malformed field_provenance JSON → skipped, not a crash
+      //    (fail-closed on ambiguity, same as the shared field_provenance
+      //    read-modify-write pattern elsewhere treating unparseable JSON as
+      //    empty rather than throwing). ───────────────────────────────────
+      {
+        const before = gateFetchCallCount;
+        const r = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-gate-malformed"], apply: true },
+        });
+        assertEq(r.status, 200, "gate-d1: malformed field_provenance provider call -> 200, not a crash");
+        assertEq(gateFetchCallCount, before, "gate-d2: malformed field_provenance -> fetch NEVER attempted (fail-closed)");
+        assertTrue(
+          r.body.excluded_unverified_website.some((e: any) => e.provider_id === "prov-gate-malformed" && e.reason === "unverified_website"),
+          "gate-d3: malformed-provenance provider reported in excluded_unverified_website"
+        );
+        assertEq(r.body.errors.length, 0, "gate-d4: malformed field_provenance is a clean skip, not an error/crash");
+        const row = getProviderRow("prov-gate-malformed");
+        assertEq(row.about_text, null, "gate-d5: malformed-provenance provider's about_text is completely unchanged");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-fillblank (section B): unexpected error: " + String(err?.stack || err?.message || err));

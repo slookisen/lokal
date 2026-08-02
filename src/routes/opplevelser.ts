@@ -39,6 +39,7 @@ import {
   // dev-request 2026-07-20-experiences-no-yield-backoff
   recordProviderContentYield,
   type ContentRefreshTarget,
+  type ContentRefreshStopReason,
   // dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
   // item 3 — multi-page-crawl content enrichment (about/visit/opening-hours)
   selectGardssalgProvidersForContentRefresh,
@@ -180,6 +181,48 @@ import {
 // common-token rule merged some genuinely different experiences), consumed by
 // the two admin endpoints at the bottom of this file.
 import { auditMergedGroups } from "../services/experience-dedup-audit";
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 2 — gårdssalg producer <-> experience/activity cross-table conflict
+// diagnosis (GET /admin/gardssalg-experience-conflict-audit) + remediation
+// (POST /admin/gardssalg-experience-conflict-remediation) + the rollback
+// substrate wired into the EXISTING POST /admin/gardssalg-content-rollback
+// below via its new `entity_type` param. NOT the same thing as lokal#440's
+// GET /admin/gardssalg-provider-dedup-audit above (that one dedupes
+// experience_providers rows against EACH OTHER — same-table dedup; this is a
+// producer-vs-experience cross-table identity check).
+import {
+  runGardssalgExperienceConflictScan,
+  planGardssalgExperienceConflictRemediation,
+  applyGardssalgExperienceConflictRemediation,
+  verifyGardssalgExperienceConflictWrites,
+  buildAmbiguousExperienceDetail,
+  planExperienceConflictRollback,
+  applyExperienceConflictRollback,
+  type GsExpMatchedPair,
+  type GsExpConflictPlanItem,
+  type GsExpConflictRollbackPlanItem,
+} from "../services/gardssalg-experience-conflict";
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice — a new,
+// independent sweep that checks each gårdssalg producer's stored hjemmeside
+// against gardssalgWebsiteEvidenceMatch (reused unchanged) and stamps the
+// result onto field_provenance.hjemmeside_verification. GET
+// /admin/gardssalg-website-verification-audit (read-only) + POST
+// /admin/gardssalg-website-verification-remediation (dry-run by default),
+// below. Does NOT gate the existing content-refresh pipeline (deliberately
+// out of scope for this slice) and does NOT duplicate POST
+// /admin/gardssalg-website-discovery (that endpoint finds a REPLACEMENT url
+// for a BLANK hjemmeside; this one only judges whether an EXISTING
+// hjemmeside is verifiably the producer's own).
+import {
+  loadGardssalgWebsiteVerificationCohort,
+  scanGardssalgWebsiteVerificationRows,
+  planGardssalgWebsiteVerificationRemediation,
+  applyGardssalgWebsiteVerification,
+  GS_WV_SCOPES,
+  type GsWvFetchFn,
+  type GsWvScope,
+} from "../services/gardssalg-website-verification";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
 // category mapper differs (experiences vocab, not the food vocab).
@@ -264,7 +307,12 @@ import {
 // verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
 // exact-name match to a bankrupt/deregistered org must never claim a row.
 // scoreNameMatch: NACE-discoveryens navne-dedup mot eksisterende gårdssalg-rader.
-import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch } from "../services/brreg-client";
+// normaliseName: dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-
+// av-seeds — bucketing key for GET /admin/gardssalg-provider-dedup-audit below
+// (same normalization scoreNameMatch itself uses internally for its
+// first-token tier, re-exposed here so the audit route can pre-bucket rows
+// instead of comparing every row against every other row).
+import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch, normaliseName } from "../services/brreg-client";
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter — kommune→fylke best-effort
 // ved landing av nye NACE-oppdagede providere.
 import { cityToFylke } from "../services/norway-fylke";
@@ -1289,7 +1337,11 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   );
 
   // ── Target selection ──────────────────────────────────────────────
+  // stopReason is only meaningful for the auto-select path below (an
+  // explicit providerIds request isn't a scan of the candidate window at
+  // all) — null there.
   let targets: ContentRefreshTarget[];
+  let stopReason: ContentRefreshStopReason | null = null;
   if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
     const ids = (body.providerIds as unknown[])
       .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
@@ -1299,7 +1351,18 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       .map((id) => getProviderContentTarget(id))
       .filter((t): t is ContentRefreshTarget => t !== null);
   } else {
-    targets = selectProvidersForContentRefresh(limit);
+    // selectProvidersForContentRefresh() pages through the SQL candidate
+    // window until `limit` enrichable providers are found, the SQL side is
+    // genuinely exhausted, or the hard scan cap is hit (2026-08-01
+    // selector-window fix) — see that function's doc comment
+    // (src/services/experience-store.ts) for the NULL-clump starvation bug
+    // this replaced. stopReason distinguishes an honest "nothing left"
+    // (real-exhaustion) from "stopped early, there may be more"
+    // (scan_cap_reached) so downstream cron reporting no longer conflates
+    // the two into a false "real-exhaustion".
+    const selection = selectProvidersForContentRefresh(limit);
+    targets = selection.targets;
+    stopReason = selection.stopReason;
   }
 
   let scanned = 0;
@@ -1507,6 +1570,13 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
+    // Why selection stopped this call: "real-exhaustion" only when the SQL
+    // candidate window is genuinely tapped out; "scan_cap_reached" when the
+    // hard CONTENT_REFRESH_HARD_SCAN_CAP scan budget stopped the search
+    // first (more candidates may exist further down the queue);
+    // "cap_reached" is the normal case (found `limit` enrichable providers);
+    // null for an explicit providerIds request (no candidate scan ran).
+    stop_reason: stopReason,
   });
 });
 
@@ -1613,6 +1683,47 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
 const GS_CR_DEFAULT_LIMIT = 25;
 const GS_CR_HARD_CAP = 48; // there are only 48 gårdssalg providers total
 
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 follow-up (Funn 4): the content-refresh route below fetches a
+// producer's hjemmeside and trusts it as a content-enrichment SOURCE. That
+// is only safe once PR #448's website-verification sweep
+// (gardssalg-website-verification.ts's applyGardssalgWebsiteVerification)
+// has actually confirmed the hjemmeside belongs to THIS producer — an
+// unrelated business with a similar name, or an aggregator link, must never
+// silently become an "enrichment source". No shared typed FieldProvenance
+// interface exists anywhere in this codebase yet (every other
+// field_provenance read/write inlines its own defensive JSON.parse — see
+// applyGardssalgWebsiteVerification and the field_provenance merge blocks in
+// experience-store.ts), so this is a local, minimal shape scoped to just
+// this one check rather than a new shared abstraction.
+interface HjemmesideVerificationEntry {
+  verified?: unknown;
+  classification?: unknown;
+}
+
+/**
+ * Fail-closed gate: true only when field_provenance.hjemmeside_verification
+ * exists and verified === true. Missing field_provenance, missing/malformed
+ * hjemmeside_verification, malformed JSON, or verified !== true (this
+ * includes classifications "unverified"/"aggregator"/"missing_source", and
+ * rows the verification sweep never scanned at all) -> false. Any ambiguity
+ * resolves to "not verified" — never to "assume verified".
+ */
+function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean {
+  if (!fieldProvenanceRaw) return false;
+  try {
+    const parsed = JSON.parse(fieldProvenanceRaw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const entry = (parsed as Record<string, unknown>).hjemmeside_verification as
+      | HjemmesideVerificationEntry
+      | undefined;
+    if (!entry || typeof entry !== "object") return false;
+    return entry.verified === true;
+  } catch {
+    return false; // malformed existing JSON -> fail closed, never treat as verified
+  }
+}
+
 router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
 
@@ -1679,6 +1790,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // Host counts are computed once per request (cheap, two-digit catalog).
   const excludedSharedDomain: Array<{ provider_id: string; reason: string }> = [];
   const sharedHostCounts = gardssalgSharedHostCounts();
+  // Steg 3 follow-up (Funn 4) — providers whose hjemmeside is not stamped
+  // verified=true by the website-verification sweep. Own named bucket
+  // (never lumped into skipped_locked/excluded_shared_domain) so a run's
+  // report always makes visible how many rows were skipped for this reason.
+  const excludedUnverifiedWebsite: Array<{ provider_id: string; reason: string }> = [];
 
   async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -1708,6 +1824,16 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // locked provider never touches the network at all.
     if (t.content_source === "manual" || t.content_source === "claim") {
       skippedLocked.push(providerId);
+      return;
+    }
+
+    // Website-verification gate — before any fetch, fail-closed: a
+    // hjemmeside the website-verification sweep has not stamped
+    // verified=true (missing, malformed, or classification other than
+    // "verified") must never be trusted as an enrichment source for this
+    // producer. See isHjemmesideVerified()'s doc comment above.
+    if (!isHjemmesideVerified(t.field_provenance)) {
+      excludedUnverifiedWebsite.push({ provider_id: providerId, reason: "unverified_website" });
       return;
     }
 
@@ -2040,6 +2166,10 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // Slice 5d: providers excluded by the shared-/directory-domain guard —
     // additive bucket; every excluded provider is visible, never dropped.
     excluded_shared_domain: excludedSharedDomain,
+    // Steg 3 follow-up (Funn 4): providers excluded because their hjemmeside
+    // is not stamped verified=true by the website-verification sweep —
+    // additive bucket; every excluded provider is visible, never dropped.
+    excluded_unverified_website: excludedUnverifiedWebsite,
   });
 });
 
@@ -4330,7 +4460,27 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
 // knows how far the walk has left.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
-const GS_CX_DEFAULT_LIMIT = 24;
+// Herding (dev-request 2026-07-30-kontakt-utvinning-kjorelaas-og-pacing —
+// leveren hang prod to ganger 30.07):
+//   1. Kjørelås: Express avbryter ikke en handler når klienten kobler fra, så
+//      timede-ut apply-kall STABLET seg og mettet event-loopen. Ett kall om
+//      gangen; nummer to får 409 umiddelbart.
+//   2. Default-limit 24 → 8 + 250ms pause mellom rader (yield til event-loopen
+//      så /health alltid får svare).
+//   3. Klient-frakobling sjekkes mellom rader — en forlatt kjøring avbrytes i
+//      stedet for å fullføre i det stille (det var de forlatte kjøringene som
+//      stablet seg).
+const GS_CX_DEFAULT_LIMIT = 8;
+const GS_CX_ROW_DELAY_MS = 250;
+let gsCxRunning = false;
+// Testene setter radpausen til 0 (fortsatt en ekte setTimeout-yield, bare uten
+// ventetid) — test-harnesset er timing-sensitivt (se tests/test.ts-headeren om
+// runSerial-kjeden), så sekunder med kunstig pause i én suite forskyver
+// urelaterte suiter inn i kjente races. Prod beholder 250ms.
+let gsCxRowDelayMs = GS_CX_ROW_DELAY_MS;
+export function __setGsCxRowDelayForTesting(ms: number | null): void {
+  gsCxRowDelayMs = ms ?? GS_CX_ROW_DELAY_MS;
+}
 
 router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown };
@@ -4341,6 +4491,15 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const limit =
     typeof body.limit === "number" && body.limit > 0 ? Math.min(Math.floor(body.limit), 48) : GS_CX_DEFAULT_LIMIT;
   const offset = typeof body.offset === "number" && body.offset >= 0 ? Math.floor(body.offset) : 0;
+
+  // Kjørelås — sjekket og satt FØR noe arbeid. finally-blokken under er eneste
+  // som slipper den, så en kastet feil aldri etterlater låsen hengende.
+  if (gsCxRunning) {
+    res.status(409).json({ error: "run_in_progress", detail: "en contact-extraction-kjøring pågår allerede — vent til den er ferdig" });
+    return;
+  }
+  gsCxRunning = true;
+  try {
   const batchId = `contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const { targets, cohortTotal } = selectGardssalgProvidersForContactExtraction(limit, offset);
@@ -4350,7 +4509,17 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
+  let clientDisconnected = false;
   for (const t of targets) {
+    // 3: en forlatt kjøring (klient timet ut / koblet fra) skal ikke fullføre
+    // i det stille — det var nøyaktig slik kjøringene stablet seg 30.07.
+    if ((req as any).aborted === true || res.writableEnded || (res as any).destroyed === true) {
+      clientDisconnected = true;
+      break;
+    }
+    // 2: yield til event-loopen mellom rader så helsesjekk/øvrig trafikk
+    // alltid får svare under en kjøring.
+    await new Promise((r) => setTimeout(r, gsCxRowDelayMs));
     try {
       const front = await wdFetchPage(t.hjemmeside);
       if (!front) {
@@ -4426,11 +4595,15 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     offset,
     scanned: targets.length,
     providers_enriched: changed.length,
+    aborted_client_disconnect: clientDisconnected,
     changed,
     no_contact_found: noContactFound,
     fetch_failed: fetchFailed,
     errors,
   });
+  } finally {
+    gsCxRunning = false;
+  }
 });
 
 const GS_CB_DEFAULT_LIMIT = 48;
@@ -4965,22 +5138,83 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, (req: Request
 //
 // Response: { success: true, dry_run, restored: [...], skipped: [...] }.
 // Auth: same X-Admin-Key convention (requireAdmin) as the rest of this file.
+//
+// entity_type (dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-
+// foer-outreach, Steg 2 addition): "provider" (default, UNCHANGED behavior —
+// every existing caller omits this and keeps targeting experience_providers
+// via gardssalg_content_audit exactly as before) or "experience" — targets
+// the `experiences` table via experience_provider_conflict_audit instead
+// (the audit trail POST /admin/gardssalg-experience-conflict-remediation
+// writes). Body shape mirrors provider_id/field_name/batch_id exactly, using
+// experience_id in place of provider_id. ONE HTTP surface for both audit
+// trails rather than a second rollback endpoint — per the dev-request's own
+// rollback section ("reverserbart... via gardssalg-content-rollback").
 router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as {
     provider_id?: unknown;
+    experience_id?: unknown;
     field_name?: unknown;
     batch_id?: unknown;
     apply?: unknown;
+    entity_type?: unknown;
   };
 
+  const entityType = body.entity_type === "experience" ? "experience" : "provider";
   const providerId =
     typeof body.provider_id === "string" && body.provider_id.trim() ? body.provider_id.trim() : undefined;
+  const experienceId =
+    typeof body.experience_id === "string" && body.experience_id.trim() ? body.experience_id.trim() : undefined;
   const fieldName =
     typeof body.field_name === "string" && body.field_name.trim() ? body.field_name.trim() : undefined;
   const batchId =
     typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : undefined;
   const apply =
     body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+
+  if (entityType === "experience") {
+    if (!experienceId && !batchId) {
+      res.status(400).json({ error: "Requires experience_id or batch_id" });
+      return;
+    }
+    try {
+      const expDb = getExpDb("experiences");
+      const { restorable, skipped } = planExperienceConflictRollback(expDb, {
+        experience_id: experienceId,
+        batch_id: batchId,
+      });
+
+      if (!apply) {
+        res.json({
+          success: true,
+          dry_run: true,
+          restored: restorable.map((r) => ({
+            experience_id: r.experience_id,
+            field_name: r.field_name,
+            current_value: r.current_value,
+            would_restore_to: r.restore_to,
+          })),
+          skipped,
+        });
+        return;
+      }
+
+      const applied = applyExperienceConflictRollback(expDb, restorable as GsExpConflictRollbackPlanItem[]);
+      res.json({
+        success: true,
+        dry_run: false,
+        restored: applied.map((r) => ({
+          experience_id: r.experience_id,
+          field_name: r.field_name,
+          restored_to: r.restored_to,
+        })),
+        skipped,
+      });
+    } catch (err: any) {
+      console.error("[opplevelser] gardssalg-content-rollback (experience) failed", err);
+      res.status(500).json({ error: "Internal error" });
+    }
+    return;
+  }
 
   if (!providerId && !batchId) {
     res.status(400).json({ error: "Requires provider_id or batch_id" });
@@ -5899,6 +6133,599 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
   });
 
   res.json({ providers, summary });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-provider-dedup-audit ───────────────
+//
+// dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds, slice
+// 1 of 3 (audit only — no merge lever, no outreach-guard; those are separate
+// future slices). Coverage measurement found that the SAME real-world
+// producer can end up as two distinct experience_providers rows across
+// different seed batches (rfb-seed vs NACE-discovery vs manual), e.g. a
+// sparse row seeded early (often now homepage_unreachable_since-flagged) and
+// a richer row discovered later with full contact info. There is no dedup
+// mechanism for this table today; this is READ-ONLY groundwork for one.
+//
+// NOT the same table/endpoint as GET .../experiences-dedup-audit (the
+// `activities`-table dedup audit) — that endpoint is untouched by this slice.
+//
+// Read-only — a single SELECT, no writes, no UPDATE/DELETE/merge of any row.
+//
+// Grouping signals (a group is any row whose id transitively connects to
+// another row's id via one or more of these — union-find over all three):
+//   1. org_nr        — both sides have a non-blank org_nr and it's equal.
+//   2. domain         — both sides have a hjemmeside and its registrable
+//                       domain (homepageRegistrableDomain — same helper the
+//                       rest of this file's gårdssalg content-refresh/
+//                       provenance code already uses on this exact column)
+//                       is equal.
+//   3. name           — scoreNameMatch (services/brreg-client.ts), the SAME
+//                       name-dedup function this file's own NACE-discovery
+//                       dedup already runs against gårdssalg rows (see
+//                       listGardssalgNameDedupRows() call above), tried both
+//                       on the raw navn and on the "— Sted"-suffix-stripped
+//                       gardssalgSearchName() variant (so "X — By" still
+//                       matches a bare "X"), keeping the higher score:
+//                         score 1.0  -> "name_exact"            (high conf.)
+//                         score 0.95 -> "name_first_token_postal" (high conf.
+//                                       — first word matches AND same postal)
+//                         score 0.80 -> "name_first_token"       (LOW conf.
+//                                       — first word matches alone; e.g.
+//                                       "Himkok" vs "Himkok Rtd" lands here:
+//                                       genuinely ambiguous — could be the
+//                                       same producer re-seeded, or a
+//                                       deliberately distinct product line —
+//                                       surfaced for human judgment, never
+//                                       silently merged or silently dropped)
+//
+// A row-pair comparison is O(n²) in the worst case, so name-matching first
+// buckets rows by the normalised first token of gardssalgSearchName(navn)
+// (exactly the token scoreNameMatch's own first-token tier keys off) and
+// only scores pairs within the same bucket.
+//
+// Privacy: same minimization convention as gardssalg-contact-coverage/
+// gardssalg-provider-lookup above — no raw epost/telefon/hjemmeside value is
+// ever returned, only booleans (has_email/has_phone) and the matching
+// SIGNAL NAMES (not the raw domain string). org_nr is returned raw, matching
+// gardssalg-outreach-readiness's existing precedent (a public Brreg registry
+// number, not a contact channel).
+type GsDedupNameTier = "name_exact" | "name_first_token_postal" | "name_first_token";
+const GS_DEDUP_HIGH_CONF_NAME_TIERS: ReadonlySet<GsDedupNameTier> = new Set([
+  "name_exact",
+  "name_first_token_postal",
+]);
+
+function gsDedupNameTierForScore(score: number): GsDedupNameTier | null {
+  if (score >= 1.0) return "name_exact";
+  if (score >= 0.95) return "name_first_token_postal";
+  if (score >= 0.8) return "name_first_token";
+  return null;
+}
+
+interface GsDedupRow {
+  id: string;
+  navn: string;
+  org_nr: string | null;
+  hjemmeside: string | null;
+  epost: string | null;
+  telefon: string | null;
+  postnummer: string | null;
+  rfb_seed_source: string | null;
+  producer_type: string | null;
+  content_source: string | null;
+  homepage_unreachable_since: string | null;
+}
+
+// Best (highest-tier) name-match between two rows, trying both the raw navn
+// and the dash-suffix-stripped gardssalgSearchName() variant — pure, exported
+// for tests.
+export function gsDedupBestNameTier(a: GsDedupRow, b: GsDedupRow): GsDedupNameTier | null {
+  const raw = scoreNameMatch(a.navn, b.navn, a.postnummer, b.postnummer);
+  const stripped = scoreNameMatch(
+    gardssalgSearchName(a.navn),
+    gardssalgSearchName(b.navn),
+    a.postnummer,
+    b.postnummer,
+  );
+  return gsDedupNameTierForScore(Math.max(raw, stripped));
+}
+
+// Minimal union-find, scoped to this route.
+class GsDedupUnionFind {
+  private parent: number[];
+  constructor(n: number) {
+    this.parent = Array.from({ length: n }, (_, i) => i);
+  }
+  find(x: number): number {
+    while (this.parent[x] !== x) {
+      this.parent[x] = this.parent[this.parent[x]];
+      x = this.parent[x];
+    }
+    return x;
+  }
+  union(a: number, b: number): void {
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra !== rb) this.parent[ra] = rb;
+  }
+}
+
+const gsDedupPresent = (v: string | null): boolean => v !== null && v.trim() !== "";
+
+router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  let rows: GsDedupRow[] = [];
+  try {
+    rows = expDb
+      .prepare(
+        // Same base gårdssalg scoping as the other admin gårdssalg reports
+        // (producer_type set OR seeded via rfb-seed), minus the hidden
+        // booking-flyt-v1 synthetic test provider (excluded the same way
+        // gardssalgSharedHostCounts() excludes it above) — a fixed test row
+        // must never surface as a "duplicate candidate".
+        `SELECT id, navn, org_nr, hjemmeside, epost, telefon, postnummer,
+                rfb_seed_source, producer_type, content_source, homepage_unreachable_since
+           FROM experience_providers
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`
+      )
+      .all() as GsDedupRow[];
+  } catch (err) {
+    console.error("[gardssalg-provider-dedup-audit] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const uf = new GsDedupUnionFind(rows.length);
+
+  // ── Signal 1: org_nr (both sides set, equal) ────────────────────────────
+  const orgNrBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const v = r.org_nr && r.org_nr.trim();
+    if (!v) return;
+    const list = orgNrBuckets.get(v) ?? [];
+    list.push(i);
+    orgNrBuckets.set(v, list);
+  });
+  for (const idxs of orgNrBuckets.values()) {
+    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
+  }
+
+  // ── Signal 2: registrable website domain (both sides set, equal) ───────
+  const domainBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const d = homepageRegistrableDomain(r.hjemmeside);
+    if (!d) return;
+    const list = domainBuckets.get(d) ?? [];
+    list.push(i);
+    domainBuckets.set(d, list);
+  });
+  for (const idxs of domainBuckets.values()) {
+    for (let k = 1; k < idxs.length; k++) uf.union(idxs[0], idxs[k]);
+  }
+
+  // ── Signal 3: name (bucketed by first-token, then scored pairwise) ─────
+  const nameBuckets = new Map<string, number[]>();
+  rows.forEach((r, i) => {
+    const key = normaliseName(gardssalgSearchName(r.navn)).split(" ")[0] ?? "";
+    if (!key) return;
+    const list = nameBuckets.get(key) ?? [];
+    list.push(i);
+    nameBuckets.set(key, list);
+  });
+  for (const idxs of nameBuckets.values()) {
+    for (let x = 0; x < idxs.length; x++) {
+      for (let y = x + 1; y < idxs.length; y++) {
+        if (gsDedupBestNameTier(rows[idxs[x]], rows[idxs[y]])) uf.union(idxs[x], idxs[y]);
+      }
+    }
+  }
+
+  // ── Collect connected components ────────────────────────────────────────
+  const componentsByRoot = new Map<number, number[]>();
+  rows.forEach((_, i) => {
+    const root = uf.find(i);
+    const list = componentsByRoot.get(root) ?? [];
+    list.push(i);
+    componentsByRoot.set(root, list);
+  });
+
+  const toRowOut = (r: GsDedupRow) => ({
+    id: r.id,
+    navn: r.navn,
+    org_nr: r.org_nr,
+    rfb_seed_source: r.rfb_seed_source,
+    producer_type: r.producer_type,
+    content_source: r.content_source,
+    has_email: gsDedupPresent(r.epost),
+    has_phone: gsDedupPresent(r.telefon),
+    unreachable: r.homepage_unreachable_since !== null,
+    homepage_unreachable_since: r.homepage_unreachable_since,
+  });
+
+  const groups: Array<{
+    signals: string[];
+    confidence: "high" | "low";
+    rows: ReturnType<typeof toRowOut>[];
+  }> = [];
+
+  for (const idxs of componentsByRoot.values()) {
+    if (idxs.length < 2) continue;
+    // Re-derive which signal(s) fired for AT LEAST one pair in this group —
+    // groups are small (a handful of rows at most), so re-checking every
+    // pair here (rather than threading evidence through the union-find
+    // above) is cheap and keeps the "why grouped" logic in one place.
+    const signals = new Set<string>();
+    let highConfidence = false;
+    for (let x = 0; x < idxs.length; x++) {
+      for (let y = x + 1; y < idxs.length; y++) {
+        const a = rows[idxs[x]];
+        const b = rows[idxs[y]];
+        const orgA = a.org_nr && a.org_nr.trim();
+        const orgB = b.org_nr && b.org_nr.trim();
+        if (orgA && orgB && orgA === orgB) {
+          signals.add("org_nr");
+          highConfidence = true;
+        }
+        const domA = homepageRegistrableDomain(a.hjemmeside);
+        const domB = homepageRegistrableDomain(b.hjemmeside);
+        if (domA && domB && domA === domB) {
+          signals.add("domain");
+          highConfidence = true;
+        }
+        const tier = gsDedupBestNameTier(a, b);
+        if (tier) {
+          signals.add(tier);
+          if (GS_DEDUP_HIGH_CONF_NAME_TIERS.has(tier)) highConfidence = true;
+        }
+      }
+    }
+    groups.push({
+      signals: Array.from(signals),
+      confidence: highConfidence ? "high" : "low",
+      rows: idxs.map((i) => toRowOut(rows[i])),
+    });
+  }
+
+  res.json({
+    total_providers_scanned: rows.length,
+    groups_found: groups.length,
+    groups,
+  });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-experience-conflict-audit ─────────
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 2 (Part A — dry-run diagnosis, read-only). See the module doc comment
+// in services/gardssalg-experience-conflict.ts for the full matching design
+// and how this differs from lokal#440's GET /admin/gardssalg-provider-dedup-
+// audit just above (same-table producer dedup — untouched by this endpoint).
+//
+// For every gårdssalg producer (catalog_hidden is noted per-row via
+// `producer_hidden`, never used to exclude a producer from the scan — task
+// spec), finds `experiences` catalog rows that plausibly describe the SAME
+// real-world business and reports whether that experience's booking_url
+// conflicts with, agrees with, or leaves unknown the producer's verified
+// hjemmeside. Pure read: runGardssalgExperienceConflictScan() only SELECTs,
+// no UPDATE/INSERT anywhere on this path.
+// `ambiguous_detail` (dev-request 2026-08-01-gardssalg-steg2-apply-tar-ikke-
+// varig-effekt, gjenstående scope §4): purely additive, derived from the SAME
+// `pairs` array below by grouping status==="ambiguous" rows by experience_id
+// (buildAmbiguousExperienceDetail, services/gardssalg-experience-conflict.ts)
+// — no second scan, no new SQL. Surfaces the "N producers collide on one
+// experience, remediation will never auto-fix this" cases (Atlungstad is the
+// concrete one) that were previously just flat rows indistinguishable from
+// any other pair.
+router.get("/admin/gardssalg-experience-conflict-audit", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const { pairs, summary } = runGardssalgExperienceConflictScan(expDb);
+    res.json({
+      summary,
+      pairs: pairs.map((p) => ({
+        producer_id: p.producer_id,
+        producer_name: p.producer_name,
+        producer_hidden: p.producer_hidden,
+        producer_hjemmeside: p.producer_hjemmeside,
+        experience_id: p.experience_id,
+        experience_title: p.experience_title,
+        experience_booking_url: p.experience_booking_url,
+        match_basis: p.match_basis,
+        status: p.status,
+      })),
+      ambiguous_detail: buildAmbiguousExperienceDetail(pairs),
+    });
+  } catch (err) {
+    console.error("[gardssalg-experience-conflict-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-experience-conflict-remediation ──
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 2 (Part B — write, dry-run by default). Re-runs the SAME diagnosis
+// scan as GET .../gardssalg-experience-conflict-audit above (never trusts a
+// client-supplied pair list — same "recompute from live DB state" discipline
+// as POST /admin/gardssalg-content-rollback's own planner), filters to
+// status==="conflict" pairs ONLY (agree/unknown pairs are never written —
+// planGardssalgExperienceConflictRemediation doesn't even see them), and for
+// each: corrects experiences.booking_url to the producer's verified
+// hjemmeside, or nulls it when copying that hjemmeside would itself be
+// unsafe (aggregator/directory host) — see the doc comment on
+// planGardssalgExperienceConflictRemediation (services/gardssalg-experience-
+// conflict.ts) for the exact rule. Never leaves a row in conflict.
+//
+// apply: dry-run by default (same convention as every other admin write
+// route in this file, e.g. POST /admin/gardssalg-content-rollback just
+// below). apply=false/omitted performs zero writes.
+// batch_id: optional caller-supplied tag, stamped on every
+// experience_provider_conflict_audit row this call inserts — the SAME lever
+// POST /admin/gardssalg-content-rollback's batch_id targeting already uses,
+// just against this table (pass entity_type: "experience" there — see that
+// endpoint below).
+//
+// Response shape — dry-run vs apply are DELIBERATELY DIFFERENT (dev-request
+// 2026-08-01-gardssalg-steg2-apply-tar-ikke-varig-effekt: a P0 caused in part
+// by a dry-run response being byte-for-byte the same shape as an apply
+// response, so a caller reading `.applied.length` reported "137 corrected"
+// off a call that wrote nothing):
+//   - dry_run=true  -> { success, dry_run: true,  planned: [...], applied: [],       skipped }
+//   - apply=true    -> { success, dry_run: false, planned: [],    applied: [...],    skipped,
+//                        verified_written, verification_mismatches: [...] }
+// `planned` and `applied` share the SAME item shape (experience_id,
+// producer_id, current_value, would_write/new_value, action) — only the key
+// name differs, on purpose, so `.applied.length` reads 0 on a dry-run instead
+// of silently reporting the plan as if it were a completed write.
+router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+
+  const expDb = getExpDb("experiences");
+  try {
+    const { pairs } = runGardssalgExperienceConflictScan(expDb);
+    const conflicting: GsExpMatchedPair[] = pairs.filter((p) => p.status === "conflict");
+    const { applicable, skipped } = planGardssalgExperienceConflictRemediation(expDb, conflicting);
+
+    if (!apply) {
+      res.json({
+        success: true,
+        dry_run: true,
+        planned: applicable.map((item) => ({
+          experience_id: item.experience_id,
+          producer_id: item.producer_id,
+          current_value: item.old_value,
+          would_write: item.new_value,
+          action: item.action,
+        })),
+        applied: [],
+        skipped,
+      });
+      return;
+    }
+
+    const applied = applyGardssalgExperienceConflictRemediation(
+      expDb,
+      applicable as GsExpConflictPlanItem[],
+      batchId
+    );
+
+    // Post-apply read-back (dev-request 2026-08-01-gardssalg-steg2-apply-tar-
+    // ikke-varig-effekt, gjenstående scope §3): the transaction above already
+    // committed — this re-reads the CURRENT DB state for every row just
+    // written and compares it against what was supposed to land. A write
+    // that did not land, or did not STAY landed, must not be reported as a
+    // plain success.
+    const { verified_written, mismatches } = verifyGardssalgExperienceConflictWrites(expDb, applied);
+    if (mismatches.length > 0) {
+      console.error(
+        "[gardssalg-experience-conflict-remediation] post-apply verification found mismatches:",
+        mismatches
+      );
+      res.status(500).json({
+        success: false,
+        dry_run: false,
+        planned: [],
+        applied,
+        skipped,
+        verified_written,
+        verification_mismatches: mismatches,
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      dry_run: false,
+      planned: [],
+      applied,
+      skipped,
+      verified_written,
+      verification_mismatches: [],
+    });
+  } catch (err) {
+    console.error("[gardssalg-experience-conflict-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-website-verification-audit ────────
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 (scoped-down slice — Part A, read-only). For every producer in the
+// outreach cohort (same base WHERE as GET /admin/gardssalg-outreach-readiness
+// AND catalog_hidden != 1 — see loadGardssalgWebsiteVerificationCohort's own
+// doc comment, services/gardssalg-website-verification.ts), classifies the
+// stored hjemmeside as verified / unverified / aggregator / missing_source.
+// A page IS fetched here (via crFetchGardssalgContent, the SAME SSRF-guarded
+// crawler content-refresh/retro-scan already use) for anything that isn't
+// already missing_source/aggregator — this is the one gårdssalg admin GET in
+// this file that makes outbound network calls, same as
+// POST .../gardssalg-website-discovery already does; it performs ZERO
+// database writes either way.
+router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  // scope=visible (default) | hidden | all — Daniel's 2026-08-01 live
+  // override: verification covers ALL harvested producers, hidden included
+  // (see loadGardssalgWebsiteVerificationCohort's doc comment for why the
+  // default stays "visible" and why verifying hidden rows exposes nothing).
+  // STRICTLY validated: an unknown value is a 400, never a silent fallback —
+  // a caller who typos `scope=al` must not walk away believing they scanned
+  // everything when they scanned the visible cohort.
+  const rawScope = req.query.scope;
+  const scope: GsWvScope = rawScope === undefined ? "visible" : (rawScope as GsWvScope);
+  if (rawScope !== undefined && !GS_WV_SCOPES.includes(scope)) {
+    res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
+    return;
+  }
+  try {
+    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
+      const fetched = await crFetchGardssalgContent(homepageUrl);
+      if (!fetched.ok) return { ok: false, reason: fetched.reason };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+    };
+    const cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
+    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+    res.json({ success: true, scope, summary, rows });
+  } catch (err) {
+    console.error("[gardssalg-website-verification-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-website-verification-remediation ─
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 3 (scoped-down slice — Part B, write, dry-run by default). Re-runs
+// the SAME classification as GET .../gardssalg-website-verification-audit
+// above by default (recomputes live — never trusts a client-supplied result
+// set for the bulk sweep), with an optional `providerIds` override to
+// re-target specific producers only (same precedent as
+// POST /admin/gardssalg-website-discovery's own providerIds override) —
+// the default/no-body case always recomputes the full live cohort.
+//
+// Dry-run (apply omitted/false): zero DB writes, reports would_enqueue (the
+// "unverified" rows that a real apply would add to the review queue).
+// Apply: for every scanned row (ALL classifications, not just unverified),
+// read-modify-writes field_provenance.hjemmeside_verification + inserts one
+// gardssalg_website_verification_audit row; additionally, for "unverified"
+// rows only, upserts gardssalg_website_review_queue with reason
+// "verification_failed" (skipped if an identical pending entry already
+// exists, for idempotent re-runs) — see applyGardssalgWebsiteVerification's
+// own doc comment (services/gardssalg-website-verification.ts) for the full
+// write contract.
+router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown; scope?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+  // Same scope contract and strict validation as the GET audit route above —
+  // and the same reason: a typo silently narrowing an APPLY to the visible
+  // cohort is worse than the read-only case, because the caller then stamps
+  // provenance on a third of the base believing they covered all of it.
+  const rawScope = body.scope;
+  const scope: GsWvScope = rawScope === undefined ? "visible" : (rawScope as GsWvScope);
+  if (rawScope !== undefined && !GS_WV_SCOPES.includes(scope)) {
+    res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
+    return;
+  }
+
+  const expDb = getExpDb("experiences");
+  try {
+    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
+      const fetched = await crFetchGardssalgContent(homepageUrl);
+      if (!fetched.ok) return { ok: false, reason: fetched.reason };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+    };
+
+    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
+    if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+      const idSet = new Set(
+        (body.providerIds as unknown[])
+          .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+          .map((v) => v.trim())
+      );
+      cohort = cohort.filter((p) => idSet.has(p.id));
+    }
+
+    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+
+    if (!apply) {
+      const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation(rows);
+      res.json({ success: true, dry_run: true, scope, would_enqueue: wouldEnqueue, summary });
+      return;
+    }
+
+    const { applied } = applyGardssalgWebsiteVerification(expDb, rows, batchId);
+    res.json({
+      success: true,
+      dry_run: false,
+      scope,
+      enqueued: applied.filter((a) => a.enqueued).length,
+      provenance_written: applied.length,
+      summary,
+    });
+  } catch (err) {
+    console.error("[gardssalg-website-verification-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/website-review-queues ───────────────────────
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach
+// (Daniels oppfølging 2026-08-01: «Jeg ønsker å få innhentet hjemmesider på
+// dem som mangler»). Both website review queues already have discovery
+// WRITERS (gardssalg-website-discovery, brreg-website-discovery,
+// listing-homepage-discovery, homepage-review-queue/submit, and the
+// verification sweep's "unverified" enqueue) and APPROVE levers that demand
+// the exact queued (provider_id, candidate_url) pair — but NO reader.
+// Measured live 2026-08-01: 43 pending gardssalg + 219 pending homepage
+// entries were sitting unreachable from outside; discovery re-runs yielded
+// 0 new proposals because the pool is already parked here. This closes that
+// gap with the smallest possible surface: one admin-gated, read-only GET.
+//
+// Pending rows only (that is what the approve levers accept). The two tables
+// model "pending" DIFFERENTLY, deliberately mirrored here rather than
+// papered over: gardssalg_website_review_queue has NO status column — its
+// approve lever DELETES the row (clearGardssalgWebsiteReviewQueueEntry), so
+// every row that exists is pending by construction. The homepage queue keeps
+// resolved rows and marks them (status='approved'), so it needs the WHERE.
+// Pure read — two SELECTs, zero writes, no network. NB: mounted (like every
+// other /admin/* GET in this block) well before the /:id catch-all.
+router.get("/admin/website-review-queues", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const gardssalg = listGardssalgWebsiteReviewQueue()
+      .map((q) => ({
+        provider_id: q.provider_id,
+        provider_name: q.provider_name,
+        candidate_url: q.candidate_url,
+        reason: q.reason,
+        evidence: q.evidence ?? null,
+        batch_id: q.batch_id ?? null,
+        updated_at: q.updated_at,
+      }));
+    const homepage = expDb
+      .prepare(
+        `SELECT provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, created_at
+           FROM experience_homepage_review_queue
+          WHERE status = 'pending'
+          ORDER BY created_at DESC`
+      )
+      .all();
+    res.json({
+      success: true,
+      counts: { gardssalg_pending: gardssalg.length, homepage_pending: (homepage as unknown[]).length },
+      gardssalg,
+      homepage,
+    });
+  } catch (err) {
+    console.error("[website-review-queues] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-provider-lookup ────────────────────

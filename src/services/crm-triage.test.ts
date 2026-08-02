@@ -246,7 +246,14 @@ export function runCrmTriageTests(opts: { log?: boolean } = {}): Promise<TestSum
         }
         const req: any = {
           method, url, originalUrl: url, path, query, body: body ?? {},
-          headers: { "x-admin-key": "test-admin-key", host: "rettfrabonden.com" },
+          // dev-request 2026-08-02-crm-summary-401-auth: crm.ts's requireAdminAuth
+          // now also checks ADMIN_KEY first (same fleet-wide pattern as
+          // admin-outreach-candidates), so this call must resolve the same
+          // ambient key as the candidates-router calls below (tr55-60) instead
+          // of the literal "test-admin-key" — see the ambientAdminKey() comment
+          // above for why this file deliberately reads rather than writes
+          // ADMIN_KEY.
+          headers: { "x-admin-key": ambientAdminKey(), host: "rettfrabonden.com" },
           get(n: string) { return this.headers[n.toLowerCase()]; },
         };
         let settle: () => void;

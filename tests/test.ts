@@ -767,6 +767,24 @@ console.log("\n── experience-tags (derived filter tags) ──");
   console.log(`  experience-tags: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 6:
+// pure clustering algorithm (services/map-clustering.ts) for the two
+// multi-marker Leaflet maps. Pins: dense point sets actually collapse into
+// clusters, sparse/far-apart point sets never falsely merge, and the
+// approx/exact precision-honesty invariant survives clustering (an
+// approximate point can never be grouped with an exact one, even at the
+// identical coordinate).
+console.log("\n── map-clustering (Leaflet marker clustering algorithm) ──");
+{
+  const { runMapClusteringTests } = require("../src/services/map-clustering.test") as
+    typeof import("../src/services/map-clustering.test");
+  const r = runMapClusteringTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("map-clustering: " + f);
+  console.log(`  map-clustering: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: distance/
 // precision label formatting for /sok's «Nær meg» result cards. Pins the
 // honesty rule: an 'address'-precision row gets an exact "X,X km unna", a
@@ -1095,6 +1113,20 @@ console.log("── admin-outreach-candidates (gate-integrity: dedupe tiebreak p
   failed += r.failed;
   for (const f of r.failures) failures.push("admin-outreach-candidates-gate-integrity: " + f);
   console.log(`  admin-outreach-candidates-gate-integrity: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── 2026-07-30 dev-request: outreach-gate-tynne-profiler — outreach_ready_pool
+// VIEW tightened to enrichment_status='rich' + GET /admin/outreach-sent-log/audit ──
+console.log("── admin-outreach-gate-tynne-profiler (VIEW tightening + sent-log audit) ──");
+{
+  const { runAdminOutreachGateTynneProfilerTests } =
+    require("../src/routes/admin-outreach-gate-tynne-profiler.test") as
+      typeof import("../src/routes/admin-outreach-gate-tynne-profiler.test");
+  const r = runAdminOutreachGateTynneProfilerTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-gate-tynne-profiler: " + f);
+  console.log(`  admin-outreach-gate-tynne-profiler: ${r.passed} passed, ${r.failed} failed`);
 }
 
 // ── 2026-07-18 dev-request: admin-blocklist-manual-entry-api — generic
@@ -5527,7 +5559,37 @@ const _m2Promise = (async function runOwnerPortalTests() {
     const addr = server.address();
     const port = typeof addr === "object" && addr ? addr.port : 0;
 
-    function req(method: string, urlPath: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; headers: any; body: string }> {
+    // kriterium 3 follow-up (dev-request 2026-07-25-testsuite-ikke-
+    // deterministisk-delte-globaler): every req() below goes over a REAL
+    // loopback HTTP round-trip (server.listen + httpMod.request), so the
+    // owner-portal route handlers' lazy getDb() reads happen in a separate
+    // event-loop turn from this block's own pin — any of the ~69 OTHER
+    // __setDbForTesting() call sites in this file can swap the singleton in
+    // that window and turn a valid session into a 302/401 or an existing
+    // agent into a 404. Same self-verifying pattern as PR-74's call() helper
+    // (~line 13950; see also the header comment at the top of this file,
+    // which names it the reusable pattern): re-pin portalDb synchronously
+    // right before every dispatch, and after each response retry (with a
+    // fresh re-pin, up to 4x) on detected contamination. The two signals
+    // are EITHER/OR per call, never OR-ed together (review finding B1 on
+    // the first cut of this slice):
+    //   - expectOk calls (OPT-IN, set only on calls whose fixtures
+    //     legitimately return 200): the STATUS is authoritative. The
+    //     fixture ids these calls hit exist ONLY in portalDb, so a foreign
+    //     DB can never produce the 200 — a non-200 (the 404-on-/eier/:id /
+    //     401-on-valid-session / 302 signatures) means contamination. A
+    //     clean 200 is conversely NEVER retried on a peek-mismatch observed
+    //     after the route already read the right db: the response is
+    //     already proven valid, and re-dispatching valid requests is at
+    //     best wasted work (and for the sibling pr24Req wrapper's
+    //     non-idempotent allow_correct PUTs it flips action "applied" to
+    //     "noop" and breaks the assert — the actual B1 bug).
+    //   - all other calls (the negative paths ASSERTING 401/403/302/404):
+    //     the PEEK is authoritative. They never retry on status — their
+    //     asserts stay exact — only on a directly observed singleton
+    //     mismatch, which a legitimate negative response can never depend
+    //     on (a foreign DB demonstrably turns an expected 403 into a 401).
+    function reqOnce(method: string, urlPath: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; headers: any; body: string }> {
       return new Promise((resolve, reject) => {
         const r = httpMod.request(
           { method, host: "127.0.0.1", port, path: urlPath, headers: opts.headers || {} },
@@ -5546,10 +5608,26 @@ const _m2Promise = (async function runOwnerPortalTests() {
         r.end();
       });
     }
+    async function req(method: string, urlPath: string, opts: { headers?: Record<string, string>; body?: string; expectOk?: boolean } = {}): Promise<{ status: number; headers: any; body: string }> {
+      let resp: { status: number; headers: any; body: string } = { status: 0, headers: {}, body: "" };
+      // 1 initial dispatch + up to 4 contamination retries (PR-74 parity).
+      for (let attempt = 0; attempt <= 4; attempt++) {
+        initMod.__setDbForTesting(portalDb as any);
+        resp = await reqOnce(method, urlPath, opts);
+        // Either/or, see comment above: expectOk → status authoritative
+        // (a foreign DB can never 200 these fixtures); otherwise → peek
+        // authoritative (status must stay exact on negative paths).
+        const contaminated = opts.expectOk === true
+          ? resp.status !== 200
+          : initMod.__peekDbForTesting() !== portalDb;
+        if (!contaminated) break;
+      }
+      return resp;
+    }
 
     // E1.3 — GET /eier/:id form returns 200 with form HTML
     {
-      const resp = await req("GET", `/eier/${TEST_AGENT_ID}`);
+      const resp = await req("GET", `/eier/${TEST_AGENT_ID}`, { expectOk: true });
       assertEq(resp.status, 200, "m2-E1.3: GET /eier/:id returns 200");
       assertTrue(
         resp.body.includes("Send tilgangslenke"),
@@ -5628,6 +5706,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
     {
       const resp = await req("GET", `/eier/${TEST_AGENT_ID}/portal`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(resp.status, 200, "m2-E1.6: portal with valid session returns 200");
       // 7 editable fields per M1 whitelist
@@ -5645,6 +5724,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
       const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/my-audit?limit=10`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(withAuth.status, 200, "m2-C4: my-audit with valid session returns 200");
       const parsed = JSON.parse(withAuth.body);
@@ -5706,6 +5786,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
       const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/owner-stats`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(withAuth.status, 200, "m2-owner-stats: with valid session returns 200");
       const parsed = JSON.parse(withAuth.body);
@@ -5775,6 +5856,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
       ).run("ml_empty", "ingenordre@example.no", emptyToken, "m2-no-orders");
       const empty = await req("GET", `/api/agents/m2-no-orders/orders`, {
         headers: { Cookie: `rfb_owner_session=${emptyToken}` },
+        expectOk: true,
       });
       assertEq(empty.status, 200, "m2-orders: agent with zero orders returns 200 (not an error)");
       const emptyBody = JSON.parse(empty.body);
@@ -5802,6 +5884,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
       const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/orders`, {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+        expectOk: true,
       });
       assertEq(withAuth.status, 200, "m2-orders: with valid session returns 200");
       const ordersBody = JSON.parse(withAuth.body);
@@ -6232,12 +6315,7 @@ const _pr24Promise = (async function runPr24Tests() {
     // near the top of this file).
     const PR24_KEY = SUITE_ADMIN_KEY;
 
-    function pr24Req(method: string, urlPath: string, body?: any, key?: string): Promise<{ status: number; body: any }> {
-      // Re-assert against the residual, out-of-scope external hazard: sibling
-      // src/**/*.test.ts helper suites required elsewhere in this file still
-      // mutate process.env.ADMIN_KEY with their own bespoke values (kriterium
-      // 2 only covers this file's own blocks, which no longer touch it).
-      process.env.ADMIN_KEY = PR24_KEY;
+    function pr24ReqOnce(method: string, urlPath: string, body?: any, key?: string): Promise<{ status: number; body: any }> {
       const payload = body ? JSON.stringify(body) : "";
       const headers: Record<string, string> = {};
       if (key !== undefined) headers["x-admin-key"] = key;
@@ -6263,6 +6341,57 @@ const _pr24Promise = (async function runPr24Tests() {
         if (payload) r.write(payload);
         r.end();
       });
+    }
+
+    // kriterium 3 follow-up (dev-request 2026-07-25-testsuite-ikke-
+    // deterministisk-delte-globaler): the pr24-* AND pr28-* requests below
+    // all dispatch through this helper over a REAL loopback HTTP round-trip,
+    // so the admin-knowledge route's lazy getDb() read can race any of the
+    // ~69 other __setDbForTesting() call sites in this file — a foreign DB
+    // in the await window turns an existing agent into a 404 (or a missing
+    // table into a 500). Same self-verifying pattern as PR-74's call()
+    // helper (~line 13950; the file header names it the reusable pattern):
+    // re-pin pr24db (and the suite-canonical ADMIN_KEY, which sibling
+    // src/**/*.test.ts helper suites still mutate — the residual kriterium-2
+    // hazard) synchronously right before every dispatch, and after each
+    // response retry (fresh re-pin, up to 4x) on detected contamination.
+    // The two signals are EITHER/OR per call, never OR-ed together (review
+    // finding B1 on the first cut of this slice):
+    //   - expectOk calls (OPT-IN, set only on calls whose fixtures
+    //     legitimately return 200): the STATUS is authoritative. These
+    //     fixture agent ids exist ONLY in pr24db, so a foreign DB can never
+    //     produce the 200 — non-200 means contamination. A clean 200 is
+    //     conversely NEVER retried on a peek-mismatch observed after the
+    //     route already read the right db: several of these PUTs are
+    //     non-idempotent (allow_correct corrections report action
+    //     "applied" exactly once — a re-PUT of the identical payload comes
+    //     back "noop"/"unchanged", src/routes/admin-knowledge.ts ~line
+    //     722), so retrying a proven-valid 200 would swap the old race
+    //     window (swap-before-read → 404) for a new one (swap-after-read →
+    //     noop) on the orch-pr-17-B13 / PR-A-E9 asserts. That was B1.
+    //   - all other calls (the negative paths ASSERTING 403/400/404): the
+    //     PEEK is authoritative. They never retry on status — those asserts
+    //     stay exact — only on a directly observed singleton mismatch (a
+    //     foreign DB demonstrably turns expected negatives into different
+    //     negatives, e.g. 403 into 401). These rejected-before-write PUTs
+    //     have no side effects, so a re-dispatch is safe.
+    async function pr24Req(method: string, urlPath: string, body?: any, key?: string, expectOk = false): Promise<{ status: number; body: any }> {
+      let resp: { status: number; body: any } = { status: 0, body: null };
+      // 1 initial dispatch + up to 4 contamination retries (PR-74 parity).
+      for (let attempt = 0; attempt <= 4; attempt++) {
+        process.env.ADMIN_KEY = PR24_KEY;
+        initMod2.__setDbForTesting(pr24db as any);
+        resp = await pr24ReqOnce(method, urlPath, body, key);
+        // Either/or, see comment above (B1): expectOk → status
+        // authoritative (a foreign DB can never 200 these fixtures; and a
+        // valid 200 must not be re-PUT — non-idempotent allow_correct);
+        // otherwise → peek authoritative (negative statuses stay exact).
+        const contaminated = expectOk
+          ? resp.status !== 200
+          : initMod2.__peekDbForTesting() !== pr24db;
+        if (!contaminated) break;
+      }
+      return resp;
     }
 
     function getProv(agentId: string): Record<string, any[]> {
@@ -6315,7 +6444,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-5: PUT returns 200");
         assertEq(resp.body?.success, true, "pr24-5: success=true");
         const prov = getProv("pr24-a");
@@ -6348,7 +6477,7 @@ const _pr24Promise = (async function runPr24Tests() {
             },
           },
         };
-        const resp = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY);
+        const resp = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-6: PUT returns 200");
         const prov = getProv("pr24-a");
         assertEq(prov.address.length, 2, "pr24-6: address has 2 sources after dedup (homepage + google_places)");
@@ -6357,7 +6486,7 @@ const _pr24Promise = (async function runPr24Tests() {
           "pr24-6: address sources are homepage + google_places");
 
         // ── re-PUT identical payload — should be a no-op ─────────────
-        const resp2 = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY);
+        const resp2 = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY, true);
         assertEq(resp2.status, 200, "pr24-6: re-PUT returns 200");
         const prov2 = getProv("pr24-a");
         assertEq(prov2.address.length, 2, "pr24-6: re-PUT identical → still 2 sources (idempotent)");
@@ -6370,7 +6499,7 @@ const _pr24Promise = (async function runPr24Tests() {
           agent_id: "pr24-a",
           about: "Oppdatert beskrivelse.",
           // NO field_provenance key
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-7: PUT returns 200");
         const after = getProv("pr24-a");
         assertEq(JSON.stringify(after), JSON.stringify(before),
@@ -6393,7 +6522,7 @@ const _pr24Promise = (async function runPr24Tests() {
               { value: "OPERATIONAL", source_type: "google_places", fetched_at: "2026-05-11T10:00:00Z" },
             ],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-8: flat-array PUT returns 200");
         const prov = getProv("pr24-b");
         assertEq(prov.address?.length, 2, "pr24-8: address has 2 sources");
@@ -6428,7 +6557,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "pr24-10: PUT returns 200");
         const prov = getProv("pr24-b");
         assertEq(prov.phone?.length, 1, "pr24-10: only the one well-formed source survived");
@@ -6592,7 +6721,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(respAddr.status, 200, "pr28-6: address write succeeds against malformed legacy data (no more 500)");
         assertEq(respAddr.body?.success, true, "pr28-6: success=true");
         const provAfterAddr = getProv("pr28-repro");
@@ -6610,7 +6739,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(respPhone.status, 200, "pr28-6: phone write succeeds against malformed legacy data");
         const provAfterPhone = getProv("pr28-repro");
         assertEq(provAfterPhone.phone?.length, 1, "pr28-6: malformed legacy phone dropped, new homepage kept");
@@ -6627,7 +6756,7 @@ const _pr24Promise = (async function runPr24Tests() {
               ],
             },
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(respBs.status, 200, "pr28-6: business_status write still succeeds (no regression)");
         const provAfterBs = getProv("pr28-repro");
         // Existing was 1 OPERATIONAL/google_places — re-PUT dedupes → still 1.
@@ -6929,7 +7058,7 @@ const _pr24Promise = (async function runPr24Tests() {
         const resp = await pr24Req("PUT", "/admin/knowledge", {
           agent_id: "pr17-def",
           products: [{ name: "new-products" }],
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "orch-pr-17-B8: default-off PUT → 200");
         assertTrue(resp.body.allow_correct === undefined, "orch-pr-17-B9: default-off response has no allow_correct/corrections");
         const row = pr24db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = 'pr17-def'").get() as any;
@@ -6960,7 +7089,7 @@ const _pr24Promise = (async function runPr24Tests() {
               { value: "multer", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
             ],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "orch-pr-17-B11: allow_correct PUT → 200");
         assertTrue(resp.body.allow_correct === true, "orch-pr-17-B12: response flags allow_correct=true");
         const applied = (resp.body.corrections as any[]).find((c) => c.field === "products");
@@ -6992,7 +7121,7 @@ const _pr24Promise = (async function runPr24Tests() {
               { value: "x", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
             ],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "orch-pr-17-B15: refuse-case PUT → 200");
         const ref = (resp.body.corrections as any[]).find((c) => c.field === "products");
         assertTrue(ref && ref.action === "refused" && ref.reason === "existing_already_two_tierA", "orch-pr-17-B16: products correction refused (existing_already_two_tierA)");
@@ -7021,7 +7150,7 @@ const _pr24Promise = (async function runPr24Tests() {
             description: [{ value: "Besøkshage med stauder og roser.", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
             categories: [{ value: "vegetables", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "PR-A-E1: description/categories PUT → 200");
         assertTrue((resp.body.columns_updated as string[]).includes("description"), "PR-A-E2: response columns_updated includes description");
         assertTrue((resp.body.columns_updated as string[]).includes("categories"), "PR-A-E3: response columns_updated includes categories");
@@ -7060,7 +7189,7 @@ const _pr24Promise = (async function runPr24Tests() {
             description: [{ value: "Andelslandbruk med grønnsaker.", source_type: "website_homepage", source_url: "https://pra-ovr.no", fetched_at: "2026-06-16T00:00:00Z" }],
             categories: [{ value: "vegetables", source_type: "website_homepage", source_url: "https://pra-ovr.no", fetched_at: "2026-06-16T00:00:00Z" }],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "PR-A-E8: homepage-correct PUT → 200");
         const descCorr = (resp.body.corrections as any[]).find((c) => c.field === "description");
         assertTrue(descCorr && descCorr.action === "applied" && descCorr.reason === "ok_homepage_preferred_over_google_places", "PR-A-E9: description correction applied (homepage preferred over google_places)");
@@ -7088,7 +7217,7 @@ const _pr24Promise = (async function runPr24Tests() {
           field_provenance: {
             description: [{ value: "Homepage tried to overwrite curated.", source_type: "website_homepage", source_url: "https://pra-lock.no", fetched_at: "2026-06-16T00:00:00Z" }],
           },
-        }, PR24_KEY);
+        }, PR24_KEY, true);
         assertEq(resp.status, 200, "PR-A-E12: curated-lock PUT → 200");
         const lockCorr = (resp.body.corrections as any[]).find((c) => c.field === "description");
         assertTrue(lockCorr && lockCorr.action === "refused" && lockCorr.reason === "curated_locked", "PR-A-E13: curated description REFUSED (curated_locked, absolute)");
@@ -18955,6 +19084,192 @@ console.log("\n── opplevagent kart-fylke: /fylke/:fylke Leaflet map (dev-req
   dbFactoryKart.__resetDbFactoryForTesting();
 })();
 
+// ── opplevagent kart-cluster: /fylke/:fylke marker clustering (dev-request
+// 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 6: "Klynging ved
+// tette punkter (Oslo/Bergen)"). Uses the SAME real render pipeline as
+// kart-01..11 above (not a synthetic browser simulation) — extracts the
+// actual #fylke-map-data JSON island the live page ships (unchanged shape —
+// clustering never alters the underlying data-island contract), then feeds
+// it through the REAL clusterMapPoints() (src/services/map-clustering.ts —
+// the exact algorithm MAP_CLUSTER_JS mirrors client-side) with the SAME
+// approx-mapping the client init script itself uses
+// (`approx: p.precision === 'kommune'`). This proves, end-to-end against
+// real rendered marker payloads (not just synthetic coordinates in
+// isolation — that's map-clustering.test.ts's job), that: (1) a dense set
+// of points actually collapses into one cluster, (2) far-apart points never
+// falsely merge, (3) an approximate point never merges into a nearby exact
+// cluster (precision-honesty invariant), and (4) the shipped page markup
+// itself carries the clustering wiring while the single-point mini-map page
+// carries NONE of it.
+console.log("\n── opplevagent kart-cluster: /fylke/:fylke marker clustering (dev-request 2026-07-19, arbeidspunkt 6) ──");
+(() => {
+  const prevPathKC = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathKC = require.resolve("../src/database/db-factory");
+  const expStorePathKC = require.resolve("../src/services/experience-store");
+  const expSeoPathKC = require.resolve("../src/routes/experiences-seo");
+  const mapClusterPathKC = require.resolve("../src/services/map-clustering");
+  delete require.cache[dbFactoryPathKC];
+  delete require.cache[expStorePathKC];
+  delete require.cache[expSeoPathKC];
+  delete require.cache[mapClusterPathKC];
+
+  const dbFactoryKC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryKC.__resetDbFactoryForTesting();
+  const expStoreKC = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterKC = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const { clusterMapPoints: clusterMapPointsKC } = require("../src/services/map-clustering") as
+    typeof import("../src/services/map-clustering");
+
+  dbFactoryKC.getDb("experiences");
+  const provKC = expStoreKC.createProvider({
+    navn: "Oslo Opplevelser AS", org_nr: "912345680",
+    fylke: "Oslo", kommune: "Oslo", brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+
+  // 6 experiences tightly packed in central Oslo — a realistic "dense area"
+  // spread, the dev-request's own named example — must engage clustering.
+  const denseCoordsKC: Array<[number, number]> = [
+    [59.9139, 10.7522], [59.9141, 10.7530], [59.9135, 10.7518],
+    [59.9144, 10.7509], [59.9130, 10.7540], [59.9137, 10.7526],
+  ];
+  denseCoordsKC.forEach(([lat, lon], i) => {
+    expStoreKC.createExperience({
+      title: `Oslo sentrum opplevelse ${i + 1}`, provider_id: provKC, provider_match_status: "matched",
+      category: "sightseeing_transport", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+      loc_lat: lat, loc_lon: lon, geo_precision: "address",
+      confidence: "high", verification_status: "verified",
+    });
+  });
+  // 2 exact-precision points FAR from the dense cluster (and from each
+  // other) — sparse points must render as individual markers, never
+  // absorbed into (or forming their own false) cluster.
+  expStoreKC.createExperience({
+    title: "Langt unna nord", provider_id: provKC, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+    loc_lat: 69.6492, loc_lon: 18.9553, geo_precision: "address",
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreKC.createExperience({
+    title: "Langt unna sørvest", provider_id: provKC, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+    loc_lat: 58.1467, loc_lon: 7.9956, geo_precision: "address",
+    confidence: "high", verification_status: "verified",
+  });
+  // 1 APPROXIMATE (kommune-precision) point at the EXACT SAME coordinates as
+  // the dense cluster's center — the precision-honesty invariant requires
+  // this to NEVER merge into the nearby exact cluster.
+  const approxIdKC = expStoreKC.createExperience({
+    title: "Ca. posisjon midt i klyngen", provider_id: provKC, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "outdoor",
+    loc_lat: 59.9139, loc_lon: 10.7522, geo_precision: "kommune",
+    confidence: "high", verification_status: "verified",
+  });
+
+  function invokeSeo(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterKC.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `kc-route: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // kc-01: the page renders, and the (unclustered) data island still
+  // carries ALL 9 individual points — requirement 1's contract (SAME
+  // already-injected JSON, byte-shape unchanged) and requirement 4 (no
+  // regression to the existing marker set).
+  const fylkeKC = invokeSeo("/fylke/:fylke", { fylke: "Oslo" }, "/fylke/Oslo");
+  assertEq(fylkeKC.status, 200, "kc-01a: GET /fylke/Oslo -> 200");
+  const dataMatchKC = fylkeKC.body.match(/<script type="application\/json" id="fylke-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchKC, "kc-01b: data island is present and matchable");
+  const markersKC: Array<{ title: string; lat: number; lon: number; precision: string }> =
+    dataMatchKC ? JSON.parse(dataMatchKC[1]) : [];
+  assertEq(markersKC.length, 9, "kc-01c: all 9 points (6 dense + 2 far + 1 approx-at-center) present in the unclustered data island");
+
+  // kc-02: feed the REAL rendered marker payload through the REAL clustering
+  // algorithm, using the exact same approx-mapping MAP_CLUSTER_JS uses
+  // client-side — proves clustering actually ENGAGES end-to-end for a dense
+  // real payload, not just in algorithm-only isolation.
+  const clusterInputKC = markersKC.map((m) => ({ lat: m.lat, lon: m.lon, approx: m.precision === "kommune" }));
+  const groupsKC = clusterMapPointsKC(clusterInputKC);
+  const sizesKC = groupsKC.map((g) => g.members.length).sort((a, b) => a - b);
+  assertEq(groupsKC.length, 4, "kc-02a: 9 real points resolve to exactly 4 groups (1 six-point cluster + 2 far singletons + 1 approx singleton)");
+  assertEq(JSON.stringify(sizesKC), JSON.stringify([1, 1, 1, 6]), "kc-02b: group sizes are exactly [1, 1, 1, 6] — the dense set collapsed, nothing else falsely merged");
+  const denseGroupKC = groupsKC.find((g) => g.members.length === 6)!;
+  assertTrue(!!denseGroupKC && denseGroupKC.approx === false, "kc-02c: the 6-point dense cluster is flagged approx:false (all its members were address-precision)");
+
+  // kc-03: precision-honesty invariant, end-to-end — the approx point sits
+  // at the IDENTICAL coordinate as the dense cluster's center, yet must
+  // remain its own singleton group, never absorbed into the exact cluster.
+  const approxGroupsKC = groupsKC.filter((g) => g.approx === true);
+  assertEq(approxGroupsKC.length, 1, "kc-03a: exactly 1 approx group exists");
+  assertEq(approxGroupsKC[0]?.members.length, 1, "kc-03b: the approx group is a singleton (never merged into the co-located exact cluster)");
+  assertTrue(denseGroupKC.members.length === 6, "kc-03c: the exact cluster's size is unaffected — still exactly its 6 real members, no approx point leaked in");
+
+  // kc-04: sparse points never falsely merge with each other or with the
+  // dense cluster (the two "Langt unna" points are ~1500km+ apart and
+  // nowhere near central Oslo).
+  const farSingletonsKC = groupsKC.filter((g) => g.members.length === 1 && g.approx === false);
+  assertEq(farSingletonsKC.length, 2, "kc-04: both far-apart exact points remain individual singleton groups");
+
+  // kc-05: the shipped page markup itself carries the clustering wiring
+  // (function + constants + CSS classes) — proves the feature is actually
+  // present in the rendered bundle, not just algorithmically correct in
+  // isolation.
+  assertTrue(/function clusterMapPoints\(/.test(fylkeKC.body), "kc-05a: page ships the clusterMapPoints() function");
+  assertTrue(/MAP_CLUSTER_RADIUS_KM/.test(fylkeKC.body), "kc-05b: page ships the clustering radius constant");
+  assertTrue(/MAP_CLUSTER_MIN_SIZE/.test(fylkeKC.body), "kc-05c: page ships the min-cluster-size constant");
+  assertTrue(/cluster-bubble/.test(fylkeKC.body) && /cluster-exact/.test(fylkeKC.body) && /cluster-approx/.test(fylkeKC.body),
+    "kc-05d: page ships the exact/approx cluster bubble CSS classes");
+
+  // kc-06: lazy-load discipline is unaffected by adding clustering — the
+  // clustering code lives inside the SAME lazy IntersectionObserver-gated
+  // init script as before, leaflet.js is still never eagerly tagged.
+  assertTrue(!/<script src="\/leaflet\/leaflet\.js"/.test(fylkeKC.body),
+    "kc-06a: leaflet.js is still NOT eagerly tagged (clustering code loads lazily with the rest of the map bundle)");
+  assertTrue(/IntersectionObserver/.test(fylkeKC.body), "kc-06b: init script (now including clustering) still uses IntersectionObserver for lazy init");
+  assertTrue(!/\son(click|change)\s*=/.test(fylkeKC.body), "kc-06c: no inline onclick=/onchange= handler attributes introduced by clustering");
+  assertTrue(!/unpkg\.com/.test(fylkeKC.body), "kc-06d: no CDN reference introduced by clustering (still self-hosted only)");
+
+  // kc-07: <noscript> OSM fallback is completely unaffected by clustering.
+  const noscriptKC = (fylkeKC.body.match(/<noscript>[\s\S]*?<\/noscript>/) || [""])[0];
+  assertTrue(/openstreetmap\.org\/search\?query=/.test(noscriptKC) && /Oslo/.test(noscriptKC),
+    "kc-07a: <noscript> OSM-search fallback still present and unchanged by clustering");
+
+  // kc-08: the single-point mini-map (arbeidspunkt 5) must carry NONE of
+  // the clustering code — clustering is scoped only to the two multi-marker
+  // maps, per the dev-request's own scoping ("Single-point mini-maps don't
+  // need clustering").
+  const approxSlugKC = (expStoreKC.getExperienceById(approxIdKC) as any).slug as string;
+  const miniKC = invokeSeo("/opplevelse/:slug", { slug: approxSlugKC }, `/opplevelse/${approxSlugKC}`);
+  assertEq(miniKC.status, 200, "kc-08a: GET /opplevelse/:slug (mini-map page) -> 200");
+  assertTrue(miniKC.body.includes('id="mini-map"'), "kc-08b: mini-map still renders normally");
+  assertTrue(!/function clusterMapPoints\(/.test(miniKC.body), "kc-08c: the mini-map page ships NO clustering code (single point never needs it)");
+
+  if (prevPathKC === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathKC;
+  dbFactoryKC.__resetDbFactoryForTesting();
+})();
+
 // ── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet map (dev-request
 // 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4: the SAME kind
 // of self-hosted-Leaflet + server-injected marker JSON island as the
@@ -19149,6 +19464,150 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   if (prevPathKG === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathKG;
   dbFactoryKG.__resetDbFactoryForTesting();
+})();
+
+// ── opplevagent kart-gardssalg-cluster: /kategori/gardssalg marker
+// clustering (dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg,
+// arbeidspunkt 6). Same end-to-end discipline as the kart-cluster block
+// above (real render pipeline + the REAL clusterMapPoints() algorithm, not
+// a synthetic-only check) but for the producer map: a dense set of
+// producers collapses into one cluster, far-apart producers stay
+// individual, and an approximate-confidence producer co-located with the
+// dense exact cluster never merges into it.
+console.log("\n── opplevagent kart-gardssalg-cluster: /kategori/gardssalg marker clustering (dev-request 2026-07-19, arbeidspunkt 6) ──");
+(() => {
+  const prevPathKGC = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathKGC = require.resolve("../src/database/db-factory");
+  const expStorePathKGC = require.resolve("../src/services/experience-store");
+  const expSeoPathKGC = require.resolve("../src/routes/experiences-seo");
+  const mapClusterPathKGC = require.resolve("../src/services/map-clustering");
+  delete require.cache[dbFactoryPathKGC];
+  delete require.cache[expStorePathKGC];
+  delete require.cache[expSeoPathKGC];
+  delete require.cache[mapClusterPathKGC];
+
+  const dbFactoryKGC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryKGC.__resetDbFactoryForTesting();
+  const expStoreKGC = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterKGC = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const { clusterMapPoints: clusterMapPointsKGC } = require("../src/services/map-clustering") as
+    typeof import("../src/services/map-clustering");
+
+  const dbKGC = dbFactoryKGC.getDb("experiences");
+
+  // 5 producers tightly packed in central Bergen (the dev-request's own
+  // second named example) — must engage clustering.
+  const denseCoordsKGC: Array<[number, number]> = [
+    [60.3913, 5.3221], [60.3920, 5.3235], [60.3905, 5.3210], [60.3918, 5.3200], [60.3908, 5.3245],
+  ];
+  denseCoordsKGC.forEach(([lat, lon], i) => {
+    const id = expStoreKGC.createProvider({
+      navn: `Bergen Sentrum Bryggeri ${i + 1}`, org_nr: `9134560${i}0`,
+      fylke: "Vestland", kommune: "Bergen", poststed: "Bergen",
+      lat, lon, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+    });
+    dbKGC.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+      .run("bryggeri", "high", id);
+  });
+  // 1 producer far away (Tromsø-like coordinates) — sparse, must stay an
+  // individual marker, never absorbed into the Bergen cluster.
+  const farIdKGC = expStoreKGC.createProvider({
+    navn: "Nordlys Sideri", org_nr: "912345690",
+    fylke: "Troms", kommune: "Tromsø", poststed: "Tromsø",
+    lat: 69.6492, lon: 18.9553, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKGC.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("sideri", "high", farIdKGC);
+  // 1 APPROXIMATE (geocode_confidence='approximate') producer at the EXACT
+  // SAME coordinates as the dense Bergen cluster's center — must never
+  // merge into the nearby exact cluster (precision-honesty invariant).
+  const approxIdKGC = expStoreKGC.createProvider({
+    navn: "Ca. Posisjon Mjøderi", org_nr: "912345691",
+    fylke: "Vestland", kommune: "Bergen", poststed: "Bergen",
+    lat: 60.3913, lon: 5.3221, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKGC.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("mjøderi", "approximate", approxIdKGC);
+
+  expStoreKGC.backfillProviderSlugs();
+  const approxSlugKGC = (expStoreKGC.listGardssalgProviders(100, 0).find((p) => p.id === approxIdKGC) || {}).slug as string;
+
+  function invokeSeo(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterKGC.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `kgc-route: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // kgc-01: page renders, unclustered data island still carries ALL 7
+  // individual producers (5 dense + 1 far + 1 approx-at-center).
+  const gardKGC = invokeSeo("/kategori/gardssalg", {}, "/kategori/gardssalg");
+  assertEq(gardKGC.status, 200, "kgc-01a: GET /kategori/gardssalg -> 200");
+  const dataMatchKGC = gardKGC.body.match(/<script type="application\/json" id="gardssalg-map-data">([\s\S]*?)<\/script>/);
+  assertTrue(!!dataMatchKGC, "kgc-01b: data island is present and matchable");
+  const markersKGC: Array<{ navn: string; lat: number; lon: number; approx: boolean }> =
+    dataMatchKGC ? JSON.parse(dataMatchKGC[1]) : [];
+  assertEq(markersKGC.length, 7, "kgc-01c: all 7 producers present in the unclustered data island");
+
+  // kgc-02: feed the REAL rendered marker payload through the REAL
+  // clustering algorithm (gardssalg markers already carry `approx` directly
+  // — same field the client init script reads) — proves clustering engages
+  // end-to-end for a dense real payload.
+  const clusterInputKGC = markersKGC.map((m) => ({ lat: m.lat, lon: m.lon, approx: m.approx }));
+  const groupsKGC = clusterMapPointsKGC(clusterInputKGC);
+  const sizesKGC = groupsKGC.map((g) => g.members.length).sort((a, b) => a - b);
+  assertEq(groupsKGC.length, 3, "kgc-02a: 7 real points resolve to exactly 3 groups (1 five-point cluster + 1 far singleton + 1 approx singleton)");
+  assertEq(JSON.stringify(sizesKGC), JSON.stringify([1, 1, 5]), "kgc-02b: group sizes are exactly [1, 1, 5] — the dense set collapsed, nothing else falsely merged");
+  const denseGroupKGC = groupsKGC.find((g) => g.members.length === 5)!;
+  assertTrue(!!denseGroupKGC && denseGroupKGC.approx === false, "kgc-02c: the 5-point dense cluster is flagged approx:false");
+
+  // kgc-03: precision-honesty invariant, end-to-end.
+  const approxGroupsKGC = groupsKGC.filter((g) => g.approx === true);
+  assertEq(approxGroupsKGC.length, 1, "kgc-03a: exactly 1 approx group exists");
+  assertEq(approxGroupsKGC[0]?.members.length, 1, "kgc-03b: the approx group is a singleton (never merged into the co-located exact cluster)");
+  assertTrue(denseGroupKGC.members.length === 5, "kgc-03c: the exact cluster's size is unaffected by the co-located approx point");
+
+  // kgc-04: shipped page markup carries the clustering wiring.
+  assertTrue(/function clusterMapPoints\(/.test(gardKGC.body), "kgc-04a: page ships the clusterMapPoints() function");
+  assertTrue(/cluster-bubble/.test(gardKGC.body) && /cluster-exact/.test(gardKGC.body) && /cluster-approx/.test(gardKGC.body),
+    "kgc-04b: page ships the exact/approx cluster bubble CSS classes");
+  assertTrue(!/unpkg\.com/.test(gardKGC.body), "kgc-04c: no CDN reference introduced by clustering");
+  assertTrue(!/<script src="\/leaflet\/leaflet\.js"/.test(gardKGC.body), "kgc-04d: leaflet.js is still NOT eagerly tagged (lazy-load unaffected)");
+
+  // kgc-05: <noscript> OSM fallback unaffected by clustering.
+  const noscriptKGC = (gardKGC.body.match(/<noscript>[\s\S]*?<\/noscript>/) || [""])[0];
+  assertTrue(/openstreetmap\.org\/search\?query=/.test(noscriptKGC), "kgc-05a: <noscript> fallback still present and unchanged by clustering");
+
+  // kgc-06: the produsent-profil mini-map ships NO clustering code.
+  const miniKGC = invokeSeo("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: approxSlugKGC }, `/kategori/gardssalg/produsent/${approxSlugKGC}`);
+  assertEq(miniKGC.status, 200, "kgc-06a: GET produsent-profil (mini-map page) -> 200");
+  assertTrue(miniKGC.body.includes('id="mini-map"'), "kgc-06b: mini-map still renders normally");
+  assertTrue(!/function clusterMapPoints\(/.test(miniKGC.body), "kgc-06c: the produsent-profil mini-map page ships NO clustering code");
+
+  if (prevPathKGC === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathKGC;
+  dbFactoryKGC.__resetDbFactoryForTesting();
 })();
 
 // ── opplevagent kart-gardssalg (no geocoded providers): honest omission ──────
@@ -24051,6 +24510,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
   try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
+  try { await _contentRefreshScanWindowPromise; } catch { /* errors already pushed to failures */ }
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
@@ -26410,7 +26870,7 @@ console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to
   // cra-01: before any attempt, both providers have last_content_attempt_at
   // NULL — tiebreak falls to created_at ASC, so the first-created (provA)
   // wins a cap=1 selection. This is pre-existing, expected behavior.
-  const firstPick = expStCRA.selectProvidersForContentRefresh(1);
+  const firstPick = expStCRA.selectProvidersForContentRefresh(1).targets;
   assertEq(firstPick.length, 1, "cra-01a: selectProvidersForContentRefresh(1) returns exactly 1");
   assertEq(firstPick[0]?.id, provA, "cra-01b: with no attempts yet, oldest-created (provA) sorts first");
 
@@ -26429,7 +26889,7 @@ console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to
   // NULL sorts first) over provA (attempted, has a real timestamp). Before
   // this fix, provA (permanently unreachable in production) would have kept
   // winning this slot on every single call, forever.
-  const secondPick = expStCRA.selectProvidersForContentRefresh(1);
+  const secondPick = expStCRA.selectProvidersForContentRefresh(1).targets;
   assertEq(secondPick.length, 1, "cra-04a: second selectProvidersForContentRefresh(1) returns exactly 1");
   assertEq(secondPick[0]?.id, provB, "cra-04b: after provA's attempt is stamped, never-attempted provB sorts first");
 
@@ -28034,6 +28494,17 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     });
     dbGCR.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?")
       .run("sideri", unlockedIdGCR);
+    // Steg 3 follow-up (dev-request 2026-08-01-gardssalg-profilkomplett-og-
+    // soekbar-foer-outreach): the content-refresh route now fail-closed-gates
+    // on field_provenance.hjemmeside_verification.verified === true BEFORE
+    // any fetch. This provider's whole point is reaching (and failing) the
+    // fetch stage, so it must be stamped verified — otherwise it would be
+    // caught by the NEW gate instead, never reaching the fetch this suite
+    // tests.
+    dbGCR.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(
+      JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified", checked_at: new Date().toISOString() } }),
+      unlockedIdGCR
+    );
 
     // ── Mount the REAL router on a minimal Express app. ────────────────
     const expressModGCR = (await import("express")).default;
@@ -28438,6 +28909,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gplr.failures) failures.push("opplevelser-gardssalg-provider-lookup: " + f);
     console.log(`  opplevelser-gardssalg-provider-lookup: ${gplr.passed} passed, ${gplr.failed} failed`);
 
+    // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+    // slice 1: GET /admin/gardssalg-provider-dedup-audit — read-only
+    // near-duplicate-candidate audit over experience_providers, grouping by
+    // org_nr / registrable website domain / name (scoreNameMatch). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-provider-dedup-audit: admin dedup-candidate audit ──");
+    const { runOpplevelserGardssalgProviderDedupAuditTests } = require("../src/routes/opplevelser-gardssalg-provider-dedup-audit.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-provider-dedup-audit.test");
+    const gpdar = await runOpplevelserGardssalgProviderDedupAuditTests({ log: false });
+    passed += gpdar.passed;
+    failed += gpdar.failed;
+    for (const f of gpdar.failures) failures.push("opplevelser-gardssalg-provider-dedup-audit: " + f);
+    console.log(`  opplevelser-gardssalg-provider-dedup-audit: ${gpdar.passed} passed, ${gpdar.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1:
     // gardssalg_content_audit table + experience_providers.field_provenance
     // column, applyGardssalgProviderContent()'s additive audit/provenance
@@ -28454,6 +28939,67 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gcar.failed;
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 2: pure matching-logic tests for the gårdssalg producer <->
+    // experience/activity cross-table conflict diagnosis
+    // (findGardssalgProducerExperienceMatches), including the confirmed
+    // Atlungstad case reproduced as a synthetic fixture. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── gardssalg-experience-conflict: producer<->experience matching (pure) ──");
+    const { runGardssalgExperienceConflictTests } = require("../src/services/gardssalg-experience-conflict.test") as
+      typeof import("../src/services/gardssalg-experience-conflict.test");
+    const gecr = await runGardssalgExperienceConflictTests({ log: false });
+    passed += gecr.passed;
+    failed += gecr.failed;
+    for (const f of gecr.failures) failures.push("gardssalg-experience-conflict: " + f);
+    console.log(`  gardssalg-experience-conflict: ${gecr.passed} passed, ${gecr.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 2 (route-level): GET /admin/gardssalg-experience-conflict-audit,
+    // POST /admin/gardssalg-experience-conflict-remediation, and the
+    // entity_type:"experience" extension of POST /admin/gardssalg-content-
+    // rollback — end-to-end through the real HTTP routes + a real DB,
+    // including the Atlungstad case's full dry-run -> apply -> rollback cycle.
+    console.log("\n── opplevelser-gardssalg-experience-conflict: producer<->experience diagnosis + remediation + rollback ──");
+    const { runOpplevelserGardssalgExperienceConflictTests } = require("../src/routes/opplevelser-gardssalg-experience-conflict.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-experience-conflict.test");
+    const ogecr = await runOpplevelserGardssalgExperienceConflictTests({ log: false });
+    passed += ogecr.passed;
+    failed += ogecr.failed;
+    for (const f of ogecr.failures) failures.push("opplevelser-gardssalg-experience-conflict: " + f);
+    console.log(`  opplevelser-gardssalg-experience-conflict: ${ogecr.passed} passed, ${ogecr.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice: pure
+    // classification-logic tests for the gårdssalg website-verification sweep
+    // (classifyGardssalgProducerWebsite et al.), including a negative-control
+    // shared-generic-word fixture. Same in-memory-DB-free pure-function
+    // pattern as gardssalg-experience-conflict's own pure test file above.
+    console.log("\n── gardssalg-website-verification: hjemmeside classification (pure) ──");
+    const { runGardssalgWebsiteVerificationTests } = require("../src/services/gardssalg-website-verification.test") as
+      typeof import("../src/services/gardssalg-website-verification.test");
+    const gwvr = await runGardssalgWebsiteVerificationTests({ log: false });
+    passed += gwvr.passed;
+    failed += gwvr.failed;
+    for (const f of gwvr.failures) failures.push("gardssalg-website-verification: " + f);
+    console.log(`  gardssalg-website-verification: ${gwvr.passed} passed, ${gwvr.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 3 (route-level): GET /admin/gardssalg-website-verification-audit,
+    // POST /admin/gardssalg-website-verification-remediation — end-to-end
+    // through the real HTTP routes + a real DB + a mocked fetch for the
+    // reused crFetchGardssalgContent crawl, including the field_provenance/
+    // audit-table/review-queue write machinery and the idempotent-re-run
+    // guarantee.
+    console.log("\n── opplevelser-gardssalg-website-verification: hjemmeside verification sweep (routes) ──");
+    const { runOpplevelserGardssalgWebsiteVerificationTests } = require("../src/routes/opplevelser-gardssalg-website-verification.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-website-verification.test");
+    const ogwvr = await runOpplevelserGardssalgWebsiteVerificationTests({ log: false });
+    passed += ogwvr.passed;
+    failed += ogwvr.failed;
+    for (const f of ogwvr.failures) failures.push("opplevelser-gardssalg-website-verification: " + f);
+    console.log(`  opplevelser-gardssalg-website-verification: ${ogwvr.passed} passed, ${ogwvr.failed} failed`);
 
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a:
     // source-grounded LLM REWRITE of about_text/visit_text for the
@@ -28888,6 +29434,53 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += pgr.failed;
     for (const f of pgr.failures) failures.push("experiences-seo-place-geo-regression: " + f);
     console.log(`  experiences-seo-place-geo-regression: ${pgr.passed} passed, ${pgr.failed} failed`);
+
+    // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info:
+    // category/fylke-boosted search grouping on /sok + route-intent
+    // detection ported into opplevagent's /sok + homepage hero copy. Same
+    // in-memory-DB pattern (swaps the experiences db-factory singleton), so
+    // it runs sequentially inside this same gated block for the same reason
+    // as the suites above.
+    console.log("\n── experiences-seo-sok-boost: kategori/fylke-boosted search + reiserute route-intent ──");
+    const { runExperiencesSeoSokBoostTests } = require("../src/routes/experiences-seo-sok-boost.test") as
+      typeof import("../src/routes/experiences-seo-sok-boost.test");
+    const sbr = await runExperiencesSeoSokBoostTests({ log: false });
+    passed += sbr.passed;
+    failed += sbr.failed;
+    for (const f of sbr.failures) failures.push("experiences-seo-sok-boost: " + f);
+    console.log(`  experiences-seo-sok-boost: ${sbr.passed} passed, ${sbr.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 1: searchGardssalgProvidersByQuery() (experience-store.ts) — the
+    // free-text producer search backing /sok's new "Produsenter" section.
+    // Store-level unit coverage only (name/kommune/fylke match, catalog_hidden
+    // exclusion, gårdssalg-gate exclusion, æøå, slug-required). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── experience-store-gardssalg-sok: searchGardssalgProvidersByQuery() ──");
+    const { runExperienceStoreGardssalgSokTests } = require("../src/services/experience-store-gardssalg-sok.test") as
+      typeof import("../src/services/experience-store-gardssalg-sok.test");
+    const esgs = await runExperienceStoreGardssalgSokTests({ log: false });
+    passed += esgs.passed;
+    failed += esgs.failed;
+    for (const f of esgs.failures) failures.push("experience-store-gardssalg-sok: " + f);
+    console.log(`  experience-store-gardssalg-sok: ${esgs.passed} passed, ${esgs.failed} failed`);
+
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+    // Steg 1 (route level): GET /sok now renders a separate, clearly labeled
+    // "Produsenter" section (never merged with "Opplevelser") when a gårdssalg
+    // producer matches the query — Daniel's own binding acceptance test is
+    // that a producer's own name typed into /sok must hit its profile. Also
+    // covers the zero-producer-match regression (existing experiences section
+    // unaffected). Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block.
+    console.log("\n── experiences-seo-sok-gardssalg: /sok \"Produsenter\" section ──");
+    const { runExperiencesSeoSokGardssalgTests } = require("../src/routes/experiences-seo-sok-gardssalg.test") as
+      typeof import("../src/routes/experiences-seo-sok-gardssalg.test");
+    const essg = await runExperiencesSeoSokGardssalgTests({ log: false });
+    passed += essg.passed;
+    failed += essg.failed;
+    for (const f of essg.failures) failures.push("experiences-seo-sok-gardssalg: " + f);
+    console.log(`  experiences-seo-sok-gardssalg: ${essg.passed} passed, ${essg.failed} failed`);
 
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
@@ -31324,6 +31917,43 @@ const _contentRefreshCharsetPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// 2026-08-01 selector-window fix: selectProvidersForContentRefresh()
+// (src/services/experience-store.ts) now pages through its SQL candidate
+// window with an advancing OFFSET instead of a single fetch-then-filter
+// pass, so a NULL-attempt clump of non-enrichable rows larger than one
+// window can no longer permanently bury genuinely-enrichable providers
+// behind it (see that function's own doc comment for the full bug). Swaps
+// the shared experiences db-factory getDb() singleton (own dedicated test
+// file, in-memory prod-schema DB) — mirrors the crFetchHtml-charset-fix
+// block immediately above, so it must run strictly after it;
+// _contentRefreshCharsetPromise is the current tail of that serial chain.
+let _contentRefreshScanWindowResolve: () => void = () => {};
+const _contentRefreshScanWindowPromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshScanWindowResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshCharsetPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── 2026-08-01 selector-window fix: selectProvidersForContentRefresh() paginated scan ──");
+  try {
+    const { runOpplevelserContentRefreshScanWindowTests } = require("../src/routes/opplevelser-content-refresh-scan-window.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-scan-window.test");
+    const crsw = await runOpplevelserContentRefreshScanWindowTests({ log: false });
+    passed += crsw.passed;
+    failed += crsw.failed;
+    for (const f of crsw.failures) failures.push("opplevelser-content-refresh-scan-window: " + f);
+    console.log(`  opplevelser-content-refresh-scan-window: ${crsw.passed} passed, ${crsw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-scan-window: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshScanWindowResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (items 1 + 3):
 // `select: "low_quality"` opt-in cohort on POST /admin/homepage-provenance-batch
 // (src/routes/marketplace.ts) — ranks agents worst-first by agents.trust_score
@@ -32555,9 +33185,13 @@ console.log("\n── outreach-suppression-P0: compose-leak + email-keyed gate �
 
     const makeEligible = (id: string, email: string) => {
       insertTestAgent(odb, id, "Prod " + id, { email, website: "https://" + id + ".example.no" });
+      // dev-request 2026-07-30-outreach-gate-tynne-profiler: outreach_ready_pool
+      // no longer admits enrichment_status='partial' — 'rich' here so this block
+      // keeps testing what it's actually about (compose-leak / suppression-gate
+      // behavior), independent of the enrichment-depth gate.
       odb.prepare(
         `UPDATE agent_knowledge
-           SET verification_status='verified', enrichment_status='partial',
+           SET verification_status='verified', enrichment_status='rich',
                url_last_status=200, url_last_probed=datetime('now'), email=?
          WHERE agent_id=?`
       ).run(email, id);
@@ -34783,6 +35417,29 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-08-01-rfb-contact-email-skrivespak (P0): the write lever
+// for `agents.contact_email`, the column outreach actually sends to. Until
+// this route there was NO update path for it anywhere in src/ (only the
+// registration INSERT), leaving 77 agents with the platform's own address as
+// the producer contact — 36 already contacted — and 202 with a DNS-dead
+// domain, all unfixable. Same lock/audit/dry-run discipline as the retro-sweep
+// above; own in-memory DB (swaps the shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-01-rfb-contact-email-skrivespak (P0): agents.contact_email write lever ──");
+  try {
+    const { runAdminAgentsContactEmailWriteTests } = require("../src/routes/admin-agents-contact-email-write.test") as
+      typeof import("../src/routes/admin-agents-contact-email-write.test");
+    const cew = await runAdminAgentsContactEmailWriteTests({ log: false });
+    passed += cew.passed;
+    failed += cew.failed;
+    for (const f of cew.failures) failures.push("contact-email-write: " + f);
+    console.log(`  contact-email-write: ${cew.passed} passed, ${cew.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-email-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-13-supply-graph-v1, Slice 1: additive
 // availability_updated_at/availability_source columns on `products` +
 // computeEffectiveAvailability()/setProducerAvailability()
@@ -35308,6 +35965,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-08-02-crm-summary-401-auth: crm admin auth (ADMIN_KEY primary / ANALYTICS_ADMIN_KEY fallback) ──");
+  try {
+    const { runCrmAuthTests } = require("../src/routes/crm.test") as
+      typeof import("../src/routes/crm.test");
+    const cat = await runCrmAuthTests({ log: false });
+    passed += cat.passed;
+    failed += cat.failed;
+    for (const f of cat.failures) failures.push("crm-auth: " + f);
+    console.log(`  crm-auth: ${cat.passed} passed, ${cat.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-auth: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-auth: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 5 (retro-tagging, dry-run + godkjenningsgate) ──");
   try {
     const { runCrmRetroTaggingTests } = require("../src/services/crm-retro-tagging.test") as
@@ -35771,5 +36445,114 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("homepage-content-refresh-parking: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-31-rfb-homepage-kategori-konsolidering: merges the 4
+// ad-hoc hero-chips + the standalone big-card "Kategorier" grid into ONE
+// compact pill row (all 10 CATEGORY_MAP categories, live counts), and drops
+// the "Populære byer"/"Popular cities" homepage section entirely (src/routes/seo.ts).
+// Own harness (__setDbForTesting/__initSchemaForTesting, real router handlers
+// pulled off the route stack — mirrors produsent-role-gate.test.ts's harness).
+// Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-31-rfb-homepage-kategori-konsolidering: homepage category-chip consolidation ──");
+  try {
+    const { runHomepageCategoryChipsTests } = require("../src/routes/rfb-homepage-category-chips.test") as
+      typeof import("../src/routes/rfb-homepage-category-chips.test");
+    const hcc = await runHomepageCategoryChipsTests({ log: false });
+    passed += hcc.passed;
+    failed += hcc.failed;
+    for (const f of hcc.failures) failures.push("rfb-homepage-category-chips: " + f);
+    console.log(`  rfb-homepage-category-chips: ${hcc.passed} passed, ${hcc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-homepage-category-chips: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter:
+// renames the owner-claim "Verifisert" badge to "Verifisert av eier" (no) /
+// "Verified by owner" (en) everywhere it renders (producer cards — all
+// renderer variants — producer profile hero, MCP lokal_info text output),
+// distinct from the untouched agent.brregVerified badge, plus a new
+// GET /verifisert-av-eier browse-all page + homepage button. Own harness
+// (__setDbForTesting/__initSchemaForTesting, real router handlers pulled off
+// the route stack — mirrors produsent-role-gate.test.ts's harness). Runs via
+// runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter: \"Verifisert av eier\" badge rename + browse-all page ──");
+  try {
+    const { runVerifisertAvEierBadgeRenameTests } = require("../src/routes/rfb-verifisert-av-eier-badge-rename.test") as
+      typeof import("../src/routes/rfb-verifisert-av-eier-badge-rename.test");
+    const vae = await runVerifisertAvEierBadgeRenameTests({ log: false });
+    passed += vae.passed;
+    failed += vae.failed;
+    for (const f of vae.failures) failures.push("rfb-verifisert-av-eier-badge-rename: " + f);
+    console.log(`  rfb-verifisert-av-eier-badge-rename: ${vae.passed} passed, ${vae.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-verifisert-av-eier-badge-rename: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-08-01-rfb-agents-url-skrivespak: `agents.url` write lever.
+// Sister to the contact-email block and the same defect class — the homepage
+// column the catalog serves (and enrichment reads a producer's email off) had
+// no UPDATE path in src/, leaving 340 agents showing a shared directory host,
+// 87 a dead own host and 4 pointing at rettfrabonden.com. Additionally closes
+// the owner-lock gap the A0 batch hit: this route locks on a VERIFIED
+// agent_claims row as well as claimed_at. Own in-memory DB reached through the
+// route's own seam — mutates NO shared global (not getDb(), not ADMIN_KEY).
+//
+// ── READ THIS BEFORE BLAMING THIS BLOCK FOR A FLAKY RUN ─────────────────────
+// Adding this block makes the suite intermittently red. It is NOT this block's
+// code. This file cannot currently absorb ANY new runSerial registration —
+// measured, on this machine, 6 runs per configuration unless noted:
+//
+//   clean main, unmodified .................... 7/7 green (13290/0)
+//   clean main + THIS block, mid-chain ........ 13354/0, 13327/1, 13295/14
+//   clean main + THIS block, at the tail ...... 8/11 green (13354/0 when green)
+//   clean main + `setTimeout(400)` mid-chain .. 1/3 green   <-- touches NOTHING
+//   clean main + `setTimeout(2000)` at tail ... 4/6 green   <-- touches NOTHING
+//
+// The last two rows are the control: a runSerial block whose entire body is a
+// sleep — no DB, no env, no require, no fetch — reproduces the same failures at
+// the same rate as this block does. Only the added wall-clock matters. The
+// dominant signature is the ad-hoc gardssalg-content-refresh block (~line
+// 28425) losing its experiences handle ("The database connection is not open",
+// -27 tests); the secondary one is a burst of `pilot-ordre-loop` suppression-
+// gate failures — i.e. BOTH hazards this file's header already documents
+// (kriterium 2's ad-hoc-vs-runSerial split, and the ADMIN_KEY-in-external-files
+// population), firing exactly as the header predicts: "a fix ... can still
+// surface a different, out-of-scope race just by changing when things run."
+//
+// Root cause of the dominant signature, for whoever picks this up:
+// `__resetDbFactoryForTesting()` (src/database/db-factory.ts:113) CLOSES every
+// handle in its map, and the ad-hoc family and the runSerial chain are two
+// serialization primitives that only join at the REPORT tail — so any change
+// in chain length can slide a singleton-toucher into an ad-hoc block's open
+// window. The header describes the barrier that fixes it and judges it too
+// risky to land before the ADMIN_KEY-in-external-files fix. This block does
+// NOT attempt that fix, and a targeted `await _gardssalgContentRefreshPromise`
+// barrier here was tried and measured ineffective (4/6) — it is not the racer.
+// Tail registration was kept because it is the least-perturbing position.
+// If the determinism gate blocks on this, deleting this one registration
+// restores the old timing exactly; the route's 64 tests still run standalone
+// via runAdminAgentsUrlWriteTests(). That is a workaround, not a fix — the
+// suite is one new test block away from red no matter who adds it.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-01-rfb-agents-url-skrivespak: agents.url write lever ──");
+  try {
+    const { runAdminAgentsUrlWriteTests } = require("../src/routes/admin-agents-url-write.test") as
+      typeof import("../src/routes/admin-agents-url-write.test");
+    const uw = await runAdminAgentsUrlWriteTests({ log: false });
+    passed += uw.passed;
+    failed += uw.failed;
+    for (const f of uw.failures) failures.push("url-write: " + f);
+    console.log(`  url-write: ${uw.passed} passed, ${uw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("url-write: unexpected error: " + String(err?.message || err));
   }
 });

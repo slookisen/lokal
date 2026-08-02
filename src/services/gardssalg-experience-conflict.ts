@@ -1,0 +1,1178 @@
+// ─── Gårdssalg producer <-> experience/activity conflict diagnosis + remediation ─
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 2 of 5.
+//
+// Gårdssalg (farm-shop) producers live in `experience_providers` as their own
+// profile pages. Separately, the `experiences` catalog ("opplevelser") can
+// independently contain a row describing the SAME real-world business,
+// harvested from a different source, with its own (sometimes wrong)
+// `booking_url`. These are two different entity TYPES in two different
+// TABLES that nobody has cross-checked against each other. Confirmed concrete
+// case (dev-request Funn 2): producer `atlungstad-brenneri--bbe4185d`
+// (hjemmeside `atlungstadbrenneri.no`, owner/review-verified) vs an
+// `experiences` row `…norway-s-oldest-distillery-tours-tastings--68220487`
+// whose `booking_url` is `atlungstad.no` — a DIFFERENT real business (a
+// riding school) that happens to share the place-name "Atlungstad". A guest
+// who books via the experience entry is misdirected.
+//
+// NOT the same thing as GET /admin/gardssalg-provider-dedup-audit (lokal#440,
+// routes/opplevelser.ts ~line 5975) — that endpoint dedupes
+// `experience_providers` rows against EACH OTHER across seed sources
+// (same-table dedup). This module is a cross-TABLE identity check: producer
+// vs. experience/activity.
+//
+// ─── Matching design ────────────────────────────────────────────────────────
+// Two independent signals decide whether a (producer, experience) pair is
+// plausibly the SAME real-world business — either is sufficient on its own:
+//
+//   1. provider_link — experience.provider_id already equals the producer's
+//      id. Strongest possible signal (an existing FK), always trusted.
+//
+//   2. name_token — a significant (>=5 char, post-normalization) token is
+//      shared between the producer's searchable name (gardssalgSearchName()
+//      strips the catalog's "— Sted" display suffix, experience-store.ts) and
+//      the experience's title/title_no. Reuses titleTokens() from
+//      experience-dedup.ts (the SAME tokenizer/stopword-list/diacritics-fold/
+//      pluralization-stem this repo's other title-fuzzy-matching already
+//      uses) rather than inventing a second one.
+//
+//      A bare shared token is NOT sufficient on its own — gårdssalg/drikke
+//      producer names routinely share category words (the `producer_type`
+//      enum vocabulary itself: bryggeri, cideri, vingård, destilleri,
+//      mjøderi, gårdsbutikk, …), so two UNRELATED producers ("Nordfjord
+//      Bryggeri", "Sørlandet Bryggeri") and an unrelated generic experience
+//      ("Norsk Bryggeri Omvisning Sommer") would otherwise all match each
+//      other purely on the word "bryggeri". Mirrors titlesMatch()'s own
+//      rarity/corroboration gate (experience-dedup.ts) rather than inventing
+//      a parallel heuristic: a shared token only counts alone when it is RARE
+//      (isGenericNameToken() below — checked against the producer_type
+//      vocabulary from route-corridor-service.ts, a curated corpus-size-
+//      independent stoplist (GENERIC_FARM_PLACE_WORD_STOPLIST — round-3
+//      review fix-up, see its own doc comment below), AND, the same
+//      corpus-frequency method titlesMatch() uses — how many DISTINCT
+//      producers in THIS scan's own producer list use it
+//      (buildProducerCorpusTokenCounts() below) — any ONE of these three is
+//      sufficient to call a token generic). A GENERIC shared token still
+//      counts when corroborated by a second independent signal — also a
+//      host_name match, or whole-title similarity >=
+//      GENERIC_TOKEN_CORROBORATION_MIN (same threshold/method titlesMatch()
+//      uses, levenshtein-based).
+//      Deliberately does NOT reuse titlesMatch()'s unconditional whole-
+//      string-similarity fallback branch (the "no shared token at all but
+//      near-identical wording" case): that branch exists for re-harvested
+//      clones of the SAME title text (experience-dedup.ts's own problem),
+//      which is not this problem's shape — a company name and an unrelated-
+//      looking activity title sharing zero tokens should not be treated as a
+//      match just because they happen to be similarly SHORT strings.
+//
+//   3. host_name — the experience's booking_url resolves to a host whose
+//      registrable-domain label (e.g. "atlungstad" out of "atlungstad.no")
+//      exactly equals one of the producer's own significant name tokens. This
+//      is what actually catches the confirmed Atlungstad case: its harvested
+//      experience title is a generic marketing phrase ("Norway's Oldest
+//      Distillery: Tours & Tastings") that shares no token with "Atlungstad
+//      Brenneri" at all — the ONLY textual trace of the real business name is
+//      in the (wrong) booking_url's host, which happens to carry the shared
+//      place-name. Precisely the "en annen virksomhet med lignende navn"
+//      (a different business with a similar name) shape the dev-request
+//      names as the reason a naive domain-vs-name heuristic missed it before.
+//
+//      Round-2 review fix-up: a bare exact-token host-label match is subject
+//      to the SAME genericity gate as name_token above (isGenericNameToken())
+//      before being trusted — standalone as a match basis, or as
+//      corroboration for an all-generic name_token set. Common words also
+//      appear in producer names' domain-derived host labels (e.g. "gard" —
+//      "gård"/"gard" is a normal word in this vertical's producer names, not
+//      even in the producer_type enum), so an ungated host_name signal is
+//      just as exploitable a false-positive path as an ungated name_token
+//      one. A GENERIC host label is never accepted, either alone or as
+//      corroboration — it is simply not real evidence. Atlungstad's host
+//      label ("atlungstad") stays distinctive under this gate, so that case
+//      is unaffected.
+//
+//      Round-3 review fix-up: the round-2 gate's corpus-frequency mechanism
+//      is only as strong as the current scan's producer count — on a small
+//      scan (or the real ~50-producer production corpus), "gard" and words
+//      like it plausibly stay under SHARED_TOKEN_GENERIC_MIN and slip
+//      through ungated regardless. isGenericNameToken() now also checks a
+//      fixed, corpus-size-independent stoplist of common Norwegian
+//      farm/place/business-generic words (GENERIC_FARM_PLACE_WORD_STOPLIST)
+//      before falling back to corpus frequency, closing that gap for both
+//      host_name and name_token. The stoplist lists "gård", "gard" AND
+//      "gaard" as separate literals, so the historical spelling is covered by
+//      enumeration rather than by any clever normalization.
+//
+//      Rounds 4-7 tried to cover it by NORMALIZATION instead — folding the
+//      historical "aa" digraph so "gaard" and "gård" would share one key.
+//      That produced three consecutive regressions, one of which shipped to
+//      production, and was measured to change nothing at all on the real
+//      127-producer corpus. It was deleted 2026-08-01. That deletion is NOT
+//      free — it reopens one narrow configuration the fold did gate; see the
+//      "deleted-fold" note further down, next to
+//      GENERIC_FARM_PLACE_WORD_STOPLIST, for the exact case, the numbers and
+//      the mitigation. Read it before adding any new transform between how
+//      the corpus map is keyed and how this gate looks keys up — that
+//      asymmetry is what went wrong all three times.
+//
+// Once a pair is matched (by any signal), its `status` is decided purely by
+// comparing registrable domains — producer.hjemmeside is the dev-request's
+// designated source of truth ("produsentens verifiserte hjemmeside er
+// fasit"): "agree" (same registrable domain), "conflict" (both resolve, and
+// differ), "unknown" (either side is blank/unparseable — never guessed), or
+// "ambiguous" (see next paragraph).
+//
+// Same-experience/multiple-producer collision -> "ambiguous": because a
+// single `experience_id` can legitimately match more than one producer as
+// "conflict" (rare, but the genericity gate above only makes false positives
+// LESS likely, not impossible — and two real producers CAN legitimately share
+// a name), findGardssalgProducerExperienceMatches() reclassifies every
+// "conflict"-status pair whose experience_id also conflict-matches a
+// DIFFERENT producer_id to "ambiguous" before returning. This is load-bearing
+// for remediation correctness: planGardssalgExperienceConflictRemediation()
+// computes each pair's plan item independently from its own pre-batch SELECT,
+// and applyGardssalgExperienceConflictRemediation() applies items
+// sequentially with no same-batch collision check — without this
+// reclassification, a second write for the same experience_id would silently
+// (and non-deterministically, iteration-order-dependent) overwrite the first,
+// with a stale audit old_value. Both callers key remediation off
+// status==="conflict" only, so "ambiguous" pairs are automatically excluded
+// from the remediation plan while still surfacing in the read-only diagnosis
+// report (GsExpConflictSummary.ambiguous) for a human to resolve.
+//
+// catalog_hidden is NEVER used to exclude a producer from the SCAN (task
+// spec): a hidden producer's conflicting duplicate is still worth knowing
+// about, just noted via `producer_hidden` in the pair.
+
+import type Database from "better-sqlite3";
+import { v4 as uuid } from "uuid";
+import { hostFromUrlLike, registrableDomain, isDirectoryOrAggregatorHost } from "./cross-source-validator";
+import { titleTokens, normalizeExperienceTitle, levenshtein, buildProviderCorpusTokenCounts } from "./experience-dedup";
+import { gardssalgSearchName, isExperienceContentLocked } from "./experience-store";
+import { DRINK_PRODUCER_TYPES, NON_DRINK_PRODUCER_TYPES } from "./route-corridor-service";
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+export interface GsExpProducerRow {
+  id: string;
+  navn: string;
+  hjemmeside: string | null;
+  catalog_hidden: number | null;
+  fylke?: string | null;
+  kommune?: string | null;
+}
+
+export interface GsExpExperienceRow {
+  id: string;
+  title: string;
+  title_no: string | null;
+  booking_url: string | null;
+  provider_id: string | null;
+  content_source?: string | null;
+  verification_status?: string | null;
+  content_field_evidence?: string | null;
+}
+
+export type GsExpMatchBasis = "provider_link" | "name_token" | "host_name";
+// "ambiguous" is never assigned by the per-pair status decision itself (the
+// domain-comparison block below only ever produces conflict/agree/unknown) —
+// it is a POST-hoc reclassification applied to a subset of "conflict" pairs
+// once the same-experience/multiple-producer collision check runs (see the
+// module doc comment's "Same-experience/multiple-producer collision" section
+// and findGardssalgProducerExperienceMatches()'s final pass). Mirrors the
+// `provider_match_status='ambiguous'` vocabulary already used elsewhere on
+// the `experiences` schema (see database/init-experiences.ts) rather than
+// inventing a new status word for the same "a human must pick" concept.
+export type GsExpConflictStatus = "conflict" | "agree" | "unknown" | "ambiguous";
+
+export interface GsExpMatchedPair {
+  producer_id: string;
+  producer_name: string;
+  producer_hidden: boolean;
+  producer_hjemmeside: string | null;
+  experience_id: string;
+  experience_title: string;
+  experience_booking_url: string | null;
+  match_basis: GsExpMatchBasis;
+  status: GsExpConflictStatus;
+}
+
+// ─── Pure helpers ───────────────────────────────────────────────────────────
+
+/** Registrable domain of any URL-like string (hjemmeside OR booking_url —
+ *  the same host/registrable-domain derivation experience-store.ts's own
+ *  homepageRegistrableDomain() uses, generalized to a plain param name since
+ *  this file applies it to both sides). Null when blank/unparseable — never
+ *  guessed. */
+function urlRegistrableDomain(urlLike: string | null | undefined): string | null {
+  if (!urlLike || !urlLike.trim()) return null;
+  const host = hostFromUrlLike(urlLike);
+  return host ? registrableDomain(host) : null;
+}
+
+// A shared token this long is distinctive enough to treat as a genuine
+// name-mention rather than an incidental short word — mirrors
+// experience-dedup.ts's SIGNIFICANT_TOKEN_MIN_LEN (that constant is not
+// exported; the value itself, 5, is the convention being reused).
+const NAME_TOKEN_MIN_LEN = 5;
+// Host-label tokens are typically shorter/denser than prose tokens (bare
+// domain labels, no filler words diluting them) — 4 chars is enough to avoid
+// generic 3-letter false positives (e.g. "mat") without missing real short
+// brand names.
+const HOST_TOKEN_MIN_LEN = 4;
+
+// ─── Generic-token gate (mirrors experience-dedup.ts's titlesMatch()) ──────
+//
+// A bare shared token is trustworthy alone only when it's RARE. "Rare" is
+// decided by two mechanisms, either sufficient to call a token generic —
+// deliberately the SAME two mechanisms this codebase already has (not a
+// third, invented one):
+//
+//   1. producer_type vocabulary — the token is literally one of this
+//      vertical's own category words (DRINK_PRODUCER_TYPES /
+//      NON_DRINK_PRODUCER_TYPES, route-corridor-service.ts — the exact
+//      producer_type enum values, e.g. "bryggeri", "cideri", "vingård").
+//      Normalized through the same normalizeExperienceTitle() diacritics-fold
+//      titleTokens() applies, so "vingård" (a token) matches the vocabulary
+//      entry "vingård" the same way regardless of case/diacritics.
+//
+//   2. corpus frequency — how many DISTINCT producers in the CURRENT scan's
+//      own producer list use the token in their name, via
+//      buildProducerCorpusTokenCounts() below, which reuses
+//      buildProviderCorpusTokenCounts() (experience-dedup.ts) unchanged, so
+//      its keys are plain titleTokens() output — the same strings this gate
+//      looks up with, no derivation on either side. Same threshold
+//      value/convention as
+//      titlesMatch()'s SHARED_TOKEN_GENERIC_MIN (that constant is not
+//      exported; the value, 5, is the convention being reused, same pattern
+//      as NAME_TOKEN_MIN_LEN above).
+const SHARED_TOKEN_GENERIC_MIN = 5;
+
+// Whole-string closeness required to corroborate a shared token that is
+// GENERIC by either mechanism above — mirrors experience-dedup.ts's
+// GENERIC_TOKEN_CORROBORATION_MIN exactly (same value, same not-exported
+// convention as SHARED_TOKEN_GENERIC_MIN above).
+const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
+
+// ─── The "aa" digraph fold used to live here. It was DELETED 2026-08-01. ───
+//
+// Rounds 3-7 of this PR's review spent four commits on a fold that mapped the
+// historical Norwegian "aa" digraph onto "å" so that "gaard" and "gård" would
+// count as ONE word for the corpus-frequency mechanism below. It produced
+// three consecutive regressions, each introduced by the fix for the previous
+// one, and one of them shipped to production:
+//
+//   1. `6dbcad1` (merged as `79adbad`, live in prod): corpus map folded the
+//      RAW name before tokenizing, the gate folded AFTER normalize+stem.
+//      fold∘normalize != normalize∘fold, so the gate looked up keys the map
+//      never held, read `?? 0`, and judged a token shared by 5 producers
+//      DISTINCTIVE -> false `conflict` -> on apply=true, a real business's
+//      booking_url overwritten.
+//   2. `a72f3a5`: made both sides use one key function. They then agreed on
+//      the WRONG key — titleTokens() stems before the key function runs, so
+//      fold∘stem != stem∘fold and "Aaros"/"Åros" SPLIT instead of merging.
+//   3. `51b8400`: re-stemmed after folding to repair (2).
+//
+// Then it was measured against the REAL production corpus (127 gårdssalg
+// producers, 2026-08-01):
+//
+//   keys reaching SHARED_TOKEN_GENERIC_MIN with the fold:     3
+//   keys reaching SHARED_TOKEN_GENERIC_MIN without the fold:  3
+//   keys the fold ALONE lifts over the threshold:             0
+//
+// Only 5 producer names contain "aa" at all (Haavaldsen Distillery, Store Naa
+// Siderkompani, Harstad Haandtverksbryggeri, Haandbryggeriet, Aass Bryggeri)
+// and NONE has a modern-spelling twin in the corpus, so the fold had nothing
+// to merge. End-to-end pair output was byte-identical with it and without it.
+// The three keys that do reach the threshold are "bryggeri" (25), "distillery"
+// (9), "mikrobryggeri" (7) — and "bryggeri" is a producer_type enum word that
+// mechanism 1 already catches without any corpus counting.
+//
+// So on the corpus that actually exists, the fold bought nothing and cost
+// three regressions. Deleted. Genericity is decided by the two mechanisms
+// that are spelling-independent and were doing the work all along: the
+// producer_type vocabulary and the curated GENERIC_FARM_PLACE_WORD_STOPLIST
+// (which lists "gård", "gard" AND "gaard" as three separate literals — that
+// stoplist, not any fold, is what makes the "gaard" spelling generic, as
+// test (s) demonstrates).
+//
+// ─── WHAT THE DELETION COSTS (round-8 review finding, accepted) ────────────
+//
+// This is NOT free, and the honest statement is narrower than "the fold
+// bought nothing". The fold DID gate one configuration that is now ungated:
+//
+//   5+ producers sharing ONE place-name across BOTH spellings, e.g.
+//   3x "… Aasen" + 2x "… Åsen". Folded, that counts 5 and trips
+//   SHARED_TOKEN_GENERIC_MIN. Unfolded it splits 3/2, neither half reaches
+//   the threshold, the word is judged DISTINCTIVE, and an unrelated
+//   experience mentioning it becomes a remediable `conflict` — which on
+//   apply=true overwrites a real business's booking_url.
+//
+// Measured across builds with that fixture (only producer 0 carrying a
+// hjemmeside, so the ambiguous-collision guard is not what decides it):
+//
+//   8dcab47 (r2, no fold)   3 pairs / 1 conflict
+//   da06537 (r3)            0
+//   6dbcad1 / 79adbad prod  0
+//   51b8400 (fold, fixed)   0
+//   this build              3 pairs / 1 conflict
+//
+// So this build is faithful to "r2 + stoplist" — it is not a NEW defect, it
+// is the pre-fold behaviour returning — but it IS a reduction against what
+// is running in production today. It was accepted deliberately: the
+// configuration does not occur in the current corpus (only 5 of 127 producer
+// names contain "aa" at all, none with a modern-spelling twin), and the
+// mitigation is cheap, local and already demonstrated.
+//
+// MITIGATION when it does occur: add BOTH spellings of that specific word to
+// GENERIC_FARM_PLACE_WORD_STOPLIST, exactly as "gård"/"gard"/"gaard" already
+// are. Do NOT reintroduce a fold: all three attempts created an ordering
+// asymmetry between how the corpus map is keyed and how the gate looks keys
+// up, and two independent reviewers approved the broken versions by reading
+// the reasoning instead of measuring it.
+//
+// Tests (y1-y3) pin the shipped asymmetry shut. They do NOT catch every
+// possible reintroduction — a same-position fold on both sides passes all of
+// them — so treat them as a tripwire for the specific class that shipped,
+// not as proof that a new transform is safe.
+
+const GENERIC_PRODUCER_TYPE_TOKENS = new Set(
+  [...DRINK_PRODUCER_TYPES, ...NON_DRINK_PRODUCER_TYPES].map((t) => normalizeExperienceTitle(t))
+);
+
+// ─── Round-3 review fix-up: a curated, corpus-SIZE-independent floor ───────
+//
+// Mechanism 2 above (corpus frequency) is entirely relative to how many
+// producers happen to be in a given scan: with a small scan (or even the
+// real production gårdssalg corpus, only ~50 producers total), an ordinary
+// Norwegian farm/place/business-generic word plausibly appears on FEWER than
+// SHARED_TOKEN_GENERIC_MIN producers and slips through ungated — silently
+// resurrecting the exact "gard" false-positive class this file already
+// fixed once (round-2), just below whatever producer count the scan happens
+// to have. This list is a fixed floor that does NOT depend on scan size: a
+// token in this set is generic regardless of how rare it happens to look in
+// the current corpus. Normalized through the SAME normalizeExperienceTitle()
+// pipeline as GENERIC_PRODUCER_TYPE_TOKENS above, same reuse-the-pattern
+// discipline. MEASURED (round 9 — after two earlier versions of this very
+// sentence each asserted an untested key count and were each wrong): the
+// three literals "gård"/"gard"/"gaard" produce TWO distinct keys, not one
+// and not three. normalizeExperienceTitle()'s shared diacritics pass folds
+// å→a, so "gård" and "gard" both key as "gard"; "gaard" stays "gaard". The
+// "gard" literal is therefore redundant with "gård" (kept for readability —
+// deleting it changes nothing, and a mutation sweep confirms no test notices
+// it), while "gaard" is the entry doing independent work: it is what covers
+// the historical spelling by enumeration, since nothing else merges it. Not
+// exhaustive by design — a deliberately small, hand-picked list of common
+// farm/place/business-generic words (plus a couple of definite-form
+// variants that plausibly stand alone as a farm-name component, e.g.
+// "tunet"), not an attempt to enumerate every generic Norwegian word.
+const GENERIC_FARM_PLACE_WORD_STOPLIST = new Set(
+  [
+    "gård", "gard", "gaard", // keys to TWO entries: gård/gard both -> "gard" (å→a fold), gaard -> "gaard" — the last is the load-bearing one
+    "tun", "tunet", // farmyard/homestead — bare + definite form (the reviewer's own repro word)
+    "bruk", // "smallholding/works" — also the generic tail of countless place-compounds
+    "sæter", "seter", // "sæter"/"seter" (mountain summer farm) — both spellings in real use
+    "dal", // valley
+    "stad", // place/site suffix
+    "gods", // manor/estate
+    "hus", // house
+  ].map((t) => normalizeExperienceTitle(t))
+);
+
+function producerTokenSet(navn: string): Set<string> {
+  return new Set(titleTokens(gardssalgSearchName(navn)));
+}
+
+/** Provider-distinct corpus token counts over the producers in THIS scan
+ *  (not the whole `experiences` table — this signal is about how common a
+ *  word is among gårdssalg producer NAMES, the corpus the false-positive
+ *  class in the module doc comment actually comes from). Reuses
+ *  buildProviderCorpusTokenCounts() (experience-dedup.ts) unchanged by
+ *  feeding it {title, provider_id} rows built from producer.navn/id: its
+ *  existing "count once per distinct provider" semantics are exactly right
+ *  here, and its keys are plain titleTokens() output — the same thing
+ *  isGenericNameToken() looks the count up with, with no key derivation on
+ *  either side that could drift out of step. Keeping it that way is the
+ *  point; see the deleted-fold note above for what happens when it doesn't. */
+function buildProducerCorpusTokenCounts(producers: GsExpProducerRow[]): Map<string, number> {
+  return buildProviderCorpusTokenCounts(
+    producers.map((p) => ({ title: gardssalgSearchName(p.navn), provider_id: p.id }))
+  );
+}
+
+/** True when a shared token is generic (a broad category/brand word) rather
+ *  than distinctive (proper-noun-like) — any ONE of three mechanisms is
+ *  sufficient: the producer_type vocabulary, the curated corpus-size-
+ *  independent stoplist (round-3 fix-up, see GENERIC_FARM_PLACE_WORD_STOPLIST
+ *  above), or corpus frequency in the current scan.
+ *
+ *  The token arrives straight from titleTokens() and is used as-is — no
+ *  per-call key derivation. The generic-word SETS are built by running their
+ *  literals through normalizeExperienceTitle() (they carry diacritics, e.g.
+ *  "vingård"), which is idempotent on an already-normalized token, so both
+ *  sides land on the same string without a second transform to keep in sync. */
+function isGenericNameToken(token: string, producerCorpusCounts: Map<string, number>): boolean {
+  if (GENERIC_PRODUCER_TYPE_TOKENS.has(token)) return true;
+  if (GENERIC_FARM_PLACE_WORD_STOPLIST.has(token)) return true;
+  return (producerCorpusCounts.get(token) ?? 0) >= SHARED_TOKEN_GENERIC_MIN;
+}
+
+/** Levenshtein-based whole-string similarity, same formula
+ *  levenshteinSimilarity() (experience-dedup.ts, unexported) uses — reuses
+ *  its exported levenshtein() rather than re-implementing edit distance. */
+function wholeStringSimilarity(a: string, b: string): number {
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return 1 - levenshtein(a, b) / maxLen;
+}
+
+/** Best whole-string similarity between the producer's searchable name and
+ *  EITHER of the experience's title/title_no — corroboration signal for a
+ *  generic-only shared token. Mirrors titlesOrTitleNoMatch()'s "try both
+ *  language columns" bridge (experience-dedup.ts), adapted to a similarity
+ *  score (max, not a boolean match) since it feeds a threshold comparison
+ *  here rather than an early-exit boolean check there. */
+function producerExperienceWholeStringSimilarity(
+  producerNavn: string,
+  exp: Pick<GsExpExperienceRow, "title" | "title_no">
+): number {
+  const pn = normalizeExperienceTitle(gardssalgSearchName(producerNavn));
+  const candidates = [exp.title, exp.title_no].filter((t): t is string => !!t && !!t.trim());
+  let best = 0;
+  for (const c of candidates) {
+    const sim = wholeStringSimilarity(pn, normalizeExperienceTitle(c));
+    if (sim > best) best = sim;
+  }
+  return best;
+}
+
+function experienceTokenSet(title: string, titleNo: string | null | undefined): Set<string> {
+  const set = new Set(titleTokens(title));
+  if (titleNo && titleNo.trim()) {
+    for (const t of titleTokens(titleNo)) set.add(t);
+  }
+  return set;
+}
+
+function sharedSignificantTokens(a: Set<string>, b: Set<string>): string[] {
+  const shared: string[] = [];
+  for (const t of a) {
+    if (t.length >= NAME_TOKEN_MIN_LEN && b.has(t)) shared.push(t);
+  }
+  return shared;
+}
+
+/**
+ * True when the significant tokens shared between a producer and an
+ * experience are trustworthy evidence of a name_token match. A shared token
+ * is sufficient ALONE only when at least one is distinctive (not generic per
+ * isGenericNameToken()). When every shared token is generic, a second
+ * independent signal must corroborate it — trustworthyHostMatch (the same
+ * host_name signal, computed by the caller — round-2 review fix-up: ALREADY
+ * gated so a generic host label can never corroborate, see
+ * hostMatchIsTrustworthy in findGardssalgProducerExperienceMatches()) or
+ * whole-title similarity >=
+ * GENERIC_TOKEN_CORROBORATION_MIN — mirroring titlesMatch()'s own
+ * rarity/corroboration gate (experience-dedup.ts). See the module doc
+ * comment's "name_token" bullet for the full false-positive scenario this
+ * closes.
+ */
+function nameTokenMatches(
+  sharedTokens: string[],
+  producerCorpusCounts: Map<string, number>,
+  trustworthyHostMatch: boolean,
+  wholeStringSim: number
+): boolean {
+  if (sharedTokens.length === 0) return false;
+  const hasDistinctiveToken = sharedTokens.some((t) => !isGenericNameToken(t, producerCorpusCounts));
+  if (hasDistinctiveToken) return true;
+  return trustworthyHostMatch || wholeStringSim >= GENERIC_TOKEN_CORROBORATION_MIN;
+}
+
+/** The normalized first label of a booking_url's registrable domain (e.g.
+ *  "atlungstad" out of "https://atlungstad.no/") — null when unparseable or
+ *  too short to be meaningful on its own. */
+function hostLabelToken(urlLike: string | null | undefined): string | null {
+  const root = urlRegistrableDomain(urlLike);
+  if (!root) return null;
+  const label = root.split(".")[0] || "";
+  const normalized = normalizeExperienceTitle(label).replace(/\s+/g, "");
+  return normalized.length >= HOST_TOKEN_MIN_LEN ? normalized : null;
+}
+
+/**
+ * Core matcher — pure, no DB access. Precomputes each experience's token set
+ * / host-label once (not once per producer), so this stays O(producers ×
+ * experiences) in cheap Set operations rather than O(producers × experiences
+ * × tokenization+Levenshtein) — the corpus size this endpoint deals with in
+ * production is small (a few dozen gårdssalg producers × the `experiences`
+ * catalog), but this keeps the admin endpoint responsive regardless.
+ */
+export function findGardssalgProducerExperienceMatches(
+  producers: GsExpProducerRow[],
+  experiences: GsExpExperienceRow[]
+): GsExpMatchedPair[] {
+  const precomputed = experiences.map((exp) => ({
+    row: exp,
+    tokens: experienceTokenSet(exp.title, exp.title_no),
+    hostLabel: hostLabelToken(exp.booking_url),
+    expDomain: urlRegistrableDomain(exp.booking_url),
+  }));
+
+  // Provider-distinct token frequencies over THIS scan's own producer names —
+  // the genericity signal for the name_token gate above. Computed once
+  // up-front (not per producer/pair) since it's a property of the whole
+  // producer corpus, not of any one pair.
+  const producerCorpusCounts = buildProducerCorpusTokenCounts(producers);
+
+  const pairs: GsExpMatchedPair[] = [];
+
+  for (const producer of producers) {
+    const pTokens = producerTokenSet(producer.navn);
+    const producerDomain = urlRegistrableDomain(producer.hjemmeside);
+
+    for (const pc of precomputed) {
+      const exp = pc.row;
+      let basis: GsExpMatchBasis | null = null;
+      const hostMatch = !!(pc.hostLabel && pTokens.has(pc.hostLabel));
+      // Round-2 review finding: a bare hostMatch is a plain Set.has() exact-
+      // token check against the producer's own name tokens — it carries no
+      // genericity concept of its own, unlike name_token's shared-token gate
+      // above. Without this, any experience whose booking_url registrable-
+      // domain label happens to equal a generic/common word a producer's name
+      // also contains (e.g. "gard" — a normal word in this vertical's
+      // producer names, not even in the producer_type enum) gets an ungated
+      // conflict match, and an ungated hostMatch could also wrongly
+      // "corroborate" an all-generic name_token set below (resurrecting the
+      // original Bryggeri-class false positive via a second path). Apply the
+      // SAME genericity gate that already protects name_token
+      // (isGenericNameToken() — same producer_type vocabulary + corpus-
+      // frequency check, not a second heuristic): a hostMatch only counts as
+      // trustworthy evidence — standalone OR as corroboration — when the host
+      // label itself is distinctive, not generic.
+      const hostMatchIsTrustworthy =
+        hostMatch && !!pc.hostLabel && !isGenericNameToken(pc.hostLabel, producerCorpusCounts);
+
+      if (exp.provider_id && exp.provider_id === producer.id) {
+        basis = "provider_link";
+      } else {
+        const shared = sharedSignificantTokens(pTokens, pc.tokens);
+        if (shared.length > 0) {
+          // Whole-string similarity is only ever needed to corroborate an
+          // all-generic shared-token set — skip the levenshtein cost
+          // otherwise (same "only pay for it when needed" discipline the
+          // module doc comment already calls out for titlesMatch's fallback
+          // branch).
+          const hasDistinctiveToken = shared.some((t) => !isGenericNameToken(t, producerCorpusCounts));
+          const wholeStringSim = hasDistinctiveToken
+            ? 0
+            : producerExperienceWholeStringSimilarity(producer.navn, exp);
+          if (nameTokenMatches(shared, producerCorpusCounts, hostMatchIsTrustworthy, wholeStringSim)) {
+            basis = "name_token";
+          }
+        }
+        if (!basis && hostMatchIsTrustworthy) {
+          basis = "host_name";
+        }
+      }
+
+      if (!basis) continue;
+
+      let status: GsExpConflictStatus;
+      if (!producerDomain || !pc.expDomain) status = "unknown";
+      else if (producerDomain === pc.expDomain) status = "agree";
+      else status = "conflict";
+
+      pairs.push({
+        producer_id: producer.id,
+        producer_name: producer.navn,
+        producer_hidden: producer.catalog_hidden === 1,
+        producer_hjemmeside: producer.hjemmeside,
+        experience_id: exp.id,
+        experience_title: exp.title,
+        experience_booking_url: exp.booking_url,
+        match_basis: basis,
+        status,
+      });
+    }
+  }
+
+  reclassifyAmbiguousCollisions(pairs);
+  return pairs;
+}
+
+/**
+ * Same-experience/multiple-producer collision guard (Finding 2 — see the
+ * module doc comment's "Same-experience/multiple-producer collision"
+ * section). Mutates `pairs` in place: any "conflict"-status pair whose
+ * experience_id ALSO conflict-matches a DIFFERENT producer_id is reclassified
+ * to "ambiguous", so downstream remediation (which only ever plans
+ * status==="conflict" pairs) silently and automatically excludes it, while it
+ * still surfaces in the read-only diagnosis report under its own status.
+ * "agree"/"unknown" pairs are never touched by this — the collision this
+ * guards against only exists on the write path, which only ever looks at
+ * "conflict" pairs.
+ */
+function reclassifyAmbiguousCollisions(pairs: GsExpMatchedPair[]): void {
+  const producersByExperience = new Map<string, Set<string>>();
+  for (const p of pairs) {
+    if (p.status !== "conflict") continue;
+    const producers = producersByExperience.get(p.experience_id) ?? new Set<string>();
+    producers.add(p.producer_id);
+    producersByExperience.set(p.experience_id, producers);
+  }
+  for (const p of pairs) {
+    if (p.status !== "conflict") continue;
+    const producers = producersByExperience.get(p.experience_id);
+    if (producers && producers.size > 1) {
+      p.status = "ambiguous";
+    }
+  }
+}
+
+export interface GsExpConflictSummary {
+  matched_pairs: number;
+  conflicting: number;
+  agreeing: number;
+  unknown: number;
+  ambiguous: number;
+}
+
+export function summarizeGardssalgExperienceConflicts(pairs: GsExpMatchedPair[]): GsExpConflictSummary {
+  const summary: GsExpConflictSummary = {
+    matched_pairs: pairs.length,
+    conflicting: 0,
+    agreeing: 0,
+    unknown: 0,
+    ambiguous: 0,
+  };
+  for (const p of pairs) {
+    if (p.status === "conflict") summary.conflicting++;
+    else if (p.status === "agree") summary.agreeing++;
+    else if (p.status === "ambiguous") summary.ambiguous++;
+    else summary.unknown++;
+  }
+  return summary;
+}
+
+// ─── DB loaders (Part A) ────────────────────────────────────────────────────
+
+const GARDSSALG_PROVIDER_SCOPE_SQL =
+  `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`;
+
+/** Every gårdssalg producer — same base scoping WHERE clause as
+ *  GET /admin/gardssalg-provider-dedup-audit (lokal#440) and
+ *  GET /admin/gardssalg-outreach-readiness, MINUS the outreach-readiness
+ *  endpoint's deliberate inclusion of catalog_hidden rows in scope — this
+ *  scan intentionally does NOT filter catalog_hidden OUT (task spec: a
+ *  hidden producer's conflicting duplicate is still worth surfacing), it is
+ *  just noted per-row via `producer_hidden`. */
+export function loadGardssalgProducersForConflictScan(db: Database.Database): GsExpProducerRow[] {
+  return db
+    .prepare(
+      `SELECT id, navn, hjemmeside, catalog_hidden, fylke, kommune
+         FROM experience_providers
+        WHERE ${GARDSSALG_PROVIDER_SCOPE_SQL}`
+    )
+    .all() as GsExpProducerRow[];
+}
+
+/** Every LIVE experience row (canonical_id IS NULL — same "never surface a
+ *  dedup-merged-away row" convention enforced everywhere else `experiences`
+ *  is read: PUBLISH_GATE_SQL, listCategories, GET .../recently-enriched, the
+ *  dedup candidate loader itself). Deliberately not scoped to gårdssalg in
+ *  any way (category/producer_type) — the whole point is that the matching
+ *  experience row was harvested independently and has no such link yet. */
+export function loadExperiencesForConflictScan(db: Database.Database): GsExpExperienceRow[] {
+  return db
+    .prepare(
+      `SELECT id, title, title_no, booking_url, provider_id, content_source,
+              verification_status, content_field_evidence
+         FROM experiences
+        WHERE canonical_id IS NULL`
+    )
+    .all() as GsExpExperienceRow[];
+}
+
+/** Full Part A pass: load both sides fresh from the DB and match them. Pure
+ *  read — no writes anywhere on this path. */
+export function runGardssalgExperienceConflictScan(db: Database.Database): {
+  pairs: GsExpMatchedPair[];
+  summary: GsExpConflictSummary;
+} {
+  const producers = loadGardssalgProducersForConflictScan(db);
+  const experiences = loadExperiencesForConflictScan(db);
+  const pairs = findGardssalgProducerExperienceMatches(producers, experiences);
+  return { pairs, summary: summarizeGardssalgExperienceConflicts(pairs) };
+}
+
+// ─── Remediation (Part B — write, dry-run by default) ──────────────────────
+//
+// For every CONFLICTING pair (never "agree"/"unknown"/"ambiguous" — those are
+// never touched; "ambiguous" pairs are conflict-shaped pairs that collided
+// with another producer over the same experience_id and were deliberately
+// excluded, see reclassifyAmbiguousCollisions() above), the producer's
+// verified hjemmeside is authoritative. The
+// remediation either (a) corrects the experience's booking_url to the
+// producer's hjemmeside, or (b) nulls it out when copying the producer's own
+// hjemmeside would itself be unsafe — namely when that hjemmeside resolves to
+// a directory/aggregator host (isDirectoryOrAggregatorHost, the SAME curated
+// classifier the website-discovery/content-refresh routes already use to
+// keep aggregator links out of a "verified own site" field) or is otherwise
+// unparseable. Never leaves a row in conflict either way.
+//
+// Deliberately NOT built on applyExperienceContent() (experience-store.ts):
+// that writer is fill-ONLY (isBlank(row.<field>) gate) — booking_url here is
+// already non-blank and WRONG, which is exactly the case that writer refuses
+// to touch by design. This is a corrective overwrite, a genuinely different
+// operation, hence its own writer + its own audit table
+// (experience_provider_conflict_audit, init-experiences.ts) rather than
+// stretching the fill-only one to do something it was deliberately built not
+// to do.
+
+export const EXPERIENCE_CONFLICT_ROLLBACKABLE_FIELDS = new Set(["booking_url"]);
+// Marker stamped on audit rows inserted by a rollback of THIS table, mirrors
+// experience-store.ts's GARDSSALG_ROLLBACK_MARKER convention exactly (kept as
+// its own local constant rather than importing that unexported one).
+export const EXPERIENCE_CONFLICT_ROLLBACK_MARKER = "internal://rollback";
+
+export interface GsExpConflictPlanItem {
+  experience_id: string;
+  producer_id: string;
+  producer_name: string;
+  old_value: string | null;
+  new_value: string | null;
+  action: "corrected" | "nulled";
+}
+
+export interface GsExpConflictSkip {
+  experience_id: string;
+  producer_id: string;
+  reason: "locked" | "already_current" | "no_producer_hjemmeside";
+}
+
+/**
+ * Plan the remediation for a set of already-diagnosed conflicting pairs
+ * (callers should pass ONLY status==="conflict" pairs — see the route, which
+ * filters runGardssalgExperienceConflictScan()'s fresh output rather than
+ * trusting a client-supplied list). Re-reads each experience's CURRENT row
+ * (never trusts the pair's snapshot) so a plan is always computed against
+ * live data, same discipline as planGardssalgContentRollback.
+ */
+export function planGardssalgExperienceConflictRemediation(
+  db: Database.Database,
+  conflictingPairs: GsExpMatchedPair[]
+): { applicable: GsExpConflictPlanItem[]; skipped: GsExpConflictSkip[] } {
+  const applicable: GsExpConflictPlanItem[] = [];
+  const skipped: GsExpConflictSkip[] = [];
+
+  for (const pair of conflictingPairs) {
+    const row = db
+      .prepare(`SELECT booking_url, content_source, verification_status FROM experiences WHERE id = ?`)
+      .get(pair.experience_id) as
+      | { booking_url: string | null; content_source: string | null; verification_status: string | null }
+      | undefined;
+    if (!row) {
+      skipped.push({ experience_id: pair.experience_id, producer_id: pair.producer_id, reason: "already_current" });
+      continue;
+    }
+    if (isExperienceContentLocked(row)) {
+      skipped.push({ experience_id: pair.experience_id, producer_id: pair.producer_id, reason: "locked" });
+      continue;
+    }
+    if (!pair.producer_hjemmeside || !pair.producer_hjemmeside.trim()) {
+      skipped.push({
+        experience_id: pair.experience_id,
+        producer_id: pair.producer_id,
+        reason: "no_producer_hjemmeside",
+      });
+      continue;
+    }
+
+    const producerHomepage = pair.producer_hjemmeside.trim();
+    const producerHost = hostFromUrlLike(producerHomepage);
+    const safeToCopy = !!producerHost && !isDirectoryOrAggregatorHost(producerHost);
+    const newValue = safeToCopy ? producerHomepage : null;
+
+    if ((row.booking_url ?? null) === newValue) {
+      skipped.push({ experience_id: pair.experience_id, producer_id: pair.producer_id, reason: "already_current" });
+      continue;
+    }
+
+    applicable.push({
+      experience_id: pair.experience_id,
+      producer_id: pair.producer_id,
+      producer_name: pair.producer_name,
+      old_value: row.booking_url ?? null,
+      new_value: newValue,
+      action: safeToCopy ? "corrected" : "nulled",
+    });
+  }
+
+  return { applicable, skipped };
+}
+
+/**
+ * Apply a previously-planned remediation: writes experiences.booking_url,
+ * merges/retracts the `booking_url` key of experiences.content_field_evidence
+ * (retracted — key deleted — on a "nulled" action, since a null value makes no
+ * provenance claim; set to the producer's hjemmeside on a "corrected" action,
+ * the same "where did this value come from" convention applyExperienceContent
+ * already uses for that column), and inserts ONE
+ * experience_provider_conflict_audit row per write — the rollback lever.
+ * content_source is deliberately left untouched: this write did not come from
+ * a homepage fetch of the EXPERIENCE's own site, so stamping
+ * content_source='provider_site' would misrepresent its provenance the exact
+ * way the content_field_evidence per-field map (not a row-level column) was
+ * built to prevent (see applyExperienceContent's own doc comment).
+ */
+export function applyGardssalgExperienceConflictRemediation(
+  db: Database.Database,
+  items: GsExpConflictPlanItem[],
+  batchId: string | null
+): Array<{ experience_id: string; producer_id: string; new_value: string | null; action: string }> {
+  const applied: Array<{ experience_id: string; producer_id: string; new_value: string | null; action: string }> = [];
+
+  const runOne = db.transaction((item: GsExpConflictPlanItem) => {
+    const row = db
+      .prepare(`SELECT content_field_evidence FROM experiences WHERE id = ?`)
+      .get(item.experience_id) as { content_field_evidence: string | null } | undefined;
+
+    let evidence: Record<string, string> = {};
+    if (row?.content_field_evidence) {
+      try {
+        const parsed = JSON.parse(row.content_field_evidence);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          evidence = parsed as Record<string, string>;
+        }
+      } catch {
+        /* malformed -> start fresh rather than throw on a remediation write */
+      }
+    }
+    if (item.action === "corrected") {
+      evidence.booking_url = `producer:${item.producer_id}`;
+    } else {
+      delete evidence.booking_url;
+    }
+
+    db.prepare(
+      `UPDATE experiences
+          SET booking_url = @booking_url,
+              content_field_evidence = @content_field_evidence,
+              updated_at = datetime('now')
+        WHERE id = @id`
+    ).run({
+      id: item.experience_id,
+      booking_url: item.new_value,
+      content_field_evidence: JSON.stringify(evidence),
+    });
+
+    db.prepare(
+      `INSERT INTO experience_provider_conflict_audit
+         (id, experience_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @experience_id, 'booking_url', @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      experience_id: item.experience_id,
+      old_value: item.old_value,
+      new_value: item.new_value,
+      source_url: `producer:${item.producer_id}`,
+      batch_id: batchId,
+    });
+  });
+
+  for (const item of items) {
+    runOne(item);
+    applied.push({
+      experience_id: item.experience_id,
+      producer_id: item.producer_id,
+      new_value: item.new_value,
+      action: item.action,
+    });
+  }
+
+  return applied;
+}
+
+// ─── Post-apply read-back verification (dev-request 2026-08-01-gardssalg-
+// steg2-apply-tar-ikke-varig-effekt, gjenstående scope §3) ──────────────────
+//
+// applyGardssalgExperienceConflictRemediation()'s own return value describes
+// what it INTENDED to write, from its own in-memory state — not what actually
+// landed and is still standing. The 2026-08-01 P0 (run-1650 reporting "137
+// corrected" while a same-cycle governance rollback had already put every one
+// of those rows back to its pre-apply value) happened because nothing
+// re-read the DB after the transaction committed. This is that re-read: pure
+// SELECTs, no writes, called by the route AFTER
+// applyGardssalgExperienceConflictRemediation()'s transaction has already
+// committed — it verifies the aftermath, it does not participate in it.
+//
+// For each applied item, compares the CURRENT experiences.booking_url against
+// the value the apply was supposed to have left behind (item.new_value), and
+// — for "corrected" actions only, since a "nulled" action deliberately
+// retracts the provenance stamp rather than setting one (see
+// applyGardssalgExperienceConflictRemediation's own doc comment) — that
+// content_field_evidence.booking_url still carries the "producer:<id>"
+// stamp. Either check failing is a mismatch: the write did not land, or did
+// not stay landed.
+export interface GsExpConflictVerificationMismatch {
+  experience_id: string;
+  producer_id: string;
+  expected_booking_url: string | null;
+  actual_booking_url: string | null;
+  expected_evidence_stamp: string | null;
+  actual_evidence_stamp: string | null;
+  reason: "booking_url_mismatch" | "evidence_stamp_missing";
+}
+
+export function verifyGardssalgExperienceConflictWrites(
+  db: Database.Database,
+  items: Array<{ experience_id: string; producer_id: string; new_value: string | null; action: string }>
+): { verified_written: number; mismatches: GsExpConflictVerificationMismatch[] } {
+  const mismatches: GsExpConflictVerificationMismatch[] = [];
+  let verifiedWritten = 0;
+
+  for (const item of items) {
+    const row = db
+      .prepare(`SELECT booking_url, content_field_evidence FROM experiences WHERE id = ?`)
+      .get(item.experience_id) as { booking_url: string | null; content_field_evidence: string | null } | undefined;
+
+    const actualBookingUrl = row?.booking_url ?? null;
+    let actualStamp: string | null = null;
+    if (row?.content_field_evidence) {
+      try {
+        const parsed = JSON.parse(row.content_field_evidence);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.booking_url === "string") {
+          actualStamp = parsed.booking_url;
+        }
+      } catch {
+        /* malformed -> treat as no stamp, same as the writer's own parse guard */
+      }
+    }
+    const expectedStamp = item.action === "corrected" ? `producer:${item.producer_id}` : null;
+    const expectedBookingUrl = item.new_value ?? null;
+
+    if (actualBookingUrl !== expectedBookingUrl) {
+      mismatches.push({
+        experience_id: item.experience_id,
+        producer_id: item.producer_id,
+        expected_booking_url: expectedBookingUrl,
+        actual_booking_url: actualBookingUrl,
+        expected_evidence_stamp: expectedStamp,
+        actual_evidence_stamp: actualStamp,
+        reason: "booking_url_mismatch",
+      });
+      continue;
+    }
+    if (item.action === "corrected" && actualStamp !== expectedStamp) {
+      mismatches.push({
+        experience_id: item.experience_id,
+        producer_id: item.producer_id,
+        expected_booking_url: expectedBookingUrl,
+        actual_booking_url: actualBookingUrl,
+        expected_evidence_stamp: expectedStamp,
+        actual_evidence_stamp: actualStamp,
+        reason: "evidence_stamp_missing",
+      });
+      continue;
+    }
+    verifiedWritten++;
+  }
+
+  return { verified_written: verifiedWritten, mismatches };
+}
+
+// ─── Ambiguous-collision escalation (dev-request 2026-08-01-gardssalg-steg2-
+// apply-tar-ikke-varig-effekt, gjenstående scope §4) ─────────────────────────
+//
+// Remediation deliberately never writes an "ambiguous" pair (see the module
+// doc comment's "Same-experience/multiple-producer collision" section) — but
+// until now nothing surfaced WHY a given experience is stuck that way, or
+// grouped the colliding producers together for a human to act on. This is a
+// pure, read-only grouping of pairs the scan already returned (no new scan,
+// no new SQL) — for GET .../gardssalg-experience-conflict-audit to attach as
+// an additive `ambiguous_detail` section. Atlungstad (three hidden producer
+// duplicates matching the same experience) is the concrete case this exists
+// to name instead of silently leaving wrong.
+export interface GsExpAmbiguousDetail {
+  experience_id: string;
+  experience_title: string;
+  colliding_producers: Array<{ producer_id: string; producer_name: string }>;
+  reason: string;
+}
+
+export function buildAmbiguousExperienceDetail(pairs: GsExpMatchedPair[]): GsExpAmbiguousDetail[] {
+  const byExperience = new Map<
+    string,
+    { experience_title: string; producers: Map<string, string> }
+  >();
+
+  for (const p of pairs) {
+    if (p.status !== "ambiguous") continue;
+    let group = byExperience.get(p.experience_id);
+    if (!group) {
+      group = { experience_title: p.experience_title, producers: new Map() };
+      byExperience.set(p.experience_id, group);
+    }
+    group.producers.set(p.producer_id, p.producer_name);
+  }
+
+  const detail: GsExpAmbiguousDetail[] = [];
+  for (const [experience_id, group] of byExperience) {
+    const colliding_producers = Array.from(group.producers, ([producer_id, producer_name]) => ({
+      producer_id,
+      producer_name,
+    }));
+    detail.push({
+      experience_id,
+      experience_title: group.experience_title,
+      colliding_producers,
+      reason:
+        `${colliding_producers.length} producers match the same experience — remediation cannot pick one ` +
+        `automatically, resolve via producer-dedup or manually`,
+    });
+  }
+  return detail;
+}
+
+// ─── Rollback (wired into the EXISTING POST /admin/gardssalg-content-rollback
+// endpoint via an `entity_type` switch, per the dev-request's own rollback
+// section — see routes/opplevelser.ts) ──────────────────────────────────────
+
+export type GsExpConflictRollbackTarget = { experience_id?: string; batch_id?: string };
+
+export interface GsExpConflictRollbackPlanItem {
+  experience_id: string;
+  field_name: string;
+  current_value: string | null;
+  restore_to: string | null;
+}
+
+export interface GsExpConflictRollbackSkip {
+  experience_id: string;
+  field_name: string;
+  reason: "no_audit_row" | "already_current" | "unknown_field" | "locked";
+}
+
+function resolveExperienceConflictRollbackTargets(
+  db: Database.Database,
+  opts: GsExpConflictRollbackTarget
+): Array<{ experience_id: string; field_name: string }> {
+  if (opts.batch_id) {
+    return db
+      .prepare(`SELECT DISTINCT experience_id, field_name FROM experience_provider_conflict_audit WHERE batch_id = ?`)
+      .all(opts.batch_id) as Array<{ experience_id: string; field_name: string }>;
+  }
+  if (opts.experience_id) {
+    const rows = db
+      .prepare(`SELECT DISTINCT field_name FROM experience_provider_conflict_audit WHERE experience_id = ?`)
+      .all(opts.experience_id) as Array<{ field_name: string }>;
+    return rows.map((r) => ({ experience_id: opts.experience_id as string, field_name: r.field_name }));
+  }
+  return [];
+}
+
+/** Mirrors planGardssalgContentRollback's exact idempotency discipline
+ *  (experience-store.ts) — same two "nothing to restore" cases (already at
+ *  the restore target; latest audit row IS a previous rollback whose
+ *  new_value already matches current) — adapted to this table/FK. */
+export function planExperienceConflictRollback(
+  db: Database.Database,
+  opts: GsExpConflictRollbackTarget
+): { restorable: GsExpConflictRollbackPlanItem[]; skipped: GsExpConflictRollbackSkip[] } {
+  const targets = resolveExperienceConflictRollbackTargets(db, opts);
+  const restorable: GsExpConflictRollbackPlanItem[] = [];
+  const skipped: GsExpConflictRollbackSkip[] = [];
+
+  for (const t of targets) {
+    if (!EXPERIENCE_CONFLICT_ROLLBACKABLE_FIELDS.has(t.field_name)) {
+      skipped.push({ experience_id: t.experience_id, field_name: t.field_name, reason: "unknown_field" });
+      continue;
+    }
+    const latest = db
+      .prepare(
+        `SELECT old_value, new_value, source_url FROM experience_provider_conflict_audit
+          WHERE experience_id = ? AND field_name = ?
+          ORDER BY rowid DESC LIMIT 1`
+      )
+      .get(t.experience_id, t.field_name) as
+      | { old_value: string | null; new_value: string | null; source_url: string | null }
+      | undefined;
+    if (!latest) {
+      skipped.push({ experience_id: t.experience_id, field_name: t.field_name, reason: "no_audit_row" });
+      continue;
+    }
+    const expRow = db
+      .prepare(`SELECT ${t.field_name} AS current_value, content_source, verification_status FROM experiences WHERE id = ?`)
+      .get(t.experience_id) as
+      | { current_value: string | null; content_source: string | null; verification_status: string | null }
+      | undefined;
+    if (!expRow) {
+      skipped.push({ experience_id: t.experience_id, field_name: t.field_name, reason: "no_audit_row" });
+      continue;
+    }
+    if (isExperienceContentLocked(expRow)) {
+      skipped.push({ experience_id: t.experience_id, field_name: t.field_name, reason: "locked" });
+      continue;
+    }
+    const currentValue = expRow.current_value ?? null;
+    const alreadyAtRestoreTarget = currentValue === (latest.old_value ?? null);
+    const alreadyRolledBack =
+      latest.source_url === EXPERIENCE_CONFLICT_ROLLBACK_MARKER && currentValue === (latest.new_value ?? null);
+    if (alreadyAtRestoreTarget || alreadyRolledBack) {
+      skipped.push({ experience_id: t.experience_id, field_name: t.field_name, reason: "already_current" });
+      continue;
+    }
+    restorable.push({
+      experience_id: t.experience_id,
+      field_name: t.field_name,
+      current_value: currentValue,
+      restore_to: latest.old_value ?? null,
+    });
+  }
+
+  return { restorable, skipped };
+}
+
+/** Mirrors applyGardssalgContentRollback exactly (experience-store.ts),
+ *  adapted to this table/FK: restores the field, inserts a NEW audit row
+ *  (never mutates/deletes existing ones) stamped with
+ *  EXPERIENCE_CONFLICT_ROLLBACK_MARKER so the rollback itself is auditable
+ *  and the same idempotency check above can recognize it next time. */
+export function applyExperienceConflictRollback(
+  db: Database.Database,
+  items: GsExpConflictRollbackPlanItem[]
+): Array<{ experience_id: string; field_name: string; restored_to: string | null }> {
+  const restored: Array<{ experience_id: string; field_name: string; restored_to: string | null }> = [];
+
+  const runOne = db.transaction((item: GsExpConflictRollbackPlanItem) => {
+    db.prepare(`UPDATE experiences SET ${item.field_name} = @val WHERE id = @id`).run({
+      val: item.restore_to,
+      id: item.experience_id,
+    });
+    db.prepare(
+      `INSERT INTO experience_provider_conflict_audit
+         (id, experience_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @experience_id, @field_name, @old_value, @new_value, @source_url, NULL, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      experience_id: item.experience_id,
+      field_name: item.field_name,
+      old_value: item.current_value,
+      new_value: item.restore_to,
+      source_url: EXPERIENCE_CONFLICT_ROLLBACK_MARKER,
+    });
+  });
+
+  for (const item of items) {
+    if (!EXPERIENCE_CONFLICT_ROLLBACKABLE_FIELDS.has(item.field_name)) continue;
+    const expRow = db
+      .prepare(`SELECT content_source, verification_status FROM experiences WHERE id = ?`)
+      .get(item.experience_id) as { content_source: string | null; verification_status: string | null } | undefined;
+    if (expRow && isExperienceContentLocked(expRow)) continue;
+    runOne(item);
+    restored.push({ experience_id: item.experience_id, field_name: item.field_name, restored_to: item.restore_to });
+  }
+
+  return restored;
+}

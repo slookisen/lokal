@@ -1684,6 +1684,45 @@ export type ContentRefreshTarget = {
 };
 
 /**
+ * Why selectProvidersForContentRefresh() below is a select-loop instead of a
+ * one-shot SELECT ... LIMIT (2026-08-01, dev-request selector-window fix):
+ *
+ * `last_content_attempt_at` is stamped ONLY on providers that actually get
+ * processed by POST /admin/content-refresh (markProviderContentAttempted,
+ * called unconditionally in apply mode before the fetch). A candidate the SQL
+ * pre-filter below fetches but the JS classifyProviderContentBucket() step
+ * then discards as not-"enrichable" is NEVER stamped — it keeps
+ * last_content_attempt_at IS NULL and therefore sorts first FOREVER under the
+ * NULLs-first `ORDER BY (last_content_attempt_at IS NOT NULL), ...` (see the
+ * content-refresh-attempt-tracking regression guard above this function for
+ * why NULLs-first ordering exists at all). Once that permanently-NULL clump
+ * grows past a single window, it silently buries every genuinely-enrichable
+ * row behind it — the selector then returns 0 candidates and the route
+ * honestly has nothing to say except "nothing found", which downstream cron
+ * reporting mistook for real cohort exhaustion (measured live 2026-07-31:
+ * limit=3 -> window 200 -> scanned=0; limit=25 -> window 300 -> scanned=0;
+ * limit=100 -> window 1000 -> scanned=88 candidates behind the NULL clump).
+ *
+ * Fix: page through the SAME SQL pre-filter/ORDER BY with an advancing
+ * OFFSET, filtering each page in JS, until EITHER (a) `cap` enrichable
+ * providers have been found, (b) the SQL side is genuinely exhausted (a page
+ * returns fewer rows than requested — end of table), or (c) the hard
+ * CONTENT_REFRESH_HARD_SCAN_CAP total-rows-scanned budget is spent (so one
+ * call can never scan the whole catalog). The three outcomes are reported
+ * back as `stopReason` so the route can tell an honest "nothing left"
+ * (real-exhaustion) apart from "stopped early, there may be more"
+ * (scan_cap_reached) instead of conflating both into one silent zero.
+ */
+export type ContentRefreshStopReason = "cap_reached" | "real-exhaustion" | "scan_cap_reached";
+
+export type ContentRefreshSelection = {
+  targets: ContentRefreshTarget[];
+  /** Total SQL candidate rows examined (summed across all pages this call). */
+  scanned: number;
+  stopReason: ContentRefreshStopReason;
+};
+
+/**
  * Auto-select providers eligible for a homepage content-refresh: providers that
  * HAVE a website (hjemmeside) AND own ≥1 experience whose content is THIN
  * (description empty OR category empty) and NOT locked (not verified, not
@@ -1797,74 +1836,84 @@ export function recordProviderHomepageFetchResult(
   return { found: true, attempts: row.homepage_fetch_attempts, parked, parked_now: parkedNow };
 }
 
-// Over-fetch window for the candidate pre-filter below, same pattern as
-// GET /admin/providers/recently-enriched's EXP_ROW_WINDOW (round-5 review of
-// dev-request 2026-07-27-kvalitetsporter-uten-signal established WHY: the
-// per-field provenance check cannot be expressed in SQL — it parses JSON and
-// compares registrable domains — so it has to run in JS AFTER a broad SQL
-// pre-filter and BEFORE the final LIMIT. Filtering post-LIMIT would mean a
-// page full of aggregator-only candidates returns fewer than `cap` results
-// even when genuinely-thin providers exist further down the ordering.
+// Over-fetch window for the candidate pre-filter below (per SQL page), same
+// pattern as GET /admin/providers/recently-enriched's EXP_ROW_WINDOW
+// (round-5 review of dev-request 2026-07-27-kvalitetsporter-uten-signal
+// established WHY: the per-field provenance check cannot be expressed in
+// SQL — it parses JSON and compares registrable domains — so it has to run
+// in JS AFTER a broad SQL pre-filter and BEFORE the final LIMIT. Filtering
+// post-LIMIT would mean a page full of aggregator-only candidates returns
+// fewer than `cap` results even when genuinely-thin providers exist further
+// down the ordering.
 const CONTENT_REFRESH_CANDIDATE_WINDOW_MULTIPLIER = 12;
 const CONTENT_REFRESH_CANDIDATE_WINDOW_MAX = 1000;
 
-export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarget[] {
+// Hard ceiling on total SQL candidate rows examined across ALL pages of a
+// single selectProvidersForContentRefresh() call (2026-08-01 selector-window
+// fix — see the doc comment above ContentRefreshSelection for the bug this
+// paginated loop fixes). Without a bound, a cohort with a very long run of
+// non-enrichable rows ahead of any enrichable one could make one call page
+// through the entire experience_providers table. 5000 is deliberately well
+// above any single-page window (max 1000) so normal cohorts never come
+// close to it, while still being a bounded, sane per-call ceiling.
+export const CONTENT_REFRESH_HARD_SCAN_CAP = 5000;
+
+export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSelection {
   const db = getDb(VERTICAL);
   const cap = Math.max(1, Math.min(100, limit));
-  const candidateWindow = Math.min(
+  const pageSize = Math.min(
     CONTENT_REFRESH_CANDIDATE_WINDOW_MAX,
     Math.max(200, cap * CONTENT_REFRESH_CANDIDATE_WINDOW_MULTIPLIER)
   );
-  const candidates = db
-    .prepare(
-      `SELECT p.id AS id, p.navn AS navn,
-              COALESCE(
-                CASE WHEN p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != ''
-                     THEN TRIM(p.hjemmeside) END,
-                (SELECT TRIM(e2.evidence_url)
-                   FROM experiences e2
-                  WHERE e2.provider_id = p.id
-                    AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
-                  LIMIT 1)
-              ) AS hjemmeside
-         FROM experience_providers p
-        WHERE (
-            (p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != '')
-            OR EXISTS (
-                SELECT 1 FROM experiences e2
-                 WHERE e2.provider_id = p.id
-                   AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
-                   AND p.hjemmeside IS NULL
-               )
-          )
-          AND EXISTS (
-            -- BROAD pre-filter only: "an unlocked, live experience exists at
-            -- all". Deliberately no longer requires a BLANK field here — that
-            -- was exactly the bug (dev-request 2026-07-29-blacklist-backfill-
-            -- og-berikelsestriage, slice 2): a non-blank but
-            -- aggregator-sourced field must still reach the per-field
-            -- provenance check below (isExperienceContentGenuinelyThin /
-            -- classifyProviderContentBucket — the SAME shared classifier the
-            -- berikelsestriage triage endpoint uses), which SQL alone cannot
-            -- express.
-            -- NULL-guarded on verification_status (round-3-review fix,
-            -- mirrored from GET .../recently-enriched): SQL three-valued
-            -- logic makes "NULL != 'verified'" evaluate to NULL, excluding
-            -- the row, while isExperienceContentLocked treats a NULL
-            -- verification_status as UNLOCKED. Latent today (createExperience
-            -- coalesces to 'pending_verify'), cheap to keep correct.
-            SELECT 1 FROM experiences e
-             WHERE e.provider_id = p.id
-               AND (e.verification_status IS NULL OR e.verification_status != 'verified')
-               AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
-               AND e.canonical_id IS NULL
-          )
-          ${providerParkingExclusionSql("p")}
-          ${noYieldBackoffExclusionSql("p")}
-        ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
-        LIMIT ?`
-    )
-    .all(candidateWindow) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+
+  const pageStmt = db.prepare(
+    `SELECT p.id AS id, p.navn AS navn,
+            COALESCE(
+              CASE WHEN p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != ''
+                   THEN TRIM(p.hjemmeside) END,
+              (SELECT TRIM(e2.evidence_url)
+                 FROM experiences e2
+                WHERE e2.provider_id = p.id
+                  AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
+                LIMIT 1)
+            ) AS hjemmeside
+       FROM experience_providers p
+      WHERE (
+          (p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != '')
+          OR EXISTS (
+              SELECT 1 FROM experiences e2
+               WHERE e2.provider_id = p.id
+                 AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
+                 AND p.hjemmeside IS NULL
+             )
+        )
+        AND EXISTS (
+          -- BROAD pre-filter only: "an unlocked, live experience exists at
+          -- all". Deliberately no longer requires a BLANK field here — that
+          -- was exactly the bug (dev-request 2026-07-29-blacklist-backfill-
+          -- og-berikelsestriage, slice 2): a non-blank but
+          -- aggregator-sourced field must still reach the per-field
+          -- provenance check below (isExperienceContentGenuinelyThin /
+          -- classifyProviderContentBucket — the SAME shared classifier the
+          -- berikelsestriage triage endpoint uses), which SQL alone cannot
+          -- express.
+          -- NULL-guarded on verification_status (round-3-review fix,
+          -- mirrored from GET .../recently-enriched): SQL three-valued
+          -- logic makes "NULL != 'verified'" evaluate to NULL, excluding
+          -- the row, while isExperienceContentLocked treats a NULL
+          -- verification_status as UNLOCKED. Latent today (createExperience
+          -- coalesces to 'pending_verify'), cheap to keep correct.
+          SELECT 1 FROM experiences e
+           WHERE e.provider_id = p.id
+             AND (e.verification_status IS NULL OR e.verification_status != 'verified')
+             AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
+             AND e.canonical_id IS NULL
+        )
+        ${providerParkingExclusionSql("p")}
+        ${noYieldBackoffExclusionSql("p")}
+      ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
+      LIMIT ? OFFSET ?`
+  );
 
   const experiencesStmt = db.prepare(
     `SELECT description, category, content_source, verification_status,
@@ -1873,14 +1922,56 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
   );
 
   const out: ContentRefreshTarget[] = [];
-  for (const row of candidates) {
-    if (!row.hjemmeside || !row.hjemmeside.trim()) continue;
-    const experiences = experiencesStmt.all(row.id) as BucketableExperienceRow[];
-    if (classifyProviderContentBucket(row.hjemmeside, experiences) !== "enrichable") continue;
-    out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() });
-    if (out.length >= cap) break;
+  let offset = 0;
+  let totalScanned = 0;
+  let stopReason: ContentRefreshStopReason = "real-exhaustion";
+
+  // Paginate the SQL pre-filter (same ORDER BY, advancing OFFSET) until cap
+  // enrichable providers are found, the SQL side runs out of rows (a page
+  // comes back shorter than requested), or the hard scan-cap budget is
+  // spent — see the doc comment above ContentRefreshSelection for why this
+  // replaced a single fetch-then-filter pass.
+  while (true) {
+    if (totalScanned >= CONTENT_REFRESH_HARD_SCAN_CAP) {
+      stopReason = "scan_cap_reached";
+      break;
+    }
+
+    const fetchSize = Math.min(pageSize, CONTENT_REFRESH_HARD_SCAN_CAP - totalScanned);
+    const page = pageStmt.all(fetchSize, offset) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+
+    totalScanned += page.length;
+    offset += page.length;
+
+    for (const row of page) {
+      if (!row.hjemmeside || !row.hjemmeside.trim()) continue;
+      const experiences = experiencesStmt.all(row.id) as BucketableExperienceRow[];
+      if (classifyProviderContentBucket(row.hjemmeside, experiences) !== "enrichable") continue;
+      out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() });
+      if (out.length >= cap) break;
+    }
+
+    if (out.length >= cap) {
+      stopReason = "cap_reached";
+      break;
+    }
+    if (page.length < fetchSize) {
+      // SQL side returned fewer rows than requested at this offset: there is
+      // genuinely nothing left to page through. Honest exhaustion.
+      stopReason = "real-exhaustion";
+      break;
+    }
+    if (totalScanned >= CONTENT_REFRESH_HARD_SCAN_CAP) {
+      // Full page delivered exactly at the budget boundary — we cannot tell
+      // whether more rows exist beyond it without another fetch, and the
+      // budget forbids that. Report the cap, not an unproven exhaustion.
+      stopReason = "scan_cap_reached";
+      break;
+    }
+    // else: SQL side had more to give and we haven't hit cap/budget — page again.
   }
-  return out;
+
+  return { targets: out, scanned: totalScanned, stopReason };
 }
 
 /**
@@ -2693,6 +2784,97 @@ export function searchGardssalgProviders(
   return withDistance.slice(0, clampedLimit);
 }
 
+// ─── Gårdssalg free-text search for /sok (dev-request 2026-08-01-gardssalg-
+//     profilkomplett-og-soekbar-foer-outreach, Steg 1) ─────────────────────
+//
+// Measured production bug: /sok's free-text search only ever queried
+// `experiences` (via searchPublishedExperiences() above) — gårdssalg
+// producers live in `experience_providers` (see listGardssalgProviders()'s
+// doc comment for why), so they had ZERO presence in search. 12 of 13
+// outreach-candidate producers returned "Ingen treff" on their own name.
+//
+// Distinct from searchGardssalgProviders(filter, limit) above: that one is
+// the STRUCTURED filter (fylke/kommune/producer_type/geo) backing the REST
+// /api/opplevelser/discover?category=gardssalg_smaking endpoint (via
+// routes/opplevelser.ts) and the discover_gardssalg MCP tool — no free-text
+// query param. This one is free-text-only, for the /sok HTML page's search
+// box, and deliberately does not touch that REST endpoint (out of scope for
+// this slice — see the dev-request).
+//
+// Reuses the EXACT SAME "is this a gårdssalg producer" gate as
+// listGardssalgProviders()/searchGardssalgProviders() (producer_type set OR
+// rfb-seed; catalog_hidden=1 rows excluded — parens around the OR are
+// load-bearing, see those functions' comments) so a hidden producer can
+// never leak into public search, same discipline as everywhere else this
+// gate is used.
+//
+// Matching reuses the SAME tokenised-AND / lower()/LIKE / expandSearchTerm()
+// Norwegian-synonym pattern as searchPublishedExperiences() above (rather
+// than inventing a second matching approach), so æøå and multi-word queries
+// behave consistently across both search surfaces — matched against
+// navn/poststed/kommune/fylke/products (products is a JSON-array-of-strings
+// text column; a plain substring LIKE still finds a product name inside it).
+//
+// Also requires a real slug (same discipline as listGardssalgProviderMapPoints():
+// a result with no /kategori/gardssalg/produsent/<slug> page to link to isn't
+// useful on a search results page) — every visible producer normally has one
+// via backfillProviderSlugs(), so this rarely excludes rows in practice.
+export type GardssalgSearchByQueryRow = {
+  id: string;
+  navn: string;
+  // Never null on a returned row — see the query's slug predicate below.
+  slug: string;
+  fylke: string | null;
+  kommune: string | null;
+  poststed: string | null;
+  producer_type: string | null;
+};
+
+export function searchGardssalgProvidersByQuery(query: string, limit = 30): GardssalgSearchByQueryRow[] {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  // Same tokenisation cap (8 terms) as searchPublishedExperiences() — an
+  // absurdly long query degrades gracefully rather than building an
+  // unbounded WHERE clause.
+  const terms = q.split(/\s+/).filter((t) => t.length > 0).slice(0, 8);
+  if (terms.length === 0) return [];
+  const db = getDb(VERTICAL);
+  const params: Record<string, unknown> = { limit: Math.max(1, Math.min(100, limit)) };
+  const termClauses = terms.map((t, i) => {
+    // Expand Norwegian term into [original, ...english_synonyms] — same
+    // helper searchPublishedExperiences() uses, kept consistent rather than
+    // reimplemented (SEARCH_SYNONYMS is activity-word-shaped, not producer-
+    // name-shaped, so it mostly no-ops here, but a shared helper means the
+    // two search surfaces never silently diverge in behavior).
+    const expanded = expandSearchTerm(t);
+    const fieldClauses = expanded.flatMap((et, ei) => {
+      const key = `t${i}_${ei}`;
+      params[key] = `%${et.toLowerCase()}%`;
+      return [
+        `lower(navn) LIKE @${key}`,
+        `lower(COALESCE(poststed,'')) LIKE @${key}`,
+        `lower(COALESCE(kommune,'')) LIKE @${key}`,
+        `lower(COALESCE(fylke,'')) LIKE @${key}`,
+        `lower(COALESCE(products,'')) LIKE @${key}`,
+      ];
+    });
+    return `(${fieldClauses.join(" OR ")})`;
+  });
+  const rows = db
+    .prepare(
+      `SELECT id, navn, slug, fylke, kommune, poststed, producer_type
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND slug IS NOT NULL AND slug != ''
+          AND ${termClauses.join(" AND ")}
+        ORDER BY navn
+        LIMIT @limit`
+    )
+    .all(params) as GardssalgSearchByQueryRow[];
+  return rows;
+}
+
 // ─── Gårdssalg content-refresh (dev-request 2026-07-03-gardssalg-rike-
 //     profiler-bilder-agentbooking, Fase 1 item 3, 2026-07-10) ──────────────
 //
@@ -2721,6 +2903,14 @@ export type GardssalgContentRefreshTarget = {
   // the content-refresh route can gate the products-extraction path on
   // gardssalgProductsEligible() without a second query.
   products: string | null;
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 3 follow-up — raw field_provenance JSON (same defensive-parse
+  // pattern as every other field_provenance read in this file, e.g.
+  // applyGardssalgWebsiteVerification in gardssalg-website-verification.ts),
+  // read here so the content-refresh route can gate its fetch on
+  // field_provenance.hjemmeside_verification.verified === true (PR #448's
+  // website-verification sweep) without a second query.
+  field_provenance: string | null;
 };
 
 /**
@@ -2739,7 +2929,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
   return db
     .prepare(
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
-              about_text, visit_text, opening_hours_text, products
+              about_text, visit_text, opening_hours_text, products, field_provenance
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
@@ -2771,7 +2961,7 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
   const row = db
     .prepare(
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
-              about_text, visit_text, opening_hours_text, products
+              about_text, visit_text, opening_hours_text, products, field_provenance
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
@@ -3898,12 +4088,12 @@ export function applyGardssalgProviderContact(
     telefon: row.telefon,
   };
 
-  if (isBlank(row.epost) && candidate.epost?.trim()) {
+  if (isBlank(row.epost) && candidate.epost?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "epost")) {
     sets.push("epost = @epost");
     params.epost = candidate.epost.trim();
     written.push("epost");
   }
-  if (isBlank(row.telefon) && candidate.telefon?.trim()) {
+  if (isBlank(row.telefon) && candidate.telefon?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "telefon")) {
     sets.push("telefon = @telefon");
     params.telefon = candidate.telefon.trim();
     written.push("telefon");
@@ -4183,14 +4373,28 @@ export function applyGardssalgProviderOrgnr(
  * itself. Exported for tests.
  */
 export function gardssalgOrgnrWasRolledBack(providerId: string): boolean {
+  return gardssalgContactFieldWasRolledBack(providerId, "org_nr");
+}
+
+/**
+ * Generalisering av gardssalgOrgnrWasRolledBack til vilkårlig felt (2026-07-31,
+ * lokal#438-review B1): en rollback nuller feltet, som gjør raden kvalifisert
+ * for fill-only-selektorene igjen — uten denne sjekken ville neste kjøring
+ * stille re-skrevet nøyaktig verdien et menneske nettopp rullet tilbake («an
+ * undo that un-undoes itself», org_nr-presedensens egne ord). Konsumeres av
+ * applyGardssalgProviderContact per felt (dekker både contact-extraction og
+ * Brreg-backfill i ett choke point) i tillegg til org_nr-wrapperen over.
+ * NB: kun EKSAKT feltnavn fra kallere — aldri brukerinput rett inn her.
+ */
+export function gardssalgContactFieldWasRolledBack(providerId: string, fieldName: string): boolean {
   const db = getDb(VERTICAL);
   const latest = db
     .prepare(
       `SELECT source_url FROM gardssalg_content_audit
-        WHERE provider_id = ? AND field_name = 'org_nr'
+        WHERE provider_id = ? AND field_name = ?
         ORDER BY rowid DESC LIMIT 1`
     )
-    .get(providerId) as { source_url: string | null } | undefined;
+    .get(providerId, fieldName) as { source_url: string | null } | undefined;
   return !!latest && latest.source_url === GARDSSALG_ROLLBACK_MARKER;
 }
 
@@ -4849,6 +5053,35 @@ export function gardssalgContactPageLinks(html: string, baseHost: string, max = 
 const CX_SKIP_LOCALPARTS = /^(noreply|no-reply|postmaster|webmaster|abuse|mailer-daemon|test|example)$/i;
 
 /**
+ * Sitebuilder-template placeholder domains. A mailto pointing at one of
+ * these is boilerplate the site owner never customised — NOT a contact
+ * address. Found the hard way in the 2026-07-31 cohort run: an
+ * un-customised Wix template served `mailto:info@mysite.com` on a real
+ * producer's site and the extractor trusted it (mailto = highest tier).
+ */
+const CX_PLACEHOLDER_DOMAINS = new Set([
+  "mysite.com",
+  "example.com",
+  "example.no",
+  "yourdomain.com",
+  "yoursite.com",
+  "yourwebsite.com",
+  "domain.com",
+  "email.com",
+  "example.org",
+  "example.net",
+  "test.com",
+  "company.com",
+  "website.com",
+  "yourcompany.com",
+  "wixpress.com",
+  "sentry.io",
+  "wix.com",
+  "squarespace.com",
+  "wordpress.com",
+]);
+
+/**
  * Extract the producer's contact EMAIL from a page.
  *
  * Trust order:
@@ -4874,7 +5107,9 @@ export function extractGardssalgContactEmail(
     if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return;
     const local = email.split("@")[0]!;
     if (CX_SKIP_LOCALPARTS.test(local)) return;
-    if (email.endsWith("@example.com") || email.endsWith(".invalid")) return;
+    if (email.endsWith(".invalid")) return;
+    const dom = email.split("@")[1]!;
+    if (CX_PLACEHOLDER_DOMAINS.has(dom) || CX_PLACEHOLDER_DOMAINS.has(registrableDomain(dom) ?? dom)) return;
     if (seen.has(email)) return;
     seen.add(email);
     candidates.push({ email, viaMailto });
@@ -5147,6 +5382,17 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // skive B (2026-07-19, komplett-foer-synlig) — fill-only hjemmeside adopted
   // from the website-discovery review queue; see applyGardssalgProviderWebsite
   "hjemmeside",
+  // 2026-07-31 (kontakt-utvinning follow-up) — applyGardssalgProviderContact
+  // has written audit rows for these since lokal#432, but this allowlist
+  // never included them, so a bad extracted address (e.g. a sitebuilder
+  // placeholder mailto like info@mysite.com) had no undo lever. The audit
+  // trail already exists; this only lets the planner act on it. Kjent og
+  // akseptert (samme som hjemmeside/adresse): field_provenance-oppføringen
+  // blir stående stale etter rollback (peker på kilde-URL-en mens verdien er
+  // null) — den er visning/audit i experiences, aldri en gate. Re-fill etter
+  // rollback vetoes av gardssalgContactFieldWasRolledBack i skriveren.
+  "epost",
+  "telefon",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
