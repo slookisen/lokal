@@ -4788,6 +4788,325 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-producer-type-classify (admin) ───
+//
+// Steg C — producer_type is currently set ONLY manually or via the 4-entry
+// GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode (NACE code) inside
+// POST /admin/gardssalg-nace-discovery above. Legacy rfb_seed_source='rfb-seed'
+// rows with no naeringskode have no signal that map-based path can use — this
+// endpoint backfills producer_type for exactly that cohort using an LLM judge
+// over navn + about_text/visit_text, restricted to the SAME closed vocabulary
+// already in use (DRINK_PRODUCER_TYPES ∪ NON_DRINK_PRODUCER_TYPES,
+// route-corridor-service.ts) plus an explicit "uklassifisert" (cannot tell)
+// escape hatch — never inventing a new category, never guessing when unsure.
+//
+// Non-goals: no change to GARDSSALG_NACE_PRODUCER_TYPE or the NACE-discovery
+// path; no overwrite of any row that already has producer_type set (fill-only,
+// same discipline as applyGardssalgProviderContact above); no change to
+// DRINK_PRODUCER_TYPES/NON_DRINK_PRODUCER_TYPES membership.
+//
+// Request/response shape mirrors gardssalg-contact-backfill above exactly:
+// { providerIds?, limit?, offset?, apply? } in, apply falsy/absent -> dry-run
+// (report only, zero writes). providerIds, when given, BYPASSES the selector's
+// WHERE clause entirely (existence-only lookup) — mirrors how
+// getGardssalgProviderContactTarget resolves locked/already-filled rows too,
+// so an admin can force a classification the auto-selector wouldn't surface
+// (e.g. a row that already has naeringskode, which the default selector
+// deliberately excludes since it belongs to the NACE-map path instead).
+import { NON_DRINK_PRODUCER_TYPES } from "../services/route-corridor-service";
+
+interface GardssalgProducerTypeCandidate {
+  id: string;
+  navn: string;
+  about_text: string | null;
+  visit_text: string | null;
+  content_source: string | null;
+  field_provenance: string | null;
+  producer_type?: string | null;
+}
+
+const GS_PTC_DEFAULT_LIMIT = 48;
+const GS_PTC_HARD_CAP = 100;
+const GS_PTC_TEXT_CHAR_CAP = 4000;
+const GARDSSALG_PRODUCER_TYPE_UKLASSIFISERT = "uklassifisert";
+// DRINK_PRODUCER_TYPES is already imported module-level above (used by the
+// verified-drinkproducer-cohort route) — imports hoist, so it's in scope here
+// too; importing it a second time would be a duplicate-identifier error.
+const GARDSSALG_PRODUCER_TYPE_VOCAB: Set<string> = new Set<string>([
+  ...Array.from(DRINK_PRODUCER_TYPES),
+  ...Array.from(NON_DRINK_PRODUCER_TYPES),
+]);
+
+/**
+ * judgeGardssalgProducerType — mirrors judgeGardssalgAboutCandidate's EXACT
+ * fail-closed contract (below, ~line 9049): direct fetch to
+ * https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+ * claude-haiku-4-5. ANY doubt or failure — missing key, network failure,
+ * non-200, unparseable JSON, a response that isn't an EXACT vocabulary token
+ * or the literal "uklassifisert" escape hatch — resolves to `type: null`.
+ * Never throws, never fabricates a category, never guesses. The literal
+ * "uklassifisert" response is a valid, non-ambiguous parse (the judge
+ * genuinely could not tell) but STILL yields `type: null` — there is nothing
+ * to apply either way; `raw` carries the model's raw text so callers/tests
+ * can tell the two null cases apart if they need to.
+ */
+async function judgeGardssalgProducerType(
+  navn: string,
+  aboutText: string | null,
+  visitText: string | null
+): Promise<{ type: string | null; raw: string }> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { type: null, raw: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+  }
+
+  const vocabList = Array.from(GARDSSALG_PRODUCER_TYPE_VOCAB).sort().join(", ");
+  const cappedAbout = (aboutText || "").slice(0, GS_PTC_TEXT_CHAR_CAP);
+  const cappedVisit = (visitText || "").slice(0, GS_PTC_TEXT_CHAR_CAP);
+  const prompt = `Du er en klassifiserer som skal bestemme produsenttype for en norsk gårdssalg-produsent, basert KUN på teksten under.
+
+Produsentnavn: ${navn}
+
+Om produsenten:
+${cappedAbout || "(ingen tekst)"}
+
+Besøket hos produsenten:
+${cappedVisit || "(ingen tekst)"}
+
+Svar med EKSAKT ett av disse ordene alene på første linje, uten annen tekst på linjen:
+${vocabList}
+
+Hvis du ikke kan avgjøre produsenttypen ut fra teksten over, svar i stedet med det eksakte ordet:
+${GARDSSALG_PRODUCER_TYPE_UKLASSIFISERT}
+
+Ved minste tvil, svar ${GARDSSALG_PRODUCER_TYPE_UKLASSIFISERT}. Finn ALDRI på en ny kategori som ikke står i listen.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 50,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { type: null, raw: "nettverksfeil under klassifiserer-kall — avvist fail-closed" }; // never fabricate
+  }
+
+  if (!response.ok) {
+    return { type: null, raw: `klassifiserer-API svarte status ${response.status} — avvist fail-closed` };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { type: null, raw: "ikke-parsbar JSON fra klassifiserer-API — avvist fail-closed" };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { type: null, raw: "uventet svarformat fra klassifiserer-API — avvist fail-closed" };
+  }
+
+  const firstLine = (text.trim().split(/\r?\n/)[0] || "").trim();
+
+  // Only an EXACT vocabulary token applies a value. A token that merely
+  // CONTAINS a vocabulary word inside a longer sentence, garbage, or an
+  // invented category is a reject — fail-closed on any ambiguity.
+  if (GARDSSALG_PRODUCER_TYPE_VOCAB.has(firstLine)) {
+    return { type: firstLine, raw: text };
+  }
+  return { type: null, raw: text || "uventet/tvetydig klassifiserer-svar — avvist fail-closed" };
+}
+
+/**
+ * Apply a judged producer_type to ONE gårdssalg provider. Same discipline as
+ * applyGardssalgProviderContact above: fresh read (never trusts the caller's
+ * stale row), NEVER writes if the provider is locked ('manual'/'claim'),
+ * FILL-ONLY via a transactional `WHERE producer_type IS NULL` guard (belt AND
+ * suspenders alongside the pre-check), one gardssalg_content_audit row,
+ * {source: "llm_classification", classified_at} merged into field_provenance
+ * (read-modify-write — every other existing key survives untouched). All in
+ * one transaction, mirroring applyGardssalgProviderContact's transaction shape
+ * (experience-store.ts) rather than hand-rolling a new one. Returns whether
+ * the write actually happened.
+ */
+function applyGardssalgProducerType(providerId: string, judgedType: string, batchId: string): boolean {
+  const expDb = getExpDb("experiences");
+  const row = expDb
+    .prepare(`SELECT id, content_source, producer_type, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; content_source: string | null; producer_type: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return false;
+  if (row.content_source === "manual" || row.content_source === "claim") return false;
+  if (row.producer_type !== null && row.producer_type !== undefined && String(row.producer_type).trim() !== "") {
+    return false;
+  }
+
+  // ── field_provenance merge (read-modify-write, preserves other keys) ──
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.producer_type = { source: "llm_classification", classified_at: new Date().toISOString() };
+
+  const applyWithAudit = expDb.transaction(() => {
+    const result = expDb
+      .prepare(
+        `UPDATE experience_providers
+            SET producer_type = @producer_type, field_provenance = @field_provenance, updated_at = datetime('now')
+          WHERE id = @id AND producer_type IS NULL`
+      )
+      .run({ id: providerId, producer_type: judgedType, field_provenance: JSON.stringify(provenance) });
+    if (result.changes === 0) {
+      // Fresh-read-at-write-time race: the pre-check above passed but the row
+      // was locked/filled between the pre-check and this transaction. Nothing
+      // was written, so nothing to audit either.
+      return false;
+    }
+    expDb
+      .prepare(
+        `INSERT INTO gardssalg_content_audit
+           (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+         VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+      )
+      .run({
+        id: crypto.randomUUID(),
+        provider_id: providerId,
+        field_name: "producer_type",
+        old_value: null,
+        new_value: judgedType,
+        source_url: null,
+        batch_id: batchId ?? null,
+      });
+    return true;
+  });
+  return applyWithAudit();
+}
+
+router.post("/admin/gardssalg-producer-type-classify", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+    apply?: unknown;
+  };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_PTC_DEFAULT_LIMIT,
+    GS_PTC_HARD_CAP
+  );
+  const offset = typeof body.offset === "number" && body.offset > 0 ? Math.floor(body.offset) : 0;
+
+  const expDb = getExpDb("experiences");
+
+  let targets: GardssalgProducerTypeCandidate[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    // Explicit ids bypass the selector's WHERE clause entirely (existence-only
+    // lookup) — mirrors gardssalg-contact-backfill's providerIds override.
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+          .map((id) => id.trim())
+      )
+    ).slice(0, limit);
+    const stmt = expDb.prepare(
+      `SELECT id, navn, about_text, visit_text, content_source, field_provenance, producer_type
+         FROM experience_providers WHERE id = ?`
+    );
+    targets = ids
+      .map((id) => stmt.get(id) as GardssalgProducerTypeCandidate | undefined)
+      .filter((t): t is GardssalgProducerTypeCandidate => t !== undefined);
+  } else {
+    targets = expDb
+      .prepare(
+        `SELECT id, navn, about_text, visit_text, content_source, field_provenance
+           FROM experience_providers
+          WHERE rfb_seed_source = 'rfb-seed'
+            AND producer_type IS NULL
+            AND (naeringskode IS NULL OR naeringskode = '')
+          ORDER BY created_at ASC, id ASC
+          LIMIT ? OFFSET ?`
+      )
+      .all(limit, offset) as GardssalgProducerTypeCandidate[];
+  }
+
+  const batchId = `producer-type-classify-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+
+  let classified = 0;
+  let unclassified = 0;
+  let skippedLocked = 0;
+  let skippedNotBlank = 0;
+  const results: Array<{ id: string; navn: string; judged_type: string | null; applied: boolean }> = [];
+
+  for (const row of targets) {
+    if (row.content_source === "manual" || row.content_source === "claim") {
+      skippedLocked++;
+      results.push({ id: row.id, navn: row.navn, judged_type: null, applied: false });
+      continue;
+    }
+    if (typeof row.producer_type === "string" && row.producer_type.trim() !== "") {
+      skippedNotBlank++;
+      results.push({ id: row.id, navn: row.navn, judged_type: null, applied: false });
+      continue;
+    }
+
+    const verdict = await judgeGardssalgProducerType(row.navn, row.about_text, row.visit_text);
+    if (verdict.type === null) {
+      unclassified++;
+      results.push({ id: row.id, navn: row.navn, judged_type: null, applied: false });
+      continue;
+    }
+
+    classified++;
+    let applied = false;
+    if (apply) {
+      applied = applyGardssalgProducerType(row.id, verdict.type, batchId);
+    }
+    results.push({ id: row.id, navn: row.navn, judged_type: verdict.type, applied });
+  }
+
+  res.json({
+    success: true,
+    dryRun,
+    summary: {
+      candidates: targets.length,
+      classified,
+      unclassified,
+      skippedLocked,
+      skippedNotBlank,
+    },
+    results,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-orgnr-backfill (admin) ───────────
 //
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b.

@@ -29428,6 +29428,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcb.failures) failures.push("opplevelser-gardssalg-contact-backfill: " + f);
     console.log(`  opplevelser-gardssalg-contact-backfill: ${gcb.passed} passed, ${gcb.failed} failed`);
 
+    // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
+    // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
+    // rfb_seed_source='rfb-seed' rows with no naeringskode have no signal that
+    // map-based path can use — POST /admin/gardssalg-producer-type-classify
+    // (src/routes/opplevelser.ts) backfills producer_type for exactly that
+    // cohort using an LLM judge over navn + about_text/visit_text, restricted
+    // to the SAME closed vocabulary already in use (DRINK_PRODUCER_TYPES ∪
+    // NON_DRINK_PRODUCER_TYPES) plus an explicit "uklassifisert" escape hatch.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block for the same reason.
+    console.log("\n── opplevelser-gardssalg-producer-type-classify: legacy-row producer_type LLM backfill ──");
+    const { runOpplevelserGardssalgProducerTypeClassifyTests } = require("../src/routes/opplevelser-gardssalg-producer-type-classify.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-producer-type-classify.test");
+    const gptc = await runOpplevelserGardssalgProducerTypeClassifyTests({ log: false });
+    passed += gptc.passed;
+    failed += gptc.failed;
+    for (const f of gptc.failures) failures.push("opplevelser-gardssalg-producer-type-classify: " + f);
+    console.log(`  opplevelser-gardssalg-producer-type-classify: ${gptc.passed} passed, ${gptc.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5d
     // + 5b-integrasjonsherding (2026-07-19-review B1/B2/M1/M2/M3/M5): delt-/
     // katalogdomene-vern på content-refresh (kuratert klassifiserer +
