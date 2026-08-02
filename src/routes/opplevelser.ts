@@ -6557,6 +6557,61 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
   }
 });
 
+// ─── GET /api/opplevelser/admin/website-review-queues ───────────────────────
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach
+// (Daniels oppfølging 2026-08-01: «Jeg ønsker å få innhentet hjemmesider på
+// dem som mangler»). Both website review queues already have discovery
+// WRITERS (gardssalg-website-discovery, brreg-website-discovery,
+// listing-homepage-discovery, homepage-review-queue/submit, and the
+// verification sweep's "unverified" enqueue) and APPROVE levers that demand
+// the exact queued (provider_id, candidate_url) pair — but NO reader.
+// Measured live 2026-08-01: 43 pending gardssalg + 219 pending homepage
+// entries were sitting unreachable from outside; discovery re-runs yielded
+// 0 new proposals because the pool is already parked here. This closes that
+// gap with the smallest possible surface: one admin-gated, read-only GET.
+//
+// Pending rows only (that is what the approve levers accept). The two tables
+// model "pending" DIFFERENTLY, deliberately mirrored here rather than
+// papered over: gardssalg_website_review_queue has NO status column — its
+// approve lever DELETES the row (clearGardssalgWebsiteReviewQueueEntry), so
+// every row that exists is pending by construction. The homepage queue keeps
+// resolved rows and marks them (status='approved'), so it needs the WHERE.
+// Pure read — two SELECTs, zero writes, no network. NB: mounted (like every
+// other /admin/* GET in this block) well before the /:id catch-all.
+router.get("/admin/website-review-queues", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const gardssalg = listGardssalgWebsiteReviewQueue()
+      .map((q) => ({
+        provider_id: q.provider_id,
+        provider_name: q.provider_name,
+        candidate_url: q.candidate_url,
+        reason: q.reason,
+        evidence: q.evidence ?? null,
+        batch_id: q.batch_id ?? null,
+        updated_at: q.updated_at,
+      }));
+    const homepage = expDb
+      .prepare(
+        `SELECT provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, created_at
+           FROM experience_homepage_review_queue
+          WHERE status = 'pending'
+          ORDER BY created_at DESC`
+      )
+      .all();
+    res.json({
+      success: true,
+      counts: { gardssalg_pending: gardssalg.length, homepage_pending: (homepage as unknown[]).length },
+      gardssalg,
+      homepage,
+    });
+  } catch (err) {
+    console.error("[website-review-queues] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/gardssalg-provider-lookup ────────────────────
 //
 // Closes a gap surfaced while targeting /admin/gardssalg-content-refresh at
