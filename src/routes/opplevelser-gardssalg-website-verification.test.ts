@@ -44,6 +44,14 @@
  *       does not duplicate/re-touch the already-queued review entry
  *   (g) providerIds override re-targets a subset without recomputing the
  *       whole cohort
+ *   (j) GET .../gardssalg-website-verification-audit `limit`/`offset`
+ *       pagination (dev-request 2026-08-02-opplevagent-hjemmesideverifisering
+ *       -og-enrichment-gate, Steg 1): default no-param response shape is
+ *       byte-for-byte unchanged, invalid limit/offset -> 400, valid limit
+ *       alone defaults offset to 0, limit+offset pages correctly with
+ *       next_offset chaining to null on the last page, and the cohort's new
+ *       deterministic ORDER BY id makes walking every page via next_offset
+ *       visit every row exactly once
  */
 
 export interface TestSummary {
@@ -287,6 +295,131 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         auditRes.body.summary,
         { verified: 1, unverified: 1, aggregator: 1, missing_source: 1, total: 4 },
         "b11: summary counts every bucket exactly once over the visible cohort",
+      );
+
+      // ── (j) GET .../gardssalg-website-verification-audit — limit/offset
+      //     pagination (Steg 1 of dev-request 2026-08-02-opplevagent-
+      //     hjemmesideverifisering-og-enrichment-gate). Uses the same 4-row
+      //     VISIBLE cohort as (b)/(c) above — the cohort's new `ORDER BY id`
+      //     (services/gardssalg-website-verification.ts) makes these row
+      //     positions ("prov-aggregator" < "prov-missing-source" <
+      //     "prov-unverified-404" < "prov-verified-orgnr", plain string
+      //     order) deterministic across repeated calls. Entirely read-only,
+      //     so it's placed here, before any POST/write section below, and
+      //     touches none of their state. ───────────────────────────────────
+
+      // j1: no-param response shape is UNCHANGED — exactly today's keys, no
+      // `pagination` key sneaking in for a caller who never asked for it.
+      assertEq(
+        Object.keys(auditRes.body).sort(),
+        ["rows", "scope", "success", "summary"].sort(),
+        "j1: default (no limit/offset) response carries EXACTLY today's keys — no new `pagination` key",
+      );
+
+      // j2-j5: invalid limit/offset -> 400, Norwegian message, matching
+      // `scope`'s own validation style.
+      const badLimit = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=0",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(badLimit.status, 400, "j2: limit=0 -> 400 (must be >= 1)");
+      assertTrue(/Ugyldig limit/.test(badLimit.body.error || ""), "j2b: limit error message names the field");
+
+      const badLimitStr = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=abc",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(badLimitStr.status, 400, "j3: limit=abc -> 400 (not an integer)");
+
+      const badOffset = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=2&offset=-1",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(badOffset.status, 400, "j4: offset=-1 -> 400 (must be >= 0)");
+      assertTrue(/Ugyldig offset/.test(badOffset.body.error || ""), "j4b: offset error message names the field");
+
+      const offsetWithoutLimit = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?offset=1",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(offsetWithoutLimit.status, 400, "j5: offset without limit -> 400, no default limit is guessed");
+
+      // j6-j10: valid limit alone (offset defaults to 0) -> first page, in
+      // id order; summary/pagination reflect only the returned page.
+      const page1 = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=1",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(page1.status, 200, "j6: limit=1 alone -> 200");
+      assertEq(page1.body.rows.length, 1, "j7: exactly one row returned");
+      assertEq(page1.body.rows[0]?.provider_id, "prov-aggregator", "j8: first id-ordered row is prov-aggregator");
+      assertEq(
+        page1.body.pagination,
+        { total: 4, offset: 0, limit: 1, returned: 1, next_offset: 1 },
+        "j9: pagination block — offset defaulted to 0, next_offset points at the next row",
+      );
+      assertEq(
+        page1.body.summary,
+        { verified: 0, unverified: 0, aggregator: 1, missing_source: 0, total: 1 },
+        "j10: summary reflects ONLY the returned page, not the full cohort",
+      );
+
+      // j11-j15: walk the whole cohort one row at a time via limit=1,
+      // confirming (a) each page's row differs from every other page's row
+      // (the ordering fix — paginated calls at offset=0/1 must never return
+      // the same row) and (b) `next_offset` correctly chains through to the
+      // last page, which reports next_offset: null.
+      const seenIds: string[] = [];
+      let cursor: number | null = 0;
+      let guard = 0;
+      while (cursor !== null && guard < 10) {
+        guard++;
+        const pageRes = await callRoute(opplevelserRouter, {
+          url: `/admin/gardssalg-website-verification-audit?limit=1&offset=${cursor}`,
+          headers: { "x-admin-key": testKey },
+        });
+        assertEq(pageRes.status, 200, `j11.${cursor}: paged GET at offset=${cursor} -> 200`);
+        assertEq(pageRes.body.rows.length, 1, `j12.${cursor}: exactly one row at offset=${cursor}`);
+        seenIds.push(pageRes.body.rows[0].provider_id);
+        cursor = pageRes.body.pagination.next_offset;
+      }
+      assertEq(seenIds.length, 4, "j13: walking next_offset visits exactly 4 pages — the whole visible cohort, no more, no less");
+      assertEq(new Set(seenIds).size, 4, "j14: all 4 visited rows are DISTINCT — no row skipped or duplicated across pages");
+      assertEq(
+        seenIds,
+        ["prov-aggregator", "prov-missing-source", "prov-unverified-404", "prov-verified-orgnr"],
+        "j15: walking order matches the cohort's new deterministic ORDER BY id",
+      );
+
+      // j16-j18: limit+offset paging with a non-1 page size, and the last
+      // page reporting next_offset: null.
+      const page2of2 = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=2&offset=2",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(page2of2.status, 200, "j16: limit=2&offset=2 -> 200");
+      assertEq(
+        page2of2.body.rows.map((r: any) => r.provider_id),
+        ["prov-unverified-404", "prov-verified-orgnr"],
+        "j17: second (final) page of a limit=2 walk carries the last two id-ordered rows",
+      );
+      assertEq(
+        page2of2.body.pagination,
+        { total: 4, offset: 2, limit: 2, returned: 2, next_offset: null },
+        "j18: final page reports next_offset: null — nothing left to fetch",
+      );
+
+      // j19-j20: an offset at/past the end of the cohort -> zero rows,
+      // next_offset still null (never negative / never re-wraps).
+      const pastEnd = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=5&offset=4",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(pastEnd.status, 200, "j19: limit=5&offset=4 (offset==total) -> 200");
+      assertEq(
+        pastEnd.body.pagination,
+        { total: 4, offset: 4, limit: 5, returned: 0, next_offset: null },
+        "j20: offset at the end of the cohort returns an empty page, not an error",
       );
 
       function getProviderRow(id: string): any {

@@ -6812,6 +6812,42 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
     return;
   }
+  // Steg 1 of dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-
+  // enrichment-gate: optional `limit`/`offset` so a caller can page through
+  // the cohort instead of forcing this route to fetch every producer's live
+  // homepage in one HTTP request — the cohort is ~87 rows today, but Steg 2
+  // widens it to the full experience_providers table (thousands of rows),
+  // and an unbounded synchronous scan at that size is exactly the timeout/
+  // event-loop-stall risk PR #432 already burned this codebase on once.
+  // Both are strictly validated (never a silent clamp/default) — same
+  // discipline as `scope` immediately above. `offset` without `limit` is
+  // ALSO invalid: there is no sane default page size to guess, and silently
+  // picking one would make `?offset=50` alone quietly behave nothing like
+  // what its caller asked for.
+  let limit: number | undefined;
+  let offset: number | undefined;
+  if (req.query.limit !== undefined) {
+    const rawLimit = String(req.query.limit);
+    const parsedLimit = Number(rawLimit);
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+      res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
+      return;
+    }
+    limit = parsedLimit;
+  }
+  if (req.query.offset !== undefined) {
+    const rawOffset = String(req.query.offset);
+    const parsedOffset = Number(rawOffset);
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+      return;
+    }
+    offset = parsedOffset;
+  }
+  if (limit === undefined && offset !== undefined) {
+    res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+    return;
+  }
   try {
     const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
       const fetched = await crFetchGardssalgContent(homepageUrl);
@@ -6819,8 +6855,30 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
       return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
     };
     const cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
-    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
-    res.json({ success: true, scope, summary, rows });
+
+    if (limit === undefined) {
+      // No pagination requested: byte-for-byte identical behavior/response
+      // shape to before this slice — the cohort's new ORDER BY doesn't
+      // change WHICH rows come back, only their order, so this branch's
+      // output is unaffected.
+      const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+      res.json({ success: true, scope, summary, rows });
+      return;
+    }
+
+    const pageOffset = offset ?? 0;
+    const page = cohort.slice(pageOffset, pageOffset + limit);
+    const { summary, rows } = await scanGardssalgWebsiteVerificationRows(page, fetchFn, CR_CONCURRENCY);
+    const total = cohort.length;
+    const returned = rows.length;
+    const nextOffset = pageOffset + returned < total ? pageOffset + returned : null;
+    res.json({
+      success: true,
+      scope,
+      summary,
+      rows,
+      pagination: { total, offset: pageOffset, limit, returned, next_offset: nextOffset },
+    });
   } catch (err) {
     console.error("[gardssalg-website-verification-audit] failed:", err);
     res.status(500).json({ error: "Internal error" });
