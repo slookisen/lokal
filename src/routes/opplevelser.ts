@@ -5812,8 +5812,27 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
     // Converge on ONE row: match an existing test row by slug OR the fixed test
     // org_nr (the stable identity across repeat calls, even if the slug changes).
     const existing = expDb
-      .prepare("SELECT id FROM experience_providers WHERE slug = ? OR org_nr = ? LIMIT 1")
-      .get(slug, TEST_PROVIDER_ORG_NR) as { id: string } | undefined;
+      .prepare("SELECT id, org_nr FROM experience_providers WHERE slug = ? OR org_nr = ? LIMIT 1")
+      .get(slug, TEST_PROVIDER_ORG_NR) as { id: string; org_nr: string | null } | undefined;
+
+    // The `slug OR org_nr` match above can land on a REAL provider — any row
+    // whose slug the caller happened to pass. Everything below this point
+    // rewrites the resolved row into the test provider (navn, producer_type,
+    // catalog_hidden, booking_live, commission_rate, verification_status), so
+    // refusing has to happen BEFORE the first write, not after it: a check
+    // placed later would report "refused" on a row it had already overwritten.
+    // The endpoint's whole contract is "upsert THE ONE test row", so a
+    // resolved row that isn't it is always a caller error, never a valid
+    // target — with or without the claimable flag.
+    if (existing && existing.org_nr !== TEST_PROVIDER_ORG_NR) {
+      res.status(409).json({
+        error:
+          `Nekter: slug '${slug}' tilhører en ekte produsent, ikke testprodusenten ` +
+          `(org_nr ${existing.org_nr ?? "NULL"} != ${TEST_PROVIDER_ORG_NR}). Ingenting er skrevet.`,
+        provider_id: existing.id,
+      });
+      return;
+    }
 
     // createProvider() covers the ProviderSchema-known fields (navn/org_nr/epost/
     // verification_status); the raw UPDATE below sets the columns the schema
@@ -5843,10 +5862,11 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
     // ── claimable opt-in (see this route's doc comment) ──────────────────
     let claimReady = false;
     if (claimable) {
-      // Pinned to the fixed test org_nr, NOT just the resolved id: the upsert
-      // above matches on `slug OR org_nr`, so a caller passing a real
-      // provider's slug lands on that real row. `changes === 0` there means the
-      // pin refused the write — reported as a 409 rather than a silent no-op.
+      // Belt to the pre-write guard's braces. That guard already turns a
+      // real-provider slug into a 409 before anything is written, so this pin
+      // should be unreachable — but it is the clause that makes the forged-
+      // ownership write structurally impossible rather than merely unreached,
+      // and it costs one AND. `changes === 0` means it fired.
       const stamp = JSON.stringify({
         hjemmeside: {
           source_url: hjemmeside,

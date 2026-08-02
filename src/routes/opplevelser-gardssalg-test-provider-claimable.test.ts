@@ -33,11 +33,17 @@
  *       then present a read-only portal — testing the wrong thing
  *   (e) repeatability: after a completed claim stamps content_source='claim',
  *       re-running the endpoint resets the row to claimable again
- *   (f) the org_nr pin: pointing the endpoint at a REAL provider's slug does
- *       not forge an ownership stamp on that row — 409, and every one of the
- *       real row's fields is byte-identical afterwards
+ *   (f) pointing the endpoint at a REAL provider's slug is refused with a 409
+ *       and EVERY one of that row's fields is byte-identical afterwards. The
+ *       whole-row check matters: the refusal has to happen before the first
+ *       write, since the pre-existing unconditional UPDATE rewrites navn/
+ *       producer_type/catalog_hidden/booking_live on whatever row the
+ *       `slug OR org_nr` match resolved. Checking only the claim fields would
+ *       pass while the row had in fact been overwritten.
  *   (g) a generic/shared domain (and a bare host) is a 400, never a silently
  *       non-claimable row
+ *   (h) that same refusal applies WITHOUT the claimable flag — the guard is on
+ *       the endpoint's "upsert THE ONE test row" contract, not on the flag
  */
 
 export interface TestSummary {
@@ -276,6 +282,13 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       assertEq(realAfter.field_provenance, null, "f3: no forged ownership stamp on the real row");
       assertEq(realAfter.content_source, "manual", "f4: the real row's content_source lock survives");
       assertEq(realAfter.hjemmeside, realBefore.hjemmeside, "f5: the real row's hjemmeside is untouched");
+      // The 409 says "refused". It has to be true of the WHOLE row, not just the
+      // claim fields — the pre-existing unconditional UPDATE runs before the
+      // claimable branch and is not pinned to the test org_nr.
+      assertEq(realAfter.navn, realBefore.navn, "f6: the real row's navn is untouched");
+      assertEq(realAfter.producer_type, realBefore.producer_type, "f7: ...its producer_type is not flipped to test-gardssalg");
+      assertEq(realAfter.catalog_hidden, realBefore.catalog_hidden, "f8: ...it is not hidden from the catalog");
+      assertEq(realAfter.booking_live, realBefore.booking_live, "f9: ...booking_live is not switched on");
 
       // ── (g) generic / unusable domains are a 400 ────────────────────────
       const generic = await callRoute(opplevelserRouter, {
@@ -298,6 +311,17 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
         "https://test-ikke-book.invalid",
         "g4: a rejected call wrote nothing — the row still carries the last good domain",
       );
+
+      // ── (h) the guard is not conditional on the flag ────────────────────
+      const plainHijack = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", slug: "ekte-bryggeri" },
+      });
+      assertEq(plainHijack.status, 409, "h1: a real provider's slug is refused even without claimable");
+      const realAfterPlain = readRow("prov-real");
+      assertEq(realAfterPlain.navn, realBefore.navn, "h2: ...and that row is still untouched");
+      assertEq(realAfterPlain.producer_type, realBefore.producer_type, "h3: ...producer_type intact");
+      assertEq(realAfterPlain.catalog_hidden, realBefore.catalog_hidden, "h4: ...still visible in the catalog");
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
