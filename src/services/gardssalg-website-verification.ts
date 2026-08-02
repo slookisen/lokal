@@ -154,7 +154,8 @@ export function loadGardssalgWebsiteVerificationCohort(
     .prepare(
       `SELECT id, navn, hjemmeside, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer, catalog_hidden
          FROM experience_providers
-        WHERE ${GS_WV_SCOPE_SQL[scope]}`
+        WHERE ${GS_WV_SCOPE_SQL[scope]}
+        ORDER BY id`
     )
     .all() as GsWvProducerRow[];
 }
