@@ -422,6 +422,41 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         "j20: offset at the end of the cohort returns an empty page, not an error",
       );
 
+      // j21-j23: server-side upper bound on `limit` (dev-request
+      // 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-gate
+      // Steg 1 follow-up — MAX_GARDSSALG_AUDIT_LIMIT). A caller-chosen `limit`
+      // large enough reproduces the exact unbounded-scan risk pagination was
+      // added to prevent, so this route rejects anything past the cap —
+      // never a silent clamp, same discipline as the rest of this route's
+      // param validation.
+      const atMax = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=12",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(atMax.status, 200, "j21: limit=12 (the max) -> 200, not rejected");
+      assertEq(
+        atMax.body.pagination,
+        { total: 4, offset: 0, limit: 12, returned: 4, next_offset: null },
+        "j21b: limit=12 at the max still pages normally (only 4 rows exist in this cohort)",
+      );
+
+      const overMax = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=13",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(overMax.status, 400, "j22: limit=13 (one over the max) -> 400");
+      assertEq(
+        overMax.body.error,
+        "Ugyldig limit — maks er 12.",
+        "j22b: limit-too-high error message names the max",
+      );
+
+      const wayOverMax = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?limit=1000",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(wayOverMax.status, 400, "j23: a much larger limit (the exact PR #432 unbounded-scan shape) is also rejected, not clamped");
+
       function getProviderRow(id: string): any {
         return expDb.prepare(`SELECT id, field_provenance FROM experience_providers WHERE id = ?`).get(id);
       }

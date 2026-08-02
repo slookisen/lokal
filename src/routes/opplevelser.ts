@@ -6797,6 +6797,21 @@ router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (r
 // this file that makes outbound network calls, same as
 // POST .../gardssalg-website-discovery already does; it performs ZERO
 // database writes either way.
+//
+// MAX_GARDSSALG_AUDIT_LIMIT: `limit` (added just above, dev-request
+// 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-gate Steg 1)
+// still needed a hard server-side ceiling — a large-but-"valid" positive
+// integer reproduces the exact unbounded-scan risk (PR #432) the pagination
+// itself exists to avoid. Live measurement on today's 87-row cohort:
+// ?limit=5 (2 CR_CONCURRENCY batches) ~7.8s, but ?limit=20 (7 batches)
+// ~77.4s — already past this route's 60s target, and the per-batch cost
+// grew FASTER than linearly (~3.9s/batch at limit=5 vs. ~11s/batch at
+// limit=20), so per-row cost is not safely extrapolable to a big ceiling.
+// 12 (= 4 full CR_CONCURRENCY batches) sits well clear of the only
+// measured-safe point (5) and, per that observed growth curve, projects to
+// roughly 40-45s worst case — comfortably under 60s, not just barely under.
+const MAX_GARDSSALG_AUDIT_LIMIT = 12;
+
 router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
   // scope=visible (default) | hidden | all — Daniel's 2026-08-01 live
@@ -6831,6 +6846,10 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     const parsedLimit = Number(rawLimit);
     if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
       res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
+      return;
+    }
+    if (parsedLimit > MAX_GARDSSALG_AUDIT_LIMIT) {
+      res.status(400).json({ error: `Ugyldig limit — maks er ${MAX_GARDSSALG_AUDIT_LIMIT}.` });
       return;
     }
     limit = parsedLimit;
