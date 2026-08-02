@@ -368,6 +368,10 @@ export function runAdminAgentsUrlWriteTests(opts: { log?: boolean } = {}): Promi
       assertEq(routeMod.isUsableHomepageUrl("https://gard.no"), true, "uw-62: plain https url accepted");
       assertEq(routeMod.isUsableHomepageUrl("https://gard.no/med mellomrom"), false, "uw-63: whitespace in the url rejected");
       assertEq(routeMod.isUrlCurated("not json"), false, "uw-64: malformed curated JSON treated as unlocked");
+      assertEq(routeMod.hostOf("https://evil.com@rettfrabonden.com/"), "rettfrabonden.com", "uw-65: hostOf strips userinfo before the real host");
+      assertEq(routeMod.hostOf("https://user:pass@facebook.com/x"), "facebook.com", "uw-66: hostOf strips user:pass userinfo too");
+      assertEq(routeMod.isPlatformOwnedHost("https://evil.com@rettfrabonden.com/"), true, "uw-67: userinfo can no longer smuggle a platform host past the guard");
+      assertEq(routeMod.isDirectoryHost("https://x@facebook.com/"), true, "uw-68: userinfo can no longer smuggle a directory host past the guard");
     } finally {
       if (setKeyOurselves) delete process.env.ADMIN_KEY;
       try {

@@ -105,7 +105,15 @@ function db_(): ReturnType<typeof getDb> {
 export function hostOf(url: string): string {
   const m = /^https?:\/\/([^/?#]+)/i.exec((url || "").trim());
   if (!m) return "";
-  const h = m[1].toLowerCase().replace(/:\d+$/, "");
+  // Strip URL userinfo (`user:pass@` / `user@`) before extracting the host —
+  // a real client resolves the host as everything AFTER the last `@` in the
+  // authority, ignoring userinfo. Without this, `https://evil.com@rettfrabonden.com/`
+  // returned the literal string "evil.com@rettfrabonden.com", which bypassed
+  // both isPlatformOwnedHost and isDirectoryHost below.
+  const authority = m[1];
+  const at = authority.lastIndexOf("@");
+  const hostPart = at === -1 ? authority : authority.slice(at + 1);
+  const h = hostPart.toLowerCase().replace(/:\d+$/, "");
   return h.startsWith("www.") ? h.slice(4) : h;
 }
 
