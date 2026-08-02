@@ -114,6 +114,18 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
         org_nr: "922222222", brreg_verified: 1, hjemmeside: "https://enannengard.no",
         content_source: "manual", field_provenance: null,
       });
+      // stored_epost_verified (c-epost) route-level fixture: content_source=
+      // 'manual', NO hjemmeside at all -- eligibility here can ONLY come
+      // from the new tier. This is what pins the GET entry page's mirroring
+      // of issueClaimMagicLink()'s own (b-epost) lookup (see routes/
+      // gardssalg-claim.ts's GET handler comment) -- a regression that
+      // updates one call site and not the other would show the wrong page.
+      insertProvider.run({
+        id: "prov-route-epost", navn: "Route Test Epost Gård", slug: "route-test-epost-gard",
+        org_nr: "933333333", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null,
+      });
+      expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("post@routeepost.no", "prov-route-epost");
 
       const routerMod = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
       const expressMod = require("express") as typeof import("express");
@@ -170,6 +182,21 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertTrue(eligiblePage.body.includes("Send meg tilgangslenke"), "a6: eligible provider's entry page shows the request button");
       assertTrue(!eligiblePage.body.includes("@route-test-gard.no"), "a7: entry page never shows the FULL target email, only a masked version");
       assertTrue(/p\*+t@r\*+\.no/.test(eligiblePage.body), "a8: entry page shows a masked version of post@route-test-gard.no");
+
+      // ── stored_epost_verified: GET entry page mirrors issueClaimMagicLink ──
+      const epostPage = await req("GET", "/kategori/gardssalg/eier/route-test-epost-gard");
+      assertEq(epostPage.status, 200, "a9: GET entry page for a stored_epost_verified-only provider -> 200");
+      assertTrue(epostPage.body.includes("Send meg tilgangslenke"), "a10: shows the self-service request button (not the manual fallback) for a stored_epost_verified-eligible provider");
+      assertTrue(!epostPage.body.includes("post@routeepost.no"), "a11: never shows the full target email, only masked");
+
+      const epostReqResp = await req("POST", "/kategori/gardssalg/eier/prov-route-epost/request", {
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      assertEq(epostReqResp.status, 200, "a12: POST request-magic-link succeeds end to end for the stored_epost_verified provider");
+      const epostClaimRow = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-epost") as any;
+      assertEq(epostClaimRow?.email, "post@routeepost.no", "a13: the issued claim really targets the provider's stored epost");
+      assertEq(epostClaimRow?.email_source, "stored_epost_verified", "a14: persisted with email_source='stored_epost_verified'");
 
       // ── (b) POST request -> issues a magic link (JSON path) ────────────
       const reqResp = await req("POST", "/kategori/gardssalg/eier/prov-route-eligible/request", {

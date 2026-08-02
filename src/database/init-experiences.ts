@@ -841,7 +841,13 @@ export function initExperiencesSchema(db: Database.Database): void {
         id TEXT PRIMARY KEY,
         provider_id TEXT NOT NULL REFERENCES experience_providers(id) ON DELETE CASCADE,
         email TEXT NOT NULL,
-        email_source TEXT NOT NULL, -- 'brreg_contact' | 'verified_domain_address'
+        email_source TEXT NOT NULL, -- 'brreg_contact' | 'verified_domain_address' | 'stored_epost_verified'
+        -- 'stored_epost_verified' added dev-request 2026-07-30-opplevagent-
+        -- claim-epost-og-perfelt-laas item 1: the provider's own epost
+        -- value, issued only when backed by real provenance -- see
+        -- deriveOrgLinkedEmail()'s module doc in services/gardssalg-claim.ts.
+        -- Column stays untyped TEXT; this is a comment-only change, no
+        -- migration needed.
         token TEXT NOT NULL UNIQUE,
         used INTEGER NOT NULL DEFAULT 0,
         used_at TEXT,

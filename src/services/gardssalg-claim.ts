@@ -15,8 +15,11 @@
 // the organisation:
 //   (a) the Brreg-registered contact email for that org_nr, or
 //   (b) an address on the producer's already ownership-verified website
-//       domain (post@<verified-domain>).
-// If neither exists, there is NO self-service claim path — only the manual
+//       domain (post@<verified-domain>), or
+//   (c) the provider's OWN stored `epost`, when independently backed by
+//       provenance — see "stored_epost_verified" below (dev-request
+//       2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 1 only).
+// If none exists, there is NO self-service claim path — only the manual
 // fallback (Daniel verifies personally via kontakt@opplevagent.no).
 //
 // IMPORTANT, VERIFIED FINDING (read directly against the code, not assumed):
@@ -68,11 +71,87 @@
 // organisation itself is confirmed real and active — a provider that isn't
 // even Brreg-verified has no confirmed legal-entity identity to claim
 // against, regardless of which email path would otherwise apply.
+//
+// ─── (c) stored_epost_verified — dev-request 2026-07-30-opplevagent-claim-
+// epost-og-perfelt-laas, item 1 ONLY (items 2-4 of that request — admin
+// claim-grant, per-field lock, CTA-hiding — are separate slices, not built
+// here) ─────────────────────────────────────────────────────────────────
+// experience_providers.epost is, by default, harvest/enrichment data
+// (homepage-crawl content or copied from an RFB producer's
+// agent_knowledge.email — gardssalg-rfb-enrich.ts) and therefore NOT
+// trustworthy as a claim target on its own, same reasoning as path (b)'s
+// "raw hjemmeside is not verified". It becomes eligible ONLY when backed by
+// one of the THREE provenance sub-cases the dev-request names — measured
+// against this codebase's REAL code/schema, not assumed:
+//
+//   (a-epost) Brreg-sourced contact email. SKIPPED — not built. Verified
+//     (again, same finding as brregContactEmail above): neither Brreg
+//     integration this repo has (experience-brreg.ts / brreg-client.ts) ever
+//     returns a contact-email field, so there is no source and no
+//     field_provenance marker for one could ever be genuine. Do not
+//     fabricate a marker name for a source that doesn't exist.
+//
+//   (b-epost) Actually the recipient of a DELIVERED outreach send, no
+//     bounce — see wasEpostDeliveredOutreachNoBounce() below. Real columns
+//     (outreach_sent_log.recipient_email/.vertical_id, email_bounces.email),
+//     but VERIFIED NARROW today, not broadly live: outreach_sent_log.agent_id
+//     is NOT NULL, and its only live writers (init.ts's
+//     trg_log_cold_outreach_to_sent_log_v2 / _on_send_confirm_v2 triggers on
+//     crm_messages) resolve agent_id via
+//     COALESCE(crm_contacts.agent_id, an agent_knowledge.email match).
+//     crm_contacts.agent_id is ALWAYS NULL for an 'experiences'-vertical
+//     contact (steg-6 vertical isolation — see crm-service.ts
+//     resolveContact()'s own comment: "its agent_id is ALWAYS null now, by
+//     trigger"), so these triggers only insert a row for a gårdssalg
+//     producer's send when that producer's email COINCIDENTALLY also
+//     matches an existing RFB agent_knowledge.email row (exactly the
+//     contrivance crm-platform-identity.test.ts's pi17-22 fixture has to
+//     manufacture to exercise the trigger at all — see that file). For a
+//     genuine opplevagent-only producer — the actual target population this
+//     slice exists for, e.g. a brewery with no RFB fruit/veg listing — there
+//     is, as of this writing, NO live write path that records their
+//     outreach send into outreach_sent_log at all. This is a real, verified
+//     gap, not a guess. wasEpostDeliveredOutreachNoBounce() is still built
+//     against the real schema (correct today for the coincidental-match
+//     population) — it starts working for the FULL population for free the
+//     day someone gives the outreach_sent_log trigger a provider_id-aware
+//     branch (out of scope here: that trigger is shared production
+//     infrastructure several other verticals depend on; a change to it
+//     belongs in its own reviewed dev-request, not folded into this one).
+//
+//   (c-epost) Manually entered/approved by Daniel. REUSES
+//     content_source==='manual' exactly as isHjemmesideOwnershipVerified()
+//     below already does for hjemmeside: per this module's own existing,
+//     already-trusted convention, a 'manual' row is Daniel's own data
+//     end-to-end, not scraped — the same trust basis already extended to
+//     hjemmeside is extended here to epost. No new marker, no new write
+//     path. A DEDICATED field_provenance.epost admin marker (independent of
+//     the whole-row 'manual' lock, mirroring hjemmeside's second,
+//     non-manual field_provenance.hjemmeside.source_url path) does NOT exist
+//     anywhere in this codebase today (verified — grepped every
+//     field_provenance usage) — flagged as a real gap: this sub-case only
+//     fires for fully-manual rows, not for an admin-approved-just-this-field
+//     case on an otherwise-harvested row. Building that second path would
+//     need a new write/approval endpoint, which is explicitly out of scope
+//     for this slice.
+//
+// Ordering: stored_epost_verified is checked LAST, after (a) brreg_contact
+// and (b) verified_domain_address, and only ever applies when neither of
+// those already qualifies — a lower-provenance tier must never override a
+// stronger one that would also match.
+//
+// deriveOrgLinkedEmail() stays a PURE function (see its own doc comment) —
+// the (b-epost) DB lookup is therefore NOT done inside it. The caller
+// (issueClaimMagicLink, and the GET claim-entry route) runs
+// wasEpostDeliveredOutreachNoBounce() itself and passes the boolean result
+// in via `opts.epostOutreachDeliveredNoBounce`, mirroring exactly how
+// brregContactEmail is already an explicit passed-in parameter above.
 
 import crypto from "crypto";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
-import { normalizeDomain } from "./blocklist-service";
+import { getDb as getRfbDb } from "../database/init";
+import { normalizeDomain, normalizeEmail } from "./blocklist-service";
 import { GENERIC_DOMAINS } from "./gardssalg-rfb-enrich";
 
 const VERTICAL = "experiences";
@@ -189,14 +268,76 @@ export function isClaimableDomain(domain: string): boolean {
 }
 
 export type OrgLinkedEmailResult =
-  | { eligible: true; email: string; source: "brreg_contact" | "verified_domain_address" }
+  | { eligible: true; email: string; source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified" }
   | { eligible: false; reason: "not_brreg_verified" | "no_org_linked_email" };
+
+// Minimal shape check for a stored `epost` candidate — good enough to catch
+// scraped garbage/truncated fragments before they're offered as a claim
+// target, NOT full RFC validation (real deliverability is proven at
+// claim-time by the magic-link actually being clicked, same as every other
+// tier here).
+function isPlausibleEmailShape(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+// Test-only: lets a test point wasEpostDeliveredOutreachNoBounce() at its own
+// standalone RFB-shaped db WITHOUT touching src/database/init.ts's shared
+// module-level singleton via __setDbForTesting. Deliberately narrower than
+// that seam: swapping the GLOBAL singleton is process-wide and this test
+// suite (tests/test.ts) chains together dozens of suites with fragile,
+// hand-maintained cross-dependencies specifically to avoid two suites
+// swapping that singleton at once (see the file's own repeated postmortem
+// comments on this exact failure class — "the exact failure mode this
+// file's own tasks-prune-async postmortem documents"). Adding a NEW global
+// singleton swap here reproduced it live (oa-home-counters intermittently
+// saw "no such table: outreach_sent_log" when this test ran). This override
+// avoids the shared singleton entirely, so it cannot race with unrelated
+// suites. Never call from production code.
+let _rfbDbOverrideForTesting: ReturnType<typeof getRfbDb> | null = null;
+export function __setRfbDbForTesting(db: ReturnType<typeof getRfbDb> | null): void {
+  _rfbDbOverrideForTesting = db;
+}
+
+/**
+ * (b-epost) — see module doc "stored_epost_verified" section for the full,
+ * verified explanation of why this is real-but-narrow today. Does the
+ * cross-DB lookup deriveOrgLinkedEmail() itself is not allowed to do (it
+ * must stay pure): outreach_sent_log and email_bounces both live in the RFB
+ * main DB (lokal.db), NOT experiences.db — getDb() here is the RFB handle
+ * (src/database/init.ts), imported directly the same way bounce-service.ts
+ * already does, NOT the per-vertical db-factory getDb("experiences").
+ *
+ * True iff `email` (case/whitespace-normalized via blocklist-service's
+ * normalizeEmail — the SAME normalization convention outreach_sent_log's own
+ * suppression matching and bounce-service use, reused here rather than
+ * reimplemented) appears in outreach_sent_log.recipient_email with
+ * vertical_id='experiences' (an Opplevagent send, not an RFB one) AND does
+ * NOT appear in email_bounces — i.e. it was actually delivered outreach,
+ * not merely attempted.
+ */
+export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefined): boolean {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return false;
+
+  const db = _rfbDbOverrideForTesting ?? getRfbDb();
+  const sentRow = db
+    .prepare(
+      `SELECT 1 FROM outreach_sent_log
+       WHERE LOWER(TRIM(recipient_email)) = ? AND vertical_id = 'experiences'
+       LIMIT 1`,
+    )
+    .get(normalized);
+  if (!sentRow) return false;
+
+  const bouncedRow = db.prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? LIMIT 1`).get(normalized);
+  return !bouncedRow;
+}
 
 /**
  * Derive the ONE email address a claim magic-link may be sent to, or
  * "not eligible" (-> manual fallback, never self-service). Pure function —
  * no DB/IO — so the decision logic is fully unit-testable without a fixture
- * database. See module doc for the full rationale of both branches.
+ * database. See module doc for the full rationale of all three branches.
  *
  * brregContactEmail is an explicit, separate parameter (not read off the
  * provider row) because no such column/source exists yet anywhere in this
@@ -204,10 +345,20 @@ export type OrgLinkedEmailResult =
  * The parameter exists so this function is ready the day a real source
  * shows up, without a signature change and without ever fabricating a value
  * meanwhile.
+ *
+ * opts.epostOutreachDeliveredNoBounce is the SAME pattern for (b-epost): the
+ * caller runs wasEpostDeliveredOutreachNoBounce() (a real DB lookup) and
+ * passes the boolean result in here, so this function itself never touches
+ * a database. `epost` on `provider` is typed optional (rather than widening
+ * the Pick below) so existing callers/fixtures that construct a provider
+ * object without it keep compiling unchanged — omitted is treated as null.
  */
 export function deriveOrgLinkedEmail(
-  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance">,
+  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    epost?: string | null;
+  },
   brregContactEmail?: string | null,
+  opts: { epostOutreachDeliveredNoBounce?: boolean } = {},
 ): OrgLinkedEmailResult {
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   if (!brregOk) return { eligible: false, reason: "not_brreg_verified" };
@@ -243,7 +394,64 @@ export function deriveOrgLinkedEmail(
     }
   }
 
+  // (c) stored_epost_verified — the provider's OWN `epost`, but ONLY when
+  // backed by real provenance (see module doc's "stored_epost_verified"
+  // section for the full (a-epost)/(b-epost)/(c-epost) breakdown). Checked
+  // LAST so a stronger tier above always wins if it also qualifies. A
+  // scraped-only epost with neither signal falls straight through to
+  // no_org_linked_email, same as today — this is Acceptance Criterion 2 from
+  // the dev-request.
+  const epostCandidate = normalizeEmail(provider.epost);
+  if (epostCandidate && isPlausibleEmailShape(epostCandidate)) {
+    const adminEntered = provider.content_source === "manual"; // (c-epost)
+    const outreachDelivered = opts.epostOutreachDeliveredNoBounce === true; // (b-epost)
+    if (adminEntered || outreachDelivered) {
+      return { eligible: true, email: epostCandidate, source: "stored_epost_verified" };
+    }
+  }
+
   return { eligible: false, reason: "no_org_linked_email" };
+}
+
+/**
+ * Call-site wrapper around deriveOrgLinkedEmail() that runs the (b-epost)
+ * cross-DB lookup (wasEpostDeliveredOutreachNoBounce) LAZILY — only when it
+ * could actually change the outcome — instead of unconditionally on every
+ * provider that merely HAS an epost value.
+ *
+ * This matters beyond efficiency: an early version called the lookup
+ * unconditionally whenever `provider.epost` was truthy, which meant EVERY
+ * existing caller of issueClaimMagicLink() for a provider with a stored
+ * epost now paid for an RFB-DB round trip even when brreg_contact or
+ * verified_domain_address (or content_source='manual', which
+ * deriveOrgLinkedEmail() itself already resolves without any opts) already
+ * settled eligibility. In production that is just a wasted query; in this
+ * codebase's test suite it was a real regression — a fixture provider with
+ * an epost value, claimed via an explicit brregContactEmail argument
+ * (tier a, already eligible), started requiring an RFB db with
+ * outreach_sent_log/email_bounces present even though that tier never
+ * needed them (caught by the full `npm test` run breaking an unrelated
+ * suite, opplevelser-booking-send-guard.test.ts's `prov-live` fixture — see
+ * that file's own issueClaimMagicLink() calls).
+ *
+ * The DB lookup now runs ONLY when: the provider is Brreg-verified (else
+ * nothing could rescue it anyway), no stronger tier already resolved it, and
+ * there IS an epost value to check at all.
+ */
+export function deriveOrgLinkedEmailWithOutreachLookup(
+  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    epost?: string | null;
+  },
+  brregContactEmail?: string | null,
+): OrgLinkedEmailResult {
+  const preliminary = deriveOrgLinkedEmail(provider, brregContactEmail);
+  if (preliminary.eligible) return preliminary;
+  if (preliminary.reason !== "no_org_linked_email" || !provider.epost) return preliminary;
+
+  const epostOutreachDeliveredNoBounce = wasEpostDeliveredOutreachNoBounce(provider.epost);
+  if (!epostOutreachDeliveredNoBounce) return preliminary;
+
+  return deriveOrgLinkedEmail(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
 }
 
 /** Mask an email for display ("we sent it to p***t@b*******t.no") — never
@@ -293,7 +501,7 @@ export interface IssuedClaim {
   token: string;
   email: string;
   maskedEmail: string;
-  source: "brreg_contact" | "verified_domain_address";
+  source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified";
   expiresAt: string;
   /** dev-request 2026-07-26-booking-test-send-guard — see issueClaimMagicLink. */
   isTest: boolean;
@@ -317,7 +525,7 @@ export function issueClaimMagicLink(
   const provider = getClaimProviderById(providerId);
   if (!provider) return { ok: false, error: "provider_not_found" };
 
-  const derived = deriveOrgLinkedEmail(provider, brregContactEmail);
+  const derived = deriveOrgLinkedEmailWithOutreachLookup(provider, brregContactEmail);
   if (!derived.eligible) return { ok: false, error: derived.reason };
 
   if (isClaimRateLimited(providerId)) return { ok: false, error: "rate_limited" };
