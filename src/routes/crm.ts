@@ -20,9 +20,11 @@ import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
 
-// ─── Admin auth (matches analytics pattern) ─────────────────
+// ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
+// admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
+// ANALYTICS_ADMIN_KEY legacy fallback) ─────────────────
 function requireAdminAuth(req: Request, res: Response, next: Function): void {
-  const expectedKey = process.env.ANALYTICS_ADMIN_KEY || process.env.ADMIN_API_KEY || "";
+  const expectedKey = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
   if (!expectedKey) {
     res.status(503).json({ error: "CRM not configured: ADMIN key not set" });
     return;

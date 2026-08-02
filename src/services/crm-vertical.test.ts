@@ -255,11 +255,19 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
       // precise damage this dev-request exists to stop.
       // ═══════════════════════════════════════════════════════════════
       {
-        // The CRM router authenticates on ANALYTICS_ADMIN_KEY / ADMIN_API_KEY —
-        // deliberately NOT the shared ADMIN_KEY that 62 other test sites fight
-        // over, so this block does not add to that known non-determinism.
-        // Saved and restored regardless.
-        const prevAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+        // The CRM router now authenticates on the fleet-wide ADMIN_KEY (primary)
+        // / ANALYTICS_ADMIN_KEY (legacy fallback) pattern — dev-request
+        // 2026-08-02-crm-summary-401-auth fixed requireAdminAuth() to match
+        // every other admin route instead of checking ANALYTICS_ADMIN_KEY /
+        // ADMIN_API_KEY. process.env.ADMIN_KEY is pinned suite-wide (see
+        // tests/test.ts's SUITE_ADMIN_KEY, dev-request 2026-07-30-testsuite-
+        // determinism-adminkey) to a value this block does not know, so it
+        // must now pin ADMIN_KEY itself (not just ANALYTICS_ADMIN_KEY) to the
+        // key it actually sends, or the suite-wide value would win instead.
+        // Both saved and restored regardless.
+        const prevAdminKey = process.env.ADMIN_KEY;
+        const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+        process.env.ADMIN_KEY = "crm-vertical-test-key";
         process.env.ANALYTICS_ADMIN_KEY = "crm-vertical-test-key";
         try {
           const crmRoutes = require("../routes/crm") as any;
@@ -447,8 +455,10 @@ export function runCrmVerticalTests(opts: { log?: boolean } = {}): Promise<TestS
           assertEq(orphan?.n, 0,
             "cv41b: …and no orphan CONTACT was created on the refused platform — the refusal happens before any write, not merely before the messages");
         } finally {
-          if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
-          else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
+          if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+          else process.env.ADMIN_KEY = prevAdminKey;
+          if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
+          else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
         }
       }
       // ═══════════════════════════════════════════════════════════════
