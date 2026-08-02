@@ -36495,3 +36495,64 @@ runSerial(async () => {
     failures.push("rfb-verifisert-av-eier-badge-rename: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-08-01-rfb-agents-url-skrivespak: `agents.url` write lever.
+// Sister to the contact-email block and the same defect class — the homepage
+// column the catalog serves (and enrichment reads a producer's email off) had
+// no UPDATE path in src/, leaving 340 agents showing a shared directory host,
+// 87 a dead own host and 4 pointing at rettfrabonden.com. Additionally closes
+// the owner-lock gap the A0 batch hit: this route locks on a VERIFIED
+// agent_claims row as well as claimed_at. Own in-memory DB reached through the
+// route's own seam — mutates NO shared global (not getDb(), not ADMIN_KEY).
+//
+// ── READ THIS BEFORE BLAMING THIS BLOCK FOR A FLAKY RUN ─────────────────────
+// Adding this block makes the suite intermittently red. It is NOT this block's
+// code. This file cannot currently absorb ANY new runSerial registration —
+// measured, on this machine, 6 runs per configuration unless noted:
+//
+//   clean main, unmodified .................... 7/7 green (13290/0)
+//   clean main + THIS block, mid-chain ........ 13354/0, 13327/1, 13295/14
+//   clean main + THIS block, at the tail ...... 8/11 green (13354/0 when green)
+//   clean main + `setTimeout(400)` mid-chain .. 1/3 green   <-- touches NOTHING
+//   clean main + `setTimeout(2000)` at tail ... 4/6 green   <-- touches NOTHING
+//
+// The last two rows are the control: a runSerial block whose entire body is a
+// sleep — no DB, no env, no require, no fetch — reproduces the same failures at
+// the same rate as this block does. Only the added wall-clock matters. The
+// dominant signature is the ad-hoc gardssalg-content-refresh block (~line
+// 28425) losing its experiences handle ("The database connection is not open",
+// -27 tests); the secondary one is a burst of `pilot-ordre-loop` suppression-
+// gate failures — i.e. BOTH hazards this file's header already documents
+// (kriterium 2's ad-hoc-vs-runSerial split, and the ADMIN_KEY-in-external-files
+// population), firing exactly as the header predicts: "a fix ... can still
+// surface a different, out-of-scope race just by changing when things run."
+//
+// Root cause of the dominant signature, for whoever picks this up:
+// `__resetDbFactoryForTesting()` (src/database/db-factory.ts:113) CLOSES every
+// handle in its map, and the ad-hoc family and the runSerial chain are two
+// serialization primitives that only join at the REPORT tail — so any change
+// in chain length can slide a singleton-toucher into an ad-hoc block's open
+// window. The header describes the barrier that fixes it and judges it too
+// risky to land before the ADMIN_KEY-in-external-files fix. This block does
+// NOT attempt that fix, and a targeted `await _gardssalgContentRefreshPromise`
+// barrier here was tried and measured ineffective (4/6) — it is not the racer.
+// Tail registration was kept because it is the least-perturbing position.
+// If the determinism gate blocks on this, deleting this one registration
+// restores the old timing exactly; the route's 64 tests still run standalone
+// via runAdminAgentsUrlWriteTests(). That is a workaround, not a fix — the
+// suite is one new test block away from red no matter who adds it.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-01-rfb-agents-url-skrivespak: agents.url write lever ──");
+  try {
+    const { runAdminAgentsUrlWriteTests } = require("../src/routes/admin-agents-url-write.test") as
+      typeof import("../src/routes/admin-agents-url-write.test");
+    const uw = await runAdminAgentsUrlWriteTests({ log: false });
+    passed += uw.passed;
+    failed += uw.failed;
+    for (const f of uw.failures) failures.push("url-write: " + f);
+    console.log(`  url-write: ${uw.passed} passed, ${uw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("url-write: unexpected error: " + String(err?.message || err));
+  }
+});
