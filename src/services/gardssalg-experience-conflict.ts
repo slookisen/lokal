@@ -894,6 +894,147 @@ export function applyGardssalgExperienceConflictRemediation(
   return applied;
 }
 
+// ─── Post-apply read-back verification (dev-request 2026-08-01-gardssalg-
+// steg2-apply-tar-ikke-varig-effekt, gjenstående scope §3) ──────────────────
+//
+// applyGardssalgExperienceConflictRemediation()'s own return value describes
+// what it INTENDED to write, from its own in-memory state — not what actually
+// landed and is still standing. The 2026-08-01 P0 (run-1650 reporting "137
+// corrected" while a same-cycle governance rollback had already put every one
+// of those rows back to its pre-apply value) happened because nothing
+// re-read the DB after the transaction committed. This is that re-read: pure
+// SELECTs, no writes, called by the route AFTER
+// applyGardssalgExperienceConflictRemediation()'s transaction has already
+// committed — it verifies the aftermath, it does not participate in it.
+//
+// For each applied item, compares the CURRENT experiences.booking_url against
+// the value the apply was supposed to have left behind (item.new_value), and
+// — for "corrected" actions only, since a "nulled" action deliberately
+// retracts the provenance stamp rather than setting one (see
+// applyGardssalgExperienceConflictRemediation's own doc comment) — that
+// content_field_evidence.booking_url still carries the "producer:<id>"
+// stamp. Either check failing is a mismatch: the write did not land, or did
+// not stay landed.
+export interface GsExpConflictVerificationMismatch {
+  experience_id: string;
+  producer_id: string;
+  expected_booking_url: string | null;
+  actual_booking_url: string | null;
+  expected_evidence_stamp: string | null;
+  actual_evidence_stamp: string | null;
+  reason: "booking_url_mismatch" | "evidence_stamp_missing";
+}
+
+export function verifyGardssalgExperienceConflictWrites(
+  db: Database.Database,
+  items: Array<{ experience_id: string; producer_id: string; new_value: string | null; action: string }>
+): { verified_written: number; mismatches: GsExpConflictVerificationMismatch[] } {
+  const mismatches: GsExpConflictVerificationMismatch[] = [];
+  let verifiedWritten = 0;
+
+  for (const item of items) {
+    const row = db
+      .prepare(`SELECT booking_url, content_field_evidence FROM experiences WHERE id = ?`)
+      .get(item.experience_id) as { booking_url: string | null; content_field_evidence: string | null } | undefined;
+
+    const actualBookingUrl = row?.booking_url ?? null;
+    let actualStamp: string | null = null;
+    if (row?.content_field_evidence) {
+      try {
+        const parsed = JSON.parse(row.content_field_evidence);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.booking_url === "string") {
+          actualStamp = parsed.booking_url;
+        }
+      } catch {
+        /* malformed -> treat as no stamp, same as the writer's own parse guard */
+      }
+    }
+    const expectedStamp = item.action === "corrected" ? `producer:${item.producer_id}` : null;
+    const expectedBookingUrl = item.new_value ?? null;
+
+    if (actualBookingUrl !== expectedBookingUrl) {
+      mismatches.push({
+        experience_id: item.experience_id,
+        producer_id: item.producer_id,
+        expected_booking_url: expectedBookingUrl,
+        actual_booking_url: actualBookingUrl,
+        expected_evidence_stamp: expectedStamp,
+        actual_evidence_stamp: actualStamp,
+        reason: "booking_url_mismatch",
+      });
+      continue;
+    }
+    if (item.action === "corrected" && actualStamp !== expectedStamp) {
+      mismatches.push({
+        experience_id: item.experience_id,
+        producer_id: item.producer_id,
+        expected_booking_url: expectedBookingUrl,
+        actual_booking_url: actualBookingUrl,
+        expected_evidence_stamp: expectedStamp,
+        actual_evidence_stamp: actualStamp,
+        reason: "evidence_stamp_missing",
+      });
+      continue;
+    }
+    verifiedWritten++;
+  }
+
+  return { verified_written: verifiedWritten, mismatches };
+}
+
+// ─── Ambiguous-collision escalation (dev-request 2026-08-01-gardssalg-steg2-
+// apply-tar-ikke-varig-effekt, gjenstående scope §4) ─────────────────────────
+//
+// Remediation deliberately never writes an "ambiguous" pair (see the module
+// doc comment's "Same-experience/multiple-producer collision" section) — but
+// until now nothing surfaced WHY a given experience is stuck that way, or
+// grouped the colliding producers together for a human to act on. This is a
+// pure, read-only grouping of pairs the scan already returned (no new scan,
+// no new SQL) — for GET .../gardssalg-experience-conflict-audit to attach as
+// an additive `ambiguous_detail` section. Atlungstad (three hidden producer
+// duplicates matching the same experience) is the concrete case this exists
+// to name instead of silently leaving wrong.
+export interface GsExpAmbiguousDetail {
+  experience_id: string;
+  experience_title: string;
+  colliding_producers: Array<{ producer_id: string; producer_name: string }>;
+  reason: string;
+}
+
+export function buildAmbiguousExperienceDetail(pairs: GsExpMatchedPair[]): GsExpAmbiguousDetail[] {
+  const byExperience = new Map<
+    string,
+    { experience_title: string; producers: Map<string, string> }
+  >();
+
+  for (const p of pairs) {
+    if (p.status !== "ambiguous") continue;
+    let group = byExperience.get(p.experience_id);
+    if (!group) {
+      group = { experience_title: p.experience_title, producers: new Map() };
+      byExperience.set(p.experience_id, group);
+    }
+    group.producers.set(p.producer_id, p.producer_name);
+  }
+
+  const detail: GsExpAmbiguousDetail[] = [];
+  for (const [experience_id, group] of byExperience) {
+    const colliding_producers = Array.from(group.producers, ([producer_id, producer_name]) => ({
+      producer_id,
+      producer_name,
+    }));
+    detail.push({
+      experience_id,
+      experience_title: group.experience_title,
+      colliding_producers,
+      reason:
+        `${colliding_producers.length} producers match the same experience — remediation cannot pick one ` +
+        `automatically, resolve via producer-dedup or manually`,
+    });
+  }
+  return detail;
+}
+
 // ─── Rollback (wired into the EXISTING POST /admin/gardssalg-content-rollback
 // endpoint via an `entity_type` switch, per the dev-request's own rollback
 // section — see routes/opplevelser.ts) ──────────────────────────────────────

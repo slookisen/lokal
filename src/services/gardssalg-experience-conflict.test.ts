@@ -26,11 +26,15 @@
  * Run standalone: npx tsx src/services/gardssalg-experience-conflict.test.ts
  */
 
+import Database from "better-sqlite3";
 import {
   findGardssalgProducerExperienceMatches,
   summarizeGardssalgExperienceConflicts,
+  verifyGardssalgExperienceConflictWrites,
+  buildAmbiguousExperienceDetail,
   type GsExpProducerRow,
   type GsExpExperienceRow,
+  type GsExpMatchedPair,
 } from "./gardssalg-experience-conflict";
 // Imported ONLY for the boundary-guard assertions (block (x) below), which
 // pin that the shared harvest-dedup matcher is not normalizing away spelling
@@ -762,6 +766,168 @@ export function runGardssalgExperienceConflictTests(opts: { log?: boolean } = {}
       "y3: 'Aaros' via host_name — trailing-'s' stemming interacts with fold order (was 5 pairs)"
     );
 
+    // ── verifyGardssalgExperienceConflictWrites (dev-request 2026-08-01-
+    //    gardssalg-steg2-apply-tar-ikke-varig-effekt §3): the post-apply
+    //    read-back comparison function, unit-tested directly against a real
+    //    in-memory `experiences` table rather than through the full route +
+    //    transaction path — this is the "inject a scenario" option the task
+    //    calls out, since simulating an out-of-band silent revert (the exact
+    //    P0 shape) is far cheaper as a direct DB mutation than an end-to-end
+    //    apply-then-sabotage-then-verify route test. ─────────────────────────
+    {
+      const vdb = new Database(":memory:");
+      vdb.exec(
+        `CREATE TABLE experiences (id TEXT PRIMARY KEY, booking_url TEXT, content_field_evidence TEXT)`
+      );
+      const insert = vdb.prepare(
+        `INSERT INTO experiences (id, booking_url, content_field_evidence) VALUES (@id, @booking_url, @content_field_evidence)`
+      );
+
+      // z1: a clean "corrected" write — booking_url AND the provenance stamp
+      //     both match what apply reported writing -> verified, no mismatch.
+      insert.run({
+        id: "exp-verify-clean",
+        booking_url: "https://producer-clean.example",
+        content_field_evidence: JSON.stringify({ booking_url: "producer:prod-clean" }),
+      });
+      const cleanResult = verifyGardssalgExperienceConflictWrites(vdb, [
+        { experience_id: "exp-verify-clean", producer_id: "prod-clean", new_value: "https://producer-clean.example", action: "corrected" },
+      ]);
+      assertEq(cleanResult.verified_written, 1, "z1: clean corrected write -> verified_written 1");
+      assertEq(cleanResult.mismatches, [], "z1b: clean corrected write -> zero mismatches");
+
+      // z2: a clean "nulled" write — booking_url is null and NO provenance
+      //     stamp is expected (nulled actions retract the stamp, never claim
+      //     one) -> verified.
+      insert.run({
+        id: "exp-verify-nulled",
+        booking_url: null,
+        content_field_evidence: JSON.stringify({}),
+      });
+      const nulledResult = verifyGardssalgExperienceConflictWrites(vdb, [
+        { experience_id: "exp-verify-nulled", producer_id: "prod-nulled", new_value: null, action: "nulled" },
+      ]);
+      assertEq(nulledResult.verified_written, 1, "z2: clean nulled write -> verified_written 1");
+      assertEq(nulledResult.mismatches, [], "z2b: clean nulled write -> zero mismatches");
+
+      // z3: THE P0 SHAPE — a write that landed and then got silently
+      //     reverted by something else (booking_url back to a different
+      //     value than what apply reported). Must be reported as a mismatch,
+      //     not silently counted as verified.
+      insert.run({
+        id: "exp-verify-reverted",
+        booking_url: "https://old-wrong-value.example",
+        content_field_evidence: JSON.stringify({}),
+      });
+      const revertedResult = verifyGardssalgExperienceConflictWrites(vdb, [
+        { experience_id: "exp-verify-reverted", producer_id: "prod-reverted", new_value: "https://producer-reverted.example", action: "corrected" },
+      ]);
+      assertEq(revertedResult.verified_written, 0, "z3: silently-reverted write -> verified_written 0");
+      assertEq(revertedResult.mismatches.length, 1, "z3b: silently-reverted write -> exactly one mismatch");
+      assertEq(revertedResult.mismatches[0]?.reason, "booking_url_mismatch", "z3c: mismatch reason is booking_url_mismatch");
+      assertEq(revertedResult.mismatches[0]?.actual_booking_url, "https://old-wrong-value.example", "z3d: mismatch reports the ACTUAL (reverted) value");
+      assertEq(revertedResult.mismatches[0]?.expected_booking_url, "https://producer-reverted.example", "z3e: mismatch reports the EXPECTED value");
+
+      // z4: booking_url landed correctly, but the provenance stamp is
+      //     missing/wrong — a partial write (or a re-harvest that overwrote
+      //     just the evidence field) must also be flagged, not just a raw
+      //     booking_url compare.
+      insert.run({
+        id: "exp-verify-stamp-missing",
+        booking_url: "https://producer-stampcheck.example",
+        content_field_evidence: JSON.stringify({}),
+      });
+      const stampResult = verifyGardssalgExperienceConflictWrites(vdb, [
+        { experience_id: "exp-verify-stamp-missing", producer_id: "prod-stampcheck", new_value: "https://producer-stampcheck.example", action: "corrected" },
+      ]);
+      assertEq(stampResult.verified_written, 0, "z4: correct booking_url but missing provenance stamp -> verified_written 0");
+      assertEq(stampResult.mismatches[0]?.reason, "evidence_stamp_missing", "z4b: mismatch reason is evidence_stamp_missing");
+
+      // z5: a row that no longer exists at all -> also a mismatch (never
+      //     silently skipped/counted as verified).
+      const missingResult = verifyGardssalgExperienceConflictWrites(vdb, [
+        { experience_id: "exp-does-not-exist", producer_id: "prod-x", new_value: "https://producer-x.example", action: "corrected" },
+      ]);
+      assertEq(missingResult.verified_written, 0, "z5: nonexistent row -> verified_written 0");
+      assertEq(missingResult.mismatches.length, 1, "z5b: nonexistent row -> reported as a mismatch");
+
+      // z6: mixed batch — one clean, one reverted -> correct partial count.
+      const mixedResult = verifyGardssalgExperienceConflictWrites(vdb, [
+        { experience_id: "exp-verify-clean", producer_id: "prod-clean", new_value: "https://producer-clean.example", action: "corrected" },
+        { experience_id: "exp-verify-reverted", producer_id: "prod-reverted", new_value: "https://producer-reverted.example", action: "corrected" },
+      ]);
+      assertEq(mixedResult.verified_written, 1, "z6: mixed batch — 1 of 2 verified");
+      assertEq(mixedResult.mismatches.length, 1, "z6b: mixed batch — 1 of 2 mismatched");
+
+      vdb.close();
+    }
+
+    // ── buildAmbiguousExperienceDetail (dev-request 2026-08-01-gardssalg-
+    //    steg2-apply-tar-ikke-varig-effekt §4): pure grouping of an existing
+    //    `pairs` array — no scan re-run, no DB. ─────────────────────────────
+    {
+      const mkPair = (over: Partial<GsExpMatchedPair>): GsExpMatchedPair => ({
+        producer_id: "prod-x",
+        producer_name: "Producer X",
+        producer_hidden: false,
+        producer_hjemmeside: "https://producer-x.example",
+        experience_id: "exp-x",
+        experience_title: "Experience X",
+        experience_booking_url: "https://booking.example",
+        match_basis: "name_token",
+        status: "ambiguous",
+        ...over,
+      });
+
+      // aa1: two producers colliding on the same experience_id -> ONE
+      //      grouped entry, both producers listed, correct reason count.
+      const twoWayPairs: GsExpMatchedPair[] = [
+        mkPair({ producer_id: "prod-a", producer_name: "Producer A", experience_id: "exp-collide", experience_title: "Collision Experience" }),
+        mkPair({ producer_id: "prod-b", producer_name: "Producer B", experience_id: "exp-collide", experience_title: "Collision Experience" }),
+      ];
+      const twoWayDetail = buildAmbiguousExperienceDetail(twoWayPairs);
+      assertEq(twoWayDetail.length, 1, "aa1: two colliding producers on one experience_id -> exactly one grouped entry");
+      assertEq(twoWayDetail[0]?.experience_id, "exp-collide", "aa1b: grouped entry's experience_id");
+      assertEq(twoWayDetail[0]?.experience_title, "Collision Experience", "aa1c: grouped entry's experience_title");
+      assertEq(
+        twoWayDetail[0]?.colliding_producers.map((p) => p.producer_id).sort(),
+        ["prod-a", "prod-b"],
+        "aa1d: grouped entry lists both colliding producer_ids"
+      );
+      assertTrue(!!twoWayDetail[0]?.reason.includes("2 producers"), "aa1e: reason names the collision count (2)");
+
+      // aa2: a THREE-way collision (the actual Atlungstad shape) -> one
+      //      entry, all three producers, reason says "3 producers".
+      const threeWayPairs: GsExpMatchedPair[] = [
+        mkPair({ producer_id: "prod-arcus", producer_name: "Arcus Norway", experience_id: "exp-atlungstad", experience_title: "Atlungstad Tours" }),
+        mkPair({ producer_id: "prod-atlungstad-hand", producer_name: "Atlungstad Håndverksdestilleri", experience_id: "exp-atlungstad", experience_title: "Atlungstad Tours" }),
+        mkPair({ producer_id: "prod-booze", producer_name: "Booze Of Norway", experience_id: "exp-atlungstad", experience_title: "Atlungstad Tours" }),
+      ];
+      const threeWayDetail = buildAmbiguousExperienceDetail(threeWayPairs);
+      assertEq(threeWayDetail.length, 1, "aa2: three colliding producers -> exactly one grouped entry");
+      assertEq(threeWayDetail[0]?.colliding_producers.length, 3, "aa2b: all three colliding producers listed");
+      assertTrue(!!threeWayDetail[0]?.reason.includes("3 producers"), "aa2c: reason names the collision count (3)");
+
+      // aa3: non-ambiguous statuses (conflict/agree/unknown) are ignored —
+      //      only "ambiguous" pairs are grouped.
+      const nonAmbiguousPairs: GsExpMatchedPair[] = [
+        mkPair({ status: "conflict", experience_id: "exp-conflict-only" }),
+        mkPair({ status: "agree", experience_id: "exp-agree-only" }),
+        mkPair({ status: "unknown", experience_id: "exp-unknown-only" }),
+      ];
+      assertEq(buildAmbiguousExperienceDetail(nonAmbiguousPairs), [], "aa3: non-ambiguous statuses produce zero grouped entries");
+
+      // aa4: two SEPARATE ambiguous experience_ids -> two separate entries,
+      //      never merged together.
+      const twoSeparateGroups: GsExpMatchedPair[] = [
+        mkPair({ producer_id: "prod-1", experience_id: "exp-group-1" }),
+        mkPair({ producer_id: "prod-2", experience_id: "exp-group-1" }),
+        mkPair({ producer_id: "prod-3", experience_id: "exp-group-2" }),
+        mkPair({ producer_id: "prod-4", experience_id: "exp-group-2" }),
+      ];
+      const separateDetail = buildAmbiguousExperienceDetail(twoSeparateGroups);
+      assertEq(separateDetail.length, 2, "aa4: two distinct ambiguous experience_ids -> two separate grouped entries");
+    }
 
     return { passed, failed, failures };
   })();
