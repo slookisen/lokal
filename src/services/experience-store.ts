@@ -2932,6 +2932,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
               about_text, visit_text, opening_hours_text, products, field_provenance
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
           AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
           AND (
@@ -3569,6 +3570,7 @@ export function selectGardssalgProvidersForRetroScan(limit = 48): GardssalgRetro
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
           AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
         ORDER BY created_at ASC

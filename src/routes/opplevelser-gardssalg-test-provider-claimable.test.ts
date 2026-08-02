@@ -156,14 +156,23 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       const claimService = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
 
       const auth = { "x-admin-key": testKey };
+      // SELECT * on purpose. The original version of this file listed 11
+      // columns and asserted on a handful — which is how it passed while the
+      // unconditional UPDATE was silently rewriting epost, rfb_seed_source and
+      // commission_rate on a real provider's row. An explicit column list can
+      // only ever pin the columns whoever wrote it thought to name; the whole
+      // row is what the 409 actually promises is untouched.
       const readRow = (id: string) =>
-        expDb
-          .prepare(
-            `SELECT id, navn, slug, org_nr, brreg_verified, hjemmeside, content_source, field_provenance,
-                    catalog_hidden, booking_live, producer_type
-               FROM experience_providers WHERE id = ?`,
-          )
-          .get(id) as any;
+        expDb.prepare(`SELECT * FROM experience_providers WHERE id = ?`).get(id) as any;
+      const diffRows = (before: any, after: any): string[] => {
+        const keys = new Set([...Object.keys(before ?? {}), ...Object.keys(after ?? {})]);
+        const changed: string[] = [];
+        for (const k of keys) {
+          if (k === "updated_at") continue; // touched by any write, not a content change
+          if (JSON.stringify(before?.[k]) !== JSON.stringify(after?.[k])) changed.push(k);
+        }
+        return changed.sort();
+      };
 
       // ── (a) 403 without X-Admin-Key ─────────────────────────────────────
       const noKey = await callRoute(opplevelserRouter, { body: { email: "daniel@example.com", claimable: true } });
@@ -234,10 +243,17 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
 
       // ── (d) content_source is NULL, not 'manual' ────────────────────────
+      // Seed a NON-null value first. Asserting `content_source === null` on a
+      // freshly created row is nearly vacuous — createProvider() leaves the
+      // column NULL anyway, so the assertion passed even with the reset
+      // deleted from the UPDATE. Starting from 'provider_site' makes it pin
+      // the RESET, which is the behaviour the comment claims.
+      expDb.prepare(`UPDATE experience_providers SET content_source = 'provider_site' WHERE id = ?`).run(plainId);
+      await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
       assertEq(
         readRow(plainId).content_source,
         null,
-        "d1: content_source left NULL — 'manual' would satisfy ownership but disable the owner portal's edit form",
+        "d1: a pre-existing content_source is RESET to NULL — not left as-is, and not set to 'manual' (which would satisfy ownership but disable the owner portal's edit form)",
       );
 
       // ── (e) repeatable after a completed claim ──────────────────────────
@@ -255,6 +271,12 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
         true,
         "e3: ...and the row is claim-eligible again",
       );
+      // e3 alone is weak: eligibility comes from the field_provenance path, which
+      // holds regardless of content_source, so it stays green even if the reset
+      // were dropped. What the reset actually buys is an EDITABLE portal on the
+      // second run — a row still stamped 'claim' is not what a fresh E2E starts
+      // from. e4 is the assertion that fails if the reset goes away.
+      assertEq(readRow(plainId).content_source, null, "e4: ...specifically because content_source is no longer 'claim'");
 
       // ── (f) the org_nr pin protects real providers ──────────────────────
       // The upsert matches `slug = ? OR org_nr = ?`, so a real provider's slug
@@ -285,10 +307,9 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       // The 409 says "refused". It has to be true of the WHOLE row, not just the
       // claim fields — the pre-existing unconditional UPDATE runs before the
       // claimable branch and is not pinned to the test org_nr.
-      assertEq(realAfter.navn, realBefore.navn, "f6: the real row's navn is untouched");
-      assertEq(realAfter.producer_type, realBefore.producer_type, "f7: ...its producer_type is not flipped to test-gardssalg");
-      assertEq(realAfter.catalog_hidden, realBefore.catalog_hidden, "f8: ...it is not hidden from the catalog");
-      assertEq(realAfter.booking_live, realBefore.booking_live, "f9: ...booking_live is not switched on");
+      // The whole row, not a column list — see readRow's comment. This is the
+      // assertion that would have caught the original defect.
+      assertEq(diffRows(realBefore, realAfter), [], "f6: NO column on the real row changed (whole-row diff)");
 
       // ── (g) generic / unusable domains are a 400 ────────────────────────
       const generic = await callRoute(opplevelserRouter, {
@@ -311,6 +332,103 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
         "https://test-ikke-book.invalid",
         "g4: a rejected call wrote nothing — the row still carries the last good domain",
       );
+
+      // ── (k) hjemmeside must be a real URL whose host IS the claim domain ──
+      // normalizeDomain() treats any string containing "@" as an email and
+      // keeps only what follows it, so without a URL-shape + host-match check
+      // the stored website and the minted post@ address can name DIFFERENT
+      // domains — and the public claim route sends to the minted one without
+      // the test redirect. These are the concrete inputs that exploited it.
+      const injection = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimable: true, hjemmeside: "https://x.no\nBcc: victim@evil.example" },
+      });
+      assertEq(injection.status, 400, "k1: an '@'-bearing value whose derived domain is an unrelated host -> 400");
+      const notAUrl = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimable: true, hjemmeside: "not a url but has.dot" },
+      });
+      assertEq(notAUrl.status, 400, "k2: a non-URL with spaces -> 400 (would have minted an address containing spaces)");
+      const noScheme = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimable: true, hjemmeside: "mintestgard.invalid" },
+      });
+      assertEq(noScheme.status, 400, "k3: a bare domain with no http(s) scheme -> 400");
+      const ftp = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimable: true, hjemmeside: "ftp://mintestgard.invalid" },
+      });
+      assertEq(ftp.status, 400, "k4: a non-http(s) scheme -> 400");
+      assertEq(
+        readRow(plainId).hjemmeside,
+        "https://test-ikke-book.invalid",
+        "k5: none of those wrote anything",
+      );
+      // www. is stripped by BOTH normalizeDomain and the host check, so it agrees.
+      const wwwOk = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimable: true, hjemmeside: "https://www.mintestgard.invalid/side" },
+      });
+      assertEq(wwwOk.status, 200, "k6: a www. URL with a path is accepted — host and derived domain agree after stripping");
+      assertEq(
+        wwwOk.body.derived_claim_email,
+        "post@mintestgard.invalid",
+        "k7: ...and mints the address from that same host",
+      );
+      // hjemmeside without the flag is a silent no-op -> now an explicit 400.
+      const hjemmesideNoFlag = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", hjemmeside: "https://mintestgard.invalid" },
+      });
+      assertEq(hjemmesideNoFlag.status, 400, "k8: hjemmeside without claimable is refused, not silently discarded");
+      // Restore the default for the sections below.
+      await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
+
+      // ── (n) the claimable row must not enter the FETCH cohorts ──────────
+      // Giving the test row a hjemmeside and a NULL content_source is exactly
+      // what selectGardssalgProvidersForContentRefresh and
+      // ...ForRetroScan select on. Both drive a homepage fetch, and the test
+      // row's homepage is deliberately non-resolving — so without the
+      // test-gardssalg exclusion the enrichment sweeps would fetch `.invalid`
+      // on every run and eventually park the row. Same argument as the
+      // website-verification cohort, two more selectors.
+      const store = require("../services/experience-store") as typeof import("../services/experience-store");
+      const inRefresh = store.selectGardssalgProvidersForContentRefresh(48).some((r: any) => r.id === plainId);
+      const inRetro = store.selectGardssalgProvidersForRetroScan(48).some((r: any) => r.id === plainId);
+      assertEq(inRefresh, false, "n1: the claimable test row is NOT selected for gardssalg content-refresh");
+      assertEq(inRetro, false, "n2: ...nor for the retro-scan");
+      // Control: a REAL row in the same state IS selected — proves n1/n2 pin the
+      // test-gardssalg exclusion, not some unrelated reason both are empty.
+      expDb
+        .prepare(
+          `INSERT INTO experience_providers (id, navn, slug, vertical, hjemmeside, content_source,
+              producer_type, enrichment_state, verification_status, source, confidence)
+           VALUES ('prov-cohort-ctl', 'Kohortkontroll', 'kohortkontroll', 'experiences',
+              'https://kohortkontroll.example.no', NULL, 'bryggeri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
+        )
+        .run();
+      assertTrue(
+        store.selectGardssalgProvidersForContentRefresh(48).some((r: any) => r.id === "prov-cohort-ctl"),
+        "n3: control — an otherwise-identical NON-test row IS selected for content-refresh",
+      );
+      assertTrue(
+        store.selectGardssalgProvidersForRetroScan(48).some((r: any) => r.id === "prov-cohort-ctl"),
+        "n4: control — ...and for the retro-scan",
+      );
+
+      // ── (i) slug collision while the test row ALSO exists ───────────────
+      // Both legs of the resolving SELECT now match, but DIFFERENT rows. The
+      // slug match must win so the guard can name the real row; picking the
+      // test row instead would try to move its slug onto the real one and hit
+      // the UNIQUE index as an opaque 500.
+      const collide = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimable: true, slug: "ekte-bryggeri" },
+      });
+      assertEq(collide.status, 409, "i1: slug collision resolves to the real row -> 409, not a UNIQUE-index 500");
+      assertEq(collide.body.provider_id, "prov-real", "i2: ...and the 409 names the real row, so the caller can see what it hit");
+      assertEq(diffRows(realBefore, readRow("prov-real")), [], "i3: the real row is untouched (whole-row diff)");
+      assertEq(readRow(plainId).slug, "test-ikke-book-slice0", "i4: the test row did not have the real slug moved onto it");
 
       // ── (h2) provenance is MERGED, not clobbered ────────────────────────
       // Both other writers of field_provenance set only their own key. Seed a
@@ -349,10 +467,7 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
         body: { email: "daniel@example.com", slug: "ekte-bryggeri" },
       });
       assertEq(plainHijack.status, 409, "h1: a real provider's slug is refused even without claimable");
-      const realAfterPlain = readRow("prov-real");
-      assertEq(realAfterPlain.navn, realBefore.navn, "h2: ...and that row is still untouched");
-      assertEq(realAfterPlain.producer_type, realBefore.producer_type, "h3: ...producer_type intact");
-      assertEq(realAfterPlain.catalog_hidden, realBefore.catalog_hidden, "h4: ...still visible in the catalog");
+      assertEq(diffRows(realBefore, readRow("prov-real")), [], "h2: ...and NO column on that row changed either");
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
