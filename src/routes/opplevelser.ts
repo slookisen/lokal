@@ -6254,15 +6254,21 @@ function computeBookingStatus(
 //   2. no_website        — (has a contact method, but) no website at all: an
 //      outreach/claim candidate lacking a source to enrich from, not a
 //      content-completeness gap.
-//   3. outreach_ready     — has a website, about_text, opening_hours_text, and
-//      (by this point in the precedence) a contact method: ready today.
-//   4. needs_enrichment    — everything else: has a website and a contact
-//      method, but is missing about_text/opening_hours_text/etc.
+//   3. needs_enrichment    — has a website and a contact method, but is
+//      missing about_text/opening_hours_text/etc.
+//   4. content-complete: would have been "outreach_ready" before dev-request
+//      2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach, Steg 4 —
+//      now gated by four further checks (skjult / ikke_soekbar /
+//      nettsted_uverifisert / dublettkonflikt), see below.
 export type GardssalgReadinessTier =
   | "outreach_ready"
   | "needs_enrichment"
   | "no_website"
-  | "unreachable";
+  | "unreachable"
+  | "skjult"
+  | "ikke_soekbar"
+  | "nettsted_uverifisert"
+  | "dublettkonflikt";
 
 export function computeGardssalgReadinessTier(input: {
   has_website: boolean;
@@ -6270,11 +6276,29 @@ export function computeGardssalgReadinessTier(input: {
   has_opening_hours: boolean;
   has_email: boolean;
   has_phone: boolean;
+  catalog_hidden: boolean;
+  is_searchable: boolean;
+  website_verified: boolean;
+  has_duplicate_conflict: boolean;
 }): GardssalgReadinessTier {
   if (!input.has_email && !input.has_phone) return "unreachable";
   if (!input.has_website) return "no_website";
-  if (input.has_about_text && input.has_opening_hours) return "outreach_ready";
-  return "needs_enrichment";
+  if (!(input.has_about_text && input.has_opening_hours)) return "needs_enrichment";
+  // Content-complete from here on — Steg 4 tightens "ready" beyond "fields
+  // are non-empty" with four more checks, in this order:
+  //   - catalog_hidden first: a hidden row is ALSO unsearchable by
+  //     construction (search excludes catalog_hidden=1, see
+  //     searchGardssalgProvidersByQuery()), so checking is_searchable first
+  //     would make "skjult" dead code — and "hidden" is the more specific,
+  //     actionable reason (an operator's deliberate choice) than the generic
+  //     "not searchable".
+  //   - then is_searchable, website_verified, has_duplicate_conflict, in the
+  //     order Daniel specified: findable -> verified -> conflict-free.
+  if (input.catalog_hidden) return "skjult";
+  if (!input.is_searchable) return "ikke_soekbar";
+  if (!input.website_verified) return "nettsted_uverifisert";
+  if (input.has_duplicate_conflict) return "dublettkonflikt";
+  return "outreach_ready";
 }
 
 router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, res: Response) => {
@@ -6295,6 +6319,8 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     content_source: string | null;
     booking_live: number | null;
     catalog_hidden: number | null;
+    slug: string | null;
+    field_provenance: string | null;
   }> = [];
   try {
     rows = expDb
@@ -6305,7 +6331,8 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
         // exclusions: every row must appear exactly once here.
         `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
-                content_source, booking_live, catalog_hidden
+                content_source, booking_live, catalog_hidden, slug,
+                field_provenance
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
       )
@@ -6318,11 +6345,27 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
 
   const present = (v: string | null): boolean => v !== null && v.trim() !== "";
 
+  // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+  // Steg 4 — has_duplicate_conflict is computed from ONE scan over the whole
+  // producer/experience corpus (O(providers × experiences)), never per-row,
+  // then looked up per-row as an O(1) Set membership check below.
+  const { pairs: conflictPairs } = runGardssalgExperienceConflictScan(expDb);
+  const duplicateConflictProducerIds = new Set<string>();
+  for (const pair of conflictPairs) {
+    if (pair.status === "conflict" || pair.status === "ambiguous") {
+      duplicateConflictProducerIds.add(pair.producer_id);
+    }
+  }
+
   const summary = {
     outreach_ready: 0,
     needs_enrichment: 0,
     no_website: 0,
     unreachable: 0,
+    skjult: 0,
+    ikke_soekbar: 0,
+    nettsted_uverifisert: 0,
+    dublettkonflikt: 0,
     total: 0,
   };
 
@@ -6334,6 +6377,12 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     const has_products = present(p.products);
     const has_email = present(p.epost);
     const has_phone = present(p.telefon);
+    const catalog_hidden = p.catalog_hidden === 1;
+    // Mirrors searchGardssalgProvidersByQuery()'s (experience-store.ts) exact
+    // predicate for whether a row can ever surface in /sok search.
+    const is_searchable = !catalog_hidden && present(p.slug);
+    const website_verified = isHjemmesideVerified(p.field_provenance);
+    const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
 
     const readiness_tier = computeGardssalgReadinessTier({
       has_website,
@@ -6341,6 +6390,10 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
       has_opening_hours,
       has_email,
       has_phone,
+      catalog_hidden,
+      is_searchable,
+      website_verified,
+      has_duplicate_conflict,
     });
     summary[readiness_tier]++;
     summary.total++;
@@ -6358,6 +6411,9 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
       has_products,
       has_email,
       has_phone,
+      is_searchable,
+      website_verified,
+      has_duplicate_conflict,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
     };
