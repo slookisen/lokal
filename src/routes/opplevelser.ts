@@ -285,7 +285,8 @@ import { fetchBrregContact } from "../services/brreg-client";
 // drivers below (POST /admin/booking-test-send, POST /admin/claim-test-send)
 // are the ONLY call sites that may set the per-transaction test flag.
 import { testSendRedirectAddress } from "../services/send-guard";
-import { issueClaimMagicLink, getClaimProviderById } from "../services/gardssalg-claim";
+import { issueClaimMagicLink, getClaimProviderById, isClaimableDomain } from "../services/gardssalg-claim";
+import { normalizeDomain } from "../services/blocklist-service";
 import { emailService } from "../services/email-service";
 
 // Same derivation as gardssalg-claim.ts's own constant — the verify URL must
@@ -5724,9 +5725,45 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // the UNIQUE indexes or duplicating. Not dry-run — it is an explicit, gated
 // admin action that creates a single hidden, double-gated test row.
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+//
+// ── `claimable: true` (dev-request 2026-07-21-opplevagent-claim-flyt-
+// drikkeprodusenter, acceptance criterion 6) ──────────────────────────────
+// The booking E2E above only needs booking_live; the CLAIM E2E needs the row
+// to satisfy deriveOrgLinkedEmail() (services/gardssalg-claim.ts), and none of
+// the fields it reads were reachable from any admin lever: brreg_verified has
+// no write route for experience_providers at all, and PATCH /admin/providers/
+// :id/hjemmeside sets hjemmeside WITHOUT the field_provenance stamp that makes
+// a domain "ownership-verified". So the claim flow had no repeatable end-to-end
+// test path. This opt-in flag closes exactly that gap and nothing else.
+//
+// It sets the three fields deriveOrgLinkedEmail() needs, and deliberately does
+// NOT use content_source='manual' as the ownership proof even though that is
+// the cheaper of the two accepted paths: the owner portal disables its whole
+// edit form on content_source==='manual' (routes/gardssalg-claim.ts), so a
+// 'manual' test row would verify the magic link and then present a read-only
+// portal — testing the wrong thing. The field_provenance.hjemmeside.source_url
+// path leaves the portal editable, which is what a claim E2E must exercise.
+//
+// SAFETY — the claimable writes are pinned to `org_nr = TEST_PROVIDER_ORG_NR`
+// in the UPDATE's own WHERE clause, not merely to the id resolved above. The
+// pre-existing upsert matches `slug = ? OR org_nr = ?`, so a caller passing a
+// REAL provider's slug already resolves to that real row; without the pin, this
+// flag would hand a real producer a forged ownership stamp and reset a genuine
+// content_source lock. With it, a non-test row is refused before any write.
+//
+// The default domain is RFC-6761-reserved `.invalid` — guaranteed never to
+// resolve — so even if a NON-test claim were ever issued against this row (the
+// public POST .../request route, which does not redirect), the derived
+// post@<domain> address cannot reach a real third party. It is also outside
+// GENERIC_DOMAINS, which isClaimableDomain() requires.
+//
+// content_source is RESET to NULL so the test is repeatable: a completed claim
+// stamps content_source='claim' (verifyClaimToken), which would otherwise make
+// the second run start from a claimed row. Same org_nr pin guards that reset.
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
+const TEST_PROVIDER_DEFAULT_HJEMMESIDE = "https://test-ikke-book.invalid";
 router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: Response) => {
   const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
   // Same shape as ProviderSchema's z.string().email() so createProvider() below
@@ -5744,14 +5781,120 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       ? req.body.slug.trim()
       : TEST_PROVIDER_DEFAULT_SLUG;
 
+  // Strict-true parse, same convention as every other opt-in flag in this file:
+  // only the literal JSON boolean `true` turns the claim fields on.
+  const claimable = req.body?.claimable === true;
+  const hjemmeside =
+    typeof req.body?.hjemmeside === "string" && req.body.hjemmeside.trim()
+      ? req.body.hjemmeside.trim()
+      : TEST_PROVIDER_DEFAULT_HJEMMESIDE;
+
+  // A caller-supplied hjemmeside is NOT free-form here, because whatever lands
+  // in this column decides who receives real mail. normalizeDomain() treats any
+  // string containing "@" as an email address and keeps only what follows it
+  // (blocklist-service.ts), so an unvalidated value like
+  //   "https://x.no\nBcc: victim@evil.example"
+  // stores one thing as the website and mints post@evil.example as the claim
+  // address — and the PUBLIC claim route (POST /kategori/gardssalg/eier/:id/
+  // request) is unauthenticated and sends WITHOUT the test redirect, so any
+  // visitor who knows the slug could then trigger a genuine magic-link email to
+  // that unrelated domain. The `.invalid` default is only a safe default; it
+  // protects nothing once a caller passes their own value.
+  //
+  // Three gates, cheapest first, and all three are required:
+  //   1. isPlausibleUrlish  — the same shape check PATCH /admin/providers/:id/
+  //      hjemmeside already applies; rejects whitespace (so header/CRLF
+  //      injection cannot survive) and anything without a dot.
+  //   2. a parseable http(s) URL whose host equals the normalized domain — this
+  //      is what closes the "@" trick: a value whose derived domain is not
+  //      simply the host of the URL we are storing is refused outright, so the
+  //      stored website and the minted address can never disagree.
+  //   3. isClaimableDomain — the SAME rule deriveOrgLinkedEmail() applies at
+  //      mint time, so a bad domain is a clean 400 instead of a silently
+  //      non-claimable test row.
+  const claimDomain = claimable ? normalizeDomain(hjemmeside) : "";
+  if (claimable) {
+    let urlHost = "";
+    try {
+      const parsed = new URL(hjemmeside);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        urlHost = parsed.hostname.toLowerCase().replace(/^www\./, "");
+      }
+    } catch {
+      /* unparseable -> urlHost stays "" -> refused below */
+    }
+    if (!isPlausibleUrlish(hjemmeside) || !urlHost || urlHost !== claimDomain) {
+      res.status(400).json({
+        error:
+          "'hjemmeside' må være en http(s)-URL uten mellomrom, og vertsnavnet må være " +
+          "nøyaktig det domenet claim-adressen utledes fra (ellers kan lagret nettside og " +
+          "utledet post@-adresse peke på ulike domener)",
+        hjemmeside,
+        url_host: urlHost || null,
+        normalized_domain: claimDomain,
+      });
+      return;
+    }
+    if (!isClaimableDomain(claimDomain)) {
+      res.status(400).json({
+        error:
+          "'hjemmeside' må være et domene claim-flyten kan utlede post@<domene> fra " +
+          "(må inneholde punktum, og kan ikke være et generisk/delt domene)",
+        hjemmeside,
+        normalized_domain: claimDomain,
+      });
+      return;
+    }
+  } else if (typeof req.body?.hjemmeside === "string" && req.body.hjemmeside.trim()) {
+    // Without the flag the value is never written. Say so rather than accepting
+    // it and silently discarding it.
+    res.status(400).json({
+      error: "'hjemmeside' krever { claimable: true } — uten flagget skrives den ikke",
+    });
+    return;
+  }
+
   const expDb = getExpDb("experiences");
 
   try {
     // Converge on ONE row: match an existing test row by slug OR the fixed test
     // org_nr (the stable identity across repeat calls, even if the slug changes).
+    // ORDER BY prefers the SLUG match. It only matters when the two legs hit
+    // DIFFERENT rows — i.e. the caller passed a real provider's slug while the
+    // test row exists — and there the slug match is the row we must surface, so
+    // the guard below can name it in a clean 409. Without the ordering,
+    // SQLite's choice is arbitrary: picking the test row instead would send the
+    // unconditional UPDATE on to `SET slug = <the real row's slug>`, which
+    // violates the UNIQUE index on slug (init-experiences.ts) and surfaces as a
+    // 500 that says nothing useful. Same row on both legs in the normal case,
+    // so the ordering is a no-op there.
     const existing = expDb
-      .prepare("SELECT id FROM experience_providers WHERE slug = ? OR org_nr = ? LIMIT 1")
-      .get(slug, TEST_PROVIDER_ORG_NR) as { id: string } | undefined;
+      .prepare(
+        `SELECT id, org_nr FROM experience_providers
+          WHERE slug = @slug OR org_nr = @testOrgNr
+          ORDER BY (slug = @slug) DESC
+          LIMIT 1`
+      )
+      .get({ slug, testOrgNr: TEST_PROVIDER_ORG_NR }) as { id: string; org_nr: string | null } | undefined;
+
+    // The `slug OR org_nr` match above can land on a REAL provider — any row
+    // whose slug the caller happened to pass. Everything below this point
+    // rewrites the resolved row into the test provider (navn, producer_type,
+    // catalog_hidden, booking_live, commission_rate, verification_status), so
+    // refusing has to happen BEFORE the first write, not after it: a check
+    // placed later would report "refused" on a row it had already overwritten.
+    // The endpoint's whole contract is "upsert THE ONE test row", so a
+    // resolved row that isn't it is always a caller error, never a valid
+    // target — with or without the claimable flag.
+    if (existing && existing.org_nr !== TEST_PROVIDER_ORG_NR) {
+      res.status(409).json({
+        error:
+          `Nekter: slug '${slug}' tilhører en ekte produsent, ikke testprodusenten ` +
+          `(org_nr ${existing.org_nr ?? "NULL"} != ${TEST_PROVIDER_ORG_NR}). Ingenting er skrevet.`,
+        provider_id: existing.id,
+      });
+      return;
+    }
 
     // createProvider() covers the ProviderSchema-known fields (navn/org_nr/epost/
     // verification_status); the raw UPDATE below sets the columns the schema
@@ -5778,8 +5921,85 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       )
       .run({ id: providerId, navn: name, email, slug });
 
+    // ── claimable opt-in (see this route's doc comment) ──────────────────
+    let claimReady = false;
+    if (claimable) {
+      // MERGE the provenance, don't clobber it — both other writers of this
+      // column (applyGardssalgProviderWebsite in experience-store.ts, and the
+      // verification sweep's hjemmeside_verification stamp) read the existing
+      // JSON, set only their own key, and write back, treating malformed JSON
+      // as empty rather than failing the write. A wholesale stringify here
+      // would silently drop any key they had set. The org_nr pin below means
+      // that can only ever be the synthetic test row today, and the cohort
+      // exclusions keep the sweeps off it — so this is convention, not a live
+      // bug. Which is the reason to follow it: the next writer of this column
+      // should find three call sites agreeing, not two and an exception.
+      //
+      // Read AND write inside ONE transaction, same as
+      // applyGardssalgWebsiteVerification: split across two statements, a
+      // concurrent provenance writer could land between them and lose its key —
+      // which is the exact failure the merge exists to prevent.
+      //
+      // The UPDATE's `AND org_nr = @testOrgNr` is belt to the pre-write guard's
+      // braces. That guard already turns a real-provider slug into a 409 before
+      // anything is written, so this pin should be unreachable — but it is what
+      // makes the forged-ownership write structurally impossible rather than
+      // merely unreached, and it costs one AND. `changes === 0` means it fired;
+      // note that if it ever DID fire, the unconditional UPDATE above would
+      // already have run, so the 409 below would be reporting a partial write.
+      // That is precisely the defect the pre-write guard was added to remove —
+      // keep them in that order.
+      const result = expDb.transaction(() => {
+        let provenance: Record<string, unknown> = {};
+        const existingProv = expDb
+          .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+          .get(providerId) as { field_provenance: string | null } | undefined;
+        if (existingProv?.field_provenance) {
+          try {
+            const parsed = JSON.parse(existingProv.field_provenance);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              provenance = parsed as Record<string, unknown>;
+            }
+          } catch {
+            /* malformed existing JSON -> treat as empty rather than clobber the write */
+          }
+        }
+        provenance.hjemmeside = {
+          source_url: hjemmeside,
+          fetched_at: new Date().toISOString(),
+          source: "admin-test-provider",
+        };
+        return expDb
+          .prepare(
+            `UPDATE experience_providers
+                SET brreg_verified = 1, hjemmeside = @hjemmeside,
+                    field_provenance = @stamp, content_source = NULL,
+                    updated_at = datetime('now')
+              WHERE id = @id AND org_nr = @testOrgNr`
+          )
+          .run({
+            id: providerId,
+            hjemmeside,
+            stamp: JSON.stringify(provenance),
+            testOrgNr: TEST_PROVIDER_ORG_NR,
+          });
+      })();
+
+      if (result.changes === 0) {
+        res.status(409).json({
+          error:
+            "Nekter claimable-skriv: raden er ikke testprodusenten " +
+            `(org_nr != ${TEST_PROVIDER_ORG_NR}). Bruk en slug som ikke tilhører en ekte produsent.`,
+          provider_id: providerId,
+        });
+        return;
+      }
+      claimReady = true;
+    }
+
     console.log(
-      `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${email} (catalog_hidden=1, booking_live=1)`
+      `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${email} ` +
+        `(catalog_hidden=1, booking_live=1, claimable=${claimReady})`
     );
 
     res.json({
@@ -5788,6 +6008,17 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       slug,
       booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
       epost: email,
+      claimable: claimReady,
+      ...(claimReady
+        ? {
+            claim_url: `${APP_URL}/kategori/gardssalg/eier/${slug}`,
+            claim_hjemmeside: hjemmeside,
+            // The address the claim would derive. Reported so the operator can
+            // confirm the E2E redirect actually diverted the send — nothing is
+            // ever sent to it by this route (it sends no email at all).
+            derived_claim_email: `post@${claimDomain}`,
+          }
+        : {}),
     });
   } catch (err) {
     console.error("[test-provider] upsert failed:", err);
