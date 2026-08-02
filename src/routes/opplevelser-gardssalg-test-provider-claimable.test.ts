@@ -312,6 +312,37 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
         "g4: a rejected call wrote nothing — the row still carries the last good domain",
       );
 
+      // ── (h2) provenance is MERGED, not clobbered ────────────────────────
+      // Both other writers of field_provenance set only their own key. Seed a
+      // foreign key on the test row, re-run, and confirm it survives.
+      expDb
+        .prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`)
+        .run(JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified" } }), plainId);
+      await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
+      const mergedProv = JSON.parse(readRow(plainId).field_provenance);
+      assertEq(
+        mergedProv.hjemmeside_verification?.classification,
+        "verified",
+        "m1: a pre-existing hjemmeside_verification key survives the claimable write",
+      );
+      assertEq(
+        mergedProv.hjemmeside?.source_url,
+        "https://test-ikke-book.invalid",
+        "m2: ...and the claimable stamp is still written alongside it",
+      );
+      // Malformed existing JSON must not fail the write (same convention as
+      // the two other writers) — it is treated as empty.
+      expDb.prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`).run("{not json", plainId);
+      const afterJunk = await callRoute(opplevelserRouter, {
+        headers: auth, body: { email: "daniel@example.com", claimable: true },
+      });
+      assertEq(afterJunk.status, 200, "m3: malformed existing provenance JSON does not fail the write");
+      assertEq(
+        JSON.parse(readRow(plainId).field_provenance).hjemmeside?.source_url,
+        "https://test-ikke-book.invalid",
+        "m4: ...it is treated as empty and the stamp lands",
+      );
+
       // ── (h) the guard is not conditional on the flag ────────────────────
       const plainHijack = await callRoute(opplevelserRouter, {
         headers: auth,

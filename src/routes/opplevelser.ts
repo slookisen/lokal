@@ -5867,13 +5867,36 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       // should be unreachable — but it is the clause that makes the forged-
       // ownership write structurally impossible rather than merely unreached,
       // and it costs one AND. `changes === 0` means it fired.
-      const stamp = JSON.stringify({
-        hjemmeside: {
-          source_url: hjemmeside,
-          fetched_at: new Date().toISOString(),
-          source: "admin-test-provider",
-        },
-      });
+      // MERGE, don't clobber — both other writers of this column
+      // (applyGardssalgProviderWebsite in experience-store.ts, and the
+      // verification sweep's hjemmeside_verification stamp) read the existing
+      // JSON, set only their own key, and write back, treating malformed JSON
+      // as empty rather than failing the write. A wholesale stringify here
+      // would silently drop any key they had set. The org_nr pin below means
+      // that can only ever be the synthetic test row today, and the cohort
+      // exclusion keeps the sweep off it — so this is convention, not a live
+      // bug. Which is the reason to follow it: the next writer of this column
+      // should find three call sites agreeing, not two and an exception.
+      let provenance: Record<string, unknown> = {};
+      const existingProv = expDb
+        .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+        .get(providerId) as { field_provenance: string | null } | undefined;
+      if (existingProv?.field_provenance) {
+        try {
+          const parsed = JSON.parse(existingProv.field_provenance);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            provenance = parsed as Record<string, unknown>;
+          }
+        } catch {
+          /* malformed existing JSON -> treat as empty rather than clobber the write */
+        }
+      }
+      provenance.hjemmeside = {
+        source_url: hjemmeside,
+        fetched_at: new Date().toISOString(),
+        source: "admin-test-provider",
+      };
+      const stamp = JSON.stringify(provenance);
       const result = expDb
         .prepare(
           `UPDATE experience_providers
