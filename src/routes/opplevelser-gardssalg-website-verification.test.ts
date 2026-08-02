@@ -218,6 +218,20 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         org_nr: "TEST000000", kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
         catalog_hidden: 1, producer_type: "test-gardssalg", rfb_seed_source: null, content_source: null,
       });
+      // A producer OUTSIDE the gårdssalg cohort entirely: producer_type IS
+      // NULL and rfb_seed_source is NOT 'rfb-seed' — exactly the shape the
+      // gårdssalg cohort (default) excludes and cohort=all (Steg 2 of
+      // dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-
+      // enrichment-gate) must newly include. Visible + blank hjemmeside
+      // (missing_source) deliberately, so it never needs a fetch mock case
+      // of its own and never affects any DEFAULT-cohort assertion above/
+      // below (sections b/c/j all run with cohort defaulted to "gardssalg",
+      // which excludes this row — that's the whole point).
+      insertProvider.run({
+        id: "prov-outside-gardssalg", navn: "Uidentifisert Aktør", hjemmeside: null,
+        org_nr: null, kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: null, rfb_seed_source: null, content_source: null,
+      });
 
       let fetchCallCount = 0;
       const fetchedHosts: string[] = [];
@@ -308,13 +322,16 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       //     so it's placed here, before any POST/write section below, and
       //     touches none of their state. ───────────────────────────────────
 
-      // j1: no-param response shape is UNCHANGED — exactly today's keys, no
-      // `pagination` key sneaking in for a caller who never asked for it.
+      // j1: no-param response shape is UNCHANGED bar the new `cohort` field
+      // (Steg 2 adds it alongside the existing `scope` field, per its own
+      // spec) — no `pagination` key sneaking in for a caller who never asked
+      // for one, and no OTHER unexpected key either.
       assertEq(
         Object.keys(auditRes.body).sort(),
-        ["rows", "scope", "success", "summary"].sort(),
-        "j1: default (no limit/offset) response carries EXACTLY today's keys — no new `pagination` key",
+        ["cohort", "rows", "scope", "success", "summary"].sort(),
+        "j1: default (no limit/offset) response carries today's keys plus the new `cohort` field — no `pagination` key",
       );
+      assertEq(auditRes.body.cohort, "gardssalg", "j1b: cohort defaults to 'gardssalg' when the param is omitted entirely");
 
       // j2-j5: invalid limit/offset -> 400, Norwegian message, matching
       // `scope`'s own validation style.
@@ -658,6 +675,133 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         visibleProv.hjemmeside_verification?.classification,
         "missing_source",
         "h13: earlier default-scope applies still own the visible rows' stamps — hidden apply did not touch or clear them"
+      );
+
+      // ── (k) `cohort` axis — Steg 2 of dev-request 2026-08-02-opplevagent-
+      //     hjemmesideverifisering-og-enrichment-gate. A SEPARATE axis from
+      //     `scope` above: `cohort` decides WHICH PRODUCER TYPES are in the
+      //     cohort at all (gårdssalg-only vs. every experience_providers
+      //     row), never visibility — sections (b)/(c)/(j) above already pin
+      //     that the default (cohort omitted) behaves byte-for-byte as
+      //     before (rows.length===4, same summary, same pagination shape
+      //     bar the new top-level `cohort` field), which IS this axis's
+      //     backwards-compatibility proof. ───────────────────────────────────
+
+      // k1: invalid cohort value -> 400 listing valid values, never a silent
+      // fallback — same discipline as `scope`.
+      const junkCohort = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=everything",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(junkCohort.status, 400, "k1: cohort=everything -> 400");
+      assertTrue(/Ugyldig cohort/.test(junkCohort.body.error || ""), "k1b: cohort error message names the field");
+      assertTrue(/gardssalg/.test(junkCohort.body.error || "") && /all/.test(junkCohort.body.error || ""), "k1c: error lists both valid values");
+
+      // k2-k3: cohort=all WITHOUT limit -> 400, the mandatory-pagination
+      // guard — checked before any DB load/fetch (fetchedHosts must gain
+      // NOTHING from this call).
+      const fetchCountBeforeGuard = fetchCallCount;
+      const cohortAllNoLimit = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=all",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(cohortAllNoLimit.status, 400, "k2: cohort=all without limit -> 400 (mandatory pagination)");
+      assertEq(
+        cohortAllNoLimit.body.error,
+        "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+        "k2b: exact Norwegian error message"
+      );
+      assertEq(fetchCallCount, fetchCountBeforeGuard, "k3: the mandatory-limit guard fires before any homepage fetch");
+
+      // k4-k5: scope=hidden combined with cohort=all and no limit is STILL a
+      // 400 — the guard fires on `cohort` alone, independent of `scope`.
+      const cohortAllHiddenNoLimit = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=all&scope=hidden",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(cohortAllHiddenNoLimit.status, 400, "k4: cohort=all&scope=hidden, still no limit -> 400");
+      assertTrue(/limit er påkrevd/.test(cohortAllHiddenNoLimit.body.error || ""), "k5: same mandatory-limit message regardless of scope");
+
+      // k6-k9: cohort=all WITH a valid limit -> 200, widens the cohort to
+      // include prov-outside-gardssalg (producer_type IS NULL, rfb_seed_
+      // source != 'rfb-seed' — the exact shape the gårdssalg cohort
+      // excludes), while the synthetic test-gardssalg row stays excluded
+      // (unconditional, both cohorts) and is never fetched.
+      const cohortAllVisible = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=all&limit=12",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(cohortAllVisible.status, 200, "k6: cohort=all&limit=12 -> 200");
+      assertEq(cohortAllVisible.body.cohort, "all", "k7: response echoes cohort=all");
+      const cohortAllVisibleIds = cohortAllVisible.body.rows.map((r: any) => r.provider_id);
+      assertTrue(
+        cohortAllVisibleIds.includes("prov-outside-gardssalg"),
+        "k8: cohort=all widens to include the row the gårdssalg cohort (default) excludes"
+      );
+      const outsideRow = cohortAllVisible.body.rows.find((r: any) => r.provider_id === "prov-outside-gardssalg");
+      assertEq(outsideRow?.classification, "missing_source", "k8b: the widened-in row classifies as missing_source (blank hjemmeside)");
+      assertTrue(
+        !cohortAllVisibleIds.includes("prov-test-gardssalg"),
+        "k9: the synthetic test-gardssalg row stays excluded even under cohort=all"
+      );
+      assertTrue(
+        !fetchedHosts.includes("test-ikke-book.invalid"),
+        "k9b: ...and is never fetched under cohort=all either"
+      );
+      // Visible-scope default still excludes the hidden fixture even at
+      // cohort=all — the two axes stay independent.
+      assertTrue(
+        !cohortAllVisibleIds.includes("prov-hidden-verified"),
+        "k10: cohort=all does not itself widen visibility — scope=visible (default) still excludes the hidden row"
+      );
+      assertEq(
+        cohortAllVisible.body.pagination.total,
+        5,
+        "k11: cohort=all&scope=visible total is the 4 default-cohort visible rows plus the 1 newly-widened-in row"
+      );
+
+      // k12-k14: cohort=all paginates correctly with a smaller page size —
+      // walk it in two pages and confirm every row is visited exactly once.
+      const cohortAllPage1 = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=all&limit=3&offset=0",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(cohortAllPage1.status, 200, "k12: cohort=all&limit=3&offset=0 -> 200");
+      assertEq(cohortAllPage1.body.pagination.returned, 3, "k12b: first page returns exactly 3 rows");
+      const cohortAllPage2 = await callRoute(opplevelserRouter, {
+        url: `/admin/gardssalg-website-verification-audit?cohort=all&limit=3&offset=${cohortAllPage1.body.pagination.next_offset}`,
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(cohortAllPage2.status, 200, "k13: second page -> 200");
+      assertEq(cohortAllPage2.body.pagination.next_offset, null, "k13b: second page is the last page (5 rows total, 3+2)");
+      const walkedIds = [
+        ...cohortAllPage1.body.rows.map((r: any) => r.provider_id),
+        ...cohortAllPage2.body.rows.map((r: any) => r.provider_id),
+      ];
+      assertEq(walkedIds.length, 5, "k14: walking both pages visits exactly 5 rows");
+      assertEq(new Set(walkedIds).size, 5, "k14b: all 5 are distinct — no row skipped or duplicated across the cohort=all pages");
+
+      // k15: scope=all COMBINED with cohort=all reaches every seeded row
+      // except the synthetic test-gardssalg one (6 seeded + 1 outside = 7,
+      // minus the always-excluded synthetic row = 6) — the two axes compose.
+      const cohortAllScopeAll = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=all&scope=all&limit=12",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(cohortAllScopeAll.status, 200, "k15: cohort=all&scope=all&limit=12 -> 200");
+      assertEq(cohortAllScopeAll.body.pagination.total, 6, "k15b: scope=all + cohort=all together see every seeded row bar the synthetic one");
+      assertTrue(
+        !cohortAllScopeAll.body.rows.some((r: any) => r.provider_id === "prov-test-gardssalg"),
+        "k15c: ...still excluding the synthetic test-gardssalg row even with both axes maximally widened"
+      );
+      // scope=all neutralizes the visibility filter entirely (test-gardssalg
+      // IS catalog_hidden=1, so a visible-only exclusion would no longer
+      // apply here) — its absence above is therefore proof the COHORT
+      // exclusion itself is what's keeping it out, not visibility. This
+      // fetchedHosts check confirms that isolation directly.
+      assertTrue(
+        !fetchedHosts.includes("test-ikke-book.invalid"),
+        "k15d: ...and, with visibility neutralized (scope=all), it's still never fetched — the cohort exclusion alone is what holds"
       );
 
       // ── (i) GET /admin/website-review-queues — the read side both queues

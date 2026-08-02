@@ -221,8 +221,10 @@ import {
   planGardssalgWebsiteVerificationRemediation,
   applyGardssalgWebsiteVerification,
   GS_WV_SCOPES,
+  GS_WV_COHORTS,
   type GsWvFetchFn,
   type GsWvScope,
+  type GsWvCohort,
 } from "../services/gardssalg-website-verification";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
@@ -7405,6 +7407,18 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
     return;
   }
+  // cohort=gardssalg (default) | all — Steg 2 of dev-request 2026-08-02-
+  // opplevagent-hjemmesideverifisering-og-enrichment-gate. A SEPARATE axis
+  // from `scope` above (visibility) — this one decides WHICH producer types
+  // are in the cohort at all (see loadGardssalgWebsiteVerificationCohort's
+  // own doc comment). STRICTLY validated, same discipline as `scope`: an
+  // unknown value is a 400, never a silent fallback.
+  const rawCohort = req.query.cohort;
+  const cohortParam: GsWvCohort = rawCohort === undefined ? "gardssalg" : (rawCohort as GsWvCohort);
+  if (rawCohort !== undefined && !GS_WV_COHORTS.includes(cohortParam)) {
+    res.status(400).json({ error: `Ugyldig cohort — må være en av: ${GS_WV_COHORTS.join(", ")}` });
+    return;
+  }
   // Steg 1 of dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-
   // enrichment-gate: optional `limit`/`offset` so a caller can page through
   // the cohort instead of forcing this route to fetch every producer's live
@@ -7445,33 +7459,50 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
     return;
   }
+  // MANDATORY pagination when cohort=all: that cohort drops the gårdssalg
+  // producer-type restriction entirely, so it can be 1000+ rows platform-
+  // wide (vs. today's ~87-row gårdssalg cohort) — the unbounded (`limit`
+  // absent) synchronous-scan code path immediately above exists ONLY so the
+  // default cohort=gardssalg stays byte-for-byte backward compatible for
+  // callers who never paginate; at cohort=all scale it reproduces exactly
+  // the timeout/event-loop-stall risk (PR #432) `limit`/MAX_GARDSSALG_AUDIT_
+  // LIMIT were added to prevent. Checked BEFORE any DB load or fetch.
+  if (cohortParam === "all" && limit === undefined) {
+    res.status(400).json({
+      error: "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+    });
+    return;
+  }
   try {
     const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
       const fetched = await crFetchGardssalgContent(homepageUrl);
       if (!fetched.ok) return { ok: false, reason: fetched.reason };
       return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
     };
-    const cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
+    const cohortRows = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
 
     if (limit === undefined) {
       // No pagination requested: byte-for-byte identical behavior/response
       // shape to before this slice — the cohort's new ORDER BY doesn't
       // change WHICH rows come back, only their order, so this branch's
-      // output is unaffected.
-      const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
-      res.json({ success: true, scope, summary, rows });
+      // output is unaffected. (cohort=all can never reach here — rejected
+      // above — so this unbounded path only ever runs for cohort=gardssalg,
+      // same as before this slice existed.)
+      const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohortRows, fetchFn, CR_CONCURRENCY);
+      res.json({ success: true, scope, cohort: cohortParam, summary, rows });
       return;
     }
 
     const pageOffset = offset ?? 0;
-    const page = cohort.slice(pageOffset, pageOffset + limit);
+    const page = cohortRows.slice(pageOffset, pageOffset + limit);
     const { summary, rows } = await scanGardssalgWebsiteVerificationRows(page, fetchFn, CR_CONCURRENCY);
-    const total = cohort.length;
+    const total = cohortRows.length;
     const returned = rows.length;
     const nextOffset = pageOffset + returned < total ? pageOffset + returned : null;
     res.json({
       success: true,
       scope,
+      cohort: cohortParam,
       summary,
       rows,
       pagination: { total, offset: pageOffset, limit, returned, next_offset: nextOffset },

@@ -126,6 +126,29 @@ export type GsWvScope = "visible" | "hidden" | "all";
 
 export const GS_WV_SCOPES: readonly GsWvScope[] = ["visible", "hidden", "all"] as const;
 
+// ─── Cohort axis (Steg 2, dev-request 2026-08-02-opplevagent-hjemmeside
+// verifisering-og-enrichment-gate) ──────────────────────────────────────────
+//
+// A SEPARATE, independent axis from `scope` above. `scope` decides WHICH
+// visibility slice of a cohort to look at (visible/hidden/all-visibility);
+// `cohort` decides WHICH producer types are IN the cohort at all
+// (gårdssalg-only vs. every experience_providers row, platform-wide). The two
+// are orthogonal and compose freely — do not conflate "cohort=all" with
+// "scope=all"; they mean entirely different things.
+//
+//   gardssalg (default) — today's existing cohort: producer_type IS NOT NULL
+//     OR rfb_seed_source = 'rfb-seed'. Every existing caller who never passes
+//     `cohort` gets exactly this, unchanged.
+//   all — the producer-type restriction is DROPPED entirely: every row in
+//     experience_providers is a candidate, platform-wide. This is
+//     substantially larger (experience_providers plausibly holds 1000+ rows
+//     platform-wide, vs. today's ~87-row gårdssalg cohort) — callers on this
+//     cohort MUST paginate (see MAX_GARDSSALG_AUDIT_LIMIT enforcement at the
+//     route layer, which makes `limit` mandatory whenever cohort=all).
+export type GsWvCohort = "gardssalg" | "all";
+
+export const GS_WV_COHORTS: readonly GsWvCohort[] = ["gardssalg", "all"] as const;
+
 // The `producer_type != 'test-gardssalg'` leg is the SAME exclusion every
 // other gårdssalg selector in this codebase already carries (experience-store
 // .ts's listing/count queries, gardssalg-experience-conflict.ts's scan cohort,
@@ -135,26 +158,36 @@ export const GS_WV_SCOPES: readonly GsWvScope[] = ["visible", "hidden", "all"] a
 // non-resolving) hjemmeside would file a bogus `verification_failed` entry in
 // the very review queue this vertical is trying to drive to empty. Null-safe
 // form for the same reason as the catalog_hidden clause below — a bare `!=`
-// would drop every producer_type IS NULL row too.
-const GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL =
-  `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')` +
-  ` AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`;
+// would drop every producer_type IS NULL row too. This exclusion is
+// UNCONDITIONAL — it applies to BOTH cohorts, since it is about a synthetic
+// test fixture, not about which cohort is selected.
+const GS_WV_TEST_GARDSSALG_EXCLUSION_SQL = `(producer_type IS NULL OR producer_type != 'test-gardssalg')`;
 
-const GS_WV_SCOPE_SQL: Record<GsWvScope, string> = {
-  visible: `${GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL} AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,
-  hidden: `${GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL} AND catalog_hidden = 1`,
-  all: GARDSSALG_WEBSITE_VERIFICATION_BASE_SQL,
+// The gårdssalg producer-type restriction — dropped entirely for cohort=all.
+const GS_WV_GARDSSALG_PRODUCER_TYPE_SQL = `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+
+const GS_WV_COHORT_SQL: Record<GsWvCohort, string> = {
+  gardssalg: `${GS_WV_GARDSSALG_PRODUCER_TYPE_SQL} AND ${GS_WV_TEST_GARDSSALG_EXCLUSION_SQL}`,
+  all: GS_WV_TEST_GARDSSALG_EXCLUSION_SQL,
+};
+
+const GS_WV_SCOPE_ONLY_SQL: Record<GsWvScope, string> = {
+  visible: `(catalog_hidden IS NULL OR catalog_hidden != 1)`,
+  hidden: `catalog_hidden = 1`,
+  all: `1=1`,
 };
 
 export function loadGardssalgWebsiteVerificationCohort(
   db: Database.Database,
-  scope: GsWvScope = "visible"
+  scope: GsWvScope = "visible",
+  cohort: GsWvCohort = "gardssalg"
 ): GsWvProducerRow[] {
+  const whereSql = `${GS_WV_COHORT_SQL[cohort]} AND ${GS_WV_SCOPE_ONLY_SQL[scope]}`;
   return db
     .prepare(
       `SELECT id, navn, hjemmeside, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer, catalog_hidden
          FROM experience_providers
-        WHERE ${GS_WV_SCOPE_SQL[scope]}
+        WHERE ${whereSql}
         ORDER BY id`
     )
     .all() as GsWvProducerRow[];
@@ -257,9 +290,10 @@ export async function runGardssalgWebsiteVerificationScan(
   db: Database.Database,
   fetchFn: GsWvFetchFn,
   concurrency = 3,
-  scope: GsWvScope = "visible"
+  scope: GsWvScope = "visible",
+  cohort: GsWvCohort = "gardssalg"
 ): Promise<{ summary: GsWvSummary; rows: GsWvScanRow[] }> {
-  const producers = loadGardssalgWebsiteVerificationCohort(db, scope);
+  const producers = loadGardssalgWebsiteVerificationCohort(db, scope, cohort);
   return scanGardssalgWebsiteVerificationRows(producers, fetchFn, concurrency);
 }
 
