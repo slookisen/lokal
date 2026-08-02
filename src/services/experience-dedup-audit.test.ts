@@ -257,7 +257,7 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
       const opplevelserRouter = (require("../routes/opplevelser") as { default: any }).default;
       const db: Database.Database = dbFactory.getDb("experiences");
 
-      const ADMIN_KEY = "dedup-audit-test-admin-key";
+      const ADMIN_KEY = process.env.ADMIN_KEY || "dedup-audit-test-admin-key";
       process.env.ADMIN_KEY = ADMIN_KEY;
       const adminHeaders = { "x-admin-key": ADMIN_KEY };
 

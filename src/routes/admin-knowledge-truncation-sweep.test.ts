@@ -141,7 +141,7 @@ export function runDescriptionTruncationSweepTests(opts: { log?: boolean } = {})
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "admin-truncation-sweep-test-key";
+    const testKey = process.env.ADMIN_KEY || "admin-truncation-sweep-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
 

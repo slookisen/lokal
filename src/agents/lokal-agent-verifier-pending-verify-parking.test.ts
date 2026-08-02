@@ -361,7 +361,7 @@ export function runLokalAgentVerifierPendingVerifyParkingTests(
       delete require.cache[require.resolve("../routes/admin-outreach-pool")];
       const routeMod = require("../routes/admin-outreach-pool");
       const router = routeMod.default;
-      const testAdminKey = "pending-verify-parking-stats-test-key";
+      const testAdminKey = process.env.ADMIN_KEY || "pending-verify-parking-stats-test-key";
       const prevAdminKey = process.env.ADMIN_KEY;
       process.env.ADMIN_KEY = testAdminKey;
       try {

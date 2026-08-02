@@ -125,7 +125,7 @@ export function runAdminDomainCoherenceSweepTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "admin-domain-coherence-sweep-test-key";
+    const testKey = process.env.ADMIN_KEY || "admin-domain-coherence-sweep-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
     const prevParkingDisabled = process.env.DOMAIN_RECONCILIATION_PARKING_DISABLED;
@@ -399,7 +399,7 @@ export function runAdminDomainCoherenceSweepTests(
     // overwritten by apply.
     {
       const prevDb2 = initMod.getDb();
-      const testKey2 = "admin-domain-coherence-onedir-test-key";
+      const testKey2 = process.env.ADMIN_KEY || "admin-domain-coherence-onedir-test-key";
       const prevAdminKey2 = process.env.ADMIN_KEY;
       process.env.ADMIN_KEY = testKey2;
       const db2 = new Database(":memory:");
@@ -485,7 +485,7 @@ export function runAdminDomainCoherenceSweepTests(
     // untouched).
     {
       const prevDb3 = initMod.getDb();
-      const testKey3 = "admin-domain-coherence-homepage-evidence-test-key";
+      const testKey3 = process.env.ADMIN_KEY || "admin-domain-coherence-homepage-evidence-test-key";
       const prevAdminKey3 = process.env.ADMIN_KEY;
       process.env.ADMIN_KEY = testKey3;
       const db3 = new Database(":memory:");

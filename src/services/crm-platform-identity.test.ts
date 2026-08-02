@@ -156,8 +156,13 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
           host: process.env.SMTP_HOST, port: process.env.SMTP_PORT,
           user: process.env.SMTP_USER, pass: process.env.SMTP_PASS,
         };
-        process.env.ADMIN_KEY = "crm-identity-test-key";
-        process.env.ANALYTICS_ADMIN_KEY = "crm-identity-test-key";
+        // Determinisme (2026-08-02): adopter suitens kanoniske nøkler når de
+        // finnes — aldri bytt de prosess-globale verdiene midt i en kjøring
+        // (se SHARED GLOBAL STATE-kontrakten i tests/test.ts). Literal kun som
+        // standalone-fallback.
+        const crmIdentityKey = process.env.ADMIN_KEY || "crm-identity-test-key";
+        process.env.ADMIN_KEY = crmIdentityKey;
+        process.env.ANALYTICS_ADMIN_KEY = process.env.ANALYTICS_ADMIN_KEY || crmIdentityKey;
 
         const emailMod = require("./email-service") as typeof import("./email-service");
         const svc = emailMod.emailService as any;
@@ -174,7 +179,7 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
           const post = async (url: string, body: any): Promise<{ status: number }> => {
             const req: any = {
               method: "POST", url, query: {}, body,
-              headers: { "x-admin-key": "crm-identity-test-key" },
+              headers: { "x-admin-key": crmIdentityKey },
               get(n: string) { return this.headers[n.toLowerCase()]; },
             };
             let settle: () => void;

@@ -81,7 +81,7 @@ export function runAdminOutreachCandidatesGateIntegrityTests(opts: { log?: boole
     }
   }
 
-  const testKey = "admin-outreach-candidates-gate-integrity-test-key";
+  const testKey = process.env.ADMIN_KEY || "admin-outreach-candidates-gate-integrity-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
   process.env.ADMIN_KEY = testKey;
 

@@ -177,7 +177,10 @@ export function runMcpUsageLoggerTests(opts: { log?: boolean } = {}): Promise<Te
     const prevDb = initMod.getDb();
     const db = new Database(":memory:");
     try {
-      process.env.ANALYTICS_ADMIN_KEY = "test-mcp-usage-key";
+      // Determinisme (2026-08-02): adopter suitens kanoniske nøkkel når den
+      // finnes (se SHARED GLOBAL STATE-kontrakten i tests/test.ts).
+      const mcpUsageKey = process.env.ANALYTICS_ADMIN_KEY || "test-mcp-usage-key";
+      process.env.ANALYTICS_ADMIN_KEY = mcpUsageKey;
       initMod.__setDbForTesting(db as any);
       initMod.__initSchemaForTesting(db as any);
 
@@ -354,7 +357,7 @@ export function runMcpUsageLoggerTests(opts: { log?: boolean } = {}): Promise<Te
         const all24h = await callRoute(router, {
           url: "/mcp-usage",
           query: { hours: "24" },
-          headers: { "x-admin-key": "test-mcp-usage-key" },
+          headers: { "x-admin-key": mcpUsageKey },
         });
         assertEq(all24h.status, 200, "mcp-23: GET /admin/analytics/mcp-usage → 200");
         assertEq(all24h.body.totalCalls, 4, "mcp-24: totalCalls excludes owner traffic and the >24h-old row");
@@ -368,7 +371,7 @@ export function runMcpUsageLoggerTests(opts: { log?: boolean } = {}): Promise<Te
         const dentalOnly = await callRoute(router, {
           url: "/mcp-usage",
           query: { hours: "24", vertical: "dental" },
-          headers: { "x-admin-key": "test-mcp-usage-key" },
+          headers: { "x-admin-key": mcpUsageKey },
         });
         assertEq(dentalOnly.body.totalCalls, 1, "mcp-28: ?vertical=dental scopes the aggregation");
 

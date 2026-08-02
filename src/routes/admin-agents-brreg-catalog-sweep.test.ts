@@ -120,7 +120,7 @@ export async function runBrregCatalogSweepTests(opts: { log?: boolean } = {}): P
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "brreg-sweep-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "brreg-sweep-test-key";
 
   const fixtures: Map<string, BrregFixture> = new Map();
   let fetchCallCount = 0;

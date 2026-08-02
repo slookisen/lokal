@@ -142,7 +142,7 @@ export function runOpplevelserBookingSendGuardTests(
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevRedirect = process.env.TEST_SEND_REDIRECT_EMAIL;
     const prevDispatch = process.env.BOOKING_DISPATCH_ENABLED;
-    const testKey = "booking-send-guard-test-key";
+    const testKey = process.env.ADMIN_KEY || "booking-send-guard-test-key";
     const REDIRECT = "daniel-test@example.no";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;

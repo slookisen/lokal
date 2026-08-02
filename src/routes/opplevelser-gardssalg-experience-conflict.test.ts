@@ -131,7 +131,7 @@ export function runOpplevelserGardssalgExperienceConflictTests(
   return (async () => {
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
-    const testKey = "gardssalg-experience-conflict-test-key";
+    const testKey = process.env.ADMIN_KEY || "gardssalg-experience-conflict-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
 

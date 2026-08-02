@@ -92,7 +92,7 @@ export async function runAdminAgentsRegisterTests(opts: { log?: boolean } = {}):
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "admin-agents-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "admin-agents-test-key";
 
   // fetchByOrgNr — org-nr → BrregFixture. verifyOrgNumber() hits
   // GET /enheter/{orgNr}; we key fixtures off the trailing path segment.

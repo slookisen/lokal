@@ -144,7 +144,7 @@ export function runHomepageProvenanceJunkEmailReplaceTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "homepage-provenance-junk-email-replace-test-key";
+    const testKey = process.env.ADMIN_KEY || "homepage-provenance-junk-email-replace-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
     const prevFetch = (globalThis as any).fetch;

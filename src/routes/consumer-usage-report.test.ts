@@ -87,7 +87,10 @@ export async function runConsumerUsageReportTests(opts: { log?: boolean } = {}):
   const prevDb = initMod.getDb();
   const db = new Database(":memory:");
   try {
-    process.env.ANALYTICS_ADMIN_KEY = "test-consumer-usage-key";
+    // Determinisme (2026-08-02): adopter suitens kanoniske nøkkel når den
+    // finnes (se SHARED GLOBAL STATE-kontrakten i tests/test.ts).
+    const usageKey = process.env.ANALYTICS_ADMIN_KEY || "test-consumer-usage-key";
+    process.env.ANALYTICS_ADMIN_KEY = usageKey;
     initMod.__setDbForTesting(db as any);
     initMod.__initSchemaForTesting(db as any);
 
@@ -127,7 +130,7 @@ export async function runConsumerUsageReportTests(opts: { log?: boolean } = {}):
     // ── 1/2/4/7: default ?days=7 aggregation ─────────────────────────────
     const week = await callRoute(router, {
       url: "/consumer-usage",
-      headers: { "x-admin-key": "test-consumer-usage-key" },
+      headers: { "x-admin-key": usageKey },
     });
     assertEq(week.status, 200, "cur-1: GET /admin/analytics/consumer-usage -> 200");
     assertEq(week.body.timeframe, "last 7 days", "cur-2: default timeframe is 7 days");
@@ -166,7 +169,7 @@ export async function runConsumerUsageReportTests(opts: { log?: boolean } = {}):
     const month = await callRoute(router, {
       url: "/consumer-usage",
       query: { days: "30" },
-      headers: { "x-admin-key": "test-consumer-usage-key" },
+      headers: { "x-admin-key": usageKey },
     });
     assertEq(month.body.timeframe, "last 30 days", "cur-15: ?days=30 reflects in timeframe");
     const activeMonth = month.body.topConsumers.find((c: any) => c.key_id === activeKey);
@@ -176,7 +179,7 @@ export async function runConsumerUsageReportTests(opts: { log?: boolean } = {}):
     const limited = await callRoute(router, {
       url: "/consumer-usage",
       query: { days: "30", limit: "1" },
-      headers: { "x-admin-key": "test-consumer-usage-key" },
+      headers: { "x-admin-key": usageKey },
     });
     assertEq(limited.body.topConsumers.length, 1, "cur-17: ?limit=1 returns exactly one consumer");
     assertEq(limited.body.topConsumers[0]?.key_id, activeKey, "cur-18: ?limit=1 keeps the highest-volume consumer");

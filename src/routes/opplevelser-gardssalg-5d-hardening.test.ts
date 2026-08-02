@@ -90,7 +90,7 @@ export function runOpplevelserGardssalg5dHardeningTests(
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
-    const testKey = "gardssalg-5d-test-key";
+    const testKey = process.env.ADMIN_KEY || "gardssalg-5d-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
     delete process.env.ANTHROPIC_API_KEY; // 5d content tests must never LLM-call

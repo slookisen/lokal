@@ -107,7 +107,7 @@ export function runAdminDbTableSizesTests(opts: { log?: boolean } = {}): Promise
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "admin-db-table-sizes-test-key";
+    const testKey = process.env.ADMIN_KEY || "admin-db-table-sizes-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
 

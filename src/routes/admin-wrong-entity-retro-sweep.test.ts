@@ -135,7 +135,7 @@ export function runAdminWrongEntityRetroSweepTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "admin-wrong-entity-retro-sweep-test-key";
+    const testKey = process.env.ADMIN_KEY || "admin-wrong-entity-retro-sweep-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
 

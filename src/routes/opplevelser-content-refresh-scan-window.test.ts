@@ -167,7 +167,7 @@ export function runOpplevelserContentRefreshScanWindowTests(
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevFetch = globalThis.fetch;
-    const testKey = "content-refresh-scan-window-test-key";
+    const testKey = process.env.ADMIN_KEY || "content-refresh-scan-window-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
 

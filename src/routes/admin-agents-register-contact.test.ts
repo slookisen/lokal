@@ -116,7 +116,7 @@ export async function runAdminAgentsRegisterContactTests(
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "admin-agents-register-contact-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "admin-agents-register-contact-test-key";
 
   try {
     __setDbForTesting(testDb as any);

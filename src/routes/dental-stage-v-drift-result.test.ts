@@ -126,7 +126,7 @@ export function runDentalStageVDriftResultTests(
     const prevDentalPath = process.env.DENTAL_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
-    const testKey = "dental-stage-v-drift-result-test-key";
+    const testKey = process.env.ADMIN_KEY || "dental-stage-v-drift-result-test-key";
     process.env.DENTAL_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
     delete process.env.ANALYTICS_ADMIN_KEY;

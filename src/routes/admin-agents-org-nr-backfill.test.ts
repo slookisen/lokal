@@ -188,7 +188,7 @@ export async function runAdminAgentsOrgNrBackfillTests(opts: { log?: boolean } =
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "agents-org-nr-backfill-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "agents-org-nr-backfill-test-key";
 
   // navn-search fixtures keyed by a substring of the encoded query string;
   // detail/liveness fixtures keyed by the bare 9-digit org number.

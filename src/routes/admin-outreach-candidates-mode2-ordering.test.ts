@@ -67,7 +67,7 @@ export function runAdminOutreachCandidatesMode2OrderingTests(opts: { log?: boole
     }
   }
 
-  const testKey = "admin-outreach-candidates-mode2-ordering-test-key";
+  const testKey = process.env.ADMIN_KEY || "admin-outreach-candidates-mode2-ordering-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
   process.env.ADMIN_KEY = testKey;
 

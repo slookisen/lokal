@@ -132,7 +132,7 @@ export function runHomepageContentRefreshParkingTests(
 
   return (async () => {
     const prevDb = initMod.getDb();
-    const testKey = "homepage-content-refresh-parking-test-key";
+    const testKey = process.env.ADMIN_KEY || "homepage-content-refresh-parking-test-key";
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
     const prevFetch = (globalThis as any).fetch;

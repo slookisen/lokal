@@ -96,7 +96,7 @@ export async function runAdminAgentsCategorySanityReportTests(opts: { log?: bool
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "category-sanity-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "category-sanity-test-key";
 
   function insertAgent(opts: {
     id: string;

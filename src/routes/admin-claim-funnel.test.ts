@@ -100,7 +100,7 @@ export async function runAdminClaimFunnelTests(opts: { log?: boolean } = {}): Pr
   // admin-agents-delete.test.ts's first (non-FK-ON) block.
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "admin-claim-funnel-test-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "admin-claim-funnel-test-key";
 
   try {
     __setDbForTesting(testDb as any);

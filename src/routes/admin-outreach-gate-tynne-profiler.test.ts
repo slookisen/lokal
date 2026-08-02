@@ -75,7 +75,7 @@ export function runAdminOutreachGateTynneProfilerTests(opts: { log?: boolean } =
     }
   }
 
-  const testKey = "outreach-gate-tynne-profiler-test-key";
+  const testKey = process.env.ADMIN_KEY || "outreach-gate-tynne-profiler-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
   process.env.ADMIN_KEY = testKey;
 

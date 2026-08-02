@@ -141,7 +141,7 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevFetch = globalThis.fetch;
-    const testKey = "gardssalg-website-verification-test-key";
+    const testKey = process.env.ADMIN_KEY || "gardssalg-website-verification-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
 

@@ -97,7 +97,7 @@ export function runAdminRunsLockTests(opts: { log?: boolean } = {}): TestSummary
     assertEq(cond, true, label);
   }
 
-  const testKey = "admin-runs-lock-test-key";
+  const testKey = process.env.ADMIN_KEY || "admin-runs-lock-test-key";
   const prevAdminKey = process.env.ADMIN_KEY;
   process.env.ADMIN_KEY = testKey;
 

@@ -161,7 +161,7 @@ export async function runAdminBillingTests(opts: { log?: boolean } = {}): Promis
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
 
-  const ADMIN_KEY = "billing-test-admin-key";
+  const ADMIN_KEY = process.env.ADMIN_KEY || "billing-test-admin-key";
 
   try {
     __setDbForTesting(testDb as any);

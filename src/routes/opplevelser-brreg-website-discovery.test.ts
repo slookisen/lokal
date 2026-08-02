@@ -83,7 +83,7 @@ export function runOpplevelserBrregWebsiteDiscoveryTests(
     const prevFetch = globalThis.fetch;
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
-    const testKey = "brreg-website-test-key";
+    const testKey = process.env.ADMIN_KEY || "brreg-website-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
 

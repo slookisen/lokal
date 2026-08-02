@@ -172,10 +172,15 @@ import conversationUiRouter, {
 //          when things run. Shipping that barrier was judged too risky
 //          for this slice; it needs to land together with (or after) the
 //          ADMIN_KEY-in-external-files fix, not before it.
-//     Until both land, a NEW block that touches __setDbForTesting() must
-//     still follow the restore-in-finally discipline above by hand AND
-//     manually verify its ordering against PR-94 and the runSerial()
-//     chain — don't assume the PR-56→PR-68 chain fix above covers it.
+//          → LANDET 2026-08-02, sammen med nettopp den fiksen (samme
+//          commit): se _adHocFamilyBarrier (grep etter navnet) — en
+//          runSerial-lenke rett før tz-parking som venter på HELE
+//          ad-hoc-familien, så ingen senere kjede-blokk kan starte mens
+//          en ad-hoc-blokk er mid-await på et åpent DB-handle.
+//     En NY blokk som touching __setDbForTesting() må fortsatt følge
+//     restore-in-finally-disiplinen over og verifisere sin ordning mot
+//     PR-94 (gap #1 er IKKE lukket av barrieren — PR-94 vs PR-63/65/67/68
+//     er interne i ad-hoc-familien, på samme side av barrieren).
 //   - A hazard the SAME SHAPE as kriterium 2 but in a DIFFERENT population
 //     of files: this file requires and invokes dozens of colocated
 //     src/**/*.test.ts helper suites (grep for `require(".*\.test")` in
@@ -184,14 +189,17 @@ import conversationUiRouter, {
 //     process.env.ADMIN_KEY / ANALYTICS_ADMIN_KEY with their own bespoke,
 //     per-file values (with their own restore-in-finally, but the same
 //     "await window sees a foreign value" hazard this comment describes).
-//     Fixing THAT population is out of scope for kriterium 2 as scoped
-//     (achievable purely inside tests/test.ts) — it would mean editing ~71
-//     other files. The mitigation applied here instead: every block in
-//     THIS file that makes a real async admin-gated HTTP/handler round trip
-//     re-asserts its canonical key value synchronously right before each
-//     dispatch (see the isolation-contract bullet above), which defends
-//     against that external population the same way it used to (accidentally)
-//     defend against this file's own, now-fixed, internal races.
+//     → FIKSET 2026-08-02 (samme commit som barrieren over): populasjonen
+//     er konvertert til adopt-ambient — hver hjelpesuites nøkkelkonstant er
+//     nå `process.env.ADMIN_KEY || "<standalone-fallback>"` (tilsvarende
+//     for ANALYTICS_ADMIN_KEY), så under suiten skriver alle tilordninger
+//     og restores den IDENTISKE kanoniske verdien (benigne no-ops), mens
+//     standalone-kjøring er uendret. Bevisste unntak: crm.test.ts (tester
+//     selve nøkkel-presedensen fra PR #455 og MÅ variere nøklene — kjører
+//     i runSerial-kjeden, post-barriere, dermed uten samtidige lesere) og
+//     korte delete-vinduer i negative tester (samme post-barriere-argument).
+//     Re-assert-før-dispatch-mitigeringen i DENNE filens blokker beholdes
+//     som belte-og-bukser mot delete-vinduene.
 // ─────────────────────────────────────────────────────────────────────────
 
 // Canonical admin keys for the ENTIRE suite's process lifetime (kriterium 2
@@ -32086,6 +32094,63 @@ const _rfbAgentsRetroScanPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
+//
+// Dette er barrieren filheaderens "NOT yet fixed"-punkt 2 beskriver: frem til
+// nå møttes runSerial()-kjeden og ad-hoc-IIFE-familien først i rapporthalen
+// (~linje 24446), så en runSerial-blokk kunne starte — og via en require't
+// hjelpesuite kalle __resetDbFactoryForTesting() / bytte getDb()-singletonen —
+// mens en ad-hoc-blokk over fortsatt var mid-await med et åpent handle.
+// Dominant-signatur: gardssalg-content-refresh sitt "TypeError: The database
+// connection is not open" (~1 av 4-10 kjøringer, målt på main 2026-08-02).
+//
+// Headeren vurderte barrieren alene som for risikabel: den flytter veggklokke-
+// timing, og det trippet ADMIN_KEY-i-eksterne-filer-hasarden (pilot-ordre-loop
+// 403-burst). DEN forutsetningen er nå lukket i samme commit: alle ~85 eksterne
+// src/**/*.test.ts-hjelpesuiter adopterer suitens kanoniske nøkler
+// (`process.env.ADMIN_KEY || "<standalone-fallback>"`) i stedet for å bytte de
+// prosess-globale verdiene midt i kjøringen — så timing-skift kan ikke lenger
+// gi fremmed-nøkkel-403 mellom blokker. (crm.test.ts er bevisst unntatt: den
+// TESTER nøkkel-presedensen fra PR #455 og må variere nøklene — den kjører i
+// runSerial-kjeden og er nettopp derfor ufarlig ETTER denne barrieren.)
+//
+// Listen speiler rapporthalens await-liste (~linje 24446) minus _serialChain
+// (kjede-medlem kan ikke vente på kjeden). _contentRefreshCharsetPromise er
+// transitivt dekket via _contentRefreshScanWindowPromise, som i rapporthalen.
+// VEDLIKEHOLD: en NY ad-hoc-blokk må inn BÅDE i rapporthalens liste OG her.
+// allSettled, ikke all: en feilende ad-hoc-blokk har allerede ført sin feil i
+// `failures` selv og skal ikke velte kjeden.
+const _adHocFamilyBarrier: Promise<unknown>[] = [
+  ..._pr21Promises, _m2Promise,
+  _pr24Promise, _pr56Promise, _pr63Promise,
+  _pr65Promise, _pr66Promise, _pr67Promise,
+  _pr68Promise, _pr74Promise, _pr75Promise,
+  _pr76Promise, _pr78Promise, _orchPr86Promise,
+  _orchPr93Promise, _pr94Promise, _pr95Promise,
+  _pr103Promise, _pr106Promise, _pr110Promise,
+  _pr125Promise, _seoDentalPromise, _platformVerifierPromise,
+  _orchPr20260614_2Promise, _orchPr20260614Promise, _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise, _orchPr14ProductIdPromise, _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise, _orchPrDedupBackfillEndpointPromise, _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
+  _salgskanalMatcherPromise, _orchPr20BmEventsPromise, _orchPr21SentLogActorPromise,
+  _adminDbTableSizesPromise, _contactClickTrackingPromise, _homepageProvenanceEmailBackfillPromise,
+  _agentKnowledgeGetAuthPromise, _oaHomeCountersPromise, _adminAgentsRegisterPromise,
+  _tasksPruneAsyncPromise, _rfbDebioSuitePromise, _dispatchTickSuitePromise,
+  _samtalerSeoPromise, _descriptionTruncationSweepPromise, _pwaSwPromise,
+  _installPromptPromise, _brregCatalogSweepPromise, _brregDescriptionFallbackPromise,
+  _retentionRollupPromise, _pageEvidenceCrawlPromise, _homepageSelectorParkingPromise,
+  _homepageSelectorRotationPromise, _domainCoherenceSweepPromise, _pendingVerifyParkingPromise,
+  _adminAgentsDeletePromise, _adminClaimFunnelPromise, _selgerHtmlOpenTrackingPromise,
+  _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
+  _expNoYieldBackoffPromise, _contentRefreshScanWindowPromise, _lowQualitySelectorPromise,
+  _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
+];
+runSerial(async () => {
+  await Promise.allSettled(_adHocFamilyBarrier);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // orch-pr-20260713-verifier-sweep-parking (second review finding): TZ
 // regression test for the pending_verify re-stamp-eligibility check in
 // applyVerifierOutcome. Spawns its own child `tsx` processes (with
@@ -36541,6 +36606,13 @@ runSerial(async () => {
 // restores the old timing exactly; the route's 64 tests still run standalone
 // via runAdminAgentsUrlWriteTests(). That is a workaround, not a fix — the
 // suite is one new test block away from red no matter who adds it.
+//
+// → OPPDATERING 2026-08-02: barrieren OG ADMIN_KEY-i-eksterne-filer-fiksen er
+// nå landet sammen (se _adHocFamilyBarrier og filheaderens oppdaterte "NOT yet
+// fixed"-punkter). Målingene over beskriver tilstanden FØR den landingen; en
+// runSerial-registrering kan ikke lenger skli inn i en ad-hoc-blokks åpne
+// vindu, siden hele kjeden fra tz-parking og ut venter på at ad-hoc-familien
+// er ferdig først.
 runSerial(async () => {
   console.log("\n── dev-request 2026-08-01-rfb-agents-url-skrivespak: agents.url write lever ──");
   try {
