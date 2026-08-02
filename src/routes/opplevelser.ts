@@ -12,6 +12,7 @@
 // Admin POST requires X-Admin-Key (same env var as rfb/dental).
 
 import { Router, Request, Response, NextFunction } from "express";
+import type Database from "better-sqlite3";
 import { z } from "zod";
 import {
   createExperience,
@@ -6301,9 +6302,42 @@ export function computeGardssalgReadinessTier(input: {
   return "outreach_ready";
 }
 
-router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, res: Response) => {
-  const expDb = getExpDb("experiences");
-
+// Extracted for dev-request
+// 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach, Steg 5 (the
+// outreach pre-flight gate): the per-row readiness computation used to live
+// inline in the GET handler below. It is now a standalone function so the
+// new POST pre-flight endpoint can reuse EXACTLY the same tiering logic —
+// never a second, divergently-maintained copy of computeGardssalgReadinessTier
+// or its inputs. `providerIds`, when given (non-empty array), narrows the
+// returned ROWS to that id set via a parameter-bound `AND id IN (...)`
+// clause (never string-interpolated — same discipline as the
+// gardssalg-verified-drinkproducer-cohort route's DRINK_PRODUCER_TYPES query
+// a few hundred lines below). The conflict scan itself is ALWAYS run
+// unfiltered (full corpus) regardless of providerIds — duplicate-conflict
+// detection needs the whole picture, only the returned rows are filtered.
+function computeGardssalgReadinessRows(
+  expDb: Database.Database,
+  providerIds?: string[],
+): Array<{
+  id: string;
+  name: string;
+  org_nr: string | null;
+  kommune: string | null;
+  visible: boolean;
+  claim_status: string | null;
+  has_website: boolean;
+  has_about_text: boolean;
+  has_visit_text: boolean;
+  has_opening_hours: boolean;
+  has_products: boolean;
+  has_email: boolean;
+  has_phone: boolean;
+  is_searchable: boolean;
+  website_verified: boolean;
+  has_duplicate_conflict: boolean;
+  booking_status: OutreachBookingStatus;
+  readiness_tier: GardssalgReadinessTier;
+}> {
   let rows: Array<{
     id: string;
     navn: string;
@@ -6322,33 +6356,34 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     slug: string | null;
     field_provenance: string | null;
   }> = [];
-  try {
-    rows = expDb
-      .prepare(
-        // Same base gårdssalg scoping WHERE clause as listGardssalgProviders()
-        // et al. (experience-store.ts) — producer_type set OR seeded via RFB —
-        // but deliberately WITHOUT their catalog_hidden/content_source
-        // exclusions: every row must appear exactly once here.
-        `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
+
+  // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
+  // al. (experience-store.ts) — producer_type set OR seeded via RFB — but
+  // deliberately WITHOUT their catalog_hidden/content_source exclusions:
+  // every row must appear exactly once here.
+  let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
                 field_provenance
            FROM experience_providers
-          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
-      )
-      .all() as typeof rows;
-  } catch (err) {
-    console.error("[gardssalg-outreach-readiness] failed to query providers:", err);
-    res.status(500).json({ error: "Failed to query experience_providers" });
-    return;
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+  const params: string[] = [];
+  if (providerIds && providerIds.length > 0) {
+    const placeholders = providerIds.map(() => "?").join(", ");
+    sql += ` AND id IN (${placeholders})`;
+    params.push(...providerIds);
   }
+
+  rows = expDb.prepare(sql).all(...params) as typeof rows;
 
   const present = (v: string | null): boolean => v !== null && v.trim() !== "";
 
   // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
   // Steg 4 — has_duplicate_conflict is computed from ONE scan over the whole
   // producer/experience corpus (O(providers × experiences)), never per-row,
-  // then looked up per-row as an O(1) Set membership check below.
+  // then looked up per-row as an O(1) Set membership check below. Always run
+  // UNFILTERED regardless of providerIds — conflict detection needs the
+  // whole picture, not just the requested subset.
   const { pairs: conflictPairs } = runGardssalgExperienceConflictScan(expDb);
   const duplicateConflictProducerIds = new Set<string>();
   for (const pair of conflictPairs) {
@@ -6357,19 +6392,7 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     }
   }
 
-  const summary = {
-    outreach_ready: 0,
-    needs_enrichment: 0,
-    no_website: 0,
-    unreachable: 0,
-    skjult: 0,
-    ikke_soekbar: 0,
-    nettsted_uverifisert: 0,
-    dublettkonflikt: 0,
-    total: 0,
-  };
-
-  const providers = rows.map((p) => {
+  return rows.map((p) => {
     const has_website = present(p.hjemmeside);
     const has_about_text = present(p.about_text);
     const has_visit_text = present(p.visit_text);
@@ -6395,10 +6418,9 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
       website_verified,
       has_duplicate_conflict,
     });
-    summary[readiness_tier]++;
-    summary.total++;
 
     return {
+      id: p.id,
       name: p.navn,
       org_nr: p.org_nr,
       kommune: p.kommune,
@@ -6418,8 +6440,109 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
       readiness_tier,
     };
   });
+}
+
+router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  let providers: ReturnType<typeof computeGardssalgReadinessRows>;
+  try {
+    providers = computeGardssalgReadinessRows(expDb);
+  } catch (err) {
+    console.error("[gardssalg-outreach-readiness] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const summary = {
+    outreach_ready: 0,
+    needs_enrichment: 0,
+    no_website: 0,
+    unreachable: 0,
+    skjult: 0,
+    ikke_soekbar: 0,
+    nettsted_uverifisert: 0,
+    dublettkonflikt: 0,
+    total: 0,
+  };
+  for (const p of providers) {
+    summary[p.readiness_tier]++;
+    summary.total++;
+  }
 
   res.json({ providers, summary });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-outreach-preflight ───────────────
+//
+// dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
+// Steg 5: given a caller-supplied batch of provider ids, answer GO/NO-GO per
+// id for an outreach campaign — using EXACTLY the same tiering logic as GET
+// /admin/gardssalg-outreach-readiness above (computeGardssalgReadinessRows /
+// computeGardssalgReadinessTier), never a second, divergently-maintained
+// copy. Purely read-only — one SELECT (narrowed to the requested ids) plus
+// the full-corpus conflict scan, no writes, no outbound fetch, no LLM call;
+// synchronous handler, same style as the sibling GET route above.
+//
+// Batch size is capped at 200 ids (mirrors the explicit-cap-then-400
+// precedent already established by MAX_GARDSSALG_AUDIT_LIMIT /
+// gardssalg-website-verification-audit above) — never silently truncated.
+const MAX_GARDSSALG_PREFLIGHT_BATCH = 200;
+
+router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { provider_ids?: unknown };
+  const rawIds = body.provider_ids;
+
+  if (
+    !Array.isArray(rawIds) ||
+    rawIds.length === 0 ||
+    !rawIds.every((v) => typeof v === "string" && v.trim() !== "")
+  ) {
+    res.status(400).json({ error: "provider_ids must be a non-empty array of strings" });
+    return;
+  }
+  if (rawIds.length > MAX_GARDSSALG_PREFLIGHT_BATCH) {
+    res.status(400).json({ error: `provider_ids exceeds max batch size of ${MAX_GARDSSALG_PREFLIGHT_BATCH}` });
+    return;
+  }
+
+  // Dedupe while preserving first-seen order — every requested id must
+  // appear EXACTLY once in the response, in the order first seen in input.
+  const seen = new Set<string>();
+  const orderedIds: string[] = [];
+  for (const rawId of rawIds as string[]) {
+    if (!seen.has(rawId)) {
+      seen.add(rawId);
+      orderedIds.push(rawId);
+    }
+  }
+
+  const expDb = getExpDb("experiences");
+  try {
+    const rows = computeGardssalgReadinessRows(expDb, orderedIds);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+
+    let go = 0;
+    let no_go = 0;
+    const results = orderedIds.map((id) => {
+      const row = byId.get(id);
+      if (!row) {
+        no_go++;
+        return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
+      }
+      if (row.readiness_tier === "outreach_ready") {
+        go++;
+        return { provider_id: id, name: row.name, go: true, reason: null };
+      }
+      no_go++;
+      return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
+    });
+
+    res.json({ results, summary: { go, no_go, total: results.length } });
+  } catch (err) {
+    console.error("[gardssalg-outreach-preflight] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-verified-drinkproducer-cohort ──────
