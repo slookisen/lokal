@@ -28888,6 +28888,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gorr.failures) failures.push("opplevelser-gardssalg-outreach-readiness: " + f);
     console.log(`  opplevelser-gardssalg-outreach-readiness: ${gorr.passed} passed, ${gorr.failed} failed`);
 
+    // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-
+    // outreach, Steg 5: POST /admin/gardssalg-outreach-preflight — read-only
+    // GO/NO-GO pre-flight over a caller-supplied batch of provider ids,
+    // reusing the SAME readiness tiering as the report above. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-outreach-preflight: admin outreach GO/NO-GO pre-flight ──");
+    const { runOpplevelserGardssalgOutreachPreflightTests } = require("../src/routes/opplevelser-gardssalg-outreach-preflight.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-preflight.test");
+    const gopf = await runOpplevelserGardssalgOutreachPreflightTests({ log: false });
+    passed += gopf.passed;
+    failed += gopf.failed;
+    for (const f of gopf.failures) failures.push("opplevelser-gardssalg-outreach-preflight: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-preflight: ${gopf.passed} passed, ${gopf.failed} failed`);
+
     // dev-request 2026-08-02-drikkesteder-hjemmeside-verifisert-kohort-
     // berikelse, Step A prerequisite: GET
     // /admin/gardssalg-verified-drinkproducer-cohort — read-only cohort of
