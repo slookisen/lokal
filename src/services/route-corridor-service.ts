@@ -578,7 +578,7 @@ export const DRINK_CATEGORIES = new Set([
 
 /** Gårdssalg producer_type values — all of them are drink producers. */
 export const DRINK_PRODUCER_TYPES = new Set([
-  "bryggeri", "cideri", "vingård", "vingard", "destilleri", "mjøderi", "mjoderi", "seltzeri",
+  "bryggeri", "cideri", "sideri", "vingård", "vingard", "destilleri", "mjøderi", "mjoderi", "seltzeri",
 ]);
 
 /** Experience categories that are food/drink stops rather than sights. */
