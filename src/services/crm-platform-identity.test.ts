@@ -143,11 +143,20 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
       // above could be perfect while no caller uses it.
       // ═══════════════════════════════════════════════════════════════
       {
-        const prevAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+        // dev-request 2026-08-02-crm-summary-401-auth: crm.ts's requireAdminAuth
+        // now checks ADMIN_KEY first (fleet-wide pattern), ANALYTICS_ADMIN_KEY
+        // as fallback — previously the reverse. process.env.ADMIN_KEY is
+        // pinned suite-wide (tests/test.ts's SUITE_ADMIN_KEY) to a value this
+        // block doesn't know, so it must now also pin ADMIN_KEY itself to the
+        // key it sends below, not just ANALYTICS_ADMIN_KEY. Both saved and
+        // restored regardless.
+        const prevAdminKey = process.env.ADMIN_KEY;
+        const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
         const prevSmtp = {
           host: process.env.SMTP_HOST, port: process.env.SMTP_PORT,
           user: process.env.SMTP_USER, pass: process.env.SMTP_PASS,
         };
+        process.env.ADMIN_KEY = "crm-identity-test-key";
         process.env.ANALYTICS_ADMIN_KEY = "crm-identity-test-key";
 
         const emailMod = require("./email-service") as typeof import("./email-service");
@@ -277,8 +286,10 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
           }
         } finally {
           svc.sendRaw = realSendRaw;
-          if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
-          else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
+          if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+          else process.env.ADMIN_KEY = prevAdminKey;
+          if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
+          else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
           for (const [k, v] of Object.entries(prevSmtp)) {
             const key = "SMTP_" + k.toUpperCase();
             if (v === undefined) delete process.env[key]; else process.env[key] = v;

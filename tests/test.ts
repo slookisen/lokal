@@ -35965,6 +35965,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-08-02-crm-summary-401-auth: crm admin auth (ADMIN_KEY primary / ANALYTICS_ADMIN_KEY fallback) ──");
+  try {
+    const { runCrmAuthTests } = require("../src/routes/crm.test") as
+      typeof import("../src/routes/crm.test");
+    const cat = await runCrmAuthTests({ log: false });
+    passed += cat.passed;
+    failed += cat.failed;
+    for (const f of cat.failures) failures.push("crm-auth: " + f);
+    console.log(`  crm-auth: ${cat.passed} passed, ${cat.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-auth: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-auth: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 5 (retro-tagging, dry-run + godkjenningsgate) ──");
   try {
     const { runCrmRetroTaggingTests } = require("../src/services/crm-retro-tagging.test") as
