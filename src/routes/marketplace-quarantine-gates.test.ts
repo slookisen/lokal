@@ -152,7 +152,7 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     };
   }
 
-  function invokeHandler(handler: Function, req: any): Promise<HandlerResult> {
+  function invokeHandler(handler: Function, req: any, next?: (err?: any) => void): Promise<HandlerResult> {
     return new Promise((resolve) => {
       let status = 200;
       let settled = false;
@@ -167,9 +167,15 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
         send(payload: any) { settle(payload); return res; },
         redirect(c: number, loc: string) { status = c; settle({ __redirect: loc }); return res; },
         end() { settle(undefined); return res; },
+        // seo.ts/discovery.ts's machine-facing routes (sitemap.xml, llms.txt,
+        // agents.json, ...) set a Content-Type/Cache-Control header before
+        // send()/json() — no-op stand-ins, this harness only asserts on body.
+        header() { return res; },
+        set() { return res; },
+        type() { return res; },
       };
       try {
-        const maybePromise = handler(req, res);
+        const maybePromise = handler(req, res, next || (() => { settle({ __next: true }); }));
         if (maybePromise && typeof maybePromise.catch === "function") {
           maybePromise.catch((err: any) => settle({ __error: String(err) }));
         }
@@ -219,12 +225,15 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     const marketplaceRoutePath = require.resolve("./marketplace");
     const adminAgentsRoutePath = require.resolve("./admin-agents");
     const seoRoutePath = require.resolve("./seo");
+    const discoveryRoutePath = require.resolve("./discovery");
     delete require.cache[marketplaceRoutePath];
     delete require.cache[adminAgentsRoutePath];
     delete require.cache[seoRoutePath];
+    delete require.cache[discoveryRoutePath];
     const marketplaceRouter = require("./marketplace").default as any;
     const adminAgentsRouter = require("./admin-agents").default as any;
     const seoRouter = require("./seo").default as any;
+    const discoveryRouter = require("./discovery").default as any;
 
     const { marketplaceRegistry } = require("../services/marketplace-registry") as
       typeof import("../services/marketplace-registry");
@@ -236,6 +245,16 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     const produsentHandler = findRouteHandler(seoRouter, "/produsent/:slug", "get");
     const reviewQueueHandler = findRouteHandler(adminAgentsRouter, "/self-registered-review-queue", "get");
     const reviewApproveHandler = findRouteHandler(adminAgentsRouter, "/self-registered-review-approve", "post");
+    const cardHandler = findRouteHandler(marketplaceRouter, "/agents/:id/card", "get");
+    const infoHandler = findRouteHandler(marketplaceRouter, "/agents/:id/info", "get");
+    const vcardHandler = findRouteHandler(marketplaceRouter, "/agents/:id/vcard", "get");
+    const trustHandler = findRouteHandler(marketplaceRouter, "/agents/:id/trust", "get");
+    const homepageHandler = findRouteHandler(seoRouter, "/", "get");
+    const cityPageHandler = findRouteHandler(seoRouter, "/:city", "get");
+    const sitemapHandler = findRouteHandler(seoRouter, "/sitemap.xml", "get");
+    const llmsTxtHandler = findRouteHandler(discoveryRouter, "/llms.txt", "get");
+    const llmsFullTxtHandler = findRouteHandler(discoveryRouter, "/llms-full.txt", "get");
+    const agentsJsonHandler = findRouteHandler(discoveryRouter, "/.well-known/agents.json", "get");
 
     const SUITE_ADMIN_KEY_LOCAL = process.env.ADMIN_KEY || "suite-canonical-admin-key-20260730";
 
@@ -481,6 +500,197 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
       assertEq(rApproveAgain.status, 200, "c14: re-approving an already-vetted agent is a no-op 200, not an error");
       assertEq(rApproveAgain.body?.alreadyVetted, true, "c15: response flags alreadyVetted:true on the no-op path");
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // (d) FIX-UP ROUND (2026-08-03, post-CHANGES-REQUESTED): an
+    // independent reviewer found Gate 1's visibility quarantine only
+    // reached 3 read-paths (discover(), /search, /produsent/:slug), while
+    // ~10 more public/crawler-facing surfaces read marketplaceRegistry.
+    // getActiveAgents() (or raw SQL) with no is_vetted check at all. The
+    // fix adds the filter directly inside getActiveAgents() (root-fix,
+    // covers most of the list for free) plus a few raw-SQL sites and
+    // ID-addressable lookups that don't route through it. This section
+    // proves each surface named in that review is actually closed.
+    // ══════════════════════════════════════════════════════════════════
+    {
+      const CITY = "Testby-Quarantine";
+      const CATEGORY = "honning";
+
+      const quarantined = marketplaceRegistry.register({
+        name: "Spammer Handel",
+        description: "En annen spam-lignende produsent til rot-fiks-testene.",
+        provider: "Spammer Handel",
+        contactEmail: "spammer@example-spam.test",
+        url: "https://spammer.example.test",
+        version: "1.0.0",
+        role: "producer",
+        capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false },
+        skills: [{
+          id: "sell-honey", name: "Selger honning", description: "Selger honning",
+          tags: ["honning"], inputModes: ["application/json"], outputModes: ["application/json"],
+        }],
+        categories: [CATEGORY], tags: [], languages: ["no"],
+        location: { city: CITY, lat: 60.0, lng: 10.0 },
+        origin: "self_registered",
+        isVetted: false,
+      } as any);
+      const quarantinedId = quarantined.id;
+
+      const vettedControl = marketplaceRegistry.register({
+        name: "Ekte Honningprodusent",
+        description: "En ekte lokal honningprodusent med bikuber i nærheten.",
+        provider: "Ekte Honningprodusent",
+        contactEmail: "post@ekte-honning.example.test",
+        url: "https://ekte-honning.example.test",
+        version: "1.0.0",
+        role: "producer",
+        capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false },
+        skills: [{
+          id: "sell-honey", name: "Selger honning", description: "Selger honning",
+          tags: ["honning"], inputModes: ["application/json"], outputModes: ["application/json"],
+        }],
+        categories: [CATEGORY], tags: [], languages: ["no"],
+        location: { city: CITY, lat: 60.0, lng: 10.0 },
+        // no origin/isVetted override — defaults to discovery/vetted, same as (b)
+      } as any);
+      const vettedControlId = vettedControl.id;
+
+      // sitemap.xml's WO-17 pre-flight gate (unrelated to this PR) skips any
+      // producer with neither a knowledge row nor a claim, to avoid listing
+      // URLs that would themselves 404 — give BOTH agents a bare knowledge
+      // row so d2 below actually exercises the is_vetted filter rather than
+      // the quarantined agent being (also) skipped for the unrelated WO-17
+      // reason, which would make that assertion pass whether or not the
+      // is_vetted filter itself was still in place.
+      testDb.prepare(
+        "INSERT INTO agent_knowledge (agent_id, created_at, updated_at) VALUES (?, datetime('now'), datetime('now'))"
+      ).run(vettedControlId);
+      testDb.prepare(
+        "INSERT INTO agent_knowledge (agent_id, created_at, updated_at) VALUES (?, datetime('now'), datetime('now'))"
+      ).run(quarantinedId);
+
+      marketplaceRegistry._agentsCache = null;
+
+      // ── d1: getActiveAgents() itself ──────────────────────────────
+      const activeDefault = marketplaceRegistry.getActiveAgents();
+      assertTrue(
+        !activeDefault.some((a: any) => a.id === quarantinedId),
+        "d1-exclude: getActiveAgents() (default) excludes the quarantined agent (would flip if 'AND is_vetted = 1' were dropped from its SQL)",
+      );
+      assertTrue(
+        activeDefault.some((a: any) => a.id === vettedControlId),
+        "d1-include: getActiveAgents() (default) still includes the vetted control agent",
+      );
+      const activeIncludeUnvetted = marketplaceRegistry.getActiveAgents({ includeUnvetted: true });
+      assertTrue(
+        activeIncludeUnvetted.some((a: any) => a.id === quarantinedId),
+        "d1-optout: getActiveAgents({ includeUnvetted: true }) still returns the quarantined agent for the narrow internal opt-out",
+      );
+
+      // ── d2: sitemap.xml ────────────────────────────────────────────
+      const rSitemap = await invokeHandler(sitemapHandler, makeReq({}));
+      assertEq(rSitemap.status, 200, "d2: sitemap.xml renders 200");
+      const sitemapXml = String(rSitemap.body);
+      assertTrue(
+        !sitemapXml.includes(`/produsent/${slugify("Spammer Handel")}`),
+        "d2-exclude: sitemap.xml does NOT list a /produsent/<slug> entry for the quarantined agent (would flip if getActiveAgents()'s filter regressed)",
+      );
+      assertTrue(
+        sitemapXml.includes(`/produsent/${slugify("Ekte Honningprodusent")}`),
+        "d2-include: sitemap.xml DOES list the vetted control agent",
+      );
+
+      // ── d3: llms.txt / llms-full.txt / agents.json ─────────────────
+      // llms.txt's body doesn't print literal producer names (it's a
+      // category x city MATRIX of /produsent/<slug> links, sampled from the
+      // filtered agent list) — check the slug it would link to instead.
+      const rLlms = await invokeHandler(llmsTxtHandler, makeReq({}));
+      assertTrue(!String(rLlms.body).includes(slugify("Spammer Handel")), "d3-llms-exclude: llms.txt's city/category matrix never links to the quarantined agent's slug");
+      assertTrue(String(rLlms.body).includes(slugify("Ekte Honningprodusent")), "d3-llms-include: llms.txt's city/category matrix DOES link to the vetted control agent's slug");
+
+      const rLlmsFull = await invokeHandler(llmsFullTxtHandler, makeReq({}));
+      assertTrue(!String(rLlmsFull.body).includes("Spammer Handel"), "d3-llmsfull-exclude: llms-full.txt never mentions the quarantined agent's name");
+      assertTrue(String(rLlmsFull.body).includes("Ekte Honningprodusent"), "d3-llmsfull-include: llms-full.txt DOES mention the vetted control agent");
+
+      // agents.json only exposes an aggregate count, not per-agent names —
+      // check the count itself against an is_vetted-filter computed
+      // INDEPENDENTLY of getActiveAgents() (raw SQL), so this doesn't just
+      // re-check the same (possibly regressed) code path against itself.
+      const rAgentsJson = await invokeHandler(agentsJsonHandler, makeReq({}));
+      const trueVettedCount = (testDb.prepare(
+        "SELECT COUNT(*) AS c FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1"
+      ).get() as any).c;
+      assertTrue(
+        typeof rAgentsJson.body?.description === "string" && rAgentsJson.body.description.includes(`${trueVettedCount}+`),
+        `d3-agentsjson: agents.json's producer count reflects the true vetted-only count (${trueVettedCount}), got: ${rAgentsJson.body?.description}`,
+      );
+
+      // ── d4: homepage featured section ──────────────────────────────
+      const rHome = await invokeHandler(homepageHandler, makeReq({}));
+      assertEq(rHome.status, 200, "d4: homepage renders 200");
+      assertTrue(!String(rHome.body).includes("Spammer Handel"), "d4-exclude: homepage never renders the quarantined agent's name");
+      assertTrue(String(rHome.body).includes("Ekte Honningprodusent"), "d4-include: homepage DOES render the vetted control agent");
+
+      // ── d5: city page ───────────────────────────────────────────────
+      const rCity = await invokeHandler(cityPageHandler, makeReq({ params: { city: slugify(CITY) } }));
+      assertEq(rCity.status, 200, `d5: city page for ${CITY} renders 200`);
+      assertTrue(!String(rCity.body).includes("Spammer Handel"), "d5-exclude: city page never renders the quarantined agent's name");
+      assertTrue(String(rCity.body).includes("Ekte Honningprodusent"), "d5-include: city page DOES render the vetted control agent");
+
+      // ── d6: related-producers raw SQL (same city / same category) ───
+      const { getRelatedBySameCity, getRelatedBySameCategory } = require("./seo") as typeof import("./seo");
+      const relatedByCity = getRelatedBySameCity(testDb, "not-a-real-agent-id", CITY, 10);
+      assertTrue(
+        !relatedByCity.some((r: any) => r.id === quarantinedId),
+        "d6-city-exclude: getRelatedBySameCity excludes the quarantined agent (would flip if 'AND a.is_vetted = 1' were dropped from its raw SQL)",
+      );
+      assertTrue(
+        relatedByCity.some((r: any) => r.id === vettedControlId),
+        "d6-city-include: getRelatedBySameCity still includes the vetted control agent",
+      );
+      const relatedByCategory = getRelatedBySameCategory(testDb, "not-a-real-agent-id", CATEGORY, null, 10);
+      assertTrue(
+        !relatedByCategory.some((r: any) => r.id === quarantinedId),
+        "d6-category-exclude: getRelatedBySameCategory excludes the quarantined agent",
+      );
+      assertTrue(
+        relatedByCategory.some((r: any) => r.id === vettedControlId),
+        "d6-category-include: getRelatedBySameCategory still includes the vetted control agent",
+      );
+
+      // ── d7: ID-addressable lookups — card / info / vcard / trust ────
+      // Decision (see PR description): these 4 are gated the same as
+      // /produsent/:slug (404 for a quarantined agent's own id), not left
+      // "intentionally different" for ID-addressable lookup.
+      const rCard = await invokeHandler(cardHandler, makeReq({ params: { id: quarantinedId } }));
+      assertEq(rCard.status, 404, "d7-card: GET /agents/:id/card 404s for the quarantined agent");
+      const rCardOk = await invokeHandler(cardHandler, makeReq({ params: { id: vettedControlId } }));
+      assertEq(rCardOk.status, 200, "d7-card-control: GET /agents/:id/card still 200s for the vetted control agent");
+
+      const rInfo = await invokeHandler(infoHandler, makeReq({ params: { id: quarantinedId } }));
+      assertEq(rInfo.status, 404, "d7-info: GET /agents/:id/info 404s for the quarantined agent");
+      const rInfoOk = await invokeHandler(infoHandler, makeReq({ params: { id: vettedControlId } }));
+      assertEq(rInfoOk.status, 200, "d7-info-control: GET /agents/:id/info still 200s for the vetted control agent");
+
+      const rVcard = await invokeHandler(vcardHandler, makeReq({ params: { id: quarantinedId } }));
+      assertEq(rVcard.status, 404, "d7-vcard: GET /agents/:id/vcard 404s for the quarantined agent");
+      const rVcardOk = await invokeHandler(vcardHandler, makeReq({ params: { id: vettedControlId } }));
+      assertEq(rVcardOk.status, 200, "d7-vcard-control: GET /agents/:id/vcard still 200s for the vetted control agent");
+
+      const rTrust = await invokeHandler(trustHandler, makeReq({ params: { id: quarantinedId } }));
+      assertEq(rTrust.status, 404, "d7-trust: GET /agents/:id/trust 404s for the quarantined agent");
+      const rTrustOk = await invokeHandler(trustHandler, makeReq({ params: { id: vettedControlId } }));
+      assertEq(rTrustOk.status, 200, "d7-trust-control: GET /agents/:id/trust still 200s for the vetted control agent");
+
+      // ── d8: claim-email bookkeeping opt-out still works (marketplace.ts
+      // ~1294, "explicitly not required to fix" per the reviewer, but the
+      // includeUnvetted opt-out added there must not itself have broken) ──
+      const rClaimD = await invokeHandler(claimHandler, makeReq({
+        params: { id: quarantinedId },
+        body: { name: "Spammer", email: "spammer@example-spam.test" },
+      }));
+      assertEq(rClaimD.status, 200, "d8: claim request still succeeds for the quarantined agent (own-claim flow unaffected)");
+    }
   } catch (err) {
     failed++;
     failures.push(`marketplace-quarantine-gates: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
@@ -498,6 +708,7 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     try { delete require.cache[require.resolve("./seo")]; } catch { /* ignore */ }
     try { delete require.cache[require.resolve("./marketplace")]; } catch { /* ignore */ }
     try { delete require.cache[require.resolve("./admin-agents")]; } catch { /* ignore */ }
+    try { delete require.cache[require.resolve("./discovery")]; } catch { /* ignore */ }
     testDb.close();
   }
 

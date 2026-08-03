@@ -3761,6 +3761,10 @@ export function getRelatedBySameCity(
   //   rich DESC    → producers with full data render the best preview
   //   RANDOM()     → break ties without favouring alphabetical order
   // is_active = 1 keeps the city block in sync with the live registry.
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension):
+  // raw SQL, not routed through getActiveAgents() — needs its own
+  // is_vetted = 1 filter so a self-registered, not-yet-vetted producer's
+  // name/preview never surfaces in another producer's "related" section.
   return db.prepare(`
     SELECT a.id, a.name, a.city, a.description, a.categories,
            k.about, k.verification_status, k.enrichment_status
@@ -3770,6 +3774,7 @@ export function getRelatedBySameCity(
       AND a.id != ?
       AND a.is_active = 1
       AND a.role = 'producer'
+      AND a.is_vetted = 1
     ORDER BY
       CASE WHEN k.verification_status = 'verified' THEN 0 ELSE 1 END,
       CASE WHEN k.enrichment_status = 'rich' THEN 0
@@ -3797,6 +3802,8 @@ export function getRelatedBySameCategory(
   // and adds geographic diversity to internal links. If we run out of
   // non-same-city producers we still fall back to same-city (covered by the
   // ORDER BY tiebreak below) rather than render an empty section.
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension):
+  // same is_vetted = 1 filter as getRelatedBySameCity above.
   return db.prepare(`
     SELECT a.id, a.name, a.city, a.description, a.categories,
            k.about, k.verification_status, k.enrichment_status
@@ -3805,6 +3812,7 @@ export function getRelatedBySameCategory(
     WHERE a.id != ?
       AND a.is_active = 1
       AND a.role = 'producer'
+      AND a.is_vetted = 1
       AND a.categories LIKE ?
     ORDER BY
       CASE WHEN ? IS NOT NULL AND a.city = ? THEN 1 ELSE 0 END,

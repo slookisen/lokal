@@ -7963,7 +7963,8 @@ console.log("── PR-29 related-producers tests ──");
       role TEXT,
       city TEXT,
       categories TEXT DEFAULT '[]',
-      is_active INTEGER DEFAULT 1
+      is_active INTEGER DEFAULT 1,
+      is_vetted INTEGER DEFAULT 1
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY REFERENCES agents(id),
@@ -9324,6 +9325,7 @@ console.log("── PR-29 related-producers tests ──");
       discovery_count INTEGER DEFAULT 0, interaction_count INTEGER DEFAULT 0,
       capabilities TEXT, skills TEXT, categories TEXT, tags TEXT, languages TEXT,
       created_at TEXT DEFAULT (datetime('now')), last_seen_at TEXT,
+      is_vetted INTEGER DEFAULT 1,
       umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER,
       umbrella_scrape_config TEXT, umbrella_venues TEXT
     );
