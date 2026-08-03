@@ -36624,6 +36624,33 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-07-31-rfb-brreg-andrekilde-adresse-telefon:
+// POST /admin/agents/brreg-contact-backfill (src/routes/admin-agents.ts) —
+// once org-nr-backfill above has given an RFB agent org_nr, this route
+// records Brreg's OWN registered address/phone as a Tier-B corroborating
+// `field_provenance` source (the missing second source cross-source-
+// validator.ts's outreach-pool gate needs), additively and independently of
+// whether the agent_knowledge.address/.phone DISPLAY column already has a
+// value (fill-only for the column, additive for provenance — see the
+// route's own file-header doc comment in admin-agents.ts for the full
+// design rationale). Own harness (__setDbForTesting/__initSchemaForTesting),
+// runs via runSerial() like the sibling suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-31-rfb-brreg-andrekilde-adresse-telefon: agents brreg-contact-backfill ──");
+  try {
+    const { runAdminAgentsBrregContactBackfillTests } = require("../src/routes/admin-agents-brreg-contact-backfill.test") as
+      typeof import("../src/routes/admin-agents-brreg-contact-backfill.test");
+    const bcb = await runAdminAgentsBrregContactBackfillTests({ log: false });
+    passed += bcb.passed;
+    failed += bcb.failed;
+    for (const f of bcb.failures) failures.push("agents-brreg-contact-backfill: " + f);
+    console.log(`  agents-brreg-contact-backfill: ${bcb.passed} passed, ${bcb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-brreg-contact-backfill: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-28-discovery-registrering-mangler-kontaktfelt-endepunkt:
 // POST /admin/agents/register contact-field write path (org_nr/source now
 // optional, email/phone persisted + agent_knowledge.field_provenance,
