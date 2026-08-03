@@ -15701,6 +15701,8 @@ console.log("\n── PR-100: dental schema extension ──");
   const prevPathPr100 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
+  const dbFactoryPathPr100 = require.resolve("../src/database/db-factory");
+  delete require.cache[dbFactoryPathPr100];
   const dbFactoryPr100 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr100.__resetDbFactoryForTesting();
 
@@ -15998,6 +16000,8 @@ console.log("\n── FIX finn-tannlege: search filters + sparse-specialty ─�
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
+  const dbFactoryPathFT = require.resolve("../src/database/db-factory");
+  delete require.cache[dbFactoryPathFT];
   const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactory.__resetDbFactoryForTesting();
 
@@ -16142,6 +16146,8 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
   // ── 1. Env-var override still works: DENTAL_DB_PATH=:memory:
   {
     process.env.DENTAL_DB_PATH = ":memory:";
+    const dbFactoryPathPr100bMem = require.resolve("../src/database/db-factory");
+    delete require.cache[dbFactoryPathPr100bMem];
     const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactory.__resetDbFactoryForTesting();
     const db = dbFactory.getDb("dental");
@@ -16180,6 +16186,8 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
     };
     require.cache[sqliteId]!.exports = FakeDatabase;
     try {
+      const dbFactoryPath2 = require.resolve("../src/database/db-factory");
+      delete require.cache[dbFactoryPath2];
       const dbFactory2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
       dbFactory2.__resetDbFactoryForTesting();
       dbFactory2.getDb("dental");
@@ -28463,6 +28471,7 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
 
   const prevPathGCR = process.env.EXPERIENCES_DB_PATH;
   let serverGCR: import("http").Server | null = null;
+  let dbFactoryGCR: typeof import("../src/database/db-factory") | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
 
@@ -28473,7 +28482,7 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     delete require.cache[expStorePathGCR];
     delete require.cache[opplevelserPathGCR];
 
-    const dbFactoryGCR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFactoryGCR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactoryGCR.__resetDbFactoryForTesting();
     const expStoreGCR = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
     const opplevelserGCR = require("../src/routes/opplevelser") as { default: import("express").Router };
@@ -28654,14 +28663,15 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
       assertTrue(r.body.errors.some((e: any) => e.provider_id === unlockedIdGCR),
         "gcr-9c: auto-select picks up the unlocked provider, whose fetch still fails fast");
     }
-
-    dbFactoryGCR.__resetDbFactoryForTesting();
   } catch (err) {
     failed++;
     failures.push("gardssalg-content-refresh: unexpected error: " + String(err));
   } finally {
     if (serverGCR) {
       await new Promise<void>((resolve) => serverGCR!.close(() => resolve()));
+    }
+    if (dbFactoryGCR) {
+      dbFactoryGCR.__resetDbFactoryForTesting();
     }
     if (prevPathGCR === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathGCR;
@@ -32901,6 +32911,8 @@ console.log("\n── geo-produkt-by-http: /kategori/:category/:kommune route + 
   } finally {
     if (prevPathPBH === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathPBH;
+    const dbFactoryPathPBHReset = require.resolve("../src/database/db-factory");
+    delete require.cache[dbFactoryPathPBHReset];
     const dbFacResetPBH = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFacResetPBH.__resetDbFactoryForTesting();
   }
