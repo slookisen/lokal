@@ -5326,7 +5326,8 @@ export function applyGardssalgProviderWebsite(
     | { id: string; content_source: string | null; hjemmeside: string | null; field_provenance: string | null }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (row.content_source === "manual") return [];
+  if (row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, "hjemmeside")) return [];
 
   const cleanUrl = (url || "").trim();
   if (cleanUrl.length === 0 || cleanUrl.length > 2048) return [];
