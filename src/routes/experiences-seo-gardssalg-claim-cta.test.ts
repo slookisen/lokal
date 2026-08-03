@@ -5,23 +5,31 @@
  * src/routes/experiences-seo.ts), dev-request 2026-07-30-opplevagent-claim-
  * epost-og-perfelt-laas, item 4 ("CTA hide").
  *
- * Mirrors RFB's seo.ts `!isClaimed` gate (knowledgeService.isAgentClaimed(),
- * consumed around seo.ts:4246-4248/5144) — the gårdssalg-side equivalent is
- * isGardssalgProviderClaimed() (src/services/gardssalg-claim.ts), which is a
- * live (uncached) COUNT(*) over gardssalg_claims WHERE provider_id = ? AND
- * used = 1 AND revoked_at IS NULL.
+ * UPDATED 2026-08-03 (dev-request 2026-08-03-claim-bekreftet-merke-og-
+ * innlogging): the route's claimed/not-claimed branch no longer reads the
+ * live, revocable isGardssalgProviderClaimed() query — it reads the
+ * persistent experience_providers.claimed_at column (stamped once by
+ * verifyClaimToken(), never cleared by revokeClaimToken(); see
+ * services/gardssalg-claim.ts). Fixtures below now stamp claimed_at directly
+ * to simulate "a magic link was used at some point in the past" instead of
+ * relying on the raw gardssalg_claims row alone. Scenario (c) — a claim that
+ * was used and LATER revoked — now asserts the OPPOSITE of before: per AC6
+ * of that dev-request, a revoke must NOT remove the "Bekreftet av eier"
+ * badge, so the old CTA stays hidden even after revoke (the badge/login-link
+ * variant is covered in detail by the sibling
+ * experiences-seo-gardssalg-claimed-badge.test.ts).
  *
  * Covers:
- *   (a) a provider with a used, non-revoked gardssalg_claims row — the CTA
- *       card is ABSENT.
- *   (b) a provider with no claim row at all — the CTA card is PRESENT
- *       (unclaimed providers keep showing it).
- *   (c) a provider with only a REVOKED claim row (used=1, revoked_at set) —
- *       must NOT count as claimed — the CTA card is PRESENT (mirrors the
- *       "revoke -> card reappears" acceptance criterion, since there's no
- *       cached flag to invalidate — it's a live query).
- *   (d) a provider with only an UNUSED claim row (used=0, never clicked) —
- *       must NOT count as claimed — the CTA card is PRESENT.
+ *   (a) a provider with claimed_at set (a used, non-revoked claim) — the old
+ *       CTA card is ABSENT.
+ *   (b) a provider with no claim row at all (claimed_at NULL) — the CTA card
+ *       is PRESENT (unclaimed providers keep showing it).
+ *   (c) a provider with claimed_at set AND a later-revoked claim row — the
+ *       badge (not the old CTA) still shows: revoking a session does not
+ *       un-claim the profile (AC6).
+ *   (d) a provider with only an UNUSED claim row (used=0, never clicked,
+ *       claimed_at still NULL) — must NOT count as claimed — the CTA card is
+ *       PRESENT.
  *
  * Same synthetic-req/res router.handle() harness + in-memory-DB
  * (EXPERIENCES_DB_PATH=":memory:") pattern as
@@ -113,31 +121,38 @@ export function runExperiencesSeoGardssalgClaimCtaTests(opts: { log?: boolean } 
       const insertProvider = db.prepare(
         `INSERT INTO experience_providers
            (id, navn, vertical, fylke, kommune, poststed, producer_type, booking_live, catalog_hidden, lat, lon,
-            geocode_confidence, slug, enrichment_state, verification_status, source, confidence)
+            geocode_confidence, slug, enrichment_state, verification_status, source, confidence, claimed_at)
          VALUES
            (@id, @navn, 'experiences', @fylke, @kommune, @poststed, @producer_type, @booking_live, @catalog_hidden, @lat, @lon,
-            @geocode_confidence, @slug, 'raw', 'pending_verify', 'test-fixture', 'medium')`
+            @geocode_confidence, @slug, 'raw', 'pending_verify', 'test-fixture', 'medium', @claimed_at)`
       );
 
       insertProvider.run({
         id: "gs-claimed", navn: "Klaimet Gård", fylke: "Telemark", kommune: "Skien",
         poststed: "Skien", producer_type: "cideri", booking_live: null, catalog_hidden: null,
         lat: 59.21, lon: 9.61, geocode_confidence: "high", slug: "klaimet-gard",
+        claimed_at: new Date().toISOString(),
       });
       insertProvider.run({
         id: "gs-unclaimed", navn: "Uklaimet Gård", fylke: "Telemark", kommune: "Skien",
         poststed: "Skien", producer_type: "bryggeri", booking_live: null, catalog_hidden: null,
         lat: 59.22, lon: 9.62, geocode_confidence: "high", slug: "uklaimet-gard",
+        claimed_at: null,
       });
       insertProvider.run({
         id: "gs-revoked", navn: "Tilbakekalt Gård", fylke: "Telemark", kommune: "Skien",
         poststed: "Skien", producer_type: "vingård", booking_live: null, catalog_hidden: null,
         lat: 59.23, lon: 9.63, geocode_confidence: "high", slug: "tilbakekalt-gard",
+        // claimed_at set: this claim WAS used (before it was later revoked) —
+        // verifyClaimToken() would have stamped it, and revokeClaimToken()
+        // never clears it (AC6).
+        claimed_at: new Date().toISOString(),
       });
       insertProvider.run({
         id: "gs-unused", navn: "Uklikket Gård", fylke: "Telemark", kommune: "Skien",
         poststed: "Skien", producer_type: "mjøderi", booking_live: null, catalog_hidden: null,
         lat: 59.24, lon: 9.64, geocode_confidence: "high", slug: "uklikket-gard",
+        claimed_at: null,
       });
 
       const insertClaim = db.prepare(
@@ -181,11 +196,15 @@ export function runExperiencesSeoGardssalgClaimCtaTests(opts: { log?: boolean } 
         assertTrue(r.body.includes("/kategori/gardssalg/eier/uklaimet-gard"), "b3: the CTA links to the claim-entry page for this slug");
       }
 
-      // ── (c) revoked claim — must NOT count as claimed, CTA present ───────
+      // ── (c) revoked-after-claimed — badge persists, old CTA stays hidden
+      // (AC6, dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging:
+      // claimed_at is a historical "has been claimed" signal, not a live
+      // session indicator — revoking the session does not un-badge the
+      // profile). ────────────────────────────────────────────────────────
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/tilbakekalt-gard");
         assertTrue(r.status === 200, `c1: GET /kategori/gardssalg/produsent/tilbakekalt-gard renders 200 (got ${r.status})`);
-        assertTrue(r.body.includes(CTA_MARKER), "c2: a REVOKED claim does not suppress the CTA — the card reappears (live query, no cached flag)");
+        assertTrue(!r.body.includes(CTA_MARKER), "c2: a claim that was used and later REVOKED still hides the old CTA — claimed_at persists through revoke (AC6)");
       }
 
       // ── (d) unused (never-clicked) claim — must NOT count as claimed, CTA present ──
