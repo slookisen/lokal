@@ -2578,10 +2578,20 @@ export type GardssalgProviderRow = {
   // entry (same "row.updated_at || today" pattern the /opplevelse/<slug>
   // sitemap loop already uses), instead of a blanket "today" on every request.
   updated_at: string | null;
+  // Additive (2026-08-03, dev-request 2026-08-03-claim-bekreftet-merke-og-
+  // innlogging): the historical "has this provider ever been claimed"
+  // timestamp, stamped once (idempotently) by verifyClaimToken()
+  // (services/gardssalg-claim.ts) the first time the owner's magic link is
+  // used — never cleared by a later revoke/logout. Distinct from the live,
+  // revocable isGardssalgProviderClaimed() query: this is what the
+  // /kategori/gardssalg/produsent/<slug> route reads to decide the
+  // "Bekreftet av eier" badge vs. the "Er dette din bedrift?" claim CTA.
+  // NULL = never claimed.
+  claimed_at: string | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at, claimed_at";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
@@ -5326,7 +5336,8 @@ export function applyGardssalgProviderWebsite(
     | { id: string; content_source: string | null; hjemmeside: string | null; field_provenance: string | null }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (row.content_source === "manual") return [];
+  if (row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, "hjemmeside")) return [];
 
   const cleanUrl = (url || "").trim();
   if (cleanUrl.length === 0 || cleanUrl.length > 2048) return [];
@@ -5441,6 +5452,78 @@ export type GardssalgRollbackSkip = {
   reason: "no_audit_row" | "already_current" | "unknown_field" | "manual_or_claim_source";
 };
 
+// Fields the claim portal actually lets an owner edit AND that the rollback
+// allow-list also covers (booking_live is claim-editable but is a consent
+// toggle with no rollback candidate, so it's excluded here on purpose — see
+// CLAIM_EDITABLE_FIELDS in gardssalg-claim.ts, which is the source of truth
+// this list is drawn from). Only these five fields ever get a per-field
+// owner_locks lookup in isGardssalgFieldOwnerLocked below.
+const GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS = new Set([
+  "about_text",
+  "visit_text",
+  "opening_hours_text",
+  "products",
+  "hjemmeside",
+]);
+
+/**
+ * Per-field owner-lock policy for gårdssalg rollback writes (dev-request
+ * 2026-08-03-gardssalg-owner-lock-rollback). Prior to this, both rollback
+ * functions gated on the WHOLE ROW: content_source 'manual' or 'claim' froze
+ * every field. PR #472 (commit 5410fd9) added an ADDITIVE per-field stamp —
+ * field_provenance.owner_locks.<field> = {locked_at} — written by the claim
+ * portal (updateClaimedProviderProfile, gardssalg-claim.ts) whenever an
+ * owner edits one of CLAIM_EDITABLE_FIELDS. This helper consults that stamp
+ * to narrow the freeze from row-level to field-level, but ONLY for
+ * content_source='claim' rows and ONLY for the five claim-editable,
+ * rollback-eligible fields:
+ *
+ *   1. content_source === 'manual' -> always locked, unconditionally. Manual
+ *      rows never consult owner_locks (a claim-portal-only concept) — the
+ *      full-row freeze for manual rows is unchanged.
+ *   2. content_source === 'claim':
+ *      - fieldName in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS -> locked IFF
+ *        field_provenance.owner_locks.<fieldName> is present (the owner
+ *        touched THIS field via the portal); if absent, the owner never
+ *        touched it and rollback may proceed.
+ *      - any other fieldName (org_nr, epost, telefon, adresse, postnummer,
+ *        poststed — fields owner_locks can never contain, since the claim
+ *        portal doesn't expose them) -> always locked, unconditionally, same
+ *        as today's row-level behavior. No change for these fields.
+ *   3. any other content_source (null, enrichment-derived, etc.) -> not
+ *      locked, same as today's existing behavior.
+ *
+ * field_provenance is read defensively (same JSON-parse-with-try-catch
+ * recipe used throughout this file, e.g. applyGardssalgProviderWebsite
+ * above) — malformed JSON is treated as "no owner_locks" rather than
+ * thrown.
+ */
+export function isGardssalgFieldOwnerLocked(
+  providerRow: { content_source: string | null; field_provenance?: string | null },
+  fieldName: string
+): boolean {
+  if (providerRow.content_source === "manual") return true;
+  if (providerRow.content_source === "claim") {
+    if (!GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS.has(fieldName)) return true;
+    let ownerLocks: Record<string, unknown> | undefined;
+    if (providerRow.field_provenance) {
+      try {
+        const parsed = JSON.parse(providerRow.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const ol = (parsed as Record<string, unknown>).owner_locks;
+          if (ol && typeof ol === "object" && !Array.isArray(ol)) {
+            ownerLocks = ol as Record<string, unknown>;
+          }
+        }
+      } catch {
+        /* malformed existing JSON -> treat as no owner_locks rather than throw */
+      }
+    }
+    return Boolean(ownerLocks && Object.prototype.hasOwnProperty.call(ownerLocks, fieldName));
+  }
+  return false;
+}
+
 // Resolve the (provider_id, field_name) pairs a rollback request targets:
 // batch_id -> every field any provider had touched under that batch;
 // provider_id (+ optional field_name) -> that provider's field(s) with any
@@ -5513,8 +5596,12 @@ export function planGardssalgContentRollback(
       continue;
     }
     const providerRow = db
-      .prepare(`SELECT ${t.field_name} AS current_value, content_source FROM experience_providers WHERE id = ?`)
-      .get(t.provider_id) as { current_value: string | null; content_source: string | null } | undefined;
+      .prepare(
+        `SELECT ${t.field_name} AS current_value, content_source, field_provenance FROM experience_providers WHERE id = ?`
+      )
+      .get(t.provider_id) as
+      | { current_value: string | null; content_source: string | null; field_provenance: string | null }
+      | undefined;
     if (!providerRow) {
       skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "no_audit_row" });
       continue;
@@ -5524,8 +5611,10 @@ export function planGardssalgContentRollback(
     // pipeline never touches that row again — a rollback is part of the same
     // automated pipeline, so it must never overwrite manually-provided
     // content either, even if a stale audit row from before the claim/manual
-    // edit makes the field look "restorable".
-    if (providerRow.content_source === "manual" || providerRow.content_source === "claim") {
+    // edit makes the field look "restorable". Narrowed to per-field for
+    // content_source='claim' rows via isGardssalgFieldOwnerLocked (dev-request
+    // 2026-08-03-gardssalg-owner-lock-rollback) — see its doc comment.
+    if (isGardssalgFieldOwnerLocked(providerRow, t.field_name)) {
       skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "manual_or_claim_source" });
       continue;
     }
@@ -5615,11 +5704,16 @@ export function applyGardssalgContentRollback(
     // here, right before the UPDATE, rather than trusting that this item
     // already passed that check in plan()'s `restorable` list. If a manual
     // or claim edit reaches this function anyway, skip it silently: no
-    // write, no audit row, and it's simply omitted from `restored`.
+    // write, no audit row, and it's simply omitted from `restored`. Narrowed
+    // to per-field for content_source='claim' rows via
+    // isGardssalgFieldOwnerLocked (dev-request 2026-08-03-gardssalg-owner-
+    // lock-rollback) — see its doc comment.
     const providerRow = db
-      .prepare(`SELECT content_source FROM experience_providers WHERE id = ?`)
-      .get(item.provider_id) as { content_source: string | null } | undefined;
-    if (providerRow && (providerRow.content_source === "manual" || providerRow.content_source === "claim")) {
+      .prepare(`SELECT content_source, field_provenance FROM experience_providers WHERE id = ?`)
+      .get(item.provider_id) as
+      | { content_source: string | null; field_provenance: string | null }
+      | undefined;
+    if (providerRow && isGardssalgFieldOwnerLocked(providerRow, item.field_name)) {
       continue;
     }
     runOne(item);

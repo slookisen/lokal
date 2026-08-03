@@ -7896,8 +7896,28 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
 // exists, for idempotent re-runs) — see applyGardssalgWebsiteVerification's
 // own doc comment (services/gardssalg-website-verification.ts) for the full
 // write contract.
+//
+// cohort/limit/offset (dev-request 2026-08-02-opplevagent-hjemmeside-
+// verifisering-og-enrichment-gate, Steg 2b): the SAME `cohort` + pagination
+// discipline as the GET audit route above, read from the request BODY (this
+// is a POST) instead of the query string — see that route's own doc comment
+// for the full rationale (MAX_GARDSSALG_AUDIT_LIMIT, mandatory pagination at
+// cohort=all). Reusing the same constant is deliberate: this route performs
+// the same per-row live outbound fetch as the GET route, so it carries
+// exactly the same PR #432 unbounded-scan risk at scale — an earlier gap
+// here (cohort hardcoded to "gardssalg", no limit/offset) was safe only
+// because the gårdssalg cohort itself is small (~87 rows). Paginating BEFORE
+// the scan also bounds `apply=true`'s blast radius to the paged rows only.
 router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown; scope?: unknown };
+  const body = (req.body ?? {}) as {
+    apply?: unknown;
+    providerIds?: unknown;
+    batch_id?: unknown;
+    scope?: unknown;
+    cohort?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+  };
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
   // Same scope contract and strict validation as the GET audit route above —
@@ -7910,6 +7930,59 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
     return;
   }
+  // cohort=gardssalg (default) | all — same axis/discipline as the GET audit
+  // route above (dev-request 2026-08-02-opplevagent-hjemmesideverifisering-
+  // og-enrichment-gate, Steg 2b): a SEPARATE axis from `scope` (visibility),
+  // decides WHICH producer types are eligible at all. Read from the BODY
+  // (this is a POST), never silently falling back on an unrecognized value.
+  const rawCohort = body.cohort;
+  const cohortParam: GsWvCohort = rawCohort === undefined ? "gardssalg" : (rawCohort as GsWvCohort);
+  if (rawCohort !== undefined && !GS_WV_COHORTS.includes(cohortParam)) {
+    res.status(400).json({ error: `Ugyldig cohort — må være en av: ${GS_WV_COHORTS.join(", ")}` });
+    return;
+  }
+  // limit/offset — same contract, same MAX_GARDSSALG_AUDIT_LIMIT ceiling, and
+  // the same reason as the GET audit route: this route scans the ENTIRE
+  // loaded cohort synchronously with a live outbound fetch per row, so an
+  // unbounded cohort=all sweep here reproduces the exact PR #432 hang class.
+  // Read from the body, not the query string, since this is a POST.
+  let limit: number | undefined;
+  let offset: number | undefined;
+  if (body.limit !== undefined) {
+    const parsedLimit = Number(body.limit);
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+      res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
+      return;
+    }
+    if (parsedLimit > MAX_GARDSSALG_AUDIT_LIMIT) {
+      res.status(400).json({ error: `Ugyldig limit — maks er ${MAX_GARDSSALG_AUDIT_LIMIT}.` });
+      return;
+    }
+    limit = parsedLimit;
+  }
+  if (body.offset !== undefined) {
+    const parsedOffset = Number(body.offset);
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+      return;
+    }
+    offset = parsedOffset;
+  }
+  if (limit === undefined && offset !== undefined) {
+    res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+    return;
+  }
+  // Mandatory pagination at scale — same rule as the GET audit route:
+  // cohort=all can be 1000+ rows platform-wide, so the unbounded (`limit`
+  // absent) synchronous-scan path stays reachable ONLY for the default
+  // cohort=gardssalg, preserving today's byte-for-byte behavior for callers
+  // who never pass a body at all. Checked before any DB load or fetch.
+  if (cohortParam === "all" && limit === undefined) {
+    res.status(400).json({
+      error: "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+    });
+    return;
+  }
 
   const expDb = getExpDb("experiences");
   try {
@@ -7919,7 +7992,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
     };
 
-    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
+    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
     if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
       const idSet = new Set(
         (body.providerIds as unknown[])
@@ -7929,11 +8002,41 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       cohort = cohort.filter((p) => idSet.has(p.id));
     }
 
+    // Paginate BEFORE scanning — mirrors the GET audit route's own
+    // `cohortRows.slice(pageOffset, pageOffset + limit)` pattern, so only the
+    // requested page ever incurs a live outbound fetch, and (for apply=true)
+    // only the paged rows are ever written — the blast radius of a single
+    // call is bounded by `limit`, never the full (possibly cohort=all) set.
+    const total = cohort.length;
+    let pageOffset: number | undefined;
+    if (limit !== undefined) {
+      pageOffset = offset ?? 0;
+      cohort = cohort.slice(pageOffset, pageOffset + limit);
+    }
+
     const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+    const pagination =
+      limit === undefined
+        ? undefined
+        : {
+            total,
+            offset: pageOffset as number,
+            limit,
+            returned: rows.length,
+            next_offset: (pageOffset as number) + rows.length < total ? (pageOffset as number) + rows.length : null,
+          };
 
     if (!apply) {
       const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation(rows);
-      res.json({ success: true, dry_run: true, scope, would_enqueue: wouldEnqueue, summary });
+      res.json({
+        success: true,
+        dry_run: true,
+        scope,
+        cohort: cohortParam,
+        would_enqueue: wouldEnqueue,
+        summary,
+        ...(pagination ? { pagination } : {}),
+      });
       return;
     }
 
@@ -7942,9 +8045,11 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       success: true,
       dry_run: false,
       scope,
+      cohort: cohortParam,
       enqueued: applied.filter((a) => a.enqueued).length,
       provenance_written: applied.length,
       summary,
+      ...(pagination ? { pagination } : {}),
     });
   } catch (err) {
     console.error("[gardssalg-website-verification-remediation] failed:", err);
@@ -10745,6 +10850,703 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
     written,
     skipped: skippedCount,
     remaining: Math.max(0, candidateRows.length - generated.length),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 1
+// ("Innholdsberikelse") — POST /admin/experiences-description-enrichment
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// PROBLEM. A large share of opplevagent.no detail pages render the
+// placeholder lede in routes/experiences-seo.ts (`descBlock`'s else branch):
+// "Detaljert beskrivelse publiseres fortløpende. <tittel> er en <kategori>-
+// opplevelse i <sted>. Se tilbyderens nettside for program, priser og
+// bestilling." — because `experiences.description` is blank, or holds
+// scraped nav junk that isJunkDescription() suppresses at render time.
+//
+// WHAT THIS BUILDS. A fail-closed writer for that column: for each candidate
+// row it generates a ≥400-word Norwegian description grounded ONLY in that
+// row's OWN structured catalog columns (the exact field set the detail page
+// already renders as `facts`/`badges`), has a SECOND LLM judge verify the
+// text invents nothing and is real prose, and only then writes it. The read
+// path is untouched — experiences-seo.ts already renders `description` when
+// it is present and non-junk.
+//
+// SAFETY POSTURE (read before changing anything here)
+// ───────────────────────────────────────────────────
+// This writer publishes prose on public, indexed pages under a provider's
+// name. A fabricated price/opening hour/landmark is a wrong-data incident,
+// not a copy nit. Every gate below is therefore fail-closed — "skip this
+// row" is always cheaper than "write something we are not sure about":
+//
+//   1. GROUNDING. The prompt carries nothing but the row's own structured
+//      fields (plus the provider name/Brreg flag from the JOIN). No scraped
+//      page text, no web search, no model world-knowledge is invited in.
+//   2. THIN DATA -> SKIP, NEVER PAD. A row with fewer than
+//      EXP_DESC_MIN_FACT_FIELDS populated fact-fields never reaches the LLM
+//      at all (zero tokens spent). Padding a two-fact row up to 400 words
+//      is exactly how invented facts get in.
+//   3. DETERMINISTIC POST-CHECKS before the judge: sentinel escape, word
+//      floor/ceiling, char cap, and an ungrounded-number scan (every digit
+//      run in the prose must appear in the facts block — prices, durations,
+//      group sizes and years are the highest-risk fabrication class and the
+//      cheapest to catch without a model).
+//   4. LLM JUDGE. Same exact-token GODKJENN/AVVIS contract as
+//      judgeGardssalgAboutCandidate() above; any doubt -> AVVIS.
+//   5. WRITE ONLY IF BOTH the generator and the judge succeeded. Missing
+//      ANTHROPIC_API_KEY, network failure, non-200, unparseable JSON or an
+//      unexpected shape at EITHER step resolves to "skip", never a throw.
+//   6. NEVER OVERWRITE GOOD COPY. Candidates are only rows whose current
+//      description is blank or fails isJunkDescription().
+//
+// WHY NOT isExperienceContentLocked() AS THE CANDIDATE GATE (deliberate).
+// That predicate locks a row when `verification_status === 'verified'` OR
+// content_source is 'manual'/'claim'. Its purpose is stopping a SCRAPE from
+// overwriting human/verified content. Reusing it wholesale here would make
+// this feature a no-op: PUBLISH_GATE_SQL only serves rows with
+// verification_status = 'verified', so the verified half covers 100% of the
+// pages that actually show the placeholder. This writer is a different
+// animal from a scrape — it never overwrites a good value, and its input is
+// the row's own already-verified structured columns rather than an external
+// page. So we honour the HUMAN-AUTHORED half of that lock (content_source
+// 'manual'/'claim' rows are skipped: a curator/owner touched that row, and
+// machine prose should not land on it without them) and deliberately do NOT
+// apply the `verified` half. Anyone widening this gate should re-read this
+// paragraph first.
+import { isJunkDescription as expDescIsJunk } from "../services/description-quality";
+import { parseContentFieldEvidence as expDescParseFieldEvidence } from "../services/experience-store";
+
+// Batch cap: HALF of TITLE_NO_BATCH_CAP (20). This feature spends TWO LLM
+// calls per row (generate + judge) instead of one, and the generate call
+// emits ~400-1200 words rather than a short title — so 10 rows/call keeps
+// both the per-request call count (<=20) and the per-request token spend in
+// the same ballpark the title-no backfill already proved safe. The
+// orchestrator drives the backlog by calling repeatedly, exactly as it does
+// for title-no.
+const EXP_DESC_BATCH_CAP = 10;
+// Dry-run sample: 3 (vs. title-no's 5) for the same reason — a dry run is
+// still 2 real LLM calls per sampled row, and 3 proposals are plenty to
+// eyeball quality before an apply run.
+const EXP_DESC_DRY_RUN_SAMPLE = 3;
+// Hard cap on an explicit `ids` list, mirroring the providerIds caps on the
+// gårdssalg admin endpoints above (a named priority list, not a bulk lever).
+const EXP_DESC_IDS_CAP = 100;
+
+// THIN-DATA THRESHOLD. A row must carry at least this many DISTINCT populated
+// fact-fields (out of the 13 buildExperienceDescriptionFacts() knows about)
+// before we are willing to ask for 400 words about it.
+//
+// Why 6: the fact set is category, subcategory, place, season, inne/ute,
+// varighet, gruppe, pris, språk, tilgjengelighet, oppmøtested, bestilling,
+// tilbyder. A row with <6 of them is essentially "title + category + a
+// municipality" — there is no honest way to reach 400 words from that, so
+// the model would have to pad or invent, and the judge would (correctly)
+// reject the result after we had already paid for two calls. 6 is also
+// comfortably above the floor a bulk-loaded harvest row lands on
+// (title/category/kommune/fylke, i.e. 2 fact-fields since kommune+fylke
+// collapse into one "Sted" fact), so the gate actually bites. It is
+// deliberately a count of DISTINCT FACT KINDS, not of non-null columns:
+// kommune+fylke count once, duration_min+duration_max count once, and a
+// price_band of 'ukjent' counts as nothing at all.
+const EXP_DESC_MIN_FACT_FIELDS = 6;
+
+// The dev-request's own bar. Below it we skip rather than write a short one:
+// the placeholder we are replacing is at least honest about being a stub.
+const EXP_DESC_MIN_WORDS = 400;
+// Ceiling: a run-away generation (repetition loops) is a quality failure, not
+// a bonus. ~1200 words is 3x the floor.
+const EXP_DESC_MAX_WORDS = 1200;
+const EXP_DESC_MAX_CHARS = 12000;
+// Escape hatch the model may return instead of padding — same idiom as
+// GARDSSALG_PRODUCTS_SENTINEL / GARDSSALG_REWRITE_SENTINEL above.
+const EXP_DESC_SENTINEL = "UTILSTREKKELIG_GRUNNLAG";
+// Verdict protocol: deliberately the SAME two tokens judgeGardssalgAbout-
+// Candidate() uses, declared separately so the two judges can evolve their
+// prompts independently without one silently redefining the other's tokens.
+const EXP_DESC_JUDGE_APPROVE_TOKEN = "GODKJENN";
+const EXP_DESC_JUDGE_REJECT_TOKEN = "AVVIS";
+
+/**
+ * Per-field provenance recorded for a description written by THIS writer.
+ * Deliberately not a URL, exactly like HARVEST_PROVENANCE_SENTINEL in
+ * experience-store.ts: isContentFieldHomepageSourced() must never mistake
+ * LLM prose for the provider's own homepage copy. Concretely this keeps the
+ * row inside isExperienceContentGenuinelyThin()'s candidate pool — i.e. the
+ * twice-daily homepage content-refresh selector behaves exactly as it did
+ * before this endpoint existed, instead of silently reclassifying the row as
+ * `done` the moment we fill `description`. (applyExperienceContent is
+ * fill-only, so it can never clobber what we wrote either way.)
+ */
+export const EXP_DESC_GENERATED_PROVENANCE_SENTINEL = "generated:katalogfelt-llm";
+
+/** The row shape the generator/judge are grounded on — the SAME field set
+ *  routes/experiences-seo.ts builds its `facts`/`badges` from. */
+export type ExperienceDescriptionCandidate = {
+  id: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  subcategory: string | null;
+  season: string | null;          // JSON array text
+  indoor_outdoor: string | null;
+  duration_min: number | null;
+  duration_max: number | null;
+  group_min: number | null;
+  group_max: number | null;
+  price_band: string | null;
+  price_from: number | null;
+  price_unit: string | null;
+  languages: string | null;       // JSON array text
+  accessibility: string | null;   // JSON array text
+  meeting_point: string | null;
+  kommune: string | null;
+  fylke: string | null;
+  booking_url: string | null;
+  content_source: string | null;
+  content_field_evidence: string | null;
+  provider_navn: string | null;
+  provider_brreg_verified: number | null;
+};
+
+// Norwegian display labels. Intentional small duplication of the maps in
+// routes/experiences-seo.ts (CATEGORY_LABELS / SEASON_LABELS / ioLabel /
+// PRICE_BAND_LABELS), which are module-private there — same call this repo
+// already made for services/experience-og-image.ts's companion colour map.
+// Importing a route module from another route module to share ten short
+// strings is more coupling than the duplication costs, and drift here can
+// only change PROMPT wording (these values are never rendered), so it is a
+// copy nit, not a correctness hazard.
+const EXP_DESC_CATEGORY_LABELS: Record<string, string> = {
+  vinter_sno: "Vinter og snø",
+  sightseeing_transport: "Sightseeing og transport",
+  dyreliv_safari: "Dyreliv og safari",
+  natur_friluft: "Natur og friluft",
+  kultur_historie: "Kultur og historie",
+  overnatting_opplevelse: "Overnatting og opplevelse",
+  adrenalin_action: "Adrenalin og action",
+  velvaere_spa: "Velvære og spa",
+  mat_drikke: "Mat og drikke",
+  gardssalg: "Gårdssalg og smaking",
+};
+const EXP_DESC_SEASON_LABELS: Record<string, string> = {
+  summer: "sommer", winter: "vinter", spring: "vår",
+  autumn: "høst", fall: "høst", year_round: "hele året",
+};
+const EXP_DESC_PRICE_BAND_LABELS: Record<string, string> = {
+  gratis: "gratis", rimelig: "rimelig prisnivå",
+  standard: "standard prisnivå", premium: "premium prisnivå",
+};
+
+/** Safe JSON-array-column read. Never throws, never guesses a list out of a
+ *  non-JSON string — an unreadable column is simply "no fact here". */
+function expDescJsonArray(raw: string | null | undefined): string[] {
+  const t = (raw ?? "").trim();
+  if (!t) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(t);
+  } catch {
+    return []; // not JSON — treat as absent, never parsed out of prose
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+    .map((v) => v.trim());
+}
+
+/**
+ * The row's populated fact-fields, as [norsk etikett, verdi] pairs — the ONLY
+ * material the generator is ever given. Mirrors the detail page's facts table
+ * (routes/experiences-seo.ts ~line 1863) field for field, so what we ground on
+ * is exactly what the page already claims. Each entry is one DISTINCT fact
+ * kind (see EXP_DESC_MIN_FACT_FIELDS), and `facts.length` is the thin-data
+ * measure.
+ */
+export function buildExperienceDescriptionFacts(
+  row: ExperienceDescriptionCandidate
+): Array<[string, string]> {
+  const facts: Array<[string, string]> = [];
+
+  const cat = (row.category ?? "").trim();
+  if (cat) facts.push(["Kategori", EXP_DESC_CATEGORY_LABELS[cat] || cat.replace(/_/g, " ")]);
+
+  const sub = (row.subcategory ?? "").trim();
+  if (sub) facts.push(["Underkategori", sub.replace(/_/g, " ")]);
+
+  const place = [row.kommune, row.fylke].map((v) => (v ?? "").trim()).filter(Boolean).join(", ");
+  if (place) facts.push(["Sted", place]);
+
+  const seasons = expDescJsonArray(row.season).map((s) => EXP_DESC_SEASON_LABELS[s] || s);
+  if (seasons.length) facts.push(["Sesong", seasons.join(", ")]);
+
+  const io = row.indoor_outdoor === "indoor" ? "innendørs"
+    : row.indoor_outdoor === "outdoor" ? "utendørs"
+    : row.indoor_outdoor === "both" ? "både inne og ute" : "";
+  if (io) facts.push(["Inne eller ute", io]);
+
+  if (row.duration_min || row.duration_max) {
+    const d = row.duration_min && row.duration_max && row.duration_min !== row.duration_max
+      ? `${row.duration_min}-${row.duration_max} minutter`
+      : `omtrent ${row.duration_min || row.duration_max} minutter`;
+    facts.push(["Varighet", d]);
+  }
+
+  if (row.group_min || row.group_max) {
+    const g = row.group_min && row.group_max
+      ? `${row.group_min}-${row.group_max} personer`
+      : row.group_max ? `inntil ${row.group_max} personer` : `fra ${row.group_min} personer`;
+    facts.push(["Gruppestørrelse", g]);
+  }
+
+  // price_band 'ukjent' literally means "we do not know" — it is not a fact.
+  const band = (row.price_band ?? "").trim();
+  const bandIsFact = band !== "" && band !== "ukjent";
+  if (row.price_from || bandIsFact) {
+    const unit = row.price_unit === "per_person" ? " per person"
+      : row.price_unit === "per_group" ? " per gruppe" : "";
+    const pr = row.price_from
+      ? `fra ${row.price_from} kroner${unit}`
+      : (EXP_DESC_PRICE_BAND_LABELS[band] || band);
+    facts.push(["Pris", pr]);
+  }
+
+  const langs = expDescJsonArray(row.languages);
+  if (langs.length) facts.push(["Språk", langs.join(", ")]);
+
+  const acc = expDescJsonArray(row.accessibility);
+  if (acc.length) facts.push(["Tilgjengelighet", acc.join(", ")]);
+
+  const meet = (row.meeting_point ?? "").trim();
+  if (meet) facts.push(["Oppmøtested", meet]);
+
+  // The URL itself is deliberately NOT handed to the model (nothing good
+  // comes of prose quoting a booking link) — only the FACT that the tilbyder
+  // takes bookings through their own channel.
+  if ((row.booking_url ?? "").trim()) {
+    facts.push(["Bestilling", "opplevelsen bestilles hos tilbyderen via tilbyderens egen bestillingsside"]);
+  }
+
+  const provName = (row.provider_navn ?? "").trim();
+  if (provName) {
+    facts.push([
+      "Tilbyder",
+      Number(row.provider_brreg_verified) === 1
+        ? `${provName} (verifisert mot Brønnøysundregistrene)`
+        : provName,
+    ]);
+  }
+
+  return facts;
+}
+
+/** The exact text block handed to BOTH the generator and the judge, so the
+ *  judge grades against byte-identical grounding material. */
+export function renderExperienceDescriptionFactsBlock(
+  row: ExperienceDescriptionCandidate,
+  facts: Array<[string, string]>
+): string {
+  return [`Tittel: ${row.title}`, ...facts.map(([k, v]) => `${k}: ${v}`)].join("\n");
+}
+
+/** Whitespace word count — the deterministic half of the ≥400-ord bar. */
+export function expDescWordCount(text: string | null | undefined): number {
+  const t = (text ?? "").trim();
+  if (!t) return 0;
+  return t.split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * True when the prose contains a number that does NOT appear in the facts
+ * block — i.e. an invented price, duration, group size, year, distance or
+ * count. Cheap, deterministic, and it catches the single highest-risk
+ * fabrication class before we spend a judge call on it.
+ *
+ * Digit groups are normalised first so a thousands separator can't cause a
+ * false positive ("1 200 kroner" in the prose vs. "1200" in the facts). The
+ * prompt tells the model in as many words to use no numbers beyond the fact
+ * list and to spell numbers out where it can, so a hit here is a real signal
+ * rather than an inevitability. Fail-closed either way: a hit means we skip
+ * the row, never that we write something doubtful.
+ */
+export function expDescHasUngroundedNumbers(text: string, factsBlock: string): boolean {
+  const normalise = (s: string) => s.replace(/(\d)[ .\u00a0](?=\d)/g, "$1");
+  const allowed = new Set((normalise(factsBlock).match(/\d+/g) ?? []).map((n) => String(Number(n))));
+  for (const raw of normalise(text).match(/\d+/g) ?? []) {
+    if (!allowed.has(String(Number(raw)))) return true;
+  }
+  return false;
+}
+
+/**
+ * Generate the description. Mirrors generateTitleNo()'s never-fabricate,
+ * never-throw contract byte for byte: direct fetch to
+ * https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+ * claude-haiku-4-5 (the model every generate/judge call site in this file
+ * uses today), `fetchImpl` as the DI seam, and `null` on ANY deviation —
+ * missing key, network failure, non-200, unparseable body, unexpected shape,
+ * the escape sentinel, or a candidate that fails the deterministic
+ * post-checks (word floor/ceiling, char cap, ungrounded numbers).
+ *
+ * Returns null for a thin row WITHOUT calling the LLM at all.
+ */
+export async function generateExperienceDescriptionNo(
+  row: ExperienceDescriptionCandidate,
+  fetchImpl: typeof fetch = fetch
+): Promise<string | null> {
+  const facts = buildExperienceDescriptionFacts(row);
+  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) return null; // thin -> never call the LLM
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
+  const prompt = `Du skriver produktbeskrivelser for opplevagent.no, en norsk markedsplass for opplevelser. Skriv beskrivelsen av opplevelsen under.
+
+ABSOLUTTE REGLER:
+- Bruk KUN faktaopplysningene i listen nedenfor. Du har ingen annen kunnskap om denne opplevelsen.
+- Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, fjell, fossefall, personer, historie, utstyr, måltider eller antall som ikke står i listen.
+- Ikke bruk tall som ikke står i faktalisten. Skriv heller tall som ord der det er naturlig.
+- Ikke gjett hva opplevelsen "sannsynligvis" inneholder, og ikke lån detaljer fra liknende opplevelser du kjenner til.
+- Du KAN utdype og forklare de oppgitte faktaene, og gi tydelig generelle, praktiske råd som følger direkte av dem (for eksempel at utendørsaktiviteter krever klær etter været). Slike generelle råd må aldri formuleres som en konkret opplysning om nettopp denne opplevelsen.
+- Skriv på norsk bokmål, i sammenhengende avsnitt. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
+- Teksten skal være minst ${EXP_DESC_MIN_WORDS} ord og høyst ${EXP_DESC_MAX_WORDS} ord.
+- Ikke gjenta setninger eller fyll ut med tomme fraser.
+- Hvis faktagrunnlaget er for tynt til å skrive ${EXP_DESC_MIN_WORDS} ord uten å finne på noe, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
+
+Fakta:
+${factsBlock}
+
+Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 3000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+
+  const cleaned = text.trim();
+  if (!cleaned) return null;
+  if (cleaned === EXP_DESC_SENTINEL) return null; // explicit "too thin" escape
+  if (cleaned.includes(EXP_DESC_SENTINEL)) return null; // sentinel smuggled into prose
+  if (cleaned.length > EXP_DESC_MAX_CHARS) return null;
+
+  const words = expDescWordCount(cleaned);
+  if (words < EXP_DESC_MIN_WORDS || words > EXP_DESC_MAX_WORDS) return null;
+
+  if (expDescHasUngroundedNumbers(cleaned, factsBlock)) return null;
+
+  return cleaned;
+}
+
+export interface ExperienceDescriptionJudgeVerdict {
+  approved: boolean;
+  reasoning: string;
+}
+
+/**
+ * The anti-fabrication judge. Same shape and the same fail-closed discipline
+ * as judgeGardssalgAboutCandidate() above (exact-token verdict on the first
+ * line, any doubt -> reject, never throws, never silently approves) — but the
+ * question is different: it is handed BOTH the candidate prose AND the exact
+ * facts block the prose was supposed to be grounded in, and must confirm that
+ * the text adds no fact that is not in that block.
+ */
+export async function judgeExperienceDescriptionCandidate(
+  candidateText: string,
+  factsBlock: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<ExperienceDescriptionJudgeVerdict> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { approved: false, reasoning: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+  }
+
+  const capped = (candidateText || "").slice(0, EXP_DESC_MAX_CHARS);
+  const prompt = `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av faktalisten under, som er alt vi vet om opplevelsen.
+
+Faktaliste (alt som er kjent):
+${factsBlock}
+
+Kandidattekst:
+${capped}
+
+Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
+- Hver konkrete opplysning i teksten (pris, varighet, gruppestørrelse, sted, sesong, inne/ute, språk, tilgjengelighet, oppmøtested, bestilling, tilbydernavn) stemmer med faktalisten.
+- Teksten inneholder ingen konkrete opplysninger som IKKE står i faktalisten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
+- Teksten er sammenhengende, ekte norsk prosa på minst ${EXP_DESC_MIN_WORDS} ord — ikke fyllstoff, ikke gjentatte setninger, ikke oppramsing av faktalisten.
+- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${EXP_DESC_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${EXP_DESC_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${EXP_DESC_JUDGE_REJECT_TOKEN}.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { approved: false, reasoning: "nettverksfeil under dommer-kall — avvist fail-closed" };
+  }
+
+  if (!response.ok) {
+    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { approved: false, reasoning: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { approved: false, reasoning: "uventet svarformat fra dommer-API — avvist fail-closed" };
+  }
+
+  const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const verdictToken = (lines[0] || "").toUpperCase();
+  const reasoning = lines.slice(1).join(" ").trim();
+
+  // Only the EXACT approve token approves — a longer sentence that merely
+  // CONTAINS the word is a reject, same as the gårdssalg judge.
+  if (verdictToken === EXP_DESC_JUDGE_APPROVE_TOKEN) {
+    return { approved: true, reasoning: reasoning || "godkjent av LLM-dommer" };
+  }
+  if (verdictToken === EXP_DESC_JUDGE_REJECT_TOKEN) {
+    return { approved: false, reasoning: reasoning || "avvist av LLM-dommer" };
+  }
+  return { approved: false, reasoning: "uventet/tvetydig dommersvar — avvist fail-closed" };
+}
+
+export type ExperienceDescriptionOutcome = {
+  id: string;
+  title: string;
+  fact_count: number;
+  thin: boolean;
+  proposed_description: string | null;
+  word_count: number;
+  judge_approved: boolean | null;
+  judge_reasoning: string | null;
+  skip_reason: "thin_data" | "generation_failed" | "judge_rejected" | null;
+};
+
+/**
+ * The whole per-row cascade, in ONE function so the dry-run preview and the
+ * apply run can never drift on what they would do (the drift hazard this
+ * repo already hit with gardssalgReplaceableFieldAction). Pure with respect
+ * to the DB — it decides, the caller writes.
+ */
+export async function enrichOneExperienceDescription(
+  row: ExperienceDescriptionCandidate,
+  fetchImpl: typeof fetch = fetch
+): Promise<ExperienceDescriptionOutcome> {
+  const facts = buildExperienceDescriptionFacts(row);
+  const base = { id: row.id, title: row.title, fact_count: facts.length };
+
+  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) {
+    // Thin -> zero LLM calls, zero tokens, nothing written.
+    return {
+      ...base, thin: true, proposed_description: null, word_count: 0,
+      judge_approved: null, judge_reasoning: null, skip_reason: "thin_data",
+    };
+  }
+
+  const proposed = await generateExperienceDescriptionNo(row, fetchImpl);
+  if (!proposed) {
+    return {
+      ...base, thin: false, proposed_description: null, word_count: 0,
+      judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
+    };
+  }
+
+  const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
+  const verdict = await judgeExperienceDescriptionCandidate(proposed, factsBlock, fetchImpl);
+  return {
+    ...base,
+    thin: false,
+    proposed_description: proposed,
+    word_count: expDescWordCount(proposed),
+    judge_approved: verdict.approved,
+    judge_reasoning: verdict.reasoning,
+    skip_reason: verdict.approved ? null : "judge_rejected",
+  };
+}
+
+/** Candidate predicate: blank, or junk by the SAME render-time guard
+ *  experiences-seo.ts already suppresses with. A good description is never a
+ *  candidate, so it can never be overwritten. */
+export function experienceDescriptionNeedsEnrichment(desc: string | null | undefined): boolean {
+  const t = (desc ?? "").trim();
+  if (!t) return true;
+  return expDescIsJunk(t);
+}
+
+router.post("/admin/experiences-description-enrichment", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; ids?: unknown };
+  // STRICT-FALSE parse — identical idiom to /admin/experiences-title-no-backfill
+  // above: writes execute ONLY on the JSON boolean false. null / "false" / 0 /
+  // "" / undefined all mean dry run.
+  const dryRun = body.dry_run !== false;
+
+  // Optional priority list. Parameterised placeholders only — never string
+  // interpolation of caller data into SQL (same discipline as the
+  // providerIds handling on the gårdssalg admin endpoints above).
+  //
+  // A MALFORMED `ids` is a 400, not a silent fall-through to the unfiltered
+  // catalog scan: "I asked for three named rows and instead got a full-batch
+  // spend across the whole catalog" is exactly the runaway this cap family
+  // exists to prevent. Omitting the key (or sending an explicitly empty
+  // array) remains the way to ask for the unfiltered scan.
+  let ids: string[] | null = null;
+  if (body.ids !== undefined && body.ids !== null) {
+    if (!Array.isArray(body.ids)) {
+      res.status(400).json({ error: "ids must be an array of experience ids" });
+      return;
+    }
+    if (body.ids.length > 0) {
+      ids = (body.ids as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim());
+      if (ids.length > EXP_DESC_IDS_CAP) {
+        res.status(400).json({ error: `Too many ids (max ${EXP_DESC_IDS_CAP} per call)` });
+        return;
+      }
+      if (ids.length === 0) {
+        res.status(400).json({ error: "ids contained no usable experience id" });
+        return;
+      }
+    }
+  }
+
+  // Per-app-instance fetch injection seam, same shape as the title-no
+  // backfill's `titleNoBackfillFetchImpl`: tests set it on their OWN Express
+  // app instance, production never does, so this falls back to global fetch.
+  const fetchImpl =
+    ((req.app?.get?.("experienceDescriptionFetchImpl")) as typeof fetch | undefined) ?? fetch;
+
+  const db = getExpDb("experiences");
+  const sql =
+    `SELECT e.id, e.title, e.description, e.category, e.subcategory, e.season,
+            e.indoor_outdoor, e.duration_min, e.duration_max, e.group_min, e.group_max,
+            e.price_band, e.price_from, e.price_unit, e.languages, e.accessibility,
+            e.meeting_point, e.kommune, e.fylke, e.booking_url,
+            e.content_source, e.content_field_evidence,
+            p.navn AS provider_navn, p.brreg_verified AS provider_brreg_verified
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+      WHERE e.canonical_id IS NULL
+        AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))` +
+    (ids ? ` AND e.id IN (${ids.map(() => "?").join(",")})` : "") +
+    ` ORDER BY e.id`;
+  const scanned = (ids ? db.prepare(sql).all(...ids) : db.prepare(sql).all()) as ExperienceDescriptionCandidate[];
+  // The junk guard is JS, not SQL — so the blank/junk filter runs here rather
+  // than in the WHERE clause. A GOOD existing description drops out at this
+  // line and is never seen again by this endpoint.
+  const candidateRows = scanned.filter((r) => experienceDescriptionNeedsEnrichment(r.description));
+
+  if (dryRun) {
+    // slice() of an empty array iterates zero times -> zero LLM calls, same
+    // documented behavior as the title-no backfill's empty-candidate case.
+    const sample = candidateRows.slice(0, EXP_DESC_DRY_RUN_SAMPLE);
+    const proposals: ExperienceDescriptionOutcome[] = [];
+    for (const row of sample) {
+      proposals.push(await enrichOneExperienceDescription(row, fetchImpl));
+    }
+    res.json({
+      success: true,
+      dry_run: true,
+      candidates: candidateRows.length,
+      batch_cap: EXP_DESC_BATCH_CAP,
+      sample: proposals,
+    });
+    return;
+  }
+
+  const batch = candidateRows.slice(0, EXP_DESC_BATCH_CAP);
+  const outcomes: ExperienceDescriptionOutcome[] = [];
+  for (const row of batch) {
+    outcomes.push(await enrichOneExperienceDescription(row, fetchImpl));
+  }
+
+  const writable = batch
+    .map((row, i) => ({ row, outcome: outcomes[i] }))
+    .filter(({ outcome }) => outcome.judge_approved === true && !!outcome.proposed_description);
+
+  const setDescription = db.prepare(
+    "UPDATE experiences SET description = ?, content_field_evidence = ?, updated_at = datetime('now') WHERE id = ?"
+  );
+  const tx = db.transaction(() => {
+    for (const { row, outcome } of writable) {
+      const evidence = expDescParseFieldEvidence(row.content_field_evidence);
+      evidence.description = EXP_DESC_GENERATED_PROVENANCE_SENTINEL;
+      setDescription.run(outcome.proposed_description, JSON.stringify(evidence), row.id);
+    }
+  });
+  tx();
+
+  const written = writable.length;
+  const skippedCount = outcomes.length - written;
+
+  res.json({
+    success: true,
+    dry_run: false,
+    candidates: candidateRows.length,
+    processed: outcomes.length,
+    written,
+    skipped: skippedCount,
+    remaining: Math.max(0, candidateRows.length - outcomes.length),
+    skipped_reasons: {
+      thin_data: outcomes.filter((o) => o.skip_reason === "thin_data").length,
+      generation_failed: outcomes.filter((o) => o.skip_reason === "generation_failed").length,
+      judge_rejected: outcomes.filter((o) => o.skip_reason === "judge_rejected").length,
+    },
   });
 });
 

@@ -15705,6 +15705,8 @@ console.log("\n── PR-100: dental schema extension ──");
   const prevPathPr100 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
+  const dbFactoryPathPr100 = require.resolve("../src/database/db-factory");
+  delete require.cache[dbFactoryPathPr100];
   const dbFactoryPr100 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr100.__resetDbFactoryForTesting();
 
@@ -16002,6 +16004,8 @@ console.log("\n── FIX finn-tannlege: search filters + sparse-specialty ─�
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
+  const dbFactoryPathFT = require.resolve("../src/database/db-factory");
+  delete require.cache[dbFactoryPathFT];
   const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactory.__resetDbFactoryForTesting();
 
@@ -16146,6 +16150,8 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
   // ── 1. Env-var override still works: DENTAL_DB_PATH=:memory:
   {
     process.env.DENTAL_DB_PATH = ":memory:";
+    const dbFactoryPathPr100bMem = require.resolve("../src/database/db-factory");
+    delete require.cache[dbFactoryPathPr100bMem];
     const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactory.__resetDbFactoryForTesting();
     const db = dbFactory.getDb("dental");
@@ -16184,6 +16190,8 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
     };
     require.cache[sqliteId]!.exports = FakeDatabase;
     try {
+      const dbFactoryPath2 = require.resolve("../src/database/db-factory");
+      delete require.cache[dbFactoryPath2];
       const dbFactory2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
       dbFactory2.__resetDbFactoryForTesting();
       dbFactory2.getDb("dental");
@@ -28467,6 +28475,7 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
 
   const prevPathGCR = process.env.EXPERIENCES_DB_PATH;
   let serverGCR: import("http").Server | null = null;
+  let dbFactoryGCR: typeof import("../src/database/db-factory") | null = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
 
@@ -28477,7 +28486,7 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
     delete require.cache[expStorePathGCR];
     delete require.cache[opplevelserPathGCR];
 
-    const dbFactoryGCR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFactoryGCR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFactoryGCR.__resetDbFactoryForTesting();
     const expStoreGCR = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
     const opplevelserGCR = require("../src/routes/opplevelser") as { default: import("express").Router };
@@ -28658,14 +28667,15 @@ const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => 
       assertTrue(r.body.errors.some((e: any) => e.provider_id === unlockedIdGCR),
         "gcr-9c: auto-select picks up the unlocked provider, whose fetch still fails fast");
     }
-
-    dbFactoryGCR.__resetDbFactoryForTesting();
   } catch (err) {
     failed++;
     failures.push("gardssalg-content-refresh: unexpected error: " + String(err));
   } finally {
     if (serverGCR) {
       await new Promise<void>((resolve) => serverGCR!.close(() => resolve()));
+    }
+    if (dbFactoryGCR) {
+      dbFactoryGCR.__resetDbFactoryForTesting();
     }
     if (prevPathGCR === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathGCR;
@@ -29641,6 +29651,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += esgcc.failed;
     for (const f of esgcc.failures) failures.push("experiences-seo-gardssalg-claim-cta: " + f);
     console.log(`  experiences-seo-gardssalg-claim-cta: ${esgcc.passed} passed, ${esgcc.failed} failed`);
+
+    // dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging: once a
+    // gårdssalg profile has been claimed (magic link used at least once), the
+    // produsent profile page swaps the "Driver du dette stedet?" CTA for a
+    // persistent "Bekreftet av eier" badge + a "Logg inn" link, driven by the
+    // new experience_providers.claimed_at column (not the old live/revocable
+    // isGardssalgProviderClaimed() query). Covers the badge/CTA render
+    // branch, AC6 (revoke does not remove the badge), verifyClaimToken()'s
+    // idempotent claimed_at stamp, and the claimed_at backfill migration.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── experiences-seo-gardssalg-claimed-badge: 'Bekreftet av eier' badge ──");
+    const { runExperiencesSeoGardssalgClaimedBadgeTests } = require("../src/routes/experiences-seo-gardssalg-claimed-badge.test") as
+      typeof import("../src/routes/experiences-seo-gardssalg-claimed-badge.test");
+    const esgcb = await runExperiencesSeoGardssalgClaimedBadgeTests({ log: false });
+    passed += esgcb.passed;
+    failed += esgcb.failed;
+    for (const f of esgcb.failures) failures.push("experiences-seo-gardssalg-claimed-badge: " + f);
+    console.log(`  experiences-seo-gardssalg-claimed-badge: ${esgcb.passed} passed, ${esgcb.failed} failed`);
 
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
@@ -32905,6 +32934,8 @@ console.log("\n── geo-produkt-by-http: /kategori/:category/:kommune route + 
   } finally {
     if (prevPathPBH === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathPBH;
+    const dbFactoryPathPBHReset = require.resolve("../src/database/db-factory");
+    delete require.cache[dbFactoryPathPBHReset];
     const dbFacResetPBH = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
     dbFacResetPBH.__resetDbFactoryForTesting();
   }
@@ -36888,5 +36919,31 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("marketplace-quarantine-gates: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 1
+// ("Innholdsberikelse"): POST /api/opplevelser/admin/experiences-description-
+// enrichment — the source-grounded, judge-gated writer for
+// `experiences.description` that replaces the "Detaljert beskrivelse
+// publiseres fortløpende"-plassholderen on opplevagent.no's detail pages.
+// Own in-memory experiences DB reached through the route's own seams (the
+// db-factory require-cache swap the sibling opplevelser-gardssalg-*.test.ts
+// files already use, plus the per-app-instance
+// "experienceDescriptionFetchImpl" fetch injection) — never touches
+// globalThis.fetch, never calls the real Anthropic API.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-12-opplevagent-serp-innholdsberikelse: experiences-description-enrichment ──");
+  try {
+    const { runOpplevelserExperienceDescriptionEnrichmentTests } = require("../src/routes/opplevelser-experience-description-enrichment.test") as
+      typeof import("../src/routes/opplevelser-experience-description-enrichment.test");
+    const ed = await runOpplevelserExperienceDescriptionEnrichmentTests({ log: false });
+    passed += ed.passed;
+    failed += ed.failed;
+    for (const f of ed.failures) failures.push("experience-description-enrichment: " + f);
+    console.log(`  experience-description-enrichment: ${ed.passed} passed, ${ed.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-description-enrichment: unexpected error: " + String(err?.message || err));
   }
 });

@@ -871,6 +871,51 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.log(`[experiences] gardssalg_claims init skipped: ${(e as Error).message}`);
   }
 
+  // ─── claimed_at (dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging)
+  // ────────────────────────────────────────────────────────────────────────
+  // Additive, explicit "has this profile ever been claimed" signal — distinct
+  // from isGardssalgProviderClaimed() (services/gardssalg-claim.ts), which is
+  // a LIVE, REVOCABLE query (COUNT of used=1 AND revoked_at IS NULL claims)
+  // used for the owner-portal session gate. This column is the opposite
+  // semantic on purpose: a historical "has been verified by the owner at
+  // least once" badge for the public produsent-profil page, set ONLY inside
+  // verifyClaimToken()'s transaction (gardssalg-claim.ts) the first time a
+  // magic link is actually used, and NEVER cleared by revokeClaimToken() — a
+  // later revoke/logout does not un-badge the profile (AC6). Same idempotent
+  // ALTER TABLE idiom as every other additive column in this file.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN claimed_at TEXT");
+  } catch { /* already present */ }
+
+  // Backfill: any pre-existing experience_providers row that already has a
+  // used, non-revoked gardssalg_claims row (i.e. was claimed before this
+  // column existed) gets claimed_at set from that claim's earliest used_at.
+  // WHERE claimed_at IS NULL makes this a no-op on every boot after the first
+  // (no separate "ran once" flag needed) and never overwrites a claimed_at
+  // already stamped live by verifyClaimToken(). Runs after both
+  // experience_providers and gardssalg_claims exist (this block is placed
+  // after both CREATE TABLE blocks above).
+  try {
+    db.exec(`
+      UPDATE experience_providers
+         SET claimed_at = (
+           SELECT MIN(gc.used_at)
+             FROM gardssalg_claims gc
+            WHERE gc.provider_id = experience_providers.id
+              AND gc.used = 1
+              AND gc.revoked_at IS NULL
+              AND gc.used_at IS NOT NULL
+         )
+       WHERE claimed_at IS NULL
+         AND id IN (
+           SELECT provider_id FROM gardssalg_claims
+            WHERE used = 1 AND revoked_at IS NULL AND used_at IS NOT NULL
+         )
+    `);
+  } catch (e) {
+    console.log(`[experiences] claimed_at backfill skipped: ${(e as Error).message}`);
+  }
+
   // ─── experience_provider_conflict_audit (dev-request 2026-08-01-gardssalg-
   // profilkomplett-og-soekbar-foer-outreach, Steg 2) ─────────────────────────
   // Insert-only, field-level changelog for `experiences.booking_url`
