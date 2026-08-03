@@ -3811,13 +3811,33 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
     }
     for (const id of ids) {
       const t = expDb
-        .prepare(`SELECT id, navn, org_nr, hjemmeside, content_source FROM experience_providers WHERE id = ?`)
+        .prepare(
+          `SELECT id, navn, org_nr, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`
+        )
         .get(id) as
-        | { id: string; navn: string; org_nr: string | null; hjemmeside: string | null; content_source: string | null }
+        | {
+            id: string;
+            navn: string;
+            org_nr: string | null;
+            hjemmeside: string | null;
+            content_source: string | null;
+            field_provenance: string | null;
+            producer_type: string | null;
+            rfb_seed_source: string | null;
+          }
         | undefined;
       if (!t) {
         notFound.push(id);
-      } else if (t.content_source === "manual" || t.content_source === "claim") {
+      } else if (
+        isHjemmesideLocked({
+          id: t.id,
+          hjemmeside: t.hjemmeside,
+          content_source: t.content_source,
+          field_provenance: t.field_provenance,
+          producer_type: t.producer_type,
+          rfb_seed_source: t.rfb_seed_source,
+        })
+      ) {
         skippedLocked.push({ provider_id: t.id, navn: t.navn });
       } else if (t.hjemmeside && t.hjemmeside.trim() !== "") {
         alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
@@ -3826,7 +3846,13 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
       }
     }
   } else {
-    targets = expDb
+    // Phase 1 — byte-for-byte unchanged from the pre-3g query: today's entire
+    // result for every non-gårdssalg-claim scenario, zero behavior change for
+    // the dominant case. Sub-slice 3g (dev-request
+    // 2026-07-30-opplevagent-claim-epost-og-perfelt-laas) only adds phase 2
+    // below as a top-up — it never alters this query, its ORDER BY, or its
+    // LIMIT.
+    const phase1Targets = expDb
       .prepare(
         `SELECT id, navn, org_nr, content_source
            FROM experience_providers
@@ -3835,6 +3861,63 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
           LIMIT ?`
       )
       .all(BW_DISCOVERY_BATCH_CAP) as Array<{ id: string; navn: string; org_nr: string | null; content_source: string | null }>;
+    targets = phase1Targets;
+
+    // Phase 2 — ONLY runs when phase 1 under-filled the batch. Widens
+    // eligibility to gårdssalg content_source='claim' rows that are NOT
+    // owner-locked on hjemmeside, using the already-shipped, already-reviewed
+    // isHjemmesideLocked() gate (sub-slice 3d/3e/3f) — no new gate logic, no
+    // re-derivation. Over-fetched by remaining_slots*4 (capped at 120) so the
+    // JS lock-filter below can reject locked rows without a third round-trip.
+    // `manual` rows and non-gårdssalg claim rows are excluded at the SQL
+    // level (content_source = 'claim' AND gårdssalg-identity predicate) —
+    // isHjemmesideLocked() would reject them too, but keeping them out of the
+    // SQL result means the over-fetch budget is spent only on rows that can
+    // plausibly pass, and content_source='manual' can NEVER reach `targets`
+    // via this path under any circumstance.
+    const remainingSlots = BW_DISCOVERY_BATCH_CAP - phase1Targets.length;
+    if (remainingSlots > 0) {
+      const phase1Ids = phase1Targets.map((t) => t.id);
+      const overFetchLimit = Math.min(remainingSlots * 4, 120);
+      const excludeClause = phase1Ids.length > 0 ? `AND id NOT IN (${phase1Ids.map(() => "?").join(",")})` : "";
+      const phase2Rows = expDb
+        .prepare(
+          `SELECT id, navn, org_nr, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source
+             FROM experience_providers
+            WHERE org_nr IS NOT NULL AND hjemmeside IS NULL
+              AND content_source = 'claim' AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+              ${excludeClause}
+            ORDER BY (brreg_website_discovery_attempted_at IS NOT NULL), brreg_website_discovery_attempted_at ASC, created_at ASC
+            LIMIT ?`
+        )
+        .all(...phase1Ids, overFetchLimit) as Array<{
+          id: string;
+          navn: string;
+          org_nr: string | null;
+          hjemmeside: string | null;
+          content_source: string | null;
+          field_provenance: string | null;
+          producer_type: string | null;
+          rfb_seed_source: string | null;
+        }>;
+
+      for (const row of phase2Rows) {
+        if (targets.length >= BW_DISCOVERY_BATCH_CAP) break;
+        if (
+          isHjemmesideLocked({
+            id: row.id,
+            hjemmeside: row.hjemmeside,
+            content_source: row.content_source,
+            field_provenance: row.field_provenance,
+            producer_type: row.producer_type,
+            rfb_seed_source: row.rfb_seed_source,
+          })
+        ) {
+          continue;
+        }
+        targets.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, content_source: row.content_source });
+      }
+    }
   }
 
   const proposed: Array<{
