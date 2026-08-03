@@ -72,6 +72,10 @@ import { parseNameLocationSuffix } from "../services/location-suffix-parser";
 // any Brreg network crawl (see local-orgnr-candidates.ts's own header for
 // why this is a checked-in file rather than a runtime cross-repo read).
 import { findLocalOrgnrCandidate, type LocalOrgnrHit } from "../services/local-orgnr-candidates";
+// dev-request 2026-08-03-mikhailo-quarantine-gates, Gate 3: the
+// self-registered-review-approve route below is the ONLY caller in this
+// file — see that route for why the ping moved here from routes/marketplace.ts.
+import { pingIndexNow } from "../services/indexnow-service";
 
 const router = Router();
 
@@ -172,6 +176,16 @@ function requireAdmin(req: Request, res: Response): boolean {
     return false;
   }
   return true;
+}
+
+// dev-request 2026-08-03-mikhailo-quarantine-gates, Gate 3: this file has no
+// existing absolute-URL builder (its routes return relative ids/counts, not
+// URLs) — mirrors routes/marketplace.ts's own getBaseUrl() exactly (same
+// BASE_URL env fallback, same req.protocol/req.get("host") shape) rather
+// than hardcoding a host, so a non-prod BASE_URL (staging, tests) is
+// respected the same way it is on the registration path.
+function getAdminBaseUrl(req: Request): string {
+  return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
 }
 
 // Minimal shape check — POST /register's only use is to reject obvious
@@ -1946,6 +1960,81 @@ router.post("/org-nr-review-approve", (req: Request, res: Response) => {
   }
 
   res.json({ dry_run: dryRun, approved_count: approved.length, approved, rejected });
+});
+
+// ─── GET /admin/agents/self-registered-review-queue + ───────────────────────
+//     POST /admin/agents/self-registered-review-approve ─────────────────────
+//     (dev-request 2026-08-03-mikhailo-quarantine-gates, Gate 3) ────────────
+//
+// Companion to org-nr-review-queue/-approve above — same auth-check style
+// (requireAdmin), same small-JSON-endpoint convention. This is the human
+// release lever for Gate 1/2's quarantine: every agent the PUBLIC
+// POST /register route creates lands with origin='self_registered',
+// is_vetted=0 (see marketplace-registry.ts's register() and routes/
+// marketplace.ts's /register handler) — invisible on every public discovery
+// surface (Gate 1: discover()/search/produsent page) and permanently
+// withheld the "Verifisert" claim badge even if claimed (Gate 2 — a hard
+// gate, no automated evidence escape hatch in this slice, see the comment
+// in knowledge-service.ts's verifyClaim()). This pair of routes is how a
+// human (Daniel) actually looks at one of these profiles and lets it into
+// the real marketplace — admin/script-called JSON endpoints only, no UI.
+//
+// GET lists the queue, oldest first — the incident this closes (Mikhailo T,
+// 2026-07-30) was a same-day drive-by; there's no reason a newer spam
+// signup should ever be reviewed ahead of an older, possibly-legitimate one.
+router.get("/self-registered-review-queue", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  const entries = db.prepare(
+    `SELECT id, name, contact_email, url, created_at
+       FROM agents
+      WHERE origin = 'self_registered' AND is_vetted = 0
+      ORDER BY created_at ASC`
+  ).all();
+  res.json({ count: entries.length, entries });
+});
+
+// POST flips is_vetted to 1 for exactly one agent, then — and ONLY then —
+// pings IndexNow for its /produsent/<slug> page, using the EXACT URL
+// convention the old (now-removed) registration-time ping in routes/
+// marketplace.ts used. Body: { agentId }.
+router.post("/self-registered-review-approve", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { agentId?: unknown };
+  const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
+  if (!agentId) {
+    res.status(400).json({ error: "Requires { agentId }" });
+    return;
+  }
+
+  const db = getDb();
+  const agent = db.prepare(
+    `SELECT id, name, origin, is_vetted FROM agents WHERE id = ?`
+  ).get(agentId) as { id: string; name: string; origin: string; is_vetted: number } | undefined;
+
+  if (!agent) {
+    res.status(404).json({ error: "Agent not found" });
+    return;
+  }
+  // Confirmation surface, not an arbitrary-write surface — same principle
+  // as org-nr-review-approve's exact-candidate check above: this lever may
+  // ONLY release an agent that is actually in the self-registered quarantine
+  // queue, never any other row.
+  if (agent.origin !== "self_registered") {
+    res.status(409).json({ error: "not_self_registered", detail: "Only self_registered agents go through this queue" });
+    return;
+  }
+  if (agent.is_vetted === 1) {
+    res.json({ success: true, agentId, isVetted: true, alreadyVetted: true });
+    return;
+  }
+
+  db.prepare(`UPDATE agents SET is_vetted = 1 WHERE id = ?`).run(agentId);
+
+  pingIndexNow([`${getAdminBaseUrl(req)}/produsent/${slugify(agent.name)}`], "rettfrabonden.com");
+
+  res.json({ success: true, agentId, isVetted: true });
 });
 
 // ─── POST /admin/agents/brreg-contact-backfill ──────────────────────────────

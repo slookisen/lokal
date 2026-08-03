@@ -4127,18 +4127,32 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // distinct, intentional rendering path (see isUmbrella below).
     if (agent) {
       let roleGateUmbrellaType: string | null = null;
+      let roleGateIsVetted = 1;
       try {
         const row = getDb()
-          .prepare("SELECT umbrella_type FROM agents WHERE id = ?")
-          .get(agent.id) as { umbrella_type: string | null } | undefined;
+          .prepare("SELECT umbrella_type, is_vetted FROM agents WHERE id = ?")
+          .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null } | undefined;
         roleGateUmbrellaType = row ? row.umbrella_type : null;
+        // is_vetted defaults to 1 in the schema (see database/init.ts) — a
+        // NULL/undefined read (shouldn't happen post-migration, but this
+        // route never fabricates trust either way) is treated as vetted.
+        roleGateIsVetted = row && row.is_vetted != null ? row.is_vetted : 1;
       } catch (e) {
         console.error("[seo] role-gate umbrella lookup failed:", e);
       }
       const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
       const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
-      if (failsRoleGate) {
-        console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${slug}`);
+      // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): a
+      // self-registered profile that hasn't been vetted by a human yet must
+      // 404 exactly like an unknown slug — never leak "this exists but is
+      // hidden". Unconditional (applies to producers AND umbrella rows
+      // alike, though umbrellas are never self-registered in practice).
+      if (failsRoleGate || !roleGateIsVetted) {
+        if (!roleGateIsVetted) {
+          console.log(`[seo:quarantine-gate] suppressed not-yet-vetted agent ${agent.id} (${agent.name}) on /produsent/${slug}`);
+        } else {
+          console.log(`[seo:role-gate] suppressed non-producer, non-umbrella agent ${agent.id} (${agent.name}, role=${agent.role}) on /produsent/${slug}`);
+        }
         agent = undefined;
       }
     }

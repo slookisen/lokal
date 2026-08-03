@@ -8812,6 +8812,7 @@ console.log("── PR-29 related-producers tests ──");
       avg_response_time_ms REAL,
       created_at TEXT DEFAULT (datetime('now')),
       last_seen_at TEXT DEFAULT (datetime('now')),
+      is_vetted INTEGER DEFAULT 1,
       umbrella_type TEXT,
       parent_umbrella_id TEXT,
       umbrella_member_count INTEGER,
@@ -13420,6 +13421,7 @@ console.log("\n── PR-72: search relevance — category beats city ──");
       avg_response_time_ms REAL,
       created_at TEXT DEFAULT (datetime('now')),
       last_seen_at TEXT DEFAULT (datetime('now')),
+      is_vetted INTEGER DEFAULT 1,
       umbrella_type TEXT,
       parent_umbrella_id TEXT,
       umbrella_member_count INTEGER,
@@ -36861,5 +36863,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("url-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-03-mikhailo-quarantine-gates: three additive quarantine
+// gates on self-registered marketplace agents (Gate 1 visibility, Gate 2
+// verified-badge withholding, Gate 3 delayed IndexNow), keyed off two new
+// `agents` columns (origin, is_vetted — see database/init.ts). Own harness
+// (__setDbForTesting/__initSchemaForTesting, real router handlers pulled off
+// each route stack — mirrors produsent-role-gate.test.ts's harness). Runs
+// via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-03-mikhailo-quarantine-gates: marketplace quarantine gates ──");
+  try {
+    const { runMarketplaceQuarantineGatesTests } = require("../src/routes/marketplace-quarantine-gates.test") as
+      typeof import("../src/routes/marketplace-quarantine-gates.test");
+    const mq = await runMarketplaceQuarantineGatesTests({ log: false });
+    passed += mq.passed;
+    failed += mq.failed;
+    for (const f of mq.failures) failures.push("marketplace-quarantine-gates: " + f);
+    console.log(`  marketplace-quarantine-gates: ${mq.passed} passed, ${mq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-quarantine-gates: unexpected error: " + String(err?.message || err));
   }
 });

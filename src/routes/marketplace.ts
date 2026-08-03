@@ -15,7 +15,6 @@ import {
   SALGSKANAL_CATEGORY_NAMES,
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
-import { pingIndexNow } from "../services/indexnow-service";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
@@ -329,7 +328,15 @@ router.post("/register", (req: Request, res: Response) => {
       return;
     }
 
-    const agent = marketplaceRegistry.register(registration);
+    // dev-request 2026-08-03-mikhailo-quarantine-gates: this is the PUBLIC
+    // self-registration endpoint — anyone on the internet can call it, with
+    // zero vetting. Every agent created here is `origin: 'self_registered'`
+    // BY CONSTRUCTION (never optional, never inferred from the request body
+    // — AgentRegistrationSchema doesn't even have an `origin` field, so a
+    // caller cannot spoof this) and starts quarantined (`isVetted: false`,
+    // i.e. is_vetted=0) until a human approves it via
+    // POST /admin/self-registered-review-approve (routes/admin-agents.ts).
+    const agent = marketplaceRegistry.register({ ...registration, origin: "self_registered", isVetted: false });
 
     interactionLogger.log("register", {
       agentId: agent.id,
@@ -337,13 +344,13 @@ router.post("/register", (req: Request, res: Response) => {
       ipAddress: req.ip,
     });
 
-    // IndexNow: tell Bing/Yandex the new producer's profile page exists,
-    // so it can be picked up without waiting for a crawl (dev-request
-    // 2026-07-04-sokemotor-indeksering-og-lenker slice 1). Fire-and-forget
-    // — never awaited, never allowed to affect the response below.
-    // /produsent/<slug> URL convention matches seo.ts / the /search route.
-    pingIndexNow([`${getBaseUrl(req)}/produsent/${slugify(agent.name)}`], "rettfrabonden.com");
-
+    // Gate 3 (IndexNow): do NOT ping Bing/Yandex from here anymore. Every
+    // agent this route creates is self_registered and unvetted (above) — the
+    // 2026-07-30 Mikhailo T incident was IndexNow-ping'd within seconds of
+    // this endpoint being hit, indexing a spam profile before any human saw
+    // it. The ping now fires later, from POST /admin/self-registered-review-
+    // approve, once a human has actually looked at the profile and flipped
+    // is_vetted to 1 — see that route for the /produsent/<slug> ping.
     res.status(201).json({
       success: true,
       message: "Agent registrert i Lokal-markedsplassen",

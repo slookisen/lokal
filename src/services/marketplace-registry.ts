@@ -66,7 +66,22 @@ class MarketplaceRegistry {
 
   // ─── Registration ─────────────────────────────────────────
 
-  register(registration: AgentRegistration): RegisteredAgent {
+  // dev-request 2026-08-03-mikhailo-quarantine-gates: `origin`/`isVetted`
+  // are deliberately NOT part of AgentRegistrationSchema/AdminRegistrationSchema
+  // (a self-registering caller must never be able to declare its own
+  // provenance — Zod strips any such field out of req.body before it gets
+  // here) — they're an out-of-band param this method's callers pass
+  // explicitly. Both default so the two existing call sites (POST
+  // /admin/register and every src/_seeds/*.ts script) need NO change at
+  // all: omitting them writes origin='discovery', is_vetted=1, byte-
+  // identical to pre-gate behaviour. Only routes/marketplace.ts's PUBLIC
+  // POST /register passes `origin: "self_registered", isVetted: false`.
+  register(
+    registration: AgentRegistration & {
+      origin?: "self_registered" | "discovery";
+      isVetted?: boolean;
+    },
+  ): RegisteredAgent {
     const db = getDb();
     const id = uuid();
     const apiKey = this.generateApiKey();
@@ -79,14 +94,14 @@ class MarketplaceRegistry {
         categories, tags, skills, capabilities, languages,
         trust_score, is_active, is_verified,
         discovery_count, interaction_count, total_interactions,
-        created_at, last_seen_at
+        created_at, last_seen_at, origin, is_vetted
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         0.5, 1, 0,
         0, 0, 0,
-        ?, ?
+        ?, ?, ?, ?
       )
     `);
 
@@ -111,6 +126,8 @@ class MarketplaceRegistry {
       JSON.stringify(registration.languages || ["no"]),
       now,
       now,
+      registration.origin || "discovery",
+      registration.isVetted === false ? 0 : 1,
     );
 
     this.invalidateCache();
@@ -132,7 +149,10 @@ class MarketplaceRegistry {
     if (nameQuery && nameQuery.length >= 3) {
       // Fetch all active agents and filter by name in JS (case-insensitive for Unicode)
       // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
-      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[];
+      // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): a
+      // self-registered, not-yet-vetted row (is_vetted = 0) must not surface
+      // on any public discovery surface, including this name-match path.
+      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1").all() as any[];
       const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
 
       console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, totalAgents=${allRows.length}`);
@@ -219,7 +239,9 @@ class MarketplaceRegistry {
 
     // Build SQL dynamically based on query filters
     // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
-    let sql = "SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL";
+    // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): exclude
+    // self-registered, not-yet-vetted rows from this public discovery path.
+    let sql = "SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1";
     const params: any[] = [];
 
     // 1. Filter by role
@@ -785,7 +807,11 @@ class MarketplaceRegistry {
           // Quick check: do any of these distinctive words appear in an agent name?
           const db = getDb();
           // Phase 5.11 A4.1: exclude umbrellas from name-match candidate set
-          const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[])
+          // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): exclude
+          // not-yet-vetted rows too — kept consistent with discover()'s own
+          // is_vetted filter even though this candidate-detection step alone
+          // can't leak a result (discover()'s actual lookup is gated too).
+          const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1").all() as any[])
             .map(r => (r.name || "").toLowerCase());
 
           const nameMatches = nameCandidateWords.filter(word =>

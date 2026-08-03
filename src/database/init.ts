@@ -3827,6 +3827,70 @@ function initSchema(db: Database.Database): void {
     )
   `);
 
+  // ─── dev-request 2026-08-03-mikhailo-quarantine-gates ───────────────────
+  // Incident: 2026-07-30, a spam profile ("Mikhailo T", Kyiv) was (1) created
+  // via the PUBLIC POST /api/marketplace/register endpoint, (2) same-day
+  // self-claimed via the ordinary email-code claim flow — which the claimant
+  // fully controls both ends of, since they own both the registration AND
+  // the "verification" inbox — earning a public "Verifisert" trust badge
+  // with zero real evidence, and (3) IndexNow-ping'd to Bing/Yandex
+  // immediately on registration, before any human ever saw it.
+  //
+  // These two columns are the distinguishing signal the three quarantine
+  // gates below key off. Both are additive with a default that makes every
+  // EXISTING row (and every row created via the admin/discovery pipeline or
+  // a seed script) a complete no-op — non-retroactive, same "monotonic
+  // guard" convention as no_yield_streak/wrong_entity_streak above.
+  //
+  //   origin     : who created this row.
+  //                'discovery'      — the admin/discovery/harvest pipeline
+  //                                   (POST /admin/register) or a seed
+  //                                   script (src/_seeds/*.ts). DEFAULT —
+  //                                   every row that exists today, and every
+  //                                   future admin/seed-created row, reads
+  //                                   as this with NO code change on their
+  //                                   part.
+  //                'self_registered'— the PUBLIC POST /register endpoint.
+  //                                   Written explicitly by that route's
+  //                                   handler on every call — anyone on the
+  //                                   internet can hit this endpoint, so a
+  //                                   row of this origin carries zero vetting
+  //                                   evidence until a human reviews it.
+  //   is_vetted  : 1 = visible on public discovery surfaces (search,
+  //                discover, the /produsent/<slug> profile page). DEFAULT 1
+  //                — every existing/admin/seed row is already vetted by the
+  //                fact a human (discovery agent + Daniel's review loop)
+  //                put it there. The PUBLIC /register route is the ONLY
+  //                writer that sets this to 0 on insert; the admin
+  //                self-registered-review-approve route (routes/
+  //                admin-agents.ts) is the ONLY writer that flips it back
+  //                to 1, after a human looks at the profile.
+  //
+  // Gate 1 (visibility): marketplace-registry.ts discover() and the
+  // /produsent/:slug route (routes/seo.ts) exclude is_vetted = 0 rows.
+  // Gate 2 (badge): knowledge-service.ts verifyClaim() skips the
+  // is_verified UPDATE when origin = 'self_registered' — the claim itself
+  // still succeeds, only the public trust badge is withheld. Deliberately a
+  // hard gate: there is no automated Brreg/domain-evidence escape hatch for
+  // this generic marketplace-agents table in this slice (known, deliberate
+  // limitation — see the comment in verifyClaim()).
+  // Gate 3 (IndexNow): routes/marketplace.ts's /register handler no longer
+  // pings IndexNow at registration (every row it creates is self_registered
+  // by construction); the ping now fires from the admin approve route
+  // instead, once a human has vetted the profile.
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN origin TEXT NOT NULL DEFAULT 'discovery'`,
+    `ALTER TABLE agents ADD COLUMN is_vetted INTEGER NOT NULL DEFAULT 1`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_agents_self_registered_review_queue
+         ON agents(origin, is_vetted, created_at) WHERE origin = 'self_registered' AND is_vetted = 0`
+    );
+  } catch { /* partial index unsupported or already created */ }
+
 }
 
 export function closeDb(): void {
