@@ -303,7 +303,12 @@ import { fetchBrregContact } from "../services/brreg-client";
 // drivers below (POST /admin/booking-test-send, POST /admin/claim-test-send)
 // are the ONLY call sites that may set the per-transaction test flag.
 import { testSendRedirectAddress } from "../services/send-guard";
-import { issueClaimMagicLink, getClaimProviderById, isClaimableDomain } from "../services/gardssalg-claim";
+import {
+  issueClaimMagicLink,
+  getClaimProviderById,
+  isClaimableDomain,
+  backfillGardssalgOwnerLockProvenance,
+} from "../services/gardssalg-claim";
 import { normalizeDomain } from "../services/blocklist-service";
 import { emailService } from "../services/email-service";
 
@@ -7802,6 +7807,57 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     });
   } catch (err) {
     console.error("[gardssalg-website-verification-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-owner-lock-backfill ──────────────
+//
+// dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 3
+// (scoped-down slice — see this route's own scoping note at the top of
+// gardssalg-claim.ts's updateClaimedProviderProfile, which now stamps
+// field_provenance.owner_locks.<field> GOING FORWARD on every new owner
+// edit). This is the one-time catch-up for owner edits that happened
+// BEFORE that forward-stamping existed: it reads gardssalg_content_audit
+// (changed_by='owner') and back-fills the same owner_locks entries from
+// that historical trail — see backfillGardssalgOwnerLockProvenance's own
+// doc comment (services/gardssalg-claim.ts) for the full write contract,
+// including why it is idempotent (a field whose owner_locks entry already
+// exists — from a prior run of this route OR from the forward-stamping
+// path — is left untouched and counted under already_stamped, never
+// rewritten/re-dated).
+//
+// Dry-run (apply omitted/false, same convention as every other gårdssalg
+// admin write route in this file, e.g. POST .../gardssalg-website-
+// verification-remediation just above): performs the exact same scan/merge
+// logic but skips the final UPDATE — literally zero DB writes — and reports
+// would_stamp instead of stamped.
+router.post("/admin/gardssalg-owner-lock-backfill", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  try {
+    const result = backfillGardssalgOwnerLockProvenance(apply);
+    if (!apply) {
+      res.json({
+        success: true,
+        dry_run: true,
+        scanned: result.scanned,
+        would_stamp: result.stamped,
+        already_stamped: result.already_stamped,
+        skipped_missing_provider: result.skipped_missing_provider,
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      dry_run: false,
+      scanned: result.scanned,
+      stamped: result.stamped,
+      already_stamped: result.already_stamped,
+      skipped_missing_provider: result.skipped_missing_provider,
+    });
+  } catch (err) {
+    console.error("[gardssalg-owner-lock-backfill] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
