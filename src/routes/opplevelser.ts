@@ -7896,8 +7896,28 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
 // exists, for idempotent re-runs) — see applyGardssalgWebsiteVerification's
 // own doc comment (services/gardssalg-website-verification.ts) for the full
 // write contract.
+//
+// cohort/limit/offset (dev-request 2026-08-02-opplevagent-hjemmeside-
+// verifisering-og-enrichment-gate, Steg 2b): the SAME `cohort` + pagination
+// discipline as the GET audit route above, read from the request BODY (this
+// is a POST) instead of the query string — see that route's own doc comment
+// for the full rationale (MAX_GARDSSALG_AUDIT_LIMIT, mandatory pagination at
+// cohort=all). Reusing the same constant is deliberate: this route performs
+// the same per-row live outbound fetch as the GET route, so it carries
+// exactly the same PR #432 unbounded-scan risk at scale — an earlier gap
+// here (cohort hardcoded to "gardssalg", no limit/offset) was safe only
+// because the gårdssalg cohort itself is small (~87 rows). Paginating BEFORE
+// the scan also bounds `apply=true`'s blast radius to the paged rows only.
 router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown; scope?: unknown };
+  const body = (req.body ?? {}) as {
+    apply?: unknown;
+    providerIds?: unknown;
+    batch_id?: unknown;
+    scope?: unknown;
+    cohort?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+  };
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
   // Same scope contract and strict validation as the GET audit route above —
@@ -7910,6 +7930,59 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
     return;
   }
+  // cohort=gardssalg (default) | all — same axis/discipline as the GET audit
+  // route above (dev-request 2026-08-02-opplevagent-hjemmesideverifisering-
+  // og-enrichment-gate, Steg 2b): a SEPARATE axis from `scope` (visibility),
+  // decides WHICH producer types are eligible at all. Read from the BODY
+  // (this is a POST), never silently falling back on an unrecognized value.
+  const rawCohort = body.cohort;
+  const cohortParam: GsWvCohort = rawCohort === undefined ? "gardssalg" : (rawCohort as GsWvCohort);
+  if (rawCohort !== undefined && !GS_WV_COHORTS.includes(cohortParam)) {
+    res.status(400).json({ error: `Ugyldig cohort — må være en av: ${GS_WV_COHORTS.join(", ")}` });
+    return;
+  }
+  // limit/offset — same contract, same MAX_GARDSSALG_AUDIT_LIMIT ceiling, and
+  // the same reason as the GET audit route: this route scans the ENTIRE
+  // loaded cohort synchronously with a live outbound fetch per row, so an
+  // unbounded cohort=all sweep here reproduces the exact PR #432 hang class.
+  // Read from the body, not the query string, since this is a POST.
+  let limit: number | undefined;
+  let offset: number | undefined;
+  if (body.limit !== undefined) {
+    const parsedLimit = Number(body.limit);
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+      res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
+      return;
+    }
+    if (parsedLimit > MAX_GARDSSALG_AUDIT_LIMIT) {
+      res.status(400).json({ error: `Ugyldig limit — maks er ${MAX_GARDSSALG_AUDIT_LIMIT}.` });
+      return;
+    }
+    limit = parsedLimit;
+  }
+  if (body.offset !== undefined) {
+    const parsedOffset = Number(body.offset);
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+      return;
+    }
+    offset = parsedOffset;
+  }
+  if (limit === undefined && offset !== undefined) {
+    res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+    return;
+  }
+  // Mandatory pagination at scale — same rule as the GET audit route:
+  // cohort=all can be 1000+ rows platform-wide, so the unbounded (`limit`
+  // absent) synchronous-scan path stays reachable ONLY for the default
+  // cohort=gardssalg, preserving today's byte-for-byte behavior for callers
+  // who never pass a body at all. Checked before any DB load or fetch.
+  if (cohortParam === "all" && limit === undefined) {
+    res.status(400).json({
+      error: "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+    });
+    return;
+  }
 
   const expDb = getExpDb("experiences");
   try {
@@ -7919,7 +7992,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
     };
 
-    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
+    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
     if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
       const idSet = new Set(
         (body.providerIds as unknown[])
@@ -7929,11 +8002,41 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       cohort = cohort.filter((p) => idSet.has(p.id));
     }
 
+    // Paginate BEFORE scanning — mirrors the GET audit route's own
+    // `cohortRows.slice(pageOffset, pageOffset + limit)` pattern, so only the
+    // requested page ever incurs a live outbound fetch, and (for apply=true)
+    // only the paged rows are ever written — the blast radius of a single
+    // call is bounded by `limit`, never the full (possibly cohort=all) set.
+    const total = cohort.length;
+    let pageOffset: number | undefined;
+    if (limit !== undefined) {
+      pageOffset = offset ?? 0;
+      cohort = cohort.slice(pageOffset, pageOffset + limit);
+    }
+
     const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+    const pagination =
+      limit === undefined
+        ? undefined
+        : {
+            total,
+            offset: pageOffset as number,
+            limit,
+            returned: rows.length,
+            next_offset: (pageOffset as number) + rows.length < total ? (pageOffset as number) + rows.length : null,
+          };
 
     if (!apply) {
       const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation(rows);
-      res.json({ success: true, dry_run: true, scope, would_enqueue: wouldEnqueue, summary });
+      res.json({
+        success: true,
+        dry_run: true,
+        scope,
+        cohort: cohortParam,
+        would_enqueue: wouldEnqueue,
+        summary,
+        ...(pagination ? { pagination } : {}),
+      });
       return;
     }
 
@@ -7942,9 +8045,11 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       success: true,
       dry_run: false,
       scope,
+      cohort: cohortParam,
       enqueued: applied.filter((a) => a.enqueued).length,
       provenance_written: applied.length,
       summary,
+      ...(pagination ? { pagination } : {}),
     });
   } catch (err) {
     console.error("[gardssalg-website-verification-remediation] failed:", err);
