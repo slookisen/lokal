@@ -79,6 +79,16 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
     const agentId = String(req.params.id || "").trim();
     if (!agentId) return res.status(400).json({ error: "agent id required" });
 
+    // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension):
+    // 404 exactly like an unknown id for a not-yet-vetted self-registered
+    // agent — this is a public, unauthenticated endpoint (see file header),
+    // same rule as /agents/:id/card, /info, /vcard, and /trust in
+    // marketplace.ts. Reuses the shared helper rather than reimplementing
+    // the quarantine check inline.
+    if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
+      return res.status(404).json({ error: "agent not found" });
+    }
+
     // Resolve the agent — we need the canonical name to derive the URL path
     // analytics_page_views actually saw (`/produsent/<slug>`).
     // Phase 5.11 follow-up: include umbrella-tagged agents. Without this,

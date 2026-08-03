@@ -173,6 +173,9 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
         header() { return res; },
         set() { return res; },
         type() { return res; },
+        // agent-stats.ts's success path calls the raw Node http res.setHeader
+        // (Cache-Control) before json() — no-op stand-in, same as header()/set().
+        setHeader() { return res; },
       };
       try {
         const maybePromise = handler(req, res, next || (() => { settle({ __next: true }); }));
@@ -226,14 +229,17 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     const adminAgentsRoutePath = require.resolve("./admin-agents");
     const seoRoutePath = require.resolve("./seo");
     const discoveryRoutePath = require.resolve("./discovery");
+    const agentStatsRoutePath = require.resolve("./agent-stats");
     delete require.cache[marketplaceRoutePath];
     delete require.cache[adminAgentsRoutePath];
     delete require.cache[seoRoutePath];
     delete require.cache[discoveryRoutePath];
+    delete require.cache[agentStatsRoutePath];
     const marketplaceRouter = require("./marketplace").default as any;
     const adminAgentsRouter = require("./admin-agents").default as any;
     const seoRouter = require("./seo").default as any;
     const discoveryRouter = require("./discovery").default as any;
+    const agentStatsRouter = require("./agent-stats").default as any;
 
     const { marketplaceRegistry } = require("../services/marketplace-registry") as
       typeof import("../services/marketplace-registry");
@@ -249,6 +255,8 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     const infoHandler = findRouteHandler(marketplaceRouter, "/agents/:id/info", "get");
     const vcardHandler = findRouteHandler(marketplaceRouter, "/agents/:id/vcard", "get");
     const trustHandler = findRouteHandler(marketplaceRouter, "/agents/:id/trust", "get");
+    const statsHandler = findRouteHandler(agentStatsRouter, "/api/agents/:id/stats", "get");
+    const deleteAgentHandler = findRouteHandler(marketplaceRouter, "/agents/:id", "delete");
     const homepageHandler = findRouteHandler(seoRouter, "/", "get");
     const cityPageHandler = findRouteHandler(seoRouter, "/:city", "get");
     const sitemapHandler = findRouteHandler(seoRouter, "/sitemap.xml", "get");
@@ -682,6 +690,18 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
       const rTrustOk = await invokeHandler(trustHandler, makeReq({ params: { id: vettedControlId } }));
       assertEq(rTrustOk.status, 200, "d7-trust-control: GET /agents/:id/trust still 200s for the vetted control agent");
 
+      // ── d9: GET /api/agents/:id/stats (2026-08-03 round-3 fix-up) ────
+      // Public, unauthenticated endpoint — same rule as card/info/vcard/
+      // trust above. Asserts the exact 404 shape this route already uses
+      // for a genuinely unknown id ({ error: "agent not found" }), so a
+      // quarantined agent is indistinguishable from a nonexistent one.
+      const rStats = await invokeHandler(statsHandler, makeReq({ params: { id: quarantinedId } }));
+      assertEq(rStats.status, 404, "d9-stats: GET /api/agents/:id/stats 404s for the quarantined agent");
+      assertEq(rStats.body, { error: "agent not found" }, "d9-stats-shape: 404 body matches the route's own unknown-id shape");
+      const rStatsOk = await invokeHandler(statsHandler, makeReq({ params: { id: vettedControlId } }));
+      assertEq(rStatsOk.status, 200, "d9-stats-control: GET /api/agents/:id/stats still 200s for the vetted control agent");
+      assertEq(rStatsOk.body?.agentId, vettedControlId, "d9-stats-control-shape: 200 body is the normal stats payload (unaffected by the gate)");
+
       // ── d8: claim-email bookkeeping opt-out still works (marketplace.ts
       // ~1294, "explicitly not required to fix" per the reviewer, but the
       // includeUnvetted opt-out added there must not itself have broken) ──
@@ -690,6 +710,31 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
         body: { name: "Spammer", email: "spammer@example-spam.test" },
       }));
       assertEq(rClaimD.status, 200, "d8: claim request still succeeds for the quarantined agent (own-claim flow unaffected)");
+
+      // ── d10: DELETE /agents/:id blocklist enrichment for an unvetted
+      // agent (2026-08-03 round-3 fix-up). Prior to the fix, the pre-delete
+      // lookup used getActiveAgents()'s default (filtered) options, which
+      // excludes is_vetted=0 rows — so a self-registered/unvetted agent's
+      // website/email were silently dropped from the blocklist entry.
+      // quarantinedId already carries a url + contactEmail from its d1-d9
+      // fixture above, and is still self_registered/unvetted (never
+      // approved in this suite), so it's a valid fixture for this too.
+      const { normalizeDomain, normalizeEmail } = require("../services/blocklist-service") as
+        typeof import("../services/blocklist-service");
+      const rDelete = await invokeHandler(deleteAgentHandler, makeReq({
+        params: { id: quarantinedId },
+        headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+      }));
+      assertEq(rDelete.status, 200, "d10: DELETE /agents/:id succeeds for the unvetted quarantined agent");
+      const blocklistRows: any[] = rDelete.body?.blocklist?.rows || [];
+      assertTrue(
+        blocklistRows.some((r: any) => r.identifier_type === "website_domain" && r.identifier_value === normalizeDomain("https://spammer.example.test")),
+        "d10-website: blocklist entry captures the deleted unvetted agent's website_domain (would be missing without includeUnvetted:true on the pre-delete lookup)",
+      );
+      assertTrue(
+        blocklistRows.some((r: any) => r.identifier_type === "email" && r.identifier_value === normalizeEmail("spammer@example-spam.test")),
+        "d10-email: blocklist entry captures the deleted unvetted agent's email (would be missing without includeUnvetted:true on the pre-delete lookup)",
+      );
     }
   } catch (err) {
     failed++;
@@ -709,6 +754,7 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     try { delete require.cache[require.resolve("./marketplace")]; } catch { /* ignore */ }
     try { delete require.cache[require.resolve("./admin-agents")]; } catch { /* ignore */ }
     try { delete require.cache[require.resolve("./discovery")]; } catch { /* ignore */ }
+    try { delete require.cache[require.resolve("./agent-stats")]; } catch { /* ignore */ }
     testDb.close();
   }
 

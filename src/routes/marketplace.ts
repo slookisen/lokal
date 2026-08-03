@@ -2570,6 +2570,16 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       return;
     }
 
+    // Capture registry data BEFORE the row is deleted below — this is the
+    // ONLY point at which a live/cached lookup can still see the row.
+    // includeUnvetted: true — an admin may be deleting a self-registered/
+    // not-yet-vetted spam agent (reviewing the queue and choosing to delete
+    // rather than approve), and the default (filtered) getActiveAgents()
+    // would never surface that row at all, leaving the blocklist entry
+    // below missing website/email. Same pattern as ensureAgentInDb and the
+    // claim-request email lookup elsewhere in this file.
+    const fromRegistry = marketplaceRegistry.getActiveAgents({ includeUnvetted: true }).find((a: any) => a.id === agentId) as any;
+
     // Delete agent and all related data in one transaction
     // Must clear all FK references before deleting the agent itself.
     // conversations.seller_agent_id lacks ON DELETE CASCADE, so we clean manually.
@@ -2595,8 +2605,8 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
     if (wantsBlock) {
       try {
         const fullAgent = db.prepare("SELECT id, name, contact_email, url FROM agents WHERE id = ?").get(agentId) as any;
-        // fullAgent is null here (we just deleted) — read from `agent` row pre-delete + try registry for richer data
-        const fromRegistry = marketplaceRegistry.getActiveAgents().find((a: any) => a.id === agentId) as any;
+        // fullAgent is null here (we just deleted) — fromRegistry (captured
+        // pre-delete above, includeUnvetted:true) supplies the richer data.
         blocklistResult = blocklistAdd({
           agentId,
           name: agent.name,
