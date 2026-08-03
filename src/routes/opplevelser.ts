@@ -1382,6 +1382,15 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
   const parkedNow: string[] = [];
+  // dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-
+  // gate, Steg 3: providers excluded because their hjemmeside is not stamped
+  // verified=true by the website-verification sweep (isHjemmesideVerified()
+  // above — mirrors PR #453's gate on the gårdssalg content-refresh route).
+  // Own named bucket (never lumped into errors/skipped_locked) so a run's
+  // report always makes visible how many rows were skipped for this reason,
+  // instead of it silently inflating the generic `errors`/
+  // http_unreachable_per_run metric the way ordinary fetch failures do.
+  const excludedUnverifiedWebsite: Array<{ provider_id: string; reason: string }> = [];
 
   async function processOne(t: ContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -1393,6 +1402,23 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     // sorting first forever (see markProviderContentAttempted's doc comment).
     if (apply) {
       try { markProviderContentAttempted(providerId); } catch { /* best-effort */ }
+    }
+
+    // Website-verification gate — before any fetch, fail-closed: a
+    // hjemmeside the website-verification sweep has not stamped
+    // verified=true (missing, malformed, or classification other than
+    // "verified") must never be trusted as an enrichment source for this
+    // producer. See isHjemmesideVerified()'s doc comment above. This also
+    // gates the COALESCE-fallback case (t.hjemmeside sourced from an
+    // experience's evidence_url because the provider's own hjemmeside column
+    // is blank — see selectProvidersForContentRefresh's SQL): the
+    // verification sweep only ever classifies the provider's OWN hjemmeside
+    // column, so a fallback-sourced target's field_provenance reads
+    // "missing_source" (verified=false) here and is skipped too, by design
+    // (the fallback URL was never itself ownership-verified).
+    if (!isHjemmesideVerified(t.field_provenance)) {
+      excludedUnverifiedWebsite.push({ provider_id: providerId, reason: "unverified_website" });
+      return;
     }
 
     // Fetch homepage content server-side (SSRF-guarded).
@@ -1574,6 +1600,13 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
+    // Steg 3 — providers excluded because their hjemmeside is not stamped
+    // verified=true by the website-verification sweep; additive bucket,
+    // every excluded provider is visible, never dropped or lumped into
+    // `errors` (which otherwise becomes the http_unreachable_per_run
+    // guardrail metric and would misread aggregator-URL rot as real
+    // unreachability).
+    excluded_unverified_website: excludedUnverifiedWebsite,
     // Why selection stopped this call: "real-exhaustion" only when the SQL
     // candidate window is genuinely tapped out; "scan_cap_reached" when the
     // hard CONTENT_REFRESH_HARD_SCAN_CAP scan budget stopped the search

@@ -24518,7 +24518,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
   try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
-  try { await _contentRefreshScanWindowPromise; } catch { /* errors already pushed to failures */ }
+  try { await _contentRefreshWebsiteVerificationGatePromise; } catch { /* errors already pushed to failures */ }
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
@@ -32027,6 +32027,43 @@ const _contentRefreshScanWindowPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-
+// gate, Steg 3: POST /admin/content-refresh (the general experiences-vertical
+// route) now fail-closed-gates its homepage fetch on
+// field_provenance.hjemmeside_verification.verified === true, reusing
+// isHjemmesideVerified() and mirroring PR #453's identical gate on the
+// narrower gårdssalg-content-refresh route. Own dedicated test file (own
+// in-memory prod-schema DB, swaps the shared experiences db-factory getDb()
+// singleton) — mirrors the block immediately above, so it must run strictly
+// after it; _contentRefreshScanWindowPromise is the current tail of that
+// serial chain.
+let _contentRefreshWebsiteVerificationGateResolve: () => void = () => {};
+const _contentRefreshWebsiteVerificationGatePromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshWebsiteVerificationGateResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshScanWindowPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── 2026-08-02 hjemmeside-verification enrichment gate: POST /admin/content-refresh ──");
+  try {
+    const { runOpplevelserContentRefreshWebsiteVerificationGateTests } = require("../src/routes/opplevelser-content-refresh-website-verification-gate.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-website-verification-gate.test");
+    const crwvg = await runOpplevelserContentRefreshWebsiteVerificationGateTests({ log: false });
+    passed += crwvg.passed;
+    failed += crwvg.failed;
+    for (const f of crwvg.failures) failures.push("opplevelser-content-refresh-website-verification-gate: " + f);
+    console.log(`  opplevelser-content-refresh-website-verification-gate: ${crwvg.passed} passed, ${crwvg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-website-verification-gate: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshWebsiteVerificationGateResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (items 1 + 3):
 // `select: "low_quality"` opt-in cohort on POST /admin/homepage-provenance-batch
 // (src/routes/marketplace.ts) — ranks agents worst-first by agents.trust_score
@@ -32180,8 +32217,10 @@ const _rfbAgentsRetroScanPromise: Promise<void> = new Promise<void>(r => {
 // runSerial-kjeden og er nettopp derfor ufarlig ETTER denne barrieren.)
 //
 // Listen speiler rapporthalens await-liste (~linje 24446) minus _serialChain
-// (kjede-medlem kan ikke vente på kjeden). _contentRefreshCharsetPromise er
-// transitivt dekket via _contentRefreshScanWindowPromise, som i rapporthalen.
+// (kjede-medlem kan ikke vente på kjeden). _contentRefreshCharsetPromise og
+// _contentRefreshScanWindowPromise er begge transitivt dekket via
+// _contentRefreshWebsiteVerificationGatePromise (2026-08-02: den nye kjede-
+// halen), som i rapporthalen.
 // VEDLIKEHOLD: en NY ad-hoc-blokk må inn BÅDE i rapporthalens liste OG her.
 // allSettled, ikke all: en feilende ad-hoc-blokk har allerede ført sin feil i
 // `failures` selv og skal ikke velte kjeden.
@@ -32208,7 +32247,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _homepageSelectorRotationPromise, _domainCoherenceSweepPromise, _pendingVerifyParkingPromise,
   _adminAgentsDeletePromise, _adminClaimFunnelPromise, _selgerHtmlOpenTrackingPromise,
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
-  _expNoYieldBackoffPromise, _contentRefreshScanWindowPromise, _lowQualitySelectorPromise,
+  _expNoYieldBackoffPromise, _contentRefreshWebsiteVerificationGatePromise, _lowQualitySelectorPromise,
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
 ];
 runSerial(async () => {
