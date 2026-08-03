@@ -147,9 +147,11 @@ export function runOpplevelserHjemmesideWriteTests(
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
            (id, navn, vertical, hjemmeside, content_source, field_provenance, updated_at,
+            producer_type, rfb_seed_source,
             enrichment_state, verification_status, source, confidence)
          VALUES
            (@id, @navn, 'experiences', @hjemmeside, @content_source, @field_provenance, @updated_at,
+            @producer_type, @rfb_seed_source,
             'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
 
@@ -162,84 +164,154 @@ export function runOpplevelserHjemmesideWriteTests(
         hjemmeside: "https://open-farm.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-manual-locked", navn: "Manuelt Låst AS",
         hjemmeside: "https://manual-farm.example.no",
         content_source: "manual", field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-claim-locked", navn: "Krevd Gård AS",
         hjemmeside: "https://claim-farm.example.no",
         content_source: "claim", field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-verified", navn: "Verifisert Gård AS",
         hjemmeside: "https://verified-farm.example.no",
         content_source: null, field_provenance: verifiedTrueProvenance,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-verified-reject", navn: "Verifisert Låst Gård AS",
         hjemmeside: "https://verified-locked-farm.example.no",
         content_source: "manual", field_provenance: verifiedTrueProvenance,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-verified-unchanged", navn: "Verifisert Uendret Gård AS",
         hjemmeside: "https://verified-unchanged-farm.example.no",
         content_source: null, field_provenance: verifiedTrueProvenance,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-verified-dryrun", navn: "Verifisert Dry-run Gård AS",
         hjemmeside: "https://verified-dryrun-farm.example.no",
         content_source: null, field_provenance: verifiedTrueProvenance,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-unchanged", navn: "Uendret Gård AS",
         hjemmeside: "https://same-farm.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-clear", navn: "Ryddes Gård AS",
         hjemmeside: "https://clear-me.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-aggregator", navn: "Aggregator-mål Gård AS",
         hjemmeside: "https://own-site.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-platform", navn: "Platform-mål Gård AS",
         hjemmeside: "https://own-site-2.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-platform-userinfo", navn: "Platform Userinfo Gård AS",
         hjemmeside: "https://own-site-3.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-empty-string", navn: "Tom Streng Gård AS",
         hjemmeside: "https://before-empty.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
       });
       insertProvider.run({
         id: "prov-audit", navn: "Revisjonsspor Gård AS",
         hjemmeside: "https://before-audit.example.no",
         content_source: null, field_provenance: null,
         updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
+      });
+
+      // ── gårdssalg per-field owner-lock narrowing fixtures (sub-slice 3d,
+      // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas) ────
+      const ownerLocksAboutTextOnly = JSON.stringify({
+        owner_locks: { about_text: { locked_at: "2026-07-01T00:00:00.000Z" } },
+      });
+      const ownerLocksHjemmeside = JSON.stringify({
+        owner_locks: { hjemmeside: { locked_at: "2026-07-01T00:00:00.000Z" } },
+      });
+
+      // (k1/k2) gårdssalg-by-producer_type claim row: owner touched a
+      // DIFFERENT field via the portal, not hjemmeside -> write should proceed.
+      insertProvider.run({
+        id: "prov-gs-claim-other-field", navn: "Gårdssalg Annet Felt AS",
+        hjemmeside: "https://gs-other-field.example.no",
+        content_source: "claim", field_provenance: ownerLocksAboutTextOnly,
+        updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: "gaardsutsalg", rfb_seed_source: null,
+      });
+      // (k3) same shape, but owner_locks.hjemmeside IS present -> still locked.
+      insertProvider.run({
+        id: "prov-gs-claim-hjemmeside-locked", navn: "Gårdssalg Hjemmeside Låst AS",
+        hjemmeside: "https://gs-hjemmeside-locked.example.no",
+        content_source: "claim", field_provenance: ownerLocksHjemmeside,
+        updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: "gaardsutsalg", rfb_seed_source: null,
+      });
+      // (k4) gårdssalg identified via rfb_seed_source instead of producer_type,
+      // no owner_locks.hjemmeside -> proceeds (proves the OR of both signals).
+      insertProvider.run({
+        id: "prov-gs-seed-claim", navn: "Gårdssalg Seed-kilde AS",
+        hjemmeside: "https://gs-seed-claim.example.no",
+        content_source: "claim", field_provenance: ownerLocksAboutTextOnly,
+        updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: "rfb-seed",
+      });
+      // (k5) critical safety/regression proof: NON-gårdssalg claim row with an
+      // adversarial owner_locks.hjemmeside key present anyway -> must STILL be
+      // rejected_locked, since isGardssalgFieldOwnerLocked must never even be
+      // consulted for this row.
+      insertProvider.run({
+        id: "prov-nongs-claim-adversarial-lock", navn: "Ikke-gårdssalg Adversarial AS",
+        hjemmeside: "https://nongs-adversarial.example.no",
+        content_source: "claim", field_provenance: ownerLocksHjemmeside,
+        updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: null, rfb_seed_source: null,
+      });
+      // (k6) gårdssalg row with content_source='manual' -> unconditionally
+      // locked regardless of field_provenance/owner_locks contents.
+      insertProvider.run({
+        id: "prov-gs-manual", navn: "Gårdssalg Manuelt AS",
+        hjemmeside: "https://gs-manual.example.no",
+        content_source: "manual", field_provenance: ownerLocksAboutTextOnly,
+        updated_at: "2026-01-01T00:00:00.000Z",
+        producer_type: "gaardsutsalg", rfb_seed_source: null,
       });
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
@@ -496,6 +568,77 @@ export function runOpplevelserHjemmesideWriteTests(
           "j15: a row with no prior verification entry never gets one invented on write",
         );
       }
+
+      // ── (k) gårdssalg per-field owner-lock narrowing (sub-slice 3d) ─────
+      // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas.
+      // isHjemmesideLocked() now defers to isGardssalgFieldOwnerLocked() for
+      // gårdssalg-identified rows (producer_type set OR rfb_seed_source ===
+      // 'rfb-seed'), narrowing the freeze from row-level to field-level;
+      // non-gårdssalg rows keep the original unconditional row-level freeze.
+
+      // k1: gårdssalg claim row (producer_type), owner touched a DIFFERENT
+      // field (about_text) but never hjemmeside -> write PROCEEDS.
+      const gsOtherField = await post({
+        apply: true,
+        items: [{ provider_id: "prov-gs-claim-other-field", hjemmeside: "https://gs-other-field-new.example.no" }],
+      });
+      assertEq(gsOtherField.body.results[0].status, "written", "k1: gårdssalg claim row, owner_locks on a different field -> proceeds (written)");
+      assertEq(getRow("prov-gs-claim-other-field")?.hjemmeside, "https://gs-other-field-new.example.no", "k1b: DB row actually updated, proving unlock is real not just response shape");
+
+      // k2: same gårdssalg row shape, but owner_locks.hjemmeside IS present
+      // -> owner touched THIS field via the portal, still wins -> rejected_locked.
+      const gsHjemmesideLocked = await post({
+        apply: true,
+        items: [{ provider_id: "prov-gs-claim-hjemmeside-locked", hjemmeside: "https://gs-hjemmeside-locked-attempt.example.no" }],
+      });
+      assertEq(gsHjemmesideLocked.body.results[0].status, "rejected_locked", "k2: gårdssalg claim row, owner_locks.hjemmeside present -> rejected_locked");
+      assertEq(getRow("prov-gs-claim-hjemmeside-locked")?.hjemmeside, "https://gs-hjemmeside-locked.example.no", "k2b: row untouched when hjemmeside itself is owner-locked");
+
+      // k3: gårdssalg identified via rfb_seed_source='rfb-seed' instead of
+      // producer_type, no owner_locks.hjemmeside -> PROCEEDS. Proves both
+      // gårdssalg-identity signals are honored.
+      const gsSeedClaim = await post({
+        apply: true,
+        items: [{ provider_id: "prov-gs-seed-claim", hjemmeside: "https://gs-seed-claim-new.example.no" }],
+      });
+      assertEq(gsSeedClaim.body.results[0].status, "written", "k3: rfb_seed_source='rfb-seed' claim row, no owner_locks.hjemmeside -> proceeds (written)");
+      assertEq(getRow("prov-gs-seed-claim")?.hjemmeside, "https://gs-seed-claim-new.example.no", "k3b: DB row actually updated for the rfb_seed_source-identified gårdssalg row");
+
+      // k4: THE CRITICAL SAFETY/REGRESSION PROOF — a NON-gårdssalg claim row
+      // (producer_type NULL, rfb_seed_source NOT 'rfb-seed') with an
+      // adversarial owner_locks.hjemmeside key present anyway must STILL be
+      // rejected_locked: a non-gårdssalg row's freeze is untouched regardless
+      // of what happens to be in field_provenance, because
+      // isGardssalgFieldOwnerLocked must never even be consulted for it.
+      const nonGsAdversarial = await post({
+        apply: true,
+        items: [{ provider_id: "prov-nongs-claim-adversarial-lock", hjemmeside: "https://nongs-adversarial-attempt.example.no" }],
+      });
+      assertEq(nonGsAdversarial.body.results[0].status, "rejected_locked", "k4: non-gårdssalg claim row with adversarial owner_locks.hjemmeside key -> STILL rejected_locked");
+      assertEq(getRow("prov-nongs-claim-adversarial-lock")?.hjemmeside, "https://nongs-adversarial.example.no", "k4b: non-gårdssalg row untouched — freeze unaffected by coincidental field_provenance contents");
+
+      // k5: gårdssalg row (producer_type set) with content_source='manual'
+      // -> stays rejected_locked unconditionally regardless of
+      // field_provenance/owner_locks contents (manual rows never consult
+      // owner_locks, same as isGardssalgFieldOwnerLocked's own contract).
+      const gsManualLocked = await post({
+        apply: true,
+        items: [{ provider_id: "prov-gs-manual", hjemmeside: "https://gs-manual-attempt.example.no" }],
+      });
+      assertEq(gsManualLocked.body.results[0].status, "rejected_locked", "k5: gårdssalg row, content_source='manual' -> rejected_locked unconditionally");
+      assertEq(getRow("prov-gs-manual")?.hjemmeside, "https://gs-manual.example.no", "k5b: manual gårdssalg row untouched regardless of field_provenance contents");
+
+      // k6: pre-existing non-gårdssalg regression fixture (no producer_type/
+      // rfb_seed_source, content_source='claim', no field_provenance at all)
+      // — this IS the non-gårdssalg regression case from before sub-slice 3d,
+      // and its rejected_locked outcome (asserted already at b3/b4 above)
+      // must not have changed. Re-assert here explicitly as the sub-slice's
+      // own regression guard.
+      const preExistingClaimLockedStillLocked = await post({
+        apply: true,
+        items: [{ provider_id: "prov-claim-locked", hjemmeside: "https://another-override-attempt.example.no" }],
+      });
+      assertEq(preExistingClaimLockedStillLocked.body.results[0].status, "rejected_locked", "k6: pre-existing non-gårdssalg prov-claim-locked fixture still rejected_locked after sub-slice 3d (regression guard)");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-hjemmeside-write: unexpected error: " + String(err?.stack || err?.message || err));
