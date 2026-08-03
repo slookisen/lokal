@@ -8863,6 +8863,314 @@ router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res
   }
 });
 
+// ─── POST /api/opplevelser/admin/providers/hjemmeside-write (admin) ─────────
+//
+// Steg 4 of the 2026-08-03-hjemmeside-skrivespak dev-request — the batch
+// write-lever the free-form PATCH .../providers/:id/hjemmeside route above
+// (isPlausibleUrlish only, no lock/denylist checks) intentionally never grew.
+// Modeled structurally on src/routes/admin-agents-url-write.ts (dry-run/apply
+// parsing, per-row transaction, batch cap, one-failure-never-aborts-the-batch)
+// but adapted to experience_providers' OWN conventions rather than the
+// agents/agent_claims ones:
+//
+//   * lock signal: `content_source IN ('manual','claim')` is the WHOLE lock
+//     — there is no separate "verified claims" table for experience_providers
+//     the way agent_claims backs agents.claimed_at. Override via
+//     `allow_locked_override: true` (per-row or top-level), the direct analog
+//     of admin-agents-url-write.ts's `allow_directory_host` escape-hatch
+//     convention (must be stated, never inferred).
+//   * host parsing: hostFromUrlLike() (cross-source-validator.ts) — the SAME
+//     parser the rest of the experiences/gardssalg code already uses
+//     everywhere (isAggregatorWebsite, gardssalg-website-verification.ts,
+//     etc.) — NOT admin-agents-url-write.ts's own local hostOf(). Two
+//     independent host-parsers already exist in this codebase; this route
+//     uses the one native to its own vertical. hostFromUrlLike already strips
+//     URL userinfo (`user:pass@host` / `user@host`) the same way hostOf()
+//     does, so the `https://evil.com@rettfrabonden.com/`-style bypass is
+//     already closed at the shared parser.
+//   * directory/aggregator denylist: isDirectoryOrAggregatorHost() +
+//     KNOWN_DIRECTORY_HOSTS (cross-source-validator.ts) — the SAME list
+//     gardssalg-website-verification.ts already classifies "aggregator" rows
+//     against, not a second copy of DIRECTORY_HOSTS.
+//   * platform-host denylist: experience_providers has NO existing
+//     platform-owned-host check (only admin-agents-url-write.ts's
+//     isPlatformOwnedHost(), scoped to the RFB/agents side). isPlatformOwnedHostForExperiences()
+//     below is a local twin, same two domains verbatim
+//     (rettfrabonden.com/.rettfrabonden.com, fly.dev/.fly.dev — the
+//     platform's actual infra domains; experience_providers can be hosted on
+//     the same Fly infra) since this is genuinely the same defect class on a
+//     second vertical, not a speculative new rule.
+//   * verification invalidation: a write that actually CHANGES the URL (skip-
+//     if-unchanged already filters no-op writes) flips a prior
+//     field_provenance.hjemmeside_verification `{verified:true}` stamp to
+//     `{verified:false, classification:"unverified", ...}` so
+//     isHjemmesideVerified() (above in this file) correctly stops trusting
+//     the OLD verification for the NEW, unverified URL. Read-modify-write on
+//     field_provenance, defensive JSON parse (malformed/missing -> `{}`,
+//     never throws, never clobbers other keys) — same pattern
+//     applyGardssalgWebsiteVerification() (gardssalg-website-verification.ts)
+//     uses, reimplemented locally here (not imported) since that function's
+//     own shape is tied to a full verification-scan row, not a single field
+//     write.
+//   * audit: one row per successful write in the NEW, generalized
+//     experience_provider_field_write_audit table (init-experiences.ts) —
+//     gardssalg_website_verification_audit is NOT reused in place, its
+//     classification/verified columns don't fit a plain field write.
+
+/** Hard cap per call — mirrors admin-agents-url-write.ts's URL_WRITE_MAX_ITEMS. */
+export const HJEMMESIDE_WRITE_MAX_ITEMS = 200;
+
+/** Our own hosts — never a provider's homepage. Local twin of
+ *  admin-agents-url-write.ts's isPlatformOwnedHost(), same two domains
+ *  verbatim, scoped to the experiences vertical (uses hostFromUrlLike, not
+ *  that file's local hostOf()). */
+function isPlatformOwnedHostForExperiences(url: string): boolean {
+  const h = hostFromUrlLike(url);
+  if (!h) return false;
+  if (h === "rettfrabonden.com" || h.endsWith(".rettfrabonden.com")) return true;
+  if (h === "fly.dev" || h.endsWith(".fly.dev")) return true;
+  return false;
+}
+
+type HjemmesideWriteOutcome =
+  | "written"
+  | "would_write"
+  | "rejected_locked"
+  | "rejected_invalid_item"
+  | "rejected_directory_host"
+  | "rejected_platform_host"
+  | "skipped_unchanged"
+  | "not_found"
+  | "error";
+
+interface HjemmesideWriteResultItem {
+  provider_id: string;
+  status: HjemmesideWriteOutcome;
+  previous_hjemmeside?: string | null;
+  new_hjemmeside?: string | null;
+  detail?: string;
+}
+
+interface HjemmesideWriteRow {
+  id: string;
+  hjemmeside: string | null;
+  content_source: string | null;
+  field_provenance: string | null;
+}
+
+const HJEMMESIDE_WRITE_ROW_SQL =
+  `SELECT id, hjemmeside, content_source, field_provenance FROM experience_providers WHERE id = ?`;
+
+/** Lock signal for experience_providers: content_source alone (no sibling
+ *  "verified claims" table exists for this entity, unlike agents/agent_claims). */
+function isHjemmesideLocked(row: HjemmesideWriteRow): boolean {
+  return row.content_source === "manual" || row.content_source === "claim";
+}
+
+/**
+ * Read-modify-write field_provenance, invalidating a stale
+ * `hjemmeside_verification: {verified:true}` stamp when the URL actually
+ * changes. Defensive parse: malformed/missing JSON -> {}, never throws,
+ * never clobbers other keys — same pattern as
+ * applyGardssalgWebsiteVerification() (gardssalg-website-verification.ts).
+ * Returns the merged object ready for JSON.stringify, or null if there was
+ * nothing to change (no prior verification entry, or it wasn't verified:true
+ * to begin with) — in which case the caller leaves field_provenance untouched.
+ */
+function invalidateHjemmesideVerificationIfPresent(
+  fieldProvenanceRaw: string | null
+): Record<string, unknown> | null {
+  let provenance: Record<string, unknown> = {};
+  if (fieldProvenanceRaw) {
+    try {
+      const parsed = JSON.parse(fieldProvenanceRaw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty, never clobber/throw */
+    }
+  }
+
+  const existing = provenance["hjemmeside_verification"];
+  const wasVerified =
+    !!existing && typeof existing === "object" && (existing as Record<string, unknown>)["verified"] === true;
+  if (!wasVerified) return null; // nothing to invalidate — leave field_provenance alone
+
+  provenance["hjemmeside_verification"] = {
+    verified: false,
+    classification: "unverified",
+    checked_at: new Date().toISOString(),
+    reason: "hjemmeside_write_invalidated_prior_verification",
+  };
+  return provenance;
+}
+
+router.post("/admin/providers/hjemmeside-write", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    items?: unknown;
+    apply?: unknown;
+    allow_locked_override?: unknown;
+  };
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true" ||
+    req.query?.apply === "1" || req.query?.apply === "true";
+  const dryRun = !apply;
+  const topLevelAllowLockedOverride = body.allow_locked_override === true;
+
+  if (!Array.isArray(body.items)) {
+    res.status(400).json({ error: "Body must contain an 'items' array of {provider_id, hjemmeside}" });
+    return;
+  }
+  if (body.items.length > HJEMMESIDE_WRITE_MAX_ITEMS) {
+    res.status(400).json({ error: `Too many items (max ${HJEMMESIDE_WRITE_MAX_ITEMS} per call)` });
+    return;
+  }
+
+  const expDb = getExpDb("experiences");
+  const batchId = `hjemmeside-write-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+  const results: HjemmesideWriteResultItem[] = [];
+
+  for (const raw of body.items as unknown[]) {
+    const it = (raw ?? {}) as {
+      provider_id?: unknown;
+      hjemmeside?: unknown;
+      allow_locked_override?: unknown;
+    };
+    const providerId = typeof it.provider_id === "string" ? it.provider_id.trim() : "";
+    if (!providerId) {
+      results.push({ provider_id: "(missing)", status: "rejected_invalid_item", detail: "provider_id required" });
+      continue;
+    }
+
+    // hjemmeside must be explicitly present: a string, or null to clear.
+    // `undefined` is a malformed item, never an inferred instruction.
+    let newValue: string | null;
+    if (it.hjemmeside === null) {
+      newValue = null;
+    } else if (typeof it.hjemmeside === "string") {
+      const trimmed = it.hjemmeside.trim();
+      if (trimmed === "") {
+        results.push({
+          provider_id: providerId,
+          status: "rejected_invalid_item",
+          detail: "empty string is not a clear instruction — send hjemmeside: null",
+        });
+        continue;
+      }
+      newValue = trimmed;
+    } else {
+      results.push({ provider_id: providerId, status: "rejected_invalid_item", detail: "hjemmeside must be a string or null" });
+      continue;
+    }
+
+    const rowAllowLockedOverride = it.allow_locked_override === true;
+    const allowLockedOverride = topLevelAllowLockedOverride || rowAllowLockedOverride;
+
+    try {
+      // 1. Load the provider row — not found never aborts the batch.
+      const cur = expDb.prepare(HJEMMESIDE_WRITE_ROW_SQL).get(providerId) as HjemmesideWriteRow | undefined;
+      if (!cur) {
+        results.push({ provider_id: providerId, status: "not_found" });
+        continue;
+      }
+      // 2. Lock check — content_source is the WHOLE lock signal here.
+      if (isHjemmesideLocked(cur) && !allowLockedOverride) {
+        results.push({ provider_id: providerId, status: "rejected_locked", previous_hjemmeside: cur.hjemmeside });
+        continue;
+      }
+      // 3. Validate the new value (skipped entirely when clearing).
+      if (newValue !== null) {
+        if (!isPlausibleUrlish(newValue)) {
+          results.push({ provider_id: providerId, status: "rejected_invalid_item", detail: "hjemmeside does not look like a plausible URL", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+          continue;
+        }
+        const host = hostFromUrlLike(newValue);
+        if (host && isDirectoryOrAggregatorHost(host)) {
+          results.push({ provider_id: providerId, status: "rejected_directory_host", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+          continue;
+        }
+        if (isPlatformOwnedHostForExperiences(newValue)) {
+          results.push({ provider_id: providerId, status: "rejected_platform_host", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+          continue;
+        }
+      }
+      // 4. Skip-if-unchanged.
+      const currentValue = cur.hjemmeside ?? null;
+      if (currentValue === newValue) {
+        results.push({ provider_id: providerId, status: "skipped_unchanged", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+        continue;
+      }
+
+      if (dryRun) {
+        results.push({ provider_id: providerId, status: "would_write", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+        continue;
+      }
+
+      const tx = expDb.transaction((): HjemmesideWriteResultItem => {
+        // Re-read from a fresh snapshot inside the transaction so a
+        // concurrent write between the pre-check above and here can't race.
+        const fresh = expDb.prepare(HJEMMESIDE_WRITE_ROW_SQL).get(providerId) as HjemmesideWriteRow | undefined;
+        if (!fresh) return { provider_id: providerId, status: "not_found" };
+        if (isHjemmesideLocked(fresh) && !allowLockedOverride) {
+          return { provider_id: providerId, status: "rejected_locked", previous_hjemmeside: fresh.hjemmeside };
+        }
+        const freshCurrentValue = fresh.hjemmeside ?? null;
+        if (freshCurrentValue === newValue) {
+          return { provider_id: providerId, status: "skipped_unchanged", previous_hjemmeside: fresh.hjemmeside, new_hjemmeside: newValue };
+        }
+
+        expDb
+          .prepare(`UPDATE experience_providers SET hjemmeside = ?, updated_at = datetime('now') WHERE id = ?`)
+          .run(newValue, providerId);
+
+        const invalidatedProvenance = invalidateHjemmesideVerificationIfPresent(fresh.field_provenance);
+        if (invalidatedProvenance) {
+          expDb
+            .prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`)
+            .run(JSON.stringify(invalidatedProvenance), providerId);
+        }
+
+        expDb
+          .prepare(
+            `INSERT INTO experience_provider_field_write_audit
+               (id, provider_id, field_name, old_value, new_value, batch_id, written_at)
+             VALUES (?, ?, 'hjemmeside', ?, ?, ?, datetime('now'))`
+          )
+          .run(crypto.randomUUID(), providerId, fresh.hjemmeside, newValue, batchId);
+
+        return { provider_id: providerId, status: "written", previous_hjemmeside: fresh.hjemmeside, new_hjemmeside: newValue };
+      });
+
+      results.push(tx());
+    } catch (err: any) {
+      results.push({ provider_id: providerId, status: "error", detail: err?.message ?? String(err) });
+    }
+  }
+
+  const summary = {
+    written: 0,
+    would_write: 0,
+    rejected_locked: 0,
+    rejected_directory_host: 0,
+    rejected_platform_host: 0,
+    skipped_unchanged: 0,
+    not_found: 0,
+    error: 0,
+  } as Record<string, number>;
+  for (const r of results) {
+    if (r.status in summary) summary[r.status]!++;
+  }
+
+  res.json({
+    success: true,
+    dry_run: dryRun,
+    batch_id: batchId,
+    results,
+    summary,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/hjemmeside-cleanup-sweep (admin) ───────────
 //
 // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,

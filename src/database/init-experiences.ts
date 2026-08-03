@@ -1012,5 +1012,42 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_field_concordance_review_queue failed:", err);
   }
 
+  // ─── experience_provider_field_write_audit (Steg 4 of the
+  // 2026-08-03-hjemmeside-skrivespak dev-request — "skrivespak for
+  // hjemmeside") ──────────────────────────────────────────────────────────
+  // Insert-only, per-write changelog for POST
+  // /api/opplevelser/admin/providers/hjemmeside-write (routes/opplevelser.ts).
+  // Generalized (field_name column, not hardcoded to "hjemmeside") on
+  // purpose so a future write-lever for another experience_providers field
+  // can reuse this SAME table rather than spinning up a fourth near-
+  // identical audit table — the gardssalg_website_verification_audit table
+  // above is NOT reused in place because its classification/verified
+  // columns are specific to the verification sweep's own vocabulary and do
+  // not fit a plain "old value -> new value" field write. Mirrors
+  // gardssalg_website_verification_audit's/experience_provider_conflict_
+  // audit's exact shape/indexing convention (this fleet's established
+  // reversible-write audit-trail idiom) — FK'd to experience_providers, ON
+  // DELETE CASCADE so orphan audit rows are cleaned up if a provider is
+  // ever deleted.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_provider_field_write_audit (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        batch_id TEXT,
+        written_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_field_write_audit_provider ON experience_provider_field_write_audit(provider_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_field_write_audit_batch ON experience_provider_field_write_audit(batch_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_field_write_audit_field ON experience_provider_field_write_audit(field_name)`);
+  } catch (err) {
+    console.error("Migration experience_provider_field_write_audit failed:", err);
+  }
+
   console.log("[experiences] schema initialized");
 }
