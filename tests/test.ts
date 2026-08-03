@@ -28917,6 +28917,35 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gvdc.failures) failures.push("opplevelser-gardssalg-verified-drinkproducer-cohort: " + f);
     console.log(`  opplevelser-gardssalg-verified-drinkproducer-cohort: ${gvdc.passed} passed, ${gvdc.failed} failed`);
 
+    // orchestrator dev-request 2026-08-03-gardssalg-field-concordance: pure
+    // classification-logic tests (extractAllEmails/extractAllPhoneRuns, each
+    // field's verdict function, buildProviderConcordanceRow, summarizeGfc)
+    // for GET /admin/gardssalg-field-concordance-audit's underlying pure
+    // module — no DB, no network. Route-level tests run right after.
+    console.log("\n── gardssalg-field-concordance: field-concordance verdicts (pure) ──");
+    const { runGardssalgFieldConcordanceTests } = require("../src/services/gardssalg-field-concordance.test") as
+      typeof import("../src/services/gardssalg-field-concordance.test");
+    const gfc = await runGardssalgFieldConcordanceTests({ log: false });
+    passed += gfc.passed;
+    failed += gfc.failed;
+    for (const f of gfc.failures) failures.push("gardssalg-field-concordance: " + f);
+    console.log(`  gardssalg-field-concordance: ${gfc.passed} passed, ${gfc.failed} failed`);
+
+    // orchestrator dev-request 2026-08-03-gardssalg-field-concordance
+    // (route-level): GET /admin/gardssalg-field-concordance-audit —
+    // read-only per-field concordance check over the verified drink-producer
+    // cohort, end-to-end through the real HTTP route, a real (in-memory) DB,
+    // and a mocked crFetchGardssalgContent fetch. Same in-memory-DB pattern,
+    // runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-field-concordance-audit: field-concordance audit endpoint ──");
+    const { runOpplevelserGardssalgFieldConcordanceAuditTests } = require("../src/routes/opplevelser-gardssalg-field-concordance-audit.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-field-concordance-audit.test");
+    const gfca = await runOpplevelserGardssalgFieldConcordanceAuditTests({ log: false });
+    passed += gfca.passed;
+    failed += gfca.failed;
+    for (const f of gfca.failures) failures.push("opplevelser-gardssalg-field-concordance-audit: " + f);
+    console.log(`  opplevelser-gardssalg-field-concordance-audit: ${gfca.passed} passed, ${gfca.failed} failed`);
+
     // dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
     // acceptance criterion 5: GET /admin/gardssalg/bookings-count — read-only
     // count + non-PII listing of existing gardssalg_bookings rows. Same

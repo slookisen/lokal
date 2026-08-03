@@ -1,0 +1,562 @@
+/**
+ * opplevelser-gardssalg-field-concordance-audit.test.ts — route-level tests
+ * for orchestrator dev-request 2026-08-03-gardssalg-field-concordance:
+ *
+ *   GET /admin/gardssalg-field-concordance-audit
+ *
+ * For every producer in the verified drink-producer cohort (the SAME
+ * provider-id set GET /admin/gardssalg-verified-drinkproducer-cohort
+ * computes), compares epost/telefon/mobil/adresse/postnummer/poststed/
+ * opening_hours_text against what's actually findable on the producer's own
+ * already-verified homepage, and reports a per-field verdict:
+ * bekreftet / avvik / ikke_funnet_på_siden. Zero writes anywhere.
+ *
+ * Mirrors opplevelser-gardssalg-website-verification.test.ts's setup
+ * (EXPERIENCES_DB_PATH=":memory:", fresh require of db-factory +
+ * gardssalg-field-concordance + opplevelser router per run, callRoute()
+ * exercising router.handle() directly with X-Admin-Key via headers, and
+ * mocks globalThis.fetch keyed by hostname for the underlying
+ * crFetchGardssalgContent crawl — same mocking convention, since this route
+ * reuses that SAME fetcher).
+ *
+ * Covers:
+ *   (a) 403 without X-Admin-Key, 403 with wrong X-Admin-Key
+ *   (b) full-cohort run: a provider whose stored fields ALL verbatim-match
+ *       the fetched page -> every field bekreftet
+ *   (c) avvik fixture: epost/telefon/mobil stored values differ from what's
+ *       extracted from the page -> avvik with correct current/found; the
+ *       four presence-only fields (adresse/postnummer/poststed/
+ *       opening_hours_text) never produce avvik (verdict space excludes it)
+ *   (d) fetch failure (simulated 500) -> EVERY field for that provider
+ *       verdicts ikke_funnet_på_siden, zero crash/throw
+ *   (e) provider with a blank hjemmeside -> fails closed the same way as a
+ *       fetch failure (never fetched, never crashes)
+ *   (f) all-blank stored fields -> every field ikke_funnet_på_siden even
+ *       though the page has real content (nothing stored to confirm)
+ *   (g) cohort membership: a non-drink producer_type (bakeri) and an
+ *       unverified drink-producer row are BOTH excluded from the cohort —
+ *       never fetched, never appear in the response
+ *   (h) providerIds filter: comma-separated query narrows to a subset;
+ *       repeated-key (array) form is also accepted; an id outside the
+ *       cohort is silently absent (never crashes the rest of the batch);
+ *       duplicate ids collapse to one entry
+ *   (i) validation: blank providerIds -> 400; >200 ids -> 400; exactly 200
+ *       -> processed (querying an empty/no-op subset, still 200)
+ *   (j) response shape: summary counts every verdict across the whole
+ *       batch, one sub-object per field
+ *   (k) zero writes anywhere — a full DB dump of experience_providers is
+ *       byte-identical before and after the call
+ */
+
+export interface TestSummary {
+  passed: number;
+  failed: number;
+  failures: string[];
+}
+
+interface RouteResult {
+  status: number;
+  body: any;
+}
+
+function callRoute(
+  router: any,
+  opts: {
+    url?: string;
+    headers?: Record<string, string>;
+    query?: Record<string, unknown>;
+  } = {},
+): Promise<RouteResult> {
+  return new Promise((resolve) => {
+    const url = opts.url || "/admin/gardssalg-field-concordance-audit";
+    const [pathOnly, queryString] = url.split("?");
+    const query: Record<string, unknown> = opts.query ? { ...opts.query } : {};
+    if (queryString) {
+      for (const [k, v] of new URLSearchParams(queryString)) query[k] = v;
+    }
+    const req: any = {
+      method: "GET",
+      url,
+      originalUrl: url,
+      path: pathOnly,
+      query,
+      headers: opts.headers || {},
+      body: {},
+      get() {
+        return undefined;
+      },
+    };
+    const res: any = {
+      statusCode: 200,
+      status(code: number) {
+        this.statusCode = code;
+        return this;
+      },
+      json(payload: any) {
+        resolve({ status: this.statusCode, body: payload });
+        return this;
+      },
+    };
+    router.handle(req, res, (err?: any) => {
+      if (err) resolve({ status: 500, body: { error: String(err) } });
+    });
+  });
+}
+
+export function runOpplevelserGardssalgFieldConcordanceAuditTests(
+  opts: { log?: boolean } = {},
+): Promise<TestSummary> {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  function assertEq(actual: unknown, expected: unknown, label: string): void {
+    if (JSON.stringify(actual) === JSON.stringify(expected)) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      const msg = `✗ ${label}\n    expected: ${JSON.stringify(expected)}\n    actual:   ${JSON.stringify(actual)}`;
+      failures.push(msg);
+      if (log) console.log("  " + msg);
+    }
+  }
+
+  function assertTrue(cond: boolean, label: string): void {
+    if (cond) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      failures.push(`✗ ${label}`);
+      if (log) console.log(`  ✗ ${label}`);
+    }
+  }
+
+  return (async () => {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    const prevAdminKey = process.env.ADMIN_KEY;
+    const prevFetch = globalThis.fetch;
+    const testKey = process.env.ADMIN_KEY || "gardssalg-field-concordance-audit-test-key";
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+    process.env.ADMIN_KEY = testKey;
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("../services/experience-store");
+    const concordanceServicePath = require.resolve("../services/gardssalg-field-concordance");
+    const opplevelserPath = require.resolve("./opplevelser");
+    const cachePaths = [dbFactoryPath, experienceStorePath, concordanceServicePath, opplevelserPath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const expDb = dbFactory.getDb("experiences");
+      const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+
+      const insertProvider = expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, hjemmeside, epost, telefon, mobil, adresse, postnummer, poststed,
+            opening_hours_text, producer_type, rfb_seed_source, catalog_hidden, field_provenance,
+            enrichment_state, verification_status, source, confidence)
+         VALUES
+           (@id, @navn, 'experiences', @hjemmeside, @epost, @telefon, @mobil, @adresse, @postnummer, @poststed,
+            @opening_hours_text, @producer_type, @rfb_seed_source, @catalog_hidden, @field_provenance,
+            'raw', 'pending_verify', 'test-fixture', 'medium')`,
+      );
+
+      const VERIFIED_STAMP = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified" },
+      });
+
+      // ── (b) full match — every stored field appears verbatim on page ────
+      insertProvider.run({
+        id: "prov-full-match",
+        navn: "Sidergarden Fullmatch",
+        hjemmeside: "https://sidergarden-fullmatch.example.no",
+        epost: "post@sidergarden.no",
+        telefon: "91234567",
+        mobil: "99887766",
+        adresse: "Gardsveien 12",
+        postnummer: "5750",
+        poststed: "Odda",
+        opening_hours_text: "Ma-Fr 10-16",
+        producer_type: "sideri",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // ── (c) avvik — stored epost/telefon/mobil all differ from page ─────
+      insertProvider.run({
+        id: "prov-avvik",
+        navn: "Bryggeriet Avvik",
+        hjemmeside: "https://bryggeriet-avvik.example.no",
+        epost: "gammel@avvikgard.no",
+        telefon: "90000001",
+        mobil: "90000002",
+        adresse: "Fjellveien 3",
+        postnummer: "6100",
+        poststed: "Volda",
+        opening_hours_text: "Man-Fre 09-15",
+        producer_type: "bryggeri",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // ── (d) fetch failure (simulated 500) ────────────────────────────────
+      insertProvider.run({
+        id: "prov-fetch-fail",
+        navn: "Vingård Utilgjengelig",
+        hjemmeside: "https://vingard-utilgjengelig.example.no",
+        epost: "post@utilgjengelig.no",
+        telefon: "91112233",
+        mobil: null,
+        adresse: "Vinveien 1",
+        postnummer: "4100",
+        poststed: "Jørpeland",
+        opening_hours_text: "Lø 11-15",
+        producer_type: "vingård",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // ── (e) blank hjemmeside — never fetched, fails closed like (d) ──────
+      insertProvider.run({
+        id: "prov-no-website",
+        navn: "Destilleri Uten Nettside",
+        hjemmeside: null,
+        epost: "post@utensted.no",
+        telefon: "92223344",
+        mobil: null,
+        adresse: "Et sted 4",
+        postnummer: "3000",
+        poststed: "Drammen",
+        opening_hours_text: "Alle dager 10-18",
+        producer_type: "destilleri",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // ── (f) all stored fields blank — nothing to confirm, even though the
+      //     page has real content ───────────────────────────────────────────
+      insertProvider.run({
+        id: "prov-blank-fields",
+        navn: "Mjøderi Tomme Felt",
+        hjemmeside: "https://mjoderi-tommefelt.example.no",
+        epost: null,
+        telefon: null,
+        mobil: null,
+        adresse: null,
+        postnummer: null,
+        poststed: null,
+        opening_hours_text: null,
+        producer_type: "mjøderi",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // ── (g) cohort-membership exclusions ─────────────────────────────────
+      insertProvider.run({
+        id: "prov-bakeri",
+        navn: "Bakeriet Utenfor Kohort",
+        hjemmeside: "https://bakeriet-utenfor.example.no",
+        epost: "post@bakeriet.no",
+        telefon: null,
+        mobil: null,
+        adresse: null,
+        postnummer: null,
+        poststed: null,
+        opening_hours_text: null,
+        producer_type: "bakeri", // NOT a drink producer type
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+      insertProvider.run({
+        id: "prov-unverified",
+        navn: "Sideri Uverifisert",
+        hjemmeside: "https://sideri-uverifisert.example.no",
+        epost: "post@uverifisert.no",
+        telefon: null,
+        mobil: null,
+        adresse: null,
+        postnummer: null,
+        poststed: null,
+        opening_hours_text: null,
+        producer_type: "sideri",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: null, // never verified -> excluded from cohort
+      });
+
+      // ── DB snapshot BEFORE any route call (zero-writes proof, section k) ─
+      const dumpProviders = () =>
+        (expDb.prepare(`SELECT * FROM experience_providers ORDER BY id`).all() as unknown[]).map((r) =>
+          JSON.stringify(r),
+        );
+      const beforeDump = dumpProviders();
+
+      let fetchCallCount = 0;
+      const fetchedHosts: string[] = [];
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const urlStr = String(url);
+        fetchCallCount++;
+        const host = new URL(urlStr).hostname;
+        fetchedHosts.push(host);
+
+        if (host === "sidergarden-fullmatch.example.no") {
+          const html = `<html><body><p>Sidergarden — velkommen til smaking.</p>
+            <p>Kontakt oss: post@sidergarden.no eller ring 912 34 567 / 998 87 766.</p>
+            <p>Adresse: Gardsveien 12, 5750 Odda.</p>
+            <p>Åpningstider: Ma-Fr 10-16.</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        if (host === "bryggeriet-avvik.example.no") {
+          // A DIFFERENT email and DIFFERENT phone numbers than what's stored
+          // — the classic avvik fixture. No address/postnr/poststed/opening
+          // hours at all, so those four fields fall to ikke_funnet_på_siden.
+          const html = `<html><body><p>Bryggeriet — kontakt: ny@avvikgard.no</p>
+            <p>Ring 900 00 009 (dagtid) eller 900 00 008 (kveld).</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        if (host === "vingard-utilgjengelig.example.no") {
+          // Simulated 500 — must classify every field ikke_funnet_på_siden,
+          // never throw, never crash the rest of the batch.
+          return {
+            ok: false, status: 500, statusText: "Internal Server Error", text: async () => "",
+            arrayBuffer: async () => new ArrayBuffer(0),
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        if (host === "mjoderi-tommefelt.example.no") {
+          const html = `<html><body><p>Mjøderiet har alt innhold likevel: post@mjoderigard.no, 900 11 223.</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        // Should never be reached — bakeriet/uverifisert are excluded from
+        // the cohort and prov-no-website has no hjemmeside to fetch.
+        return {
+          ok: false, status: 404, statusText: "Not Found", text: async () => "",
+          arrayBuffer: async () => new ArrayBuffer(0),
+          headers: { get: () => null }, url: urlStr,
+        } as unknown as Response;
+      }) as typeof fetch;
+
+      // ── (a) auth gate ─────────────────────────────────────────────────────
+      const noKey = await callRoute(opplevelserRouter);
+      assertEq(noKey.status, 403, "a1: GET without X-Admin-Key -> 403");
+      assertTrue(!noKey.body?.providers, "a2: no-key response carries no payload");
+
+      const badKey = await callRoute(opplevelserRouter, { headers: { "x-admin-key": "wrong-key" } });
+      assertEq(badKey.status, 403, "a3: GET with wrong X-Admin-Key -> 403");
+
+      const authHeaders = { "x-admin-key": testKey };
+
+      // ── full-cohort run ──────────────────────────────────────────────────
+      const full = await callRoute(opplevelserRouter, { headers: authHeaders });
+      assertEq(full.status, 200, "full1: full-cohort GET -> 200");
+      assertEq(full.body.success, true, "full2: success:true");
+      const providers: any[] = full.body.providers;
+      assertTrue(Array.isArray(providers), "full3: providers is an array");
+
+      // ── (g) cohort membership — bakeri and unverified excluded ───────────
+      assertEq(providers.length, 5, "g1: exactly 5 cohort members (bakeri + unverified excluded)");
+      assertTrue(!providers.some((p) => p.provider_id === "prov-bakeri"), "g2: non-drink producer_type never appears");
+      assertTrue(!providers.some((p) => p.provider_id === "prov-unverified"), "g3: unverified drink producer never appears");
+      assertTrue(!fetchedHosts.includes("bakeriet-utenfor.example.no"), "g4: excluded bakeri homepage never fetched");
+      assertTrue(!fetchedHosts.includes("sideri-uverifisert.example.no"), "g5: excluded unverified homepage never fetched");
+
+      // ── (b) full match -> every field bekreftet ──────────────────────────
+      const fullMatch = providers.find((p) => p.provider_id === "prov-full-match");
+      assertTrue(!!fullMatch, "b1: prov-full-match present");
+      assertEq(fullMatch.provider_name, "Sidergarden Fullmatch", "b2: provider_name passthrough");
+      assertEq(fullMatch.epost, { verdict: "bekreftet", current: "post@sidergarden.no", found: "post@sidergarden.no" }, "b3: epost bekreftet");
+      assertEq(fullMatch.telefon.verdict, "bekreftet", "b4: telefon bekreftet");
+      assertEq(fullMatch.mobil.verdict, "bekreftet", "b5: mobil bekreftet");
+      assertEq(fullMatch.adresse, { verdict: "bekreftet" }, "b6: adresse bekreftet, presence-only shape (no current/found keys)");
+      assertEq(fullMatch.postnummer, { verdict: "bekreftet" }, "b7: postnummer bekreftet");
+      assertEq(fullMatch.poststed, { verdict: "bekreftet" }, "b8: poststed bekreftet");
+      assertEq(fullMatch.opening_hours_text, { verdict: "bekreftet" }, "b9: opening_hours_text bekreftet");
+
+      // ── (c) avvik fixture ─────────────────────────────────────────────────
+      const avvik = providers.find((p) => p.provider_id === "prov-avvik");
+      assertTrue(!!avvik, "c1: prov-avvik present");
+      assertEq(avvik.epost, { verdict: "avvik", current: "gammel@avvikgard.no", found: "ny@avvikgard.no" }, "c2: epost avvik with correct current/found");
+      // telefon and mobil both scan the SAME page text independently; the
+      // page's first extracted phone run (90000009) differs from BOTH
+      // stored numbers, so both fields correctly surface it as `found` —
+      // the algorithm picks "the first candidate that differs from THIS
+      // field's own stored value", with no cross-field exclusion required
+      // by spec.
+      assertEq(avvik.telefon, { verdict: "avvik", current: "90000001", found: "90000009" }, "c3: telefon avvik with correct current/found");
+      assertEq(avvik.mobil, { verdict: "avvik", current: "90000002", found: "90000009" }, "c4: mobil avvik with correct current/found");
+      assertEq(avvik.adresse.verdict, "ikke_funnet_på_siden", "c5: adresse not on the avvik page -> ikke_funnet_på_siden (never avvik)");
+      assertEq(avvik.postnummer.verdict, "ikke_funnet_på_siden", "c6: postnummer not on page -> ikke_funnet_på_siden (never avvik)");
+      assertEq(avvik.poststed.verdict, "ikke_funnet_på_siden", "c7: poststed not on page -> ikke_funnet_på_siden (never avvik)");
+      assertEq(avvik.opening_hours_text.verdict, "ikke_funnet_på_siden", "c8: opening_hours_text not on page -> ikke_funnet_på_siden (never avvik)");
+
+      // ── (d) fetch failure -> every field ikke_funnet_på_siden ────────────
+      const fetchFail = providers.find((p) => p.provider_id === "prov-fetch-fail");
+      assertTrue(!!fetchFail, "d1: prov-fetch-fail present");
+      assertEq(fetchFail.epost, { verdict: "ikke_funnet_på_siden", current: "post@utilgjengelig.no", found: null }, "d2: epost fails closed with current still carried, found null");
+      assertEq(fetchFail.telefon.verdict, "ikke_funnet_på_siden", "d3: telefon fails closed");
+      assertEq(fetchFail.mobil, { verdict: "ikke_funnet_på_siden", current: null, found: null }, "d4: mobil (blank stored) fails closed, current null");
+      assertEq(fetchFail.adresse, { verdict: "ikke_funnet_på_siden" }, "d5: adresse fails closed");
+      assertEq(fetchFail.postnummer, { verdict: "ikke_funnet_på_siden" }, "d6: postnummer fails closed");
+      assertEq(fetchFail.poststed, { verdict: "ikke_funnet_på_siden" }, "d7: poststed fails closed");
+      assertEq(fetchFail.opening_hours_text, { verdict: "ikke_funnet_på_siden" }, "d8: opening_hours_text fails closed");
+
+      // ── (e) blank hjemmeside -> never fetched, fails closed ──────────────
+      const noWebsite = providers.find((p) => p.provider_id === "prov-no-website");
+      assertTrue(!!noWebsite, "e1: prov-no-website present");
+      assertEq(noWebsite.epost.verdict, "ikke_funnet_på_siden", "e2: epost fails closed (no hjemmeside)");
+      assertEq(noWebsite.telefon.verdict, "ikke_funnet_på_siden", "e3: telefon fails closed (no hjemmeside)");
+      assertTrue(!fetchedHosts.some((h) => h.includes("utensted")), "e4: no-website provider is never fetched at all");
+
+      // ── (f) all-blank stored fields -> ikke_funnet_på_siden despite real
+      //     page content (nothing stored to confirm) ────────────────────────
+      const blankFields = providers.find((p) => p.provider_id === "prov-blank-fields");
+      assertTrue(!!blankFields, "f1: prov-blank-fields present");
+      assertEq(blankFields.epost, { verdict: "ikke_funnet_på_siden", current: null, found: null }, "f2: blank stored epost -> ikke_funnet_på_siden even though page has an email");
+      assertEq(blankFields.telefon, { verdict: "ikke_funnet_på_siden", current: null, found: null }, "f3: blank stored telefon -> ikke_funnet_på_siden even though page has a phone run");
+      assertEq(blankFields.adresse, { verdict: "ikke_funnet_på_siden" }, "f4: blank stored adresse -> ikke_funnet_på_siden");
+
+      // ── (j) summary shape — counts every verdict across the whole batch ──
+      const s = full.body.summary;
+      assertTrue(!!s && !!s.epost && !!s.telefon, "j1: summary carries per-field sub-objects");
+      assertEq(
+        s.epost,
+        { bekreftet: 1, avvik: 1, ikke_funnet_på_siden: 3 },
+        "j2: epost summary — full-match(bekreftet) + avvik(avvik) + fetch-fail/no-website/blank(ikke_funnet_på_siden x3)",
+      );
+      assertEq(full.body.count, 5, "j3: top-level count matches providers.length");
+
+      // ── (h) providerIds filter ────────────────────────────────────────────
+      const filtered = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=prov-full-match,prov-avvik",
+      });
+      assertEq(filtered.status, 200, "h1: providerIds filter -> 200");
+      assertEq(filtered.body.providers.length, 2, "h2: exactly 2 providers returned");
+      assertTrue(
+        filtered.body.providers.every((p: any) => ["prov-full-match", "prov-avvik"].includes(p.provider_id)),
+        "h3: only the filtered ids are present",
+      );
+
+      // Array/repeated-key form (bypassing URL string parsing) — the route
+      // must accept Array.isArray(req.query.providerIds) too.
+      const filteredArrayForm = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        query: { providerIds: ["prov-full-match"] },
+      });
+      assertEq(filteredArrayForm.status, 200, "h4: array-form providerIds -> 200");
+      assertEq(filteredArrayForm.body.providers.length, 1, "h5: array-form providerIds narrows to exactly one");
+      assertEq(filteredArrayForm.body.providers[0].provider_id, "prov-full-match", "h6: array-form providerIds resolves the right row");
+
+      // An id outside the cohort (unknown + a real-but-excluded id) mixed
+      // into a real id -> silently absent, never crashes the rest.
+      const withUnknown = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=prov-full-match,prov-does-not-exist,prov-bakeri",
+      });
+      assertEq(withUnknown.status, 200, "h7: batch with unknown/excluded ids -> 200, no crash");
+      assertEq(withUnknown.body.providers.length, 1, "h8: only the one real cohort member survives");
+      assertEq(withUnknown.body.providers[0].provider_id, "prov-full-match", "h9: the surviving row is correct and unaffected");
+
+      // Duplicate ids collapse to one entry.
+      const withDupes = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=prov-full-match,prov-full-match,prov-full-match",
+      });
+      assertEq(withDupes.status, 200, "h10: duplicate providerIds -> 200");
+      assertEq(withDupes.body.providers.length, 1, "h11: duplicates collapse to exactly one entry");
+
+      // ── (i) validation ─────────────────────────────────────────────────────
+      const blankFilter = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=",
+      });
+      assertEq(blankFilter.status, 400, "i1: blank providerIds -> 400");
+      assertTrue(typeof blankFilter.body?.error === "string", "i1b: error message present");
+
+      const whitespaceOnly = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=%20%20,%20",
+      });
+      assertEq(whitespaceOnly.status, 400, "i2: whitespace-only providerIds entries -> 400 (nothing usable survives trimming)");
+
+      const tooMany = Array.from({ length: 201 }, (_, i) => `prov-bulk-${i}`).join(",");
+      const overCap = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: `/admin/gardssalg-field-concordance-audit?providerIds=${tooMany}`,
+      });
+      assertEq(overCap.status, 400, "i3: 201 ids -> 400 (exceeds cap of 200)");
+      assertTrue(/200/.test(overCap.body.error || ""), "i3b: error message names the cap");
+
+      const exactlyCap = Array.from({ length: 200 }, (_, i) => `prov-bulk-${i}`).join(",");
+      const atCap = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: `/admin/gardssalg-field-concordance-audit?providerIds=${exactlyCap}`,
+      });
+      assertEq(atCap.status, 200, "i4: exactly 200 (all nonexistent) ids -> 200, not rejected");
+      assertEq(atCap.body.providers.length, 0, "i5: none of the 200 nonexistent ids resolve to a row -> empty (but valid) response");
+      assertEq(atCap.body.count, 0, "i6: count reflects the empty result");
+
+      // ── (k) zero writes anywhere ──────────────────────────────────────────
+      const afterDump = dumpProviders();
+      assertEq(afterDump, beforeDump, "k1: experience_providers table is byte-identical before/after every call above");
+      assertTrue(fetchCallCount > 0, "k1b: sanity — the mocked fetch was actually exercised (the zero-writes assertion isn't vacuous)");
+    } catch (err: any) {
+      failed++;
+      failures.push(
+        "opplevelser-gardssalg-field-concordance-audit: unexpected error: " + String(err?.stack || err?.message || err),
+      );
+    } finally {
+      if (prevExperiencesDbPath === undefined) {
+        delete process.env.EXPERIENCES_DB_PATH;
+      } else {
+        process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      }
+      if (prevAdminKey === undefined) {
+        delete process.env.ADMIN_KEY;
+      } else {
+        process.env.ADMIN_KEY = prevAdminKey;
+      }
+      globalThis.fetch = prevFetch;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch {
+        // best-effort cleanup
+      }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+
+    return { passed, failed, failures };
+  })();
+}
+
+// Standalone runner: `npx tsx src/routes/opplevelser-gardssalg-field-concordance-audit.test.ts`
+if (require.main === module) {
+  runOpplevelserGardssalgFieldConcordanceAuditTests({ log: true }).then((summary) => {
+    console.log(`\n${summary.passed} passed, ${summary.failed} failed`);
+    process.exit(summary.failed > 0 ? 1 : 0);
+  });
+}

@@ -226,6 +226,21 @@ import {
   type GsWvScope,
   type GsWvCohort,
 } from "../services/gardssalg-website-verification";
+// orchestrator dev-request 2026-08-03-gardssalg-field-concordance:
+// GET /admin/gardssalg-field-concordance-audit — read-only per-field
+// concordance check (DB-stored value vs. what's actually findable on the
+// producer's own already-verified homepage) over the verified drink-producer
+// cohort. Pure comparison logic lives entirely in gardssalg-field-
+// concordance.ts (no DB access, no fetch) — this route only supplies the
+// cohort rows (reusing GET /admin/gardssalg-verified-drinkproducer-cohort's
+// own provider-id-set query below, unchanged) and each producer's
+// already-fetched page text via crFetchGardssalgContent + gardssalgPageText,
+// the SAME pipeline content-refresh/website-verification already use.
+import {
+  buildProviderConcordanceRow,
+  summarizeGfc,
+  type GfcProviderResult,
+} from "../services/gardssalg-field-concordance";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
 // category mapper differs (experiences vocab, not the food vocab).
@@ -6977,6 +6992,174 @@ router.get("/admin/gardssalg-verified-drinkproducer-cohort", requireAdmin, (_req
     },
     cohort,
   });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-field-concordance-audit ───────────
+//
+// orchestrator dev-request 2026-08-03-gardssalg-field-concordance: for every
+// producer in the verified drink-producer cohort (the SAME provider-id set
+// GET /admin/gardssalg-verified-drinkproducer-cohort just above computes —
+// producer_type IN DRINK_PRODUCER_TYPES AND isHjemmesideVerified(field_
+// provenance), reused/mirrored here rather than re-derived, since that route
+// itself has no exported cohort-loader function to call directly), compares
+// epost/telefon/mobil/adresse/postnummer/poststed/opening_hours_text against
+// what's actually findable on the producer's own already-verified homepage,
+// and reports a per-field verdict (bekreftet / avvik / ikke_funnet_på_siden
+// — see gardssalg-field-concordance.ts's own doc comment for the full rule).
+//
+// Fetch mechanism: crFetchGardssalgContent + gardssalgPageText, the SAME
+// SSRF-guarded pipeline content-refresh/gardssalg-website-verification.ts
+// already use — never a new fetch path. A fetch failure (or a cohort row
+// with no usable hjemmeside at all — should not occur in practice since
+// isHjemmesideVerified implies a hjemmeside was once verified, but handled
+// defensively anyway) fails CLOSED: every field for that provider verdicts
+// ikke_funnet_på_siden, never guessed, never thrown — a failure inside one
+// producer's fetch must never crash or skip the rest of the batch.
+//
+// providerIds: optional filter, query-string (`?providerIds=id1,id2` or
+// repeated `?providerIds=id1&providerIds=id2` — either form is accepted).
+// Same validation discipline as POST /admin/gardssalg-outreach-preflight's
+// own provider_ids batch (a few hundred lines above): parameter-bound
+// `IN (...)` only, never string-interpolated; deduplicated preserving
+// first-seen order; capped at MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH with a
+// 400 if exceeded. An id that doesn't resolve to a row in the drink-producer
+// cohort (unknown id, or a real id just outside that cohort) is silently
+// absent from the response rather than erroring — unlike outreach-preflight,
+// this endpoint's contract is "a verdict per COHORT MEMBER", not "an answer
+// per REQUESTED id", so there is no ikke_funnet-style placeholder row to
+// synthesize for it; the acceptance bar is simply that it never crashes the
+// rest of the batch, which the parameter-bound SQL already guarantees.
+//
+// Zero writes of any kind — no field_provenance stamp, no queue insert, no
+// DB write whatsoever. This is a pure GET, purely diagnostic.
+const MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH = 200;
+
+router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req: Request, res: Response) => {
+  const rawProviderIds = req.query.providerIds;
+  let providerIdsFilter: string[] | undefined;
+  if (rawProviderIds !== undefined) {
+    const rawList: string[] = Array.isArray(rawProviderIds)
+      ? (rawProviderIds as unknown[]).map((v) => String(v))
+      : String(rawProviderIds).split(",");
+    // Dedupe while preserving first-seen order — same discipline as
+    // POST /admin/gardssalg-outreach-preflight's provider_ids handling.
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+    for (const raw of rawList) {
+      const id = raw.trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      ordered.push(id);
+    }
+    if (ordered.length === 0) {
+      res.status(400).json({ error: "providerIds må inneholde minst én ikke-tom id." });
+      return;
+    }
+    if (ordered.length > MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH) {
+      res.status(400).json({
+        error: `providerIds overstiger maks batch-størrelse på ${MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH}.`,
+      });
+      return;
+    }
+    providerIdsFilter = ordered;
+  }
+
+  const expDb = getExpDb("experiences");
+  try {
+    const drinkTypes = Array.from(DRINK_PRODUCER_TYPES);
+    const typePlaceholders = drinkTypes.map(() => "?").join(", ");
+
+    let sql = `SELECT id, navn, hjemmeside, epost, telefon, mobil, adresse, postnummer, poststed,
+                      opening_hours_text, field_provenance
+                 FROM experience_providers
+                WHERE producer_type IN (${typePlaceholders})`;
+    const params: string[] = [...drinkTypes];
+    if (providerIdsFilter) {
+      const idPlaceholders = providerIdsFilter.map(() => "?").join(", ");
+      sql += ` AND id IN (${idPlaceholders})`;
+      params.push(...providerIdsFilter);
+    }
+    sql += ` ORDER BY id`;
+
+    let rows: Array<{
+      id: string;
+      navn: string;
+      hjemmeside: string | null;
+      epost: string | null;
+      telefon: string | null;
+      mobil: string | null;
+      adresse: string | null;
+      postnummer: string | null;
+      poststed: string | null;
+      opening_hours_text: string | null;
+      field_provenance: string | null;
+    }> = [];
+    try {
+      rows = expDb.prepare(sql).all(...params) as typeof rows;
+    } catch (err) {
+      console.error("[gardssalg-field-concordance-audit] failed to query providers:", err);
+      res.status(500).json({ error: "Failed to query experience_providers" });
+      return;
+    }
+
+    // Same fail-closed gate as GET /admin/gardssalg-verified-drinkproducer-
+    // cohort above — verified === true only, never a truthy/ambiguous check.
+    const cohort = rows.filter((p) => isHjemmesideVerified(p.field_provenance));
+
+    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
+      const fetched = await crFetchGardssalgContent(homepageUrl);
+      if (!fetched.ok) return { ok: false, reason: fetched.reason };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+    };
+
+    const providers: GfcProviderResult[] = [];
+    for (let i = 0; i < cohort.length; i += CR_CONCURRENCY) {
+      const slice = cohort.slice(i, i + CR_CONCURRENCY);
+      const sliceResults = await Promise.all(
+        slice.map(async (p) => {
+          const hjemmeside = p.hjemmeside && p.hjemmeside.trim() !== "" ? p.hjemmeside.trim() : null;
+          let pageText: string | null = null;
+          if (hjemmeside) {
+            try {
+              const fetched = await fetchFn(hjemmeside);
+              pageText = fetched.ok ? fetched.pageText : null;
+            } catch {
+              // fetchFn's own contract never throws in practice, but this
+              // route treats a throw exactly like a reported failure —
+              // fail-closed either way, never an uncaught rejection, never a
+              // crashed batch.
+              pageText = null;
+            }
+          }
+          return buildProviderConcordanceRow(
+            {
+              id: p.id,
+              navn: p.navn,
+              epost: p.epost,
+              telefon: p.telefon,
+              mobil: p.mobil,
+              adresse: p.adresse,
+              postnummer: p.postnummer,
+              poststed: p.poststed,
+              opening_hours_text: p.opening_hours_text,
+            },
+            pageText,
+          );
+        }),
+      );
+      providers.push(...sliceResults);
+    }
+
+    res.json({
+      success: true,
+      count: providers.length,
+      summary: summarizeGfc(providers),
+      providers,
+    });
+  } catch (err) {
+    console.error("[gardssalg-field-concordance-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-provider-dedup-audit ───────────────
