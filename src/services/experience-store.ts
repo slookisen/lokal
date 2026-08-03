@@ -5426,6 +5426,12 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // rollback vetoes av gardssalgContactFieldWasRolledBack i skriveren.
   "epost",
   "telefon",
+  // 2026-08-03 (gardssalg-field-concordance-review-approve) —
+  // applyGardssalgFieldConcordanceApproval writes mobil via the same
+  // audit-trail discipline as epost/telefon above (a confirmed avvik
+  // approval, not a fill-only extraction, but the audit row shape is
+  // identical), so the standard rollback lever must cover it too.
+  "mobil",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
@@ -5721,4 +5727,189 @@ export function applyGardssalgContentRollback(
   }
 
   return restored;
+}
+
+// ─── Gårdssalg field-concordance review-queue approval (orchestrator
+// dev-request 2026-08-03-gardssalg-field-concordance-review-approve) ────────
+// The missing consumer for gardssalg_field_concordance_review_queue (see its
+// schema doc comment, init-experiences.ts, and applyGardssalgFieldConcordance
+// above — the scanner that populates the queue but never resolves it). Same
+// strict "confirmation surface, never an arbitrary-write surface" contract as
+// applyGardssalgProviderOrgnr/applyGardssalgProviderWebsite's own approve
+// levers: the route (routes/opplevelser.ts) only ever calls this with the
+// EXACT (provider_id, field_name, found_value) triple the queue itself
+// carries, having already rejected anything else.
+
+/** Field names this approval function may ever write. adresse/postnummer/
+ *  poststed/opening_hours_text (the four presence-only GFC fields) are
+ *  deliberately NEVER in this set — they can never land an avvik in the
+ *  queue in the first place (see GFC_AVVIK_CAPABLE_FIELDS), and this
+ *  function must reject them even if a caller tried anyway. Validated BEFORE
+ *  fieldName is ever used in a SQL string. */
+const GFC_APPROVAL_FIELDS = new Set(["epost", "telefon", "mobil"]);
+
+export type GfcApprovalResult = {
+  provider_id: string;
+  field_name: string;
+  written: boolean;
+  reason?: "invalid_field" | "not_found" | "owner_locked" | "stale_current_value";
+};
+
+/**
+ * Apply ONE confirmed gardssalg_field_concordance_review_queue finding to
+ * experience_providers.<fieldName>. Unlike every other gårdssalg write
+ * helper in this file (applyGardssalgProviderContact et al., which are
+ * fill-only — they only ever write when the existing value is blank), this
+ * one OVERWRITES a non-blank value: the entire point of an `avvik` finding
+ * is "the stored value contradicts the producer's own verified homepage",
+ * so a confirmed approval must be able to correct it, not just fill a gap.
+ *
+ * Guard order (first failing gate wins, no DB write on any of them):
+ *   1. fieldName not in GFC_APPROVAL_FIELDS -> "invalid_field", no DB call
+ *      at all (defense in depth — field_name can arrive from an admin
+ *      request body one hop up).
+ *   2. provider not found -> "not_found".
+ *   3. isGardssalgFieldOwnerLocked(row, fieldName) -> "owner_locked" (the
+ *      SAME per-field lock policy every other gårdssalg write helper in this
+ *      file consults — see its own doc comment. mobil is not in
+ *      GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS, so for content_source='claim'
+ *      rows it always falls into that helper's "any other fieldName ->
+ *      always locked" branch, same as epost/telefon today).
+ *   4. the row's CURRENT value for fieldName (trimmed, blank -> null)
+ *      doesn't match `expectedCurrentValue` (same normalisation) ->
+ *      "stale_current_value" — something else already changed the field
+ *      since this finding was queued; approving the stale finding would
+ *      silently clobber that other change.
+ *
+ * On success: read-modify-write field_provenance[fieldName] (defensive JSON
+ * parse, malformed/missing -> {}, never clobbers other keys — same recipe as
+ * applyGardssalgProviderContact above), UPDATE the column, and insert one
+ * gardssalg_content_audit row (old_value = the true pre-write trimmed
+ * current value, new_value = newValue, source_url = the same value stamped
+ * into field_provenance) — all inside one db.transaction. Returns
+ * `{written: true}` (no `reason`).
+ */
+export function applyGardssalgFieldConcordanceApproval(
+  providerId: string,
+  fieldName: string,
+  expectedCurrentValue: string | null,
+  newValue: string,
+  batchId?: string
+): GfcApprovalResult {
+  if (!GFC_APPROVAL_FIELDS.has(fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "invalid_field" };
+  }
+
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, epost, telefon, mobil, hjemmeside, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        epost: string | null;
+        telefon: string | null;
+        mobil: string | null;
+        hjemmeside: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "not_found" };
+  }
+
+  if (isGardssalgFieldOwnerLocked(row, fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "owner_locked" };
+  }
+
+  const normalise = (v: string | null | undefined): string | null => {
+    if (v === null || v === undefined) return null;
+    const trimmed = String(v).trim();
+    return trimmed === "" ? null : trimmed;
+  };
+  const currentValueRaw = (row as unknown as Record<string, string | null>)[fieldName] ?? null;
+  const currentValue = normalise(currentValueRaw);
+  if (currentValue !== normalise(expectedCurrentValue)) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "stale_current_value" };
+  }
+
+  const evidenceUrl = row.hjemmeside || "internal://field-concordance-review-approve";
+
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance[fieldName] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET ${fieldName} = @newValue, field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`
+    ).run({ id: providerId, newValue, field_provenance: JSON.stringify(provenance) });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      field_name: fieldName,
+      old_value: currentValue,
+      new_value: newValue,
+      source_url: evidenceUrl,
+      batch_id: batchId ?? null,
+    });
+  });
+  applyWithAudit();
+
+  return { provider_id: providerId, field_name: fieldName, written: true };
+}
+
+export type GardssalgFieldConcordanceReviewQueueEntry = {
+  id: string;
+  provider_id: string;
+  provider_name: string | null;
+  field_name: string;
+  current_value: string | null;
+  found_value: string | null;
+  reason: string;
+  batch_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Lists all current gardssalg_field_concordance_review_queue entries,
+ *  newest-updated first. Read-only, backs GET /admin/gardssalg-field-
+ *  concordance-review-queue. Mirrors listGardssalgOrgnrReviewQueue's
+ *  shape/typing style. */
+export function listGardssalgFieldConcordanceReviewQueue(): GardssalgFieldConcordanceReviewQueueEntry[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(`SELECT * FROM gardssalg_field_concordance_review_queue ORDER BY updated_at DESC`)
+    .all() as GardssalgFieldConcordanceReviewQueueEntry[];
+}
+
+/** Removes ONE (provider_id, field_name) entry from
+ *  gardssalg_field_concordance_review_queue. IMPORTANT: unlike
+ *  clearGardssalgOrgnrReviewQueueEntry/clearGardssalgWebsiteReviewQueueEntry
+ *  (both UNIQUE(provider_id) only), this table is UNIQUE(provider_id,
+ *  field_name) — a single producer can have up to 3 independently-pending
+ *  avvik rows (epost/telefon/mobil). The DELETE is scoped to BOTH columns so
+ *  approving one field never wrongly deletes a different still-pending field
+ *  for the same provider. Never throws if no row exists. */
+export function clearGardssalgFieldConcordanceReviewQueueEntry(providerId: string, fieldName: string): void {
+  const db = getDb(VERTICAL);
+  db.prepare(`DELETE FROM gardssalg_field_concordance_review_queue WHERE provider_id = ? AND field_name = ?`).run(
+    providerId,
+    fieldName
+  );
 }
