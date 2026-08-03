@@ -28946,6 +28946,31 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gfca.failures) failures.push("opplevelser-gardssalg-field-concordance-audit: " + f);
     console.log(`  opplevelser-gardssalg-field-concordance-audit: ${gfca.passed} passed, ${gfca.failed} failed`);
 
+    // orchestrator dev-request 2026-08-03-gardssalg-field-concordance-write:
+    // applyGardssalgFieldConcordance write-logic tests (services/gardssalg-
+    // field-concordance.ts) — real in-memory experiences DB, no HTTP route.
+    console.log("\n── gardssalg-field-concordance-write: applyGardssalgFieldConcordance ──");
+    const { runGardssalgFieldConcordanceWriteTests } = require("../src/services/gardssalg-field-concordance-write.test") as
+      typeof import("../src/services/gardssalg-field-concordance-write.test");
+    const gfcw = await runGardssalgFieldConcordanceWriteTests({ log: false });
+    passed += gfcw.passed;
+    failed += gfcw.failed;
+    for (const f of gfcw.failures) failures.push("gardssalg-field-concordance-write: " + f);
+    console.log(`  gardssalg-field-concordance-write: ${gfcw.passed} passed, ${gfcw.failed} failed`);
+
+    // orchestrator dev-request 2026-08-03-gardssalg-field-concordance-write
+    // (route-level): POST /admin/gardssalg-field-concordance-remediation —
+    // dry-run/apply write side of the read-only GET audit route above, same
+    // in-memory-DB + mocked-fetch harness.
+    console.log("\n── opplevelser-gardssalg-field-concordance-remediation: field-concordance remediation endpoint ──");
+    const { runOpplevelserGardssalgFieldConcordanceRemediationTests } = require("../src/routes/opplevelser-gardssalg-field-concordance-remediation.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-field-concordance-remediation.test");
+    const gfcr = await runOpplevelserGardssalgFieldConcordanceRemediationTests({ log: false });
+    passed += gfcr.passed;
+    failed += gfcr.failed;
+    for (const f of gfcr.failures) failures.push("opplevelser-gardssalg-field-concordance-remediation: " + f);
+    console.log(`  opplevelser-gardssalg-field-concordance-remediation: ${gfcr.passed} passed, ${gfcr.failed} failed`);
+
     // dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
     // acceptance criterion 5: GET /admin/gardssalg/bookings-count — read-only
     // count + non-PII listing of existing gardssalg_bookings rows. Same
