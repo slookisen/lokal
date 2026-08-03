@@ -496,12 +496,26 @@ export function isClaimRateLimited(providerId: string): boolean {
 
 // ── Issue a claim magic link (DB insert only — sending the email is the
 // route layer's job, via email-service.ts, mirroring RFB's split) ─────────
+//
+// "manual" (added dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+// laas, item 2 — admin claim-grant) is a FOURTH, distinct source tag from
+// deriveOrgLinkedEmail()'s three tiers above. It marks a claim minted by
+// issueAdminGrantedClaimMagicLink() (below) for a producer who contacted
+// kontakt@opplevagent.no directly asking to claim — a human-vouched address
+// an admin operator typed in, not a machine-derived one — so it must stay
+// distinguishable in the gardssalg_claims audit trail from every self-serve
+// tier. NOT to be confused with experience_providers.content_source='manual'
+// (Daniel's own hand-curated ROWS) — same word, different column, unrelated
+// meaning; see issueAdminGrantedClaimMagicLink's own doc for why this route
+// deliberately never touches content_source at all.
+export type ClaimEmailSource = "brreg_contact" | "verified_domain_address" | "stored_epost_verified" | "manual";
+
 export interface IssuedClaim {
   claimId: string;
   token: string;
   email: string;
   maskedEmail: string;
-  source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified";
+  source: ClaimEmailSource;
   expiresAt: string;
   /** dev-request 2026-07-26-booking-test-send-guard — see issueClaimMagicLink. */
   isTest: boolean;
@@ -510,6 +524,40 @@ export interface IssuedClaim {
 export type IssueClaimResult =
   | { ok: true; claim: IssuedClaim }
   | { ok: false; error: "provider_not_found" | "not_brreg_verified" | "no_org_linked_email" | "rate_limited" };
+
+// Shared INSERT — the ONE place a gardssalg_claims row is actually created,
+// used by both issueClaimMagicLink() (self-serve, derived email) and
+// issueAdminGrantedClaimMagicLink() (admin-granted, operator-supplied email)
+// below, so the two paths can never diverge in token generation, expiry, or
+// row shape — only in how `email`/`source` were arrived at.
+function insertGardssalgClaimRow(
+  providerId: string,
+  email: string,
+  source: ClaimEmailSource,
+  opts: { isTest?: boolean } = {},
+): IssuedClaim {
+  const db = getDb(VERTICAL);
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + CLAIM_MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000);
+  const claimId = `gsc_${crypto.randomBytes(8).toString("hex")}`;
+  const isTest = opts.isTest === true ? 1 : 0;
+
+  db.prepare(
+    `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at, is_test)
+     VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+  ).run(claimId, providerId, email, source, token, now.toISOString(), expiresAt.toISOString(), isTest);
+
+  return {
+    claimId,
+    token,
+    email,
+    maskedEmail: maskEmail(email),
+    source,
+    expiresAt: expiresAt.toISOString(),
+    isTest: isTest === 1,
+  };
+}
 
 // `opts.isTest` (dev-request 2026-07-26-booking-test-send-guard) marks the
 // claim as a deliberate end-to-end test so the route layer redirects its
@@ -530,30 +578,80 @@ export function issueClaimMagicLink(
 
   if (isClaimRateLimited(providerId)) return { ok: false, error: "rate_limited" };
 
+  const claim = insertGardssalgClaimRow(providerId, derived.email, derived.source, { isTest: opts.isTest });
+  return { ok: true, claim };
+}
+
+// ── Admin-granted claim (dev-request 2026-07-30-opplevagent-claim-epost-og-
+// perfelt-laas, item 2 ONLY — item 3 per-field lock and item 4 CTA-hiding are
+// separate slices, not built here) ────────────────────────────────────────
+//
+// For a producer who emailed kontakt@opplevagent.no directly asking to claim
+// their profile, rather than reaching the self-serve flow. An admin operator
+// reads that request and supplies the exact `email` to grant — this is a
+// HUMAN-VOUCHED address, not one deriveOrgLinkedEmail() computes, so this
+// function deliberately does NOT call deriveOrgLinkedEmail()/
+// deriveOrgLinkedEmailWithOutreachLookup() at all (no brreg_verified gate
+// either — that gate exists to protect the SELF-SERVE derivation tiers from
+// minting an address for an unconfirmed legal entity; it says nothing about
+// an admin who has already read the request and knows which provider it's
+// for). It DOES reuse the exact same magic-link mechanics as the self-serve
+// path — insertGardssalgClaimRow() above, the same token/expiry shape, the
+// same gardssalg_claims row, the same verifyClaimToken()/session flow once
+// clicked — so there is only ONE magic-link mechanism in this codebase, not
+// two parallel ones.
+//
+// email_source is recorded as 'manual' (see ClaimEmailSource's doc above) —
+// a fourth, audit-visible tier distinct from the three self-serve ones.
+//
+// Deliberately never touches experience_providers.content_source: that stays
+// entirely verifyClaimToken()'s job, unchanged, run at the SAME point in the
+// flow (the link being clicked) as every other tier — so a producer granted
+// through this path ends up on content_source='claim' once they verify,
+// exactly like a self-serve claim, and can edit their profile in the portal.
+// It must NOT become content_source='manual' (Daniel's own hand-entered,
+// enrichment-frozen rows) — this function's own write path plays no part in
+// setting content_source at all, so there is no way for it to.
+//
+// Does NOT call isClaimRateLimited(): that limiter exists to stop a public,
+// unauthenticated caller from spamming magic-link sends at an address they
+// don't control (src/routes/gardssalg-claim.ts's public POST .../request).
+// This function is only ever reached via an X-Admin-Key-gated route — not a
+// public abuse surface — so the self-serve rate limit does not apply here.
+//
+// "Already claimed, non-revoked" guard (hasActiveNonRevokedClaim, below):
+// rejects granting a NEW claim while an existing one is both used (someone
+// completed a claim) AND not revoked (that access was never explicitly
+// revoked). Deliberately NOT keyed on that claim's expires_at — content_
+// source='claim' is a PERMANENT mark once verifyClaimToken sets it, so
+// "is this provider already claimed" is an ownership question, not a
+// question about one token's current session-validity window. A REVOKED
+// prior claim (a real owner logout, or an admin-forced revoke) does NOT
+// block this route — re-granting access after a revoke is exactly the
+// legitimate case this guard must still allow through.
+export type IssueAdminGrantedClaimResult =
+  | { ok: true; claim: IssuedClaim }
+  | { ok: false; error: "provider_not_found" | "invalid_email" | "already_claimed" };
+
+export function hasActiveNonRevokedClaim(providerId: string): boolean {
   const db = getDb(VERTICAL);
-  const token = crypto.randomBytes(32).toString("hex");
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + CLAIM_MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000);
-  const claimId = `gsc_${crypto.randomBytes(8).toString("hex")}`;
-  const isTest = opts.isTest === true ? 1 : 0;
+  const row = db
+    .prepare(`SELECT 1 FROM gardssalg_claims WHERE provider_id = ? AND used = 1 AND revoked_at IS NULL LIMIT 1`)
+    .get(providerId);
+  return !!row;
+}
 
-  db.prepare(
-    `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at, is_test)
-     VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-  ).run(claimId, providerId, derived.email, derived.source, token, now.toISOString(), expiresAt.toISOString(), isTest);
+export function issueAdminGrantedClaimMagicLink(providerId: string, email: string): IssueAdminGrantedClaimResult {
+  const provider = getClaimProviderById(providerId);
+  if (!provider) return { ok: false, error: "provider_not_found" };
 
-  return {
-    ok: true,
-    claim: {
-      claimId,
-      token,
-      email: derived.email,
-      maskedEmail: maskEmail(derived.email),
-      source: derived.source,
-      expiresAt: expiresAt.toISOString(),
-      isTest: isTest === 1,
-    },
-  };
+  const normalized = normalizeEmail(email);
+  if (!normalized || !isPlausibleEmailShape(normalized)) return { ok: false, error: "invalid_email" };
+
+  if (hasActiveNonRevokedClaim(providerId)) return { ok: false, error: "already_claimed" };
+
+  const claim = insertGardssalgClaimRow(providerId, normalized, "manual");
+  return { ok: true, claim };
 }
 
 // ── Verify a magic-link token -> mark used, stamp the claim lock ─────────

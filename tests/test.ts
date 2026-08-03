@@ -29391,6 +29391,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gob.failures) failures.push("opplevelser-gardssalg-orgnr-backfill: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-backfill: ${gob.passed} passed, ${gob.failed} failed`);
 
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2:
+    // admin claim-grant — issueAdminGrantedClaimMagicLink()/
+    // hasActiveNonRevokedClaim() (src/services/gardssalg-claim.ts) and
+    // POST /admin/gardssalg-claim-grant (src/routes/opplevelser.ts). Lets an
+    // admin grant a claim magic-link to a producer who emailed
+    // kontakt@opplevagent.no directly, via the SAME magic-link mechanics as
+    // the self-serve flow, WITHOUT ever stamping content_source='manual'.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── opplevelser-gardssalg-claim-grant: admin claim-grant lever ──");
+    const { runOpplevelserGardssalgClaimGrantTests } = require("../src/routes/opplevelser-gardssalg-claim-grant.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-claim-grant.test");
+    const gcg = await runOpplevelserGardssalgClaimGrantTests({ log: false });
+    passed += gcg.passed;
+    failed += gcg.failed;
+    for (const f of gcg.failures) failures.push("opplevelser-gardssalg-claim-grant: " + f);
+    console.log(`  opplevelser-gardssalg-claim-grant: ${gcg.passed} passed, ${gcg.failed} failed`);
+
     // dev-request 2026-07-26-booking-test-send-guard: per-transaction test
     // flag that redirects EVERY outgoing email of that one transaction to
     // TEST_SEND_REDIRECT_EMAIL (services/send-guard.ts, applied inside

@@ -288,8 +288,16 @@ import { fetchBrregContact } from "../services/brreg-client";
 // drivers below (POST /admin/booking-test-send, POST /admin/claim-test-send)
 // are the ONLY call sites that may set the per-transaction test flag.
 import { testSendRedirectAddress } from "../services/send-guard";
-import { issueClaimMagicLink, getClaimProviderById, isClaimableDomain } from "../services/gardssalg-claim";
-import { normalizeDomain } from "../services/blocklist-service";
+import {
+  issueClaimMagicLink,
+  getClaimProviderById,
+  isClaimableDomain,
+  // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2 —
+  // POST /admin/gardssalg-claim-grant below.
+  issueAdminGrantedClaimMagicLink,
+  hasActiveNonRevokedClaim,
+} from "../services/gardssalg-claim";
+import { normalizeDomain, normalizeEmail } from "../services/blocklist-service";
 import { emailService } from "../services/email-service";
 
 // Same derivation as gardssalg-claim.ts's own constant — the verify URL must
@@ -4407,6 +4415,154 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
     is_test: result.claim.isTest,
     intended_recipient: result.claim.email,
     intended_recipient_masked: result.claim.maskedEmail,
+    email_source: result.claim.source,
+    expires_at: result.claim.expiresAt,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-claim-grant (admin) ─────────────
+//
+// dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2
+// ONLY (item 3 per-field lock, item 4 CTA-hiding on claimed profiles are
+// separate slices, NOT built here).
+//
+// Population this exists for: a producer who emails kontakt@opplevagent.no
+// directly asking to claim their profile, instead of going through (or
+// qualifying for) the self-serve flow at GET /kategori/gardssalg/eier/:slug.
+// An admin reads that request, confirms which provider + address it's for,
+// and grants a claim magic-link to exactly that email — via
+// issueAdminGrantedClaimMagicLink() (services/gardssalg-claim.ts), the SAME
+// underlying magic-link mechanism (token/expiry/gardssalg_claims row,
+// verifyClaimToken()/session on click, emailService.sendGardssalgClaimMagicLink
+// template) issueClaimMagicLink() already uses for self-serve — not a second,
+// divergent one. email_source is recorded 'manual' on the claim row (see
+// ClaimEmailSource's doc comment) so this admin-granted tier stays
+// distinguishable from the three self-serve tiers in the audit trail.
+//
+// Body: { provider_id: string, email: string, apply?: boolean }.
+//
+// apply: dry-run by default — SAME convention as every other admin write
+// route in this file (apply=1/"1"/true body, or ?apply=1/?apply=true query;
+// see e.g. POST /admin/gardssalg-address-enrichment above). This route is a
+// REAL, un-redirected send to an arbitrary operator-supplied address (unlike
+// POST /admin/claim-test-send, which always redirects to
+// TEST_SEND_REDIRECT_EMAIL and exists purely to test the send path) — no
+// existing admin route in this file sends a genuine, non-test email to a
+// caller-chosen address, so there is no dedicated precedent for THAT
+// specific combination. The safest read of this codebase's two closest
+// conventions — (a) every other admin WRITE route here defaults to dry-run,
+// and (b) the one convention for admin ROUTES THAT SEND EMAIL
+// (booking-test-send/claim-test-send) already treats "send a real email"
+// as consequential enough to gate behind an explicit signal — is to compose
+// them: dry-run-by-default (so a bare POST can never fire an email), apply
+// to actually send, same flag name/parsing as every sibling route in this
+// file for consistency.
+//
+// Validation, in order (each a clean 4xx before anything is written):
+//   1. provider_id required (400 provider_id_required).
+//   2. email required + plausible shape, same regex convention POST
+//      /admin/gardssalg/test-provider already uses for its own `email` field
+//      (400 invalid_email).
+//   3. provider_id must resolve to a real provider (404 provider_not_found).
+//   4. provider must NOT already have an active, non-revoked claim — see
+//      hasActiveNonRevokedClaim()'s doc comment in gardssalg-claim.ts for the
+//      exact "already-claimed, non-revoked" definition used (409
+//      already_claimed) — this route never silently no-ops onto an
+//      already-claimed, non-revoked provider.
+// The dry-run path runs all four checks (so an operator previewing a grant
+// finds out about an already-claimed provider before spending an apply call)
+// but performs NO DB write and sends NO email.
+//
+// Never touches experience_providers.content_source (acceptance criterion 3
+// of the dev-request) — see issueAdminGrantedClaimMagicLink()'s doc comment:
+// that stays verifyClaimToken()'s job alone, unchanged, run at click-time
+// exactly like every other claim tier, so a producer granted here still ends
+// up on content_source='claim' (not 'manual') once they verify, and can
+// therefore edit their profile in the portal like any other claimed
+// producer.
+//
+// provider_id and email are supplied TOGETHER by the (trusted, admin-key-
+// gated) caller and bound to exactly one gardssalg_claims row — there is no
+// derivation step here that could send a link for providerA to an address
+// meant for providerB.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-claim-grant", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    return res.status(400).json({ success: false, error: "provider_id_required" });
+  }
+
+  const emailRaw = typeof body.email === "string" ? body.email.trim() : "";
+  // Same plausible-shape regex convention as POST /admin/gardssalg/test-provider's
+  // own `email` field (above) — good enough to catch typos/garbage before any
+  // DB write or send is attempted; issueAdminGrantedClaimMagicLink() applies
+  // the same shape check again server-side (defense in depth).
+  if (!emailRaw || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailRaw)) {
+    return res.status(400).json({ success: false, error: "invalid_email" });
+  }
+  const email = normalizeEmail(emailRaw);
+
+  // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1/?apply=true (query).
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const provider = getClaimProviderById(providerId);
+  if (!provider) {
+    return res.status(404).json({ success: false, error: "provider_not_found" });
+  }
+
+  if (hasActiveNonRevokedClaim(providerId)) {
+    return res.status(409).json({ success: false, error: "already_claimed" });
+  }
+
+  if (dryRun) {
+    return res.json({
+      success: true,
+      dry_run: true,
+      would_grant: {
+        provider_id: providerId,
+        provider_name: provider.navn,
+        email,
+        email_source: "manual",
+      },
+    });
+  }
+
+  const result = issueAdminGrantedClaimMagicLink(providerId, email);
+  if (!result.ok) {
+    const status = result.error === "provider_not_found" ? 404 : result.error === "already_claimed" ? 409 : 400;
+    return res.status(status).json({ success: false, error: result.error });
+  }
+
+  const verifyUrl = `${OPPLEVAGENT_CLAIM_BASE_URL}/kategori/gardssalg/eier/magic-link-verify?token=${result.claim.token}`;
+  emailService
+    .sendGardssalgClaimMagicLink({
+      to: result.claim.email,
+      providerName: provider.navn || "din profil",
+      verifyUrl,
+      isTestSend: false,
+    })
+    .then((r) => {
+      if (!r.success) console.error(`[gardssalg-claim-grant] send failed for ${providerId}: ${r.error}`);
+    })
+    .catch((e) => console.error("[gardssalg-claim-grant] send error:", e));
+
+  res.json({
+    success: true,
+    dry_run: false,
+    claim_id: result.claim.claimId,
+    provider_id: providerId,
+    email: result.claim.email,
+    email_masked: result.claim.maskedEmail,
     email_source: result.claim.source,
     expires_at: result.claim.expiresAt,
   });
