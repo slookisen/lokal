@@ -3412,7 +3412,13 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
       }
     }
   } else {
-    targets = expDb
+    // Phase 1 — byte-for-byte unchanged from the pre-3f query: today's entire
+    // result for every non-gårdssalg-claim scenario, zero behavior change for
+    // the dominant case. Sub-slice 3f (dev-request
+    // 2026-07-30-opplevagent-claim-epost-og-perfelt-laas) only adds phase 2
+    // below as a top-up — it never alters this query, its ORDER BY, or its
+    // LIMIT.
+    const phase1Targets = expDb
       .prepare(
         `SELECT id, navn, listing_url, content_source
            FROM experience_providers
@@ -3421,6 +3427,63 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
           LIMIT ?`
       )
       .all(LH_DISCOVERY_BATCH_CAP) as Array<{ id: string; navn: string; listing_url: string | null; content_source: string | null }>;
+    targets = phase1Targets;
+
+    // Phase 2 — ONLY runs when phase 1 under-filled the batch. Widens
+    // eligibility to gårdssalg content_source='claim' rows that are NOT
+    // owner-locked on hjemmeside, using the already-shipped, already-reviewed
+    // isHjemmesideLocked() gate (sub-slice 3d/3e) — no new gate logic, no
+    // re-derivation. Over-fetched by remaining_slots*4 (capped at 120) so the
+    // JS lock-filter below can reject locked rows without a third round-trip.
+    // `manual` rows and non-gårdssalg claim rows are excluded at the SQL
+    // level (content_source = 'claim' AND gårdssalg-identity predicate) —
+    // isHjemmesideLocked() would reject them too, but keeping them out of the
+    // SQL result means the over-fetch budget is spent only on rows that can
+    // plausibly pass, and content_source='manual' can NEVER reach `targets`
+    // via this path under any circumstance.
+    const remainingSlots = LH_DISCOVERY_BATCH_CAP - phase1Targets.length;
+    if (remainingSlots > 0) {
+      const phase1Ids = phase1Targets.map((t) => t.id);
+      const overFetchLimit = Math.min(remainingSlots * 4, 120);
+      const excludeClause = phase1Ids.length > 0 ? `AND id NOT IN (${phase1Ids.map(() => "?").join(",")})` : "";
+      const phase2Rows = expDb
+        .prepare(
+          `SELECT id, navn, listing_url, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source
+             FROM experience_providers
+            WHERE listing_url IS NOT NULL AND hjemmeside IS NULL
+              AND content_source = 'claim' AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+              ${excludeClause}
+            ORDER BY (listing_homepage_discovery_attempted_at IS NOT NULL), listing_homepage_discovery_attempted_at ASC, created_at ASC
+            LIMIT ?`
+        )
+        .all(...phase1Ids, overFetchLimit) as Array<{
+          id: string;
+          navn: string;
+          listing_url: string | null;
+          hjemmeside: string | null;
+          content_source: string | null;
+          field_provenance: string | null;
+          producer_type: string | null;
+          rfb_seed_source: string | null;
+        }>;
+
+      for (const row of phase2Rows) {
+        if (targets.length >= LH_DISCOVERY_BATCH_CAP) break;
+        if (
+          isHjemmesideLocked({
+            id: row.id,
+            hjemmeside: row.hjemmeside,
+            content_source: row.content_source,
+            field_provenance: row.field_provenance,
+            producer_type: row.producer_type,
+            rfb_seed_source: row.rfb_seed_source,
+          })
+        ) {
+          continue;
+        }
+        targets.push({ id: row.id, navn: row.navn, listing_url: row.listing_url, content_source: row.content_source });
+      }
+    }
   }
 
   const proposed: Array<{
