@@ -1681,6 +1681,21 @@ export type ContentRefreshTarget = {
   id: string;
   navn: string;
   hjemmeside: string;
+  // dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-
+  // gate, Steg 3 — raw field_provenance JSON (same defensive-parse pattern
+  // as GardssalgContentRefreshTarget.field_provenance below), read here so
+  // the general content-refresh route can gate its fetch on
+  // isHjemmesideVerified(t.field_provenance) (routes/opplevelser.ts) without
+  // a second query. NOTE: `hjemmeside` above can be a COALESCE fallback to
+  // an experience's evidence_url when the provider's own `hjemmeside` column
+  // is blank (see selectProvidersForContentRefresh's SQL) — the
+  // website-verification classifier only ever classifies the PROVIDER's own
+  // hjemmeside column, so a fallback-sourced target reads as
+  // "missing_source" (verified=false) here and is gated closed too. That is
+  // the deliberate, fail-closed choice: the fallback URL was never itself
+  // ownership-verified, so it must not be trusted as an enrichment source
+  // either.
+  field_provenance: string | null;
 };
 
 /**
@@ -1876,7 +1891,8 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
                 WHERE e2.provider_id = p.id
                   AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
                 LIMIT 1)
-            ) AS hjemmeside
+            ) AS hjemmeside,
+            p.field_provenance AS field_provenance
        FROM experience_providers p
       WHERE (
           (p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != '')
@@ -1938,7 +1954,9 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
     }
 
     const fetchSize = Math.min(pageSize, CONTENT_REFRESH_HARD_SCAN_CAP - totalScanned);
-    const page = pageStmt.all(fetchSize, offset) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+    const page = pageStmt.all(fetchSize, offset) as Array<{
+      id: string; navn: string; hjemmeside: string | null; field_provenance: string | null;
+    }>;
 
     totalScanned += page.length;
     offset += page.length;
@@ -1947,7 +1965,7 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
       if (!row.hjemmeside || !row.hjemmeside.trim()) continue;
       const experiences = experiencesStmt.all(row.id) as BucketableExperienceRow[];
       if (classifyProviderContentBucket(row.hjemmeside, experiences) !== "enrichable") continue;
-      out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() });
+      out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim(), field_provenance: row.field_provenance });
       if (out.length >= cap) break;
     }
 
@@ -1983,12 +2001,14 @@ export function getProviderContentTarget(providerId: string): ContentRefreshTarg
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, field_provenance
          FROM experience_providers WHERE id = ?`
     )
-    .get(providerId) as { id: string; navn: string; hjemmeside: string | null } | undefined;
+    .get(providerId) as
+    | { id: string; navn: string; hjemmeside: string | null; field_provenance: string | null }
+    | undefined;
   if (!row || !row.hjemmeside || row.hjemmeside.trim().length === 0) return null;
-  return { id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() };
+  return { id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim(), field_provenance: row.field_provenance };
 }
 
 /** A provider's experiences, with only the columns the content gate needs. */
