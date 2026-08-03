@@ -29623,6 +29623,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of essg.failures) failures.push("experiences-seo-sok-gardssalg: " + f);
     console.log(`  experiences-seo-sok-gardssalg: ${essg.passed} passed, ${essg.failed} failed`);
 
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
+    // ("CTA hide"): the "Driver du dette stedet?" claim-CTA aside-card on the
+    // gårdssalg produsent profile page must be hidden once the provider has
+    // a used, non-revoked gardssalg_claims row (mirrors seo.ts's !isClaimed
+    // gate). Same in-memory-DB pattern, runs sequentially inside this same
+    // gated block.
+    console.log("\n── experiences-seo-gardssalg-claim-cta: 'Driver du dette stedet?' CTA hide ──");
+    const { runExperiencesSeoGardssalgClaimCtaTests } = require("../src/routes/experiences-seo-gardssalg-claim-cta.test") as
+      typeof import("../src/routes/experiences-seo-gardssalg-claim-cta.test");
+    const esgcc = await runExperiencesSeoGardssalgClaimCtaTests({ log: false });
+    passed += esgcc.passed;
+    failed += esgcc.failed;
+    for (const f of esgcc.failures) failures.push("experiences-seo-gardssalg-claim-cta: " + f);
+    console.log(`  experiences-seo-gardssalg-claim-cta: ${esgcc.passed} passed, ${esgcc.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
     // re-harvest guard, discover-query invariant). Same in-memory-DB pattern,
