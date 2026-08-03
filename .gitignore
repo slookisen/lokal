@@ -1,5 +1,10 @@
 # Dependencies
-node_modules/
+# No trailing slash, deliberately: `node_modules/` only matches a DIRECTORY, so
+# a SYMLINK named node_modules slipped past it and got committed (2026-07-27,
+# ef1bc4b — a stray `node_modules -> /workspace/wt-crmtriage/node_modules` from
+# a worktree session, dangling in every other checkout). Slash-less matches
+# both, at any depth.
+node_modules
 
 # Build output (compiled from src/)
 dist/
