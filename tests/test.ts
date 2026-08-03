@@ -28985,6 +28985,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gfcr.failures) failures.push("opplevelser-gardssalg-field-concordance-remediation: " + f);
     console.log(`  opplevelser-gardssalg-field-concordance-remediation: ${gfcr.passed} passed, ${gfcr.failed} failed`);
 
+    // dev-request 2026-08-03-gardssalg-field-concordance-review-approve: the
+    // missing consumer for gardssalg_field_concordance_review_queue — GET
+    // .../gardssalg-field-concordance-review-queue + POST .../gardssalg-
+    // field-concordance-review-approve. Same in-memory-DB + mocked-router
+    // harness, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-field-concordance-review-approve: review-queue approve endpoint ──");
+    const { runOpplevelserGardssalgFieldConcordanceReviewApproveTests } = require("../src/routes/opplevelser-gardssalg-field-concordance-review-approve.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-field-concordance-review-approve.test");
+    const gfcrq = await runOpplevelserGardssalgFieldConcordanceReviewApproveTests({ log: false });
+    passed += gfcrq.passed;
+    failed += gfcrq.failed;
+    for (const f of gfcrq.failures) failures.push("opplevelser-gardssalg-field-concordance-review-approve: " + f);
+    console.log(`  opplevelser-gardssalg-field-concordance-review-approve: ${gfcrq.passed} passed, ${gfcrq.failed} failed`);
+
     // dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
     // acceptance criterion 5: GET /admin/gardssalg/bookings-count — read-only
     // count + non-PII listing of existing gardssalg_bookings rows. Same

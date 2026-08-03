@@ -181,6 +181,16 @@ import {
   classifyProviderContentBucket,
   type ProviderContentBucket,
   type BucketableExperienceRow,
+  // dev-request 2026-08-03-gardssalg-field-concordance-review-approve — the
+  // missing consumer for gardssalg_field_concordance_review_queue (see
+  // applyGardssalgFieldConcordance's own doc comment, services/gardssalg-
+  // field-concordance.ts). GET .../gardssalg-field-concordance-review-queue
+  // + POST .../gardssalg-field-concordance-review-approve, near the existing
+  // GET .../gardssalg-field-concordance-audit / POST .../gardssalg-field-
+  // concordance-remediation pair below.
+  listGardssalgFieldConcordanceReviewQueue,
+  clearGardssalgFieldConcordanceReviewQueueEntry,
+  applyGardssalgFieldConcordanceApproval,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -7477,6 +7487,138 @@ router.post("/admin/gardssalg-field-concordance-remediation", requireAdmin, asyn
     console.error("[gardssalg-field-concordance-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-field-concordance-review-queue
+//     (admin) ───────────────────────────────────────────────────────────────
+//
+// dev-request 2026-08-03-gardssalg-field-concordance-review-approve.
+// Read-only listing of every current gardssalg_field_concordance_review_queue
+// row — the durable record of `avvik` findings POST /admin/gardssalg-field-
+// concordance-remediation's apply mode has queued for a human/orchestrator to
+// resolve (up to 3 pending rows per provider: epost/telefon/mobil are
+// independent). No UI reads this yet; it exists so Daniel/CS/the orchestrator
+// has something to query before deciding what to approve below.
+router.get("/admin/gardssalg-field-concordance-review-queue", requireAdmin, (_req: Request, res: Response) => {
+  const entries = listGardssalgFieldConcordanceReviewQueue();
+  res.json({ count: entries.length, entries });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-field-concordance-review-approve
+//     (admin) ───────────────────────────────────────────────────────────────
+//
+// dev-request 2026-08-03-gardssalg-field-concordance-review-approve — the
+// review queue's missing APPLY lever, same strict confirmation-surface
+// contract as gardssalg-orgnr-review-approve/gardssalg-website-review-approve
+// above:
+//
+//   A human/the orchestrator may ONLY approve the exact (provider_id,
+//   field_name, found_value) triple the queue itself carries — a found_value
+//   that doesn't byte-match the queued candidate is rejected
+//   (mismatch_with_queued_candidate). This is a confirmation surface, not an
+//   arbitrary-write surface: candidates come exclusively from the
+//   field-concordance scan's own page-extraction, the human/orchestrator adds
+//   the judgment the scanner deliberately withheld ("Ingen automatisk
+//   overskriving ved avvik"), and the write still passes through
+//   applyGardssalgFieldConcordanceApproval's owner-lock/staleness guards and
+//   lands in the same gardssalg_content_audit/field_provenance/rollback
+//   machinery every other gårdssalg write uses.
+//
+// Body: { approvals: [{provider_id, field_name, found_value}], apply? } —
+// dry-run by default (same apply truthy-check as every other approve lever in
+// this file: apply === true/1/"1"/"true" in the body, or ?apply=1/true in the
+// query string). Response buckets: approved / written / rejected (reason per
+// item) — every submitted item lands in `rejected` unless it was both
+// approved AND (when applying) actually written.
+router.post("/admin/gardssalg-field-concordance-review-approve", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+    res.status(400).json({
+      error: "Body must contain a non-empty 'approvals' array of {provider_id, field_name, found_value}",
+    });
+    return;
+  }
+  if (body.approvals.length > 200) {
+    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+    return;
+  }
+
+  const queue = listGardssalgFieldConcordanceReviewQueue();
+  const byKey = new Map(queue.map((q) => [`${q.provider_id}::${q.field_name}`, q]));
+  const seen = new Set<string>();
+  const approved: Array<{ provider_id: string; field_name: string; found_value: string }> = [];
+  const written: Array<{ provider_id: string; field_name: string; found_value: string }> = [];
+  const rejected: Array<{ provider_id: string; field_name: string; reason: string }> = [];
+
+  for (const raw of body.approvals as unknown[]) {
+    const a = (raw ?? {}) as { provider_id?: unknown; field_name?: unknown; found_value?: unknown };
+    const providerId = typeof a.provider_id === "string" ? a.provider_id.trim() : "";
+    const fieldName = typeof a.field_name === "string" ? a.field_name.trim() : "";
+    const foundValue = a.found_value;
+    if (!providerId || !fieldName || typeof foundValue !== "string") {
+      rejected.push({ provider_id: providerId || "(missing)", field_name: fieldName || "(missing)", reason: "invalid_item" });
+      continue;
+    }
+    const key = `${providerId}::${fieldName}`;
+    if (seen.has(key)) {
+      rejected.push({ provider_id: providerId, field_name: fieldName, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(key);
+
+    const q = byKey.get(key);
+    if (!q) {
+      rejected.push({ provider_id: providerId, field_name: fieldName, reason: "not_in_review_queue" });
+      continue;
+    }
+    if (foundValue !== q.found_value) {
+      // The human/orchestrator must approve the QUEUED candidate — a
+      // different found_value in the request is a data-entry error or an
+      // attempt to use this as an arbitrary-write surface. Either way:
+      // rejected, nothing written.
+      rejected.push({ provider_id: providerId, field_name: fieldName, reason: "mismatch_with_queued_candidate" });
+      continue;
+    }
+
+    approved.push({ provider_id: providerId, field_name: fieldName, found_value: foundValue });
+    if (!dryRun) {
+      try {
+        const result = applyGardssalgFieldConcordanceApproval(
+          providerId,
+          fieldName,
+          q.current_value,
+          foundValue,
+          q.batch_id ?? undefined
+        );
+        if (result.written) {
+          written.push({ provider_id: providerId, field_name: fieldName, found_value: foundValue });
+          clearGardssalgFieldConcordanceReviewQueueEntry(providerId, fieldName);
+        } else {
+          rejected.push({ provider_id: providerId, field_name: fieldName, reason: result.reason ?? "write_refused" });
+        }
+      } catch (err: any) {
+        rejected.push({ provider_id: providerId, field_name: fieldName, reason: `write_failed: ${err?.message ?? String(err)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    approved_count: approved.length,
+    approved,
+    written_count: written.length,
+    written,
+    rejected,
+  });
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-provider-dedup-audit ───────────────
