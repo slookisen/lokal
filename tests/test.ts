@@ -29648,6 +29648,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esgcc.failures) failures.push("experiences-seo-gardssalg-claim-cta: " + f);
     console.log(`  experiences-seo-gardssalg-claim-cta: ${esgcc.passed} passed, ${esgcc.failed} failed`);
 
+    // dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging: once a
+    // gårdssalg profile has been claimed (magic link used at least once), the
+    // produsent profile page swaps the "Driver du dette stedet?" CTA for a
+    // persistent "Bekreftet av eier" badge + a "Logg inn" link, driven by the
+    // new experience_providers.claimed_at column (not the old live/revocable
+    // isGardssalgProviderClaimed() query). Covers the badge/CTA render
+    // branch, AC6 (revoke does not remove the badge), verifyClaimToken()'s
+    // idempotent claimed_at stamp, and the claimed_at backfill migration.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── experiences-seo-gardssalg-claimed-badge: 'Bekreftet av eier' badge ──");
+    const { runExperiencesSeoGardssalgClaimedBadgeTests } = require("../src/routes/experiences-seo-gardssalg-claimed-badge.test") as
+      typeof import("../src/routes/experiences-seo-gardssalg-claimed-badge.test");
+    const esgcb = await runExperiencesSeoGardssalgClaimedBadgeTests({ log: false });
+    passed += esgcb.passed;
+    failed += esgcb.failed;
+    for (const f of esgcb.failures) failures.push("experiences-seo-gardssalg-claimed-badge: " + f);
+    console.log(`  experiences-seo-gardssalg-claimed-badge: ${esgcb.passed} passed, ${esgcb.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
     // re-harvest guard, discover-query invariant). Same in-memory-DB pattern,

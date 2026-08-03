@@ -2578,10 +2578,20 @@ export type GardssalgProviderRow = {
   // entry (same "row.updated_at || today" pattern the /opplevelse/<slug>
   // sitemap loop already uses), instead of a blanket "today" on every request.
   updated_at: string | null;
+  // Additive (2026-08-03, dev-request 2026-08-03-claim-bekreftet-merke-og-
+  // innlogging): the historical "has this provider ever been claimed"
+  // timestamp, stamped once (idempotently) by verifyClaimToken()
+  // (services/gardssalg-claim.ts) the first time the owner's magic link is
+  // used — never cleared by a later revoke/logout. Distinct from the live,
+  // revocable isGardssalgProviderClaimed() query: this is what the
+  // /kategori/gardssalg/produsent/<slug> route reads to decide the
+  // "Bekreftet av eier" badge vs. the "Er dette din bedrift?" claim CTA.
+  // NULL = never claimed.
+  claimed_at: string | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at, claimed_at";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);

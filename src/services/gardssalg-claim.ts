@@ -588,6 +588,14 @@ export interface VerifyClaimResult {
  * gardssalg-rfb-enrich.ts) skips this row from here on. Never downgrades an
  * existing 'manual' lock (Daniel's own curation takes precedence) — the
  * session is still granted either way, only the lock label is left alone.
+ *
+ * Also stamps experience_providers.claimed_at (dev-request 2026-08-03-claim-
+ * bekreftet-merke-og-innlogging) — the historical "has been claimed at least
+ * once" signal behind the public "Bekreftet av eier" badge. Idempotent:
+ * first-claim wins, a second/later verify (re-login, or a second producer
+ * link on the same provider) never overwrites an existing claimed_at. This is
+ * the ONLY place claimed_at is ever set — never on issue/send, only on use —
+ * and revokeClaimToken() below deliberately never touches it.
  */
 export function verifyClaimToken(token: string): VerifyClaimResult {
   const db = getDb(VERTICAL);
@@ -605,6 +613,10 @@ export function verifyClaimToken(token: string): VerifyClaimResult {
     db.prepare(
       `UPDATE experience_providers SET content_source = 'claim', updated_at = datetime('now')
        WHERE id = ? AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`,
+    ).run(claim.provider_id);
+    db.prepare(
+      `UPDATE experience_providers SET claimed_at = datetime('now')
+       WHERE id = ? AND claimed_at IS NULL`,
     ).run(claim.provider_id);
   });
   txn();
