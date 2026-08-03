@@ -29038,6 +29038,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ogwvr.failures) failures.push("opplevelser-gardssalg-website-verification: " + f);
     console.log(`  opplevelser-gardssalg-website-verification: ${ogwvr.passed} passed, ${ogwvr.failed} failed`);
 
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 3
+    // (route-level): POST /admin/gardssalg-owner-lock-backfill — the
+    // one-time catch-up that backfills field_provenance.owner_locks.<field>
+    // from pre-existing gardssalg_content_audit (changed_by='owner') rows.
+    // Dry-run-by-default, idempotent re-run, stale-provider tolerance.
+    console.log("\n── opplevelser-gardssalg-owner-lock-backfill: owner-lock provenance backfill (routes) ──");
+    const { runOpplevelserGardssalgOwnerLockBackfillTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-backfill.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-backfill.test");
+    const ogolb = await runOpplevelserGardssalgOwnerLockBackfillTests({ log: false });
+    passed += ogolb.passed;
+    failed += ogolb.failed;
+    for (const f of ogolb.failures) failures.push("opplevelser-gardssalg-owner-lock-backfill: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-backfill: ${ogolb.passed} passed, ${ogolb.failed} failed`);
+
     // dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter, AC6:
     // the `claimable: true` opt-in on POST /admin/gardssalg/test-provider —
     // the only lever that can write the three fields deriveOrgLinkedEmail()

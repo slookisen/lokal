@@ -616,7 +616,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         assertTrue(update1.updatedFields.includes("booking_live"), "e5: booking_live was updated");
         assertEq(update1.skippedFields, [], "e6: no fields skipped on a valid, unlocked update");
       }
-      const afterUpdate = expDb.prepare("SELECT about_text, products, hjemmeside, booking_live, opening_hours_text FROM experience_providers WHERE id = ?").get("prov-claimable") as any;
+      const afterUpdate = expDb.prepare("SELECT about_text, products, hjemmeside, booking_live, opening_hours_text, field_provenance FROM experience_providers WHERE id = ?").get("prov-claimable") as any;
       assertEq(afterUpdate.about_text, "En fin gård med lang historie.", "e7: about_text trimmed and persisted");
       assertEq(JSON.parse(afterUpdate.products), ["Eplesider", "Eplemost"], "e8: products de-duped (case-insensitive) and blanks dropped");
       assertEq(afterUpdate.hjemmeside, "https://klostergarden.no/ny-side", "e9: hjemmeside persisted");
@@ -626,12 +626,49 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       assertTrue(auditRows.length >= 4, "e11: an audit row was inserted for each updated field");
       assertTrue(auditRows.every((r) => r.changed_by === "owner"), "e12: every audit row is attributed to changed_by='owner'");
 
+      // ── field_provenance.owner_locks stamp (dev-request 2026-07-30-
+      // opplevagent-claim-epost-og-perfelt-laas, item 3) ────────────────────
+      const provenanceAfterUpdate1 = JSON.parse(afterUpdate.field_provenance);
+      const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+      for (const field of ["about_text", "products", "hjemmeside", "booking_live", "opening_hours_text"]) {
+        assertTrue(
+          !!provenanceAfterUpdate1.owner_locks?.[field]?.locked_at,
+          `e19: owner_locks.${field} stamped for a field actually changed`,
+        );
+        assertTrue(
+          ISO_RE.test(provenanceAfterUpdate1.owner_locks?.[field]?.locked_at ?? ""),
+          `e20: owner_locks.${field}.locked_at is an ISO-ish timestamp`,
+        );
+      }
+      // (b) a field never included in the update body gets no stamp.
+      assertTrue(!("visit_text" in (provenanceAfterUpdate1.owner_locks ?? {})), "e21: a field NOT edited (visit_text) gets no owner_locks stamp");
+      // (d) THE most important regression: the pre-seeded field_provenance.
+      // hjemmeside key (a totally different shape, written by
+      // applyGardssalgProviderWebsite in experience-store.ts) survives
+      // completely untouched — merge, not overwrite. Nesting under
+      // owner_locks (not a bare top-level `hjemmeside` key) is exactly what
+      // avoids this collision.
+      assertEq(
+        provenanceAfterUpdate1.hjemmeside,
+        { source_url: "https://visitnorway.no/listing/klostergarden", fetched_at: "2026-07-01T00:00:00Z" },
+        "e22: pre-existing field_provenance.hjemmeside (unrelated shape) survives untouched after an owner edit",
+      );
+
       // Invalid values are skipped, not silently coerced.
       const update2 = claimSvc.updateClaimedProviderProfile("prov-claimable", { hjemmeside: "not-a-url" });
       assertTrue("ok" in update2 && update2.ok === true, "e13: updateClaimedProviderProfile still returns ok:true when a field is rejected");
       if ("ok" in update2 && update2.ok) {
         assertTrue(update2.skippedFields.some((s) => s.field === "hjemmeside" && s.reason === "invalid_value"), "e14: an invalid website value is skipped with reason invalid_value, not written");
       }
+      // (c) invalid_value skip -> no NEW stamp is added (owner_locks.hjemmeside
+      // keeps its ORIGINAL locked_at from update1, not a fresh one).
+      const afterInvalidUpdate = expDb.prepare("SELECT field_provenance FROM experience_providers WHERE id = ?").get("prov-claimable") as any;
+      const provenanceAfterInvalid = JSON.parse(afterInvalidUpdate.field_provenance);
+      assertEq(
+        provenanceAfterInvalid.owner_locks.hjemmeside.locked_at,
+        provenanceAfterUpdate1.owner_locks.hjemmeside.locked_at,
+        "e23: a field skipped as invalid_value gets no new owner_locks stamp (timestamp unchanged from the earlier successful edit)",
+      );
 
       // Manual-locked provider -> every field skipped, nothing written.
       const update3 = claimSvc.updateClaimedProviderProfile("prov-manual", { about_text: "Forsøk på overskriving" });
@@ -640,8 +677,27 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         assertEq(update3.updatedFields, [], "e16: no fields updated on a manual-locked provider");
         assertTrue(update3.skippedFields.some((s) => s.field === "about_text" && s.reason === "locked_by_manual"), "e17: about_text skipped with reason locked_by_manual");
       }
-      const manualRowAfter = expDb.prepare("SELECT about_text FROM experience_providers WHERE id = ?").get("prov-manual") as any;
+      const manualRowAfter = expDb.prepare("SELECT about_text, field_provenance FROM experience_providers WHERE id = ?").get("prov-manual") as any;
       assertEq(manualRowAfter.about_text, null, "e18: manual-locked provider's about_text is untouched");
+      // (c) locked_by_manual skip -> no field_provenance write at all (the
+      // whole SET sets.length>0 gate, which also guards the owner_locks
+      // stamp, never fires when every field was skipped).
+      assertEq(manualRowAfter.field_provenance, null, "e24: manual-locked provider gets no field_provenance write at all (nothing was actually updated)");
+
+      // (e) malformed pre-existing field_provenance JSON does not crash the
+      // write and still results in a valid stamp (same defensive-parse
+      // contract as applyGardssalgWebsiteVerification).
+      insertProvider.run({
+        id: "prov-malformed-provenance", navn: "Uryddig Gård", slug: "uryddig-gard",
+        org_nr: "988888888", brreg_verified: 1, hjemmeside: "https://uryddig.no",
+        content_source: "provider_site", field_provenance: "{not valid json[[",
+      });
+      const update4 = claimSvc.updateClaimedProviderProfile("prov-malformed-provenance", { about_text: "Ny tekst" });
+      assertTrue("ok" in update4 && update4.ok === true, "e25: updateClaimedProviderProfile does not throw on malformed pre-existing field_provenance JSON");
+      const malformedAfter = expDb.prepare("SELECT about_text, field_provenance FROM experience_providers WHERE id = ?").get("prov-malformed-provenance") as any;
+      assertEq(malformedAfter.about_text, "Ny tekst", "e26: the actual field write still succeeds despite malformed pre-existing field_provenance");
+      const malformedProvenance = JSON.parse(malformedAfter.field_provenance);
+      assertTrue(!!malformedProvenance.owner_locks?.about_text?.locked_at, "e27: a valid owner_locks.about_text stamp is produced even though the prior JSON was malformed (treated as empty, not clobbered/thrown)");
     } catch (err: any) {
       failed++;
       failures.push("gardssalg-claim: unexpected error: " + String(err?.stack || err?.message || err));
