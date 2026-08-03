@@ -31812,6 +31812,27 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("opplevelser-admin-providers-hjemmeside: unexpected error: " + String(err?.message || err));
   }
 
+  // dev-request 2026-08-03-hjemmeside-skrivespak, Steg 4: POST
+  // /admin/providers/hjemmeside-write — batch write-lever for
+  // experience_providers.hjemmeside (lock check, directory/platform-host
+  // denylists, skip-if-unchanged, field_provenance.hjemmeside_verification
+  // invalidation-on-change, experience_provider_field_write_audit trail).
+  // Same isolated experiences db-factory handle as the block immediately
+  // above — safe to run in this same sequential slot.
+  console.log("\n── dev-request 2026-08-03-hjemmeside-skrivespak (Steg 4): POST admin/providers/hjemmeside-write (experiences) ──");
+  try {
+    const { runOpplevelserHjemmesideWriteTests } = require("../src/routes/opplevelser-hjemmeside-write.test") as
+      typeof import("../src/routes/opplevelser-hjemmeside-write.test");
+    const ohw = await runOpplevelserHjemmesideWriteTests({ log: false });
+    passed += ohw.passed;
+    failed += ohw.failed;
+    for (const f of ohw.failures) failures.push("opplevelser-hjemmeside-write: " + f);
+    console.log(`  opplevelser-hjemmeside-write: ${ohw.passed} passed, ${ohw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-hjemmeside-write: unexpected error: " + String(err?.message || err));
+  }
+
   // dev-request 2026-07-30-experience-providers-enumerate: GET
   // .../providers/all — full-catalog enumeration (incl. rows with no
   // hjemmeside at all) for the persistent, git-committed blacklist ledger.
