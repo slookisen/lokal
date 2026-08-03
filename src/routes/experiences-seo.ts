@@ -136,6 +136,10 @@ import {
   osloDatetimeLocalToUtcIso,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
+// dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
+// ("CTA hide") — mirrors seo.ts's knowledgeService.isAgentClaimed() gate for
+// the "Driver du dette stedet?" aside-card on the produsent profile page.
+import { isGardssalgProviderClaimed } from "../services/gardssalg-claim";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
 
@@ -3622,6 +3626,17 @@ router.get(
     // provider's canonical profile URL.
     const badgeProfileHref = canonical;
     const badgeEmbedSnippet = opplevagentBadgeEmbedSnippet(slug, url);
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
+    // ("CTA hide") — mirrors seo.ts's isClaimed pattern (knowledgeService.
+    // isAgentClaimed): a live query, gated in try/catch so a claim-status
+    // lookup failure never breaks the page (defaults to false — the CTA
+    // stays visible, same fail-open behavior as seo.ts).
+    let isClaimed = false;
+    try {
+      isClaimed = isGardssalgProviderClaimed(provider.id);
+    } catch (e) {
+      console.error("[experiences-seo] gardssalg claim status query failed:", e);
+    }
     const sted = drivingSted(provider);
     const meta = drinkTypeMeta(provider.producer_type);
     const badge = drinkBadge(provider.producer_type);
@@ -3891,11 +3906,11 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
         <h2>Sted</h2>
         ${mapBlock}
       </div>
-      <div class="aside-card">
+      ${!isClaimed ? `<div class="aside-card">
         <h2>Driver du dette stedet?</h2>
         <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>
         <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:#fff;color:#0f5a50;font-weight:700;padding:10px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.9rem">Er dette din bedrift?</a>
-      </div>
+      </div>` : ""}
       <div class="aside-card">
         <h2>Lenk til oss</h2>
         <p style="font-size:.85rem;color:var(--ink-soft);margin-bottom:10px">Legg badgen på din egen nettside og lenk tilbake til profilen din her på Opplevagent.</p>

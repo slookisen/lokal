@@ -494,6 +494,23 @@ export function isClaimRateLimited(providerId: string): boolean {
   return row.count >= CLAIM_RATE_LIMIT_MAX_PER_WINDOW;
 }
 
+// ── Claimed-status check (dev-request 2026-07-30-opplevagent-claim-epost-
+// og-perfelt-laas, item 4 — "CTA hide"). Mirrors
+// knowledgeService.isAgentClaimed() (src/services/knowledge-service.ts)
+// exactly: a plain COUNT(*) live query, no caching. A provider is
+// "claimed" once a gardssalg_claims row for it has been used (the magic
+// link was clicked — see verifyClaimToken above) AND not since revoked.
+// Deliberately a live query (not a cached flag anywhere persistent) so a
+// later revoke (revokeClaimToken above) makes the provider un-claimed again
+// on the very next read, no invalidation step needed. ─────────────────────
+export function isGardssalgProviderClaimed(providerId: string): boolean {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT COUNT(*) as c FROM gardssalg_claims WHERE provider_id = ? AND used = 1 AND revoked_at IS NULL`)
+    .get(providerId) as { c: number };
+  return row.c > 0;
+}
+
 // ── Issue a claim magic link (DB insert only — sending the email is the
 // route layer's job, via email-service.ts, mirroring RFB's split) ─────────
 export interface IssuedClaim {
