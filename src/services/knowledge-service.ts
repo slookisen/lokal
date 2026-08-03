@@ -608,8 +608,39 @@ class KnowledgeService {
       WHERE id = ?
     `).run(claimToken, tokenExpiry, now, claimId);
 
-    // Mark agent as verified
-    db.prepare("UPDATE agents SET is_verified = 1 WHERE id = ?").run(claim.agent_id);
+    // ─── dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 2) ──────────
+    // Mark agent as verified — EXCEPT when the agent's own registration is
+    // the thing being "verified": a self_registered row (created via the
+    // PUBLIC POST /register — anyone on the internet) was claimed through
+    // this SAME code-based flow, so the claimant controls both ends (the
+    // registration AND the "verification" email) and this UPDATE would hand
+    // out a public trust badge on zero real evidence — exactly the Mikhailo
+    // T incident (2026-07-30) this gate exists to close.
+    //
+    // The claim itself still fully succeeds above (status='verified',
+    // claimToken issued, claimant CAN still manage the listing) — only the
+    // public "Verifisert" badge is withheld for this origin.
+    //
+    // KNOWN, DELIBERATE LIMITATION: there is no automated Brreg/domain-
+    // evidence escape hatch in this slice — a genuine small producer who
+    // self-registers has no way to earn the badge today short of a human
+    // (Daniel) manually flipping is_verified after reviewing the profile via
+    // the self-registered-review-queue (routes/admin-agents.ts). No such
+    // evidence-matching machinery exists for this generic marketplace-agents
+    // table today (unlike e.g. the Brreg org-nr cross-check for discovery-
+    // origin rows). This is a hard, unconditional gate, not a placeholder for
+    // logic that secretly runs elsewhere.
+    //
+    // A discovery-origin (or any legacy/NULL-defaulted, pre-migration) row is
+    // BYTE-IDENTICAL to pre-gate behaviour: the UPDATE below fires
+    // unconditionally whenever origin !== 'self_registered'.
+    const claimedAgent = db.prepare("SELECT origin FROM agents WHERE id = ?").get(claim.agent_id) as
+      { origin: string | null } | undefined;
+    if (claimedAgent?.origin !== "self_registered") {
+      db.prepare("UPDATE agents SET is_verified = 1 WHERE id = ?").run(claim.agent_id);
+    } else {
+      console.log(`[claim-verify:quarantine-gate] withheld is_verified badge for self_registered agent ${claim.agent_id} (claim ${claimId} still succeeded)`);
+    }
 
     // Update knowledge data_source
     const knowledge = this.getKnowledge(claim.agent_id);

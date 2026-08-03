@@ -15,7 +15,6 @@ import {
   SALGSKANAL_CATEGORY_NAMES,
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
-import { pingIndexNow } from "../services/indexnow-service";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
@@ -125,7 +124,12 @@ function ensureAgentInDb(agentId: string): boolean {
   if (exists) return true;
 
   // Try to get from registry and insert
-  const agents = marketplaceRegistry.getActiveAgents();
+  // dev-request 2026-08-03-mikhailo-quarantine-gates: internal DB-sync
+  // bookkeeping, not a public listing — includeUnvetted so this can still
+  // sync a self_registered/not-yet-vetted agent's row (register() already
+  // writes it directly to SQLite, so in practice this branch is unreached
+  // for that origin, but the intent here is FK existence, not visibility).
+  const agents = marketplaceRegistry.getActiveAgents({ includeUnvetted: true });
   const agent = agents.find((a: any) => a.id === agentId);
   if (!agent) return false;
 
@@ -329,7 +333,15 @@ router.post("/register", (req: Request, res: Response) => {
       return;
     }
 
-    const agent = marketplaceRegistry.register(registration);
+    // dev-request 2026-08-03-mikhailo-quarantine-gates: this is the PUBLIC
+    // self-registration endpoint — anyone on the internet can call it, with
+    // zero vetting. Every agent created here is `origin: 'self_registered'`
+    // BY CONSTRUCTION (never optional, never inferred from the request body
+    // — AgentRegistrationSchema doesn't even have an `origin` field, so a
+    // caller cannot spoof this) and starts quarantined (`isVetted: false`,
+    // i.e. is_vetted=0) until a human approves it via
+    // POST /admin/self-registered-review-approve (routes/admin-agents.ts).
+    const agent = marketplaceRegistry.register({ ...registration, origin: "self_registered", isVetted: false });
 
     interactionLogger.log("register", {
       agentId: agent.id,
@@ -337,13 +349,13 @@ router.post("/register", (req: Request, res: Response) => {
       ipAddress: req.ip,
     });
 
-    // IndexNow: tell Bing/Yandex the new producer's profile page exists,
-    // so it can be picked up without waiting for a crawl (dev-request
-    // 2026-07-04-sokemotor-indeksering-og-lenker slice 1). Fire-and-forget
-    // — never awaited, never allowed to affect the response below.
-    // /produsent/<slug> URL convention matches seo.ts / the /search route.
-    pingIndexNow([`${getBaseUrl(req)}/produsent/${slugify(agent.name)}`], "rettfrabonden.com");
-
+    // Gate 3 (IndexNow): do NOT ping Bing/Yandex from here anymore. Every
+    // agent this route creates is self_registered and unvetted (above) — the
+    // 2026-07-30 Mikhailo T incident was IndexNow-ping'd within seconds of
+    // this endpoint being hit, indexing a spam profile before any human saw
+    // it. The ping now fires later, from POST /admin/self-registered-review-
+    // approve, once a human has actually looked at the profile and flipped
+    // is_vetted to 1 — see that route for the /produsent/<slug> ping.
     res.status(201).json({
       success: true,
       message: "Agent registrert i Lokal-markedsplassen",
@@ -746,6 +758,13 @@ router.get("/search", async (req: Request, res: Response) => {
 
 router.get("/agents/:id/vcard", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension):
+  // 404 exactly like an unknown id for a not-yet-vetted self-registered
+  // agent — see isQuarantinedFromPublicView's own comment for the reasoning.
+  if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
   const vcard = buildVCard(agentId);
   if (!vcard) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
@@ -772,6 +791,14 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
 
 router.get("/agents/:id/card", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension):
+  // this is "the main endpoint AI agents use to learn about a producer" —
+  // 404 exactly like an unknown id for a not-yet-vetted self-registered
+  // agent, same as /produsent/:slug.
+  if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
+    res.status(404).json({ error: "Agent ikke funnet" });
+    return;
+  }
   const card = marketplaceRegistry.getAgentCard(agentId) as any;
   if (!card) {
     res.status(404).json({ error: "Agent ikke funnet" });
@@ -1125,6 +1152,14 @@ router.get("/agents", (req: Request, res: Response) => {
 
 router.get("/agents/:id/info", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension):
+  // 404 exactly like an unknown id for a not-yet-vetted self-registered
+  // agent — same "tell me about this seller" surface, same rule as
+  // /produsent/:slug and /agents/:id/card.
+  if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
@@ -1284,7 +1319,12 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
     });
 
     // Get agent name for the email
-    const agents = marketplaceRegistry.getActiveAgents();
+    // dev-request 2026-08-03-mikhailo-quarantine-gates: claim-email bookkeeping,
+    // not a public listing — a self_registered/unvetted agent must still get
+    // its real name in its OWN claim-verification email (the claimant is the
+    // registrant themselves and already knows the agent id from the 201
+    // registration response; this is not a new public exposure).
+    const agents = marketplaceRegistry.getActiveAgents({ includeUnvetted: true });
     const agent = agents.find((a: any) => a.id === agentId);
     const agentName = agent?.name || "Ukjent produsent";
 
@@ -2530,6 +2570,16 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       return;
     }
 
+    // Capture registry data BEFORE the row is deleted below — this is the
+    // ONLY point at which a live/cached lookup can still see the row.
+    // includeUnvetted: true — an admin may be deleting a self-registered/
+    // not-yet-vetted spam agent (reviewing the queue and choosing to delete
+    // rather than approve), and the default (filtered) getActiveAgents()
+    // would never surface that row at all, leaving the blocklist entry
+    // below missing website/email. Same pattern as ensureAgentInDb and the
+    // claim-request email lookup elsewhere in this file.
+    const fromRegistry = marketplaceRegistry.getActiveAgents({ includeUnvetted: true }).find((a: any) => a.id === agentId) as any;
+
     // Delete agent and all related data in one transaction
     // Must clear all FK references before deleting the agent itself.
     // conversations.seller_agent_id lacks ON DELETE CASCADE, so we clean manually.
@@ -2555,8 +2605,8 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
     if (wantsBlock) {
       try {
         const fullAgent = db.prepare("SELECT id, name, contact_email, url FROM agents WHERE id = ?").get(agentId) as any;
-        // fullAgent is null here (we just deleted) — read from `agent` row pre-delete + try registry for richer data
-        const fromRegistry = marketplaceRegistry.getActiveAgents().find((a: any) => a.id === agentId) as any;
+        // fullAgent is null here (we just deleted) — fromRegistry (captured
+        // pre-delete above, includeUnvetted:true) supplies the richer data.
         blocklistResult = blocklistAdd({
           agentId,
           name: agent.name,
@@ -2790,6 +2840,15 @@ router.post("/admin/deduplicate", (req: Request, res: Response) => {
 
 router.get("/agents/:id/trust", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension):
+  // 404 exactly like an unknown id for a not-yet-vetted self-registered
+  // agent, same rule as card/info/vcard/produsent above. This is an
+  // unauthenticated public GET (no claim-token/API-key check today), so
+  // it's gated the same way rather than treated as an owner-only dashboard.
+  if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
   const breakdown = trustScoreService.getBreakdown(agentId);
   if (!breakdown) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });

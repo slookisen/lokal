@@ -66,7 +66,22 @@ class MarketplaceRegistry {
 
   // ─── Registration ─────────────────────────────────────────
 
-  register(registration: AgentRegistration): RegisteredAgent {
+  // dev-request 2026-08-03-mikhailo-quarantine-gates: `origin`/`isVetted`
+  // are deliberately NOT part of AgentRegistrationSchema/AdminRegistrationSchema
+  // (a self-registering caller must never be able to declare its own
+  // provenance — Zod strips any such field out of req.body before it gets
+  // here) — they're an out-of-band param this method's callers pass
+  // explicitly. Both default so the two existing call sites (POST
+  // /admin/register and every src/_seeds/*.ts script) need NO change at
+  // all: omitting them writes origin='discovery', is_vetted=1, byte-
+  // identical to pre-gate behaviour. Only routes/marketplace.ts's PUBLIC
+  // POST /register passes `origin: "self_registered", isVetted: false`.
+  register(
+    registration: AgentRegistration & {
+      origin?: "self_registered" | "discovery";
+      isVetted?: boolean;
+    },
+  ): RegisteredAgent {
     const db = getDb();
     const id = uuid();
     const apiKey = this.generateApiKey();
@@ -79,14 +94,14 @@ class MarketplaceRegistry {
         categories, tags, skills, capabilities, languages,
         trust_score, is_active, is_verified,
         discovery_count, interaction_count, total_interactions,
-        created_at, last_seen_at
+        created_at, last_seen_at, origin, is_vetted
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         0.5, 1, 0,
         0, 0, 0,
-        ?, ?
+        ?, ?, ?, ?
       )
     `);
 
@@ -111,6 +126,8 @@ class MarketplaceRegistry {
       JSON.stringify(registration.languages || ["no"]),
       now,
       now,
+      registration.origin || "discovery",
+      registration.isVetted === false ? 0 : 1,
     );
 
     this.invalidateCache();
@@ -132,7 +149,10 @@ class MarketplaceRegistry {
     if (nameQuery && nameQuery.length >= 3) {
       // Fetch all active agents and filter by name in JS (case-insensitive for Unicode)
       // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
-      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[];
+      // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): a
+      // self-registered, not-yet-vetted row (is_vetted = 0) must not surface
+      // on any public discovery surface, including this name-match path.
+      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1").all() as any[];
       const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
 
       console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, totalAgents=${allRows.length}`);
@@ -219,7 +239,9 @@ class MarketplaceRegistry {
 
     // Build SQL dynamically based on query filters
     // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
-    let sql = "SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL";
+    // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): exclude
+    // self-registered, not-yet-vetted rows from this public discovery path.
+    let sql = "SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1";
     const params: any[] = [];
 
     // 1. Filter by role
@@ -785,7 +807,11 @@ class MarketplaceRegistry {
           // Quick check: do any of these distinctive words appear in an agent name?
           const db = getDb();
           // Phase 5.11 A4.1: exclude umbrellas from name-match candidate set
-          const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[])
+          // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): exclude
+          // not-yet-vetted rows too — kept consistent with discover()'s own
+          // is_vetted filter even though this candidate-detection step alone
+          // can't leak a result (discover()'s actual lookup is gated too).
+          const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1").all() as any[])
             .map(r => (r.name || "").toLowerCase());
 
           const nameMatches = nameCandidateWords.filter(word =>
@@ -1167,6 +1193,38 @@ class MarketplaceRegistry {
     return row ? this.rowToAgent(row) : undefined;
   }
 
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1 extension —
+  // ID-addressable single-agent lookups): getActiveAgents()'s is_vetted
+  // filter only protects LIST surfaces. GET /agents/:id/card, /info, /vcard,
+  // and /trust are ID-addressable single-agent lookups, not filtered lists
+  // — "exclude from getActiveAgents()" doesn't apply the same way, so each
+  // of those routes calls this helper directly and 404s exactly like
+  // /produsent/:slug does for an unknown id, rather than serving a
+  // self_registered agent's full card/knowledge/trust-breakdown before a
+  // human has vetted it.
+  //
+  // Decision (see PR description for the fuller reasoning): the claiming
+  // producer themselves already gets their own agent id back in the 201
+  // response from POST /register, and separately keeps the ability to
+  // manage their listing via PUT /agents/:id/knowledge with their claim
+  // token (unaffected by this — that route is owner-authenticated, not a
+  // public read). There's no legitimate PUBLIC/unauthenticated reason to
+  // read a quarantined agent's card/info/vcard/trust before approval, so
+  // the safer default — matching this PR's "never visible before human
+  // review" thesis — wins over "ID-addressable lookups are intentionally
+  // different": treat these 4 endpoints the same as /produsent/:slug.
+  //
+  // Unknown ids return false (not quarantined) so callers fall through to
+  // their own normal "not found" handling instead of this helper
+  // manufacturing a false positive.
+  isQuarantinedFromPublicView(agentId: string): boolean {
+    const db = getDb();
+    const row = db.prepare("SELECT origin, is_vetted FROM agents WHERE id = ?").get(agentId) as
+      { origin: string | null; is_vetted: number | null } | undefined;
+    if (!row) return false;
+    return row.origin === "self_registered" && row.is_vetted !== 1;
+  }
+
   getAgentByApiKey(apiKey: string): RegisteredAgent | undefined {
     const db = getDb();
     const row = db.prepare("SELECT * FROM agents WHERE api_key = ?").get(apiKey) as any;
@@ -1230,14 +1288,44 @@ class MarketplaceRegistry {
     return rows.map(r => this.rowToAgent(r)!);
   }
 
-  getActiveAgents(): RegisteredAgent[] {
+  // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1, root-fix round):
+  // this single method backs the vast majority of public/crawler-facing
+  // agent-listing surfaces in the codebase (marketplace API listings, SEO
+  // city pages, the homepage featured section, sitemap.xml, llms.txt/
+  // llms-full.txt/agents.json, the /produsent/:slug "did you mean" fuzzy
+  // fallback, salgskanal listings, MCP resources, the A2A card...). Rather
+  // than patch each downstream consumer, the is_vetted filter lives HERE —
+  // is_vetted defaults to 1 (see database/init.ts), so this is a no-op for
+  // every existing/admin/seed-created row; only self_registered, not-yet-
+  // approved rows are newly excluded.
+  //
+  // `includeUnvetted` is an explicit, narrow opt-out for the handful of
+  // INTERNAL by-ID bookkeeping call sites that must be able to see a
+  // quarantined agent's own data (e.g. filling in its name for a claim-
+  // request email, or its url/email for a blocklist entry when an admin
+  // deletes it) — never for anything that renders a public listing or page.
+  // Default false: every call site that doesn't explicitly ask for it keeps
+  // getting the filtered set, so a future new caller can't silently regress
+  // the gate simply by omitting an option it doesn't know exists.
+  //
+  // Caching: only the default (filtered, includeUnvetted=false) path is
+  // cached — this is the hot path called on nearly every public request.
+  // The opt-out path is called from a couple of rare, low-traffic admin/
+  // claim code paths, so it queries live rather than adding a second cache
+  // dimension (and the two would otherwise need independent invalidation).
+  getActiveAgents(opts?: { includeUnvetted?: boolean }): RegisteredAgent[] {
+    const includeUnvetted = opts?.includeUnvetted === true;
+    const db = getDb();
+    if (includeUnvetted) {
+      const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC").all() as any[];
+      return rows.map(r => this.rowToAgent(r)!);
+    }
     const now = Date.now();
     if (this._agentsCache && (now - this._agentsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
       return this._agentsCache;
     }
-    const db = getDb();
     // Phase 5.11 A4.1: getActiveAgents powers producer-discovery surfaces; exclude umbrellas
-    const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC").all() as any[];
+    const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 ORDER BY trust_score DESC, created_at DESC").all() as any[];
     this._agentsCache = rows.map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;
