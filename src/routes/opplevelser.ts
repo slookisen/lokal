@@ -3377,13 +3377,33 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
     }
     for (const id of ids) {
       const t = expDb
-        .prepare(`SELECT id, navn, listing_url, hjemmeside, content_source FROM experience_providers WHERE id = ?`)
+        .prepare(
+          `SELECT id, navn, listing_url, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`
+        )
         .get(id) as
-        | { id: string; navn: string; listing_url: string | null; hjemmeside: string | null; content_source: string | null }
+        | {
+            id: string;
+            navn: string;
+            listing_url: string | null;
+            hjemmeside: string | null;
+            content_source: string | null;
+            field_provenance: string | null;
+            producer_type: string | null;
+            rfb_seed_source: string | null;
+          }
         | undefined;
       if (!t) {
         notFound.push(id);
-      } else if (t.content_source === "manual" || t.content_source === "claim") {
+      } else if (
+        isHjemmesideLocked({
+          id: t.id,
+          hjemmeside: t.hjemmeside,
+          content_source: t.content_source,
+          field_provenance: t.field_provenance,
+          producer_type: t.producer_type,
+          rfb_seed_source: t.rfb_seed_source,
+        })
+      ) {
         skippedLocked.push({ provider_id: t.id, navn: t.navn });
       } else if (t.hjemmeside && t.hjemmeside.trim() !== "") {
         alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
