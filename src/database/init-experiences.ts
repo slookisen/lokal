@@ -959,6 +959,59 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_website_verification_audit failed:", err);
   }
 
+  // ─── gardssalg_field_concordance_review_queue (orchestrator dev-request
+  // 2026-08-03-gardssalg-field-concordance, write-side slice) ────────────────
+  // The review queue for `avvik` verdicts produced by the field-concordance
+  // sweep (GET /admin/gardssalg-field-concordance-audit, POST
+  // /admin/gardssalg-field-concordance-remediation,
+  // services/gardssalg-field-concordance.ts). An `avvik` verdict is only
+  // possible on the three avvik-capable fields (epost/telefon/mobil — see
+  // GFC_AVVIK_CAPABLE_FIELDS in gardssalg-field-concordance.ts); the four
+  // presence-only fields never land a row here. Per the dev-request's own
+  // spec ("Ingen automatisk overskriving ved avvik"), this queue carries BOTH
+  // the stored (`current_value`) and page-extracted (`found_value`) value for
+  // a human/future-slice to resolve — applyGardssalgFieldConcordance()
+  // (services/gardssalg-field-concordance.ts) NEVER writes epost/telefon/
+  // mobil on experience_providers directly; this table + the
+  // field_provenance.field_concordance stamp are its only writes.
+  //
+  // Deliberately a SEPARATE table from gardssalg_website_review_queue, not a
+  // shared/reused one, and with a DIFFERENT uniqueness shape:
+  // gardssalg_website_review_queue is UNIQUE(provider_id) because only one
+  // hjemmeside-URL candidate makes sense pending at a time per provider; here
+  // a single producer can simultaneously have a genuine avvik on epost AND
+  // telefon (independent fields, independent findings) — so uniqueness is
+  // per (provider_id, field_name), letting up to 3 pending rows coexist per
+  // provider (one per avvik-capable field) without evicting each other.
+  // Upsert-on-rerun semantics on that composite key: a repeat scan reaching
+  // the SAME avvik (identical current_value+found_value) is a no-op (skipped
+  // at the application layer, not here — see applyGardssalgFieldConcordance's
+  // own doc comment) so updated_at doesn't churn pointlessly; a repeat scan
+  // finding a CHANGED found_value overwrites the existing row (refresh-on-
+  // rerun, same contract as the website queue's own upsert).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_field_concordance_review_queue (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        provider_name TEXT,
+        field_name TEXT NOT NULL,
+        current_value TEXT,
+        found_value TEXT,
+        reason TEXT NOT NULL DEFAULT 'field_concordance_avvik',
+        batch_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(provider_id, field_name),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_field_concordance_review_queue_reason ON gardssalg_field_concordance_review_queue(reason)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_field_concordance_review_queue_provider ON gardssalg_field_concordance_review_queue(provider_id)`);
+  } catch (err) {
+    console.error("Migration gardssalg_field_concordance_review_queue failed:", err);
+  }
+
   // ─── experience_provider_field_write_audit (Steg 4 of the
   // 2026-08-03-hjemmeside-skrivespak dev-request — "skrivespak for
   // hjemmeside") ──────────────────────────────────────────────────────────

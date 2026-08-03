@@ -36,6 +36,8 @@
 // for those four fields (out of scope: free-text competing-value extraction
 // is a false-positive risk this slice does not take on).
 
+import type Database from "better-sqlite3";
+import { v4 as uuid } from "uuid";
 import { normaliseNorwegianPhone } from "./experience-store";
 import { normaliseName } from "./brreg-client";
 
@@ -84,7 +86,15 @@ export type GfcFieldName =
   | "poststed"
   | "opening_hours_text";
 
-export const GFC_AVVIK_CAPABLE_FIELDS: readonly GfcFieldName[] = ["epost", "telefon", "mobil"];
+// Narrower than GfcFieldName on purpose (dev-request 2026-08-03-gardssalg-
+// field-concordance-write): the write-side code below indexes
+// GfcProviderResult by one of these three names specifically to read the
+// avvik-capable `.current`/`.found` keys (GfcAvvikCapableField), which the
+// four presence-only fields (GfcPresenceField) don't carry — keeping this a
+// literal union lets the compiler catch a field mixed in from
+// GFC_PRESENCE_ONLY_FIELDS instead of silently typing as `unknown`/`any`.
+export type GfcAvvikCapableFieldName = "epost" | "telefon" | "mobil";
+export const GFC_AVVIK_CAPABLE_FIELDS: readonly GfcAvvikCapableFieldName[] = ["epost", "telefon", "mobil"];
 export const GFC_PRESENCE_ONLY_FIELDS: readonly GfcFieldName[] = [
   "adresse",
   "postnummer",
@@ -317,4 +327,153 @@ export function summarizeGfc(rows: GfcProviderResult[]): GfcSummary {
     }
   }
   return summary;
+}
+
+// ─── Write side — orchestrator dev-request 2026-08-03-gardssalg-field-
+// concordance-write ──────────────────────────────────────────────────────────
+//
+// applyGardssalgFieldConcordance is the WRITE-SIDE the read-only GET
+// endpoint above deliberately left out. Per the dev-request's own spec
+// ("avvik går til eksisterende review-løype (kø-oppføring med begge
+// verdier)... Ingen automatisk overskriving ved avvik"), an `avvik` verdict
+// on epost/telefon/mobil (the only avvik-capable fields — see
+// GFC_AVVIK_CAPABLE_FIELDS above) goes into a review queue carrying BOTH the
+// stored and found value, for a human/future-slice to resolve. This function
+// NEVER writes epost/telefon/mobil/adresse/postnummer/poststed/
+// opening_hours_text on experience_providers directly, under any
+// circumstance — its only writes are (a) the field_provenance.
+// field_concordance stamp and (b) the review-queue table.
+//
+// Follows applyGardssalgWebsiteVerification's exact shape (services/
+// gardssalg-website-verification.ts): parse-defensive JSON read (malformed/
+// missing existing field_provenance -> treat as {}, never throw, never
+// clobber other keys — in particular hjemmeside_verification, written by the
+// sibling slice, is byte-preserved), one db.prepare(...).run(...) per row,
+// all inside a single db.transaction.
+
+/** One row's outcome — provider_id plus the avvik-capable field names that
+ *  were actually queued (new OR refreshed) for it this run. A provider whose
+ *  every field verdicts bekreftet/ikke_funnet_på_siden still gets a
+ *  provenance stamp but an empty queued_fields array. */
+export interface GfcApplyResult {
+  provider_id: string;
+  queued_fields: GfcFieldName[];
+}
+
+export interface GfcApplyOutcome {
+  applied: GfcApplyResult[];
+  provenance_written: number;
+  total_queued: number;
+}
+
+interface GfcExistingQueueRow {
+  current_value: string | null;
+  found_value: string | null;
+}
+
+/**
+ * Apply a previously-scanned set of provider results: for every provider,
+ * read-modify-write field_provenance.field_concordance (a NEW key — never
+ * touches hjemmeside_verification or any other existing key), then upsert a
+ * gardssalg_field_concordance_review_queue row for each avvik-capable field
+ * (epost/telefon/mobil) whose verdict is exactly "avvik".
+ *
+ * Idempotency discipline (mirrors applyGardssalgWebsiteVerification's own):
+ * a re-run reaching the SAME conclusion for a given (provider_id, field_name)
+ * — identical current_value + found_value already queued — is a genuine
+ * no-op for that field (no SQL run at all, updated_at is not bumped
+ * pointlessly). A re-run whose found_value has changed overwrites the
+ * existing row (refresh-on-rerun, same contract as the website queue's own
+ * upsert). Fields verdicting bekreftet or ikke_funnet_på_siden never touch
+ * the queue at all — it is ONLY for genuine avvik.
+ *
+ * A provider_id that no longer resolves to a row (deleted mid-run) is
+ * silently skipped — nothing to stamp, nothing to queue for it.
+ */
+export function applyGardssalgFieldConcordance(
+  db: Database.Database,
+  providers: GfcProviderResult[],
+  batchId: string | null,
+): GfcApplyOutcome {
+  const applied: GfcApplyResult[] = [];
+  const checkedAt = new Date().toISOString();
+
+  const getExistingQueueRow = db.prepare(
+    `SELECT current_value, found_value FROM gardssalg_field_concordance_review_queue
+      WHERE provider_id = ? AND field_name = ?`,
+  );
+  const upsertQueueRow = db.prepare(
+    `INSERT INTO gardssalg_field_concordance_review_queue
+       (id, provider_id, provider_name, field_name, current_value, found_value, reason, batch_id, created_at, updated_at)
+     VALUES (@id, @provider_id, @provider_name, @field_name, @current_value, @found_value, @reason, @batch_id, datetime('now'), datetime('now'))
+     ON CONFLICT(provider_id, field_name) DO UPDATE SET
+       provider_name = excluded.provider_name,
+       current_value = excluded.current_value,
+       found_value = excluded.found_value,
+       reason = excluded.reason,
+       batch_id = excluded.batch_id,
+       updated_at = datetime('now')`,
+  );
+
+  const runOne = db.transaction((provider: GfcProviderResult) => {
+    const providerRow = db
+      .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+      .get(provider.provider_id) as { field_provenance: string | null } | undefined;
+    if (!providerRow) return; // provider vanished mid-run (deleted) -> nothing to stamp/queue
+
+    let provenance: Record<string, unknown> = {};
+    if (providerRow.field_provenance) {
+      try {
+        const parsed = JSON.parse(providerRow.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          provenance = parsed as Record<string, unknown>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty rather than clobber the write */
+      }
+    }
+
+    const verdictSummary = {} as Record<GfcFieldName, GfcFieldVerdict>;
+    for (const f of GFC_ALL_FIELDS) verdictSummary[f] = provider[f].verdict;
+
+    provenance.field_concordance = {
+      checked_at: checkedAt,
+      batch_id: batchId,
+      summary: verdictSummary,
+    };
+
+    db.prepare(
+      `UPDATE experience_providers SET field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`,
+    ).run({ id: provider.provider_id, field_provenance: JSON.stringify(provenance) });
+
+    const queuedFields: GfcFieldName[] = [];
+    for (const field of GFC_AVVIK_CAPABLE_FIELDS) {
+      const cell = provider[field];
+      if (cell.verdict !== "avvik") continue;
+
+      const existing = getExistingQueueRow.get(provider.provider_id, field) as GfcExistingQueueRow | undefined;
+      const alreadyQueuedSame =
+        !!existing && existing.current_value === cell.current && existing.found_value === cell.found;
+      if (alreadyQueuedSame) continue; // re-run reaching the SAME conclusion -> no-op, no updated_at churn
+
+      upsertQueueRow.run({
+        id: uuid(),
+        provider_id: provider.provider_id,
+        provider_name: provider.provider_name,
+        field_name: field,
+        current_value: cell.current,
+        found_value: cell.found,
+        reason: "field_concordance_avvik",
+        batch_id: batchId,
+      });
+      queuedFields.push(field);
+    }
+
+    applied.push({ provider_id: provider.provider_id, queued_fields: queuedFields });
+  });
+
+  for (const provider of providers) runOne(provider);
+
+  const total_queued = applied.reduce((sum, a) => sum + a.queued_fields.length, 0);
+  return { applied, provenance_written: applied.length, total_queued };
 }

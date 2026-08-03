@@ -239,7 +239,10 @@ import {
 import {
   buildProviderConcordanceRow,
   summarizeGfc,
+  applyGardssalgFieldConcordance,
+  GFC_AVVIK_CAPABLE_FIELDS,
   type GfcProviderResult,
+  type GfcFieldName,
 } from "../services/gardssalg-field-concordance";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
@@ -7036,8 +7039,145 @@ router.get("/admin/gardssalg-verified-drinkproducer-cohort", requireAdmin, (_req
 // rest of the batch, which the parameter-bound SQL already guarantees.
 //
 // Zero writes of any kind — no field_provenance stamp, no queue insert, no
-// DB write whatsoever. This is a pure GET, purely diagnostic.
+// DB write whatsoever. This is a pure GET, purely diagnostic. The write side
+// (queue + provenance stamp) is POST /admin/gardssalg-field-concordance-
+// remediation, below — see its own doc comment.
 const MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH = 200;
+
+// Thrown by runGardssalgFieldConcordanceScan when the cohort query itself
+// fails (malformed SQL / DB error, not a page-fetch failure — those fail
+// closed per-row inside buildProviderConcordanceRow and never throw). A
+// dedicated class lets each route's own catch block recognize this ONE
+// failure mode and reply with the same specific "Failed to query
+// experience_providers" message the original (pre-refactor) GET route always
+// gave, instead of collapsing into the generic "Internal error" every other
+// unexpected failure gets.
+class GfcQueryError extends Error {}
+
+// Shared providerIds validation for both the GET audit route and the POST
+// remediation route below — same discipline as POST /admin/gardssalg-
+// outreach-preflight's own provider_ids batch: parameter-bound only (never
+// string-interpolated — callers pass this straight into an `IN (...)`
+// clause), deduplicated preserving first-seen order, capped at
+// MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH with a 400 if exceeded or if nothing
+// usable survives trimming.
+function parseGfcProviderIdsFilter(rawList: string[]): { ids: string[] } | { error: string } {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const raw of rawList) {
+    const id = raw.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ordered.push(id);
+  }
+  if (ordered.length === 0) {
+    return { error: "providerIds må inneholde minst én ikke-tom id." };
+  }
+  if (ordered.length > MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH) {
+    return { error: `providerIds overstiger maks batch-størrelse på ${MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH}.` };
+  }
+  return { ids: ordered };
+}
+
+// Extracted from the original inline GET route body (dev-request 2026-08-03-
+// gardssalg-field-concordance-write) so the write-side POST route below can
+// run the EXACT same scan rather than duplicating the cohort query + fetch
+// loop. Loads the verified drink-producer cohort (producer_type IN
+// DRINK_PRODUCER_TYPES AND isHjemmesideVerified(field_provenance) —
+// unchanged from before this refactor), fetches each producer's homepage via
+// crFetchGardssalgContent/gardssalgPageText (the SAME SSRF-guarded pipeline
+// content-refresh/website-verification already use), and builds each row via
+// buildProviderConcordanceRow. Zero writes — this function itself never
+// touches the DB beyond the initial SELECT.
+async function runGardssalgFieldConcordanceScan(
+  expDb: Database.Database,
+  providerIdsFilter?: string[],
+): Promise<{ providers: GfcProviderResult[] }> {
+  const drinkTypes = Array.from(DRINK_PRODUCER_TYPES);
+  const typePlaceholders = drinkTypes.map(() => "?").join(", ");
+
+  let sql = `SELECT id, navn, hjemmeside, epost, telefon, mobil, adresse, postnummer, poststed,
+                    opening_hours_text, field_provenance
+               FROM experience_providers
+              WHERE producer_type IN (${typePlaceholders})`;
+  const params: string[] = [...drinkTypes];
+  if (providerIdsFilter) {
+    const idPlaceholders = providerIdsFilter.map(() => "?").join(", ");
+    sql += ` AND id IN (${idPlaceholders})`;
+    params.push(...providerIdsFilter);
+  }
+  sql += ` ORDER BY id`;
+
+  let rows: Array<{
+    id: string;
+    navn: string;
+    hjemmeside: string | null;
+    epost: string | null;
+    telefon: string | null;
+    mobil: string | null;
+    adresse: string | null;
+    postnummer: string | null;
+    poststed: string | null;
+    opening_hours_text: string | null;
+    field_provenance: string | null;
+  }> = [];
+  try {
+    rows = expDb.prepare(sql).all(...params) as typeof rows;
+  } catch (err) {
+    console.error("[gardssalg-field-concordance-scan] failed to query providers:", err);
+    throw new GfcQueryError("Failed to query experience_providers");
+  }
+
+  // Same fail-closed gate as GET /admin/gardssalg-verified-drinkproducer-
+  // cohort above — verified === true only, never a truthy/ambiguous check.
+  const cohort = rows.filter((p) => isHjemmesideVerified(p.field_provenance));
+
+  const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
+    const fetched = await crFetchGardssalgContent(homepageUrl);
+    if (!fetched.ok) return { ok: false, reason: fetched.reason };
+    return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+  };
+
+  const providers: GfcProviderResult[] = [];
+  for (let i = 0; i < cohort.length; i += CR_CONCURRENCY) {
+    const slice = cohort.slice(i, i + CR_CONCURRENCY);
+    const sliceResults = await Promise.all(
+      slice.map(async (p) => {
+        const hjemmeside = p.hjemmeside && p.hjemmeside.trim() !== "" ? p.hjemmeside.trim() : null;
+        let pageText: string | null = null;
+        if (hjemmeside) {
+          try {
+            const fetched = await fetchFn(hjemmeside);
+            pageText = fetched.ok ? fetched.pageText : null;
+          } catch {
+            // fetchFn's own contract never throws in practice, but this
+            // route treats a throw exactly like a reported failure —
+            // fail-closed either way, never an uncaught rejection, never a
+            // crashed batch.
+            pageText = null;
+          }
+        }
+        return buildProviderConcordanceRow(
+          {
+            id: p.id,
+            navn: p.navn,
+            epost: p.epost,
+            telefon: p.telefon,
+            mobil: p.mobil,
+            adresse: p.adresse,
+            postnummer: p.postnummer,
+            poststed: p.poststed,
+            opening_hours_text: p.opening_hours_text,
+          },
+          pageText,
+        );
+      }),
+    );
+    providers.push(...sliceResults);
+  }
+
+  return { providers };
+}
 
 router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req: Request, res: Response) => {
   const rawProviderIds = req.query.providerIds;
@@ -7046,115 +7186,17 @@ router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req:
     const rawList: string[] = Array.isArray(rawProviderIds)
       ? (rawProviderIds as unknown[]).map((v) => String(v))
       : String(rawProviderIds).split(",");
-    // Dedupe while preserving first-seen order — same discipline as
-    // POST /admin/gardssalg-outreach-preflight's provider_ids handling.
-    const seen = new Set<string>();
-    const ordered: string[] = [];
-    for (const raw of rawList) {
-      const id = raw.trim();
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      ordered.push(id);
-    }
-    if (ordered.length === 0) {
-      res.status(400).json({ error: "providerIds må inneholde minst én ikke-tom id." });
+    const parsed = parseGfcProviderIdsFilter(rawList);
+    if ("error" in parsed) {
+      res.status(400).json({ error: parsed.error });
       return;
     }
-    if (ordered.length > MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH) {
-      res.status(400).json({
-        error: `providerIds overstiger maks batch-størrelse på ${MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH}.`,
-      });
-      return;
-    }
-    providerIdsFilter = ordered;
+    providerIdsFilter = parsed.ids;
   }
 
   const expDb = getExpDb("experiences");
   try {
-    const drinkTypes = Array.from(DRINK_PRODUCER_TYPES);
-    const typePlaceholders = drinkTypes.map(() => "?").join(", ");
-
-    let sql = `SELECT id, navn, hjemmeside, epost, telefon, mobil, adresse, postnummer, poststed,
-                      opening_hours_text, field_provenance
-                 FROM experience_providers
-                WHERE producer_type IN (${typePlaceholders})`;
-    const params: string[] = [...drinkTypes];
-    if (providerIdsFilter) {
-      const idPlaceholders = providerIdsFilter.map(() => "?").join(", ");
-      sql += ` AND id IN (${idPlaceholders})`;
-      params.push(...providerIdsFilter);
-    }
-    sql += ` ORDER BY id`;
-
-    let rows: Array<{
-      id: string;
-      navn: string;
-      hjemmeside: string | null;
-      epost: string | null;
-      telefon: string | null;
-      mobil: string | null;
-      adresse: string | null;
-      postnummer: string | null;
-      poststed: string | null;
-      opening_hours_text: string | null;
-      field_provenance: string | null;
-    }> = [];
-    try {
-      rows = expDb.prepare(sql).all(...params) as typeof rows;
-    } catch (err) {
-      console.error("[gardssalg-field-concordance-audit] failed to query providers:", err);
-      res.status(500).json({ error: "Failed to query experience_providers" });
-      return;
-    }
-
-    // Same fail-closed gate as GET /admin/gardssalg-verified-drinkproducer-
-    // cohort above — verified === true only, never a truthy/ambiguous check.
-    const cohort = rows.filter((p) => isHjemmesideVerified(p.field_provenance));
-
-    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
-      const fetched = await crFetchGardssalgContent(homepageUrl);
-      if (!fetched.ok) return { ok: false, reason: fetched.reason };
-      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
-    };
-
-    const providers: GfcProviderResult[] = [];
-    for (let i = 0; i < cohort.length; i += CR_CONCURRENCY) {
-      const slice = cohort.slice(i, i + CR_CONCURRENCY);
-      const sliceResults = await Promise.all(
-        slice.map(async (p) => {
-          const hjemmeside = p.hjemmeside && p.hjemmeside.trim() !== "" ? p.hjemmeside.trim() : null;
-          let pageText: string | null = null;
-          if (hjemmeside) {
-            try {
-              const fetched = await fetchFn(hjemmeside);
-              pageText = fetched.ok ? fetched.pageText : null;
-            } catch {
-              // fetchFn's own contract never throws in practice, but this
-              // route treats a throw exactly like a reported failure —
-              // fail-closed either way, never an uncaught rejection, never a
-              // crashed batch.
-              pageText = null;
-            }
-          }
-          return buildProviderConcordanceRow(
-            {
-              id: p.id,
-              navn: p.navn,
-              epost: p.epost,
-              telefon: p.telefon,
-              mobil: p.mobil,
-              adresse: p.adresse,
-              postnummer: p.postnummer,
-              poststed: p.poststed,
-              opening_hours_text: p.opening_hours_text,
-            },
-            pageText,
-          );
-        }),
-      );
-      providers.push(...sliceResults);
-    }
-
+    const { providers } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter);
     res.json({
       success: true,
       count: providers.length,
@@ -7162,7 +7204,106 @@ router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req:
       providers,
     });
   } catch (err) {
+    if (err instanceof GfcQueryError) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
     console.error("[gardssalg-field-concordance-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-field-concordance-remediation ────
+//
+// orchestrator dev-request 2026-08-03-gardssalg-field-concordance (write-side
+// slice): the WRITE side the read-only GET .../gardssalg-field-concordance-
+// audit route above deliberately left out. Re-runs the EXACT same scan as
+// GET (via the shared runGardssalgFieldConcordanceScan helper above — never
+// duplicated) with an optional `providerIds` override (same validation as
+// GET's own filter, see parseGfcProviderIdsFilter above) and an optional
+// `batch_id` string recorded on any queue rows written.
+//
+// Dry-run (apply omitted/false — the default): ZERO writes. Reports
+// `would_queue`: the avvik entries (epost/telefon/mobil only — the only
+// avvik-capable fields) a real apply would upsert into
+// gardssalg_field_concordance_review_queue. Lists every current avvik found
+// by this scan, new or already-queued alike — dry-run is a preview of the
+// scan's findings, not a diff against the queue's current contents.
+//
+// Apply: calls applyGardssalgFieldConcordance (services/gardssalg-field-
+// concordance.ts) — for every scanned provider, read-modify-writes
+// field_provenance.field_concordance (a verdict-only stamp; never touches
+// hjemmeside_verification or any other existing provenance key), then
+// upserts a gardssalg_field_concordance_review_queue row for every field
+// whose verdict is exactly "avvik" (skipped if an identical pending entry
+// already exists, for idempotent re-runs). Per the dev-request's own spec
+// ("Ingen automatisk overskriving ved avvik"), this NEVER writes epost/
+// telefon/mobil/adresse/postnummer/poststed/opening_hours_text on
+// experience_providers directly, under any circumstance — see that
+// function's own doc comment for the full write contract.
+router.post("/admin/gardssalg-field-concordance-remediation", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+
+  const rawProviderIds = body.providerIds;
+  let providerIdsFilter: string[] | undefined;
+  if (rawProviderIds !== undefined) {
+    const rawList: string[] = Array.isArray(rawProviderIds)
+      ? (rawProviderIds as unknown[]).map((v) => String(v))
+      : String(rawProviderIds).split(",");
+    const parsed = parseGfcProviderIdsFilter(rawList);
+    if ("error" in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    providerIdsFilter = parsed.ids;
+  }
+
+  const expDb = getExpDb("experiences");
+  try {
+    const { providers } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter);
+    const summary = summarizeGfc(providers);
+
+    if (!apply) {
+      const would_queue: Array<{
+        provider_id: string;
+        field_name: GfcFieldName;
+        current_value: string | null;
+        found_value: string | null;
+      }> = [];
+      for (const p of providers) {
+        for (const field of GFC_AVVIK_CAPABLE_FIELDS) {
+          const cell = p[field];
+          if (cell.verdict === "avvik") {
+            would_queue.push({
+              provider_id: p.provider_id,
+              field_name: field,
+              current_value: cell.current,
+              found_value: cell.found,
+            });
+          }
+        }
+      }
+      res.json({ success: true, dry_run: true, would_queue, summary });
+      return;
+    }
+
+    const { applied, provenance_written, total_queued } = applyGardssalgFieldConcordance(expDb, providers, batchId);
+    res.json({
+      success: true,
+      dry_run: false,
+      provenance_written,
+      queued: total_queued,
+      applied,
+      summary,
+    });
+  } catch (err) {
+    if (err instanceof GfcQueryError) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    console.error("[gardssalg-field-concordance-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
