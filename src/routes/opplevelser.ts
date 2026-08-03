@@ -128,6 +128,11 @@ import {
   listGardssalgWebsiteReviewQueue,
   stampGardssalgWebsiteDiscoveryAttempt,
   applyGardssalgProviderWebsite,
+  // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
+  // 3d — narrows POST /admin/providers/hjemmeside-write's lock check from
+  // row-level content_source to this SAME per-field owner_locks helper
+  // (gated on gårdssalg-row identity; see isHjemmesideLocked below).
+  isGardssalgFieldOwnerLocked,
   // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — search-based
   // candidate source (tier 2, after the free name-guess tier above): combined
   // social-media + directory/DMO pre-fetch exclusion, query builder, Brave
@@ -9061,14 +9066,29 @@ interface HjemmesideWriteRow {
   hjemmeside: string | null;
   content_source: string | null;
   field_provenance: string | null;
+  producer_type: string | null;
+  rfb_seed_source: string | null;
 }
 
 const HJEMMESIDE_WRITE_ROW_SQL =
-  `SELECT id, hjemmeside, content_source, field_provenance FROM experience_providers WHERE id = ?`;
+  `SELECT id, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`;
 
 /** Lock signal for experience_providers: content_source alone (no sibling
- *  "verified claims" table exists for this entity, unlike agents/agent_claims). */
+ *  "verified claims" table exists for this entity, unlike agents/agent_claims) —
+ *  EXCEPT experience_providers is shared with the gårdssalg sub-vertical
+ *  (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
+ *  3d), whose claim portal writes a per-field field_provenance.owner_locks
+ *  stamp that isGardssalgFieldOwnerLocked() (experience-store.ts) already
+ *  consults to narrow the freeze from row-level to field-level. That helper
+ *  must NEVER be called on a non-gårdssalg row — a coincidental owner_locks
+ *  key there isn't a real owner-lock stamp — so gate on the SAME gårdssalg-row
+ *  predicate already used elsewhere in this file (e.g.
+ *  admin/gardssalg-provider-visibility above): producer_type IS NOT NULL OR
+ *  rfb_seed_source = 'rfb-seed'. Non-gårdssalg rows keep the original
+ *  unconditional row-level freeze. */
 function isHjemmesideLocked(row: HjemmesideWriteRow): boolean {
+  const isGardssalgRow = row.producer_type !== null || row.rfb_seed_source === "rfb-seed";
+  if (isGardssalgRow) return isGardssalgFieldOwnerLocked(row, "hjemmeside");
   return row.content_source === "manual" || row.content_source === "claim";
 }
 
