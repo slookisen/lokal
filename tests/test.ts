@@ -36875,3 +36875,29 @@ runSerial(async () => {
     failures.push("url-write: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 1
+// ("Innholdsberikelse"): POST /api/opplevelser/admin/experiences-description-
+// enrichment — the source-grounded, judge-gated writer for
+// `experiences.description` that replaces the "Detaljert beskrivelse
+// publiseres fortløpende"-plassholderen on opplevagent.no's detail pages.
+// Own in-memory experiences DB reached through the route's own seams (the
+// db-factory require-cache swap the sibling opplevelser-gardssalg-*.test.ts
+// files already use, plus the per-app-instance
+// "experienceDescriptionFetchImpl" fetch injection) — never touches
+// globalThis.fetch, never calls the real Anthropic API.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-12-opplevagent-serp-innholdsberikelse: experiences-description-enrichment ──");
+  try {
+    const { runOpplevelserExperienceDescriptionEnrichmentTests } = require("../src/routes/opplevelser-experience-description-enrichment.test") as
+      typeof import("../src/routes/opplevelser-experience-description-enrichment.test");
+    const ed = await runOpplevelserExperienceDescriptionEnrichmentTests({ log: false });
+    passed += ed.passed;
+    failed += ed.failed;
+    for (const f of ed.failures) failures.push("experience-description-enrichment: " + f);
+    console.log(`  experience-description-enrichment: ${ed.passed} passed, ${ed.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-description-enrichment: unexpected error: " + String(err?.message || err));
+  }
+});
