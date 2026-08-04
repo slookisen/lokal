@@ -4199,9 +4199,21 @@ router.post("/admin/homepage-review-queue/submit", requireAdmin, (req: Request, 
     seen.add(pid);
 
     const provider = expDb
-      .prepare(`SELECT id, navn, hjemmeside, org_nr, listing_url, content_source FROM experience_providers WHERE id = ?`)
+      .prepare(
+        `SELECT id, navn, hjemmeside, org_nr, listing_url, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`
+      )
       .get(pid) as
-      | { id: string; navn: string; hjemmeside: string | null; org_nr: string | null; listing_url: string | null; content_source: string | null }
+      | {
+          id: string;
+          navn: string;
+          hjemmeside: string | null;
+          org_nr: string | null;
+          listing_url: string | null;
+          content_source: string | null;
+          field_provenance: string | null;
+          producer_type: string | null;
+          rfb_seed_source: string | null;
+        }
       | undefined;
     if (!provider) {
       rejected.push({ provider_id: pid, reason: "not_found" });
@@ -4220,7 +4232,16 @@ router.post("/admin/homepage-review-queue/submit", requireAdmin, (req: Request, 
       rejected.push({ provider_id: pid, reason: "already_has_website" });
       continue;
     }
-    if (provider.content_source === "manual" || provider.content_source === "claim") {
+    if (
+      isHjemmesideLocked({
+        id: provider.id,
+        hjemmeside: provider.hjemmeside,
+        content_source: provider.content_source,
+        field_provenance: provider.field_provenance,
+        producer_type: provider.producer_type,
+        rfb_seed_source: provider.rfb_seed_source,
+      })
+    ) {
       rejected.push({ provider_id: pid, reason: "locked_content_source" });
       continue;
     }
