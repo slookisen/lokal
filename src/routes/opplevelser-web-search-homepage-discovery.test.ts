@@ -420,6 +420,136 @@ export function runOpplevelserWebSearchHomepageDiscoveryTests(
         const qB = expDb.prepare(`SELECT 1 FROM experience_homepage_review_queue WHERE provider_id='ws-cross-b'`).get() as any;
         assertTrue(!qB, "ws-15g: ws-cross-b never got a queue row of its own");
       }
+
+      // ── ws-16: sub-slice 3h — the locked_content_source guard in
+      //    POST /admin/homepage-review-queue/submit now goes through the
+      //    shared isHjemmesideLocked() helper (already shipped for
+      //    hjemmeside-write/listing-homepage-discovery/brreg-website-discovery,
+      //    sub-slices 3d/3e/3g), narrowing the freeze from an unconditional
+      //    row-level content_source check to isGardssalgFieldOwnerLocked()'s
+      //    per-field owner_locks stamp — but ONLY for gårdssalg-identified
+      //    rows (producer_type set, or rfb_seed_source='rfb-seed'). A
+      //    non-gårdssalg claim row keeps today's exact unconditional freeze.
+      //    Mirrors opplevelser-brreg-website-discovery.test.ts's bw-9
+      //    section, adapted to this route's {provider_id, candidate_url,
+      //    name_verified} candidate shape and 'rejected'/'locked_content_source'
+      //    response shape. ──────────────────────────────────────────────────
+      {
+        const insertGardssalgFixture = expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, org_nr, listing_url, hjemmeside, content_source, source, confidence,
+              enrichment_state, verification_status, producer_type, rfb_seed_source, field_provenance)
+           VALUES
+             (@id, @navn, 'experiences', NULL, NULL, NULL, @content_source, 'test-fixture', 'medium',
+              'raw', 'pending_verify', @producer_type, @rfb_seed_source, @field_provenance)`,
+        );
+
+        // ws-16-nongardssalg-claim: AC1 — non-gårdssalg row, content_source
+        // 'claim' → still rejected locked_content_source (regression guard).
+        insertGardssalgFixture.run({
+          id: "ws-16-nongardssalg-claim",
+          navn: "Ikke Gårdssalg Ws",
+          content_source: "claim",
+          producer_type: null,
+          rfb_seed_source: null,
+          field_provenance: null,
+        });
+        // ws-16-unlocked-producer-type: AC2 — gårdssalg row (producer_type
+        // set), content_source 'claim', field_provenance.owner_locks does
+        // NOT contain 'hjemmeside' → NOT locked_content_source-rejected.
+        insertGardssalgFixture.run({
+          id: "ws-16-unlocked-producer-type",
+          navn: "Ulåst Bryggeri Ws",
+          content_source: "claim",
+          producer_type: "bryggeri",
+          rfb_seed_source: null,
+          field_provenance: JSON.stringify({ owner_locks: { about_text: { locked_at: "2026-08-01T00:00:00Z" } } }),
+        });
+        // ws-16-locked-producer-type: AC3 — same gårdssalg row shape, but
+        // owner_locks.hjemmeside IS present → still rejected
+        // locked_content_source.
+        insertGardssalgFixture.run({
+          id: "ws-16-locked-producer-type",
+          navn: "Låst Bryggeri Ws",
+          content_source: "claim",
+          producer_type: "bryggeri",
+          rfb_seed_source: null,
+          field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T00:00:00Z" } } }),
+        });
+        // ws-16-adversarial: AC4 — non-gårdssalg row with an adversarial
+        // field_provenance.owner_locks.hjemmeside key present anyway → still
+        // rejected locked_content_source (gårdssalg-identity predicate must
+        // gate first).
+        insertGardssalgFixture.run({
+          id: "ws-16-adversarial",
+          navn: "Adversarial Ws",
+          content_source: "claim",
+          producer_type: null,
+          rfb_seed_source: null,
+          field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T00:00:00Z" } } }),
+        });
+        // ws-16-unlocked-rfbseed: gårdssalg identity via rfb_seed_source
+        // instead of producer_type, no owner_locks.hjemmeside → not locked
+        // (mirrors bw-9's rfb_seed_source coverage).
+        insertGardssalgFixture.run({
+          id: "ws-16-unlocked-rfbseed",
+          navn: "Ulåst Rfb-Seed Ws",
+          content_source: "claim",
+          producer_type: null,
+          rfb_seed_source: "rfb-seed",
+          field_provenance: JSON.stringify({ owner_locks: {} }),
+        });
+
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: {
+            candidates: [
+              { provider_id: "ws-16-nongardssalg-claim", candidate_url: "https://ws16-a.no", name_verified: true },
+              { provider_id: "ws-16-unlocked-producer-type", candidate_url: "https://ws16-b.no", name_verified: true },
+              { provider_id: "ws-16-locked-producer-type", candidate_url: "https://ws16-c.no", name_verified: true },
+              { provider_id: "ws-16-adversarial", candidate_url: "https://ws16-d.no", name_verified: true },
+              { provider_id: "ws-16-unlocked-rfbseed", candidate_url: "https://ws16-e.no", name_verified: true },
+            ],
+            apply: true,
+          },
+        });
+        assertEq(r.status, 200, "ws-16-0: request succeeds");
+        const rejectedById = new Map(
+          (r.body.rejected as any[]).map((x) => [x.provider_id, x.reason]),
+        );
+
+        assertEq(
+          rejectedById.get("ws-16-nongardssalg-claim"),
+          "locked_content_source",
+          "ws-16a (AC1): non-gårdssalg row, content_source='claim' → still rejected locked_content_source (regression guard)",
+        );
+
+        assertTrue(
+          rejectedById.get("ws-16-unlocked-producer-type") !== "locked_content_source",
+          "ws-16b (AC2): gårdssalg row (producer_type set), content_source='claim', owner_locks without 'hjemmeside' → NOT locked_content_source-rejected",
+        );
+        const qUnlocked = expDb.prepare(`SELECT COUNT(*) c FROM experience_homepage_review_queue WHERE provider_id='ws-16-unlocked-producer-type'`).get() as any;
+        assertEq(qUnlocked.c, 1, "ws-16b2: ...and proceeds all the way through to a queued row");
+
+        assertEq(
+          rejectedById.get("ws-16-locked-producer-type"),
+          "locked_content_source",
+          "ws-16c (AC3): same gårdssalg row shape, but owner_locks.hjemmeside present → still rejected locked_content_source",
+        );
+
+        assertEq(
+          rejectedById.get("ws-16-adversarial"),
+          "locked_content_source",
+          "ws-16d (AC4): non-gårdssalg row with adversarial owner_locks.hjemmeside → still rejected locked_content_source (gårdssalg-identity predicate gates first)",
+        );
+
+        assertTrue(
+          rejectedById.get("ws-16-unlocked-rfbseed") !== "locked_content_source",
+          "ws-16e: gårdssalg identity via rfb_seed_source='rfb-seed' (producer_type null), no owner_locks.hjemmeside → NOT locked_content_source-rejected",
+        );
+
+        expDb.prepare(`DELETE FROM experience_providers WHERE id LIKE 'ws-16-%'`).run();
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-web-search-homepage-discovery: unexpected error: " + String(err?.stack || err?.message || err));
