@@ -35762,6 +35762,28 @@ runSerial(async () => {
   }
 });
 
+// POST /admin/agents/contact-email-dns-check — diagnostic-only DNS-liveness
+// stamp on agent_knowledge.field_provenance.contact_email_dns_check. Detects
+// (never gates on, never writes contact_email/email, never touches
+// email_bounces) the ~200-of-1611 producers whose contact_email domain has no
+// DNS presence at all. Own in-memory DB + its own DNS-resolver seam, so no
+// real network calls happen during the suite.
+runSerial(async () => {
+  console.log("\n── agents.contact_email DNS-liveness diagnostic stamp ──");
+  try {
+    const { runAdminAgentsContactEmailDnsCheckTests } = require("../src/routes/admin-agents-contact-email-dns-check.test") as
+      typeof import("../src/routes/admin-agents-contact-email-dns-check.test");
+    const cedc = await runAdminAgentsContactEmailDnsCheckTests({ log: false });
+    passed += cedc.passed;
+    failed += cedc.failed;
+    for (const f of cedc.failures) failures.push("contact-email-dns-check: " + f);
+    console.log(`  contact-email-dns-check: ${cedc.passed} passed, ${cedc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-email-dns-check: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-13-supply-graph-v1, Slice 1: additive
 // availability_updated_at/availability_source columns on `products` +
 // computeEffectiveAvailability()/setProducerAvailability()
