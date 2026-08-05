@@ -1681,6 +1681,21 @@ export type ContentRefreshTarget = {
   id: string;
   navn: string;
   hjemmeside: string;
+  // dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-
+  // gate, Steg 3 — raw field_provenance JSON (same defensive-parse pattern
+  // as GardssalgContentRefreshTarget.field_provenance below), read here so
+  // the general content-refresh route can gate its fetch on
+  // isHjemmesideVerified(t.field_provenance) (routes/opplevelser.ts) without
+  // a second query. NOTE: `hjemmeside` above can be a COALESCE fallback to
+  // an experience's evidence_url when the provider's own `hjemmeside` column
+  // is blank (see selectProvidersForContentRefresh's SQL) — the
+  // website-verification classifier only ever classifies the PROVIDER's own
+  // hjemmeside column, so a fallback-sourced target reads as
+  // "missing_source" (verified=false) here and is gated closed too. That is
+  // the deliberate, fail-closed choice: the fallback URL was never itself
+  // ownership-verified, so it must not be trusted as an enrichment source
+  // either.
+  field_provenance: string | null;
 };
 
 /**
@@ -1876,7 +1891,8 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
                 WHERE e2.provider_id = p.id
                   AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
                 LIMIT 1)
-            ) AS hjemmeside
+            ) AS hjemmeside,
+            p.field_provenance AS field_provenance
        FROM experience_providers p
       WHERE (
           (p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != '')
@@ -1938,7 +1954,9 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
     }
 
     const fetchSize = Math.min(pageSize, CONTENT_REFRESH_HARD_SCAN_CAP - totalScanned);
-    const page = pageStmt.all(fetchSize, offset) as Array<{ id: string; navn: string; hjemmeside: string | null }>;
+    const page = pageStmt.all(fetchSize, offset) as Array<{
+      id: string; navn: string; hjemmeside: string | null; field_provenance: string | null;
+    }>;
 
     totalScanned += page.length;
     offset += page.length;
@@ -1947,7 +1965,7 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshSele
       if (!row.hjemmeside || !row.hjemmeside.trim()) continue;
       const experiences = experiencesStmt.all(row.id) as BucketableExperienceRow[];
       if (classifyProviderContentBucket(row.hjemmeside, experiences) !== "enrichable") continue;
-      out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() });
+      out.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim(), field_provenance: row.field_provenance });
       if (out.length >= cap) break;
     }
 
@@ -1983,12 +2001,14 @@ export function getProviderContentTarget(providerId: string): ContentRefreshTarg
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, field_provenance
          FROM experience_providers WHERE id = ?`
     )
-    .get(providerId) as { id: string; navn: string; hjemmeside: string | null } | undefined;
+    .get(providerId) as
+    | { id: string; navn: string; hjemmeside: string | null; field_provenance: string | null }
+    | undefined;
   if (!row || !row.hjemmeside || row.hjemmeside.trim().length === 0) return null;
-  return { id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() };
+  return { id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim(), field_provenance: row.field_provenance };
 }
 
 /** A provider's experiences, with only the columns the content gate needs. */
@@ -2558,10 +2578,20 @@ export type GardssalgProviderRow = {
   // entry (same "row.updated_at || today" pattern the /opplevelse/<slug>
   // sitemap loop already uses), instead of a blanket "today" on every request.
   updated_at: string | null;
+  // Additive (2026-08-03, dev-request 2026-08-03-claim-bekreftet-merke-og-
+  // innlogging): the historical "has this provider ever been claimed"
+  // timestamp, stamped once (idempotently) by verifyClaimToken()
+  // (services/gardssalg-claim.ts) the first time the owner's magic link is
+  // used — never cleared by a later revoke/logout. Distinct from the live,
+  // revocable isGardssalgProviderClaimed() query: this is what the
+  // /kategori/gardssalg/produsent/<slug> route reads to decide the
+  // "Bekreftet av eier" badge vs. the "Er dette din bedrift?" claim CTA.
+  // NULL = never claimed.
+  claimed_at: string | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at, claimed_at";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
@@ -5306,7 +5336,8 @@ export function applyGardssalgProviderWebsite(
     | { id: string; content_source: string | null; hjemmeside: string | null; field_provenance: string | null }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (row.content_source === "manual") return [];
+  if (row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, "hjemmeside")) return [];
 
   const cleanUrl = (url || "").trim();
   if (cleanUrl.length === 0 || cleanUrl.length > 2048) return [];
@@ -5395,6 +5426,12 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // rollback vetoes av gardssalgContactFieldWasRolledBack i skriveren.
   "epost",
   "telefon",
+  // 2026-08-03 (gardssalg-field-concordance-review-approve) —
+  // applyGardssalgFieldConcordanceApproval writes mobil via the same
+  // audit-trail discipline as epost/telefon above (a confirmed avvik
+  // approval, not a fill-only extraction, but the audit row shape is
+  // identical), so the standard rollback lever must cover it too.
+  "mobil",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
@@ -5420,6 +5457,78 @@ export type GardssalgRollbackSkip = {
   field_name: string;
   reason: "no_audit_row" | "already_current" | "unknown_field" | "manual_or_claim_source";
 };
+
+// Fields the claim portal actually lets an owner edit AND that the rollback
+// allow-list also covers (booking_live is claim-editable but is a consent
+// toggle with no rollback candidate, so it's excluded here on purpose — see
+// CLAIM_EDITABLE_FIELDS in gardssalg-claim.ts, which is the source of truth
+// this list is drawn from). Only these five fields ever get a per-field
+// owner_locks lookup in isGardssalgFieldOwnerLocked below.
+const GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS = new Set([
+  "about_text",
+  "visit_text",
+  "opening_hours_text",
+  "products",
+  "hjemmeside",
+]);
+
+/**
+ * Per-field owner-lock policy for gårdssalg rollback writes (dev-request
+ * 2026-08-03-gardssalg-owner-lock-rollback). Prior to this, both rollback
+ * functions gated on the WHOLE ROW: content_source 'manual' or 'claim' froze
+ * every field. PR #472 (commit 5410fd9) added an ADDITIVE per-field stamp —
+ * field_provenance.owner_locks.<field> = {locked_at} — written by the claim
+ * portal (updateClaimedProviderProfile, gardssalg-claim.ts) whenever an
+ * owner edits one of CLAIM_EDITABLE_FIELDS. This helper consults that stamp
+ * to narrow the freeze from row-level to field-level, but ONLY for
+ * content_source='claim' rows and ONLY for the five claim-editable,
+ * rollback-eligible fields:
+ *
+ *   1. content_source === 'manual' -> always locked, unconditionally. Manual
+ *      rows never consult owner_locks (a claim-portal-only concept) — the
+ *      full-row freeze for manual rows is unchanged.
+ *   2. content_source === 'claim':
+ *      - fieldName in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS -> locked IFF
+ *        field_provenance.owner_locks.<fieldName> is present (the owner
+ *        touched THIS field via the portal); if absent, the owner never
+ *        touched it and rollback may proceed.
+ *      - any other fieldName (org_nr, epost, telefon, adresse, postnummer,
+ *        poststed — fields owner_locks can never contain, since the claim
+ *        portal doesn't expose them) -> always locked, unconditionally, same
+ *        as today's row-level behavior. No change for these fields.
+ *   3. any other content_source (null, enrichment-derived, etc.) -> not
+ *      locked, same as today's existing behavior.
+ *
+ * field_provenance is read defensively (same JSON-parse-with-try-catch
+ * recipe used throughout this file, e.g. applyGardssalgProviderWebsite
+ * above) — malformed JSON is treated as "no owner_locks" rather than
+ * thrown.
+ */
+export function isGardssalgFieldOwnerLocked(
+  providerRow: { content_source: string | null; field_provenance?: string | null },
+  fieldName: string
+): boolean {
+  if (providerRow.content_source === "manual") return true;
+  if (providerRow.content_source === "claim") {
+    if (!GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS.has(fieldName)) return true;
+    let ownerLocks: Record<string, unknown> | undefined;
+    if (providerRow.field_provenance) {
+      try {
+        const parsed = JSON.parse(providerRow.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const ol = (parsed as Record<string, unknown>).owner_locks;
+          if (ol && typeof ol === "object" && !Array.isArray(ol)) {
+            ownerLocks = ol as Record<string, unknown>;
+          }
+        }
+      } catch {
+        /* malformed existing JSON -> treat as no owner_locks rather than throw */
+      }
+    }
+    return Boolean(ownerLocks && Object.prototype.hasOwnProperty.call(ownerLocks, fieldName));
+  }
+  return false;
+}
 
 // Resolve the (provider_id, field_name) pairs a rollback request targets:
 // batch_id -> every field any provider had touched under that batch;
@@ -5493,8 +5602,12 @@ export function planGardssalgContentRollback(
       continue;
     }
     const providerRow = db
-      .prepare(`SELECT ${t.field_name} AS current_value, content_source FROM experience_providers WHERE id = ?`)
-      .get(t.provider_id) as { current_value: string | null; content_source: string | null } | undefined;
+      .prepare(
+        `SELECT ${t.field_name} AS current_value, content_source, field_provenance FROM experience_providers WHERE id = ?`
+      )
+      .get(t.provider_id) as
+      | { current_value: string | null; content_source: string | null; field_provenance: string | null }
+      | undefined;
     if (!providerRow) {
       skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "no_audit_row" });
       continue;
@@ -5504,8 +5617,10 @@ export function planGardssalgContentRollback(
     // pipeline never touches that row again — a rollback is part of the same
     // automated pipeline, so it must never overwrite manually-provided
     // content either, even if a stale audit row from before the claim/manual
-    // edit makes the field look "restorable".
-    if (providerRow.content_source === "manual" || providerRow.content_source === "claim") {
+    // edit makes the field look "restorable". Narrowed to per-field for
+    // content_source='claim' rows via isGardssalgFieldOwnerLocked (dev-request
+    // 2026-08-03-gardssalg-owner-lock-rollback) — see its doc comment.
+    if (isGardssalgFieldOwnerLocked(providerRow, t.field_name)) {
       skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "manual_or_claim_source" });
       continue;
     }
@@ -5595,11 +5710,16 @@ export function applyGardssalgContentRollback(
     // here, right before the UPDATE, rather than trusting that this item
     // already passed that check in plan()'s `restorable` list. If a manual
     // or claim edit reaches this function anyway, skip it silently: no
-    // write, no audit row, and it's simply omitted from `restored`.
+    // write, no audit row, and it's simply omitted from `restored`. Narrowed
+    // to per-field for content_source='claim' rows via
+    // isGardssalgFieldOwnerLocked (dev-request 2026-08-03-gardssalg-owner-
+    // lock-rollback) — see its doc comment.
     const providerRow = db
-      .prepare(`SELECT content_source FROM experience_providers WHERE id = ?`)
-      .get(item.provider_id) as { content_source: string | null } | undefined;
-    if (providerRow && (providerRow.content_source === "manual" || providerRow.content_source === "claim")) {
+      .prepare(`SELECT content_source, field_provenance FROM experience_providers WHERE id = ?`)
+      .get(item.provider_id) as
+      | { content_source: string | null; field_provenance: string | null }
+      | undefined;
+    if (providerRow && isGardssalgFieldOwnerLocked(providerRow, item.field_name)) {
       continue;
     }
     runOne(item);
@@ -5607,4 +5727,189 @@ export function applyGardssalgContentRollback(
   }
 
   return restored;
+}
+
+// ─── Gårdssalg field-concordance review-queue approval (orchestrator
+// dev-request 2026-08-03-gardssalg-field-concordance-review-approve) ────────
+// The missing consumer for gardssalg_field_concordance_review_queue (see its
+// schema doc comment, init-experiences.ts, and applyGardssalgFieldConcordance
+// above — the scanner that populates the queue but never resolves it). Same
+// strict "confirmation surface, never an arbitrary-write surface" contract as
+// applyGardssalgProviderOrgnr/applyGardssalgProviderWebsite's own approve
+// levers: the route (routes/opplevelser.ts) only ever calls this with the
+// EXACT (provider_id, field_name, found_value) triple the queue itself
+// carries, having already rejected anything else.
+
+/** Field names this approval function may ever write. adresse/postnummer/
+ *  poststed/opening_hours_text (the four presence-only GFC fields) are
+ *  deliberately NEVER in this set — they can never land an avvik in the
+ *  queue in the first place (see GFC_AVVIK_CAPABLE_FIELDS), and this
+ *  function must reject them even if a caller tried anyway. Validated BEFORE
+ *  fieldName is ever used in a SQL string. */
+const GFC_APPROVAL_FIELDS = new Set(["epost", "telefon", "mobil"]);
+
+export type GfcApprovalResult = {
+  provider_id: string;
+  field_name: string;
+  written: boolean;
+  reason?: "invalid_field" | "not_found" | "owner_locked" | "stale_current_value";
+};
+
+/**
+ * Apply ONE confirmed gardssalg_field_concordance_review_queue finding to
+ * experience_providers.<fieldName>. Unlike every other gårdssalg write
+ * helper in this file (applyGardssalgProviderContact et al., which are
+ * fill-only — they only ever write when the existing value is blank), this
+ * one OVERWRITES a non-blank value: the entire point of an `avvik` finding
+ * is "the stored value contradicts the producer's own verified homepage",
+ * so a confirmed approval must be able to correct it, not just fill a gap.
+ *
+ * Guard order (first failing gate wins, no DB write on any of them):
+ *   1. fieldName not in GFC_APPROVAL_FIELDS -> "invalid_field", no DB call
+ *      at all (defense in depth — field_name can arrive from an admin
+ *      request body one hop up).
+ *   2. provider not found -> "not_found".
+ *   3. isGardssalgFieldOwnerLocked(row, fieldName) -> "owner_locked" (the
+ *      SAME per-field lock policy every other gårdssalg write helper in this
+ *      file consults — see its own doc comment. mobil is not in
+ *      GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS, so for content_source='claim'
+ *      rows it always falls into that helper's "any other fieldName ->
+ *      always locked" branch, same as epost/telefon today).
+ *   4. the row's CURRENT value for fieldName (trimmed, blank -> null)
+ *      doesn't match `expectedCurrentValue` (same normalisation) ->
+ *      "stale_current_value" — something else already changed the field
+ *      since this finding was queued; approving the stale finding would
+ *      silently clobber that other change.
+ *
+ * On success: read-modify-write field_provenance[fieldName] (defensive JSON
+ * parse, malformed/missing -> {}, never clobbers other keys — same recipe as
+ * applyGardssalgProviderContact above), UPDATE the column, and insert one
+ * gardssalg_content_audit row (old_value = the true pre-write trimmed
+ * current value, new_value = newValue, source_url = the same value stamped
+ * into field_provenance) — all inside one db.transaction. Returns
+ * `{written: true}` (no `reason`).
+ */
+export function applyGardssalgFieldConcordanceApproval(
+  providerId: string,
+  fieldName: string,
+  expectedCurrentValue: string | null,
+  newValue: string,
+  batchId?: string
+): GfcApprovalResult {
+  if (!GFC_APPROVAL_FIELDS.has(fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "invalid_field" };
+  }
+
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, epost, telefon, mobil, hjemmeside, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        epost: string | null;
+        telefon: string | null;
+        mobil: string | null;
+        hjemmeside: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "not_found" };
+  }
+
+  if (isGardssalgFieldOwnerLocked(row, fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "owner_locked" };
+  }
+
+  const normalise = (v: string | null | undefined): string | null => {
+    if (v === null || v === undefined) return null;
+    const trimmed = String(v).trim();
+    return trimmed === "" ? null : trimmed;
+  };
+  const currentValueRaw = (row as unknown as Record<string, string | null>)[fieldName] ?? null;
+  const currentValue = normalise(currentValueRaw);
+  if (currentValue !== normalise(expectedCurrentValue)) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "stale_current_value" };
+  }
+
+  const evidenceUrl = row.hjemmeside || "internal://field-concordance-review-approve";
+
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance[fieldName] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET ${fieldName} = @newValue, field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`
+    ).run({ id: providerId, newValue, field_provenance: JSON.stringify(provenance) });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      field_name: fieldName,
+      old_value: currentValue,
+      new_value: newValue,
+      source_url: evidenceUrl,
+      batch_id: batchId ?? null,
+    });
+  });
+  applyWithAudit();
+
+  return { provider_id: providerId, field_name: fieldName, written: true };
+}
+
+export type GardssalgFieldConcordanceReviewQueueEntry = {
+  id: string;
+  provider_id: string;
+  provider_name: string | null;
+  field_name: string;
+  current_value: string | null;
+  found_value: string | null;
+  reason: string;
+  batch_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Lists all current gardssalg_field_concordance_review_queue entries,
+ *  newest-updated first. Read-only, backs GET /admin/gardssalg-field-
+ *  concordance-review-queue. Mirrors listGardssalgOrgnrReviewQueue's
+ *  shape/typing style. */
+export function listGardssalgFieldConcordanceReviewQueue(): GardssalgFieldConcordanceReviewQueueEntry[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(`SELECT * FROM gardssalg_field_concordance_review_queue ORDER BY updated_at DESC`)
+    .all() as GardssalgFieldConcordanceReviewQueueEntry[];
+}
+
+/** Removes ONE (provider_id, field_name) entry from
+ *  gardssalg_field_concordance_review_queue. IMPORTANT: unlike
+ *  clearGardssalgOrgnrReviewQueueEntry/clearGardssalgWebsiteReviewQueueEntry
+ *  (both UNIQUE(provider_id) only), this table is UNIQUE(provider_id,
+ *  field_name) — a single producer can have up to 3 independently-pending
+ *  avvik rows (epost/telefon/mobil). The DELETE is scoped to BOTH columns so
+ *  approving one field never wrongly deletes a different still-pending field
+ *  for the same provider. Never throws if no row exists. */
+export function clearGardssalgFieldConcordanceReviewQueueEntry(providerId: string, fieldName: string): void {
+  const db = getDb(VERTICAL);
+  db.prepare(`DELETE FROM gardssalg_field_concordance_review_queue WHERE provider_id = ? AND field_name = ?`).run(
+    providerId,
+    fieldName
+  );
 }

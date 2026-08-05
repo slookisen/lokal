@@ -56,6 +56,44 @@ const router = Router();
 
 const OPPLEVAGENT_BASE_URL = (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "");
 
+// ── Owner-portal save receipt (dev-request 2026-08-03-eierportal-lagre-
+// knapp-henger) ─────────────────────────────────────────────────────────
+// Diagnosis: the portal's save button previously depended on a fetch's
+// .then/.catch BOTH settling to ever leave "Lagrer ..." — one branch showed
+// the receipt via a full-page redirect (`?status=saved`), the other reset
+// the button on a rejection. Live reproduction wasn't possible from this
+// session (the portal requires a real magic-link session and this session
+// has no mailbox to receive one — the same structural blocker documented in
+// the sibling dev-request 2026-08-03-claim-reinnlogging-kan-ikke-testes),
+// but the reported symptom (server-side write succeeded, button frozen on
+// "Lagrer ...", no receipt, no error) is only explained by the fetch
+// promise never settling at all — network layer completes the request
+// server-side (hence the write happens) but the browser's callback never
+// runs (e.g. a dropped connection after the response was sent, or a
+// backgrounded/suspended tab on mobile deferring the callback
+// indefinitely). Neither existing branch can fire in that case, since both
+// require the promise to settle. Fixed two ways, independent of the exact
+// trigger: (1) the receipt no longer depends on a second round-trip (a
+// full-page redirect) succeeding — it renders directly from the POST's own
+// response; (2) a client-side watchdog timeout guarantees the button is
+// never permanently stuck, regardless of whether the fetch promise ever
+// settles.
+//
+// `describeSaveOutcome` is pure (no DOM/fetch) so it's unit-testable
+// directly in Node, and is shipped to the browser via
+// `describeSaveOutcome.toString()` in the inline <script> below — the
+// tested code IS the code that runs in the browser, no hand-copied,
+// driftable duplicate. Must stay dependency-free for that to work.
+export function describeSaveOutcome(ok: boolean, body: any): { success: boolean; message: string } {
+  if (ok && body && body.success === true) {
+    return { success: true, message: "Endringene er lagret." };
+  }
+  return { success: false, message: "Klarte ikke å lagre. Prøv igjen." };
+}
+
+// Safety-net timeout for the watchdog described above.
+const GC_SAVE_WATCHDOG_MS = 15000;
+
 function escapeHtml(text: string): string {
   const map: { [key: string]: string } = {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
@@ -428,6 +466,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", (req: Request, res: 
             <button type="submit" class="gc-btn gc-btn-primary" ${locked ? "disabled" : ""}>Lagre alle endringer</button>
             <a href="/kategori/gardssalg/produsent/${encodeURIComponent(slug)}" class="gc-btn gc-btn-secondary">Se profilen</a>
           </div>
+          <div id="gc-save-status" aria-live="polite"></div>
         </form>
       </div>
       <div class="gc-card">
@@ -451,8 +490,11 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", (req: Request, res: 
             }
           }).catch(function () {});
 
+        var gcDescribeSaveOutcome = ${describeSaveOutcome.toString()};
+
         var form = document.getElementById("gc-profile-form");
         if (form && window.fetch) {
+          var statusEl = document.getElementById("gc-save-status");
           form.addEventListener("submit", function (ev) {
             ev.preventDefault();
             var fd = new FormData(form);
@@ -465,16 +507,39 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", (req: Request, res: 
               booking_live: fd.get("field_booking_live") ? 1 : 0,
             };
             var btn = form.querySelector("button[type=submit]");
+            var settled = false;
+            function showReceipt(success, message) {
+              if (statusEl) {
+                statusEl.innerHTML = '<div class="gc-alert ' + (success ? "gc-alert-ok" : "gc-alert-error") +
+                  '" role="' + (success ? "status" : "alert") + '">' + message + '</div>';
+              }
+              if (btn) { btn.disabled = false; btn.textContent = "Lagre alle endringer"; }
+            }
             if (btn) { btn.disabled = true; btn.textContent = "Lagrer ..."; }
+            if (statusEl) statusEl.innerHTML = "";
+            // Watchdog: guarantees the button is NEVER stuck on "Lagrer ..."
+            // forever, independent of whether the fetch promise below ever
+            // settles (see the diagnosis note above describeSaveOutcome).
+            var watchdog = setTimeout(function () {
+              if (settled) return;
+              settled = true;
+              showReceipt(false, "Lagringen tar uventet lang tid. Prøv å laste siden på nytt for å se om endringene ble lagret.");
+            }, ${GC_SAVE_WATCHDOG_MS});
             fetch("/api/opplevelser/gardssalg-claim/${encodeURIComponent(provider.id)}/update-profile", {
               method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
               body: JSON.stringify(payload),
             }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
               .then(function (out) {
-                var base = window.location.pathname;
-                window.location.href = base + (out.ok && out.body && out.body.success ? "?status=saved" : "?status=error");
+                if (settled) return;
+                settled = true;
+                clearTimeout(watchdog);
+                var outcome = gcDescribeSaveOutcome(out.ok, out.body);
+                showReceipt(outcome.success, outcome.message);
               }).catch(function () {
-                if (btn) { btn.disabled = false; btn.textContent = "Lagre alle endringer"; }
+                if (settled) return;
+                settled = true;
+                clearTimeout(watchdog);
+                showReceipt(false, "Klarte ikke å lagre. Prøv igjen.");
               });
           });
         }

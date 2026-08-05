@@ -3622,6 +3622,14 @@ router.get(
     // provider's canonical profile URL.
     const badgeProfileHref = canonical;
     const badgeEmbedSnippet = opplevagentBadgeEmbedSnippet(slug, url);
+    // dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging: this
+    // branching now reads the HISTORICAL provider.claimed_at column (set once,
+    // idempotently, by verifyClaimToken() — never cleared by a revoke/logout),
+    // not the live, revocable isGardssalgProviderClaimed() query (that query
+    // still exists for the owner-portal session gate; see gardssalg-claim.ts's
+    // doc comment on it). A revoked/expired session must NOT flip this back to
+    // "unclaimed" (AC6) — claimed_at means "has been claimed at some point".
+    const isClaimed = provider.claimed_at != null;
     const sted = drivingSted(provider);
     const meta = drinkTypeMeta(provider.producer_type);
     const badge = drinkBadge(provider.producer_type);
@@ -3891,11 +3899,15 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
         <h2>Sted</h2>
         ${mapBlock}
       </div>
-      <div class="aside-card">
+      ${isClaimed ? `<div class="aside-card">
+        <h2 style="display:flex;align-items:center;gap:6px"><span style="color:#0f5a50">&#10003;</span> Bekreftet av eier</h2>
+        <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet denne profilen via magisk lenke.</p>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.86rem">Logg inn</a>
+      </div>` : `<div class="aside-card">
         <h2>Driver du dette stedet?</h2>
         <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>
         <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:#fff;color:#0f5a50;font-weight:700;padding:10px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.9rem">Er dette din bedrift?</a>
-      </div>
+      </div>`}
       <div class="aside-card">
         <h2>Lenk til oss</h2>
         <p style="font-size:.85rem;color:var(--ink-soft);margin-bottom:10px">Legg badgen på din egen nettside og lenk tilbake til profilen din her på Opplevagent.</p>

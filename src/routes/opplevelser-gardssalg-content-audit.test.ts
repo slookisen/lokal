@@ -358,6 +358,152 @@ export function runOpplevelserGardssalgContentAuditTests(
       assertEq(rowClaimedLaterFinal.about_text, "Bondens egen håndskrevne tekst etter claim.", "i12: value still unchanged after the route-level apply:true call");
       assertEq(getAuditRows("prov-claimed-later").length, auditCountBeforeRollback, "i13: still no new audit row after the route call");
 
+      // ── (n) per-field owner-lock rollback (dev-request 2026-08-03-gardssalg-
+      //      owner-lock-rollback): PR #472 (commit 5410fd9) added
+      //      field_provenance.owner_locks.<field> stamps, written by the claim
+      //      portal (updateClaimedProviderProfile, gardssalg-claim.ts) when an
+      //      owner edits one of CLAIM_EDITABLE_FIELDS. This narrows the
+      //      previously row-level manual/claim rollback freeze to per-field
+      //      for content_source='claim' rows via isGardssalgFieldOwnerLocked,
+      //      for exactly the 5 claim-editable rollback-eligible fields. ─────
+
+      // n1-n6: content_source='claim', owner_locks.about_text present (the
+      // owner touched it), owner_locks.hjemmeside ABSENT (the owner never
+      // touched it) -> about_text stays locked, hjemmeside is now eligible.
+      insertProvider.run({
+        id: "prov-owner-lock-claim",
+        navn: "Prov Owner Lock Claim Gard",
+        hjemmeside: "https://prov-owner-lock-claim-new.example.no",
+        content_source: "claim",
+        about_text: "Eier-redigert om-tekst",
+        visit_text: null,
+        opening_hours_text: null,
+        field_provenance: JSON.stringify({
+          hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+          owner_locks: { about_text: { locked_at: "2026-08-01T12:00:00.000Z" } },
+        }),
+      });
+      const insertAuditStmt = expDb.prepare(
+        `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+         VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, @changed_by, datetime('now'))`,
+      );
+      insertAuditStmt.run({
+        id: "audit-n-about", provider_id: "prov-owner-lock-claim", field_name: "about_text",
+        old_value: "Automatisk generert om-tekst.", new_value: "Eier-redigert om-tekst",
+        source_url: null, batch_id: null, changed_by: "owner",
+      });
+      insertAuditStmt.run({
+        id: "audit-n-hjemmeside", provider_id: "prov-owner-lock-claim", field_name: "hjemmeside",
+        old_value: null, new_value: "https://prov-owner-lock-claim-new.example.no",
+        source_url: "https://prov-owner-lock-claim.example.no/kontakt", batch_id: null, changed_by: "system",
+      });
+
+      const nAboutPlan = store.planGardssalgContentRollback({ provider_id: "prov-owner-lock-claim", field_name: "about_text" });
+      assertEq(nAboutPlan.restorable, [], "n1: owner-touched about_text (owner_locks entry present) stays locked -> not restorable, unchanged from row-level behavior");
+      assertTrue(
+        nAboutPlan.skipped.some((s: any) => s.provider_id === "prov-owner-lock-claim" && s.field_name === "about_text" && s.reason === "manual_or_claim_source"),
+        "n2: about_text plan skip reason is manual_or_claim_source",
+      );
+
+      const nHjemmesidePlan = store.planGardssalgContentRollback({ provider_id: "prov-owner-lock-claim", field_name: "hjemmeside" });
+      assertEq(nHjemmesidePlan.skipped, [], "n3: hjemmeside (no owner_locks entry) is NOT skipped -- core behavior change proven");
+      assertEq(nHjemmesidePlan.restorable.length, 1, "n4: hjemmeside is restorable exactly once");
+      assertEq(nHjemmesidePlan.restorable[0].restore_to, null, "n5: hjemmeside plan would restore to null (its pre-write value)");
+
+      const nHjemmesideApplyResult = store.applyGardssalgContentRollback(nHjemmesidePlan.restorable);
+      assertEq(
+        nHjemmesideApplyResult,
+        [{ provider_id: "prov-owner-lock-claim", field_name: "hjemmeside", restored_to: null }],
+        "n6: applying the hjemmeside plan actually restores it (not locked)",
+      );
+      const rowOwnerLockClaimAfter = getProviderRow("prov-owner-lock-claim");
+      assertEq(rowOwnerLockClaimAfter.about_text, "Eier-redigert om-tekst", "n7: about_text untouched by the hjemmeside rollback");
+
+      // Also prove apply() itself refuses the still-locked about_text field
+      // directly (defense-in-depth, mirrors block i's forced-item check).
+      const nAboutForcedResult = store.applyGardssalgContentRollback([
+        { provider_id: "prov-owner-lock-claim", field_name: "about_text", current_value: "Eier-redigert om-tekst", restore_to: "Automatisk generert om-tekst." },
+      ]);
+      assertEq(nAboutForcedResult, [], "n8: applyGardssalgContentRollback refuses the owner-locked about_text item even when handed directly");
+      const rowOwnerLockClaimFinal = expDb.prepare(`SELECT about_text FROM experience_providers WHERE id = ?`).get("prov-owner-lock-claim") as any;
+      assertEq(rowOwnerLockClaimFinal.about_text, "Eier-redigert om-tekst", "n9: about_text value unchanged after the forced apply() attempt");
+
+      // n10-n13: negative control -- content_source='manual' row, WITH an
+      // owner_locks entry present (proving it's ignored): manual rows never
+      // consult owner_locks, they stay fully locked regardless.
+      insertProvider.run({
+        id: "prov-owner-lock-manual",
+        navn: "Prov Owner Lock Manual Gard",
+        hjemmeside: "https://prov-owner-lock-manual.example.no",
+        content_source: "manual",
+        about_text: "Håndskrevet manuell tekst",
+        visit_text: null,
+        opening_hours_text: null,
+        field_provenance: JSON.stringify({
+          hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+          // owner_locks present even though content_source is 'manual' (should
+          // never happen in practice via the real write path, but proves the
+          // helper ignores owner_locks unconditionally for manual rows).
+          owner_locks: {},
+        }),
+      });
+      insertAuditStmt.run({
+        id: "audit-n-manual-about", provider_id: "prov-owner-lock-manual", field_name: "about_text",
+        old_value: "Eldre tekst", new_value: "Håndskrevet manuell tekst",
+        source_url: null, batch_id: null, changed_by: "owner",
+      });
+      const nManualPlan = store.planGardssalgContentRollback({ provider_id: "prov-owner-lock-manual", field_name: "about_text" });
+      assertEq(nManualPlan.restorable, [], "n10: manual row's about_text stays locked even with an (empty) owner_locks object present");
+      assertTrue(
+        nManualPlan.skipped.some((s: any) => s.provider_id === "prov-owner-lock-manual" && s.field_name === "about_text" && s.reason === "manual_or_claim_source"),
+        "n11: manual row plan skip reason is manual_or_claim_source",
+      );
+      const nManualApplyResult = store.applyGardssalgContentRollback([
+        { provider_id: "prov-owner-lock-manual", field_name: "about_text", current_value: "Håndskrevet manuell tekst", restore_to: "Eldre tekst" },
+      ]);
+      assertEq(nManualApplyResult, [], "n12: applyGardssalgContentRollback also refuses the manual row's about_text directly");
+      const rowOwnerLockManualFinal = expDb.prepare(`SELECT about_text FROM experience_providers WHERE id = ?`).get("prov-owner-lock-manual") as any;
+      assertEq(rowOwnerLockManualFinal.about_text, "Håndskrevet manuell tekst", "n13: manual row's about_text unchanged");
+
+      // n14-n16: negative control -- content_source='claim', but targeting
+      // org_nr, a field OUTSIDE the 5-field claim-editable/owner-lock-eligible
+      // boundary (owner_locks can never contain this key -- the claim portal
+      // doesn't expose it). Must stay locked exactly as today, proving the
+      // per-field carve-out isn't accidentally widened beyond the 5 fields.
+      insertProvider.run({
+        id: "prov-owner-lock-orgnr",
+        navn: "Prov Owner Lock Orgnr Gard",
+        hjemmeside: "https://prov-owner-lock-orgnr.example.no",
+        content_source: "claim",
+        about_text: null,
+        visit_text: null,
+        opening_hours_text: null,
+        field_provenance: JSON.stringify({
+          hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+          // no owner_locks.org_nr entry -- and can never have one -- but the
+          // row still has SOME owner_locks (about_text), to prove that
+          // presence of unrelated owner_locks entries doesn't leak eligibility
+          // onto out-of-scope fields.
+          owner_locks: { about_text: { locked_at: "2026-08-01T12:00:00.000Z" } },
+        }),
+      });
+      expDb.prepare(`UPDATE experience_providers SET org_nr = ? WHERE id = ?`).run("999999999", "prov-owner-lock-orgnr");
+      insertAuditStmt.run({
+        id: "audit-n-orgnr", provider_id: "prov-owner-lock-orgnr", field_name: "org_nr",
+        old_value: "000000000", new_value: "999999999",
+        source_url: "https://data.brreg.no/enhetsregisteret", batch_id: null, changed_by: "system",
+      });
+      const nOrgnrPlan = store.planGardssalgContentRollback({ provider_id: "prov-owner-lock-orgnr", field_name: "org_nr" });
+      assertEq(nOrgnrPlan.restorable, [], "n14: org_nr (out-of-scope field) stays locked for a claim-sourced row, unchanged from today's row-level behavior");
+      assertTrue(
+        nOrgnrPlan.skipped.some((s: any) => s.provider_id === "prov-owner-lock-orgnr" && s.field_name === "org_nr" && s.reason === "manual_or_claim_source"),
+        "n15: org_nr plan skip reason is manual_or_claim_source",
+      );
+      const nOrgnrApplyResult = store.applyGardssalgContentRollback([
+        { provider_id: "prov-owner-lock-orgnr", field_name: "org_nr", current_value: "999999999", restore_to: "000000000" },
+      ]);
+      assertEq(nOrgnrApplyResult, [], "n16: applyGardssalgContentRollback also refuses org_nr directly for a claim-sourced row");
+
       // ── Seed prov-b with a batch-2-tagged write, for the batch rollback
       //    test (d) below — both prov-a's opening_hours_text (batch-2, from
       //    a15 above) and prov-b's about_text will share batch_id "batch-2".

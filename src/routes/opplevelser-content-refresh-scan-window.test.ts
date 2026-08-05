@@ -385,6 +385,17 @@ export function runOpplevelserContentRefreshScanWindowTests(
       });
       db2.prepare("UPDATE experience_providers SET created_at = ? WHERE id = ?")
         .run(new Date(baseB1 + 60_000).toISOString(), enrProviderB1);
+      // dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-
+      // enrichment-gate, Steg 3: POST /admin/content-refresh now fail-closed-
+      // gates its fetch on field_provenance.hjemmeside_verification.verified
+      // === true (isHjemmesideVerified()) — this fixture predates that gate
+      // and must be stamped verified so this pre-existing test keeps
+      // exercising the selector-window fix it was written for, not the new
+      // gate.
+      db2.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(
+        JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" } }),
+        enrProviderB1,
+      );
       const enrExpB1 = expStore.createExperience({
         title: "Route fixture opplevelse", provider_id: enrProviderB1, provider_match_status: "matched",
         fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
@@ -439,6 +450,10 @@ export function runOpplevelserContentRefreshScanWindowTests(
         hjemmeside: "https://write-regression.example",
         brreg_verified: 1, brreg_active: 1, verification_status: "verified",
       });
+      db2.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(
+        JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" } }),
+        provB2,
+      );
       const lockedExpB2 = expStore.createExperience({
         title: "Låst opplevelse", provider_id: provB2, provider_match_status: "matched",
         fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "verified",

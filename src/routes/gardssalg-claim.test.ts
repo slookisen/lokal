@@ -128,6 +128,33 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("post@routeepost.no", "prov-route-epost");
 
       const routerMod = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
+
+      // ── describeSaveOutcome (pure, dev-request 2026-08-03-eierportal-
+      // lagre-knapp-henger) — both outcomes, no server/DOM needed. This is
+      // the exact function shipped to the browser via `.toString()` in the
+      // portal's inline <script>, so testing it here IS testing the client
+      // logic, not a hand-copied stand-in.
+      assertEq(
+        routerMod.describeSaveOutcome(true, { success: true, updated_fields: ["about_text"] }),
+        { success: true, message: "Endringene er lagret." },
+        "save-01: ok response with success:true -> success receipt",
+      );
+      assertEq(
+        routerMod.describeSaveOutcome(false, { success: false, error: "session_invalid" }),
+        { success: false, message: "Klarte ikke å lagre. Prøv igjen." },
+        "save-02: non-ok response -> error receipt",
+      );
+      assertEq(
+        routerMod.describeSaveOutcome(true, { success: false, error: "provider_not_found" }),
+        { success: false, message: "Klarte ikke å lagre. Prøv igjen." },
+        "save-03: ok:true but body.success:false (e.g. a 200 that still reports failure) -> error receipt, not success",
+      );
+      assertEq(
+        routerMod.describeSaveOutcome(true, null),
+        { success: false, message: "Klarte ikke å lagre. Prøv igjen." },
+        "save-04: ok:true but unparsable/null body -> error receipt, not a throw",
+      );
+
       const expressMod = require("express") as typeof import("express");
       const app = expressMod();
       app.use(expressMod.json());
@@ -252,6 +279,10 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertEq(portalAuthed.status, 200, "d6: GET portal with a valid session cookie -> 200");
       assertTrue(portalAuthed.body.includes("Route Test Gård"), "d7: portal HTML shows the provider name");
       assertTrue(portalAuthed.body.includes("Logg ut"), "d8: portal HTML shows a logout button");
+      assertTrue(portalAuthed.body.includes('id="gc-save-status"'), "d8a: portal HTML has the in-place save-receipt container");
+      assertTrue(portalAuthed.body.includes("gcDescribeSaveOutcome"), "d8b: portal HTML wires up describeSaveOutcome for the in-place receipt");
+      assertTrue(portalAuthed.body.includes("var watchdog = setTimeout"), "d8c: portal HTML includes the never-stuck-forever watchdog timeout");
+      assertTrue(!portalAuthed.body.includes('window.location.href = base + (out.ok'), "d8d: portal HTML no longer redirects to show the save receipt");
 
       const profileAuthed = await req("GET", "/api/opplevelser/gardssalg-claim/prov-route-eligible/profile", { headers: { Cookie: cookieHeader } });
       assertEq(profileAuthed.status, 200, "d9: GET profile API with the right session -> 200");

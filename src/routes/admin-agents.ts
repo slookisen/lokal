@@ -37,9 +37,20 @@ import {
   normaliseName,
   BRREG_BASE_URL,
   BRREG_SEARCH_PATH,
+  fetchBrregBusinessAddress,
+  fetchBrregContact,
   type BrregVerifyResult,
   type BrregHit,
+  type BrregAddress,
+  type BrregContact,
 } from "../services/brreg-client";
+// POST /brreg-contact-backfill below (dev-request 2026-07-31-rfb-brreg-
+// andrekilde-adresse-telefon): a Brreg phone value must clear the SAME
+// write-time guard knowledge-service.ts's upsertKnowledge() already applies
+// to every other phone write in this codebase (org-nr-as-phone leak class,
+// dev-request 2026-07-28) before it may be used anywhere — column write OR
+// provenance value.
+import { validatePhoneForWrite } from "../services/contact-normalizer";
 // Reused, unchanged, from the admin-knowledge factual-field write gate (see
 // POST /brreg-description-fallback below): canCorrectFactualField's
 // curated-lock refusal is the SAME hard rule every other admin write path
@@ -61,6 +72,10 @@ import { parseNameLocationSuffix } from "../services/location-suffix-parser";
 // any Brreg network crawl (see local-orgnr-candidates.ts's own header for
 // why this is a checked-in file rather than a runtime cross-repo read).
 import { findLocalOrgnrCandidate, type LocalOrgnrHit } from "../services/local-orgnr-candidates";
+// dev-request 2026-08-03-mikhailo-quarantine-gates, Gate 3: the
+// self-registered-review-approve route below is the ONLY caller in this
+// file — see that route for why the ping moved here from routes/marketplace.ts.
+import { pingIndexNow } from "../services/indexnow-service";
 
 const router = Router();
 
@@ -161,6 +176,16 @@ function requireAdmin(req: Request, res: Response): boolean {
     return false;
   }
   return true;
+}
+
+// dev-request 2026-08-03-mikhailo-quarantine-gates, Gate 3: this file has no
+// existing absolute-URL builder (its routes return relative ids/counts, not
+// URLs) — mirrors routes/marketplace.ts's own getBaseUrl() exactly (same
+// BASE_URL env fallback, same req.protocol/req.get("host") shape) rather
+// than hardcoding a host, so a non-prod BASE_URL (staging, tests) is
+// respected the same way it is on the registration path.
+function getAdminBaseUrl(req: Request): string {
+  return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
 }
 
 // Minimal shape check — POST /register's only use is to reject obvious
@@ -1935,6 +1960,633 @@ router.post("/org-nr-review-approve", (req: Request, res: Response) => {
   }
 
   res.json({ dry_run: dryRun, approved_count: approved.length, approved, rejected });
+});
+
+// ─── GET /admin/agents/self-registered-review-queue + ───────────────────────
+//     POST /admin/agents/self-registered-review-approve ─────────────────────
+//     (dev-request 2026-08-03-mikhailo-quarantine-gates, Gate 3) ────────────
+//
+// Companion to org-nr-review-queue/-approve above — same auth-check style
+// (requireAdmin), same small-JSON-endpoint convention. This is the human
+// release lever for Gate 1/2's quarantine: every agent the PUBLIC
+// POST /register route creates lands with origin='self_registered',
+// is_vetted=0 (see marketplace-registry.ts's register() and routes/
+// marketplace.ts's /register handler) — invisible on every public discovery
+// surface (Gate 1: discover()/search/produsent page) and permanently
+// withheld the "Verifisert" claim badge even if claimed (Gate 2 — a hard
+// gate, no automated evidence escape hatch in this slice, see the comment
+// in knowledge-service.ts's verifyClaim()). This pair of routes is how a
+// human (Daniel) actually looks at one of these profiles and lets it into
+// the real marketplace — admin/script-called JSON endpoints only, no UI.
+//
+// GET lists the queue, oldest first — the incident this closes (Mikhailo T,
+// 2026-07-30) was a same-day drive-by; there's no reason a newer spam
+// signup should ever be reviewed ahead of an older, possibly-legitimate one.
+router.get("/self-registered-review-queue", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  const entries = db.prepare(
+    `SELECT id, name, contact_email, url, created_at
+       FROM agents
+      WHERE origin = 'self_registered' AND is_vetted = 0
+      ORDER BY created_at ASC`
+  ).all();
+  res.json({ count: entries.length, entries });
+});
+
+// POST flips is_vetted to 1 for exactly one agent, then — and ONLY then —
+// pings IndexNow for its /produsent/<slug> page, using the EXACT URL
+// convention the old (now-removed) registration-time ping in routes/
+// marketplace.ts used. Body: { agentId }.
+router.post("/self-registered-review-approve", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { agentId?: unknown };
+  const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
+  if (!agentId) {
+    res.status(400).json({ error: "Requires { agentId }" });
+    return;
+  }
+
+  const db = getDb();
+  const agent = db.prepare(
+    `SELECT id, name, origin, is_vetted FROM agents WHERE id = ?`
+  ).get(agentId) as { id: string; name: string; origin: string; is_vetted: number } | undefined;
+
+  if (!agent) {
+    res.status(404).json({ error: "Agent not found" });
+    return;
+  }
+  // Confirmation surface, not an arbitrary-write surface — same principle
+  // as org-nr-review-approve's exact-candidate check above: this lever may
+  // ONLY release an agent that is actually in the self-registered quarantine
+  // queue, never any other row.
+  if (agent.origin !== "self_registered") {
+    res.status(409).json({ error: "not_self_registered", detail: "Only self_registered agents go through this queue" });
+    return;
+  }
+  if (agent.is_vetted === 1) {
+    res.json({ success: true, agentId, isVetted: true, alreadyVetted: true });
+    return;
+  }
+
+  db.prepare(`UPDATE agents SET is_vetted = 1 WHERE id = ?`).run(agentId);
+
+  pingIndexNow([`${getAdminBaseUrl(req)}/produsent/${slugify(agent.name)}`], "rettfrabonden.com");
+
+  res.json({ success: true, agentId, isVetted: true });
+});
+
+// ─── POST /admin/agents/brreg-contact-backfill ──────────────────────────────
+//     (dev-request 2026-07-31-rfb-brreg-andrekilde-adresse-telefon) ─────────
+//
+// Why this exists: RFB's outreach pool requires >=2 independent Tier-A/B
+// corroborating sources agreeing on `address`/`phone` before an agent is
+// pool_eligible (cross-source-validator.ts's GATING_FIELDS gate — NOT
+// touched by this slice). 981 RFB agents are blocked on this. The gate is
+// correct; what's missing is that nobody writes Brreg's OWN registered
+// address/phone as a Tier-B corroborating source for agents that now have
+// org_nr (POST /org-nr-backfill above). This ports gårdssalg's own Brreg
+// contact backfill (POST /admin/gardssalg-contact-backfill, opplevelser.ts)
+// onto the `agents`/`agent_knowledge` tables, reusing fetchBrregBusinessAddress/
+// fetchBrregContact (brreg-client.ts) unchanged.
+//
+// ── THE design point (read before touching this route) ─────────────────────
+// cross-source-validator.ts's gate reads MULTIPLE provenance records per
+// field out of agent_knowledge.field_provenance[fieldName] (array, merged
+// ADDITIVELY by mergeFieldProvenance — admin-knowledge.ts). It does NOT read
+// agent_knowledge.address/.phone (each a single, currently-displayed value).
+// So this route does TWO independent things per field, and they are NOT the
+// same operation:
+//   1. Provenance add (the actual point of this slice) — merge a
+//      { source_type: "brreg", value, fetched_at, source_url } record into
+//      field_provenance WHENEVER a usable Brreg value exists, REGARDLESS of
+//      whether the address/phone COLUMN already has a value. Most blocked
+//      agents already have exactly 1 source in the column (351 for address,
+//      299 for phone, per the dev-request's own measurement) — only adding
+//      provenance when the column is blank would accomplish almost nothing.
+//   2. Column fill-only write — the DISPLAY column (agent_knowledge.address/
+//      .phone) is written ONLY when currently blank/null, mirroring
+//      applyAgentOrgNr's fill-only + lock-guard SQL idiom above (re-checked
+//      inside the UPDATE's own WHERE, wrapped in db.transaction()). An
+//      existing display value is NEVER overwritten with Brreg's value even
+//      when they differ.
+// mergeFieldProvenance already dedups by `source_type::value`, so calling it
+// repeatedly across wakes with the same Brreg value is naturally idempotent.
+//
+// ── source_type MUST be the literal string "brreg" ──────────────────────────
+// tierForSource() (cross-source-validator.ts) does an EXACT string match
+// against TIER_B = ["brreg", "facebook_official_page"] — no `:`-splitting.
+// Any other spelling (e.g. "brreg_fallback") silently falls to Tier-C and
+// contributes NOTHING to the gate, with no visible error. Never prefix it.
+//
+// ── Address: postboks guard ─────────────────────────────────────────────────
+// fetchBrregBusinessAddress()'s pickBrregAddress (brreg-client.ts, private)
+// treats any non-empty street-line array as "usable", including a PO box
+// (e.g. "Postboks 123") — it does NOT filter those out. isPostboksAddress()
+// below adds that guard: a postboks-shaped adresse is treated as NO usable
+// Brreg address for that agent (same as a null result) — never written to
+// the column, never added as a provenance source. Matched forms (case-
+// insensitive, leading token only): "postboks", "postb."/"postb" (the common
+// abbreviation), and a bare leading "boks" token (e.g. "Boks 44") — a
+// judgment call: "boks" alone as agent 1 could in principle be part of a
+// real street name, but Norwegian street names practically never start with
+// the bare word "boks", while postal-box addresses commonly drop "post-" in
+// casual registrations, so treating it as a postboks signal is the safer
+// (lower false-negative) choice here. Prefers forretningsadresse over
+// postadresse — that fallback is fetchBrregBusinessAddress's own existing
+// behaviour (pickBrregAddress), not reimplemented here.
+//
+// ── Phone: validatePhoneForWrite gate ────────────────────────────────────────
+// Every phone value from Brreg — column write OR provenance value — must
+// pass validatePhoneForWrite(raw, orgNr) (contact-normalizer.ts, the SAME
+// call knowledge-service.ts's upsertKnowledge() already makes for every
+// other phone write in this codebase). A null result means "no usable phone
+// from Brreg for this agent" — skip phone entirely for that agent.
+//
+// ── Audit rows (agent_knowledge_audit; no batch_id column -> batch id lives
+// in `notes`, e.g. "batch:<batchId> source:brreg") ───────────────────────────
+// Decision (documented here for the reviewer): an audit row is written for a
+// field whenever EITHER (a) a NEW Brreg provenance record was added for that
+// field (source_type/value pair not already present), OR (b) the display
+// column was actually written this call. In practice these two nearly always
+// coincide (a column write only ever happens on the same pass that also adds
+// the provenance record for that exact value) — the split matters only for
+// the idempotent-rerun case (row (a) is false the second time; no column
+// write either -> correctly no audit row) and the already-corroborated-
+// column-still-blank-by-coincidence edge case (still audited, since the
+// column genuinely changed). old_value is the pre-write display-column
+// value; new_value is the newly-written value if the column was actually
+// written this call, else unchanged (== old_value) for a provenance-only
+// touch. changed_by is always 'system'.
+//
+// ── Request/response shape (mirrors org-nr-backfill above + gårdssalg's own
+// contact-backfill, opplevelser.ts ~4671) ────────────────────────────────────
+//   Body: { agentIds?: string[], limit?: number, offset?: number, apply?: bool }
+//   apply truthy (bool true/1/"1"/"true", or ?apply=1/?apply=true query) ->
+//   real writes; default is dry-run (report only, zero writes).
+//   Selector: RFB producer agents (role='producer', is_active=1,
+//   umbrella_type IS NULL, COALESCE(vertical_id,'rfb')='rfb') that NOW HAVE
+//   org_nr (org-nr-backfill's own cohort, once it has run) and are not
+//   owner-claimed. Deliberately NOT filtered on address/phone blank state —
+//   see the design point above. agentIds bypasses the WHERE selector
+//   (existence-only lookup, same override semantics as org-nr-backfill's own
+//   agentIds), so an explicitly-named agent can be processed even without
+//   org_nr (reported unresolved: no_org_nr) or already fully filled.
+//   Default limit 25 / hard cap 100 — same scale as org-nr-backfill's own
+//   defaults immediately above (this file's own closest same-table analogue,
+//   at RFB's ~1000-agent scale).
+
+const AGENTS_BRREG_CONTACT_BACKFILL_DEFAULT_LIMIT = 25;
+const AGENTS_BRREG_CONTACT_BACKFILL_MAX_LIMIT = 100;
+
+// ─── injectable fetch seam for this route's own Brreg calls ────────────────
+// Own seam, deliberately separate from __setAgentsOrgNrBackfillFetchForTesting
+// above: that seam's tests and this route's tests run as independent, non-
+// mutually-exclusive test suites (see admin-agents-org-nr-backfill.test.ts's
+// own header on why a SHARED global fetch reassignment across concurrently-
+// running blocks is unsafe) — a single shared module-level fetch variable
+// would let one suite's stub silently leak into the other's calls if their
+// runs ever overlapped. Same non-throwing default-to-real-fetch convention.
+let agentsBrregContactBackfillFetchImpl: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
+
+export function __setAgentsBrregContactBackfillFetchForTesting(impl?: typeof fetch): void {
+  agentsBrregContactBackfillFetchImpl = impl || ((...args: Parameters<typeof fetch>) => fetch(...args));
+}
+
+// See the "Address: postboks guard" doc comment above for the exact forms
+// matched and why. Leading-token only (start of the trimmed string), case-
+// insensitive. Exported for unit tests.
+const POSTBOKS_ADDRESS_RE = /^\s*(?:postboks|postb\.?|boks)\b/i;
+
+export function isPostboksAddress(adresse: string | null | undefined): boolean {
+  if (!adresse) return false;
+  return POSTBOKS_ADDRESS_RE.test(adresse);
+}
+
+interface AgentBrregContactBackfillTargetRow {
+  id: string;
+  name: string;
+  org_nr: string | null;
+  claimed_at: string | null;
+}
+
+// Shared WHERE clause for both the count and the capped batch query — one
+// source of truth, mirrors agentsOrgNrBackfillCandidateWhereSql's own
+// convention above.
+function agentsBrregContactBackfillCandidateWhereSql(): string {
+  return `
+    a.role = 'producer'
+    AND a.is_active = 1
+    AND a.umbrella_type IS NULL
+    AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+    AND a.org_nr IS NOT NULL AND TRIM(a.org_nr) != ''
+    AND a.claimed_at IS NULL
+  `;
+}
+
+function agentsBrregContactBackfillSelectSql(): string {
+  return `
+    SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at
+      FROM agents a
+     WHERE ${agentsBrregContactBackfillCandidateWhereSql()}
+  `;
+}
+
+function countAgentsBrregContactBackfillCandidates(db: ReturnType<typeof getDb>): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${agentsBrregContactBackfillSelectSql()})`).get() as { n: number };
+  return row?.n ?? 0;
+}
+
+function fetchAgentsBrregContactBackfillBatch(
+  db: ReturnType<typeof getDb>,
+  limit: number,
+  offset: number,
+): AgentBrregContactBackfillTargetRow[] {
+  return db
+    .prepare(`${agentsBrregContactBackfillSelectSql()} ORDER BY a.created_at ASC, a.id ASC LIMIT ? OFFSET ?`)
+    .all(limit, offset) as AgentBrregContactBackfillTargetRow[];
+}
+
+// Explicit-agentIds override lookup — scoped to role/vertical only (NOT the
+// org_nr-present/claimed/active/umbrella filters), same override semantics
+// as getAgentOrgNrBackfillTarget above: an admin can force a lookup attempt
+// on any RFB producer agent; org_nr-presence and the lock are still enforced
+// downstream (reported as a specific unresolved/skipped_locked reason, never
+// silently dropped).
+function getAgentBrregContactBackfillTarget(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+): AgentBrregContactBackfillTargetRow | null {
+  const row = db
+    .prepare(
+      `SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at
+         FROM agents a
+        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'`,
+    )
+    .get(agentId) as AgentBrregContactBackfillTargetRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * True when `field`'s existing (pre-merge) provenance array already carries
+ * a `source_type: "brreg"` record whose value matches `value` (trimmed) —
+ * i.e. mergeFieldProvenance would treat this exact record as a dup. Accepts
+ * both on-disk provenance shapes mergeFieldProvenance itself tolerates (bare
+ * array, or a `{ sources: [...] }` wrapper) — see admin-knowledge.ts's own
+ * extractSources()/isWellFormedRecord() for the shapes this mirrors.
+ */
+function agentKnowledgeHasBrregValueAlready(
+  existingProv: Record<string, unknown>,
+  field: string,
+  value: string,
+): boolean {
+  const raw = existingProv[field];
+  const list: unknown[] = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as { sources?: unknown }).sources)
+      ? (raw as { sources: unknown[] }).sources
+      : [];
+  const trimmed = value.trim();
+  return list.some(
+    (r) =>
+      r &&
+      typeof r === "object" &&
+      (r as Record<string, unknown>).source_type === "brreg" &&
+      typeof (r as Record<string, unknown>).value === "string" &&
+      ((r as Record<string, unknown>).value as string).trim() === trimmed,
+  );
+}
+
+/**
+ * Apply (or, with opts.dryRun, merely PREVIEW) a Brreg address/phone
+ * candidate to ONE agent — see the file-header doc comment above for the
+ * full design rationale. Returns the field names actually touched: in
+ * dry-run mode this is what WOULD be touched (a pure read, zero writes —
+ * no transaction is ever opened when dryRun is true); in apply mode it is
+ * what WAS touched (provenance newly added and/or the display column newly
+ * filled), after a FRESH re-read of both the owner-lock and the current
+ * agent_knowledge row inside the write transaction (race-safety, mirrors
+ * applyAgentOrgNr's own repeated-guard discipline above). "Touched" per
+ * field means the field's incoming value is non-blank AND (the exact
+ * source_type=brreg/value pair is not already in field_provenance for that
+ * field, OR the display column was/would be newly filled) — an idempotent
+ * rerun with an already-filled column and an already-recorded provenance
+ * value touches nothing and returns []. A locked agent (claimed_at IS NOT
+ * NULL, checked both up front and freshly inside the write transaction)
+ * always returns [] and never opens a transaction that writes. Exported for
+ * unit tests.
+ */
+export function applyAgentBrregContact(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  values: { address?: string | null; phone?: string | null },
+  evidenceUrl: string,
+  opts: { dryRun?: boolean; batchId?: string } = {},
+): string[] {
+  const dryRun = !!opts.dryRun;
+
+  const agentRow = db.prepare(`SELECT id, claimed_at FROM agents WHERE id = ?`).get(agentId) as
+    | { id: string; claimed_at: string | null }
+    | undefined;
+  if (!agentRow) return [];
+  if (agentRow.claimed_at) return []; // owner-claimed -> locked, mirrors applyAgentOrgNr
+
+  const addressVal = values.address && values.address.trim() !== "" ? values.address.trim() : null;
+  const phoneVal = values.phone && values.phone.trim() !== "" ? values.phone.trim() : null;
+  if (!addressVal && !phoneVal) return [];
+
+  const kRow = db.prepare(`SELECT address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
+    | { address: string | null; phone: string | null; field_provenance: string | null }
+    | undefined;
+
+  let existingProv: Record<string, unknown> = {};
+  if (kRow?.field_provenance) {
+    try {
+      const parsed = JSON.parse(kRow.field_provenance);
+      if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+
+  const addressProvNew = !!addressVal && !agentKnowledgeHasBrregValueAlready(existingProv, "address", addressVal);
+  const phoneProvNew = !!phoneVal && !agentKnowledgeHasBrregValueAlready(existingProv, "phone", phoneVal);
+  const addressColumnBlank = !kRow?.address || kRow.address.trim() === "";
+  const phoneColumnBlank = !kRow?.phone || kRow.phone.trim() === "";
+  const addressWouldFillColumn = !!addressVal && addressColumnBlank;
+  const phoneWouldFillColumn = !!phoneVal && phoneColumnBlank;
+
+  const touched: string[] = [];
+  if (addressVal && (addressProvNew || addressWouldFillColumn)) touched.push("address");
+  if (phoneVal && (phoneProvNew || phoneWouldFillColumn)) touched.push("phone");
+
+  if (dryRun || touched.length === 0) return touched;
+
+  const nowIso = new Date().toISOString();
+  const written: string[] = [];
+
+  const applyWithAudit = db.transaction(() => {
+    // Fresh lock + row re-check INSIDE the transaction — same race-safety
+    // discipline as applyAgentOrgNr's repeated-guard convention above.
+    const freshAgent = db.prepare(`SELECT claimed_at FROM agents WHERE id = ?`).get(agentId) as
+      | { claimed_at: string | null }
+      | undefined;
+    if (!freshAgent || freshAgent.claimed_at) throw new Error("locked_concurrently");
+
+    let freshK = db.prepare(`SELECT address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
+      | { address: string | null; phone: string | null; field_provenance: string | null }
+      | undefined;
+    if (freshK === undefined) {
+      db.prepare(`INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)`).run(agentId, nowIso);
+      freshK = { address: null, phone: null, field_provenance: "{}" };
+    }
+
+    let freshProv: Record<string, unknown> = {};
+    if (freshK.field_provenance) {
+      try {
+        const parsed = JSON.parse(freshK.field_provenance);
+        if (parsed && typeof parsed === "object") freshProv = parsed as Record<string, unknown>;
+      } catch {
+        /* malformed existing JSON -> treat as empty rather than clobber the write */
+      }
+    }
+
+    const incoming: Record<string, { sources: Array<{ source_type: string; value: string; fetched_at: string; source_url: string }> }> = {};
+    const provenanceNewlyAdded: string[] = [];
+    if (addressVal && !agentKnowledgeHasBrregValueAlready(freshProv, "address", addressVal)) {
+      incoming.address = { sources: [{ source_type: "brreg", value: addressVal, fetched_at: nowIso, source_url: evidenceUrl }] };
+      provenanceNewlyAdded.push("address");
+    }
+    if (phoneVal && !agentKnowledgeHasBrregValueAlready(freshProv, "phone", phoneVal)) {
+      incoming.phone = { sources: [{ source_type: "brreg", value: phoneVal, fetched_at: nowIso, source_url: evidenceUrl }] };
+      provenanceNewlyAdded.push("phone");
+    }
+    if (Object.keys(incoming).length > 0) {
+      const merged = mergeFieldProvenance(freshProv, incoming);
+      db.prepare(`UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(
+        JSON.stringify(merged),
+        nowIso,
+        agentId,
+      );
+    }
+
+    // Fill-only column writes — guard re-checked INSIDE the UPDATE's own
+    // WHERE (mirrors applyAgentOrgNr's org_nr UPDATE above exactly).
+    let addressColumnWritten = false;
+    let phoneColumnWritten = false;
+    if (addressVal) {
+      const upd = db
+        .prepare(
+          `UPDATE agent_knowledge SET address = @val, updated_at = @now
+            WHERE agent_id = @id AND (address IS NULL OR TRIM(address) = '')`,
+        )
+        .run({ id: agentId, val: addressVal, now: nowIso });
+      addressColumnWritten = upd.changes > 0;
+    }
+    if (phoneVal) {
+      const upd = db
+        .prepare(
+          `UPDATE agent_knowledge SET phone = @val, updated_at = @now
+            WHERE agent_id = @id AND (phone IS NULL OR TRIM(phone) = '')`,
+        )
+        .run({ id: agentId, val: phoneVal, now: nowIso });
+      phoneColumnWritten = upd.changes > 0;
+    }
+
+    // Audit rows — see the file-header "Audit rows" doc comment for the
+    // provenance-newly-added-OR-column-written decision.
+    const auditFields: string[] = [];
+    if (addressVal && (provenanceNewlyAdded.includes("address") || addressColumnWritten)) auditFields.push("address");
+    if (phoneVal && (provenanceNewlyAdded.includes("phone") || phoneColumnWritten)) auditFields.push("phone");
+
+    for (const field of auditFields) {
+      const oldVal = field === "address" ? (freshK.address ?? null) : (freshK.phone ?? null);
+      const columnWrittenThisField = field === "address" ? addressColumnWritten : phoneColumnWritten;
+      const newVal = columnWrittenThisField ? (field === "address" ? addressVal : phoneVal) : oldVal;
+      db.prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, ?, ?, ?, 'system', NULL, datetime('now'), ?)`,
+      ).run(uuid(), agentId, field, oldVal, newVal, `batch:${opts.batchId ?? "manual"} source:brreg`);
+      written.push(field);
+    }
+  });
+
+  try {
+    applyWithAudit();
+  } catch (e: any) {
+    if (String(e?.message) === "locked_concurrently") return [];
+    throw e;
+  }
+
+  return written;
+}
+
+router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; offset?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0
+      ? Math.floor(body.limit)
+      : AGENTS_BRREG_CONTACT_BACKFILL_DEFAULT_LIMIT,
+    AGENTS_BRREG_CONTACT_BACKFILL_MAX_LIMIT,
+  );
+  const offset = typeof body.offset === "number" && body.offset > 0 ? Math.floor(body.offset) : 0;
+
+  try {
+    const db = getDb();
+    const batchId = `agents-brreg-contact-backfill-${new Date().toISOString().replace(/[^0-9]/g, "")}`;
+    const cohortTotal = countAgentsBrregContactBackfillCandidates(db);
+
+    let targets: AgentBrregContactBackfillTargetRow[];
+    if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
+      const ids = Array.from(
+        new Set(
+          (body.agentIds as unknown[])
+            .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+            .map((id) => id.trim()),
+        ),
+      ).slice(0, limit);
+      targets = ids
+        .map((id) => getAgentBrregContactBackfillTarget(db, id))
+        .filter((t): t is AgentBrregContactBackfillTargetRow => t !== null);
+    } else {
+      targets = fetchAgentsBrregContactBackfillBatch(db, limit, offset);
+    }
+
+    let scanned = 0;
+    let brregHitAddress = 0;
+    let brregHitPhone = 0;
+    let brregHitAny = 0;
+    const changed: Array<{ agent_id: string; fields: string[]; address: string | null; phone: string | null; source_url: string }> = [];
+    const skippedLocked: string[] = [];
+    const unresolved: Array<{ agent_id: string; reason: string }> = [];
+    const errors: Array<{ agent_id: string; error: string }> = [];
+
+    for (const t of targets) {
+      const agentId = t.id;
+
+      if (t.claimed_at) {
+        skippedLocked.push(agentId);
+        continue;
+      }
+      if (!t.org_nr || t.org_nr.trim() === "") {
+        // Only reachable via the explicit agentIds override — the auto-
+        // selector already filters org_nr-blank rows.
+        unresolved.push({ agent_id: agentId, reason: "no_org_nr" });
+        continue;
+      }
+
+      let brregAddress: BrregAddress | null;
+      let brregContact: BrregContact | null;
+      try {
+        [brregAddress, brregContact] = await Promise.all([
+          fetchBrregBusinessAddress(t.org_nr, agentsBrregContactBackfillFetchImpl),
+          fetchBrregContact(t.org_nr, agentsBrregContactBackfillFetchImpl),
+        ]);
+      } catch (e: any) {
+        // Both fetch functions are documented never-throw; this catch exists
+        // so a contract violation degrades one row instead of the batch.
+        errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
+        continue;
+      }
+      scanned++;
+
+      // ── Address: postboks guard (see file-header doc comment) ────────────
+      const usableAddress =
+        brregAddress?.adresse && !isPostboksAddress(brregAddress.adresse) ? brregAddress.adresse : null;
+      if (usableAddress) brregHitAddress++;
+
+      // ── Phone: validatePhoneForWrite gate ─────────────────────────────────
+      const usablePhone = brregContact?.telefon ? validatePhoneForWrite(brregContact.telefon, t.org_nr) : null;
+      if (usablePhone) brregHitPhone++;
+
+      if (usableAddress || usablePhone) brregHitAny++;
+
+      if (!usableAddress && !usablePhone) {
+        unresolved.push({ agent_id: agentId, reason: "no_usable_brreg_contact" });
+        continue;
+      }
+
+      const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+
+      if (dryRun) {
+        const wouldTouch = applyAgentBrregContact(
+          db,
+          agentId,
+          { address: usableAddress, phone: usablePhone },
+          evidenceUrl,
+          { dryRun: true },
+        );
+        if (wouldTouch.length === 0) {
+          unresolved.push({ agent_id: agentId, reason: "already_up_to_date" });
+          continue;
+        }
+        changed.push({
+          agent_id: agentId,
+          fields: wouldTouch,
+          address: wouldTouch.includes("address") ? usableAddress : null,
+          phone: wouldTouch.includes("phone") ? usablePhone : null,
+          source_url: evidenceUrl,
+        });
+      } else {
+        try {
+          const written = applyAgentBrregContact(
+            db,
+            agentId,
+            { address: usableAddress, phone: usablePhone },
+            evidenceUrl,
+            { dryRun: false, batchId },
+          );
+          if (written.length > 0) {
+            changed.push({
+              agent_id: agentId,
+              fields: written,
+              address: written.includes("address") ? usableAddress : null,
+              phone: written.includes("phone") ? usablePhone : null,
+              source_url: evidenceUrl,
+            });
+          } else {
+            // Idempotent rerun (column already filled + provenance already
+            // recorded this exact value) or a concurrent lock/write raced
+            // us between the dry-read above and the write transaction —
+            // bucketed, never silently dropped.
+            unresolved.push({ agent_id: agentId, reason: "already_up_to_date" });
+          }
+        } catch (e: any) {
+          errors.push({ agent_id: agentId, error: `write_failed: ${e?.message ?? String(e)}` });
+        }
+      }
+    }
+
+    res.json({
+      dry_run: dryRun,
+      batch_id: batchId,
+      cohort_total: cohortTotal,
+      offset,
+      limit,
+      scanned,
+      brreg_hits: { address: brregHitAddress, phone: brregHitPhone, any: brregHitAny },
+      agents_enriched: changed.length,
+      changed,
+      skipped_locked: skippedLocked,
+      unresolved,
+      errors,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "brreg-contact-backfill failed", detail: err.message });
+  }
 });
 
 // ─── GET /admin/agents/category-sanity-report ───────────────────

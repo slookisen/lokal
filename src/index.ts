@@ -62,6 +62,7 @@ import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
+import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
@@ -602,6 +603,10 @@ app.use("/admin/db", adminLimiter, adminDbTableSizesRoutes);
 // adminAgentsRoutes would otherwise swallow "contact-email-write" as an id —
 // the same ordering trap opplevelser.ts documents for its own admin routes.
 app.use("/admin/agents/contact-email-write", adminLimiter, adminAgentsContactEmailWriteRoutes);
+// POST /admin/agents/contact-email-dns-check — diagnostic-only DNS-liveness
+// stamp on agent_knowledge.field_provenance.contact_email_dns_check. Same
+// ordering rule as the sibling above — mount BEFORE /admin/agents.
+app.use("/admin/agents/contact-email-dns-check", adminLimiter, adminAgentsContactEmailDnsCheckRoutes);
 // POST /admin/agents/url-write (dev-request 2026-08-01-rfb-agents-url-skrivespak).
 // Same ordering rule as the sibling above — mount BEFORE /admin/agents.
 app.use("/admin/agents/url-write", adminLimiter, adminAgentsUrlWriteRoutes);

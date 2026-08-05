@@ -52,6 +52,19 @@
  *       next_offset chaining to null on the last page, and the cohort's new
  *       deterministic ORDER BY id makes walking every page via next_offset
  *       visit every row exactly once
+ *   (k) GET .../gardssalg-website-verification-audit `cohort` axis (Steg 2 of
+ *       the same dev-request): invalid cohort -> 400, cohort=all without
+ *       limit -> 400 (mandatory pagination), cohort=all widens the cohort
+ *       beyond the gårdssalg producer-type restriction while the synthetic
+ *       test-gardssalg row stays excluded either way, and cohort=all pages
+ *       correctly
+ *   (l) POST .../gardssalg-website-verification-remediation — the SAME
+ *       `cohort`/`limit`/`offset` discipline as (j)/(k) above, applied to the
+ *       write endpoint (Steg 2b): read from the request body instead of the
+ *       query string, same validation/messages, `pagination` block on both
+ *       the dry-run and apply responses, apply+cohort=all+limit writes
+ *       provenance for exactly the paged rows (bounded blast radius), and the
+ *       providerIds-only/no-cohort-body case stays byte-for-byte unchanged
  */
 
 export interface TestSummary {
@@ -803,6 +816,174 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         !fetchedHosts.includes("test-ikke-book.invalid"),
         "k15d: ...and, with visibility neutralized (scope=all), it's still never fetched — the cohort exclusion alone is what holds"
       );
+
+      // ── (l) POST .../gardssalg-website-verification-remediation — the SAME
+      //     `cohort`/`limit`/`offset` discipline as the GET audit route
+      //     above, applied to the write endpoint (dev-request 2026-08-02-
+      //     opplevagent-hjemmesideverifisering-og-enrichment-gate, Steg 2b).
+      //     Read from the request BODY (this is a POST), same validation
+      //     style/messages as the GET route's query parsing. Reuses the same
+      //     5-row (default cohort=gardssalg 4 rows + prov-outside-gardssalg)
+      //     cohort=all shape sections (j)/(k) already established above, in
+      //     the SAME id order (prov-aggregator, prov-missing-source,
+      //     prov-outside-gardssalg, prov-unverified-404, prov-verified-orgnr)
+      //     — this section runs AFTER (e)/(f)/(h) have already applied
+      //     provenance to the 4 default-cohort + 1 hidden rows, so
+      //     prov-outside-gardssalg is the one row in this cohort that is
+      //     STILL untouched going in — that's exactly what makes it useful
+      //     as the bounded-blast-radius witness below (l9-l11). ─────────────
+
+      // l1: cohort=all without limit -> 400, same mandatory-pagination guard
+      // as the GET route, checked before any DB load/fetch.
+      const fetchCountBeforePostGuard = fetchCallCount;
+      const postCohortAllNoLimit = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { cohort: "all" },
+      });
+      assertEq(postCohortAllNoLimit.status, 400, "l1: POST cohort=all without limit -> 400 (mandatory pagination)");
+      assertEq(
+        postCohortAllNoLimit.body.error,
+        "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+        "l1b: exact Norwegian error message, same as the GET route's"
+      );
+      assertEq(fetchCallCount, fetchCountBeforePostGuard, "l1c: the mandatory-limit guard fires before any homepage fetch");
+
+      // l2: an unrecognized cohort value -> 400, never a silent fallback.
+      const postJunkCohort = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { cohort: "everything" },
+      });
+      assertEq(postJunkCohort.status, 400, "l2: POST cohort=everything -> 400");
+      assertTrue(/Ugyldig cohort/.test(postJunkCohort.body.error || ""), "l2b: cohort error message names the field");
+
+      // l3: limit above the cap (13, cap is MAX_GARDSSALG_AUDIT_LIMIT=12) -> 400.
+      const postOverMaxLimit = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { limit: 13 },
+      });
+      assertEq(postOverMaxLimit.status, 400, "l3: POST limit=13 (one over the max) -> 400");
+      assertEq(postOverMaxLimit.body.error, "Ugyldig limit — maks er 12.", "l3b: limit-too-high error message names the max, same as the GET route's");
+
+      // l4: offset without limit -> 400, no default page size is guessed.
+      const postOffsetWithoutLimit = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { offset: 1 },
+      });
+      assertEq(postOffsetWithoutLimit.status, 400, "l4: POST offset without limit -> 400");
+
+      // l5-l6: limit=0 or negative -> 400.
+      const postLimitZero = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { limit: 0 },
+      });
+      assertEq(postLimitZero.status, 400, "l5: POST limit=0 -> 400 (must be >= 1)");
+      const postLimitNegative = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { limit: -3 },
+      });
+      assertEq(postLimitNegative.status, 400, "l6: POST limit=-3 -> 400 (must be >= 1)");
+
+      // l7-l8: negative offset -> 400, same message style as the GET route.
+      const postOffsetNegative = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { limit: 2, offset: -1 },
+      });
+      assertEq(postOffsetNegative.status, 400, "l7: POST offset=-1 -> 400 (must be >= 0)");
+      assertTrue(/Ugyldig offset/.test(postOffsetNegative.body.error || ""), "l8: offset error message names the field");
+
+      // l9-l14: cohort=all with a valid limit that covers the whole 5-row
+      // cohort -> 200, response echoes cohort:"all" and carries a
+      // `pagination` block, and the scan reaches prov-outside-gardssalg — the
+      // row OUTSIDE the gårdssalg producer-type restriction — proving the
+      // widening actually reaches beyond it on the WRITE endpoint too, not
+      // just the GET audit route.
+      const fetchCountBeforeAllScan = fetchCallCount;
+      const postCohortAllDryRun = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { cohort: "all", limit: 5 },
+      });
+      assertEq(postCohortAllDryRun.status, 200, "l9: POST cohort=all&limit=5 -> 200");
+      assertEq(postCohortAllDryRun.body.cohort, "all", "l10: response echoes cohort:'all'");
+      assertEq(
+        postCohortAllDryRun.body.pagination,
+        { total: 5, offset: 0, limit: 5, returned: 5, next_offset: null },
+        "l11: pagination block mirrors the GET route's shape — total/offset/limit/returned/next_offset"
+      );
+      const dryRunAllIds = postCohortAllDryRun.body.would_enqueue.map((r: any) => r.provider_id);
+      // would_enqueue only ever carries unverified rows (same contract as
+      // section (d)) — assert instead via the summary total, which reflects
+      // every SCANNED row regardless of classification.
+      assertEq(postCohortAllDryRun.body.summary.total, 5, "l12: summary.total reflects all 5 scanned rows, not just the 4-row default cohort");
+      assertTrue(
+        fetchCallCount > fetchCountBeforeAllScan,
+        "l13: the widened-in row(s) actually get scanned (this call performs real work, not a vacuous 200)"
+      );
+      assertTrue(Array.isArray(dryRunAllIds), "l14: would_enqueue is present and well-shaped on a paginated dry-run too");
+
+      // l15-l18: apply=true with cohort=all + a bounded limit writes
+      // provenance for EXACTLY the paged rows, not the whole cohort — the
+      // bounded-blast-radius regression test. Targets prov-outside-gardssalg
+      // specifically (offset=2 in the established id order: 0=prov-
+      // aggregator, 1=prov-missing-source, 2=prov-outside-gardssalg), which
+      // is untouched going into this section (every other row in this
+      // cohort already got a provenance stamp from sections (e)/(f)/(h)
+      // above), so its field_provenance is a clean before/after witness that
+      // this call wrote for it and ONLY the one paged row.
+      assertEq(getProviderRow("prov-outside-gardssalg").field_provenance, null, "l15: pre-check — prov-outside-gardssalg has no provenance yet, the clean witness for this test");
+      const boundedApply = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { apply: true, cohort: "all", limit: 1, offset: 2, batch_id: "test-batch-wv-cohort-all-bounded" },
+      });
+      assertEq(boundedApply.status, 200, "l16: bounded apply (cohort=all, limit=1, offset=2) -> 200");
+      assertEq(boundedApply.body.provenance_written, 1, "l17: provenance_written is exactly 1 — the single paged row, not the whole 5-row cohort");
+      assertEq(
+        boundedApply.body.pagination,
+        { total: 5, offset: 2, limit: 1, returned: 1, next_offset: 3 },
+        "l17b: apply response carries the same pagination block shape as the dry-run"
+      );
+      const outsideProvenanceAfter = JSON.parse(getProviderRow("prov-outside-gardssalg").field_provenance);
+      assertEq(
+        outsideProvenanceAfter.hjemmeside_verification?.classification,
+        "missing_source",
+        "l18: prov-outside-gardssalg now carries a provenance stamp — the one paged row was actually written"
+      );
+
+      // l19: default/no-body behavior stays byte-for-byte identical — the
+      // hard regression requirement. Re-runs the exact section (g) call
+      // (providerIds override, no cohort/limit/offset in the body at all)
+      // and confirms it is unaffected by every cohort/pagination addition
+      // above.
+      const noBodyFieldsRegression = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-verified-orgnr"] },
+      });
+      assertEq(noBodyFieldsRegression.status, 200, "l19: providerIds-only body (no cohort/limit/offset) still -> 200");
+      assertEq(
+        Object.keys(noBodyFieldsRegression.body).sort(),
+        ["cohort", "dry_run", "scope", "success", "summary", "would_enqueue"].sort(),
+        "l19b: unpaginated response carries today's keys plus the new `cohort` field — no `pagination` key sneaking in"
+      );
+      assertEq(noBodyFieldsRegression.body.cohort, "gardssalg", "l19c: cohort defaults to 'gardssalg' when omitted, same as the GET route");
 
       // ── (i) GET /admin/website-review-queues — the read side both queues
       //     lacked. Semantics differ per table BY DESIGN and the assertions

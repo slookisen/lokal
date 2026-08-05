@@ -494,6 +494,23 @@ export function isClaimRateLimited(providerId: string): boolean {
   return row.count >= CLAIM_RATE_LIMIT_MAX_PER_WINDOW;
 }
 
+// ── Claimed-status check (dev-request 2026-07-30-opplevagent-claim-epost-
+// og-perfelt-laas, item 4 — "CTA hide"). Mirrors
+// knowledgeService.isAgentClaimed() (src/services/knowledge-service.ts)
+// exactly: a plain COUNT(*) live query, no caching. A provider is
+// "claimed" once a gardssalg_claims row for it has been used (the magic
+// link was clicked — see verifyClaimToken above) AND not since revoked.
+// Deliberately a live query (not a cached flag anywhere persistent) so a
+// later revoke (revokeClaimToken above) makes the provider un-claimed again
+// on the very next read, no invalidation step needed. ─────────────────────
+export function isGardssalgProviderClaimed(providerId: string): boolean {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT COUNT(*) as c FROM gardssalg_claims WHERE provider_id = ? AND used = 1 AND revoked_at IS NULL`)
+    .get(providerId) as { c: number };
+  return row.c > 0;
+}
+
 // ── Issue a claim magic link (DB insert only — sending the email is the
 // route layer's job, via email-service.ts, mirroring RFB's split) ─────────
 //
@@ -669,6 +686,14 @@ export interface VerifyClaimResult {
  * gardssalg-rfb-enrich.ts) skips this row from here on. Never downgrades an
  * existing 'manual' lock (Daniel's own curation takes precedence) — the
  * session is still granted either way, only the lock label is left alone.
+ *
+ * Also stamps experience_providers.claimed_at (dev-request 2026-08-03-claim-
+ * bekreftet-merke-og-innlogging) — the historical "has been claimed at least
+ * once" signal behind the public "Bekreftet av eier" badge. Idempotent:
+ * first-claim wins, a second/later verify (re-login, or a second producer
+ * link on the same provider) never overwrites an existing claimed_at. This is
+ * the ONLY place claimed_at is ever set — never on issue/send, only on use —
+ * and revokeClaimToken() below deliberately never touches it.
  */
 export function verifyClaimToken(token: string): VerifyClaimResult {
   const db = getDb(VERTICAL);
@@ -686,6 +711,10 @@ export function verifyClaimToken(token: string): VerifyClaimResult {
     db.prepare(
       `UPDATE experience_providers SET content_source = 'claim', updated_at = datetime('now')
        WHERE id = ? AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`,
+    ).run(claim.provider_id);
+    db.prepare(
+      `UPDATE experience_providers SET claimed_at = datetime('now')
+       WHERE id = ? AND claimed_at IS NULL`,
     ).run(claim.provider_id);
   });
   txn();
@@ -852,9 +881,142 @@ export function updateClaimedProviderProfile(
            VALUES (?, ?, ?, NULL, ?, NULL, 'owner-portal', 'owner', datetime('now'))`,
         ).run(uuid(), providerId, field, String(params[field]));
       }
+
+      // ── Owner-lock provenance stamp (dev-request 2026-07-30-opplevagent-
+      // claim-epost-og-perfelt-laas, item 3 — purely additive metadata, NO
+      // gate/behavior change: the row-level content_source lock above is
+      // untouched, this only records WHICH fields the owner personally
+      // edited and WHEN). Nested under field_provenance.owner_locks.<field>
+      // — deliberately NOT a bare top-level field_provenance.<field> key,
+      // because field_provenance already uses bare field names for a
+      // DIFFERENT shape (e.g. field_provenance.hjemmeside =
+      // {source_url, fetched_at}, written by applyGardssalgProviderWebsite
+      // in experience-store.ts; field_provenance.hjemmeside_verification,
+      // written by gardssalg-website-verification.ts). Stamping a bare key
+      // here would silently clobber those. Same defensive read-parse-merge-
+      // write recipe as applyGardssalgWebsiteVerification (gardssalg-
+      // website-verification.ts), inside this SAME transaction (no second
+      // txn) so the profile write and the provenance stamp commit atomically.
+      const provRow = db
+        .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+        .get(providerId) as { field_provenance: string | null } | undefined;
+      let provenance: Record<string, unknown> = {};
+      if (provRow?.field_provenance) {
+        try {
+          const parsed = JSON.parse(provRow.field_provenance);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            provenance = parsed as Record<string, unknown>;
+          }
+        } catch {
+          /* malformed existing JSON -> treat as empty rather than clobber the write */
+        }
+      }
+      const existingOwnerLocks = provenance.owner_locks;
+      const ownerLocks: Record<string, unknown> =
+        existingOwnerLocks && typeof existingOwnerLocks === "object" && !Array.isArray(existingOwnerLocks)
+          ? { ...(existingOwnerLocks as Record<string, unknown>) }
+          : {};
+      const lockedAt = new Date().toISOString();
+      for (const field of updatedFields) {
+        ownerLocks[field] = { locked_at: lockedAt };
+      }
+      provenance.owner_locks = ownerLocks;
+      db.prepare(`UPDATE experience_providers SET field_provenance = @field_provenance WHERE id = @id`).run({
+        id: providerId,
+        field_provenance: JSON.stringify(provenance),
+      });
     });
     txn();
   }
 
   return { ok: true, updatedFields, skippedFields };
+}
+
+// ─── One-time backfill: owner_locks provenance for pre-existing claim edits ──
+// dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 3.
+// updateClaimedProviderProfile (above) only stamps field_provenance.
+// owner_locks.<field> going FORWARD, on each new owner edit — this backfills
+// field_provenance.owner_locks for owner edits that already happened before
+// that stamping existed, sourced from the existing gardssalg_content_audit
+// trail (changed_by='owner' rows), which is the only historical record of
+// which fields an owner actually changed. Idempotent: a field whose
+// owner_locks entry is already present (whether from a prior backfill run OR
+// from updateClaimedProviderProfile's own forward-stamping) is left
+// untouched and counted separately — re-running this after all rows are
+// already stamped is a true no-op (zero writes).
+export interface OwnerLockBackfillResult {
+  scanned: number;
+  stamped: number;
+  already_stamped: number;
+  skipped_missing_provider: number;
+}
+
+export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockBackfillResult {
+  const db = getDb(VERTICAL);
+  const rows = db
+    .prepare(
+      `SELECT provider_id, field_name, MAX(changed_at) AS latest_changed_at
+       FROM gardssalg_content_audit
+       WHERE changed_by = 'owner'
+       GROUP BY provider_id, field_name`,
+    )
+    .all() as Array<{ provider_id: string; field_name: string; latest_changed_at: string }>;
+
+  let stamped = 0;
+  let alreadyStamped = 0;
+  let skippedMissingProvider = 0;
+
+  // One provider row can appear for multiple field_name groups above — each
+  // (provider_id, field_name) group gets its OWN read-modify-write (same
+  // per-row-transaction discipline as applyGardssalgWebsiteVerification in
+  // gardssalg-website-verification.ts) rather than batching all of a
+  // provider's fields into one write, so a mid-batch failure on one group
+  // never loses/duplicates a write already committed for another.
+  const runOne = db.transaction((row: { provider_id: string; field_name: string; latest_changed_at: string }) => {
+    const providerRow = db
+      .prepare(`SELECT id, field_provenance FROM experience_providers WHERE id = ?`)
+      .get(row.provider_id) as { id: string; field_provenance: string | null } | undefined;
+    if (!providerRow) {
+      // Stale audit row referencing a since-deleted provider — skip, never
+      // crash the batch.
+      skippedMissingProvider++;
+      return;
+    }
+
+    let provenance: Record<string, unknown> = {};
+    if (providerRow.field_provenance) {
+      try {
+        const parsed = JSON.parse(providerRow.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          provenance = parsed as Record<string, unknown>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty rather than clobber the write */
+      }
+    }
+    const existingOwnerLocks = provenance.owner_locks;
+    const ownerLocks: Record<string, unknown> =
+      existingOwnerLocks && typeof existingOwnerLocks === "object" && !Array.isArray(existingOwnerLocks)
+        ? { ...(existingOwnerLocks as Record<string, unknown>) }
+        : {};
+
+    if (Object.prototype.hasOwnProperty.call(ownerLocks, row.field_name)) {
+      alreadyStamped++;
+      return;
+    }
+
+    stamped++;
+    if (!apply) return; // dry-run: count what WOULD be stamped, write nothing
+
+    ownerLocks[row.field_name] = { locked_at: row.latest_changed_at };
+    provenance.owner_locks = ownerLocks;
+    db.prepare(`UPDATE experience_providers SET field_provenance = @field_provenance WHERE id = @id`).run({
+      id: row.provider_id,
+      field_provenance: JSON.stringify(provenance),
+    });
+  });
+
+  for (const row of rows) runOne(row);
+
+  return { scanned: rows.length, stamped, already_stamped: alreadyStamped, skipped_missing_provider: skippedMissingProvider };
 }

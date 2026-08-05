@@ -191,14 +191,21 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       }
 
       // ═══ Fixtures ═══════════════════════════════════════════════════════
-      const insertProvider = expDb.prepare(
+      const insertProviderStmt = expDb.prepare(
         `INSERT INTO experience_providers
            (id, navn, vertical, org_nr, kommune, poststed, hjemmeside, catalog_hidden, content_source, products,
-            producer_type, enrichment_state, verification_status, source, confidence)
+            producer_type, enrichment_state, verification_status, source, confidence, field_provenance)
          VALUES
            (@id, @navn, 'experiences', @org_nr, @kommune, @poststed, @hjemmeside, @catalog_hidden, @content_source, '["x"]',
-            @producer_type, 'raw', 'pending_verify', 'test-fixture', 'medium')`,
+            @producer_type, 'raw', 'pending_verify', 'test-fixture', 'medium', @field_provenance)`,
       );
+      // Wrapper so most fixtures can omit field_provenance entirely (defaults
+      // to null/none) while owner-lock-specific fixtures below can stamp it.
+      const insertProvider = {
+        run(params: Record<string, unknown>): void {
+          insertProviderStmt.run({ field_provenance: null, ...params });
+        },
+      };
       // HIDDEN row (the komplett-foer-synlig batch shape) — page will carry its org_nr.
       insertProvider.run({ id: "wd-hidden", navn: "Fjelldal Brenneri", org_nr: "944444444", kommune: "Saltdal", poststed: null, hjemmeside: null, catalog_hidden: 1, content_source: null, producer_type: "destilleri" });
       // Visible row whose candidate host collides with the curated directory list (hanen.no).
@@ -206,8 +213,28 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       // Row whose candidate host is ALREADY carried by another catalog row.
       insertProvider.run({ id: "wd-taken", navn: "Solbakken Gard", org_nr: "922222222", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
       insertProvider.run({ id: "wd-owner", navn: "Annen Produsent", org_nr: "933333333", kommune: "Voss", poststed: null, hjemmeside: "https://solbakkengard.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
-      // Claim-locked row — never processed.
-      insertProvider.run({ id: "wd-locked", navn: "Kravsatt Gard", org_nr: "955555555", kommune: "Bodø", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: "claim", producer_type: "bryggeri" });
+      // Claim-locked row — never processed. Stamped with
+      // field_provenance.owner_locks.hjemmeside (dev-request 2026-08-03-
+      // gardssalg-owner-lock-rollback, pilot widened to
+      // applyGardssalgProviderWebsite): this is now a true "owner touched
+      // THIS field via the claim portal" positive, not just a bare
+      // content_source='claim' row-level assumption — see wd-6a/f below.
+      insertProvider.run({
+        id: "wd-locked", navn: "Kravsatt Gard", org_nr: "955555555", kommune: "Bodø", poststed: null,
+        hjemmeside: null, catalog_hidden: null, content_source: "claim", producer_type: "bryggeri",
+        field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T12:00:00.000Z" } } }),
+      });
+      // Claim row where the owner touched a DIFFERENT claim-editable field
+      // (about_text) but never hjemmeside — proves the per-field narrowing
+      // actually unlocks writes it should, not just that nothing broke.
+      insertProvider.run({
+        id: "wd-claim-unlocked", navn: "Ny Eier Gard", org_nr: "944555666", kommune: "Bodø", poststed: null,
+        hjemmeside: null, catalog_hidden: null, content_source: "claim", producer_type: "bryggeri",
+        field_provenance: JSON.stringify({ owner_locks: { about_text: { locked_at: "2026-08-01T12:00:00.000Z" } } }),
+      });
+      // Manual row — unconditionally locked, never consults owner_locks (no
+      // field_provenance at all here, matching the real write path).
+      insertProvider.run({ id: "wd-manual", navn: "Manuell Gard", org_nr: "944777888", kommune: "Bodø", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: "manual", producer_type: "bryggeri" });
       // Row with no verifiable page anywhere.
       insertProvider.run({ id: "wd-none", navn: "Ukjent Fjellgard", org_nr: "966666666", kommune: "Lom", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
       // Test provider — must never be selected nor counted.
@@ -386,13 +413,31 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       }
 
       // ── wd-6: write-time identity guards in applyGardssalgProviderWebsite. ─
+      // wd-6a/d-f extended for the per-field owner-lock narrowing (dev-
+      // request 2026-08-03-gardssalg-owner-lock-rollback, pilot widened to
+      // this write lever): a content_source='claim' row now stays locked
+      // for hjemmeside IFF the owner specifically touched hjemmeside via the
+      // claim portal (field_provenance.owner_locks.hjemmeside), rather than
+      // the old row-level "any claim row is fully frozen" assumption.
       {
         const wLocked = expStore.applyGardssalgProviderWebsite("wd-locked", "https://kravsattgard.no", "https://x");
-        assertEq(wLocked.length, 0, "wd-6a: locked provider → nothing written");
+        assertEq(wLocked.length, 0, "wd-6a: claim row WITH owner_locks.hjemmeside → nothing written (field-locked)");
         const wTaken = expStore.applyGardssalgProviderWebsite("wd-taken", "https://solbakkengard.no", "https://x");
         assertEq(wTaken.length, 0, "wd-6b: host already carried by another provider → write refused (shared-host guard)");
         const wBad = expStore.applyGardssalgProviderWebsite("wd-agg", "ikke-en-url", "https://x");
         assertEq(wBad.length, 0, "wd-6c: non-URL rejected by sanity gate");
+
+        // wd-6d/e: positive unlock case — the owner touched about_text, NOT
+        // hjemmeside, via the claim portal, so hjemmeside is fair game.
+        const wUnlocked = expStore.applyGardssalgProviderWebsite("wd-claim-unlocked", "https://ny-eier-gard.no", "https://x");
+        assertEq(JSON.stringify(wUnlocked), JSON.stringify(["hjemmeside"]), "wd-6d: claim row with owner_locks on a DIFFERENT field → write succeeds");
+        const rowUnlocked = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id = 'wd-claim-unlocked'`).get() as { hjemmeside: string | null };
+        assertEq(rowUnlocked.hjemmeside, "https://ny-eier-gard.no", "wd-6e: hjemmeside actually persisted to the DB for the field-unlocked claim row");
+
+        // wd-6f: negative control — content_source='manual' rows stay
+        // blocked unconditionally and never consult owner_locks.
+        const wManual = expStore.applyGardssalgProviderWebsite("wd-manual", "https://manuellgard.no", "https://x");
+        assertEq(wManual.length, 0, "wd-6f: manual row → nothing written, regardless of owner_locks");
       }
 
       // ── wd-7: shared-host counter counts hidden rows, excludes test provider. ─

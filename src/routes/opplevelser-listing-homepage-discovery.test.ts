@@ -499,6 +499,407 @@ export function runOpplevelserListingHomepageDiscoveryTests(
         const qCount = (expDb.prepare(`SELECT COUNT(*) c FROM experience_homepage_review_queue WHERE provider_id = 'lh-preclobbered'`).get() as any).c;
         assertEq(qCount, 1, "lh-8g: still exactly one queue row for this provider — no duplicate inserted alongside it");
       }
+
+      // ── lh-9: sub-slice 3e — the explicit-providerIds branch's lock check
+      //    now goes through the shared isHjemmesideLocked() helper (already
+      //    shipped for the hjemmeside-write route, sub-slice 3d), narrowing
+      //    the freeze from an unconditional row-level content_source check
+      //    to isGardssalgFieldOwnerLocked()'s per-field owner_locks stamp —
+      //    but ONLY for gårdssalg-identified rows (producer_type set, or
+      //    rfb_seed_source='rfb-seed'). A non-gårdssalg claim row keeps
+      //    today's exact unconditional freeze. All listing_url: null here —
+      //    these fixtures only need to prove skipped_locked membership, not
+      //    a full discovery proposal (null listing_url just lands the row in
+      //    no_candidate_verified once past the lock check). ───────────────
+      {
+        const insertGardssalgFixture = expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, hjemmeside, listing_url, content_source, source, confidence,
+              enrichment_state, verification_status, producer_type, rfb_seed_source, field_provenance)
+           VALUES
+             (@id, @navn, 'experiences', NULL, NULL, @content_source, 'test-fixture', 'medium',
+              'raw', 'pending_verify', @producer_type, @rfb_seed_source, @field_provenance)`,
+        );
+
+        // lh-3e-1: gårdssalg row (producer_type set), content_source='claim',
+        // field_provenance has owner_locks but NOT for 'hjemmeside' → not locked.
+        insertGardssalgFixture.run({
+          id: "lh-3e-unlocked-producer-type",
+          navn: "Ulåst Bryggeri",
+          content_source: "claim",
+          producer_type: "bryggeri",
+          rfb_seed_source: null,
+          field_provenance: JSON.stringify({ owner_locks: { about_text: { locked_at: "2026-08-01T00:00:00Z" } } }),
+        });
+        // lh-3e-2: same gårdssalg row shape, but owner_locks.hjemmeside IS
+        // present → locked (negative control).
+        insertGardssalgFixture.run({
+          id: "lh-3e-locked-producer-type",
+          navn: "Låst Bryggeri",
+          content_source: "claim",
+          producer_type: "bryggeri",
+          rfb_seed_source: null,
+          field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T00:00:00Z" } } }),
+        });
+        // lh-3e-3: gårdssalg identity via rfb_seed_source instead of
+        // producer_type, no owner_locks.hjemmeside → not locked.
+        insertGardssalgFixture.run({
+          id: "lh-3e-unlocked-rfbseed",
+          navn: "Ulåst Rfb-Seed",
+          content_source: "claim",
+          producer_type: null,
+          rfb_seed_source: "rfb-seed",
+          field_provenance: JSON.stringify({ owner_locks: {} }),
+        });
+        // lh-3e-4: critical safety test — NON-gårdssalg row (no producer_type,
+        // no rfb_seed_source='rfb-seed'), content_source='claim', but an
+        // ADVERSARIAL owner_locks.hjemmeside present anyway → still locked.
+        // A non-gårdssalg claim row's freeze must never consult field_provenance.
+        insertGardssalgFixture.run({
+          id: "lh-3e-adversarial-non-gardssalg",
+          navn: "Ikke Gårdssalg",
+          content_source: "claim",
+          producer_type: null,
+          rfb_seed_source: null,
+          field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T00:00:00Z" } } }),
+        });
+        // lh-3e-6: gårdssalg row with content_source='manual' → stays locked
+        // unconditionally, regardless of field_provenance contents (manual
+        // rows never consult owner_locks).
+        insertGardssalgFixture.run({
+          id: "lh-3e-manual-producer-type",
+          navn: "Manuelt Bryggeri",
+          content_source: "manual",
+          producer_type: "bryggeri",
+          rfb_seed_source: null,
+          field_provenance: JSON.stringify({ owner_locks: {} }),
+        });
+
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: {
+            providerIds: [
+              "lh-3e-unlocked-producer-type",
+              "lh-3e-locked-producer-type",
+              "lh-3e-unlocked-rfbseed",
+              "lh-3e-adversarial-non-gardssalg",
+              "lh-3e-manual-producer-type",
+            ],
+          },
+        });
+        assertEq(r.status, 200, "lh-3e-0: request succeeds");
+        const skippedIds = (r.body.skipped_locked as any[]).map((s) => s.provider_id);
+        const noCandidateIds = (r.body.no_candidate_verified as any[]).map((n) => n.provider_id);
+
+        assertTrue(
+          !skippedIds.includes("lh-3e-unlocked-producer-type"),
+          "lh-3e-1: gårdssalg row (producer_type), owner_locks without 'hjemmeside' → NOT skipped_locked",
+        );
+        assertTrue(
+          noCandidateIds.includes("lh-3e-unlocked-producer-type"),
+          "lh-3e-1b: ...and proceeds to normal discovery processing (reaches no_candidate_verified, null listing_url)",
+        );
+
+        assertTrue(
+          skippedIds.includes("lh-3e-locked-producer-type"),
+          "lh-3e-2: same gårdssalg row shape, but owner_locks.hjemmeside present → IS skipped_locked (negative control)",
+        );
+
+        assertTrue(
+          !skippedIds.includes("lh-3e-unlocked-rfbseed"),
+          "lh-3e-3: gårdssalg identity via rfb_seed_source='rfb-seed' (producer_type null), no owner_locks.hjemmeside → NOT skipped_locked",
+        );
+        assertTrue(
+          noCandidateIds.includes("lh-3e-unlocked-rfbseed"),
+          "lh-3e-3b: ...and proceeds to normal discovery processing",
+        );
+
+        assertTrue(
+          skippedIds.includes("lh-3e-adversarial-non-gardssalg"),
+          "lh-3e-4: non-gårdssalg claim row with adversarial owner_locks.hjemmeside → STILL skipped_locked (field_provenance never consulted for non-gårdssalg rows)",
+        );
+
+        assertTrue(
+          skippedIds.includes("lh-3e-manual-producer-type"),
+          "lh-3e-6: gårdssalg row with content_source='manual' → skipped_locked unconditionally regardless of field_provenance",
+        );
+      }
+
+      // ── lh-9b: existing lh-locked fixture (non-gårdssalg claim row, no
+      //    producer_type/rfb_seed_source, no field_provenance) — unmodified
+      //    re-assertion that it still lands in skipped_locked after the
+      //    switch to isHjemmesideLocked(). (lh-5: original coverage is
+      //    lh-2d above; this is a direct, standalone re-check.) ───────────
+      {
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { providerIds: ["lh-locked"] },
+        });
+        assertEq(
+          (r.body.skipped_locked as any[])[0]?.provider_id,
+          "lh-locked",
+          "lh-9b: pre-existing non-gårdssalg lh-locked fixture still lands in skipped_locked, unmodified",
+        );
+      }
+
+      // ── lh-10: sub-slice 3f — the auto-batch branch (no providerIds in the
+      //    body) gains a two-phase top-up: phase 1 is today's exact SQL query
+      //    unchanged (LIMIT LH_DISCOVERY_BATCH_CAP=30); phase 2 ONLY runs when
+      //    phase 1 under-fills the batch, widening eligibility to gårdssalg
+      //    content_source='claim' rows that pass isHjemmesideLocked()===false
+      //    (the same shared, already-shipped gate 3d/3e already use). All
+      //    fetches in this section are forced to 404 — every fixture below
+      //    only needs to prove it was PROCESSED (landed in `targets`, visible
+      //    via proposed/excluded/no_candidate_verified) or NOT processed, not
+      //    whether a website candidate was actually found. Each sub-test
+      //    inserts its own uniquely-prefixed (`lh-3f-...`) fixtures and
+      //    deletes them again afterward, so sub-tests don't leak into one
+      //    another's phase-1/phase-2 pool. Baseline phase-1-eligible pool at
+      //    the start of this section (from earlier sections in this same
+      //    file, unmodified/reused): lh-agg-only, lh-taken, lh-taken2,
+      //    lh-noname, lh-preclobbered — 5 rows, well under the 30 cap, so
+      //    phase 2 runs by default for every sub-test here except lh-10a
+      //    (which deliberately fills the cap with phase-1-only rows first). ──
+      {
+        (globalThis.fetch as any) = (async (url: string | URL | Request) => {
+          return { ok: false, status: 404, url: String(url), text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        const insertGardssalgClaim = expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, hjemmeside, listing_url, content_source, source, confidence,
+              enrichment_state, verification_status, producer_type, rfb_seed_source, field_provenance)
+           VALUES
+             (@id, @navn, 'experiences', NULL, @listing_url, @content_source, 'test-fixture', 'medium',
+              'raw', 'pending_verify', @producer_type, @rfb_seed_source, @field_provenance)`,
+        );
+
+        function autoBatch(): Promise<RouteResult> {
+          return callRoute(opplevelserRouter, { headers: adminHeaders, body: {} });
+        }
+        function processedIdSet(r: RouteResult): Set<string> {
+          const s = new Set<string>();
+          for (const p of r.body.proposed as any[]) s.add(p.provider_id);
+          for (const e of r.body.excluded as any[]) s.add(e.provider_id);
+          for (const n of r.body.no_candidate_verified as any[]) s.add(n.provider_id);
+          return s;
+        }
+        function deleteFixtures(ids: string[]): void {
+          const del = expDb.prepare(`DELETE FROM experience_providers WHERE id = ?`);
+          for (const id of ids) del.run(id);
+        }
+
+        // ── lh-10a (AC1): phase 1 alone already fills LH_DISCOVERY_BATCH_CAP
+        //    (>=30 eligible non-manual/non-claim rows) → phase 2 does NOT
+        //    run, even though an eligible+unlocked gårdssalg claim row
+        //    exists. ─────────────────────────────────────────────────────
+        {
+          const capFillIds: string[] = [];
+          const insertCapFill = expDb.prepare(
+            `INSERT INTO experience_providers
+               (id, navn, vertical, hjemmeside, listing_url, content_source, source, confidence,
+                enrichment_state, verification_status)
+             VALUES (@id, @navn, 'experiences', NULL, @listing_url, NULL, 'test-fixture', 'medium',
+                     'raw', 'pending_verify')`,
+          );
+          for (let i = 0; i < 30; i++) {
+            const id = `lh-3f-capfill-${i}`;
+            capFillIds.push(id);
+            insertCapFill.run({ id, navn: `Cap Fill ${i}`, listing_url: `https://lh3f-capfill-${i}.example.no` });
+          }
+          insertGardssalgClaim.run({
+            id: "lh-3f-ac1-claim",
+            navn: "AC1 Skulle Vært Med",
+            listing_url: "https://lh3f-ac1-claim.example.no",
+            content_source: "claim",
+            producer_type: "bryggeri",
+            rfb_seed_source: null,
+            field_provenance: JSON.stringify({ owner_locks: {} }),
+          });
+
+          const r = await autoBatch();
+          assertEq(r.body.scanned, 30, "lh-10a-1: phase 1 alone fills the cap (30 scanned)");
+          assertTrue(
+            !processedIdSet(r).has("lh-3f-ac1-claim"),
+            "lh-10a-2: eligible+unlocked gårdssalg claim row NOT processed — phase 2 never ran because phase 1 already filled the cap",
+          );
+
+          deleteFixtures([...capFillIds, "lh-3f-ac1-claim"]);
+        }
+
+        // ── lh-10b (AC2): phase 1 under-fills; a gårdssalg (producer_type
+        //    set) content_source='claim' row with owner_locks.hjemmeside NOT
+        //    set → appears in targets (processed). ─────────────────────────
+        {
+          insertGardssalgClaim.run({
+            id: "lh-3f-ac2-unlocked",
+            navn: "AC2 Ulåst Bryggeri",
+            listing_url: "https://lh3f-ac2-unlocked.example.no",
+            content_source: "claim",
+            producer_type: "bryggeri",
+            rfb_seed_source: null,
+            field_provenance: JSON.stringify({ owner_locks: { about_text: { locked_at: "2026-08-01T00:00:00Z" } } }),
+          });
+
+          const r = await autoBatch();
+          assertTrue(
+            processedIdSet(r).has("lh-3f-ac2-unlocked"),
+            "lh-10b: gårdssalg claim row (producer_type), owner_locks without 'hjemmeside' → IS processed (widening works)",
+          );
+
+          deleteFixtures(["lh-3f-ac2-unlocked"]);
+        }
+
+        // ── lh-10c (AC3): same shape, but owner_locks.hjemmeside IS set →
+        //    negative control, row does NOT appear in targets. ─────────────
+        {
+          insertGardssalgClaim.run({
+            id: "lh-3f-ac3-locked",
+            navn: "AC3 Låst Bryggeri",
+            listing_url: "https://lh3f-ac3-locked.example.no",
+            content_source: "claim",
+            producer_type: "bryggeri",
+            rfb_seed_source: null,
+            field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T00:00:00Z" } } }),
+          });
+
+          const r = await autoBatch();
+          assertTrue(
+            !processedIdSet(r).has("lh-3f-ac3-locked"),
+            "lh-10c: same gårdssalg row shape but owner_locks.hjemmeside present → NOT processed (negative control, same gate as 3d/3e)",
+          );
+
+          deleteFixtures(["lh-3f-ac3-locked"]);
+        }
+
+        // ── lh-10d (AC4): gårdssalg identity via rfb_seed_source='rfb-seed'
+        //    (producer_type NULL) instead of producer_type, no
+        //    owner_locks.hjemmeside → also appears (both identity signals
+        //    honored, matching 3e's AC3). ────────────────────────────────
+        {
+          insertGardssalgClaim.run({
+            id: "lh-3f-ac4-rfbseed",
+            navn: "AC4 Ulåst Rfb-Seed",
+            listing_url: "https://lh3f-ac4-rfbseed.example.no",
+            content_source: "claim",
+            producer_type: null,
+            rfb_seed_source: "rfb-seed",
+            field_provenance: JSON.stringify({ owner_locks: {} }),
+          });
+
+          const r = await autoBatch();
+          assertTrue(
+            processedIdSet(r).has("lh-3f-ac4-rfbseed"),
+            "lh-10d: gårdssalg identity via rfb_seed_source='rfb-seed' (producer_type null), no owner_locks.hjemmeside → IS processed",
+          );
+
+          deleteFixtures(["lh-3f-ac4-rfbseed"]);
+        }
+
+        // ── lh-10e (AC5): critical safety proof — content_source='manual'
+        //    rows never appear in targets, regardless of how many manual
+        //    rows exist or how few phase-1 rows exist (phase 1's own pool
+        //    here is the 5-row baseline, well under the cap, so phase 2
+        //    genuinely runs). Proves phase 2's SQL-level content_source =
+        //    'claim' filter — not just the JS gate — keeps manual out. ────
+        {
+          const manualIds: string[] = [];
+          for (let i = 0; i < 5; i++) {
+            const id = `lh-3f-ac5-manual-${i}`;
+            manualIds.push(id);
+            insertGardssalgClaim.run({
+              id,
+              navn: `AC5 Manuell ${i}`,
+              listing_url: `https://lh3f-ac5-manual-${i}.example.no`,
+              content_source: "manual",
+              producer_type: "bryggeri",
+              rfb_seed_source: null,
+              field_provenance: JSON.stringify({ owner_locks: {} }),
+            });
+          }
+
+          const r = await autoBatch();
+          const processed = processedIdSet(r);
+          assertTrue(
+            manualIds.every((id) => !processed.has(id)),
+            "lh-10e: content_source='manual' rows NEVER appear in targets, even gårdssalg-identified + field-level-unlocked ones",
+          );
+
+          deleteFixtures(manualIds);
+        }
+
+        // ── lh-10f (AC6): non-gårdssalg content_source='claim' row
+        //    (producer_type NULL, rfb_seed_source NOT 'rfb-seed') is never
+        //    returned by phase 2 even with an adversarial owner_locks entry
+        //    that would look "unlocked" — proves the SQL-level gårdssalg-
+        //    identity filter is the first gate, isHjemmesideLocked the
+        //    second, belt-and-suspenders. ──────────────────────────────────
+        {
+          insertGardssalgClaim.run({
+            id: "lh-3f-ac6-adversarial",
+            navn: "AC6 Ikke Gårdssalg",
+            listing_url: "https://lh3f-ac6-adversarial.example.no",
+            content_source: "claim",
+            producer_type: null,
+            rfb_seed_source: null,
+            field_provenance: JSON.stringify({ owner_locks: {} }),
+          });
+
+          const r = await autoBatch();
+          assertTrue(
+            !processedIdSet(r).has("lh-3f-ac6-adversarial"),
+            "lh-10f: non-gårdssalg claim row (no producer_type/rfb_seed_source) never returned by phase 2, even with an adversarial owner_locks shape",
+          );
+
+          deleteFixtures(["lh-3f-ac6-adversarial"]);
+        }
+
+        // ── lh-10g (AC7): total targets.length from the combined phase-1 +
+        //    phase-2 flow never exceeds LH_DISCOVERY_BATCH_CAP, even when
+        //    phase 2 has far more eligible candidates (40) than remaining
+        //    slots (25 = 30 - 5-row baseline). ──────────────────────────────
+        {
+          const ac7Ids: string[] = [];
+          for (let i = 0; i < 40; i++) {
+            const id = `lh-3f-ac7-${i}`;
+            ac7Ids.push(id);
+            insertGardssalgClaim.run({
+              id,
+              navn: `AC7 Kandidat ${i}`,
+              listing_url: `https://lh3f-ac7-${i}.example.no`,
+              content_source: "claim",
+              producer_type: "bryggeri",
+              rfb_seed_source: null,
+              field_provenance: JSON.stringify({ owner_locks: {} }),
+            });
+          }
+
+          const r = await autoBatch();
+          assertEq(r.body.scanned, 30, "lh-10g-1: total scanned never exceeds the cap even with 40 eligible phase-2 candidates");
+          const processed = processedIdSet(r);
+          const ac7Processed = ac7Ids.filter((id) => processed.has(id));
+          assertEq(ac7Processed.length, 25, "lh-10g-2: exactly remaining_slots (25) of the 40 eligible phase-2 candidates are taken, never more");
+
+          deleteFixtures(ac7Ids);
+        }
+
+        // ── lh-10h (AC8): existing auto-batch tests (phase-1-only scenarios,
+        //    no gårdssalg claim rows in the fixture set) pass unmodified —
+        //    zero behavior change for the dominant case. lh-4 above already
+        //    covers this against the full mixed fixture set; this is a
+        //    direct, isolated re-check against the clean 5-row baseline
+        //    (all lh-10a..g fixtures deleted above) confirming the result
+        //    set is EXACTLY the baseline 5 rows, nothing more, nothing
+        //    less. ─────────────────────────────────────────────────────────
+        {
+          const r = await autoBatch();
+          assertEq(r.body.scanned, 5, "lh-10h-1: clean baseline (no gårdssalg claim rows) scans exactly the 5 pre-existing eligible rows");
+          const processed = processedIdSet(r);
+          for (const id of ["lh-agg-only", "lh-taken", "lh-taken2", "lh-noname", "lh-preclobbered"]) {
+            assertTrue(processed.has(id), `lh-10h-2: baseline row ${id} still processed, unmodified by the 3f change`);
+          }
+        }
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-listing-homepage-discovery: unexpected error: " + String(err?.stack || err?.message || err));

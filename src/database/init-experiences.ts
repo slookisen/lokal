@@ -871,6 +871,51 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.log(`[experiences] gardssalg_claims init skipped: ${(e as Error).message}`);
   }
 
+  // ─── claimed_at (dev-request 2026-08-03-claim-bekreftet-merke-og-innlogging)
+  // ────────────────────────────────────────────────────────────────────────
+  // Additive, explicit "has this profile ever been claimed" signal — distinct
+  // from isGardssalgProviderClaimed() (services/gardssalg-claim.ts), which is
+  // a LIVE, REVOCABLE query (COUNT of used=1 AND revoked_at IS NULL claims)
+  // used for the owner-portal session gate. This column is the opposite
+  // semantic on purpose: a historical "has been verified by the owner at
+  // least once" badge for the public produsent-profil page, set ONLY inside
+  // verifyClaimToken()'s transaction (gardssalg-claim.ts) the first time a
+  // magic link is actually used, and NEVER cleared by revokeClaimToken() — a
+  // later revoke/logout does not un-badge the profile (AC6). Same idempotent
+  // ALTER TABLE idiom as every other additive column in this file.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN claimed_at TEXT");
+  } catch { /* already present */ }
+
+  // Backfill: any pre-existing experience_providers row that already has a
+  // used, non-revoked gardssalg_claims row (i.e. was claimed before this
+  // column existed) gets claimed_at set from that claim's earliest used_at.
+  // WHERE claimed_at IS NULL makes this a no-op on every boot after the first
+  // (no separate "ran once" flag needed) and never overwrites a claimed_at
+  // already stamped live by verifyClaimToken(). Runs after both
+  // experience_providers and gardssalg_claims exist (this block is placed
+  // after both CREATE TABLE blocks above).
+  try {
+    db.exec(`
+      UPDATE experience_providers
+         SET claimed_at = (
+           SELECT MIN(gc.used_at)
+             FROM gardssalg_claims gc
+            WHERE gc.provider_id = experience_providers.id
+              AND gc.used = 1
+              AND gc.revoked_at IS NULL
+              AND gc.used_at IS NOT NULL
+         )
+       WHERE claimed_at IS NULL
+         AND id IN (
+           SELECT provider_id FROM gardssalg_claims
+            WHERE used = 1 AND revoked_at IS NULL AND used_at IS NOT NULL
+         )
+    `);
+  } catch (e) {
+    console.log(`[experiences] claimed_at backfill skipped: ${(e as Error).message}`);
+  }
+
   // ─── experience_provider_conflict_audit (dev-request 2026-08-01-gardssalg-
   // profilkomplett-og-soekbar-foer-outreach, Steg 2) ─────────────────────────
   // Insert-only, field-level changelog for `experiences.booking_url`
@@ -957,6 +1002,96 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_website_verification_audit_batch ON gardssalg_website_verification_audit(batch_id)`);
   } catch (err) {
     console.error("Migration gardssalg_website_verification_audit failed:", err);
+  }
+
+  // ─── gardssalg_field_concordance_review_queue (orchestrator dev-request
+  // 2026-08-03-gardssalg-field-concordance, write-side slice) ────────────────
+  // The review queue for `avvik` verdicts produced by the field-concordance
+  // sweep (GET /admin/gardssalg-field-concordance-audit, POST
+  // /admin/gardssalg-field-concordance-remediation,
+  // services/gardssalg-field-concordance.ts). An `avvik` verdict is only
+  // possible on the three avvik-capable fields (epost/telefon/mobil — see
+  // GFC_AVVIK_CAPABLE_FIELDS in gardssalg-field-concordance.ts); the four
+  // presence-only fields never land a row here. Per the dev-request's own
+  // spec ("Ingen automatisk overskriving ved avvik"), this queue carries BOTH
+  // the stored (`current_value`) and page-extracted (`found_value`) value for
+  // a human/future-slice to resolve — applyGardssalgFieldConcordance()
+  // (services/gardssalg-field-concordance.ts) NEVER writes epost/telefon/
+  // mobil on experience_providers directly; this table + the
+  // field_provenance.field_concordance stamp are its only writes.
+  //
+  // Deliberately a SEPARATE table from gardssalg_website_review_queue, not a
+  // shared/reused one, and with a DIFFERENT uniqueness shape:
+  // gardssalg_website_review_queue is UNIQUE(provider_id) because only one
+  // hjemmeside-URL candidate makes sense pending at a time per provider; here
+  // a single producer can simultaneously have a genuine avvik on epost AND
+  // telefon (independent fields, independent findings) — so uniqueness is
+  // per (provider_id, field_name), letting up to 3 pending rows coexist per
+  // provider (one per avvik-capable field) without evicting each other.
+  // Upsert-on-rerun semantics on that composite key: a repeat scan reaching
+  // the SAME avvik (identical current_value+found_value) is a no-op (skipped
+  // at the application layer, not here — see applyGardssalgFieldConcordance's
+  // own doc comment) so updated_at doesn't churn pointlessly; a repeat scan
+  // finding a CHANGED found_value overwrites the existing row (refresh-on-
+  // rerun, same contract as the website queue's own upsert).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_field_concordance_review_queue (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        provider_name TEXT,
+        field_name TEXT NOT NULL,
+        current_value TEXT,
+        found_value TEXT,
+        reason TEXT NOT NULL DEFAULT 'field_concordance_avvik',
+        batch_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(provider_id, field_name),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_field_concordance_review_queue_reason ON gardssalg_field_concordance_review_queue(reason)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_field_concordance_review_queue_provider ON gardssalg_field_concordance_review_queue(provider_id)`);
+  } catch (err) {
+    console.error("Migration gardssalg_field_concordance_review_queue failed:", err);
+  }
+
+  // ─── experience_provider_field_write_audit (Steg 4 of the
+  // 2026-08-03-hjemmeside-skrivespak dev-request — "skrivespak for
+  // hjemmeside") ──────────────────────────────────────────────────────────
+  // Insert-only, per-write changelog for POST
+  // /api/opplevelser/admin/providers/hjemmeside-write (routes/opplevelser.ts).
+  // Generalized (field_name column, not hardcoded to "hjemmeside") on
+  // purpose so a future write-lever for another experience_providers field
+  // can reuse this SAME table rather than spinning up a fourth near-
+  // identical audit table — the gardssalg_website_verification_audit table
+  // above is NOT reused in place because its classification/verified
+  // columns are specific to the verification sweep's own vocabulary and do
+  // not fit a plain "old value -> new value" field write. Mirrors
+  // gardssalg_website_verification_audit's/experience_provider_conflict_
+  // audit's exact shape/indexing convention (this fleet's established
+  // reversible-write audit-trail idiom) — FK'd to experience_providers, ON
+  // DELETE CASCADE so orphan audit rows are cleaned up if a provider is
+  // ever deleted.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_provider_field_write_audit (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        batch_id TEXT,
+        written_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_field_write_audit_provider ON experience_provider_field_write_audit(provider_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_field_write_audit_batch ON experience_provider_field_write_audit(batch_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_provider_field_write_audit_field ON experience_provider_field_write_audit(field_name)`);
+  } catch (err) {
+    console.error("Migration experience_provider_field_write_audit failed:", err);
   }
 
   console.log("[experiences] schema initialized");

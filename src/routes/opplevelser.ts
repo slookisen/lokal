@@ -128,6 +128,11 @@ import {
   listGardssalgWebsiteReviewQueue,
   stampGardssalgWebsiteDiscoveryAttempt,
   applyGardssalgProviderWebsite,
+  // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
+  // 3d — narrows POST /admin/providers/hjemmeside-write's lock check from
+  // row-level content_source to this SAME per-field owner_locks helper
+  // (gated on gårdssalg-row identity; see isHjemmesideLocked below).
+  isGardssalgFieldOwnerLocked,
   // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — search-based
   // candidate source (tier 2, after the free name-guess tier above): combined
   // social-media + directory/DMO pre-fetch exclusion, query builder, Brave
@@ -176,6 +181,16 @@ import {
   classifyProviderContentBucket,
   type ProviderContentBucket,
   type BucketableExperienceRow,
+  // dev-request 2026-08-03-gardssalg-field-concordance-review-approve — the
+  // missing consumer for gardssalg_field_concordance_review_queue (see
+  // applyGardssalgFieldConcordance's own doc comment, services/gardssalg-
+  // field-concordance.ts). GET .../gardssalg-field-concordance-review-queue
+  // + POST .../gardssalg-field-concordance-review-approve, near the existing
+  // GET .../gardssalg-field-concordance-audit / POST .../gardssalg-field-
+  // concordance-remediation pair below.
+  listGardssalgFieldConcordanceReviewQueue,
+  clearGardssalgFieldConcordanceReviewQueueEntry,
+  applyGardssalgFieldConcordanceApproval,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -226,6 +241,24 @@ import {
   type GsWvScope,
   type GsWvCohort,
 } from "../services/gardssalg-website-verification";
+// orchestrator dev-request 2026-08-03-gardssalg-field-concordance:
+// GET /admin/gardssalg-field-concordance-audit — read-only per-field
+// concordance check (DB-stored value vs. what's actually findable on the
+// producer's own already-verified homepage) over the verified drink-producer
+// cohort. Pure comparison logic lives entirely in gardssalg-field-
+// concordance.ts (no DB access, no fetch) — this route only supplies the
+// cohort rows (reusing GET /admin/gardssalg-verified-drinkproducer-cohort's
+// own provider-id-set query below, unchanged) and each producer's
+// already-fetched page text via crFetchGardssalgContent + gardssalgPageText,
+// the SAME pipeline content-refresh/website-verification already use.
+import {
+  buildProviderConcordanceRow,
+  summarizeGfc,
+  applyGardssalgFieldConcordance,
+  GFC_AVVIK_CAPABLE_FIELDS,
+  type GfcProviderResult,
+  type GfcFieldName,
+} from "../services/gardssalg-field-concordance";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
 // category mapper differs (experiences vocab, not the food vocab).
@@ -296,6 +329,7 @@ import {
   // POST /admin/gardssalg-claim-grant below.
   issueAdminGrantedClaimMagicLink,
   hasActiveNonRevokedClaim,
+  backfillGardssalgOwnerLockProvenance,
 } from "../services/gardssalg-claim";
 import { normalizeDomain, normalizeEmail } from "../services/blocklist-service";
 import { emailService } from "../services/email-service";
@@ -1390,6 +1424,15 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
   const parkedNow: string[] = [];
+  // dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-enrichment-
+  // gate, Steg 3: providers excluded because their hjemmeside is not stamped
+  // verified=true by the website-verification sweep (isHjemmesideVerified()
+  // above — mirrors PR #453's gate on the gårdssalg content-refresh route).
+  // Own named bucket (never lumped into errors/skipped_locked) so a run's
+  // report always makes visible how many rows were skipped for this reason,
+  // instead of it silently inflating the generic `errors`/
+  // http_unreachable_per_run metric the way ordinary fetch failures do.
+  const excludedUnverifiedWebsite: Array<{ provider_id: string; reason: string }> = [];
 
   async function processOne(t: ContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -1401,6 +1444,23 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     // sorting first forever (see markProviderContentAttempted's doc comment).
     if (apply) {
       try { markProviderContentAttempted(providerId); } catch { /* best-effort */ }
+    }
+
+    // Website-verification gate — before any fetch, fail-closed: a
+    // hjemmeside the website-verification sweep has not stamped
+    // verified=true (missing, malformed, or classification other than
+    // "verified") must never be trusted as an enrichment source for this
+    // producer. See isHjemmesideVerified()'s doc comment above. This also
+    // gates the COALESCE-fallback case (t.hjemmeside sourced from an
+    // experience's evidence_url because the provider's own hjemmeside column
+    // is blank — see selectProvidersForContentRefresh's SQL): the
+    // verification sweep only ever classifies the provider's OWN hjemmeside
+    // column, so a fallback-sourced target's field_provenance reads
+    // "missing_source" (verified=false) here and is skipped too, by design
+    // (the fallback URL was never itself ownership-verified).
+    if (!isHjemmesideVerified(t.field_provenance)) {
+      excludedUnverifiedWebsite.push({ provider_id: providerId, reason: "unverified_website" });
+      return;
     }
 
     // Fetch homepage content server-side (SSRF-guarded).
@@ -1582,6 +1642,13 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
+    // Steg 3 — providers excluded because their hjemmeside is not stamped
+    // verified=true by the website-verification sweep; additive bucket,
+    // every excluded provider is visible, never dropped or lumped into
+    // `errors` (which otherwise becomes the http_unreachable_per_run
+    // guardrail metric and would misread aggregator-URL rot as real
+    // unreachability).
+    excluded_unverified_website: excludedUnverifiedWebsite,
     // Why selection stopped this call: "real-exhaustion" only when the SQL
     // candidate window is genuinely tapped out; "scan_cap_reached" when the
     // hard CONTENT_REFRESH_HARD_SCAN_CAP scan budget stopped the search
@@ -3324,13 +3391,33 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
     }
     for (const id of ids) {
       const t = expDb
-        .prepare(`SELECT id, navn, listing_url, hjemmeside, content_source FROM experience_providers WHERE id = ?`)
+        .prepare(
+          `SELECT id, navn, listing_url, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`
+        )
         .get(id) as
-        | { id: string; navn: string; listing_url: string | null; hjemmeside: string | null; content_source: string | null }
+        | {
+            id: string;
+            navn: string;
+            listing_url: string | null;
+            hjemmeside: string | null;
+            content_source: string | null;
+            field_provenance: string | null;
+            producer_type: string | null;
+            rfb_seed_source: string | null;
+          }
         | undefined;
       if (!t) {
         notFound.push(id);
-      } else if (t.content_source === "manual" || t.content_source === "claim") {
+      } else if (
+        isHjemmesideLocked({
+          id: t.id,
+          hjemmeside: t.hjemmeside,
+          content_source: t.content_source,
+          field_provenance: t.field_provenance,
+          producer_type: t.producer_type,
+          rfb_seed_source: t.rfb_seed_source,
+        })
+      ) {
         skippedLocked.push({ provider_id: t.id, navn: t.navn });
       } else if (t.hjemmeside && t.hjemmeside.trim() !== "") {
         alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
@@ -3339,7 +3426,13 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
       }
     }
   } else {
-    targets = expDb
+    // Phase 1 — byte-for-byte unchanged from the pre-3f query: today's entire
+    // result for every non-gårdssalg-claim scenario, zero behavior change for
+    // the dominant case. Sub-slice 3f (dev-request
+    // 2026-07-30-opplevagent-claim-epost-og-perfelt-laas) only adds phase 2
+    // below as a top-up — it never alters this query, its ORDER BY, or its
+    // LIMIT.
+    const phase1Targets = expDb
       .prepare(
         `SELECT id, navn, listing_url, content_source
            FROM experience_providers
@@ -3348,6 +3441,63 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
           LIMIT ?`
       )
       .all(LH_DISCOVERY_BATCH_CAP) as Array<{ id: string; navn: string; listing_url: string | null; content_source: string | null }>;
+    targets = phase1Targets;
+
+    // Phase 2 — ONLY runs when phase 1 under-filled the batch. Widens
+    // eligibility to gårdssalg content_source='claim' rows that are NOT
+    // owner-locked on hjemmeside, using the already-shipped, already-reviewed
+    // isHjemmesideLocked() gate (sub-slice 3d/3e) — no new gate logic, no
+    // re-derivation. Over-fetched by remaining_slots*4 (capped at 120) so the
+    // JS lock-filter below can reject locked rows without a third round-trip.
+    // `manual` rows and non-gårdssalg claim rows are excluded at the SQL
+    // level (content_source = 'claim' AND gårdssalg-identity predicate) —
+    // isHjemmesideLocked() would reject them too, but keeping them out of the
+    // SQL result means the over-fetch budget is spent only on rows that can
+    // plausibly pass, and content_source='manual' can NEVER reach `targets`
+    // via this path under any circumstance.
+    const remainingSlots = LH_DISCOVERY_BATCH_CAP - phase1Targets.length;
+    if (remainingSlots > 0) {
+      const phase1Ids = phase1Targets.map((t) => t.id);
+      const overFetchLimit = Math.min(remainingSlots * 4, 120);
+      const excludeClause = phase1Ids.length > 0 ? `AND id NOT IN (${phase1Ids.map(() => "?").join(",")})` : "";
+      const phase2Rows = expDb
+        .prepare(
+          `SELECT id, navn, listing_url, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source
+             FROM experience_providers
+            WHERE listing_url IS NOT NULL AND hjemmeside IS NULL
+              AND content_source = 'claim' AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+              ${excludeClause}
+            ORDER BY (listing_homepage_discovery_attempted_at IS NOT NULL), listing_homepage_discovery_attempted_at ASC, created_at ASC
+            LIMIT ?`
+        )
+        .all(...phase1Ids, overFetchLimit) as Array<{
+          id: string;
+          navn: string;
+          listing_url: string | null;
+          hjemmeside: string | null;
+          content_source: string | null;
+          field_provenance: string | null;
+          producer_type: string | null;
+          rfb_seed_source: string | null;
+        }>;
+
+      for (const row of phase2Rows) {
+        if (targets.length >= LH_DISCOVERY_BATCH_CAP) break;
+        if (
+          isHjemmesideLocked({
+            id: row.id,
+            hjemmeside: row.hjemmeside,
+            content_source: row.content_source,
+            field_provenance: row.field_provenance,
+            producer_type: row.producer_type,
+            rfb_seed_source: row.rfb_seed_source,
+          })
+        ) {
+          continue;
+        }
+        targets.push({ id: row.id, navn: row.navn, listing_url: row.listing_url, content_source: row.content_source });
+      }
+    }
   }
 
   const proposed: Array<{
@@ -3675,13 +3825,33 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
     }
     for (const id of ids) {
       const t = expDb
-        .prepare(`SELECT id, navn, org_nr, hjemmeside, content_source FROM experience_providers WHERE id = ?`)
+        .prepare(
+          `SELECT id, navn, org_nr, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`
+        )
         .get(id) as
-        | { id: string; navn: string; org_nr: string | null; hjemmeside: string | null; content_source: string | null }
+        | {
+            id: string;
+            navn: string;
+            org_nr: string | null;
+            hjemmeside: string | null;
+            content_source: string | null;
+            field_provenance: string | null;
+            producer_type: string | null;
+            rfb_seed_source: string | null;
+          }
         | undefined;
       if (!t) {
         notFound.push(id);
-      } else if (t.content_source === "manual" || t.content_source === "claim") {
+      } else if (
+        isHjemmesideLocked({
+          id: t.id,
+          hjemmeside: t.hjemmeside,
+          content_source: t.content_source,
+          field_provenance: t.field_provenance,
+          producer_type: t.producer_type,
+          rfb_seed_source: t.rfb_seed_source,
+        })
+      ) {
         skippedLocked.push({ provider_id: t.id, navn: t.navn });
       } else if (t.hjemmeside && t.hjemmeside.trim() !== "") {
         alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
@@ -3690,7 +3860,13 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
       }
     }
   } else {
-    targets = expDb
+    // Phase 1 — byte-for-byte unchanged from the pre-3g query: today's entire
+    // result for every non-gårdssalg-claim scenario, zero behavior change for
+    // the dominant case. Sub-slice 3g (dev-request
+    // 2026-07-30-opplevagent-claim-epost-og-perfelt-laas) only adds phase 2
+    // below as a top-up — it never alters this query, its ORDER BY, or its
+    // LIMIT.
+    const phase1Targets = expDb
       .prepare(
         `SELECT id, navn, org_nr, content_source
            FROM experience_providers
@@ -3699,6 +3875,63 @@ router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request,
           LIMIT ?`
       )
       .all(BW_DISCOVERY_BATCH_CAP) as Array<{ id: string; navn: string; org_nr: string | null; content_source: string | null }>;
+    targets = phase1Targets;
+
+    // Phase 2 — ONLY runs when phase 1 under-filled the batch. Widens
+    // eligibility to gårdssalg content_source='claim' rows that are NOT
+    // owner-locked on hjemmeside, using the already-shipped, already-reviewed
+    // isHjemmesideLocked() gate (sub-slice 3d/3e/3f) — no new gate logic, no
+    // re-derivation. Over-fetched by remaining_slots*4 (capped at 120) so the
+    // JS lock-filter below can reject locked rows without a third round-trip.
+    // `manual` rows and non-gårdssalg claim rows are excluded at the SQL
+    // level (content_source = 'claim' AND gårdssalg-identity predicate) —
+    // isHjemmesideLocked() would reject them too, but keeping them out of the
+    // SQL result means the over-fetch budget is spent only on rows that can
+    // plausibly pass, and content_source='manual' can NEVER reach `targets`
+    // via this path under any circumstance.
+    const remainingSlots = BW_DISCOVERY_BATCH_CAP - phase1Targets.length;
+    if (remainingSlots > 0) {
+      const phase1Ids = phase1Targets.map((t) => t.id);
+      const overFetchLimit = Math.min(remainingSlots * 4, 120);
+      const excludeClause = phase1Ids.length > 0 ? `AND id NOT IN (${phase1Ids.map(() => "?").join(",")})` : "";
+      const phase2Rows = expDb
+        .prepare(
+          `SELECT id, navn, org_nr, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source
+             FROM experience_providers
+            WHERE org_nr IS NOT NULL AND hjemmeside IS NULL
+              AND content_source = 'claim' AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+              ${excludeClause}
+            ORDER BY (brreg_website_discovery_attempted_at IS NOT NULL), brreg_website_discovery_attempted_at ASC, created_at ASC
+            LIMIT ?`
+        )
+        .all(...phase1Ids, overFetchLimit) as Array<{
+          id: string;
+          navn: string;
+          org_nr: string | null;
+          hjemmeside: string | null;
+          content_source: string | null;
+          field_provenance: string | null;
+          producer_type: string | null;
+          rfb_seed_source: string | null;
+        }>;
+
+      for (const row of phase2Rows) {
+        if (targets.length >= BW_DISCOVERY_BATCH_CAP) break;
+        if (
+          isHjemmesideLocked({
+            id: row.id,
+            hjemmeside: row.hjemmeside,
+            content_source: row.content_source,
+            field_provenance: row.field_provenance,
+            producer_type: row.producer_type,
+            rfb_seed_source: row.rfb_seed_source,
+          })
+        ) {
+          continue;
+        }
+        targets.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, content_source: row.content_source });
+      }
+    }
   }
 
   const proposed: Array<{
@@ -3970,9 +4203,21 @@ router.post("/admin/homepage-review-queue/submit", requireAdmin, (req: Request, 
     seen.add(pid);
 
     const provider = expDb
-      .prepare(`SELECT id, navn, hjemmeside, org_nr, listing_url, content_source FROM experience_providers WHERE id = ?`)
+      .prepare(
+        `SELECT id, navn, hjemmeside, org_nr, listing_url, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`
+      )
       .get(pid) as
-      | { id: string; navn: string; hjemmeside: string | null; org_nr: string | null; listing_url: string | null; content_source: string | null }
+      | {
+          id: string;
+          navn: string;
+          hjemmeside: string | null;
+          org_nr: string | null;
+          listing_url: string | null;
+          content_source: string | null;
+          field_provenance: string | null;
+          producer_type: string | null;
+          rfb_seed_source: string | null;
+        }
       | undefined;
     if (!provider) {
       rejected.push({ provider_id: pid, reason: "not_found" });
@@ -3991,7 +4236,16 @@ router.post("/admin/homepage-review-queue/submit", requireAdmin, (req: Request, 
       rejected.push({ provider_id: pid, reason: "already_has_website" });
       continue;
     }
-    if (provider.content_source === "manual" || provider.content_source === "claim") {
+    if (
+      isHjemmesideLocked({
+        id: provider.id,
+        hjemmeside: provider.hjemmeside,
+        content_source: provider.content_source,
+        field_provenance: provider.field_provenance,
+        producer_type: provider.producer_type,
+        rfb_seed_source: provider.rfb_seed_source,
+      })
+    ) {
       rejected.push({ provider_id: pid, reason: "locked_content_source" });
       continue;
     }
@@ -7102,6 +7356,444 @@ router.get("/admin/gardssalg-verified-drinkproducer-cohort", requireAdmin, (_req
   });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-field-concordance-audit ───────────
+//
+// orchestrator dev-request 2026-08-03-gardssalg-field-concordance: for every
+// producer in the verified drink-producer cohort (the SAME provider-id set
+// GET /admin/gardssalg-verified-drinkproducer-cohort just above computes —
+// producer_type IN DRINK_PRODUCER_TYPES AND isHjemmesideVerified(field_
+// provenance), reused/mirrored here rather than re-derived, since that route
+// itself has no exported cohort-loader function to call directly), compares
+// epost/telefon/mobil/adresse/postnummer/poststed/opening_hours_text against
+// what's actually findable on the producer's own already-verified homepage,
+// and reports a per-field verdict (bekreftet / avvik / ikke_funnet_på_siden
+// — see gardssalg-field-concordance.ts's own doc comment for the full rule).
+//
+// Fetch mechanism: crFetchGardssalgContent + gardssalgPageText, the SAME
+// SSRF-guarded pipeline content-refresh/gardssalg-website-verification.ts
+// already use — never a new fetch path. A fetch failure (or a cohort row
+// with no usable hjemmeside at all — should not occur in practice since
+// isHjemmesideVerified implies a hjemmeside was once verified, but handled
+// defensively anyway) fails CLOSED: every field for that provider verdicts
+// ikke_funnet_på_siden, never guessed, never thrown — a failure inside one
+// producer's fetch must never crash or skip the rest of the batch.
+//
+// providerIds: optional filter, query-string (`?providerIds=id1,id2` or
+// repeated `?providerIds=id1&providerIds=id2` — either form is accepted).
+// Same validation discipline as POST /admin/gardssalg-outreach-preflight's
+// own provider_ids batch (a few hundred lines above): parameter-bound
+// `IN (...)` only, never string-interpolated; deduplicated preserving
+// first-seen order; capped at MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH with a
+// 400 if exceeded. An id that doesn't resolve to a row in the drink-producer
+// cohort (unknown id, or a real id just outside that cohort) is silently
+// absent from the response rather than erroring — unlike outreach-preflight,
+// this endpoint's contract is "a verdict per COHORT MEMBER", not "an answer
+// per REQUESTED id", so there is no ikke_funnet-style placeholder row to
+// synthesize for it; the acceptance bar is simply that it never crashes the
+// rest of the batch, which the parameter-bound SQL already guarantees.
+//
+// Zero writes of any kind — no field_provenance stamp, no queue insert, no
+// DB write whatsoever. This is a pure GET, purely diagnostic. The write side
+// (queue + provenance stamp) is POST /admin/gardssalg-field-concordance-
+// remediation, below — see its own doc comment.
+const MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH = 200;
+
+// Thrown by runGardssalgFieldConcordanceScan when the cohort query itself
+// fails (malformed SQL / DB error, not a page-fetch failure — those fail
+// closed per-row inside buildProviderConcordanceRow and never throw). A
+// dedicated class lets each route's own catch block recognize this ONE
+// failure mode and reply with the same specific "Failed to query
+// experience_providers" message the original (pre-refactor) GET route always
+// gave, instead of collapsing into the generic "Internal error" every other
+// unexpected failure gets.
+class GfcQueryError extends Error {}
+
+// Shared providerIds validation for both the GET audit route and the POST
+// remediation route below — same discipline as POST /admin/gardssalg-
+// outreach-preflight's own provider_ids batch: parameter-bound only (never
+// string-interpolated — callers pass this straight into an `IN (...)`
+// clause), deduplicated preserving first-seen order, capped at
+// MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH with a 400 if exceeded or if nothing
+// usable survives trimming.
+function parseGfcProviderIdsFilter(rawList: string[]): { ids: string[] } | { error: string } {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const raw of rawList) {
+    const id = raw.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ordered.push(id);
+  }
+  if (ordered.length === 0) {
+    return { error: "providerIds må inneholde minst én ikke-tom id." };
+  }
+  if (ordered.length > MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH) {
+    return { error: `providerIds overstiger maks batch-størrelse på ${MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH}.` };
+  }
+  return { ids: ordered };
+}
+
+// Extracted from the original inline GET route body (dev-request 2026-08-03-
+// gardssalg-field-concordance-write) so the write-side POST route below can
+// run the EXACT same scan rather than duplicating the cohort query + fetch
+// loop. Loads the verified drink-producer cohort (producer_type IN
+// DRINK_PRODUCER_TYPES AND isHjemmesideVerified(field_provenance) —
+// unchanged from before this refactor), fetches each producer's homepage via
+// crFetchGardssalgContent/gardssalgPageText (the SAME SSRF-guarded pipeline
+// content-refresh/website-verification already use), and builds each row via
+// buildProviderConcordanceRow. Zero writes — this function itself never
+// touches the DB beyond the initial SELECT.
+async function runGardssalgFieldConcordanceScan(
+  expDb: Database.Database,
+  providerIdsFilter?: string[],
+): Promise<{ providers: GfcProviderResult[] }> {
+  const drinkTypes = Array.from(DRINK_PRODUCER_TYPES);
+  const typePlaceholders = drinkTypes.map(() => "?").join(", ");
+
+  let sql = `SELECT id, navn, hjemmeside, epost, telefon, mobil, adresse, postnummer, poststed,
+                    opening_hours_text, field_provenance
+               FROM experience_providers
+              WHERE producer_type IN (${typePlaceholders})`;
+  const params: string[] = [...drinkTypes];
+  if (providerIdsFilter) {
+    const idPlaceholders = providerIdsFilter.map(() => "?").join(", ");
+    sql += ` AND id IN (${idPlaceholders})`;
+    params.push(...providerIdsFilter);
+  }
+  sql += ` ORDER BY id`;
+
+  let rows: Array<{
+    id: string;
+    navn: string;
+    hjemmeside: string | null;
+    epost: string | null;
+    telefon: string | null;
+    mobil: string | null;
+    adresse: string | null;
+    postnummer: string | null;
+    poststed: string | null;
+    opening_hours_text: string | null;
+    field_provenance: string | null;
+  }> = [];
+  try {
+    rows = expDb.prepare(sql).all(...params) as typeof rows;
+  } catch (err) {
+    console.error("[gardssalg-field-concordance-scan] failed to query providers:", err);
+    throw new GfcQueryError("Failed to query experience_providers");
+  }
+
+  // Same fail-closed gate as GET /admin/gardssalg-verified-drinkproducer-
+  // cohort above — verified === true only, never a truthy/ambiguous check.
+  const cohort = rows.filter((p) => isHjemmesideVerified(p.field_provenance));
+
+  const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
+    const fetched = await crFetchGardssalgContent(homepageUrl);
+    if (!fetched.ok) return { ok: false, reason: fetched.reason };
+    return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+  };
+
+  const providers: GfcProviderResult[] = [];
+  for (let i = 0; i < cohort.length; i += CR_CONCURRENCY) {
+    const slice = cohort.slice(i, i + CR_CONCURRENCY);
+    const sliceResults = await Promise.all(
+      slice.map(async (p) => {
+        const hjemmeside = p.hjemmeside && p.hjemmeside.trim() !== "" ? p.hjemmeside.trim() : null;
+        let pageText: string | null = null;
+        if (hjemmeside) {
+          try {
+            const fetched = await fetchFn(hjemmeside);
+            pageText = fetched.ok ? fetched.pageText : null;
+          } catch {
+            // fetchFn's own contract never throws in practice, but this
+            // route treats a throw exactly like a reported failure —
+            // fail-closed either way, never an uncaught rejection, never a
+            // crashed batch.
+            pageText = null;
+          }
+        }
+        return buildProviderConcordanceRow(
+          {
+            id: p.id,
+            navn: p.navn,
+            epost: p.epost,
+            telefon: p.telefon,
+            mobil: p.mobil,
+            adresse: p.adresse,
+            postnummer: p.postnummer,
+            poststed: p.poststed,
+            opening_hours_text: p.opening_hours_text,
+          },
+          pageText,
+        );
+      }),
+    );
+    providers.push(...sliceResults);
+  }
+
+  return { providers };
+}
+
+router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req: Request, res: Response) => {
+  const rawProviderIds = req.query.providerIds;
+  let providerIdsFilter: string[] | undefined;
+  if (rawProviderIds !== undefined) {
+    const rawList: string[] = Array.isArray(rawProviderIds)
+      ? (rawProviderIds as unknown[]).map((v) => String(v))
+      : String(rawProviderIds).split(",");
+    const parsed = parseGfcProviderIdsFilter(rawList);
+    if ("error" in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    providerIdsFilter = parsed.ids;
+  }
+
+  const expDb = getExpDb("experiences");
+  try {
+    const { providers } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter);
+    res.json({
+      success: true,
+      count: providers.length,
+      summary: summarizeGfc(providers),
+      providers,
+    });
+  } catch (err) {
+    if (err instanceof GfcQueryError) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    console.error("[gardssalg-field-concordance-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-field-concordance-remediation ────
+//
+// orchestrator dev-request 2026-08-03-gardssalg-field-concordance (write-side
+// slice): the WRITE side the read-only GET .../gardssalg-field-concordance-
+// audit route above deliberately left out. Re-runs the EXACT same scan as
+// GET (via the shared runGardssalgFieldConcordanceScan helper above — never
+// duplicated) with an optional `providerIds` override (same validation as
+// GET's own filter, see parseGfcProviderIdsFilter above) and an optional
+// `batch_id` string recorded on any queue rows written.
+//
+// Dry-run (apply omitted/false — the default): ZERO writes. Reports
+// `would_queue`: the avvik entries (epost/telefon/mobil only — the only
+// avvik-capable fields) a real apply would upsert into
+// gardssalg_field_concordance_review_queue. Lists every current avvik found
+// by this scan, new or already-queued alike — dry-run is a preview of the
+// scan's findings, not a diff against the queue's current contents.
+//
+// Apply: calls applyGardssalgFieldConcordance (services/gardssalg-field-
+// concordance.ts) — for every scanned provider, read-modify-writes
+// field_provenance.field_concordance (a verdict-only stamp; never touches
+// hjemmeside_verification or any other existing provenance key), then
+// upserts a gardssalg_field_concordance_review_queue row for every field
+// whose verdict is exactly "avvik" (skipped if an identical pending entry
+// already exists, for idempotent re-runs). Per the dev-request's own spec
+// ("Ingen automatisk overskriving ved avvik"), this NEVER writes epost/
+// telefon/mobil/adresse/postnummer/poststed/opening_hours_text on
+// experience_providers directly, under any circumstance — see that
+// function's own doc comment for the full write contract.
+router.post("/admin/gardssalg-field-concordance-remediation", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+
+  const rawProviderIds = body.providerIds;
+  let providerIdsFilter: string[] | undefined;
+  if (rawProviderIds !== undefined) {
+    const rawList: string[] = Array.isArray(rawProviderIds)
+      ? (rawProviderIds as unknown[]).map((v) => String(v))
+      : String(rawProviderIds).split(",");
+    const parsed = parseGfcProviderIdsFilter(rawList);
+    if ("error" in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    providerIdsFilter = parsed.ids;
+  }
+
+  const expDb = getExpDb("experiences");
+  try {
+    const { providers } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter);
+    const summary = summarizeGfc(providers);
+
+    if (!apply) {
+      const would_queue: Array<{
+        provider_id: string;
+        field_name: GfcFieldName;
+        current_value: string | null;
+        found_value: string | null;
+      }> = [];
+      for (const p of providers) {
+        for (const field of GFC_AVVIK_CAPABLE_FIELDS) {
+          const cell = p[field];
+          if (cell.verdict === "avvik") {
+            would_queue.push({
+              provider_id: p.provider_id,
+              field_name: field,
+              current_value: cell.current,
+              found_value: cell.found,
+            });
+          }
+        }
+      }
+      res.json({ success: true, dry_run: true, would_queue, summary });
+      return;
+    }
+
+    const { applied, provenance_written, total_queued } = applyGardssalgFieldConcordance(expDb, providers, batchId);
+    res.json({
+      success: true,
+      dry_run: false,
+      provenance_written,
+      queued: total_queued,
+      applied,
+      summary,
+    });
+  } catch (err) {
+    if (err instanceof GfcQueryError) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    console.error("[gardssalg-field-concordance-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-field-concordance-review-queue
+//     (admin) ───────────────────────────────────────────────────────────────
+//
+// dev-request 2026-08-03-gardssalg-field-concordance-review-approve.
+// Read-only listing of every current gardssalg_field_concordance_review_queue
+// row — the durable record of `avvik` findings POST /admin/gardssalg-field-
+// concordance-remediation's apply mode has queued for a human/orchestrator to
+// resolve (up to 3 pending rows per provider: epost/telefon/mobil are
+// independent). No UI reads this yet; it exists so Daniel/CS/the orchestrator
+// has something to query before deciding what to approve below.
+router.get("/admin/gardssalg-field-concordance-review-queue", requireAdmin, (_req: Request, res: Response) => {
+  const entries = listGardssalgFieldConcordanceReviewQueue();
+  res.json({ count: entries.length, entries });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-field-concordance-review-approve
+//     (admin) ───────────────────────────────────────────────────────────────
+//
+// dev-request 2026-08-03-gardssalg-field-concordance-review-approve — the
+// review queue's missing APPLY lever, same strict confirmation-surface
+// contract as gardssalg-orgnr-review-approve/gardssalg-website-review-approve
+// above:
+//
+//   A human/the orchestrator may ONLY approve the exact (provider_id,
+//   field_name, found_value) triple the queue itself carries — a found_value
+//   that doesn't byte-match the queued candidate is rejected
+//   (mismatch_with_queued_candidate). This is a confirmation surface, not an
+//   arbitrary-write surface: candidates come exclusively from the
+//   field-concordance scan's own page-extraction, the human/orchestrator adds
+//   the judgment the scanner deliberately withheld ("Ingen automatisk
+//   overskriving ved avvik"), and the write still passes through
+//   applyGardssalgFieldConcordanceApproval's owner-lock/staleness guards and
+//   lands in the same gardssalg_content_audit/field_provenance/rollback
+//   machinery every other gårdssalg write uses.
+//
+// Body: { approvals: [{provider_id, field_name, found_value}], apply? } —
+// dry-run by default (same apply truthy-check as every other approve lever in
+// this file: apply === true/1/"1"/"true" in the body, or ?apply=1/true in the
+// query string). Response buckets: approved / written / rejected (reason per
+// item) — every submitted item lands in `rejected` unless it was both
+// approved AND (when applying) actually written.
+router.post("/admin/gardssalg-field-concordance-review-approve", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+    res.status(400).json({
+      error: "Body must contain a non-empty 'approvals' array of {provider_id, field_name, found_value}",
+    });
+    return;
+  }
+  if (body.approvals.length > 200) {
+    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+    return;
+  }
+
+  const queue = listGardssalgFieldConcordanceReviewQueue();
+  const byKey = new Map(queue.map((q) => [`${q.provider_id}::${q.field_name}`, q]));
+  const seen = new Set<string>();
+  const approved: Array<{ provider_id: string; field_name: string; found_value: string }> = [];
+  const written: Array<{ provider_id: string; field_name: string; found_value: string }> = [];
+  const rejected: Array<{ provider_id: string; field_name: string; reason: string }> = [];
+
+  for (const raw of body.approvals as unknown[]) {
+    const a = (raw ?? {}) as { provider_id?: unknown; field_name?: unknown; found_value?: unknown };
+    const providerId = typeof a.provider_id === "string" ? a.provider_id.trim() : "";
+    const fieldName = typeof a.field_name === "string" ? a.field_name.trim() : "";
+    const foundValue = a.found_value;
+    if (!providerId || !fieldName || typeof foundValue !== "string") {
+      rejected.push({ provider_id: providerId || "(missing)", field_name: fieldName || "(missing)", reason: "invalid_item" });
+      continue;
+    }
+    const key = `${providerId}::${fieldName}`;
+    if (seen.has(key)) {
+      rejected.push({ provider_id: providerId, field_name: fieldName, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(key);
+
+    const q = byKey.get(key);
+    if (!q) {
+      rejected.push({ provider_id: providerId, field_name: fieldName, reason: "not_in_review_queue" });
+      continue;
+    }
+    if (foundValue !== q.found_value) {
+      // The human/orchestrator must approve the QUEUED candidate — a
+      // different found_value in the request is a data-entry error or an
+      // attempt to use this as an arbitrary-write surface. Either way:
+      // rejected, nothing written.
+      rejected.push({ provider_id: providerId, field_name: fieldName, reason: "mismatch_with_queued_candidate" });
+      continue;
+    }
+
+    approved.push({ provider_id: providerId, field_name: fieldName, found_value: foundValue });
+    if (!dryRun) {
+      try {
+        const result = applyGardssalgFieldConcordanceApproval(
+          providerId,
+          fieldName,
+          q.current_value,
+          foundValue,
+          q.batch_id ?? undefined
+        );
+        if (result.written) {
+          written.push({ provider_id: providerId, field_name: fieldName, found_value: foundValue });
+          clearGardssalgFieldConcordanceReviewQueueEntry(providerId, fieldName);
+        } else {
+          rejected.push({ provider_id: providerId, field_name: fieldName, reason: result.reason ?? "write_refused" });
+        }
+      } catch (err: any) {
+        rejected.push({ provider_id: providerId, field_name: fieldName, reason: `write_failed: ${err?.message ?? String(err)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    approved_count: approved.length,
+    approved,
+    written_count: written.length,
+    written,
+    rejected,
+  });
+});
+
 // ─── GET /api/opplevelser/admin/gardssalg-provider-dedup-audit ───────────────
 //
 // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds, slice
@@ -7690,8 +8382,28 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
 // exists, for idempotent re-runs) — see applyGardssalgWebsiteVerification's
 // own doc comment (services/gardssalg-website-verification.ts) for the full
 // write contract.
+//
+// cohort/limit/offset (dev-request 2026-08-02-opplevagent-hjemmeside-
+// verifisering-og-enrichment-gate, Steg 2b): the SAME `cohort` + pagination
+// discipline as the GET audit route above, read from the request BODY (this
+// is a POST) instead of the query string — see that route's own doc comment
+// for the full rationale (MAX_GARDSSALG_AUDIT_LIMIT, mandatory pagination at
+// cohort=all). Reusing the same constant is deliberate: this route performs
+// the same per-row live outbound fetch as the GET route, so it carries
+// exactly the same PR #432 unbounded-scan risk at scale — an earlier gap
+// here (cohort hardcoded to "gardssalg", no limit/offset) was safe only
+// because the gårdssalg cohort itself is small (~87 rows). Paginating BEFORE
+// the scan also bounds `apply=true`'s blast radius to the paged rows only.
 router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown; scope?: unknown };
+  const body = (req.body ?? {}) as {
+    apply?: unknown;
+    providerIds?: unknown;
+    batch_id?: unknown;
+    scope?: unknown;
+    cohort?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+  };
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
   // Same scope contract and strict validation as the GET audit route above —
@@ -7704,6 +8416,59 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
     return;
   }
+  // cohort=gardssalg (default) | all — same axis/discipline as the GET audit
+  // route above (dev-request 2026-08-02-opplevagent-hjemmesideverifisering-
+  // og-enrichment-gate, Steg 2b): a SEPARATE axis from `scope` (visibility),
+  // decides WHICH producer types are eligible at all. Read from the BODY
+  // (this is a POST), never silently falling back on an unrecognized value.
+  const rawCohort = body.cohort;
+  const cohortParam: GsWvCohort = rawCohort === undefined ? "gardssalg" : (rawCohort as GsWvCohort);
+  if (rawCohort !== undefined && !GS_WV_COHORTS.includes(cohortParam)) {
+    res.status(400).json({ error: `Ugyldig cohort — må være en av: ${GS_WV_COHORTS.join(", ")}` });
+    return;
+  }
+  // limit/offset — same contract, same MAX_GARDSSALG_AUDIT_LIMIT ceiling, and
+  // the same reason as the GET audit route: this route scans the ENTIRE
+  // loaded cohort synchronously with a live outbound fetch per row, so an
+  // unbounded cohort=all sweep here reproduces the exact PR #432 hang class.
+  // Read from the body, not the query string, since this is a POST.
+  let limit: number | undefined;
+  let offset: number | undefined;
+  if (body.limit !== undefined) {
+    const parsedLimit = Number(body.limit);
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+      res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
+      return;
+    }
+    if (parsedLimit > MAX_GARDSSALG_AUDIT_LIMIT) {
+      res.status(400).json({ error: `Ugyldig limit — maks er ${MAX_GARDSSALG_AUDIT_LIMIT}.` });
+      return;
+    }
+    limit = parsedLimit;
+  }
+  if (body.offset !== undefined) {
+    const parsedOffset = Number(body.offset);
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+      return;
+    }
+    offset = parsedOffset;
+  }
+  if (limit === undefined && offset !== undefined) {
+    res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+    return;
+  }
+  // Mandatory pagination at scale — same rule as the GET audit route:
+  // cohort=all can be 1000+ rows platform-wide, so the unbounded (`limit`
+  // absent) synchronous-scan path stays reachable ONLY for the default
+  // cohort=gardssalg, preserving today's byte-for-byte behavior for callers
+  // who never pass a body at all. Checked before any DB load or fetch.
+  if (cohortParam === "all" && limit === undefined) {
+    res.status(400).json({
+      error: "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+    });
+    return;
+  }
 
   const expDb = getExpDb("experiences");
   try {
@@ -7713,7 +8478,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
     };
 
-    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope);
+    let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
     if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
       const idSet = new Set(
         (body.providerIds as unknown[])
@@ -7723,11 +8488,41 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       cohort = cohort.filter((p) => idSet.has(p.id));
     }
 
+    // Paginate BEFORE scanning — mirrors the GET audit route's own
+    // `cohortRows.slice(pageOffset, pageOffset + limit)` pattern, so only the
+    // requested page ever incurs a live outbound fetch, and (for apply=true)
+    // only the paged rows are ever written — the blast radius of a single
+    // call is bounded by `limit`, never the full (possibly cohort=all) set.
+    const total = cohort.length;
+    let pageOffset: number | undefined;
+    if (limit !== undefined) {
+      pageOffset = offset ?? 0;
+      cohort = cohort.slice(pageOffset, pageOffset + limit);
+    }
+
     const { summary, rows } = await scanGardssalgWebsiteVerificationRows(cohort, fetchFn, CR_CONCURRENCY);
+    const pagination =
+      limit === undefined
+        ? undefined
+        : {
+            total,
+            offset: pageOffset as number,
+            limit,
+            returned: rows.length,
+            next_offset: (pageOffset as number) + rows.length < total ? (pageOffset as number) + rows.length : null,
+          };
 
     if (!apply) {
       const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation(rows);
-      res.json({ success: true, dry_run: true, scope, would_enqueue: wouldEnqueue, summary });
+      res.json({
+        success: true,
+        dry_run: true,
+        scope,
+        cohort: cohortParam,
+        would_enqueue: wouldEnqueue,
+        summary,
+        ...(pagination ? { pagination } : {}),
+      });
       return;
     }
 
@@ -7736,12 +8531,65 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       success: true,
       dry_run: false,
       scope,
+      cohort: cohortParam,
       enqueued: applied.filter((a) => a.enqueued).length,
       provenance_written: applied.length,
       summary,
+      ...(pagination ? { pagination } : {}),
     });
   } catch (err) {
     console.error("[gardssalg-website-verification-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-owner-lock-backfill ──────────────
+//
+// dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 3
+// (scoped-down slice — see this route's own scoping note at the top of
+// gardssalg-claim.ts's updateClaimedProviderProfile, which now stamps
+// field_provenance.owner_locks.<field> GOING FORWARD on every new owner
+// edit). This is the one-time catch-up for owner edits that happened
+// BEFORE that forward-stamping existed: it reads gardssalg_content_audit
+// (changed_by='owner') and back-fills the same owner_locks entries from
+// that historical trail — see backfillGardssalgOwnerLockProvenance's own
+// doc comment (services/gardssalg-claim.ts) for the full write contract,
+// including why it is idempotent (a field whose owner_locks entry already
+// exists — from a prior run of this route OR from the forward-stamping
+// path — is left untouched and counted under already_stamped, never
+// rewritten/re-dated).
+//
+// Dry-run (apply omitted/false, same convention as every other gårdssalg
+// admin write route in this file, e.g. POST .../gardssalg-website-
+// verification-remediation just above): performs the exact same scan/merge
+// logic but skips the final UPDATE — literally zero DB writes — and reports
+// would_stamp instead of stamped.
+router.post("/admin/gardssalg-owner-lock-backfill", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  try {
+    const result = backfillGardssalgOwnerLockProvenance(apply);
+    if (!apply) {
+      res.json({
+        success: true,
+        dry_run: true,
+        scanned: result.scanned,
+        would_stamp: result.stamped,
+        already_stamped: result.already_stamped,
+        skipped_missing_provider: result.skipped_missing_provider,
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      dry_run: false,
+      scanned: result.scanned,
+      stamped: result.stamped,
+      already_stamped: result.already_stamped,
+      skipped_missing_provider: result.skipped_missing_provider,
+    });
+  } catch (err) {
+    console.error("[gardssalg-owner-lock-backfill] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
@@ -8604,6 +9452,329 @@ router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res
     console.error("[opplevelser] admin/providers/:id/hjemmeside PATCH failed", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── POST /api/opplevelser/admin/providers/hjemmeside-write (admin) ─────────
+//
+// Steg 4 of the 2026-08-03-hjemmeside-skrivespak dev-request — the batch
+// write-lever the free-form PATCH .../providers/:id/hjemmeside route above
+// (isPlausibleUrlish only, no lock/denylist checks) intentionally never grew.
+// Modeled structurally on src/routes/admin-agents-url-write.ts (dry-run/apply
+// parsing, per-row transaction, batch cap, one-failure-never-aborts-the-batch)
+// but adapted to experience_providers' OWN conventions rather than the
+// agents/agent_claims ones:
+//
+//   * lock signal: `content_source IN ('manual','claim')` is the WHOLE lock
+//     — there is no separate "verified claims" table for experience_providers
+//     the way agent_claims backs agents.claimed_at. Override via
+//     `allow_locked_override: true` (per-row or top-level), the direct analog
+//     of admin-agents-url-write.ts's `allow_directory_host` escape-hatch
+//     convention (must be stated, never inferred).
+//   * host parsing: hostFromUrlLike() (cross-source-validator.ts) — the SAME
+//     parser the rest of the experiences/gardssalg code already uses
+//     everywhere (isAggregatorWebsite, gardssalg-website-verification.ts,
+//     etc.) — NOT admin-agents-url-write.ts's own local hostOf(). Two
+//     independent host-parsers already exist in this codebase; this route
+//     uses the one native to its own vertical. hostFromUrlLike already strips
+//     URL userinfo (`user:pass@host` / `user@host`) the same way hostOf()
+//     does, so the `https://evil.com@rettfrabonden.com/`-style bypass is
+//     already closed at the shared parser.
+//   * directory/aggregator denylist: isDirectoryOrAggregatorHost() +
+//     KNOWN_DIRECTORY_HOSTS (cross-source-validator.ts) — the SAME list
+//     gardssalg-website-verification.ts already classifies "aggregator" rows
+//     against, not a second copy of DIRECTORY_HOSTS.
+//   * platform-host denylist: experience_providers has NO existing
+//     platform-owned-host check (only admin-agents-url-write.ts's
+//     isPlatformOwnedHost(), scoped to the RFB/agents side). isPlatformOwnedHostForExperiences()
+//     below is a local twin, same two domains verbatim
+//     (rettfrabonden.com/.rettfrabonden.com, fly.dev/.fly.dev — the
+//     platform's actual infra domains; experience_providers can be hosted on
+//     the same Fly infra) since this is genuinely the same defect class on a
+//     second vertical, not a speculative new rule.
+//   * verification invalidation: a write that actually CHANGES the URL (skip-
+//     if-unchanged already filters no-op writes) flips a prior
+//     field_provenance.hjemmeside_verification `{verified:true}` stamp to
+//     `{verified:false, classification:"unverified", ...}` so
+//     isHjemmesideVerified() (above in this file) correctly stops trusting
+//     the OLD verification for the NEW, unverified URL. Read-modify-write on
+//     field_provenance, defensive JSON parse (malformed/missing -> `{}`,
+//     never throws, never clobbers other keys) — same pattern
+//     applyGardssalgWebsiteVerification() (gardssalg-website-verification.ts)
+//     uses, reimplemented locally here (not imported) since that function's
+//     own shape is tied to a full verification-scan row, not a single field
+//     write.
+//   * audit: one row per successful write in the NEW, generalized
+//     experience_provider_field_write_audit table (init-experiences.ts) —
+//     gardssalg_website_verification_audit is NOT reused in place, its
+//     classification/verified columns don't fit a plain field write.
+
+/** Hard cap per call — mirrors admin-agents-url-write.ts's URL_WRITE_MAX_ITEMS. */
+export const HJEMMESIDE_WRITE_MAX_ITEMS = 200;
+
+/** Our own hosts — never a provider's homepage. Local twin of
+ *  admin-agents-url-write.ts's isPlatformOwnedHost(), same two domains
+ *  verbatim, scoped to the experiences vertical (uses hostFromUrlLike, not
+ *  that file's local hostOf()). */
+function isPlatformOwnedHostForExperiences(url: string): boolean {
+  const h = hostFromUrlLike(url);
+  if (!h) return false;
+  if (h === "rettfrabonden.com" || h.endsWith(".rettfrabonden.com")) return true;
+  if (h === "fly.dev" || h.endsWith(".fly.dev")) return true;
+  return false;
+}
+
+type HjemmesideWriteOutcome =
+  | "written"
+  | "would_write"
+  | "rejected_locked"
+  | "rejected_invalid_item"
+  | "rejected_directory_host"
+  | "rejected_platform_host"
+  | "skipped_unchanged"
+  | "not_found"
+  | "error";
+
+interface HjemmesideWriteResultItem {
+  provider_id: string;
+  status: HjemmesideWriteOutcome;
+  previous_hjemmeside?: string | null;
+  new_hjemmeside?: string | null;
+  detail?: string;
+}
+
+interface HjemmesideWriteRow {
+  id: string;
+  hjemmeside: string | null;
+  content_source: string | null;
+  field_provenance: string | null;
+  producer_type: string | null;
+  rfb_seed_source: string | null;
+}
+
+const HJEMMESIDE_WRITE_ROW_SQL =
+  `SELECT id, hjemmeside, content_source, field_provenance, producer_type, rfb_seed_source FROM experience_providers WHERE id = ?`;
+
+/** Lock signal for experience_providers: content_source alone (no sibling
+ *  "verified claims" table exists for this entity, unlike agents/agent_claims) —
+ *  EXCEPT experience_providers is shared with the gårdssalg sub-vertical
+ *  (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
+ *  3d), whose claim portal writes a per-field field_provenance.owner_locks
+ *  stamp that isGardssalgFieldOwnerLocked() (experience-store.ts) already
+ *  consults to narrow the freeze from row-level to field-level. That helper
+ *  must NEVER be called on a non-gårdssalg row — a coincidental owner_locks
+ *  key there isn't a real owner-lock stamp — so gate on the SAME gårdssalg-row
+ *  predicate already used elsewhere in this file (e.g.
+ *  admin/gardssalg-provider-visibility above): producer_type IS NOT NULL OR
+ *  rfb_seed_source = 'rfb-seed'. Non-gårdssalg rows keep the original
+ *  unconditional row-level freeze. */
+function isHjemmesideLocked(row: HjemmesideWriteRow): boolean {
+  const isGardssalgRow = row.producer_type !== null || row.rfb_seed_source === "rfb-seed";
+  if (isGardssalgRow) return isGardssalgFieldOwnerLocked(row, "hjemmeside");
+  return row.content_source === "manual" || row.content_source === "claim";
+}
+
+/**
+ * Read-modify-write field_provenance, invalidating a stale
+ * `hjemmeside_verification: {verified:true}` stamp when the URL actually
+ * changes. Defensive parse: malformed/missing JSON -> {}, never throws,
+ * never clobbers other keys — same pattern as
+ * applyGardssalgWebsiteVerification() (gardssalg-website-verification.ts).
+ * Returns the merged object ready for JSON.stringify, or null if there was
+ * nothing to change (no prior verification entry, or it wasn't verified:true
+ * to begin with) — in which case the caller leaves field_provenance untouched.
+ */
+function invalidateHjemmesideVerificationIfPresent(
+  fieldProvenanceRaw: string | null
+): Record<string, unknown> | null {
+  let provenance: Record<string, unknown> = {};
+  if (fieldProvenanceRaw) {
+    try {
+      const parsed = JSON.parse(fieldProvenanceRaw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty, never clobber/throw */
+    }
+  }
+
+  const existing = provenance["hjemmeside_verification"];
+  const wasVerified =
+    !!existing && typeof existing === "object" && (existing as Record<string, unknown>)["verified"] === true;
+  if (!wasVerified) return null; // nothing to invalidate — leave field_provenance alone
+
+  provenance["hjemmeside_verification"] = {
+    verified: false,
+    classification: "unverified",
+    checked_at: new Date().toISOString(),
+    reason: "hjemmeside_write_invalidated_prior_verification",
+  };
+  return provenance;
+}
+
+router.post("/admin/providers/hjemmeside-write", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    items?: unknown;
+    apply?: unknown;
+    allow_locked_override?: unknown;
+  };
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true" ||
+    req.query?.apply === "1" || req.query?.apply === "true";
+  const dryRun = !apply;
+  const topLevelAllowLockedOverride = body.allow_locked_override === true;
+
+  if (!Array.isArray(body.items)) {
+    res.status(400).json({ error: "Body must contain an 'items' array of {provider_id, hjemmeside}" });
+    return;
+  }
+  if (body.items.length > HJEMMESIDE_WRITE_MAX_ITEMS) {
+    res.status(400).json({ error: `Too many items (max ${HJEMMESIDE_WRITE_MAX_ITEMS} per call)` });
+    return;
+  }
+
+  const expDb = getExpDb("experiences");
+  const batchId = `hjemmeside-write-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+  const results: HjemmesideWriteResultItem[] = [];
+
+  for (const raw of body.items as unknown[]) {
+    const it = (raw ?? {}) as {
+      provider_id?: unknown;
+      hjemmeside?: unknown;
+      allow_locked_override?: unknown;
+    };
+    const providerId = typeof it.provider_id === "string" ? it.provider_id.trim() : "";
+    if (!providerId) {
+      results.push({ provider_id: "(missing)", status: "rejected_invalid_item", detail: "provider_id required" });
+      continue;
+    }
+
+    // hjemmeside must be explicitly present: a string, or null to clear.
+    // `undefined` is a malformed item, never an inferred instruction.
+    let newValue: string | null;
+    if (it.hjemmeside === null) {
+      newValue = null;
+    } else if (typeof it.hjemmeside === "string") {
+      const trimmed = it.hjemmeside.trim();
+      if (trimmed === "") {
+        results.push({
+          provider_id: providerId,
+          status: "rejected_invalid_item",
+          detail: "empty string is not a clear instruction — send hjemmeside: null",
+        });
+        continue;
+      }
+      newValue = trimmed;
+    } else {
+      results.push({ provider_id: providerId, status: "rejected_invalid_item", detail: "hjemmeside must be a string or null" });
+      continue;
+    }
+
+    const rowAllowLockedOverride = it.allow_locked_override === true;
+    const allowLockedOverride = topLevelAllowLockedOverride || rowAllowLockedOverride;
+
+    try {
+      // 1. Load the provider row — not found never aborts the batch.
+      const cur = expDb.prepare(HJEMMESIDE_WRITE_ROW_SQL).get(providerId) as HjemmesideWriteRow | undefined;
+      if (!cur) {
+        results.push({ provider_id: providerId, status: "not_found" });
+        continue;
+      }
+      // 2. Lock check — content_source is the WHOLE lock signal here.
+      if (isHjemmesideLocked(cur) && !allowLockedOverride) {
+        results.push({ provider_id: providerId, status: "rejected_locked", previous_hjemmeside: cur.hjemmeside });
+        continue;
+      }
+      // 3. Validate the new value (skipped entirely when clearing).
+      if (newValue !== null) {
+        if (!isPlausibleUrlish(newValue)) {
+          results.push({ provider_id: providerId, status: "rejected_invalid_item", detail: "hjemmeside does not look like a plausible URL", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+          continue;
+        }
+        const host = hostFromUrlLike(newValue);
+        if (host && isDirectoryOrAggregatorHost(host)) {
+          results.push({ provider_id: providerId, status: "rejected_directory_host", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+          continue;
+        }
+        if (isPlatformOwnedHostForExperiences(newValue)) {
+          results.push({ provider_id: providerId, status: "rejected_platform_host", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+          continue;
+        }
+      }
+      // 4. Skip-if-unchanged.
+      const currentValue = cur.hjemmeside ?? null;
+      if (currentValue === newValue) {
+        results.push({ provider_id: providerId, status: "skipped_unchanged", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+        continue;
+      }
+
+      if (dryRun) {
+        results.push({ provider_id: providerId, status: "would_write", previous_hjemmeside: cur.hjemmeside, new_hjemmeside: newValue });
+        continue;
+      }
+
+      const tx = expDb.transaction((): HjemmesideWriteResultItem => {
+        // Re-read from a fresh snapshot inside the transaction so a
+        // concurrent write between the pre-check above and here can't race.
+        const fresh = expDb.prepare(HJEMMESIDE_WRITE_ROW_SQL).get(providerId) as HjemmesideWriteRow | undefined;
+        if (!fresh) return { provider_id: providerId, status: "not_found" };
+        if (isHjemmesideLocked(fresh) && !allowLockedOverride) {
+          return { provider_id: providerId, status: "rejected_locked", previous_hjemmeside: fresh.hjemmeside };
+        }
+        const freshCurrentValue = fresh.hjemmeside ?? null;
+        if (freshCurrentValue === newValue) {
+          return { provider_id: providerId, status: "skipped_unchanged", previous_hjemmeside: fresh.hjemmeside, new_hjemmeside: newValue };
+        }
+
+        expDb
+          .prepare(`UPDATE experience_providers SET hjemmeside = ?, updated_at = datetime('now') WHERE id = ?`)
+          .run(newValue, providerId);
+
+        const invalidatedProvenance = invalidateHjemmesideVerificationIfPresent(fresh.field_provenance);
+        if (invalidatedProvenance) {
+          expDb
+            .prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`)
+            .run(JSON.stringify(invalidatedProvenance), providerId);
+        }
+
+        expDb
+          .prepare(
+            `INSERT INTO experience_provider_field_write_audit
+               (id, provider_id, field_name, old_value, new_value, batch_id, written_at)
+             VALUES (?, ?, 'hjemmeside', ?, ?, ?, datetime('now'))`
+          )
+          .run(crypto.randomUUID(), providerId, fresh.hjemmeside, newValue, batchId);
+
+        return { provider_id: providerId, status: "written", previous_hjemmeside: fresh.hjemmeside, new_hjemmeside: newValue };
+      });
+
+      results.push(tx());
+    } catch (err: any) {
+      results.push({ provider_id: providerId, status: "error", detail: err?.message ?? String(err) });
+    }
+  }
+
+  const summary = {
+    written: 0,
+    would_write: 0,
+    rejected_locked: 0,
+    rejected_directory_host: 0,
+    rejected_platform_host: 0,
+    skipped_unchanged: 0,
+    not_found: 0,
+    error: 0,
+  } as Record<string, number>;
+  for (const r of results) {
+    if (r.status in summary) summary[r.status]!++;
+  }
+
+  res.json({
+    success: true,
+    dry_run: dryRun,
+    batch_id: batchId,
+    results,
+    summary,
+  });
 });
 
 // ─── POST /api/opplevelser/admin/hjemmeside-cleanup-sweep (admin) ───────────
@@ -10180,6 +11351,703 @@ router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Re
     written,
     skipped: skippedCount,
     remaining: Math.max(0, candidateRows.length - generated.length),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 1
+// ("Innholdsberikelse") — POST /admin/experiences-description-enrichment
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// PROBLEM. A large share of opplevagent.no detail pages render the
+// placeholder lede in routes/experiences-seo.ts (`descBlock`'s else branch):
+// "Detaljert beskrivelse publiseres fortløpende. <tittel> er en <kategori>-
+// opplevelse i <sted>. Se tilbyderens nettside for program, priser og
+// bestilling." — because `experiences.description` is blank, or holds
+// scraped nav junk that isJunkDescription() suppresses at render time.
+//
+// WHAT THIS BUILDS. A fail-closed writer for that column: for each candidate
+// row it generates a ≥400-word Norwegian description grounded ONLY in that
+// row's OWN structured catalog columns (the exact field set the detail page
+// already renders as `facts`/`badges`), has a SECOND LLM judge verify the
+// text invents nothing and is real prose, and only then writes it. The read
+// path is untouched — experiences-seo.ts already renders `description` when
+// it is present and non-junk.
+//
+// SAFETY POSTURE (read before changing anything here)
+// ───────────────────────────────────────────────────
+// This writer publishes prose on public, indexed pages under a provider's
+// name. A fabricated price/opening hour/landmark is a wrong-data incident,
+// not a copy nit. Every gate below is therefore fail-closed — "skip this
+// row" is always cheaper than "write something we are not sure about":
+//
+//   1. GROUNDING. The prompt carries nothing but the row's own structured
+//      fields (plus the provider name/Brreg flag from the JOIN). No scraped
+//      page text, no web search, no model world-knowledge is invited in.
+//   2. THIN DATA -> SKIP, NEVER PAD. A row with fewer than
+//      EXP_DESC_MIN_FACT_FIELDS populated fact-fields never reaches the LLM
+//      at all (zero tokens spent). Padding a two-fact row up to 400 words
+//      is exactly how invented facts get in.
+//   3. DETERMINISTIC POST-CHECKS before the judge: sentinel escape, word
+//      floor/ceiling, char cap, and an ungrounded-number scan (every digit
+//      run in the prose must appear in the facts block — prices, durations,
+//      group sizes and years are the highest-risk fabrication class and the
+//      cheapest to catch without a model).
+//   4. LLM JUDGE. Same exact-token GODKJENN/AVVIS contract as
+//      judgeGardssalgAboutCandidate() above; any doubt -> AVVIS.
+//   5. WRITE ONLY IF BOTH the generator and the judge succeeded. Missing
+//      ANTHROPIC_API_KEY, network failure, non-200, unparseable JSON or an
+//      unexpected shape at EITHER step resolves to "skip", never a throw.
+//   6. NEVER OVERWRITE GOOD COPY. Candidates are only rows whose current
+//      description is blank or fails isJunkDescription().
+//
+// WHY NOT isExperienceContentLocked() AS THE CANDIDATE GATE (deliberate).
+// That predicate locks a row when `verification_status === 'verified'` OR
+// content_source is 'manual'/'claim'. Its purpose is stopping a SCRAPE from
+// overwriting human/verified content. Reusing it wholesale here would make
+// this feature a no-op: PUBLISH_GATE_SQL only serves rows with
+// verification_status = 'verified', so the verified half covers 100% of the
+// pages that actually show the placeholder. This writer is a different
+// animal from a scrape — it never overwrites a good value, and its input is
+// the row's own already-verified structured columns rather than an external
+// page. So we honour the HUMAN-AUTHORED half of that lock (content_source
+// 'manual'/'claim' rows are skipped: a curator/owner touched that row, and
+// machine prose should not land on it without them) and deliberately do NOT
+// apply the `verified` half. Anyone widening this gate should re-read this
+// paragraph first.
+import { isJunkDescription as expDescIsJunk } from "../services/description-quality";
+import { parseContentFieldEvidence as expDescParseFieldEvidence } from "../services/experience-store";
+
+// Batch cap: HALF of TITLE_NO_BATCH_CAP (20). This feature spends TWO LLM
+// calls per row (generate + judge) instead of one, and the generate call
+// emits ~400-1200 words rather than a short title — so 10 rows/call keeps
+// both the per-request call count (<=20) and the per-request token spend in
+// the same ballpark the title-no backfill already proved safe. The
+// orchestrator drives the backlog by calling repeatedly, exactly as it does
+// for title-no.
+const EXP_DESC_BATCH_CAP = 10;
+// Dry-run sample: 3 (vs. title-no's 5) for the same reason — a dry run is
+// still 2 real LLM calls per sampled row, and 3 proposals are plenty to
+// eyeball quality before an apply run.
+const EXP_DESC_DRY_RUN_SAMPLE = 3;
+// Hard cap on an explicit `ids` list, mirroring the providerIds caps on the
+// gårdssalg admin endpoints above (a named priority list, not a bulk lever).
+const EXP_DESC_IDS_CAP = 100;
+
+// THIN-DATA THRESHOLD. A row must carry at least this many DISTINCT populated
+// fact-fields (out of the 13 buildExperienceDescriptionFacts() knows about)
+// before we are willing to ask for 400 words about it.
+//
+// Why 6: the fact set is category, subcategory, place, season, inne/ute,
+// varighet, gruppe, pris, språk, tilgjengelighet, oppmøtested, bestilling,
+// tilbyder. A row with <6 of them is essentially "title + category + a
+// municipality" — there is no honest way to reach 400 words from that, so
+// the model would have to pad or invent, and the judge would (correctly)
+// reject the result after we had already paid for two calls. 6 is also
+// comfortably above the floor a bulk-loaded harvest row lands on
+// (title/category/kommune/fylke, i.e. 2 fact-fields since kommune+fylke
+// collapse into one "Sted" fact), so the gate actually bites. It is
+// deliberately a count of DISTINCT FACT KINDS, not of non-null columns:
+// kommune+fylke count once, duration_min+duration_max count once, and a
+// price_band of 'ukjent' counts as nothing at all.
+const EXP_DESC_MIN_FACT_FIELDS = 6;
+
+// The dev-request's own bar. Below it we skip rather than write a short one:
+// the placeholder we are replacing is at least honest about being a stub.
+const EXP_DESC_MIN_WORDS = 400;
+// Ceiling: a run-away generation (repetition loops) is a quality failure, not
+// a bonus. ~1200 words is 3x the floor.
+const EXP_DESC_MAX_WORDS = 1200;
+const EXP_DESC_MAX_CHARS = 12000;
+// Escape hatch the model may return instead of padding — same idiom as
+// GARDSSALG_PRODUCTS_SENTINEL / GARDSSALG_REWRITE_SENTINEL above.
+const EXP_DESC_SENTINEL = "UTILSTREKKELIG_GRUNNLAG";
+// Verdict protocol: deliberately the SAME two tokens judgeGardssalgAbout-
+// Candidate() uses, declared separately so the two judges can evolve their
+// prompts independently without one silently redefining the other's tokens.
+const EXP_DESC_JUDGE_APPROVE_TOKEN = "GODKJENN";
+const EXP_DESC_JUDGE_REJECT_TOKEN = "AVVIS";
+
+/**
+ * Per-field provenance recorded for a description written by THIS writer.
+ * Deliberately not a URL, exactly like HARVEST_PROVENANCE_SENTINEL in
+ * experience-store.ts: isContentFieldHomepageSourced() must never mistake
+ * LLM prose for the provider's own homepage copy. Concretely this keeps the
+ * row inside isExperienceContentGenuinelyThin()'s candidate pool — i.e. the
+ * twice-daily homepage content-refresh selector behaves exactly as it did
+ * before this endpoint existed, instead of silently reclassifying the row as
+ * `done` the moment we fill `description`. (applyExperienceContent is
+ * fill-only, so it can never clobber what we wrote either way.)
+ */
+export const EXP_DESC_GENERATED_PROVENANCE_SENTINEL = "generated:katalogfelt-llm";
+
+/** The row shape the generator/judge are grounded on — the SAME field set
+ *  routes/experiences-seo.ts builds its `facts`/`badges` from. */
+export type ExperienceDescriptionCandidate = {
+  id: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  subcategory: string | null;
+  season: string | null;          // JSON array text
+  indoor_outdoor: string | null;
+  duration_min: number | null;
+  duration_max: number | null;
+  group_min: number | null;
+  group_max: number | null;
+  price_band: string | null;
+  price_from: number | null;
+  price_unit: string | null;
+  languages: string | null;       // JSON array text
+  accessibility: string | null;   // JSON array text
+  meeting_point: string | null;
+  kommune: string | null;
+  fylke: string | null;
+  booking_url: string | null;
+  content_source: string | null;
+  content_field_evidence: string | null;
+  provider_navn: string | null;
+  provider_brreg_verified: number | null;
+};
+
+// Norwegian display labels. Intentional small duplication of the maps in
+// routes/experiences-seo.ts (CATEGORY_LABELS / SEASON_LABELS / ioLabel /
+// PRICE_BAND_LABELS), which are module-private there — same call this repo
+// already made for services/experience-og-image.ts's companion colour map.
+// Importing a route module from another route module to share ten short
+// strings is more coupling than the duplication costs, and drift here can
+// only change PROMPT wording (these values are never rendered), so it is a
+// copy nit, not a correctness hazard.
+const EXP_DESC_CATEGORY_LABELS: Record<string, string> = {
+  vinter_sno: "Vinter og snø",
+  sightseeing_transport: "Sightseeing og transport",
+  dyreliv_safari: "Dyreliv og safari",
+  natur_friluft: "Natur og friluft",
+  kultur_historie: "Kultur og historie",
+  overnatting_opplevelse: "Overnatting og opplevelse",
+  adrenalin_action: "Adrenalin og action",
+  velvaere_spa: "Velvære og spa",
+  mat_drikke: "Mat og drikke",
+  gardssalg: "Gårdssalg og smaking",
+};
+const EXP_DESC_SEASON_LABELS: Record<string, string> = {
+  summer: "sommer", winter: "vinter", spring: "vår",
+  autumn: "høst", fall: "høst", year_round: "hele året",
+};
+const EXP_DESC_PRICE_BAND_LABELS: Record<string, string> = {
+  gratis: "gratis", rimelig: "rimelig prisnivå",
+  standard: "standard prisnivå", premium: "premium prisnivå",
+};
+
+/** Safe JSON-array-column read. Never throws, never guesses a list out of a
+ *  non-JSON string — an unreadable column is simply "no fact here". */
+function expDescJsonArray(raw: string | null | undefined): string[] {
+  const t = (raw ?? "").trim();
+  if (!t) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(t);
+  } catch {
+    return []; // not JSON — treat as absent, never parsed out of prose
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+    .map((v) => v.trim());
+}
+
+/**
+ * The row's populated fact-fields, as [norsk etikett, verdi] pairs — the ONLY
+ * material the generator is ever given. Mirrors the detail page's facts table
+ * (routes/experiences-seo.ts ~line 1863) field for field, so what we ground on
+ * is exactly what the page already claims. Each entry is one DISTINCT fact
+ * kind (see EXP_DESC_MIN_FACT_FIELDS), and `facts.length` is the thin-data
+ * measure.
+ */
+export function buildExperienceDescriptionFacts(
+  row: ExperienceDescriptionCandidate
+): Array<[string, string]> {
+  const facts: Array<[string, string]> = [];
+
+  const cat = (row.category ?? "").trim();
+  if (cat) facts.push(["Kategori", EXP_DESC_CATEGORY_LABELS[cat] || cat.replace(/_/g, " ")]);
+
+  const sub = (row.subcategory ?? "").trim();
+  if (sub) facts.push(["Underkategori", sub.replace(/_/g, " ")]);
+
+  const place = [row.kommune, row.fylke].map((v) => (v ?? "").trim()).filter(Boolean).join(", ");
+  if (place) facts.push(["Sted", place]);
+
+  const seasons = expDescJsonArray(row.season).map((s) => EXP_DESC_SEASON_LABELS[s] || s);
+  if (seasons.length) facts.push(["Sesong", seasons.join(", ")]);
+
+  const io = row.indoor_outdoor === "indoor" ? "innendørs"
+    : row.indoor_outdoor === "outdoor" ? "utendørs"
+    : row.indoor_outdoor === "both" ? "både inne og ute" : "";
+  if (io) facts.push(["Inne eller ute", io]);
+
+  if (row.duration_min || row.duration_max) {
+    const d = row.duration_min && row.duration_max && row.duration_min !== row.duration_max
+      ? `${row.duration_min}-${row.duration_max} minutter`
+      : `omtrent ${row.duration_min || row.duration_max} minutter`;
+    facts.push(["Varighet", d]);
+  }
+
+  if (row.group_min || row.group_max) {
+    const g = row.group_min && row.group_max
+      ? `${row.group_min}-${row.group_max} personer`
+      : row.group_max ? `inntil ${row.group_max} personer` : `fra ${row.group_min} personer`;
+    facts.push(["Gruppestørrelse", g]);
+  }
+
+  // price_band 'ukjent' literally means "we do not know" — it is not a fact.
+  const band = (row.price_band ?? "").trim();
+  const bandIsFact = band !== "" && band !== "ukjent";
+  if (row.price_from || bandIsFact) {
+    const unit = row.price_unit === "per_person" ? " per person"
+      : row.price_unit === "per_group" ? " per gruppe" : "";
+    const pr = row.price_from
+      ? `fra ${row.price_from} kroner${unit}`
+      : (EXP_DESC_PRICE_BAND_LABELS[band] || band);
+    facts.push(["Pris", pr]);
+  }
+
+  const langs = expDescJsonArray(row.languages);
+  if (langs.length) facts.push(["Språk", langs.join(", ")]);
+
+  const acc = expDescJsonArray(row.accessibility);
+  if (acc.length) facts.push(["Tilgjengelighet", acc.join(", ")]);
+
+  const meet = (row.meeting_point ?? "").trim();
+  if (meet) facts.push(["Oppmøtested", meet]);
+
+  // The URL itself is deliberately NOT handed to the model (nothing good
+  // comes of prose quoting a booking link) — only the FACT that the tilbyder
+  // takes bookings through their own channel.
+  if ((row.booking_url ?? "").trim()) {
+    facts.push(["Bestilling", "opplevelsen bestilles hos tilbyderen via tilbyderens egen bestillingsside"]);
+  }
+
+  const provName = (row.provider_navn ?? "").trim();
+  if (provName) {
+    facts.push([
+      "Tilbyder",
+      Number(row.provider_brreg_verified) === 1
+        ? `${provName} (verifisert mot Brønnøysundregistrene)`
+        : provName,
+    ]);
+  }
+
+  return facts;
+}
+
+/** The exact text block handed to BOTH the generator and the judge, so the
+ *  judge grades against byte-identical grounding material. */
+export function renderExperienceDescriptionFactsBlock(
+  row: ExperienceDescriptionCandidate,
+  facts: Array<[string, string]>
+): string {
+  return [`Tittel: ${row.title}`, ...facts.map(([k, v]) => `${k}: ${v}`)].join("\n");
+}
+
+/** Whitespace word count — the deterministic half of the ≥400-ord bar. */
+export function expDescWordCount(text: string | null | undefined): number {
+  const t = (text ?? "").trim();
+  if (!t) return 0;
+  return t.split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * True when the prose contains a number that does NOT appear in the facts
+ * block — i.e. an invented price, duration, group size, year, distance or
+ * count. Cheap, deterministic, and it catches the single highest-risk
+ * fabrication class before we spend a judge call on it.
+ *
+ * Digit groups are normalised first so a thousands separator can't cause a
+ * false positive ("1 200 kroner" in the prose vs. "1200" in the facts). The
+ * prompt tells the model in as many words to use no numbers beyond the fact
+ * list and to spell numbers out where it can, so a hit here is a real signal
+ * rather than an inevitability. Fail-closed either way: a hit means we skip
+ * the row, never that we write something doubtful.
+ */
+export function expDescHasUngroundedNumbers(text: string, factsBlock: string): boolean {
+  const normalise = (s: string) => s.replace(/(\d)[ .\u00a0](?=\d)/g, "$1");
+  const allowed = new Set((normalise(factsBlock).match(/\d+/g) ?? []).map((n) => String(Number(n))));
+  for (const raw of normalise(text).match(/\d+/g) ?? []) {
+    if (!allowed.has(String(Number(raw)))) return true;
+  }
+  return false;
+}
+
+/**
+ * Generate the description. Mirrors generateTitleNo()'s never-fabricate,
+ * never-throw contract byte for byte: direct fetch to
+ * https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+ * claude-haiku-4-5 (the model every generate/judge call site in this file
+ * uses today), `fetchImpl` as the DI seam, and `null` on ANY deviation —
+ * missing key, network failure, non-200, unparseable body, unexpected shape,
+ * the escape sentinel, or a candidate that fails the deterministic
+ * post-checks (word floor/ceiling, char cap, ungrounded numbers).
+ *
+ * Returns null for a thin row WITHOUT calling the LLM at all.
+ */
+export async function generateExperienceDescriptionNo(
+  row: ExperienceDescriptionCandidate,
+  fetchImpl: typeof fetch = fetch
+): Promise<string | null> {
+  const facts = buildExperienceDescriptionFacts(row);
+  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) return null; // thin -> never call the LLM
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
+  const prompt = `Du skriver produktbeskrivelser for opplevagent.no, en norsk markedsplass for opplevelser. Skriv beskrivelsen av opplevelsen under.
+
+ABSOLUTTE REGLER:
+- Bruk KUN faktaopplysningene i listen nedenfor. Du har ingen annen kunnskap om denne opplevelsen.
+- Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, fjell, fossefall, personer, historie, utstyr, måltider eller antall som ikke står i listen.
+- Ikke bruk tall som ikke står i faktalisten. Skriv heller tall som ord der det er naturlig.
+- Ikke gjett hva opplevelsen "sannsynligvis" inneholder, og ikke lån detaljer fra liknende opplevelser du kjenner til.
+- Du KAN utdype og forklare de oppgitte faktaene, og gi tydelig generelle, praktiske råd som følger direkte av dem (for eksempel at utendørsaktiviteter krever klær etter været). Slike generelle råd må aldri formuleres som en konkret opplysning om nettopp denne opplevelsen.
+- Skriv på norsk bokmål, i sammenhengende avsnitt. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
+- Teksten skal være minst ${EXP_DESC_MIN_WORDS} ord og høyst ${EXP_DESC_MAX_WORDS} ord.
+- Ikke gjenta setninger eller fyll ut med tomme fraser.
+- Hvis faktagrunnlaget er for tynt til å skrive ${EXP_DESC_MIN_WORDS} ord uten å finne på noe, svar med KUN dette ordet: ${EXP_DESC_SENTINEL}
+
+Fakta:
+${factsBlock}
+
+Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, ingen forklaring, ingen anførselstegn.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 3000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+
+  const cleaned = text.trim();
+  if (!cleaned) return null;
+  if (cleaned === EXP_DESC_SENTINEL) return null; // explicit "too thin" escape
+  if (cleaned.includes(EXP_DESC_SENTINEL)) return null; // sentinel smuggled into prose
+  if (cleaned.length > EXP_DESC_MAX_CHARS) return null;
+
+  const words = expDescWordCount(cleaned);
+  if (words < EXP_DESC_MIN_WORDS || words > EXP_DESC_MAX_WORDS) return null;
+
+  if (expDescHasUngroundedNumbers(cleaned, factsBlock)) return null;
+
+  return cleaned;
+}
+
+export interface ExperienceDescriptionJudgeVerdict {
+  approved: boolean;
+  reasoning: string;
+}
+
+/**
+ * The anti-fabrication judge. Same shape and the same fail-closed discipline
+ * as judgeGardssalgAboutCandidate() above (exact-token verdict on the first
+ * line, any doubt -> reject, never throws, never silently approves) — but the
+ * question is different: it is handed BOTH the candidate prose AND the exact
+ * facts block the prose was supposed to be grounded in, and must confirm that
+ * the text adds no fact that is not in that block.
+ */
+export async function judgeExperienceDescriptionCandidate(
+  candidateText: string,
+  factsBlock: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<ExperienceDescriptionJudgeVerdict> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { approved: false, reasoning: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+  }
+
+  const capped = (candidateText || "").slice(0, EXP_DESC_MAX_CHARS);
+  const prompt = `Du er faktakontrollør for opplevelsesbeskrivelser på den norske markedsplassen opplevagent.no. Teksten under skal være skrevet UTELUKKENDE på grunnlag av faktalisten under, som er alt vi vet om opplevelsen.
+
+Faktaliste (alt som er kjent):
+${factsBlock}
+
+Kandidattekst:
+${capped}
+
+Svar ${EXP_DESC_JUDGE_APPROVE_TOKEN} KUN hvis ALLE punktene under er oppfylt:
+- Hver konkrete opplysning i teksten (pris, varighet, gruppestørrelse, sted, sesong, inne/ute, språk, tilgjengelighet, oppmøtested, bestilling, tilbydernavn) stemmer med faktalisten.
+- Teksten inneholder ingen konkrete opplysninger som IKKE står i faktalisten — ingen oppdiktede priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, personer, historie, utstyr, måltider eller antall.
+- Teksten er sammenhengende, ekte norsk prosa på minst ${EXP_DESC_MIN_WORDS} ord — ikke fyllstoff, ikke gjentatte setninger, ikke oppramsing av faktalisten.
+- Teksten er ren prosa uten overskrifter, punktlister, markdown, lenker eller HTML.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${EXP_DESC_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${EXP_DESC_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${EXP_DESC_JUDGE_REJECT_TOKEN}.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { approved: false, reasoning: "nettverksfeil under dommer-kall — avvist fail-closed" };
+  }
+
+  if (!response.ok) {
+    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { approved: false, reasoning: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { approved: false, reasoning: "uventet svarformat fra dommer-API — avvist fail-closed" };
+  }
+
+  const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const verdictToken = (lines[0] || "").toUpperCase();
+  const reasoning = lines.slice(1).join(" ").trim();
+
+  // Only the EXACT approve token approves — a longer sentence that merely
+  // CONTAINS the word is a reject, same as the gårdssalg judge.
+  if (verdictToken === EXP_DESC_JUDGE_APPROVE_TOKEN) {
+    return { approved: true, reasoning: reasoning || "godkjent av LLM-dommer" };
+  }
+  if (verdictToken === EXP_DESC_JUDGE_REJECT_TOKEN) {
+    return { approved: false, reasoning: reasoning || "avvist av LLM-dommer" };
+  }
+  return { approved: false, reasoning: "uventet/tvetydig dommersvar — avvist fail-closed" };
+}
+
+export type ExperienceDescriptionOutcome = {
+  id: string;
+  title: string;
+  fact_count: number;
+  thin: boolean;
+  proposed_description: string | null;
+  word_count: number;
+  judge_approved: boolean | null;
+  judge_reasoning: string | null;
+  skip_reason: "thin_data" | "generation_failed" | "judge_rejected" | null;
+};
+
+/**
+ * The whole per-row cascade, in ONE function so the dry-run preview and the
+ * apply run can never drift on what they would do (the drift hazard this
+ * repo already hit with gardssalgReplaceableFieldAction). Pure with respect
+ * to the DB — it decides, the caller writes.
+ */
+export async function enrichOneExperienceDescription(
+  row: ExperienceDescriptionCandidate,
+  fetchImpl: typeof fetch = fetch
+): Promise<ExperienceDescriptionOutcome> {
+  const facts = buildExperienceDescriptionFacts(row);
+  const base = { id: row.id, title: row.title, fact_count: facts.length };
+
+  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) {
+    // Thin -> zero LLM calls, zero tokens, nothing written.
+    return {
+      ...base, thin: true, proposed_description: null, word_count: 0,
+      judge_approved: null, judge_reasoning: null, skip_reason: "thin_data",
+    };
+  }
+
+  const proposed = await generateExperienceDescriptionNo(row, fetchImpl);
+  if (!proposed) {
+    return {
+      ...base, thin: false, proposed_description: null, word_count: 0,
+      judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
+    };
+  }
+
+  const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
+  const verdict = await judgeExperienceDescriptionCandidate(proposed, factsBlock, fetchImpl);
+  return {
+    ...base,
+    thin: false,
+    proposed_description: proposed,
+    word_count: expDescWordCount(proposed),
+    judge_approved: verdict.approved,
+    judge_reasoning: verdict.reasoning,
+    skip_reason: verdict.approved ? null : "judge_rejected",
+  };
+}
+
+/** Candidate predicate: blank, or junk by the SAME render-time guard
+ *  experiences-seo.ts already suppresses with. A good description is never a
+ *  candidate, so it can never be overwritten. */
+export function experienceDescriptionNeedsEnrichment(desc: string | null | undefined): boolean {
+  const t = (desc ?? "").trim();
+  if (!t) return true;
+  return expDescIsJunk(t);
+}
+
+router.post("/admin/experiences-description-enrichment", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown; ids?: unknown };
+  // STRICT-FALSE parse — identical idiom to /admin/experiences-title-no-backfill
+  // above: writes execute ONLY on the JSON boolean false. null / "false" / 0 /
+  // "" / undefined all mean dry run.
+  const dryRun = body.dry_run !== false;
+
+  // Optional priority list. Parameterised placeholders only — never string
+  // interpolation of caller data into SQL (same discipline as the
+  // providerIds handling on the gårdssalg admin endpoints above).
+  //
+  // A MALFORMED `ids` is a 400, not a silent fall-through to the unfiltered
+  // catalog scan: "I asked for three named rows and instead got a full-batch
+  // spend across the whole catalog" is exactly the runaway this cap family
+  // exists to prevent. Omitting the key (or sending an explicitly empty
+  // array) remains the way to ask for the unfiltered scan.
+  let ids: string[] | null = null;
+  if (body.ids !== undefined && body.ids !== null) {
+    if (!Array.isArray(body.ids)) {
+      res.status(400).json({ error: "ids must be an array of experience ids" });
+      return;
+    }
+    if (body.ids.length > 0) {
+      ids = (body.ids as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim());
+      if (ids.length > EXP_DESC_IDS_CAP) {
+        res.status(400).json({ error: `Too many ids (max ${EXP_DESC_IDS_CAP} per call)` });
+        return;
+      }
+      if (ids.length === 0) {
+        res.status(400).json({ error: "ids contained no usable experience id" });
+        return;
+      }
+    }
+  }
+
+  // Per-app-instance fetch injection seam, same shape as the title-no
+  // backfill's `titleNoBackfillFetchImpl`: tests set it on their OWN Express
+  // app instance, production never does, so this falls back to global fetch.
+  const fetchImpl =
+    ((req.app?.get?.("experienceDescriptionFetchImpl")) as typeof fetch | undefined) ?? fetch;
+
+  const db = getExpDb("experiences");
+  const sql =
+    `SELECT e.id, e.title, e.description, e.category, e.subcategory, e.season,
+            e.indoor_outdoor, e.duration_min, e.duration_max, e.group_min, e.group_max,
+            e.price_band, e.price_from, e.price_unit, e.languages, e.accessibility,
+            e.meeting_point, e.kommune, e.fylke, e.booking_url,
+            e.content_source, e.content_field_evidence,
+            p.navn AS provider_navn, p.brreg_verified AS provider_brreg_verified
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+      WHERE e.canonical_id IS NULL
+        AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))` +
+    (ids ? ` AND e.id IN (${ids.map(() => "?").join(",")})` : "") +
+    ` ORDER BY e.id`;
+  const scanned = (ids ? db.prepare(sql).all(...ids) : db.prepare(sql).all()) as ExperienceDescriptionCandidate[];
+  // The junk guard is JS, not SQL — so the blank/junk filter runs here rather
+  // than in the WHERE clause. A GOOD existing description drops out at this
+  // line and is never seen again by this endpoint.
+  const candidateRows = scanned.filter((r) => experienceDescriptionNeedsEnrichment(r.description));
+
+  if (dryRun) {
+    // slice() of an empty array iterates zero times -> zero LLM calls, same
+    // documented behavior as the title-no backfill's empty-candidate case.
+    const sample = candidateRows.slice(0, EXP_DESC_DRY_RUN_SAMPLE);
+    const proposals: ExperienceDescriptionOutcome[] = [];
+    for (const row of sample) {
+      proposals.push(await enrichOneExperienceDescription(row, fetchImpl));
+    }
+    res.json({
+      success: true,
+      dry_run: true,
+      candidates: candidateRows.length,
+      batch_cap: EXP_DESC_BATCH_CAP,
+      sample: proposals,
+    });
+    return;
+  }
+
+  const batch = candidateRows.slice(0, EXP_DESC_BATCH_CAP);
+  const outcomes: ExperienceDescriptionOutcome[] = [];
+  for (const row of batch) {
+    outcomes.push(await enrichOneExperienceDescription(row, fetchImpl));
+  }
+
+  const writable = batch
+    .map((row, i) => ({ row, outcome: outcomes[i] }))
+    .filter(({ outcome }) => outcome.judge_approved === true && !!outcome.proposed_description);
+
+  const setDescription = db.prepare(
+    "UPDATE experiences SET description = ?, content_field_evidence = ?, updated_at = datetime('now') WHERE id = ?"
+  );
+  const tx = db.transaction(() => {
+    for (const { row, outcome } of writable) {
+      const evidence = expDescParseFieldEvidence(row.content_field_evidence);
+      evidence.description = EXP_DESC_GENERATED_PROVENANCE_SENTINEL;
+      setDescription.run(outcome.proposed_description, JSON.stringify(evidence), row.id);
+    }
+  });
+  tx();
+
+  const written = writable.length;
+  const skippedCount = outcomes.length - written;
+
+  res.json({
+    success: true,
+    dry_run: false,
+    candidates: candidateRows.length,
+    processed: outcomes.length,
+    written,
+    skipped: skippedCount,
+    remaining: Math.max(0, candidateRows.length - outcomes.length),
+    skipped_reasons: {
+      thin_data: outcomes.filter((o) => o.skip_reason === "thin_data").length,
+      generation_failed: outcomes.filter((o) => o.skip_reason === "generation_failed").length,
+      judge_rejected: outcomes.filter((o) => o.skip_reason === "judge_rejected").length,
+    },
   });
 });
 

@@ -145,6 +145,16 @@ export function runOpplevelserContentRefreshCharsetTests(
       const store = require("../services/experience-store") as typeof import("../services/experience-store");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
+      // dev-request 2026-08-02-opplevagent-hjemmesideverifisering-og-
+      // enrichment-gate, Steg 3: POST /admin/content-refresh now fail-closed-
+      // gates its fetch on field_provenance.hjemmeside_verification.verified
+      // === true (isHjemmesideVerified()) — every fixture below predates that
+      // gate and must be stamped verified so these pre-existing tests keep
+      // exercising crFetchHtml's charset decoding, not the new gate.
+      const VERIFIED_PROVENANCE = JSON.stringify({
+        hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" },
+      });
+
       function seedProvider(id: string, hjemmeside: string): { providerId: string; experienceId: string } {
         const providerId = store.createProvider({
           navn: `Test Provider ${id}`,
@@ -153,6 +163,7 @@ export function runOpplevelserContentRefreshCharsetTests(
           hjemmeside,
           brreg_verified: 1, brreg_active: 1, verification_status: "verified",
         });
+        expDb.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(VERIFIED_PROVENANCE, providerId);
         const experienceId = store.createExperience({
           title: `Test Provider ${id} opplevelse`, provider_id: providerId, provider_match_status: "matched",
           fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
