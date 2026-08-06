@@ -27044,6 +27044,13 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
   assertTrue(new RegExp(`method="POST" action="[^"]*${slugGB}"`).test(panelGB.body),
     "gb-03g: form POSTs to a URL that works without JS (true HTML form target)");
   assertTrue(panelGB.body.includes('type="datetime-local"'), "gb-03h: slot_at is a datetime-local input");
+  // dev-request 2026-08-06-booking-tidsvelger-default: the empty field used
+  // to fall back to the browser's own "now" default (always wrong — no
+  // producer takes visitors at whatever minute a visitor loads the page).
+  // It must now carry a server-rendered value: the next round hour, Oslo
+  // wall time.
+  assertTrue(/id="slot_at"[^>]*value="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}"/.test(panelGB.body),
+    "gb-03h2: slot_at carries a server-rendered default value (YYYY-MM-DDTHH:mm), never blank/browser-\"now\"");
   assertTrue(panelGB.body.includes('name="guest_phone"'), "gb-03i: guest_phone field is present");
   assertTrue(!panelGB.body.includes('id="guest_phone" name="guest_phone" type="tel" maxlength="30" required'),
     "gb-03j: guest_phone is optional (no required attribute)");
@@ -35119,6 +35126,58 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
     dbPV.prepare("UPDATE gardssalg_bookings SET respond_token = NULL WHERE booking_ref = ?")
       .run(tzBooking.booking_ref);
   }
+
+  // ── bt-1..bt-8: dev-request 2026-08-06-booking-tidsvelger-default — the
+  //    slot_at field's server-rendered default value. Daniel's wish: never
+  //    default to "now" (always wrong — no producer takes visitors at
+  //    whatever minute a visitor loads the page), always a rounded, always-
+  //    future Oslo (Europe/Oslo) wall-clock time.
+  {
+    const nrh = bookStPV.nextRoundHourWallTime;
+    assertEq(nrh(2026, 8, 6, 13, 0, 0), "2026-08-06T14:00",
+      "bt-1: exact hour input → NEXT hour, not the same hour");
+    assertEq(nrh(2026, 8, 6, 13, 1, 0), "2026-08-06T14:00",
+      "bt-2: 1 minute past the hour → next hour");
+    assertEq(nrh(2026, 8, 6, 13, 59, 0), "2026-08-06T14:00",
+      "bt-3: 59 minutes past the hour → still just the NEXT hour (not +2)");
+    assertEq(nrh(2026, 8, 6, 23, 30, 0), "2026-08-07T00:00",
+      "bt-4: midnight rollover onto the next calendar day");
+    assertEq(nrh(2026, 12, 31, 23, 30, 0), "2027-01-01T00:00",
+      "bt-5: year rollover (Dec 31 23:30 → Jan 1 00:00 of the following year)");
+
+    const dflt = bookStPV.defaultBookingSlotAtDatetimeLocal;
+    // Oslo summer time (CEST, +02): now is EXACTLY on the hour in Oslo wall
+    // time (minute=0, second=0) — proves "always advance, even already on
+    // the hour" holds through the full Intl round-trip, not just in the pure
+    // component function above.
+    const nowSummerPV = new Date("2026-08-02T19:00:00.000Z"); // 21:00:00 Oslo (CEST, tz-1's instant)
+    const slotSummerPV = dflt(nowSummerPV);
+    assertEq(slotSummerPV, "2026-08-02T22:00",
+      "bt-6a: summer, now already exactly on the hour (21:00 Oslo) → next hour (22:00), not 21:00");
+    assertTrue(/T\d{2}:00$/.test(slotSummerPV), "bt-6b: minutes are always \"00\"");
+    const slotSummerUtcPV = bookStPV.osloDatetimeLocalToUtcIso(slotSummerPV);
+    assertTrue(!!slotSummerUtcPV && new Date(slotSummerUtcPV).getTime() > nowSummerPV.getTime(),
+      "bt-6c: the reconstructed instant is strictly after `now`");
+
+    // Oslo winter time (CET, +01), non-zero minute.
+    const nowWinterPV = new Date("2026-01-15T11:15:00.000Z"); // 12:15:00 Oslo (CET)
+    const slotWinterPV = dflt(nowWinterPV);
+    assertEq(slotWinterPV, "2026-01-15T13:00",
+      "bt-7a: winter, 12:15 Oslo → rounds up to 13:00");
+    const slotWinterUtcPV = bookStPV.osloDatetimeLocalToUtcIso(slotWinterPV);
+    assertTrue(!!slotWinterUtcPV && new Date(slotWinterUtcPV).getTime() > nowWinterPV.getTime(),
+      "bt-7b: the reconstructed instant is strictly after `now`");
+
+    // No injected `now` (real clock) → still always strictly future and on
+    // the hour.
+    const liveDefaultPV = dflt();
+    assertTrue(/^\d{4}-\d{2}-\d{2}T\d{2}:00$/.test(liveDefaultPV),
+      "bt-8a: default now() → well-formed YYYY-MM-DDTHH:00");
+    const liveUtcPV = bookStPV.osloDatetimeLocalToUtcIso(liveDefaultPV);
+    assertTrue(!!liveUtcPV && new Date(liveUtcPV).getTime() > Date.now(),
+      "bt-8b: default now() → strictly in the future");
+  }
+
   // Guest decision page: GET mutates nothing, shows both times.
   const decisionTokenPV = String(b3RowPV!.guest_decision_token);
   const decisionPagePV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
