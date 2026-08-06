@@ -1389,3 +1389,9 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
 
   setInterval(() => { void dispatchTick("interval"); }, tickIntervalMin * 60_000);
 }
+
+// ─── Graceful shutdown ───────────────────────────────────────
+process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
+process.on("SIGINT", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
+
+export default app;
