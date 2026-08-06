@@ -186,6 +186,24 @@ export function runOpplevelserBookingSendGuardTests(
       const emailMod = require("../services/email-service") as typeof import("../services/email-service");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
+      // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse:
+      // issueClaimMagicLink() below now always builds the FULL candidate
+      // list (deriveOrgLinkedEmailCandidatesWithOutreachLookup), not just
+      // the first match — so it may run the RFB-db-backed
+      // wasEpostDeliveredOutreachNoBounce() lookup even when this fixture's
+      // explicit brregContactEmail argument already makes it eligible,
+      // where the old single-result function's short-circuit meant it
+      // never did. This suite never provided its own RFB db (it only ever
+      // needed the EXPERIENCES vertical), which used to be safe because the
+      // lookup never ran — install the SAME isolated, empty, schema'd
+      // override services/gardssalg-claim.test.ts's own suite uses, so this
+      // suite no longer depends on whatever the process-wide shared RFB
+      // singleton happens to be at the moment it runs (the exact race class
+      // that override exists to avoid — see its own doc comment).
+      const bsgRfbDb = new (require("better-sqlite3"))(":memory:");
+      (require("../database/init") as typeof import("../database/init")).__initSchemaForTesting(bsgRfbDb);
+      claimSvc.__setRfbDbForTesting(bsgRfbDb);
+
       // ── Fake transport at the REAL send boundary ─────────────────────────
       // The guard lives inside sendEmail(); stubbing sendEmail itself would
       // stub out the thing under test. Injecting a transporter observes the
@@ -309,6 +327,21 @@ export function runOpplevelserBookingSendGuardTests(
       ).run({
         id: "prov-claim-admin", navn: "Admin Test Gård", epost: "admin.testrow@example.no",
         org_nr: "955555555", catalog_hidden: null,
+      });
+
+      // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse
+      // (independent-review follow-up, PR #494): a provider that qualifies
+      // on TWO tiers, dedicated to (p17)-(p20) below — own org_nr/rate-limit
+      // window so it doesn't interact with prov-claim-admin's own count.
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, org_nr, brreg_verified, hjemmeside, content_source, catalog_hidden,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES (@id, @navn, 'experiences', @epost, @org_nr, 1, @hjemmeside, 'manual', @catalog_hidden,
+                 'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
+      ).run({
+        id: "prov-claim-admin-two", navn: "Admin Test To-Valg Gård", epost: "admin-two@example.no",
+        org_nr: "988888887", hjemmeside: "https://admin-two-gard.no", catalog_hidden: null,
       });
 
       const bookingInput = {
@@ -484,6 +517,28 @@ export function runOpplevelserBookingSendGuardTests(
       assertEq(claimRateLimited.body.error, "rate_limited", "p15: with the same error code the public route returns");
       assertTrue(!("verify_url" in claimRateLimited.body), "p16: a rate-limited response carries no verify_url");
 
+      // ── (p17)-(p20) dev-request 2026-08-06-claim-produsent-velger-
+      // mottakeradresse (independent-review follow-up, PR #494): a provider
+      // qualifying on 2 tiers used to be impossible for this admin tool to
+      // test-send to at all (issueClaimMagicLink returned selection_required
+      // with no way to name a choice, mapped to the WRONG status code, 403,
+      // alongside unrelated errors) ────────────────────────────────────────
+      const claimAdminNoSelection = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two" },
+      });
+      assertEq(claimAdminNoSelection.status, 400, "p17: a 2-candidate provider with no selected_source -> 400 (not 403, distinguishable from an auth/eligibility failure)");
+      assertEq(claimAdminNoSelection.body.error, "selection_required", "p18: error body names selection_required");
+
+      const claimAdminSelected = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "stored_epost_verified" },
+      });
+      assertEq(claimAdminSelected.status, 200, "p19: the SAME provider with a valid selected_source -> 200, the admin tool can test-send to a multi-candidate provider again");
+
+      const claimAdminBadSelection = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "brreg_contact" },
+      });
+      assertEq(claimAdminBadSelection.status, 403, "p20: a selected_source that isn't one of this provider's real candidates is still rejected, not silently substituted");
+
       // ── (q) the public booking path can never produce a test booking ─────
       sent = [];
       const publicBooking = await callRoute(opplevelserRouter, {
@@ -512,6 +567,11 @@ export function runOpplevelserBookingSendGuardTests(
       restore("ADMIN_KEY", prevAdminKey);
       restore("TEST_SEND_REDIRECT_EMAIL", prevRedirect);
       restore("BOOKING_DISPATCH_ENABLED", prevDispatch);
+      try {
+        (require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim")).__setRfbDbForTesting(null);
+      } catch {
+        // best-effort cleanup
+      }
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

@@ -291,6 +291,79 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         "post@brreg-kilde.no",
       );
       assertEq(rF7, { eligible: true, email: "post@brreg-kilde.no", source: "brreg_contact" }, "f7: tier priority — brreg_contact wins over stored_epost_verified when both would apply");
+
+      // ── deriveOrgLinkedEmailCandidates — dev-request 2026-08-06-claim-
+      // produsent-velger-mottakeradresse. AC1 (all qualifying candidates,
+      // not just the first) + AC7 (never a non-qualifying one). ──────────
+      const { deriveOrgLinkedEmailCandidates } = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
+
+      const noneCandidates = deriveOrgLinkedEmailCandidates({ org_nr: null, brreg_verified: 0, hjemmeside: null, content_source: null, field_provenance: null });
+      assertEq(noneCandidates, [], "i1: not Brreg-verified -> zero candidates (AC7 — never a non-qualifying tier)");
+
+      // Same row as rF6/rF7 above (both verified_domain_address AND
+      // stored_epost_verified independently qualify) — the single-result
+      // function picks the first (f6); the candidates function must return
+      // BOTH, in stable tier order, and never a THIRD entry that wasn't one
+      // of the two qualifying tiers.
+      const twoCandidates = deriveOrgLinkedEmailCandidates({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
+        content_source: "manual", field_provenance: null, epost: "other@klostergarden.no",
+      });
+      assertEq(
+        twoCandidates,
+        [
+          { email: "post@klostergarden.no", source: "verified_domain_address" },
+          { email: "other@klostergarden.no", source: "stored_epost_verified" },
+        ],
+        "i2: a row qualifying on two tiers -> both candidates, in tier order (AC1)",
+      );
+
+      const threeCandidates = deriveOrgLinkedEmailCandidates(
+        {
+          org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
+          content_source: "manual", field_provenance: null, epost: "other@klostergarden.no",
+        },
+        "post@brreg-kilde.no",
+      );
+      assertEq(
+        threeCandidates,
+        [
+          { email: "post@brreg-kilde.no", source: "brreg_contact" },
+          { email: "post@klostergarden.no", source: "verified_domain_address" },
+          { email: "other@klostergarden.no", source: "stored_epost_verified" },
+        ],
+        "i3: a row qualifying on all three tiers -> all three, in tier order",
+      );
+
+      const oneCandidate = deriveOrgLinkedEmailCandidates({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null, epost: "post@bryggerix.no",
+      });
+      assertEq(
+        oneCandidate,
+        [{ email: "post@bryggerix.no", source: "stored_epost_verified" }],
+        "i4: a row qualifying on exactly one tier -> a single-element list (AC3's underlying data shape)",
+      );
+      assertEq(
+        deriveOrgLinkedEmail({
+          org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
+          content_source: "manual", field_provenance: null, epost: "post@bryggerix.no",
+        }),
+        { eligible: true, email: oneCandidate[0].email, source: oneCandidate[0].source },
+        "i5: deriveOrgLinkedEmail() and deriveOrgLinkedEmailCandidates()[0] agree for a single-candidate row (AC1 — existing callers unchanged)",
+      );
+
+      const genericDomainCandidates = deriveOrgLinkedEmailCandidates({
+        org_nr: "922222222", brreg_verified: 1, hjemmeside: "https://www.facebook.com/x",
+        content_source: "provider_site",
+        field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://example.no/listing", fetched_at: "2026-07-01T00:00:00Z" } }),
+        epost: "scraped-only@x.no",
+      });
+      assertEq(
+        genericDomainCandidates,
+        [],
+        "i6: generic-domain hjemmeside + a non-qualifying epost -> zero candidates, never post@facebook.com (AC7 security regression guard)",
+      );
     }
 
     // ── DB-backed tests ──────────────────────────────────────────────────
@@ -520,6 +593,45 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       // provenance at all -> manual fallback, never self-service.
       const scrapedOnlyEpost = claimSvc.issueClaimMagicLink("prov-epost-scraped-only");
       assertEq(scrapedOnlyEpost, { ok: false, error: "no_org_linked_email" }, "h10: Acceptance Criterion 2 — a purely scraped epost (no provenance) stays on the manual fallback end to end");
+
+      // ── Producer address selection — dev-request 2026-08-06-claim-
+      // produsent-velger-mottakeradresse. A realistic two-candidate row: a
+      // vetted own domain (verified_domain_address) AND a manually-entered
+      // Gmail (stored_epost_verified) — the exact "small producer with only
+      // a Gmail" case the dev-request itself cites. ────────────────────────
+      insertProvider.run({
+        id: "prov-two-candidates", navn: "To Adresser Gård", slug: "to-adresser-gard",
+        org_nr: "990000001", brreg_verified: 1, hjemmeside: "https://toadresser.no",
+        content_source: "manual", field_provenance: null,
+      });
+      setEpost.run("eier@gmail.com", "prov-two-candidates");
+
+      const needsSelection = claimSvc.issueClaimMagicLink("prov-two-candidates");
+      assertEq(needsSelection, { ok: false, error: "selection_required" }, "j1: issueClaimMagicLink on a 2-candidate provider with no selection -> selection_required (AC2's server-side half)");
+
+      const badSelection = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "brreg_contact" });
+      assertEq(badSelection, { ok: false, error: "invalid_selection" }, "j2: a selectedSource that is not one of THIS provider's own re-derived candidates -> invalid_selection, never a silent fallback guess (AC5)");
+
+      const chosenDomain = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "verified_domain_address" });
+      assertTrue(chosenDomain.ok === true, "j3: a selectedSource matching a real candidate -> succeeds");
+      if (chosenDomain.ok) {
+        assertEq(chosenDomain.claim.email, "post@toadresser.no", "j4: issued claim targets the SELECTED candidate's address");
+        assertEq(chosenDomain.claim.source, "verified_domain_address", "j5: claim.source matches the selection");
+      }
+
+      const chosenEpost = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "stored_epost_verified" });
+      assertTrue(chosenEpost.ok === true, "j6: selecting the OTHER qualifying candidate for the same provider also succeeds");
+      if (chosenEpost.ok) {
+        assertEq(chosenEpost.claim.email, "eier@gmail.com", "j7: issued claim targets the second candidate's own address, not the first");
+      }
+
+      // AC6: rate limit is per-PROVIDER (isClaimRateLimited keys on
+      // provider_id only), shared across different address selections. j3
+      // and j6 already spent 2 of the 3-per-window budget on this provider.
+      const chosenThird = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "verified_domain_address" });
+      assertTrue(chosenThird.ok === true, "j8: 3rd request on this provider (regardless of which candidate) still succeeds (limit is 3)");
+      const chosenFourth = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "stored_epost_verified" });
+      assertEq(chosenFourth, { ok: false, error: "rate_limited" }, "j9: AC6 — the 4th request is rate-limited even though it picks a DIFFERENT candidate than the 3 before it; the limit is shared, not per-address");
 
       // ── Rate limiting ──────────────────────────────────────────────────
       claimSvc.issueClaimMagicLink("prov-claimable");

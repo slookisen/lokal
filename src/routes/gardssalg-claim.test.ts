@@ -79,12 +79,26 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
     let server: any = null;
     const initMod = require("../database/init") as typeof import("../database/init");
     const Database = (require("better-sqlite3")) as typeof import("better-sqlite3");
-    const prevRfbDb = initMod.getDb();
     const rfbDb = new Database(":memory:");
 
     try {
-      initMod.__setDbForTesting(rfbDb as any);
       initMod.__initSchemaForTesting(rfbDb as any);
+      // Isolated override (dev-request 2026-08-06-claim-produsent-velger-
+      // mottakeradresse), not the shared GLOBAL RFB singleton this route
+      // suite used to swap via initMod.__setDbForTesting(): the ONLY thing
+      // this router touches on the RFB db is wasEpostDeliveredOutreachNoBounce()
+      // (via issueClaimMagicLink -> deriveOrgLinkedEmailCandidatesWithOutreachLookup),
+      // which already has its own test-only seam for exactly this — see
+      // services/gardssalg-claim.test.ts's own doc comment on
+      // __setRfbDbForTesting for the full rationale (swapping the shared
+      // singleton here raced live against unrelated suites running
+      // concurrently elsewhere in the full `npm test`, the "no such table:
+      // outreach_sent_log" failure class its postmortem documents). This
+      // suite never actually populates rfbDb with outreach fixture rows —
+      // it only needs a validly-schema'd, empty RFB db so that lookup never
+      // throws — so the isolated override is a drop-in, lower-risk swap.
+      const claimSvcForRfbOverride = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
+      claimSvcForRfbOverride.__setRfbDbForTesting(rfbDb as any);
 
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
@@ -141,6 +155,16 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
         content_source: "manual", field_provenance: null,
       });
       expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("post@routeepost.no", "prov-route-epost");
+
+      // Two-candidate route fixture — dev-request 2026-08-06-claim-
+      // produsent-velger-mottakeradresse: a verified own domain AND a
+      // manually-entered second address both qualify.
+      insertProvider.run({
+        id: "prov-route-two", navn: "To Valg Gård", slug: "to-valg-gard",
+        org_nr: "966666666", brreg_verified: 1, hjemmeside: "https://toroute.no",
+        content_source: "manual", field_provenance: null,
+      });
+      expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("eier2@gmail.com", "prov-route-two");
 
       const routerMod = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
 
@@ -239,6 +263,102 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       const epostClaimRow = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-epost") as any;
       assertEq(epostClaimRow?.email, "post@routeepost.no", "a13: the issued claim really targets the provider's stored epost");
       assertEq(epostClaimRow?.email_source, "stored_epost_verified", "a14: persisted with email_source='stored_epost_verified'");
+
+      // ── Producer address selection (2+ candidates) — dev-request
+      // 2026-08-06-claim-produsent-velger-mottakeradresse ─────────────────
+      const twoChoicePage = await req("GET", "/kategori/gardssalg/eier/to-valg-gard");
+      assertEq(twoChoicePage.status, 200, "k1: GET entry page for a 2-candidate provider -> 200");
+      assertTrue(twoChoicePage.body.includes('name="selected"'), "k2: entry page renders a selection control when there is more than one candidate");
+      assertTrue(
+        (twoChoicePage.body.match(/type="radio"/g) || []).length === 2,
+        "k3: exactly one radio per candidate (2 candidates -> 2 radios)",
+      );
+      assertTrue(twoChoicePage.body.includes('value="verified_domain_address"'), "k4: one radio's value is the verified_domain_address source tag");
+      assertTrue(twoChoicePage.body.includes('value="stored_epost_verified"'), "k5: the other radio's value is the stored_epost_verified source tag");
+      assertTrue(!twoChoicePage.body.includes("eier2@gmail.com"), "k6: the full second address never appears anywhere on the page (AC4)");
+      assertTrue(!twoChoicePage.body.includes("post@toroute.no"), "k7: the full first address never appears anywhere on the page either (AC4)");
+      assertTrue(/e\*+2@g\*+\.com/.test(twoChoicePage.body), "k8: the second address IS shown, masked");
+
+      // k8a-k8c: DOM-structural check (independent review finding, PR #494) —
+      // a real browser (JS `form.querySelector(...)` AND a plain no-JS
+      // native form submit) only ever sees a field as "in the form" if it is
+      // a DESCENDANT of the <form>...</form> element, or carries a matching
+      // `form="..."` attribute. Earlier drafts of this page rendered the
+      // radios as SIBLINGS before <form> opened — every assertion above
+      // still passed (they only check the radios exist SOMEWHERE in the
+      // body), yet the picker was completely non-functional end to end: the
+      // JS handler's querySelector found nothing, and a plain form submit
+      // never included `selected` at all, so every real click on any radio
+      // still resulted in "selection_required". Assert the actual DOM
+      // nesting, not just presence, so this class of bug can't recur silently.
+      const formOpenIdx = twoChoicePage.body.indexOf('<form id="gc-request-form"');
+      const formCloseIdx = twoChoicePage.body.indexOf("</form>", formOpenIdx);
+      assertTrue(formOpenIdx >= 0 && formCloseIdx > formOpenIdx, "k8a: the request form is present and well-formed (fixture sanity check)");
+      const radioIndices: number[] = [];
+      {
+        const re = /<input type="radio" name="selected"/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(twoChoicePage.body))) radioIndices.push(m.index);
+      }
+      assertEq(radioIndices.length, 2, "k8b: found exactly 2 radio inputs to check (fixture sanity check)");
+      assertTrue(
+        radioIndices.every((idx) => idx > formOpenIdx && idx < formCloseIdx),
+        "k8c: every radio input is a DESCENDANT of <form id=\"gc-request-form\">...</form> (not a sibling before it) — the actual DOM relationship a real browser's form submission and querySelector(form, ...) depend on",
+      );
+
+      // No selection at all -> selection_required, never a silent guess.
+      const noSelectionResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      assertEq(noSelectionResp.status, 400, "k9: POST request with no selection on a 2-candidate provider -> 400");
+      assertEq(JSON.parse(noSelectionResp.body).error, "selection_required", "k10: error body names selection_required");
+
+      // An invalid/unknown selection value -> rejected, never silently
+      // falls back to picking one on the client's behalf.
+      const invalidSelectionResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected: "brreg_contact" }),
+      });
+      assertEq(invalidSelectionResp.status, 403, "k11: POST request with a selection that isn't one of this provider's real candidates -> 403");
+      assertEq(JSON.parse(invalidSelectionResp.body).error, "invalid_selection", "k12: error body names invalid_selection");
+
+      // A real selection (JSON/fetch path) -> succeeds, targets exactly the
+      // chosen candidate.
+      const selectDomainResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected: "verified_domain_address" }),
+      });
+      assertEq(selectDomainResp.status, 200, "k13: POST request selecting verified_domain_address -> 200");
+      const domainClaimRow = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-two") as any;
+      assertEq(domainClaimRow?.email, "post@toroute.no", "k14: issued claim targets the SELECTED candidate's address");
+      assertEq(domainClaimRow?.email_source, "verified_domain_address", "k15: persisted with the selected source");
+
+      // The OTHER candidate, no-JS form-POST path (urlencoded, mirrors a
+      // real browser submitting the radio group natively).
+      const selectEpostResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "selected=stored_epost_verified",
+      });
+      assertEq(selectEpostResp.status, 303, "k16: no-JS form POST selecting the other candidate -> 303 redirect (same as the single-candidate no-JS path)");
+      assertTrue(String(selectEpostResp.headers.location || "").includes("status=sent"), "k17: redirects to status=sent");
+      const epostClaimRow2 = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-two") as any;
+      assertEq(epostClaimRow2?.email, "eier2@gmail.com", "k18: the no-JS path issued a claim for the OTHER selected candidate, not the first");
+      assertEq(epostClaimRow2?.email_source, "stored_epost_verified", "k19: persisted with the newly-selected source");
+
+      // AC6: rate limit shared across selections — 3 requests total have now
+      // been made for prov-route-two (k13, k16 above are #1 and #2; a 3rd
+      // still succeeds, a 4th — regardless of which candidate — is blocked).
+      const thirdSelectResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected: "verified_domain_address" }),
+      });
+      assertEq(thirdSelectResp.status, 200, "k20: 3rd request on this provider still succeeds (limit is 3)");
+      const fourthSelectResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected: "stored_epost_verified" }),
+      });
+      assertEq(fourthSelectResp.status, 429, "k21: AC6 — the 4th request is rate-limited even though it picks a different candidate than the 3 before it");
 
       // ── (b) POST request -> issues a magic link (JSON path) ────────────
       const reqResp = await req("POST", "/kategori/gardssalg/eier/prov-route-eligible/request", {
@@ -437,7 +557,11 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       if (server) {
         try { server.close(); } catch { /* ignore */ }
       }
-      initMod.__setDbForTesting(prevRfbDb);
+      try {
+        const claimSvcForRfbOverride = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
+        claimSvcForRfbOverride.__setRfbDbForTesting(null);
+      } catch { /* ignore */ }
+      try { rfbDb.close(); } catch { /* already closed */ }
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       try {

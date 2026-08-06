@@ -4616,6 +4616,21 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
   });
 });
 
+// dev-request 2026-08-06-claim-produsent-velger-mottakeradresse: same
+// closed allow-list as routes/gardssalg-claim.ts's parseSelectedSource() —
+// issueClaimMagicLink() now returns "selection_required" for a provider
+// with 2+ qualifying candidates (previously always exactly one via the old
+// short-circuiting derivation), so this admin tool needs a way to name
+// which one, same as the public route. Kept as its own small allow-list
+// rather than importing the route file's private helper, to avoid coupling
+// an admin-API route to a public-page route module.
+const ADMIN_CLAIM_TEST_SEND_SOURCES = ["brreg_contact", "verified_domain_address", "stored_epost_verified"] as const;
+function parseAdminSelectedSource(value: unknown): (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number] | undefined {
+  return typeof value === "string" && (ADMIN_CLAIM_TEST_SEND_SOURCES as readonly string[]).includes(value)
+    ? (value as (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number])
+    : undefined;
+}
+
 router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response) => {
   const redirect = testSendRedirectAddress();
   if (!redirect) {
@@ -4633,10 +4648,16 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
   if (!providerId) {
     return res.status(400).json({ success: false, error: "provider_id_required" });
   }
+  const selectedSource = parseAdminSelectedSource(body.selected_source);
 
-  const result = issueClaimMagicLink(providerId, null, { isTest: true });
+  const result = issueClaimMagicLink(providerId, null, { isTest: true, selectedSource });
   if (!result.ok) {
-    return res.status(result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : 403).json({
+    const status =
+      result.error === "provider_not_found" ? 404
+      : result.error === "rate_limited" ? 429
+      : result.error === "selection_required" ? 400
+      : 403;
+    return res.status(status).json({
       success: false,
       error: result.error,
     });
