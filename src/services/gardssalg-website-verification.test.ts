@@ -367,6 +367,111 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
 
       db.close();
     }
+
+    // ═══ AC4 (dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet) —
+    //     <title> as a corroborating signal ══════════════════════════════════
+    //
+    // Incident: 7 of 9 sibling-TLD candidate homepages (guessed producer.com
+    // when producer.no was dead) were WRONG — squatted domains, unrelated
+    // organisations (a regional council, a town-centre association, an
+    // unrelated foreign company) — yet all 7 passed the existing body-text
+    // name/place checks because a stray mention of the producer's name and
+    // kommune is exactly the kind of thing that turns up on an unrelated
+    // page (directories, council minutes, town-association member lists…).
+    // None of the 7 ever carried the producer's brand in their <title>.
+    //
+    // (k) — ZERO REGRESSION: org_nr or phone present, title absent/wrong —
+    //     still verifies. Proves the two strong-signal branches never look
+    //     at title_found at all. ────────────────────────────────────────────
+    {
+      // org_nr branch: title is present but is a squatted/unrelated page —
+      // must not matter, org_nr alone still verifies.
+      const orgProducer = blankProducer({
+        id: "prov-title-orgnr",
+        navn: "Fjordgard Sideri",
+        hjemmeside: "https://fjordgardsideri.no",
+        org_nr: "918273645",
+        kommune: "Ulvik",
+      });
+      const orgFetchFn: GsWvFetchFn = async () => ({
+        ok: true,
+        pageText: "Org.nr: 918 273 645. Denne siden driftes av Setesdal Regionråd.",
+        title: "Setesdal Regionråd — offisiell side",
+      });
+      const orgRow = await classifyGardssalgProducerWebsite(orgProducer, orgFetchFn);
+      assertEq(orgRow.classification, "verified", "k1: org_nr found despite a squatted/unrelated title -> still verified");
+      assertEq(orgRow.evidence?.org_nr_found, true, "k2: org_nr_found true");
+      assertEq(orgRow.evidence?.title_found, false, "k3: title_found correctly false (title has nothing to do with the producer)");
+      assertEq(orgRow.evidence?.verified, true, "k4: org_nr branch verifies regardless of title_found");
+
+      // phone branch: title is entirely absent (no <title> tag at all) —
+      // must not matter, phone+name alone still verifies.
+      const phoneProducer = blankProducer({
+        id: "prov-title-phone",
+        navn: "Fjordgard Sideri",
+        hjemmeside: "https://fjordgardsideri.no",
+        telefon: "912 34 567",
+      });
+      const phoneFetchFn: GsWvFetchFn = async () => ({
+        ok: true,
+        pageText: "Velkommen til Fjordgard Sideri. Ring oss: +47 912 34 567.",
+        title: "",
+      });
+      const phoneRow = await classifyGardssalgProducerWebsite(phoneProducer, phoneFetchFn);
+      assertEq(phoneRow.classification, "verified", "k5: phone+name found, no title at all -> still verified");
+      assertEq(phoneRow.evidence?.phone_found, true, "k6: phone_found true");
+      assertEq(phoneRow.evidence?.title_found, false, "k7: title_found correctly false (no title text to match)");
+      assertEq(phoneRow.evidence?.verified, true, "k8: phone branch verifies regardless of title_found");
+    }
+
+    // (l) — the exact incident shape: name+place-only body-text hits (no
+    //     org_nr, no phone — the weakest branch), squatted/unrelated
+    //     <title> — now correctly REJECTED where it used to false-positive. ─
+    {
+      const producer = blankProducer({
+        id: "prov-title-squat",
+        navn: "Fjordgard Sideri",
+        hjemmeside: "https://fjordgardsideri.com",
+        kommune: "Ulvik",
+      });
+      const fetchFn: GsWvFetchFn = async () => ({
+        ok: true,
+        // The producer's name and kommune both appear — but only as a stray
+        // mention (a council minutes/member-list style page), exactly the
+        // shape that produced the 7 false positives in the incident.
+        pageText:
+          "Fjordgard Sideri i Ulvik er nevnt i sakslisten. Denne siden tilhører Setesdal Regionråd og dekker regionens fellesoppgaver.",
+        title: "Setesdal Regionråd — sakspapirer og møtereferat",
+      });
+      const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+      assertEq(row.evidence?.name_found, true, "l1: sanity — the producer's name IS a stray hit in the body text");
+      assertEq(row.evidence?.place_found, true, "l2: sanity — the kommune IS a stray hit in the body text");
+      assertEq(row.evidence?.title_found, false, "l3: the squatted/unrelated title never carries the producer's brand");
+      assertEq(row.evidence?.verified, false, "l4: name+place alone (no org_nr, no phone) no longer verifies without a matching title");
+      assertEq(row.classification, "unverified", "l5: classifies as unverified — exactly the incident's 7 false positives, now caught");
+    }
+
+    // (m) — same shape as (l), but the <title> genuinely carries the
+    //     producer's own name — correctly ACCEPTED. ─────────────────────────
+    {
+      const producer = blankProducer({
+        id: "prov-title-match",
+        navn: "Fjordgard Sideri",
+        hjemmeside: "https://fjordgardsideri.no",
+        kommune: "Ulvik",
+      });
+      const fetchFn: GsWvFetchFn = async () => ({
+        ok: true,
+        pageText: "Velkommen til Fjordgard Sideri, en gård i Ulvik med lange tradisjoner for sider.",
+        title: "Fjordgard Sideri — velkommen til gården vår",
+      });
+      const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+      assertEq(row.evidence?.name_found, true, "m1: name found in body text");
+      assertEq(row.evidence?.place_found, true, "m2: place found in body text");
+      assertEq(row.evidence?.title_found, true, "m3: the producer's own name IS in the title this time");
+      assertEq(row.evidence?.verified, true, "m4: name+place+matching title verifies");
+      assertEq(row.classification, "verified", "m5: classifies as verified");
+    }
   })().then(() => ({ passed, failed, failures }));
 }
 

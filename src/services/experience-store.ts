@@ -4913,6 +4913,32 @@ export function gardssalgPageText(html: string): string {
 }
 
 /**
+ * Extract a page's <title> text for evidence matching — dev-request
+ * 2026-08-02-enrichment-kadens-og-kildekvalitet, AC4: a real incident found
+ * 7 of 9 sibling-TLD candidate homepages were WRONG (squatted domains,
+ * unrelated organisations) yet all 7 passed the existing body-text
+ * name/place checks; none of the 7 ever carried the producer's brand in
+ * their <title>, so the title is a cheap, independent corroborating signal.
+ *
+ * Regex-only extraction (this codebase has no HTML parser anywhere — see
+ * organic-keyword-detector.ts:19 for why), same entity/whitespace handling
+ * gardssalgPageText already applies to body text so title and body text
+ * compare on equal footing once both are run through normaliseName. Only
+ * the literal <title> tag is read — deliberately NOT the og:title fallback
+ * extractTitle (search-enrich.ts) also checks, since that can carry
+ * page-specific marketing copy rather than the whole site's own title.
+ * Pure — exported for tests.
+ */
+export function gardssalgPageTitle(html: string): string {
+  const m = (html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!m || !m[1]) return "";
+  return m[1]
+    .replace(/&[a-z]+;|&#\d+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * Normalise a Norwegian phone number to its 8 significant digits: strips
  * +47/0047 country prefixes and every non-digit. Returns null when what
  * remains is not exactly 8 digits — a partial number must never match.
@@ -4943,16 +4969,36 @@ export function normaliseNorwegianPhone(raw: string | null | undefined): string 
  *   postnr    — the 4-digit postnummer as its own digit run. Deliberately
  *               NEVER sufficient (thousands of businesses share one) — it
  *               only strengthens name.
+ *   title     — (AC4, dev-request 2026-08-02-enrichment-kadens-og-
+ *               kildekvalitet) the page's own <title> text (gardssalgPageTitle,
+ *               caller-supplied — this function does no fetching/parsing of
+ *               its own beyond the regex helper) containing the pruned name
+ *               at the same token boundaries as the body-text `name` check.
+ *               Caller-optional: when the caller has no title source to
+ *               offer (`pageTitle` omitted), title_found is simply false and
+ *               plays no part beyond what's documented below.
  *
  * verified =
  *   org_nr
  *   OR (phone AND (name OR place))   — the provider's own registered number
  *                                      plus any second signal; phone ALONE
  *                                      stays insufficient (call-list pages)
- *   OR (name AND (place OR address OR postnr))
+ *   OR (name AND (place OR address OR postnr) AND title)
+ *       — title is required on this branch ONLY (2026-08-06 incident: 7 of
+ *         9 sibling-TLD candidates had name+place-only body-text hits and
+ *         were all wrong; org_nr and phone are already independently
+ *         registry-sourced signals and do NOT gain a title requirement).
+ *         Every caller so far updated to supply `pageTitle` opts into this;
+ *         a caller that never passes `pageTitle` keeps evaluating this
+ *         branch as it did before AC4 (title_found is vacuously false only
+ *         when title data was actually offered and didn't match — a caller
+ *         offering no title source at all is a caller not yet wired for
+ *         this signal, not a caller whose pages provably lack a title).
  *
- * The v1 rule (org_nr OR name+place) is a strict subset — nothing that
- * verified before stops verifying; this can only widen, never tighten.
+ * The v1 rule (org_nr OR name+place) is a strict subset of the org_nr and
+ * phone branches — nothing that verified via those stops verifying; only
+ * the weakest (name-only-corroborated) branch tightens, and only for
+ * callers that opt in by supplying `pageTitle`.
  * Pure — exported for tests.
  */
 export function gardssalgWebsiteEvidenceMatch(
@@ -4966,7 +5012,8 @@ export function gardssalgWebsiteEvidenceMatch(
     mobil?: string | null;
     adresse?: string | null;
     postnummer?: string | null;
-  }
+  },
+  pageTitle?: string
 ): {
   org_nr_found: boolean;
   name_found: boolean;
@@ -4974,6 +5021,7 @@ export function gardssalgWebsiteEvidenceMatch(
   phone_found: boolean;
   address_found: boolean;
   postnr_found: boolean;
+  title_found: boolean;
   verified: boolean;
 } {
   const text = pageText || "";
@@ -5019,6 +5067,22 @@ export function gardssalgWebsiteEvidenceMatch(
   const postnr = (target.postnummer || "").trim();
   const postnrFound = /^\d{4}$/.test(postnr) && new RegExp(`(?<!\\d)${postnr}(?!\\d)`).test(digitCollapsed);
 
+  // title: same token-boundary-safe containment as `name` above, against the
+  // caller-supplied page <title> text instead of the body. `pageTitle`
+  // undefined means "no title source offered" (pre-AC4 caller) — titleFound
+  // stays false either way, but see the weakest-branch gate below, which
+  // only imposes the new requirement on callers that DID offer a title.
+  const titleOffered = pageTitle !== undefined;
+  const normTitle = normaliseName(pageTitle || "");
+  const titleFound = titleOffered && nameSpecific && boundaryIncludes(normTitle, normName);
+
+  const weakestBranchBase = nameFound && (placeFound || addressFound || postnrFound);
+  // Incident fix (2026-08-06): once a caller has wired a title source, the
+  // weakest branch — the ONLY branch with neither org_nr nor phone behind it
+  // — must also see the producer's name in the page <title>. org_nr and
+  // phone are registry-sourced and stay completely untouched by this gate.
+  const weakestBranchVerified = titleOffered ? weakestBranchBase && titleFound : weakestBranchBase;
+
   return {
     org_nr_found: orgFound,
     name_found: nameFound,
@@ -5026,10 +5090,11 @@ export function gardssalgWebsiteEvidenceMatch(
     phone_found: phoneFound,
     address_found: addressFound,
     postnr_found: postnrFound,
+    title_found: titleFound,
     verified:
       orgFound ||
       (phoneFound && (nameFound || placeFound)) ||
-      (nameFound && (placeFound || addressFound || postnrFound)),
+      weakestBranchVerified,
   };
 }
 
