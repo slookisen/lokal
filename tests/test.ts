@@ -5651,6 +5651,97 @@ const _m2Promise = (async function runOwnerPortalTests() {
       );
     }
 
+    // ── dev-request: owner-portal magic-link rate-limit was UTC-calendar-
+    //    day, not rolling hour (mirrors gardssalg-claim's isClaimRateLimited
+    //    fix, see git history for src/services/gardssalg-claim.ts) ─────────
+    // created_at is stored as an ISO-8601 string (now.toISOString(), see the
+    // INSERT in POST /api/agents/:id/request-magic-link), while
+    // datetime('now', ...) produces SQLite's own native (space-separated,
+    // no-ms/Z) format. Both columns are TEXT, so comparing created_at
+    // directly against datetime('now', ...) is a raw string comparison: the
+    // date prefix matches for any same-UTC-day row, and 'T' (0x54) >
+    // ' ' (0x20), so every link from today counted as "within the last
+    // hour" regardless of actual time. These tests use raw INSERTs with
+    // EXPLICIT created_at offsets in the SAME ISO format the route actually
+    // writes (independent of wall-clock timing) so they also cover AC2 (old
+    // ISO-format rows, no migration needed) — m2-rl-1/2/3 below FAIL against
+    // the pre-fix code (which counts the 2h-old rows and rate-limits early)
+    // and PASS after the fix.
+    {
+      const RL_AGENT_ID = "m2-ratelimit-agent";
+      const RL_AGENT_NAME = "M2 Rate-Limit Gård";
+      const RL_EMAIL = "rl@m2.example.no";
+      portalDb.prepare(
+        "INSERT OR REPLACE INTO agents (id, name, slug, description, provider, contact_email, url, role, api_key) VALUES (?, ?, ?, 'test', 'test', ?, 'https://example.no', 'producer', 'k-rl')"
+      ).run(RL_AGENT_ID, RL_AGENT_NAME, "m2-ratelimit-gaard", RL_EMAIL);
+      portalDb.prepare(
+        "INSERT OR REPLACE INTO agent_knowledge (agent_id, email, field_provenance, verification_status, enrichment_status) VALUES (?, ?, '{}', 'unverified', 'partial')"
+      ).run(RL_AGENT_ID, RL_EMAIL);
+
+      const insertMagicLinkAt = portalDb.prepare(
+        `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
+         VALUES (?, ?, ?, ?, 0, ?, datetime('now', '+7 days'))`
+      );
+
+      // Three links from 2 hours ago, stored in the legacy ISO-with-
+      // milliseconds-and-Z format — outside the 1-hour window, so none of
+      // them should count against the rate limit.
+      for (let i = 0; i < 3; i++) {
+        insertMagicLinkAt.run(
+          `ml_rl_old_${i}`, RL_EMAIL, `tok-rl-old-${i}`, RL_AGENT_ID,
+          new Date(Date.now() - 2 * 60 * 60 * 1000 - i * 1000).toISOString()
+        );
+      }
+
+      // Mock sendEmail so the real POST route can run end-to-end without
+      // hitting SMTP (same technique as m2-E1.4 above).
+      const emailSvcMod2 = await import("../src/services/email-service");
+      const origSendEmail2 = emailSvcMod2.emailService.sendEmail.bind(emailSvcMod2.emailService);
+      (emailSvcMod2.emailService as any).sendEmail = async () => ({ success: true, messageId: "mock-rl" });
+      try {
+        const rlHeaders = { "Content-Type": "application/json" };
+
+        // m2-rl-1/2/3 (AC1 + AC2): three real requests, each should succeed
+        // because the only existing rows are 2 hours old and must not count.
+        // Pre-fix, the 2h-old rows are counted (same-UTC-day string
+        // comparison) so this loop rate-limits well before request 3.
+        for (let i = 1; i <= 3; i++) {
+          const resp = await req("POST", `/api/agents/${RL_AGENT_ID}/request-magic-link`, {
+            headers: rlHeaders,
+            body: JSON.stringify({ email: RL_EMAIL }),
+            expectOk: true,
+          });
+          assertEq(resp.status, 200, `m2-rl-${i}: request ${i} succeeds — 2h-old ISO-format links don't count against the 1h window (AC1/AC2)`);
+        }
+
+        // m2-rl-4 (AC3): a 4th request within the window is now rejected —
+        // the 3 requests just issued above ARE inside the rolling window,
+        // so the (unchanged) 3-per-window threshold correctly kicks in.
+        const fourth = await req("POST", `/api/agents/${RL_AGENT_ID}/request-magic-link`, {
+          headers: rlHeaders,
+          body: JSON.stringify({ email: RL_EMAIL }),
+        });
+        assertEq(fourth.status, 429, "m2-rl-4: AC3 — 4th request inside the rolling 1h window is rate-limited");
+        const fourthBody = JSON.parse(fourth.body);
+        assertEq(fourthBody.error, "rate_limited", "m2-rl-4: 429 body has error=rate_limited");
+
+        // m2-rl-5 (AC3): once the 3 recent links age past the window, a new
+        // request succeeds again — the limit is a rolling window, not a
+        // permanent lockout.
+        portalDb.prepare(
+          `UPDATE magic_links SET created_at = datetime('now', '-2 hours') WHERE agent_id = ? AND id NOT LIKE 'ml_rl_old_%'`
+        ).run(RL_AGENT_ID);
+        const fifth = await req("POST", `/api/agents/${RL_AGENT_ID}/request-magic-link`, {
+          headers: rlHeaders,
+          body: JSON.stringify({ email: RL_EMAIL }),
+          expectOk: true,
+        });
+        assertEq(fifth.status, 200, "m2-rl-5: AC3 — request succeeds again once the previous window's links have aged out");
+      } finally {
+        (emailSvcMod2.emailService as any).sendEmail = origSendEmail2;
+      }
+    }
+
     // E1.4 — Magic-link email body template contains agent name + 7-day expiry.
     // Tested directly against the email-service helper (avoids HTTP rate-limit + SMTP).
     {
