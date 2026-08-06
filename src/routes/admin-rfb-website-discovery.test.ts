@@ -218,7 +218,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       return testDb.prepare("SELECT * FROM agents_website_review_queue WHERE agent_id = ?").get(agentId);
     }
 
-    // ── (a) auth ──────────────────────────────────────────────────
+    // ── (a) auth ─────────────────────────────────────────────────────────────
     {
       const p = await callDiscovery({}, {});
       assertEq(p.status, 403, "auth: POST without X-Admin-Key -> 403");
@@ -226,7 +226,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(g.status, 403, "auth: GET without X-Admin-Key -> 403");
     }
 
-    // ── (b) candidate accepted: org_nr evidence verifies ────────────
+    // ── (b) candidate accepted: org_nr evidence verifies ────────────────────────
     {
       insertAgent({ id: "wd-ok", name: "Fjelldal Brenneri AS", orgNr: "944444444", city: "Saltdal" });
       fixtures.set(
@@ -250,7 +250,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(typeof row.evidence === "string" && JSON.parse(row.evidence).org_nr_found === true, "b10: queue row evidence JSON round-trips");
     }
 
-    // ── (c) candidate rejected: fetched, but no evidence anywhere ─────
+    // ── (c) candidate rejected: fetched, but no evidence anywhere ─────────────
     {
       insertAgent({ id: "wd-none", name: "Ukjent Fjellgard", orgNr: "966666666", city: "Lom" });
       const unrelated = htmlResponse("<html><body>Parkert domene til salgs</body></html>");
@@ -267,7 +267,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(!readQueueRow("wd-none"), "c6: nothing queued for this agent");
     }
 
-    // ── (d) aggregator-host candidate rejected ──────────────────
+    // ── (d) aggregator-host candidate rejected ────────────────────────────────────
     {
       insertAgent({ id: "wd-agg", name: "Hanen", orgNr: "911111111", city: "Oslo" });
       // hanen.com must NOT verify either, or this agent would be proposed
@@ -284,7 +284,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     }
 
     // ── (e) shared-host guard: host already carried by another agent's
-    //     live agent_knowledge.website ──────────────────────────
+    //     live agent_knowledge.website ──────────────────────────────────────
     {
       insertAgent({ id: "wd-owner", name: "Annen Produsent", orgNr: "933333333", city: "Voss", website: "https://solbakkengard.no" });
       insertAgent({ id: "wd-taken", name: "Solbakken Gard", orgNr: "922222222", city: "Voss" });
@@ -327,7 +327,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(!readQueueRow("wd-batch-2"), "f5: nothing queued for wd-batch-2");
     }
 
-    // ── (g) already-has-website row is skipped, never scanned ────────
+    // ── (g) already-has-website row is skipped, never scanned ────────────
     {
       insertAgent({ id: "wd-has-site", name: "Har Allerede Nettside", website: "https://eksisterende-side.no" });
 
@@ -343,14 +343,14 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       );
     }
 
-    // ── (h) batch-size cap enforced ───────────────────────
+    // ── (h) batch-size cap enforced ──────────────────────────────────────────────────
     {
       const ids = Array.from({ length: RFB_WD_HARD_CAP + 1 }, (_, i) => `cap-${i}`);
       const r = await callDiscovery({ agentIds: ids });
       assertEq(r.status, 400, `h1: more than ${RFB_WD_HARD_CAP} agentIds -> 400`);
     }
 
-    // ── (i) GET review-queue returns only status='pending' rows ────
+    // ── (i) GET review-queue returns only status='pending' rows ────────────
     {
       testDb.prepare(
         `INSERT INTO agents_website_review_queue
