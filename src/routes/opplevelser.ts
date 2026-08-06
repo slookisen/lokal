@@ -2943,7 +2943,7 @@ async function tryGardssalgCandidateHosts(
       adresse: target.adresse ?? null,
       postnummer: target.postnummer ?? null,
     };
-    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget);
+    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget, gardssalgPageTitle(page.html));
     if (ev.verified) {
       return { host, finalUrl: page.finalUrl, evidence: ev };
     }
@@ -2962,7 +2962,7 @@ async function tryGardssalgCandidateHosts(
         if (!subPage) continue;
         const subHost = hostFromUrlLike(subPage.finalUrl) || host;
         if (subHost.toLowerCase().replace(/^www\./, "") !== host.toLowerCase().replace(/^www\./, "")) continue;
-        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget);
+        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget, gardssalgPageTitle(subPage.html));
         if (subEv.verified) {
           return { host, finalUrl: subPage.finalUrl, evidence: subEv };
         }
