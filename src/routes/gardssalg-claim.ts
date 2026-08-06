@@ -2,7 +2,7 @@ import express, { Router, Request, Response } from "express";
 import {
   getClaimProviderById,
   getClaimProviderBySlug,
-  deriveOrgLinkedEmailWithOutreachLookup,
+  deriveOrgLinkedEmailCandidatesWithOutreachLookup,
   issueClaimMagicLink,
   verifyClaimToken,
   verifyGardssalgOwnerSessionToken,
@@ -273,8 +273,10 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
     // provider whose POST would then fail (or vice versa: show the fallback
     // for a provider the POST would actually succeed for). Same lazy
     // wrapper issueClaimMagicLink() uses, so the RFB cross-DB lookup only
-    // ever runs when it could actually change the outcome.
-    const derived = deriveOrgLinkedEmailWithOutreachLookup(provider);
+    // ever runs when it could actually change the outcome. Candidates form
+    // (dev-request 2026-08-06-claim-produsent-velger-mottakeradresse) —
+    // 0/1/2+ are the three cases below.
+    const candidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider);
     const backUrl = provider.slug ? `/kategori/gardssalg/produsent/${encodeURIComponent(provider.slug)}` : "/kategori/gardssalg";
 
     const status = String(req.query.status || "");
@@ -285,21 +287,47 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
     } else if (status === "error") {
       const msg = reason === "rate_limited"
         ? "For mange forsøk. Prøv igjen om en time."
+        : reason === "selection_required"
+        ? "Velg en adresse under."
+        : reason === "invalid_selection"
+        ? "Det valget er ikke lenger gyldig. Velg på nytt."
         : "Kunne ikke sende lenke. Prøv igjen senere, eller kontakt kontakt@opplevagent.no.";
       alert = `<div class="gc-alert gc-alert-error" role="alert">${escapeHtml(msg)}</div>`;
     }
 
-    if (!derived.eligible) {
+    if (candidates.length === 0) {
       return res.send(shell("Er dette din bedrift?", `${alert}${manualFallbackBlock()}
         <div class="gc-card"><a href="${escapeHtml(backUrl)}" class="gc-btn gc-btn-secondary">Tilbake til profilen</a></div>`));
     }
 
-    const masked = maskEmail(derived.email);
+    // Exactly one candidate: unchanged from before this dev-request — same
+    // markup, same single-button flow, no selection concept at all (AC3).
+    const addressChoiceHtml = candidates.length === 1
+      ? `<p>Vi sender en innloggingslenke til <strong>${escapeHtml(maskEmail(candidates[0].email))}</strong> — adressen vi har registrert for
+          <strong>${escapeHtml(provider.navn)}</strong> hos Brønnøysundregistrene/på deres verifiserte nettside.</p>`
+      // Two or more: producer picks. The value posted back is the SOURCE TAG
+      // ("verified_domain_address" etc.), never the address itself — the
+      // masked text is display-only and the full address never reaches the
+      // page's HTML/JS in any form (AC4). issueClaimMagicLink() re-derives
+      // and re-validates the tag server-side (AC5) — the client's choice of
+      // WHICH candidate is trusted, never a value naming an address.
+      : `<p>Vi fant flere adresser registrert for <strong>${escapeHtml(provider.navn)}</strong>. Velg hvor
+          innloggingslenken skal sendes:</p>
+         <div class="gc-field" role="radiogroup" aria-label="Velg mottakeradresse">
+           ${candidates
+             .map(
+               (c, i) => `<label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:6px 0;">
+             <input type="radio" name="selected" value="${escapeHtml(c.source)}" ${i === 0 ? "checked" : ""} style="width:auto;min-height:0;">
+             ${escapeHtml(maskEmail(c.email))}
+           </label>`,
+             )
+             .join("")}
+         </div>`;
+
     const body = `
       <div class="gc-card">
         <h1>Er dette din bedrift?</h1>
-        <p>Vi sender en innloggingslenke til <strong>${escapeHtml(masked)}</strong> — adressen vi har registrert for
-          <strong>${escapeHtml(provider.navn)}</strong> hos Brønnøysundregistrene/på deres verifiserte nettside.</p>
+        ${addressChoiceHtml}
         ${alert}
         <form id="gc-request-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(provider.id)}/request" novalidate>
           <div class="gc-form-actions">
@@ -320,7 +348,9 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
           ev.preventDefault();
           var btn = form.querySelector("button[type=submit]");
           if (btn) { btn.disabled = true; btn.textContent = "Sender ..."; }
-          fetch(form.action, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+          var selectedInput = form.querySelector('input[name="selected"]:checked');
+          var payload = selectedInput ? { selected: selectedInput.value } : {};
+          fetch(form.action, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
             .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
             .then(function (out) {
               var base = window.location.pathname;
@@ -349,20 +379,36 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
 // (works both as a plain no-JS form POST and as the JS-fetch target above;
 // response shape adapts to Accept/Content-Type like RFB's dual routes).
 // ─────────────────────────────────────────────────────────────────
+// Runtime allow-list mirroring OrgLinkedEmailCandidate["source"] — the ONLY
+// values issueClaimMagicLink() will ever accept as opts.selectedSource. Any
+// other posted "selected" value (typo, stale page, hostile client) is
+// treated as no selection at all, never forwarded — the union type alone is
+// a compile-time guarantee, not a runtime one, since req.body is unknown().
+const CLAIM_EMAIL_SOURCES = ["brreg_contact", "verified_domain_address", "stored_epost_verified"] as const;
+function parseSelectedSource(value: unknown): (typeof CLAIM_EMAIL_SOURCES)[number] | undefined {
+  return typeof value === "string" && (CLAIM_EMAIL_SOURCES as readonly string[]).includes(value)
+    ? (value as (typeof CLAIM_EMAIL_SOURCES)[number])
+    : undefined;
+}
+
 router.post(
   "/kategori/gardssalg/eier/:providerId/request",
   express.json(),
+  express.urlencoded({ extended: false }),
   (req: Request, res: Response) => {
     const providerId = String((req.params as any).providerId || "");
     const wantsJson = (req.headers["content-type"] || "").includes("application/json") || (req.headers.accept || "").includes("application/json");
+    const selectedSource = parseSelectedSource((req.body as any)?.selected);
 
     const provider = getClaimProviderById(providerId);
     const redirectBase = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}` : null;
 
-    const result = issueClaimMagicLink(providerId);
+    const result = issueClaimMagicLink(providerId, undefined, { selectedSource });
 
     if (!result.ok) {
-      if (wantsJson) return res.status(result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : 403).json({ success: false, error: result.error });
+      const status =
+        result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : result.error === "selection_required" ? 400 : 403;
+      if (wantsJson) return res.status(status).json({ success: false, error: result.error });
       if (!redirectBase) return res.status(404).send(notFoundPage());
       return res.redirect(303, `${redirectBase}?status=error&reason=${encodeURIComponent(result.error)}`);
     }

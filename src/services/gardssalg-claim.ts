@@ -271,6 +271,11 @@ export type OrgLinkedEmailResult =
   | { eligible: true; email: string; source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified" }
   | { eligible: false; reason: "not_brreg_verified" | "no_org_linked_email" };
 
+export type OrgLinkedEmailCandidate = {
+  email: string;
+  source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified";
+};
+
 // Minimal shape check for a stored `epost` candidate — good enough to catch
 // scraped garbage/truncated fragments before they're offered as a claim
 // target, NOT full RFC validation (real deliverability is proven at
@@ -353,20 +358,37 @@ export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefin
  * the Pick below) so existing callers/fixtures that construct a provider
  * object without it keep compiling unchanged — omitted is treated as null.
  */
-export function deriveOrgLinkedEmail(
+/**
+ * Same three tiers deriveOrgLinkedEmail() has always checked — (a) Brreg
+ * contact, (b) post@<verified-domain>, (c) provenance-backed stored epost —
+ * but returns EVERY tier that qualifies instead of stopping at the first.
+ * dev-request 2026-08-06-claim-produsent-velger-mottakeradresse: lets a
+ * producer with more than one qualified address choose which one the magic
+ * link goes to, rather than the fleet silently picking (b) over (c) even
+ * when (b) is an unproven address-convention guess and (c) has real
+ * delivery evidence. Introduces NO new qualification path — a candidate
+ * appears here iff it would already have been eligible under the single-
+ * result function below. Order is stable (a, b, c) but is NOT a ranking
+ * once there is more than one candidate — see deriveOrgLinkedEmail(), which
+ * still takes the first as its single answer for every existing caller.
+ * Same purity contract: no DB/IO.
+ */
+export function deriveOrgLinkedEmailCandidates(
   provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
     epost?: string | null;
   },
   brregContactEmail?: string | null,
   opts: { epostOutreachDeliveredNoBounce?: boolean } = {},
-): OrgLinkedEmailResult {
+): OrgLinkedEmailCandidate[] {
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
-  if (!brregOk) return { eligible: false, reason: "not_brreg_verified" };
+  if (!brregOk) return [];
+
+  const candidates: OrgLinkedEmailCandidate[] = [];
 
   // (a) Brreg-registered contact email — dormant today (see module doc).
   const contact = (brregContactEmail || "").trim().toLowerCase();
   if (contact && contact.includes("@")) {
-    return { eligible: true, email: contact, source: "brreg_contact" };
+    candidates.push({ email: contact, source: "brreg_contact" });
   }
 
   // (b) post@<ownership-verified-domain>. Deliberately NOT the (possibly
@@ -385,32 +407,52 @@ export function deriveOrgLinkedEmail(
   // deriving post@facebook.com (or post@mail.gmail.com, post@gmail.com.,
   // etc.) from that would hand a claim link to a shared/social mailbox, not
   // the org — the exact "wrong producer's info on a page" harm this module
-  // exists to prevent. Falls through to no_org_linked_email (manual
-  // fallback) exactly like an unvetted domain.
+  // exists to prevent. Falls through (no candidate added) exactly like an
+  // unvetted domain.
   if (isHjemmesideOwnershipVerified(provider)) {
     const domain = normalizeDomain(provider.hjemmeside);
     if (isClaimableDomain(domain)) {
-      return { eligible: true, email: `post@${domain}`, source: "verified_domain_address" };
+      candidates.push({ email: `post@${domain}`, source: "verified_domain_address" });
     }
   }
 
   // (c) stored_epost_verified — the provider's OWN `epost`, but ONLY when
   // backed by real provenance (see module doc's "stored_epost_verified"
-  // section for the full (a-epost)/(b-epost)/(c-epost) breakdown). Checked
-  // LAST so a stronger tier above always wins if it also qualifies. A
-  // scraped-only epost with neither signal falls straight through to
-  // no_org_linked_email, same as today — this is Acceptance Criterion 2 from
-  // the dev-request.
+  // section for the full (a-epost)/(b-epost)/(c-epost) breakdown). A
+  // scraped-only epost with neither signal is never added, same as today —
+  // this is Acceptance Criterion 2 from the dev-request.
   const epostCandidate = normalizeEmail(provider.epost);
   if (epostCandidate && isPlausibleEmailShape(epostCandidate)) {
     const adminEntered = provider.content_source === "manual"; // (c-epost)
     const outreachDelivered = opts.epostOutreachDeliveredNoBounce === true; // (b-epost)
     if (adminEntered || outreachDelivered) {
-      return { eligible: true, email: epostCandidate, source: "stored_epost_verified" };
+      candidates.push({ email: epostCandidate, source: "stored_epost_verified" });
     }
   }
 
-  return { eligible: false, reason: "no_org_linked_email" };
+  return candidates;
+}
+
+/**
+ * Single-answer form, kept for every existing caller (route/report code
+ * that only ever expected one address) — now a thin wrapper over
+ * deriveOrgLinkedEmailCandidates(), taking the first qualifying tier.
+ * Behavior for a provider with 0 or 1 qualifying candidates is byte-for-
+ * byte unchanged from before this dev-request.
+ */
+export function deriveOrgLinkedEmail(
+  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    epost?: string | null;
+  },
+  brregContactEmail?: string | null,
+  opts: { epostOutreachDeliveredNoBounce?: boolean } = {},
+): OrgLinkedEmailResult {
+  const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
+  if (!brregOk) return { eligible: false, reason: "not_brreg_verified" };
+
+  const [first] = deriveOrgLinkedEmailCandidates(provider, brregContactEmail, opts);
+  if (!first) return { eligible: false, reason: "no_org_linked_email" };
+  return { eligible: true, email: first.email, source: first.source };
 }
 
 /**
@@ -452,6 +494,32 @@ export function deriveOrgLinkedEmailWithOutreachLookup(
   if (!epostOutreachDeliveredNoBounce) return preliminary;
 
   return deriveOrgLinkedEmail(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
+}
+
+/**
+ * Candidates form of deriveOrgLinkedEmailWithOutreachLookup() — same lazy
+ * DB-lookup discipline (the RFB cross-DB outreach/bounce check only runs
+ * when it could actually add a candidate that isn't there already), used by
+ * the entry page (to render the choice) and issueClaimMagicLink() (to
+ * validate a producer's choice) so both always see the exact same list.
+ */
+export function deriveOrgLinkedEmailCandidatesWithOutreachLookup(
+  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    epost?: string | null;
+  },
+  brregContactEmail?: string | null,
+): OrgLinkedEmailCandidate[] {
+  const withoutOutreach = deriveOrgLinkedEmailCandidates(provider, brregContactEmail);
+  const alreadyHasEpostCandidate = withoutOutreach.some((c) => c.source === "stored_epost_verified");
+  if (alreadyHasEpostCandidate || !provider.epost) return withoutOutreach;
+
+  const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
+  if (!brregOk) return withoutOutreach;
+
+  const epostOutreachDeliveredNoBounce = wasEpostDeliveredOutreachNoBounce(provider.epost);
+  if (!epostOutreachDeliveredNoBounce) return withoutOutreach;
+
+  return deriveOrgLinkedEmailCandidates(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
 }
 
 /** Mask an email for display ("we sent it to p***t@b*******t.no") — never
@@ -526,7 +594,26 @@ export interface IssuedClaim {
 
 export type IssueClaimResult =
   | { ok: true; claim: IssuedClaim }
-  | { ok: false; error: "provider_not_found" | "not_brreg_verified" | "no_org_linked_email" | "rate_limited" };
+  | {
+      ok: false;
+      error:
+        | "provider_not_found"
+        | "not_brreg_verified"
+        | "no_org_linked_email"
+        | "rate_limited"
+        // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse:
+        // "invalid_selection" — opts.selectedSource was given but does not
+        // match any of THIS provider's own current candidates (a stale
+        // choice, or an attempt to request a source that was never offered
+        // — the server never trusts the client's chosen VALUE, only which
+        // of its own re-derived candidates was picked, so this is the only
+        // way a bad selection can surface, never a wrong email). "selection_
+        // required" — more than one candidate qualifies and no selection was
+        // given (the entry page always offers one when there's more than
+        // one; this only fires against a client that skipped the UI).
+        | "invalid_selection"
+        | "selection_required";
+    };
 
 // `opts.isTest` (dev-request 2026-07-26-booking-test-send-guard) marks the
 // claim as a deliberate end-to-end test so the route layer redirects its
@@ -534,16 +621,39 @@ export type IssueClaimResult =
 // org-linked address. A THIRD ARGUMENT on purpose, not part of any request
 // body the public POST route parses — that route calls this with one
 // argument, so no public caller can reach it.
+//
+// `opts.selectedSource` (2026-08-06-claim-produsent-velger-mottakeradresse):
+// which of the producer's own qualified candidates to send to, when there is
+// more than one. Deliberately a SOURCE TAG, never an email address — the
+// caller (route layer) never has a raw address to pass in the first place,
+// since the entry page only ever shows masked addresses. The source tag is
+// re-validated here against a FRESH deriveOrgLinkedEmailCandidatesWithOutreachLookup()
+// call, not trusted as-is, so a caller can never steer a link to any address
+// beyond this provider's own already-qualified set.
 export function issueClaimMagicLink(
   providerId: string,
   brregContactEmail?: string | null,
-  opts: { isTest?: boolean } = {},
+  opts: { isTest?: boolean; selectedSource?: OrgLinkedEmailCandidate["source"] } = {},
 ): IssueClaimResult {
   const provider = getClaimProviderById(providerId);
   if (!provider) return { ok: false, error: "provider_not_found" };
 
-  const derived = deriveOrgLinkedEmailWithOutreachLookup(provider, brregContactEmail);
-  if (!derived.eligible) return { ok: false, error: derived.reason };
+  const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
+  if (!brregOk) return { ok: false, error: "not_brreg_verified" };
+
+  const candidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider, brregContactEmail);
+  if (candidates.length === 0) return { ok: false, error: "no_org_linked_email" };
+
+  let chosen: OrgLinkedEmailCandidate;
+  if (opts.selectedSource) {
+    const match = candidates.find((c) => c.source === opts.selectedSource);
+    if (!match) return { ok: false, error: "invalid_selection" };
+    chosen = match;
+  } else if (candidates.length === 1) {
+    chosen = candidates[0];
+  } else {
+    return { ok: false, error: "selection_required" };
+  }
 
   if (isClaimRateLimited(providerId)) return { ok: false, error: "rate_limited" };
 
@@ -557,16 +667,16 @@ export function issueClaimMagicLink(
   db.prepare(
     `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at, is_test)
      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-  ).run(claimId, providerId, derived.email, derived.source, token, now.toISOString(), expiresAt.toISOString(), isTest);
+  ).run(claimId, providerId, chosen.email, chosen.source, token, now.toISOString(), expiresAt.toISOString(), isTest);
 
   return {
     ok: true,
     claim: {
       claimId,
       token,
-      email: derived.email,
-      maskedEmail: maskEmail(derived.email),
-      source: derived.source,
+      email: chosen.email,
+      maskedEmail: maskEmail(chosen.email),
+      source: chosen.source,
       expiresAt: expiresAt.toISOString(),
       isTest: isTest === 1,
     },

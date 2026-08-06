@@ -186,6 +186,24 @@ export function runOpplevelserBookingSendGuardTests(
       const emailMod = require("../services/email-service") as typeof import("../services/email-service");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
+      // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse:
+      // issueClaimMagicLink() below now always builds the FULL candidate
+      // list (deriveOrgLinkedEmailCandidatesWithOutreachLookup), not just
+      // the first match — so it may run the RFB-db-backed
+      // wasEpostDeliveredOutreachNoBounce() lookup even when this fixture's
+      // explicit brregContactEmail argument already makes it eligible,
+      // where the old single-result function's short-circuit meant it
+      // never did. This suite never provided its own RFB db (it only ever
+      // needed the EXPERIENCES vertical), which used to be safe because the
+      // lookup never ran — install the SAME isolated, empty, schema'd
+      // override services/gardssalg-claim.test.ts's own suite uses, so this
+      // suite no longer depends on whatever the process-wide shared RFB
+      // singleton happens to be at the moment it runs (the exact race class
+      // that override exists to avoid — see its own doc comment).
+      const bsgRfbDb = new (require("better-sqlite3"))(":memory:");
+      (require("../database/init") as typeof import("../database/init")).__initSchemaForTesting(bsgRfbDb);
+      claimSvc.__setRfbDbForTesting(bsgRfbDb);
+
       // ── Fake transport at the REAL send boundary ─────────────────────────
       // The guard lives inside sendEmail(); stubbing sendEmail itself would
       // stub out the thing under test. Injecting a transporter observes the
@@ -512,6 +530,11 @@ export function runOpplevelserBookingSendGuardTests(
       restore("ADMIN_KEY", prevAdminKey);
       restore("TEST_SEND_REDIRECT_EMAIL", prevRedirect);
       restore("BOOKING_DISPATCH_ENABLED", prevDispatch);
+      try {
+        (require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim")).__setRfbDbForTesting(null);
+      } catch {
+        // best-effort cleanup
+      }
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();
