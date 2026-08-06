@@ -79,7 +79,13 @@ export function dedupeGardssalgOutreachRecipients(
       continue;
     }
 
-    const emailDomainPart = normalizedEmail.split("@").pop() ?? "";
+    // Malformed epost values (enrichment-sourced, can contain garbage) with
+    // no "@" at all have no derivable domain — mirrors hostFromEmail's
+    // `!raw.includes("@")` guard in cross-source-validator.ts. Without this,
+    // "example.com".split("@").pop() returns "example.com" itself, which
+    // would then be treated as a real domain and could false-positive
+    // collide with an unrelated provider's genuine info@example.com.
+    const emailDomainPart = normalizedEmail.includes("@") ? normalizedEmail.split("@").pop() ?? "" : "";
     const host = emailDomainPart ? hostFromUrlLike(emailDomainPart) : null;
     const domain = host ? registrableDomain(host) : null;
     const isFreeMail = !!domain && FREE_MAIL_DOMAINS.includes(domain);

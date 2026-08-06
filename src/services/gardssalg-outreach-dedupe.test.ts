@@ -13,6 +13,8 @@
  *       @gmail.com, different local-part) -> NEITHER suppressed
  *   (d) null/empty email -> always allowed, never a dedup source or target
  *   (e) input order determines the winner (first seen)
+ *   (f) malformed epost with no "@" -> no derivable domain (regression);
+ *       exact-match rule still applies to identical malformed values
  *
  * Run standalone: npx tsx src/services/gardssalg-outreach-dedupe.test.ts
  * Wired into tests/test.ts via runGardssalgOutreachDedupeTests().
@@ -162,6 +164,40 @@ export function runGardssalgOutreachDedupeTests(opts: { log?: boolean } = {}): T
     ]);
     assertTrue(r.allowed.has("e4"), "e-domain: first-in-input-order candidate (e4) wins the domain slot");
     assertEq(r.suppressed.get("e3"), "duplikat_epost_domene", "e-domain: later-in-input-order candidate (e3) is suppressed");
+  }
+
+  // ── (f) malformed epost with no "@" -> no derivable domain ────────────
+  // Regression: normalizedEmail.split("@").pop() on a string with no "@"
+  // returns the string itself, which used to be fed straight into
+  // hostFromUrlLike/registrableDomain as if it WERE a domain — causing a
+  // false-positive duplikat_epost_domene collision with an unrelated
+  // provider's genuine email at that literal string as a domain.
+  {
+    const r = dedupeGardssalgOutreachRecipients([
+      { provider_id: "f1", email: "info@example.com" },
+      { provider_id: "f2", email: "example.com" }, // malformed epost value, no "@"
+    ]);
+    assertTrue(r.allowed.has("f1"), "f: real email candidate allowed");
+    assertTrue(
+      r.allowed.has("f2"),
+      "f: malformed no-@ epost value must NOT false-positive collide on domain with an unrelated real email",
+    );
+    assertTrue(!r.suppressed.has("f1") && !r.suppressed.has("f2"), "f: neither candidate suppressed");
+  }
+  // But the exact-match rule still applies to malformed values: two
+  // providers with the SAME malformed no-@ string should still collide.
+  {
+    const r = dedupeGardssalgOutreachRecipients([
+      { provider_id: "f3", email: "example.com" },
+      { provider_id: "f4", email: "example.com" },
+    ]);
+    assertTrue(r.allowed.has("f3"), "f-exact: first malformed candidate allowed");
+    assertTrue(!r.allowed.has("f4"), "f-exact: second identical malformed candidate not allowed");
+    assertEq(
+      r.suppressed.get("f4"),
+      "duplikat_epost",
+      "f-exact: identical malformed no-@ values still collide via exact-email rule, suppressed as duplikat_epost",
+    );
   }
 
   return { passed, failed, failures };
