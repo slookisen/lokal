@@ -64,6 +64,7 @@ import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
+import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
@@ -689,6 +690,12 @@ app.use("/admin", adminLimiter, homepageContentRefreshRouter);
 // agents.description truncation sweep — GET (read-only diagnostic) + POST
 // (dry-run default) /admin/description-truncation-sweep
 app.use("/admin", adminLimiter, descriptionTruncationSweepRouter);
+// dev-requests/2026-08-06-rfb-website-discovery-slice.md: candidate-homepage
+// discovery for RFB `agents` rows with no website on file — queues verified
+// proposals into agents_website_review_queue, never writes agents/
+// agent_knowledge directly. POST /admin/rfb-website-discovery,
+// GET /admin/rfb-website-review-queue (read-only, pending rows only).
+app.use("/admin", adminLimiter, adminRfbWebsiteDiscoveryRoutes);
 // orch-pr-10 (2026-06-14): per-producer Brave search→crawl→confirm→email — POST /admin/search-enrich (dry-run default)
 app.use("/admin/search-enrich", adminLimiter, express.json(), adminSearchEnrichRoutes);
 // PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create
@@ -1382,9 +1389,3 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
 
   setInterval(() => { void dispatchTick("interval"); }, tickIntervalMin * 60_000);
 }
-
-// ─── Graceful shutdown ───────────────────────────────────────
-process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
-process.on("SIGINT", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
-
-export default app;
