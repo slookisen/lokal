@@ -998,3 +998,1003 @@ function initSchema(db: Database.Database): void {
   }
 
   // Index for the hottest table (agents). Other tables get indexes
+  // when Phase 4.6b starts filtering on them.
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_vertical_id ON agents(vertical_id)`);
+  } catch {
+    // Index already exists
+  }
+
+  // ─── crm_contacts uniqueness: (email) → (email, vertical_id) ──
+  //
+  // dev-requests/2026-07-27-crm-plattformadskillelse-opplevagent.md, steg 2.
+  // Daniels valg A, ordrett: «gå for adskilte kontakter.» One person who is a
+  // customer on BOTH rettfrabonden.com and opplevagent.no must be two separate
+  // contacts — not one shared row whose thread history mixes the platforms.
+  // The old UNIQUE(email) made that impossible to even represent: the second
+  // platform's INSERT would fail outright.
+  //
+  // Safe on live data by construction. Every existing row is vertical_id='rfb'
+  // (nothing wrote the column until this PR), so the composite index holds on
+  // exactly the same row set the single-column one did — it cannot fail on
+  // existing data, and there is nothing to de-duplicate first.
+  //
+  // The two statements run in ONE TRANSACTION, so there is no window between
+  // them at all — SQLite has fully transactional DDL. The first version argued
+  // for a careful ordering instead (CREATE before DROP, so a crash in between
+  // leaves the table more constrained rather than less), but an ordering
+  // argument is only as good as the next person who reorders the lines, and a
+  // mutation swapping them was undetectable by any test: "what happens if the
+  // process dies between two synchronous statements" is not observable from a
+  // test process. BEGIN/COMMIT makes the hazard structurally impossible rather
+  // than merely documented, which is the better of the two.
+  //
+  // Idempotent ACROSS BOOTS, not merely across DB states — REVIEW B1. This runs
+  // on every single boot, so the pair below has to be a no-op on boot 2, 3, 4…
+  // It is, now that nothing re-creates the single-column index earlier in this
+  // file (see the note in the crm_contacts DDL block). The first draft did
+  // re-create it, and the result was a crash loop the moment one legitimate
+  // cross-vertical contact existed. Reproduced before fixing:
+  //     boot 1  → OK, two contacts sharing an email on two platforms
+  //     boot 2  → THREW: UNIQUE constraint failed: crm_contacts.email
+  //
+  // NOT freely reversible any more, and that is worth stating plainly: a plain
+  // `git revert` of this change restores the UNIQUE(email) index, which will
+  // fail to build against exactly the data steg 2 exists to allow — the same
+  // crash, arrived at deliberately. Reverting safely means de-duplicating
+  // crm_contacts first (keep the 'rfb' row, re-point its threads), THEN
+  // reverting. Do not treat this as a one-command rollback.
+  try {
+    db.exec(`
+      BEGIN;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_vertical_unique ON crm_contacts(email, vertical_id);
+        DROP INDEX IF EXISTS idx_crm_contacts_email_unique;
+      COMMIT;
+    `);
+  } catch {
+    // Already migrated, or the CREATE failed on genuinely duplicate data. Either
+    // way the transaction rolls back, so the table is never left half-migrated.
+    try { db.exec(`ROLLBACK`); } catch { /* no transaction open — nothing to undo */ }
+  }
+
+  // ─── CRM steg 6 — crm_contacts.provider_id (kontakt ↔ opplevagent-produsent) ───
+  //
+  // dev-requests/2026-07-27-crm-plattformadskillelse-opplevagent.md, steg 6 / funn 6.
+  //
+  // Option (a) from the spec: a nullable `provider_id` column NEXT TO `agent_id`,
+  // not option (b)'s generic (vertical_id, entity_id) pair replacing both. The
+  // pair would rewrite every read site that joins on agent_id — listContacts,
+  // getContactDetail, the marketing pool VIEW, and the PR-38 outreach_sent_log
+  // auto-record trigger whose `agent_id IS NOT NULL` guard is load-bearing for
+  // suppression — for zero functional gain over two well-guarded columns.
+  //
+  // provider_id points at experience_providers.id in experiences.db — a DIFFERENT
+  // database file, so it can never be a REFERENCES clause. Row existence is
+  // enforced in code (crm-service validates against the experiences DB before
+  // writing); what the schema CAN enforce is the spec's invariant «en kontakt kan
+  // aldri peke på en entitet i feil vertical», via the triggers below: agent_id
+  // only on rfb contacts, provider_id only on experiences contacts.
+  // COALESCE(vertical_id,'rfb') matches how every reader treats a legacy NULL.
+  try {
+    db.exec(`ALTER TABLE crm_contacts ADD COLUMN provider_id TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_contacts_provider ON crm_contacts(provider_id)`);
+  } catch {
+    // Index already exists
+  }
+
+  // Healing sweep, BEFORE the triggers exist: classifyEmail() used to match every
+  // vertical's contacts against the RFB `agents` table, so an experiences contact
+  // whose email happened to match an RFB producer got agent_id pointing at the
+  // wrong vertical's entity. Clear those links (the contact row itself stays).
+  // Runs every boot; 0 rows affected after the first pass. Each cleared row is
+  // logged to crm_actions so the un-linking shows in the contact's history
+  // rather than happening silently.
+  try {
+    const crossLinked = db
+      .prepare(
+        `SELECT id, email, agent_id, COALESCE(vertical_id,'rfb') AS vertical_id FROM crm_contacts
+          WHERE agent_id IS NOT NULL AND COALESCE(vertical_id,'rfb') != 'rfb'`,
+      )
+      .all() as Array<{ id: string; email: string; agent_id: string; vertical_id: string }>;
+    if (crossLinked.length > 0) {
+      const clear = db.prepare(`UPDATE crm_contacts SET agent_id = NULL WHERE id = ?`);
+      const logIt = db.prepare(
+        `INSERT INTO crm_actions (id, contact_id, type, actor, payload)
+         VALUES (lower(hex(randomblob(16))), ?, 'crm_cross_vertical_agent_link_cleared', 'system', ?)`,
+      );
+      for (const row of crossLinked) {
+        clear.run(row.id);
+        logIt.run(
+          row.id,
+          JSON.stringify({
+            email: row.email,
+            cleared_agent_id: row.agent_id,
+            contact_vertical: row.vertical_id,
+            reason: "steg 6: agent_id må aldri peke på tvers av vertical (funn 6)",
+          }),
+        );
+      }
+      console.log(
+        `[migration] steg 6: cleared ${crossLinked.length} cross-vertical agent_id link(s) on crm_contacts`,
+      );
+    }
+  } catch (e) {
+    console.error(`[migration] steg 6 cross-vertical healing sweep failed:`, e);
+  }
+
+  // The vertical-safety triggers. DROP+CREATE every boot so a future edit to the
+  // trigger body actually lands (CREATE TRIGGER IF NOT EXISTS would silently keep
+  // the old body forever).
+  try {
+    db.exec(`
+      DROP TRIGGER IF EXISTS trg_crm_contacts_agent_vertical_ins;
+      CREATE TRIGGER trg_crm_contacts_agent_vertical_ins
+      BEFORE INSERT ON crm_contacts
+      WHEN NEW.agent_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'rfb'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_agent_id_wrong_vertical');
+      END;
+
+      DROP TRIGGER IF EXISTS trg_crm_contacts_agent_vertical_upd;
+      CREATE TRIGGER trg_crm_contacts_agent_vertical_upd
+      BEFORE UPDATE ON crm_contacts
+      WHEN NEW.agent_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'rfb'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_agent_id_wrong_vertical');
+      END;
+
+      DROP TRIGGER IF EXISTS trg_crm_contacts_provider_vertical_ins;
+      CREATE TRIGGER trg_crm_contacts_provider_vertical_ins
+      BEFORE INSERT ON crm_contacts
+      WHEN NEW.provider_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'experiences'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_provider_id_wrong_vertical');
+      END;
+
+      DROP TRIGGER IF EXISTS trg_crm_contacts_provider_vertical_upd;
+      CREATE TRIGGER trg_crm_contacts_provider_vertical_upd
+      BEFORE UPDATE ON crm_contacts
+      WHEN NEW.provider_id IS NOT NULL AND COALESCE(NEW.vertical_id,'rfb') != 'experiences'
+      BEGIN
+        SELECT RAISE(ABORT, 'crm_contact_provider_id_wrong_vertical');
+      END;
+    `);
+  } catch (e) {
+    console.error(`[migration] steg 6 vertical-safety triggers failed:`, e);
+  }
+
+  // Dashboards filter analytics by vertical_id (rfb vs dental) — index the
+  // analytics tables so the per-vertical WHERE clauses stay cheap.
+  for (const [idx, tbl] of [
+    ["idx_analytics_page_views_vertical", "analytics_page_views"],
+    ["idx_analytics_queries_vertical", "analytics_queries"],
+    ["idx_analytics_agent_views_vertical", "analytics_agent_views"],
+  ]) {
+    try {
+      db.exec(`CREATE INDEX IF NOT EXISTS ${idx} ON ${tbl}(vertical_id, created_at)`);
+    } catch {
+      // Index already exists
+    }
+  }
+
+  // ─── Backfill: dental page views misattributed as 'rfb' ───────
+  // finn-tannlege.com went live 2026-06-04, but the analytics middleware
+  // didn't stamp vertical_id until the vertical-split PR — so every dental
+  // page view between launch and deploy sits with the default 'rfb'.
+  // Best-effort re-tag: these path prefixes are served ONLY by the dental
+  // SEO router (dental-seo.ts) and can't be rfb traffic. Shared paths
+  // ("/", "/sok", "/om", sitemap/robots/llms) are ambiguous without the
+  // Host header and intentionally stay as-is.
+  // Migration-flagged: runs once, safe on fresh DBs (0 rows updated).
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare("SELECT 1 FROM migrations WHERE name = 'backfill_dental_vertical_v1'").get();
+    if (!alreadyRan) {
+      const result = db.prepare(`
+        UPDATE analytics_page_views
+        SET vertical_id = 'dental'
+        WHERE vertical_id = 'rfb'
+          AND (
+            path LIKE '/klinikk/%'
+            OR path LIKE '/fylke/%'
+            OR path LIKE '/spesialitet/%'
+            OR path LIKE '/sted/%'
+            OR path = '/hvordan-det-fungerer'
+            OR path LIKE '/api/tannlege%'
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_dental_vertical_v1')").run();
+      if (result.changes > 0) {
+        console.log(`\u{1F9F9} Migration backfill_dental_vertical_v1: re-tagged ${result.changes} page view(s) as dental`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_dental_vertical_v1 failed:", err);
+  }
+
+
+  // ─── Phase 4.9a — agent_knowledge.curated_fields ──────────────
+  // Customer-curated content protection: when CS-agent applies a
+  // customer-requested change (about-text, opening hours, contact info),
+  // the field is locked here. Enrichment-agent must check curated_fields
+  // before PUT and skip locked fields — otherwise customer's preferred
+  // text gets overwritten on next crawl.
+  //
+  // Schema: JSON object, keyed by field name.
+  //   {
+  //     "about": {"locked_at": "ISO", "by": "rfb-customer-service",
+  //               "thread_id": "<gmail-thread>", "request_summary": "..."},
+  //     "opening_hours": {...}
+  //   }
+  // Empty {} = no locks (default for all existing rows).
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN curated_fields TEXT NOT NULL DEFAULT '{}'`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+
+  // ─── orch-pr-87 — agent_knowledge.sweep_round + sweep_processed_at ─
+  // Systematic-sweep observability (PHASE5: full-sweep design,
+  // 2026-05-23). `sweep_processed_at` is set on every verifier write
+  // (see applyVerifierOutcome in lokal-agent-verifier.ts). `sweep_round`
+  // is reserved for app-layer computation (current v1 leaves the column
+  // at its default of 0; the useful signal today is the min/max of
+  // sweep_processed_at, exposed via getSweepStatus() and the
+  // GET /admin/verifier/sweep-status endpoint).
+  //
+  // Both ALTERs are wrapped in try/catch — idempotent across re-runs.
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN sweep_round INTEGER NOT NULL DEFAULT 0`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN sweep_processed_at TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+
+  // ─── Phase 4.10c-2 Steg 1 — DB-trigger: auto-update last_outbound_at ─
+  // Whenever a crm_messages row is INSERTed with direction='out' AND
+  // delivery_status='sent', set the parent thread's last_outbound_at if
+  // either it's NULL or the new sent_at is newer. Closes the duplicate-send
+  // bug where the agent never knew an outbound had already been sent.
+  //
+  // Idempotent: CREATE TRIGGER IF NOT EXISTS — safe to re-run on every boot.
+  // Catches every write path including manual scripts, future agents,
+  // Resend-webhooks if/when added — not just the composeNewThread path.
+  //
+  // Origin: orchestrator work-order #2 (run-2026-05-03T1940-platform-orchestrator-rfb).
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_update_thread_outbound_at
+        AFTER INSERT ON crm_messages
+        FOR EACH ROW
+        WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
+        BEGIN
+          UPDATE crm_threads
+          SET last_outbound_at = NEW.sent_at,
+              updated_at = datetime('now')
+          WHERE id = NEW.thread_id
+            AND (last_outbound_at IS NULL OR last_outbound_at < NEW.sent_at);
+        END
+    `);
+  } catch (err) {
+    console.error("Migration trg_update_thread_outbound_at failed:", err);
+  }
+
+  // ─── Idempotent backfill: same migration block as the trigger ────
+  // Catch threads that were created before the trigger landed, OR that
+  // were INSERTed with delivery_status='sent' via paths not covered by
+  // composeNewThread (which already sets last_outbound_at synchronously).
+  // Safe re-run: WHERE filter ensures only NULL→MAX(sent_at) updates.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare("SELECT 1 FROM migrations WHERE name = 'backfill_last_outbound_at_v1'").get();
+    if (!alreadyRan) {
+      const result = db.prepare(`
+        UPDATE crm_threads
+        SET last_outbound_at = (
+              SELECT MAX(sent_at)
+              FROM crm_messages
+              WHERE crm_messages.thread_id = crm_threads.id
+                AND direction = 'out'
+                AND delivery_status = 'sent'
+            ),
+            updated_at = datetime('now')
+        WHERE last_outbound_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM crm_messages
+            WHERE crm_messages.thread_id = crm_threads.id
+              AND direction = 'out'
+              AND delivery_status = 'sent'
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_last_outbound_at_v1')").run();
+      if (result.changes > 0) {
+        console.log(`🧹 Migration backfill_last_outbound_at_v1: updated ${result.changes} thread(s)`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_last_outbound_at_v1 failed:", err);
+  }
+
+
+  // ─── One-time cleanup: reset all test verifications ──────────
+  // No real sellers have claimed yet — all is_verified=1 entries
+  // are from development/testing. Reset them to 0 and clean claims.
+  // Uses a migration flag so this only runs once.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare("SELECT 1 FROM migrations WHERE name = 'reset_test_verifications_v1'").get();
+    if (!alreadyRan) {
+      const resetCount = db.prepare("UPDATE agents SET is_verified = 0 WHERE is_verified = 1").run().changes;
+      db.prepare("DELETE FROM agent_claims").run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('reset_test_verifications_v1')").run();
+      if (resetCount > 0) {
+        console.log(`🧹 Migration: reset ${resetCount} test verifications and cleared all claims`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration reset_test_verifications failed:", err);
+  }
+
+  // ─── Phase 5.1 — verify-first schema (WO #7, 2026-05-05) ─────
+  // Adds the columns that lokal-agent-verifier (WO #8, future) will
+  // populate. All seven columns get safe defaults so the existing
+  // 1416 agents start as `unverified`/`thin` and the marketing
+  // pipeline keeps reading from the legacy uncontacted-pool until
+  // WO #9 switches it to outreach_ready_pool.
+  //
+  // Reference: PHASE5-DATA-QUALITY-PLAN.md §3.1
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN field_provenance TEXT NOT NULL DEFAULT '{}'`,
+    `ALTER TABLE agent_knowledge ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'`,
+    `ALTER TABLE agent_knowledge ADD COLUMN enrichment_status TEXT NOT NULL DEFAULT 'thin'`,
+    `ALTER TABLE agent_knowledge ADD COLUMN outreach_eligible_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_verified_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_http_check_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_http_status INTEGER`,
+    // ─── PR-21 / WO-19 (2026-05-10): link-freshness probe ───
+    // url_last_probed: ISO timestamp of the last HEAD/GET probe of agent.url
+    // url_last_status: HTTP status returned (0 = network failure / abort).
+    // Together with the outreach_ready_pool VIEW these enforce a 30d freshness
+    // window so marketing never emails an agent whose homepage 4xx/5xx's.
+    `ALTER TABLE agent_knowledge ADD COLUMN url_last_probed TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN url_last_status INTEGER`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
+  // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction ──
+  // homepage_fetch_attempts: consecutive homepage-provenance-batch fetch
+  //   failures for this agent (any successful fetch resets it to 0).
+  // homepage_unreachable_since: set when attempts reaches 3 — parks the agent
+  //   out of the batch auto-select until 30 days have passed, so each run
+  //   stops re-fetching the same dead/aggregator URLs.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN homepage_fetch_attempts INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agent_knowledge ADD COLUMN homepage_unreachable_since TEXT`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
+  // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+  // (item 3) — domain-coherence reconciliation parking ──────────────────────
+  // domain_reconciliation_checked_at: ISO timestamp of the last
+  //   /admin/verifier/domain-coherence-sweep apply-mode pass that looked at
+  //   this agent and did NOT auto-fix it (coherent / manual_review_needed /
+  //   circular_scramble_candidate outcome).
+  // domain_reconciliation_outcome: 'no_action_needed' | 'manual_review_needed'
+  //   | 'circular_scramble_candidate' — what the sweep decided, for
+  //   observability/debugging.
+  // domain_reconciliation_reason_snapshot: the agent_knowledge.
+  //   verification_review_reason value AT the time of the check, so the
+  //   backoff-exclusion query can tell "still the same problem" (skip) apart
+  //   from "something new happened since" (don't permanently silence —
+  //   re-surface even inside the 30-day window).
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN domain_reconciliation_checked_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN domain_reconciliation_outcome TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN domain_reconciliation_reason_snapshot TEXT`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
+  // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+  // (item 6 follow-up) — pending_verify no-progress parking ────────────────
+  // pending_verify_no_progress_count: increments every time a re-verification
+  //   of a `pending_verify` agent (via the bulk sweep in
+  //   src/services/verifier-sweep.ts / applyVerifierOutcome) resolves BACK to
+  //   `pending_verify` — i.e. the gate re-fails for the same structural reason
+  //   (deriveVerificationStatus's `!passes` branch) and no new data (email,
+  //   Brreg fix, etc.) was acquired. Any outcome OTHER than `pending_verify`
+  //   (verified / review_required / data_insufficient — real progress) fully
+  //   resets this to 0.
+  // pending_verify_parked_since: stamped once pending_verify_no_progress_count
+  //   reaches 3 consecutive no-progress outcomes — parks the agent out of
+  //   pickPendingVerifyBatch's auto-select for 30 days, same shape as
+  //   PR #248's homepage_fetch_attempts/homepage_unreachable_since idiom in
+  //   marketplace.ts and the domain_reconciliation_checked_at idiom in
+  //   lokal-agent-verifier.ts's pickReviewQueueBatch — this stops the bulk
+  //   sweep from burning wall-clock/compute re-probing website/Brreg
+  //   reachability on a cohort (a real ~817-row prod tail) that is proven
+  //   unresolvable by re-verification alone because it's missing data the
+  //   sweep has no way to acquire (e.g. a missing email). Reset to NULL the
+  //   moment real progress happens (any non-pending_verify outcome).
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN pending_verify_no_progress_count INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agent_knowledge ADD COLUMN pending_verify_parked_since TEXT`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
+  // ─── dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff ──
+  // POST /admin/homepage-provenance-batch's default auto-select ordered by
+  // k.updated_at ASC, but its two "nothing useful came out of this fetch"
+  // early-return paths (fetch succeeded, ownership guard rejected the page /
+  // fetch succeeded but no contact fields were extractable) never wrote
+  // ANYTHING to agent_knowledge — not even updated_at. An agent that landed in
+  // that gap sorted as "least recently touched" FOREVER and got reselected on
+  // every single call (CONFIRMED: 3 consecutive calls with limit:15 returned
+  // the identical processed=13, enriched=0 batch — zero universe coverage).
+  // last_enrichment_attempt_at / last_enrichment_outcome are stamped on EVERY
+  // agent for which a homepage fetch was actually attempted (all outcomes),
+  // and the selector now orders by last_enrichment_attempt_at ASC (NULLs —
+  // never attempted — first) instead of updated_at, guaranteeing full-universe
+  // rotation before any repeat. no_yield_streak adds a softer, separate
+  // backoff on top of that rotation: 3 consecutive no-yield outcomes (fetched
+  // fine, nothing extractable) rest the agent for NO_YIELD_BACKOFF_DAYS days
+  // (env-configurable, default 14) so a page that structurally never yields
+  // anything doesn't keep burning a network round-trip every run. This is
+  // fully independent of, and additive alongside, the existing
+  // homepage_fetch_attempts / homepage_unreachable_since 3-strikes / 30-day
+  // fetch-FAILURE parking mechanism above — that mechanism is untouched.
+  // last_enrichment_outcome values: 'enriched' | 'no_yield' | 'fetch_failed' |
+  // 'wrong_entity' (the existing website-ownership-guard rejection branch —
+  // homepage fetched fine but the page doesn't mention the producer).
+  // 'locked' is part of the outcome vocabulary for other enrichment handlers
+  // (e.g. the curated-fields gate in homepage-content-refresh) but has no
+  // reachable branch in THIS handler, so it is never written here.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN last_enrichment_attempt_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_enrichment_outcome TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN no_yield_streak INTEGER NOT NULL DEFAULT 0`,
+    // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff
+    // (follow-up slice, orch-pr-wrongentity): mirrors no_yield_streak above but
+    // for the website-ownership-guard rejection branch ('wrong_entity' — page
+    // fetched fine but doesn't mention the producer) specifically. A wrong-site
+    // mismatch essentially never resolves itself, so this cohort needs its own
+    // independent backoff or it gets reselected forever once the rest of the
+    // universe rests. Independent of no_yield_streak — only an 'enriched'
+    // outcome resets either streak.
+    `ALTER TABLE agent_knowledge ADD COLUMN wrong_entity_streak INTEGER NOT NULL DEFAULT 0`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
+  // outreach_sent_log — Phase 5 ledger of WHAT we have actually sent
+  // through the verify-first pipeline. Empty initially; the WO #9
+  // marketing-pool-switch will start writing rows here. CRM threads
+  // are NOT backfilled in here on purpose — they belong to the legacy
+  // uncontacted-pool and have their own dedupe (last_outbound_at).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outreach_sent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+        channel TEXT NOT NULL DEFAULT 'email',
+        message_id TEXT,
+        notes TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_agent ON outreach_sent_log(agent_id)`);
+    // ─── P0-2026-07-11: recipient_email — email-keyed suppression column ──────
+    // The agent_id key is fragile: the same producer can hold multiple/churning
+    // agent_id rows (duplicate producers, re-registration), so an agent_id-only
+    // NOT EXISTS gate leaks a re-send whenever the send-time agent_id differs
+    // from the pool-time agent_id (confirmed live: Beiarmat, send-time producer
+    // 38476f5d… vs current agent 94af0bec…). recipient_email is the immutable
+    // key we actually emailed; suppression matches on it the same normalized way
+    // isBlocked() matches the blocklist. Idempotent ALTER (column-guard).
+    const oslCols = db.prepare(`PRAGMA table_info(outreach_sent_log)`).all() as Array<{ name: string }>;
+    if (!oslCols.some((c) => c.name === "recipient_email")) {
+      db.exec(`ALTER TABLE outreach_sent_log ADD COLUMN recipient_email TEXT`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_recipient_email ON outreach_sent_log(recipient_email)`);
+    // Which platform the send belonged to. The table serves TWO purposes that the
+    // original schema conflated, and they want opposite scopes:
+    //   • the 60-day cold-outreach cooldown (routes/crm.ts) is keyed on the
+    //     recipient EMAIL and must stay CROSS-PLATFORM — mailing the same human
+    //     as "Rett fra Bonden" on Monday and "Opplevagent" on Wednesday is spam
+    //     however clean our data model is.
+    //   • the outreach_ready_pool exclusion is keyed on the RFB agent and must be
+    //     RFB-ONLY — an Opplevagent send must never drop a producer out of RFB
+    //     outreach.
+    // Without this column the two cannot be told apart, and any fix for one
+    // breaks the other. (Measured: guarding the WRITE fixed the pool and silently
+    // deleted the cooldown for every non-rfb vertical — review B2.)
+    if (!oslCols.some((c) => c.name === "vertical_id")) {
+      db.exec(`ALTER TABLE outreach_sent_log ADD COLUMN vertical_id TEXT NOT NULL DEFAULT 'rfb'`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_vertical ON outreach_sent_log(vertical_id)`);
+  } catch (err) {
+    console.error("Migration outreach_sent_log failed:", err);
+  }
+
+  // ─── PR-38: auto-record marketing sends to outreach_sent_log ─────────────
+  //
+  // PROBLEM: outreach_sent_log had no live-path writer. The marketing agent
+  // calls /admin/crm/ingest after each Resend send (category:"innkommende",
+  // threadId:"marketing-batch-eN-<producerId>"). That INSERT fires into
+  // crm_messages with delivery_status='sent' (the column default). Without
+  // this trigger the outreach_ready_pool VIEW's NOT EXISTS gate never sees the
+  // send, so the same producer leaks back into the pool on the next batch.
+  //
+  // DESIGN NOTE (v2, P0-2026-07-11): the original trigger identified marketing
+  // sends ONLY by the threadId prefix "marketing-batch-%". That discriminator
+  // silently broke when the marketing agent's phase-2 send loop switched to
+  // POST /admin/crm/compose (marketing-comms-agent-email-verification-addendum),
+  // which creates compose-<uuid> threads. Those sends never matched the prefix
+  // → never landed in outreach_sent_log → the outreach_ready_pool VIEW never
+  // excluded them → the same producer was re-sent every morning (Beiarmat 3
+  // days in a row; 91 recipients ≥2 days, July 2026).
+  //
+  // FIX: discriminate on SHAPE, not thread-id format. A cold outreach is an
+  // out/sent message on a thread with NO inbound message. That captures BOTH
+  // marketing-batch-* (Resend/ingest) AND compose-* (compose UI/agent) cold
+  // outreach, while excluding CS replies (which always sit on a thread that has
+  // an inbound). We also record recipient_email (LOWER(cc.email)) so the pool
+  // gate can suppress by the immutable email key even when agent_id churns.
+  //
+  // agent_id stays NOT NULL: resolve it best-effort (cc.agent_id, else the
+  // agent_knowledge.email match used by the v2 reclassify migration below). If
+  // no agent resolves, the recipient is not in our catalog / pool anyway, so
+  // skipping the row is safe.
+  //
+  // Idempotent: DROP old + CREATE IF NOT EXISTS. Dedup guard: NOT EXISTS on
+  // message_id. Origin: orchestrator PR-38 (2026-06-21); v2 P0 fix 2026-07-11.
+  try {
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_marketing_send_to_outreach_sent_log`);
+    // The v2 triggers are DROPped before being recreated, not merely guarded by
+    // IF NOT EXISTS. Without the drop, editing the body below has NO EFFECT on
+    // any database that already carries the trigger — i.e. on production — and
+    // the change would look applied while the old definition kept running. That
+    // is exactly how a migration can pass review and do nothing.
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_to_sent_log_v2`);
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_to_sent_log_v2
+        AFTER INSERT ON crm_messages
+        FOR EACH ROW
+        WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
+        BEGIN
+          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+          SELECT
+            COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ),
+            LOWER(cc.email),
+            COALESCE(NEW.sent_at, datetime('now')),
+            'email',
+            NEW.id,
+            'auto:cold_outreach_v2',
+            NEW.vertical_id
+          FROM crm_threads ct
+          JOIN crm_contacts cc ON cc.id = ct.contact_id
+          WHERE ct.id = NEW.thread_id
+            AND cc.email IS NOT NULL AND cc.email != ''
+            AND COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ) IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM crm_messages m2
+              WHERE m2.thread_id = NEW.thread_id AND m2.direction = 'in'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM outreach_sent_log o WHERE o.message_id = NEW.id
+            );
+        END
+    `);
+  } catch (err) {
+    console.error("Migration trg_log_cold_outreach_to_sent_log_v2 failed:", err);
+  }
+
+  // ─── v2b (P0-2026-07-11): also record on the queued→sent CONFIRM path ─────
+  //
+  // CRITICAL companion to the AFTER INSERT trigger above. The marketing agent's
+  // phase-2 loop sends via POST /admin/crm/compose, which inserts the crm_message
+  // as delivery_status='queued' and only flips it to 'sent' via a LATER UPDATE
+  // (updateMessageDeliveryStatus) once Resend confirms. An AFTER INSERT trigger
+  // with WHEN NEW.delivery_status='sent' therefore NEVER fires for compose sends
+  // — the row is 'queued' at insert time. Without this AFTER UPDATE trigger the
+  // v2 fix would only close historical sends (via the backfill) while every
+  // FUTURE compose send would still leak. The marketing-batch/ingest path inserts
+  // directly as 'sent' (AFTER INSERT covers it); this covers the compose path.
+  //
+  // Fires only on the transition INTO 'sent' (OLD.delivery_status != 'sent') so a
+  // no-op UPDATE can't re-run it; the message_id dedup guard makes a double-fire
+  // across both triggers a no-op anyway.
+  try {
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_cold_outreach_on_send_confirm_v2`);
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_on_send_confirm_v2
+        AFTER UPDATE OF delivery_status ON crm_messages
+        FOR EACH ROW
+        WHEN NEW.direction = 'out'
+          AND NEW.delivery_status = 'sent'
+          AND (OLD.delivery_status IS NULL OR OLD.delivery_status != 'sent')
+        BEGIN
+          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+          SELECT
+            COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ),
+            LOWER(cc.email),
+            COALESCE(NEW.sent_at, datetime('now')),
+            'email',
+            NEW.id,
+            'auto:cold_outreach_confirm_v2',
+            NEW.vertical_id
+          FROM crm_threads ct
+          JOIN crm_contacts cc ON cc.id = ct.contact_id
+          WHERE ct.id = NEW.thread_id
+            AND cc.email IS NOT NULL AND cc.email != ''
+            AND COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ) IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM crm_messages m2
+              WHERE m2.thread_id = NEW.thread_id AND m2.direction = 'in'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM outreach_sent_log o WHERE o.message_id = NEW.id
+            );
+        END
+    `);
+  } catch (err) {
+    console.error("Migration trg_log_cold_outreach_on_send_confirm_v2 failed:", err);
+  }
+
+  // ─── PR-38: backfill existing marketing sends into outreach_sent_log ─────
+  //
+  // One-time idempotent backfill: find every crm_messages row that is an
+  // out/sent message on a marketing-batch thread whose agent_id is resolvable
+  // and is NOT yet in outreach_sent_log, and insert it.
+  //
+  // "marketing-batch-" threadId prefix is the canonical discriminator (see
+  // trigger comment above). We log each row count so the boot log shows
+  // whether legacy sends were picked up.
+  //
+  // Guarded by the migrations table — runs exactly once per DB file.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRanBackfill = db.prepare("SELECT 1 FROM migrations WHERE name = 'backfill_marketing_sends_to_sent_log_v1'").get();
+    if (!alreadyRanBackfill) {
+      const backfillResult = db.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id, notes)
+        SELECT cc.agent_id,
+               COALESCE(m.sent_at, datetime('now')),
+               'email',
+               m.id,
+               'backfill:marketing_crm_send_v1'
+        FROM crm_messages m
+        JOIN crm_threads ct ON ct.id = m.thread_id
+        JOIN crm_contacts cc ON cc.id = ct.contact_id
+        WHERE m.direction = 'out'
+          AND m.delivery_status = 'sent'
+          AND ct.id LIKE 'marketing-batch-%'
+          AND cc.agent_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM outreach_sent_log o WHERE o.message_id = m.id
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_marketing_sends_to_sent_log_v1')").run();
+      if (backfillResult.changes > 0) {
+        console.log(`[PR-38] Migration backfill_marketing_sends_to_sent_log_v1: inserted ${backfillResult.changes} row(s) into outreach_sent_log`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_marketing_sends_to_sent_log_v1 failed:", err);
+  }
+
+  // ─── v2: reclassify contacts via agent_knowledge.email + backfill sent log ─
+  //
+  // PROBLEM: classifyEmail() only matched agents.contact_email. Marketing's
+  // real outreach recipient is agent_knowledge.email, which is frequently a
+  // different (often personal) address. Contacts stuck at type='unknown' with
+  // agent_id IS NULL never satisfy the PR-38 trigger's agent_id IS NOT NULL
+  // guard, so their sends never landed in outreach_sent_log and they kept
+  // reappearing in the outreach_ready_pool candidate list (confirmed live:
+  // Olestølen Mikroysteri, agent_id 53c171e2-3b18-4486-bd82-5d7c9938c789,
+  // recontacted 3 consecutive days 2026-07-01..2026-07-03 despite already
+  // having been sent to on 2026-07-01).
+  //
+  // Step 1: reclassify existing unknown/unlinked crm_contacts by matching
+  // their email against agent_knowledge.email (exact match only — see
+  // classifyEmail() 1b for why domain-matching this column would be wrong).
+  // Step 2: re-run the PR-38-style backfill so any marketing sends that were
+  // stuck behind the unresolved agent_id now get logged into
+  // outreach_sent_log, retroactively suppressing those producers from the
+  // pool.
+  //
+  // Guarded by the migrations table — runs exactly once per DB file.
+  try {
+    const alreadyRanReclassify = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email'"
+    ).get();
+    if (!alreadyRanReclassify) {
+      const reclassifyResult = db.prepare(`
+        UPDATE crm_contacts
+        SET type = 'producer',
+            agent_id = (
+              SELECT a.id
+              FROM agent_knowledge k
+              JOIN agents a ON a.id = k.agent_id
+              WHERE LOWER(k.email) = crm_contacts.email
+                AND a.is_active = 1
+              LIMIT 1
+            )
+        WHERE type = 'unknown'
+          AND agent_id IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM agent_knowledge k
+            JOIN agents a ON a.id = k.agent_id
+            WHERE LOWER(k.email) = crm_contacts.email
+              AND a.is_active = 1
+          )
+      `).run();
+      if (reclassifyResult.changes > 0) {
+        console.log(`[v2] Migration reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email: reclassified ${reclassifyResult.changes} crm_contacts row(s) to producer via agent_knowledge.email`);
+      }
+
+      const backfillKnowledgeResult = db.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id, notes)
+        SELECT cc.agent_id,
+               COALESCE(m.sent_at, datetime('now')),
+               'email',
+               m.id,
+               'backfill:marketing_crm_send_agent_knowledge_email_v1'
+        FROM crm_messages m
+        JOIN crm_threads ct ON ct.id = m.thread_id
+        JOIN crm_contacts cc ON cc.id = ct.contact_id
+        WHERE m.direction = 'out'
+          AND m.delivery_status = 'sent'
+          AND ct.id LIKE 'marketing-batch-%'
+          AND cc.agent_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM outreach_sent_log o WHERE o.message_id = m.id
+          )
+      `).run();
+      if (backfillKnowledgeResult.changes > 0) {
+        console.log(`[v2] Migration reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email: inserted ${backfillKnowledgeResult.changes} row(s) into outreach_sent_log`);
+      }
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email')").run();
+    }
+  } catch (err) {
+    console.error("Migration reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email failed:", err);
+  }
+
+  // ─── v3 (P0-2026-07-11): backfill recipient_email + missing compose- sends ──
+  //
+  // Two idempotent steps, guarded by the migrations table:
+  //   Step 1 — populate recipient_email on existing outreach_sent_log rows
+  //            (the ~363 legacy marketing-batch rows have it NULL) from the
+  //            crm_message they reference; fall back to agent_knowledge.email.
+  //   Step 2 — retroactively log every historical COLD outreach (out/sent on a
+  //            no-inbound thread) that is NOT yet in outreach_sent_log — this is
+  //            the ~127 July compose-<uuid> sends that leaked past the old
+  //            marketing-batch-% trigger. Same shape-discriminator + email key
+  //            as the v2 trigger above, so the pool VIEW excludes them at once.
+  try {
+    const alreadyRanV3 = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'backfill_recipient_email_and_compose_cold_sends_v3'"
+    ).get();
+    if (!alreadyRanV3) {
+      // Step 1a: recipient_email from the referenced crm_message's contact.
+      const emailFromMsg = db.prepare(`
+        UPDATE outreach_sent_log
+        SET recipient_email = (
+          SELECT LOWER(cc.email)
+          FROM crm_messages m
+          JOIN crm_threads ct ON ct.id = m.thread_id
+          JOIN crm_contacts cc ON cc.id = ct.contact_id
+          WHERE m.id = outreach_sent_log.message_id
+            AND cc.email IS NOT NULL AND cc.email != ''
+        )
+        WHERE recipient_email IS NULL AND message_id IS NOT NULL
+      `).run();
+      // Step 1b: fallback via agent_knowledge.email for rows still NULL.
+      const emailFromKnowledge = db.prepare(`
+        UPDATE outreach_sent_log
+        SET recipient_email = (
+          SELECT LOWER(k.email) FROM agent_knowledge k
+          WHERE k.agent_id = outreach_sent_log.agent_id
+            AND k.email IS NOT NULL AND k.email != ''
+          LIMIT 1
+        )
+        WHERE recipient_email IS NULL
+      `).run();
+      // Step 2: backfill missing cold outreach (compose-* etc.) by shape.
+      const composeBackfill = db.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes, vertical_id)
+        SELECT
+          COALESCE(
+            cc.agent_id,
+            (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+              WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+          ),
+          LOWER(cc.email),
+          COALESCE(m.sent_at, datetime('now')),
+          'email',
+          m.id,
+          'backfill:cold_outreach_v3',
+          m.vertical_id
+        FROM crm_messages m
+        JOIN crm_threads ct ON ct.id = m.thread_id
+        JOIN crm_contacts cc ON cc.id = ct.contact_id
+        WHERE m.direction = 'out'
+          AND m.delivery_status = 'sent'
+          AND cc.email IS NOT NULL AND cc.email != ''
+          AND COALESCE(
+            cc.agent_id,
+            (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+              WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+          ) IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_messages m2
+            WHERE m2.thread_id = m.thread_id AND m2.direction = 'in'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM outreach_sent_log o WHERE o.message_id = m.id
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_recipient_email_and_compose_cold_sends_v3')").run();
+      const touched = (emailFromMsg.changes || 0) + (emailFromKnowledge.changes || 0);
+      if (touched > 0 || composeBackfill.changes > 0) {
+        console.log(`[v3-P0] backfill recipient_email: ${touched} row(s) filled; compose/cold backfill inserted ${composeBackfill.changes} missing send(s) into outreach_sent_log`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_recipient_email_and_compose_cold_sends_v3 failed:", err);
+  }
+
+
+  // outreach_ready_pool VIEW — the list marketing will read once
+  // WO #9 switches over. Filtered by:
+  //   - non-null email
+  //   - verification_status = 'verified'
+  //   - enrichment_status = 'rich'
+  //   - never sent through the new pipeline (outreach_sent_log)
+  // NOTE: agents.removed_at does not exist yet (Phase 5.10) — using
+  // 1=1 as placeholder so the VIEW resolves on prod today.
+  //
+  // ─── dev-request 2026-07-30-outreach-gate-tynne-profiler ───
+  // Was `enrichment_status IN ('partial', 'rich')`. `partial` profiles are
+  // half-empty by computeEnrichmentStatus's own definition (lokal-agent-
+  // verifier.ts) — an outreach email pointing a producer at their own thin
+  // profile burns the first impression with exactly the producers we want.
+  // Tightened to `= 'rich'` only. Deliberately the simplest lever (Daniel,
+  // 2026-07-30): one condition, enforced at the same single choke point as
+  // the rest of the gate, no new mechanism. Pool size drops as a direct,
+  // expected consequence — the bottleneck moves to enrichment, which is
+  // exactly where dev-request 2026-07-29-blacklist-backfill-og-
+  // berikelsestriage (slice 3) is already refilling it with `rich` profiles.
+  try {
+    db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
+    // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
+    // Two extra conditions vs. the original WO #7 view:
+    //   - url_last_status BETWEEN 200 AND 399  → URL was reachable last probe
+    //   - url_last_probed > now-30d            → probe is fresh
+    // Together: an agent whose URL has not been probed in 30d, OR whose last
+    // probe returned 4xx/5xx/0, is silently dropped from the marketing pool
+    // until lokal-agent-verifier re-probes successfully.
+    db.exec(`
+      CREATE VIEW outreach_ready_pool AS
+      SELECT
+        a.id AS agent_id,
+        a.name,
+        a.role,
+        a.city AS location_city,
+        k.email,
+        k.phone,
+        k.verification_status,
+        k.enrichment_status,
+        k.outreach_eligible_at,
+        k.last_verified_at,
+        k.url_last_probed,
+        k.url_last_status
+      FROM agents a
+      INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE
+        k.email IS NOT NULL
+        AND k.email != ''
+        AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
+        AND k.verification_status = 'verified'
+        AND k.enrichment_status = 'rich'
+        AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
+        AND k.url_last_status IS NOT NULL
+        AND k.url_last_status >= 200
+        AND k.url_last_status < 400
+        AND k.url_last_probed IS NOT NULL
+        AND k.url_last_probed > datetime('now', '-30 days')
+        /* P0-2026-07-11: email-keyed OR agent_id-keyed exclusion. Matching on
+           recipient_email (the immutable address we emailed) makes suppression
+           survive agent_id churn / duplicate producer rows — the same robust
+           key the blocklist uses. agent_id kept for legacy rows lacking a
+           recipient_email backfill. */
+        AND NOT EXISTS (
+          SELECT 1 FROM outreach_sent_log o
+          /* Platform scope (dev-request 2026-07-27-crm-plattformadskillelse, steg 3
+             precondition). This pool is the RFB outreach pool — its rows are agents
+             in the RFB catalogue. An Opplevagent send resolves to the same producer
+             by EMAIL, so without this line it would drop them out of RFB outreach
+             for good: a silent under-send, where nothing errors and the producer
+             simply stops being contacted.
+             The 60-day cooldown in routes/crm.ts is deliberately NOT scoped this
+             way — see the comment on outreach_sent_log.vertical_id. Suppressing a
+             POOL is per-platform bookkeeping; not cold-mailing the same human twice
+             is a courtesy that does not care which brand is on the envelope. */
+          WHERE o.vertical_id = 'rfb'
+            AND (o.agent_id = a.id
+                 OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email)))
+        )
+    `);
+  } catch (err) {
+    console.error("Migration outreach_ready_pool VIEW failed:", err);
+  }
+
+  // Phase 5.1 backfill — populate field_provenance for existing rows
+  // from data_source + auto_sources. Tier-B confidence (0.7) since
+  // these were enriched before per-field provenance existed.
+  try {
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'phase51_backfill_provenance_v1'"
+    ).get();
+    if (!alreadyRan) {
+      const rows = db.prepare(`
+        SELECT agent_id, address, phone, email, about, products,
+               opening_hours, specialties, certifications,
+               data_source, auto_sources, last_enriched_at
+        FROM agent_knowledge
+        WHERE field_provenance = '{}' OR field_provenance IS NULL
+      `).all() as any[];
+      const trackable = ['address','phone','email','about','products','opening_hours','specialties','certifications'];
+      const upd = db.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?");
+      let touched = 0;
