@@ -551,12 +551,25 @@ export function maskEmail(email: string): string {
 }
 
 // ── Rate limiting ─────────────────────────────────────────────────────────
+// created_at is stored as an ISO-8601 string (now.toISOString(), e.g.
+// "2026-08-06T13:20:00.000Z" — see issueClaimMagicLink below), while
+// datetime('now', ...) produces SQLite's own native format (e.g.
+// "2026-08-06 16:41:17", space separator, no milliseconds/Z). Both columns
+// are TEXT, so comparing created_at directly against datetime('now', ...)
+// is a plain string comparison: the date prefixes match but 'T' (0x54) >
+// ' ' (0x20), so EVERY claim from the current UTC calendar day sorted as
+// ">= now - 1h" regardless of actual time — the rate limit degraded to "3
+// per UTC day" instead of "3 per rolling hour". Wrapping created_at in
+// datetime() too routes BOTH sides through SQLite's own date normalization
+// (verified empirically against both the legacy ISO-with-milliseconds-and-
+// Z format already in the table and SQLite's native format — no data
+// migration needed, old rows are handled correctly as-is).
 export function isClaimRateLimited(providerId: string): boolean {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
       `SELECT COUNT(*) as count FROM gardssalg_claims
-       WHERE provider_id = ? AND created_at >= datetime('now', '-' || ? || ' hours')`,
+       WHERE provider_id = ? AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`,
     )
     .get(providerId, CLAIM_RATE_LIMIT_WINDOW_HOURS) as { count: number };
   return row.count >= CLAIM_RATE_LIMIT_MAX_PER_WINDOW;
