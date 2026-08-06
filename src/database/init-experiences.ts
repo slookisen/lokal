@@ -867,6 +867,27 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_gardssalg_claims_token ON gardssalg_claims(token)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_provider ON gardssalg_claims(provider_id)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_created ON gardssalg_claims(provider_id, created_at)`);
+
+    // dev-request 2026-08-06-claim-post-adresse-leveringssjekk: MX-liveness
+    // cache for the domains behind the `post@<domain>` convention address.
+    //
+    // A cache rather than a live lookup on the claim path, deliberately: the
+    // claim entry page is UNAUTHENTICATED, so a per-pageview DNS lookup would
+    // be both a latency source and a DNS-amplification vector. Population is
+    // out-of-band (admin sweep); the claim path only ever does a local read.
+    //
+    // Only DEFINITIVE results are stored — has_mx=1 (resolved, has MX) or
+    // has_mx=0 (resolved NXDOMAIN / no MX records). An inconclusive lookup
+    // (timeout, SERVFAIL) writes NOTHING, so an absent row means "unknown",
+    // which the claim path treats as non-disqualifying. A DNS blip must never
+    // become a claim denial.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_domain_mx_cache (
+        domain TEXT PRIMARY KEY,
+        has_mx INTEGER NOT NULL,
+        checked_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
   } catch (e) {
     console.log(`[experiences] gardssalg_claims init skipped: ${(e as Error).message}`);
   }

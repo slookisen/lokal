@@ -326,6 +326,8 @@ import {
   getClaimProviderById,
   isClaimableDomain,
   backfillGardssalgOwnerLockProvenance,
+  refreshDomainMxCache,
+  isHjemmesideOwnershipVerified,
 } from "../services/gardssalg-claim";
 import { normalizeDomain } from "../services/blocklist-service";
 import { emailService } from "../services/email-service";
@@ -4700,6 +4702,50 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
     // /kategori/gardssalg/eier/:providerId/request route's response.
     verify_url: verifyUrl,
   });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg/mx-refresh   (admin) ────────────
+//
+// dev-request 2026-08-06-claim-post-adresse-leveringssjekk.
+//
+// Populates gardssalg_domain_mx_cache for the domains behind the invented
+// `post@<domain>` claim address. Deliberately an ADMIN, out-of-band sweep and
+// not a lookup on the claim entry page: that page is unauthenticated, so a
+// per-pageview DNS query would be both a latency source and a DNS-
+// amplification vector. The claim path only ever reads this cache.
+//
+// Only providers that could actually yield a post@ candidate are swept
+// (ownership-verified hjemmeside + claimable domain) — the same two rules
+// deriveOrgLinkedEmailCandidates() applies — so the sweep never resolves
+// domains no claim would ever use.
+router.post("/admin/gardssalg/mx-refresh", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(Math.max(Number((req.body ?? {}).limit) || 200, 1), 1000);
+    const rows = getExperiencesDbHandle("experiences")
+      .prepare(
+        `SELECT id, hjemmeside, content_source, field_provenance
+           FROM experience_providers
+          WHERE kategori = 'gardssalg' AND brreg_verified = 1
+            AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          LIMIT ?`,
+      )
+      .all(limit) as Array<{ id: string; hjemmeside: string; content_source: string | null; field_provenance: string | null }>;
+
+    const seen = new Set<string>();
+    const counts = { has_mx: 0, no_mx: 0, inconclusive: 0 };
+    for (const r of rows) {
+      if (!isHjemmesideOwnershipVerified(r)) continue;
+      const domain = normalizeDomain(r.hjemmeside);
+      if (!domain || !isClaimableDomain(domain) || seen.has(domain)) continue;
+      seen.add(domain);
+      counts[await refreshDomainMxCache(domain)]++;
+    }
+
+    return res.json({ success: true, domains_checked: seen.size, ...counts });
+  } catch (err) {
+    console.error("[opplevelser] mx-refresh error:", err);
+    return res.status(500).json({ success: false, error: "internal_error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-contact-backfill (admin) ─────────

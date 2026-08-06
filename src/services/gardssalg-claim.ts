@@ -339,6 +339,107 @@ export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefin
 }
 
 /**
+ * How stale a cached MX verdict may be before it stops counting. A domain
+ * that lost (or gained) mail hosting months ago should not keep disqualifying
+ * (or rescuing) a producer forever on the strength of one old lookup.
+ */
+export const MX_CACHE_MAX_AGE_DAYS = 30;
+
+/**
+ * dev-request 2026-08-06-claim-post-adresse-leveringssjekk.
+ *
+ * True ONLY when we have a definitive, current reason to believe
+ * `post@<domain>` cannot receive mail:
+ *   - the MX cache holds a fresh has_mx=0 verdict (domain resolved, no MX), OR
+ *   - `post@<domain>` appears in email_bounces (we sent, it bounced).
+ *
+ * Everything else — no cache row, a stale row, an inconclusive lookup that was
+ * deliberately never cached, a DB error — returns FALSE, i.e. "not proven
+ * undeliverable", so the candidate survives. This asymmetry is the whole
+ * safety property: a DNS blip or an empty cache must never silently lock a
+ * legitimate producer out of claiming their own profile. Only evidence
+ * removes a candidate; absence of evidence never does.
+ *
+ * Sync (local DB reads only) so the pure candidate-derivation above keeps its
+ * no-IO contract and callers stay synchronous. The DNS lookup that populates
+ * the cache runs out-of-band — see refreshDomainMxCache().
+ */
+export function isPostAddressUndeliverable(domain: string | null | undefined): boolean {
+  const d = (domain || "").trim().toLowerCase();
+  if (!d) return false;
+
+  try {
+    const row = getDb(VERTICAL)
+      .prepare(
+        `SELECT has_mx FROM gardssalg_domain_mx_cache
+         WHERE domain = ? AND datetime(checked_at) >= datetime('now', '-' || ? || ' days')`,
+      )
+      .get(d, MX_CACHE_MAX_AGE_DAYS) as { has_mx: number } | undefined;
+    if (row && row.has_mx === 0) return true;
+  } catch {
+    // Cache table missing or unreadable — treat as unknown, never as a denial.
+  }
+
+  try {
+    const db = _rfbDbOverrideForTesting ?? getRfbDb();
+    const bounced = db
+      .prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? LIMIT 1`)
+      .get(`post@${d}`);
+    if (bounced) return true;
+  } catch {
+    // Same rule: an unavailable bounce table is not evidence of anything.
+  }
+
+  return false;
+}
+
+/**
+ * Populates the MX cache for one domain. Async (real DNS), so it is called
+ * ONLY from out-of-band/admin paths — never from the unauthenticated claim
+ * entry page, which would make that page both slow and a DNS-amplification
+ * vector.
+ *
+ * Writes a row ONLY for a definitive answer:
+ *   - MX records found            -> has_mx = 1
+ *   - NXDOMAIN / NODATA / no MX   -> has_mx = 0
+ * Any other failure (timeout, SERVFAIL, EAI_AGAIN, …) is inconclusive and
+ * writes NOTHING, leaving the domain "unknown" rather than recording a
+ * transient network problem as a permanent verdict against a producer.
+ *
+ * Returns what it decided, so a sweep can report counts.
+ */
+export async function refreshDomainMxCache(domain: string): Promise<"has_mx" | "no_mx" | "inconclusive"> {
+  const d = (domain || "").trim().toLowerCase();
+  if (!d) return "inconclusive";
+
+  const dns = await import("dns");
+  let verdict: "has_mx" | "no_mx" | "inconclusive";
+  try {
+    const records = await dns.promises.resolveMx(d);
+    verdict = records && records.length > 0 ? "has_mx" : "no_mx";
+  } catch (err: any) {
+    // ENOTFOUND (NXDOMAIN) and ENODATA (resolves, but no MX) are real answers:
+    // this domain does not take mail. Anything else is a failure to find out.
+    verdict = err?.code === "ENOTFOUND" || err?.code === "ENODATA" ? "no_mx" : "inconclusive";
+  }
+
+  if (verdict === "inconclusive") return verdict;
+
+  try {
+    getDb(VERTICAL)
+      .prepare(
+        `INSERT INTO gardssalg_domain_mx_cache (domain, has_mx, checked_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(domain) DO UPDATE SET has_mx = excluded.has_mx, checked_at = excluded.checked_at`,
+      )
+      .run(d, verdict === "has_mx" ? 1 : 0);
+  } catch (e) {
+    console.error(`[gardssalg-claim] refreshDomainMxCache: could not cache verdict for ${d}:`, e);
+  }
+  return verdict;
+}
+
+/**
  * Derive the ONE email address a claim magic-link may be sent to, or
  * "not eligible" (-> manual fallback, never self-service). Pure function —
  * no DB/IO — so the decision logic is fully unit-testable without a fixture
@@ -378,7 +479,7 @@ export function deriveOrgLinkedEmailCandidates(
     epost?: string | null;
   },
   brregContactEmail?: string | null,
-  opts: { epostOutreachDeliveredNoBounce?: boolean } = {},
+  opts: { epostOutreachDeliveredNoBounce?: boolean; postAddressUndeliverable?: boolean } = {},
 ): OrgLinkedEmailCandidate[] {
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   if (!brregOk) return [];
@@ -411,7 +512,21 @@ export function deriveOrgLinkedEmailCandidates(
   // unvetted domain.
   if (isHjemmesideOwnershipVerified(provider)) {
     const domain = normalizeDomain(provider.hjemmeside);
-    if (isClaimableDomain(domain)) {
+    // dev-request 2026-08-06-claim-post-adresse-leveringssjekk: `post@` here
+    // is a CONVENTION address this codebase invents from the verified domain
+    // — it is never harvested or registered anywhere, so unlike every other
+    // tier we have no evidence the mailbox exists. Measured 2026-08-06 across
+    // all 10 then-eligible producers: only ONE actually publishes `post@` at
+    // the domain we derive it from. So when we have a DEFINITIVE signal that
+    // this address cannot receive mail (domain resolved with no MX, or the
+    // address has bounced before), drop the candidate rather than send into a
+    // void and report success. Falls through to the manual-verification path,
+    // exactly like a provider with no qualifying address at all.
+    //
+    // Purity contract unchanged: the caller does the lookup (DB read of the
+    // MX cache + bounce table) and passes the boolean in, same as
+    // epostOutreachDeliveredNoBounce. Absent/unknown === not disqualifying.
+    if (isClaimableDomain(domain) && opts.postAddressUndeliverable !== true) {
       candidates.push({ email: `post@${domain}`, source: "verified_domain_address" });
     }
   }
@@ -508,8 +623,23 @@ export function deriveOrgLinkedEmailCandidatesWithOutreachLookup(
     epost?: string | null;
   },
   brregContactEmail?: string | null,
+  opts: { skipDeliverabilityGate?: boolean } = {},
 ): OrgLinkedEmailCandidate[] {
-  const withoutOutreach = deriveOrgLinkedEmailCandidates(provider, brregContactEmail);
+  // dev-request 2026-08-06-claim-post-adresse-leveringssjekk. Computed once
+  // here and threaded through BOTH derive calls below, so the entry page and
+  // issueClaimMagicLink()'s validation can never disagree about whether the
+  // post@ candidate exists.
+  //
+  // Lazy, like the outreach lookup beside it: only consulted when a post@
+  // candidate could actually be produced, so providers that were never going
+  // to get one pay for no DB reads.
+  const postDomain = isHjemmesideOwnershipVerified(provider) ? normalizeDomain(provider.hjemmeside) : "";
+  const postAddressUndeliverable =
+    opts.skipDeliverabilityGate === true || !postDomain || !isClaimableDomain(postDomain)
+      ? false
+      : isPostAddressUndeliverable(postDomain);
+
+  const withoutOutreach = deriveOrgLinkedEmailCandidates(provider, brregContactEmail, { postAddressUndeliverable });
   const alreadyHasEpostCandidate = withoutOutreach.some((c) => c.source === "stored_epost_verified");
   if (alreadyHasEpostCandidate || !provider.epost) return withoutOutreach;
 
@@ -519,7 +649,10 @@ export function deriveOrgLinkedEmailCandidatesWithOutreachLookup(
   const epostOutreachDeliveredNoBounce = wasEpostDeliveredOutreachNoBounce(provider.epost);
   if (!epostOutreachDeliveredNoBounce) return withoutOutreach;
 
-  return deriveOrgLinkedEmailCandidates(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
+  return deriveOrgLinkedEmailCandidates(provider, brregContactEmail, {
+    epostOutreachDeliveredNoBounce: true,
+    postAddressUndeliverable,
+  });
 }
 
 /** Mask an email for display ("we sent it to p***t@b*******t.no") — never
@@ -654,7 +787,17 @@ export function issueClaimMagicLink(
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   if (!brregOk) return { ok: false, error: "not_brreg_verified" };
 
-  const candidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider, brregContactEmail);
+  // dev-request 2026-08-06-claim-post-adresse-leveringssjekk: an admin TEST
+  // send (isTest) bypasses the deliverability gate. The test provider is
+  // pinned to an RFC-6761 `.invalid` domain precisely so its derived post@
+  // address can never reach a real third party — which also means it can
+  // never have MX, so the gate would otherwise disqualify the one row the
+  // whole claim test-harness (AC5/AC8 on the sibling dev-requests) depends
+  // on. Safe because an isTest send is redirected to TEST_SEND_REDIRECT_EMAIL
+  // and never delivered to the derived address at all.
+  const candidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider, brregContactEmail, {
+    skipDeliverabilityGate: opts.isTest === true,
+  });
   if (candidates.length === 0) return { ok: false, error: "no_org_linked_email" };
 
   let chosen: OrgLinkedEmailCandidate;

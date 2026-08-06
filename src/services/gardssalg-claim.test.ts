@@ -364,6 +364,58 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         [],
         "i6: generic-domain hjemmeside + a non-qualifying epost -> zero candidates, never post@facebook.com (AC7 security regression guard)",
       );
+
+      // ── dev-request 2026-08-06-claim-post-adresse-leveringssjekk ──────
+      // The pure half of the deliverability gate: postAddressUndeliverable
+      // removes ONLY the invented post@ convention candidate, and only when
+      // explicitly true. The default and the false case must be byte-for-byte
+      // what shipped before — this gate is allowed to take an address away on
+      // evidence, never to appear on its own.
+      const gatedRow = {
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
+        content_source: "manual" as const, field_provenance: null, epost: "other@klostergarden.no",
+      };
+
+      assertEq(
+        deriveOrgLinkedEmailCandidates(gatedRow, null, { postAddressUndeliverable: true }),
+        [{ email: "other@klostergarden.no", source: "stored_epost_verified" }],
+        "mx1: post@ proven undeliverable -> that candidate is dropped, the other tier survives (AC1)",
+      );
+
+      assertEq(
+        deriveOrgLinkedEmailCandidates(gatedRow, null, { postAddressUndeliverable: false }),
+        deriveOrgLinkedEmailCandidates(gatedRow),
+        "mx2: postAddressUndeliverable=false is identical to omitting it entirely (AC2/AC3 — unknown never disqualifies)",
+      );
+
+      // The gate must not be able to empty a row that never had a post@
+      // candidate to begin with, and must not touch tier (a).
+      assertEq(
+        deriveOrgLinkedEmailCandidates(
+          { org_nr: "912345678", brreg_verified: 1, hjemmeside: null, content_source: null, field_provenance: null },
+          "kontakt@brreg-source.no",
+          { postAddressUndeliverable: true },
+        ),
+        [{ email: "kontakt@brreg-source.no", source: "brreg_contact" }],
+        "mx3: the gate only ever removes verified_domain_address, never another tier",
+      );
+
+      // A row whose ONLY tier is the post@ convention address, proven
+      // undeliverable, must fall all the way through to zero candidates —
+      // i.e. the manual-verification path, not a silent send into a void.
+      assertEq(
+        deriveOrgLinkedEmailCandidates(
+          {
+            org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://kunpostadresse.no",
+            content_source: "provider_site",
+            field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://example.no/l", fetched_at: "2026-07-01T00:00:00Z" } }),
+          },
+          null,
+          { postAddressUndeliverable: true },
+        ),
+        [],
+        "mx4: post@-only row proven undeliverable -> zero candidates -> manual fallback (the whole point of the dev-request)",
+      );
     }
 
     // ── DB-backed tests ──────────────────────────────────────────────────
@@ -868,6 +920,59 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       assertEq(malformedAfter.about_text, "Ny tekst", "e26: the actual field write still succeeds despite malformed pre-existing field_provenance");
       const malformedProvenance = JSON.parse(malformedAfter.field_provenance);
       assertTrue(!!malformedProvenance.owner_locks?.about_text?.locked_at, "e27: a valid owner_locks.about_text stamp is produced even though the prior JSON was malformed (treated as empty, not clobbered/thrown)");
+
+      // ── dev-request 2026-08-06-claim-post-adresse-leveringssjekk ────────
+      // The DB half of the gate. The load-bearing property here is the
+      // ASYMMETRY: only positive evidence (a fresh no-MX verdict, or a real
+      // bounce) may disqualify. No row, a stale row, or an unreadable table
+      // must all read as "not proven undeliverable" — otherwise a DNS blip or
+      // an unpopulated cache would silently lock legitimate producers out of
+      // their own profiles, a far worse failure than the one being fixed.
+      assertTrue(
+        claimSvc.isPostAddressUndeliverable("ukjent-domene.no") === false,
+        "mx5: a domain with NO cache row is not 'undeliverable' — absence of evidence never disqualifies (AC3)",
+      );
+
+      expDb
+        .prepare(`INSERT INTO gardssalg_domain_mx_cache (domain, has_mx, checked_at) VALUES (?, 0, datetime('now'))`)
+        .run("ingen-mx.no");
+      assertTrue(
+        claimSvc.isPostAddressUndeliverable("ingen-mx.no") === true,
+        "mx6: a FRESH definitive no-MX verdict disqualifies post@<domain> (AC1)",
+      );
+
+      expDb
+        .prepare(`INSERT INTO gardssalg_domain_mx_cache (domain, has_mx, checked_at) VALUES (?, 1, datetime('now'))`)
+        .run("har-mx.no");
+      assertTrue(
+        claimSvc.isPostAddressUndeliverable("har-mx.no") === false,
+        "mx7: a domain with MX is untouched (AC2 — the 10 real producers all land here)",
+      );
+
+      // Stale verdicts stop counting: a domain that lost mail hosting a year
+      // ago must not keep disqualifying a producer on one ancient lookup.
+      expDb
+        .prepare(
+          `INSERT INTO gardssalg_domain_mx_cache (domain, has_mx, checked_at)
+           VALUES (?, 0, datetime('now', '-' || ? || ' days'))`,
+        )
+        .run("gammel-verdikt.no", claimSvc.MX_CACHE_MAX_AGE_DAYS + 1);
+      assertTrue(
+        claimSvc.isPostAddressUndeliverable("gammel-verdikt.no") === false,
+        "mx8: a STALE no-MX verdict no longer disqualifies — it reverts to unknown, not to a permanent denial",
+      );
+
+      // The bounce half: we sent to this post@ address and it came back.
+      rfbDb.prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type) VALUES (?, datetime('now'), 'hard')`)
+        .run("post@spratt-tilbake.no");
+      assertTrue(
+        claimSvc.isPostAddressUndeliverable("spratt-tilbake.no") === true,
+        "mx9: a post@ address that has bounced disqualifies the candidate (AC4 — the half MX alone cannot catch)",
+      );
+      assertTrue(
+        claimSvc.isPostAddressUndeliverable("aldri-sendt.no") === false,
+        "mx10: an address that never bounced is unaffected by the bounce check",
+      );
     } catch (err: any) {
       failed++;
       failures.push("gardssalg-claim: unexpected error: " + String(err?.stack || err?.message || err));
