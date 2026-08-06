@@ -3902,7 +3902,7 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
       ${isClaimed ? `<div class="aside-card">
         <h2 style="display:flex;align-items:center;gap:6px"><span style="color:#0f5a50">&#10003;</span> Bekreftet av eier</h2>
         <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet denne profilen via magisk lenke.</p>
-        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.86rem">Logg inn</a>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal" style="display:block;text-align:center;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.86rem">Logg inn</a>
       </div>` : `<div class="aside-card">
         <h2>Driver du dette stedet?</h2>
         <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>

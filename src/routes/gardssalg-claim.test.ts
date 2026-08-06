@@ -370,6 +370,60 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertEq(typeof statsBody.stats.humanViews, "number", "d20: stats API returns a numeric humanViews");
       assertTrue(Array.isArray(statsBody.stats.notAvailable) && statsBody.stats.notAvailable.length > 0, "d21: stats API honestly lists what's NOT available (never fabricated)");
 
+      // ── (f) dev-request 2026-08-06-claim-innlogging-sesjon: the claimed-
+      // badge's "Logg inn" link on the public producer page now points
+      // straight at .../portal instead of the entry page, so an owner with
+      // a still-valid session skips the "request a new link" round-trip.
+      // The portal route's OWN session/ownership/redirect logic (already
+      // exercised above in (d)) is exactly what makes this fix correct with
+      // zero new logic — these four cases pin that behavior end to end from
+      // the "Logg inn" link's actual target, not just the API. ───────────
+
+      // f1 (AC1): valid session for THIS producer hitting the portal
+      // directly (what the fixed link now does) -> lands in the portal,
+      // no fresh magic link needed.
+      const loginLinkOwnSession = await req(
+        "GET",
+        "/kategori/gardssalg/eier/route-test-gard/portal",
+        { headers: { Cookie: cookieHeader } },
+      );
+      assertEq(loginLinkOwnSession.status, 200, "f1: 'Logg inn' link target (.../portal) with a valid session for THIS producer -> 200, straight into the portal");
+      assertTrue(loginLinkOwnSession.body.includes("Route Test Gård"), "f1b: the portal page rendered for the right producer");
+
+      // f2 (AC2): the SAME valid session used against a DIFFERENT
+      // producer's portal URL -> 403, never bypassing the ownership check.
+      const loginLinkWrongProvider = await req(
+        "GET",
+        "/kategori/gardssalg/eier/en-annen-gard/portal",
+        { headers: { Cookie: cookieHeader } },
+      );
+      assertEq(loginLinkWrongProvider.status, 403, "f2: a valid session for producer A hitting producer B's portal URL -> 403 (ownership check preserved)");
+      assertTrue(loginLinkWrongProvider.body.includes("Ingen tilgang"), "f2b: the 403 page explains access is denied, not a silent portal render");
+
+      // f3 (AC3): no/expired session hitting the portal URL directly ->
+      // redirected to that SAME producer's entry page (not a different one,
+      // not a bare 404/500).
+      assertTrue(
+        String(portalNoAuth.headers.location || "") === "/kategori/gardssalg/eier/route-test-gard",
+        `f3: no-session portal hit redirects to this producer's OWN entry page (got ${JSON.stringify(portalNoAuth.headers.location)})`,
+      );
+
+      // f4 (AC3 cont'd): following that redirect lands on the entry page
+      // with the "Send meg tilgangslenke" request-a-link CTA still shown —
+      // current no-session behavior is unchanged by the fix.
+      const entryAfterRedirect = await req("GET", String(portalNoAuth.headers.location));
+      assertEq(entryAfterRedirect.status, 200, "f4: following the no-session redirect -> entry page, 200");
+      assertTrue(entryAfterRedirect.body.includes("Send meg tilgangslenke"), "f4b: entry page still offers to send a fresh access link");
+
+      // f5 (AC4): the owner can still deliberately reach the entry page
+      // (e.g. to log in on another device) even while already holding a
+      // valid session elsewhere — the entry page itself stays reachable and
+      // able to issue a brand-new link on request (reuses the (b) POST
+      // .../request path already proven above).
+      const deliberateEntryVisit = await req("GET", "/kategori/gardssalg/eier/route-test-gard", { headers: { Cookie: cookieHeader } });
+      assertEq(deliberateEntryVisit.status, 200, "f5: the entry page is still directly reachable (even with a valid session already held) for a deliberate re-login elsewhere");
+      assertTrue(deliberateEntryVisit.body.includes("Send meg tilgangslenke"), "f5b: it still offers 'Send meg tilgangslenke' so a new device/link can be requested on demand");
+
       // ── (e) logout really revokes ───────────────────────────────────────
       const logout = await req("POST", "/kategori/gardssalg/eier/route-test-gard/logout", { headers: { Cookie: cookieHeader } });
       assertEq(logout.status, 303, "e1: POST logout -> 303 redirect");
