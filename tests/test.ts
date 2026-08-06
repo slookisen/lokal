@@ -29066,6 +29066,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
 
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-
+    // slice 3i: wires the already-shipped isGardssalgFieldOwnerLocked()
+    // per-field owner-lock helper through applyGardssalgProviderContent's
+    // three row-level bail points (SQL auto-select, route early-skip,
+    // applyGardssalgProviderContent itself) for content_source='claim' rows
+    // — 'manual' keeps its full row-level freeze, unchanged. Same in-
+    // memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-owner-lock-content-refresh: per-field owner-lock for the content-refresh writer ──");
+    const { runOpplevelserGardssalgOwnerLockContentRefreshTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-content-refresh.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-content-refresh.test");
+    const golcr = await runOpplevelserGardssalgOwnerLockContentRefreshTests({ log: false });
+    passed += golcr.passed;
+    failed += golcr.failed;
+    for (const f of golcr.failures) failures.push("opplevelser-gardssalg-owner-lock-content-refresh: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-content-refresh: ${golcr.passed} passed, ${golcr.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 2: pure matching-logic tests for the gårdssalg producer <->
     // experience/activity cross-table conflict diagnosis

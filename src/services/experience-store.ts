@@ -2945,8 +2945,11 @@ export type GardssalgContentRefreshTarget = {
 
 /**
  * Auto-select gårdssalg providers eligible for a content-refresh: gårdssalg
- * providers (producer_type set OR rfb-seed) WITH a website, NOT locked
- * (content_source not in manual/claim), and THIN on at least one of
+ * providers (producer_type set OR rfb-seed) WITH a website, not fully locked
+ * (content_source != 'manual' — sub-slice 3i: 'claim' rows ARE now included
+ * here, since locking is gated per-field downstream in
+ * applyGardssalgProviderContent via isGardssalgFieldOwnerLocked, not by
+ * excluding the whole row at select time), and THIN on at least one of
  * about_text/visit_text/opening_hours_text. Ordered oldest-attempted first
  * (last_content_attempt_at NULLs first, same discipline as
  * selectProvidersForContentRefresh — see that function's doc comment for why
@@ -2964,7 +2967,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
-          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (content_source IS NULL OR content_source != 'manual')
           AND (
                 about_text IS NULL OR TRIM(about_text) = ''
              OR visit_text IS NULL OR TRIM(visit_text) = ''
@@ -3410,7 +3413,13 @@ export function applyGardssalgProviderContent(
       }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
+  // 3i: 'manual' rows keep the unconditional, full-row freeze (unchanged).
+  // 'claim' rows no longer bail here -- the freeze narrows to per-field below,
+  // via isGardssalgFieldOwnerLocked(row, fieldName) guarding each of the 4
+  // write branches individually (same helper PR #472/#478 already ship and
+  // review; no new policy logic added here).
+  if (row.content_source === "manual") return [];
 
   function isBlank(v: unknown): boolean {
     return v === null || v === undefined || String(v).trim() === "";
@@ -3450,54 +3459,82 @@ export function applyGardssalgProviderContent(
   // still corrupted) and only needs the audit/lock machinery below, not a
   // second opinion from a length-based heuristic that doesn't apply here.
   const forceSet = new Set(forceFields ?? []);
+  // Sub-slice 3i per-field owner-lock guard: only meaningful for
+  // content_source='claim' rows (isGardssalgFieldOwnerLocked always returns
+  // false for any other content_source, including the enrichment-derived
+  // rows this function otherwise handles) — reuses the SAME already-shipped,
+  // already-reviewed helper the hjemmeside pilot (3c) and the rollback
+  // writers (3b) already gate on. No new policy logic here, only wiring.
+  const isFieldOwnerLocked = (fieldName: string): boolean =>
+    row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, fieldName);
 
-  if (forceSet.has("about_text") && candidate.about_text?.trim()) {
-    sets.push("about_text = @about_text");
-    params.about_text = candidate.about_text.trim();
-    written.push("about_text");
-  } else if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
-    sets.push("about_text = @about_text");
-    params.about_text = candidate.about_text.trim();
-    written.push("about_text");
-  } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text, contaminatedSet.has("about_text"))) {
-    sets.push("about_text = @about_text");
-    params.about_text = candidate.about_text!.trim();
-    written.push("about_text");
+  if (!isFieldOwnerLocked("about_text")) {
+    if (forceSet.has("about_text") && candidate.about_text?.trim()) {
+      sets.push("about_text = @about_text");
+      params.about_text = candidate.about_text.trim();
+      written.push("about_text");
+    } else if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
+      sets.push("about_text = @about_text");
+      params.about_text = candidate.about_text.trim();
+      written.push("about_text");
+    } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text, contaminatedSet.has("about_text"))) {
+      sets.push("about_text = @about_text");
+      params.about_text = candidate.about_text!.trim();
+      written.push("about_text");
+    }
   }
-  if (forceSet.has("visit_text") && candidate.visit_text?.trim()) {
-    sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text.trim();
-    written.push("visit_text");
-  } else if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
-    sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text.trim();
-    written.push("visit_text");
-  } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text, contaminatedSet.has("visit_text"))) {
-    sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text!.trim();
-    written.push("visit_text");
+  if (!isFieldOwnerLocked("visit_text")) {
+    if (forceSet.has("visit_text") && candidate.visit_text?.trim()) {
+      sets.push("visit_text = @visit_text");
+      params.visit_text = candidate.visit_text.trim();
+      written.push("visit_text");
+    } else if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
+      sets.push("visit_text = @visit_text");
+      params.visit_text = candidate.visit_text.trim();
+      written.push("visit_text");
+    } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text, contaminatedSet.has("visit_text"))) {
+      sets.push("visit_text = @visit_text");
+      params.visit_text = candidate.visit_text!.trim();
+      written.push("visit_text");
+    }
   }
-  if (forceSet.has("opening_hours_text") && candidate.opening_hours_text?.trim()) {
-    sets.push("opening_hours_text = @opening_hours_text");
-    params.opening_hours_text = candidate.opening_hours_text.trim();
-    written.push("opening_hours_text");
-  } else if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
-    sets.push("opening_hours_text = @opening_hours_text");
-    params.opening_hours_text = candidate.opening_hours_text.trim();
-    written.push("opening_hours_text");
+  if (!isFieldOwnerLocked("opening_hours_text")) {
+    if (forceSet.has("opening_hours_text") && candidate.opening_hours_text?.trim()) {
+      sets.push("opening_hours_text = @opening_hours_text");
+      params.opening_hours_text = candidate.opening_hours_text.trim();
+      written.push("opening_hours_text");
+    } else if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
+      sets.push("opening_hours_text = @opening_hours_text");
+      params.opening_hours_text = candidate.opening_hours_text.trim();
+      written.push("opening_hours_text");
+    }
   }
   // Slice 5c — fill-only, re-checked against the FRESH row snapshot (not the
   // caller's possibly-stale target snapshot), same defense-in-depth
   // discipline as the rewriteFields re-check above.
-  if (candidate.products && candidate.products.length > 0 && gardssalgProductsEligible(row.products)) {
-    sets.push("products = @products");
-    params.products = JSON.stringify(candidate.products);
-    written.push("products");
+  if (!isFieldOwnerLocked("products")) {
+    if (candidate.products && candidate.products.length > 0 && gardssalgProductsEligible(row.products)) {
+      sets.push("products = @products");
+      params.products = JSON.stringify(candidate.products);
+      written.push("products");
+    }
   }
 
   if (sets.length === 0) return [];
 
-  sets.push("content_source = 'provider_site'");
+  // Sub-slice 3i fix (fresh-context review, CHANGES-REQUESTED): a still-
+  // 'claim' row must keep its content_source identity across a per-field
+  // write. Before this guard, the very first partial-field write to a claim
+  // row re-stamped content_source='provider_site' unconditionally, which
+  // would make the NEXT content-refresh run treat the row as fully
+  // unprotected (isFieldOwnerLocked/isGardssalgFieldOwnerLocked only gate
+  // when content_source === "claim") — silently unlocking every remaining
+  // field the owner explicitly locked via the claim portal. 'manual' rows
+  // never reach this function's write path (row-level bail above), and
+  // every other content_source is unaffected — this only excludes 'claim'.
+  if (row.content_source !== "claim") {
+    sets.push("content_source = 'provider_site'");
+  }
   sets.push("content_evidence_url = @evidence_url");
   sets.push("content_updated_at = datetime('now')");
   params.evidence_url = evidenceUrl;
