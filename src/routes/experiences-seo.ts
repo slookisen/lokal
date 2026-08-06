@@ -134,6 +134,7 @@ import {
   sendGuestDecisionToProducer,
   type GardssalgBooking,
   osloDatetimeLocalToUtcIso,
+  defaultBookingSlotAtDatetimeLocal,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
@@ -4053,7 +4054,7 @@ ${BROWSE_CSS}
     <form class="book-form" method="POST" action="${canonical}" id="book-form">
       <input type="hidden" name="provider_id" value="${escapeHtml(provider.id)}">
       <label for="slot_at">Dato og tid (norsk tid)</label>
-      <input id="slot_at" name="slot_at" type="datetime-local" required>
+      <input id="slot_at" name="slot_at" type="datetime-local" value="${escapeHtml(defaultBookingSlotAtDatetimeLocal())}" required>
       <label for="party_size">Antall personer</label>
       <input id="party_size" name="party_size" type="number" min="1" max="50" value="2" required>
       <label for="guest_name">Navn</label>
