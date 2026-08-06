@@ -327,9 +327,9 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
     const body = `
       <div class="gc-card">
         <h1>Er dette din bedrift?</h1>
-        ${addressChoiceHtml}
-        ${alert}
         <form id="gc-request-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(provider.id)}/request" novalidate>
+          ${addressChoiceHtml}
+          ${alert}
           <div class="gc-form-actions">
             <button type="submit" class="gc-btn gc-btn-primary">Send meg tilgangslenke</button>
             <a href="${escapeHtml(backUrl)}" class="gc-btn gc-btn-secondary">Tilbake til profilen</a>

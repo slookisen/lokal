@@ -279,6 +279,33 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertTrue(!twoChoicePage.body.includes("post@toroute.no"), "k7: the full first address never appears anywhere on the page either (AC4)");
       assertTrue(/e\*+2@g\*+\.com/.test(twoChoicePage.body), "k8: the second address IS shown, masked");
 
+      // k8a-k8c: DOM-structural check (independent review finding, PR #494) —
+      // a real browser (JS `form.querySelector(...)` AND a plain no-JS
+      // native form submit) only ever sees a field as "in the form" if it is
+      // a DESCENDANT of the <form>...</form> element, or carries a matching
+      // `form="..."` attribute. Earlier drafts of this page rendered the
+      // radios as SIBLINGS before <form> opened — every assertion above
+      // still passed (they only check the radios exist SOMEWHERE in the
+      // body), yet the picker was completely non-functional end to end: the
+      // JS handler's querySelector found nothing, and a plain form submit
+      // never included `selected` at all, so every real click on any radio
+      // still resulted in "selection_required". Assert the actual DOM
+      // nesting, not just presence, so this class of bug can't recur silently.
+      const formOpenIdx = twoChoicePage.body.indexOf('<form id="gc-request-form"');
+      const formCloseIdx = twoChoicePage.body.indexOf("</form>", formOpenIdx);
+      assertTrue(formOpenIdx >= 0 && formCloseIdx > formOpenIdx, "k8a: the request form is present and well-formed (fixture sanity check)");
+      const radioIndices: number[] = [];
+      {
+        const re = /<input type="radio" name="selected"/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(twoChoicePage.body))) radioIndices.push(m.index);
+      }
+      assertEq(radioIndices.length, 2, "k8b: found exactly 2 radio inputs to check (fixture sanity check)");
+      assertTrue(
+        radioIndices.every((idx) => idx > formOpenIdx && idx < formCloseIdx),
+        "k8c: every radio input is a DESCENDANT of <form id=\"gc-request-form\">...</form> (not a sibling before it) — the actual DOM relationship a real browser's form submission and querySelector(form, ...) depend on",
+      );
+
       // No selection at all -> selection_required, never a silent guess.
       const noSelectionResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
         headers: { "Content-Type": "application/json" },

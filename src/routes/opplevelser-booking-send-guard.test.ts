@@ -329,6 +329,21 @@ export function runOpplevelserBookingSendGuardTests(
         org_nr: "955555555", catalog_hidden: null,
       });
 
+      // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse
+      // (independent-review follow-up, PR #494): a provider that qualifies
+      // on TWO tiers, dedicated to (p17)-(p20) below — own org_nr/rate-limit
+      // window so it doesn't interact with prov-claim-admin's own count.
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, org_nr, brreg_verified, hjemmeside, content_source, catalog_hidden,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES (@id, @navn, 'experiences', @epost, @org_nr, 1, @hjemmeside, 'manual', @catalog_hidden,
+                 'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
+      ).run({
+        id: "prov-claim-admin-two", navn: "Admin Test To-Valg Gård", epost: "admin-two@example.no",
+        org_nr: "988888887", hjemmeside: "https://admin-two-gard.no", catalog_hidden: null,
+      });
+
       const bookingInput = {
         provider_id: "prov-live",
         slot_at: "2026-09-01T12:00:00.000Z",
@@ -501,6 +516,28 @@ export function runOpplevelserBookingSendGuardTests(
       assertEq(claimRateLimited.status, 429, "p14: 4th call within the window -> 429, same limit as the public route");
       assertEq(claimRateLimited.body.error, "rate_limited", "p15: with the same error code the public route returns");
       assertTrue(!("verify_url" in claimRateLimited.body), "p16: a rate-limited response carries no verify_url");
+
+      // ── (p17)-(p20) dev-request 2026-08-06-claim-produsent-velger-
+      // mottakeradresse (independent-review follow-up, PR #494): a provider
+      // qualifying on 2 tiers used to be impossible for this admin tool to
+      // test-send to at all (issueClaimMagicLink returned selection_required
+      // with no way to name a choice, mapped to the WRONG status code, 403,
+      // alongside unrelated errors) ────────────────────────────────────────
+      const claimAdminNoSelection = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two" },
+      });
+      assertEq(claimAdminNoSelection.status, 400, "p17: a 2-candidate provider with no selected_source -> 400 (not 403, distinguishable from an auth/eligibility failure)");
+      assertEq(claimAdminNoSelection.body.error, "selection_required", "p18: error body names selection_required");
+
+      const claimAdminSelected = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "stored_epost_verified" },
+      });
+      assertEq(claimAdminSelected.status, 200, "p19: the SAME provider with a valid selected_source -> 200, the admin tool can test-send to a multi-candidate provider again");
+
+      const claimAdminBadSelection = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "brreg_contact" },
+      });
+      assertEq(claimAdminBadSelection.status, 403, "p20: a selected_source that isn't one of this provider's real candidates is still rejected, not silently substituted");
 
       // ── (q) the public booking path can never produce a test booking ─────
       sent = [];
