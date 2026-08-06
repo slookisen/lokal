@@ -4667,6 +4667,17 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
     intended_recipient_masked: result.claim.maskedEmail,
     email_source: result.claim.source,
     expires_at: result.claim.expiresAt,
+    // dev-request 2026-08-03-claim-reinnlogging-kan-ikke-testes: the ONLY
+    // reliable way to test the re-login flow end-to-end on a test provider
+    // row was reading the magic-link token back out of the redirected email
+    // — found fragile (garbled/truncated) by the available email-reading
+    // tool (see that dev-request's "Probe 1"). verifyUrl is already computed
+    // above for the email body; returning it here too means an ADMIN_KEY
+    // holder gets the working re-login link directly and deterministically
+    // from this authenticated JSON response, without ever parsing an email.
+    // Admin-key-gated only — NEVER add this field to the public
+    // /kategori/gardssalg/eier/:providerId/request route's response.
+    verify_url: verifyUrl,
   });
 });
 

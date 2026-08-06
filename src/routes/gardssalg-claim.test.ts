@@ -15,7 +15,11 @@
  *       masked-email + request form for an eligible provider.
  *   (b) POST .../request issues a real gardssalg_claims row and (indirectly,
  *       via the service-level test) sends the magic link; repeated requests
- *       past the rate limit are rejected.
+ *       past the rate limit are rejected. (b5)-(b16): dev-request 2026-08-03-
+ *       claim-reinnlogging-kan-ikke-testes AC2/AC3 — this PUBLIC route never
+ *       exposes a verify_url/token, in either its JSON-fetch or its no-JS
+ *       (redirect) response shape, and a real provider's claim row stays
+ *       is_test=0.
  *   (c) GET magic-link-verify: invalid token -> redirect with error; valid
  *       token -> sets the oa_owner_session cookie and redirects to the portal.
  *   (d) session gating on every edit endpoint: no cookie -> 401/redirect;
@@ -113,6 +117,17 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
         id: "prov-route-other", navn: "En Annen Gård", slug: "en-annen-gard",
         org_nr: "922222222", brreg_verified: 1, hjemmeside: "https://enannengard.no",
         content_source: "manual", field_provenance: null,
+      });
+      // dev-request 2026-08-03-claim-reinnlogging-kan-ikke-testes AC2/AC3 —
+      // a REAL (non-test) provider dedicated to asserting the public route
+      // never leaks a verify_url/token, in both its JSON and no-JS
+      // (redirect) response shapes. Own fixture so its rate-limit window
+      // and claim-row history don't interact with any other section here.
+      insertProvider.run({
+        id: "prov-route-noleak", navn: "No Leak Gård", slug: "no-leak-gard",
+        org_nr: "944444444", brreg_verified: 1, hjemmeside: "https://no-leak-gard.no",
+        content_source: null,
+        field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/no-leak-gard", fetched_at: "2026-07-01T00:00:00Z" } }),
       });
       // stored_epost_verified (c-epost) route-level fixture: content_source=
       // 'manual', NO hjemmeside at all -- eligibility here can ONLY come
@@ -240,6 +255,50 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       await req("POST", "/kategori/gardssalg/eier/prov-route-eligible/request", { headers: { "Content-Type": "application/json" }, body: "{}" });
       const rateLimited = await req("POST", "/kategori/gardssalg/eier/prov-route-eligible/request", { headers: { "Content-Type": "application/json" }, body: "{}" });
       assertEq(rateLimited.status, 429, "b4: 4th request within the window -> 429 rate_limited");
+
+      // ── (b5)-(b10) dev-request 2026-08-03-claim-reinnlogging-kan-ikke-
+      // testes AC2/AC3: the public route NEVER exposes a verify_url/token,
+      // in either its JSON-fetch or its no-JS (redirect) response shape —
+      // and a real (non-test) provider's claim row stays is_test=0
+      // ─────────────────────────────────────────────────────────────────
+      const noLeakJson = await req("POST", "/kategori/gardssalg/eier/prov-route-noleak/request", {
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      assertEq(noLeakJson.status, 200, "b5: JSON-fetch request-magic-link for a real provider -> 200");
+      const noLeakJsonBody = JSON.parse(noLeakJson.body);
+      assertTrue(noLeakJsonBody.success === true, "b6: JSON response success=true");
+      assertTrue(
+        !("verify_url" in noLeakJsonBody) && !("token" in noLeakJsonBody),
+        "b7: AC2 — JSON response body has no verify_url/token field"
+      );
+
+      const noLeakClaimRow = expDb.prepare(
+        `SELECT token, is_test FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1`
+      ).get("prov-route-noleak") as any;
+      assertTrue(!!noLeakClaimRow?.token, "b8: a claim token was really issued (fixture sanity check)");
+      assertTrue(
+        !noLeakJson.body.includes(noLeakClaimRow.token),
+        "b9: AC2 — the actual token value appears nowhere in the JSON response body"
+      );
+      assertEq(noLeakClaimRow.is_test, 0, "b10: AC3 — a real (non-test) provider's claim row is is_test=0 via the public route");
+
+      // No-JS (plain form POST) path — no Content-Type/Accept advertising
+      // JSON, exactly like a browser without JS submitting the HTML form.
+      const noLeakForm = await req("POST", "/kategori/gardssalg/eier/prov-route-noleak/request");
+      assertEq(noLeakForm.status, 303, "b11: no-JS request-magic-link -> 303 redirect to the entry page");
+      const noLeakLocation = String(noLeakForm.headers.location || "");
+      assertTrue(noLeakLocation.startsWith("/kategori/gardssalg/eier/no-leak-gard"), "b12: redirects back to the provider's own entry page");
+      assertTrue(!noLeakLocation.includes("token"), "b13: AC2 — the redirect Location header carries no token/verify_url");
+      assertTrue(!noLeakForm.body.includes("token"), "b14: AC2 — the redirect response body carries no token/verify_url");
+      const noLeakClaimRow2 = expDb.prepare(
+        `SELECT token, is_test FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1`
+      ).get("prov-route-noleak") as any;
+      assertTrue(
+        noLeakClaimRow2.token !== noLeakClaimRow.token && !noLeakLocation.includes(noLeakClaimRow2.token) && !noLeakForm.body.includes(noLeakClaimRow2.token),
+        "b15: AC2 — the no-JS response leaks neither the earlier nor this request's actual token value anywhere (headers or body)"
+      );
+      assertEq(noLeakClaimRow2.is_test, 0, "b16: AC3 — the no-JS path's claim row is also is_test=0 (real, not a test row)");
 
       // ── (c) magic-link-verify ───────────────────────────────────────────
       const badVerify = await req("GET", "/kategori/gardssalg/eier/magic-link-verify?token=bogus");

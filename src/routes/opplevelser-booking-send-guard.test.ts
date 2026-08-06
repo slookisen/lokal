@@ -47,7 +47,11 @@
  *   (o) POST /admin/booking-test-send: happy path → is_test row, both sends
  *       redirected, response reports the intended recipients
  *   (p) POST /admin/claim-test-send: unauthenticated → 403; no redirect
- *       configured → 400 and no claim row
+ *       configured → 400 and no claim row; happy path returns a verify_url
+ *       usable for a full re-login test without reading any email (dev-
+ *       request 2026-08-03-claim-reinnlogging-kan-ikke-testes, AC1); a
+ *       second ("re-login") call returns a fresh verify_url; the existing
+ *       3/hour rate limit still applies unchanged to this admin path (AC4)
  *   (q) the public POST /book path cannot produce a test booking even when the
  *       payload screams for one
  */
@@ -287,6 +291,26 @@ export function runOpplevelserBookingSendGuardTests(
                  'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
       ).run({ id: "prov-live", navn: "Test Gård", epost: "ekte.produsent@gard.no", catalog_hidden: null });
 
+      // dev-request 2026-08-03-claim-reinnlogging-kan-ikke-testes — a
+      // DEDICATED fixture (own org_nr, own rate-limit window) for the
+      // admin claim-test-send verify_url tests in (p) below, so their
+      // call count doesn't interact with prov-live's own rate-limit use
+      // in (l). content_source='manual' + a stored epost is enough for
+      // deriveOrgLinkedEmail's stored_epost_verified tier (c-epost,
+      // adminEntered) to resolve WITHOUT an explicit brregContactEmail
+      // argument — the same call shape the admin route itself uses
+      // (issueClaimMagicLink(providerId, null, {isTest:true})).
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, org_nr, brreg_verified, content_source, catalog_hidden,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES (@id, @navn, 'experiences', @epost, @org_nr, 1, 'manual', @catalog_hidden,
+                 'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
+      ).run({
+        id: "prov-claim-admin", navn: "Admin Test Gård", epost: "admin.testrow@example.no",
+        org_nr: "955555555", catalog_hidden: null,
+      });
+
       const bookingInput = {
         provider_id: "prov-live",
         slot_at: "2026-09-01T12:00:00.000Z",
@@ -404,6 +428,61 @@ export function runOpplevelserBookingSendGuardTests(
         "p3: and NO claim row was created"
       );
       process.env.TEST_SEND_REDIRECT_EMAIL = REDIRECT;
+
+      // ── (p4)-(p7) dev-request 2026-08-03-claim-reinnlogging-kan-ikke-
+      // testes AC1: happy path returns a verify_url the operator can use
+      // directly, without ever reading the (possibly garbled) redirected
+      // email ─────────────────────────────────────────────────────────────
+      const claimHappy1 = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimHappy1.status, 200, "p4: happy-path claim-test-send -> 200");
+      assertTrue(claimHappy1.body.success === true, "p5: response success=true");
+      assertTrue(
+        typeof claimHappy1.body.verify_url === "string" && claimHappy1.body.verify_url.length > 0,
+        "p6: response carries a non-empty verify_url"
+      );
+      assertTrue(
+        claimHappy1.body.verify_url.includes("/kategori/gardssalg/eier/magic-link-verify?token="),
+        "p7: verify_url targets the magic-link-verify route"
+      );
+
+      const claimRow1 = expDb.prepare(
+        `SELECT token, is_test FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1`
+      ).get("prov-claim-admin") as any;
+      assertTrue(!!claimRow1?.token, "p8: a claim row was created (fixture sanity check)");
+      assertEq(
+        claimHappy1.body.verify_url.endsWith(`token=${claimRow1.token}`), true,
+        "p9: verify_url's token is exactly the persisted claim row's token — the one verifyClaimToken() will accept"
+      );
+      assertEq(claimRow1.is_test, 1, "p10: the admin route's claim row is always is_test=1");
+
+      // ── (p11)-(p12) AC1: a SECOND call ("re-login") returns a FRESH,
+      // independently-working verify_url — re-login can be exercised twice
+      // without ever touching email ────────────────────────────────────────
+      const claimHappy2 = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimHappy2.status, 200, "p11: second (re-login) claim-test-send call -> 200");
+      assertTrue(
+        typeof claimHappy2.body.verify_url === "string" && claimHappy2.body.verify_url !== claimHappy1.body.verify_url,
+        "p12: re-login call returns a DIFFERENT, fresh verify_url (a new token, not a reused one)"
+      );
+
+      // ── (p13)-(p16) AC4: the existing 3/hour rate-limit still applies
+      // unchanged to this admin path too (it goes through the SAME
+      // issueClaimMagicLink()/isClaimRateLimited() the public route uses) ──
+      const claimHappy3 = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimHappy3.status, 200, "p13: third call within the 3/hour window -> still 200 (limit not yet reached)");
+
+      const claimRateLimited = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimRateLimited.status, 429, "p14: 4th call within the window -> 429, same limit as the public route");
+      assertEq(claimRateLimited.body.error, "rate_limited", "p15: with the same error code the public route returns");
+      assertTrue(!("verify_url" in claimRateLimited.body), "p16: a rate-limited response carries no verify_url");
 
       // ── (q) the public booking path can never produce a test booking ─────
       sent = [];
