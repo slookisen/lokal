@@ -26,6 +26,15 @@
  *       first-seen order
  *   (f) validation: missing/empty/non-array provider_ids -> 400
  *   (g) validation: >200 ids -> 400
+ *   (h) outreach-guard (dev-request
+ *       2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds, Slice 2):
+ *       two outreach_ready fixtures sharing an exact email -> only the
+ *       first stays go:true, the second is downgraded to go:false,
+ *       reason:"duplikat_epost"; two outreach_ready fixtures with different
+ *       emails but the same non-freemail registrable domain -> same
+ *       downgrade pattern with reason:"duplikat_epost_domene"; a third
+ *       outreach_ready fixture with a unique email in the SAME batch stays
+ *       go:true, unaffected.
  */
 
 export interface TestSummary {
@@ -219,6 +228,56 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         booking_url: "https://uenighetsbutikk.no/produkt",
       });
 
+      // ── outreach-guard fixtures (dev-request 2026-07-31-gardssalg-
+      // provider-dubletter-på-tvers-av-seeds, Slice 2) — five otherwise-
+      // independent outreach_ready-tier rows (same shape as prov-ready
+      // above), used ONLY by the (h) block below so they never interfere
+      // with the tier tests (b)/(c)/(d)/(e)/(g), which use disjoint ids.
+      insertProvider.run({
+        id: "prov-dup-email-1", navn: "Duplikat Epost Gård Én", org_nr: "101010101", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@duplikatepost.no", telefon: null, hjemmeside: "https://duplikatepost-en.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
+        products: "Sider", content_source: "provider_site",
+        booking_live: 1, catalog_hidden: 0, slug: "duplikat-epost-gard-en", field_provenance: VERIFIED_PROVENANCE,
+      });
+      insertProvider.run({
+        id: "prov-dup-email-2", navn: "Duplikat Epost Gård To", org_nr: "202020202", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        // Same exact email as prov-dup-email-1 (different provider row —
+        // the cross-seed duplicate scenario this dev-request is about).
+        epost: "post@duplikatepost.no", telefon: null, hjemmeside: "https://duplikatepost-to.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 09-15",
+        products: "Cider", content_source: "provider_site",
+        booking_live: 1, catalog_hidden: 0, slug: "duplikat-epost-gard-to", field_provenance: VERIFIED_PROVENANCE,
+      });
+      insertProvider.run({
+        id: "prov-dup-domain-1", navn: "Duplikat Domene Gård Én", org_nr: "303030303", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "kontakt@duplikatdomene.no", telefon: null, hjemmeside: "https://duplikatdomene-en.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
+        products: "Sider", content_source: "provider_site",
+        booking_live: 1, catalog_hidden: 0, slug: "duplikat-domene-gard-en", field_provenance: VERIFIED_PROVENANCE,
+      });
+      insertProvider.run({
+        id: "prov-dup-domain-2", navn: "Duplikat Domene Gård To", org_nr: "404040404", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        // Different local-part, SAME non-freemail registrable domain as
+        // prov-dup-domain-1's email.
+        epost: "post@duplikatdomene.no", telefon: null, hjemmeside: "https://duplikatdomene-to.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 09-15",
+        products: "Cider", content_source: "provider_site",
+        booking_live: 1, catalog_hidden: 0, slug: "duplikat-domene-gard-to", field_provenance: VERIFIED_PROVENANCE,
+      });
+      insertProvider.run({
+        id: "prov-dup-unique", navn: "Unik Epost Gård", org_nr: "505050505", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@enda-en-gard.no", telefon: null, hjemmeside: "https://enda-en-gard.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "On-Fr 10-16",
+        products: "Most", content_source: "provider_site",
+        booking_live: 1, catalog_hidden: 0, slug: "unik-epost-gard", field_provenance: VERIFIED_PROVENANCE,
+      });
+
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // ── (a) auth gate ────────────────────────────────────────────────────
@@ -326,6 +385,48 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
       assertEq(atCapResult.status, 200, "g2: exactly 200 ids -> 200 (at the cap, not over it)");
       assertEq(atCapResult.body.results.length, 200, "g3: all 200 (nonexistent) ids come back as ikke_funnet entries");
       assertEq(atCapResult.body.summary, { go: 0, no_go: 200, total: 200 }, "g4: summary for 200 nonexistent ids is all no_go");
+
+      // ── (h) outreach-guard: cross-row dedup within a single batch ──────
+      // (dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-
+      // seeds, Slice 2). All five fixtures are independently outreach_ready
+      // in the first pass; the guard downgrades the 2nd of each colliding
+      // pair, leaves the unique one and the first-of-each-pair untouched.
+      const dedupIds = [
+        "prov-dup-email-1",
+        "prov-dup-email-2",
+        "prov-dup-domain-1",
+        "prov-dup-domain-2",
+        "prov-dup-unique",
+      ];
+      const dedup = await callRoute(opplevelserRouter, { headers: authHeaders, body: { provider_ids: dedupIds } });
+      assertEq(dedup.status, 200, "h0: outreach-guard batch -> 200");
+      assertEq(dedup.body.results.length, 5, "h0a: results has 5 entries");
+      assertEq(
+        dedup.body.results[0],
+        { provider_id: "prov-dup-email-1", name: "Duplikat Epost Gård Én", go: true, reason: null },
+        "h1: first exact-email candidate stays go:true, reason:null",
+      );
+      assertEq(
+        dedup.body.results[1],
+        { provider_id: "prov-dup-email-2", name: "Duplikat Epost Gård To", go: false, reason: "duplikat_epost" },
+        "h2: second exact-email candidate downgraded to go:false, reason:duplikat_epost",
+      );
+      assertEq(
+        dedup.body.results[2],
+        { provider_id: "prov-dup-domain-1", name: "Duplikat Domene Gård Én", go: true, reason: null },
+        "h3: first same-domain candidate stays go:true, reason:null",
+      );
+      assertEq(
+        dedup.body.results[3],
+        { provider_id: "prov-dup-domain-2", name: "Duplikat Domene Gård To", go: false, reason: "duplikat_epost_domene" },
+        "h4: second same-domain candidate downgraded to go:false, reason:duplikat_epost_domene",
+      );
+      assertEq(
+        dedup.body.results[4],
+        { provider_id: "prov-dup-unique", name: "Unik Epost Gård", go: true, reason: null },
+        "h5: unique-email candidate in the same batch stays go:true, unaffected",
+      );
+      assertEq(dedup.body.summary, { go: 3, no_go: 2, total: 5 }, "h6: summary reflects the two downgrades (3 go, 2 no_go of 5)");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-preflight: unexpected error: " + String(err?.stack || err?.message || err));

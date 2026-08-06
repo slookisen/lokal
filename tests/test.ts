@@ -28923,6 +28923,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gopf.failures) failures.push("opplevelser-gardssalg-outreach-preflight: " + f);
     console.log(`  opplevelser-gardssalg-outreach-preflight: ${gopf.passed} passed, ${gopf.failed} failed`);
 
+    // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+    // Slice 2 ("outreach-guard"): pure-function unit tests for
+    // dedupeGardssalgOutreachRecipients (no DB) — wired into POST
+    // /admin/gardssalg-outreach-preflight above via the (h) cases in
+    // opplevelser-gardssalg-outreach-preflight.test.ts.
+    console.log("\n── gardssalg-outreach-dedupe: cross-row outreach dedup guard (pure function) ──");
+    const { runGardssalgOutreachDedupeTests } = require("../src/services/gardssalg-outreach-dedupe.test") as
+      typeof import("../src/services/gardssalg-outreach-dedupe.test");
+    const good = runGardssalgOutreachDedupeTests({ log: false });
+    passed += good.passed;
+    failed += good.failed;
+    for (const f of good.failures) failures.push("gardssalg-outreach-dedupe: " + f);
+    console.log(`  gardssalg-outreach-dedupe: ${good.passed} passed, ${good.failed} failed`);
+
     // dev-request 2026-08-02-drikkesteder-hjemmeside-verifisert-kohort-
     // berikelse, Step A prerequisite: GET
     // /admin/gardssalg-verified-drinkproducer-cohort — read-only cohort of
