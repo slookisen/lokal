@@ -640,6 +640,64 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       const fourth = claimSvc.issueClaimMagicLink("prov-claimable");
       assertEq(fourth, { ok: false, error: "rate_limited" }, "b10: 4th request within the window is rate-limited");
 
+      // ── isClaimRateLimited: rolling-hour window, not UTC-calendar-day
+      // (dev-request 2026-08-06-claim-rate-limit-datetime-bug) ─────────────
+      // created_at is written as an ISO-8601 string with milliseconds/Z
+      // (new Date().toISOString() — see issueClaimMagicLink above). The old
+      // read query compared that raw TEXT directly against
+      // datetime('now', '-1 hours') (SQLite's own space-separated, no-ms/Z
+      // format) — a plain string comparison whose date PREFIX matched for
+      // any same-UTC-day row, so every claim from today counted as "within
+      // the last hour" regardless of actual time. Fixed by wrapping
+      // created_at in datetime() too, so both sides go through SQLite's own
+      // normalization. These tests use raw INSERTs with EXPLICIT created_at
+      // offsets (independent of wall-clock timing) in the SAME ISO format
+      // issueClaimMagicLink actually writes, so they also cover AC2 (old
+      // ISO-format rows, no migration needed) — b11/b12 below FAIL against
+      // the pre-fix code and PASS after the fix.
+      insertProvider.run({
+        id: "prov-ratelimit-window", navn: "Rate Limit Vindu Gård", slug: "rate-limit-vindu-gard",
+        org_nr: "990000002", brreg_verified: 1, hjemmeside: "https://ratevindu.no",
+        content_source: "manual", field_provenance: null,
+      });
+      const insertClaimAt = expDb.prepare(
+        `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, created_at, expires_at)
+         VALUES (?, 'prov-ratelimit-window', 'post@ratevindu.no', 'verified_domain_address', ?, 0, ?, datetime('now','+7 days'))`,
+      );
+
+      // b11 (AC1 + AC2 regression): three claims from 2 hours ago, stored in
+      // the legacy ISO-with-milliseconds-and-Z format — outside the 1-hour
+      // window, so none of them should count. Pre-fix, the raw string
+      // comparison counted all three as "within the last hour" (same UTC
+      // calendar day) -> isClaimRateLimited() incorrectly returned true.
+      for (let i = 0; i < 3; i++) {
+        insertClaimAt.run(
+          `gsc_rl_old_${i}`, `tok-rl-old-${i}`,
+          new Date(Date.now() - 2 * 60 * 60 * 1000 - i * 1000).toISOString(),
+        );
+      }
+      assertTrue(
+        claimSvc.isClaimRateLimited("prov-ratelimit-window") === false,
+        "b11: AC1/AC2 — three ISO-format claims from 2 hours ago do NOT count against the 1-hour window (fails pre-fix: same-UTC-day string compare counted them)",
+      );
+
+      // b12 (AC1 + AC3): add three MORE claims from inside the real rolling
+      // window (10m/5m/1m ago) — now count-within-window is 3 (the b11
+      // claims correctly still excluded) -> hits the unchanged 3-per-window
+      // threshold. Confirms recent claims DO count and the limit itself
+      // (still 3 per 1h) is unaffected by the comparison fix.
+      insertClaimAt.run("gsc_rl_recent_1", "tok-rl-recent-1", new Date(Date.now() - 10 * 60 * 1000).toISOString());
+      assertTrue(
+        claimSvc.isClaimRateLimited("prov-ratelimit-window") === false,
+        "b12a: one recent (10m-ago) claim alone is under the 3-per-window threshold",
+      );
+      insertClaimAt.run("gsc_rl_recent_2", "tok-rl-recent-2", new Date(Date.now() - 5 * 60 * 1000).toISOString());
+      insertClaimAt.run("gsc_rl_recent_3", "tok-rl-recent-3", new Date(Date.now() - 1 * 60 * 1000).toISOString());
+      assertTrue(
+        claimSvc.isClaimRateLimited("prov-ratelimit-window") === true,
+        "b12b: AC1/AC3 — three claims inside the rolling 1-hour window DO count and hit the 3-per-window limit, even though the three 2h-old same-day claims (b11) correctly do not",
+      );
+
       // ── verifyClaimToken + the lock invariant ───────────────────────────
       const invalidVerify = claimSvc.verifyClaimToken("not-a-real-token");
       assertEq(invalidVerify, { valid: false }, "c1: verifyClaimToken with a bogus token -> invalid");
