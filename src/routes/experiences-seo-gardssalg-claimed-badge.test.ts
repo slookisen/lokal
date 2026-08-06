@@ -8,8 +8,10 @@
  * Once a gårdssalg profile has been claimed (a magic link has been used at
  * least once), the "Driver du dette stedet? / Er dette din bedrift?"
  * claim-CTA card is replaced by a "Bekreftet av eier" trust badge + a
- * discreet "Logg inn" link back into the owner portal
- * (/kategori/gardssalg/eier/<slug>). This is driven by the new,
+ * discreet "Logg inn" link back into the owner portal — pointed directly at
+ * /kategori/gardssalg/eier/<slug>/portal since dev-request 2026-08-06-claim-
+ * innlogging-sesjon (previously the entry page; see a6 below). This is
+ * driven by the new,
  * PERSISTENT experience_providers.claimed_at column — set once, idempotently,
  * by verifyClaimToken() (services/gardssalg-claim.ts) the first time a magic
  * link is used, and NEVER cleared by revokeClaimToken() — as opposed to the
@@ -184,8 +186,8 @@ export function runExperiencesSeoGardssalgClaimedBadgeTests(opts: { log?: boolea
         assertTrue(r.body.includes(BADGE_MARKER), "a4: the 'Bekreftet av eier' badge is present");
         assertTrue(r.body.includes(LOGIN_MARKER), "a5: a 'Logg inn' link is present");
         assertTrue(
-          r.body.includes("/kategori/gardssalg/eier/bekreftet-gard"),
-          "a6: the 'Logg inn' link points at the owner-portal entry page for this slug",
+          r.body.includes('href="/kategori/gardssalg/eier/bekreftet-gard/portal"'),
+          "a6: the 'Logg inn' link points DIRECTLY at the owner portal for this slug (not the entry page) — dev-request 2026-08-06-claim-innlogging-sesjon, so a valid-session owner lands in the portal without a fresh magic link",
         );
         assertTrue(!r.body.includes(OLD_CTA_HEADING), "a7: the old 'Driver du dette stedet?' heading does NOT appear");
         assertTrue(!r.body.includes(OLD_CTA_BUTTON), "a8: the old 'Er dette din bedrift?' CTA button text does NOT appear");
