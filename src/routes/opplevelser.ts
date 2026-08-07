@@ -375,6 +375,7 @@ import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch, normaliseName } f
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter — kommune→fylke best-effort
 // ved landing av nye NACE-oppdagede providere.
 import { cityToFylke } from "../services/norway-fylke";
+import { resolveFylke2024 } from "../services/fylke-2024-migration";
 import {
   createBooking,
   getBookingByRef,
@@ -8797,6 +8798,175 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     });
   } catch (err) {
     console.error("[gardssalg-website-verification-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/fylke-2024-migration ───────────────────────
+//
+// dev-request 2026-08-07-orch-fylke-2024-migrasjon. Norway's fylke (county)
+// model changed in 2024: three 2020-era merged fylker split back into six
+// (see services/fylke-2024-migration.ts's own header for the full mapping).
+// This sweep finds `experiences` and `experience_providers` rows still
+// carrying one of the three stale 2020-era names — 'Viken',
+// 'Vestfold og Telemark', 'Troms og Finnmark' — and resolves each row's
+// correct 2024 fylke via resolveFylke2024() (kommunenummer-exact when
+// available, else normalized-kommune-name match; never guesses — see that
+// function's own doc comment for the needs_review cases). Every OTHER fylke
+// value (including rows already on a correct 2024 name) is left completely
+// alone — the WHERE clause below is deliberately an exact IN(...) over only
+// those three literal strings.
+//
+// Dry-run (apply omitted/false, same STRICT-true-only parse convention as
+// this file's other admin bulk levers): zero writes, scans the FULL matching
+// cohort in each table (resolveFylke2024 is a pure, local, in-memory lookup
+// — no network/DB cost per row — so unlike the gårdssalg website-
+// verification sweep above, there is no reason to page the dry-run scan
+// itself) and reports per-table {total_candidates, resolved, needs_review,
+// needs_review_samples} — samples capped at 20/table so the response stays
+// small.
+//
+// Apply (apply:true): writes the resolved fylke ONLY on `resolved` rows —
+// needs_review rows are NEVER written, exactly as scanned. Batch-capped at
+// FYLKE_2024_MIGRATION_BATCH_CAP (=200) WRITES per table per call — same
+// number/convention as this file's other full-table sweeps (see
+// HJEMMESIDE_LISTING_SWEEP_BATCH_CAP / MAX_GARDSSALG_PREFLIGHT_BATCH /
+// MAX_GARDSSALG_FIELD_CONCORDANCE_BATCH above), deterministic oldest-id-first
+// ordering so repeated calls make forward progress through a cohort larger
+// than the cap. Each write's UPDATE carries a `WHERE fylke = <the fylke
+// value seen at scan time>` re-verify guard (cheap, same statement, no extra
+// round trip) so a row already moved by a concurrent/earlier call in the
+// same batch-cap window is silently skipped rather than double-written or
+// double-audited — `written` only counts rows whose UPDATE actually changed
+// a row. Every successful write also inserts one
+// experience_fylke_2024_migration_audit row (init-experiences.ts).
+//
+// requireAdmin-gated, same as every other admin route in this file.
+const FYLKE_2024_MIGRATION_STALE_FYLKER = ["Viken", "Vestfold og Telemark", "Troms og Finnmark"] as const;
+const FYLKE_2024_MIGRATION_SAMPLE_CAP = 20;
+const FYLKE_2024_MIGRATION_BATCH_CAP = 200;
+
+interface Fylke2024MigrationCandidateRow {
+  id: string;
+  fylke: string;
+  kommune: string | null;
+  kommunenummer?: string | null;
+}
+
+interface Fylke2024MigrationTableReport {
+  table: string;
+  total_candidates: number;
+  resolved: number;
+  needs_review: number;
+  needs_review_samples: Array<{ id: string; fylke: string; reason: string }>;
+  written?: number;
+}
+
+function fylke2024MigrationStaleWhereSql(): string {
+  return `fylke IN (${FYLKE_2024_MIGRATION_STALE_FYLKER.map(() => "?").join(", ")})`;
+}
+
+function scanFylke2024MigrationTable(
+  db: ReturnType<typeof getExpDb>,
+  table: "experiences" | "experience_providers",
+): { candidates: Fylke2024MigrationCandidateRow[]; report: Fylke2024MigrationTableReport } {
+  const cols = table === "experience_providers" ? "id, fylke, kommune, kommunenummer" : "id, fylke, kommune";
+  const candidates = db
+    .prepare(
+      `SELECT ${cols} FROM ${table} WHERE ${fylke2024MigrationStaleWhereSql()} ORDER BY id ASC`
+    )
+    .all(...FYLKE_2024_MIGRATION_STALE_FYLKER) as Fylke2024MigrationCandidateRow[];
+
+  let resolved = 0;
+  const needsReviewSamples: Array<{ id: string; fylke: string; reason: string }> = [];
+  let needsReviewCount = 0;
+  for (const row of candidates) {
+    const result =
+      table === "experience_providers"
+        ? resolveFylke2024({ kommunenummer: row.kommunenummer, kommune: row.kommune })
+        : resolveFylke2024({ kommune: row.kommune });
+    if ("fylke" in result) {
+      resolved++;
+    } else {
+      needsReviewCount++;
+      if (needsReviewSamples.length < FYLKE_2024_MIGRATION_SAMPLE_CAP) {
+        needsReviewSamples.push({ id: row.id, fylke: row.fylke, reason: result.needs_review });
+      }
+    }
+  }
+
+  return {
+    candidates,
+    report: {
+      table,
+      total_candidates: candidates.length,
+      resolved,
+      needs_review: needsReviewCount,
+      needs_review_samples: needsReviewSamples,
+    },
+  };
+}
+
+router.post("/admin/fylke-2024-migration", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const tables: Array<"experiences" | "experience_providers"> = ["experiences", "experience_providers"];
+    const reports: Fylke2024MigrationTableReport[] = [];
+
+    for (const table of tables) {
+      const { candidates, report } = scanFylke2024MigrationTable(expDb, table);
+
+      if (!apply) {
+        reports.push(report);
+        continue;
+      }
+
+      const insertAudit = expDb.prepare(
+        `INSERT INTO experience_fylke_2024_migration_audit (id, table_name, row_id, old_fylke, new_fylke, batch_id)
+         VALUES (@id, @table_name, @row_id, @old_fylke, @new_fylke, @batch_id)`
+      );
+      // UPDATE ... WHERE fylke = <scan-time value> re-verifies the row is
+      // still on the stale value it was scanned with — see this route's doc
+      // comment above. Table name is one of the two literal identifiers in
+      // `tables` above, never request-controlled, so this is not a SQL
+      // injection surface.
+      const updateStmt = expDb.prepare(`UPDATE ${table} SET fylke = ? WHERE id = ? AND fylke = ?`);
+
+      let written = 0;
+      const tx = expDb.transaction(() => {
+        for (const row of candidates) {
+          if (written >= FYLKE_2024_MIGRATION_BATCH_CAP) break;
+          const result =
+            table === "experience_providers"
+              ? resolveFylke2024({ kommunenummer: row.kommunenummer, kommune: row.kommune })
+              : resolveFylke2024({ kommune: row.kommune });
+          if (!("fylke" in result)) continue; // needs_review row — never written
+          const info = updateStmt.run(result.fylke, row.id, row.fylke);
+          if (info.changes > 0) {
+            insertAudit.run({
+              id: crypto.randomUUID(),
+              table_name: table,
+              row_id: row.id,
+              old_fylke: row.fylke,
+              new_fylke: result.fylke,
+              batch_id: batchId,
+            });
+            written++;
+          }
+        }
+      });
+      tx();
+
+      reports.push({ ...report, written });
+    }
+
+    res.json({ success: true, dry_run: !apply, batch_id: batchId, tables: reports });
+  } catch (err) {
+    console.error("[fylke-2024-migration] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

@@ -98,6 +98,12 @@ import {
   type GardssalgProviderMapPoint,
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
+// dev-request 2026-08-07-orch-fylke-2024-migrasjon: the /fylke/:fylke 301
+// fallback below reuses norway-fylke.ts's own historical-alias map
+// (ALIAS_TO_CANONICAL), merged-legacy equivalence classes
+// (EQUIVALENCE_CLASSES), and fold/normalize convention (key) rather than
+// duplicating any of that data/logic — see the fallback's own doc comment.
+import { key as fylkeFoldKey, ALIAS_TO_CANONICAL, EQUIVALENCE_CLASSES } from "../services/norway-fylke";
 import { geocodingService } from "../services/geocoding-service";
 // dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
@@ -5729,6 +5735,67 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
       if (matches.length === 1 && matches[0].fylke !== fylke) {
         return res.redirect(301, `/fylke/${encodeURIComponent(matches[0].fylke)}`);
       }
+
+      // ── dev-request 2026-08-07-orch-fylke-2024-migrasjon: historical fylke
+      // name fallback — reached ONLY when both the exact match AND the
+      // fold-match above missed (a historical name has, by definition, zero
+      // live rows under its own literal string, so the fold-match above
+      // never finds it either). Two shapes, checked in this order:
+      //
+      //   1. A 1:1 historical alias (e.g. "Hordaland" → "Vestland",
+      //      "Sør-Trøndelag" → "Trøndelag") — norway-fylke.ts's
+      //      ALIAS_TO_CANONICAL map, keyed by the SAME fold/normalize
+      //      convention (key()) this file already uses for foldPlaceSlug-
+      //      style matching, so a differently-cased URL segment still
+      //      resolves (a real URL param is capitalized, e.g. "Hordaland",
+      //      never the map's lowercase key form itself). Three of
+      //      ALIAS_TO_CANONICAL's entries ("viken", "vestfoldogtelemark"/
+      //      "vestfold og telemark", "tromsogfinnmark"/"troms og finnmark")
+      //      are self-mapping placeholders for the BROAD merged names —
+      //      norway-fylke.ts's own comment says as much — so those are
+      //      explicitly excluded here and handled by branch 2 instead.
+      //   2. One of the three merged/split legacy names itself (Viken /
+      //      Vestfold og Telemark / Troms og Finnmark) — redirects to
+      //      whichever successor fylke in that EQUIVALENCE_CLASSES class
+      //      currently has the HIGHEST published count, computed LIVE from
+      //      listPublishedFylker() on every request (never a hardcoded
+      //      guess — today's winner can change as new experiences/providers
+      //      are published), alphabetically-first as the tie-break.
+      //
+      // Either branch falls through to the existing next() 404 below when
+      // its target(s) currently have zero published rows — this must never
+      // redirect a visitor into an empty page.
+      const paramKey = fylkeFoldKey(fylke);
+      const mergedLegacyNames = new Set(EQUIVALENCE_CLASSES.map((cls) => cls[0]));
+      const aliasCanonical = paramKey ? ALIAS_TO_CANONICAL[paramKey] : undefined;
+
+      if (aliasCanonical && !mergedLegacyNames.has(aliasCanonical)) {
+        const liveTarget = listPublishedFylker().find((f) => f.fylke === aliasCanonical);
+        if (liveTarget && liveTarget.count > 0) {
+          return res.redirect(301, `/fylke/${encodeURIComponent(aliasCanonical)}`);
+        }
+        return next();
+      }
+
+      const legacyClass = paramKey
+        ? EQUIVALENCE_CLASSES.find((cls) => fylkeFoldKey(cls[0]) === paramKey)
+        : undefined;
+      if (legacyClass) {
+        const liveRows = listPublishedFylker();
+        let best: { fylke: string; count: number } | null = null;
+        for (const successor of legacyClass.slice(1)) {
+          const row = liveRows.find((f) => f.fylke === successor);
+          if (!row || row.count <= 0) continue;
+          if (!best || row.count > best.count || (row.count === best.count && successor < best.fylke)) {
+            best = { fylke: successor, count: row.count };
+          }
+        }
+        if (best) {
+          return res.redirect(301, `/fylke/${encodeURIComponent(best.fylke)}`);
+        }
+        return next(); // none of this class's successors currently have any published rows
+      }
+
       return next(); // unknown/empty fylke → 404 (no orphan page)
     }
   } catch {

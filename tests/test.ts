@@ -37545,3 +37545,60 @@ runSerial(async () => {
     failures.push("experiences-wrong-content-rate: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-07-orch-fylke-2024-migrasjon: Norway's fylke (county)
+// model changed in 2024 (three 2020-era merged fylker split back into six);
+// this migrates stale 2020-era fylke values ('Viken' / 'Vestfold og
+// Telemark' / 'Troms og Finnmark') left over in experiences/
+// experience_providers rows, plus 301 redirects for historical fylke URL
+// names. Three suites: resolveFylke2024() pure-function unit tests,
+// POST /api/opplevelser/admin/fylke-2024-migration route tests, and the
+// GET /fylke/:fylke 301-fallback route tests. Tail-registered via
+// runSerial() like the suites immediately above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-07-orch-fylke-2024-migrasjon: resolveFylke2024() unit tests ──");
+  try {
+    const { runFylke2024MigrationTests } = require("../src/services/fylke-2024-migration.test") as
+      typeof import("../src/services/fylke-2024-migration.test");
+    const f24 = runFylke2024MigrationTests({ log: false });
+    passed += f24.passed;
+    failed += f24.failed;
+    for (const f of f24.failures) failures.push("fylke-2024-migration: " + f);
+    console.log(`  fylke-2024-migration: ${f24.passed} passed, ${f24.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("fylke-2024-migration: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-07-orch-fylke-2024-migrasjon: POST /admin/fylke-2024-migration route tests ──");
+  try {
+    const { runOpplevelserAdminFylke2024MigrationTests } = require("../src/routes/opplevelser-admin-fylke-2024-migration.test") as
+      typeof import("../src/routes/opplevelser-admin-fylke-2024-migration.test");
+    const af24 = await runOpplevelserAdminFylke2024MigrationTests({ log: false });
+    passed += af24.passed;
+    failed += af24.failed;
+    for (const f of af24.failures) failures.push("opplevelser-admin-fylke-2024-migration: " + f);
+    console.log(`  opplevelser-admin-fylke-2024-migration: ${af24.passed} passed, ${af24.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-admin-fylke-2024-migration: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-07-orch-fylke-2024-migrasjon: GET /fylke/:fylke historical-alias 301 fallback tests ──");
+  try {
+    const { runExperiencesSeoFylke2024RedirectTests } = require("../src/routes/experiences-seo-fylke-2024-redirect.test") as
+      typeof import("../src/routes/experiences-seo-fylke-2024-redirect.test");
+    const sr24 = await runExperiencesSeoFylke2024RedirectTests({ log: false });
+    passed += sr24.passed;
+    failed += sr24.failed;
+    for (const f of sr24.failures) failures.push("experiences-seo-fylke-2024-redirect: " + f);
+    console.log(`  experiences-seo-fylke-2024-redirect: ${sr24.passed} passed, ${sr24.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-fylke-2024-redirect: unexpected error: " + String(err?.message || err));
+  }
+});

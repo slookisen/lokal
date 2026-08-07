@@ -1105,5 +1105,37 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_provider_field_write_audit failed:", err);
   }
 
+  // ─── experience_fylke_2024_migration_audit (dev-request
+  // 2026-08-07-orch-fylke-2024-migrasjon) ─────────────────────────────────
+  // Insert-only changelog for POST /api/opplevelser/admin/fylke-2024-
+  // migration's apply path (routes/opplevelser.ts,
+  // services/fylke-2024-migration.ts): one row per WRITE the migration
+  // makes when it moves a stale 2020-era fylke value ('Viken' /
+  // 'Vestfold og Telemark' / 'Troms og Finnmark') to its resolved 2024
+  // successor on an `experiences` or `experience_providers` row. `table_name`
+  // + `row_id` (rather than a single FK column) because this ONE audit table
+  // covers writes to TWO different source tables — mirrors
+  // experience_provider_conflict_audit's/gardssalg_website_verification_
+  // audit's exact shape/indexing convention (this fleet's established
+  // reversible-write audit-trail idiom), but with no FOREIGN KEY (a single
+  // row_id column can't reference two different parent tables at once).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_fylke_2024_migration_audit (
+        id TEXT PRIMARY KEY,
+        table_name TEXT NOT NULL,
+        row_id TEXT NOT NULL,
+        old_fylke TEXT,
+        new_fylke TEXT,
+        batch_id TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_fylke_2024_migration_audit_row ON experience_fylke_2024_migration_audit(table_name, row_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_exp_fylke_2024_migration_audit_batch ON experience_fylke_2024_migration_audit(batch_id)`);
+  } catch (err) {
+    console.error("Migration experience_fylke_2024_migration_audit failed:", err);
+  }
+
   console.log("[experiences] schema initialized");
 }
