@@ -1853,6 +1853,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     provenance: GsProvenanceMap;
   }> = [];
   const skippedLocked: string[] = [];
+  // Sub-slice 3i (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+  // laas): a DISTINCT bucket from skipped_locked above — skipped_locked keeps
+  // meaning "manual row, full row-level skip, never fetched" (unchanged).
+  // owner_field_locked is for 'claim' rows that DID reach candidate
+  // generation (>=1 candidate field found this run) but ended up writing
+  // nothing because every one of those candidate fields was individually
+  // owner-locked via field_provenance.owner_locks — distinct from "no
+  // candidate found" or "already fresh", which both stay silent as today.
+  const ownerFieldLocked: Array<{ provider_id: string; fields: string[] }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
@@ -1896,8 +1905,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     }
 
     // LOCK check — from the target's own row snapshot, BEFORE any fetch, so a
-    // locked provider never touches the network at all.
-    if (t.content_source === "manual" || t.content_source === "claim") {
+    // locked provider never touches the network at all. Sub-slice 3i
+    // (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas): only
+    // 'manual' short-circuits here now — a full-row freeze, unchanged. A
+    // 'claim' row proceeds to fetch/candidate-generation as normal; the
+    // per-field owner-lock decision happens later, once candidate fields are
+    // known (see the owner_field_locked bucket below and
+    // applyGardssalgProviderContent's own per-field gate).
+    if (t.content_source === "manual") {
       skippedLocked.push(providerId);
       return;
     }
@@ -2177,9 +2192,40 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     const wouldWrite = Object.keys(wouldWriteActions);
     if (wouldWrite.length === 0) return;
 
+    // Sub-slice 3i (dev-request 2026-07-30-opplevagent-claim-epost-og-
+    // perfelt-laas): predict, from THIS target's own row snapshot (t — the
+    // same snapshot applyGardssalgProviderContent's own fresh DB read will
+    // agree with, barring a concurrent edit), which of this run's candidate
+    // fields are owner-locked. Only meaningful for content_source='claim'
+    // rows (isGardssalgFieldOwnerLocked always returns false for any other
+    // content_source). Reused by BOTH branches below: dry-run needs it to
+    // keep the preview honest (dry-run never calls
+    // applyGardssalgProviderContent, so nothing else would catch this);
+    // apply uses it only to populate the owner_field_locked report — the
+    // actual gating decision for apply is made by
+    // applyGardssalgProviderContent's own per-field guard, not by this
+    // prediction.
+    const lockedCandidateFields =
+      t.content_source === "claim"
+        ? wouldWrite.filter((f) => isGardssalgFieldOwnerLocked(t, f))
+        : [];
+
     if (dryRun) {
-      for (const f of wouldWrite) if (f in byField) byField[f] += 1;
-      changed.push({ provider_id: providerId, fields: wouldWrite, actions: wouldWriteActions, provenance });
+      const writableFields = wouldWrite.filter((f) => !lockedCandidateFields.includes(f));
+      if (writableFields.length === 0) {
+        // Every candidate field this run was owner-locked — distinct bucket,
+        // NOT skipped_locked (reserved for 'manual', row-level, never-fetched).
+        ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
+        return;
+      }
+      for (const f of writableFields) if (f in byField) byField[f] += 1;
+      const writableActions: Record<string, GsFieldAction> = {};
+      const writableProvenance: GsProvenanceMap = {};
+      for (const f of writableFields) {
+        writableActions[f] = wouldWriteActions[f];
+        if (provenance[f]) writableProvenance[f] = provenance[f];
+      }
+      changed.push({ provider_id: providerId, fields: writableFields, actions: writableActions, provenance: writableProvenance });
     } else {
       try {
         const rewriteFields: Array<"about_text" | "visit_text"> = [];
@@ -2213,6 +2259,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
             actions[f] = wouldWriteActions[f] ?? "filled";
           }
           changed.push({ provider_id: providerId, fields: written, actions, provenance });
+        } else if (lockedCandidateFields.length > 0 && lockedCandidateFields.length === wouldWrite.length) {
+          // applyGardssalgProviderContent's own per-field gate agreed with the
+          // prediction above: every candidate field for this claim row was
+          // owner-locked, so nothing was written.
+          ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
         }
       } catch (e: any) {
         errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
@@ -2235,6 +2286,10 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     by_field: byField,
     changed,
     skipped_locked: skippedLocked,
+    // Sub-slice 3i: 'claim' rows whose candidate fields were ALL owner-locked
+    // this run (0 written as a result) — additive bucket, distinct from
+    // skipped_locked (manual, row-level, never-fetched) above.
+    owner_field_locked: ownerFieldLocked,
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
