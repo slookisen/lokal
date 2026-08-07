@@ -33,6 +33,15 @@
  *                gir 409 på samtidig kall og slippes etterpå, default-limit
  *                er 8, og en frakoblet klient avbryter kjøringen i stedet
  *                for å fullføre i det stille.
+ *   cx-27..cx-31 fetchPage()-bytte + per-host cooldown (dev-request
+ *                2026-08-07-kontaktjakt-drikkeprodusenter, nedstrandbryggeri.no
+ *                sin rate-limiter): en 503 blir automatisk retried (fetchPage()s
+ *                interne ett-forsøks-retry) i stedet for umiddelbar
+ *                fetch_failed; en 429 parkerer verten i cooldown, og et senere
+ *                kall mot SAMME vert — samme kjøring eller en frisk kjøring
+ *                innenfor vinduet — hoppes over med den dedikerte
+ *                cooldown_skipped-bøtta i stedet for å bli fetchet på nytt;
+ *                en vert UTENFOR cooldown fetches som normalt.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/routes/opplevelser-gardssalg-contact-extraction.test.ts
@@ -187,8 +196,31 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
       // og en mock som 404-er alt (uten headers) er nøyaktig stub-klassen
       // tests/test.ts-headeren dokumenterer som kilde til interleaving-krasj
       // («Cannot read properties of undefined (reading 'get')»).
+      // fetchPage()-compatible: bodies read via arrayBuffer(), not .text() —
+      // fetchPage decodes the raw bytes itself (see src/services/fetch-page.ts).
+      // headers.get() defaults to null throughout (no content-type override
+      // needed, the html fixtures all carry markup so the charset-sniff falls
+      // back to utf-8; no retry-after needed outside the cooldown suite below).
       const cxMockHeaders = { get: () => null } as unknown as Headers;
       const fetchCalls: string[] = [];
+      const mkHtmlResponse = (u: string, html: string): Response =>
+        ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          url: u,
+          headers: cxMockHeaders,
+          arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+        }) as unknown as Response;
+      const mk404Response = (u: string): Response =>
+        ({
+          ok: false,
+          status: 404,
+          statusText: "Not Found",
+          url: u,
+          headers: cxMockHeaders,
+          arrayBuffer: async () => new ArrayBuffer(0),
+        }) as unknown as Response;
       globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
         const u = String(url);
         const host = (() => { try { return new URL(u).hostname; } catch { return ""; } })();
@@ -197,18 +229,17 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         }
         fetchCalls.push(u);
         if (u.startsWith("https://fjellbrygg.no/kontakt")) {
-          return { ok: true, status: 200, url: u, headers: cxMockHeaders, text: async () =>
-            '<html><body>Kontakt oss: <a href="mailto:post@fjellbrygg.no">post@fjellbrygg.no</a> — tlf 912 34 567</body></html>' } as unknown as Response;
+          return mkHtmlResponse(u,
+            '<html><body>Kontakt oss: <a href="mailto:post@fjellbrygg.no">post@fjellbrygg.no</a> — tlf 912 34 567</body></html>');
         }
         if (u === "https://fjellbrygg.no" || u === "https://fjellbrygg.no/") {
-          return { ok: true, status: 200, url: u, headers: cxMockHeaders, text: async () =>
-            '<html><body>Fjellbrygg — håndverksøl. feil@aggregator.no <a href="/kontakt">Kontakt</a></body></html>' } as unknown as Response;
+          return mkHtmlResponse(u,
+            '<html><body>Fjellbrygg — håndverksøl. feil@aggregator.no <a href="/kontakt">Kontakt</a></body></html>');
         }
         if (u.startsWith("https://delvis.no")) {
-          return { ok: true, status: 200, url: u, headers: cxMockHeaders, text: async () =>
-            "<html><body>Delvis vingård. Ring 45 67 89 01 for besøk</body></html>" } as unknown as Response;
+          return mkHtmlResponse(u, "<html><body>Delvis vingård. Ring 45 67 89 01 for besøk</body></html>");
         }
-        return { ok: false, status: 404, url: u, headers: cxMockHeaders, text: async () => "" } as unknown as Response;
+        return mk404Response(u);
       }) as unknown as typeof fetch;
 
       {
@@ -354,6 +385,87 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         assertEq(rowVeto.telefon, "91234567", "cx-26e: telefonen (aldri rullet tilbake) står fortsatt");
         const reWrites = (reRun.body.changed as any[]).filter((c) => c.provider_id === "cx-a");
         assertEq(reWrites.length, 0, "cx-26f: kjøringen rapporterer heller ingen skriving for cx-a");
+      }
+
+      // ═══ cx-27..cx-31: fetchPage() retry + per-host cooldown ═══
+      // (dev-request 2026-08-07-kontaktjakt-drikkeprodusenter: nedstrandbryggeri.no's
+      // aggressive rate-limiter 429s a dry-run and then 429s AGAIN on the very
+      // next apply against the same host. The route now fetches via the shared
+      // classified fetcher fetchPage() — src/services/fetch-page.ts — instead
+      // of the single-shot wdFetchPage(), so a transient/5xx failure is retried
+      // once transparently, and a 429 parks its host in an in-process cooldown
+      // so a later fetch to the SAME host is skipped rather than re-hammered.)
+      {
+        // Tracked SEPARATELY from `fetchCalls` (and by exact URL, not just
+        // host) so cx-29d/cx-31b below can assert a specific cooldown-parked
+        // URL was NEVER fetched at all — not merely "not seen in the outer
+        // suite's counter", which would be vacuously true regardless of
+        // whether the cooldown logic actually skipped the call.
+        let retryHostCalls = 0;
+        const newHostCalls: string[] = [];
+        const cxMockFetch2 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          const u = String(url);
+          if (u.startsWith("https://retryhost.no")) {
+            newHostCalls.push(u);
+            retryHostCalls++;
+            if (retryHostCalls === 1) {
+              return { ok: false, status: 503, statusText: "Service Unavailable", url: u, headers: cxMockHeaders, arrayBuffer: async () => new ArrayBuffer(0) } as unknown as Response;
+            }
+            return mkHtmlResponse(u, "<html><body>Retry gård. Ring 23 45 67 89 for besøk</body></html>");
+          }
+          if (u.startsWith("https://cooldownhost.no")) {
+            newHostCalls.push(u);
+            return { ok: false, status: 429, statusText: "Too Many Requests", url: u, headers: cxMockHeaders, arrayBuffer: async () => new ArrayBuffer(0) } as unknown as Response;
+          }
+          if (u.startsWith("https://normalhost.no")) {
+            newHostCalls.push(u);
+            return mkHtmlResponse(u, "<html><body>Normal gård. Ring 34 56 78 90 for besøk</body></html>");
+          }
+          return (cxMockFetch2 as typeof fetch)(url as any, init);
+        }) as unknown as typeof fetch;
+
+        ins.run({ id: "cx-retry", navn: "Retry Gard", pt: "bryggeri", hj: "https://retryhost.no", ep: null, tlf: null, cs: null, created: "2026-03-01" });
+        ins.run({ id: "cx-cool1", navn: "Cooldown Gard 1", pt: "bryggeri", hj: "https://cooldownhost.no", ep: null, tlf: null, cs: null, created: "2026-03-02" });
+        ins.run({ id: "cx-cool2", navn: "Cooldown Gard 2", pt: "bryggeri", hj: "https://cooldownhost.no/annen-side", ep: null, tlf: null, cs: null, created: "2026-03-03" });
+        ins.run({ id: "cx-normal", navn: "Normal Gard", pt: "bryggeri", hj: "https://normalhost.no", ep: null, tlf: null, cs: null, created: "2026-03-04" });
+
+        const r27 = await callRoute({ limit: 20 });
+        assertEq(r27.status, 200, "cx-27: ruta svarer 200 med de nye radene i kohorten");
+
+        // (a) transient (503) fetches get fetchPage()'s one retry, not an
+        // immediate fetchFailed.
+        assertEq(retryHostCalls, 2, "cx-27b: retryhost.no ble forsøkt to ganger — det interne retry-passet i fetchPage()");
+        assertTrue(!(r27.body.fetch_failed as any[]).some((f) => f.provider_id === "cx-retry"),
+          "cx-27c: cx-retry endte IKKE i fetch_failed — retryen reddet forsøket");
+        const retryRow = (r27.body.changed as any[]).find((c) => c.provider_id === "cx-retry");
+        assertEq(retryRow?.telefon, "23456789", "cx-27d: telefonen fra den vellykkede retry-responsen ble hentet ut");
+
+        // (b) a 429 parks its host; a later fetch to the SAME host in the
+        // SAME run is skipped with the dedicated cooldown_skipped reason, not
+        // lumped into fetch_failed/errors.
+        assertTrue((r27.body.fetch_failed as any[]).some((f) => f.provider_id === "cx-cool1"),
+          "cx-28: cx-cool1 (som selv fikk 429-svaret) rapporteres i fetch_failed, som før");
+        const cool2Entry = (r27.body.cooldown_skipped as any[]).find((c) => c.provider_id === "cx-cool2");
+        assertTrue(!!cool2Entry, "cx-29: cx-cool2 er i den dedikerte cooldown_skipped-bøtta");
+        assertEq(cool2Entry?.host, "cooldownhost.no", "cx-29b: …med riktig vert");
+        assertTrue(!(r27.body.fetch_failed as any[]).some((f) => f.provider_id === "cx-cool2"),
+          "cx-29c: cx-cool2 er IKKE også lumpet inn i fetch_failed");
+        assertTrue(!newHostCalls.includes("https://cooldownhost.no/annen-side"),
+          "cx-29d: cx-cool2s egen URL ble ALDRI fetchet — cooldownen hoppet over kallet helt");
+
+        // (c) a host NOT in cooldown fetches normally.
+        const normalRow = (r27.body.changed as any[]).find((c) => c.provider_id === "cx-normal");
+        assertEq(normalRow?.telefon, "34567890", "cx-30: normalhost.no (ikke i cooldown) fetches og ekstraheres normalt");
+
+        // A fresh run (separate POST) within the cooldown window still skips
+        // the same host — the map is per-process, not per-request.
+        ins.run({ id: "cx-cool3", navn: "Cooldown Gard 3", pt: "bryggeri", hj: "https://cooldownhost.no/tredje", ep: null, tlf: null, cs: null, created: "2026-03-05" });
+        const r31 = await callRoute({ limit: 20 });
+        const cool3Entry = (r31.body.cooldown_skipped as any[]).find((c) => c.provider_id === "cx-cool3");
+        assertTrue(!!cool3Entry, "cx-31: cooldownen består inn i en FRISK kjøring innenfor vinduet");
+        assertTrue(!newHostCalls.includes("https://cooldownhost.no/tredje"),
+          "cx-31b: …og cx-cool3s egen URL ble aldri fetchet i den friske kjøringen heller");
       }
     } catch (err: any) {
       failed++;
