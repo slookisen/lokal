@@ -605,6 +605,37 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertEq(deliberateEntryVisit.status, 200, "f5: the entry page is still directly reachable (even with a valid session already held) for a deliberate re-login elsewhere");
       assertTrue(deliberateEntryVisit.body.includes("Send meg tilgangslenke"), "f5b: it still offers 'Send meg tilgangslenke' so a new device/link can be requested on demand");
 
+      // ── (g) dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-
+      // profil: GET /api/opplevelser/gardssalg-claim/:providerId/session-
+      // status — the client-side-only owner-CTA-swap endpoint. Session
+      // still valid here (asserted before the (e) logout block below,
+      // which revokes it). ─────────────────────────────────────────────
+
+      // g1: no session cookie at all -> isOwner:false (never a 401/403 —
+      // this endpoint always answers a plain boolean, fails closed).
+      const statusNoAuth = await req("GET", "/api/opplevelser/gardssalg-claim/prov-route-eligible/session-status");
+      assertEq(statusNoAuth.status, 200, "g1: GET session-status with no cookie -> 200 (not 401)");
+      assertEq(JSON.parse(statusNoAuth.body), { isOwner: false }, "g1b: no session -> isOwner:false");
+      assertEq(statusNoAuth.headers["cache-control"], "no-store", "g1c: no-store cache header present even on the no-session path");
+
+      // g2: valid session, matching providerId -> isOwner:true.
+      const statusOwn = await req("GET", "/api/opplevelser/gardssalg-claim/prov-route-eligible/session-status", { headers: { Cookie: cookieHeader } });
+      assertEq(statusOwn.status, 200, "g2: GET session-status with a valid session for THIS provider -> 200");
+      assertEq(JSON.parse(statusOwn.body), { isOwner: true }, "g2b: valid session + matching providerId -> isOwner:true");
+      assertEq(statusOwn.headers["cache-control"], "no-store", "g2c: no-store cache header present on the isOwner:true path (this response must never be cached/reused for another visitor)");
+
+      // g3: valid session, but a DIFFERENT provider's id in the URL ->
+      // isOwner:false. Same session as g2, only the path providerId changes.
+      const statusOther = await req("GET", "/api/opplevelser/gardssalg-claim/prov-route-other/session-status", { headers: { Cookie: cookieHeader } });
+      assertEq(statusOther.status, 200, "g3: GET session-status for a DIFFERENT provider with a valid-but-mismatched session -> 200");
+      assertEq(JSON.parse(statusOther.body), { isOwner: false }, "g3b: valid session for provider A queried against provider B -> isOwner:false (never leaks A's session validity)");
+      assertEq(statusOther.headers["cache-control"], "no-store", "g3c: no-store cache header present on the cross-provider path too");
+
+      // g4: invalid/bogus session cookie -> isOwner:false, no throw.
+      const statusBogus = await req("GET", "/api/opplevelser/gardssalg-claim/prov-route-eligible/session-status", { headers: { Cookie: "oa_owner_session=totally-bogus-token" } });
+      assertEq(statusBogus.status, 200, "g4: GET session-status with an invalid/unknown session token -> 200 (fails closed, not an error)");
+      assertEq(JSON.parse(statusBogus.body), { isOwner: false }, "g4b: invalid session token -> isOwner:false");
+
       // ── (e) logout really revokes ───────────────────────────────────────
       const logout = await req("POST", "/kategori/gardssalg/eier/route-test-gard/logout", { headers: { Cookie: cookieHeader } });
       assertEq(logout.status, 303, "e1: POST logout -> 303 redirect");

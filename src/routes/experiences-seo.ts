@@ -3939,6 +3939,42 @@ const VISIT_TYPE_COPY: Record<string, string> = {
   seltzeri: "en smaking av kombucha og et innblikk i produksjonen",
 };
 
+// dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: pure
+// decision function for the client-side owner-CTA swap below. This page is
+// public/shared-cacheable (`Cache-Control: public, max-age=300` a few lines
+// down) so the server-rendered HTML must NOT branch on the request's
+// session cookie — any downstream cache stores ONE response body per URL,
+// and a cookie-dependent render would leak one owner's edit-CTA to other
+// visitors of the same cached URL. So "Reserver besøk" is always rendered
+// exactly as today, and the swap happens client-side, after load, via a
+// fetch() to the separate `Cache-Control: no-store`
+// GET /api/opplevelser/gardssalg-claim/:providerId/session-status endpoint
+// (src/routes/gardssalg-claim.ts) that DOES know the viewer's session.
+//
+// `decideOwnerCtaSwap` is pure (no DOM/fetch) so it's unit-testable
+// directly in Node, and is shipped to the browser via
+// `decideOwnerCtaSwap.toString()` in the inline <script> below — same
+// tested-code-is-shipped-code pattern as `describeSaveOutcome` in
+// gardssalg-claim.ts (PR #492). Must stay dependency-free for that to work.
+// Fails closed: any falsy/malformed input (fetch failed, non-JSON body,
+// isOwner not exactly `true`) returns `{ swap: false }` — the page keeps
+// its server-rendered "Reserver besøk", never a broken/wrong swap.
+export function decideOwnerCtaSwap(
+  ok: boolean,
+  body: any,
+  portalHref: string,
+  previewHref: string,
+): { swap: boolean; primaryLabel?: string; primaryHref?: string; secondaryLabel?: string; secondaryHref?: string } {
+  if (!ok || !body || body.isOwner !== true) return { swap: false };
+  return {
+    swap: true,
+    primaryLabel: "Rediger profilen",
+    primaryHref: portalHref,
+    secondaryLabel: "Forhåndsvis som besøkende",
+    secondaryHref: previewHref,
+  };
+}
+
 router.get(
   "/kategori/gardssalg/produsent/:providerSlug",
   (req: Request, res: Response, next: NextFunction) => {
@@ -4233,7 +4269,7 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
       <div class="aside-card">
         <h2>Reserver</h2>
         ${isBookingPaused(provider.booking_live, provider.catalog_hidden) ? `<p class="reserve-notice">Reservasjoner er ikke aktive ennå — kommer snart.</p>` : ""}
-        <a class="reserve-cta" href="${bookHref}">Reserver besøk</a>
+        <a id="reserve-cta" class="reserve-cta" href="${bookHref}">Reserver besøk</a>
       </div>
       <div class="aside-card">
         <h2>Sted</h2>
@@ -4261,6 +4297,37 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 <footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
   <span><a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a></span>
 </footer>
+<script>
+(function () {
+  // dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: swap
+  // "Reserver besøk" to an owner action ONLY for the logged-in owner of
+  // THIS provider, entirely client-side — this page's server-rendered HTML
+  // (see the doc comment above decideOwnerCtaSwap() in experiences-seo.ts)
+  // is identical for every visitor/cache. Fails closed to "no change" if
+  // the fetch errors, is unauthenticated, or is for a different provider.
+  var cta = document.getElementById("reserve-cta");
+  if (!cta || !window.fetch) return;
+  var decideOwnerCtaSwap = ${decideOwnerCtaSwap.toString()};
+  var providerId = ${JSON.stringify(provider.id)};
+  var portalHref = ${JSON.stringify(`/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal`)};
+  var previewHref = ${JSON.stringify(bookHref)};
+  fetch("/api/opplevelser/gardssalg-claim/" + encodeURIComponent(providerId) + "/session-status", { credentials: "same-origin" })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+    .then(function (out) {
+      var decision = decideOwnerCtaSwap(out.ok, out.body, portalHref, previewHref);
+      if (!decision.swap) return;
+      cta.textContent = decision.primaryLabel;
+      cta.setAttribute("href", decision.primaryHref);
+      var secondary = document.createElement("a");
+      secondary.id = "reserve-cta-preview";
+      secondary.setAttribute("href", decision.secondaryHref);
+      secondary.textContent = decision.secondaryLabel;
+      secondary.style.cssText = "display:block;text-align:center;margin-top:8px;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:999px;font-size:.86rem;text-decoration:none";
+      cta.insertAdjacentElement("afterend", secondary);
+    })
+    .catch(function () {});
+})();
+</script>
 </body>
 </html>`;
 

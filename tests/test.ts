@@ -36420,6 +36420,22 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: owner-CTA swap (decideOwnerCtaSwap + cache-safety regression) ──");
+  try {
+    const { runExperiencesSeoEierCtaSwapTests } = require("../src/routes/experiences-seo-eier-cta-swap.test") as
+      typeof import("../src/routes/experiences-seo-eier-cta-swap.test");
+    const ects = await runExperiencesSeoEierCtaSwapTests({ log: false });
+    passed += ects.passed;
+    failed += ects.failed;
+    for (const f of ects.failures) failures.push("experiences-seo-eier-cta-swap: " + f);
+    console.log(`  experiences-seo-eier-cta-swap: ${ects.passed} passed, ${ects.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-eier-cta-swap: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-19-opplevagent-gsc-indekseringsfikser: robots.txt Disallow + sitemap lastmod honesty ──");
   try {
     const { runExperiencesSeoGscFixesTests } = require("../src/routes/experiences-seo-gsc-fixes.test") as

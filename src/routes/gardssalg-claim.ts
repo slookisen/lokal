@@ -133,7 +133,7 @@ function readSessionCookie(req: Request): string | undefined {
   return parsed[GARDSSALG_OWNER_SESSION_COOKIE];
 }
 
-function sessionFromRequest(req: Request): { valid: boolean; providerId?: string; token?: string } {
+export function sessionFromRequest(req: Request): { valid: boolean; providerId?: string; token?: string } {
   const cookieToken = readSessionCookie(req);
   if (cookieToken) {
     const s = verifyGardssalgOwnerSessionToken(cookieToken);
@@ -763,6 +763,44 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", (req: Request, 
   const stats = getGardssalgOwnerStats(path);
   res.setHeader("Cache-Control", "private, max-age=60");
   return res.json({ success: true, stats });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/opplevelser/gardssalg-claim/:providerId/session-status —
+// dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil.
+//
+// The produsent profile page (src/routes/experiences-seo.ts) is a public,
+// shared-cacheable response (`Cache-Control: public, max-age=300`) — its
+// server-rendered HTML must stay byte-identical regardless of the
+// request's Cookie header, or a CDN/proxy will serve one owner's
+// personalized variant to a different visitor of the same cached URL
+// (AC4 of that dev-request). So the "does the current viewer own THIS
+// provider?" check can't happen in that route's own render at all — it
+// happens here, in a separate, `no-store` JSON endpoint the page's own
+// inline <script> calls client-side AFTER the (identically-cached) HTML
+// has already loaded. This endpoint is deliberately request-scoped and
+// per-visitor by design — the opposite cacheability contract of the page
+// that calls it.
+//
+// Answers a plain boolean, nothing more: never reveals whether a session
+// exists/is valid at all, and never reveals anything about some OTHER
+// provider — only "does the CURRENT session (if any) own THIS providerId".
+// Fails closed (isOwner:false) on any invalid/missing/errored session so a
+// caller can never be shown the wrong owner affordance.
+// ─────────────────────────────────────────────────────────────────
+router.get("/api/opplevelser/gardssalg-claim/:providerId/session-status", (req: Request, res: Response) => {
+  // Set even on the error path below — this response varies per-visitor by
+  // design and must never be cached, unlike the profile page that calls it.
+  res.setHeader("Cache-Control", "no-store");
+  const { providerId } = req.params as any;
+  try {
+    const session = sessionFromRequest(req);
+    const isOwner = !!(session.valid && providerId && session.providerId === providerId);
+    return res.json({ isOwner });
+  } catch (err) {
+    console.error("[gardssalg-claim] GET session-status error:", err);
+    return res.json({ isOwner: false });
+  }
 });
 
 export default router;
