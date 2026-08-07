@@ -42,7 +42,12 @@
 // Lowercase, transliterate æ/ø/å, strip non-alphanum to a canonical key
 // usable for lookups. Same convention as name-matcher.normaliseForMatch
 // but kept inline so we don't take a cross-module dep for one regex.
-function key(s: string): string {
+//
+// Exported (dev-request fylke-2024-migrasjon) so
+// services/fylke-2024-migration.ts's kommune-name matching can reuse this
+// EXACT fold/normalize convention instead of duplicating it — see that
+// file's own doc comment.
+export function key(s: string): string {
   if (!s) return "";
   return s
     .normalize("NFC")
@@ -88,7 +93,11 @@ for (const f of CANONICAL_FYLKER) CANONICAL_BY_KEY.set(key(f), f);
 // IMPORTANT: a few aliases are MANY-to-ONE (e.g. "Viken" was Akershus +
 // Buskerud + Østfold). fylkerMatch() handles those via an explicit
 // equivalence-class table below; this map only stores 1:1 redirects.
-const ALIAS_TO_CANONICAL: Record<string, string> = {
+// Exported (dev-request fylke-2024-migrasjon) so routes/experiences-seo.ts's
+// /fylke/:fylke 301-redirect fallback can recognise a raw historical alias
+// param (e.g. "Hordaland") as a 1:1 redirect target — see that route's own
+// doc comment. Read-only from callers outside this module.
+export const ALIAS_TO_CANONICAL: Record<string, string> = {
   // ── pre-2018 Trøndelag halves ──
   "sortrondelag": "Trøndelag",
   "sor trondelag": "Trøndelag",
@@ -136,7 +145,11 @@ const ALIAS_TO_CANONICAL: Record<string, string> = {
 // matches as TRUE (intentionally permissive — Hanen's "Viken" tag means
 // any one of the three, and a producer's kommune-mapped fylke could be
 // any of the three).
-const EQUIVALENCE_CLASSES: ReadonlyArray<ReadonlyArray<string>> = [
+// Exported (dev-request fylke-2024-migrasjon) so routes/experiences-seo.ts's
+// /fylke/:fylke 301-redirect fallback can recognise a raw merged-legacy-name
+// param (Viken / Vestfold og Telemark / Troms og Finnmark) and pick its
+// live-highest-count successor — see that route's own doc comment.
+export const EQUIVALENCE_CLASSES: ReadonlyArray<ReadonlyArray<string>> = [
   // Viken 2020-2023 = Akershus + Buskerud + Østfold
   ["Viken", "Akershus", "Buskerud", "Østfold"],
   // Vestfold og Telemark 2020-2023 = Vestfold + Telemark
