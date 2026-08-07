@@ -384,6 +384,13 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
 // other posted "selected" value (typo, stale page, hostile client) is
 // treated as no selection at all, never forwarded — the union type alone is
 // a compile-time guarantee, not a runtime one, since req.body is unknown().
+// NOTE: deriveOrgLinkedEmailCandidatesWithHarvest() (services/gardssalg-
+// claim.ts, dev-request 2026-08-06-aldri-gjett-epostadresse Slice 2) can also
+// produce "found_same_domain" / "found_contact_page" / "found_site_other" —
+// this list does NOT include them yet, since that function isn't wired into
+// this route. Whoever wires it in must extend this list at the same time, or
+// a harvested candidate rendered as a radio option will silently fail to
+// register as a selection.
 const CLAIM_EMAIL_SOURCES = ["brreg_contact", "verified_domain_address", "stored_epost_verified"] as const;
 function parseSelectedSource(value: unknown): (typeof CLAIM_EMAIL_SOURCES)[number] | undefined {
   return typeof value === "string" && (CLAIM_EMAIL_SOURCES as readonly string[]).includes(value)

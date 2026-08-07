@@ -436,6 +436,265 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       );
     }
 
+    // ── Found-address harvest — dev-request 2026-08-06-aldri-gjett-
+    // epostadresse SLICE 2 (2026-08-07). deriveOrgLinkedEmailCandidatesWithHarvest()
+    // is async/fetch-mocked but otherwise pure (no DB) — a self-contained
+    // block, same fetchImpl-injection convention as fetch-page.test.ts's own
+    // mockResponse() (passed via opts.fetchImpl, never a global fetch swap —
+    // see fetch-page.ts's own doc comment on FetchPageOptions.fetchImpl for
+    // why a global swap would race this suite's interleaved async blocks). ──
+    {
+      const { deriveOrgLinkedEmailCandidatesWithHarvest } = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
+
+      /** Build a mock Response with a real byte body (mirrors fetch-page.test.ts's mockResponse). */
+      function mockHarvestResponse(html: string, url: string, status = 200): Response {
+        const bytes = new TextEncoder().encode(html);
+        const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
+        return {
+          ok: status >= 200 && status < 300,
+          status,
+          statusText: `S${status}`,
+          url,
+          headers,
+          arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+        } as unknown as Response;
+      }
+
+      /** Map of URL -> HTML body. Missing key -> the fetch throws (never a silent 404), so a
+       * test only ever "expects" the exact set of requests it declares. */
+      function fetchImplFromMap(byUrl: Record<string, string>): typeof fetch {
+        return (async (input: unknown) => {
+          const url = String(input);
+          if (!(url in byUrl)) throw new Error(`mock fetch: unexpected request to ${url}`);
+          return mockHarvestResponse(byUrl[url]!, url);
+        }) as unknown as typeof fetch;
+      }
+
+      /** Like fetchImplFromMap, but each entry can also carry a `finalUrl`
+       * that differs from the requested URL (mirrors a real apex->www or
+       * renamed-domain redirect, where resp.url != the requested URL) — see
+       * fetch-page.ts's `finalUrl = resp.url || fetchUrl`. Missing key ->
+       * throws, same convention as fetchImplFromMap. */
+      function fetchImplFromMapWithRedirect(
+        byUrl: Record<string, { html: string; finalUrl?: string }>,
+      ): typeof fetch {
+        return (async (input: unknown) => {
+          const url = String(input);
+          if (!(url in byUrl)) throw new Error(`mock fetch: unexpected request to ${url}`);
+          const entry = byUrl[url]!;
+          return mockHarvestResponse(entry.html, entry.finalUrl ?? url);
+        }) as unknown as typeof fetch;
+      }
+
+      const BRREG_OK = { org_nr: "912345678", brreg_verified: 1 as const };
+
+      // (h1) PRECONDITION: isHjemmesideOwnershipVerified() gates the harvest
+      // entirely — an UNVERIFIED hjemmeside gets ZERO fetch attempts (not a
+      // fetch-then-discard). Proven by a CALL-COUNTING SPY rather than a
+      // throwing fetchImpl: fetchPage() (fetch-page.ts) internally wraps its
+      // fetch call in try/catch and NEVER rethrows (a thrown error is always
+      // converted into a classified `{ok:false, ...}` result), so a throwing
+      // fetchImpl would make h1 pass identically whether the precondition is
+      // present or removed entirely — it only proves "no throw", not "no
+      // call". Counting actual invocations distinguishes the two.
+      let noFetchAllowedCalls = 0;
+      const noFetchAllowed: typeof fetch = (async () => {
+        noFetchAllowedCalls++;
+        return mockHarvestResponse("<html><body>should never be reached</body></html>", "https://uverifisert-gard.no");
+      }) as unknown as typeof fetch;
+      const h1 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://uverifisert-gard.no",
+          content_source: "provider_site", // not 'manual', and no field_provenance.hjemmeside -> NOT verified
+          field_provenance: null,
+        },
+        undefined,
+        { fetchImpl: noFetchAllowed },
+      );
+      assertEq(h1, [], "h1: unverified hjemmeside -> zero harvest candidates");
+      assertEq(noFetchAllowedCalls, 0, "h1: unverified hjemmeside -> zero fetch attempts (precondition reused from isHjemmesideOwnershipVerified; a call-counting spy, not a throwing fetchImpl, since fetchPage() never rethrows)");
+
+      // (h2) AC2 priority ordering, all three tiers present simultaneously,
+      // PLUS an embedded AC3 rejection (a genuine different-company, non-
+      // free-mail domain found on a sub-page must be dropped, not offered).
+      // Home page: discoverable links to /kontakt (score 3) and /om-oss
+      // (score 2) [see fetch-page.ts's discoverContentLinks PATTERNS], plus
+      // a bare freemail address of its own (found_site_other candidate,
+      // since the home page itself is never contact/about-classified).
+      const h2HomeHtml = `<html><body><h1>Prioritetsgården</h1>
+        <p>Kontakt: other@gmail.com</p>
+        <a href="/kontakt">Kontakt oss</a>
+        <a href="/om-oss">Om oss</a>
+        </body></html>`;
+      const h2KontaktHtml = `<html><body><h1>Kontakt</h1>
+        <p>Skriv til post@prioritetsgard.no eller kontakt@hotmail.com</p>
+        </body></html>`;
+      const h2OmOssHtml = `<html><body><h1>Om oss</h1>
+        <p>Distributør: post@konkurrentbedrift.no</p>
+        </body></html>`;
+      const h2 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://prioritetsgard.no",
+          content_source: "manual", // ownership-verified
+          field_provenance: null,
+        },
+        undefined,
+        {
+          fetchImpl: fetchImplFromMap({
+            "https://prioritetsgard.no": h2HomeHtml,
+            "https://prioritetsgard.no/kontakt": h2KontaktHtml,
+            "https://prioritetsgard.no/om-oss": h2OmOssHtml,
+          }),
+        },
+      );
+      assertEq(
+        h2,
+        [
+          { email: "post@prioritetsgard.no", source: "found_same_domain" },
+          { email: "kontakt@hotmail.com", source: "found_contact_page" },
+          { email: "other@gmail.com", source: "found_site_other" },
+        ],
+        "h2: AC2 priority ordering — found_same_domain (post@prioritetsgard.no, from the /kontakt page but same-domain wins regardless of page) > found_contact_page (kontakt@hotmail.com, freemail found on /kontakt) > found_site_other (other@gmail.com, freemail found on the home page); post@konkurrentbedrift.no (a real different-company, non-free-mail domain found on /om-oss) is dropped outright — AC3, embedded in the same scenario",
+      );
+
+      // (h3) AC3, isolated: the ONLY email on the site belongs to a real
+      // different company (non-free-mail, not the site's own domain) ->
+      // zero candidates, never auto-used, never a fallback guess either.
+      const h3 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://acme-gard.no",
+          content_source: "manual",
+          field_provenance: null,
+        },
+        undefined,
+        { fetchImpl: fetchImplFromMap({ "https://acme-gard.no": `<html><body>Kontakt: post@totaltannenbedrift.no</body></html>` }) },
+      );
+      assertEq(h3, [], "h3: AC3 isolated — a different-company, non-free-mail address is never a candidate; the producer falls through to the existing zero-candidate/manual-fallback behavior unchanged");
+
+      // (h4) AC8 direction 1: a found address on a GENERIC_DOMAINS-listed
+      // free-mail host (gmail.com is in BOTH GENERIC_DOMAINS and
+      // FREE_MAIL_DOMAINS) IS accepted when found — GENERIC_DOMAINS must
+      // NOT block a found address.
+      const h4 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://frittstaende-gard.no",
+          content_source: "manual",
+          field_provenance: null,
+        },
+        undefined,
+        { fetchImpl: fetchImplFromMap({ "https://frittstaende-gard.no": `<html><body>E-post: eier@gmail.com</body></html>` }) },
+      );
+      assertEq(
+        h4,
+        [{ email: "eier@gmail.com", source: "found_site_other" }],
+        "h4: AC8 direction 1 — a found @gmail.com address (GENERIC_DOMAINS-listed) IS accepted; GENERIC_DOMAINS/isClaimableDomain is never applied to a found address, only isAcceptableHomepageEmail's own-domain-or-freemail logic",
+      );
+
+      // (h5) AC8 direction 2: a domain that is NOT in GENERIC_DOMAINS at all
+      // (proving GENERIC_DOMAINS and the found-address gate are doing
+      // GENUINELY DIFFERENT jobs, not overlapping ones) is still rejected
+      // when it's a real different-company domain — via isAcceptableHomepageEmail
+      // alone, the SAME mechanism h3 already exercises.
+      const enrichMod = require("./gardssalg-rfb-enrich") as typeof import("./gardssalg-rfb-enrich");
+      assertTrue(
+        !enrichMod.GENERIC_DOMAINS.has("totaltannenbedrift.no"),
+        "h5-precondition: totaltannenbedrift.no (h3's rejected domain) is confirmed NOT a member of GENERIC_DOMAINS -- so h3's rejection could not possibly be coming from that list",
+      );
+
+      // (h6) Regression guard: if NO email appears anywhere in the fetched
+      // HTML, the harvest returns zero candidates -- it NEVER synthesizes
+      // post@<domain> from the (verified, known) hjemmeside domain alone,
+      // even though nothing here would technically stop such a guess.
+      const h6 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://stille-gard.no",
+          content_source: "manual",
+          field_provenance: null,
+        },
+        undefined,
+        { fetchImpl: fetchImplFromMap({ "https://stille-gard.no": `<html><body><h1>Stille Gård</h1><p>Ingen kontaktinfo her.</p></body></html>` }) },
+      );
+      assertEq(h6, [], "h6: REGRESSION GUARD — zero emails found anywhere -> zero candidates, never a synthesized post@stille-gard.no");
+
+      // (h7) Fetch failure (site unreachable) -> zero candidates, no throw.
+      const h7 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://nede-gard.no",
+          content_source: "manual",
+          field_provenance: null,
+        },
+        undefined,
+        { fetchImpl: (async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch },
+      );
+      assertEq(h7, [], "h7: an unreachable hjemmeside -> zero harvest candidates, never throws");
+
+      // (h8) Merge ordering + dedupe: brreg_contact first, found-tiers next,
+      // stored_epost_verified LAST — and a harvested address identical to
+      // the stored epost is offered only ONCE, under the higher-priority
+      // found tier (never duplicated under two source tags).
+      const h8 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://fullrekke-gard.no",
+          content_source: "manual",
+          field_provenance: null,
+          epost: "post@fullrekke-gard.no", // manual -> qualifies as stored_epost_verified, AND happens to equal the harvested same-domain address
+        },
+        "post@brreg-kilde.no",
+        {
+          fetchImpl: fetchImplFromMap({
+            "https://fullrekke-gard.no": `<html><body>Kontakt: post@fullrekke-gard.no</body></html>`,
+          }),
+        },
+      );
+      assertEq(
+        h8,
+        [
+          { email: "post@brreg-kilde.no", source: "brreg_contact" },
+          { email: "post@fullrekke-gard.no", source: "found_same_domain" },
+        ],
+        "h8: merge ordering -- brreg_contact, then found tiers, then stored_epost_verified (last, and here suppressed entirely by the dedupe since it's the SAME address the found_same_domain tier already offered under a higher-priority tag)",
+      );
+
+      // (h9) Post-redirect host is used for tier assignment, not the
+      // originally-requested hjemmeside — harvestFoundOrgEmails uses
+      // `primary.finalUrl || hjemmeside` as siteBase for the found_same_domain
+      // comparison (an apex/renamed-domain redirect must not make the site's
+      // own address look cross-domain). The requested URL is old-domain.no,
+      // but the mocked response's `finalUrl` lands on new-domain.no, and the
+      // page's own email is @new-domain.no -> must tag found_same_domain (if
+      // the code compared against the requested hjemmeside instead, the
+      // domains would mismatch and this would NOT come out found_same_domain).
+      const h9 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://old-domain.no",
+          content_source: "manual",
+          field_provenance: null,
+        },
+        undefined,
+        {
+          fetchImpl: fetchImplFromMapWithRedirect({
+            "https://old-domain.no": {
+              html: `<html><body>Kontakt: kontakt@new-domain.no</body></html>`,
+              finalUrl: "https://new-domain.no",
+            },
+          }),
+        },
+      );
+      assertEq(
+        h9,
+        [{ email: "kontakt@new-domain.no", source: "found_same_domain" }],
+        "h9: tier assignment uses the POST-REDIRECT host (finalUrl=new-domain.no) not the originally-requested hjemmeside (old-domain.no) -- kontakt@new-domain.no is correctly tagged found_same_domain",
+      );
+    }
+
     // ── DB-backed tests ──────────────────────────────────────────────────
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     process.env.EXPERIENCES_DB_PATH = ":memory:";

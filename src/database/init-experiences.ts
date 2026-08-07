@@ -841,11 +841,19 @@ export function initExperiencesSchema(db: Database.Database): void {
         id TEXT PRIMARY KEY,
         provider_id TEXT NOT NULL REFERENCES experience_providers(id) ON DELETE CASCADE,
         email TEXT NOT NULL,
-        email_source TEXT NOT NULL, -- 'brreg_contact' | 'verified_domain_address' | 'stored_epost_verified'
+        email_source TEXT NOT NULL, -- 'brreg_contact' | 'verified_domain_address' | 'stored_epost_verified' | 'found_same_domain' | 'found_contact_page' | 'found_site_other'
         -- 'stored_epost_verified' added dev-request 2026-07-30-opplevagent-
         -- claim-epost-og-perfelt-laas item 1: the provider's own epost
         -- value, issued only when backed by real provenance -- see
         -- deriveOrgLinkedEmail()'s module doc in services/gardssalg-claim.ts.
+        -- 'found_same_domain' | 'found_contact_page' | 'found_site_other'
+        -- added dev-request 2026-08-06-aldri-gjett-epostadresse SLICE 2
+        -- (2026-08-07) -- see gardssalg-claim.ts's
+        -- deriveOrgLinkedEmailCandidatesWithHarvest(). Not yet reachable from
+        -- any live INSERT into this table (that function is not live-wired
+        -- this slice -- see its own doc comment), so this is documentation
+        -- ahead of first use, same as 'verified_domain_address' was until
+        -- tier (b) went live originally.
         -- Column stays untyped TEXT; this is a comment-only change, no
         -- migration needed.
         token TEXT NOT NULL UNIQUE,
