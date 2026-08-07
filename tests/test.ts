@@ -29019,6 +29019,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gopf.failures) failures.push("opplevelser-gardssalg-outreach-preflight: " + f);
     console.log(`  opplevelser-gardssalg-outreach-preflight: ${gopf.passed} passed, ${gopf.failed} failed`);
 
+    // dev-request 2026-08-07-outreach-pool-krav123-og-pilot, AC4: POST
+    // /admin/gardssalg-outreach-pilot-send — the pilot send-mechanic (1-4
+    // provider_ids per call, preflight-gated via
+    // computeGardssalgOutreachPreflight just above/reused, suppression-gated
+    // via isBlocked() + a dual own-table/cross-platform cooldown check,
+    // apply=falsy default dry-run). Same in-memory-DB pattern (both
+    // experiences AND a fresh RFB db via database/init's
+    // __setDbForTesting), runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-outreach-pilot-send: pilot send-mechanic ──");
+    const { runOpplevelserGardssalgOutreachPilotSendTests } = require("../src/routes/opplevelser-gardssalg-outreach-pilot-send.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-pilot-send.test");
+    const gops = await runOpplevelserGardssalgOutreachPilotSendTests({ log: false });
+    passed += gops.passed;
+    failed += gops.failed;
+    for (const f of gops.failures) failures.push("opplevelser-gardssalg-outreach-pilot-send: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-pilot-send: ${gops.passed} passed, ${gops.failed} failed`);
+
     // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
     // Slice 2 ("outreach-guard"): pure-function unit tests for
     // dedupeGardssalgOutreachRecipients (no DB) — wired into POST

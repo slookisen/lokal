@@ -345,7 +345,7 @@ import { emailService } from "../services/email-service";
 // was removed; a merge with main's independently-built AC6 slice (#508)
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
-import { normalizeDomain, normalizeEmail } from "../services/blocklist-service";
+import { normalizeDomain, normalizeEmail, isBlocked } from "../services/blocklist-service";
 
 // Same derivation as gardssalg-claim.ts's own constant — the verify URL must
 // point at the host that serves the claim routes.
@@ -7447,6 +7447,91 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
 import { dedupeGardssalgOutreachRecipients } from "../services/gardssalg-outreach-dedupe";
 const MAX_GARDSSALG_PREFLIGHT_BATCH = 200;
 
+// Extracted for dev-request 2026-08-07-outreach-pool-krav123-og-pilot, AC4:
+// this used to be inline in the POST handler below; it is now a plain,
+// exported function so the new pilot-send route
+// (POST /admin/gardssalg-outreach-pilot-send, further below) can reuse
+// EXACTLY the same GO/NO-GO computation — single source of truth, never a
+// second/forked copy. Behavior-preserving extraction: same dedupe-by-
+// first-seen-order, same computeGardssalgReadinessRows/
+// computeGardssalgReadinessTier reuse, same Slice-2 outreach-guard
+// (dedupeGardssalgOutreachRecipients) cross-row dedup pass. Callers are
+// responsible for their own batch-size validation (this function itself
+// has no upper bound) — the HTTP handler below enforces
+// MAX_GARDSSALG_PREFLIGHT_BATCH, the pilot-send route enforces its own
+// (smaller) cap.
+export function computeGardssalgOutreachPreflight(
+  expDb: Database.Database,
+  providerIds: string[],
+): {
+  results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }>;
+  summary: { go: number; no_go: number; total: number };
+} {
+  // Dedupe while preserving first-seen order — every requested id must
+  // appear EXACTLY once in the response, in the order first seen in input.
+  const seen = new Set<string>();
+  const orderedIds: string[] = [];
+  for (const rawId of providerIds) {
+    if (!seen.has(rawId)) {
+      seen.add(rawId);
+      orderedIds.push(rawId);
+    }
+  }
+
+  const rows = computeGardssalgReadinessRows(expDb, orderedIds);
+  const byId = new Map(rows.map((r) => [r.id, r]));
+
+  const results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }> =
+    orderedIds.map((id) => {
+      const row = byId.get(id);
+      if (!row) {
+        return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
+      }
+      if (row.readiness_tier === "outreach_ready") {
+        return { provider_id: id, name: row.name, go: true, reason: null };
+      }
+      return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
+    });
+
+  // ── Slice 2 outreach-guard: cross-row dedup over THIS batch's go:true
+  // rows only. Fetch email separately (does NOT touch
+  // computeGardssalgReadinessRows's signature/return type — that function
+  // is also used, unmodified, by GET /admin/gardssalg-outreach-readiness).
+  const goIds = results.filter((r) => r.go).map((r) => r.provider_id);
+  if (goIds.length > 0) {
+    const placeholders = goIds.map(() => "?").join(", ");
+    const emailRows = expDb
+      .prepare(`SELECT id, epost FROM experience_providers WHERE id IN (${placeholders})`)
+      .all(...goIds) as Array<{ id: string; epost: string | null }>;
+    const emailById = new Map(emailRows.map((r) => [r.id, r.epost]));
+
+    // orderedIds order, restricted to the go:true candidates — first-seen
+    // in the ORIGINAL batch order wins the dedup, not query result order.
+    const candidates = orderedIds
+      .filter((id) => emailById.has(id))
+      .map((id) => ({ provider_id: id, email: emailById.get(id) ?? null }));
+
+    const { suppressed } = dedupeGardssalgOutreachRecipients(candidates);
+
+    for (const result of results) {
+      const reason = suppressed.get(result.provider_id);
+      if (reason) {
+        result.go = false;
+        result.reason = reason;
+      }
+    }
+  }
+
+  let go = 0;
+  let no_go = 0;
+  for (const r of results) {
+    if (r.go) go++;
+    else no_go++;
+  }
+
+  return { results, summary: { go, no_go, total: results.length } };
+}
+
 router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { provider_ids?: unknown };
   const rawIds = body.provider_ids;
@@ -7464,73 +7549,214 @@ router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, 
     return;
   }
 
-  // Dedupe while preserving first-seen order — every requested id must
-  // appear EXACTLY once in the response, in the order first seen in input.
-  const seen = new Set<string>();
-  const orderedIds: string[] = [];
-  for (const rawId of rawIds as string[]) {
-    if (!seen.has(rawId)) {
-      seen.add(rawId);
-      orderedIds.push(rawId);
-    }
-  }
-
   const expDb = getExpDb("experiences");
   try {
-    const rows = computeGardssalgReadinessRows(expDb, orderedIds);
-    const byId = new Map(rows.map((r) => [r.id, r]));
+    const { results, summary } = computeGardssalgOutreachPreflight(expDb, rawIds as string[]);
+    res.json({ results, summary });
+  } catch (err) {
+    console.error("[gardssalg-outreach-preflight] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
 
-    const results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }> =
-      orderedIds.map((id) => {
-        const row = byId.get(id);
-        if (!row) {
-          return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
+// ─── POST /api/opplevelser/admin/gardssalg-outreach-pilot-send ─────────────
+//
+// dev-request 2026-08-07-outreach-pool-krav123-og-pilot, AC4: the pilot
+// send-mechanic. Sends to 1-4 caller-selected provider_ids per call (hard
+// upper bound of 4 until Daniel raises it explicitly — NOT a rigid "must be
+// exactly 4" requirement, which would itself be the kind of false-blocking
+// complexity the dev-request explicitly warns against on a still-small pilot
+// pool). Every id is preflight-gated through computeGardssalgOutreachPreflight
+// just above (single source of truth — never a forked GO/NO-GO copy), then
+// suppression-gated: isBlocked() (src/services/blocklist-service.ts,
+// vertical-agnostic, keyed on email) + a dual cooldown check —
+//   1. this vertical's OWN persistent log, experience_outreach_sent_log
+//      (init-experiences.ts) — additive sibling table, NOT a write into the
+//      shared RFB outreach_sent_log (see that table's own doc comment for
+//      why: an experiences provider has no agents.id to satisfy
+//      outreach_sent_log's NOT NULL FK, and relaxing that on a live,
+//      trigger-laden table is out of scope for this slice).
+//   2. a READ-ONLY cross-platform check against the EXISTING RFB
+//      outreach_sent_log.recipient_email — mirrors routes/crm.ts's own
+//      ~L441-476 cooldown check/shape (same OUTREACH_COOLDOWN_DAYS env,
+//      default 60, same Math.max(1, parseInt(...) || 60) pattern), so a
+//      same-human RFB send still suppresses an Opplevagent send and vice
+//      versa, without this route ever writing into the RFB table.
+//
+// `apply` falsy/absent (the default) is a DRY RUN: preflight + suppression
+// are evaluated and reported, but nothing is sent and nothing is written.
+// Only `apply === true` sends real email (or, with `is_test: true`, a
+// send-guard-redirected test copy — see EmailService.sendEmail's
+// isTestSend/TEST_SEND_REDIRECT_EMAIL mechanism, unchanged, reused as-is).
+//
+// NON-GOAL, unchanged from the dev-request: this route builds the send
+// MACHINERY only. An actual produsent (non-test) send requires Daniel's
+// separate, explicit GO — this route itself does not gate that; the
+// operator invoking it with apply:true against real recipients is what the
+// dev-request's own non-goals section is trusting to stay Daniel-gated at
+// the ORCHESTRATION layer, not enforced in code here.
+const MAX_GARDSSALG_OUTREACH_PILOT_BATCH = 4;
+
+router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { provider_ids?: unknown; is_test?: unknown; apply?: unknown };
+  const rawIds = body.provider_ids;
+
+  if (
+    !Array.isArray(rawIds) ||
+    rawIds.length === 0 ||
+    !rawIds.every((v) => typeof v === "string" && v.trim() !== "")
+  ) {
+    res.status(400).json({ error: "provider_ids must be a non-empty array of strings" });
+    return;
+  }
+  if (rawIds.length > MAX_GARDSSALG_OUTREACH_PILOT_BATCH) {
+    res.status(400).json({ error: `provider_ids exceeds max batch size of ${MAX_GARDSSALG_OUTREACH_PILOT_BATCH}` });
+    return;
+  }
+
+  const isTest = body.is_test === true;
+  const apply = body.apply === true;
+  const providerIds = rawIds as string[];
+
+  type PilotResultRow = {
+    provider_id: string;
+    status: "sent" | "would_send" | "skipped" | "error";
+    reason?: string;
+    preflight_reason?: string;
+    last_sent_at?: string;
+    suppressed_by?: string;
+    cross_platform?: boolean;
+  };
+
+  const expDb = getExpDb("experiences");
+  const results: PilotResultRow[] = [];
+
+  try {
+    // Single preflight pass, reused per-provider below — same tiering
+    // logic/outcome as POST /admin/gardssalg-outreach-preflight.
+    const { results: preflightResults } = computeGardssalgOutreachPreflight(expDb, providerIds);
+    const preflightById = new Map(preflightResults.map((r) => [r.provider_id, r]));
+
+    // Same cooldown-window derivation as routes/crm.ts ~L441.
+    const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
+    const cooldownCutoff = new Date(Date.now() - cooldownDays * 86400_000).toISOString();
+
+    for (const providerId of providerIds) {
+      const pf = preflightById.get(providerId);
+      if (!pf || !pf.go) {
+        results.push({
+          provider_id: providerId,
+          status: "skipped",
+          reason: "preflight_no_go",
+          preflight_reason: pf?.reason ?? "ikke_funnet",
+        });
+        continue; // NO-GO: no provider-row fetch, no email lookup, no send attempt.
+      }
+
+      const providerRow = expDb
+        .prepare(`SELECT navn, slug, epost FROM experience_providers WHERE id = ?`)
+        .get(providerId) as { navn: string | null; slug: string | null; epost: string | null } | undefined;
+
+      const email = providerRow?.epost?.trim();
+      if (!email) {
+        results.push({ provider_id: providerId, status: "skipped", reason: "no_email" });
+        continue;
+      }
+
+      const blockCheck = isBlocked({ email });
+      if (blockCheck.blocked) {
+        results.push({ provider_id: providerId, status: "skipped", reason: "blocklisted" });
+        continue;
+      }
+
+      // ── Own-table cooldown: this vertical's persistent send log ─────────
+      const ownPrior = expDb
+        .prepare(
+          `SELECT sent_at FROM experience_outreach_sent_log
+            WHERE LOWER(recipient_email) = LOWER(?) AND sent_at >= ?
+            ORDER BY sent_at DESC LIMIT 1`,
+        )
+        .get(email, cooldownCutoff) as { sent_at: string } | undefined;
+
+      if (ownPrior) {
+        results.push({
+          provider_id: providerId,
+          status: "skipped",
+          reason: "cooldown_suppressed",
+          last_sent_at: ownPrior.sent_at,
+          suppressed_by: "experiences",
+        });
+        continue;
+      }
+
+      // ── Cross-platform cooldown: read-only, existing RFB outreach_sent_log
+      const rfbDb = getRfbDb();
+      const crossPrior = rfbDb
+        .prepare(
+          `SELECT sent_at, vertical_id FROM outreach_sent_log
+            WHERE recipient_email IS NOT NULL
+              AND LOWER(recipient_email) = LOWER(?)
+              AND sent_at >= ?
+            ORDER BY sent_at DESC LIMIT 1`,
+        )
+        .get(email, cooldownCutoff) as { sent_at: string; vertical_id: string } | undefined;
+
+      if (crossPrior) {
+        results.push({
+          provider_id: providerId,
+          status: "skipped",
+          reason: "cooldown_suppressed",
+          last_sent_at: crossPrior.sent_at,
+          suppressed_by: crossPrior.vertical_id,
+          cross_platform: true,
+        });
+        continue;
+      }
+
+      // ── Eligible ──────────────────────────────────────────────────────
+      if (!apply) {
+        results.push({ provider_id: providerId, status: "would_send" });
+        continue;
+      }
+
+      const providerName = providerRow?.navn || providerId;
+      const profileUrl = `https://opplevagent.no/kategori/gardssalg/produsent/${providerRow?.slug ?? ""}`;
+
+      try {
+        const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
+          isTestSend: isTest,
+        });
+        if (!sendResult.success) {
+          results.push({ provider_id: providerId, status: "error", reason: sendResult.error || "send_failed" });
+          continue;
         }
-        if (row.readiness_tier === "outreach_ready") {
-          return { provider_id: id, name: row.name, go: true, reason: null };
-        }
-        return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
-      });
-
-    // ── Slice 2 outreach-guard: cross-row dedup over THIS batch's go:true
-    // rows only. Fetch email separately (does NOT touch
-    // computeGardssalgReadinessRows's signature/return type — that function
-    // is also used, unmodified, by GET /admin/gardssalg-outreach-readiness).
-    const goIds = results.filter((r) => r.go).map((r) => r.provider_id);
-    if (goIds.length > 0) {
-      const placeholders = goIds.map(() => "?").join(", ");
-      const emailRows = expDb
-        .prepare(`SELECT id, epost FROM experience_providers WHERE id IN (${placeholders})`)
-        .all(...goIds) as Array<{ id: string; epost: string | null }>;
-      const emailById = new Map(emailRows.map((r) => [r.id, r.epost]));
-
-      // orderedIds order, restricted to the go:true candidates — first-seen
-      // in the ORIGINAL batch order wins the dedup, not query result order.
-      const candidates = orderedIds
-        .filter((id) => emailById.has(id))
-        .map((id) => ({ provider_id: id, email: emailById.get(id) ?? null }));
-
-      const { suppressed } = dedupeGardssalgOutreachRecipients(candidates);
-
-      for (const result of results) {
-        const reason = suppressed.get(result.provider_id);
-        if (reason) {
-          result.go = false;
-          result.reason = reason;
-        }
+        expDb
+          .prepare(
+            `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, channel, message_id, is_test)
+             VALUES (?, ?, 'email', ?, ?)`,
+          )
+          .run(providerId, email, sendResult.messageId ?? null, isTest ? 1 : 0);
+        results.push({ provider_id: providerId, status: "sent" });
+      } catch (err) {
+        results.push({
+          provider_id: providerId,
+          status: "error",
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 
-    let go = 0;
-    let no_go = 0;
+    const summary = { sent: 0, would_send: 0, skipped: 0, error: 0, total: results.length };
     for (const r of results) {
-      if (r.go) go++;
-      else no_go++;
+      if (r.status === "sent") summary.sent++;
+      else if (r.status === "would_send") summary.would_send++;
+      else if (r.status === "skipped") summary.skipped++;
+      else if (r.status === "error") summary.error++;
     }
 
-    res.json({ results, summary: { go, no_go, total: results.length } });
+    res.json({ dry_run: !apply, results, summary });
   } catch (err) {
-    console.error("[gardssalg-outreach-preflight] failed:", err);
+    console.error("[gardssalg-outreach-pilot-send] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
