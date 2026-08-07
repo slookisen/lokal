@@ -24647,7 +24647,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
   try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
-  try { await _contentRefreshWebsiteVerificationGatePromise; } catch { /* errors already pushed to failures */ }
+  try { await _contentRefreshErrorsByPersistencePromise; } catch { /* errors already pushed to failures */ }
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
@@ -32462,6 +32462,41 @@ const _contentRefreshWebsiteVerificationGatePromise: Promise<void> = new Promise
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet, AC3-slice:
+// structured `persistence` field + `errors_by_persistence` tally on both
+// POST /admin/content-refresh and POST /admin/gardssalg-content-refresh
+// (src/routes/opplevelser.ts). Own dedicated test file (own in-memory
+// prod-schema DB, swaps the shared experiences db-factory getDb()
+// singleton) — mirrors the block immediately above, so it must run strictly
+// after it; _contentRefreshWebsiteVerificationGatePromise is the current
+// tail of that serial chain.
+let _contentRefreshErrorsByPersistenceResolve: () => void = () => {};
+const _contentRefreshErrorsByPersistencePromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshErrorsByPersistenceResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshWebsiteVerificationGatePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── 2026-08-02 AC3-slice: errors_by_persistence on content-refresh + gardssalg-content-refresh ──");
+  try {
+    const { runOpplevelserContentRefreshErrorsByPersistenceTests } = require("../src/routes/opplevelser-content-refresh-errors-by-persistence.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-errors-by-persistence.test");
+    const crebp = await runOpplevelserContentRefreshErrorsByPersistenceTests({ log: false });
+    passed += crebp.passed;
+    failed += crebp.failed;
+    for (const f of crebp.failures) failures.push("opplevelser-content-refresh-errors-by-persistence: " + f);
+    console.log(`  opplevelser-content-refresh-errors-by-persistence: ${crebp.passed} passed, ${crebp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-errors-by-persistence: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshErrorsByPersistenceResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (items 1 + 3):
 // `select: "low_quality"` opt-in cohort on POST /admin/homepage-provenance-batch
 // (src/routes/marketplace.ts) — ranks agents worst-first by agents.trust_score
@@ -32615,10 +32650,10 @@ const _rfbAgentsRetroScanPromise: Promise<void> = new Promise<void>(r => {
 // runSerial-kjeden og er nettopp derfor ufarlig ETTER denne barrieren.)
 //
 // Listen speiler rapporthalens await-liste (~linje 24446) minus _serialChain
-// (kjede-medlem kan ikke vente på kjeden). _contentRefreshCharsetPromise og
-// _contentRefreshScanWindowPromise er begge transitivt dekket via
-// _contentRefreshWebsiteVerificationGatePromise (2026-08-02: den nye kjede-
-// halen), som i rapporthalen.
+// (kjede-medlem kan ikke vente på kjeden). _contentRefreshCharsetPromise,
+// _contentRefreshScanWindowPromise og _contentRefreshWebsiteVerificationGate
+// Promise er alle transitivt dekket via _contentRefreshErrorsByPersistence
+// Promise (2026-08-02: den nye kjede-halen, AC3-slice), som i rapporthalen.
 // VEDLIKEHOLD: en NY ad-hoc-blokk må inn BÅDE i rapporthalens liste OG her.
 // allSettled, ikke all: en feilende ad-hoc-blokk har allerede ført sin feil i
 // `failures` selv og skal ikke velte kjeden.
@@ -32645,7 +32680,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _homepageSelectorRotationPromise, _domainCoherenceSweepPromise, _pendingVerifyParkingPromise,
   _adminAgentsDeletePromise, _adminClaimFunnelPromise, _selgerHtmlOpenTrackingPromise,
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
-  _expNoYieldBackoffPromise, _contentRefreshWebsiteVerificationGatePromise, _lowQualitySelectorPromise,
+  _expNoYieldBackoffPromise, _contentRefreshErrorsByPersistencePromise, _lowQualitySelectorPromise,
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
 ];
 runSerial(async () => {
