@@ -87,6 +87,19 @@ export function ensureRfbWebsiteReviewQueueTable(db: ReturnType<typeof getDb>): 
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_website_review_queue_status ON agents_website_review_queue(status)`);
+
+  // Additive migration: `existing_url` (nullable) was added for the
+  // "aggregator_replace" discovery mode, which needs to record the
+  // producer's CURRENT (aggregator/directory) website alongside the newly
+  // proposed candidate — the "blank" mode leaves this column NULL, since
+  // there was never a prior website to record. SQLite has no
+  // `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so this is guarded by
+  // checking PRAGMA table_info first, making the migration idempotent
+  // across repeated calls (this function runs at the top of every handler).
+  const existingCols = db.prepare(`PRAGMA table_info(agents_website_review_queue)`).all() as Array<{ name: string }>;
+  if (!existingCols.some((c) => c.name === "existing_url")) {
+    db.exec(`ALTER TABLE agents_website_review_queue ADD COLUMN existing_url TEXT`);
+  }
 }
 
 function getAdminKey(): string {
@@ -234,6 +247,35 @@ function selectRfbWebsiteDiscoveryTargets(db: ReturnType<typeof getDb>, limit: n
     .all(limit) as RfbWdTargetRow[];
 }
 
+// Request-body mode selector: "blank" (default, unchanged) targets producer
+// rows with NO website on file; "aggregator_replace" targets a DIFFERENT
+// cohort — rows that DO have a website, but that website is itself a
+// directory/aggregator/social host (rfbWebsiteHostExclusionReason) rather
+// than the producer's own real site. The host-exclusion check can't be
+// expressed in SQL (it walks eTLD+1 suffixes against the curated sets), so
+// this selects every non-blank-website row (same rfbWdSelectSql shape as the
+// blank-mode selector) and filters/limits in application code — the cohort
+// this route operates on (~981 RFB producer agents) is small enough that
+// this costs nothing that matters. Never selects blank-website rows (the
+// WHERE clause enforces that up front, same as the blank-mode selector's
+// inverse).
+function selectRfbWebsiteReplacementTargets(db: ReturnType<typeof getDb>, limit: number): RfbWdTargetRow[] {
+  const rows = db
+    .prepare(
+      `${rfbWdSelectSql(`AND k.website IS NOT NULL AND TRIM(k.website) != ''`)} ORDER BY a.created_at ASC, a.id ASC`,
+    )
+    .all() as RfbWdTargetRow[];
+  const out: RfbWdTargetRow[] = [];
+  for (const r of rows) {
+    const host = rfbWdHostFromUrl(r.website as string);
+    if (host && rfbWebsiteHostExclusionReason(host)) {
+      out.push(r);
+      if (out.length >= limit) break;
+    }
+  }
+  return out;
+}
+
 // agentIds override: scoped to role/vertical only (NOT the verification-
 // status/blank-website filters) — mirrors getAgentOrgNrBackfillTarget's own
 // override semantics (admin-agents.ts): an admin can force a lookup attempt
@@ -363,13 +405,17 @@ function upsertRfbWebsiteReviewQueue(
     evidence: RfbWdEvidence;
     confidence: number;
     batch_id: string;
+    // "blank" mode omits both — default reason preserves today's row shape
+    // exactly; existing_url stays NULL since there was no prior website.
+    reason?: string;
+    existing_url?: string | null;
   },
 ): void {
   db.prepare(
     `INSERT INTO agents_website_review_queue
-       (id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, updated_at)
+       (id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, existing_url, batch_id, status, created_at, updated_at)
      VALUES (@id, @agent_id, @agent_name, @candidate_url, @final_url, @evidence, @confidence,
-             'website_discovery_candidate', @batch_id, 'pending', datetime('now'), datetime('now'))
+             @reason, @existing_url, @batch_id, 'pending', datetime('now'), datetime('now'))
      ON CONFLICT(agent_id) DO UPDATE SET
        agent_name = excluded.agent_name,
        candidate_url = excluded.candidate_url,
@@ -377,6 +423,7 @@ function upsertRfbWebsiteReviewQueue(
        evidence = excluded.evidence,
        confidence = excluded.confidence,
        reason = excluded.reason,
+       existing_url = excluded.existing_url,
        batch_id = excluded.batch_id,
        status = 'pending',
        updated_at = datetime('now')`,
@@ -388,6 +435,8 @@ function upsertRfbWebsiteReviewQueue(
     final_url: entry.final_url,
     evidence: JSON.stringify(entry.evidence),
     confidence: entry.confidence,
+    reason: entry.reason ?? "website_discovery_candidate",
+    existing_url: entry.existing_url ?? null,
     batch_id: entry.batch_id,
   });
 }
@@ -397,13 +446,20 @@ const router = Router();
 router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown };
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; mode?: unknown };
+  // "blank" (default/omitted) — unchanged, byte-identical behaviour: targets
+  // producer rows with NO website on file. "aggregator_replace" is the new
+  // mode: targets rows whose CURRENT website is itself a directory/
+  // aggregator/social host rather than the producer's own real site. Any
+  // value other than the literal string "aggregator_replace" resolves to
+  // "blank", so an omitted/unset mode is indistinguishable from today.
+  const mode: "blank" | "aggregator_replace" = body.mode === "aggregator_replace" ? "aggregator_replace" : "blank";
   const batchId = `rfb-website-discovery-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   const db = getDb();
   ensureRfbWebsiteReviewQueueTable(db);
   const notFound: string[] = [];
-  const alreadyHasWebsite: Array<{ agent_id: string; agent_name: string }> = [];
+  const alreadyHasWebsite: Array<{ agent_id: string; agent_name: string; reason?: string }> = [];
   let targets: RfbWdTargetRow[] = [];
 
   if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
@@ -418,6 +474,20 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       const t = getRfbWebsiteDiscoveryTarget(db, id);
       if (!t) {
         notFound.push(id);
+      } else if (mode === "aggregator_replace") {
+        // Inverted-check idiom mirrored from blank mode's own
+        // already-has-website check, but the semantics are inverted for
+        // this cohort: a row only qualifies if its CURRENT website is a
+        // known aggregator/directory/social host. Blank websites and
+        // already-genuine sites are both rejected here, distinguished from
+        // blank mode's rejection reason so a caller isn't guessing.
+        const currentHost = t.website ? rfbWdHostFromUrl(t.website) : null;
+        const exclusionReason = currentHost ? rfbWebsiteHostExclusionReason(currentHost) : null;
+        if (!t.website || t.website.trim() === "" || !exclusionReason) {
+          alreadyHasWebsite.push({ agent_id: t.id, agent_name: t.name, reason: "no_current_aggregator_website" });
+        } else {
+          targets.push(t);
+        }
       } else if (t.website && t.website.trim() !== "") {
         alreadyHasWebsite.push({ agent_id: t.id, agent_name: t.name });
       } else {
@@ -429,17 +499,34 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : RFB_WD_DEFAULT_LIMIT,
       RFB_WD_HARD_CAP,
     );
-    targets = selectRfbWebsiteDiscoveryTargets(db, limit);
-    // Auto-select's own WHERE already excludes non-blank website, but the
-    // check is repeated defensively so the two selection paths can never
-    // silently diverge in behaviour.
-    targets = targets.filter((t) => {
-      if (t.website && t.website.trim() !== "") {
-        alreadyHasWebsite.push({ agent_id: t.id, agent_name: t.name });
-        return false;
-      }
-      return true;
-    });
+    if (mode === "aggregator_replace") {
+      targets = selectRfbWebsiteReplacementTargets(db, limit);
+      // Auto-select's own filtering already excludes rows that don't
+      // qualify, but the check is repeated defensively (same convention as
+      // blank mode below) so the two selection paths can never silently
+      // diverge in behaviour.
+      targets = targets.filter((t) => {
+        const currentHost = t.website ? rfbWdHostFromUrl(t.website) : null;
+        const exclusionReason = currentHost ? rfbWebsiteHostExclusionReason(currentHost) : null;
+        if (!t.website || t.website.trim() === "" || !exclusionReason) {
+          alreadyHasWebsite.push({ agent_id: t.id, agent_name: t.name, reason: "no_current_aggregator_website" });
+          return false;
+        }
+        return true;
+      });
+    } else {
+      targets = selectRfbWebsiteDiscoveryTargets(db, limit);
+      // Auto-select's own WHERE already excludes non-blank website, but the
+      // check is repeated defensively so the two selection paths can never
+      // silently diverge in behaviour.
+      targets = targets.filter((t) => {
+        if (t.website && t.website.trim() !== "") {
+          alreadyHasWebsite.push({ agent_id: t.id, agent_name: t.name });
+          return false;
+        }
+        return true;
+      });
+    }
   }
 
   const existingHosts = rfbWdExistingWebsiteHosts(db);
@@ -452,6 +539,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     final_url: string;
     evidence: RfbWdEvidence;
     confidence: number;
+    existing_url?: string | null;
   }> = [];
   const rejected: Array<{
     agent_id: string;
@@ -493,6 +581,13 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         candidateUrl = `https://${hit.host}`;
       }
       const confidence = rfbWdConfidence(hit.evidence);
+      // Reason + existing_url are mode-scoped: blank mode omits both (undefined
+      // existing_url, default reason inside upsertRfbWebsiteReviewQueue) so its
+      // queue-row shape and this response are unchanged from before this mode
+      // existed; aggregator_replace records the producer's CURRENT (bad)
+      // website alongside the newly proposed candidate.
+      const isReplacement = mode === "aggregator_replace";
+      const existingUrl = isReplacement ? t.website : undefined;
       upsertRfbWebsiteReviewQueue(db, {
         agent_id: t.id,
         agent_name: t.name,
@@ -501,6 +596,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         evidence: hit.evidence,
         confidence,
         batch_id: batchId,
+        reason: isReplacement ? "website_discovery_candidate_replacement" : undefined,
+        existing_url: existingUrl,
       });
       proposed.push({
         agent_id: t.id,
@@ -509,6 +606,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         final_url: hit.finalUrl,
         evidence: hit.evidence,
         confidence,
+        existing_url: existingUrl,
       });
     } else {
       // No verified candidate. Reason: if no candidate host could even be
@@ -529,6 +627,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
 
   res.json({
     success: true,
+    mode,
     batch_id: batchId,
     scanned: targets.length,
     proposed,
