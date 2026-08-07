@@ -107,6 +107,43 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       const claimSvcForRfbOverride = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
       claimSvcForRfbOverride.__setRfbDbForTesting(rfbDb as any);
 
+      // ── THE FETCH-INJECTION SEAM (dev-request 2026-08-06-aldri-gjett-
+      // epostadresse, SLICE 5 / AC7) ───────────────────────────────────────
+      // Slice 2 named the absence of this seam as one of the three reasons
+      // the harvest could not be live-wired: this suite drives the router
+      // over a REAL http.Server with raw http.request(), so a route handler
+      // has no parameter list a test can reach into, and wiring a live fetch
+      // into the GET entry page would have made `npm test` fetch
+      // route-test-gard.no / enannengard.no for real. gardssalg-claim.ts's
+      // module-level __setClaimHarvestFetchForTesting() is that seam — the
+      // SAME shape experience-brreg.ts's __setBrregFetchForTesting and
+      // bm-events-scraper.ts's __setBmEventsScraperFetchForTesting already
+      // use, installed here on the SAME freshly-required module instance
+      // __setRfbDbForTesting is installed on one line up.
+      //
+      // `routeHarvestHtml` is what every harvest fetch in this suite sees;
+      // individual sections below reassign it (and reset the harvest cache)
+      // to drive a specific scenario. The DEFAULT is an email-free page, so
+      // every pre-SLICE-5 assertion in this suite keeps its original answer.
+      // routeFetchCalls exists so a test can prove a fetch did or did NOT
+      // happen — fetchPage() never rethrows, so a throwing stub could not.
+      let routeHarvestHtml = "<html><body><h1>Ingen kontaktinfo her</h1></body></html>";
+      let routeFetchCalls: string[] = [];
+      claimSvcForRfbOverride.__setClaimHarvestFetchForTesting(((async (input: unknown) => {
+        const url = String(input);
+        routeFetchCalls.push(url);
+        const bytes = new TextEncoder().encode(routeHarvestHtml);
+        return {
+          ok: true,
+          status: 200,
+          statusText: "S200",
+          url,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+        } as unknown as Response;
+      }) as unknown) as typeof fetch);
+      claimSvcForRfbOverride.__resetClaimHarvestCacheForTesting();
+
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
@@ -574,6 +611,82 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
 
       const afterLogout = await req("GET", "/api/opplevelser/gardssalg-claim/prov-route-eligible/profile", { headers: { Cookie: cookieHeader } });
       assertEq(afterLogout.status, 401, "e2: the SAME (pre-logout) session cookie no longer authenticates after logout — a real revoke, not just a cookie-clear");
+
+      // ── (w) SLICE 5 / AC7 live-wiring, at the HTTP level ────────────────
+      // These are the route-level counterpart of the service suite's own
+      // w-series. What they pin is specifically the thing the dev-request's
+      // live measurement found missing in production: the PUBLIC, unauthenticated
+      // entry page and the POST it submits to must both go through the
+      // harvest, agree with each other, and stop offering a producer nothing
+      // when their own website publishes a perfectly good address.
+      //
+      // `prov-route-found` deliberately has NO stored epost, NO brreg contact
+      // and content_source='provider_site' — under slice 1 alone it is
+      // claim-dead (the entry page would show the manual fallback), which is
+      // exactly the 0/87 cohort state. Its hjemmeside is ownership-verified
+      // via the field_provenance stamp, the shape the admin website-approval
+      // queue produces.
+      insertProvider.run({
+        id: "prov-route-found", navn: "Funnet Rute Gård", slug: "funnet-rute-gard",
+        org_nr: "977777771", brreg_verified: 1, hjemmeside: "https://funnet-rute-gard.no",
+        content_source: "provider_site",
+        field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/funnet-rute-gard", fetched_at: "2026-07-01T00:00:00Z" } }),
+      });
+
+      routeHarvestHtml = `<html><body><h1>Funnet Rute Gård</h1><p>E-post: post@funnet-rute-gard.no</p></body></html>`;
+      routeFetchCalls = [];
+      claimSvcForRfbOverride.__resetClaimHarvestCacheForTesting();
+
+      const foundPage = await req("GET", "/kategori/gardssalg/eier/funnet-rute-gard");
+      assertEq(foundPage.status, 200, "w1: GET entry page for a harvest-only-eligible provider -> 200");
+      assertTrue(foundPage.body.includes("Send meg tilgangslenke"), "w2: SLICE 5 — the entry page now offers the self-service link to a producer whose ONLY address was found on their own verified website (before wiring: manual fallback only — the measured 0/87 state)");
+      assertTrue(!foundPage.body.includes("post@funnet-rute-gard.no"), "w3: ...and still never renders the full address, only a masked form (unchanged AC4 invariant)");
+      assertTrue(/p\*+t@f\*+\.no/.test(foundPage.body), "w4: ...the masked form really is that of the harvested address");
+      assertTrue(routeFetchCalls.includes("https://funnet-rute-gard.no"), "w5: ...and the page genuinely fetched the producer's own site through the injected fetch (never the real network)");
+
+      // (w6) The cache: reloading the same public page inside the TTL costs
+      // the producer's website nothing. This is the concrete protection the
+      // CLAIM_HARVEST_CACHE_TTL_MS judgment call exists for — an unauthenticated
+      // visitor holding down reload must not become a request amplifier.
+      const fetchesAfterFirstView = routeFetchCalls.length;
+      const foundPageAgain = await req("GET", "/kategori/gardssalg/eier/funnet-rute-gard");
+      assertEq(foundPageAgain.status, 200, "w6: a reload of the same entry page -> 200");
+      assertTrue(foundPageAgain.body.includes("Send meg tilgangslenke"), "w6b: ...still offering the link (the cached harvest is a real result, not an empty placeholder)");
+      assertEq(routeFetchCalls.length, fetchesAfterFirstView, "w7: ...with ZERO additional outbound fetches — repeat unauthenticated page views reuse the cached harvest for the TTL");
+
+      // (w8-w10) The POST agrees with what the page offered: same provider,
+      // same harvest cache key, so a link really is issued and really is
+      // stamped with the found tier.
+      const foundReq = await req("POST", "/kategori/gardssalg/eier/prov-route-found/request", {
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      assertEq(foundReq.status, 200, "w8: POST request-magic-link succeeds end to end for the harvest-only provider (page and POST agree — the invariant the GET handler's own comment states)");
+      const foundClaimRow = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-found") as any;
+      assertEq(foundClaimRow?.email, "post@funnet-rute-gard.no", "w9: the issued claim targets the address actually found on the producer's page");
+      assertEq(foundClaimRow?.email_source, "found_same_domain", "w10: ...persisted with email_source='found_same_domain'");
+
+      // (w11) A producer whose site publishes nothing usable still falls
+      // through to the manual fallback — "empty is better than guessed"
+      // (AC1) survives the wiring; nothing here invents an address from the
+      // known-good domain just because the fetch succeeded.
+      insertProvider.run({
+        id: "prov-route-silent", navn: "Stille Rute Gård", slug: "stille-rute-gard",
+        org_nr: "977777772", brreg_verified: 1, hjemmeside: "https://stille-rute-gard.no",
+        content_source: "provider_site",
+        field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/stille-rute-gard", fetched_at: "2026-07-01T00:00:00Z" } }),
+      });
+      routeHarvestHtml = "<html><body><h1>Stille Rute Gård</h1><p>Ingen e-post her.</p></body></html>";
+      claimSvcForRfbOverride.__resetClaimHarvestCacheForTesting();
+      const silentPage = await req("GET", "/kategori/gardssalg/eier/stille-rute-gard");
+      assertEq(silentPage.status, 200, "w11: GET entry page for a verified-site provider whose site publishes no address -> 200");
+      assertTrue(!silentPage.body.includes("Send meg tilgangslenke"), "w12: AC1 REGRESSION GUARD — no address found means no self-service offer; the wiring never synthesizes post@stille-rute-gard.no from the (verified, known) domain");
+      assertTrue(silentPage.body.includes("kontakt@opplevagent.no"), "w13: ...the manual fallback is shown instead");
+
+      // Restore the suite default so nothing after this block inherits a
+      // page with an address on it.
+      routeHarvestHtml = "<html><body><h1>Ingen kontaktinfo her</h1></body></html>";
+      claimSvcForRfbOverride.__resetClaimHarvestCacheForTesting();
     } catch (err: any) {
       failed++;
       failures.push("gardssalg-claim routes: unexpected error: " + String(err?.stack || err?.message || err));
@@ -584,6 +697,11 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       try {
         const claimSvcForRfbOverride = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
         claimSvcForRfbOverride.__setRfbDbForTesting(null);
+        // SLICE 5 / AC7 — same discipline as the RFB-db override: a leftover
+        // fetch override would silently answer a LATER suite's harvest, and a
+        // leftover cache entry would silently answer its first call.
+        claimSvcForRfbOverride.__setClaimHarvestFetchForTesting(undefined);
+        claimSvcForRfbOverride.__resetClaimHarvestCacheForTesting();
       } catch { /* ignore */ }
       try { rfbDb.close(); } catch { /* already closed */ }
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;

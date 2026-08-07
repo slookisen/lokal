@@ -841,7 +841,7 @@ export function initExperiencesSchema(db: Database.Database): void {
         id TEXT PRIMARY KEY,
         provider_id TEXT NOT NULL REFERENCES experience_providers(id) ON DELETE CASCADE,
         email TEXT NOT NULL,
-        email_source TEXT NOT NULL, -- 'brreg_contact' | 'verified_domain_address' | 'stored_epost_verified' | 'found_same_domain' | 'found_contact_page' | 'found_site_other'
+        email_source TEXT NOT NULL, -- 'brreg_contact' | 'verified_domain_address' | 'stored_epost_verified' | 'found_same_domain' | 'found_contact_page' | 'found_site_other' | 'found_umbrella_member'
         -- 'stored_epost_verified' added dev-request 2026-07-30-opplevagent-
         -- claim-epost-og-perfelt-laas item 1: the provider's own epost
         -- value, issued only when backed by real provenance -- see
@@ -849,13 +849,16 @@ export function initExperiencesSchema(db: Database.Database): void {
         -- 'found_same_domain' | 'found_contact_page' | 'found_site_other'
         -- added dev-request 2026-08-06-aldri-gjett-epostadresse SLICE 2
         -- (2026-08-07) -- see gardssalg-claim.ts's
-        -- deriveOrgLinkedEmailCandidatesWithHarvest(). Not yet reachable from
-        -- any live INSERT into this table (that function is not live-wired
-        -- this slice -- see its own doc comment), so this is documentation
-        -- ahead of first use, same as 'verified_domain_address' was until
-        -- tier (b) went live originally.
-        -- Column stays untyped TEXT; this is a comment-only change, no
-        -- migration needed.
+        -- deriveOrgLinkedEmailCandidatesWithHarvest(); 'found_umbrella_member'
+        -- added by that dev-request's SLICE 4 as the fallback below those
+        -- three (an address published by the producer's umbrella org, matched
+        -- to the producer by name -- see harvestUmbrellaMemberEmail()).
+        -- All four were documentation ahead of first use until SLICE 5 / AC7
+        -- (2026-08-07) live-wired the harvest into issueClaimMagicLink() and
+        -- the public claim-entry route; they are reachable from a live INSERT
+        -- into this table from that slice onwards.
+        -- Column stays untyped TEXT; every change here has been comment-only,
+        -- no migration needed.
         token TEXT NOT NULL UNIQUE,
         used INTEGER NOT NULL DEFAULT 0,
         used_at TEXT,

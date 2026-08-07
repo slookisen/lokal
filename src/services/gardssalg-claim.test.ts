@@ -733,6 +733,42 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       claimSvc.__setRfbDbForTesting(rfbDb as any);
       const enrich = require("./gardssalg-rfb-enrich") as typeof import("./gardssalg-rfb-enrich");
 
+      // ── NO REAL NETWORK, EVER (dev-request 2026-08-06-aldri-gjett-
+      // epostadresse SLICE 5 / AC7) ────────────────────────────────────────
+      // issueClaimMagicLink() is now harvest-backed, so several DB-backed
+      // fixtures below (prov-claimable, prov-manual, prov-generic-domain —
+      // all Brreg-verified WITH an ownership-verified hjemmeside) would
+      // otherwise cause this suite to fetch klostergarden.no, danielsgard.no
+      // and facebook.com for real. This module-level override is the seam
+      // that stops that; it is installed on the SAME freshly-required module
+      // instance __setRfbDbForTesting is installed on two lines up (this
+      // suite deletes gardssalg-claim from require.cache above), so it cannot
+      // leak into a concurrently-running unrelated suite — the same isolation
+      // argument that override's own doc comment makes.
+      //
+      // Returns a real 200 page with NO email addresses on it, so every
+      // harvest attempt legitimately yields zero found candidates and every
+      // pre-existing assertion in this suite keeps its pre-SLICE-5 answer.
+      // A COUNTER, not a throwing stub: fetchPage() never rethrows (see the
+      // h1 test's own doc comment), so only counting can prove "this fixture
+      // did / did not attempt a fetch".
+      let suiteFetchCalls: string[] = [];
+      const emptyPageFetchImpl = ((async (input: unknown) => {
+        const url = String(input);
+        suiteFetchCalls.push(url);
+        const bytes = new TextEncoder().encode("<html><body><h1>Ingen kontaktinfo</h1></body></html>");
+        return {
+          ok: true,
+          status: 200,
+          statusText: "S200",
+          url,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+        } as unknown as Response;
+      }) as unknown) as typeof fetch;
+      claimSvc.__setClaimHarvestFetchForTesting(emptyPageFetchImpl);
+      claimSvc.__resetClaimHarvestCacheForTesting();
+
       const insertProvider = expDb.prepare(`
         INSERT INTO experience_providers
           (id, navn, slug, vertical, org_nr, brreg_verified, hjemmeside, content_source, field_provenance,
@@ -910,19 +946,19 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       assertTrue(!claimSvc.wasEpostDeliveredOutreachNoBounce(""), "g6: empty-string input -> false, never throws");
 
       // ── issueClaimMagicLink ────────────────────────────────────────────
-      const notFound = claimSvc.issueClaimMagicLink("prov-missing");
+      const notFound = await claimSvc.issueClaimMagicLink("prov-missing");
       assertEq(notFound, { ok: false, error: "provider_not_found" }, "b1: issueClaimMagicLink on a missing provider -> provider_not_found");
 
-      const noEmail = claimSvc.issueClaimMagicLink("prov-noemail");
+      const noEmail = await claimSvc.issueClaimMagicLink("prov-noemail");
       assertEq(noEmail, { ok: false, error: "no_org_linked_email" }, "b2: issueClaimMagicLink with no org-linked email -> no_org_linked_email (no self-service)");
 
       // SECURITY: a 'manual' provider whose hjemmeside is a generic/shared
       // domain (Facebook page, no real site) must never issue a claim link —
       // that would derive post@facebook.com as the "verified" target.
-      const genericDomain = claimSvc.issueClaimMagicLink("prov-generic-domain");
+      const genericDomain = await claimSvc.issueClaimMagicLink("prov-generic-domain");
       assertEq(genericDomain, { ok: false, error: "no_org_linked_email" }, "b2b: issueClaimMagicLink on a manual provider with a generic-domain hjemmeside (facebook.com) -> no_org_linked_email, never a viable claim-email");
 
-      const issued = claimSvc.issueClaimMagicLink("prov-claimable");
+      const issued = await claimSvc.issueClaimMagicLink("prov-claimable");
       assertTrue(issued.ok === true, "b3: issueClaimMagicLink succeeds for the claimable provider");
       if (issued.ok) {
         assertEq(issued.claim.email, "post@klostergarden.no", "b4: issued claim targets the provider's stored epost (tier (c) — see prov-claimable's own fixture comment for the tier (b) retirement)");
@@ -937,7 +973,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
 
       // (c-epost) positive: content_source='manual', no verified hjemmeside —
       // only the stored epost tier can produce this claim.
-      const issuedManualEpost = claimSvc.issueClaimMagicLink("prov-epost-manual");
+      const issuedManualEpost = await claimSvc.issueClaimMagicLink("prov-epost-manual");
       assertTrue(issuedManualEpost.ok === true, "h1: issueClaimMagicLink succeeds for a manual provider via its stored epost");
       if (issuedManualEpost.ok) {
         assertEq(issuedManualEpost.claim.email, "post@epostmanual.no", "h2: issued claim targets the provider's OWN stored epost, unchanged");
@@ -948,7 +984,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
 
       // (b-epost) positive: harvested content_source, but the address was
       // real, delivered, non-bounced Opplevagent outreach.
-      const issuedOutreachEpost = claimSvc.issueClaimMagicLink("prov-epost-outreach");
+      const issuedOutreachEpost = await claimSvc.issueClaimMagicLink("prov-epost-outreach");
       assertTrue(issuedOutreachEpost.ok === true, "h5: issueClaimMagicLink succeeds for a harvested-content_source provider whose epost received delivered, non-bounced outreach");
       if (issuedOutreachEpost.ok) {
         assertEq(issuedOutreachEpost.claim.email, "utsendt@epostoutreach.no", "h6: issued claim targets the outreach-delivered address");
@@ -956,16 +992,16 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       }
 
       // Negative: same shape, but the address bounced -> no self-service.
-      const bouncedEpost = claimSvc.issueClaimMagicLink("prov-epost-bounced");
+      const bouncedEpost = await claimSvc.issueClaimMagicLink("prov-epost-bounced");
       assertEq(bouncedEpost, { ok: false, error: "no_org_linked_email" }, "h8: a bounced outreach address never becomes a claim target, even though a send WAS logged");
 
       // Negative: outreach_sent_log row exists but is stamped vertical_id='rfb'.
-      const wrongVerticalEpost = claimSvc.issueClaimMagicLink("prov-epost-wrong-vertical");
+      const wrongVerticalEpost = await claimSvc.issueClaimMagicLink("prov-epost-wrong-vertical");
       assertEq(wrongVerticalEpost, { ok: false, error: "no_org_linked_email" }, "h9: an RFB-vertical outreach_sent_log row does not qualify an Opplevagent claim");
 
       // ACCEPTANCE CRITERION 2, full call chain: purely scraped epost, no
       // provenance at all -> manual fallback, never self-service.
-      const scrapedOnlyEpost = claimSvc.issueClaimMagicLink("prov-epost-scraped-only");
+      const scrapedOnlyEpost = await claimSvc.issueClaimMagicLink("prov-epost-scraped-only");
       assertEq(scrapedOnlyEpost, { ok: false, error: "no_org_linked_email" }, "h10: Acceptance Criterion 2 — a purely scraped epost (no provenance) stays on the manual fallback end to end");
 
       // ── Producer address selection — dev-request 2026-08-06-claim-
@@ -993,7 +1029,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       });
       setEpost.run("eier@gmail.com", "prov-two-candidates");
 
-      const needsSelection = claimSvc.issueClaimMagicLink("prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT);
+      const needsSelection = await claimSvc.issueClaimMagicLink("prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT);
       assertEq(needsSelection, { ok: false, error: "selection_required" }, "j1: issueClaimMagicLink on a 2-candidate provider with no selection -> selection_required (AC2's server-side half)");
 
       // AC1 REGRESSION GUARD: explicitly asking for the RETIRED tier by
@@ -1001,12 +1037,12 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       // never a crash — proves selectedSource validation doesn't special-
       // case the old tier tag, it simply isn't in this provider's (or any
       // provider's) candidate list anymore.
-      const badSelection = claimSvc.issueClaimMagicLink(
+      const badSelection = await claimSvc.issueClaimMagicLink(
         "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "verified_domain_address" },
       );
       assertEq(badSelection, { ok: false, error: "invalid_selection" }, "j2: AC1/AC5 — selecting the RETIRED verified_domain_address tier by name -> invalid_selection, never a silent fallback guess");
 
-      const chosenBrreg = claimSvc.issueClaimMagicLink(
+      const chosenBrreg = await claimSvc.issueClaimMagicLink(
         "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "brreg_contact" },
       );
       assertTrue(chosenBrreg.ok === true, "j3: a selectedSource matching a real candidate -> succeeds");
@@ -1015,7 +1051,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         assertEq(chosenBrreg.claim.source, "brreg_contact", "j5: claim.source matches the selection");
       }
 
-      const chosenEpost = claimSvc.issueClaimMagicLink(
+      const chosenEpost = await claimSvc.issueClaimMagicLink(
         "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "stored_epost_verified" },
       );
       assertTrue(chosenEpost.ok === true, "j6: selecting the OTHER qualifying candidate for the same provider also succeeds");
@@ -1026,20 +1062,20 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       // AC6: rate limit is per-PROVIDER (isClaimRateLimited keys on
       // provider_id only), shared across different address selections. j3
       // and j6 already spent 2 of the 3-per-window budget on this provider.
-      const chosenThird = claimSvc.issueClaimMagicLink(
+      const chosenThird = await claimSvc.issueClaimMagicLink(
         "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "brreg_contact" },
       );
       assertTrue(chosenThird.ok === true, "j8: 3rd request on this provider (regardless of which candidate) still succeeds (limit is 3)");
-      const chosenFourth = claimSvc.issueClaimMagicLink(
+      const chosenFourth = await claimSvc.issueClaimMagicLink(
         "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "stored_epost_verified" },
       );
       assertEq(chosenFourth, { ok: false, error: "rate_limited" }, "j9: AC6 — the 4th request is rate-limited even though it picks a DIFFERENT candidate than the 3 before it; the limit is shared, not per-address");
 
       // ── Rate limiting ──────────────────────────────────────────────────
-      claimSvc.issueClaimMagicLink("prov-claimable");
-      const third = claimSvc.issueClaimMagicLink("prov-claimable");
+      await claimSvc.issueClaimMagicLink("prov-claimable");
+      const third = await claimSvc.issueClaimMagicLink("prov-claimable");
       assertTrue(third.ok === true, "b9: 3rd request within the window still succeeds (limit is 3)");
-      const fourth = claimSvc.issueClaimMagicLink("prov-claimable");
+      const fourth = await claimSvc.issueClaimMagicLink("prov-claimable");
       assertEq(fourth, { ok: false, error: "rate_limited" }, "b10: 4th request within the window is rate-limited");
 
       // ── isClaimRateLimited: rolling-hour window, not UTC-calendar-day
@@ -1149,7 +1185,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       }
 
       // content_source='manual' must NOT be downgraded by a claim.
-      const manualClaim = claimSvc.issueClaimMagicLink("prov-manual");
+      const manualClaim = await claimSvc.issueClaimMagicLink("prov-manual");
       if (manualClaim.ok) {
         claimSvc.verifyClaimToken(manualClaim.claim.token);
         const manualRow = expDb.prepare("SELECT content_source FROM experience_providers WHERE id = ?").get("prov-manual") as any;
@@ -1630,6 +1666,215 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         );
         assertEq(u14, { email: "synlig-variant@gmail.com", source: "found_umbrella_member" }, "u14: REGRESSION (review finding 2, `visibility:hidden` variant + no-over-stripping check) — the visibility:hidden sibling's name+email is excluded (skjult-variant@gmail.com never qualifies) while the genuinely visible sibling's own name+email is matched completely normally -> synlig-variant@gmail.com, proving the fix doesn't over-strip visible content");
       }
+
+      // ── SLICE 5 / AC7 live-wiring — dev-request 2026-08-06-aldri-gjett-
+      // epostadresse. The whole point of this slice: a producer whose ONLY
+      // possible address is one found on their own verified website must now
+      // actually be able to claim, end to end through issueClaimMagicLink().
+      // Before this slice that producer got no_org_linked_email — which is
+      // exactly the 10/87 -> 0/87 coverage collapse the dev-request's live
+      // verification measured. ──
+      {
+        /** Serves one HTML body for every requested URL, and counts requests. */
+        function countingPageFetchImpl(html: string, calls: string[]): typeof fetch {
+          return ((async (input: unknown) => {
+            const url = String(input);
+            calls.push(url);
+            const bytes = new TextEncoder().encode(html);
+            return {
+              ok: true, status: 200, statusText: "S200", url,
+              headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+              arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+            } as unknown as Response;
+          }) as unknown) as typeof fetch;
+        }
+
+        // A provider with NO brreg contact, NO stored epost, and no 'manual'
+        // content_source — its hjemmeside is ownership-verified purely by the
+        // field_provenance.hjemmeside stamp, i.e. the admin-approved-website
+        // shape the real cohort is full of. Under slice 1 alone this row is
+        // claim-dead; under slice 5 it claims via found_same_domain.
+        insertProvider.run({
+          id: "prov-w1-found", navn: "Funnet Adresse Gård", slug: "funnet-adresse-gard",
+          org_nr: "912350001", brreg_verified: 1, hjemmeside: "https://funnetadresse.no",
+          content_source: "provider_site",
+          field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/funnetadresse", fetched_at: "2026-07-01T00:00:00Z" } }),
+        });
+
+        const w1Calls: string[] = [];
+        claimSvc.__setClaimHarvestFetchForTesting(
+          countingPageFetchImpl(`<html><body><h1>Funnet Adresse Gård</h1><p>E-post: post@funnetadresse.no</p></body></html>`, w1Calls),
+        );
+        claimSvc.__resetClaimHarvestCacheForTesting();
+
+        const w1 = await claimSvc.issueClaimMagicLink("prov-w1-found");
+        assertTrue(w1.ok === true, "w1: SLICE 5 — issueClaimMagicLink now succeeds for a producer whose only address is one FOUND on their own ownership-verified website (before this slice: no_org_linked_email — the 0/87 coverage case)");
+        if (w1.ok) {
+          assertEq(w1.claim.email, "post@funnetadresse.no", "w2: the issued claim targets the address that was actually present in the fetched HTML");
+          assertEq(w1.claim.source, "found_same_domain", "w3: ...tagged found_same_domain, the AC2 priority-1 tier");
+          const w3row = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE token = ?").get(w1.claim.token) as any;
+          assertEq(w3row?.email_source, "found_same_domain", "w4: ...and persisted on the gardssalg_claims row with that source tag");
+        }
+        assertTrue(w1Calls.length > 0, "w5: ...and the harvest really did fetch the producer's own site (not a coincidental DB-tier match)");
+
+        // (w6-w7) The harvest cache: a SECOND issue for the same provider
+        // inside the TTL must not re-fetch the producer's website, but must
+        // still produce the same candidate. This is the unauthenticated-
+        // reload protection described on CLAIM_HARVEST_CACHE_TTL_MS.
+        const callsBeforeSecond = w1Calls.length;
+        const w6 = await claimSvc.issueClaimMagicLink("prov-w1-found");
+        assertTrue(w6.ok === true, "w6: a second issue for the same provider still resolves to a candidate");
+        assertEq(w1Calls.length, callsBeforeSecond, "w7: ...with ZERO additional outbound fetches — the harvest result came from the in-process TTL cache (the unauthenticated-reload amplification guard)");
+
+        // (w8) ...and the cache is genuinely keyed/clearable, not a
+        // permanent memo: after __resetClaimHarvestCacheForTesting() the next
+        // call fetches again (this is also what makes the reset in this
+        // suite's finally block meaningful rather than decorative).
+        claimSvc.__resetClaimHarvestCacheForTesting();
+        await claimSvc.issueClaimMagicLink("prov-w1-found");
+        assertTrue(w1Calls.length > callsBeforeSecond, "w8: after a cache reset the next issue fetches the site again — the cache is a TTL cache, not a permanent memo");
+
+        // (w9) selectedSource re-validation reaches the found tiers too
+        // (dev-request 2026-08-06-claim-produsent-velger-mottakeradresse's
+        // machinery, now that a found-tier candidate can exist at all): a
+        // producer with BOTH a brreg contact and a found address gets
+        // selection_required with no choice, and honours an explicit
+        // found-tier choice. Uses its OWN fixture so prov-w1-found's
+        // rate-limit budget (3/window, already spent above) is untouched.
+        insertProvider.run({
+          id: "prov-w9-choice", navn: "Valg Gård", slug: "valg-gard",
+          org_nr: "912350002", brreg_verified: 1, hjemmeside: "https://valggard.no",
+          content_source: "manual", field_provenance: null,
+        });
+        const w9Calls: string[] = [];
+        claimSvc.__setClaimHarvestFetchForTesting(
+          countingPageFetchImpl(`<html><body><p>E-post: post@valggard.no</p></body></html>`, w9Calls),
+        );
+        claimSvc.__resetClaimHarvestCacheForTesting();
+
+        const w9NoChoice = await claimSvc.issueClaimMagicLink("prov-w9-choice", "brreg@valggard-kilde.no");
+        assertEq(w9NoChoice, { ok: false, error: "selection_required" }, "w9: brreg_contact + a found_same_domain address = two candidates -> selection_required, exactly as for any other two-tier pair");
+        const w10 = await claimSvc.issueClaimMagicLink("prov-w9-choice", "brreg@valggard-kilde.no", { selectedSource: "found_same_domain" });
+        assertTrue(w10.ok === true, "w10: an explicit found-tier selection is re-validated against the harvest-aware candidate list and accepted");
+        if (w10.ok) {
+          assertEq(w10.claim.email, "post@valggard.no", "w11: ...and steers the link to the FOUND address, not the brreg one");
+          assertEq(w10.claim.source, "found_same_domain", "w12: ...with the selected source tag persisted");
+        }
+        const w13 = await claimSvc.issueClaimMagicLink("prov-w9-choice", "brreg@valggard-kilde.no", { selectedSource: "found_contact_page" });
+        assertEq(w13, { ok: false, error: "invalid_selection" }, "w13: naming a found tier this provider does NOT have -> invalid_selection, never a fallback to some other found tier");
+
+        // (x1-x5) SINGLE-FLIGHT — review finding, 2026-08-07. w6/w7 above
+        // only prove the SEQUENTIAL case: call, await, call again, served
+        // from cache. The first version of this cache wrote its entry AFTER
+        // the harvest await, so it did nothing at all for CONCURRENT callers
+        // — the reviewer reproduced 50 simultaneous cold page views making 50
+        // real fetch bursts against one producer's site. That is the exact
+        // scenario the cache exists to prevent (this GET is public,
+        // unauthenticated, and mounted above every rate limiter in index.ts),
+        // so it needs its own test rather than an inference from w7.
+        //
+        // Uses deriveOrgLinkedEmailCandidatesWithHarvest() directly rather
+        // than issueClaimMagicLink(): the claim rate limit is 3/window, so 50
+        // concurrent issues would measure THAT instead of the cache. The
+        // provider is a plain literal — no DB row needed, since this asks
+        // only about the network-derived half.
+        //
+        // The fetch is GATED, not merely slow: all 50 calls are started before
+        // any fetch is allowed to complete, so "1 fetch" can only be the
+        // single-flight and never a lucky ordering.
+        {
+          let sfFetchCount = 0;
+          let releaseFetch: () => void = () => {};
+          const sfGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+          claimSvc.__setClaimHarvestFetchForTesting(((async (input: unknown) => {
+            sfFetchCount++;
+            await sfGate;
+            const url = String(input);
+            const bytes = new TextEncoder().encode(`<html><body><p>E-post: post@samtidig.no</p></body></html>`);
+            return {
+              ok: true, status: 200, statusText: "S200", url,
+              headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+              arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+            } as unknown as Response;
+          }) as unknown) as typeof fetch);
+          claimSvc.__resetClaimHarvestCacheForTesting();
+
+          const sfProvider = {
+            navn: "Samtidig Gård",
+            org_nr: "912350003",
+            brreg_verified: 1,
+            hjemmeside: "https://samtidig.no",
+            content_source: "provider_site",
+            field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/samtidig", fetched_at: "2026-07-01T00:00:00Z" } }),
+          };
+
+          const SF_CONCURRENCY = 50;
+          const sfInflight = Array.from({ length: SF_CONCURRENCY }, () =>
+            claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(sfProvider as any, null, { cacheKey: "prov-x-singleflight" }),
+          );
+          // Let the fetch actually be dispatched (fetchPage reaches its
+          // fetchImpl after pure sync work) while the gate still holds every
+          // response open — i.e. observe the world mid-flight.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          assertEq(sfFetchCount, 1, `x1: ${SF_CONCURRENCY} SIMULTANEOUS derivations for the same COLD provider start exactly ONE outbound fetch — the in-flight promise goes into the cache before the await, so callers 2..N join it instead of each harvesting (before the fix: ${SF_CONCURRENCY} fetches)`);
+
+          releaseFetch();
+          const sfResults = await Promise.all(sfInflight);
+          assertEq(sfFetchCount, 1, "x2: ...and still exactly one after all of them resolved — no late straggler slipped past the shared entry");
+          assertTrue(
+            sfResults.every((r) => r.length === 1 && r[0].email === "post@samtidig.no" && r[0].source === "found_same_domain"),
+            "x3: every one of the concurrent callers gets the SAME correct answer — sharing one promise is not a partial or empty result for the late joiners",
+          );
+
+          // (x4-x5) A harvest that FAILS must not become a 12-minute cached
+          // answer, and its entry must not sit in the Map rethrowing one stale
+          // rejection at everyone: the entry is dropped, so a later caller
+          // re-attempts. Same property w8 checks for the success path.
+          let sfFailCount = 0;
+          claimSvc.__setClaimHarvestFetchForTesting(((async () => {
+            sfFailCount++;
+            throw new Error("boom");
+          }) as unknown) as typeof fetch);
+          claimSvc.__resetClaimHarvestCacheForTesting();
+          await claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(sfProvider as any, null, { cacheKey: "prov-x-fail" });
+          const sfFailAfterFirst = sfFailCount;
+          assertTrue(sfFailAfterFirst > 0, "x4: a failing harvest really did attempt the network");
+          claimSvc.__resetClaimHarvestCacheForTesting();
+          await claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(sfProvider as any, null, { cacheKey: "prov-x-fail" });
+          assertTrue(sfFailCount > sfFailAfterFirst, "x5: once the entry is gone the next caller re-attempts — a failed harvest is never a permanently cached answer");
+        }
+
+        // Restore the suite-wide empty-page override for anything after this
+        // block, and leave no cache entries behind.
+        claimSvc.__setClaimHarvestFetchForTesting(emptyPageFetchImpl);
+        claimSvc.__resetClaimHarvestCacheForTesting();
+      }
+
+      // ── (z) Suite-wide outbound-fetch ledger ─────────────────────────────
+      // emptyPageFetchImpl has been counting into suiteFetchCalls since the
+      // top of this suite but nothing ever read it — dead tracking, and out of
+      // step with the sibling guard in routes/opplevelser-booking-send-guard.
+      // test.ts, which asserts its own bsgHarvestFetchCalls is exactly []. This
+      // suite CANNOT assert [] (three of its fixtures are legitimately harvest-
+      // eligible: prov-claimable, prov-manual and prov-generic-domain are all
+      // Brreg-verified with an ownership-verified hjemmeside), so it asserts
+      // the exact expected shape instead — those three domains, once each.
+      // ONCE each is itself the point: it is the same TTL-cache property w7
+      // proves, observed across the whole suite. Sorted so this asserts the
+      // multiset rather than an incidental execution order.
+      // If this ever fails, either a new fixture became harvest-eligible (fine
+      // — but then it deserves a deliberate harvest scenario, not an accidental
+      // one) or the cache stopped holding; and had the override not been
+      // installed, `npm test` would have made these requests for real.
+      assertEq(
+        [...suiteFetchCalls].sort(),
+        [
+          "https://danielsgard.no",
+          "https://klostergarden.no",
+          "https://www.facebook.com/gardutenegennettside",
+        ],
+        "z1: over the whole suite the harvest attempted exactly the three known harvest-eligible fixtures' own sites, once each — no unexpected outbound fetch, and no re-fetch of a cached one",
+      );
     } catch (err: any) {
       failed++;
       failures.push("gardssalg-claim: unexpected error: " + String(err?.stack || err?.message || err));
@@ -1643,6 +1888,12 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       try {
         const claimSvc = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
         claimSvc.__setRfbDbForTesting(null);
+        // SLICE 5 / AC7: drop the fetch override and the harvest cache with
+        // the same discipline the RFB-db override is dropped — a leftover
+        // override would silently answer some LATER suite's harvest, and a
+        // leftover cache entry would silently answer its first call.
+        claimSvc.__setClaimHarvestFetchForTesting(undefined);
+        claimSvc.__resetClaimHarvestCacheForTesting();
       } catch { /* ignore */ }
       try { rfbDb.close(); } catch { /* already closed */ }
     }
