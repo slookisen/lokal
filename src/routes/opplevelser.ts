@@ -2314,9 +2314,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
 // applyGardssalgProviderContent's currentValueContaminated doc comment
 // above). Content written before the gate existed, or by a run where no
 // fresh candidate happened to qualify, is never revisited. This endpoint is
-// the retroactive sweep: for every non-locked gårdssalg row (visible AND
-// hidden — "excluding only content_source IN ('manual','claim')", the
-// dev-request's own words), it re-fetches the stored hjemmeside (reusing
+// the retroactive sweep: for every non-row-locked gårdssalg row (visible AND
+// hidden — originally "excluding only content_source IN ('manual','claim')",
+// the dev-request's own words; narrowed by sub-slice 3j of dev-request
+// 2026-07-30-opplevagent-claim-epost-og-perfelt-laas to exclude only
+// 'manual' at the row level — 'claim' rows are now in scope here too, with
+// the freeze enforced per-field inside applyGardssalgRetroScanNull via the
+// same already-shipped isGardssalgFieldOwnerLocked helper sub-slice 3i wired
+// through the content-refresh writer), it re-fetches the stored hjemmeside (reusing
 // crFetchGardssalgContent, same SSRF-guarded pipeline as content-refresh, so
 // content_evidence_url is a real, freshly-verified URL) and judges the
 // row's CURRENTLY STORED about_text/visit_text — not a freshly generated
@@ -2454,16 +2459,28 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
   };
   const changed: Array<{ provider_id: string; fields: string[]; reasons: Record<string, string> }> = [];
   const skippedLocked: string[] = [];
+  // Sub-slice 3j (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+  // laas): a DISTINCT bucket from skipped_locked above — skipped_locked keeps
+  // meaning "manual row, full row-level skip, never fetched" (unchanged).
+  // ownerFieldLocked is for 'claim' rows that DID reach candidate nulling
+  // (>=1 field flagged this run) but ended up nulling nothing because every
+  // one of those flagged fields was individually owner-locked via
+  // field_provenance.owner_locks — same convention as the content-refresh
+  // route's own owner_field_locked bucket (sub-slice 3i).
+  const ownerFieldLocked: Array<{ provider_id: string; fields: string[] }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
   async function processOne(t: GardssalgRetroScanTarget): Promise<void> {
     const providerId = t.id;
 
     // LOCK check — from the target's own row snapshot, BEFORE any fetch, so
-    // a locked provider never touches the network at all. Same discipline as
-    // /admin/gardssalg-content-refresh (see that route's own doc comment for
-    // why this is deliberately a pre-fetch, snapshot-based check).
-    if (t.content_source === "manual" || t.content_source === "claim") {
+    // a locked provider never touches the network at all. Sub-slice 3j: only
+    // 'manual' short-circuits here now — a full-row freeze, unchanged. A
+    // 'claim' row proceeds to fetch/judge as normal; the per-field owner-lock
+    // decision happens later, once the candidate null fields are known (see
+    // the ownerFieldLocked bucket below and applyGardssalgRetroScanNull's own
+    // per-field gate).
+    if (t.content_source === "manual") {
       skippedLocked.push(providerId);
       return;
     }
@@ -2510,18 +2527,54 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
     }
     if (wouldNullFields.length === 0) return;
 
-    for (const f of wouldNullFields) byField[f].flagged += 1;
+    // Sub-slice 3j (dev-request 2026-07-30-opplevagent-claim-epost-og-
+    // perfelt-laas): predict, from THIS target's own row snapshot (t — the
+    // same snapshot applyGardssalgRetroScanNull's own fresh DB read will
+    // agree with, barring a concurrent edit), which of this run's candidate
+    // null fields are owner-locked. Only meaningful for content_source=
+    // 'claim' rows (isGardssalgFieldOwnerLocked always returns false for any
+    // other content_source). Reused by BOTH branches below: dry-run needs it
+    // to keep the preview honest (dry-run never calls
+    // applyGardssalgRetroScanNull, so nothing else would catch this); apply
+    // uses it only to populate the owner_field_locked report — the actual
+    // gating decision for apply is made by applyGardssalgRetroScanNull's own
+    // per-field guard, not by this prediction.
+    const lockedCandidateFields =
+      t.content_source === "claim"
+        ? wouldNullFields.filter((f) => isGardssalgFieldOwnerLocked(t, f))
+        : [];
+    const writableFields = wouldNullFields.filter((f) => !lockedCandidateFields.includes(f));
+
+    if (writableFields.length === 0) {
+      // Every candidate field this run was owner-locked — distinct bucket,
+      // NOT skipped_locked (reserved for 'manual', row-level, never-fetched).
+      ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
+      return;
+    }
+
+    for (const f of writableFields) byField[f as "about_text" | "visit_text"].flagged += 1;
 
     if (dryRun) {
-      changed.push({ provider_id: providerId, fields: wouldNullFields, reasons });
+      const writableReasons: Record<string, string> = {};
+      for (const f of writableFields) writableReasons[f] = reasons[f];
+      changed.push({ provider_id: providerId, fields: writableFields, reasons: writableReasons });
       return;
     }
 
     try {
+      // Pass the FULL wouldNullFields (not the pre-filtered writableFields) —
+      // applyGardssalgRetroScanNull's own fresh-row-snapshot per-field gate
+      // makes the real decision (defense in depth against a stale
+      // route-level snapshot).
       const written = applyGardssalgRetroScanNull(providerId, wouldNullFields, fetched.fetchUrl);
       if (written.length > 0) {
         for (const f of written) byField[f as "about_text" | "visit_text"].nulled += 1;
         changed.push({ provider_id: providerId, fields: written, reasons });
+      } else if (lockedCandidateFields.length > 0 && lockedCandidateFields.length === wouldNullFields.length) {
+        // applyGardssalgRetroScanNull's own per-field gate agreed with the
+        // prediction above: every candidate field for this claim row was
+        // owner-locked, so nothing was nulled.
+        ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
       }
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
@@ -2541,6 +2594,10 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
     by_field: byField,
     changed,
     skipped_locked: skippedLocked,
+    // Sub-slice 3j: 'claim' rows whose flagged null-candidate fields were ALL
+    // owner-locked this run (0 nulled as a result) — additive bucket,
+    // distinct from skipped_locked (manual, row-level, never-fetched) above.
+    owner_field_locked: ownerFieldLocked,
     errors,
   });
 });

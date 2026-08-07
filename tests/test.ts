@@ -29339,6 +29339,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of grsr.failures) failures.push("opplevelser-gardssalg-retro-scan: " + f);
     console.log(`  opplevelser-gardssalg-retro-scan: ${grsr.passed} passed, ${grsr.failed} failed`);
 
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-
+    // slice 3j: wires the already-shipped isGardssalgFieldOwnerLocked()
+    // per-field owner-lock helper through applyGardssalgRetroScanNull's
+    // three row-level bail points (SQL auto-select, route early-skip,
+    // applyGardssalgRetroScanNull itself) for content_source='claim' rows —
+    // 'manual' keeps its full row-level freeze, unchanged. Mirrors sub-slice
+    // 3i's own content-refresh owner-lock test file. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-owner-lock-retro-scan: per-field owner-lock for the retro-scan nuller ──");
+    const { runOpplevelserGardssalgOwnerLockRetroScanTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-retro-scan.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-retro-scan.test");
+    const golrs = await runOpplevelserGardssalgOwnerLockRetroScanTests({ log: false });
+    passed += golrs.passed;
+    failed += golrs.failed;
+    for (const f of golrs.failures) failures.push("opplevelser-gardssalg-owner-lock-retro-scan: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-retro-scan: ${golrs.passed} passed, ${golrs.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c:
     // fill-only extraction of the "products" JSON-array column —
     // generateGardssalgProductList() (routes/opplevelser.ts, mirrors

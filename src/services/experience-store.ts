@@ -3609,24 +3609,31 @@ export type GardssalgRetroScanTarget = {
   content_source: string | null;
   about_text: string | null;
   visit_text: string | null;
+  field_provenance: string | null;
 };
 
 /**
  * Auto-select gårdssalg providers in scope for the retroactive scan:
  * gårdssalg providers (producer_type set OR rfb-seed) WITH a website, NOT
- * locked (content_source not in manual/claim — the dev-request's "excluding
- * only content_source IN ('manual','claim')" clause). Deliberately does NOT
- * filter on catalog_hidden — the dev-request explicitly requires "both
- * visible AND hidden" rows in scope, unlike
- * selectGardssalgProvidersForAddressEnrichment's catalog_hidden exclusion
- * above. Deliberately does NOT filter on whether about_text/visit_text is
- * blank/thin either — unlike selectGardssalgProvidersForContentRefresh, this
- * is a full retroactive sweep, not a "only rows with an obvious gap" queue;
- * a row whose about_text/visit_text is already blank is simply a no-op once
- * selected (nothing to judge/null). Ordered oldest-created first — there is
- * no dedicated retro-scan attempt timestamp (out of scope for this one-shot
- * sweep, mirrors selectGardssalgProvidersForAddressEnrichment's own choice
- * of created_at ASC over adding a new column). Hard-capped at 48 — there are
+ * row-level locked (content_source != 'manual'). Sub-slice 3j (dev-request
+ * 2026-07-30-opplevagent-claim-epost-og-perfelt-laas): 'claim' rows are now
+ * IN scope here too — the whole-row freeze narrows to a per-field freeze,
+ * enforced downstream in applyGardssalgRetroScanNull via the same already-
+ * shipped isGardssalgFieldOwnerLocked(row, fieldName) helper sub-slice 3i
+ * wired through the content-refresh writer. `field_provenance` is selected
+ * so that per-field check has the `owner_locks` data it needs, without a
+ * second DB round-trip. Deliberately does NOT filter on catalog_hidden — the
+ * dev-request explicitly requires "both visible AND hidden" rows in scope,
+ * unlike selectGardssalgProvidersForAddressEnrichment's catalog_hidden
+ * exclusion above. Deliberately does NOT filter on whether about_text/
+ * visit_text is blank/thin either — unlike
+ * selectGardssalgProvidersForContentRefresh, this is a full retroactive
+ * sweep, not a "only rows with an obvious gap" queue; a row whose about_text/
+ * visit_text is already blank is simply a no-op once selected (nothing to
+ * judge/null). Ordered oldest-created first — there is no dedicated
+ * retro-scan attempt timestamp (out of scope for this one-shot sweep,
+ * mirrors selectGardssalgProvidersForAddressEnrichment's own choice of
+ * created_at ASC over adding a new column). Hard-capped at 48 — there are
  * only 48 gårdssalg providers total.
  */
 export function selectGardssalgProvidersForRetroScan(limit = 48): GardssalgRetroScanTarget[] {
@@ -3634,12 +3641,12 @@ export function selectGardssalgProvidersForRetroScan(limit = 48): GardssalgRetro
   const cap = Math.max(1, Math.min(48, limit));
   return db
     .prepare(
-      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text, field_provenance
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
-          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (content_source IS NULL OR content_source != 'manual')
         ORDER BY created_at ASC
         LIMIT ?`
     )
@@ -3660,7 +3667,7 @@ export function getGardssalgProviderRetroScanTarget(providerId: string): Gardssa
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text, field_provenance
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
@@ -3694,6 +3701,19 @@ export function getGardssalgProviderRetroScanTarget(providerId: string): Gardssa
  *     backing it any more.
  * A field already blank is left alone (nothing to null); a provider with
  * nothing to null across the requested fields writes nothing and returns [].
+ *
+ * Sub-slice 3j (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+ * laas): 'manual' rows keep the unconditional, full-row freeze (unchanged —
+ * still bails before the loop below). 'claim' rows no longer bail here — the
+ * freeze narrows to per-field, via the SAME already-shipped, already-
+ * reviewed isGardssalgFieldOwnerLocked(row, fieldName) helper sub-slice 3i
+ * wired through applyGardssalgProviderContent (no new policy logic, only
+ * wiring): each requested field is checked individually inside the loop
+ * below, and an owner-locked field is skipped (never nulled, never added to
+ * `written`) exactly like an already-blank field is. This is the real
+ * enforcement point — the route's own prediction (see processOne in
+ * routes/opplevelser.ts) is only a preview; this function's fresh DB read of
+ * `row` is what actually decides.
  */
 export function applyGardssalgRetroScanNull(
   providerId: string,
@@ -3714,7 +3734,7 @@ export function applyGardssalgRetroScanNull(
       }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (row.content_source === "manual") return [];
 
   const oldValues: Record<string, string | null> = { about_text: row.about_text, visit_text: row.visit_text };
   const sets: string[] = [];
@@ -3724,6 +3744,7 @@ export function applyGardssalgRetroScanNull(
   for (const f of fields) {
     const current = oldValues[f];
     if (current === null || current === undefined || String(current).trim() === "") continue; // already blank — nothing to null
+    if (row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, f)) continue; // owner-locked — never null a field the owner explicitly locked
     sets.push(`${f} = NULL`);
     written.push(f);
   }
