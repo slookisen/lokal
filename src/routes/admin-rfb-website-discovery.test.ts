@@ -34,6 +34,22 @@
  *   (h) batch-size cap: more than RFB_WD_HARD_CAP agentIds -> 400.
  *   (i) GET /admin/rfb-website-review-queue returns only status='pending'
  *       rows, newest first.
+ *   (j) mode: "aggregator_replace" — a row whose current website is a known
+ *       aggregator/directory host is selected, a verified candidate is
+ *       queued with existing_url set to the old aggregator URL and
+ *       reason 'website_discovery_candidate_replacement', and the response
+ *       echoes mode: "aggregator_replace".
+ *   (k) mode: "aggregator_replace" — a row with a blank website is rejected
+ *       with reason 'no_current_aggregator_website'.
+ *   (l) mode: "aggregator_replace" — a row whose current website is already
+ *       a genuine (non-excluded) site is rejected with
+ *       'no_current_aggregator_website'.
+ *   (m) mode: "aggregator_replace" — the shared-host guard (existing-in-
+ *       catalog) still fires exactly as in blank mode.
+ *   (n) GET /admin/rfb-website-review-queue returns existing_url for a row
+ *       created via aggregator_replace mode.
+ *   (o) mode omitted/"blank" — response and DB effect are unchanged (no
+ *       regression versus (b)-(i) above, which all run with mode omitted).
  *
  * globalThis.fetch is mocked directly, keyed on URL (same convention as the
  * closest sibling test file, opplevelser-gardssalg-website-discovery.test.ts)
@@ -367,6 +383,127 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         r.body.queue.every((row: any) => row.status === "pending"),
         "i4: every returned row has status='pending'",
       );
+    }
+
+    // ── (j) mode: "aggregator_replace" — candidate accepted, existing_url
+    //     records the old aggregator URL, reason is the replacement variant --
+    {
+      insertAgent({
+        id: "wd-repl-ok",
+        name: "Solvang Gard",
+        orgNr: "977777777",
+        city: "Oppdal",
+        website: "https://facebook.com/solvanggard",
+      });
+      fixtures.set(
+        "https://solvanggard.no",
+        htmlResponse("<html><body>Solvang Gard — org.nr 977 777 777</body></html>", { finalUrl: "https://solvanggard.no" }),
+      );
+
+      const r = await callDiscovery({ agentIds: ["wd-repl-ok"], mode: "aggregator_replace" });
+      assertEq(r.status, 200, "j1: 200");
+      assertEq(r.body.mode, "aggregator_replace", "j2: response echoes mode");
+      assertEq(r.body.proposed.length, 1, "j3: exactly one proposal");
+      const prop = r.body.proposed[0];
+      assertEq(prop.agent_id, "wd-repl-ok", "j4: proposal is for the right agent");
+      assertEq(prop.candidate_url, "https://solvanggard.no", "j5: candidate_url is the new origin");
+      assertEq(r.body.rejected.length, 0, "j6: nothing rejected");
+      assertEq(r.body.already_has_website.length, 0, "j7: nothing rejected as already-has-website");
+
+      const row = readQueueRow("wd-repl-ok");
+      assertTrue(!!row, "j8: a queue row was inserted");
+      assertEq(row.existing_url, "https://facebook.com/solvanggard", "j9: existing_url is the old aggregator URL");
+      assertEq(row.reason, "website_discovery_candidate_replacement", "j10: reason is the replacement variant");
+      assertEq(row.candidate_url, "https://solvanggard.no", "j11: queue row candidate_url matches");
+    }
+
+    // ── (k) mode: "aggregator_replace" — blank-website row is rejected --
+    {
+      insertAgent({ id: "wd-repl-blank", name: "Blank Website Gard" });
+
+      const r = await callDiscovery({ agentIds: ["wd-repl-blank"], mode: "aggregator_replace" });
+      assertEq(r.body.scanned, 0, "k1: blank-website row never enters the scanned target set");
+      const rej = r.body.already_has_website.find((x: any) => x.agent_id === "wd-repl-blank");
+      assertTrue(!!rej, "k2: row is reported in already_has_website");
+      assertEq(rej.reason, "no_current_aggregator_website", "k3: reason is no_current_aggregator_website");
+      assertTrue(!readQueueRow("wd-repl-blank"), "k4: nothing queued");
+    }
+
+    // ── (l) mode: "aggregator_replace" — already-genuine-website row is
+    //     rejected (same reason as a blank row, distinguishing this mode
+    //     from blank mode's already_has_website check) --
+    {
+      insertAgent({ id: "wd-repl-genuine", name: "Ekte Egen Nettside Gard", website: "https://ekteeigennettside.no" });
+
+      const r = await callDiscovery({ agentIds: ["wd-repl-genuine"], mode: "aggregator_replace" });
+      assertEq(r.body.scanned, 0, "l1: genuine-website row never enters the scanned target set");
+      const rej = r.body.already_has_website.find((x: any) => x.agent_id === "wd-repl-genuine");
+      assertTrue(!!rej, "l2: row is reported in already_has_website");
+      assertEq(rej.reason, "no_current_aggregator_website", "l3: reason is no_current_aggregator_website");
+      assertTrue(
+        !fetchCalls.some((u) => u.includes("ekteeigennettside")),
+        "l4: no fetch ever attempted for a row that already has a genuine site",
+      );
+    }
+
+    // ── (m) mode: "aggregator_replace" — shared-host guard (existing-in-
+    //     catalog) still fires exactly as in blank mode --
+    {
+      insertAgent({ id: "wd-repl-owner", name: "Annen Produsent To", orgNr: "988888888", city: "Voss", website: "https://batchdeltgard.no" });
+      insertAgent({
+        id: "wd-repl-taken",
+        name: "Batch Delt Gard AS",
+        city: "Bodø",
+        website: "https://gulesider.no/batchdeltgard",
+      });
+      // Candidate hosts 2/3 must not verify either, or the shared-host guard
+      // on host 1 alone wouldn't be what determines the outcome (same
+      // fixture shape as (e); "https://batchdeltgard.no" is already claimed
+      // by wd-repl-owner's own live agent_knowledge.website above).
+      fixtures.set("https://batch-delt-gard.no", notFoundResponse());
+      fixtures.set("https://batchdeltgard.com", notFoundResponse());
+
+      const r = await callDiscovery({ agentIds: ["wd-repl-taken"], mode: "aggregator_replace" });
+      assertEq(r.body.proposed.length, 0, "m1: nothing proposed for wd-repl-taken");
+      const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-repl-taken");
+      assertTrue(!!rej, "m2: wd-repl-taken was rejected");
+      assertEq(rej.reason, "host_already_in_use", "m3: reason is host_already_in_use");
+      assertTrue(!readQueueRow("wd-repl-taken"), "m4: nothing queued for wd-repl-taken");
+    }
+
+    // ── (n) GET review-queue returns existing_url for an aggregator_replace
+    //     row --
+    {
+      const r = await callQueue();
+      const row = r.body.queue.find((x: any) => x.agent_id === "wd-repl-ok");
+      assertTrue(!!row, "n1: the aggregator_replace row from (j) is listed");
+      assertEq(row.existing_url, "https://facebook.com/solvanggard", "n2: GET echoes existing_url");
+      assertEq(row.reason, "website_discovery_candidate_replacement", "n3: GET echoes the replacement reason");
+    }
+
+    // ── (o) mode omitted/"blank" — unchanged: re-running discovery for
+    //     wd-ok (from (b)) with mode explicitly "blank" reproduces the same
+    //     result and refreshes (not duplicates) its queue row --
+    {
+      const r = await callDiscovery({ agentIds: ["wd-ok"], mode: "blank" });
+      assertEq(r.body.mode, "blank", "o1: response echoes mode: blank");
+      assertEq(r.body.proposed.length, 1, "o2: still exactly one proposal");
+      assertEq(r.body.proposed[0].agent_id, "wd-ok", "o3: still proposes wd-ok");
+      // fakeRes stores the body object directly (no real JSON.stringify), so
+      // an `undefined` value is still an own key; what matters is that the
+      // real Express res.json() (which DOES call JSON.stringify) would drop
+      // it — check that directly, the same serialization blank-mode callers
+      // over HTTP actually observe.
+      assertTrue(
+        !JSON.stringify(r.body.proposed[0]).includes("existing_url"),
+        "o4: blank-mode proposal's serialized JSON omits existing_url entirely",
+      );
+
+      const row = readQueueRow("wd-ok");
+      assertEq(row.existing_url, null, "o5: blank-mode queue row's existing_url stays NULL");
+      assertEq(row.reason, "website_discovery_candidate", "o6: blank-mode reason is unchanged");
+      const countRow = testDb.prepare("SELECT COUNT(*) AS n FROM agents_website_review_queue WHERE agent_id = 'wd-ok'").get() as { n: number };
+      assertEq(countRow.n, 1, "o7: refresh, don't pile up — still exactly one row for wd-ok");
     }
   } catch (err: any) {
     failed++;
