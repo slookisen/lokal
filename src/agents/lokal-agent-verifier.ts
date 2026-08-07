@@ -33,6 +33,11 @@ import {
   type CrossSourceVerdict,
   type DomainCoherenceResult,
 } from "../services/cross-source-validator";
+// Steg B fix-up (PR #524): reuse the SAME syntactic-validity / platform-owned-
+// domain helpers admin-agents-contact-email-write.ts already exports for
+// agents.contact_email, rather than hand-rolling new ones for
+// agent_knowledge.email. See the Steg B block in runVerifierBatch for why.
+import { isPlatformOwnedEmailDomain, isSyntacticallyValidEmail } from "../routes/admin-agents-contact-email-write";
 
 export interface VerifierResult {
   agent_id: string;
@@ -1112,52 +1117,118 @@ export async function runVerifierBatch(opts: {
     // branch that matters). `gate.reasons.website_ok` is still surfaced in
     // the reported object below for review-queue transparency.
     //
-    // What Steg B actually ADDS is the corroborated-email leg:
-    //   corroboratedEmail — `agents.contact_email` (the column outreach
-    //     actually sends to, see admin-rfb-contact-extraction.ts's header —
-    //     a DIFFERENT column from `agent_knowledge.email`/`agent.email` used
-    //     by the email_own_domain / Guard #3 checks above) is non-empty AND
-    //     not DNS-confirmed-dead for THAT SAME domain by the A0 stamp
-    //     (field_provenance.contact_email_dns_check, written by
-    //     admin-agents-contact-email-dns-check.ts: {checked_at, domain,
-    //     live, method, batch_id}). Domain-bound so a STALE dead stamp left
-    //     over from BEFORE A2 (admin-rfb-contact-extraction.ts) replaced a
-    //     dead address can't wrongly block the new one — A2 only overwrites
-    //     contact_email when it was blank or DNS-flagged-dead, so after a
-    //     replacement the stamp's `domain` no longer matches the current
-    //     email's domain. Absent/never-checked counts as "not known dead"
-    //     (honest — we don't invent evidence we don't have; this mirrors the
-    //     literal spec wording "non-empty AND live !== false").
+    // What Steg B actually ADDS is the corroborated-email leg.
+    //
+    // FIX-UP (independent review, PR #524, 2026-08-07): the original slice
+    // (commit 845f84d) read `agents.contact_email` here and checked it
+    // against `field_provenance.contact_email_dns_check`. That is the WRONG
+    // column for this gate. `outreach_ready_pool` (database/init.ts, `CREATE
+    // VIEW outreach_ready_pool`) requires `k.email IS NOT NULL AND k.email
+    // != ''` where `k` is `agent_knowledge` — and
+    // `src/routes/admin-outreach-candidates.ts`, the actual outreach
+    // candidate-export/send pipeline, selects and keys everything off
+    // `agent_knowledge.email`/`ak.email` throughout, NEVER
+    // `agents.contact_email`. Re-verified both independently while fixing
+    // this. `agents.contact_email` and `agent_knowledge.email` are not
+    // synced anywhere in this codebase (contact_email is a brand-new
+    // column, written/DNS-checked only by admin-rfb-contact-extraction.ts /
+    // admin-agents-contact-email-write.ts /
+    // admin-agents-contact-email-dns-check.ts, all landed earlier the same
+    // day as this slice; agent_knowledge.email is populated separately by
+    // registration (admin-agents.ts) and the ongoing search-enrich-sweep
+    // crawl (search-enrich-sweep.ts, source_type `web_search:<domain>`), and
+    // has no DNS-liveness stamp of its own). So the original gate checked a
+    // column outreach never reads, and risked wrongly demoting an
+    // already-`verified` agent whose `agents.contact_email` happened to be
+    // blank/DNS-dead while its real send-address, `agent_knowledge.email`
+    // (`agent.email` here — same column Guard #3 / domain-coherence above
+    // already use), was perfectly good. That's not a rare edge case: EVERY
+    // agent enriched before A0/A2 shipped has a populated
+    // agent_knowledge.email and a still-blank agents.contact_email.
+    //
+    // Corrected definition of "corroborated" for `agent_knowledge.email`,
+    // chosen as the most honest option buildable from existing data with no
+    // new schema:
+    //   1. BASELINE — non-empty, `isSyntacticallyValidEmail`, and NOT
+    //      `isPlatformOwnedEmailDomain` (the same two helpers
+    //      admin-agents-contact-email-write.ts already exports and uses for
+    //      `agents.contact_email` — reused here for this column instead of
+    //      hand-rolling new ones). There is no DNS-liveness stamp for
+    //      `agent_knowledge.email` today, so "corroborated" here honestly
+    //      means "present and not obviously bogus" — we don't invent
+    //      evidence we don't have.
+    //   2. OPTIONAL DNS VETO, applied only on top of a baseline pass, never
+    //      as a substitute for it — judgment call, documented here: DNS
+    //      liveness is a DOMAIN-level fact (MX/A/AAAA resolution), it does
+    //      not care which literal mailbox at that domain is being asked
+    //      about. So when `agent_knowledge.email`'s domain happens to be the
+    //      SAME domain as this agent's `agents.contact_email`, the A0 DNS
+    //      stamp (field_provenance.contact_email_dns_check) genuinely IS
+    //      evidence about `agent_knowledge.email` too, not only about
+    //      contact_email — reusing it there is legitimate (a domain fact,
+    //      not a mailbox-specific one), not overreaching. Only withdraw
+    //      corroboration when the domains match AND the stamp's own
+    //      `domain` field matches that same domain AND `live === false`
+    //      (strict boolean check — missing/malformed shapes, or `live` as
+    //      the string `"false"`, are ignored: this fails OPEN, exactly
+    //      mirroring the original slice's dead-stamp parsing, just retargeted
+    //      at the right domain comparison). Any other case (domains differ,
+    //      no contact_email, stamp never written, or malformed) leaves the
+    //      baseline result untouched.
     //
     // Mirrors the existing guards' pattern above: only downgrades an agent
     // that would otherwise be 'verified'; an already-worse status is left
     // alone. Deliberately NOT given the wasInPool monotonic exception Guard
     // #3 has — that exception was a specific, documented Daniel instruction
     // scoped to the free-mail-ownership check; this requirement applies
-    // uniformly to every determination of 'verified'.
-    const contactEmailRow = db
-      .prepare(`SELECT contact_email FROM agents WHERE id = ?`)
-      .get(agent.id) as { contact_email: string | null } | undefined;
-    const contactEmail = contactEmailRow?.contact_email ?? null;
-    const hasContactEmail = !!(contactEmail && contactEmail.trim());
-    const contactEmailDomain = hasContactEmail ? emailDomain(contactEmail) : null;
-    const dnsCheckRaw = (fieldProv as Record<string, unknown>)?.contact_email_dns_check;
-    let corroboratedEmail = hasContactEmail;
-    if (hasContactEmail && dnsCheckRaw && typeof dnsCheckRaw === "object") {
-      const dc = dnsCheckRaw as { domain?: unknown; live?: unknown };
-      if (typeof dc.domain === "string" && dc.domain === contactEmailDomain && dc.live === false) {
-        corroboratedEmail = false;
+    // uniformly to every determination of 'verified'. Unlike the ORIGINAL
+    // (buggy) version, this is now safe to apply uniformly: gating on the
+    // correct column means an already-verified agent with a good
+    // agent_knowledge.email is never wrongly caught by it.
+    const knowledgeEmail = (agent.email as string | null | undefined) ?? null;
+    const hasKnowledgeEmail = !!(knowledgeEmail && knowledgeEmail.trim());
+    const knowledgeEmailSyntacticallyValid = hasKnowledgeEmail && isSyntacticallyValidEmail(knowledgeEmail!);
+    const knowledgeEmailPlatformOwned = hasKnowledgeEmail && isPlatformOwnedEmailDomain(knowledgeEmail!);
+    let corroboratedEmail = hasKnowledgeEmail && knowledgeEmailSyntacticallyValid && !knowledgeEmailPlatformOwned;
+
+    let dnsDeadDomainVeto = false;
+    if (corroboratedEmail) {
+      const knowledgeEmailDomain = emailDomain(knowledgeEmail);
+      const contactEmailRow = db
+        .prepare(`SELECT contact_email FROM agents WHERE id = ?`)
+        .get(agent.id) as { contact_email: string | null } | undefined;
+      const contactEmailDomain = emailDomain(contactEmailRow?.contact_email ?? null);
+      const dnsCheckRaw = (fieldProv as Record<string, unknown>)?.contact_email_dns_check;
+      if (
+        knowledgeEmailDomain &&
+        contactEmailDomain &&
+        knowledgeEmailDomain === contactEmailDomain &&
+        dnsCheckRaw &&
+        typeof dnsCheckRaw === "object"
+      ) {
+        const dc = dnsCheckRaw as { domain?: unknown; live?: unknown };
+        if (typeof dc.domain === "string" && dc.domain === knowledgeEmailDomain && dc.live === false) {
+          dnsDeadDomainVeto = true;
+          corroboratedEmail = false;
+        }
       }
     }
+
     (crossSourceResults as Record<string, unknown>).email_website_gate = {
       corroborated_email: corroboratedEmail,
       website_ok: gate.reasons.website_ok,
+      email_present: hasKnowledgeEmail,
+      email_syntactically_valid: knowledgeEmailSyntacticallyValid,
+      email_platform_owned_domain: knowledgeEmailPlatformOwned,
+      email_dns_dead_domain_veto: dnsDeadDomainVeto,
     };
     if (!corroboratedEmail) {
       if (newVerification === "verified") newVerification = "review_required";
       gate.flags.push("corroborated_email_missing");
       console.log(
-        `[verifier] ${agent.id} (${agent.name ?? "?"}) corroborated_email_missing (has_contact_email=${hasContactEmail}) — quarantined from pool`,
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) corroborated_email_missing ` +
+        `(agent_knowledge.email present=${hasKnowledgeEmail}, syntactically_valid=${knowledgeEmailSyntacticallyValid}, ` +
+        `platform_owned=${knowledgeEmailPlatformOwned}, dns_dead_domain_veto=${dnsDeadDomainVeto}) — quarantined from pool`,
       );
     }
 
