@@ -944,13 +944,17 @@ function findUmbrellaAffiliation(
 // but a member-list page's actual member directory is very often EXACTLY a
 // link-dense <ul>/<ol> of member cards, which is precisely the content this
 // scan needs to see. Reusing extractProseText here would risk silently
-// stripping the one block that matters. This stripper keeps everything,
-// tags out.
+// stripping the one block that matters. This stripper keeps everything
+// VISIBLE, tags out — except CSS/HTML-hidden elements (see
+// stripHiddenElements below), which are dropped content-and-all so hidden
+// tab/accordion markup common in member-list pages can't masquerade as
+// visible text for the name-proximity scan.
 function stripToPlainText(html: string): string {
-  return html
+  const withoutScriptsStylesComments = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ");
+  return stripHiddenElements(withoutScriptsStylesComments)
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
@@ -960,15 +964,124 @@ function stripToPlainText(html: string): string {
     .trim();
 }
 
+// Does this start tag's attribute text mark the element as CSS/HTML hidden?
+// Checked (pragmatically — see stripHiddenElements's own doc comment on why
+// this isn't a full CSS engine):
+//   - the `hidden` boolean attribute (`<div hidden>`, `<div hidden="">`,
+//     `<div hidden="hidden">`) — anchored on a preceding boundary so it
+//     never fires on an unrelated attribute that merely CONTAINS "hidden"
+//     as a substring, e.g. `data-hidden-count="3"`;
+//   - an inline `style="..."` containing `display:none`/`display: none`
+//     (whitespace around the colon allowed) or `visibility:hidden`/
+//     `visibility: hidden`, single- or double-quoted.
+function elementIsHidden(attrs: string): boolean {
+  if (/(?:^|\s)hidden(?:\s|=|$)/i.test(attrs)) return true;
+  const styleMatch = attrs.match(/\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+  const styleValue = styleMatch ? styleMatch[1] ?? styleMatch[2] ?? "" : "";
+  if (!styleValue) return false;
+  return /display\s*:\s*none\b/i.test(styleValue) || /visibility\s*:\s*hidden\b/i.test(styleValue);
+}
+
+// Finds the index just past the closing tag that matches the open tag
+// `tagName` whose content starts at `searchFrom`, honoring nesting of the
+// SAME tag name in between (e.g. `<div hidden><div>x</div></div>` — the
+// inner `</div>` must not be mistaken for the outer one's close). An
+// unclosed element (malformed HTML) is treated as running to the end of the
+// document — the conservative choice, same convention search-enrich.ts's
+// own depth-aware stripBlocksByTagNames() uses for the same situation:
+// better to over-exclude possible hidden chrome than to leak it into text
+// scanned for name/email attribution.
+function findMatchingCloseTagEnd(html: string, tagName: string, searchFrom: number): number {
+  const tagRe = new RegExp(`<(/?)${tagName}(?![\\w-])[^>]*?(/?)>`, "gi");
+  tagRe.lastIndex = searchFrom;
+  let depth = 1;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(html))) {
+    const isClosing = m[1] === "/";
+    const isSelfClosing = m[2] === "/";
+    if (isSelfClosing) continue; // empty element, doesn't affect depth
+    if (isClosing) {
+      depth--;
+      if (depth === 0) return m.index + m[0].length;
+    } else {
+      depth++;
+    }
+  }
+  return html.length;
+}
+
+// Pre-pass for stripToPlainText: removes the ENTIRE content (tags + text)
+// of any element that is CSS/HTML-hidden per elementIsHidden() above —
+// `hidden` attribute, `display:none`/`display: none`, or
+// `visibility:hidden`/`visibility: hidden` — before the generic tag-strip
+// below turns everything into flat text. Without this, a hidden element's
+// text (e.g. an off-screen tab panel or accordion pane in a member-list
+// page, where several members' markup commonly sits in the DOM at once but
+// only one is visible) survives stripToPlainText intact and gets scanned
+// for name-proximity attribution identically to genuinely visible text —
+// widening the false-positive surface for the AC5 attribution question this
+// file exists to get right. A deliberately pragmatic regex/tag-scan pass —
+// same robustness level as this file's existing <script>/<style> stripping
+// above, NOT a full CSS/HTML engine (doesn't evaluate external stylesheets,
+// classes, or computed style — only inline `style="..."` and the `hidden`
+// attribute, which covers the realistic member-directory-markup case this
+// exists for).
+function stripHiddenElements(html: string): string {
+  const openTagRe = /<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*?)(\/?)>/g;
+  let result = "";
+  let cursor = 0;
+  let m: RegExpExecArray | null;
+  while ((m = openTagRe.exec(html))) {
+    if (m.index < cursor) continue; // inside a hidden range already removed below
+    const [full, tagName, attrs, selfClose] = m;
+    if (selfClose === "/") continue; // no content to hide
+    if (!elementIsHidden(attrs)) continue;
+    const contentStart = m.index + full.length;
+    const closeEnd = findMatchingCloseTagEnd(html, tagName, contentStart);
+    result += html.slice(cursor, m.index);
+    result += " "; // placeholder so words either side don't fuse together
+    cursor = closeEnd;
+    openTagRe.lastIndex = closeEnd;
+  }
+  result += html.slice(cursor);
+  return result;
+}
+
+// Unicode-aware "is this a word character" test, used to anchor the
+// name-proximity match below to real word/token boundaries. Deliberately
+// NOT a plain `\b` regex word boundary: `\b` is defined in terms of ASCII
+// `\w` ([A-Za-z0-9_]), so it does NOT treat æ/ø/å (or any other non-ASCII
+// letter) as word characters — a boundary check built on bare `\b` would
+// silently mis-anchor on the exact Norwegian names this function exists to
+// attribute correctly. `\p{L}`/`\p{N}` (with the `u` flag) are Unicode
+// property escapes that classify by the actual Unicode General_Category,
+// so "æ", "ø", "å" (and their uppercase forms) correctly count as letters.
+// Concretely verified (see the u10 test below, and this file's own test
+// suite): /[\p{L}\p{N}]/u.test("æ") -> true, .test("å") -> true.
+function isWordChar(ch: string | undefined): boolean {
+  return !!ch && /[\p{L}\p{N}]/u.test(ch);
+}
+
 /** All start indices of `needle` inside `haystack` (both already
- * case-normalized by the caller), overlap-inclusive. Empty needle -> no
- * matches (never "everywhere"). */
+ * case-normalized by the caller) where the match is anchored to a real
+ * word/token boundary: the character immediately before the match and the
+ * character immediately after it (when either exists) must NOT be a
+ * (Unicode-aware) word character. This rejects a `needle` that is merely
+ * embedded inside — or a strict prefix/suffix of — a longer word or name,
+ * e.g. needle "nordgård" against haystack "nordgårds bakeri as" finds the
+ * raw substring at index 0 but then rejects it: the character immediately
+ * after the match ("s") is a word character, so "nordgård" here is only
+ * the first part of the longer, DIFFERENT word "nordgårds", not a genuine
+ * standalone occurrence of the name. Overlap-inclusive among the indices
+ * that DO qualify. Empty needle -> no matches (never "everywhere"). */
 function allIndicesOf(haystack: string, needle: string): number[] {
   if (!needle) return [];
   const out: number[] = [];
   let idx = haystack.indexOf(needle);
   while (idx !== -1) {
-    out.push(idx);
+    const before = idx > 0 ? haystack[idx - 1] : undefined;
+    const after = idx + needle.length < haystack.length ? haystack[idx + needle.length] : undefined;
+    if (!isWordChar(before) && !isWordChar(after)) out.push(idx);
     idx = haystack.indexOf(needle, idx + 1);
   }
   return out;

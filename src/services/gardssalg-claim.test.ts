@@ -1506,6 +1506,129 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
           { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u9.no": u9Html }) },
         );
         assertEq(u9, [{ email: "eier@gmail.com", source: "found_umbrella_member" }], "u9: end-to-end success — no own site, no stored epost, but the umbrella's member page names this producer next to a qualifying (free-mail) address -> found_umbrella_member candidate; the non-free-mail, non-umbrella-domain address on the same line is correctly rejected by the AC3/AC8 accept gate");
+
+        // (u10) REVIEW FIX — unanchored substring matching (2026-08-07
+        // fix-up, finding 1): the reviewer's adversarial scenario, restated
+        // exactly. Producer "Nordgård" never appears STANDALONE anywhere on
+        // its umbrella's page — the only occurrence of the raw substring
+        // "nordgård" is as the first part of a DIFFERENT, longer entity's
+        // name, "Nordgårds Bakeri AS" (a sponsor, not this producer), which
+        // sits right next to an otherwise-qualifying free-mail address. A
+        // raw, unanchored substring search (the pre-fix behaviour) finds
+        // "nordgård" at index 0 of "nordgårds bakeri as" and — since nothing
+        // else disqualifies it — would confidently return the sponsor's
+        // address as this producer's own found_umbrella_member candidate:
+        // exactly the account-takeover-shaped misattribution the review
+        // flagged. The fix anchors the match to real word boundaries: the
+        // character immediately after the "nordgård" substring here is "s"
+        // (part of "nordgårds"), a word character, so the match is rejected
+        // as embedded in a longer word — never even reaching Step 4's
+        // proximity check. Must return null, NOT the sponsor's address.
+        insertAgent.run("agent-u10-producer", "Nordgård", "https://ukjent10.no", "key-u10-p", "912340010", null);
+        insertAgent.run("agent-u10-umbrella", "Paraplyen U10", "https://paraplyen-u10.no", "key-u10-u", null, "cooperative");
+        insertAffiliation.run("agent-u10-producer", "agent-u10-umbrella", "active");
+        const u10Html = `<html><body><h1>Våre sponsorer</h1>
+          <p>Nordgårds Bakeri AS er stolt sponsor av laget. Kontakt: sponsor@gmail.com</p>
+          </body></html>`;
+        const u10 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Nordgård", org_nr: "912340010" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u10.no": u10Html }) },
+        );
+        assertEq(u10, null, "u10: REGRESSION (review finding 1) — producer 'Nordgård' is a strict prefix of the unrelated 'Nordgårds Bakeri AS' on the page; the substring match is correctly rejected by word-boundary anchoring (the char right after the match, 's', is a word char) so sponsor@gmail.com is NEVER attributed to this producer — must be null, not a wrong-entity guess");
+
+        // (u10b) Sanity check on the SAME page/producer name: when the
+        // producer's name genuinely DOES appear standalone (real word
+        // boundaries on both sides), the anchored match still fires
+        // normally and the tier still works — the fix must not be so
+        // strict it breaks genuine matches. (u2/u9 above already cover this
+        // for other names; this repeats it specifically for a name that
+        // ALSO happens to be a prefix of a longer name elsewhere on a page,
+        // to prove the anchoring is precise, not merely "always reject".)
+        const u10bHtml = `<html><body><h1>Våre medlemmer</h1>
+          <p>Nordgård er medlem hos oss. Kontakt: nordgard@gmail.com</p>
+          </body></html>`;
+        const u10b = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Nordgård", org_nr: "912340010" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u10.no": u10bHtml }) },
+        );
+        assertEq(u10b, { email: "nordgard@gmail.com", source: "found_umbrella_member" }, "u10b: anchoring is precise, not overbroad — 'Nordgård' occurring as a genuine standalone word (real boundaries both sides) still matches and still yields its own qualifying address");
+
+        // (u11) REVIEW FIX — CSS/HTML-hidden content (2026-08-07 fix-up,
+        // finding 2), case (a): a `hidden` boolean attribute. The producer's
+        // name AND a qualifying email exist ONLY inside a `<div hidden>` —
+        // nowhere else on the page. Before the fix, stripToPlainText left
+        // this text intact and it would be scanned exactly like visible
+        // text, yielding a candidate; after the fix, the whole hidden
+        // element (name + email) is dropped before scanning, so the name
+        // never even registers -> null.
+        insertAgent.run("agent-u11-producer", "Skjult Gård", "https://ukjent11.no", "key-u11-p", "912340011", null);
+        insertAgent.run("agent-u11-umbrella", "Paraplyen U11", "https://paraplyen-u11.no", "key-u11-u", null, "cooperative");
+        insertAffiliation.run("agent-u11-producer", "agent-u11-umbrella", "active");
+        const u11Html = `<html><body><h1>Medlemmer</h1>
+          <div hidden><p>Skjult Gård kontakt: skjult@gmail.com</p></div>
+          </body></html>`;
+        const u11 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Skjult Gård", org_nr: "912340011" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u11.no": u11Html }) },
+        );
+        assertEq(u11, null, "u11: REGRESSION (review finding 2a) — a `<div hidden>` containing the producer's name and a qualifying email is excluded entirely; the name never registers as occurring on the page at all -> null, not skjult@gmail.com");
+
+        // (u12) same review finding, case (b): `style="display:none"`
+        // (no whitespace around the colon).
+        // (org_nr 912340112, not 912340012 — the latter is already used
+        // above by u2's "Fjellro Gård")
+        insertAgent.run("agent-u12-producer", "Usynlig Gård", "https://ukjent12.no", "key-u12-p", "912340112", null);
+        insertAgent.run("agent-u12-umbrella", "Paraplyen U12", "https://paraplyen-u12.no", "key-u12-u", null, "cooperative");
+        insertAffiliation.run("agent-u12-producer", "agent-u12-umbrella", "active");
+        const u12Html = `<html><body><h1>Medlemmer</h1>
+          <div style="display:none"><p>Usynlig Gård kontakt: usynlig@gmail.com</p></div>
+          </body></html>`;
+        const u12 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Usynlig Gård", org_nr: "912340112" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u12.no": u12Html }) },
+        );
+        assertEq(u12, null, "u12: REGRESSION (review finding 2b) — `style=\"display:none\"` content is excluded entirely -> null, not usynlig@gmail.com");
+
+        // (u13) same review finding, case (c): the whitespace variant
+        // `style="display: none;"` (space after the colon, trailing
+        // semicolon) — must be recognized the same as the no-whitespace
+        // form in u12, not treated as a different/unmatched value.
+        // (org_nr 912340113, not 912340013 — the latter is already used
+        // above by u3c's "Ingen Paraply Gård")
+        insertAgent.run("agent-u13-producer", "Bortgjemt Gård", "https://ukjent13.no", "key-u13-p", "912340113", null);
+        insertAgent.run("agent-u13-umbrella", "Paraplyen U13", "https://paraplyen-u13.no", "key-u13-u", null, "cooperative");
+        insertAffiliation.run("agent-u13-producer", "agent-u13-umbrella", "active");
+        const u13Html = `<html><body><h1>Medlemmer</h1>
+          <div style="display: none;"><p>Bortgjemt Gård kontakt: bortgjemt@gmail.com</p></div>
+          </body></html>`;
+        const u13 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Bortgjemt Gård", org_nr: "912340113" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u13.no": u13Html }) },
+        );
+        assertEq(u13, null, "u13: REGRESSION (review finding 2c) — the whitespace variant `style=\"display: none;\"` is recognized identically to the tight `display:none` form -> null, not bortgjemt@gmail.com");
+
+        // (u14) same review finding, case (d): genuinely VISIBLE content in
+        // a SIBLING element must still be matched normally — proving the
+        // hidden-content fix doesn't over-strip. Uses `visibility:hidden`
+        // for the hidden sibling (the third form the fix recognizes,
+        // alongside `hidden` and `display:none`), so this test also
+        // incidentally covers that variant. Same producer name appears in
+        // BOTH the hidden sibling (next to a DIFFERENT email that must
+        // never be picked) and a visible sibling (next to its own
+        // qualifying email, which must be picked) — proving both halves at
+        // once: hidden text truly excluded, visible text truly unaffected.
+        insertAgent.run("agent-u14-producer", "Synlig Gård", "https://ukjent14.no", "key-u14-p", "912340014", null);
+        insertAgent.run("agent-u14-umbrella", "Paraplyen U14", "https://paraplyen-u14.no", "key-u14-u", null, "cooperative");
+        insertAffiliation.run("agent-u14-producer", "agent-u14-umbrella", "active");
+        const u14Html = `<html><body><h1>Medlemmer</h1>
+          <div style="visibility:hidden"><p>Synlig Gård kontakt: skjult-variant@gmail.com</p></div>
+          <p>Synlig Gård kontakt: synlig-variant@gmail.com</p>
+          </body></html>`;
+        const u14 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Synlig Gård", org_nr: "912340014" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u14.no": u14Html }) },
+        );
+        assertEq(u14, { email: "synlig-variant@gmail.com", source: "found_umbrella_member" }, "u14: REGRESSION (review finding 2, `visibility:hidden` variant + no-over-stripping check) — the visibility:hidden sibling's name+email is excluded (skjult-variant@gmail.com never qualifies) while the genuinely visible sibling's own name+email is matched completely normally -> synlig-variant@gmail.com, proving the fix doesn't over-strip visible content");
       }
     } catch (err: any) {
       failed++;
