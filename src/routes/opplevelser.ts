@@ -303,7 +303,7 @@ import {
 // CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
-import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult } from "../services/fetch-page";
+import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
 // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
 // hygiene, item 5 ("wrong_content_rate holdout") — the fail-closed LLM judge
 // + candidate sampler for POST /admin/experiences-wrong-content-rate below.
@@ -1342,7 +1342,35 @@ async function crFetchHtml(url: string): Promise<string | null> {
  */
 type CrFetchOutcome =
   | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
-  | { ok: false; reason: string; persistence: string; status: number | null };
+  | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
+
+// dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet, AC3-slice: the
+// structured persistence tag attached to every errors[] entry on the two
+// content-refresh routes below. Reuses FetchPersistence unmodified (no new
+// category added to that type — see fetch-page.ts's own doc comment) and adds
+// exactly one literal, "internal", used ONLY in this response shape for the
+// two "our own bug, not the site's fault" branches (the fetch-throws catch
+// block and the write_failed branch) — never fed into FetchPersistence-typed
+// code elsewhere.
+type CrErrorPersistence = FetchPersistence | "internal";
+
+/** Zero-initialized errors_by_persistence tally, filled by tallyErrorsByPersistence. */
+function emptyErrorsByPersistence(): Record<CrErrorPersistence, number> {
+  return { permanent: 0, transient: 0, blocked: 0, internal: 0 };
+}
+
+/**
+ * Tally errors[] entries by their persistence tag into the
+ * errors_by_persistence response field. Pure, called once after each route's
+ * processing loop completes.
+ */
+function tallyErrorsByPersistence(
+  errors: ReadonlyArray<{ persistence: CrErrorPersistence }>
+): Record<CrErrorPersistence, number> {
+  const tally = emptyErrorsByPersistence();
+  for (const e of errors) tally[e.persistence] += 1;
+  return tally;
+}
 
 async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
@@ -1434,7 +1462,7 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   type ProvenanceMap = Record<string, { source_url: string; snippet: string | null }>;
   const changed: Array<{ provider_id: string; fields: string[]; provenance: ProvenanceMap }> = [];
   const skippedLocked: Array<{ provider_id: string; experience_ids: string[] }> = [];
-  const errors: Array<{ provider_id: string; error: string }> = [];
+  const errors: Array<{ provider_id: string; error: string; persistence: CrErrorPersistence }> = [];
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
   const parkedNow: string[] = [];
@@ -1482,7 +1510,7 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     try {
       fetched = await crFetchHomepageContent(t.hjemmeside);
     } catch (e: any) {
-      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e), persistence: "internal" });
       // NO parking strike here. fetchPage() never throws — it returns a
       // classified failure — so reaching this catch means an INTERNAL fault on
       // our side (a malformed stored URL, a bug), which is no evidence at all
@@ -1496,6 +1524,7 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       errors.push({
         provider_id: providerId,
         error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}`,
+        persistence: fetched.persistence,
       });
       // PARKING NOW DEPENDS ON PERSISTENCE. A `transient` failure (timeout,
       // 5xx, 429, connection reset) must NOT count a strike: the 2026-07-26
@@ -1620,7 +1649,7 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
           const fields = applyExperienceContent(a.id, candidateObj, fetched.fetchUrl);
           for (const f of fields) writtenFields.add(f);
         } catch (e: any) {
-          errors.push({ provider_id: providerId, error: `write_failed ${a.id}: ${e?.message ?? String(e)}` });
+          errors.push({ provider_id: providerId, error: `write_failed ${a.id}: ${e?.message ?? String(e)}`, persistence: "internal" });
         }
       }
       if (writtenFields.size > 0) {
@@ -1654,6 +1683,12 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     changed,
     skipped_locked: skippedLocked,
     errors,
+    // dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet, AC3-slice:
+    // structured counts of errors[] by persistence, so a consumer can report
+    // http_unreachable_per_run as `permanent`-only and surface `blocked`
+    // ("blokkerer oss, ikke død") as its own line instead of both silently
+    // inflating the same raw errors.length "unreachable" bucket.
+    errors_by_persistence: tallyErrorsByPersistence(errors),
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
     // Steg 3 — providers excluded because their hjemmeside is not stamped
@@ -1880,7 +1915,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // owner-locked via field_provenance.owner_locks — distinct from "no
   // candidate found" or "already fresh", which both stay silent as today.
   const ownerFieldLocked: Array<{ provider_id: string; fields: string[] }> = [];
-  const errors: Array<{ provider_id: string; error: string }> = [];
+  const errors: Array<{ provider_id: string; error: string; persistence: CrErrorPersistence }> = [];
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
   const parkedNow: string[] = [];
@@ -1950,7 +1985,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     try {
       fetched = await crFetchGardssalgContent(t.hjemmeside);
     } catch (e: any) {
-      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e), persistence: "internal" });
       // NO parking strike here. fetchPage() never throws — it returns a
       // classified failure — so reaching this catch means an INTERNAL fault on
       // our side (a malformed stored URL, a bug), which is no evidence at all
@@ -1962,6 +1997,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       errors.push({
         provider_id: providerId,
         error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}`,
+        persistence: fetched.persistence,
       });
       // Persistence-gated parking — SAME rule as /admin/content-refresh above.
       // These gårdssalg routes write the very same counter
@@ -2284,7 +2320,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
           ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
         }
       } catch (e: any) {
-        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}`, persistence: "internal" });
       }
     }
   }
@@ -2309,6 +2345,10 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // skipped_locked (manual, row-level, never-fetched) above.
     owner_field_locked: ownerFieldLocked,
     errors,
+    // dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet, AC3-slice:
+    // structured counts of errors[] by persistence — same additive contract
+    // as /admin/content-refresh above.
+    errors_by_persistence: tallyErrorsByPersistence(errors),
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
     // Slice 5d: providers excluded by the shared-/directory-domain guard —
