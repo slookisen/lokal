@@ -455,8 +455,23 @@ function computeConflictSeverity(
 // used for delivery). business_status is still computed and surfaced in
 // CrossSourceResult outputs for review-queue display — it just doesn't gate.
 //
+// Steg B (dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet,
+// 2026-08-07): `phone` removed from the gating set too — same rationale as
+// business_status above, PLUS phone has no reliable second corroborating
+// source for most small Norwegian producers (brreg's phone field is sparse),
+// so requiring 2-source agreement on it was blocking otherwise-solid agents
+// on a field that adds little marketing value over email. `phone` is still
+// COMPUTED via crossSourceAgreement and surfaced in CrossSourceResult /
+// cross_source_reason for review-queue display — it just no longer gates.
+// In its place, lokal-agent-verifier.ts's runVerifierBatch gates
+// `pending_verify -> verified` on a corroborated `agents.contact_email` +
+// this run's own live website probe — a field-agnostic boolean check on a
+// single send-address fact, deliberately NOT modeled here as a fake "email"
+// FieldName (this module's per-field agreement machinery is for multi-source
+// cross-checking, which doesn't apply to that check).
+//
 // This is the gate-split logic that the verifier and the migration both need.
-const GATING_FIELDS: readonly string[] = ["address", "phone"];
+const GATING_FIELDS: readonly string[] = ["address"];
 
 export function aggregateVerdict(
   perField: Record<string, CrossSourceResult>
