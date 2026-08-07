@@ -7218,6 +7218,16 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
 // Batch size is capped at 200 ids (mirrors the explicit-cap-then-400
 // precedent already established by MAX_GARDSSALG_AUDIT_LIMIT /
 // gardssalg-website-verification-audit above) — never silently truncated.
+//
+// dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+// Slice 2 ("outreach-guard"): AFTER the tier-based go/no_go pass above
+// (unchanged), a second pass downgrades any go:true id that collides on
+// exact email or shared non-freemail email domain with an EARLIER go:true
+// id in the SAME batch — two experience_providers rows can represent the
+// same real business seeded from different sources, and this guard is what
+// stops both from independently coming back go:true. Scoped to a single
+// request/response only, no persistent "already sent" ledger.
+import { dedupeGardssalgOutreachRecipients } from "../services/gardssalg-outreach-dedupe";
 const MAX_GARDSSALG_PREFLIGHT_BATCH = 200;
 
 router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, res: Response) => {
@@ -7253,21 +7263,53 @@ router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, 
     const rows = computeGardssalgReadinessRows(expDb, orderedIds);
     const byId = new Map(rows.map((r) => [r.id, r]));
 
+    const results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }> =
+      orderedIds.map((id) => {
+        const row = byId.get(id);
+        if (!row) {
+          return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
+        }
+        if (row.readiness_tier === "outreach_ready") {
+          return { provider_id: id, name: row.name, go: true, reason: null };
+        }
+        return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
+      });
+
+    // ── Slice 2 outreach-guard: cross-row dedup over THIS batch's go:true
+    // rows only. Fetch email separately (does NOT touch
+    // computeGardssalgReadinessRows's signature/return type — that function
+    // is also used, unmodified, by GET /admin/gardssalg-outreach-readiness).
+    const goIds = results.filter((r) => r.go).map((r) => r.provider_id);
+    if (goIds.length > 0) {
+      const placeholders = goIds.map(() => "?").join(", ");
+      const emailRows = expDb
+        .prepare(`SELECT id, epost FROM experience_providers WHERE id IN (${placeholders})`)
+        .all(...goIds) as Array<{ id: string; epost: string | null }>;
+      const emailById = new Map(emailRows.map((r) => [r.id, r.epost]));
+
+      // orderedIds order, restricted to the go:true candidates — first-seen
+      // in the ORIGINAL batch order wins the dedup, not query result order.
+      const candidates = orderedIds
+        .filter((id) => emailById.has(id))
+        .map((id) => ({ provider_id: id, email: emailById.get(id) ?? null }));
+
+      const { suppressed } = dedupeGardssalgOutreachRecipients(candidates);
+
+      for (const result of results) {
+        const reason = suppressed.get(result.provider_id);
+        if (reason) {
+          result.go = false;
+          result.reason = reason;
+        }
+      }
+    }
+
     let go = 0;
     let no_go = 0;
-    const results = orderedIds.map((id) => {
-      const row = byId.get(id);
-      if (!row) {
-        no_go++;
-        return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
-      }
-      if (row.readiness_tier === "outreach_ready") {
-        go++;
-        return { provider_id: id, name: row.name, go: true, reason: null };
-      }
-      no_go++;
-      return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
-    });
+    for (const r of results) {
+      if (r.go) go++;
+      else no_go++;
+    }
 
     res.json({ results, summary: { go, no_go, total: results.length } });
   } catch (err) {
