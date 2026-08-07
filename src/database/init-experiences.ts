@@ -1137,5 +1137,45 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_fylke_2024_migration_audit failed:", err);
   }
 
+  // ─── experience_outreach_sent_log (dev-request
+  // 2026-08-07-outreach-pool-krav123-og-pilot, AC4 — pilot send-mechanic) ──
+  // This vertical's OWN persistent send-log/cooldown source for POST
+  // /admin/gardssalg-outreach-pilot-send (routes/opplevelser.ts). NOT a
+  // write into the existing (RFB-db) `outreach_sent_log` table — that table's
+  // `agent_id TEXT NOT NULL REFERENCES agents(id)` cannot be satisfied for a
+  // gårdssalg/experiences provider (experience_providers has no agents.id;
+  // `crm_contacts.provider_id`'s own migration note, init.ts ~L1071, already
+  // established provider_id "can never be a REFERENCES clause" for exactly
+  // this cross-db reason), and relaxing that NOT NULL/FK on a live,
+  // trigger-laden table the RFB revenue-critical 60-day cooldown already
+  // depends on is real surgery this slice deliberately does not attempt —
+  // see the dev-request's own build log for the full investigation/decision.
+  // The pilot-send route ALSO reads (read-only, no write) the existing
+  // cross-platform `outreach_sent_log.recipient_email` cooldown check
+  // routes/crm.ts already implements, so the cross-platform-cooldown
+  // property (same human, same sender identity, RFB+Opplevagent) is
+  // preserved without writing into the RFB table. Additive only — no other
+  // table/trigger touched. Indexed on recipient_email (the cooldown lookup
+  // key, case-insensitive match done at the query layer) and provider_id
+  // (per-provider send history lookups).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_outreach_sent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_id TEXT NOT NULL,
+        recipient_email TEXT NOT NULL,
+        sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+        channel TEXT NOT NULL DEFAULT 'email',
+        message_id TEXT,
+        notes TEXT,
+        is_test INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_experience_outreach_sent_log_recipient_email ON experience_outreach_sent_log(recipient_email)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_experience_outreach_sent_log_provider ON experience_outreach_sent_log(provider_id)`);
+  } catch (err) {
+    console.error("Migration experience_outreach_sent_log failed:", err);
+  }
+
   console.log("[experiences] schema initialized");
 }

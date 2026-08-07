@@ -375,6 +375,35 @@ export class EmailService {
     });
   }
 
+  /**
+   * dev-request 2026-08-07-outreach-pool-krav123-og-pilot, AC4 (pilot
+   * send-mechanic). The cold-outreach email for a gårdssalg/opplevagent
+   * producer whose profile is already outreach_ready — copy is the
+   * dev-request's own "Revidert e-postutkast" (already Daniel-reviewed,
+   * no design judgment left to make). Mirrors sendGardssalgClaimMagicLink()
+   * just above: kontakt@opplevagent.no reply-to, crmFromHeader("experiences")
+   * From (display name carries the Opplevagent brand; the address itself is
+   * shared across verticals), isTestSend passed straight through to
+   * sendEmail() so the existing send-guard/TEST_SEND_REDIRECT_EMAIL
+   * mechanism applies unchanged.
+   */
+  async sendGardssalgOutreach(
+    to: string,
+    providerName: string,
+    profileUrl: string,
+    opts: { isTestSend?: boolean } = {},
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    return await this.sendEmail({
+      to,
+      subject: `${providerName} er nå synlig for AI-assistenter — se over profilen deres`,
+      htmlContent: buildGardssalgOutreachHtml(providerName, profileUrl),
+      textContent: buildGardssalgOutreachText(providerName, profileUrl),
+      replyTo: "kontakt@opplevagent.no",
+      from: crmFromHeader("experiences"),
+      isTestSend: opts.isTestSend,
+    });
+  }
+
   async sendRaw(options: {
     to: string;
     cc?: string;
@@ -1062,6 +1091,94 @@ Mvh,
 Opplevagent
 kontakt@opplevagent.no
 https://opplevagent.no
+`;
+}
+
+// ─── Gårdssalg/opplevagent cold-outreach templates (dev-request
+// 2026-08-07-outreach-pool-krav123-og-pilot, AC4/AC6) — the "Revidert
+// e-postutkast" from that dev-request, translated verbatim: Markdown -> HTML
+// for the HTML version, plain text for the text version. [Produsentnavn] ->
+// providerName, [profil-lenke] -> profileUrl. No other copy changes — the
+// text itself was already reviewed/revised (statistikk-løftet + avsender-
+// identitet fixes) in that dev-request, not re-derived here. See
+// sendGardssalgOutreach()'s doc comment for why this is its own template
+// rather than reusing buildGardssalgClaimMagicLinkHtml/Text above (different
+// email entirely — cold outreach, not a magic-link login).
+function buildGardssalgOutreachHtml(providerName: string, profileUrl: string): string {
+  const safeName = epEscape(providerName);
+  const safeUrl = epEscape(profileUrl);
+  return `<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 0; }
+    .container { background: #ffffff; padding: 40px 20px; }
+    .header { margin-bottom: 24px; border-bottom: 3px solid #0f5a50; padding-bottom: 16px; }
+    .logo { font-size: 22px; font-weight: 700; color: #0f5a50; }
+    h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
+    p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
+    ol { margin: 12px 0; padding-left: 22px; font-size: 15px; line-height: 1.7; }
+    li { margin: 8px 0; }
+    a { color: #0f5a50; }
+    .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="logo">opplevagent.no</div>
+    </div>
+
+    <h1>Hei,</h1>
+
+    <p>Jeg heter Daniel og driver Opplevagent (opplevagent.no) — en norsk katalog over gårdssalg, bryggerier, siderier og destillerier, bygget for å være synlig der folk faktisk leter nå: i AI-assistenter som ChatGPT og Claude.</p>
+
+    <p><strong>${safeName}</strong> har allerede en profil hos oss, basert på offentlige kilder (Brønnøysundregistrene og deres egen nettside): <a href="${safeUrl}">${safeUrl}</a></p>
+
+    <p>Tre ting dere kan gjøre — alt er gratis:</p>
+    <ol>
+      <li><strong>Se over profilen.</strong> Stemmer beskrivelsen og produktene? Si fra, så retter vi.</li>
+      <li><strong>Overta profilen.</strong> Da styrer dere innholdet selv og ser besøkstallene til profilen — inkludert hvor stor del av trafikken som kommer fra AI-assistenter.</li>
+      <li><strong>Ta imot besøk?</strong> Tilbyr dere smaking eller omvisning, kan gjester melde seg på direkte via profilen — dere bekrefter hver påmelding selv, og det koster ingenting.</li>
+    </ol>
+
+    <p>Ingen betaling, ingen binding — katalogen er gratis for produsenter. Vil dere ikke stå oppført, fjerner vi profilen umiddelbart.</p>
+
+    <div class="footer">
+      <p>Vennlig hilsen<br>Daniel Fredriksen<br>Opplevagent / Rett fra Bonden<br>kontakt@opplevagent.no</p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+function buildGardssalgOutreachText(providerName: string, profileUrl: string): string {
+  return `Hei,
+
+Jeg heter Daniel og driver Opplevagent (opplevagent.no) — en norsk katalog over
+gårdssalg, bryggerier, siderier og destillerier, bygget for å være synlig der folk
+faktisk leter nå: i AI-assistenter som ChatGPT og Claude.
+
+${providerName} har allerede en profil hos oss, basert på offentlige kilder
+(Brønnøysundregistrene og deres egen nettside): ${profileUrl}
+
+Tre ting dere kan gjøre — alt er gratis:
+1. Se over profilen. Stemmer beskrivelsen og produktene? Si fra, så retter vi.
+2. Overta profilen. Da styrer dere innholdet selv og ser besøkstallene til
+   profilen — inkludert hvor stor del av trafikken som kommer fra AI-assistenter.
+3. Ta imot besøk? Tilbyr dere smaking eller omvisning, kan gjester melde seg på
+   direkte via profilen — dere bekrefter hver påmelding selv, og det koster
+   ingenting.
+
+Ingen betaling, ingen binding — katalogen er gratis for produsenter. Vil dere ikke
+stå oppført, fjerner vi profilen umiddelbart.
+
+Vennlig hilsen
+Daniel Fredriksen
+Opplevagent / Rett fra Bonden
+kontakt@opplevagent.no
 `;
 }
 
