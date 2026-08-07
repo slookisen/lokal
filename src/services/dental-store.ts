@@ -531,48 +531,110 @@ export function recordDentalExtractionResult(
   return { found: true, attempts: row.extraction_attempts, parked, parked_now: parkedNow };
 }
 
-// ── Stage V helfo_agreement auto-correction (dev-request 2026-07-12-dental-
-// enrichment-universe-growth-and-queue-hygiene, item 4 / slice 4a, 2026-07-20)
-// ─────────────────────────────────────────────────────────────────────────
+// ── Stage V field auto-correction (dev-request 2026-07-12-dental-
+// enrichment-universe-growth-and-queue-hygiene, item 4 / slice 4a
+// (2026-07-20, helfo_agreement only) + slice 4b (2026-08-07, generalized to
+// treatments/opening_hours)) ────────────────────────────────────────────
 // Mirrors recordDentalHomepageFetchResult()/recordDentalExtractionResult()
 // above: read row, branch, write, return an outcome object. Stage V (the
 // enrichment routine's §5 sample-verify) re-fetches a small sample of
-// clinics each cycle and checks the site's helfo-signal against the DB
-// value; today it can only flag a mismatch ("drift" → needs_review), never
-// correct it. This function is the correction path for non-Brreg fields:
-// a SINGLE contradicting observation is parked (not yet trusted — could be
-// a stale/transient site glitch); only when the SAME contradicting value is
+// clinics each cycle and checks the site's signal against the DB value;
+// today it can only flag a mismatch ("drift" → needs_review), never correct
+// it. This function is the correction path for non-Brreg fields: a SINGLE
+// contradicting observation is parked (not yet trusted — could be a
+// stale/transient site glitch); only when the SAME contradicting value is
 // confirmed TWICE IN A ROW does it auto-correct the DB and record
 // provenance. This NEVER touches verification_status — the existing §5.3
 // drift→needs_review rule is completely unchanged, orthogonal side-channel.
 //
-// `field` is restricted to "helfo_agreement" this slice (item 4b —
-// treatments/opening_hours — is future work); the caller (the route below)
-// validates this before calling, so this function trusts its `field`
-// argument the same way recordDentalExtractionResult trusts `reason` being
-// pre-validated by its caller.
+// `field` is restricted to the three StageVField members; the caller (the
+// route below) validates this before calling, so this function trusts its
+// `field` argument the same way recordDentalExtractionResult trusts `reason`
+// being pre-validated by its caller.
+export type StageVField = "helfo_agreement" | "treatments" | "opening_hours";
+
+type OpeningHoursObservation = { day: string; open: string; close: string };
+
+// Allowlist, not string interpolation of the caller's `field` value — even
+// though the route already restricts `field` to the StageVField enum, this
+// is defense in depth matching this file's existing parameterized-SQL
+// discipline everywhere else.
+const STAGE_V_FIELD_COLUMN: Record<StageVField, string> = {
+  helfo_agreement: "helfo_agreement",
+  treatments: "treatments",
+  opening_hours: "opening_hours",
+};
+
+// Normalize a Stage V field value (either freshly observed, or read back off
+// the row) into a single canonical JSON string. This canonical string is
+// used for BOTH comparison (order/duplicate-insensitive, so extraction-order
+// jitter across fetches never produces a false non-match) AND as the exact
+// value written to the DB column (so stored JSON is always the normalized
+// form) AND as the pending-map entry value.
+//   - helfo_agreement → `raw` unchanged (already the exact string the
+//     column stores).
+//   - treatments → dedupe + sort `raw` (expects string[]), JSON.stringify —
+//     matches the column's existing JSON-array storage format exactly.
+//   - opening_hours → sort `raw` (expects {day,open,close}[]) by day then
+//     open, JSON.stringify — same column-format-matching + order-
+//     insensitivity reasoning.
+export function canonicalizeStageVValue(field: StageVField, raw: unknown): string {
+  if (field === "helfo_agreement") {
+    return raw as string;
+  }
+  if (field === "treatments") {
+    const arr = Array.isArray(raw) ? (raw as unknown[]).map(String) : [];
+    const deduped = Array.from(new Set(arr)).sort();
+    return JSON.stringify(deduped);
+  }
+  // opening_hours
+  const arr = Array.isArray(raw) ? (raw as OpeningHoursObservation[]) : [];
+  const sorted = [...arr].sort((a, b) => {
+    if (a.day !== b.day) return a.day < b.day ? -1 : 1;
+    if (a.open !== b.open) return a.open < b.open ? -1 : 1;
+    return 0;
+  });
+  return JSON.stringify(sorted);
+}
+
+// Read the row's current value for `field` off the raw column value,
+// tolerant-parsing the JSON columns (treatments/opening_hours) with the same
+// idiom already used elsewhere in this file (parseJsonArray/parseJsonOrNull)
+// — never throw on a malformed column. helfo_agreement is a plain string
+// column, passed through unchanged.
+function readCurrentStageVValue(field: StageVField, columnValue: string | null): unknown {
+  if (field === "helfo_agreement") return columnValue;
+  if (field === "treatments") return parseJsonArray(columnValue);
+  const parsed = parseJsonOrNull(columnValue);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
 export function recordStageVFieldObservation(
   id: string,
-  field: "helfo_agreement",
-  observedValue: string,
+  field: StageVField,
+  observedValue: string | string[] | OpeningHoursObservation[],
 ):
   | { found: false }
   | { found: true; corrected: false; cleared: true }
   | { found: true; corrected: false; pending: true }
   | { found: true; corrected: true; previous_value: string | null; new_value: string } {
   const db = getDb("dental");
+  const column = STAGE_V_FIELD_COLUMN[field];
   const row = db
     .prepare(
-      "SELECT helfo_agreement, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?"
+      `SELECT ${column} AS current_value, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?`
     )
     .get(id) as
     | {
-        helfo_agreement: string | null;
+        current_value: string | null;
         field_provenance: string | null;
         stage_v_pending_correction: string | null;
       }
     | undefined;
   if (!row) return { found: false };
+
+  const currentCanonical = canonicalizeStageVValue(field, readCurrentStageVValue(field, row.current_value));
+  const observedCanonical = canonicalizeStageVValue(field, observedValue);
 
   // Tolerant parse — junk/missing JSON is treated as an empty pending map,
   // mirroring the tolerant-parse idiom used for field_provenance elsewhere
@@ -600,7 +662,7 @@ export function recordStageVFieldObservation(
   // Site now agrees with the DB — any stale pending disagreement for this
   // field was transient. Clear it so a FUTURE contradiction needs 2 fresh
   // confirmations again, not 1.
-  if (observedValue === row.helfo_agreement) {
+  if (observedCanonical === currentCanonical) {
     if (field in pendingMap) {
       delete pendingMap[field];
       writePendingMap(pendingMap);
@@ -609,9 +671,9 @@ export function recordStageVFieldObservation(
   }
 
   const pendingEntry = pendingMap[field];
-  if (pendingEntry && pendingEntry.value === observedValue) {
+  if (pendingEntry && pendingEntry.value === observedCanonical) {
     // SAME contradicting value seen twice in a row → auto-correct.
-    const previousValue = row.helfo_agreement;
+    const previousValue = currentCanonical;
 
     let existingProv: Record<string, unknown> = {};
     if (row.field_provenance) {
@@ -627,7 +689,7 @@ export function recordStageVFieldObservation(
         sources: [
           {
             source_type: "stage_v_correction",
-            value: observedValue,
+            value: observedCanonical,
             fetched_at: new Date().toISOString(),
           },
         ],
@@ -636,20 +698,20 @@ export function recordStageVFieldObservation(
 
     delete pendingMap[field];
     db.prepare(
-      "UPDATE dental_agents SET helfo_agreement = ?, field_provenance = ?, stage_v_pending_correction = ? WHERE id = ?"
+      `UPDATE dental_agents SET ${column} = ?, field_provenance = ?, stage_v_pending_correction = ? WHERE id = ?`
     ).run(
-      observedValue,
+      observedCanonical,
       JSON.stringify(mergedProv),
       Object.keys(pendingMap).length ? JSON.stringify(pendingMap) : null,
       id
     );
 
-    return { found: true, corrected: true, previous_value: previousValue, new_value: observedValue };
+    return { found: true, corrected: true, previous_value: previousValue, new_value: observedCanonical };
   }
 
   // First observation of this contradicting value, or a different value than
   // whatever was pending — (re)start the 2-confirmation window.
-  pendingMap[field] = { value: observedValue, observed_at: new Date().toISOString() };
+  pendingMap[field] = { value: observedCanonical, observed_at: new Date().toISOString() };
   writePendingMap(pendingMap);
   return { found: true, corrected: false, pending: true };
 }
