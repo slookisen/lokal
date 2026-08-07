@@ -65,6 +65,7 @@ import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-em
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
+import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
@@ -696,6 +697,12 @@ app.use("/admin", adminLimiter, descriptionTruncationSweepRouter);
 // agent_knowledge directly. POST /admin/rfb-website-discovery,
 // GET /admin/rfb-website-review-queue (read-only, pending rows only).
 app.use("/admin", adminLimiter, adminRfbWebsiteDiscoveryRoutes);
+// dev-requests/2026-08-07-rfb-contact-extraction.md: corroborated contact-
+// email extraction from a producer's own website for RFB `agents` rows whose
+// contact_email is blank or DNS-flagged-dead — writes agents.contact_email
+// (fill-or-replace-if-flagged-dead), never phone, never field_provenance.
+// POST /admin/rfb-contact-extraction (dry-run default).
+app.use("/admin", adminLimiter, adminRfbContactExtractionRoutes);
 // orch-pr-10 (2026-06-14): per-producer Brave search→crawl→confirm→email — POST /admin/search-enrich (dry-run default)
 app.use("/admin/search-enrich", adminLimiter, express.json(), adminSearchEnrichRoutes);
 // PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create
