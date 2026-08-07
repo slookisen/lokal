@@ -58,6 +58,10 @@ import {
   getProduktByStats,
   listProduktByCombos,
   countGardssalgProviders,
+  // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2: the
+  // homepage drikkested feature section's per-type chips — same WHERE gate as
+  // countGardssalgProviders(), plus GROUP BY producer_type.
+  countGardssalgProvidersByType,
   getPublishedProviderById,
   getPublishedProviderBySlug,
   getGardssalgProviderBySlug,
@@ -330,6 +334,141 @@ const OA_CHROME_CSS = `
   .footer-bottom .verified svg{color:var(--teal-400);flex:0 0 15px}
 `;
 
+// ─────────────────────────────────────────────────────────────
+// Illustrated hero scene (dev-request
+// 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2).
+// Hand-drawn, layered SVG silhouettes that sit BEHIND the hero text
+// (absolute inset:0; .hero-inner / .hero-section>.container carry z-index:1)
+// so the dark hero gradient + white AA-contrast text are untouched. Two
+// motifs, one palette (the page's own tokens only — fjord silhuettes as
+// rgba(#0b2e29)/rgba(#18130d), copper #c98a2b at low opacity, #12a594/#ff5d3b
+// glows via <radialGradient>):
+//   "forside" — fjord/farm silhouettes in three depth layers + a discreet
+//               copper pot-still in the right field (replaces the old
+//               two-path .hero-range mountain strip, whose role the darkest
+//               bottom layer takes over).
+//   "drikke"  — copper kettle + barrels + apple-orchard/hop hints; used on
+//               the /kategori/gardssalg hero (and only there — the homepage
+//               keeps the broader forside motif).
+// The kettle steam (class="steam") animates via ONE @keyframes rule that
+// lives EXCLUSIVELY inside @media (prefers-reduced-motion: no-preference)
+// in OA_HERO_SCENE_CSS below — reduced-motion visitors get a static wisp.
+// No JS anywhere. Every layer's fill opacity stays ≤ .6 under the text zone.
+// Exported for the S2 test suite's per-variant size assertion (each variant
+// must stay well under 50 000 chars — target ~12 kB).
+// ─────────────────────────────────────────────────────────────
+export function heroSceneSvg(motif: "forside" | "drikke"): string {
+  const open = (cls: string) =>
+    `<svg class="hero-scene ${cls}" viewBox="0 0 1440 480" preserveAspectRatio="xMidYMax slice" aria-hidden="true" focusable="false">`;
+  if (motif === "forside") {
+    // Gradient ids are motif-prefixed (oaHsF-/oaHsD-) so both motifs could
+    // coexist in one document without id collisions.
+    //
+    // COMPOSITION (S2 review fix, 9e1559e CHANGES-REQUESTED B1): the hero
+    // renders ~737px tall against this 480-unit viewBox, so `xMidYMax slice`
+    // upscales ~1.5× and CROPS horizontally — the guaranteed-visible band is
+    // only x≈303–1137 at 1280px viewport (x≈253–1187 at 1440px) and
+    // x≈596–844 on a 360px phone. Every figurative element therefore lives
+    // in-band: the farm cluster (tree/house/barn/fence/tree) spans x≈600–856
+    // so the PHONE crop gets real character around x≈720, and the copper
+    // pot-still spans x≈956–1110 so it's fully visible from 1280px up. The
+    // x<300 / x>1140 margins carry only depth layers + edge trees that
+    // progressively appear on wider viewports — nothing load-bearing.
+    return `${open("hero-scene-forside")}
+<defs>
+<radialGradient id="oaHsF-teal" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#12a594" stop-opacity=".30"/><stop offset="100%" stop-color="#12a594" stop-opacity="0"/></radialGradient>
+<radialGradient id="oaHsF-coral" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#ff5d3b" stop-opacity=".24"/><stop offset="100%" stop-color="#ff5d3b" stop-opacity="0"/></radialGradient>
+</defs>
+<ellipse cx="430" cy="330" rx="430" ry="190" fill="url(#oaHsF-teal)"/>
+<ellipse cx="1040" cy="360" rx="390" ry="175" fill="url(#oaHsF-coral)"/>
+<path fill="rgba(11,46,41,.30)" d="M0 336 C96 318 178 288 268 282 C364 275 430 300 520 302 C628 305 700 262 806 254 C900 247 964 274 1060 280 C1170 287 1252 258 1348 262 C1384 264 1416 272 1440 280 L1440 480 L0 480 Z"/>
+<path fill="none" stroke="rgba(18,165,148,.16)" stroke-width="3" stroke-linecap="round" d="M330 372 C470 366 600 368 726 372 M800 380 C930 374 1056 376 1180 380"/>
+<path fill="rgba(11,46,41,.46)" d="M0 402 C84 384 160 366 252 368 C348 370 420 392 516 396 C640 401 748 372 862 374 C980 376 1072 398 1180 402 C1272 405 1362 396 1440 400 L1440 480 L0 480 Z"/>
+<g fill="rgba(11,46,41,.55)">
+<path d="M660 390 L660 352 L684 332 L708 352 L708 390 Z"/>
+<path d="M716 390 L716 356 L760 356 L760 390 Z"/>
+<path d="M710 356 L738 338 L766 356 Z"/>
+</g>
+<path fill="none" stroke="rgba(11,46,41,.50)" stroke-width="3" stroke-linecap="round" d="M772 384 H816 M780 376 V384 M792 376 V384 M804 376 V384"/>
+<g fill="rgba(11,46,41,.52)">
+<path d="M600 400 L614 352 L628 400 Z"/>
+<path d="M830 394 L843 350 L856 394 Z"/>
+</g>
+<path fill="rgba(24,19,13,.58)" d="M0 452 C120 436 232 424 366 428 C512 432 618 448 764 450 C918 452 1030 436 1170 438 C1272 440 1366 448 1440 450 L1440 480 L0 480 Z"/>
+<g fill="rgba(24,19,13,.60)">
+<path d="M84 450 L98 400 L112 450 Z"/>
+<path d="M118 452 L129 412 L140 452 Z"/>
+<path d="M1244 446 L1258 398 L1272 446 Z"/>
+<path d="M1284 448 L1296 410 L1308 448 Z"/>
+</g>
+<g>
+<path fill="rgba(201,138,43,.32)" d="M956 448 C956 410 972 390 1004 390 C1036 390 1052 410 1052 448 Z"/>
+<path fill="rgba(201,138,43,.32)" d="M978 390 C981 372 991 363 1004 363 C1017 363 1027 372 1030 390 Z"/>
+<path fill="none" stroke="rgba(201,138,43,.36)" stroke-width="6" stroke-linecap="round" d="M1004 363 C1004 350 1012 344 1026 343 C1060 340 1080 354 1086 378 L1092 448"/>
+<rect x="1074" y="412" width="36" height="36" rx="5" fill="rgba(201,138,43,.22)"/>
+<path fill="none" stroke="rgba(201,138,43,.28)" stroke-width="3" d="M964 426 H1044"/>
+</g>
+<g class="steam" fill="none" stroke="rgba(255,255,255,.28)" stroke-width="5" stroke-linecap="round">
+<path d="M996 346 C990 330 1000 320 994 304 C989 291 997 281 993 266"/>
+<path d="M1014 350 C1022 336 1012 324 1020 310 C1026 299 1018 288 1024 274"/>
+</g>
+</svg>`;
+  }
+  return `${open("hero-scene-drikke")}
+<defs>
+<radialGradient id="oaHsD-teal" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#12a594" stop-opacity=".28"/><stop offset="100%" stop-color="#12a594" stop-opacity="0"/></radialGradient>
+<radialGradient id="oaHsD-coral" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#ff5d3b" stop-opacity=".26"/><stop offset="100%" stop-color="#ff5d3b" stop-opacity="0"/></radialGradient>
+</defs>
+<ellipse cx="360" cy="360" rx="420" ry="180" fill="url(#oaHsD-teal)"/>
+<ellipse cx="1050" cy="340" rx="410" ry="190" fill="url(#oaHsD-coral)"/>
+<path fill="rgba(11,46,41,.32)" d="M0 388 C140 370 260 358 420 362 C600 366 720 344 900 348 C1080 352 1200 368 1320 372 C1370 374 1412 378 1440 380 L1440 480 L0 480 Z"/>
+<g fill="rgba(11,46,41,.42)">
+<circle cx="150" cy="350" r="22"/><path d="M147 366 h6 v22 h-6 Z"/>
+<circle cx="216" cy="342" r="18"/><path d="M213 356 h6 v24 h-6 Z"/>
+<circle cx="282" cy="350" r="21"/><path d="M279 366 h6 v22 h-6 Z"/>
+</g>
+<g fill="rgba(255,93,59,.28)"><circle cx="142" cy="346" r="3.2"/><circle cx="158" cy="354" r="3.2"/><circle cx="222" cy="338" r="3"/><circle cx="288" cy="346" r="3"/></g>
+<path fill="none" stroke="rgba(11,46,41,.40)" stroke-width="4" stroke-linecap="round" d="M336 258 C356 270 370 284 376 300 M404 264 C412 280 414 294 410 310"/>
+<g fill="rgba(11,46,41,.40)">
+<path d="M376 300 C364 300 357 311 359 325 C360 337 367 346 376 346 C385 346 392 337 393 325 C395 311 388 300 376 300 Z"/>
+<path d="M410 310 C400 310 394 319 396 331 C397 341 403 348 410 348 C417 348 423 341 424 331 C426 319 420 310 410 310 Z"/>
+</g>
+<path fill="rgba(24,19,13,.55)" d="M0 446 C160 432 300 424 470 428 C660 432 790 446 950 448 C1110 450 1260 440 1440 444 L1440 480 L0 480 Z"/>
+<g>
+<rect x="620" y="386" width="66" height="60" rx="12" fill="rgba(24,19,13,.60)"/>
+<path d="M624 404 H682 M624 428 H682" stroke="rgba(201,138,43,.34)" stroke-width="4" fill="none"/>
+<rect x="700" y="398" width="54" height="48" rx="10" fill="rgba(24,19,13,.50)"/>
+<path d="M703 412 H751 M703 432 H751" stroke="rgba(201,138,43,.30)" stroke-width="3.5" fill="none"/>
+</g>
+<g>
+<path fill="rgba(201,138,43,.34)" d="M886 446 C886 380 916 346 972 346 C1028 346 1058 380 1058 446 Z"/>
+<path fill="rgba(201,138,43,.34)" d="M920 346 C926 320 946 306 972 306 C998 306 1018 320 1024 346 Z"/>
+<path fill="none" stroke="rgba(201,138,43,.38)" stroke-width="7" stroke-linecap="round" d="M972 306 C972 288 982 278 1002 275 C1056 267 1092 288 1104 324 L1114 446"/>
+<path fill="none" stroke="rgba(24,19,13,.24)" stroke-width="4" d="M896 408 H1048"/>
+<rect x="1094" y="398" width="46" height="48" rx="7" fill="rgba(201,138,43,.24)"/>
+</g>
+<g class="steam" fill="none" stroke="rgba(255,255,255,.28)" stroke-width="6" stroke-linecap="round">
+<path d="M960 288 C952 270 964 258 956 240 C950 226 960 214 954 198"/>
+<path d="M986 292 C996 276 984 262 994 246 C1002 233 992 220 1000 204"/>
+</g>
+</svg>`;
+}
+
+// Positioning + the ONE steam animation for the hero scene. The @keyframes
+// rule intentionally lives INSIDE the prefers-reduced-motion:no-preference
+// block (not merely the animation-name binding) so reduced-motion UAs never
+// even parse a motion definition — statically the steam just sits at its
+// base opacity. Shared verbatim by the homepage hero and the
+// /kategori/gardssalg .hero-section.
+const OA_HERO_SCENE_CSS = `
+  /* ── HERO SCENE (S2 illustrated backdrop) ── */
+  .hero-scene{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  .hero-scene .steam{opacity:.5}
+  @media (prefers-reduced-motion: no-preference){
+    .hero-scene .steam{animation:oaSteamRise 10s ease-in-out infinite}
+    @keyframes oaSteamRise{0%{transform:translateY(0);opacity:0}18%{opacity:.55}70%{opacity:.3}100%{transform:translateY(-46px);opacity:0}}
+  }
+`;
 
 const CATEGORY_LABELS: Record<string, string> = {
   vinter_sno: "Vinter & snø",
@@ -519,6 +658,13 @@ export function homeStrings(lang: Lang) {
     counterAiExplain: "AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.",
     counterWindowPre: "Siste", counterWindowPost: "dager",
     networkLabel: "En del av A2A-nettverket:", networkTagline: "Bygget for både mennesker og AI-agenter",
+    // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2:
+    // the homepage drikkested feature section (rendered only when
+    // gardssalgVisible() — see renderDrikkestedFeatureSection()).
+    // Keep in sync with the `en` object below.
+    drikkeKicker: "Nytt", drikkeTitle: "Besøk lokale drikkeprodusenter",
+    drikkeIntro: "Bryggeri, sideri, mjøderi og destilleri åpner dørene for smaking og omvisning &mdash; book besøket direkte hos produsenten, verifisert mot Brønnøysundregistrene.",
+    drikkeCta: "Utforsk drikkesteder", drikkeAria: "Drikkeprodusenter etter type", drikkeChipCountAria: "produsenter",
     catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
     fylkeKicker: "Steder", fylkeTitle: "Utforsk etter fylke", fylkeIntro: "Se hvor opplevelsene finnes &mdash; velg et fylke for en fullstendig oversikt.", fylkeAria: "Fylker",
     kommuneTitle: "Populære kommuner", kommuneAria: "Populære kommuner",
@@ -556,6 +702,10 @@ export function homeStrings(lang: Lang) {
     counterAiExplain: "AI search: a human asked ChatGPT, Claude or Perplexity, and the assistant fetched information from us in real time. Crawlers: automated indexing and scraping.",
     counterWindowPre: "Last", counterWindowPost: "days",
     networkLabel: "Part of the A2A network:", networkTagline: "Built for both humans and AI agents",
+    // Keep in sync with the `no` object above (S2 drikkested feature section).
+    drikkeKicker: "New", drikkeTitle: "Visit local drink producers",
+    drikkeIntro: "Breweries, cideries, meaderies and distilleries open their doors for tastings and tours &mdash; book your visit directly with the producer, verified against the Norwegian business registry.",
+    drikkeCta: "Explore drink stops", drikkeAria: "Drink producers by type", drikkeChipCountAria: "producers",
     catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
     fylkeKicker: "Places", fylkeTitle: "Explore by county", fylkeIntro: "See where the experiences are &mdash; pick a county for a full overview.", fylkeAria: "Counties",
     kommuneTitle: "Popular municipalities", kommuneAria: "Popular municipalities",
@@ -569,6 +719,91 @@ export function homeStrings(lang: Lang) {
     footTagline: "Curated marketplace for Norwegian experiences and activities &mdash; searchable for humans and AI agents.", footExplore: "Explore", footAgents: "For agents", footPrivacy: "Privacy", footTerms: "Terms", footVerified: "Providers verified against the Norwegian business registry",
   };
   return lang === "en" ? en : no;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Homepage drikkested feature section (dev-request
+// 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2): a "Nytt" callout
+// card between the counter strip and #kategorier that fronts the gardssalg
+// (drink-producer) category for the outreach launch. Rendered ONLY when
+// gardssalgVisible() is true — the caller gates, and below threshold nothing
+// (not even an empty wrapper) is emitted.
+//
+// `typeCounts` is countGardssalgProvidersByType()'s raw per-type rows.
+// Chips aggregate to DRINK_TYPE_META's canonical LABELS (its own source of
+// truth for label+color): cideri+sideri → «Sider», vingård (and the
+// unaccented vingard spelling) → «Fruktvin», mjøderi/mjoderi → «Mjød»,
+// seltzeri → «Kombucha». NULL/unknown producer_type rows are part of the
+// gate's provider set but have no honest label — they simply get no chip.
+// Only labels with count > 0 render.
+// ─────────────────────────────────────────────────────────────
+// Unaccented/transliterated aliases seen in enrichment data — same
+// label/color as their accented DRINK_TYPE_META twins. Both ASCII spellings
+// occur: the å→a strip (vingard/mjoderi) AND the å→aa / ø→oe
+// transliteration (vingaard is a real pipeline spelling — see
+// search-enrich.ts's producer-type mapping; mjoederi included for the same
+// reason). Kept OUT of DRINK_TYPE_META itself so the badge surfaces'
+// behavior (drinkBadge()/drinkTypeMeta()) is unchanged.
+const DRINK_TYPE_UNACCENTED_ALIASES: Record<string, string> = {
+  vingard: "vingård",
+  vingaard: "vingård",
+  mjoderi: "mjøderi",
+  mjoederi: "mjøderi",
+};
+
+export function renderDrikkestedFeatureSection(
+  lang: Lang,
+  typeCounts: Array<{ producer_type: string | null; count: number }>
+): string {
+  const S = homeStrings(lang);
+  // Aggregate raw producer_type rows by canonical label.
+  const agg = new Map<string, { label: string; color: string; count: number }>();
+  for (const row of typeCounts) {
+    if (!row || !Number.isFinite(row.count) || row.count <= 0) continue;
+    const rawKey = row.producer_type ? row.producer_type.toLowerCase() : "";
+    if (!rawKey) continue;
+    const key = DRINK_TYPE_UNACCENTED_ALIASES[rawKey] ?? rawKey;
+    const meta = DRINK_TYPE_META[key];
+    if (!meta) continue; // unknown type — no honest chip label for it
+    const cur = agg.get(meta.label);
+    if (cur) cur.count += row.count;
+    else agg.set(meta.label, { label: meta.label, color: meta.color, count: row.count });
+  }
+  const chips = [...agg.values()]
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label, "nb"))
+    .map(
+      (c) =>
+        `<span class="drink-chip" role="listitem"><span class="dot" style="background:${c.color}" aria-hidden="true"></span>${escapeHtml(c.label)} <span class="n" aria-label="${c.count} ${S.drikkeChipCountAria}">${c.count}</span></span>`
+    )
+    .join("");
+
+  // Small copper-kettle decor lifted from the drikke hero-scene motif —
+  // pure decoration, hidden from AT.
+  // The swan neck ends IN the little condenser box (review fix on 9e1559e:
+  // it previously trailed off as a free-floating stroke).
+  const decor = `<svg viewBox="0 0 120 120" width="132" height="132" aria-hidden="true" focusable="false">
+<path fill="rgba(201,138,43,.5)" d="M32 98 C32 60 45 42 60 42 C75 42 88 60 88 98 Z"/>
+<path fill="rgba(201,138,43,.5)" d="M45 42 C47 30 52 24 60 24 C68 24 73 30 75 42 Z"/>
+<path fill="none" stroke="rgba(201,138,43,.55)" stroke-width="4" stroke-linecap="round" d="M60 24 C60 16 64 12 72 11 C88 9 98 18 100 32 L102 72"/>
+<rect x="92" y="70" width="20" height="28" rx="4" fill="rgba(201,138,43,.42)"/>
+<path fill="none" stroke="rgba(255,255,255,.32)" stroke-width="3.5" stroke-linecap="round" d="M54 16 C51 10 55 6 52 0 M66 18 C69 12 65 8 68 2"/>
+</svg>`;
+
+  return `
+  <section class="section drikkested-feature" id="drikkested" aria-labelledby="drikkested-title">
+    <div class="container">
+      <div class="drikkested-card">
+        <div class="drikkested-copy">
+          <span class="kicker">${S.drikkeKicker}</span>
+          <h2 id="drikkested-title">${S.drikkeTitle}</h2>
+          <p>${S.drikkeIntro}</p>
+          ${chips ? `<div class="drink-chips" role="list" aria-label="${S.drikkeAria}">${chips}</div>` : ""}
+          <a class="drikkested-cta" href="/kategori/gardssalg">${S.drikkeCta}</a>
+        </div>
+        <div class="drikkested-decor" aria-hidden="true">${decor}</div>
+      </div>
+    </div>
+  </section>`;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -618,6 +853,16 @@ router.get("/", (req: Request, res: Response) => {
       &mdash; ${S.networkTagline}
     </div>
   </div>`;
+
+  // S2 drikkested feature section — gated on the SAME gardssalgVisible()
+  // flag as the category card/nav/sitemap; below threshold NOTHING renders.
+  // Type counts are read defensively (must never break the homepage).
+  let drikkestedSectionHtml = "";
+  if (gardssalgVisible()) {
+    let drinkTypeCounts: Array<{ producer_type: string | null; count: number }> = [];
+    try { drinkTypeCounts = countGardssalgProvidersByType(); } catch { drinkTypeCounts = []; }
+    drikkestedSectionHtml = renderDrikkestedFeatureSection(lang, drinkTypeCounts);
+  }
 
   // categories (DB not open / no data yet). When empty we show a tasteful set
   // of example categories so the grid never looks broken pre-data.
@@ -825,7 +1070,7 @@ ${ldScripts}
   /* ── HERO ── */
   .hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(135deg,#0b2e29 0%,#0e3c36 34%,#0f5a50 56%,#12a594 82%,#ff5d3b 136%)}
   .hero::before{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 18% 8%,rgba(60,195,180,.30),transparent 55%),radial-gradient(90% 80% at 92% 18%,rgba(255,93,59,.28),transparent 60%);pointer-events:none}
-  .hero-range{position:absolute;left:0;right:0;bottom:-1px;height:140px;opacity:.55;pointer-events:none}
+  ${OA_HERO_SCENE_CSS}
   .hero-inner{position:relative;max-width:920px;margin:0 auto;padding:84px 24px 104px;text-align:center;z-index:1}
   @media(max-width:560px){.hero-inner{padding:60px 16px 96px}}
   .eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:var(--r-pill);background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);font-size:.78rem;font-weight:600;letter-spacing:.02em;margin-bottom:22px;backdrop-filter:blur(4px)}
@@ -875,6 +1120,22 @@ ${ldScripts}
   .counter-lbl{margin-top:3px;font-size:.68rem;font-weight:600;color:var(--mist);text-transform:uppercase;letter-spacing:.04em}
   .counter-sep{width:1px;height:26px;background:var(--line)}
   @media(max-width:640px){.counter-sep{display:none}}
+
+  /* ── DRIKKESTED FEATURE (S2) ── */
+  .drikkested-card{position:relative;overflow:hidden;display:grid;grid-template-columns:1fr auto;gap:30px;align-items:center;background:linear-gradient(135deg,var(--fjord-900) 0%,var(--fjord-700) 90%);color:#fff;border-radius:var(--r-lg);padding:44px 40px;box-shadow:var(--sh-md)}
+  .drikkested-card::before{content:"";position:absolute;inset:0;background:radial-gradient(75% 110% at 100% 10%,rgba(201,138,43,.20),transparent 60%);pointer-events:none}
+  @media(max-width:720px){.drikkested-card{grid-template-columns:1fr;padding:32px 24px}.drikkested-decor{display:none}}
+  .drikkested-copy{position:relative}
+  .drikkested-card .kicker{color:var(--amber-400)}
+  .drikkested-card h2{font-size:clamp(1.45rem,3vw,2rem);font-weight:800;letter-spacing:-.02em;margin-bottom:12px}
+  .drikkested-card p{color:rgba(255,255,255,.9);font-size:1rem;max-width:52ch}
+  .drink-chips{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 24px}
+  .drink-chip{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:var(--r-pill);background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.22);font-size:.84rem;font-weight:600}
+  .drink-chip .dot{width:9px;height:9px;border-radius:50%;box-shadow:0 0 0 3px rgba(255,255,255,.12)}
+  .drink-chip .n{opacity:.75;font-weight:700}
+  .drikkested-cta{display:inline-flex;align-items:center;gap:8px;padding:13px 26px;border-radius:var(--r-pill);background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;font-size:.95rem;box-shadow:0 4px 14px rgba(255,93,59,.4);transition:transform .12s ease,box-shadow .12s ease}
+  .drikkested-cta:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(255,93,59,.5);text-decoration:none}
+  .drikkested-decor{position:relative;padding-right:8px}
   .counter-note{max-width:var(--maxw);margin:0 auto;padding:0 24px 14px;text-align:center;font-size:.7rem;color:var(--mist);line-height:1.5}
   .network-strip{max-width:var(--maxw);margin:0 auto;padding:0 24px 16px;text-align:center;font-size:.74rem;color:var(--mist)}
   .network-strip a{color:var(--fjord-700);font-weight:600;text-decoration:none}
@@ -957,10 +1218,7 @@ ${oaSiteNav({ active: "hjem", lang })}
 
 <main id="hovedinnhold">
   <section class="hero" aria-labelledby="hero-title">
-    <svg class="hero-range" viewBox="0 0 1440 140" preserveAspectRatio="none" aria-hidden="true">
-      <path d="M0 140 L0 96 L150 40 L300 92 L470 24 L640 88 L820 36 L1010 96 L1200 48 L1340 90 L1440 60 L1440 140 Z" fill="rgba(24,19,13,.45)"/>
-      <path d="M0 140 L0 116 L210 72 L420 112 L640 70 L900 118 L1150 82 L1440 110 L1440 140 Z" fill="rgba(24,19,13,.65)"/>
-    </svg>
+    ${heroSceneSvg("forside")}
     <div class="hero-inner">
       <span class="eyebrow"><span class="dot"></span> ${S.heroPill}</span>
       <h1 id="hero-title">${S.heroH1}<span class="accent">${S.heroAccent}</span></h1>
@@ -1042,6 +1300,7 @@ ${oaSiteNav({ active: "hjem", lang })}
     </div>
   </div>
   ${counterStripHtml}
+  ${drikkestedSectionHtml}
 
   <section class="section" id="kategorier" aria-labelledby="kat-title">
     <div class="container">
@@ -3591,7 +3850,11 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
 ${BROWSE_CSS}
 .provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:20px;margin-top:24px}
 @media(max-width:560px){.provider-grid{grid-template-columns:1fr}}
-.hero-section{background:linear-gradient(135deg,#0e3c36 0%,#0f5a50 100%);color:#fff;padding:48px 0 40px;margin-bottom:32px}
+.hero-section{position:relative;overflow:hidden;background:linear-gradient(135deg,#0e3c36 0%,#0f5a50 100%);color:#fff;padding:48px 0 40px;margin-bottom:32px}
+/* S2: the illustrated drikke scene sits BEHIND the hero copy — same
+   z-index technique as the homepage hero (.hero-inner has z-index:1). */
+.hero-section>.container{position:relative;z-index:1}
+${OA_HERO_SCENE_CSS}
 .hero-kicker{font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.7;margin-bottom:8px}
 .hero-h1{font-size:2rem;font-weight:800;margin-bottom:10px;line-height:1.2}
 .hero-sub{opacity:.85;font-size:1rem;max-width:560px;line-height:1.5}
@@ -3608,6 +3871,7 @@ ${mapPoints.length > 0 ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
 <a class="skip-link" href="#main">Hopp til innhold</a>
 ${oaSiteNav({ active: "gardssalg" })}
 <header class="hero-section">
+  ${heroSceneSvg("drikke")}
   <div class="container">
     <div class="hero-kicker">Gårdssalg &amp; smaking</div>
     <h1 class="hero-h1">Lokale drikkeprodusenter</h1>
