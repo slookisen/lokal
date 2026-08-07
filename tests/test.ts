@@ -37434,3 +37434,25 @@ runSerial(async () => {
     failures.push("gardssalg-epost-synthesis-audit: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+// hygiene, item 5 ("wrong_content_rate holdout"), slice claimed
+// 2026-08-07T05:56Z: src/services/experience-content-judge.ts's fail-closed
+// LLM judge + candidate sampler, and POST /admin/experiences-wrong-content-
+// rate (src/routes/opplevelser.ts) — read-only holdout, zero writes. Tail-
+// registered via runSerial() like the suites immediately above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene, item 5: experiences-wrong-content-rate ──");
+  try {
+    const { runExperiencesWrongContentRateTests } = require("../src/routes/experiences-wrong-content-rate.test") as
+      typeof import("../src/routes/experiences-wrong-content-rate.test");
+    const wcr = await runExperiencesWrongContentRateTests(false);
+    passed += wcr.passed;
+    failed += wcr.failed;
+    for (const f of wcr.failures) failures.push("experiences-wrong-content-rate: " + f);
+    console.log(`  experiences-wrong-content-rate: ${wcr.passed} passed, ${wcr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-wrong-content-rate: unexpected error: " + String(err?.message || err));
+  }
+});
