@@ -2501,8 +2501,36 @@ export function markProviderContentAttempted(providerId: string): boolean {
 // whether to surface /kategori/gardssalg in nav, homepage cards, and sitemap.
 // Threshold: ≥5 providers → category becomes visible. Phase 1 (2026-06-28).
 // Query hits experience_providers only — no join, very fast.
-export function countGardssalgProviders(): number {
+//
+// dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S3: the
+// optional trailing `filter` parameter (here and on listGardssalgProviders()/
+// listGardssalgProviderMapPoints()) narrows the SAME provider set to rows
+// whose LOWER(producer_type) matches one of filter.producerTypes — feeds the
+// /kategori/gardssalg/<typeSlug> subpages. STRICTLY additive: when the filter
+// is omitted/empty the built SQL string is byte-identical to before this
+// parameter existed, so every pre-S3 caller behaves exactly as it always has.
+// The IN-list is bound parameters (never string-interpolated values), and the
+// predicate is appended AFTER the existing base gate so catalog_hidden=1 rows
+// can never leak through any filter combination. NULL producer_type rows
+// never match any type filter (LOWER(NULL) IS NULL → not IN) — deliberate:
+// NULL-type rfb-seed rows belong to the unfiltered base catalog only, and
+// isGardssalgDrinkType() (which counts NULL as drink) must NOT be used here.
+export type GardssalgProviderTypeFilter = { producerTypes?: string[] };
+
+function gardssalgTypeFilterSql(filter?: GardssalgProviderTypeFilter): { sql: string; params: string[] } {
+  const types = (filter?.producerTypes ?? [])
+    .map((t) => String(t).toLowerCase())
+    .filter((t) => t.length > 0);
+  if (types.length === 0) return { sql: "", params: [] };
+  return {
+    sql: ` AND LOWER(producer_type) IN (${types.map(() => "?").join(",")})`,
+    params: types,
+  };
+}
+
+export function countGardssalgProviders(filter?: GardssalgProviderTypeFilter): number {
   const db = getDb(VERTICAL);
+  const typeFilter = gardssalgTypeFilterSql(filter);
   const row = db
     .prepare(
       "SELECT COUNT(*) AS c FROM experience_providers " +
@@ -2511,9 +2539,10 @@ export function countGardssalgProviders(): number {
       // hidden booking-flyt-v1 test provider) never bump the count that gates
       // gardssalgVisible() (dev-request 2026-07-14-booking-flyt-v1, slice 0).
       "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1)"
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1)" +
+      typeFilter.sql
     )
-    .get() as { c: number };
+    .get(...typeFilter.params) as { c: number };
   return row.c;
 }
 
@@ -2615,8 +2644,11 @@ export type GardssalgProviderRow = {
 const GARDSSALG_PROVIDER_COLUMNS =
   "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at, claimed_at";
 
-export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
+export function listGardssalgProviders(limit = 100, offset = 0, filter?: GardssalgProviderTypeFilter): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
+  // Optional S3 type filter — see countGardssalgProviders()'s doc comment;
+  // omitted/empty filter builds the exact pre-S3 SQL string.
+  const typeFilter = gardssalgTypeFilterSql(filter);
   return db
     .prepare(
       // catalog_hidden=1 rows (the hidden booking-flyt-v1 test provider) are
@@ -2626,11 +2658,11 @@ export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProvid
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)${typeFilter.sql}
         ORDER BY navn
         LIMIT ? OFFSET ?`
     )
-    .all(limit, offset) as GardssalgProviderRow[];
+    .all(...typeFilter.params, limit, offset) as GardssalgProviderRow[];
 }
 
 export type GardssalgProviderMapPoint = {
@@ -2677,8 +2709,13 @@ export type GardssalgProviderMapPoint = {
  * so a caller must handle "no confidence tag" defensively rather than assume
  * exact precision.
  */
-export function listGardssalgProviderMapPoints(): GardssalgProviderMapPoint[] {
+export function listGardssalgProviderMapPoints(filter?: GardssalgProviderTypeFilter): GardssalgProviderMapPoint[] {
   const db = getDb(VERTICAL);
+  // Optional S3 type filter — see countGardssalgProviders()'s doc comment;
+  // omitted/empty filter builds the exact pre-S3 SQL string. Appended AFTER
+  // the coordinate/slug predicates so the filtered marker set stays a strict
+  // subset of the unfiltered one, in lockstep with the filtered card grid.
+  const typeFilter = gardssalgTypeFilterSql(filter);
   return db
     .prepare(
       `SELECT slug, navn, producer_type, fylke, kommune, poststed, lat, lon, geocode_confidence
@@ -2686,10 +2723,10 @@ export function listGardssalgProviderMapPoints(): GardssalgProviderMapPoint[] {
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (catalog_hidden IS NULL OR catalog_hidden != 1)
           AND lat IS NOT NULL AND lon IS NOT NULL
-          AND slug IS NOT NULL AND slug != ''
+          AND slug IS NOT NULL AND slug != ''${typeFilter.sql}
         ORDER BY navn`
     )
-    .all() as GardssalgProviderMapPoint[];
+    .all(...typeFilter.params) as GardssalgProviderMapPoint[];
 }
 
 /** Look up a single gårdssalg provider (drink producer) by slug — for the

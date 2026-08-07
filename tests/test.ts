@@ -29837,6 +29837,26 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esfd.failures) failures.push("experiences-seo-forside-drikkested: " + f);
     console.log(`  experiences-seo-forside-drikkested: ${esfd.passed} passed, ${esfd.failed} failed`);
 
+    // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S3:
+    // indexable /kategori/gardssalg/<typeSlug> drink-type subpages
+    // (GARDSSALG_TYPE_PAGES whitelist + alias 301s), the type-chips row +
+    // category-boosted searchBox on the gårdssalg catalog, per-type sitemap
+    // entries, and the additive producer-type filter on
+    // listGardssalgProviders()/countGardssalgProviders()/
+    // listGardssalgProviderMapPoints(). Covers the empty-type/unknown-slug
+    // next() guards, catalog_hidden exclusion everywhere, the NULL-type-only-
+    // on-«Alle» rule, and the pre-S3 result-identity of the omitted filter.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── experiences-seo-gardssalg-typesider: drikkested type subpages + chips (S3) ──");
+    const { runExperiencesSeoGardssalgTypesiderTests } = require("../src/routes/experiences-seo-gardssalg-typesider.test") as
+      typeof import("../src/routes/experiences-seo-gardssalg-typesider.test");
+    const esgt = await runExperiencesSeoGardssalgTypesiderTests({ log: false });
+    passed += esgt.passed;
+    failed += esgt.failed;
+    for (const f of esgt.failures) failures.push("experiences-seo-gardssalg-typesider: " + f);
+    console.log(`  experiences-seo-gardssalg-typesider: ${esgt.passed} passed, ${esgt.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
     // ("CTA hide"): the "Driver du dette stedet?" claim-CTA aside-card on the
     // gårdssalg produsent profile page must be hidden once the provider has
