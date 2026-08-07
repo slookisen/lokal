@@ -143,7 +143,7 @@ const RFB_WD_USER_AGENT = "Lokal-RFB-WebsiteDiscovery/1.0";
 // (cross-source-validator.ts / experience-store.ts) but kept small and
 // scoped to what this route needs. Suffix-walks the host down to its eTLD+1
 // so a subdomain (e.g. "m.facebook.com") still matches its family entry.
-const RFB_WD_SOCIAL_HOSTS: ReadonlySet<string> = new Set([
+export const RFB_WD_SOCIAL_HOSTS: ReadonlySet<string> = new Set([
   "facebook.com",
   "instagram.com",
   "tiktok.com",
@@ -155,7 +155,7 @@ const RFB_WD_SOCIAL_HOSTS: ReadonlySet<string> = new Set([
   "snapchat.com",
 ]);
 
-const RFB_WD_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
+export const RFB_WD_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "1881.no",
   "gulesider.no",
   "proff.no",
@@ -179,7 +179,13 @@ const RFB_WD_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "wikipedia.org",
 ]);
 
-function rfbWebsiteHostExclusionReason(host: string | null): string | null {
+// Exported (dev-request rfb-contact-extraction slice) so the sibling
+// POST /admin/rfb-contact-extraction route (admin-rfb-contact-extraction.ts)
+// can apply the SAME aggregator/social-media host exclusion to its own,
+// differently-shaped cohort (rows that already have a website but a blank or
+// DNS-dead contact_email) without re-implementing or drifting from this
+// curated list. Export-only change — no behavior here is altered.
+export function rfbWebsiteHostExclusionReason(host: string | null): string | null {
   if (!host) return null;
   const h = host.toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
   const labels = h.split(".").filter(Boolean);
