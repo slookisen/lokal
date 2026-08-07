@@ -470,13 +470,37 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         }) as unknown as typeof fetch;
       }
 
+      /** Like fetchImplFromMap, but each entry can also carry a `finalUrl`
+       * that differs from the requested URL (mirrors a real apex->www or
+       * renamed-domain redirect, where resp.url != the requested URL) — see
+       * fetch-page.ts's `finalUrl = resp.url || fetchUrl`. Missing key ->
+       * throws, same convention as fetchImplFromMap. */
+      function fetchImplFromMapWithRedirect(
+        byUrl: Record<string, { html: string; finalUrl?: string }>,
+      ): typeof fetch {
+        return (async (input: unknown) => {
+          const url = String(input);
+          if (!(url in byUrl)) throw new Error(`mock fetch: unexpected request to ${url}`);
+          const entry = byUrl[url]!;
+          return mockHarvestResponse(entry.html, entry.finalUrl ?? url);
+        }) as unknown as typeof fetch;
+      }
+
       const BRREG_OK = { org_nr: "912345678", brreg_verified: 1 as const };
 
       // (h1) PRECONDITION: isHjemmesideOwnershipVerified() gates the harvest
       // entirely — an UNVERIFIED hjemmeside gets ZERO fetch attempts (not a
-      // fetch-then-discard). Proven by a fetchImpl that throws on ANY call.
+      // fetch-then-discard). Proven by a CALL-COUNTING SPY rather than a
+      // throwing fetchImpl: fetchPage() (fetch-page.ts) internally wraps its
+      // fetch call in try/catch and NEVER rethrows (a thrown error is always
+      // converted into a classified `{ok:false, ...}` result), so a throwing
+      // fetchImpl would make h1 pass identically whether the precondition is
+      // present or removed entirely — it only proves "no throw", not "no
+      // call". Counting actual invocations distinguishes the two.
+      let noFetchAllowedCalls = 0;
       const noFetchAllowed: typeof fetch = (async () => {
-        throw new Error("harvest must not fetch an unverified hjemmeside");
+        noFetchAllowedCalls++;
+        return mockHarvestResponse("<html><body>should never be reached</body></html>", "https://uverifisert-gard.no");
       }) as unknown as typeof fetch;
       const h1 = await deriveOrgLinkedEmailCandidatesWithHarvest(
         {
@@ -488,7 +512,8 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         undefined,
         { fetchImpl: noFetchAllowed },
       );
-      assertEq(h1, [], "h1: unverified hjemmeside -> zero harvest candidates AND zero fetch attempts (precondition reused from isHjemmesideOwnershipVerified)");
+      assertEq(h1, [], "h1: unverified hjemmeside -> zero harvest candidates");
+      assertEq(noFetchAllowedCalls, 0, "h1: unverified hjemmeside -> zero fetch attempts (precondition reused from isHjemmesideOwnershipVerified; a call-counting spy, not a throwing fetchImpl, since fetchPage() never rethrows)");
 
       // (h2) AC2 priority ordering, all three tiers present simultaneously,
       // PLUS an embedded AC3 rejection (a genuine different-company, non-
@@ -635,6 +660,38 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
           { email: "post@fullrekke-gard.no", source: "found_same_domain" },
         ],
         "h8: merge ordering -- brreg_contact, then found tiers, then stored_epost_verified (last, and here suppressed entirely by the dedupe since it's the SAME address the found_same_domain tier already offered under a higher-priority tag)",
+      );
+
+      // (h9) Post-redirect host is used for tier assignment, not the
+      // originally-requested hjemmeside — harvestFoundOrgEmails uses
+      // `primary.finalUrl || hjemmeside` as siteBase for the found_same_domain
+      // comparison (an apex/renamed-domain redirect must not make the site's
+      // own address look cross-domain). The requested URL is old-domain.no,
+      // but the mocked response's `finalUrl` lands on new-domain.no, and the
+      // page's own email is @new-domain.no -> must tag found_same_domain (if
+      // the code compared against the requested hjemmeside instead, the
+      // domains would mismatch and this would NOT come out found_same_domain).
+      const h9 = await deriveOrgLinkedEmailCandidatesWithHarvest(
+        {
+          ...BRREG_OK,
+          hjemmeside: "https://old-domain.no",
+          content_source: "manual",
+          field_provenance: null,
+        },
+        undefined,
+        {
+          fetchImpl: fetchImplFromMapWithRedirect({
+            "https://old-domain.no": {
+              html: `<html><body>Kontakt: kontakt@new-domain.no</body></html>`,
+              finalUrl: "https://new-domain.no",
+            },
+          }),
+        },
+      );
+      assertEq(
+        h9,
+        [{ email: "kontakt@new-domain.no", source: "found_same_domain" }],
+        "h9: tier assignment uses the POST-REDIRECT host (finalUrl=new-domain.no) not the originally-requested hjemmeside (old-domain.no) -- kontakt@new-domain.no is correctly tagged found_same_domain",
       );
     }
 
