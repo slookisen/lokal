@@ -15,6 +15,19 @@
  * conflict — four new tiers (skjult, ikke_soekbar, nettsted_uverifisert,
  * dublettkonflikt) sit ahead of outreach_ready in precedence.
  *
+ * Redefined for dev-request 2026-08-07-outreach-pool-krav123-og-pilot (AC1):
+ * the content-completeness gate (previously "needs_enrichment" unless
+ * about_text AND opening_hours_text were both present) is now krav 2 —
+ * about_text AND products AND brreg_verified. Opening hours / visit text
+ * (krav 3) are explicitly NOT required anymore — many gårdssalg producers
+ * (breweries, distilleries) run "open by arrangement" with no fixed hours,
+ * and the claim flow is how a producer fills that field in themselves, not
+ * a precondition for outreach. See the new/adjusted fixtures below: prov-
+ * ready now deliberately carries NO opening_hours_text/visit_text (the core
+ * regression case — would have tiered needs_enrichment under the OLD
+ * cascade), and two new fixtures (prov-no-brreg, prov-no-products) prove the
+ * new krav-2 fields DO still gate, independently of opening hours.
+ *
  * Mirrors opplevelser-gardssalg-contact-coverage.test.ts's setup
  * (EXPERIENCES_DB_PATH=":memory:", fresh require of db-factory + opplevelser
  * router per run, callRoute() exercising router.handle() directly with
@@ -131,11 +144,13 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
            (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
             epost, telefon, hjemmeside, about_text, visit_text, opening_hours_text,
             products, content_source, booking_live, catalog_hidden, slug, field_provenance,
+            brreg_verified,
             enrichment_state, verification_status, source, confidence)
          VALUES
            (@id, @navn, 'experiences', @org_nr, @kommune, @rfb_seed_source, @producer_type,
             @epost, @telefon, @hjemmeside, @about_text, @visit_text, @opening_hours_text,
             @products, @content_source, @booking_live, @catalog_hidden, @slug, @field_provenance,
+            @brreg_verified,
             'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
       // For the dublettkonflikt fixture below — a minimal `experiences` row
@@ -156,22 +171,29 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       });
 
       // ── (b) one fixture per readiness_tier ──────────────────────────────
-      // outreach_ready: website + about_text + opening_hours_text + email,
-      // has a slug (searchable), a verified field_provenance, not hidden, and
-      // no conflicting experience row -- the ONE fixture proving a row can
-      // still reach outreach_ready under the tightened Steg-4 rules.
+      // outreach_ready: website + about_text + products + brreg_verified +
+      // email, has a slug (searchable), a verified field_provenance, not
+      // hidden, and no conflicting experience row -- the ONE fixture proving
+      // a row can still reach outreach_ready under the Steg-4 rules.
+      // Deliberately carries NO opening_hours_text/visit_text (dev-request
+      // 2026-08-07-outreach-pool-krav123-og-pilot, krav 3: opening
+      // hours/visit text must NOT block outreach_ready anymore) -- this is
+      // the core regression case: it would have tiered needs_enrichment
+      // under the OLD (pre-krav-123) cascade.
       // also booking_live=1 with dispatch enabled -> booking_status "live".
       process.env.BOOKING_DISPATCH_ENABLED = "true";
       insertProvider.run({
         id: "prov-ready", navn: "Klar Gård AS", org_nr: "111111111", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: null,
         epost: "post@klargard.no", telefon: null, hjemmeside: "https://klargard.no",
-        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
         products: "Sider, cider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "klar-gard-as", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
-      // needs_enrichment: has website + email but no about_text/opening_hours.
-      // Fails before the new checks are even reached -- no slug/provenance.
+      // needs_enrichment: has website + email but no about_text/products/
+      // brreg_verified at all. Fails before the Steg-4 checks are even
+      // reached -- no slug/provenance.
       insertProvider.run({
         id: "prov-enrich", navn: "Under Arbeid Gård", org_nr: "222222222", kommune: "Ulvik",
         rfb_seed_source: "rfb-seed", producer_type: null,
@@ -179,9 +201,38 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 0,
+      });
+      // needs_enrichment (negative case for krav 2's brreg_verified leg):
+      // about_text, products, AND opening_hours_text/visit_text are ALL
+      // present -- proving opening hours being present does NOT compensate
+      // for a missing brreg_verified -- but brreg_verified is 0 (never
+      // matched), so it still falls to needs_enrichment.
+      insertProvider.run({
+        id: "prov-no-brreg", navn: "Ubekreftet Brreg Gård", org_nr: "121212121", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@ubekreftetbrreg.no", telefon: null, hjemmeside: "https://ubekreftetbrreg.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 0,
+      });
+      // needs_enrichment (negative case for krav 2's products leg):
+      // about_text, brreg_verified, AND opening_hours_text are ALL present --
+      // proving opening hours being present does NOT compensate for missing
+      // products -- but products is null, so it still falls to
+      // needs_enrichment.
+      insertProvider.run({
+        id: "prov-no-products", navn: "Uten Produkter Gård", org_nr: "131313131", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@utenprodukter.no", telefon: null, hjemmeside: "https://utenprodukter.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 09-15",
+        products: null, content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 1,
       });
       // no_website: has a phone (reachable) but no hjemmeside at all.
-      // Fails before the new checks are even reached -- no slug/provenance.
+      // Fails before the Steg-4 checks are even reached -- no slug/provenance.
       insertProvider.run({
         id: "prov-noweb", navn: "Ingen Nettside Gård", org_nr: "333333333", kommune: "Aurland",
         rfb_seed_source: "rfb-seed", producer_type: null,
@@ -189,10 +240,11 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: null,
         booking_live: null, catalog_hidden: null, slug: null, field_provenance: null,
+        brreg_verified: 0,
       });
       // unreachable: no email AND no phone at all, even though it otherwise
       // looks fully content-complete -- unreachable must win regardless.
-      // Fails before the new checks are even reached -- no slug/provenance.
+      // Fails before the Steg-4 checks are even reached -- no slug/provenance.
       insertProvider.run({
         id: "prov-unreach", navn: "Utilgjengelig Gård", org_nr: "444444444", kommune: "Lærdal",
         rfb_seed_source: "rfb-seed", producer_type: null,
@@ -200,11 +252,13 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Lø 10-14",
         products: "Eplemost", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 1,
       });
       // hidden (catalog_hidden=1) row -- must still appear, marked visible:false.
-      // Fully complete content, AND a slug + verified field_provenance --
-      // still must tier "skjult", not "outreach_ready" (catalog_hidden is
-      // checked first among the new checks -- see computeGardssalgReadinessTier's
+      // Fully content-complete under krav 2 (about_text + products +
+      // brreg_verified), AND a slug + verified field_provenance -- still
+      // must tier "skjult", not "outreach_ready" (catalog_hidden is checked
+      // first among the Steg-4 checks -- see computeGardssalgReadinessTier's
       // doc comment) -- and must be reported is_searchable:false regardless
       // of having a slug, since a hidden row is unsearchable by construction.
       // booking_live unset -> booking_status "none".
@@ -215,6 +269,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Alle dager",
         products: "Sider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 1, slug: "skjult-test-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       // manually-claimed row -- must still appear, claim_status carries the
       // raw content_source value ('manual'), never excluded. No slug and no
@@ -228,9 +283,10 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Skrevet av eier selv.", visit_text: "Kom innom!", opening_hours_text: "Lø-Sø 11-15",
         products: "Eplevin", content_source: "manual",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 1,
       });
-      // nettsted_uverifisert: content-complete, has a slug (searchable), not
-      // hidden -- but field_provenance carries no verified
+      // nettsted_uverifisert: content-complete under krav 2, has a slug
+      // (searchable), not hidden -- but field_provenance carries no verified
       // hjemmeside_verification entry.
       insertProvider.run({
         id: "prov-unverified", navn: "Uverifisert Gård AS", org_nr: "888888888", kommune: "Voss",
@@ -239,11 +295,13 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 10-17",
         products: "Most", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "uverifisert-gard", field_provenance: null,
+        brreg_verified: 1,
       });
-      // dublettkonflikt: content-complete, searchable, website-verified, not
-      // hidden -- but a matching `experiences` row (linked directly via
-      // provider_id, see insertExperience below) has a booking_url whose
-      // registrable domain does NOT match this producer's hjemmeside domain.
+      // dublettkonflikt: content-complete under krav 2, searchable,
+      // website-verified, not hidden -- but a matching `experiences` row
+      // (linked directly via provider_id, see insertExperience below) has a
+      // booking_url whose registrable domain does NOT match this producer's
+      // hjemmeside domain.
       insertProvider.run({
         id: "prov-conflict", navn: "Konflikt Gård AS", org_nr: "999999999", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: null,
@@ -251,6 +309,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 09-16",
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "konflikt-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertExperience.run({
         id: "exp-konflikt-gard", provider_id: "prov-conflict",
@@ -266,6 +325,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         about_text: "Tekst.", visit_text: "Tekst.", opening_hours_text: "Tekst.",
         products: "Noe", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 1,
       });
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
@@ -288,6 +348,8 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       const NAME_BY_FIXTURE_ID: Record<string, string> = {
         "prov-ready": "Klar Gård AS",
         "prov-enrich": "Under Arbeid Gård",
+        "prov-no-brreg": "Ubekreftet Brreg Gård",
+        "prov-no-products": "Uten Produkter Gård",
         "prov-noweb": "Ingen Nettside Gård",
         "prov-unreach": "Utilgjengelig Gård",
         "prov-hidden": "Skjult Test Gård",
@@ -298,15 +360,15 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       const byId = (id: string) =>
         (ok.body.providers as any[]).find((r) => r.name === NAME_BY_FIXTURE_ID[id]);
 
-      assertEq(ok.body.providers.length, 8, "d1: total providers is 8 (non-gårdssalg row excluded)");
+      assertEq(ok.body.providers.length, 10, "d1: total providers is 10 (non-gårdssalg row excluded)");
 
       const ready = byId("prov-ready");
       assertTrue(!!ready, "b3: outreach_ready fixture present");
       assertEq(ready?.readiness_tier, "outreach_ready", "b4: prov-ready tiered outreach_ready");
       assertEq(ready?.has_website, true, "b5: prov-ready has_website true");
       assertEq(ready?.has_about_text, true, "b6: prov-ready has_about_text true");
-      assertEq(ready?.has_visit_text, true, "b7: prov-ready has_visit_text true");
-      assertEq(ready?.has_opening_hours, true, "b8: prov-ready has_opening_hours true");
+      assertEq(ready?.has_visit_text, false, "b7: prov-ready has_visit_text false (krav 3 -- no longer required for outreach_ready)");
+      assertEq(ready?.has_opening_hours, false, "b8: prov-ready has_opening_hours false (krav 3 -- no longer required for outreach_ready)");
       assertEq(ready?.has_products, true, "b9: prov-ready has_products true");
       assertEq(ready?.has_email, true, "b10: prov-ready has_email true");
       assertEq(ready?.has_phone, false, "b11: prov-ready has_phone false");
@@ -323,8 +385,24 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(enrich?.readiness_tier, "needs_enrichment", "b17: prov-enrich tiered needs_enrichment");
       assertEq(enrich?.has_website, true, "b18: prov-enrich has_website true");
       assertEq(enrich?.has_about_text, false, "b19: prov-enrich has_about_text false");
-      assertEq(enrich?.has_opening_hours, false, "b20: prov-enrich has_opening_hours false");
+      assertEq(enrich?.has_products, false, "b20: prov-enrich has_products false");
       assertEq(enrich?.booking_status, "none", "b21: prov-enrich booking_status none (booking_live=0)");
+
+      // ── krav-2 negative cases: opening hours present does NOT compensate
+      // for a missing brreg_verified or a missing products field.
+      const noBrreg = byId("prov-no-brreg");
+      assertTrue(!!noBrreg, "b21a: prov-no-brreg fixture present");
+      assertEq(noBrreg?.readiness_tier, "needs_enrichment", "b21b: prov-no-brreg tiered needs_enrichment despite about_text+products+opening_hours all present (brreg_verified missing)");
+      assertEq(noBrreg?.has_about_text, true, "b21c: prov-no-brreg has_about_text true");
+      assertEq(noBrreg?.has_products, true, "b21d: prov-no-brreg has_products true");
+      assertEq(noBrreg?.has_opening_hours, true, "b21e: prov-no-brreg has_opening_hours true (present, but no longer sufficient/relevant on its own)");
+
+      const noProducts = byId("prov-no-products");
+      assertTrue(!!noProducts, "b21f: prov-no-products fixture present");
+      assertEq(noProducts?.readiness_tier, "needs_enrichment", "b21g: prov-no-products tiered needs_enrichment despite about_text+opening_hours present (products missing)");
+      assertEq(noProducts?.has_about_text, true, "b21h: prov-no-products has_about_text true");
+      assertEq(noProducts?.has_products, false, "b21i: prov-no-products has_products false");
+      assertEq(noProducts?.has_opening_hours, true, "b21j: prov-no-products has_opening_hours true (present, but no longer sufficient/relevant on its own)");
 
       const noweb = byId("prov-noweb");
       assertEq(noweb?.readiness_tier, "no_website", "b22: prov-noweb tiered no_website");
@@ -372,13 +450,14 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       );
 
       // ── (c) summary ──────────────────────────────────────────────────────
-      // 8 fixtures, one per tier: prov-ready (outreach_ready), prov-enrich
-      // (needs_enrichment), prov-noweb (no_website), prov-unreach
-      // (unreachable), prov-hidden (skjult), prov-claimed (ikke_soekbar),
-      // prov-unverified (nettsted_uverifisert), prov-conflict (dublettkonflikt).
-      assertEq(ok.body.summary.total, 8, "c1: summary.total is 8");
+      // 10 fixtures: prov-ready (outreach_ready), prov-enrich + prov-no-brreg
+      // + prov-no-products (needs_enrichment, 3), prov-noweb (no_website),
+      // prov-unreach (unreachable), prov-hidden (skjult), prov-claimed
+      // (ikke_soekbar), prov-unverified (nettsted_uverifisert), prov-conflict
+      // (dublettkonflikt).
+      assertEq(ok.body.summary.total, 10, "c1: summary.total is 10");
       assertEq(ok.body.summary.outreach_ready, 1, "c2: summary.outreach_ready counts prov-ready only");
-      assertEq(ok.body.summary.needs_enrichment, 1, "c3: summary.needs_enrichment counts prov-enrich");
+      assertEq(ok.body.summary.needs_enrichment, 3, "c3: summary.needs_enrichment counts prov-enrich + prov-no-brreg + prov-no-products");
       assertEq(ok.body.summary.no_website, 1, "c4: summary.no_website counts prov-noweb");
       assertEq(ok.body.summary.unreachable, 1, "c5: summary.unreachable counts prov-unreach");
       assertEq(ok.body.summary.skjult, 1, "c5a: summary.skjult counts prov-hidden");
