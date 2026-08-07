@@ -1763,11 +1763,118 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         const w13 = await claimSvc.issueClaimMagicLink("prov-w9-choice", "brreg@valggard-kilde.no", { selectedSource: "found_contact_page" });
         assertEq(w13, { ok: false, error: "invalid_selection" }, "w13: naming a found tier this provider does NOT have -> invalid_selection, never a fallback to some other found tier");
 
+        // (x1-x5) SINGLE-FLIGHT — review finding, 2026-08-07. w6/w7 above
+        // only prove the SEQUENTIAL case: call, await, call again, served
+        // from cache. The first version of this cache wrote its entry AFTER
+        // the harvest await, so it did nothing at all for CONCURRENT callers
+        // — the reviewer reproduced 50 simultaneous cold page views making 50
+        // real fetch bursts against one producer's site. That is the exact
+        // scenario the cache exists to prevent (this GET is public,
+        // unauthenticated, and mounted above every rate limiter in index.ts),
+        // so it needs its own test rather than an inference from w7.
+        //
+        // Uses deriveOrgLinkedEmailCandidatesWithHarvest() directly rather
+        // than issueClaimMagicLink(): the claim rate limit is 3/window, so 50
+        // concurrent issues would measure THAT instead of the cache. The
+        // provider is a plain literal — no DB row needed, since this asks
+        // only about the network-derived half.
+        //
+        // The fetch is GATED, not merely slow: all 50 calls are started before
+        // any fetch is allowed to complete, so "1 fetch" can only be the
+        // single-flight and never a lucky ordering.
+        {
+          let sfFetchCount = 0;
+          let releaseFetch: () => void = () => {};
+          const sfGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+          claimSvc.__setClaimHarvestFetchForTesting(((async (input: unknown) => {
+            sfFetchCount++;
+            await sfGate;
+            const url = String(input);
+            const bytes = new TextEncoder().encode(`<html><body><p>E-post: post@samtidig.no</p></body></html>`);
+            return {
+              ok: true, status: 200, statusText: "S200", url,
+              headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+              arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+            } as unknown as Response;
+          }) as unknown) as typeof fetch);
+          claimSvc.__resetClaimHarvestCacheForTesting();
+
+          const sfProvider = {
+            navn: "Samtidig Gård",
+            org_nr: "912350003",
+            brreg_verified: 1,
+            hjemmeside: "https://samtidig.no",
+            content_source: "provider_site",
+            field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/samtidig", fetched_at: "2026-07-01T00:00:00Z" } }),
+          };
+
+          const SF_CONCURRENCY = 50;
+          const sfInflight = Array.from({ length: SF_CONCURRENCY }, () =>
+            claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(sfProvider as any, null, { cacheKey: "prov-x-singleflight" }),
+          );
+          // Let the fetch actually be dispatched (fetchPage reaches its
+          // fetchImpl after pure sync work) while the gate still holds every
+          // response open — i.e. observe the world mid-flight.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          assertEq(sfFetchCount, 1, `x1: ${SF_CONCURRENCY} SIMULTANEOUS derivations for the same COLD provider start exactly ONE outbound fetch — the in-flight promise goes into the cache before the await, so callers 2..N join it instead of each harvesting (before the fix: ${SF_CONCURRENCY} fetches)`);
+
+          releaseFetch();
+          const sfResults = await Promise.all(sfInflight);
+          assertEq(sfFetchCount, 1, "x2: ...and still exactly one after all of them resolved — no late straggler slipped past the shared entry");
+          assertTrue(
+            sfResults.every((r) => r.length === 1 && r[0].email === "post@samtidig.no" && r[0].source === "found_same_domain"),
+            "x3: every one of the concurrent callers gets the SAME correct answer — sharing one promise is not a partial or empty result for the late joiners",
+          );
+
+          // (x4-x5) A harvest that FAILS must not become a 12-minute cached
+          // answer, and its entry must not sit in the Map rethrowing one stale
+          // rejection at everyone: the entry is dropped, so a later caller
+          // re-attempts. Same property w8 checks for the success path.
+          let sfFailCount = 0;
+          claimSvc.__setClaimHarvestFetchForTesting(((async () => {
+            sfFailCount++;
+            throw new Error("boom");
+          }) as unknown) as typeof fetch);
+          claimSvc.__resetClaimHarvestCacheForTesting();
+          await claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(sfProvider as any, null, { cacheKey: "prov-x-fail" });
+          const sfFailAfterFirst = sfFailCount;
+          assertTrue(sfFailAfterFirst > 0, "x4: a failing harvest really did attempt the network");
+          claimSvc.__resetClaimHarvestCacheForTesting();
+          await claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(sfProvider as any, null, { cacheKey: "prov-x-fail" });
+          assertTrue(sfFailCount > sfFailAfterFirst, "x5: once the entry is gone the next caller re-attempts — a failed harvest is never a permanently cached answer");
+        }
+
         // Restore the suite-wide empty-page override for anything after this
         // block, and leave no cache entries behind.
         claimSvc.__setClaimHarvestFetchForTesting(emptyPageFetchImpl);
         claimSvc.__resetClaimHarvestCacheForTesting();
       }
+
+      // ── (z) Suite-wide outbound-fetch ledger ─────────────────────────────
+      // emptyPageFetchImpl has been counting into suiteFetchCalls since the
+      // top of this suite but nothing ever read it — dead tracking, and out of
+      // step with the sibling guard in routes/opplevelser-booking-send-guard.
+      // test.ts, which asserts its own bsgHarvestFetchCalls is exactly []. This
+      // suite CANNOT assert [] (three of its fixtures are legitimately harvest-
+      // eligible: prov-claimable, prov-manual and prov-generic-domain are all
+      // Brreg-verified with an ownership-verified hjemmeside), so it asserts
+      // the exact expected shape instead — those three domains, once each.
+      // ONCE each is itself the point: it is the same TTL-cache property w7
+      // proves, observed across the whole suite. Sorted so this asserts the
+      // multiset rather than an incidental execution order.
+      // If this ever fails, either a new fixture became harvest-eligible (fine
+      // — but then it deserves a deliberate harvest scenario, not an accidental
+      // one) or the cache stopped holding; and had the override not been
+      // installed, `npm test` would have made these requests for real.
+      assertEq(
+        [...suiteFetchCalls].sort(),
+        [
+          "https://danielsgard.no",
+          "https://klostergarden.no",
+          "https://www.facebook.com/gardutenegennettside",
+        ],
+        "z1: over the whole suite the harvest attempted exactly the three known harvest-eligible fixtures' own sites, once each — no unexpected outbound fetch, and no re-fetch of a cached one",
+      );
     } catch (err: any) {
       failed++;
       failures.push("gardssalg-claim: unexpected error: " + String(err?.stack || err?.message || err));

@@ -843,10 +843,42 @@ function resolveHarvestFetchImpl(perCall?: typeof fetch): typeof fetch | undefin
 // a producer who never asked for it. The claim rate limit does NOT protect
 // this: isClaimRateLimited() only gates the POST that issues a link, and is
 // checked AFTER candidate derivation by design (see issueClaimMagicLink's
-// error precedence), so it never bounds GET-side fetching at all.
+// error precedence), so it never bounds GET-side fetching at all. Nor does
+// express-rate-limit: gardssalgClaimRoutes is mounted in src/index.ts at the
+// `app.use("/", gardssalgClaimRoutes)` line that sits ABOVE every limiter
+// mount in that file (generalLimiter, adminLimiter, …), deliberately so
+// (the opplevagent.no host-gate's catch-all 404 would otherwise swallow it),
+// so this path has NO middleware rate limit either. This cache is genuinely
+// the only thing standing between a public page view and a third party's
+// server — which is why it has to be single-flight, below.
 //
-// THE CHOICE: a process-local Map<cacheKey, {candidates, expiresAt}> around
-// the NETWORK-DERIVED tiers only, TTL 12 minutes.
+// THE CHOICE: a process-local Map<cacheKey, {promise, expiresAt}> around
+// the NETWORK-DERIVED tiers only, TTL 12 minutes, SINGLE-FLIGHT.
+//   - Why the map holds a PROMISE and not a finished result (review finding,
+//     2026-08-07 — the first version of this cache stored the resolved
+//     candidates and wrote them only AFTER the harvest await returned): a
+//     result-only cache helps SEQUENTIAL callers exclusively. The reviewer
+//     reproduced it — 50 simultaneous page views for one COLD producer each
+//     found an empty map, each started its own harvest, and the route made 50
+//     real outbound fetch bursts, not 1. Since the whole justification for
+//     having no other protection on this public GET is "the cache removes the
+//     amplification", the cache has to hold under concurrency or it does not
+//     hold at all. Storing the in-flight promise and inserting it
+//     SYNCHRONOUSLY (before the first await) makes the second concurrent
+//     caller for the same key find it already there and await the SAME
+//     harvest. See resolveFoundTierCandidates for the mechanics.
+//   - Why a rejected in-flight entry is DELETED rather than cached: a
+//     transient DNS/TLS failure must not become a 12-minute answer, and a
+//     settled-rejected promise left in the map would rethrow the same stale
+//     error at every later caller. On rejection the key is dropped, so the
+//     next request gets a genuinely fresh attempt.
+//   - What this now GUARANTEES, precisely: concurrent requests for the same
+//     uncached provider share ONE in-flight harvest (N simultaneous visitors
+//     cost 1 fetch burst, not N), and once it resolves the TTL caps REPEAT
+//     harvests for that provider at ~5/hour for as long as visitors keep
+//     arriving. Both halves are needed; neither alone bounds the outbound
+//     rate. NOTE this is per-process — two instances behind a load balancer
+//     have one cache each, so the real ceiling is ~5/hour × instances.
 //   - Why cache only the network tiers, not the whole candidate list: the
 //     DB-derived tiers (brreg_contact / stored_epost_verified) cost one
 //     local SQLite read and are the ones an admin edit can change; keeping
@@ -855,10 +887,12 @@ function resolveHarvestFetchImpl(perCall?: typeof fetch): typeof fetch | undefin
 //     still re-validated against genuinely fresh DB evidence — the property
 //     issueClaimMagicLink's own doc comment promises. Only the part that
 //     costs somebody ELSE a request is cached.
-//   - Why 12 minutes: it has to be long enough that a reload-hammering
-//     visitor cannot convert page views into outbound requests at all (12
-//     minutes caps one producer at ~5 harvests/hour no matter how many
-//     visitors or reloads), and short enough that a producer who has JUST
+//   - Why 12 minutes: with single-flight above already collapsing the
+//     CONCURRENT burst to one harvest, the TTL is what bounds the REPEAT
+//     rate — it has to be long enough that a reload-hammering visitor cannot
+//     convert sequential page views into outbound requests (12 minutes caps
+//     one producer at ~5 harvests/hour per process, however many visitors or
+//     reloads arrive), and short enough that a producer who has JUST
 //     put their address on their contact page — plausibly while sitting on
 //     this very page, having been told that is what we look for — does not
 //     have to wait long enough to give up. 12 min sits between those: a
@@ -882,9 +916,29 @@ function resolveHarvestFetchImpl(perCall?: typeof fetch): typeof fetch | undefin
 const CLAIM_HARVEST_CACHE_TTL_MS = 12 * 60 * 1000;
 
 interface HarvestCacheEntry {
-  candidates: OrgLinkedEmailCandidate[];
+  /** The IN-FLIGHT (or already settled) harvest, not its result — see the
+   * single-flight bullet on CLAIM_HARVEST_CACHE_TTL_MS. Inserted before the
+   * first await so concurrent callers share it. */
+  promise: Promise<OrgLinkedEmailCandidate[]>;
   expiresAt: number;
 }
+// KNOWN, ACCEPTED STALENESS (written down rather than left silent, same as
+// the TTL choice above): the cache key is provider.id + alreadyHasStoredEpost
+// and deliberately does NOT include the provider's `hjemmeside`. An admin who
+// edits a producer's hjemmeside mid-TTL therefore keeps seeing found-tier
+// candidates harvested from the OLD site for up to
+// CLAIM_HARVEST_CACHE_TTL_MS. Accepted: hjemmeside edits are rare and
+// admin-driven, the stale window is one coffee break, and the DB-derived
+// tiers (the ones an admin edit usually means to fix — stored epost) are
+// re-derived live on every call anyway. If this ever bites, the fix is to
+// fold hjemmeside into the key, not to shorten the TTL.
+//
+// The key also does NOT include `fetchImpl`. Safe today because no live
+// caller passes both a custom opts.fetchImpl AND an opts.cacheKey — the
+// routes pass cacheKey only, and every fetchImpl-passing caller is a test
+// that passes no cacheKey. A future caller that passes BOTH must key on the
+// fetch implementation too, or two different fetch impls will cross-
+// contaminate each other's cached results under the same provider id.
 const _claimHarvestCache = new Map<string, HarvestCacheEntry>();
 
 /** Test-only: drop every cached harvest result. Follows the
@@ -1412,8 +1466,10 @@ export async function harvestUmbrellaMemberEmail(
  *
  * `opts.cacheKey` (SLICE 5 / AC7) — when given (the live routes pass
  * provider.id), the NETWORK-DERIVED tiers only (the three own-site found
- * tiers plus found_umbrella_member) are cached in-process for
- * CLAIM_HARVEST_CACHE_TTL_MS. The DB-derived tiers are re-derived on every
+ * tiers plus found_umbrella_member) are SINGLE-FLIGHTED and cached in-process
+ * for CLAIM_HARVEST_CACHE_TTL_MS: concurrent calls for the same key share one
+ * in-flight harvest instead of each starting their own, and the TTL then caps
+ * repeat harvests for that key. The DB-derived tiers are re-derived on every
  * call regardless, so an admin edit to a provider's stored epost — and
  * therefore opts.selectedSource re-validation in issueClaimMagicLink — is
  * never served from a stale snapshot. Omitting it (every pre-existing caller,
@@ -1465,20 +1521,32 @@ export async function deriveOrgLinkedEmailCandidatesWithHarvest(
 }
 
 /**
- * The NETWORK-DERIVED half of deriveOrgLinkedEmailCandidatesWithHarvest():
- * the three own-site found tiers, plus the SLICE 4 found_umbrella_member
- * fallback, in that order. Split out from its caller purely so exactly this
- * part — the part that costs a third party an HTTP request — is what the
- * SLICE 5 / AC7 cache wraps; the merge/dedup/priority logic and the DB-derived
- * tiers stay uncached and unchanged.
+ * The CACHE / SINGLE-FLIGHT wrapper around harvestFoundTierCandidates() — the
+ * NETWORK-DERIVED half of deriveOrgLinkedEmailCandidatesWithHarvest(). Split
+ * out from its caller purely so exactly this part — the part that costs a
+ * third party an HTTP request — is what the SLICE 5 / AC7 cache wraps; the
+ * merge/dedup/priority logic and the DB-derived tiers stay uncached.
+ *
+ * DELIBERATELY NOT `async`. The whole correctness argument is that the
+ * check-then-insert below happens in ONE synchronous turn: a second concurrent
+ * caller for the same key must find the in-flight entry already in the Map
+ * rather than race to start its own harvest. Marking this `async` would still
+ * work today (an async body runs synchronously up to its first await), but it
+ * would make "there must be no await between the .get and the .set" an
+ * invisible invariant that the next editor can break by accident. As a plain
+ * function returning a Promise, the invariant is structural. (Review finding
+ * 2026-08-07: the first version of this cache stored the RESULT and wrote it
+ * only after the await — 50 concurrent cold page views made 50 real fetch
+ * bursts. See CLAIM_HARVEST_CACHE_TTL_MS's single-flight bullet.)
  *
  * Cache key is `${cacheKey}|${alreadyHasStoredEpost}` rather than the bare
- * provider id: alreadyHasStoredEpost is a genuine INPUT to what this function
- * fetches (it suppresses the umbrella attempt entirely, see below), so a run
- * with one value must never be served from an entry produced with the other.
- * Caching is opt-in — no cacheKey, no read and no write.
+ * provider id: alreadyHasStoredEpost is a genuine INPUT to what the harvest
+ * fetches (it suppresses the umbrella attempt entirely), so a run with one
+ * value must never be served from an entry produced with the other. What the
+ * key deliberately omits, and why, is on _claimHarvestCache itself.
+ * Caching is opt-in — no cacheKey, no read and no write, no single-flight.
  */
-async function resolveFoundTierCandidates(
+function resolveFoundTierCandidates(
   provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
     navn?: string;
   },
@@ -1486,15 +1554,53 @@ async function resolveFoundTierCandidates(
   opts: { fetchImpl?: typeof fetch; cacheKey?: string },
 ): Promise<OrgLinkedEmailCandidate[]> {
   const cacheKey = opts.cacheKey ? `${opts.cacheKey}|${alreadyHasStoredEpost ? "1" : "0"}` : null;
+  if (!cacheKey) return harvestFoundTierCandidates(provider, alreadyHasStoredEpost, opts);
+
   const now = Date.now();
-  if (cacheKey) {
-    const hit = _claimHarvestCache.get(cacheKey);
-    if (hit) {
-      if (hit.expiresAt > now) return hit.candidates;
-      _claimHarvestCache.delete(cacheKey); // expired — drop it rather than let the Map grow
-    }
+  const hit = _claimHarvestCache.get(cacheKey);
+  if (hit) {
+    // Still inside the TTL — hand back the SAME promise. Whether it is still
+    // in flight (concurrent caller) or long since settled (sequential caller)
+    // is not something this side has to care about: awaiting a settled promise
+    // just resolves, and awaiting an in-flight one joins it.
+    if (hit.expiresAt > now) return hit.promise;
+    _claimHarvestCache.delete(cacheKey); // expired — drop it rather than let the Map grow
   }
 
+  // expiresAt is stamped from `now`, i.e. from when the entry is populated —
+  // the same instant the previous result-caching version used, so the TTL
+  // window is unchanged in length and start point.
+  const entry: HarvestCacheEntry = {
+    promise: harvestFoundTierCandidates(provider, alreadyHasStoredEpost, opts),
+    expiresAt: now + CLAIM_HARVEST_CACHE_TTL_MS,
+  };
+  _claimHarvestCache.set(cacheKey, entry);
+  // A FAILED harvest must not be cached for 12 minutes, and a settled-rejected
+  // promise must not sit in the Map rethrowing the same stale error at every
+  // later caller: drop the entry so the next request gets a fresh attempt. The
+  // identity check matters — by the time this runs the entry may already have
+  // been evicted and replaced (expiry, or __resetClaimHarvestCacheForTesting
+  // plus a new call), and deleting somebody else's live entry would silently
+  // undo their single-flight.
+  entry.promise.catch(() => {
+    if (_claimHarvestCache.get(cacheKey) === entry) _claimHarvestCache.delete(cacheKey);
+  });
+  return entry.promise;
+}
+
+/**
+ * The actual network work: the three own-site found tiers, plus the SLICE 4
+ * found_umbrella_member fallback, in that order. Never consults or writes the
+ * cache — resolveFoundTierCandidates() above owns that entirely, so this
+ * function is exactly "one harvest", which is what single-flight de-duplicates.
+ */
+async function harvestFoundTierCandidates(
+  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    navn?: string;
+  },
+  alreadyHasStoredEpost: boolean,
+  opts: { fetchImpl?: typeof fetch },
+): Promise<OrgLinkedEmailCandidate[]> {
   const fetchImpl = resolveHarvestFetchImpl(opts.fetchImpl);
 
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
@@ -1523,14 +1629,14 @@ async function resolveFoundTierCandidates(
       ? await harvestUmbrellaMemberEmail({ navn: provider.navn, org_nr: provider.org_nr }, { fetchImpl })
       : null;
 
-  const found = [...harvestCandidates, ...(umbrellaCandidate ? [umbrellaCandidate] : [])];
-  // A ZERO-candidate result is cached too, deliberately: "this producer's
-  // site published nothing usable" is exactly the answer a reload loop would
-  // otherwise re-fetch forever, and it is the MAJORITY case in the measured
-  // cohort. Not caching negatives would leave the amplification hole open for
-  // most of the 87 producers.
-  if (cacheKey) _claimHarvestCache.set(cacheKey, { candidates: found, expiresAt: now + CLAIM_HARVEST_CACHE_TTL_MS });
-  return found;
+  // A ZERO-candidate result is cached too, deliberately (it resolves, so the
+  // wrapper keeps its entry): "this producer's site published nothing usable"
+  // is exactly the answer a reload loop would otherwise re-fetch forever, and
+  // it is the MAJORITY case in the measured cohort. Not caching negatives
+  // would leave the amplification hole open for most of the 87 producers. A
+  // zero-candidate result is NOT a failure — only a thrown error is, and only
+  // that evicts the entry.
+  return [...harvestCandidates, ...(umbrellaCandidate ? [umbrellaCandidate] : [])];
 }
 
 /** Mask an email for display ("we sent it to p***t@b*******t.no") — never
