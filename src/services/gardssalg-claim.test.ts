@@ -1120,11 +1120,21 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         const verify2 = claimSvc.verifyClaimToken(goodClaim.token);
         assertTrue(verify2.valid === true, "c5: an already-used, unexpired token verifies again (session persists across requests)");
 
-        // ── THE LOCK INVARIANT — the real enrichment gate skips this row ──
+        // ── THE (NARROWED) LOCK INVARIANT — sub-slice 3k (dev-request
+        // 2026-07-30-opplevagent-claim-epost-og-perfelt-laas): a
+        // content_source='claim' row is NO LONGER a row-level bail in
+        // gardssalg-rfb-enrich's pickEnrichmentFields. With NO
+        // field_provenance.owner_locks entries, the owner-lock-eligible
+        // fields it can write (about_text, products — hjemmeside is already
+        // set on this fixture, so not fillable either way) get filled from a
+        // real, non-junk RFB candidate. Fields outside
+        // GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS (adresse/telefon/epost/
+        // lat/lon) still never fill for a claim row (isGardssalgFieldOwnerLocked
+        // fails closed on them) — unchanged from before this sub-slice.
         const lockedRow = {
           id: "prov-claimable", navn: "Klostergården Håndbryggeri", hjemmeside: "https://klostergarden.no",
           adresse: null, telefon: null, epost: null, lat: null, lon: null,
-          about_text: null, products: null, content_source: "claim",
+          about_text: null, products: null, content_source: "claim", field_provenance: null,
         };
         const rfbSource = {
           agent_id: "agent-x", name: "Klostergården Håndbryggeri", url: "https://klostergarden.no",
@@ -1133,8 +1143,9 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         };
         const byDomain = enrich.indexRfbByDomain([rfbSource]);
         const enrichResult = enrich.pickEnrichmentFields(lockedRow as any, byDomain);
-        assertEq(enrichResult.status, "locked", "c6: gardssalg-rfb-enrich's pickEnrichmentFields returns 'locked' for a content_source='claim' row");
-        assertEq(enrichResult.copy, {}, "c7: a locked row's enrichment 'copy' is empty — nothing would be written");
+        assertEq(enrichResult.status, "would_enrich", "c6: gardssalg-rfb-enrich's pickEnrichmentFields no longer fully locks a content_source='claim' row (sub-slice 3k)");
+        assertEq(enrichResult.copy, { about_text: "Ekte beskrivelse fra RFB", products: JSON.stringify(["Sider"]) },
+          "c7: a claim row with no owner_locks fills its owner-lock-eligible fields (about_text/products); non-eligible fields (adresse/telefon/epost/lat/lon) still stay unfilled");
       }
 
       // content_source='manual' must NOT be downgraded by a claim.

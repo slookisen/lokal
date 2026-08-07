@@ -2945,8 +2945,11 @@ export type GardssalgContentRefreshTarget = {
 
 /**
  * Auto-select gårdssalg providers eligible for a content-refresh: gårdssalg
- * providers (producer_type set OR rfb-seed) WITH a website, NOT locked
- * (content_source not in manual/claim), and THIN on at least one of
+ * providers (producer_type set OR rfb-seed) WITH a website, not fully locked
+ * (content_source != 'manual' — sub-slice 3i: 'claim' rows ARE now included
+ * here, since locking is gated per-field downstream in
+ * applyGardssalgProviderContent via isGardssalgFieldOwnerLocked, not by
+ * excluding the whole row at select time), and THIN on at least one of
  * about_text/visit_text/opening_hours_text. Ordered oldest-attempted first
  * (last_content_attempt_at NULLs first, same discipline as
  * selectProvidersForContentRefresh — see that function's doc comment for why
@@ -2964,7 +2967,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
-          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (content_source IS NULL OR content_source != 'manual')
           AND (
                 about_text IS NULL OR TRIM(about_text) = ''
              OR visit_text IS NULL OR TRIM(visit_text) = ''
@@ -3410,7 +3413,13 @@ export function applyGardssalgProviderContent(
       }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
+  // 3i: 'manual' rows keep the unconditional, full-row freeze (unchanged).
+  // 'claim' rows no longer bail here -- the freeze narrows to per-field below,
+  // via isGardssalgFieldOwnerLocked(row, fieldName) guarding each of the 4
+  // write branches individually (same helper PR #472/#478 already ship and
+  // review; no new policy logic added here).
+  if (row.content_source === "manual") return [];
 
   function isBlank(v: unknown): boolean {
     return v === null || v === undefined || String(v).trim() === "";
@@ -3450,54 +3459,82 @@ export function applyGardssalgProviderContent(
   // still corrupted) and only needs the audit/lock machinery below, not a
   // second opinion from a length-based heuristic that doesn't apply here.
   const forceSet = new Set(forceFields ?? []);
+  // Sub-slice 3i per-field owner-lock guard: only meaningful for
+  // content_source='claim' rows (isGardssalgFieldOwnerLocked always returns
+  // false for any other content_source, including the enrichment-derived
+  // rows this function otherwise handles) — reuses the SAME already-shipped,
+  // already-reviewed helper the hjemmeside pilot (3c) and the rollback
+  // writers (3b) already gate on. No new policy logic here, only wiring.
+  const isFieldOwnerLocked = (fieldName: string): boolean =>
+    row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, fieldName);
 
-  if (forceSet.has("about_text") && candidate.about_text?.trim()) {
-    sets.push("about_text = @about_text");
-    params.about_text = candidate.about_text.trim();
-    written.push("about_text");
-  } else if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
-    sets.push("about_text = @about_text");
-    params.about_text = candidate.about_text.trim();
-    written.push("about_text");
-  } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text, contaminatedSet.has("about_text"))) {
-    sets.push("about_text = @about_text");
-    params.about_text = candidate.about_text!.trim();
-    written.push("about_text");
+  if (!isFieldOwnerLocked("about_text")) {
+    if (forceSet.has("about_text") && candidate.about_text?.trim()) {
+      sets.push("about_text = @about_text");
+      params.about_text = candidate.about_text.trim();
+      written.push("about_text");
+    } else if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
+      sets.push("about_text = @about_text");
+      params.about_text = candidate.about_text.trim();
+      written.push("about_text");
+    } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text, contaminatedSet.has("about_text"))) {
+      sets.push("about_text = @about_text");
+      params.about_text = candidate.about_text!.trim();
+      written.push("about_text");
+    }
   }
-  if (forceSet.has("visit_text") && candidate.visit_text?.trim()) {
-    sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text.trim();
-    written.push("visit_text");
-  } else if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
-    sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text.trim();
-    written.push("visit_text");
-  } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text, contaminatedSet.has("visit_text"))) {
-    sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text!.trim();
-    written.push("visit_text");
+  if (!isFieldOwnerLocked("visit_text")) {
+    if (forceSet.has("visit_text") && candidate.visit_text?.trim()) {
+      sets.push("visit_text = @visit_text");
+      params.visit_text = candidate.visit_text.trim();
+      written.push("visit_text");
+    } else if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
+      sets.push("visit_text = @visit_text");
+      params.visit_text = candidate.visit_text.trim();
+      written.push("visit_text");
+    } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text, contaminatedSet.has("visit_text"))) {
+      sets.push("visit_text = @visit_text");
+      params.visit_text = candidate.visit_text!.trim();
+      written.push("visit_text");
+    }
   }
-  if (forceSet.has("opening_hours_text") && candidate.opening_hours_text?.trim()) {
-    sets.push("opening_hours_text = @opening_hours_text");
-    params.opening_hours_text = candidate.opening_hours_text.trim();
-    written.push("opening_hours_text");
-  } else if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
-    sets.push("opening_hours_text = @opening_hours_text");
-    params.opening_hours_text = candidate.opening_hours_text.trim();
-    written.push("opening_hours_text");
+  if (!isFieldOwnerLocked("opening_hours_text")) {
+    if (forceSet.has("opening_hours_text") && candidate.opening_hours_text?.trim()) {
+      sets.push("opening_hours_text = @opening_hours_text");
+      params.opening_hours_text = candidate.opening_hours_text.trim();
+      written.push("opening_hours_text");
+    } else if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
+      sets.push("opening_hours_text = @opening_hours_text");
+      params.opening_hours_text = candidate.opening_hours_text.trim();
+      written.push("opening_hours_text");
+    }
   }
   // Slice 5c — fill-only, re-checked against the FRESH row snapshot (not the
   // caller's possibly-stale target snapshot), same defense-in-depth
   // discipline as the rewriteFields re-check above.
-  if (candidate.products && candidate.products.length > 0 && gardssalgProductsEligible(row.products)) {
-    sets.push("products = @products");
-    params.products = JSON.stringify(candidate.products);
-    written.push("products");
+  if (!isFieldOwnerLocked("products")) {
+    if (candidate.products && candidate.products.length > 0 && gardssalgProductsEligible(row.products)) {
+      sets.push("products = @products");
+      params.products = JSON.stringify(candidate.products);
+      written.push("products");
+    }
   }
 
   if (sets.length === 0) return [];
 
-  sets.push("content_source = 'provider_site'");
+  // Sub-slice 3i fix (fresh-context review, CHANGES-REQUESTED): a still-
+  // 'claim' row must keep its content_source identity across a per-field
+  // write. Before this guard, the very first partial-field write to a claim
+  // row re-stamped content_source='provider_site' unconditionally, which
+  // would make the NEXT content-refresh run treat the row as fully
+  // unprotected (isFieldOwnerLocked/isGardssalgFieldOwnerLocked only gate
+  // when content_source === "claim") — silently unlocking every remaining
+  // field the owner explicitly locked via the claim portal. 'manual' rows
+  // never reach this function's write path (row-level bail above), and
+  // every other content_source is unaffected — this only excludes 'claim'.
+  if (row.content_source !== "claim") {
+    sets.push("content_source = 'provider_site'");
+  }
   sets.push("content_evidence_url = @evidence_url");
   sets.push("content_updated_at = datetime('now')");
   params.evidence_url = evidenceUrl;
@@ -3572,24 +3609,31 @@ export type GardssalgRetroScanTarget = {
   content_source: string | null;
   about_text: string | null;
   visit_text: string | null;
+  field_provenance: string | null;
 };
 
 /**
  * Auto-select gårdssalg providers in scope for the retroactive scan:
  * gårdssalg providers (producer_type set OR rfb-seed) WITH a website, NOT
- * locked (content_source not in manual/claim — the dev-request's "excluding
- * only content_source IN ('manual','claim')" clause). Deliberately does NOT
- * filter on catalog_hidden — the dev-request explicitly requires "both
- * visible AND hidden" rows in scope, unlike
- * selectGardssalgProvidersForAddressEnrichment's catalog_hidden exclusion
- * above. Deliberately does NOT filter on whether about_text/visit_text is
- * blank/thin either — unlike selectGardssalgProvidersForContentRefresh, this
- * is a full retroactive sweep, not a "only rows with an obvious gap" queue;
- * a row whose about_text/visit_text is already blank is simply a no-op once
- * selected (nothing to judge/null). Ordered oldest-created first — there is
- * no dedicated retro-scan attempt timestamp (out of scope for this one-shot
- * sweep, mirrors selectGardssalgProvidersForAddressEnrichment's own choice
- * of created_at ASC over adding a new column). Hard-capped at 48 — there are
+ * row-level locked (content_source != 'manual'). Sub-slice 3j (dev-request
+ * 2026-07-30-opplevagent-claim-epost-og-perfelt-laas): 'claim' rows are now
+ * IN scope here too — the whole-row freeze narrows to a per-field freeze,
+ * enforced downstream in applyGardssalgRetroScanNull via the same already-
+ * shipped isGardssalgFieldOwnerLocked(row, fieldName) helper sub-slice 3i
+ * wired through the content-refresh writer. `field_provenance` is selected
+ * so that per-field check has the `owner_locks` data it needs, without a
+ * second DB round-trip. Deliberately does NOT filter on catalog_hidden — the
+ * dev-request explicitly requires "both visible AND hidden" rows in scope,
+ * unlike selectGardssalgProvidersForAddressEnrichment's catalog_hidden
+ * exclusion above. Deliberately does NOT filter on whether about_text/
+ * visit_text is blank/thin either — unlike
+ * selectGardssalgProvidersForContentRefresh, this is a full retroactive
+ * sweep, not a "only rows with an obvious gap" queue; a row whose about_text/
+ * visit_text is already blank is simply a no-op once selected (nothing to
+ * judge/null). Ordered oldest-created first — there is no dedicated
+ * retro-scan attempt timestamp (out of scope for this one-shot sweep,
+ * mirrors selectGardssalgProvidersForAddressEnrichment's own choice of
+ * created_at ASC over adding a new column). Hard-capped at 48 — there are
  * only 48 gårdssalg providers total.
  */
 export function selectGardssalgProvidersForRetroScan(limit = 48): GardssalgRetroScanTarget[] {
@@ -3597,12 +3641,12 @@ export function selectGardssalgProvidersForRetroScan(limit = 48): GardssalgRetro
   const cap = Math.max(1, Math.min(48, limit));
   return db
     .prepare(
-      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text, field_provenance
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
-          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (content_source IS NULL OR content_source != 'manual')
         ORDER BY created_at ASC
         LIMIT ?`
     )
@@ -3623,7 +3667,7 @@ export function getGardssalgProviderRetroScanTarget(providerId: string): Gardssa
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text, field_provenance
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
@@ -3657,6 +3701,19 @@ export function getGardssalgProviderRetroScanTarget(providerId: string): Gardssa
  *     backing it any more.
  * A field already blank is left alone (nothing to null); a provider with
  * nothing to null across the requested fields writes nothing and returns [].
+ *
+ * Sub-slice 3j (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+ * laas): 'manual' rows keep the unconditional, full-row freeze (unchanged —
+ * still bails before the loop below). 'claim' rows no longer bail here — the
+ * freeze narrows to per-field, via the SAME already-shipped, already-
+ * reviewed isGardssalgFieldOwnerLocked(row, fieldName) helper sub-slice 3i
+ * wired through applyGardssalgProviderContent (no new policy logic, only
+ * wiring): each requested field is checked individually inside the loop
+ * below, and an owner-locked field is skipped (never nulled, never added to
+ * `written`) exactly like an already-blank field is. This is the real
+ * enforcement point — the route's own prediction (see processOne in
+ * routes/opplevelser.ts) is only a preview; this function's fresh DB read of
+ * `row` is what actually decides.
  */
 export function applyGardssalgRetroScanNull(
   providerId: string,
@@ -3677,7 +3734,7 @@ export function applyGardssalgRetroScanNull(
       }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (row.content_source === "manual") return [];
 
   const oldValues: Record<string, string | null> = { about_text: row.about_text, visit_text: row.visit_text };
   const sets: string[] = [];
@@ -3687,6 +3744,7 @@ export function applyGardssalgRetroScanNull(
   for (const f of fields) {
     const current = oldValues[f];
     if (current === null || current === undefined || String(current).trim() === "") continue; // already blank — nothing to null
+    if (row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, f)) continue; // owner-locked — never null a field the owner explicitly locked
     sets.push(`${f} = NULL`);
     written.push(f);
   }
@@ -4913,6 +4971,32 @@ export function gardssalgPageText(html: string): string {
 }
 
 /**
+ * Extract a page's <title> text for evidence matching — dev-request
+ * 2026-08-02-enrichment-kadens-og-kildekvalitet, AC4: a real incident found
+ * 7 of 9 sibling-TLD candidate homepages were WRONG (squatted domains,
+ * unrelated organisations) yet all 7 passed the existing body-text
+ * name/place checks; none of the 7 ever carried the producer's brand in
+ * their <title>, so the title is a cheap, independent corroborating signal.
+ *
+ * Regex-only extraction (this codebase has no HTML parser anywhere — see
+ * organic-keyword-detector.ts:19 for why), same entity/whitespace handling
+ * gardssalgPageText already applies to body text so title and body text
+ * compare on equal footing once both are run through normaliseName. Only
+ * the literal <title> tag is read — deliberately NOT the og:title fallback
+ * extractTitle (search-enrich.ts) also checks, since that can carry
+ * page-specific marketing copy rather than the whole site's own title.
+ * Pure — exported for tests.
+ */
+export function gardssalgPageTitle(html: string): string {
+  const m = (html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!m || !m[1]) return "";
+  return m[1]
+    .replace(/&[a-z]+;|&#\d+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * Normalise a Norwegian phone number to its 8 significant digits: strips
  * +47/0047 country prefixes and every non-digit. Returns null when what
  * remains is not exactly 8 digits — a partial number must never match.
@@ -4943,16 +5027,36 @@ export function normaliseNorwegianPhone(raw: string | null | undefined): string 
  *   postnr    — the 4-digit postnummer as its own digit run. Deliberately
  *               NEVER sufficient (thousands of businesses share one) — it
  *               only strengthens name.
+ *   title     — (AC4, dev-request 2026-08-02-enrichment-kadens-og-
+ *               kildekvalitet) the page's own <title> text (gardssalgPageTitle,
+ *               caller-supplied — this function does no fetching/parsing of
+ *               its own beyond the regex helper) containing the pruned name
+ *               at the same token boundaries as the body-text `name` check.
+ *               Caller-optional: when the caller has no title source to
+ *               offer (`pageTitle` omitted), title_found is simply false and
+ *               plays no part beyond what's documented below.
  *
  * verified =
  *   org_nr
  *   OR (phone AND (name OR place))   — the provider's own registered number
  *                                      plus any second signal; phone ALONE
  *                                      stays insufficient (call-list pages)
- *   OR (name AND (place OR address OR postnr))
+ *   OR (name AND (place OR address OR postnr) AND title)
+ *       — title is required on this branch ONLY (2026-08-06 incident: 7 of
+ *         9 sibling-TLD candidates had name+place-only body-text hits and
+ *         were all wrong; org_nr and phone are already independently
+ *         registry-sourced signals and do NOT gain a title requirement).
+ *         Every caller so far updated to supply `pageTitle` opts into this;
+ *         a caller that never passes `pageTitle` keeps evaluating this
+ *         branch as it did before AC4 (title_found is vacuously false only
+ *         when title data was actually offered and didn't match — a caller
+ *         offering no title source at all is a caller not yet wired for
+ *         this signal, not a caller whose pages provably lack a title).
  *
- * The v1 rule (org_nr OR name+place) is a strict subset — nothing that
- * verified before stops verifying; this can only widen, never tighten.
+ * The v1 rule (org_nr OR name+place) is a strict subset of the org_nr and
+ * phone branches — nothing that verified via those stops verifying; only
+ * the weakest (name-only-corroborated) branch tightens, and only for
+ * callers that opt in by supplying `pageTitle`.
  * Pure — exported for tests.
  */
 export function gardssalgWebsiteEvidenceMatch(
@@ -4966,7 +5070,8 @@ export function gardssalgWebsiteEvidenceMatch(
     mobil?: string | null;
     adresse?: string | null;
     postnummer?: string | null;
-  }
+  },
+  pageTitle?: string
 ): {
   org_nr_found: boolean;
   name_found: boolean;
@@ -4974,6 +5079,7 @@ export function gardssalgWebsiteEvidenceMatch(
   phone_found: boolean;
   address_found: boolean;
   postnr_found: boolean;
+  title_found: boolean;
   verified: boolean;
 } {
   const text = pageText || "";
@@ -5019,6 +5125,22 @@ export function gardssalgWebsiteEvidenceMatch(
   const postnr = (target.postnummer || "").trim();
   const postnrFound = /^\d{4}$/.test(postnr) && new RegExp(`(?<!\\d)${postnr}(?!\\d)`).test(digitCollapsed);
 
+  // title: same token-boundary-safe containment as `name` above, against the
+  // caller-supplied page <title> text instead of the body. `pageTitle`
+  // undefined means "no title source offered" (pre-AC4 caller) — titleFound
+  // stays false either way, but see the weakest-branch gate below, which
+  // only imposes the new requirement on callers that DID offer a title.
+  const titleOffered = pageTitle !== undefined;
+  const normTitle = normaliseName(pageTitle || "");
+  const titleFound = titleOffered && nameSpecific && boundaryIncludes(normTitle, normName);
+
+  const weakestBranchBase = nameFound && (placeFound || addressFound || postnrFound);
+  // Incident fix (2026-08-06): once a caller has wired a title source, the
+  // weakest branch — the ONLY branch with neither org_nr nor phone behind it
+  // — must also see the producer's name in the page <title>. org_nr and
+  // phone are registry-sourced and stay completely untouched by this gate.
+  const weakestBranchVerified = titleOffered ? weakestBranchBase && titleFound : weakestBranchBase;
+
   return {
     org_nr_found: orgFound,
     name_found: nameFound,
@@ -5026,10 +5148,11 @@ export function gardssalgWebsiteEvidenceMatch(
     phone_found: phoneFound,
     address_found: addressFound,
     postnr_found: postnrFound,
+    title_found: titleFound,
     verified:
       orgFound ||
       (phoneFound && (nameFound || placeFound)) ||
-      (nameFound && (placeFound || addressFound || postnrFound)),
+      weakestBranchVerified,
   };
 }
 

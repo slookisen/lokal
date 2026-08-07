@@ -26909,7 +26909,12 @@ console.log("\n── gardssalg-homepage-count: live count replaces hardcoded 'K
 
   assertEq(statusGHC, 200, "ghc-01: GET / → 200");
 
-  const hrefIdxGHC = bodyGHC.indexOf("/kategori/gardssalg");
+  // NB (S1 site chrome, dev-request 2026-08-06-opplevagent-ux-loft-
+  // drikkested-lansering): the shared nav/footer now ALWAYS link
+  // /kategori/gardssalg, so a bare indexOf("/kategori/gardssalg") would land
+  // on the nav link, not the category card. Anchor on the cat-card markup
+  // instead — this block is about the CARD's live count.
+  const hrefIdxGHC = bodyGHC.indexOf('class="cat-card" href="/kategori/gardssalg"');
   assertTrue(hrefIdxGHC >= 0, "ghc-02: gardssalg card is present on the homepage grid");
   const cardBlockGHC = hrefIdxGHC >= 0 ? bodyGHC.substring(hrefIdxGHC, hrefIdxGHC + 900) : "";
 
@@ -29157,6 +29162,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
 
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-
+    // slice 3i: wires the already-shipped isGardssalgFieldOwnerLocked()
+    // per-field owner-lock helper through applyGardssalgProviderContent's
+    // three row-level bail points (SQL auto-select, route early-skip,
+    // applyGardssalgProviderContent itself) for content_source='claim' rows
+    // — 'manual' keeps its full row-level freeze, unchanged. Same in-
+    // memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-owner-lock-content-refresh: per-field owner-lock for the content-refresh writer ──");
+    const { runOpplevelserGardssalgOwnerLockContentRefreshTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-content-refresh.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-content-refresh.test");
+    const golcr = await runOpplevelserGardssalgOwnerLockContentRefreshTests({ log: false });
+    passed += golcr.passed;
+    failed += golcr.failed;
+    for (const f of golcr.failures) failures.push("opplevelser-gardssalg-owner-lock-content-refresh: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-content-refresh: ${golcr.passed} passed, ${golcr.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 2: pure matching-logic tests for the gårdssalg producer <->
     // experience/activity cross-table conflict diagnosis
@@ -29322,6 +29343,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += grsr.failed;
     for (const f of grsr.failures) failures.push("opplevelser-gardssalg-retro-scan: " + f);
     console.log(`  opplevelser-gardssalg-retro-scan: ${grsr.passed} passed, ${grsr.failed} failed`);
+
+    // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-
+    // slice 3j: wires the already-shipped isGardssalgFieldOwnerLocked()
+    // per-field owner-lock helper through applyGardssalgRetroScanNull's
+    // three row-level bail points (SQL auto-select, route early-skip,
+    // applyGardssalgRetroScanNull itself) for content_source='claim' rows —
+    // 'manual' keeps its full row-level freeze, unchanged. Mirrors sub-slice
+    // 3i's own content-refresh owner-lock test file. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-owner-lock-retro-scan: per-field owner-lock for the retro-scan nuller ──");
+    const { runOpplevelserGardssalgOwnerLockRetroScanTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-retro-scan.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-retro-scan.test");
+    const golrs = await runOpplevelserGardssalgOwnerLockRetroScanTests({ log: false });
+    passed += golrs.passed;
+    failed += golrs.failed;
+    for (const f of golrs.failures) failures.push("opplevelser-gardssalg-owner-lock-retro-scan: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-retro-scan: ${golrs.passed} passed, ${golrs.failed} failed`);
 
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c:
     // fill-only extraction of the "products" JSON-array column —
@@ -29748,6 +29786,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += essg.failed;
     for (const f of essg.failures) failures.push("experiences-seo-sok-gardssalg: " + f);
     console.log(`  experiences-seo-sok-gardssalg: ${essg.passed} passed, ${essg.failed} failed`);
+
+    // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S1:
+    // shared site chrome — oaSiteNav()/oaSiteFooter() + the CSS-only
+    // (checkbox-hack) hamburger nav, adopted by "/" and /kategori/gardssalg.
+    // Covers hamburger elements, the gardssalg page's upgrade to brand nav +
+    // full footer, nav-link parity between the two pages, the :checked
+    // reveal rule replacing the old always-hide-below-760px rule,
+    // aria-current placement, and the focusable (not display:none) toggle.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── experiences-seo-site-chrome: shared nav/footer + hamburger (S1) ──");
+    const { runExperiencesSeoSiteChromeTests } = require("../src/routes/experiences-seo-site-chrome.test") as
+      typeof import("../src/routes/experiences-seo-site-chrome.test");
+    const essc = await runExperiencesSeoSiteChromeTests({ log: false });
+    passed += essc.passed;
+    failed += essc.failed;
+    for (const f of essc.failures) failures.push("experiences-seo-site-chrome: " + f);
+    console.log(`  experiences-seo-site-chrome: ${essc.passed} passed, ${essc.failed} failed`);
 
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
     // ("CTA hide"): the "Driver du dette stedet?" claim-CTA aside-card on the
@@ -34111,7 +34167,7 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   const base = {
     id: "p1", navn: "Alde Sider / Ulvik Frukt & Cideri", hjemmeside: "http://www.aldesider.no",
     adresse: null, telefon: null, epost: null, lat: null, lon: null,
-    about_text: null, products: null, content_source: null,
+    about_text: null, products: null, content_source: null, field_provenance: null,
   };
 
   // (1) Strict domain match → would_enrich, copies the good fields, skips junk email.
@@ -34193,12 +34249,91 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   const rNameCollide = pickEnrichmentFields({ ...base, navn: "Fellesnavn Gård", hjemmeside: null }, new Map(), byNameCollide);
   assertEq(rNameCollide.status, "no_domain", "enrich-37: provider on a collided name → no_domain (no wrong-producer copy)");
 
-  // (4) content_source lock → never overwrite human/owner-authored rows.
+  // (4) content_source lock → 'manual' rows never overwrite human/owner-
+  // authored data (unchanged, full-row freeze).
   const r4 = pickEnrichmentFields({ ...base, content_source: "manual" }, byDomain);
   assertEq(r4.status, "locked", "enrich-15: content_source=manual → locked");
   assertEq(Object.keys(r4.copy).length, 0, "enrich-16: locked copies nothing");
-  const r4b = pickEnrichmentFields({ ...base, content_source: "claim" }, byDomain);
-  assertEq(r4b.status, "locked", "enrich-17: content_source=claim → locked");
+
+  // enrich-17 (REWRITTEN, sub-slice 3k, dev-request 2026-07-30-opplevagent-
+  // claim-epost-og-perfelt-laas): the OLD assertion here — content_source=
+  // "claim" → status "locked" — is now WRONG and replaced. A 'claim' row
+  // with NO field_provenance (no owner_locks at all) is no longer fully
+  // locked; it falls through to the normal domain/name-match + field-by-
+  // field logic, so the three owner-lock-eligible fields (about_text,
+  // products, hjemmeside) with real, non-junk RFB candidates all get
+  // copied. Uses the no-website, name-matched `alde` fixture (defined above
+  // for enrich-30..34) rather than `base` so hjemmeside is also provably
+  // fillable — a byDomain-only match wouldn't fill it since `base` already
+  // has a hjemmeside set.
+  const r4b = pickEnrichmentFields({ ...alde, content_source: "claim" }, byDomain, byName);
+  assertEq(r4b.status, "would_enrich", "enrich-17: content_source=claim, no field_provenance → would_enrich (row no longer fully locked)");
+  assertEq(typeof r4b.copy.about_text, "string", "enrich-17b: claim row about_text copied (not owner-locked)");
+  assertEq(String(r4b.copy.products), JSON.stringify(["Eplesider", "Eplemost"]), "enrich-17c: claim row products copied (not owner-locked)");
+  assertEq(r4b.copy.hjemmeside, "https://aldesider.no/", "enrich-17d: claim row hjemmeside copied (not owner-locked)");
+
+  // (4b) sub-slice 3k: per-field owner-lock split. A claim row whose
+  // field_provenance.owner_locks locks ONLY about_text (not products/
+  // hjemmeside), matched against an RFB source offering real, non-junk
+  // candidates for all three → about_text is skipped as owner_field_locked
+  // and NOT copied, while products and hjemmeside (unlocked) DO get copied.
+  // Proves the per-field split in a single case.
+  const claimPartialLock = {
+    ...alde,
+    content_source: "claim",
+    field_provenance: JSON.stringify({ owner_locks: { about_text: { locked_at: "2026-08-01T00:00:00.000Z" } } }),
+  };
+  const rPartial = pickEnrichmentFields(claimPartialLock, byDomain, byName);
+  assertTrue(rPartial.skipped.some((s) => s.field === "about_text" && s.reason === "owner_field_locked"),
+    "enrich-38: about_text owner-locked (field_provenance.owner_locks.about_text) → skipped with owner_field_locked");
+  assertEq(rPartial.copy.about_text, undefined, "enrich-39: owner-locked about_text NOT copied");
+  assertEq(typeof rPartial.copy.products, "string", "enrich-40: products NOT owner-locked → still copied");
+  assertEq(rPartial.copy.hjemmeside, "https://aldesider.no/", "enrich-41: hjemmeside NOT owner-locked → still copied");
+
+  // (4c) sub-slice 3k: a claim row where owner_locks locks ALL THREE
+  // eligible fields → copy contains none of the three, skipped names all
+  // three with owner_field_locked, and status is "nothing_to_fill" — NEVER
+  // "locked" (that value is reserved for 'manual' rows only under the new
+  // logic).
+  const claimAllLocked = {
+    ...alde,
+    content_source: "claim",
+    field_provenance: JSON.stringify({
+      owner_locks: {
+        about_text: { locked_at: "2026-08-01T00:00:00.000Z" },
+        products: { locked_at: "2026-08-01T00:00:00.000Z" },
+        hjemmeside: { locked_at: "2026-08-01T00:00:00.000Z" },
+      },
+    }),
+  };
+  const rAllLocked = pickEnrichmentFields(claimAllLocked, byDomain, byName);
+  assertEq(rAllLocked.copy.about_text, undefined, "enrich-42: all-locked claim row → about_text not copied");
+  assertEq(rAllLocked.copy.products, undefined, "enrich-43: all-locked claim row → products not copied");
+  assertEq(rAllLocked.copy.hjemmeside, undefined, "enrich-44: all-locked claim row → hjemmeside not copied");
+  assertTrue(rAllLocked.skipped.some((s) => s.field === "about_text" && s.reason === "owner_field_locked"), "enrich-45: about_text in skipped");
+  assertTrue(rAllLocked.skipped.some((s) => s.field === "products" && s.reason === "owner_field_locked"), "enrich-46: products in skipped");
+  assertTrue(rAllLocked.skipped.some((s) => s.field === "hjemmeside" && s.reason === "owner_field_locked"), "enrich-47: hjemmeside in skipped");
+  assertEq(rAllLocked.status, "nothing_to_fill", "enrich-48: all fields owner-locked, nothing else fillable → nothing_to_fill (never 'locked')");
+
+  // (4d) sub-slice 3k: adresse/telefon/epost/lat/lon are OUTSIDE
+  // GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS and must still NEVER be written for
+  // a claim row, regardless of lock state (no owner_locks at all, partial
+  // lock, or all-eligible-fields locked) — isGardssalgFieldOwnerLocked fails
+  // closed on them, so this is the pre-3k behavior, unchanged. rfbAlde/alde
+  // carry real, non-junk candidate address/phone/lat/lng values, so a
+  // regression here (missing the guard) would show up as a filled value.
+  for (const [label, row] of [
+    ["no field_provenance", { ...alde, content_source: "claim" }],
+    ["partial owner_locks", claimPartialLock],
+    ["all eligible fields owner_locks", claimAllLocked],
+  ] as const) {
+    const r = pickEnrichmentFields(row, byDomain, byName);
+    assertEq(r.copy.adresse, undefined, `enrich-49 (${label}): claim row adresse NOT copied`);
+    assertEq(r.copy.telefon, undefined, `enrich-49 (${label}): claim row telefon NOT copied`);
+    assertEq(r.copy.epost, undefined, `enrich-49 (${label}): claim row epost NOT copied`);
+    assertEq(r.copy.lat, undefined, `enrich-49 (${label}): claim row lat NOT copied`);
+    assertEq(r.copy.lon, undefined, `enrich-49 (${label}): claim row lon NOT copied`);
+  }
 
   // (5) Fill ONLY missing fields — an existing adresse is never clobbered.
   const r5 = pickEnrichmentFields({ ...base, adresse: "Egen adresse 1" }, byDomain);
@@ -34230,7 +34365,7 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   assertEq(JSON.stringify(parseProductNames("garbage")), "[]", "enrich-28: parseProductNames malformed → []");
   assertEq(JSON.stringify(parseProductNames(null)), "[]", "enrich-29: parseProductNames null → []");
 
-  console.log("  gardssalg-rfb-enrich: OK (29 assertions)");
+  console.log("  gardssalg-rfb-enrich: OK (58 assertions)");
 }
 
 
@@ -34652,6 +34787,169 @@ console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-s
   } finally {
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFactoryS4a.__resetDbFactoryForTesting();
+  }
+})();
+
+// ── slice 4b: Stage V treatments/opening_hours auto-correction (dev-request
+// 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene, item 4,
+// 2026-08-07) ────────────────────────────────────────────────────────────
+// Generalizes slice 4a's mechanism to two more fields. Covers
+// canonicalizeStageVValue() (dedupe+sort for treatments, sort-by-day-then-
+// open for opening_hours) and recordStageVFieldObservation() directly for
+// both new fields, mirroring the slice4a block above's style. Route-level
+// (400/404/403 + order-insensitive HTTP-layer) coverage lives in
+// dental-stage-v-drift-result.test.ts (sections i-n).
+console.log("\n── slice4b: Stage V treatments/opening_hours auto-correction (dental-store) ──");
+(() => {
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFacS4b = require.resolve("../src/database/db-factory");
+  const dentalStorePathS4b = require.resolve("../src/services/dental-store");
+  delete require.cache[dbFacS4b];
+  delete require.cache[dentalStorePathS4b];
+  const dbFactoryS4b = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryS4b.__resetDbFactoryForTesting();
+  const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  try {
+    const dentalDb = dbFactoryS4b.getDb("dental");
+
+    // ── canonicalizeStageVValue: dedupe+sort (treatments), sort-by-day-
+    // then-open (opening_hours), pass-through (helfo_agreement) ──────────
+    assertEq(
+      dstore.canonicalizeStageVValue("helfo_agreement", "true"),
+      "true",
+      "s4b-01: canonicalizeStageVValue helfo_agreement is a pass-through",
+    );
+    assertEq(
+      dstore.canonicalizeStageVValue("treatments", ["b", "a", "b"]),
+      JSON.stringify(["a", "b"]),
+      "s4b-02: canonicalizeStageVValue treatments dedupes and sorts",
+    );
+    assertEq(
+      dstore.canonicalizeStageVValue("treatments", ["a", "b"]),
+      dstore.canonicalizeStageVValue("treatments", ["b", "a"]),
+      "s4b-03: canonicalizeStageVValue treatments is order-insensitive",
+    );
+    const oh1 = [
+      { day: "tue", open: "09:00", close: "17:00" },
+      { day: "mon", open: "08:00", close: "16:00" },
+    ];
+    const oh2 = [
+      { day: "mon", open: "08:00", close: "16:00" },
+      { day: "tue", open: "09:00", close: "17:00" },
+    ];
+    assertEq(
+      dstore.canonicalizeStageVValue("opening_hours", oh1),
+      dstore.canonicalizeStageVValue("opening_hours", oh2),
+      "s4b-04: canonicalizeStageVValue opening_hours is order-insensitive (sorted by day)",
+    );
+    assertEq(
+      dstore.canonicalizeStageVValue("opening_hours", oh1),
+      JSON.stringify(oh2),
+      "s4b-05: canonicalizeStageVValue opening_hours sorts by day (mon before tue)",
+    );
+
+    // ── recordStageVFieldObservation: treatments ─────────────────────────
+    const idT = dstore.createDentalAgent({
+      navn: "Treatments Tvist Tannlege AS",
+      org_nr: "911200444",
+      treatments: ["fylling", "rotfylling"],
+    } as any);
+
+    // unknown id -> found:false (same contract as helfo_agreement).
+    assertEq(
+      (dstore.recordStageVFieldObservation("no-such-id", "treatments", ["fylling"]) as any).found,
+      false,
+      "s4b-06: unknown id -> found=false (treatments)",
+    );
+
+    // first differing observation -> pending, DB unchanged.
+    let rT = dstore.recordStageVFieldObservation(idT, "treatments", ["implantat", "fylling"]) as any;
+    assertEq(rT.corrected, false, "s4b-07: first differing treatments observation -> corrected=false");
+    assertEq(rT.pending, true, "s4b-08: first differing treatments observation -> pending=true");
+    let rowT = dentalDb.prepare("SELECT treatments, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idT) as any;
+    assertEq(rowT.treatments, JSON.stringify(["fylling", "rotfylling"]), "s4b-09: DB treatments UNCHANGED after first observation");
+    assertEq(rowT.field_provenance, null, "s4b-10: field_provenance UNCHANGED after first treatments observation");
+
+    // second observation, SAME set but a DIFFERENT order -> auto-correct,
+    // proving order-insensitive canonicalization end-to-end (not just in
+    // canonicalizeStageVValue's own unit assertions above).
+    rT = dstore.recordStageVFieldObservation(idT, "treatments", ["fylling", "implantat"]) as any;
+    assertEq(rT.corrected, true, "s4b-11: second (reordered) matching treatments observation -> corrected=true");
+    assertEq(rT.new_value, JSON.stringify(["fylling", "implantat"]), "s4b-12: new_value reports the canonical (sorted) form");
+    rowT = dentalDb.prepare("SELECT treatments, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idT) as any;
+    assertEq(rowT.treatments, JSON.stringify(["fylling", "implantat"]), "s4b-13: DB treatments column now holds the canonical (sorted, deduped) JSON");
+    assertEq(rowT.stage_v_pending_correction, null, "s4b-14: pending entry cleared after correction (treatments)");
+    const provT = JSON.parse(rowT.field_provenance);
+    assertTrue(
+      Array.isArray(provT.treatments) &&
+        provT.treatments.some((e: any) => e.source_type === "stage_v_correction" && e.value === JSON.stringify(["fylling", "implantat"])),
+      "s4b-15: field_provenance.treatments carries a stage_v_correction entry with the canonical value",
+    );
+
+    // ── recordStageVFieldObservation: opening_hours ──────────────────────
+    const idH = dstore.createDentalAgent({
+      navn: "Opening Hours Tvist Tannlege AS",
+      org_nr: "911200555",
+    } as any);
+    dstore.updateDentalAgent(idH, {
+      opening_hours: [{ day: "mon", open: "08:00", close: "16:00" }],
+    } as any);
+
+    const observedOnce = [
+      { day: "tue", open: "09:00", close: "17:00" },
+      { day: "wed", open: "09:00", close: "17:00" },
+    ];
+    const observedReordered = [
+      { day: "wed", open: "09:00", close: "17:00" },
+      { day: "tue", open: "09:00", close: "17:00" },
+    ];
+
+    let rH = dstore.recordStageVFieldObservation(idH, "opening_hours", observedOnce) as any;
+    assertEq(rH.corrected, false, "s4b-16: first differing opening_hours observation -> corrected=false");
+    assertEq(rH.pending, true, "s4b-17: first differing opening_hours observation -> pending=true");
+    let rowH = dentalDb.prepare("SELECT opening_hours, field_provenance FROM dental_agents WHERE id = ?").get(idH) as any;
+    assertEq(rowH.opening_hours, JSON.stringify([{ day: "mon", open: "08:00", close: "16:00" }]), "s4b-18: DB opening_hours UNCHANGED after first observation");
+
+    rH = dstore.recordStageVFieldObservation(idH, "opening_hours", observedReordered) as any;
+    assertEq(rH.corrected, true, "s4b-19: second (reordered) matching opening_hours observation -> corrected=true");
+    rowH = dentalDb.prepare("SELECT opening_hours, field_provenance, verification_status FROM dental_agents WHERE id = ?").get(idH) as any;
+    assertEq(rowH.opening_hours, JSON.stringify(observedOnce), "s4b-20: DB opening_hours column now holds the canonical (day-sorted) JSON");
+    const provH = JSON.parse(rowH.field_provenance);
+    assertTrue(
+      Array.isArray(provH.opening_hours) && provH.opening_hours.some((e: any) => e.source_type === "stage_v_correction"),
+      "s4b-21: field_provenance.opening_hours carries a stage_v_correction entry",
+    );
+    assertEq(rowH.verification_status, "pending_verify", "s4b-22: verification_status untouched by the opening_hours auto-correction");
+
+    // ── unrelated field_provenance keys survive a correction untouched ───
+    const idU = dstore.createDentalAgent({
+      navn: "Unrelated Provenance Tannlege AS",
+      org_nr: "911200666",
+      treatments: ["fylling"],
+    } as any);
+    dstore.updateDentalAgent(idU, {
+      field_provenance: { adresse: [{ source_type: "manual", value: "Storgata 1", fetched_at: "2026-01-01T00:00:00.000Z" }] },
+    } as any);
+    dstore.recordStageVFieldObservation(idU, "treatments", ["implantat"]); // pending
+    dstore.recordStageVFieldObservation(idU, "treatments", ["implantat"]); // corrected
+    const rowU = dentalDb.prepare("SELECT field_provenance, verification_status FROM dental_agents WHERE id = ?").get(idU) as any;
+    const provU = JSON.parse(rowU.field_provenance);
+    assertTrue(
+      Array.isArray(provU.adresse) && provU.adresse.some((e: any) => e.value === "Storgata 1"),
+      "s4b-23: unrelated field_provenance.adresse entry survives a treatments correction untouched",
+    );
+    assertEq(rowU.verification_status, "pending_verify", "s4b-24: verification_status untouched (unrelated-provenance regression guard)");
+
+    console.log("  slice4b (Stage V treatments/opening_hours auto-correction): OK (24 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`slice4b Stage V treatments/opening_hours auto-correction: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
+    dbFactoryS4b.__resetDbFactoryForTesting();
   }
 })();
 
@@ -37131,5 +37429,53 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experience-description-enrichment: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
+// 6: GET /admin/gardssalg-epost-synthesis-audit (read-only) + POST
+// /admin/gardssalg-epost-synthesis-remediation (dry-run-by-default write) —
+// verifies (rather than assumes) that no synthesized post@<own-domain>
+// address is stored in experience_providers.epost or RFB's
+// agents.contact_email, distinguishing a genuinely-unevidenced match from a
+// producer's REAL published post@ address (the hunsfos-bryggeri.no case).
+// Tail-registered via runSerial() like the suites immediately above — see
+// this file's own "determinism gate" comments further up for why new blocks
+// land here rather than earlier in the file.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-06-aldri-gjett-epostadresse: gardssalg-epost-synthesis-audit + remediation ──");
+  try {
+    const { runOpplevelserGardssalgEpostSynthesisAuditTests } = require("../src/routes/opplevelser-gardssalg-epost-synthesis-audit.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-epost-synthesis-audit.test");
+    const gesa = await runOpplevelserGardssalgEpostSynthesisAuditTests({ log: false });
+    passed += gesa.passed;
+    failed += gesa.failed;
+    for (const f of gesa.failures) failures.push("gardssalg-epost-synthesis-audit: " + f);
+    console.log(`  gardssalg-epost-synthesis-audit: ${gesa.passed} passed, ${gesa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-epost-synthesis-audit: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+// hygiene, item 5 ("wrong_content_rate holdout"), slice claimed
+// 2026-08-07T05:56Z: src/services/experience-content-judge.ts's fail-closed
+// LLM judge + candidate sampler, and POST /admin/experiences-wrong-content-
+// rate (src/routes/opplevelser.ts) — read-only holdout, zero writes. Tail-
+// registered via runSerial() like the suites immediately above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene, item 5: experiences-wrong-content-rate ──");
+  try {
+    const { runExperiencesWrongContentRateTests } = require("../src/routes/experiences-wrong-content-rate.test") as
+      typeof import("../src/routes/experiences-wrong-content-rate.test");
+    const wcr = await runExperiencesWrongContentRateTests(false);
+    passed += wcr.passed;
+    failed += wcr.failed;
+    for (const f of wcr.failures) failures.push("experiences-wrong-content-rate: " + f);
+    console.log(`  experiences-wrong-content-rate: ${wcr.passed} passed, ${wcr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-wrong-content-rate: unexpected error: " + String(err?.message || err));
   }
 });
