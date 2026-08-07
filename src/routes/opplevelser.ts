@@ -117,6 +117,7 @@ import {
   getGardssalgWebsiteDiscoveryTarget,
   gardssalgWebsiteCandidateHosts,
   gardssalgPageText,
+  gardssalgPageTitle,
   gardssalgWebsiteEvidenceMatch,
   gardssalgContactPageLinks,
   extractGardssalgContactEmail,
@@ -3054,7 +3055,7 @@ async function tryGardssalgCandidateHosts(
       adresse: target.adresse ?? null,
       postnummer: target.postnummer ?? null,
     };
-    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget);
+    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget, gardssalgPageTitle(page.html));
     if (ev.verified) {
       return { host, finalUrl: page.finalUrl, evidence: ev };
     }
@@ -3073,7 +3074,7 @@ async function tryGardssalgCandidateHosts(
         if (!subPage) continue;
         const subHost = hostFromUrlLike(subPage.finalUrl) || host;
         if (subHost.toLowerCase().replace(/^www\./, "") !== host.toLowerCase().replace(/^www\./, "")) continue;
-        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget);
+        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget, gardssalgPageTitle(subPage.html));
         if (subEv.verified) {
           return { host, finalUrl: subPage.finalUrl, evidence: subEv };
         }
@@ -7481,7 +7482,7 @@ async function runGardssalgFieldConcordanceScan(
   const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
     const fetched = await crFetchGardssalgContent(homepageUrl);
     if (!fetched.ok) return { ok: false, reason: fetched.reason };
-    return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+    return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
   };
 
   const providers: GfcProviderResult[] = [];
@@ -8317,7 +8318,7 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
       const fetched = await crFetchGardssalgContent(homepageUrl);
       if (!fetched.ok) return { ok: false, reason: fetched.reason };
-      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
     };
     const cohortRows = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
 
@@ -8467,7 +8468,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
       const fetched = await crFetchGardssalgContent(homepageUrl);
       if (!fetched.ok) return { ok: false, reason: fetched.reason };
-      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
     };
 
     let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);

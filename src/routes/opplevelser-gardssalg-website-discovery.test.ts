@@ -691,6 +691,111 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         }
       }
 
+      // ── wd-18/19/20: title corroboration on the discovery flow itself
+      //    (dev-request/reviewer follow-up 2026-08-06) — this is the
+      //    LITERAL originating incident: sibling-TLD/search-tier candidate
+      //    guessing (tryGardssalgCandidateHosts, backing THIS route) is
+      //    where 7 of 9 guessed-TLD candidates were wrong — squatted
+      //    domains and unrelated orgs that all passed on name+place body
+      //    text alone. gardssalgWebsiteEvidenceMatch's title gate was
+      //    already proven at the other 3 call sites; wd-18/19/20 prove it
+      //    now also applies at the two real call sites INSIDE
+      //    tryGardssalgCandidateHosts — the front-page match (~line 2946)
+      //    and the subpage-crawl match (~line 2965). ──────────────────────
+      {
+        // wd-18: pure regression check — same page, same evidence, only
+        // whether a title source is offered differs. This is exactly the
+        // shape of the incident: a squatted/unrelated <title> sitting on
+        // top of a body that happens to contain the producer's name+place.
+        const incidentBody = "Kaldvik Gardsutsalg i vakre Alta.";
+        const squattedTitle = "Kjøp dette domenet — DomainBrokers Inc";
+        const incidentTarget = { orgNr: null, navn: "Kaldvik Gardsutsalg", kommune: "Alta", poststed: null };
+        const withoutTitleSource = expStore.gardssalgWebsiteEvidenceMatch(incidentBody, incidentTarget);
+        assertEq(withoutTitleSource.verified, true, "wd-18a: name+place alone verifies when no title source is offered (the pre-fix / not-yet-wired shape)");
+        const withSquattedTitle = expStore.gardssalgWebsiteEvidenceMatch(incidentBody, incidentTarget, squattedTitle);
+        assertEq(withSquattedTitle.title_found, false, "wd-18b: the squatted-domain title does not contain the producer's name");
+        assertEq(withSquattedTitle.verified, false, "wd-18c: the SAME page is now rejected once a title source is supplied — the incident shape, fixed");
+
+        // wd-19: route-level, FRONT-PAGE call site (~line 2946) —
+        // tryGardssalgCandidateHosts's tier-1 name-guess lands directly on
+        // a squatted sibling-TLD host whose body text hits name+place but
+        // whose <title> is the squatter's, not the producer's.
+        insertProvider.run({ id: "wd-title-front", navn: "Kaldvik Gardsutsalg", org_nr: "922000004", kommune: "Alta", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "gardsbutikk" });
+
+        const titleFetchCalls: string[] = [];
+        const prevFetch4 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const u = String(url);
+          titleFetchCalls.push(u);
+          // Guessed front-page host for "Kaldvik Gardsutsalg": name+place
+          // in the body, but a squatted-domain <title> — no contact links,
+          // so there is nothing to crawl further.
+          if (u === "https://kaldvikgardsutsalg.no" || u === "https://kaldvikgardsutsalg.no/") {
+            return { ok: true, status: 200, url: u, text: async () =>
+              "<html><head><title>Kjøp dette domenet — DomainBrokers Inc</title></head>" +
+              "<body>Kaldvik Gardsutsalg i vakre Alta.</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-title-front"], apply: true },
+          });
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-title-front"),
+            "wd-19a: squatted-title sibling-TLD candidate is NOT proposed at the front-page call site (previously it would have been — name+place alone used to verify)");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-title-front"),
+            "wd-19b: falls through honestly to no_candidate_verified");
+          const qCnt = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-title-front'`).get() as any).c;
+          assertEq(qCnt, 0, "wd-19c: nothing queued for the rejected candidate");
+        } finally {
+          globalThis.fetch = prevFetch4;
+        }
+
+        // wd-20: route-level, SUBPAGE-CRAWL call site (~line 2965) — the
+        // front page shows only a partial signal (name, no place), so the
+        // contact-page crawl fires; the /kontakt subpage is where the
+        // name+place hit actually lands, but its <title> is still the
+        // squatter's — must be rejected there too, not just on the front
+        // page.
+        insertProvider.run({ id: "wd-title-sub", navn: "Mork Gardsutsalg", org_nr: "922000005", kommune: "Alta", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "gardsbutikk" });
+
+        const subTitleFetchCalls: string[] = [];
+        const prevFetch5 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const u = String(url);
+          subTitleFetchCalls.push(u);
+          if (u === "https://morkgardsutsalg.no" || u === "https://morkgardsutsalg.no/") {
+            return { ok: true, status: 200, url: u, text: async () =>
+              '<html><body>Mork Gardsutsalg — besøksgard. <a href="/kontakt">Kontakt oss</a></body></html>' } as unknown as Response;
+          }
+          if (u.startsWith("https://morkgardsutsalg.no/kontakt")) {
+            return { ok: true, status: 200, url: u, text: async () =>
+              "<html><head><title>Dette domenet er til salgs</title></head>" +
+              "<body>Mork Gardsutsalg ligger i Alta.</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-title-sub"], apply: true },
+          });
+          assertTrue(subTitleFetchCalls.some((u) => u.startsWith("https://morkgardsutsalg.no/kontakt")),
+            "wd-20a: the name-only front-page signal DID trigger the subpage crawl (sanity — the flow reached the second call site)");
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-title-sub"),
+            "wd-20b: the subpage's name+place hit is NOT proposed once its squatted title fails the gate (previously it would have verified via v1 name+place)");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-title-sub"),
+            "wd-20c: falls through honestly to no_candidate_verified");
+          const qCnt = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-title-sub'`).get() as any).c;
+          assertEq(qCnt, 0, "wd-20d: nothing queued for the rejected subpage candidate");
+        } finally {
+          globalThis.fetch = prevFetch5;
+        }
+      }
+
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
