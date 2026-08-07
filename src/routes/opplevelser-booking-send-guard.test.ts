@@ -204,6 +204,35 @@ export function runOpplevelserBookingSendGuardTests(
       (require("../database/init") as typeof import("../database/init")).__initSchemaForTesting(bsgRfbDb);
       claimSvc.__setRfbDbForTesting(bsgRfbDb);
 
+      // dev-request 2026-08-06-aldri-gjett-epostadresse SLICE 5 / AC7:
+      // issueClaimMagicLink() is now harvest-backed and async. AUDITED, not
+      // assumed — none of this suite's fixtures can actually reach an
+      // outbound fetch: prov-live has no hjemmeside at all (the own-site
+      // harvest needs one) and its umbrella fallback dies inside
+      // findUmbrellaAffiliation() against the empty bsgRfbDb above, before
+      // any network call; prov-claim-admin / prov-claim-admin-two are
+      // content_source='manual' WITH a stored epost, so stored_epost_verified
+      // already qualifies and the umbrella fallback is suppressed by its own
+      // gating condition. The override below is therefore a REGRESSION
+      // GUARD, not a requirement: bsgHarvestFetchCalls is asserted empty at
+      // the end of this suite, so if a future fixture change (or a change to
+      // those gating conditions) ever made this suite reach the network, it
+      // fails loudly here instead of silently making a real outbound request
+      // from `npm test`. A COUNTER rather than a throwing stub because
+      // fetchPage() never rethrows — only counting can prove "zero calls".
+      const bsgHarvestFetchCalls: string[] = [];
+      claimSvc.__setClaimHarvestFetchForTesting(((async (input: unknown) => {
+        const url = String(input);
+        bsgHarvestFetchCalls.push(url);
+        const bytes = new TextEncoder().encode("<html><body>ingen kontaktinfo</body></html>");
+        return {
+          ok: true, status: 200, statusText: "S200", url,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+        } as unknown as Response;
+      }) as unknown) as typeof fetch);
+      claimSvc.__resetClaimHarvestCacheForTesting();
+
       // ── Fake transport at the REAL send boundary ─────────────────────────
       // The guard lives inside sendEmail(); stubbing sendEmail itself would
       // stub out the thing under test. Injecting a transporter observes the
@@ -413,7 +442,7 @@ export function runOpplevelserBookingSendGuardTests(
         `UPDATE experience_providers SET org_nr = '910000111', brreg_verified = 1
          WHERE id = 'prov-live'`
       ).run();
-      const claimTest = claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no", { isTest: true });
+      const claimTest = await claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no", { isTest: true });
       if (claimTest.ok) {
         assertEq(claimTest.claim.isTest, true, "l1: {isTest:true} marks the claim");
         assertEq(
@@ -424,7 +453,7 @@ export function runOpplevelserBookingSendGuardTests(
       } else {
         assertTrue(false, `l1/l2: expected a claim to be issued, got ${claimTest.error}`);
       }
-      const claimReal = claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no");
+      const claimReal = await claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no");
       if (claimReal.ok) {
         assertEq(claimReal.claim.isTest, false, "l3: the default leaves a claim un-flagged");
       } else {
@@ -568,6 +597,15 @@ export function runOpplevelserBookingSendGuardTests(
         sent.length === 0 || sent.every((m) => !String(m.subject).startsWith("[TESTSENDING]")),
         "q3: and nothing it sent was marked as a test send"
       );
+
+      // ── (r) SLICE 5 / AC7 zero-network regression guard ──────────────────
+      // See the __setClaimHarvestFetchForTesting install at the top of this
+      // suite for the per-fixture audit this asserts. If this ever fails, a
+      // fixture in this suite has become harvest-eligible — which is fine in
+      // itself, but the fixture then needs a deliberate harvest scenario
+      // rather than an accidental one, and (had the override not been
+      // installed) `npm test` would have made a real outbound request.
+      assertEq(bsgHarvestFetchCalls, [], "r1: this suite never triggers an outbound harvest fetch — every claim fixture here qualifies (or fails to) purely on DB evidence");
     } finally {
       if (emailSvc) {
         emailSvc.isConfigured = origConfigured;
@@ -582,7 +620,11 @@ export function runOpplevelserBookingSendGuardTests(
       restore("TEST_SEND_REDIRECT_EMAIL", prevRedirect);
       restore("BOOKING_DISPATCH_ENABLED", prevDispatch);
       try {
-        (require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim")).__setRfbDbForTesting(null);
+        const claimMod = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
+        claimMod.__setRfbDbForTesting(null);
+        // SLICE 5 / AC7: same discipline as the RFB-db override above.
+        claimMod.__setClaimHarvestFetchForTesting(undefined);
+        claimMod.__resetClaimHarvestCacheForTesting();
       } catch {
         // best-effort cleanup
       }

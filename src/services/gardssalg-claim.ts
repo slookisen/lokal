@@ -297,22 +297,51 @@
 // judgment call, not a re-derivation of anything Daniel stated explicitly for
 // THIS specific sub-ordering — flagged as such for the reviewer.
 //
-// NOT LIVE-WIRED in this slice — a deliberate scope boundary, not an
-// oversight (see deriveOrgLinkedEmailCandidatesWithHarvest()'s own doc
-// comment below for the three concrete reasons: (1) it would require
-// converting issueClaimMagicLink from sync to async, cascading into ~20
-// existing synchronous call sites across three test files; (2) the public
-// GET claim-entry route's HTTP-level test harness (routes/gardssalg-
-// claim.test.ts) has no fetch-injection seam today, so wiring a live fetch
-// into that route would make its test suite perform real outbound network
-// calls against nonexistent test-fixture domains; (3) the claim entry page is
-// UNAUTHENTICATED — fetching a producer's hjemmeside on every page view with
-// no caching/rate-limiting is a real design question (cache TTL? move to the
-// existing periodic gårdssalg enrichment sweep instead of on-request?) that
-// deserves its own decision, not one implied by this slice. This exact
-// "built, tested, and correct, but not yet reachable from a live route"
-// pattern already exists in this file for tier (a) brreg_contact (see the
-// module doc's very first section) — this is the same shape, not a new one.
+// NOT LIVE-WIRED in slice 2 — was a deliberate scope boundary, not an
+// oversight (three concrete reasons: (1) it would require converting
+// issueClaimMagicLink from sync to async, cascading into ~20 existing
+// synchronous call sites across three test files; (2) the public GET
+// claim-entry route's HTTP-level test harness (routes/gardssalg-claim.test.ts)
+// had no fetch-injection seam, so wiring a live fetch into that route would
+// make its test suite perform real outbound network calls against nonexistent
+// test-fixture domains; (3) the claim entry page is UNAUTHENTICATED —
+// fetching a producer's hjemmeside on every page view with no caching/
+// rate-limiting is a real design question that deserves its own decision).
+// ALL THREE ARE NOW RESOLVED — see the "LIVE-WIRING" section immediately
+// below, which is what actually restores claim coverage.
+//
+// ─── LIVE-WIRING — dev-request 2026-08-06-aldri-gjett-epostadresse, SLICE 5,
+// AC7 (2026-08-07) ──────────────────────────────────────────────────────────
+// WHY THIS SLICE EXISTS, measured, not hypothesised: with slice 1's deletion
+// of the post@<domain> guess merged to production and slices 2/4 built but
+// dormant, the live cohort measurement in the dev-request itself
+// ("Live-verifisering 2026-08-07T07:3xZ") found claim coverage across all 87
+// published gårdssalg producers had gone 10/87 -> **0/87**. AC1 ("never guess
+// an address") was satisfied and confirmed live; the replacement simply was
+// not reachable from any route. This slice reaches it.
+//
+// What changed, exactly three things:
+//   1. issueClaimMagicLink() is now `async` and derives its candidates via
+//      deriveOrgLinkedEmailCandidatesWithHarvest() instead of the sync
+//      deriveOrgLinkedEmailCandidatesWithOutreachLookup(). Its opts.selectedSource
+//      re-validation runs against that SAME harvest-aware list — so a producer
+//      can pick a found-tier address on the entry page and have that choice
+//      validate server-side, which is the whole point of offering it.
+//   2. The public GET claim-entry route (routes/gardssalg-claim.ts) derives
+//      its displayed candidate list from the same async function, so the page
+//      and the POST it submits to can never disagree about eligibility (the
+//      pre-existing "must mirror issueClaimMagicLink()'s own lookup exactly"
+//      invariant that route's own comment already states).
+//   3. Both live routes reach the REAL global fetch in production and an
+//      INJECTED one in tests, via __setClaimHarvestFetchForTesting() below.
+//
+// What deliberately did NOT change: magic-link validity duration, the
+// rate-limit window/ceiling, the isTest test-send-guard semantics
+// (dev-request 2026-07-26-booking-test-send-guard), the DB schema, and the
+// ordering of issueClaimMagicLink()'s own error precedence (candidate
+// derivation before the rate-limit check, exactly as before — moving the
+// rate-limit check earlier would silently reorder which error a caller sees
+// and several existing tests pin that order).
 //
 // ─── found_umbrella_member — dev-request 2026-08-06-aldri-gjett-epostadresse,
 // SLICE 4, AC5 (2026-08-07) ─────────────────────────────────────────────────
@@ -758,6 +787,112 @@ const HARVEST_FETCH_TIMEOUT_MS = 8_000;
 // Matches discoverContentLinks' own default `max` and buildPageEvidence's
 // existing sub-page crawl budget (home page + up to 3 discovered links).
 const HARVEST_MAX_SUBPAGES = 3;
+
+// ── Injectable fetch (test seam) — SLICE 5 / AC7 live-wiring ─────────────
+// Same module-level "override, else global fetch" shape this repo already
+// uses for every other outbound-fetching service: experience-brreg.ts's
+// __setBrregFetchForTesting(), bm-events-scraper.ts's
+// __setBmEventsScraperFetchForTesting(), experience-store.ts's
+// __setGardssalgWebsiteSearchForTesting(). Deliberately NOT a new mechanism.
+//
+// WHY a module-level override is needed AT ALL, given
+// deriveOrgLinkedEmailCandidatesWithHarvest() already takes a per-call
+// opts.fetchImpl: the live callers are now HTTP ROUTES. A route handler has
+// no test-visible parameter list — routes/gardssalg-claim.test.ts drives the
+// router over a real http.Server with raw http.request(), so the only way it
+// can control what the harvest fetches is a seam on the module the router
+// imports. Per-call opts.fetchImpl STILL WINS over this override (see
+// resolveHarvestFetchImpl below), so every existing service-level test that
+// passes its own fetchImpl is unaffected, and the interleaved-suite race the
+// __setRfbDbForTesting doc comment above documents does not apply the same
+// way here: each of the three suites that reach this code deletes
+// gardssalg-claim from require.cache and installs its own override on its
+// own fresh module instance, exactly as they already do for the RFB db.
+//
+// PRODUCTION NEVER CALLS THE SETTER — the default is undefined, which
+// fetchPage() resolves to the global fetch exactly as before.
+let _claimHarvestFetchOverrideForTesting: typeof fetch | undefined = undefined;
+
+/** Test-only: swap the fetch used by the claim-flow harvest tiers. Pass
+ * nothing (or undefined) to restore the global fetch. Never call from
+ * production code. */
+export function __setClaimHarvestFetchForTesting(impl?: typeof fetch): void {
+  _claimHarvestFetchOverrideForTesting = impl;
+}
+
+function resolveHarvestFetchImpl(perCall?: typeof fetch): typeof fetch | undefined {
+  return perCall ?? _claimHarvestFetchOverrideForTesting;
+}
+
+// ── Harvest result cache — SLICE 5 / AC7, and an explicit JUDGMENT CALL ───
+// Flagged for the reviewer in the same voice as the found-tier ranking note
+// in the module doc above: this TTL is MY choice, not a re-derivation of
+// anything Daniel stated explicitly. The dev-request only says the caching/
+// rate-limit question for the unauthenticated entry page "deserves its own
+// decision"; it does not name a number. Here is the decision and the
+// reasoning, so a reviewer can disagree with a concrete thing rather than
+// with a silence.
+//
+// THE PROBLEM this exists to solve: GET /kategori/gardssalg/eier/:slug is
+// PUBLIC and UNAUTHENTICATED. Wiring the harvest into it means one page view
+// of an eligible producer can trigger up to 1 + HARVEST_MAX_SUBPAGES (=4)
+// outbound requests to that producer's own website, plus up to 4 more to
+// their umbrella's site on the fallback path. Uncached, that makes any
+// visitor holding down F5 into a small, free, third-party-targeted request
+// amplifier running from our IP — against a site we do not own, on behalf of
+// a producer who never asked for it. The claim rate limit does NOT protect
+// this: isClaimRateLimited() only gates the POST that issues a link, and is
+// checked AFTER candidate derivation by design (see issueClaimMagicLink's
+// error precedence), so it never bounds GET-side fetching at all.
+//
+// THE CHOICE: a process-local Map<cacheKey, {candidates, expiresAt}> around
+// the NETWORK-DERIVED tiers only, TTL 12 minutes.
+//   - Why cache only the network tiers, not the whole candidate list: the
+//     DB-derived tiers (brreg_contact / stored_epost_verified) cost one
+//     local SQLite read and are the ones an admin edit can change; keeping
+//     them live means an admin fixing a producer's stored epost sees it take
+//     effect on the very next page view, and means opts.selectedSource is
+//     still re-validated against genuinely fresh DB evidence — the property
+//     issueClaimMagicLink's own doc comment promises. Only the part that
+//     costs somebody ELSE a request is cached.
+//   - Why 12 minutes: it has to be long enough that a reload-hammering
+//     visitor cannot convert page views into outbound requests at all (12
+//     minutes caps one producer at ~5 harvests/hour no matter how many
+//     visitors or reloads), and short enough that a producer who has JUST
+//     put their address on their contact page — plausibly while sitting on
+//     this very page, having been told that is what we look for — does not
+//     have to wait long enough to give up. 12 min sits between those: a
+//     coffee-break, not a deploy cycle. 60s would barely dent a reload loop;
+//     an hour would make "I fixed it, now what?" feel broken. There is no
+//     measured optimum here and I am not pretending there is one.
+//   - Why in-process and not persistent: single Node process (same premise
+//     route-corridor-service.ts's own in-memory route cache and
+//     traffic-stats.ts's counter cache already rely on), and a cache whose
+//     worst-case failure is "we re-fetch a homepage after a restart" needs no
+//     durability. Unbounded growth is bounded in practice by the cohort size
+//     (87 published gårdssalg producers today, low hundreds at any plausible
+//     scale) and expired entries are dropped on read.
+//   - What I did NOT do, and why: no per-IP rate limit on the GET route
+//     (would need shared state to be meaningful behind more than one
+//     instance, and the cache already removes the amplification this was
+//     meant to stop), and no move of harvesting into the periodic gårdssalg
+//     enrichment sweep (that was the other option the slice-2 comment
+//     floated — it would make coverage depend on a sweep having run, which
+//     is exactly the "built but not reachable" failure this slice is fixing).
+const CLAIM_HARVEST_CACHE_TTL_MS = 12 * 60 * 1000;
+
+interface HarvestCacheEntry {
+  candidates: OrgLinkedEmailCandidate[];
+  expiresAt: number;
+}
+const _claimHarvestCache = new Map<string, HarvestCacheEntry>();
+
+/** Test-only: drop every cached harvest result. Follows the
+ * __resetTrafficStatsCacheForTesting / __clearRouteCacheForTesting naming
+ * convention already used for this repo's other in-process caches. */
+export function __resetClaimHarvestCacheForTesting(): void {
+  _claimHarvestCache.clear();
+}
 
 // See module doc for why this list exists and what it deliberately excludes.
 const CONTACT_ABOUT_PATH_FRAGMENTS: readonly string[] = ["kontakt", "contact", "om-oss", "om-garden", "om-gården", "about"];
@@ -1263,20 +1398,29 @@ export async function harvestUmbrellaMemberEmail(
  *
  * `opts.fetchImpl` is the SAME "injected for tests, defaults to global
  * fetch" seam fetch-page.ts's own FetchPageOptions already uses — passed
- * straight through to fetchPage(), never a global fetch swap (this repo's
- * test suite runs many async blocks interleaved; see fetch-page.ts's own doc
- * comment on FetchPageOptions.fetchImpl for why a global swap would race).
+ * straight through to fetchPage(). When omitted it falls back to the
+ * module-level __setClaimHarvestFetchForTesting() override (undefined in
+ * production, i.e. the global fetch), which exists ONLY because the SLICE 5
+ * live callers are HTTP route handlers with no test-visible parameter list —
+ * see that setter's own doc comment. Per-call always wins over module-level,
+ * so every pre-existing caller that passes its own fetchImpl is unaffected.
  *
- * NOT CALLED from any live route in this slice — see the module doc's
- * "NOT LIVE-WIRED in this slice" paragraph for the three concrete reasons.
- * This function is fully built, fully tested, and correct; wiring it into
- * issueClaimMagicLink() / the public GET+POST routes (converting them from
- * sync to async, and giving routes/gardssalg-claim.test.ts's HTTP harness a
- * fetch-injection seam it does not have today) is left as deliberate,
- * flagged follow-up work — the exact same shape tier (a) brreg_contact
- * already sits in (built + tested, dormant in production) elsewhere in this
- * file. SLICE 4's found_umbrella_member tier (see below) sits in the exact
- * same dormant-but-correct state, for the same reasons.
+ * LIVE-WIRED since SLICE 5 / AC7 (2026-08-07): issueClaimMagicLink() and the
+ * public GET claim-entry route both derive their candidates through this
+ * function. See the module doc's "LIVE-WIRING" section for what that changed
+ * and what it deliberately did not.
+ *
+ * `opts.cacheKey` (SLICE 5 / AC7) — when given (the live routes pass
+ * provider.id), the NETWORK-DERIVED tiers only (the three own-site found
+ * tiers plus found_umbrella_member) are cached in-process for
+ * CLAIM_HARVEST_CACHE_TTL_MS. The DB-derived tiers are re-derived on every
+ * call regardless, so an admin edit to a provider's stored epost — and
+ * therefore opts.selectedSource re-validation in issueClaimMagicLink — is
+ * never served from a stale snapshot. Omitting it (every pre-existing caller,
+ * and every test that wants to observe a specific fetch) disables caching
+ * entirely for that call: nothing is read from the cache and nothing is
+ * written to it. See CLAIM_HARVEST_CACHE_TTL_MS's own comment for the full
+ * TTL rationale and the alternatives rejected.
  *
  * `navn` is added to the Pick, OPTIONAL (same "existing callers/fixtures
  * that construct a provider object without it keep compiling unchanged"
@@ -1291,14 +1435,72 @@ export async function deriveOrgLinkedEmailCandidatesWithHarvest(
     navn?: string;
   },
   brregContactEmail?: string | null,
-  opts: { fetchImpl?: typeof fetch } = {},
+  opts: { fetchImpl?: typeof fetch; cacheKey?: string } = {},
 ): Promise<OrgLinkedEmailCandidate[]> {
   const baseCandidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider, brregContactEmail);
+
+  // SLICE 4 / AC5's second gating condition, hoisted above the fetch work so
+  // it can also form part of the SLICE 5 cache key (see below).
+  const alreadyHasStoredEpost = baseCandidates.some((c) => c.source === "stored_epost_verified");
+
+  const foundCandidates = await resolveFoundTierCandidates(provider, alreadyHasStoredEpost, opts);
+
+  // Merge in the documented priority order — (a) brreg_contact, then the
+  // three own-site found-tiers, then (SLICE 4) found_umbrella_member, then
+  // (c) stored_epost_verified — deduping by normalized email so the SAME
+  // address is never offered twice under two different source tags (e.g. a
+  // harvested same-domain address that happens to equal the stored,
+  // provenance-backed epost).
+  const brregContactCandidates = baseCandidates.filter((c) => c.source === "brreg_contact");
+  const storedEpostCandidates = baseCandidates.filter((c) => c.source === "stored_epost_verified");
+  const merged: OrgLinkedEmailCandidate[] = [];
+  const seen = new Set<string>();
+  for (const candidate of [...brregContactCandidates, ...foundCandidates, ...storedEpostCandidates]) {
+    const key = candidate.email.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(candidate);
+  }
+  return merged;
+}
+
+/**
+ * The NETWORK-DERIVED half of deriveOrgLinkedEmailCandidatesWithHarvest():
+ * the three own-site found tiers, plus the SLICE 4 found_umbrella_member
+ * fallback, in that order. Split out from its caller purely so exactly this
+ * part — the part that costs a third party an HTTP request — is what the
+ * SLICE 5 / AC7 cache wraps; the merge/dedup/priority logic and the DB-derived
+ * tiers stay uncached and unchanged.
+ *
+ * Cache key is `${cacheKey}|${alreadyHasStoredEpost}` rather than the bare
+ * provider id: alreadyHasStoredEpost is a genuine INPUT to what this function
+ * fetches (it suppresses the umbrella attempt entirely, see below), so a run
+ * with one value must never be served from an entry produced with the other.
+ * Caching is opt-in — no cacheKey, no read and no write.
+ */
+async function resolveFoundTierCandidates(
+  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    navn?: string;
+  },
+  alreadyHasStoredEpost: boolean,
+  opts: { fetchImpl?: typeof fetch; cacheKey?: string },
+): Promise<OrgLinkedEmailCandidate[]> {
+  const cacheKey = opts.cacheKey ? `${opts.cacheKey}|${alreadyHasStoredEpost ? "1" : "0"}` : null;
+  const now = Date.now();
+  if (cacheKey) {
+    const hit = _claimHarvestCache.get(cacheKey);
+    if (hit) {
+      if (hit.expiresAt > now) return hit.candidates;
+      _claimHarvestCache.delete(cacheKey); // expired — drop it rather than let the Map grow
+    }
+  }
+
+  const fetchImpl = resolveHarvestFetchImpl(opts.fetchImpl);
 
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   const canHarvest = brregOk && !!provider.hjemmeside && isHjemmesideOwnershipVerified(provider);
   const harvestCandidates = canHarvest
-    ? pickHarvestCandidatesByTier(await harvestFoundOrgEmails(provider.hjemmeside as string, opts.fetchImpl))
+    ? pickHarvestCandidatesByTier(await harvestFoundOrgEmails(provider.hjemmeside as string, fetchImpl))
     : [];
 
   // SLICE 4 / AC5 — found_umbrella_member, a FALLBACK below the three
@@ -1316,34 +1518,19 @@ export async function deriveOrgLinkedEmailCandidatesWithHarvest(
   //       umbrella fetch instead).
   // See harvestUmbrellaMemberEmail()'s own doc comment for the full
   // attribution/hard-exclusion rationale.
-  const alreadyHasStoredEpost = baseCandidates.some((c) => c.source === "stored_epost_verified");
   const umbrellaCandidate =
     harvestCandidates.length === 0 && !alreadyHasStoredEpost && provider.navn
-      ? await harvestUmbrellaMemberEmail({ navn: provider.navn, org_nr: provider.org_nr }, { fetchImpl: opts.fetchImpl })
+      ? await harvestUmbrellaMemberEmail({ navn: provider.navn, org_nr: provider.org_nr }, { fetchImpl })
       : null;
 
-  // Merge in the documented priority order — (a) brreg_contact, then the
-  // three own-site found-tiers, then (SLICE 4) found_umbrella_member, then
-  // (c) stored_epost_verified — deduping by normalized email so the SAME
-  // address is never offered twice under two different source tags (e.g. a
-  // harvested same-domain address that happens to equal the stored,
-  // provenance-backed epost).
-  const brregContactCandidates = baseCandidates.filter((c) => c.source === "brreg_contact");
-  const storedEpostCandidates = baseCandidates.filter((c) => c.source === "stored_epost_verified");
-  const merged: OrgLinkedEmailCandidate[] = [];
-  const seen = new Set<string>();
-  for (const candidate of [
-    ...brregContactCandidates,
-    ...harvestCandidates,
-    ...(umbrellaCandidate ? [umbrellaCandidate] : []),
-    ...storedEpostCandidates,
-  ]) {
-    const key = candidate.email.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(candidate);
-  }
-  return merged;
+  const found = [...harvestCandidates, ...(umbrellaCandidate ? [umbrellaCandidate] : [])];
+  // A ZERO-candidate result is cached too, deliberately: "this producer's
+  // site published nothing usable" is exactly the answer a reload loop would
+  // otherwise re-fetch forever, and it is the MAJORITY case in the measured
+  // cohort. Not caching negatives would leave the amplification hole open for
+  // most of the 87 producers.
+  if (cacheKey) _claimHarvestCache.set(cacheKey, { candidates: found, expiresAt: now + CLAIM_HARVEST_CACHE_TTL_MS });
+  return found;
 }
 
 /** Mask an email for display ("we sent it to p***t@b*******t.no") — never
@@ -1471,21 +1658,42 @@ export type IssueClaimResult =
 // more than one. Deliberately a SOURCE TAG, never an email address — the
 // caller (route layer) never has a raw address to pass in the first place,
 // since the entry page only ever shows masked addresses. The source tag is
-// re-validated here against a FRESH deriveOrgLinkedEmailCandidatesWithOutreachLookup()
+// re-validated here against a FRESH deriveOrgLinkedEmailCandidatesWithHarvest()
 // call, not trusted as-is, so a caller can never steer a link to any address
 // beyond this provider's own already-qualified set.
-export function issueClaimMagicLink(
+//
+// SLICE 5 / AC7 (2026-08-07): this function is now ASYNC, and derives from
+// deriveOrgLinkedEmailCandidatesWithHarvest() — the harvest-aware list —
+// instead of the sync deriveOrgLinkedEmailCandidatesWithOutreachLookup().
+// That is deliberately the SAME list the public entry page renders its radio
+// options from, so a producer picking a found-tier address there validates
+// against the same set here (before this, a found-tier selection could not
+// exist at all; now it can, and both halves must agree about it). "Fresh"
+// still means fresh in the sense that matters: the DB-derived tiers are
+// re-read from SQLite on every single call, and only the network-derived
+// tiers can come from the ≤12-minute in-process cache — see
+// CLAIM_HARVEST_CACHE_TTL_MS. `provider.id` is the cache key, shared with the
+// GET entry route so the page and the POST it submits to cannot disagree.
+//
+// `provider.navn` reaches the umbrella tier for free here: getClaimProviderById()
+// already selects `navn` (see CLAIM_PROVIDER_COLUMNS), and ClaimProviderRow
+// therefore satisfies the optional `navn` in that function's own Pick — no
+// threading needed.
+export async function issueClaimMagicLink(
   providerId: string,
   brregContactEmail?: string | null,
-  opts: { isTest?: boolean; selectedSource?: OrgLinkedEmailCandidate["source"] } = {},
-): IssueClaimResult {
+  opts: { isTest?: boolean; selectedSource?: OrgLinkedEmailCandidate["source"]; fetchImpl?: typeof fetch } = {},
+): Promise<IssueClaimResult> {
   const provider = getClaimProviderById(providerId);
   if (!provider) return { ok: false, error: "provider_not_found" };
 
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   if (!brregOk) return { ok: false, error: "not_brreg_verified" };
 
-  const candidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider, brregContactEmail);
+  const candidates = await deriveOrgLinkedEmailCandidatesWithHarvest(provider, brregContactEmail, {
+    fetchImpl: opts.fetchImpl,
+    cacheKey: provider.id,
+  });
   if (candidates.length === 0) return { ok: false, error: "no_org_linked_email" };
 
   let chosen: OrgLinkedEmailCandidate;

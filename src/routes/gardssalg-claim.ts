@@ -2,7 +2,7 @@ import express, { Router, Request, Response } from "express";
 import {
   getClaimProviderById,
   getClaimProviderBySlug,
-  deriveOrgLinkedEmailCandidatesWithOutreachLookup,
+  deriveOrgLinkedEmailCandidatesWithHarvest,
   issueClaimMagicLink,
   verifyClaimToken,
   verifyGardssalgOwnerSessionToken,
@@ -33,11 +33,20 @@ import { emailService } from "../services/email-service";
 //
 // Differences from RFB's owner-portal.ts, all deliberate (see
 // services/gardssalg-claim.ts's module doc for the full rationale):
-//   - The claim entry page never asks the visitor to type an email. The
-//     ONE org-linked email (Brreg contact, or post@<ownership-verified-
-//     domain>) is derived entirely server-side — Daniel's "never open
-//     claiming by name alone" requirement — and the masked address is
-//     shown so the visitor knows where the link went.
+//   - The claim entry page never asks the visitor to type an email. Every
+//     org-linked candidate address is derived entirely server-side —
+//     Daniel's "never open claiming by name alone" requirement — and only
+//     MASKED forms are ever rendered, so the visitor knows where the link
+//     went without the page ever carrying a full address.
+//     (Was "the ONE org-linked email (Brreg contact, or
+//     post@<ownership-verified-domain>)". Both halves of that are now
+//     wrong: dev-request 2026-08-06-claim-produsent-velger-mottakeradresse
+//     made it a LIST the producer can choose from, and dev-request
+//     2026-08-06-aldri-gjett-epostadresse retired the post@<domain> guess
+//     outright (slice 1) and replaced it with tiers of addresses actually
+//     FOUND on the producer's own verified site / their umbrella's member
+//     list (slices 2 & 4, live-wired into this route in slice 5). See
+//     services/gardssalg-claim.ts's module doc for the tier list.)
 //   - If no org-linked email can be derived, there is NO self-service path
 //     at all: the page shows the manual-fallback contact
 //     (kontakt@opplevagent.no) instead of a request form.
@@ -262,21 +271,31 @@ router.get("/kategori/gardssalg/eier/magic-link-verify", (req: Request, res: Res
 // point ("Er dette din bedrift?"). Never asks for a typed email — the
 // eligible org-linked address (if any) is derived server-side.
 // ─────────────────────────────────────────────────────────────────
-router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Response) => {
+// ASYNC since dev-request 2026-08-06-aldri-gjett-epostadresse SLICE 5 / AC7:
+// the candidate derivation below now performs the found-address harvest,
+// which is IO. The handler keeps the SAME single top-level try/catch this
+// file uses on every other page-rendering handler (see magic-link-verify
+// above and .../portal below) — an `await` inside a try block is caught by
+// that block exactly like a synchronous throw was, so the 500-page fallback
+// and its console.error line are unchanged, not re-invented.
+router.get("/kategori/gardssalg/eier/:providerSlug", async (req: Request, res: Response) => {
   try {
     const slug = String((req.params as any).providerSlug || "");
     const provider = getClaimProviderBySlug(slug);
     if (!provider) return res.status(404).send(notFoundPage());
 
-    // Must mirror issueClaimMagicLink()'s own (b-epost) lookup exactly —
-    // otherwise this page could show the "send me a link" form for a
-    // provider whose POST would then fail (or vice versa: show the fallback
-    // for a provider the POST would actually succeed for). Same lazy
-    // wrapper issueClaimMagicLink() uses, so the RFB cross-DB lookup only
-    // ever runs when it could actually change the outcome. Candidates form
-    // (dev-request 2026-08-06-claim-produsent-velger-mottakeradresse) —
-    // 0/1/2+ are the three cases below.
-    const candidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider);
+    // Must mirror issueClaimMagicLink()'s own derivation exactly — otherwise
+    // this page could show the "send me a link" form for a provider whose
+    // POST would then fail (or vice versa: show the fallback for a provider
+    // the POST would actually succeed for). Same harvest-aware wrapper
+    // issueClaimMagicLink() uses, with the SAME cacheKey (provider.id), so
+    // the two halves cannot disagree AND a repeat page view inside the
+    // harvest TTL costs the producer's website nothing — see
+    // CLAIM_HARVEST_CACHE_TTL_MS's own comment in services/gardssalg-claim.ts
+    // for why that cache exists and why this UNAUTHENTICATED route is the
+    // reason it exists. Candidates form (dev-request 2026-08-06-claim-
+    // produsent-velger-mottakeradresse) — 0/1/2+ are the three cases below.
+    const candidates = await deriveOrgLinkedEmailCandidatesWithHarvest(provider, undefined, { cacheKey: provider.id });
     const backUrl = provider.slug ? `/kategori/gardssalg/produsent/${encodeURIComponent(provider.slug)}` : "/kategori/gardssalg";
 
     const status = String(req.query.status || "");
@@ -384,15 +403,29 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
 // other posted "selected" value (typo, stale page, hostile client) is
 // treated as no selection at all, never forwarded — the union type alone is
 // a compile-time guarantee, not a runtime one, since req.body is unknown().
-// NOTE: deriveOrgLinkedEmailCandidatesWithHarvest() (services/gardssalg-
-// claim.ts, dev-request 2026-08-06-aldri-gjett-epostadresse Slice 2) can also
-// produce "found_same_domain" / "found_contact_page" / "found_site_other",
-// and (Slice 4, AC5) "found_umbrella_member" — this list does NOT include
-// any of them yet, since that function isn't wired into this route. Whoever
-// wires it in must extend this list at the same time, or a harvested
-// candidate rendered as a radio option will silently fail to register as a
-// selection.
-const CLAIM_EMAIL_SOURCES = ["brreg_contact", "verified_domain_address", "stored_epost_verified"] as const;
+// SLICE 5 / AC7 (2026-08-07) — the four found-tiers ARE now in this list,
+// because deriveOrgLinkedEmailCandidatesWithHarvest() is now what both this
+// route and the GET entry page above derive from, so a harvested candidate
+// really can be rendered as a radio option here. (The slice-2 version of this
+// comment warned that whoever wired the harvest in had to extend this list at
+// the same time or a harvested selection would silently fail to register —
+// this is that extension.)
+//
+// "verified_domain_address" stays for exactly the reason gardssalg-claim.ts's
+// module doc gives: it is still a valid member of the OrgLinkedEmailCandidate
+// union and a valid HISTORICAL email_source value, and keeping it here costs
+// nothing — no live derivation can produce it, so a client naming it still
+// lands on issueClaimMagicLink()'s "invalid_selection" (there is no such
+// candidate to match), which is what the j2 regression test pins.
+const CLAIM_EMAIL_SOURCES = [
+  "brreg_contact",
+  "verified_domain_address",
+  "stored_epost_verified",
+  "found_same_domain",
+  "found_contact_page",
+  "found_site_other",
+  "found_umbrella_member",
+] as const;
 function parseSelectedSource(value: unknown): (typeof CLAIM_EMAIL_SOURCES)[number] | undefined {
   return typeof value === "string" && (CLAIM_EMAIL_SOURCES as readonly string[]).includes(value)
     ? (value as (typeof CLAIM_EMAIL_SOURCES)[number])
@@ -403,7 +436,17 @@ router.post(
   "/kategori/gardssalg/eier/:providerId/request",
   express.json(),
   express.urlencoded({ extended: false }),
-  (req: Request, res: Response) => {
+  // ASYNC since SLICE 5 / AC7 — issueClaimMagicLink() is now async (it can
+  // harvest). The awaited call is wrapped in the same shape as this file's
+  // other handlers' try/catch: log with the `[gardssalg-claim]` prefix, then
+  // answer in whichever of the two response shapes this dual route is being
+  // used in. Express 5 would already funnel a rejected handler promise to its
+  // default error handler (a bare 500 HTML page) even without this, so the
+  // catch is not load-bearing for correctness — it exists so the JS-fetch
+  // client above gets a parseable `{success:false, error}` body it can turn
+  // into the page's own generic "Kunne ikke sende lenke ..." alert, instead
+  // of an HTML error page it would fail to JSON-parse and silently swallow.
+  async (req: Request, res: Response) => {
     const providerId = String((req.params as any).providerId || "");
     const wantsJson = (req.headers["content-type"] || "").includes("application/json") || (req.headers.accept || "").includes("application/json");
     const selectedSource = parseSelectedSource((req.body as any)?.selected);
@@ -411,7 +454,15 @@ router.post(
     const provider = getClaimProviderById(providerId);
     const redirectBase = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}` : null;
 
-    const result = issueClaimMagicLink(providerId, undefined, { selectedSource });
+    let result: Awaited<ReturnType<typeof issueClaimMagicLink>>;
+    try {
+      result = await issueClaimMagicLink(providerId, undefined, { selectedSource });
+    } catch (err) {
+      console.error("[gardssalg-claim] POST /kategori/gardssalg/eier/:providerId/request error:", err);
+      if (wantsJson) return res.status(500).json({ success: false, error: "internal_error" });
+      if (!redirectBase) return res.status(404).send(notFoundPage());
+      return res.redirect(303, `${redirectBase}?status=error&reason=internal_error`);
+    }
 
     if (!result.ok) {
       const status =

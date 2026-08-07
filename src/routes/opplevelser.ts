@@ -4749,14 +4749,34 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
 // which one, same as the public route. Kept as its own small allow-list
 // rather than importing the route file's private helper, to avoid coupling
 // an admin-API route to a public-page route module.
-const ADMIN_CLAIM_TEST_SEND_SOURCES = ["brreg_contact", "verified_domain_address", "stored_epost_verified"] as const;
+// SLICE 5 / AC7 (dev-request 2026-08-06-aldri-gjett-epostadresse): extended
+// with the four found-tiers at the same time routes/gardssalg-claim.ts's own
+// CLAIM_EMAIL_SOURCES was — issueClaimMagicLink() now derives from
+// deriveOrgLinkedEmailCandidatesWithHarvest(), so an admin running the claim
+// E2E against a producer whose address came off their own website must be
+// able to name that tier here too. Still its own copy, not an import, for the
+// coupling reason stated above.
+const ADMIN_CLAIM_TEST_SEND_SOURCES = [
+  "brreg_contact",
+  "verified_domain_address",
+  "stored_epost_verified",
+  "found_same_domain",
+  "found_contact_page",
+  "found_site_other",
+  "found_umbrella_member",
+] as const;
 function parseAdminSelectedSource(value: unknown): (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number] | undefined {
   return typeof value === "string" && (ADMIN_CLAIM_TEST_SEND_SOURCES as readonly string[]).includes(value)
     ? (value as (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number])
     : undefined;
 }
 
-router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response) => {
+// ASYNC since SLICE 5 / AC7 — issueClaimMagicLink() is now async. PURELY a
+// sync->async plumbing change: the isTest semantics (dev-request
+// 2026-07-26-booking-test-send-guard), the TEST_SEND_REDIRECT_EMAIL
+// precondition above it, the guard ordering, and every response field below
+// are untouched.
+router.post("/admin/claim-test-send", requireAdmin, async (req: Request, res: Response) => {
   const redirect = testSendRedirectAddress();
   if (!redirect) {
     return res.status(400).json({
@@ -4775,7 +4795,7 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
   }
   const selectedSource = parseAdminSelectedSource(body.selected_source);
 
-  const result = issueClaimMagicLink(providerId, null, { isTest: true, selectedSource });
+  const result = await issueClaimMagicLink(providerId, null, { isTest: true, selectedSource });
   if (!result.ok) {
     const status =
       result.error === "provider_not_found" ? 404
