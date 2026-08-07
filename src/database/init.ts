@@ -3891,6 +3891,30 @@ function initSchema(db: Database.Database): void {
     );
   } catch { /* partial index unsupported or already created */ }
 
+  // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
+  // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
+  // outreach_daily_send_cap: one row per UTC calendar day, holding an
+  // atomically-incremented reservation counter. routes/crm.ts POST /compose
+  // reserves a slot with a single synchronous better-sqlite3 statement
+  // (INSERT ... ON CONFLICT DO UPDATE ... WHERE reserved_count < cap)
+  // BEFORE calling emailService.sendRaw — this is what makes the cap
+  // atomic across concurrent requests despite the await on the actual send;
+  // a plain pre-flight COUNT(*) would not be (see routes/crm.ts for the
+  // interleaving scenario this avoids). A failed send decrements
+  // reserved_count back so a failed attempt doesn't permanently eat into
+  // the day's real cap. Purely additive — brand-new table, plain
+  // `CREATE TABLE IF NOT EXISTS` is itself the safe migration.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outreach_daily_send_cap (
+        day TEXT PRIMARY KEY,
+        reserved_count INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+  } catch (err) {
+    console.error("Migration outreach_daily_send_cap failed:", err);
+  }
+
 }
 
 export function closeDb(): void {
