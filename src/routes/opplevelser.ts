@@ -7034,8 +7034,17 @@ function computeBookingStatus(
 //   2. no_website        — (has a contact method, but) no website at all: an
 //      outreach/claim candidate lacking a source to enrich from, not a
 //      content-completeness gap.
-//   3. needs_enrichment    — has a website and a contact method, but is
-//      missing about_text/opening_hours_text/etc.
+//   3. needs_enrichment    — has a website and a contact method, but fails
+//      dev-request 2026-08-07-outreach-pool-krav123-og-pilot's krav 2:
+//      about_text, products, and brreg_verified all present/true. Opening
+//      hours and visit text (krav 3) are DELIBERATELY excluded from this
+//      gate as of that dev-request — many gårdssalg producers (breweries,
+//      distilleries) run "open by arrangement" with no fixed hours, and
+//      requiring the field up front was a false blocker; the claim flow is
+//      how a producer fills it in themselves, not a precondition for
+//      outreach. has_opening_hours/has_visit_text remain informational-only
+//      fields on the row output below (computeGardssalgReadinessRows),
+//      unrelated to this gate now.
 //   4. content-complete: would have been "outreach_ready" before dev-request
 //      2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach, Steg 4 —
 //      now gated by four further checks (skjult / ikke_soekbar /
@@ -7053,7 +7062,8 @@ export type GardssalgReadinessTier =
 export function computeGardssalgReadinessTier(input: {
   has_website: boolean;
   has_about_text: boolean;
-  has_opening_hours: boolean;
+  has_products: boolean;
+  brreg_verified: boolean;
   has_email: boolean;
   has_phone: boolean;
   catalog_hidden: boolean;
@@ -7063,7 +7073,10 @@ export function computeGardssalgReadinessTier(input: {
 }): GardssalgReadinessTier {
   if (!input.has_email && !input.has_phone) return "unreachable";
   if (!input.has_website) return "no_website";
-  if (!(input.has_about_text && input.has_opening_hours)) return "needs_enrichment";
+  // krav 2 (dev-request 2026-08-07-outreach-pool-krav123-og-pilot): content-
+  // completeness is about_text + products + brreg_verified. Opening
+  // hours/visit text (krav 3) are explicitly NOT part of this gate anymore.
+  if (!(input.has_about_text && input.has_products && input.brreg_verified)) return "needs_enrichment";
   // Content-complete from here on — Steg 4 tightens "ready" beyond "fields
   // are non-empty" with four more checks, in this order:
   //   - catalog_hidden first: a hidden row is ALSO unsearchable by
@@ -7134,6 +7147,7 @@ function computeGardssalgReadinessRows(
     catalog_hidden: number | null;
     slug: string | null;
     field_provenance: string | null;
+    brreg_verified: number | null;
   }> = [];
 
   // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
@@ -7143,7 +7157,7 @@ function computeGardssalgReadinessRows(
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
-                field_provenance
+                field_provenance, brreg_verified
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
   const params: string[] = [];
@@ -7185,11 +7199,13 @@ function computeGardssalgReadinessRows(
     const is_searchable = !catalog_hidden && present(p.slug);
     const website_verified = isHjemmesideVerified(p.field_provenance);
     const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
+    const brreg_verified = p.brreg_verified === 1;
 
     const readiness_tier = computeGardssalgReadinessTier({
       has_website,
       has_about_text,
-      has_opening_hours,
+      has_products,
+      brreg_verified,
       has_email,
       has_phone,
       catalog_hidden,

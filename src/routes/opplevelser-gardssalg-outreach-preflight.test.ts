@@ -35,6 +35,15 @@
  *       downgrade pattern with reason:"duplikat_epost_domene"; a third
  *       outreach_ready fixture with a unique email in the SAME batch stays
  *       go:true, unaffected.
+ *
+ * Redefined for dev-request 2026-08-07-outreach-pool-krav123-og-pilot (AC1 +
+ * AC2): the needs_enrichment gate is now krav 2 (about_text + products +
+ * brreg_verified), opening hours/visit text (krav 3) no longer required.
+ * prov-ready deliberately carries NO opening_hours_text/visit_text (proving
+ * go:true doesn't need them). AC2 -- this file exercises the SAME shared
+ * computeGardssalgReadinessRows/computeGardssalgReadinessTier as the sibling
+ * readiness-report test, so the gate change is proven to apply identically
+ * to the preflight endpoint without a second, forked copy of the logic.
  */
 
 export interface TestSummary {
@@ -136,11 +145,13 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
            (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
             epost, telefon, hjemmeside, about_text, visit_text, opening_hours_text,
             products, content_source, booking_live, catalog_hidden, slug, field_provenance,
+            brreg_verified,
             enrichment_state, verification_status, source, confidence)
          VALUES
            (@id, @navn, 'experiences', @org_nr, @kommune, @rfb_seed_source, @producer_type,
             @epost, @telefon, @hjemmeside, @about_text, @visit_text, @opening_hours_text,
             @products, @content_source, @booking_live, @catalog_hidden, @slug, @field_provenance,
+            @brreg_verified,
             'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
       // Same "provider_link" dublettkonflikt trigger as the readiness test —
@@ -158,13 +169,19 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
       // report test — kept in sync deliberately, since both exercise the
       // SAME computeGardssalgReadinessRows/computeGardssalgReadinessTier) ──
       process.env.BOOKING_DISPATCH_ENABLED = "true";
+      // Deliberately carries NO opening_hours_text/visit_text (dev-request
+      // 2026-08-07-outreach-pool-krav123-og-pilot, krav 3: opening
+      // hours/visit text must NOT block outreach_ready anymore) -- proves
+      // the preflight go:true case doesn't need them either (AC2: same
+      // shared tiering logic as the readiness report).
       insertProvider.run({
         id: "prov-ready", navn: "Klar Gård AS", org_nr: "111111111", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: null,
         epost: "post@klargard.no", telefon: null, hjemmeside: "https://klargard.no",
-        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
         products: "Sider, cider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "klar-gard-as", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-enrich", navn: "Under Arbeid Gård", org_nr: "222222222", kommune: "Ulvik",
@@ -173,6 +190,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 0,
       });
       insertProvider.run({
         id: "prov-noweb", navn: "Ingen Nettside Gård", org_nr: "333333333", kommune: "Aurland",
@@ -181,6 +199,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: null,
         booking_live: null, catalog_hidden: null, slug: null, field_provenance: null,
+        brreg_verified: 0,
       });
       insertProvider.run({
         id: "prov-unreach", navn: "Utilgjengelig Gård", org_nr: "444444444", kommune: "Lærdal",
@@ -189,6 +208,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Lø 10-14",
         products: "Eplemost", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-hidden", navn: "Skjult Test Gård", org_nr: "555555555", kommune: "Voss",
@@ -197,6 +217,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Alle dager",
         products: "Sider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 1, slug: "skjult-test-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-claimed", navn: "Krevd Gård AS", org_nr: "666666666", kommune: "Voss",
@@ -205,6 +226,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Skrevet av eier selv.", visit_text: "Kom innom!", opening_hours_text: "Lø-Sø 11-15",
         products: "Eplevin", content_source: "manual",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-unverified", navn: "Uverifisert Gård AS", org_nr: "888888888", kommune: "Voss",
@@ -213,6 +235,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 10-17",
         products: "Most", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "uverifisert-gard", field_provenance: null,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-conflict", navn: "Konflikt Gård AS", org_nr: "999999999", kommune: "Voss",
@@ -221,11 +244,33 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 09-16",
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "konflikt-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertExperience.run({
         id: "exp-konflikt-gard", provider_id: "prov-conflict",
         title: "Konflikt Gård — gårdsbesøk og smaking",
         booking_url: "https://uenighetsbutikk.no/produkt",
+      });
+      // krav-2 negative fixtures (opening hours present, but that no longer
+      // matters -- brreg_verified/products are the actual krav-2 gate now):
+      // used ONLY by the (i) block below.
+      insertProvider.run({
+        id: "prov-no-brreg", navn: "Ubekreftet Brreg Gård", org_nr: "121212121", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@ubekreftetbrreg.no", telefon: null, hjemmeside: "https://ubekreftetbrreg.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 0,
+      });
+      insertProvider.run({
+        id: "prov-no-products", navn: "Uten Produkter Gård", org_nr: "131313131", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@utenprodukter.no", telefon: null, hjemmeside: "https://utenprodukter.no",
+        about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 09-15",
+        products: null, content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
+        brreg_verified: 1,
       });
 
       // ── outreach-guard fixtures (dev-request 2026-07-31-gardssalg-
@@ -240,6 +285,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
         products: "Sider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "duplikat-epost-gard-en", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-dup-email-2", navn: "Duplikat Epost Gård To", org_nr: "202020202", kommune: "Voss",
@@ -250,6 +296,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 09-15",
         products: "Cider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "duplikat-epost-gard-to", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-dup-domain-1", navn: "Duplikat Domene Gård Én", org_nr: "303030303", kommune: "Voss",
@@ -258,6 +305,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ma-Fr 10-16",
         products: "Sider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "duplikat-domene-gard-en", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-dup-domain-2", navn: "Duplikat Domene Gård To", org_nr: "404040404", kommune: "Voss",
@@ -268,6 +316,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "Ti-Lø 09-15",
         products: "Cider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "duplikat-domene-gard-to", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
       insertProvider.run({
         id: "prov-dup-unique", navn: "Unik Epost Gård", org_nr: "505050505", kommune: "Voss",
@@ -276,6 +325,7 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         about_text: "Om gården.", visit_text: "Besøksinfo.", opening_hours_text: "On-Fr 10-16",
         products: "Most", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "unik-epost-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
       });
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
@@ -427,6 +477,29 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         "h5: unique-email candidate in the same batch stays go:true, unaffected",
       );
       assertEq(dedup.body.summary, { go: 3, no_go: 2, total: 5 }, "h6: summary reflects the two downgrades (3 go, 2 no_go of 5)");
+
+      // ── (i) krav-2 negative cases (dev-request
+      // 2026-08-07-outreach-pool-krav123-og-pilot, AC1): opening hours
+      // present does NOT make a row go:true anymore -- brreg_verified and
+      // products are the actual krav-2 gate now. Also proves AC2: the SAME
+      // needs_enrichment reason the readiness report would tier this row as
+      // comes back from preflight too (shared tiering function).
+      const krav2Negatives = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        body: { provider_ids: ["prov-no-brreg", "prov-no-products"] },
+      });
+      assertEq(krav2Negatives.status, 200, "i0: krav-2 negative batch -> 200");
+      assertEq(
+        krav2Negatives.body.results[0],
+        { provider_id: "prov-no-brreg", name: "Ubekreftet Brreg Gård", go: false, reason: "needs_enrichment" },
+        "i1: prov-no-brreg (about_text+products+opening_hours present, brreg_verified missing) -> go:false, reason:needs_enrichment",
+      );
+      assertEq(
+        krav2Negatives.body.results[1],
+        { provider_id: "prov-no-products", name: "Uten Produkter Gård", go: false, reason: "needs_enrichment" },
+        "i2: prov-no-products (about_text+brreg_verified+opening_hours present, products missing) -> go:false, reason:needs_enrichment",
+      );
+      assertEq(krav2Negatives.body.summary, { go: 0, no_go: 2, total: 2 }, "i3: summary is all no_go for the krav-2 negative batch");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-preflight: unexpected error: " + String(err?.stack || err?.message || err));
