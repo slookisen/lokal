@@ -663,6 +663,7 @@ export function homeStrings(lang: Lang) {
     counterExperiences: "Opplevelser", counterProviders: "Tilbydere", counterMunicipalities: "Kommuner",
     counterAiExplain: "AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.",
     counterWindowPre: "Siste", counterWindowPost: "dager",
+    counterSincePre: "Tall siden",
     networkLabel: "En del av A2A-nettverket:", networkTagline: "Bygget for både mennesker og AI-agenter",
     // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2:
     // the homepage drikkested feature section (rendered only when
@@ -707,6 +708,7 @@ export function homeStrings(lang: Lang) {
     counterExperiences: "Experiences", counterProviders: "Providers", counterMunicipalities: "Municipalities",
     counterAiExplain: "AI search: a human asked ChatGPT, Claude or Perplexity, and the assistant fetched information from us in real time. Crawlers: automated indexing and scraping.",
     counterWindowPre: "Last", counterWindowPost: "days",
+    counterSincePre: "Figures since",
     networkLabel: "Part of the A2A network:", networkTagline: "Built for both humans and AI agents",
     // Keep in sync with the `no` object above (S2 drikkested feature section).
     drikkeKicker: "New", drikkeTitle: "Visit local drink producers",
@@ -828,12 +830,24 @@ router.get("/", (req: Request, res: Response) => {
   // for the exact scoping/exclusion rules this reuses from the RFB homepage
   // pattern). Read defensively — must never break the homepage.
   const numFmt = lang === "en" ? "en-US" : "nb-NO";
-  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, aiSearchViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0 };
+  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, aiSearchViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0, sinceDate: null as string | null };
   try {
     counters = getOaHomeCounters();
   } catch {
     // Analytics/catalog DB not open — render the strip with 0s rather than
     // failing the whole homepage.
+  }
+  // Since-date: the oldest analytics datapoint the counters above are drawn
+  // from (counters.sinceDate, from oa-home-counters.ts). Omit entirely when
+  // null (no analytics rows yet) or unparseable — never render
+  // "since Invalid Date".
+  let sinceDateFragment = "";
+  if (counters.sinceDate) {
+    const sinceD = new Date(counters.sinceDate);
+    if (!isNaN(sinceD.getTime())) {
+      const formattedSinceDate = sinceD.toLocaleDateString(numFmt, { day: "numeric", month: "short", year: "numeric" });
+      sinceDateFragment = ` &middot; ${S.counterSincePre} ${formattedSinceDate}`;
+    }
   }
   const counterStripHtml = `
   <div class="counters" aria-label="${S.counterAria}">
@@ -852,7 +866,7 @@ router.get("/", (req: Request, res: Response) => {
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
     </div>
-    <div class="counter-note">${S.counterAiExplain} &middot; ${S.counterWindowPre} ${counters.windowDays} ${S.counterWindowPost}</div>
+    <div class="counter-note">${S.counterAiExplain} &middot; ${S.counterWindowPre} ${counters.windowDays} ${S.counterWindowPost}${sinceDateFragment}</div>
     <div class="network-strip">${S.networkLabel}
       <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot;
       <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a>
