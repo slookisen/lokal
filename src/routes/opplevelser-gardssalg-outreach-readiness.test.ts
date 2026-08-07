@@ -28,6 +28,21 @@
  * cascade), and two new fixtures (prov-no-brreg, prov-no-products) prove the
  * new krav-2 fields DO still gate, independently of opening hours.
  *
+ * Extended for dev-request
+ * 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 1:
+ * has_duplicate_conflict (and with it the dublettkonflikt tier) is now set
+ * ONLY by conflict/ambiguous pairs whose match_basis is "provider_link" —
+ * an explicit FK, real evidence. name_token/host_name pairs (proven >=13/14
+ * false by the 2026-08-01 semantic spot-check) no longer block the pool;
+ * they surface per-row as the informational flag
+ * `name_token_conflict_candidate` plus the summary count
+ * `name_token_conflict_candidates`. The new prov-nametoken fixture is the
+ * regression case: an otherwise-outreach_ready producer whose name shares a
+ * distinctive token with an unlinked experience row on a different domain
+ * (a status="conflict", basis="name_token" pair) MUST tier outreach_ready —
+ * on the pre-slice-1 code it tiered dublettkonflikt, so these assertions
+ * fail if a name-token pair ever reaches the gate again.
+ *
  * Mirrors opplevelser-gardssalg-contact-coverage.test.ts's setup
  * (EXPERIENCES_DB_PATH=":memory:", fresh require of db-factory + opplevelser
  * router per run, callRoute() exercising router.handle() directly with
@@ -316,6 +331,32 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         title: "Konflikt Gård — gårdsbesøk og smaking",
         booking_url: "https://uenighetsbutikk.no/produkt",
       });
+      // name_token-basis candidate (dev-request
+      // 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 1's core
+      // regression fixture): fully outreach_ready on its own merits (krav 1
+      // + krav 2 + searchable + verified + not hidden), AND an UNLINKED
+      // experiences row (provider_id NULL) shares the distinctive >=5-char
+      // name token "fjellbekken" while its booking_url sits on a different
+      // registrable domain -- a status="conflict", match_basis="name_token"
+      // pair (exactly the >=13/14-false pattern: a kayak tour sharing a
+      // place-name token with a brewery). Slice 1's whole point: this row
+      // must tier outreach_ready and carry name_token_conflict_candidate
+      // instead of being dublettkonflikt-blocked. On pre-slice-1 code it
+      // tiered dublettkonflikt -- the f-assertions below fail there.
+      insertProvider.run({
+        id: "prov-nametoken", navn: "Fjellbekken Håndbryggeri AS", org_nr: "141414141", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@fjellbekkenbrygg.no", telefon: null, hjemmeside: "https://fjellbekkenbrygg.no",
+        about_text: "Om bryggeriet.", visit_text: null, opening_hours_text: null,
+        products: "Håndverksøl", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "fjellbekken-handbryggeri", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
+      });
+      insertExperience.run({
+        id: "exp-fjellbekken-kajakk", provider_id: null,
+        title: "Fjellbekken kajakktur med fjordsafari",
+        booking_url: "https://kajakkeventyr.no/turer",
+      });
       // non-gårdssalg provider (no producer_type, not rfb-seed) -> excluded
       // entirely, same scoping as the sibling contact-coverage report.
       insertProvider.run({
@@ -356,11 +397,12 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         "prov-claimed": "Krevd Gård AS",
         "prov-unverified": "Uverifisert Gård AS",
         "prov-conflict": "Konflikt Gård AS",
+        "prov-nametoken": "Fjellbekken Håndbryggeri AS",
       };
       const byId = (id: string) =>
         (ok.body.providers as any[]).find((r) => r.name === NAME_BY_FIXTURE_ID[id]);
 
-      assertEq(ok.body.providers.length, 10, "d1: total providers is 10 (non-gårdssalg row excluded)");
+      assertEq(ok.body.providers.length, 11, "d1: total providers is 11 (non-gårdssalg row excluded)");
 
       const ready = byId("prov-ready");
       assertTrue(!!ready, "b3: outreach_ready fixture present");
@@ -443,6 +485,18 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(conflict?.website_verified, true, "b45: prov-conflict website_verified true (verified field_provenance)");
       assertEq(conflict?.has_duplicate_conflict, true, "b46: prov-conflict has_duplicate_conflict true");
 
+      // ── (f) slice 1 (2026-08-07-dublett-evidensbasis-og-pool-avblokkering):
+      // evidence basis only — a name_token pair must never block the pool
+      // again. These assertions FAIL on the pre-slice-1 code (prov-nametoken
+      // tiered dublettkonflikt there).
+      const nameToken = byId("prov-nametoken");
+      assertTrue(!!nameToken, "f1: prov-nametoken fixture is present");
+      assertEq(nameToken?.readiness_tier, "outreach_ready", "f2: prov-nametoken tiered outreach_ready — a name_token-basis conflict pair must NOT block the pool");
+      assertEq(nameToken?.has_duplicate_conflict, false, "f3: prov-nametoken has_duplicate_conflict false (name_token basis is candidate-only, never evidence)");
+      assertEq(nameToken?.name_token_conflict_candidate, true, "f4: prov-nametoken carries the informational name_token_conflict_candidate flag");
+      assertEq(conflict?.name_token_conflict_candidate, false, "f5: prov-conflict (provider_link basis) does NOT carry the candidate flag — the two fields never bleed into each other");
+      assertEq(ready?.name_token_conflict_candidate, false, "f6: prov-ready (no matching experience at all) carries no candidate flag");
+
       // No non-gårdssalg row leaked in.
       assertTrue(
         !(ok.body.providers as any[]).some((r) => r.name === "Ikke Gårdssalg AS"),
@@ -450,13 +504,13 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       );
 
       // ── (c) summary ──────────────────────────────────────────────────────
-      // 10 fixtures: prov-ready (outreach_ready), prov-enrich + prov-no-brreg
-      // + prov-no-products (needs_enrichment, 3), prov-noweb (no_website),
-      // prov-unreach (unreachable), prov-hidden (skjult), prov-claimed
-      // (ikke_soekbar), prov-unverified (nettsted_uverifisert), prov-conflict
-      // (dublettkonflikt).
-      assertEq(ok.body.summary.total, 10, "c1: summary.total is 10");
-      assertEq(ok.body.summary.outreach_ready, 1, "c2: summary.outreach_ready counts prov-ready only");
+      // 11 fixtures: prov-ready + prov-nametoken (outreach_ready, 2),
+      // prov-enrich + prov-no-brreg + prov-no-products (needs_enrichment, 3),
+      // prov-noweb (no_website), prov-unreach (unreachable), prov-hidden
+      // (skjult), prov-claimed (ikke_soekbar), prov-unverified
+      // (nettsted_uverifisert), prov-conflict (dublettkonflikt).
+      assertEq(ok.body.summary.total, 11, "c1: summary.total is 11");
+      assertEq(ok.body.summary.outreach_ready, 2, "c2: summary.outreach_ready counts prov-ready + prov-nametoken (slice 1: the candidate no longer blocks)");
       assertEq(ok.body.summary.needs_enrichment, 3, "c3: summary.needs_enrichment counts prov-enrich + prov-no-brreg + prov-no-products");
       assertEq(ok.body.summary.no_website, 1, "c4: summary.no_website counts prov-noweb");
       assertEq(ok.body.summary.unreachable, 1, "c5: summary.unreachable counts prov-unreach");
@@ -470,6 +524,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         ok.body.summary.skjult + ok.body.summary.ikke_soekbar +
         ok.body.summary.nettsted_uverifisert + ok.body.summary.dublettkonflikt;
       assertEq(summarySum, ok.body.summary.total, "c6: per-tier summary counts (all 8 tiers) sum to total (every row tiered exactly once)");
+      assertEq(ok.body.summary.name_token_conflict_candidates, 1, "c7: summary.name_token_conflict_candidates counts prov-nametoken only (informational, NOT a tier — excluded from the c6 sum)");
 
       // ── (e) zero-provider edge case ─────────────────────────────────────
       expDb.prepare("DELETE FROM experiences").run();
@@ -486,6 +541,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(empty.body.summary.ikke_soekbar, 0, "e9: summary.ikke_soekbar is 0");
       assertEq(empty.body.summary.nettsted_uverifisert, 0, "e10: summary.nettsted_uverifisert is 0");
       assertEq(empty.body.summary.dublettkonflikt, 0, "e11: summary.dublettkonflikt is 0");
+      assertEq(empty.body.summary.name_token_conflict_candidates, 0, "e12: summary.name_token_conflict_candidates is 0");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-readiness: unexpected error: " + String(err?.stack || err?.message || err));

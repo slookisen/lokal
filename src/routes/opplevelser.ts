@@ -7280,6 +7280,7 @@ function computeGardssalgReadinessRows(
   is_searchable: boolean;
   website_verified: boolean;
   has_duplicate_conflict: boolean;
+  name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
 }> {
@@ -7331,10 +7332,30 @@ function computeGardssalgReadinessRows(
   // UNFILTERED regardless of providerIds — conflict detection needs the
   // whole picture, not just the requested subset.
   const { pairs: conflictPairs } = runGardssalgExperienceConflictScan(expDb);
+  // dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 1:
+  // only EVIDENCE-based pairs may block the outreach pool. The 2026-08-01
+  // semantic spot-check proved the name_token basis ≥13/14 false at this
+  // corpus size (different businesses sharing a place-name or common word —
+  // "aurora", "silver", "ulvik", …), and host_name shares the same
+  // shared-token foundation. Treating those as pool-blocking conflicts is
+  // exactly the "false blockings" failure Daniel ruled out: a real producer
+  // gets excluded from outreach because a kayak tour shares a token with
+  // their name. provider_link is a real FK — an explicit, deliberate link —
+  // so a conflicting/ambiguous pair on that basis is a genuine data problem
+  // and keeps blocking. name_token/host_name pairs remain visible as
+  // CANDIDATES (own field below) so the readiness report loses no insight;
+  // they feed slice 2's confirmation queue, and only a human-confirmed pair
+  // will ever block again (via a basis the queue will stamp — not built yet,
+  // deliberately: until then candidates never block).
   const duplicateConflictProducerIds = new Set<string>();
+  const nameTokenConflictCandidateIds = new Set<string>();
   for (const pair of conflictPairs) {
     if (pair.status === "conflict" || pair.status === "ambiguous") {
-      duplicateConflictProducerIds.add(pair.producer_id);
+      if (pair.match_basis === "provider_link") {
+        duplicateConflictProducerIds.add(pair.producer_id);
+      } else {
+        nameTokenConflictCandidateIds.add(pair.producer_id);
+      }
     }
   }
 
@@ -7352,6 +7373,7 @@ function computeGardssalgReadinessRows(
     const is_searchable = !catalog_hidden && present(p.slug);
     const website_verified = isHjemmesideVerified(p.field_provenance);
     const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
+    const name_token_conflict_candidate = nameTokenConflictCandidateIds.has(p.id);
     const brreg_verified = p.brreg_verified === 1;
 
     const readiness_tier = computeGardssalgReadinessTier({
@@ -7384,6 +7406,7 @@ function computeGardssalgReadinessRows(
       is_searchable,
       website_verified,
       has_duplicate_conflict,
+      name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
     };
@@ -7411,10 +7434,15 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     ikke_soekbar: 0,
     nettsted_uverifisert: 0,
     dublettkonflikt: 0,
+    // dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering,
+    // slice 1: NOT a tier — the count of rows carrying the informational
+    // name_token/host_name candidate flag (rows may sit in any tier).
+    name_token_conflict_candidates: 0,
     total: 0,
   };
   for (const p of providers) {
     summary[p.readiness_tier]++;
+    if (p.name_token_conflict_candidate) summary.name_token_conflict_candidates++;
     summary.total++;
   }
 
