@@ -62,7 +62,9 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
     {
       const {
         deriveOrgLinkedEmail,
+        deriveOrgLinkedEmailCandidates,
         isHjemmesideOwnershipVerified,
+        isClaimableDomain,
         maskEmail,
       } = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
 
@@ -87,22 +89,39 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       );
       assertEq(r2, { eligible: true, email: "post@brreg-kilde.no", source: "brreg_contact" }, "a2: brreg-contact email present -> eligible via brreg_contact");
 
-      // (a3) Verified-domain path — content_source='manual' counts as verified.
+      // (a3) RETIRED 2026-08-06 (dev-request 2026-08-06-aldri-gjett-
+      // epostadresse, AC1): a verified hjemmeside with NO stored epost used
+      // to be eligible via post@<domain> (tier (b)). Tier (b) is deleted
+      // outright, not gated — so this exact shape (content_source='manual',
+      // a clean non-generic hjemmeside, brreg_verified=1, NO epost) is now
+      // the canonical "nothing qualifies" case: no tier fires at all. THIS
+      // is the dedicated regression assertion the dev-request calls for —
+      // it fails immediately if tier (b) is ever reintroduced in any form.
       const r3 = deriveOrgLinkedEmail({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://www.klostergarden.no/om-oss",
         content_source: "manual", field_provenance: null,
       });
-      assertEq(r3, { eligible: true, email: "post@klostergarden.no", source: "verified_domain_address" }, "a3: manual content_source + hjemmeside -> eligible via post@<domain>, www/path stripped");
+      assertEq(r3, { eligible: false, reason: "no_org_linked_email" }, "a3: AC1 REGRESSION GUARD — manual content_source + verified hjemmeside + NO stored epost -> no_org_linked_email; tier (b) post@<domain> is retired and must NEVER fire again, regardless of how 'verified' the domain is");
+      // Same shape, through the candidates function (what a future
+      // reintroduction of tier (b) would actually need to touch) — empty,
+      // not a single 'verified_domain_address' entry.
+      const r3Candidates = deriveOrgLinkedEmailCandidates({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://www.klostergarden.no/om-oss",
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(r3Candidates, [], "a3-candidates: AC1 REGRESSION GUARD — same shape via deriveOrgLinkedEmailCandidates() -> zero candidates, never a synthesized post@<domain> entry");
 
-      // (a3b) Verified-domain path via field_provenance.hjemmeside (the
-      // admin-approved discovery evidence marker) — content_source can be
-      // 'provider_site' or even null, only the provenance marker matters.
+      // (a3b) Same retirement, via the field_provenance.hjemmeside path
+      // (the OTHER way hjemmeside used to count as "ownership-verified") —
+      // still zero candidates. content_source can be 'provider_site' or
+      // even null; only used to matter for isHjemmesideOwnershipVerified(),
+      // which nothing in this function calls anymore.
       const r3b = deriveOrgLinkedEmail({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://bringebaerlandet.no",
         content_source: "provider_site",
         field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/123", fetched_at: "2026-07-01T00:00:00Z" } }),
       });
-      assertEq(r3b, { eligible: true, email: "post@bringebaerlandet.no", source: "verified_domain_address" }, "a3b: field_provenance.hjemmeside evidence marker -> eligible via post@<domain>");
+      assertEq(r3b, { eligible: false, reason: "no_org_linked_email" }, "a3b: AC1 REGRESSION GUARD — field_provenance.hjemmeside evidence marker + NO stored epost -> no_org_linked_email, tier (b) retired");
 
       // (a4) No org-linked email at all -> manual fallback, NEVER self-service.
       const r4 = deriveOrgLinkedEmail({
@@ -111,6 +130,21 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       });
       assertEq(r4, { eligible: false, reason: "no_org_linked_email" }, "a4: unvetted hjemmeside (no provenance, not manual) -> no_org_linked_email");
 
+      // (a4c-a4i) STALE PURPOSE, STILL-VALID ASSERTIONS, post tier-(b)
+      // retirement (2026-08-06): these were originally a generic-domain
+      // regression suite for the post@<domain> MINT specifically — proving a
+      // Facebook/gmail.com hjemmeside could never become post@facebook.com
+      // even when "ownership-verified". Tier (b) no longer exists, so
+      // hjemmeside no longer contributes a candidate AT ALL, generic or not
+      // — every one of these rows is "no_org_linked_email" for the SAME
+      // reason a3/a3b above are (no epost, no brreg contact). Left in place
+      // rather than deleted: their expected VALUES are unchanged (still
+      // no_org_linked_email, since generic-domain-blocked and tier-b-retired
+      // both land on the same outcome for a hjemmeside-only row), and they
+      // cost nothing to keep as an extra belt on top of a3/a3b/AC1's
+      // dedicated regression test — EXCEPT a4i, which asserted a POSITIVE
+      // (eligible) outcome and therefore genuinely breaks; see its own note.
+      //
       // (a4c) SECURITY: a generic/shared domain must NEVER become a claim
       // target, even when "verified" via content_source='manual' — Daniel
       // entering a Facebook page as a producer's hjemmeside (no real site)
@@ -168,20 +202,48 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       });
       assertEq(r4h, { eligible: false, reason: "no_org_linked_email" }, "a4h: pure-case generic domain (GMAIL.COM) -> no_org_linked_email (pre-existing behavior, regression guard only)");
 
-      // (a4i) A genuinely DISTINCT domain must NOT be caught by the suffix
-      // check merely because it happens to start with a generic name as a
-      // label prefix — "gmail.com.evil.example" is not a subdomain of
-      // gmail.com (it doesn't END with ".gmail.com"), it's an unrelated,
-      // real domain and must still be eligible.
+      // (a4i) RETIRED-TIER UPDATE: used to prove a genuinely DISTINCT domain
+      // ("gmail.com.evil.example" is not a subdomain of gmail.com — it
+      // doesn't END with ".gmail.com" — so isClaimableDomain() must not
+      // false-positive-block it) was still eligible via post@<domain>. Tier
+      // (b) is retired, so there is no mint left to prove isn't wrongly
+      // blocked — this row is "no_org_linked_email" now for the same
+      // tier-(b)-doesn't-exist reason as a3/a3b, regardless of domain
+      // genericness. isClaimableDomain()'s own suffix-vs-prefix distinction
+      // is covered DIRECTLY right below (a4j) — now that it's no longer
+      // exercised end-to-end through a live claim-derivation path, testing
+      // it as a pure function is the only coverage it has left, and it is
+      // kept exported specifically for a future found-address tier to reuse
+      // (see gardssalg-claim.ts's module doc), so it must not go untested.
       const r4i = deriveOrgLinkedEmail({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://gmail.com.evil.example",
         content_source: "manual", field_provenance: null,
       });
       assertEq(
         r4i,
-        { eligible: true, email: "post@gmail.com.evil.example", source: "verified_domain_address" },
-        "a4i: genuinely distinct domain (gmail.com.evil.example) is NOT a subdomain bypass -> still eligible",
+        { eligible: false, reason: "no_org_linked_email" },
+        "a4i: AC1 REGRESSION GUARD — a genuinely distinct, non-generic domain (gmail.com.evil.example) still gets no_org_linked_email; tier (b) is retired regardless of domain genericness",
       );
+
+      // (a4j) isClaimableDomain() direct coverage — same cases a4c-a4i used
+      // to exercise end-to-end, tested as a pure function now that this
+      // module has no live call site left for it. Kept exported for a
+      // plausible future found-address tier (see this file's module doc);
+      // this is what keeps that documented behavior from silently rotting.
+      assertTrue(isClaimableDomain("klostergarden.no"), "a4j-1: an ordinary, non-generic domain is claimable");
+      assertTrue(!isClaimableDomain("facebook.com"), "a4j-2: an exact generic-list match is not claimable");
+      assertTrue(!isClaimableDomain("mail.gmail.com"), "a4j-3: a subdomain of a generic host is not claimable");
+      assertTrue(!isClaimableDomain("sub.facebook.com"), "a4j-4: ...same for a different generic host");
+      assertTrue(!isClaimableDomain("gmail.com."), "a4j-5: a trailing-FQDN-dot generic domain is not claimable (dot must not defeat the Set match)");
+      // isClaimableDomain() itself does NOT lowercase — every real call site
+      // feeds it an ALREADY-normalized domain (normalizeDomain() upstream,
+      // e.g. deriveOrgLinkedEmail's historical tier (b) call before it was
+      // retired). A raw mixed-case string is the caller's bug, not this
+      // function's — verified here so that contract stays explicit.
+      assertTrue(isClaimableDomain("GMAIL.COM"), "a4j-6: isClaimableDomain() does its own matching case-SENSITIVELY — callers are responsible for normalizeDomain()'s lowercasing upstream, same as every real call site already does");
+      assertTrue(isClaimableDomain("gmail.com.evil.example"), "a4j-7: a genuinely distinct domain that merely STARTS WITH a generic label is claimable — not a subdomain (doesn't END with '.gmail.com')");
+      assertTrue(!isClaimableDomain(""), "a4j-8: an empty domain is not claimable");
+      assertTrue(!isClaimableDomain("localhost"), "a4j-9: a bare host with no dot is not claimable");
 
       const r4b = deriveOrgLinkedEmail({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
@@ -275,14 +337,16 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       });
       assertEq(rF5c, { eligible: false, reason: "no_org_linked_email" }, "f5c: epost field omitted entirely -> treated as absent, no crash, no_org_linked_email");
 
-      // (f6) TIER PRIORITY: a qualifying verified_domain_address must win
-      // over stored_epost_verified even when content_source='manual' would
-      // make BOTH tiers match on the very same row.
+      // (f6) RETIRED-TIER UPDATE: used to prove verified_domain_address won
+      // tier priority over stored_epost_verified on a row qualifying for
+      // both. Tier (b) is retired, so this exact row (manual + verified
+      // hjemmeside + a qualifying stored epost) now qualifies on stored_
+      // epost_verified ALONE — there's only one tier left to win.
       const rF6 = deriveOrgLinkedEmail({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
         content_source: "manual", field_provenance: null, epost: "other@klostergarden.no",
       });
-      assertEq(rF6, { eligible: true, email: "post@klostergarden.no", source: "verified_domain_address" }, "f6: tier priority — verified_domain_address wins over stored_epost_verified when both would apply");
+      assertEq(rF6, { eligible: true, email: "other@klostergarden.no", source: "stored_epost_verified" }, "f6: AC1 — hjemmeside no longer contributes a candidate; the row's ONLY eligibility is via stored_epost_verified (tier (b) retired)");
 
       // (f7) TIER PRIORITY: brreg_contact (the dormant-but-highest tier)
       // wins over stored_epost_verified too, when supplied.
@@ -295,30 +359,31 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       // ── deriveOrgLinkedEmailCandidates — dev-request 2026-08-06-claim-
       // produsent-velger-mottakeradresse. AC1 (all qualifying candidates,
       // not just the first) + AC7 (never a non-qualifying one). ──────────
-      const { deriveOrgLinkedEmailCandidates } = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
-
       const noneCandidates = deriveOrgLinkedEmailCandidates({ org_nr: null, brreg_verified: 0, hjemmeside: null, content_source: null, field_provenance: null });
       assertEq(noneCandidates, [], "i1: not Brreg-verified -> zero candidates (AC7 — never a non-qualifying tier)");
 
-      // Same row as rF6/rF7 above (both verified_domain_address AND
-      // stored_epost_verified independently qualify) — the single-result
-      // function picks the first (f6); the candidates function must return
-      // BOTH, in stable tier order, and never a THIRD entry that wasn't one
-      // of the two qualifying tiers.
-      const twoCandidates = deriveOrgLinkedEmailCandidates({
+      // Same row as rF6 above — RETIRED-TIER UPDATE: used to prove BOTH
+      // verified_domain_address AND stored_epost_verified came back (tier
+      // (b) retired -> now only stored_epost_verified can). Kept as its own
+      // assertion (rather than deleted as a duplicate of f6) because it
+      // exercises the CANDIDATES function specifically — the thing AC1 is
+      // actually about — not the single-result wrapper.
+      const singleCandidateDespiteHjemmeside = deriveOrgLinkedEmailCandidates({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
         content_source: "manual", field_provenance: null, epost: "other@klostergarden.no",
       });
       assertEq(
-        twoCandidates,
-        [
-          { email: "post@klostergarden.no", source: "verified_domain_address" },
-          { email: "other@klostergarden.no", source: "stored_epost_verified" },
-        ],
-        "i2: a row qualifying on two tiers -> both candidates, in tier order (AC1)",
+        singleCandidateDespiteHjemmeside,
+        [{ email: "other@klostergarden.no", source: "stored_epost_verified" }],
+        "i2: AC1 REGRESSION GUARD — a verified hjemmeside alongside a qualifying epost yields exactly ONE candidate (stored_epost_verified); hjemmeside never contributes a second, tier (b), entry",
       );
 
-      const threeCandidates = deriveOrgLinkedEmailCandidates(
+      // The genuine multi-candidate case left standing after tier (b)'s
+      // retirement: (a) brreg_contact, supplied explicitly, alongside (c)
+      // stored_epost_verified from the row itself. Two tiers, not three —
+      // this test used to be "all three tiers qualify" (i3); with only two
+      // live tiers left, it's now the top of the range.
+      const twoCandidates = deriveOrgLinkedEmailCandidates(
         {
           org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
           content_source: "manual", field_provenance: null, epost: "other@klostergarden.no",
@@ -326,13 +391,12 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         "post@brreg-kilde.no",
       );
       assertEq(
-        threeCandidates,
+        twoCandidates,
         [
           { email: "post@brreg-kilde.no", source: "brreg_contact" },
-          { email: "post@klostergarden.no", source: "verified_domain_address" },
           { email: "other@klostergarden.no", source: "stored_epost_verified" },
         ],
-        "i3: a row qualifying on all three tiers -> all three, in tier order",
+        "i3: a row qualifying on both surviving tiers -> both candidates, in tier order, and never a synthesized verified_domain_address third entry",
       );
 
       const oneCandidate = deriveOrgLinkedEmailCandidates({
@@ -353,6 +417,12 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         "i5: deriveOrgLinkedEmail() and deriveOrgLinkedEmailCandidates()[0] agree for a single-candidate row (AC1 — existing callers unchanged)",
       );
 
+      // RETIRED-TIER NOTE: the "never post@facebook.com" half of this
+      // guard is now trivially true for EVERY hjemmeside (see a3/a3b/a4i) —
+      // domain-genericness stopped mattering the moment tier (b) was
+      // deleted. Kept as-is (still a correct assertion: the row's epost
+      // isn't manual/outreach-delivered either, so it stays at zero
+      // candidates) as one more instance of the AC1 invariant.
       const genericDomainCandidates = deriveOrgLinkedEmailCandidates({
         org_nr: "922222222", brreg_verified: 1, hjemmeside: "https://www.facebook.com/x",
         content_source: "provider_site",
@@ -415,8 +485,25 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
            'raw', 'pending_verify', 'test-fixture', 'medium')
       `);
 
-      // A claimable provider: Brreg-verified, hjemmeside vetted via admin-
-      // approved discovery evidence (field_provenance.hjemmeside).
+      // A claimable provider. RETIRED-TIER UPDATE: used to be eligible ONLY
+      // via a field_provenance-verified hjemmeside (tier (b)), deliberately
+      // WITHOUT content_source='manual' — the whole POINT of that shape was
+      // to reach a claimable-but-still-EDITABLE row, since updateClaimed-
+      // ProviderProfile() locks every field the instant content_source is
+      // 'manual' (see e2-e27 further below, which edit THIS SAME provider
+      // post-claim and require it to still be unlocked). Tier (b) is gone,
+      // so hjemmeside/field_provenance no longer produce anything — but
+      // content_source='manual' is NOT the right replacement here (that's
+      // prov-manual's job, a few fixtures down, which deliberately IS
+      // locked). Instead this fixture now qualifies via stored_epost_
+      // verified's OTHER sub-case, (b-epost) delivered-outreach-no-bounce
+      // (setEpost + the outreach_sent_log row seeded below, alongside the
+      // other (b-epost) fixtures) — content_source stays 'provider_site',
+      // so the row is claimable AND still editable, exactly like before.
+      // hjemmeside + its field_provenance stamp are left in place (harmless,
+      // unused by claim-eligibility now) since c6/c7's lock-invariant check
+      // below still keys off this SAME domain via gardssalg-rfb-enrich's
+      // indexRfbByDomain(), which is unrelated to claim tiers.
       insertProvider.run({
         id: "prov-claimable", navn: "Klostergården Håndbryggeri", slug: "klostergarden-handbryggeri",
         org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://klostergarden.no",
@@ -432,15 +519,24 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       });
       // Already Daniel-curated (manual) — still claimable (session still
       // granted), but the content lock must NOT be downgraded to 'claim'.
+      // RETIRED-TIER UPDATE: used to qualify via tier (b) (manual + verified
+      // hjemmeside, no epost needed) — now needs its OWN stored epost
+      // (setEpost call below) to qualify via stored_epost_verified instead.
       insertProvider.run({
         id: "prov-manual", navn: "Daniels Gård", slug: "daniels-gard",
         org_nr: "911111111", brreg_verified: 1, hjemmeside: "https://danielsgard.no",
         content_source: "manual", field_provenance: null,
       });
-      // SECURITY regression fixture: content_source='manual' (so
-      // isHjemmesideOwnershipVerified is true) but hjemmeside is a generic/
-      // shared domain (Facebook page entered as the producer's "hjemmeside").
-      // Must NOT produce a viable claim-email -> manual fallback only.
+      // Originally a SECURITY regression fixture: content_source='manual'
+      // (so isHjemmesideOwnershipVerified is true) but hjemmeside is a
+      // generic/shared domain (Facebook page entered as the producer's
+      // "hjemmeside") — proved the tier (b) mint never fired for a generic
+      // domain even when "verified". RETIRED-TIER UPDATE: tier (b) is gone,
+      // so this row is ineligible for the SAME reason prov-noemail is (no
+      // epost, no brreg contact) — domain-genericness no longer has any
+      // effect on the outcome either way. Left as its own fixture (rather
+      // than merged into prov-noemail) purely so the assertion below (b2b)
+      // still names what it's guarding against.
       insertProvider.run({
         id: "prov-generic-domain", navn: "Gård Uten Egen Nettside", slug: "gard-uten-egen-nettside",
         org_nr: "922222222", brreg_verified: 1, hjemmeside: "https://www.facebook.com/gardutenegennettside",
@@ -452,6 +548,17 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       // above (not a bound parameter), so these are set via a follow-up
       // UPDATE rather than widening that shared statement for every caller.
       const setEpost = expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?");
+      // RETIRED-TIER UPDATE (see prov-claimable/prov-manual's own comments
+      // above): both now need a stored epost to remain claimable at all,
+      // since tier (b) no longer exists to carry them — prov-claimable via
+      // (b-epost) delivered-outreach (its own outreach_sent_log row is
+      // seeded below, alongside the other (b-epost) fixtures), prov-manual
+      // via (c-epost) since it's already content_source='manual'. Using the
+      // SAME literal address deriveOrgLinkedEmail() used to derive from
+      // their domain keeps every downstream assertion that checks the exact
+      // email string (b4, c8, etc.) unchanged.
+      setEpost.run("post@klostergarden.no", "prov-claimable");
+      setEpost.run("post@danielsgard.no", "prov-manual");
 
       // (c-epost) content_source='manual', no hjemmeside at all -> only the
       // stored_epost_verified tier can fire here.
@@ -509,6 +616,14 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
         VALUES ('agent-fixture-osl', 'Fixture Agent', 'x', 'test', 'agent-fixture@example.no', 'https://example.no', 'producer', 'fixture-key-osl', 1)
       `).run();
+      // prov-claimable's own (b-epost) row — see its fixture comment above
+      // for why it goes through delivered-outreach rather than
+      // content_source='manual' (the e2-e27 editable-portal tests below
+      // need this row to stay UNLOCKED after claiming).
+      rfbDb.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, vertical_id)
+        VALUES ('agent-fixture-osl', 'post@klostergarden.no', datetime('now', '-2 days'), 'email', 'experiences')
+      `).run();
       rfbDb.prepare(`
         INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, vertical_id)
         VALUES ('agent-fixture-osl', 'utsendt@epostoutreach.no', datetime('now', '-2 days'), 'email', 'experiences')
@@ -551,7 +666,7 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       const issued = claimSvc.issueClaimMagicLink("prov-claimable");
       assertTrue(issued.ok === true, "b3: issueClaimMagicLink succeeds for the claimable provider");
       if (issued.ok) {
-        assertEq(issued.claim.email, "post@klostergarden.no", "b4: issued claim targets post@<verified-domain>");
+        assertEq(issued.claim.email, "post@klostergarden.no", "b4: issued claim targets the provider's stored epost (tier (c) — see prov-claimable's own fixture comment for the tier (b) retirement)");
         assertEq(issued.claim.maskedEmail, claimSvc.maskEmail("post@klostergarden.no"), "b5: issued claim carries the masked email");
         const row = expDb.prepare("SELECT provider_id, email, used FROM gardssalg_claims WHERE token = ?").get(issued.claim.token) as any;
         assertTrue(!!row, "b6: a gardssalg_claims row was inserted for the issued token");
@@ -595,31 +710,55 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       assertEq(scrapedOnlyEpost, { ok: false, error: "no_org_linked_email" }, "h10: Acceptance Criterion 2 — a purely scraped epost (no provenance) stays on the manual fallback end to end");
 
       // ── Producer address selection — dev-request 2026-08-06-claim-
-      // produsent-velger-mottakeradresse. A realistic two-candidate row: a
-      // vetted own domain (verified_domain_address) AND a manually-entered
-      // Gmail (stored_epost_verified) — the exact "small producer with only
-      // a Gmail" case the dev-request itself cites. ────────────────────────
+      // produsent-velger-mottakeradresse. RETIRED-TIER UPDATE: this used to
+      // be a realistic two-candidate row via a vetted own domain
+      // (verified_domain_address) AND a manually-entered Gmail
+      // (stored_epost_verified) — the exact "small producer with only a
+      // Gmail" case the dev-request itself cites. Tier (b) is retired, so
+      // that specific realistic pairing no longer exists; the only way left
+      // to reach a genuine 2-candidate row is (a) brreg_contact — supplied
+      // explicitly, as issueClaimMagicLink's own second argument, exactly
+      // like the dormant-path pure tests (rF7 etc.) already do — alongside
+      // (c) stored_epost_verified from the row. Less realistic as a
+      // real-world scenario (brreg_contact has no live source yet — see
+      // gardssalg-claim.ts's module doc), but the SELECTION MACHINERY this
+      // block actually tests (multiple candidates -> selection_required;
+      // an explicit choice re-validated against the provider's OWN current
+      // candidates, never trusted as-is) doesn't care which two tiers
+      // qualify, only that more than one does.
+      const PROV_TWO_CANDIDATES_BRREG_CONTACT = "eier@toadresser.no";
       insertProvider.run({
         id: "prov-two-candidates", navn: "To Adresser Gård", slug: "to-adresser-gard",
-        org_nr: "990000001", brreg_verified: 1, hjemmeside: "https://toadresser.no",
+        org_nr: "990000001", brreg_verified: 1, hjemmeside: null,
         content_source: "manual", field_provenance: null,
       });
       setEpost.run("eier@gmail.com", "prov-two-candidates");
 
-      const needsSelection = claimSvc.issueClaimMagicLink("prov-two-candidates");
+      const needsSelection = claimSvc.issueClaimMagicLink("prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT);
       assertEq(needsSelection, { ok: false, error: "selection_required" }, "j1: issueClaimMagicLink on a 2-candidate provider with no selection -> selection_required (AC2's server-side half)");
 
-      const badSelection = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "brreg_contact" });
-      assertEq(badSelection, { ok: false, error: "invalid_selection" }, "j2: a selectedSource that is not one of THIS provider's own re-derived candidates -> invalid_selection, never a silent fallback guess (AC5)");
+      // AC1 REGRESSION GUARD: explicitly asking for the RETIRED tier by
+      // name is still just an invalid selection, never a silent guess and
+      // never a crash — proves selectedSource validation doesn't special-
+      // case the old tier tag, it simply isn't in this provider's (or any
+      // provider's) candidate list anymore.
+      const badSelection = claimSvc.issueClaimMagicLink(
+        "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "verified_domain_address" },
+      );
+      assertEq(badSelection, { ok: false, error: "invalid_selection" }, "j2: AC1/AC5 — selecting the RETIRED verified_domain_address tier by name -> invalid_selection, never a silent fallback guess");
 
-      const chosenDomain = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "verified_domain_address" });
-      assertTrue(chosenDomain.ok === true, "j3: a selectedSource matching a real candidate -> succeeds");
-      if (chosenDomain.ok) {
-        assertEq(chosenDomain.claim.email, "post@toadresser.no", "j4: issued claim targets the SELECTED candidate's address");
-        assertEq(chosenDomain.claim.source, "verified_domain_address", "j5: claim.source matches the selection");
+      const chosenBrreg = claimSvc.issueClaimMagicLink(
+        "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "brreg_contact" },
+      );
+      assertTrue(chosenBrreg.ok === true, "j3: a selectedSource matching a real candidate -> succeeds");
+      if (chosenBrreg.ok) {
+        assertEq(chosenBrreg.claim.email, PROV_TWO_CANDIDATES_BRREG_CONTACT, "j4: issued claim targets the SELECTED candidate's address");
+        assertEq(chosenBrreg.claim.source, "brreg_contact", "j5: claim.source matches the selection");
       }
 
-      const chosenEpost = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "stored_epost_verified" });
+      const chosenEpost = claimSvc.issueClaimMagicLink(
+        "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "stored_epost_verified" },
+      );
       assertTrue(chosenEpost.ok === true, "j6: selecting the OTHER qualifying candidate for the same provider also succeeds");
       if (chosenEpost.ok) {
         assertEq(chosenEpost.claim.email, "eier@gmail.com", "j7: issued claim targets the second candidate's own address, not the first");
@@ -628,9 +767,13 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       // AC6: rate limit is per-PROVIDER (isClaimRateLimited keys on
       // provider_id only), shared across different address selections. j3
       // and j6 already spent 2 of the 3-per-window budget on this provider.
-      const chosenThird = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "verified_domain_address" });
+      const chosenThird = claimSvc.issueClaimMagicLink(
+        "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "brreg_contact" },
+      );
       assertTrue(chosenThird.ok === true, "j8: 3rd request on this provider (regardless of which candidate) still succeeds (limit is 3)");
-      const chosenFourth = claimSvc.issueClaimMagicLink("prov-two-candidates", undefined, { selectedSource: "stored_epost_verified" });
+      const chosenFourth = claimSvc.issueClaimMagicLink(
+        "prov-two-candidates", PROV_TWO_CANDIDATES_BRREG_CONTACT, { selectedSource: "stored_epost_verified" },
+      );
       assertEq(chosenFourth, { ok: false, error: "rate_limited" }, "j9: AC6 — the 4th request is rate-limited even though it picks a DIFFERENT candidate than the 3 before it; the limit is shared, not per-address");
 
       // ── Rate limiting ──────────────────────────────────────────────────

@@ -93,10 +93,17 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       // __setRfbDbForTesting for the full rationale (swapping the shared
       // singleton here raced live against unrelated suites running
       // concurrently elsewhere in the full `npm test`, the "no such table:
-      // outreach_sent_log" failure class its postmortem documents). This
-      // suite never actually populates rfbDb with outreach fixture rows —
-      // it only needs a validly-schema'd, empty RFB db so that lookup never
-      // throws — so the isolated override is a drop-in, lower-risk swap.
+      // outreach_sent_log" failure class its postmortem documents).
+      //
+      // RETIRED-TIER UPDATE (dev-request 2026-08-06-aldri-gjett-
+      // epostadresse): used to say this suite never populates rfbDb with
+      // outreach rows — now prov-route-eligible needs ONE (see its own
+      // fixture comment below), since tier (b) retiring took away the only
+      // OTHER way this suite had to keep a claimed row editable
+      // (content_source='manual' locks the owner portal — see gardssalg-
+      // claim.ts's isHjemmesideOwnershipVerified doc / updateClaimed-
+      // ProviderProfile's `locked` check). Still the isolated override, not
+      // the shared singleton — same race-avoidance reasoning as above.
       const claimSvcForRfbOverride = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
       claimSvcForRfbOverride.__setRfbDbForTesting(rfbDb as any);
 
@@ -112,16 +119,36 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
           (@id, @navn, @slug, 'experiences', @org_nr, @brreg_verified, @hjemmeside, @content_source, @field_provenance,
            'raw', 'pending_verify', 'test-fixture', 'medium')
       `);
+      // RETIRED-TIER UPDATE (dev-request 2026-08-06-aldri-gjett-
+      // epostadresse): used to be eligible via the field_provenance-verified
+      // hjemmeside marker (tier (b)), deliberately NOT 'manual' — the whole
+      // point was a row that stays WRITABLE after the claim (content_source
+      // -> 'claim', then owner edits in section (d) below must succeed).
+      // Tier (b) is gone; content_source='manual' would ALSO be eligible
+      // (tier (c), c-epost) but would lock the row forever, breaking every
+      // (d) assertion. So this fixture now goes through (c)'s OTHER
+      // sub-case, (b-epost) delivered-outreach-no-bounce — content_source
+      // stays 'provider_site' (unlocked), and the matching outreach_sent_log
+      // row is seeded right after the rfbDb handle is set up.
       insertProvider.run({
         id: "prov-route-eligible", navn: "Route Test Gård", slug: "route-test-gard",
         org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://route-test-gard.no",
-        // NOT 'manual' — this fixture needs the row to still be WRITABLE
-        // after the claim (content_source -> 'claim'), so eligibility here
-        // comes via the admin-approved-discovery evidence marker
-        // (field_provenance.hjemmeside), not via a Daniel-curated 'manual' row.
-        content_source: null,
+        content_source: "provider_site",
         field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/route-test-gard", fetched_at: "2026-07-01T00:00:00Z" } }),
       });
+      expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("post@route-test-gard.no", "prov-route-eligible");
+      // (b-epost) fixture for prov-route-eligible — a real agents row is
+      // inserted too so this holds even if a future change turns FK
+      // enforcement on for this DB (mirrors services/gardssalg-claim.test.ts's
+      // own identical rationale for its own copy of this fixture).
+      rfbDb.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
+        VALUES ('agent-fixture-route', 'Fixture Agent', 'x', 'test', 'agent-fixture@example.no', 'https://example.no', 'producer', 'fixture-key-route', 1)
+      `).run();
+      rfbDb.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, vertical_id)
+        VALUES ('agent-fixture-route', 'post@route-test-gard.no', datetime('now', '-2 days'), 'email', 'experiences')
+      `).run();
       insertProvider.run({
         id: "prov-route-noemail", navn: "Route Test Uten Epost", slug: "route-test-uten-epost",
         org_nr: "911111111", brreg_verified: 1, hjemmeside: null,
@@ -137,12 +164,18 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       // never leaks a verify_url/token, in both its JSON and no-JS
       // (redirect) response shapes. Own fixture so its rate-limit window
       // and claim-row history don't interact with any other section here.
+      // RETIRED-TIER UPDATE: used to be eligible via tier (b) (field_
+      // provenance-verified hjemmeside); this section never verifies the
+      // token (no owner-portal editability to preserve), so — unlike
+      // prov-route-eligible above — a plain content_source='manual' + epost
+      // (tier (c), c-epost) is the simplest surviving path and needs no RFB
+      // db fixture.
       insertProvider.run({
         id: "prov-route-noleak", navn: "No Leak Gård", slug: "no-leak-gard",
-        org_nr: "944444444", brreg_verified: 1, hjemmeside: "https://no-leak-gard.no",
-        content_source: null,
-        field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/no-leak-gard", fetched_at: "2026-07-01T00:00:00Z" } }),
+        org_nr: "944444444", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null,
       });
+      expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("post@no-leak-gard.no", "prov-route-noleak");
       // stored_epost_verified (c-epost) route-level fixture: content_source=
       // 'manual', NO hjemmeside at all -- eligibility here can ONLY come
       // from the new tier. This is what pins the GET entry page's mirroring
@@ -156,12 +189,24 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       });
       expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("post@routeepost.no", "prov-route-epost");
 
-      // Two-candidate route fixture — dev-request 2026-08-06-claim-
-      // produsent-velger-mottakeradresse: a verified own domain AND a
-      // manually-entered second address both qualify.
+      // RETIRED-TIER UPDATE, dev-request 2026-08-06-aldri-gjett-epostadresse:
+      // used to be a genuine two-candidate route fixture (verified own
+      // domain [tier (b)] AND a manually-entered second address [tier (c)]
+      // both qualifying) — dev-request 2026-08-06-claim-produsent-velger-
+      // mottakeradresse's own worked example. Tier (b) is retired, and this
+      // PUBLIC route never supplies an explicit brreg_contact address (see
+      // routes/gardssalg-claim.ts's issueClaimMagicLink() call, second
+      // argument always undefined) — brreg_contact stays dormant here the
+      // same way it's dormant in production (gardssalg-claim.ts's own
+      // module doc). So a genuine 2-candidate row is no longer reachable
+      // through THIS route at all; a real multi-candidate scenario is only
+      // reachable service-side today (services/gardssalg-claim.test.ts's
+      // own j-series, which supplies brreg_contact explicitly, the way an
+      // admin tool can). This fixture is downgraded to single-candidate —
+      // see the rewritten k-series below for what it now actually proves.
       insertProvider.run({
         id: "prov-route-two", navn: "To Valg Gård", slug: "to-valg-gard",
-        org_nr: "966666666", brreg_verified: 1, hjemmeside: "https://toroute.no",
+        org_nr: "966666666", brreg_verified: 1, hjemmeside: null,
         content_source: "manual", field_provenance: null,
       });
       expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("eier2@gmail.com", "prov-route-two");
@@ -264,101 +309,80 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertEq(epostClaimRow?.email, "post@routeepost.no", "a13: the issued claim really targets the provider's stored epost");
       assertEq(epostClaimRow?.email_source, "stored_epost_verified", "a14: persisted with email_source='stored_epost_verified'");
 
-      // ── Producer address selection (2+ candidates) — dev-request
-      // 2026-08-06-claim-produsent-velger-mottakeradresse ─────────────────
-      const twoChoicePage = await req("GET", "/kategori/gardssalg/eier/to-valg-gard");
-      assertEq(twoChoicePage.status, 200, "k1: GET entry page for a 2-candidate provider -> 200");
-      assertTrue(twoChoicePage.body.includes('name="selected"'), "k2: entry page renders a selection control when there is more than one candidate");
-      assertTrue(
-        (twoChoicePage.body.match(/type="radio"/g) || []).length === 2,
-        "k3: exactly one radio per candidate (2 candidates -> 2 radios)",
-      );
-      assertTrue(twoChoicePage.body.includes('value="verified_domain_address"'), "k4: one radio's value is the verified_domain_address source tag");
-      assertTrue(twoChoicePage.body.includes('value="stored_epost_verified"'), "k5: the other radio's value is the stored_epost_verified source tag");
-      assertTrue(!twoChoicePage.body.includes("eier2@gmail.com"), "k6: the full second address never appears anywhere on the page (AC4)");
-      assertTrue(!twoChoicePage.body.includes("post@toroute.no"), "k7: the full first address never appears anywhere on the page either (AC4)");
-      assertTrue(/e\*+2@g\*+\.com/.test(twoChoicePage.body), "k8: the second address IS shown, masked");
+      // ── Producer address selection — dev-request 2026-08-06-claim-
+      // produsent-velger-mottakeradresse. REWRITTEN 2026-08-06 for dev-
+      // request 2026-08-06-aldri-gjett-epostadresse: see prov-route-two's
+      // own fixture comment above for why a genuine 2-candidate row is no
+      // longer reachable through this PUBLIC route now that tier (b) is
+      // retired (brreg_contact — the only other tier that could pair with
+      // stored_epost_verified — is never supplied here). What's left worth
+      // proving at THIS route level: the single-candidate render path shows
+      // no selection UI, an explicit selection is still validated (not just
+      // silently ignored) even when there's nothing to choose between, and
+      // the RETIRED tier name specifically is rejected like any other
+      // invalid selection — never treated as special/legacy-compatible. ──
+      const singleCandidatePage = await req("GET", "/kategori/gardssalg/eier/to-valg-gard");
+      assertEq(singleCandidatePage.status, 200, "k1: GET entry page for a single-candidate provider -> 200");
+      // NOT a bare `body.includes('name="selected"')` — the page's own
+      // inline <script> contains that exact string as JS source text
+      // (`form.querySelector('input[name="selected"]:checked')`), which
+      // is present on EVERY entry page regardless of candidate count and
+      // would make this assertion vacuously true. Require the `<input`
+      // element form specifically.
+      assertTrue(!singleCandidatePage.body.includes('<input type="radio" name="selected"'), "k2: entry page renders NO selection control (radio input) when there is only one candidate");
+      assertEq((singleCandidatePage.body.match(/type="radio"/g) || []).length, 0, "k3: no radios rendered for a single-candidate provider");
+      assertTrue(!singleCandidatePage.body.includes("eier2@gmail.com"), "k6: the full address never appears anywhere on the page (AC4)");
+      assertTrue(/e\*+2@g\*+\.com/.test(singleCandidatePage.body), "k8: the address IS shown, masked");
 
-      // k8a-k8c: DOM-structural check (independent review finding, PR #494) —
-      // a real browser (JS `form.querySelector(...)` AND a plain no-JS
-      // native form submit) only ever sees a field as "in the form" if it is
-      // a DESCENDANT of the <form>...</form> element, or carries a matching
-      // `form="..."` attribute. Earlier drafts of this page rendered the
-      // radios as SIBLINGS before <form> opened — every assertion above
-      // still passed (they only check the radios exist SOMEWHERE in the
-      // body), yet the picker was completely non-functional end to end: the
-      // JS handler's querySelector found nothing, and a plain form submit
-      // never included `selected` at all, so every real click on any radio
-      // still resulted in "selection_required". Assert the actual DOM
-      // nesting, not just presence, so this class of bug can't recur silently.
-      const formOpenIdx = twoChoicePage.body.indexOf('<form id="gc-request-form"');
-      const formCloseIdx = twoChoicePage.body.indexOf("</form>", formOpenIdx);
-      assertTrue(formOpenIdx >= 0 && formCloseIdx > formOpenIdx, "k8a: the request form is present and well-formed (fixture sanity check)");
-      const radioIndices: number[] = [];
-      {
-        const re = /<input type="radio" name="selected"/g;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(twoChoicePage.body))) radioIndices.push(m.index);
-      }
-      assertEq(radioIndices.length, 2, "k8b: found exactly 2 radio inputs to check (fixture sanity check)");
-      assertTrue(
-        radioIndices.every((idx) => idx > formOpenIdx && idx < formCloseIdx),
-        "k8c: every radio input is a DESCENDANT of <form id=\"gc-request-form\">...</form> (not a sibling before it) — the actual DOM relationship a real browser's form submission and querySelector(form, ...) depend on",
-      );
+      // AC1 REGRESSION GUARD: explicitly selecting the RETIRED tier by name
+      // is STILL rejected as invalid_selection on a single-candidate
+      // provider — proves selectedSource validation runs regardless of
+      // candidate count, never short-circuited to "there's only one, so
+      // anything goes".
+      const retiredTierSelectionResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected: "verified_domain_address" }),
+      });
+      assertEq(retiredTierSelectionResp.status, 403, "k11: POST selecting the RETIRED verified_domain_address tier by name -> 403, never silently substituted for the real candidate");
+      assertEq(JSON.parse(retiredTierSelectionResp.body).error, "invalid_selection", "k12: error body names invalid_selection");
 
-      // No selection at all -> selection_required, never a silent guess.
+      // No selection at all -> succeeds directly (single-candidate path,
+      // no selection_required — that error is reserved for 2+ candidates,
+      // which this route can no longer produce).
       const noSelectionResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
         headers: { "Content-Type": "application/json" },
         body: "{}",
       });
-      assertEq(noSelectionResp.status, 400, "k9: POST request with no selection on a 2-candidate provider -> 400");
-      assertEq(JSON.parse(noSelectionResp.body).error, "selection_required", "k10: error body names selection_required");
+      assertEq(noSelectionResp.status, 200, "k9: POST request with no selection on a single-candidate provider -> 200, auto-selects the only candidate");
+      const soloClaimRow = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-two") as any;
+      assertEq(soloClaimRow?.email, "eier2@gmail.com", "k14: issued claim targets the provider's only qualifying address");
+      assertEq(soloClaimRow?.email_source, "stored_epost_verified", "k15: persisted with the (only surviving) stored_epost_verified source");
 
-      // An invalid/unknown selection value -> rejected, never silently
-      // falls back to picking one on the client's behalf.
-      const invalidSelectionResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selected: "brreg_contact" }),
-      });
-      assertEq(invalidSelectionResp.status, 403, "k11: POST request with a selection that isn't one of this provider's real candidates -> 403");
-      assertEq(JSON.parse(invalidSelectionResp.body).error, "invalid_selection", "k12: error body names invalid_selection");
-
-      // A real selection (JSON/fetch path) -> succeeds, targets exactly the
-      // chosen candidate.
-      const selectDomainResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selected: "verified_domain_address" }),
-      });
-      assertEq(selectDomainResp.status, 200, "k13: POST request selecting verified_domain_address -> 200");
-      const domainClaimRow = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-two") as any;
-      assertEq(domainClaimRow?.email, "post@toroute.no", "k14: issued claim targets the SELECTED candidate's address");
-      assertEq(domainClaimRow?.email_source, "verified_domain_address", "k15: persisted with the selected source");
-
-      // The OTHER candidate, no-JS form-POST path (urlencoded, mirrors a
-      // real browser submitting the radio group natively).
+      // An explicit selection that DOES match the one real candidate also
+      // succeeds — the no-JS form-POST path (urlencoded, mirrors a real
+      // browser submitting a form field natively).
       const selectEpostResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "selected=stored_epost_verified",
       });
-      assertEq(selectEpostResp.status, 303, "k16: no-JS form POST selecting the other candidate -> 303 redirect (same as the single-candidate no-JS path)");
+      assertEq(selectEpostResp.status, 303, "k16: no-JS form POST with a matching explicit selection -> 303 redirect");
       assertTrue(String(selectEpostResp.headers.location || "").includes("status=sent"), "k17: redirects to status=sent");
-      const epostClaimRow2 = expDb.prepare("SELECT email, email_source FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1").get("prov-route-two") as any;
-      assertEq(epostClaimRow2?.email, "eier2@gmail.com", "k18: the no-JS path issued a claim for the OTHER selected candidate, not the first");
-      assertEq(epostClaimRow2?.email_source, "stored_epost_verified", "k19: persisted with the newly-selected source");
 
-      // AC6: rate limit shared across selections — 3 requests total have now
-      // been made for prov-route-two (k13, k16 above are #1 and #2; a 3rd
-      // still succeeds, a 4th — regardless of which candidate — is blocked).
+      // AC6: rate limit is unchanged by any of this — invalid_selection
+      // (k11) returns before the rate-limit check and before any DB insert,
+      // so it does NOT consume a slot; k9 and k16 above are the only 2
+      // successful issues so far. A 3rd successful request still succeeds,
+      // a 4th is blocked.
       const thirdSelectResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selected: "verified_domain_address" }),
+        body: "{}",
       });
       assertEq(thirdSelectResp.status, 200, "k20: 3rd request on this provider still succeeds (limit is 3)");
       const fourthSelectResp = await req("POST", "/kategori/gardssalg/eier/prov-route-two/request", {
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selected: "stored_epost_verified" }),
+        body: "{}",
       });
-      assertEq(fourthSelectResp.status, 429, "k21: AC6 — the 4th request is rate-limited even though it picks a different candidate than the 3 before it");
+      assertEq(fourthSelectResp.status, 429, "k21: AC6 — the 4th request is rate-limited");
 
       // ── (b) POST request -> issues a magic link (JSON path) ────────────
       const reqResp = await req("POST", "/kategori/gardssalg/eier/prov-route-eligible/request", {

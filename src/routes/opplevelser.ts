@@ -324,10 +324,8 @@ import { testSendRedirectAddress } from "../services/send-guard";
 import {
   issueClaimMagicLink,
   getClaimProviderById,
-  isClaimableDomain,
   backfillGardssalgOwnerLockProvenance,
 } from "../services/gardssalg-claim";
-import { normalizeDomain } from "../services/blocklist-service";
 import { emailService } from "../services/email-service";
 
 // Same derivation as gardssalg-claim.ts's own constant — the verify URL must
@@ -6343,18 +6341,32 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // The booking E2E above only needs booking_live; the CLAIM E2E needs the row
 // to satisfy deriveOrgLinkedEmail() (services/gardssalg-claim.ts), and none of
 // the fields it reads were reachable from any admin lever: brreg_verified has
-// no write route for experience_providers at all, and PATCH /admin/providers/
-// :id/hjemmeside sets hjemmeside WITHOUT the field_provenance stamp that makes
-// a domain "ownership-verified". So the claim flow had no repeatable end-to-end
-// test path. This opt-in flag closes exactly that gap and nothing else.
+// no write route for experience_providers at all. So the claim flow had no
+// repeatable end-to-end test path. This opt-in flag closes exactly that gap
+// and nothing else.
 //
-// It sets the three fields deriveOrgLinkedEmail() needs, and deliberately does
-// NOT use content_source='manual' as the ownership proof even though that is
-// the cheaper of the two accepted paths: the owner portal disables its whole
-// edit form on content_source==='manual' (routes/gardssalg-claim.ts), so a
-// 'manual' test row would verify the magic link and then present a read-only
-// portal — testing the wrong thing. The field_provenance.hjemmeside.source_url
-// path leaves the portal editable, which is what a claim E2E must exercise.
+// REWRITTEN 2026-08-06 (dev-request 2026-08-06-aldri-gjett-epostadresse):
+// this used to make the row claimable via the NOW-RETIRED tier (b)
+// (`post@<verified-domain>`, see gardssalg-claim.ts's module doc) — it
+// stamped hjemmeside + a field_provenance.hjemmeside evidence marker and
+// deliberately left content_source untouched, specifically SO THAT it would
+// look "ownership-verified" without ever setting content_source='manual'
+// (which disables the owner portal's whole edit form — a 'manual' test row
+// would verify the magic link and then present a read-only portal, testing
+// the wrong thing). Tier (b) no longer exists, so none of that produces a
+// claimable row anymore; it would just be a lie. This flag now goes through
+// the SURVIVING tier (c), stored_epost_verified, the only path a bare
+// `content_source='manual'` + a stored `epost` was always enough for. The
+// trade-off flagged above (read-only portal after claim) is now a REAL,
+// accepted trade-off of this test route, not avoided — the claim E2E below
+// exercises "does the magic link issue and verify", not "is the portal
+// post-claim editable"; a portal-editability E2E would need a DIFFERENT
+// fixture (e.g. the field_provenance path, hand-seeded, same as
+// gardssalg-claim.test.ts's own DB-backed fixtures do), which is out of
+// scope for this route.
+//
+// It sets the two fields deriveOrgLinkedEmail() needs for tier (c):
+// content_source='manual' and a stored `epost`.
 //
 // SAFETY — the claimable writes are pinned to `org_nr = TEST_PROVIDER_ORG_NR`
 // in the UPDATE's own WHERE clause, not merely to the id resolved above. The
@@ -6363,24 +6375,40 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // flag would hand a real producer a forged ownership stamp and reset a genuine
 // content_source lock. With it, a non-test row is refused before any write.
 //
-// The default domain is RFC-6761-reserved `.invalid` — guaranteed never to
-// resolve — so even if a NON-test claim were ever issued against this row (the
-// public POST .../request route, which does not redirect), the derived
-// post@<domain> address cannot reach a real third party. It is also outside
-// GENERIC_DOMAINS, which isClaimableDomain() requires.
+// JUDGMENT CALL (reviewer: scrutinize this) — `epost` is ONE shared column
+// that BOTH this route's booking-notification target (the required top-level
+// `email`, dispatched to on a real booking against this test row — see the
+// booking-E2E doc above) and the claim-eligibility tier (c) address read.
+// When `claimable: true`, the claimable branch below OVERWRITES `epost` with
+// the (optional, separately-supplied) `claimEmail` — NOT the required
+// `email` — so a caller doing a pure claim-E2E run never has to hand this
+// route a real inbox merely to satisfy the unrelated `email` shape check,
+// and a caller doing a pure booking-E2E run (claimable omitted/false) is
+// completely unaffected (claimEmail is refused if supplied without the
+// flag, same convention hjemmeside used to follow). The two E2E flows are
+// NOT designed to be exercised in the SAME call with two different real
+// addresses — if a future caller needs booking-notify AND a specific,
+// non-default claim address simultaneously, pass `claimEmail` equal to
+// `email` explicitly; don't assume `email` doubles as the claim target.
 //
-// content_source is RESET to NULL so the test is repeatable: a completed claim
-// stamps content_source='claim' (verifyClaimToken), which would otherwise make
-// the second run start from a claimed row. Same org_nr pin guards that reset.
+// The default claim address is on the RFC-6761-reserved `.invalid` TLD —
+// guaranteed never to resolve — so even if a NON-test claim were ever issued
+// against this row (the public POST .../request route, which does not
+// redirect), the stored address cannot reach a real third party. Mirrors the
+// exact same reasoning this route used to apply to the (now-removed)
+// hjemmeside default.
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
-const TEST_PROVIDER_DEFAULT_HJEMMESIDE = "https://test-ikke-book.invalid";
+const TEST_PROVIDER_DEFAULT_CLAIM_EMAIL = "claim-test@test-ikke-book.invalid";
 router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: Response) => {
+  // Same shape check reused for BOTH email fields below (email, claimEmail) —
+  // matches ProviderSchema's z.string().email() shape so createProvider()
+  // won't reject it, validated up front for a clean 400 instead of a 500.
+  const EMAIL_SHAPE_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
   const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
-  // Same shape as ProviderSchema's z.string().email() so createProvider() below
-  // won't reject it — validate up front for a clean 400 instead of a 500.
-  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+  if (!email || !EMAIL_SHAPE_RE.test(email)) {
     res.status(400).json({ error: "Body må inneholde en gyldig { email }" });
     return;
   }
@@ -6396,74 +6424,38 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
   // Strict-true parse, same convention as every other opt-in flag in this file:
   // only the literal JSON boolean `true` turns the claim fields on.
   const claimable = req.body?.claimable === true;
-  const hjemmeside =
-    typeof req.body?.hjemmeside === "string" && req.body.hjemmeside.trim()
-      ? req.body.hjemmeside.trim()
-      : TEST_PROVIDER_DEFAULT_HJEMMESIDE;
 
-  // A caller-supplied hjemmeside is NOT free-form here, because whatever lands
-  // in this column decides who receives real mail. normalizeDomain() treats any
-  // string containing "@" as an email address and keeps only what follows it
-  // (blocklist-service.ts), so an unvalidated value like
-  //   "https://x.no\nBcc: victim@evil.example"
-  // stores one thing as the website and mints post@evil.example as the claim
-  // address — and the PUBLIC claim route (POST /kategori/gardssalg/eier/:id/
-  // request) is unauthenticated and sends WITHOUT the test redirect, so any
-  // visitor who knows the slug could then trigger a genuine magic-link email to
-  // that unrelated domain. The `.invalid` default is only a safe default; it
-  // protects nothing once a caller passes their own value.
-  //
-  // Three gates, cheapest first, and all three are required:
-  //   1. isPlausibleUrlish  — the same shape check PATCH /admin/providers/:id/
-  //      hjemmeside already applies; rejects whitespace (so header/CRLF
-  //      injection cannot survive) and anything without a dot.
-  //   2. a parseable http(s) URL whose host equals the normalized domain — this
-  //      is what closes the "@" trick: a value whose derived domain is not
-  //      simply the host of the URL we are storing is refused outright, so the
-  //      stored website and the minted address can never disagree.
-  //   3. isClaimableDomain — the SAME rule deriveOrgLinkedEmail() applies at
-  //      mint time, so a bad domain is a clean 400 instead of a silently
-  //      non-claimable test row.
-  const claimDomain = claimable ? normalizeDomain(hjemmeside) : "";
-  if (claimable) {
-    let urlHost = "";
-    try {
-      const parsed = new URL(hjemmeside);
-      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-        urlHost = parsed.hostname.toLowerCase().replace(/^www\./, "");
-      }
-    } catch {
-      /* unparseable -> urlHost stays "" -> refused below */
-    }
-    if (!isPlausibleUrlish(hjemmeside) || !urlHost || urlHost !== claimDomain) {
+  // `claimEmail` — the tier (c) stored_epost_verified address (see this
+  // route's doc comment above for why this is deliberately NOT the same
+  // field as the required `email`). Only meaningful, and only accepted, with
+  // `claimable: true` — same "refuse rather than silently discard" contract
+  // hjemmeside used to follow for tier (b).
+  if (!claimable) {
+    if (typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim()) {
       res.status(400).json({
-        error:
-          "'hjemmeside' må være en http(s)-URL uten mellomrom, og vertsnavnet må være " +
-          "nøyaktig det domenet claim-adressen utledes fra (ellers kan lagret nettside og " +
-          "utledet post@-adresse peke på ulike domener)",
-        hjemmeside,
-        url_host: urlHost || null,
-        normalized_domain: claimDomain,
+        error: "'claimEmail' krever { claimable: true } — uten flagget skrives den ikke",
       });
       return;
     }
-    if (!isClaimableDomain(claimDomain)) {
+  }
+  let claimEmail = TEST_PROVIDER_DEFAULT_CLAIM_EMAIL;
+  if (claimable && typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim()) {
+    const candidate = req.body.claimEmail.trim();
+    // Plausible shape only — NOT the URL-host-match / isClaimableDomain
+    // checks the old hjemmeside-derivation path required. Those existed
+    // ONLY to keep a stored website and a domain-DERIVED address from
+    // disagreeing; there is no derivation left to protect, and a free-mail
+    // address (gmail/hotmail/...) is a perfectly legitimate claim target
+    // under tier (c) — unlike the retired tier (b), this path never rejects
+    // a domain for being "generic".
+    if (!EMAIL_SHAPE_RE.test(candidate)) {
       res.status(400).json({
-        error:
-          "'hjemmeside' må være et domene claim-flyten kan utlede post@<domene> fra " +
-          "(må inneholde punktum, og kan ikke være et generisk/delt domene)",
-        hjemmeside,
-        normalized_domain: claimDomain,
+        error: "'claimEmail' må se ut som en e-postadresse",
+        claimEmail: candidate,
       });
       return;
     }
-  } else if (typeof req.body?.hjemmeside === "string" && req.body.hjemmeside.trim()) {
-    // Without the flag the value is never written. Say so rather than accepting
-    // it and silently discarding it.
-    res.status(400).json({
-      error: "'hjemmeside' krever { claimable: true } — uten flagget skrives den ikke",
-    });
-    return;
+    claimEmail = candidate;
   }
 
   const expDb = getExpDb("experiences");
@@ -6534,24 +6526,15 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       .run({ id: providerId, navn: name, email, slug });
 
     // ── claimable opt-in (see this route's doc comment) ──────────────────
+    // Sets exactly the two fields tier (c) stored_epost_verified needs:
+    // content_source='manual' (adminEntered — deriveOrgLinkedEmailCandidates()
+    // reads this literally) and `epost` = claimEmail. No field_provenance
+    // touch anymore (tier (b)'s hjemmeside evidence stamp is retired along
+    // with the tier itself), so a pre-existing field_provenance value on this
+    // row — e.g. an unrelated hjemmeside_verification stamp from a prior test
+    // run — is left completely alone; nothing to merge, nothing to clobber.
     let claimReady = false;
     if (claimable) {
-      // MERGE the provenance, don't clobber it — both other writers of this
-      // column (applyGardssalgProviderWebsite in experience-store.ts, and the
-      // verification sweep's hjemmeside_verification stamp) read the existing
-      // JSON, set only their own key, and write back, treating malformed JSON
-      // as empty rather than failing the write. A wholesale stringify here
-      // would silently drop any key they had set. The org_nr pin below means
-      // that can only ever be the synthetic test row today, and the cohort
-      // exclusions keep the sweeps off it — so this is convention, not a live
-      // bug. Which is the reason to follow it: the next writer of this column
-      // should find three call sites agreeing, not two and an exception.
-      //
-      // Read AND write inside ONE transaction, same as
-      // applyGardssalgWebsiteVerification: split across two statements, a
-      // concurrent provenance writer could land between them and lose its key —
-      // which is the exact failure the merge exists to prevent.
-      //
       // The UPDATE's `AND org_nr = @testOrgNr` is belt to the pre-write guard's
       // braces. That guard already turns a real-provider slug into a 409 before
       // anything is written, so this pin should be unreachable — but it is what
@@ -6561,41 +6544,14 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       // already have run, so the 409 below would be reporting a partial write.
       // That is precisely the defect the pre-write guard was added to remove —
       // keep them in that order.
-      const result = expDb.transaction(() => {
-        let provenance: Record<string, unknown> = {};
-        const existingProv = expDb
-          .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
-          .get(providerId) as { field_provenance: string | null } | undefined;
-        if (existingProv?.field_provenance) {
-          try {
-            const parsed = JSON.parse(existingProv.field_provenance);
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-              provenance = parsed as Record<string, unknown>;
-            }
-          } catch {
-            /* malformed existing JSON -> treat as empty rather than clobber the write */
-          }
-        }
-        provenance.hjemmeside = {
-          source_url: hjemmeside,
-          fetched_at: new Date().toISOString(),
-          source: "admin-test-provider",
-        };
-        return expDb
-          .prepare(
-            `UPDATE experience_providers
-                SET brreg_verified = 1, hjemmeside = @hjemmeside,
-                    field_provenance = @stamp, content_source = NULL,
-                    updated_at = datetime('now')
-              WHERE id = @id AND org_nr = @testOrgNr`
-          )
-          .run({
-            id: providerId,
-            hjemmeside,
-            stamp: JSON.stringify(provenance),
-            testOrgNr: TEST_PROVIDER_ORG_NR,
-          });
-      })();
+      const result = expDb
+        .prepare(
+          `UPDATE experience_providers
+              SET brreg_verified = 1, content_source = 'manual', epost = @claimEmail,
+                  updated_at = datetime('now')
+            WHERE id = @id AND org_nr = @testOrgNr`
+        )
+        .run({ id: providerId, claimEmail, testOrgNr: TEST_PROVIDER_ORG_NR });
 
       if (result.changes === 0) {
         res.status(409).json({
@@ -6609,8 +6565,13 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       claimReady = true;
     }
 
+    // The row's ACTUAL current epost — claimEmail when claimable overwrote
+    // it, the general `email` otherwise (see this route's doc comment's
+    // "JUDGMENT CALL" note on why these can differ).
+    const currentEpost = claimReady ? claimEmail : email;
+
     console.log(
-      `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${email} ` +
+      `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${currentEpost} ` +
         `(catalog_hidden=1, booking_live=1, claimable=${claimReady})`
     );
 
@@ -6619,16 +6580,16 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       provider_id: providerId,
       slug,
       booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
-      epost: email,
+      epost: currentEpost,
       claimable: claimReady,
       ...(claimReady
         ? {
             claim_url: `${APP_URL}/kategori/gardssalg/eier/${slug}`,
-            claim_hjemmeside: hjemmeside,
-            // The address the claim would derive. Reported so the operator can
-            // confirm the E2E redirect actually diverted the send — nothing is
-            // ever sent to it by this route (it sends no email at all).
-            derived_claim_email: `post@${claimDomain}`,
+            // The address stored for tier (c) stored_epost_verified. Reported
+            // so the operator can confirm the E2E redirect actually diverted
+            // the send — nothing is ever sent to it by this route (it sends
+            // no email at all).
+            claim_epost: claimEmail,
           }
         : {}),
     });

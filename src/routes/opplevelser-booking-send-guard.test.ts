@@ -330,18 +330,30 @@ export function runOpplevelserBookingSendGuardTests(
       });
 
       // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse
-      // (independent-review follow-up, PR #494): a provider that qualifies
-      // on TWO tiers, dedicated to (p17)-(p20) below — own org_nr/rate-limit
-      // window so it doesn't interact with prov-claim-admin's own count.
+      // (independent-review follow-up, PR #494), dedicated to (p17)-(p20)
+      // below — own org_nr/rate-limit window so it doesn't interact with
+      // prov-claim-admin's own count.
+      //
+      // Used to ALSO carry a verified hjemmeside so it qualified on two
+      // tiers (verified_domain_address + stored_epost_verified) — the
+      // multi-candidate case p17-p20 exercise. dev-request 2026-08-06-aldri-
+      // gjett-epostadresse retired verified_domain_address entirely, and
+      // this admin route (POST /admin/claim-test-send) always calls
+      // issueClaimMagicLink() with brregContactEmail=null (see that route in
+      // opplevelser.ts), so brreg_contact can never fire here either — with
+      // both of the OTHER two tiers structurally unreachable from this
+      // route, a manual+epost row now has exactly ONE qualifying candidate,
+      // no matter what. hjemmeside dropped (no longer contributes anything);
+      // p17-p20 rewritten below for the single-candidate reality.
       expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, vertical, epost, org_nr, brreg_verified, hjemmeside, content_source, catalog_hidden,
+           (id, navn, vertical, epost, org_nr, brreg_verified, content_source, catalog_hidden,
             producer_type, enrichment_state, verification_status, source, confidence, created_at)
-         VALUES (@id, @navn, 'experiences', @epost, @org_nr, 1, @hjemmeside, 'manual', @catalog_hidden,
+         VALUES (@id, @navn, 'experiences', @epost, @org_nr, 1, 'manual', @catalog_hidden,
                  'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
       ).run({
         id: "prov-claim-admin-two", navn: "Admin Test To-Valg Gård", epost: "admin-two@example.no",
-        org_nr: "988888887", hjemmeside: "https://admin-two-gard.no", catalog_hidden: null,
+        org_nr: "988888887", catalog_hidden: null,
       });
 
       const bookingInput = {
@@ -518,21 +530,23 @@ export function runOpplevelserBookingSendGuardTests(
       assertTrue(!("verify_url" in claimRateLimited.body), "p16: a rate-limited response carries no verify_url");
 
       // ── (p17)-(p20) dev-request 2026-08-06-claim-produsent-velger-
-      // mottakeradresse (independent-review follow-up, PR #494): a provider
-      // qualifying on 2 tiers used to be impossible for this admin tool to
-      // test-send to at all (issueClaimMagicLink returned selection_required
-      // with no way to name a choice, mapped to the WRONG status code, 403,
-      // alongside unrelated errors) ────────────────────────────────────────
+      // mottakeradresse (independent-review follow-up, PR #494), REWRITTEN
+      // 2026-08-06 for dev-request 2026-08-06-aldri-gjett-epostadresse: the
+      // selection MACHINERY (selectedSource validated against the
+      // provider's own re-derived candidates, never trusted as-is) is still
+      // real and still worth covering end to end, even though this fixture
+      // can no longer be multi-candidate (see the fixture's own comment
+      // above) — p17 now covers the single-candidate "no selection needed"
+      // path instead of "selection_required" ──────────────────────────────
       const claimAdminNoSelection = await callRoute(opplevelserRouter, {
         url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two" },
       });
-      assertEq(claimAdminNoSelection.status, 400, "p17: a 2-candidate provider with no selected_source -> 400 (not 403, distinguishable from an auth/eligibility failure)");
-      assertEq(claimAdminNoSelection.body.error, "selection_required", "p18: error body names selection_required");
+      assertEq(claimAdminNoSelection.status, 200, "p17: a single-candidate provider needs no selected_source -> 200 (brreg_contact and verified_domain_address are both structurally unreachable via this route/tier-b-retirement, so stored_epost_verified is the only candidate)");
 
       const claimAdminSelected = await callRoute(opplevelserRouter, {
         url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "stored_epost_verified" },
       });
-      assertEq(claimAdminSelected.status, 200, "p19: the SAME provider with a valid selected_source -> 200, the admin tool can test-send to a multi-candidate provider again");
+      assertEq(claimAdminSelected.status, 200, "p19: the SAME provider with an explicit, matching selected_source also succeeds -> 200");
 
       const claimAdminBadSelection = await callRoute(opplevelserRouter, {
         url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "brreg_contact" },
