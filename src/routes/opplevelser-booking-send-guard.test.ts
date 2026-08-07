@@ -47,7 +47,11 @@
  *   (o) POST /admin/booking-test-send: happy path → is_test row, both sends
  *       redirected, response reports the intended recipients
  *   (p) POST /admin/claim-test-send: unauthenticated → 403; no redirect
- *       configured → 400 and no claim row
+ *       configured → 400 and no claim row; happy path returns a verify_url
+ *       usable for a full re-login test without reading any email (dev-
+ *       request 2026-08-03-claim-reinnlogging-kan-ikke-testes, AC1); a
+ *       second ("re-login") call returns a fresh verify_url; the existing
+ *       3/hour rate limit still applies unchanged to this admin path (AC4)
  *   (q) the public POST /book path cannot produce a test booking even when the
  *       payload screams for one
  */
@@ -182,6 +186,53 @@ export function runOpplevelserBookingSendGuardTests(
       const emailMod = require("../services/email-service") as typeof import("../services/email-service");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
+      // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse:
+      // issueClaimMagicLink() below now always builds the FULL candidate
+      // list (deriveOrgLinkedEmailCandidatesWithOutreachLookup), not just
+      // the first match — so it may run the RFB-db-backed
+      // wasEpostDeliveredOutreachNoBounce() lookup even when this fixture's
+      // explicit brregContactEmail argument already makes it eligible,
+      // where the old single-result function's short-circuit meant it
+      // never did. This suite never provided its own RFB db (it only ever
+      // needed the EXPERIENCES vertical), which used to be safe because the
+      // lookup never ran — install the SAME isolated, empty, schema'd
+      // override services/gardssalg-claim.test.ts's own suite uses, so this
+      // suite no longer depends on whatever the process-wide shared RFB
+      // singleton happens to be at the moment it runs (the exact race class
+      // that override exists to avoid — see its own doc comment).
+      const bsgRfbDb = new (require("better-sqlite3"))(":memory:");
+      (require("../database/init") as typeof import("../database/init")).__initSchemaForTesting(bsgRfbDb);
+      claimSvc.__setRfbDbForTesting(bsgRfbDb);
+
+      // dev-request 2026-08-06-aldri-gjett-epostadresse SLICE 5 / AC7:
+      // issueClaimMagicLink() is now harvest-backed and async. AUDITED, not
+      // assumed — none of this suite's fixtures can actually reach an
+      // outbound fetch: prov-live has no hjemmeside at all (the own-site
+      // harvest needs one) and its umbrella fallback dies inside
+      // findUmbrellaAffiliation() against the empty bsgRfbDb above, before
+      // any network call; prov-claim-admin / prov-claim-admin-two are
+      // content_source='manual' WITH a stored epost, so stored_epost_verified
+      // already qualifies and the umbrella fallback is suppressed by its own
+      // gating condition. The override below is therefore a REGRESSION
+      // GUARD, not a requirement: bsgHarvestFetchCalls is asserted empty at
+      // the end of this suite, so if a future fixture change (or a change to
+      // those gating conditions) ever made this suite reach the network, it
+      // fails loudly here instead of silently making a real outbound request
+      // from `npm test`. A COUNTER rather than a throwing stub because
+      // fetchPage() never rethrows — only counting can prove "zero calls".
+      const bsgHarvestFetchCalls: string[] = [];
+      claimSvc.__setClaimHarvestFetchForTesting(((async (input: unknown) => {
+        const url = String(input);
+        bsgHarvestFetchCalls.push(url);
+        const bytes = new TextEncoder().encode("<html><body>ingen kontaktinfo</body></html>");
+        return {
+          ok: true, status: 200, statusText: "S200", url,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+        } as unknown as Response;
+      }) as unknown) as typeof fetch);
+      claimSvc.__resetClaimHarvestCacheForTesting();
+
       // ── Fake transport at the REAL send boundary ─────────────────────────
       // The guard lives inside sendEmail(); stubbing sendEmail itself would
       // stub out the thing under test. Injecting a transporter observes the
@@ -287,6 +338,53 @@ export function runOpplevelserBookingSendGuardTests(
                  'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
       ).run({ id: "prov-live", navn: "Test Gård", epost: "ekte.produsent@gard.no", catalog_hidden: null });
 
+      // dev-request 2026-08-03-claim-reinnlogging-kan-ikke-testes — a
+      // DEDICATED fixture (own org_nr, own rate-limit window) for the
+      // admin claim-test-send verify_url tests in (p) below, so their
+      // call count doesn't interact with prov-live's own rate-limit use
+      // in (l). content_source='manual' + a stored epost is enough for
+      // deriveOrgLinkedEmail's stored_epost_verified tier (c-epost,
+      // adminEntered) to resolve WITHOUT an explicit brregContactEmail
+      // argument — the same call shape the admin route itself uses
+      // (issueClaimMagicLink(providerId, null, {isTest:true})).
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, org_nr, brreg_verified, content_source, catalog_hidden,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES (@id, @navn, 'experiences', @epost, @org_nr, 1, 'manual', @catalog_hidden,
+                 'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
+      ).run({
+        id: "prov-claim-admin", navn: "Admin Test Gård", epost: "admin.testrow@example.no",
+        org_nr: "955555555", catalog_hidden: null,
+      });
+
+      // dev-request 2026-08-06-claim-produsent-velger-mottakeradresse
+      // (independent-review follow-up, PR #494), dedicated to (p17)-(p20)
+      // below — own org_nr/rate-limit window so it doesn't interact with
+      // prov-claim-admin's own count.
+      //
+      // Used to ALSO carry a verified hjemmeside so it qualified on two
+      // tiers (verified_domain_address + stored_epost_verified) — the
+      // multi-candidate case p17-p20 exercise. dev-request 2026-08-06-aldri-
+      // gjett-epostadresse retired verified_domain_address entirely, and
+      // this admin route (POST /admin/claim-test-send) always calls
+      // issueClaimMagicLink() with brregContactEmail=null (see that route in
+      // opplevelser.ts), so brreg_contact can never fire here either — with
+      // both of the OTHER two tiers structurally unreachable from this
+      // route, a manual+epost row now has exactly ONE qualifying candidate,
+      // no matter what. hjemmeside dropped (no longer contributes anything);
+      // p17-p20 rewritten below for the single-candidate reality.
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, org_nr, brreg_verified, content_source, catalog_hidden,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES (@id, @navn, 'experiences', @epost, @org_nr, 1, 'manual', @catalog_hidden,
+                 'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
+      ).run({
+        id: "prov-claim-admin-two", navn: "Admin Test To-Valg Gård", epost: "admin-two@example.no",
+        org_nr: "988888887", catalog_hidden: null,
+      });
+
       const bookingInput = {
         provider_id: "prov-live",
         slot_at: "2026-09-01T12:00:00.000Z",
@@ -344,7 +442,7 @@ export function runOpplevelserBookingSendGuardTests(
         `UPDATE experience_providers SET org_nr = '910000111', brreg_verified = 1
          WHERE id = 'prov-live'`
       ).run();
-      const claimTest = claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no", { isTest: true });
+      const claimTest = await claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no", { isTest: true });
       if (claimTest.ok) {
         assertEq(claimTest.claim.isTest, true, "l1: {isTest:true} marks the claim");
         assertEq(
@@ -355,7 +453,7 @@ export function runOpplevelserBookingSendGuardTests(
       } else {
         assertTrue(false, `l1/l2: expected a claim to be issued, got ${claimTest.error}`);
       }
-      const claimReal = claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no");
+      const claimReal = await claimSvc.issueClaimMagicLink("prov-live", "eier@testgard.no");
       if (claimReal.ok) {
         assertEq(claimReal.claim.isTest, false, "l3: the default leaves a claim un-flagged");
       } else {
@@ -405,6 +503,85 @@ export function runOpplevelserBookingSendGuardTests(
       );
       process.env.TEST_SEND_REDIRECT_EMAIL = REDIRECT;
 
+      // ── (p4)-(p7) dev-request 2026-08-03-claim-reinnlogging-kan-ikke-
+      // testes AC1: happy path returns a verify_url the operator can use
+      // directly, without ever reading the (possibly garbled) redirected
+      // email ─────────────────────────────────────────────────────────────
+      const claimHappy1 = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimHappy1.status, 200, "p4: happy-path claim-test-send -> 200");
+      assertTrue(claimHappy1.body.success === true, "p5: response success=true");
+      assertTrue(
+        typeof claimHappy1.body.verify_url === "string" && claimHappy1.body.verify_url.length > 0,
+        "p6: response carries a non-empty verify_url"
+      );
+      assertTrue(
+        claimHappy1.body.verify_url.includes("/kategori/gardssalg/eier/magic-link-verify?token="),
+        "p7: verify_url targets the magic-link-verify route"
+      );
+
+      const claimRow1 = expDb.prepare(
+        `SELECT token, is_test FROM gardssalg_claims WHERE provider_id = ? ORDER BY created_at DESC LIMIT 1`
+      ).get("prov-claim-admin") as any;
+      assertTrue(!!claimRow1?.token, "p8: a claim row was created (fixture sanity check)");
+      assertEq(
+        claimHappy1.body.verify_url.endsWith(`token=${claimRow1.token}`), true,
+        "p9: verify_url's token is exactly the persisted claim row's token — the one verifyClaimToken() will accept"
+      );
+      assertEq(claimRow1.is_test, 1, "p10: the admin route's claim row is always is_test=1");
+
+      // ── (p11)-(p12) AC1: a SECOND call ("re-login") returns a FRESH,
+      // independently-working verify_url — re-login can be exercised twice
+      // without ever touching email ────────────────────────────────────────
+      const claimHappy2 = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimHappy2.status, 200, "p11: second (re-login) claim-test-send call -> 200");
+      assertTrue(
+        typeof claimHappy2.body.verify_url === "string" && claimHappy2.body.verify_url !== claimHappy1.body.verify_url,
+        "p12: re-login call returns a DIFFERENT, fresh verify_url (a new token, not a reused one)"
+      );
+
+      // ── (p13)-(p16) AC4: the existing 3/hour rate-limit still applies
+      // unchanged to this admin path too (it goes through the SAME
+      // issueClaimMagicLink()/isClaimRateLimited() the public route uses) ──
+      const claimHappy3 = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimHappy3.status, 200, "p13: third call within the 3/hour window -> still 200 (limit not yet reached)");
+
+      const claimRateLimited = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin" },
+      });
+      assertEq(claimRateLimited.status, 429, "p14: 4th call within the window -> 429, same limit as the public route");
+      assertEq(claimRateLimited.body.error, "rate_limited", "p15: with the same error code the public route returns");
+      assertTrue(!("verify_url" in claimRateLimited.body), "p16: a rate-limited response carries no verify_url");
+
+      // ── (p17)-(p20) dev-request 2026-08-06-claim-produsent-velger-
+      // mottakeradresse (independent-review follow-up, PR #494), REWRITTEN
+      // 2026-08-06 for dev-request 2026-08-06-aldri-gjett-epostadresse: the
+      // selection MACHINERY (selectedSource validated against the
+      // provider's own re-derived candidates, never trusted as-is) is still
+      // real and still worth covering end to end, even though this fixture
+      // can no longer be multi-candidate (see the fixture's own comment
+      // above) — p17 now covers the single-candidate "no selection needed"
+      // path instead of "selection_required" ──────────────────────────────
+      const claimAdminNoSelection = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two" },
+      });
+      assertEq(claimAdminNoSelection.status, 200, "p17: a single-candidate provider needs no selected_source -> 200 (brreg_contact and verified_domain_address are both structurally unreachable via this route/tier-b-retirement, so stored_epost_verified is the only candidate)");
+
+      const claimAdminSelected = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "stored_epost_verified" },
+      });
+      assertEq(claimAdminSelected.status, 200, "p19: the SAME provider with an explicit, matching selected_source also succeeds -> 200");
+
+      const claimAdminBadSelection = await callRoute(opplevelserRouter, {
+        url: "/admin/claim-test-send", headers: auth, body: { provider_id: "prov-claim-admin-two", selected_source: "brreg_contact" },
+      });
+      assertEq(claimAdminBadSelection.status, 403, "p20: a selected_source that isn't one of this provider's real candidates is still rejected, not silently substituted");
+
       // ── (q) the public booking path can never produce a test booking ─────
       sent = [];
       const publicBooking = await callRoute(opplevelserRouter, {
@@ -420,6 +597,15 @@ export function runOpplevelserBookingSendGuardTests(
         sent.length === 0 || sent.every((m) => !String(m.subject).startsWith("[TESTSENDING]")),
         "q3: and nothing it sent was marked as a test send"
       );
+
+      // ── (r) SLICE 5 / AC7 zero-network regression guard ──────────────────
+      // See the __setClaimHarvestFetchForTesting install at the top of this
+      // suite for the per-fixture audit this asserts. If this ever fails, a
+      // fixture in this suite has become harvest-eligible — which is fine in
+      // itself, but the fixture then needs a deliberate harvest scenario
+      // rather than an accidental one, and (had the override not been
+      // installed) `npm test` would have made a real outbound request.
+      assertEq(bsgHarvestFetchCalls, [], "r1: this suite never triggers an outbound harvest fetch — every claim fixture here qualifies (or fails to) purely on DB evidence");
     } finally {
       if (emailSvc) {
         emailSvc.isConfigured = origConfigured;
@@ -433,6 +619,15 @@ export function runOpplevelserBookingSendGuardTests(
       restore("ADMIN_KEY", prevAdminKey);
       restore("TEST_SEND_REDIRECT_EMAIL", prevRedirect);
       restore("BOOKING_DISPATCH_ENABLED", prevDispatch);
+      try {
+        const claimMod = require("../services/gardssalg-claim") as typeof import("../services/gardssalg-claim");
+        claimMod.__setRfbDbForTesting(null);
+        // SLICE 5 / AC7: same discipline as the RFB-db override above.
+        claimMod.__setClaimHarvestFetchForTesting(undefined);
+        claimMod.__resetClaimHarvestCacheForTesting();
+      } catch {
+        // best-effort cleanup
+      }
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

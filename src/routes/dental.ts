@@ -34,8 +34,10 @@ import {
   // item 2a (2026-07-17): dead-extraction parking
   recordDentalExtractionResult,
   // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
-  // item 4 / slice 4a (2026-07-20): Stage V helfo_agreement auto-correction
+  // item 4 / slice 4a (2026-07-20): Stage V helfo_agreement auto-correction;
+  // slice 4b (2026-08-07): generalized to treatments/opening_hours
   recordStageVFieldObservation,
+  type StageVField,
   DENTAL_AGENT_WRITABLE_FIELDS,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
@@ -578,23 +580,49 @@ router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Respon
 });
 
 // POST /api/tannlege/admin/stage-v-drift-result
-// Body: { agentId: string, field: "helfo_agreement", value: "true"|"false"|"unknown" }
+// Body: { agentId: string, field: "helfo_agreement"|"treatments"|"opening_hours", value: ... }
 // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
 // item 4 / slice 4a (2026-07-20): Stage V (the enrichment routine's §5
 // sample-verify) re-fetches a small sample of clinics each cycle and checks
-// the site's helfo-signal against the DB value, but today can only flag a
+// the site's signal against the DB value, but today can only flag a
 // mismatch ("drift" → needs_review), never correct it. This route is the
 // correction-reporting surface: Stage V calls it with the concrete value it
 // found on-site; the server (recordStageVFieldObservation, dental-store.ts)
 // owns the "2 consecutive matching contradictions → auto-correct" logic —
 // a single differing observation is only parked as pending, not yet
-// trusted. `field` is restricted to "helfo_agreement" this slice — any
-// other value 400s (forward-compat guard for the future item-4b
-// treatments/opening_hours fields, so they can't be silently half-shipped
-// by a client sending an unsupported field name). This endpoint NEVER
-// touches verification_status — the existing §5.3 drift→needs_review rule
-// is completely unchanged (see recordStageVFieldObservation's own comment).
+// trusted. `field` is restricted to the three StageVField members — any
+// other value 400s. This endpoint NEVER touches verification_status — the
+// existing §5.3 drift→needs_review rule is completely unchanged (see
+// recordStageVFieldObservation's own comment).
+//
+// slice 4b (2026-08-07): generalized from helfo_agreement-only to also
+// accept treatments/opening_hours. Per-field body validation runs BEFORE
+// calling recordStageVFieldObservation (400 on any failure), mirroring
+// (not reusing directly — this route's bounds are intentionally stricter
+// than the full-record PUT schema, see the schemas' own comments below)
+// DentalAgentSchema's treatments/opening_hours element shapes so the stored
+// shape can never diverge from what Stage X itself is allowed to write.
 const STAGE_V_HELFO_VALUES = new Set(["true", "false", "unknown"]);
+const STAGE_V_FIELDS = new Set<StageVField>(["helfo_agreement", "treatments", "opening_hours"]);
+
+// A Stage V *observation*, not a full re-ingest — an unbounded array is a
+// signal something is wrong upstream, not a legitimate correction, hence the
+// explicit max-length guard (no such cap exists on the stored field itself).
+const StageVTreatmentsValueSchema = z.array(z.string().trim().min(1)).min(1).max(50);
+
+// Mirrors DentalAgentSchema.shape.opening_hours's inner object shape
+// (day enum + HH:MM regex) exactly, plus a max-length guard (a week has at
+// most 7 days).
+const StageVOpeningHoursValueSchema = z
+  .array(
+    z.object({
+      day: z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]),
+      open: z.string().regex(/^\d{2}:\d{2}$/),
+      close: z.string().regex(/^\d{2}:\d{2}$/),
+    })
+  )
+  .max(7);
+
 router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Response) => {
   try {
     const { agentId, field, value } = (req.body ?? {}) as {
@@ -606,15 +634,43 @@ router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Res
       res.status(400).json({ error: "Invalid body: need {agentId: string, field: string, value: string}" });
       return;
     }
-    if (field !== "helfo_agreement") {
-      res.status(400).json({ error: 'Invalid field: only "helfo_agreement" is supported this slice' });
+    if (typeof field !== "string" || !STAGE_V_FIELDS.has(field as StageVField)) {
+      res.status(400).json({
+        error: 'Invalid field: must be one of "helfo_agreement"|"treatments"|"opening_hours"',
+      });
       return;
     }
-    if (typeof value !== "string" || !STAGE_V_HELFO_VALUES.has(value)) {
-      res.status(400).json({ error: 'Invalid value: must be one of "true"|"false"|"unknown"' });
-      return;
+
+    let observedValue: string | string[] | { day: string; open: string; close: string }[];
+    if (field === "helfo_agreement") {
+      if (typeof value !== "string" || !STAGE_V_HELFO_VALUES.has(value)) {
+        res.status(400).json({ error: 'Invalid value: must be one of "true"|"false"|"unknown"' });
+        return;
+      }
+      observedValue = value;
+    } else if (field === "treatments") {
+      const parsed = StageVTreatmentsValueSchema.safeParse(value);
+      if (!parsed.success) {
+        res.status(400).json({
+          error: "Invalid value: treatments must be an array of 1-50 non-empty strings",
+          details: parsed.error.issues,
+        });
+        return;
+      }
+      observedValue = parsed.data;
+    } else {
+      const parsed = StageVOpeningHoursValueSchema.safeParse(value);
+      if (!parsed.success) {
+        res.status(400).json({
+          error: "Invalid value: opening_hours must be an array of up to 7 {day,open,close} objects",
+          details: parsed.error.issues,
+        });
+        return;
+      }
+      observedValue = parsed.data;
     }
-    const r = recordStageVFieldObservation(agentId.trim(), field, value);
+
+    const r = recordStageVFieldObservation(agentId.trim(), field as StageVField, observedValue);
     if (!r.found) {
       res.status(404).json({ error: "Not found" });
       return;

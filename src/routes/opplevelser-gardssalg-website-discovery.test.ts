@@ -440,6 +440,85 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertEq(wManual.length, 0, "wd-6f: manual row → nothing written, regardless of owner_locks");
       }
 
+      // ── wd-11: "godkjenn-på-plass" — a candidate byte-identical to the
+      //    row's OWN current hjemmeside is not a fill-only violation, it's a
+      //    no-op re-approval: provenance gets (re)stamped and the write
+      //    succeeds instead of forever tripping the fill-only guard (which
+      //    used to strand these forever in the review queue). ─────────────
+      {
+        insertProvider.run({ id: "wd-atplace", navn: "Plassert Gard", org_nr: "911222333", kommune: "Voss", poststed: null, hjemmeside: "https://atplace-gard.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-atplace-route", navn: "Plassert Rute Gard", org_nr: "911222444", kommune: "Voss", poststed: null, hjemmeside: "https://atplace-route-gard.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({
+          id: "wd-manual-atplace", navn: "Manuell Plassert Gard", org_nr: "911222555", kommune: "Voss", poststed: null,
+          hjemmeside: "https://manuell-egen.no", catalog_hidden: null, content_source: "manual", producer_type: "sideri",
+        });
+        insertProvider.run({
+          id: "wd-locked-atplace", navn: "Kravsatt Plassert Gard", org_nr: "911222666", kommune: "Voss", poststed: null,
+          hjemmeside: "https://kravsatt-egen.no", catalog_hidden: null, content_source: "claim", producer_type: "sideri",
+          field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T12:00:00.000Z" } } }),
+        });
+
+        // (a) exact-match candidate: succeeds, value UNCHANGED, provenance
+        //     stamped, exactly one new audit row.
+        const auditBefore = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_content_audit WHERE provider_id='wd-atplace' AND field_name='hjemmeside'`).get() as any).c;
+        assertEq(auditBefore, 0, "wd-11a0: no pre-existing audit row for wd-atplace/hjemmeside");
+        const wAtPlace = expStore.applyGardssalgProviderWebsite("wd-atplace", "https://atplace-gard.no", "https://evidence-atplace.example");
+        assertEq(JSON.stringify(wAtPlace), JSON.stringify(["hjemmeside"]), 'wd-11a: at-place candidate returns ["hjemmeside"] (not [])');
+        const rowAtPlace = expDb.prepare(`SELECT hjemmeside, field_provenance FROM experience_providers WHERE id='wd-atplace'`).get() as any;
+        assertEq(rowAtPlace.hjemmeside, "https://atplace-gard.no", "wd-11b: hjemmeside column UNCHANGED by the at-place write");
+        assertEq(
+          JSON.parse(rowAtPlace.field_provenance || "{}").hjemmeside?.source_url,
+          "https://evidence-atplace.example",
+          "wd-11c: field_provenance.hjemmeside stamped with the new evidence url",
+        );
+        const auditAfter = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_content_audit WHERE provider_id='wd-atplace' AND field_name='hjemmeside'`).get() as any).c;
+        assertEq(auditAfter, 1, "wd-11d: exactly one new gardssalg_content_audit row written");
+
+        // (b) same scenario driven through the approve ROUTE with apply:true
+        //     — must land as a real write, not write_skipped_by_guards, and
+        //     must clear the queue entry.
+        expStore.upsertGardssalgWebsiteReviewQueue({
+          provider_id: "wd-atplace-route",
+          provider_name: "Plassert Rute Gard",
+          candidate_url: "https://atplace-route-gard.no",
+          final_url: "https://atplace-route-gard.no",
+          reason: "website_discovery_candidate",
+        });
+        const approveRes = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { approvals: [{ provider_id: "wd-atplace-route", url: "https://atplace-route-gard.no" }], apply: true },
+        });
+        assertEq(approveRes.body.written_count, 1, "wd-11e: approve route treats the at-place candidate as a real write (not write_skipped_by_guards)");
+        const qLeftAtPlace = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-atplace-route'`).get() as any).c;
+        assertEq(qLeftAtPlace, 0, "wd-11f: queue entry for the at-place candidate is cleared");
+
+        // (c) negative control — a DIFFERENT candidate on a row that already
+        //     carries a hjemmeside still hits the unchanged fill-only guard
+        //     (proves the non-at-place path is untouched).
+        const wDiffers = expStore.applyGardssalgProviderWebsite("wd-atplace", "https://helt-annen-url.no", "https://x");
+        assertEq(wDiffers.length, 0, "wd-11g: negative control — non-matching candidate on a filled row still refused (fill-only path unchanged)");
+        const rowDiffers = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-atplace'`).get() as any;
+        assertEq(rowDiffers.hjemmeside, "https://atplace-gard.no", "wd-11h: hjemmeside still unchanged after the refused non-matching write");
+
+        // (d) the manual / owner-lock guards must still fire BEFORE the
+        //     at-place check — isAtPlace must never bypass them, and NOTHING
+        //     (not even provenance) gets stamped for either, even though the
+        //     candidate equals the row's own current hjemmeside.
+        const wManualAtPlace = expStore.applyGardssalgProviderWebsite("wd-manual-atplace", "https://manuell-egen.no", "https://x");
+        assertEq(wManualAtPlace.length, 0, "wd-11i: manual row → still refused even when candidate equals its own hjemmeside");
+        const rowManualAtPlace = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='wd-manual-atplace'`).get() as any;
+        assertEq(rowManualAtPlace.field_provenance, null, "wd-11j: manual row's field_provenance was NOT stamped by the at-place path");
+
+        const wLockedAtPlace = expStore.applyGardssalgProviderWebsite("wd-locked-atplace", "https://kravsatt-egen.no", "https://x");
+        assertEq(wLockedAtPlace.length, 0, "wd-11k: owner-locked claim row → still refused even when candidate equals its own hjemmeside");
+        const rowLockedAtPlace = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='wd-locked-atplace'`).get() as any;
+        assertTrue(
+          !JSON.parse(rowLockedAtPlace.field_provenance || "{}").hjemmeside,
+          "wd-11l: owner-locked row's field_provenance.hjemmeside was NOT stamped by the at-place path",
+        );
+      }
+
       // ── wd-7: shared-host counter counts hidden rows, excludes test provider. ─
       {
         const counts = expStore.gardssalgSharedHostCounts();
@@ -688,6 +767,111 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         } finally {
           globalThis.fetch = prevFetch3;
           expStore.__setGardssalgWebsiteSearchForTesting(null);
+        }
+      }
+
+      // ── wd-18/19/20: title corroboration on the discovery flow itself
+      //    (dev-request/reviewer follow-up 2026-08-06) — this is the
+      //    LITERAL originating incident: sibling-TLD/search-tier candidate
+      //    guessing (tryGardssalgCandidateHosts, backing THIS route) is
+      //    where 7 of 9 guessed-TLD candidates were wrong — squatted
+      //    domains and unrelated orgs that all passed on name+place body
+      //    text alone. gardssalgWebsiteEvidenceMatch's title gate was
+      //    already proven at the other 3 call sites; wd-18/19/20 prove it
+      //    now also applies at the two real call sites INSIDE
+      //    tryGardssalgCandidateHosts — the front-page match (~line 2946)
+      //    and the subpage-crawl match (~line 2965). ──────────────────────
+      {
+        // wd-18: pure regression check — same page, same evidence, only
+        // whether a title source is offered differs. This is exactly the
+        // shape of the incident: a squatted/unrelated <title> sitting on
+        // top of a body that happens to contain the producer's name+place.
+        const incidentBody = "Kaldvik Gardsutsalg i vakre Alta.";
+        const squattedTitle = "Kjøp dette domenet — DomainBrokers Inc";
+        const incidentTarget = { orgNr: null, navn: "Kaldvik Gardsutsalg", kommune: "Alta", poststed: null };
+        const withoutTitleSource = expStore.gardssalgWebsiteEvidenceMatch(incidentBody, incidentTarget);
+        assertEq(withoutTitleSource.verified, true, "wd-18a: name+place alone verifies when no title source is offered (the pre-fix / not-yet-wired shape)");
+        const withSquattedTitle = expStore.gardssalgWebsiteEvidenceMatch(incidentBody, incidentTarget, squattedTitle);
+        assertEq(withSquattedTitle.title_found, false, "wd-18b: the squatted-domain title does not contain the producer's name");
+        assertEq(withSquattedTitle.verified, false, "wd-18c: the SAME page is now rejected once a title source is supplied — the incident shape, fixed");
+
+        // wd-19: route-level, FRONT-PAGE call site (~line 2946) —
+        // tryGardssalgCandidateHosts's tier-1 name-guess lands directly on
+        // a squatted sibling-TLD host whose body text hits name+place but
+        // whose <title> is the squatter's, not the producer's.
+        insertProvider.run({ id: "wd-title-front", navn: "Kaldvik Gardsutsalg", org_nr: "922000004", kommune: "Alta", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "gardsbutikk" });
+
+        const titleFetchCalls: string[] = [];
+        const prevFetch4 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const u = String(url);
+          titleFetchCalls.push(u);
+          // Guessed front-page host for "Kaldvik Gardsutsalg": name+place
+          // in the body, but a squatted-domain <title> — no contact links,
+          // so there is nothing to crawl further.
+          if (u === "https://kaldvikgardsutsalg.no" || u === "https://kaldvikgardsutsalg.no/") {
+            return { ok: true, status: 200, url: u, text: async () =>
+              "<html><head><title>Kjøp dette domenet — DomainBrokers Inc</title></head>" +
+              "<body>Kaldvik Gardsutsalg i vakre Alta.</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-title-front"], apply: true },
+          });
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-title-front"),
+            "wd-19a: squatted-title sibling-TLD candidate is NOT proposed at the front-page call site (previously it would have been — name+place alone used to verify)");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-title-front"),
+            "wd-19b: falls through honestly to no_candidate_verified");
+          const qCnt = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-title-front'`).get() as any).c;
+          assertEq(qCnt, 0, "wd-19c: nothing queued for the rejected candidate");
+        } finally {
+          globalThis.fetch = prevFetch4;
+        }
+
+        // wd-20: route-level, SUBPAGE-CRAWL call site (~line 2965) — the
+        // front page shows only a partial signal (name, no place), so the
+        // contact-page crawl fires; the /kontakt subpage is where the
+        // name+place hit actually lands, but its <title> is still the
+        // squatter's — must be rejected there too, not just on the front
+        // page.
+        insertProvider.run({ id: "wd-title-sub", navn: "Mork Gardsutsalg", org_nr: "922000005", kommune: "Alta", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "gardsbutikk" });
+
+        const subTitleFetchCalls: string[] = [];
+        const prevFetch5 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const u = String(url);
+          subTitleFetchCalls.push(u);
+          if (u === "https://morkgardsutsalg.no" || u === "https://morkgardsutsalg.no/") {
+            return { ok: true, status: 200, url: u, text: async () =>
+              '<html><body>Mork Gardsutsalg — besøksgard. <a href="/kontakt">Kontakt oss</a></body></html>' } as unknown as Response;
+          }
+          if (u.startsWith("https://morkgardsutsalg.no/kontakt")) {
+            return { ok: true, status: 200, url: u, text: async () =>
+              "<html><head><title>Dette domenet er til salgs</title></head>" +
+              "<body>Mork Gardsutsalg ligger i Alta.</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-title-sub"], apply: true },
+          });
+          assertTrue(subTitleFetchCalls.some((u) => u.startsWith("https://morkgardsutsalg.no/kontakt")),
+            "wd-20a: the name-only front-page signal DID trigger the subpage crawl (sanity — the flow reached the second call site)");
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-title-sub"),
+            "wd-20b: the subpage's name+place hit is NOT proposed once its squatted title fails the gate (previously it would have verified via v1 name+place)");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-title-sub"),
+            "wd-20c: falls through honestly to no_candidate_verified");
+          const qCnt = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-title-sub'`).get() as any).c;
+          assertEq(qCnt, 0, "wd-20d: nothing queued for the rejected subpage candidate");
+        } finally {
+          globalThis.fetch = prevFetch5;
         }
       }
 

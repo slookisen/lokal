@@ -7,10 +7,22 @@
  * added so dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter's
  * acceptance criterion 6 (claim end-to-end) has a repeatable test subject.
  * Before it, no admin lever could write the fields deriveOrgLinkedEmail()
- * reads — brreg_verified has no write route for experience_providers at all,
- * and PATCH /admin/providers/:id/hjemmeside sets hjemmeside WITHOUT the
- * field_provenance stamp that makes a domain ownership-verified — so a
- * claim E2E could only ever be run by hand-editing production data.
+ * reads — brreg_verified has no write route for experience_providers at all.
+ *
+ * REWRITTEN 2026-08-06 (dev-request 2026-08-06-aldri-gjett-epostadresse):
+ * the `claimable` flag used to make a row claimable via tier (b),
+ * post@<verified-domain> — minting `post@${hjemmeside domain}` and stamping
+ * a field_provenance.hjemmeside evidence marker. Daniel banned constructing
+ * ANY email address from a domain (see gardssalg-claim.ts's module doc for
+ * the full policy rationale); tier (b) is deleted outright, not gated, so
+ * this flag now goes through the SURVIVING tier (c), stored_epost_verified:
+ * it sets content_source='manual' and a stored `epost` — the ONLY two
+ * fields tier (c)'s c-epost sub-case needs. hjemmeside/field_provenance are
+ * no longer touched by this route AT ALL (there is nothing left for them to
+ * prove for claim purposes) — every section below that used to validate the
+ * old hjemmeside-derivation machinery (generic-domain 400s, URL-host-match
+ * injection guard, field_provenance merge-not-clobber) is either removed
+ * (nothing left to protect) or rewritten for the epost-based mechanism.
  *
  * Harness mirrors opplevelser-gardssalg-website-verification.test.ts
  * (EXPERIENCES_DB_PATH=":memory:", fresh require of db-factory +
@@ -20,30 +32,36 @@
  *
  * Covers:
  *   (a) 403 without X-Admin-Key
- *   (b) WITHOUT the flag, behaviour is unchanged: none of the three claim
- *       fields is written, and the row stays claim-INELIGIBLE. This is the
+ *   (b) WITHOUT the flag, behaviour is unchanged: none of the claim fields
+ *       is written, and the row stays claim-INELIGIBLE. This is the
  *       backwards-compatibility proof for the existing booking E2E caller.
  *   (c) WITH the flag, deriveOrgLinkedEmail() flips to eligible via the
- *       verified_domain_address path, and the derived address is
- *       post@<the domain we set> — checked against the real service function,
- *       not a re-implementation of its rule
- *   (d) content_source is left NULL, NOT 'manual': 'manual' would also
- *       satisfy the ownership check but disables the owner portal's entire
- *       edit form, so a 'manual' test row would verify the magic link and
- *       then present a read-only portal — testing the wrong thing
- *   (e) repeatability: after a completed claim stamps content_source='claim',
- *       re-running the endpoint resets the row to claimable again
- *   (f) pointing the endpoint at a REAL provider's slug is refused with a 409
- *       and EVERY one of that row's fields is byte-identical afterwards. The
- *       whole-row check matters: the refusal has to happen before the first
- *       write, since the pre-existing unconditional UPDATE rewrites navn/
- *       producer_type/catalog_hidden/booking_live on whatever row the
- *       `slug OR org_nr` match resolved. Checking only the claim fields would
- *       pass while the row had in fact been overwritten.
- *   (g) a generic/shared domain (and a bare host) is a 400, never a silently
- *       non-claimable row
- *   (h) that same refusal applies WITHOUT the claimable flag — the guard is on
- *       the endpoint's "upsert THE ONE test row" contract, not on the flag
+ *       stored_epost_verified path, targeting a safe `.invalid` default
+ *       address unless the caller supplies `claimEmail` — checked against
+ *       the real service function, not a re-implementation of its rule
+ *   (d) content_source IS 'manual' (the opposite of the old tier-(b) design,
+ *       which deliberately avoided 'manual' to keep the owner portal
+ *       editable) — this is now a real, accepted, documented trade-off:
+ *       claiming via this test row leaves the portal read-only, same as any
+ *       other content_source='manual' row
+ *   (e) idempotent/repeatable: content_source='manual' never flips away on
+ *       a real claim (verifyClaimToken never downgrades an existing
+ *       'manual' lock), and a stale/foreign content_source is forcibly
+ *       reset to 'manual' on any claimable=true re-run
+ *   (f) pointing the endpoint at a REAL provider's slug is refused with a
+ *       409 and EVERY one of that row's fields is byte-identical afterwards
+ *   (g) `claimEmail` validation: a malformed value is a 400, and supplying
+ *       it without `claimable: true` is a 400 (not a silent no-op)
+ *   (h) that (f)'s guard applies WITHOUT the claimable flag too — the guard
+ *       is on the endpoint's "upsert THE ONE test row" contract, not the flag
+ *   (i) slug collision while the test row ALSO exists resolves to the real
+ *       row, not a UNIQUE-index 500
+ *   (m) field_provenance is left COMPLETELY untouched by the claimable
+ *       write now (nothing left to merge — a pre-existing arbitrary value
+ *       survives byte-for-byte)
+ *   (n) the claimable row must not enter the FETCH cohorts (independent of
+ *       this route now, since it never writes hjemmeside — see that
+ *       section's own comment for why a directly-seeded fixture is used)
  */
 
 export interface TestSummary {
@@ -188,19 +206,19 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       const plainId = plain.body.provider_id as string;
       const plainRow = readRow(plainId);
       // 0, not null — the column carries a schema DEFAULT 0. Either way it is
-      // not 1, which is what the eligibility gate reads (pinned by b8).
+      // not 1, which is what the eligibility gate reads (pinned by b9).
       assertEq(plainRow.brreg_verified, 0, "b3: brreg_verified NOT raised to 1 without the flag");
-      assertEq(plainRow.hjemmeside, null, "b4: hjemmeside NOT written without the flag");
-      assertEq(plainRow.field_provenance, null, "b5: field_provenance NOT stamped without the flag");
+      assertEq(plainRow.content_source, null, "b4: content_source NOT set to 'manual' without the flag");
+      assertEq(plainRow.epost, "daniel@example.com", "b5: epost is the general contact address (booking-notify target), NOT a claim-specific one — the claimable branch never ran");
       assertEq(plainRow.catalog_hidden, 1, "b6: the pre-existing test-row fields are still set (catalog_hidden)");
       assertEq(plainRow.booking_live, 1, "b7: ...and booking_live — the booking E2E caller is unaffected");
       assertEq(
         claimService.deriveOrgLinkedEmail(plainRow),
         { eligible: false, reason: "not_brreg_verified" },
-        "b8: the row really is claim-INELIGIBLE without the flag — b3-b5 are load-bearing, not decorative",
+        "b8: the row really is claim-INELIGIBLE without the flag — b3/b4 are load-bearing, not decorative",
       );
 
-      // ── (c) WITH the flag — eligible via the verified-domain path ────────
+      // ── (c) WITH the flag — eligible via stored_epost_verified ──────────
       const claimable = await callRoute(opplevelserRouter, {
         headers: auth,
         body: { email: "daniel@example.com", claimable: true },
@@ -210,86 +228,93 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       assertEq(claimable.body.provider_id, plainId, "c3: idempotent — same row as the plain call, not a duplicate");
       const claimRow = readRow(plainId);
       assertEq(claimRow.brreg_verified, 1, "c4: brreg_verified = 1");
-      assertEq(claimRow.hjemmeside, "https://test-ikke-book.invalid", "c5: default hjemmeside is the RFC-6761 .invalid domain");
-      const prov = JSON.parse(claimRow.field_provenance);
-      assertEq(
-        prov.hjemmeside?.source_url,
-        "https://test-ikke-book.invalid",
-        "c6: field_provenance.hjemmeside.source_url is stamped — the marker isHjemmesideOwnershipVerified() reads",
-      );
+      assertEq(claimRow.content_source, "manual", "c5: content_source = 'manual' (tier (c)'s c-epost sub-case, adminEntered)");
+      // Safe-by-default: RFC-6761-reserved `.invalid` — never resolves, so
+      // even an unguarded/misrouted magic-link send can't reach a real
+      // third party. Same security posture the old hjemmeside default used.
+      assertEq(claimRow.epost, "claim-test@test-ikke-book.invalid", "c6: the claim epost defaults to a safe .invalid address, NOT the general `email` field");
       assertEq(
         claimService.deriveOrgLinkedEmail(claimRow),
-        { eligible: true, email: "post@test-ikke-book.invalid", source: "verified_domain_address" },
-        "c7: the REAL deriveOrgLinkedEmail() now returns eligible, via verified_domain_address",
+        { eligible: true, email: "claim-test@test-ikke-book.invalid", source: "stored_epost_verified" },
+        "c7: the REAL deriveOrgLinkedEmail() now returns eligible, via stored_epost_verified",
       );
       assertEq(
-        claimable.body.derived_claim_email,
-        "post@test-ikke-book.invalid",
-        "c8: the response's derived_claim_email matches what the service actually derives",
+        claimable.body.claim_epost,
+        "claim-test@test-ikke-book.invalid",
+        "c8: the response's claim_epost matches what was actually stored (no 'derivation' anymore — it's literal)",
       );
 
-      // A caller-supplied domain is honoured, and drives the derivation.
-      const customDomain = await callRoute(opplevelserRouter, {
+      // A caller-supplied claimEmail is honoured, and independent of the
+      // (still-required) general `email` field.
+      const customClaimEmail = await callRoute(opplevelserRouter, {
         headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "https://minetestgard.invalid" },
+        body: { email: "daniel@example.com", claimable: true, claimEmail: "eier@minetestgard.invalid" },
       });
-      assertEq(customDomain.status, 200, "c9: caller-supplied hjemmeside -> 200");
+      assertEq(customClaimEmail.status, 200, "c9: caller-supplied claimEmail -> 200");
       assertEq(
         claimService.deriveOrgLinkedEmail(readRow(plainId)),
-        { eligible: true, email: "post@minetestgard.invalid", source: "verified_domain_address" },
-        "c10: the derived address follows the supplied domain, not the default",
+        { eligible: true, email: "eier@minetestgard.invalid", source: "stored_epost_verified" },
+        "c10: the stored/derived address follows the supplied claimEmail, not the default",
       );
       // Put the default back for the sections below.
       await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
 
-      // ── (d) content_source is NULL, not 'manual' ────────────────────────
-      // Seed a NON-null value first. Asserting `content_source === null` on a
-      // freshly created row is nearly vacuous — createProvider() leaves the
-      // column NULL anyway, so the assertion passed even with the reset
-      // deleted from the UPDATE. Starting from 'provider_site' makes it pin
-      // the RESET, which is the behaviour the comment claims.
-      expDb.prepare(`UPDATE experience_providers SET content_source = 'provider_site' WHERE id = ?`).run(plainId);
-      await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
-      assertEq(
-        readRow(plainId).content_source,
-        null,
-        "d1: a pre-existing content_source is RESET to NULL — not left as-is, and not set to 'manual' (which would satisfy ownership but disable the owner portal's edit form)",
-      );
+      // ── (d) content_source IS 'manual' — the accepted trade-off ─────────
+      // See this file's own header comment + opplevelser.ts's route doc for
+      // the full reasoning: tier (b) used to deliberately AVOID 'manual' to
+      // keep the owner portal editable post-claim; tier (c) has no such
+      // option (its only DB-lever sub-case, c-epost, IS content_source=
+      // 'manual'). d1 below is the explicit, accepted consequence — a claim
+      // E2E run via this route now exercises "does the magic link issue and
+      // verify", not "is the portal post-claim editable".
+      assertEq(readRow(plainId).content_source, "manual", "d1: content_source is 'manual' after a claimable upsert (opposite of the old tier-(b) design, and a real, accepted trade-off — see header comment)");
 
-      // ── (e) repeatable after a completed claim ──────────────────────────
-      // verifyClaimToken() stamps content_source='claim' on a successful
-      // claim; simulate that end state and re-run.
-      expDb.prepare(`UPDATE experience_providers SET content_source = 'claim' WHERE id = ?`).run(plainId);
-      const rerun = await callRoute(opplevelserRouter, {
+      // ── (e) idempotent / repeatable ──────────────────────────────────────
+      // Unlike tier (b) (which needed an explicit content_source RESET so a
+      // completed claim — content_source='claim' — didn't block re-running
+      // the E2E), tier (c)'s 'manual' lock NEVER flips to 'claim'
+      // (verifyClaimToken() never downgrades an existing 'manual' row — see
+      // its own doc comment in gardssalg-claim.ts) — so there is nothing to
+      // reset. e1 proves the trivial case (still 'manual' after a normal
+      // re-run); e2 proves the claimable branch is UNCONDITIONAL about it —
+      // even a stale/foreign content_source value (simulating some other
+      // future write path landing on this row) is forcibly overwritten back
+      // to 'manual' by any claimable=true call, not merely left alone.
+      await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
+      assertEq(readRow(plainId).content_source, "manual", "e1: content_source is still 'manual' after a repeat claimable run (no drift)");
+
+      expDb.prepare(`UPDATE experience_providers SET content_source = 'provider_site' WHERE id = ?`).run(plainId);
+      const rerunAfterForeignState = await callRoute(opplevelserRouter, {
         headers: auth,
         body: { email: "daniel@example.com", claimable: true },
       });
-      assertEq(rerun.status, 200, "e1: re-run against an already-claimed test row -> 200");
-      assertEq(readRow(plainId).content_source, null, "e2: content_source reset to NULL — the E2E can be run again");
+      assertEq(rerunAfterForeignState.status, 200, "e2: re-run against a row with a stale/foreign content_source -> 200");
+      assertEq(readRow(plainId).content_source, "manual", "e3: ...and content_source is forcibly reset to 'manual', not left at the foreign value");
       assertEq(
         claimService.deriveOrgLinkedEmail(readRow(plainId)).eligible,
         true,
-        "e3: ...and the row is claim-eligible again",
+        "e4: ...and the row is claim-eligible again",
       );
-      // e3 alone is weak: eligibility comes from the field_provenance path, which
-      // holds regardless of content_source, so it stays green even if the reset
-      // were dropped. What the reset actually buys is an EDITABLE portal on the
-      // second run — a row still stamped 'claim' is not what a fresh E2E starts
-      // from. e4 is the assertion that fails if the reset goes away.
-      assertEq(readRow(plainId).content_source, null, "e4: ...specifically because content_source is no longer 'claim'");
 
       // ── (f) the org_nr pin protects real providers ──────────────────────
       // The upsert matches `slug = ? OR org_nr = ?`, so a real provider's slug
       // resolves to that real row. Without the pin, this call would hand it a
-      // forged ownership stamp AND clear a genuine content_source lock.
+      // forged 'manual'/brreg_verified stamp AND overwrite its real epost.
+      //
+      // content_source='manual' is prov-real's OWN legitimate state here
+      // (a real Daniel-curated provider) — unlike tier (b)'s field_
+      // provenance stamp, 'manual' isn't itself proof of a forged write, so
+      // the meaningful non-forgery checks are epost (must stay the real
+      // producer's own address, never the fake claim-test one) and
+      // brreg_verified (must stay 0, not forced to 1).
       expDb
         .prepare(
           `INSERT INTO experience_providers
-             (id, navn, slug, vertical, org_nr, brreg_verified, hjemmeside, content_source, field_provenance,
+             (id, navn, slug, vertical, org_nr, brreg_verified, hjemmeside, epost, content_source, field_provenance,
               producer_type, enrichment_state, verification_status, source, confidence)
            VALUES
              ('prov-real', 'Ekte Bryggeri', 'ekte-bryggeri', 'experiences', '912345678', 0,
-              'https://ektebryggeri.example.no', 'manual', NULL,
+              'https://ektebryggeri.example.no', 'ekte@ektebryggeri.no', 'manual', NULL,
               'bryggeri', 'raw', 'verified', 'test-fixture', 'high')`,
         )
         .run();
@@ -300,105 +325,64 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       });
       assertEq(hijack.status, 409, "f1: claimable write against a real provider's slug -> 409, refused");
       const realAfter = readRow("prov-real");
-      assertEq(realAfter.brreg_verified, realBefore.brreg_verified, "f2: the real row's brreg_verified is untouched");
-      assertEq(realAfter.field_provenance, null, "f3: no forged ownership stamp on the real row");
-      assertEq(realAfter.content_source, "manual", "f4: the real row's content_source lock survives");
-      assertEq(realAfter.hjemmeside, realBefore.hjemmeside, "f5: the real row's hjemmeside is untouched");
+      assertEq(realAfter.brreg_verified, realBefore.brreg_verified, "f2: the real row's brreg_verified is untouched (not forced to 1)");
+      assertEq(realAfter.epost, "ekte@ektebryggeri.no", "f3: the real row's own epost is untouched — never overwritten with the fake claim-test address");
+      assertEq(realAfter.content_source, "manual", "f4: the real row's content_source lock survives (unchanged, not merely 'still happens to be manual')");
       // The 409 says "refused". It has to be true of the WHOLE row, not just the
       // claim fields — the pre-existing unconditional UPDATE runs before the
       // claimable branch and is not pinned to the test org_nr.
       // The whole row, not a column list — see readRow's comment. This is the
       // assertion that would have caught the original defect.
-      assertEq(diffRows(realBefore, realAfter), [], "f6: NO column on the real row changed (whole-row diff)");
+      assertEq(diffRows(realBefore, realAfter), [], "f5: NO column on the real row changed (whole-row diff)");
 
-      // ── (g) generic / unusable domains are a 400 ────────────────────────
-      const generic = await callRoute(opplevelserRouter, {
+      // ── (g) claimEmail validation ────────────────────────────────────────
+      const badShape = await callRoute(opplevelserRouter, {
         headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "https://facebook.com/mintestgard" },
+        body: { email: "daniel@example.com", claimable: true, claimEmail: "not-an-email" },
       });
-      assertEq(generic.status, 400, "g1: a generic/shared domain is a 400, not a silently non-claimable row");
-      const genericSub = await callRoute(opplevelserRouter, {
-        headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "https://sub.facebook.com/x" },
-      });
-      assertEq(genericSub.status, 400, "g2: ...and so is a subdomain of one — same rule the mint applies");
-      const bareHost = await callRoute(opplevelserRouter, {
-        headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "http://localhost" },
-      });
-      assertEq(bareHost.status, 400, "g3: a bare host with no dot is a 400");
-      assertEq(
-        readRow(plainId).hjemmeside,
-        "https://test-ikke-book.invalid",
-        "g4: a rejected call wrote nothing — the row still carries the last good domain",
-      );
+      assertEq(badShape.status, 400, "g1: a malformed claimEmail is a 400, not a silently non-claimable row");
+      assertEq(readRow(plainId).epost, "claim-test@test-ikke-book.invalid", "g2: a rejected call wrote nothing — the row still carries the last good claim epost");
 
-      // ── (k) hjemmeside must be a real URL whose host IS the claim domain ──
-      // normalizeDomain() treats any string containing "@" as an email and
-      // keeps only what follows it, so without a URL-shape + host-match check
-      // the stored website and the minted post@ address can name DIFFERENT
-      // domains — and the public claim route sends to the minted one without
-      // the test redirect. These are the concrete inputs that exploited it.
-      const injection = await callRoute(opplevelserRouter, {
+      // claimEmail without the flag is a silent no-op -> now an explicit 400,
+      // same "refuse rather than silently discard" convention the old
+      // hjemmeside-without-claimable check used.
+      const claimEmailNoFlag = await callRoute(opplevelserRouter, {
         headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "https://x.no\nBcc: victim@evil.example" },
+        body: { email: "daniel@example.com", claimEmail: "eier@minetestgard.invalid" },
       });
-      assertEq(injection.status, 400, "k1: an '@'-bearing value whose derived domain is an unrelated host -> 400");
-      const notAUrl = await callRoute(opplevelserRouter, {
-        headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "not a url but has.dot" },
-      });
-      assertEq(notAUrl.status, 400, "k2: a non-URL with spaces -> 400 (would have minted an address containing spaces)");
-      const noScheme = await callRoute(opplevelserRouter, {
-        headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "mintestgard.invalid" },
-      });
-      assertEq(noScheme.status, 400, "k3: a bare domain with no http(s) scheme -> 400");
-      const ftp = await callRoute(opplevelserRouter, {
-        headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "ftp://mintestgard.invalid" },
-      });
-      assertEq(ftp.status, 400, "k4: a non-http(s) scheme -> 400");
-      assertEq(
-        readRow(plainId).hjemmeside,
-        "https://test-ikke-book.invalid",
-        "k5: none of those wrote anything",
-      );
-      // www. is stripped by BOTH normalizeDomain and the host check, so it agrees.
-      const wwwOk = await callRoute(opplevelserRouter, {
-        headers: auth,
-        body: { email: "daniel@example.com", claimable: true, hjemmeside: "https://www.mintestgard.invalid/side" },
-      });
-      assertEq(wwwOk.status, 200, "k6: a www. URL with a path is accepted — host and derived domain agree after stripping");
-      assertEq(
-        wwwOk.body.derived_claim_email,
-        "post@mintestgard.invalid",
-        "k7: ...and mints the address from that same host",
-      );
-      // hjemmeside without the flag is a silent no-op -> now an explicit 400.
-      const hjemmesideNoFlag = await callRoute(opplevelserRouter, {
-        headers: auth,
-        body: { email: "daniel@example.com", hjemmeside: "https://mintestgard.invalid" },
-      });
-      assertEq(hjemmesideNoFlag.status, 400, "k8: hjemmeside without claimable is refused, not silently discarded");
+      assertEq(claimEmailNoFlag.status, 400, "g3: claimEmail without claimable is refused, not silently discarded");
       // Restore the default for the sections below.
       await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
 
       // ── (n) the claimable row must not enter the FETCH cohorts ──────────
-      // Giving the test row a hjemmeside and a NULL content_source is exactly
-      // what selectGardssalgProvidersForContentRefresh and
-      // ...ForRetroScan select on. Both drive a homepage fetch, and the test
-      // row's homepage is deliberately non-resolving — so without the
-      // test-gardssalg exclusion the enrichment sweeps would fetch `.invalid`
-      // on every run and eventually park the row. Same argument as the
-      // website-verification cohort, two more selectors.
+      // Both fetch-cohort selectors (selectGardssalgProvidersForContentRefresh
+      // / ...ForRetroScan) require hjemmeside IS NOT NULL — a precondition
+      // this route's claimable row can NO LONGER EVER satisfy, since the
+      // route dropped hjemmeside handling entirely along with tier (b). So
+      // this route's own output can't meaningfully exercise the
+      // test-gardssalg producer_type exclusion anymore (it's excluded for
+      // an unrelated, structural reason — no hjemmeside at all — regardless
+      // of whether the exclusion itself still works). To keep REAL coverage
+      // of that exclusion, this section seeds its own dedicated fixture
+      // directly (same technique opplevelser-gardssalg-website-
+      // verification.test.ts's own "prov-test-gardssalg" fixture already
+      // uses), independent of what this route produces.
       const store = require("../services/experience-store") as typeof import("../services/experience-store");
-      const inRefresh = store.selectGardssalgProvidersForContentRefresh(48).some((r: any) => r.id === plainId);
-      const inRetro = store.selectGardssalgProvidersForRetroScan(48).some((r: any) => r.id === plainId);
-      assertEq(inRefresh, false, "n1: the claimable test row is NOT selected for gardssalg content-refresh");
+      expDb
+        .prepare(
+          `INSERT INTO experience_providers
+             (id, navn, slug, vertical, hjemmeside, content_source,
+              producer_type, enrichment_state, verification_status, source, confidence)
+           VALUES ('prov-test-gardssalg-cohort', 'TEST — Ikke book', 'test-ikke-book-cohort', 'experiences',
+              'https://test-ikke-book.invalid', NULL, 'test-gardssalg', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
+        )
+        .run();
+      const inRefresh = store.selectGardssalgProvidersForContentRefresh(48).some((r: any) => r.id === "prov-test-gardssalg-cohort");
+      const inRetro = store.selectGardssalgProvidersForRetroScan(48).some((r: any) => r.id === "prov-test-gardssalg-cohort");
+      assertEq(inRefresh, false, "n1: a producer_type='test-gardssalg' row is NOT selected for gardssalg content-refresh, even with a resolving-shaped hjemmeside");
       assertEq(inRetro, false, "n2: ...nor for the retro-scan");
-      // Control: a REAL row in the same state IS selected — proves n1/n2 pin the
-      // test-gardssalg exclusion, not some unrelated reason both are empty.
+      // Control: a REAL row in the same state IS selected — proves n1/n2 pin
+      // the test-gardssalg exclusion, not some unrelated reason both are empty.
       expDb
         .prepare(
           `INSERT INTO experience_providers (id, navn, slug, vertical, hjemmeside, content_source,
@@ -415,6 +399,15 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
         store.selectGardssalgProvidersForRetroScan(48).some((r: any) => r.id === "prov-cohort-ctl"),
         "n4: control — ...and for the retro-scan",
       );
+      // The route's OWN claimable row also stays out, for the (now
+      // structural, hjemmeside-less) reason described above — still worth
+      // pinning so a future re-introduction of hjemmeside-writing to this
+      // route doesn't silently reopen the cohort-leak this exclusion guards.
+      assertEq(
+        store.selectGardssalgProvidersForContentRefresh(48).some((r: any) => r.id === plainId),
+        false,
+        "n5: this route's own claimable test row is NOT selected for content-refresh either (no hjemmeside to fetch)",
+      );
 
       // ── (i) slug collision while the test row ALSO exists ───────────────
       // Both legs of the resolving SELECT now match, but DIFFERENT rows. The
@@ -430,35 +423,22 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       assertEq(diffRows(realBefore, readRow("prov-real")), [], "i3: the real row is untouched (whole-row diff)");
       assertEq(readRow(plainId).slug, "test-ikke-book-slice0", "i4: the test row did not have the real slug moved onto it");
 
-      // ── (h2) provenance is MERGED, not clobbered ────────────────────────
-      // Both other writers of field_provenance set only their own key. Seed a
-      // foreign key on the test row, re-run, and confirm it survives.
+      // ── (m) field_provenance is left COMPLETELY untouched now ───────────
+      // Tier (b)'s hjemmeside evidence stamp used to need a careful read-
+      // merge-write to avoid clobbering the OTHER writers of this column
+      // (applyGardssalgProviderWebsite, the verification sweep). That merge
+      // dance is gone along with the stamp itself — the claimable branch no
+      // longer touches field_provenance AT ALL, so a pre-existing arbitrary
+      // value simply survives, byte-for-byte, with no write path to race
+      // against and no malformed-JSON case to defend against either.
       expDb
         .prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`)
         .run(JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified" } }), plainId);
       await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimable: true } });
-      const mergedProv = JSON.parse(readRow(plainId).field_provenance);
       assertEq(
-        mergedProv.hjemmeside_verification?.classification,
+        JSON.parse(readRow(plainId).field_provenance).hjemmeside_verification?.classification,
         "verified",
-        "m1: a pre-existing hjemmeside_verification key survives the claimable write",
-      );
-      assertEq(
-        mergedProv.hjemmeside?.source_url,
-        "https://test-ikke-book.invalid",
-        "m2: ...and the claimable stamp is still written alongside it",
-      );
-      // Malformed existing JSON must not fail the write (same convention as
-      // the two other writers) — it is treated as empty.
-      expDb.prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`).run("{not json", plainId);
-      const afterJunk = await callRoute(opplevelserRouter, {
-        headers: auth, body: { email: "daniel@example.com", claimable: true },
-      });
-      assertEq(afterJunk.status, 200, "m3: malformed existing provenance JSON does not fail the write");
-      assertEq(
-        JSON.parse(readRow(plainId).field_provenance).hjemmeside?.source_url,
-        "https://test-ikke-book.invalid",
-        "m4: ...it is treated as empty and the stamp lands",
+        "m1: a pre-existing field_provenance value survives the claimable write completely untouched",
       );
 
       // ── (h) the guard is not conditional on the flag ────────────────────

@@ -117,6 +117,7 @@ import {
   getGardssalgWebsiteDiscoveryTarget,
   gardssalgWebsiteCandidateHosts,
   gardssalgPageText,
+  gardssalgPageTitle,
   gardssalgWebsiteEvidenceMatch,
   gardssalgContactPageLinks,
   extractGardssalgContactEmail,
@@ -302,7 +303,14 @@ import {
 // CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
-import { fetchPage, discoverContentLinks, type FetchPageResult } from "../services/fetch-page";
+import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult } from "../services/fetch-page";
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+// hygiene, item 5 ("wrong_content_rate holdout") — the fail-closed LLM judge
+// + candidate sampler for POST /admin/experiences-wrong-content-rate below.
+import {
+  sampleEnrichedExperiencesForHoldout,
+  judgeExperienceContentMatch,
+} from "../services/experience-content-judge";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
@@ -324,15 +332,20 @@ import { testSendRedirectAddress } from "../services/send-guard";
 import {
   issueClaimMagicLink,
   getClaimProviderById,
-  isClaimableDomain,
   // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2 —
   // POST /admin/gardssalg-claim-grant below.
   issueAdminGrantedClaimMagicLink,
   hasActiveNonRevokedClaim,
   backfillGardssalgOwnerLockProvenance,
 } from "../services/gardssalg-claim";
-import { normalizeDomain, normalizeEmail } from "../services/blocklist-service";
 import { emailService } from "../services/email-service";
+// Used by isGardssalgEpostSynthesisPatternMatch() below (AC6 epost-synthesis
+// audit) — re-added after the post@<domain> claim-derivation tier that used
+// to import this (dev-request 2026-08-06-aldri-gjett-epostadresse slice 1)
+// was removed; a merge with main's independently-built AC6 slice (#508)
+// silently dropped the import since neither side's diff hunk touched the
+// same line the other needed, tsc caught it as the two branches combined.
+import { normalizeDomain, normalizeEmail } from "../services/blocklist-service";
 
 // Same derivation as gardssalg-claim.ts's own constant — the verify URL must
 // point at the host that serves the claim routes.
@@ -1857,6 +1870,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     provenance: GsProvenanceMap;
   }> = [];
   const skippedLocked: string[] = [];
+  // Sub-slice 3i (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+  // laas): a DISTINCT bucket from skipped_locked above — skipped_locked keeps
+  // meaning "manual row, full row-level skip, never fetched" (unchanged).
+  // owner_field_locked is for 'claim' rows that DID reach candidate
+  // generation (>=1 candidate field found this run) but ended up writing
+  // nothing because every one of those candidate fields was individually
+  // owner-locked via field_provenance.owner_locks — distinct from "no
+  // candidate found" or "already fresh", which both stay silent as today.
+  const ownerFieldLocked: Array<{ provider_id: string; fields: string[] }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
@@ -1900,8 +1922,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     }
 
     // LOCK check — from the target's own row snapshot, BEFORE any fetch, so a
-    // locked provider never touches the network at all.
-    if (t.content_source === "manual" || t.content_source === "claim") {
+    // locked provider never touches the network at all. Sub-slice 3i
+    // (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas): only
+    // 'manual' short-circuits here now — a full-row freeze, unchanged. A
+    // 'claim' row proceeds to fetch/candidate-generation as normal; the
+    // per-field owner-lock decision happens later, once candidate fields are
+    // known (see the owner_field_locked bucket below and
+    // applyGardssalgProviderContent's own per-field gate).
+    if (t.content_source === "manual") {
       skippedLocked.push(providerId);
       return;
     }
@@ -2181,9 +2209,40 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     const wouldWrite = Object.keys(wouldWriteActions);
     if (wouldWrite.length === 0) return;
 
+    // Sub-slice 3i (dev-request 2026-07-30-opplevagent-claim-epost-og-
+    // perfelt-laas): predict, from THIS target's own row snapshot (t — the
+    // same snapshot applyGardssalgProviderContent's own fresh DB read will
+    // agree with, barring a concurrent edit), which of this run's candidate
+    // fields are owner-locked. Only meaningful for content_source='claim'
+    // rows (isGardssalgFieldOwnerLocked always returns false for any other
+    // content_source). Reused by BOTH branches below: dry-run needs it to
+    // keep the preview honest (dry-run never calls
+    // applyGardssalgProviderContent, so nothing else would catch this);
+    // apply uses it only to populate the owner_field_locked report — the
+    // actual gating decision for apply is made by
+    // applyGardssalgProviderContent's own per-field guard, not by this
+    // prediction.
+    const lockedCandidateFields =
+      t.content_source === "claim"
+        ? wouldWrite.filter((f) => isGardssalgFieldOwnerLocked(t, f))
+        : [];
+
     if (dryRun) {
-      for (const f of wouldWrite) if (f in byField) byField[f] += 1;
-      changed.push({ provider_id: providerId, fields: wouldWrite, actions: wouldWriteActions, provenance });
+      const writableFields = wouldWrite.filter((f) => !lockedCandidateFields.includes(f));
+      if (writableFields.length === 0) {
+        // Every candidate field this run was owner-locked — distinct bucket,
+        // NOT skipped_locked (reserved for 'manual', row-level, never-fetched).
+        ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
+        return;
+      }
+      for (const f of writableFields) if (f in byField) byField[f] += 1;
+      const writableActions: Record<string, GsFieldAction> = {};
+      const writableProvenance: GsProvenanceMap = {};
+      for (const f of writableFields) {
+        writableActions[f] = wouldWriteActions[f];
+        if (provenance[f]) writableProvenance[f] = provenance[f];
+      }
+      changed.push({ provider_id: providerId, fields: writableFields, actions: writableActions, provenance: writableProvenance });
     } else {
       try {
         const rewriteFields: Array<"about_text" | "visit_text"> = [];
@@ -2217,6 +2276,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
             actions[f] = wouldWriteActions[f] ?? "filled";
           }
           changed.push({ provider_id: providerId, fields: written, actions, provenance });
+        } else if (lockedCandidateFields.length > 0 && lockedCandidateFields.length === wouldWrite.length) {
+          // applyGardssalgProviderContent's own per-field gate agreed with the
+          // prediction above: every candidate field for this claim row was
+          // owner-locked, so nothing was written.
+          ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
         }
       } catch (e: any) {
         errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
@@ -2239,6 +2303,10 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     by_field: byField,
     changed,
     skipped_locked: skippedLocked,
+    // Sub-slice 3i: 'claim' rows whose candidate fields were ALL owner-locked
+    // this run (0 written as a result) — additive bucket, distinct from
+    // skipped_locked (manual, row-level, never-fetched) above.
+    owner_field_locked: ownerFieldLocked,
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
@@ -2263,9 +2331,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
 // applyGardssalgProviderContent's currentValueContaminated doc comment
 // above). Content written before the gate existed, or by a run where no
 // fresh candidate happened to qualify, is never revisited. This endpoint is
-// the retroactive sweep: for every non-locked gårdssalg row (visible AND
-// hidden — "excluding only content_source IN ('manual','claim')", the
-// dev-request's own words), it re-fetches the stored hjemmeside (reusing
+// the retroactive sweep: for every non-row-locked gårdssalg row (visible AND
+// hidden — originally "excluding only content_source IN ('manual','claim')",
+// the dev-request's own words; narrowed by sub-slice 3j of dev-request
+// 2026-07-30-opplevagent-claim-epost-og-perfelt-laas to exclude only
+// 'manual' at the row level — 'claim' rows are now in scope here too, with
+// the freeze enforced per-field inside applyGardssalgRetroScanNull via the
+// same already-shipped isGardssalgFieldOwnerLocked helper sub-slice 3i wired
+// through the content-refresh writer), it re-fetches the stored hjemmeside (reusing
 // crFetchGardssalgContent, same SSRF-guarded pipeline as content-refresh, so
 // content_evidence_url is a real, freshly-verified URL) and judges the
 // row's CURRENTLY STORED about_text/visit_text — not a freshly generated
@@ -2403,16 +2476,28 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
   };
   const changed: Array<{ provider_id: string; fields: string[]; reasons: Record<string, string> }> = [];
   const skippedLocked: string[] = [];
+  // Sub-slice 3j (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+  // laas): a DISTINCT bucket from skipped_locked above — skipped_locked keeps
+  // meaning "manual row, full row-level skip, never fetched" (unchanged).
+  // ownerFieldLocked is for 'claim' rows that DID reach candidate nulling
+  // (>=1 field flagged this run) but ended up nulling nothing because every
+  // one of those flagged fields was individually owner-locked via
+  // field_provenance.owner_locks — same convention as the content-refresh
+  // route's own owner_field_locked bucket (sub-slice 3i).
+  const ownerFieldLocked: Array<{ provider_id: string; fields: string[] }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
   async function processOne(t: GardssalgRetroScanTarget): Promise<void> {
     const providerId = t.id;
 
     // LOCK check — from the target's own row snapshot, BEFORE any fetch, so
-    // a locked provider never touches the network at all. Same discipline as
-    // /admin/gardssalg-content-refresh (see that route's own doc comment for
-    // why this is deliberately a pre-fetch, snapshot-based check).
-    if (t.content_source === "manual" || t.content_source === "claim") {
+    // a locked provider never touches the network at all. Sub-slice 3j: only
+    // 'manual' short-circuits here now — a full-row freeze, unchanged. A
+    // 'claim' row proceeds to fetch/judge as normal; the per-field owner-lock
+    // decision happens later, once the candidate null fields are known (see
+    // the ownerFieldLocked bucket below and applyGardssalgRetroScanNull's own
+    // per-field gate).
+    if (t.content_source === "manual") {
       skippedLocked.push(providerId);
       return;
     }
@@ -2459,18 +2544,54 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
     }
     if (wouldNullFields.length === 0) return;
 
-    for (const f of wouldNullFields) byField[f].flagged += 1;
+    // Sub-slice 3j (dev-request 2026-07-30-opplevagent-claim-epost-og-
+    // perfelt-laas): predict, from THIS target's own row snapshot (t — the
+    // same snapshot applyGardssalgRetroScanNull's own fresh DB read will
+    // agree with, barring a concurrent edit), which of this run's candidate
+    // null fields are owner-locked. Only meaningful for content_source=
+    // 'claim' rows (isGardssalgFieldOwnerLocked always returns false for any
+    // other content_source). Reused by BOTH branches below: dry-run needs it
+    // to keep the preview honest (dry-run never calls
+    // applyGardssalgRetroScanNull, so nothing else would catch this); apply
+    // uses it only to populate the owner_field_locked report — the actual
+    // gating decision for apply is made by applyGardssalgRetroScanNull's own
+    // per-field guard, not by this prediction.
+    const lockedCandidateFields =
+      t.content_source === "claim"
+        ? wouldNullFields.filter((f) => isGardssalgFieldOwnerLocked(t, f))
+        : [];
+    const writableFields = wouldNullFields.filter((f) => !lockedCandidateFields.includes(f));
+
+    if (writableFields.length === 0) {
+      // Every candidate field this run was owner-locked — distinct bucket,
+      // NOT skipped_locked (reserved for 'manual', row-level, never-fetched).
+      ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
+      return;
+    }
+
+    for (const f of writableFields) byField[f as "about_text" | "visit_text"].flagged += 1;
 
     if (dryRun) {
-      changed.push({ provider_id: providerId, fields: wouldNullFields, reasons });
+      const writableReasons: Record<string, string> = {};
+      for (const f of writableFields) writableReasons[f] = reasons[f];
+      changed.push({ provider_id: providerId, fields: writableFields, reasons: writableReasons });
       return;
     }
 
     try {
+      // Pass the FULL wouldNullFields (not the pre-filtered writableFields) —
+      // applyGardssalgRetroScanNull's own fresh-row-snapshot per-field gate
+      // makes the real decision (defense in depth against a stale
+      // route-level snapshot).
       const written = applyGardssalgRetroScanNull(providerId, wouldNullFields, fetched.fetchUrl);
       if (written.length > 0) {
         for (const f of written) byField[f as "about_text" | "visit_text"].nulled += 1;
         changed.push({ provider_id: providerId, fields: written, reasons });
+      } else if (lockedCandidateFields.length > 0 && lockedCandidateFields.length === wouldNullFields.length) {
+        // applyGardssalgRetroScanNull's own per-field gate agreed with the
+        // prediction above: every candidate field for this claim row was
+        // owner-locked, so nothing was nulled.
+        ownerFieldLocked.push({ provider_id: providerId, fields: lockedCandidateFields });
       }
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
@@ -2490,6 +2611,10 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
     by_field: byField,
     changed,
     skipped_locked: skippedLocked,
+    // Sub-slice 3j: 'claim' rows whose flagged null-candidate fields were ALL
+    // owner-locked this run (0 nulled as a result) — additive bucket,
+    // distinct from skipped_locked (manual, row-level, never-fetched) above.
+    owner_field_locked: ownerFieldLocked,
     errors,
   });
 });
@@ -2946,7 +3071,7 @@ async function tryGardssalgCandidateHosts(
       adresse: target.adresse ?? null,
       postnummer: target.postnummer ?? null,
     };
-    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget);
+    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget, gardssalgPageTitle(page.html));
     if (ev.verified) {
       return { host, finalUrl: page.finalUrl, evidence: ev };
     }
@@ -2965,7 +3090,7 @@ async function tryGardssalgCandidateHosts(
         if (!subPage) continue;
         const subHost = hostFromUrlLike(subPage.finalUrl) || host;
         if (subHost.toLowerCase().replace(/^www\./, "") !== host.toLowerCase().replace(/^www\./, "")) continue;
-        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget);
+        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget, gardssalgPageTitle(subPage.html));
         if (subEv.verified) {
           return { host, finalUrl: subPage.finalUrl, evidence: subEv };
         }
@@ -4620,7 +4745,42 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
   });
 });
 
-router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response) => {
+// dev-request 2026-08-06-claim-produsent-velger-mottakeradresse: same
+// closed allow-list as routes/gardssalg-claim.ts's parseSelectedSource() —
+// issueClaimMagicLink() now returns "selection_required" for a provider
+// with 2+ qualifying candidates (previously always exactly one via the old
+// short-circuiting derivation), so this admin tool needs a way to name
+// which one, same as the public route. Kept as its own small allow-list
+// rather than importing the route file's private helper, to avoid coupling
+// an admin-API route to a public-page route module.
+// SLICE 5 / AC7 (dev-request 2026-08-06-aldri-gjett-epostadresse): extended
+// with the four found-tiers at the same time routes/gardssalg-claim.ts's own
+// CLAIM_EMAIL_SOURCES was — issueClaimMagicLink() now derives from
+// deriveOrgLinkedEmailCandidatesWithHarvest(), so an admin running the claim
+// E2E against a producer whose address came off their own website must be
+// able to name that tier here too. Still its own copy, not an import, for the
+// coupling reason stated above.
+const ADMIN_CLAIM_TEST_SEND_SOURCES = [
+  "brreg_contact",
+  "verified_domain_address",
+  "stored_epost_verified",
+  "found_same_domain",
+  "found_contact_page",
+  "found_site_other",
+  "found_umbrella_member",
+] as const;
+function parseAdminSelectedSource(value: unknown): (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number] | undefined {
+  return typeof value === "string" && (ADMIN_CLAIM_TEST_SEND_SOURCES as readonly string[]).includes(value)
+    ? (value as (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number])
+    : undefined;
+}
+
+// ASYNC since SLICE 5 / AC7 — issueClaimMagicLink() is now async. PURELY a
+// sync->async plumbing change: the isTest semantics (dev-request
+// 2026-07-26-booking-test-send-guard), the TEST_SEND_REDIRECT_EMAIL
+// precondition above it, the guard ordering, and every response field below
+// are untouched.
+router.post("/admin/claim-test-send", requireAdmin, async (req: Request, res: Response) => {
   const redirect = testSendRedirectAddress();
   if (!redirect) {
     return res.status(400).json({
@@ -4637,10 +4797,16 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
   if (!providerId) {
     return res.status(400).json({ success: false, error: "provider_id_required" });
   }
+  const selectedSource = parseAdminSelectedSource(body.selected_source);
 
-  const result = issueClaimMagicLink(providerId, null, { isTest: true });
+  const result = await issueClaimMagicLink(providerId, null, { isTest: true, selectedSource });
   if (!result.ok) {
-    return res.status(result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : 403).json({
+    const status =
+      result.error === "provider_not_found" ? 404
+      : result.error === "rate_limited" ? 429
+      : result.error === "selection_required" ? 400
+      : 403;
+    return res.status(status).json({
       success: false,
       error: result.error,
     });
@@ -4671,6 +4837,17 @@ router.post("/admin/claim-test-send", requireAdmin, (req: Request, res: Response
     intended_recipient_masked: result.claim.maskedEmail,
     email_source: result.claim.source,
     expires_at: result.claim.expiresAt,
+    // dev-request 2026-08-03-claim-reinnlogging-kan-ikke-testes: the ONLY
+    // reliable way to test the re-login flow end-to-end on a test provider
+    // row was reading the magic-link token back out of the redirected email
+    // — found fragile (garbled/truncated) by the available email-reading
+    // tool (see that dev-request's "Probe 1"). verifyUrl is already computed
+    // above for the email body; returning it here too means an ADMIN_KEY
+    // holder gets the working re-login link directly and deterministically
+    // from this authenticated JSON response, without ever parsing an email.
+    // Admin-key-gated only — NEVER add this field to the public
+    // /kategori/gardssalg/eier/:providerId/request route's response.
+    verify_url: verifyUrl,
   });
 });
 
@@ -4896,6 +5073,56 @@ export function __setGsCxRowDelayForTesting(ms: number | null): void {
   gsCxRowDelayMs = ms ?? GS_CX_ROW_DELAY_MS;
 }
 
+// Per-host cooldown (dev-request 2026-08-07-kontaktjakt-drikkeprodusenter):
+// nedstrandbryggeri.no's aggressive rate-limiter 429s a dry-run's fetch and
+// then 429s again on the very next apply run against the same host — hammering
+// an already-rate-limited host a second time just burns the retry budget for
+// nothing. This is deliberately a small in-process map LOCAL to this route,
+// not shared/global infrastructure: an admin-triggered batch tool has no need
+// for a persistent (DB/file) rate-limit store, and the process restarting
+// (or a fresh run past the window) simply clears it.
+const GS_CX_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
+const gsCxHostCooldownUntil = new Map<string, number>();
+export function __resetGsCxCooldownForTesting(): void {
+  gsCxHostCooldownUntil.clear();
+}
+
+type GsCxFetchOutcome =
+  | { kind: "ok"; html: string; finalUrl: string }
+  | { kind: "cooldown_skipped"; host: string }
+  | { kind: "failed" };
+
+/**
+ * Fetch one URL for the contact-extraction route via the shared classified
+ * fetcher (fetchPage(), src/services/fetch-page.ts) instead of the single-shot
+ * wdFetchPage(): a transient/5xx/timeout/connection-reset failure now gets
+ * fetchPage()'s existing one-retry-with-Retry-After behaviour instead of
+ * giving up in one shot. On top of that this route adds its own per-host
+ * cooldown: a 429 (rate-limited) response parks the host for GS_CX_COOLDOWN_MS
+ * so a later fetch to the SAME host in this run (or a fresh run started within
+ * the window) is skipped outright rather than hammering it again.
+ *
+ * wdFetchPage() itself is untouched — its contract is shared with other
+ * website-discovery admin routes and out of scope here.
+ */
+async function gsCxFetchPage(url: string): Promise<GsCxFetchOutcome> {
+  const host = hostFromUrlLike(url);
+  if (host) {
+    const until = gsCxHostCooldownUntil.get(host);
+    if (until !== undefined && until > Date.now()) {
+      return { kind: "cooldown_skipped", host };
+    }
+  }
+  const result = await fetchPage(url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+  if (result.ok) {
+    return { kind: "ok", html: result.html, finalUrl: result.finalUrl };
+  }
+  if (result.reason === "http_429" && host) {
+    gsCxHostCooldownUntil.set(host, Date.now() + GS_CX_COOLDOWN_MS);
+  }
+  return { kind: "failed" };
+}
+
 router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown };
   const apply =
@@ -4921,6 +5148,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const changed: Array<{ provider_id: string; navn: string; fields: string[]; epost: string | null; telefon: string | null; source_url: string; email_source?: string; phone_cued?: boolean }> = [];
   const noContactFound: Array<{ provider_id: string; navn: string; pages_tried: number }> = [];
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
+  const cooldownSkipped: Array<{ provider_id: string; navn: string; host: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
   let clientDisconnected = false;
@@ -4935,19 +5163,27 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     // alltid får svare under en kjøring.
     await new Promise((r) => setTimeout(r, gsCxRowDelayMs));
     try {
-      const front = await wdFetchPage(t.hjemmeside);
-      if (!front) {
+      const frontOutcome = await gsCxFetchPage(t.hjemmeside);
+      if (frontOutcome.kind === "cooldown_skipped") {
+        cooldownSkipped.push({ provider_id: t.id, navn: t.navn, host: frontOutcome.host });
+        continue;
+      }
+      if (frontOutcome.kind === "failed") {
         fetchFailed.push({ provider_id: t.id, navn: t.navn });
         continue;
       }
+      const front = { html: frontOutcome.html, finalUrl: frontOutcome.finalUrl };
       const host = hostFromUrlLike(front.finalUrl) || hostFromUrlLike(t.hjemmeside) || "";
       const homeDomain = homepageRegistrableDomain(t.hjemmeside);
       // Contact-ish subpages FIRST (that's where the info is authoritative),
-      // front page as fallback.
+      // front page as fallback. A subpage that is cooldown_skipped or fails is
+      // simply not added to `pages` — same as the old wdFetchPage() null
+      // handling — the front page (already fetched above) still stands as a
+      // fallback source.
       const pages: Array<{ url: string; html: string; contactish: boolean }> = [];
       for (const sub of gardssalgContactPageLinks(front.html, host, 2)) {
-        const p = await wdFetchPage(sub);
-        if (p) pages.push({ url: p.finalUrl, html: p.html, contactish: true });
+        const subOutcome = await gsCxFetchPage(sub);
+        if (subOutcome.kind === "ok") pages.push({ url: subOutcome.finalUrl, html: subOutcome.html, contactish: true });
       }
       pages.push({ url: front.finalUrl, html: front.html, contactish: false });
 
@@ -5013,6 +5249,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     changed,
     no_contact_found: noContactFound,
     fetch_failed: fetchFailed,
+    cooldown_skipped: cooldownSkipped,
     errors,
   });
   } finally {
@@ -6463,18 +6700,32 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // The booking E2E above only needs booking_live; the CLAIM E2E needs the row
 // to satisfy deriveOrgLinkedEmail() (services/gardssalg-claim.ts), and none of
 // the fields it reads were reachable from any admin lever: brreg_verified has
-// no write route for experience_providers at all, and PATCH /admin/providers/
-// :id/hjemmeside sets hjemmeside WITHOUT the field_provenance stamp that makes
-// a domain "ownership-verified". So the claim flow had no repeatable end-to-end
-// test path. This opt-in flag closes exactly that gap and nothing else.
+// no write route for experience_providers at all. So the claim flow had no
+// repeatable end-to-end test path. This opt-in flag closes exactly that gap
+// and nothing else.
 //
-// It sets the three fields deriveOrgLinkedEmail() needs, and deliberately does
-// NOT use content_source='manual' as the ownership proof even though that is
-// the cheaper of the two accepted paths: the owner portal disables its whole
-// edit form on content_source==='manual' (routes/gardssalg-claim.ts), so a
-// 'manual' test row would verify the magic link and then present a read-only
-// portal — testing the wrong thing. The field_provenance.hjemmeside.source_url
-// path leaves the portal editable, which is what a claim E2E must exercise.
+// REWRITTEN 2026-08-06 (dev-request 2026-08-06-aldri-gjett-epostadresse):
+// this used to make the row claimable via the NOW-RETIRED tier (b)
+// (`post@<verified-domain>`, see gardssalg-claim.ts's module doc) — it
+// stamped hjemmeside + a field_provenance.hjemmeside evidence marker and
+// deliberately left content_source untouched, specifically SO THAT it would
+// look "ownership-verified" without ever setting content_source='manual'
+// (which disables the owner portal's whole edit form — a 'manual' test row
+// would verify the magic link and then present a read-only portal, testing
+// the wrong thing). Tier (b) no longer exists, so none of that produces a
+// claimable row anymore; it would just be a lie. This flag now goes through
+// the SURVIVING tier (c), stored_epost_verified, the only path a bare
+// `content_source='manual'` + a stored `epost` was always enough for. The
+// trade-off flagged above (read-only portal after claim) is now a REAL,
+// accepted trade-off of this test route, not avoided — the claim E2E below
+// exercises "does the magic link issue and verify", not "is the portal
+// post-claim editable"; a portal-editability E2E would need a DIFFERENT
+// fixture (e.g. the field_provenance path, hand-seeded, same as
+// gardssalg-claim.test.ts's own DB-backed fixtures do), which is out of
+// scope for this route.
+//
+// It sets the two fields deriveOrgLinkedEmail() needs for tier (c):
+// content_source='manual' and a stored `epost`.
 //
 // SAFETY — the claimable writes are pinned to `org_nr = TEST_PROVIDER_ORG_NR`
 // in the UPDATE's own WHERE clause, not merely to the id resolved above. The
@@ -6483,24 +6734,40 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // flag would hand a real producer a forged ownership stamp and reset a genuine
 // content_source lock. With it, a non-test row is refused before any write.
 //
-// The default domain is RFC-6761-reserved `.invalid` — guaranteed never to
-// resolve — so even if a NON-test claim were ever issued against this row (the
-// public POST .../request route, which does not redirect), the derived
-// post@<domain> address cannot reach a real third party. It is also outside
-// GENERIC_DOMAINS, which isClaimableDomain() requires.
+// JUDGMENT CALL (reviewer: scrutinize this) — `epost` is ONE shared column
+// that BOTH this route's booking-notification target (the required top-level
+// `email`, dispatched to on a real booking against this test row — see the
+// booking-E2E doc above) and the claim-eligibility tier (c) address read.
+// When `claimable: true`, the claimable branch below OVERWRITES `epost` with
+// the (optional, separately-supplied) `claimEmail` — NOT the required
+// `email` — so a caller doing a pure claim-E2E run never has to hand this
+// route a real inbox merely to satisfy the unrelated `email` shape check,
+// and a caller doing a pure booking-E2E run (claimable omitted/false) is
+// completely unaffected (claimEmail is refused if supplied without the
+// flag, same convention hjemmeside used to follow). The two E2E flows are
+// NOT designed to be exercised in the SAME call with two different real
+// addresses — if a future caller needs booking-notify AND a specific,
+// non-default claim address simultaneously, pass `claimEmail` equal to
+// `email` explicitly; don't assume `email` doubles as the claim target.
 //
-// content_source is RESET to NULL so the test is repeatable: a completed claim
-// stamps content_source='claim' (verifyClaimToken), which would otherwise make
-// the second run start from a claimed row. Same org_nr pin guards that reset.
+// The default claim address is on the RFC-6761-reserved `.invalid` TLD —
+// guaranteed never to resolve — so even if a NON-test claim were ever issued
+// against this row (the public POST .../request route, which does not
+// redirect), the stored address cannot reach a real third party. Mirrors the
+// exact same reasoning this route used to apply to the (now-removed)
+// hjemmeside default.
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
-const TEST_PROVIDER_DEFAULT_HJEMMESIDE = "https://test-ikke-book.invalid";
+const TEST_PROVIDER_DEFAULT_CLAIM_EMAIL = "claim-test@test-ikke-book.invalid";
 router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: Response) => {
+  // Same shape check reused for BOTH email fields below (email, claimEmail) —
+  // matches ProviderSchema's z.string().email() shape so createProvider()
+  // won't reject it, validated up front for a clean 400 instead of a 500.
+  const EMAIL_SHAPE_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
   const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
-  // Same shape as ProviderSchema's z.string().email() so createProvider() below
-  // won't reject it — validate up front for a clean 400 instead of a 500.
-  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+  if (!email || !EMAIL_SHAPE_RE.test(email)) {
     res.status(400).json({ error: "Body må inneholde en gyldig { email }" });
     return;
   }
@@ -6516,74 +6783,38 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
   // Strict-true parse, same convention as every other opt-in flag in this file:
   // only the literal JSON boolean `true` turns the claim fields on.
   const claimable = req.body?.claimable === true;
-  const hjemmeside =
-    typeof req.body?.hjemmeside === "string" && req.body.hjemmeside.trim()
-      ? req.body.hjemmeside.trim()
-      : TEST_PROVIDER_DEFAULT_HJEMMESIDE;
 
-  // A caller-supplied hjemmeside is NOT free-form here, because whatever lands
-  // in this column decides who receives real mail. normalizeDomain() treats any
-  // string containing "@" as an email address and keeps only what follows it
-  // (blocklist-service.ts), so an unvalidated value like
-  //   "https://x.no\nBcc: victim@evil.example"
-  // stores one thing as the website and mints post@evil.example as the claim
-  // address — and the PUBLIC claim route (POST /kategori/gardssalg/eier/:id/
-  // request) is unauthenticated and sends WITHOUT the test redirect, so any
-  // visitor who knows the slug could then trigger a genuine magic-link email to
-  // that unrelated domain. The `.invalid` default is only a safe default; it
-  // protects nothing once a caller passes their own value.
-  //
-  // Three gates, cheapest first, and all three are required:
-  //   1. isPlausibleUrlish  — the same shape check PATCH /admin/providers/:id/
-  //      hjemmeside already applies; rejects whitespace (so header/CRLF
-  //      injection cannot survive) and anything without a dot.
-  //   2. a parseable http(s) URL whose host equals the normalized domain — this
-  //      is what closes the "@" trick: a value whose derived domain is not
-  //      simply the host of the URL we are storing is refused outright, so the
-  //      stored website and the minted address can never disagree.
-  //   3. isClaimableDomain — the SAME rule deriveOrgLinkedEmail() applies at
-  //      mint time, so a bad domain is a clean 400 instead of a silently
-  //      non-claimable test row.
-  const claimDomain = claimable ? normalizeDomain(hjemmeside) : "";
-  if (claimable) {
-    let urlHost = "";
-    try {
-      const parsed = new URL(hjemmeside);
-      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-        urlHost = parsed.hostname.toLowerCase().replace(/^www\./, "");
-      }
-    } catch {
-      /* unparseable -> urlHost stays "" -> refused below */
-    }
-    if (!isPlausibleUrlish(hjemmeside) || !urlHost || urlHost !== claimDomain) {
+  // `claimEmail` — the tier (c) stored_epost_verified address (see this
+  // route's doc comment above for why this is deliberately NOT the same
+  // field as the required `email`). Only meaningful, and only accepted, with
+  // `claimable: true` — same "refuse rather than silently discard" contract
+  // hjemmeside used to follow for tier (b).
+  if (!claimable) {
+    if (typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim()) {
       res.status(400).json({
-        error:
-          "'hjemmeside' må være en http(s)-URL uten mellomrom, og vertsnavnet må være " +
-          "nøyaktig det domenet claim-adressen utledes fra (ellers kan lagret nettside og " +
-          "utledet post@-adresse peke på ulike domener)",
-        hjemmeside,
-        url_host: urlHost || null,
-        normalized_domain: claimDomain,
+        error: "'claimEmail' krever { claimable: true } — uten flagget skrives den ikke",
       });
       return;
     }
-    if (!isClaimableDomain(claimDomain)) {
+  }
+  let claimEmail = TEST_PROVIDER_DEFAULT_CLAIM_EMAIL;
+  if (claimable && typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim()) {
+    const candidate = req.body.claimEmail.trim();
+    // Plausible shape only — NOT the URL-host-match / isClaimableDomain
+    // checks the old hjemmeside-derivation path required. Those existed
+    // ONLY to keep a stored website and a domain-DERIVED address from
+    // disagreeing; there is no derivation left to protect, and a free-mail
+    // address (gmail/hotmail/...) is a perfectly legitimate claim target
+    // under tier (c) — unlike the retired tier (b), this path never rejects
+    // a domain for being "generic".
+    if (!EMAIL_SHAPE_RE.test(candidate)) {
       res.status(400).json({
-        error:
-          "'hjemmeside' må være et domene claim-flyten kan utlede post@<domene> fra " +
-          "(må inneholde punktum, og kan ikke være et generisk/delt domene)",
-        hjemmeside,
-        normalized_domain: claimDomain,
+        error: "'claimEmail' må se ut som en e-postadresse",
+        claimEmail: candidate,
       });
       return;
     }
-  } else if (typeof req.body?.hjemmeside === "string" && req.body.hjemmeside.trim()) {
-    // Without the flag the value is never written. Say so rather than accepting
-    // it and silently discarding it.
-    res.status(400).json({
-      error: "'hjemmeside' krever { claimable: true } — uten flagget skrives den ikke",
-    });
-    return;
+    claimEmail = candidate;
   }
 
   const expDb = getExpDb("experiences");
@@ -6654,24 +6885,15 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       .run({ id: providerId, navn: name, email, slug });
 
     // ── claimable opt-in (see this route's doc comment) ──────────────────
+    // Sets exactly the two fields tier (c) stored_epost_verified needs:
+    // content_source='manual' (adminEntered — deriveOrgLinkedEmailCandidates()
+    // reads this literally) and `epost` = claimEmail. No field_provenance
+    // touch anymore (tier (b)'s hjemmeside evidence stamp is retired along
+    // with the tier itself), so a pre-existing field_provenance value on this
+    // row — e.g. an unrelated hjemmeside_verification stamp from a prior test
+    // run — is left completely alone; nothing to merge, nothing to clobber.
     let claimReady = false;
     if (claimable) {
-      // MERGE the provenance, don't clobber it — both other writers of this
-      // column (applyGardssalgProviderWebsite in experience-store.ts, and the
-      // verification sweep's hjemmeside_verification stamp) read the existing
-      // JSON, set only their own key, and write back, treating malformed JSON
-      // as empty rather than failing the write. A wholesale stringify here
-      // would silently drop any key they had set. The org_nr pin below means
-      // that can only ever be the synthetic test row today, and the cohort
-      // exclusions keep the sweeps off it — so this is convention, not a live
-      // bug. Which is the reason to follow it: the next writer of this column
-      // should find three call sites agreeing, not two and an exception.
-      //
-      // Read AND write inside ONE transaction, same as
-      // applyGardssalgWebsiteVerification: split across two statements, a
-      // concurrent provenance writer could land between them and lose its key —
-      // which is the exact failure the merge exists to prevent.
-      //
       // The UPDATE's `AND org_nr = @testOrgNr` is belt to the pre-write guard's
       // braces. That guard already turns a real-provider slug into a 409 before
       // anything is written, so this pin should be unreachable — but it is what
@@ -6681,41 +6903,14 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       // already have run, so the 409 below would be reporting a partial write.
       // That is precisely the defect the pre-write guard was added to remove —
       // keep them in that order.
-      const result = expDb.transaction(() => {
-        let provenance: Record<string, unknown> = {};
-        const existingProv = expDb
-          .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
-          .get(providerId) as { field_provenance: string | null } | undefined;
-        if (existingProv?.field_provenance) {
-          try {
-            const parsed = JSON.parse(existingProv.field_provenance);
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-              provenance = parsed as Record<string, unknown>;
-            }
-          } catch {
-            /* malformed existing JSON -> treat as empty rather than clobber the write */
-          }
-        }
-        provenance.hjemmeside = {
-          source_url: hjemmeside,
-          fetched_at: new Date().toISOString(),
-          source: "admin-test-provider",
-        };
-        return expDb
-          .prepare(
-            `UPDATE experience_providers
-                SET brreg_verified = 1, hjemmeside = @hjemmeside,
-                    field_provenance = @stamp, content_source = NULL,
-                    updated_at = datetime('now')
-              WHERE id = @id AND org_nr = @testOrgNr`
-          )
-          .run({
-            id: providerId,
-            hjemmeside,
-            stamp: JSON.stringify(provenance),
-            testOrgNr: TEST_PROVIDER_ORG_NR,
-          });
-      })();
+      const result = expDb
+        .prepare(
+          `UPDATE experience_providers
+              SET brreg_verified = 1, content_source = 'manual', epost = @claimEmail,
+                  updated_at = datetime('now')
+            WHERE id = @id AND org_nr = @testOrgNr`
+        )
+        .run({ id: providerId, claimEmail, testOrgNr: TEST_PROVIDER_ORG_NR });
 
       if (result.changes === 0) {
         res.status(409).json({
@@ -6729,8 +6924,13 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       claimReady = true;
     }
 
+    // The row's ACTUAL current epost — claimEmail when claimable overwrote
+    // it, the general `email` otherwise (see this route's doc comment's
+    // "JUDGMENT CALL" note on why these can differ).
+    const currentEpost = claimReady ? claimEmail : email;
+
     console.log(
-      `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${email} ` +
+      `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${currentEpost} ` +
         `(catalog_hidden=1, booking_live=1, claimable=${claimReady})`
     );
 
@@ -6739,16 +6939,16 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       provider_id: providerId,
       slug,
       booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
-      epost: email,
+      epost: currentEpost,
       claimable: claimReady,
       ...(claimReady
         ? {
             claim_url: `${APP_URL}/kategori/gardssalg/eier/${slug}`,
-            claim_hjemmeside: hjemmeside,
-            // The address the claim would derive. Reported so the operator can
-            // confirm the E2E redirect actually diverted the send — nothing is
-            // ever sent to it by this route (it sends no email at all).
-            derived_claim_email: `post@${claimDomain}`,
+            // The address stored for tier (c) stored_epost_verified. Reported
+            // so the operator can confirm the E2E redirect actually diverted
+            // the send — nothing is ever sent to it by this route (it sends
+            // no email at all).
+            claim_epost: claimEmail,
           }
         : {}),
     });
@@ -6805,7 +7005,7 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
   try {
     providers = expDb.prepare(
       `SELECT id, navn, hjemmeside, adresse, telefon, epost, lat, lon,
-              about_text, products, content_source
+              about_text, products, content_source, field_provenance
          FROM experience_providers
         WHERE rfb_seed_source = 'rfb-seed'`
     ).all() as EnrichProviderRow[];
@@ -7218,6 +7418,16 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
 // Batch size is capped at 200 ids (mirrors the explicit-cap-then-400
 // precedent already established by MAX_GARDSSALG_AUDIT_LIMIT /
 // gardssalg-website-verification-audit above) — never silently truncated.
+//
+// dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+// Slice 2 ("outreach-guard"): AFTER the tier-based go/no_go pass above
+// (unchanged), a second pass downgrades any go:true id that collides on
+// exact email or shared non-freemail email domain with an EARLIER go:true
+// id in the SAME batch — two experience_providers rows can represent the
+// same real business seeded from different sources, and this guard is what
+// stops both from independently coming back go:true. Scoped to a single
+// request/response only, no persistent "already sent" ledger.
+import { dedupeGardssalgOutreachRecipients } from "../services/gardssalg-outreach-dedupe";
 const MAX_GARDSSALG_PREFLIGHT_BATCH = 200;
 
 router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, res: Response) => {
@@ -7253,21 +7463,53 @@ router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, 
     const rows = computeGardssalgReadinessRows(expDb, orderedIds);
     const byId = new Map(rows.map((r) => [r.id, r]));
 
+    const results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }> =
+      orderedIds.map((id) => {
+        const row = byId.get(id);
+        if (!row) {
+          return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
+        }
+        if (row.readiness_tier === "outreach_ready") {
+          return { provider_id: id, name: row.name, go: true, reason: null };
+        }
+        return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
+      });
+
+    // ── Slice 2 outreach-guard: cross-row dedup over THIS batch's go:true
+    // rows only. Fetch email separately (does NOT touch
+    // computeGardssalgReadinessRows's signature/return type — that function
+    // is also used, unmodified, by GET /admin/gardssalg-outreach-readiness).
+    const goIds = results.filter((r) => r.go).map((r) => r.provider_id);
+    if (goIds.length > 0) {
+      const placeholders = goIds.map(() => "?").join(", ");
+      const emailRows = expDb
+        .prepare(`SELECT id, epost FROM experience_providers WHERE id IN (${placeholders})`)
+        .all(...goIds) as Array<{ id: string; epost: string | null }>;
+      const emailById = new Map(emailRows.map((r) => [r.id, r.epost]));
+
+      // orderedIds order, restricted to the go:true candidates — first-seen
+      // in the ORIGINAL batch order wins the dedup, not query result order.
+      const candidates = orderedIds
+        .filter((id) => emailById.has(id))
+        .map((id) => ({ provider_id: id, email: emailById.get(id) ?? null }));
+
+      const { suppressed } = dedupeGardssalgOutreachRecipients(candidates);
+
+      for (const result of results) {
+        const reason = suppressed.get(result.provider_id);
+        if (reason) {
+          result.go = false;
+          result.reason = reason;
+        }
+      }
+    }
+
     let go = 0;
     let no_go = 0;
-    const results = orderedIds.map((id) => {
-      const row = byId.get(id);
-      if (!row) {
-        no_go++;
-        return { provider_id: id, name: null, go: false, reason: "ikke_funnet" };
-      }
-      if (row.readiness_tier === "outreach_ready") {
-        go++;
-        return { provider_id: id, name: row.name, go: true, reason: null };
-      }
-      no_go++;
-      return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
-    });
+    for (const r of results) {
+      if (r.go) go++;
+      else no_go++;
+    }
 
     res.json({ results, summary: { go, no_go, total: results.length } });
   } catch (err) {
@@ -7489,7 +7731,7 @@ async function runGardssalgFieldConcordanceScan(
   const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
     const fetched = await crFetchGardssalgContent(homepageUrl);
     if (!fetched.ok) return { ok: false, reason: fetched.reason };
-    return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+    return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
   };
 
   const providers: GfcProviderResult[] = [];
@@ -8325,7 +8567,7 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
       const fetched = await crFetchGardssalgContent(homepageUrl);
       if (!fetched.ok) return { ok: false, reason: fetched.reason };
-      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
     };
     const cohortRows = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
 
@@ -8475,7 +8717,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
       const fetched = await crFetchGardssalgContent(homepageUrl);
       if (!fetched.ok) return { ok: false, reason: fetched.reason };
-      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml) };
+      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
     };
 
     let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
@@ -8590,6 +8832,465 @@ router.post("/admin/gardssalg-owner-lock-backfill", requireAdmin, (req: Request,
     });
   } catch (err) {
     console.error("[gardssalg-owner-lock-backfill] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-epost-synthesis-audit ─────────────
+// ─── POST /api/opplevelser/admin/gardssalg-epost-synthesis-remediation ──────
+//
+// dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
+// 6. Daniel's ruling: never CONSTRUCT/guess an email address for a producer —
+// only ever use addresses actually found. `deriveOrgLinkedEmailCandidates`
+// (services/gardssalg-claim.ts) still has a "guess" tier — the well-known
+// post@<verified-domain> convention address on a claimant's OWNERSHIP-
+// VERIFIED domain — but that construction is RUNTIME-ONLY: it is derived
+// fresh on every claim-link request and never written to any column (grep
+// confirms no INSERT/UPDATE anywhere in src/ builds a template-string
+// `post@...` email and persists it). This pair of routes is the audit half
+// of criterion 6: verify that claim, don't just assume it — because a
+// producer's REAL published address can ALSO happen to look exactly like
+// that pattern (hunsfos-bryggeri.no's actual contact is post@hunsfos-
+// bryggeri.no — a real business, not a synthesized one), so pattern-matching
+// alone can never distinguish "fake" from "genuinely published" and must
+// never drive an unconditional delete.
+//
+// ── Scope: two tables, two verticals ─────────────────────────────────────
+//   - experience_providers.epost, domain source = experience_providers.hjemmeside
+//   - RFB's agents.contact_email, domain source = agents.url (RFB's `agents`
+//     has no separate "own site" column — url IS the producer's site)
+//
+// ── The exact pattern ──────────────────────────────────────────────────────
+// A row matches iff its stored address's local-part is literally "post"
+// (case-insensitive) AND its domain equals that SAME row's own site domain
+// (hjemmeside/url), compared via normalizeDomain() (services/blocklist-
+// service.ts — the SAME host-normalization helper gardssalg-claim.ts's own
+// post@<verified-domain> construction already reuses; not reimplemented
+// here). Any other stored address (different domain, different local-part,
+// or a row with no site to compare against) is simply not in scope — it was
+// never a candidate the "guess" tier could have produced in the first place.
+//
+// ── Classification (per matched row) ────────────────────────────────────────
+// A pattern match alone proves NOTHING — it is equally consistent with "this
+// was synthesized" and "this producer really does publish post@own-domain".
+// So every match is further classified by whether the row carries any trace
+// of a legitimate source:
+//   - has_content_source_evidence: experience_providers.content_source is
+//     one of 'manual' | 'claim' | 'provider_site' — i.e. the row's epost was
+//     either curator/owner-authored or actually scraped off the provider's
+//     own site, not merely assumed. This is EXACTLY the hunsfos-bryggeri.no
+//     shape (content_source='provider_site' after a real crawl found it) —
+//     preserved, never a removal candidate.
+//   - has_provenance_evidence: experience_providers.field_provenance is a
+//     non-empty JSON object (any key) — some enrichment/verification step
+//     left a trace for this row. Preserved, never a removal candidate.
+//   - no_evidence_found: neither of the above. The ONLY bucket a remediation
+//     apply is ever allowed to touch.
+// experience_providers is the only table with content_source/field_provenance
+// columns of this shape — RFB's agents/agent_knowledge.field_provenance is a
+// structurally different, per-field array-tiered thing (unrelated check, see
+// admin-agent-audit*.ts) and is deliberately NOT read here. Instead, the
+// agents-side analog reuses this codebase's own established row-level lock:
+// `agents.claimed_at IS NOT NULL` — an owner-claimed agent's contact_email
+// was asserted by the actual producer (same protective intent as
+// content_source='manual'/'claim'/'provider_site'), so a claimed match lands
+// in has_content_source_evidence too. There is no agents-side analog for
+// has_provenance_evidence (deliberately — see above); an unclaimed agents
+// match with no other evidence falls straight to no_evidence_found.
+//
+// ── Read-only vs. write ──────────────────────────────────────────────────
+// GET is a pure read — zero writes, mirrors gardssalg-experience-conflict-
+// audit's / gardssalg-website-verification-audit's own read-only convention
+// exactly. POST is dry-run BY DEFAULT (apply must be an explicit truthy
+// form, same convention as every other gårdssalg admin write route in this
+// file) and, even under apply, NEVER trusts a caller-supplied row list —
+// it re-runs the SAME scan live and only ever writes rows that land in
+// no_evidence_found on that FRESH pass (fail-closed: a row that gained
+// evidence, or whose value changed, between scan and write is left alone).
+// A claimed_at re-check immediately before each write is an additional
+// defense-in-depth belt-and-suspenders measure (mirrors every other write
+// route in this file's "owner controls their own data from claim onward"
+// discipline) — largely redundant for experience_providers in practice
+// (claiming always stamps content_source='claim', see
+// issueClaimMagicLink/updateClaimedProviderProfile in gardssalg-claim.ts, so
+// a claimed provider row is already excluded via has_content_source_evidence
+// before this check even runs) but kept anyway for the same reason every
+// other route here keeps it: never rely on a single line of defense for an
+// owner's own data.
+//
+// This is expected to find close to zero real rows given the analysis above
+// — that is fine and correct, not a bug to chase.
+
+const GARDSSALG_EPOST_SYNTHESIS_MAX_LIST = 200;
+
+// ── Injectable RFB-DB seam (tests only) ─────────────────────────────────────
+// These two routes read/write the RFB `agents` table through getRfbDb()
+// (= getDb() from ../database/init), the SAME shared, module-level singleton
+// every other suite in tests/test.ts also reads/swaps. gardssalg-claim.test.ts
+// documents exactly why a test must NOT pin that singleton directly
+// (src/database/init.ts's __setDbForTesting): doing so raced live against a
+// concurrently-running, unrelated suite in the full test.ts run. So — same
+// fix as gardssalg-claim.ts's own __setRfbDbForTesting and admin-agents-
+// contact-email-write.ts's dbOverrideForTesting — one indirection a test can
+// override for ITS OWN calls, touching no global. Production code never
+// calls the setter.
+let gardssalgEpostSynthesisRfbDbOverrideForTesting: Database.Database | null = null;
+/** Test-only. Pass null to clear. Never called by production code. */
+export function __setGardssalgEpostSynthesisRfbDbForTesting(db: Database.Database | null): void {
+  gardssalgEpostSynthesisRfbDbOverrideForTesting = db;
+}
+function resolveGardssalgEpostSynthesisRfbDb(): Database.Database {
+  return gardssalgEpostSynthesisRfbDbOverrideForTesting ?? getRfbDb();
+}
+
+type EpostSynthesisTable = "experience_providers" | "agents";
+type EpostSynthesisBucket = "has_content_source_evidence" | "has_provenance_evidence" | "no_evidence_found";
+
+const EPOST_SYNTHESIS_CONTENT_SOURCE_EVIDENCE = new Set(["manual", "claim", "provider_site"]);
+
+interface EpostSynthesisRow {
+  table: EpostSynthesisTable;
+  id: string;
+  label: string | null;
+  storedEmail: string;
+  domainSource: string;
+  contentSource: string | null;
+  fieldProvenance: string | null;
+  claimedAt: string | null;
+}
+
+/**
+ * True iff `storedEmail`'s local-part is literally "post" (case-insensitive)
+ * and its domain equals `domainSource`'s own domain — the EXACT
+ * post@<own-domain> shape. Both sides go through normalizeDomain() so
+ * "www." prefixes / protocols / trailing ports never cause a false miss.
+ */
+function isGardssalgEpostSynthesisPatternMatch(
+  storedEmail: string | null | undefined,
+  domainSource: string | null | undefined,
+): boolean {
+  if (!storedEmail || !domainSource) return false;
+  const trimmed = storedEmail.trim().toLowerCase();
+  const at = trimmed.indexOf("@");
+  if (at <= 0) return false;
+  if (trimmed.slice(0, at) !== "post") return false;
+  const emailDomain = normalizeDomain(trimmed);
+  const siteDomain = normalizeDomain(domainSource);
+  if (!emailDomain || !siteDomain) return false;
+  return emailDomain === siteDomain;
+}
+
+/** True iff `json` parses to a non-empty object (any key at all). */
+function gardssalgEpostSynthesisHasProvenance(json: string | null | undefined): boolean {
+  if (!json) return false;
+  try {
+    const parsed = JSON.parse(json);
+    return !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length > 0);
+  } catch {
+    return false;
+  }
+}
+
+function classifyGardssalgEpostSynthesisRow(row: EpostSynthesisRow): EpostSynthesisBucket {
+  if (row.table === "experience_providers") {
+    if (row.contentSource && EPOST_SYNTHESIS_CONTENT_SOURCE_EVIDENCE.has(row.contentSource)) {
+      return "has_content_source_evidence";
+    }
+    if (gardssalgEpostSynthesisHasProvenance(row.fieldProvenance)) {
+      return "has_provenance_evidence";
+    }
+    return "no_evidence_found";
+  }
+  // agents/RFB side — see the file-header doc comment above for why
+  // claimed_at is this side's evidence analog.
+  if (row.claimedAt) return "has_content_source_evidence";
+  return "no_evidence_found";
+}
+
+interface EpostSynthesisScan {
+  scanned: { experience_providers: number; agents: number };
+  pattern_matches: { experience_providers: number; agents: number };
+  buckets: { has_content_source_evidence: number; has_provenance_evidence: number; no_evidence_found: number };
+  rows: Record<EpostSynthesisBucket, EpostSynthesisRow[]>;
+}
+
+/**
+ * Runs the full scan+classify pass across both tables. Always live — never
+ * cached, never trusts a caller-supplied row list. Used by BOTH the GET
+ * audit (read-only) and the POST remediation (which re-runs this exact same
+ * function immediately before writing, per the file-header note above).
+ */
+function scanGardssalgEpostSynthesis(expDb: Database.Database, rfbDb: Database.Database): EpostSynthesisScan {
+  const providerRows = expDb
+    .prepare(
+      `SELECT id, slug, epost, hjemmeside, content_source, field_provenance, claimed_at
+         FROM experience_providers
+        WHERE epost IS NOT NULL AND TRIM(epost) != ''`,
+    )
+    .all() as {
+    id: string;
+    slug: string | null;
+    epost: string;
+    hjemmeside: string | null;
+    content_source: string | null;
+    field_provenance: string | null;
+    claimed_at: string | null;
+  }[];
+
+  const agentRows = rfbDb
+    .prepare(
+      `SELECT id, name, contact_email, url, claimed_at
+         FROM agents
+        WHERE contact_email IS NOT NULL AND TRIM(contact_email) != ''`,
+    )
+    .all() as { id: string; name: string | null; contact_email: string; url: string | null; claimed_at: string | null }[];
+
+  const scanned = { experience_providers: providerRows.length, agents: agentRows.length };
+
+  const matched: EpostSynthesisRow[] = [];
+  for (const r of providerRows) {
+    if (!isGardssalgEpostSynthesisPatternMatch(r.epost, r.hjemmeside)) continue;
+    matched.push({
+      table: "experience_providers",
+      id: r.id,
+      label: r.slug,
+      storedEmail: r.epost,
+      domainSource: r.hjemmeside ?? "",
+      contentSource: r.content_source,
+      fieldProvenance: r.field_provenance,
+      claimedAt: r.claimed_at,
+    });
+  }
+  for (const r of agentRows) {
+    if (!isGardssalgEpostSynthesisPatternMatch(r.contact_email, r.url)) continue;
+    matched.push({
+      table: "agents",
+      id: r.id,
+      label: r.name,
+      storedEmail: r.contact_email,
+      domainSource: r.url ?? "",
+      contentSource: null,
+      fieldProvenance: null,
+      claimedAt: r.claimed_at,
+    });
+  }
+
+  const pattern_matches = {
+    experience_providers: matched.filter((r) => r.table === "experience_providers").length,
+    agents: matched.filter((r) => r.table === "agents").length,
+  };
+
+  const rows: Record<EpostSynthesisBucket, EpostSynthesisRow[]> = {
+    has_content_source_evidence: [],
+    has_provenance_evidence: [],
+    no_evidence_found: [],
+  };
+  for (const r of matched) rows[classifyGardssalgEpostSynthesisRow(r)].push(r);
+
+  return {
+    scanned,
+    pattern_matches,
+    buckets: {
+      has_content_source_evidence: rows.has_content_source_evidence.length,
+      has_provenance_evidence: rows.has_provenance_evidence.length,
+      no_evidence_found: rows.no_evidence_found.length,
+    },
+    rows,
+  };
+}
+
+function gardssalgEpostSynthesisRowForResponse(r: EpostSynthesisRow) {
+  return r.table === "experience_providers"
+    ? { table: r.table, id: r.id, slug: r.label, epost: r.storedEmail, hjemmeside: r.domainSource }
+    : { table: r.table, id: r.id, agent_id: r.id, contact_email: r.storedEmail, url: r.domainSource };
+}
+
+router.get("/admin/gardssalg-epost-synthesis-audit", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  const rfbDb = resolveGardssalgEpostSynthesisRfbDb();
+  try {
+    const scan = scanGardssalgEpostSynthesis(expDb, rfbDb);
+    const noEvidenceRows = scan.rows.no_evidence_found;
+    const truncated = noEvidenceRows.length > GARDSSALG_EPOST_SYNTHESIS_MAX_LIST;
+    res.json({
+      success: true,
+      scanned: scan.scanned,
+      pattern_matches: scan.pattern_matches,
+      buckets: scan.buckets,
+      no_evidence_rows: noEvidenceRows.slice(0, GARDSSALG_EPOST_SYNTHESIS_MAX_LIST).map(gardssalgEpostSynthesisRowForResponse),
+      ...(truncated ? { truncated: true } : {}),
+    });
+  } catch (err) {
+    console.error("[gardssalg-epost-synthesis-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/**
+ * Removes ONE experience_providers row's epost (sets NULL) — only ever
+ * called for a row the FRESH re-scan itself just classified as
+ * no_evidence_found. Re-reads + re-classifies from a fresh snapshot inside
+ * its own transaction (never trusts the scan-time snapshot for the actual
+ * write decision) and writes a field_provenance audit-trail entry (additive
+ * key, never clobbers any existing provenance) recording what was removed
+ * and why, PLUS a row in experience_provider_field_write_audit — the SAME
+ * generalized per-write changelog table POST .../providers/hjemmeside-write
+ * already uses for this table (field_name column, not reinvented here).
+ */
+function applyGardssalgEpostSynthesisProviderRemoval(
+  expDb: Database.Database,
+  providerId: string,
+): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" {
+  const tx = expDb.transaction((): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" => {
+    const fresh = expDb
+      .prepare(
+        `SELECT epost, hjemmeside, content_source, field_provenance, claimed_at
+           FROM experience_providers WHERE id = ?`,
+      )
+      .get(providerId) as
+      | { epost: string | null; hjemmeside: string | null; content_source: string | null; field_provenance: string | null; claimed_at: string | null }
+      | undefined;
+    if (!fresh) return "not_found";
+    if (fresh.claimed_at) return "skipped_claimed"; // defense-in-depth, see file-header note
+    const freshRow: EpostSynthesisRow = {
+      table: "experience_providers",
+      id: providerId,
+      label: null,
+      storedEmail: fresh.epost ?? "",
+      domainSource: fresh.hjemmeside ?? "",
+      contentSource: fresh.content_source,
+      fieldProvenance: fresh.field_provenance,
+      claimedAt: fresh.claimed_at,
+    };
+    if (!isGardssalgEpostSynthesisPatternMatch(fresh.epost, fresh.hjemmeside)) return "skipped_already_changed";
+    if (classifyGardssalgEpostSynthesisRow(freshRow) !== "no_evidence_found") return "skipped_already_changed";
+
+    const oldEpost = fresh.epost;
+    expDb.prepare(`UPDATE experience_providers SET epost = NULL, updated_at = datetime('now') WHERE id = ?`).run(providerId);
+
+    let provenance: Record<string, unknown> = {};
+    if (fresh.field_provenance) {
+      try {
+        const parsed = JSON.parse(fresh.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) provenance = parsed;
+      } catch {
+        /* malformed existing provenance — start a fresh object rather than fail the removal */
+      }
+    }
+    provenance.epost_synthesis_removal = {
+      removed_value: oldEpost,
+      reason: "post@<own-domain> pattern match with no content_source/field_provenance evidence of a real source",
+      removed_at: new Date().toISOString(),
+    };
+    expDb.prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`).run(JSON.stringify(provenance), providerId);
+
+    expDb
+      .prepare(
+        `INSERT INTO experience_provider_field_write_audit
+           (id, provider_id, field_name, old_value, new_value, batch_id, written_at)
+         VALUES (?, ?, 'epost', ?, NULL, ?, datetime('now'))`,
+      )
+      .run(crypto.randomUUID(), providerId, oldEpost, "gardssalg-epost-synthesis-remediation");
+
+    return "removed";
+  });
+  return tx();
+}
+
+/**
+ * Removes ONE agent's contact_email — same re-check-before-write discipline
+ * as applyGardssalgEpostSynthesisProviderRemoval above. `agents.contact_email`
+ * is TEXT NOT NULL (database/init.ts), so "removed" is stored as the EMPTY
+ * STRING, exactly like POST /admin/agents/contact-email-write's own "cleared"
+ * convention (admin-agents-contact-email-write.ts) — the outreach selector
+ * already treats "" and NULL as equivalent ("no contact"), so this drops the
+ * row out of outreach exactly as a NULL would have. Writes an
+ * agent_knowledge_audit row carrying the OLD value (same audit table/shape
+ * admin-agents-contact-email-write.ts and admin-contact-write-guard-retro-
+ * sweep.ts already use for agents.contact_email writes — not reinvented).
+ */
+function applyGardssalgEpostSynthesisAgentRemoval(
+  rfbDb: Database.Database,
+  agentId: string,
+): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" {
+  const tx = rfbDb.transaction((): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" => {
+    const fresh = rfbDb
+      .prepare(`SELECT contact_email, url, claimed_at FROM agents WHERE id = ?`)
+      .get(agentId) as { contact_email: string | null; url: string | null; claimed_at: string | null } | undefined;
+    if (!fresh) return "not_found";
+    if (fresh.claimed_at) return "skipped_claimed";
+    if (!isGardssalgEpostSynthesisPatternMatch(fresh.contact_email, fresh.url)) return "skipped_already_changed";
+    // agents has no content_source/field_provenance evidence tier — the
+    // claimed_at check immediately above IS the full fresh re-classification
+    // (mirrors classifyGardssalgEpostSynthesisRow's agents branch exactly).
+
+    const oldValue = fresh.contact_email;
+    rfbDb.prepare(`UPDATE agents SET contact_email = '' WHERE id = ?`).run(agentId);
+    rfbDb
+      .prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, 'contact_email', ?, '', 'system', NULL, datetime('now'), ?)`,
+      )
+      .run(
+        crypto.randomUUID(),
+        agentId,
+        oldValue,
+        "gardssalg-epost-synthesis-remediation: removed post@<own-domain> pattern match with no evidence of a real source",
+      );
+    return "removed";
+  });
+  return tx();
+}
+
+router.post("/admin/gardssalg-epost-synthesis-remediation", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const dryRun = !apply;
+
+  const expDb = getExpDb("experiences");
+  const rfbDb = resolveGardssalgEpostSynthesisRfbDb();
+  try {
+    const scan = scanGardssalgEpostSynthesis(expDb, rfbDb);
+    const candidates = scan.rows.no_evidence_found;
+
+    if (dryRun) {
+      res.json({
+        success: true,
+        dry_run: true,
+        removed: 0,
+        would_remove: candidates.length,
+        buckets_recomputed: scan.buckets,
+        candidates: candidates.slice(0, GARDSSALG_EPOST_SYNTHESIS_MAX_LIST).map(gardssalgEpostSynthesisRowForResponse),
+        ...(candidates.length > GARDSSALG_EPOST_SYNTHESIS_MAX_LIST ? { truncated: true } : {}),
+      });
+      return;
+    }
+
+    let removed = 0;
+    const results: Array<{ table: EpostSynthesisTable; id: string; outcome: string }> = [];
+    for (const row of candidates) {
+      const outcome =
+        row.table === "experience_providers"
+          ? applyGardssalgEpostSynthesisProviderRemoval(expDb, row.id)
+          : applyGardssalgEpostSynthesisAgentRemoval(rfbDb, row.id);
+      if (outcome === "removed") removed++;
+      results.push({ table: row.table, id: row.id, outcome });
+    }
+
+    // Post-apply: recompute live so the response's bucket counts reflect
+    // reality after the writes just made, not the pre-write snapshot.
+    const after = scanGardssalgEpostSynthesis(expDb, rfbDb);
+
+    res.json({
+      success: true,
+      dry_run: false,
+      removed,
+      buckets_recomputed: after.buckets,
+      results,
+    });
+  } catch (err) {
+    console.error("[gardssalg-epost-synthesis-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
@@ -9169,6 +9870,117 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
     res.json({ success: true, count: providers.length, providers });
   } catch (err) {
     console.error("[opplevelser] admin/providers/by-hjemmeside failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-wrong-content-rate ─────────────
+//
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+// hygiene, item 5 ("wrong_content_rate holdout"), slice claimed
+// 2026-08-07T05:56Z. Makes charters/experiences-enrichment.yaml's
+// `wrong_content_rate` guardrail (status: not_computable_yet since 06-17)
+// actually computable: samples enriched `experiences` rows, re-fetches each
+// row's own `evidence_url` (the live source page it was enriched from), and
+// asks an LLM judge whether the stored description/category/price plausibly
+// matches that source.
+//
+// READ-ONLY — this route makes ZERO writes to `experiences` or
+// `experience_providers`. It is a measurement holdout, not an auto-fix (see
+// the dev-request's own Non-goals: "No auto-fix of mismatched rows").
+//
+// Body: { sample_size?: number } — default WCR_DEFAULT_SAMPLE_SIZE (30),
+// hard-capped at WCR_MAX_SAMPLE_SIZE (100) regardless of what is requested
+// (cost control: each sampled row costs one fetchPage() call plus one LLM
+// judge call).
+//
+// Per-row outcome:
+//   - fetchPage(evidence_url) fails (any FetchFailureReason) → `unresolved`.
+//   - fetchPage succeeds but judgeExperienceContentMatch() itself fails
+//     (missing key / network / non-200 / unparseable JSON / ambiguous
+//     verdict — `{ ok: false }`) → `unresolved`.
+//   - judge renders a genuine verdict → MATCH increments `matched`,
+//     MISMATCH increments `mismatched`.
+// A row NEVER lands in `matched` just because it couldn't be checked — the
+// fleet's fail-closed convention, applied here to keep the RATE honest
+// rather than to reject a write (there is no write here to reject).
+//
+// wrong_content_rate = mismatched / (matched + mismatched). `unresolved`
+// rows are excluded from that denominator entirely (they carry no signal
+// either way). When the denominator is 0 (every sampled row was unresolved,
+// or the sample itself was empty), wrong_content_rate is `null` — never `0`
+// (which would falsely claim a perfect measured score) and never a crash
+// (a bare NaN would serialize to `null` over JSON anyway via JSON.stringify,
+// but that's accidental — this is explicit).
+const WCR_DEFAULT_SAMPLE_SIZE = 30;
+const WCR_MAX_SAMPLE_SIZE = 100;
+const WCR_THRESHOLD = 0.02;
+
+router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { sample_size?: unknown };
+
+  let requestedSampleSize =
+    typeof body.sample_size === "number" && Number.isFinite(body.sample_size)
+      ? Math.floor(body.sample_size)
+      : WCR_DEFAULT_SAMPLE_SIZE;
+  if (requestedSampleSize <= 0) requestedSampleSize = WCR_DEFAULT_SAMPLE_SIZE;
+  const sampleSize = Math.min(WCR_MAX_SAMPLE_SIZE, requestedSampleSize);
+
+  try {
+    const expDb = getExpDb("experiences");
+    const rows = sampleEnrichedExperiencesForHoldout(expDb, sampleSize);
+
+    let matched = 0;
+    let mismatched = 0;
+    let unresolved = 0;
+    const results: Array<{ experience_id: string; verdict: "MATCH" | "MISMATCH" | "unresolved"; reasoning: string }> = [];
+
+    for (const row of rows) {
+      const fetchResult = await fetchPage(row.evidence_url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+      if (!fetchResult.ok) {
+        unresolved++;
+        results.push({
+          experience_id: row.id,
+          verdict: "unresolved",
+          reasoning: `henting av evidence_url feilet: ${fetchResult.reason} (${fetchResult.detail})`,
+        });
+        continue;
+      }
+
+      const pageText = visibleTextOf(fetchResult.html);
+      const judged = await judgeExperienceContentMatch(row, pageText);
+      if (!judged.ok) {
+        unresolved++;
+        results.push({ experience_id: row.id, verdict: "unresolved", reasoning: judged.reasoning });
+        continue;
+      }
+
+      if (judged.verdict === "MATCH") matched++;
+      else mismatched++;
+      results.push({ experience_id: row.id, verdict: judged.verdict, reasoning: judged.reasoning });
+    }
+
+    const denominator = matched + mismatched;
+    const wrongContentRate = denominator > 0 ? mismatched / denominator : null;
+    // No resolvable data → nothing observed over threshold. This is a
+    // deliberate default (not asserted elsewhere by the spec), documented
+    // here rather than silently chosen: an empty/all-unresolved sample
+    // carries no evidence of a problem, so it is not reported as breaching.
+    const status: "under_threshold" | "over_threshold" =
+      wrongContentRate !== null && wrongContentRate > WCR_THRESHOLD ? "over_threshold" : "under_threshold";
+
+    res.json({
+      sample_size: rows.length,
+      matched,
+      mismatched,
+      unresolved,
+      wrong_content_rate: wrongContentRate,
+      threshold: WCR_THRESHOLD,
+      status,
+      results,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-wrong-content-rate failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

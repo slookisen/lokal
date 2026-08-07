@@ -708,6 +708,54 @@ export function osloDatetimeLocalToUtcIso(input: string): string | null {
 }
 
 /**
+ * Round a wall-clock time (already broken into components) up to the START
+ * of the NEXT hour — always strictly greater than the input, even when the
+ * input is already exactly on an hour boundary (e.g. 13:00:00 -> 14:00, not
+ * 13:00). Pure calendar arithmetic done on a Date.UTC-labelled timeline used
+ * purely as a component-math scratch space (no real UTC/offset conversion
+ * happens here, so this needs no DST handling of its own — it just carries
+ * whatever wall-clock components it's given forward). Returns a
+ * "YYYY-MM-DDTHH:mm" string, the exact format <input type="datetime-local">
+ * consumes. Exported for tests.
+ */
+export function nextRoundHourWallTime(y: number, mo: number, d: number, h: number, mi: number, s: number): string {
+  const scratch = Date.UTC(y, mo - 1, d, h, mi, s);
+  const flooredToHour = scratch - (scratch % 3_600_000);
+  const nextHour = new Date(flooredToHour + 3_600_000);
+  const pad = (n: number, len = 2): string => String(n).padStart(len, "0");
+  const yy = nextHour.getUTCFullYear();
+  const mm = pad(nextHour.getUTCMonth() + 1);
+  const dd = pad(nextHour.getUTCDate());
+  const hh = pad(nextHour.getUTCHours());
+  return `${pad(yy, 4)}-${mm}-${dd}T${hh}:00`;
+}
+
+/**
+ * The booking form's default `slot_at` value: the next round hour in
+ * EUROPE/OSLO wall-clock time, computed from `now` (injectable for tests,
+ * defaults to `new Date()`). Reads Oslo's current wall-clock components via
+ * Intl.DateTimeFormat (hourCycle "h23" so midnight is "00", not "24"), then
+ * delegates to nextRoundHourWallTime — this function's ONLY job is the
+ * UTC-instant -> Oslo-wall-clock-components step; the hour-rounding math
+ * lives in nextRoundHourWallTime alone. Pure given an injected `now`.
+ * Exported for tests.
+ */
+export function defaultBookingSlotAtDatetimeLocal(now: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Oslo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+  const get = (type: string): number => +(parts.find((p) => p.type === type)?.value ?? "0");
+  return nextRoundHourWallTime(get("year"), get("month"), get("day"), get("hour"), get("minute"), get("second"));
+}
+
+/**
  * Normalise ANY slot input to the canonical stored form: a naked
  * datetime-local string is Oslo wall time → UTC ISO; a string that already
  * carries a zone (Z or ±hh:mm) passes through untouched (API/MCP callers

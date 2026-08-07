@@ -2,7 +2,7 @@ import express, { Router, Request, Response } from "express";
 import {
   getClaimProviderById,
   getClaimProviderBySlug,
-  deriveOrgLinkedEmailWithOutreachLookup,
+  deriveOrgLinkedEmailCandidatesWithHarvest,
   issueClaimMagicLink,
   verifyClaimToken,
   verifyGardssalgOwnerSessionToken,
@@ -33,11 +33,20 @@ import { emailService } from "../services/email-service";
 //
 // Differences from RFB's owner-portal.ts, all deliberate (see
 // services/gardssalg-claim.ts's module doc for the full rationale):
-//   - The claim entry page never asks the visitor to type an email. The
-//     ONE org-linked email (Brreg contact, or post@<ownership-verified-
-//     domain>) is derived entirely server-side — Daniel's "never open
-//     claiming by name alone" requirement — and the masked address is
-//     shown so the visitor knows where the link went.
+//   - The claim entry page never asks the visitor to type an email. Every
+//     org-linked candidate address is derived entirely server-side —
+//     Daniel's "never open claiming by name alone" requirement — and only
+//     MASKED forms are ever rendered, so the visitor knows where the link
+//     went without the page ever carrying a full address.
+//     (Was "the ONE org-linked email (Brreg contact, or
+//     post@<ownership-verified-domain>)". Both halves of that are now
+//     wrong: dev-request 2026-08-06-claim-produsent-velger-mottakeradresse
+//     made it a LIST the producer can choose from, and dev-request
+//     2026-08-06-aldri-gjett-epostadresse retired the post@<domain> guess
+//     outright (slice 1) and replaced it with tiers of addresses actually
+//     FOUND on the producer's own verified site / their umbrella's member
+//     list (slices 2 & 4, live-wired into this route in slice 5). See
+//     services/gardssalg-claim.ts's module doc for the tier list.)
 //   - If no org-linked email can be derived, there is NO self-service path
 //     at all: the page shows the manual-fallback contact
 //     (kontakt@opplevagent.no) instead of a request form.
@@ -124,7 +133,7 @@ function readSessionCookie(req: Request): string | undefined {
   return parsed[GARDSSALG_OWNER_SESSION_COOKIE];
 }
 
-function sessionFromRequest(req: Request): { valid: boolean; providerId?: string; token?: string } {
+export function sessionFromRequest(req: Request): { valid: boolean; providerId?: string; token?: string } {
   const cookieToken = readSessionCookie(req);
   if (cookieToken) {
     const s = verifyGardssalgOwnerSessionToken(cookieToken);
@@ -262,19 +271,31 @@ router.get("/kategori/gardssalg/eier/magic-link-verify", (req: Request, res: Res
 // point ("Er dette din bedrift?"). Never asks for a typed email — the
 // eligible org-linked address (if any) is derived server-side.
 // ─────────────────────────────────────────────────────────────────
-router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Response) => {
+// ASYNC since dev-request 2026-08-06-aldri-gjett-epostadresse SLICE 5 / AC7:
+// the candidate derivation below now performs the found-address harvest,
+// which is IO. The handler keeps the SAME single top-level try/catch this
+// file uses on every other page-rendering handler (see magic-link-verify
+// above and .../portal below) — an `await` inside a try block is caught by
+// that block exactly like a synchronous throw was, so the 500-page fallback
+// and its console.error line are unchanged, not re-invented.
+router.get("/kategori/gardssalg/eier/:providerSlug", async (req: Request, res: Response) => {
   try {
     const slug = String((req.params as any).providerSlug || "");
     const provider = getClaimProviderBySlug(slug);
     if (!provider) return res.status(404).send(notFoundPage());
 
-    // Must mirror issueClaimMagicLink()'s own (b-epost) lookup exactly —
-    // otherwise this page could show the "send me a link" form for a
-    // provider whose POST would then fail (or vice versa: show the fallback
-    // for a provider the POST would actually succeed for). Same lazy
-    // wrapper issueClaimMagicLink() uses, so the RFB cross-DB lookup only
-    // ever runs when it could actually change the outcome.
-    const derived = deriveOrgLinkedEmailWithOutreachLookup(provider);
+    // Must mirror issueClaimMagicLink()'s own derivation exactly — otherwise
+    // this page could show the "send me a link" form for a provider whose
+    // POST would then fail (or vice versa: show the fallback for a provider
+    // the POST would actually succeed for). Same harvest-aware wrapper
+    // issueClaimMagicLink() uses, with the SAME cacheKey (provider.id), so
+    // the two halves cannot disagree AND a repeat page view inside the
+    // harvest TTL costs the producer's website nothing — see
+    // CLAIM_HARVEST_CACHE_TTL_MS's own comment in services/gardssalg-claim.ts
+    // for why that cache exists and why this UNAUTHENTICATED route is the
+    // reason it exists. Candidates form (dev-request 2026-08-06-claim-
+    // produsent-velger-mottakeradresse) — 0/1/2+ are the three cases below.
+    const candidates = await deriveOrgLinkedEmailCandidatesWithHarvest(provider, undefined, { cacheKey: provider.id });
     const backUrl = provider.slug ? `/kategori/gardssalg/produsent/${encodeURIComponent(provider.slug)}` : "/kategori/gardssalg";
 
     const status = String(req.query.status || "");
@@ -285,23 +306,49 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
     } else if (status === "error") {
       const msg = reason === "rate_limited"
         ? "For mange forsøk. Prøv igjen om en time."
+        : reason === "selection_required"
+        ? "Velg en adresse under."
+        : reason === "invalid_selection"
+        ? "Det valget er ikke lenger gyldig. Velg på nytt."
         : "Kunne ikke sende lenke. Prøv igjen senere, eller kontakt kontakt@opplevagent.no.";
       alert = `<div class="gc-alert gc-alert-error" role="alert">${escapeHtml(msg)}</div>`;
     }
 
-    if (!derived.eligible) {
+    if (candidates.length === 0) {
       return res.send(shell("Er dette din bedrift?", `${alert}${manualFallbackBlock()}
         <div class="gc-card"><a href="${escapeHtml(backUrl)}" class="gc-btn gc-btn-secondary">Tilbake til profilen</a></div>`));
     }
 
-    const masked = maskEmail(derived.email);
+    // Exactly one candidate: unchanged from before this dev-request — same
+    // markup, same single-button flow, no selection concept at all (AC3).
+    const addressChoiceHtml = candidates.length === 1
+      ? `<p>Vi sender en innloggingslenke til <strong>${escapeHtml(maskEmail(candidates[0].email))}</strong> — adressen vi har registrert for
+          <strong>${escapeHtml(provider.navn)}</strong> hos Brønnøysundregistrene/på deres verifiserte nettside.</p>`
+      // Two or more: producer picks. The value posted back is the SOURCE TAG
+      // ("verified_domain_address" etc.), never the address itself — the
+      // masked text is display-only and the full address never reaches the
+      // page's HTML/JS in any form (AC4). issueClaimMagicLink() re-derives
+      // and re-validates the tag server-side (AC5) — the client's choice of
+      // WHICH candidate is trusted, never a value naming an address.
+      : `<p>Vi fant flere adresser registrert for <strong>${escapeHtml(provider.navn)}</strong>. Velg hvor
+          innloggingslenken skal sendes:</p>
+         <div class="gc-field" role="radiogroup" aria-label="Velg mottakeradresse">
+           ${candidates
+             .map(
+               (c, i) => `<label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:6px 0;">
+             <input type="radio" name="selected" value="${escapeHtml(c.source)}" ${i === 0 ? "checked" : ""} style="width:auto;min-height:0;">
+             ${escapeHtml(maskEmail(c.email))}
+           </label>`,
+             )
+             .join("")}
+         </div>`;
+
     const body = `
       <div class="gc-card">
         <h1>Er dette din bedrift?</h1>
-        <p>Vi sender en innloggingslenke til <strong>${escapeHtml(masked)}</strong> — adressen vi har registrert for
-          <strong>${escapeHtml(provider.navn)}</strong> hos Brønnøysundregistrene/på deres verifiserte nettside.</p>
-        ${alert}
         <form id="gc-request-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(provider.id)}/request" novalidate>
+          ${addressChoiceHtml}
+          ${alert}
           <div class="gc-form-actions">
             <button type="submit" class="gc-btn gc-btn-primary">Send meg tilgangslenke</button>
             <a href="${escapeHtml(backUrl)}" class="gc-btn gc-btn-secondary">Tilbake til profilen</a>
@@ -320,7 +367,9 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
           ev.preventDefault();
           var btn = form.querySelector("button[type=submit]");
           if (btn) { btn.disabled = true; btn.textContent = "Sender ..."; }
-          fetch(form.action, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+          var selectedInput = form.querySelector('input[name="selected"]:checked');
+          var payload = selectedInput ? { selected: selectedInput.value } : {};
+          fetch(form.action, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
             .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
             .then(function (out) {
               var base = window.location.pathname;
@@ -349,20 +398,76 @@ router.get("/kategori/gardssalg/eier/:providerSlug", (req: Request, res: Respons
 // (works both as a plain no-JS form POST and as the JS-fetch target above;
 // response shape adapts to Accept/Content-Type like RFB's dual routes).
 // ─────────────────────────────────────────────────────────────────
+// Runtime allow-list mirroring OrgLinkedEmailCandidate["source"] — the ONLY
+// values issueClaimMagicLink() will ever accept as opts.selectedSource. Any
+// other posted "selected" value (typo, stale page, hostile client) is
+// treated as no selection at all, never forwarded — the union type alone is
+// a compile-time guarantee, not a runtime one, since req.body is unknown().
+// SLICE 5 / AC7 (2026-08-07) — the four found-tiers ARE now in this list,
+// because deriveOrgLinkedEmailCandidatesWithHarvest() is now what both this
+// route and the GET entry page above derive from, so a harvested candidate
+// really can be rendered as a radio option here. (The slice-2 version of this
+// comment warned that whoever wired the harvest in had to extend this list at
+// the same time or a harvested selection would silently fail to register —
+// this is that extension.)
+//
+// "verified_domain_address" stays for exactly the reason gardssalg-claim.ts's
+// module doc gives: it is still a valid member of the OrgLinkedEmailCandidate
+// union and a valid HISTORICAL email_source value, and keeping it here costs
+// nothing — no live derivation can produce it, so a client naming it still
+// lands on issueClaimMagicLink()'s "invalid_selection" (there is no such
+// candidate to match), which is what the j2 regression test pins.
+const CLAIM_EMAIL_SOURCES = [
+  "brreg_contact",
+  "verified_domain_address",
+  "stored_epost_verified",
+  "found_same_domain",
+  "found_contact_page",
+  "found_site_other",
+  "found_umbrella_member",
+] as const;
+function parseSelectedSource(value: unknown): (typeof CLAIM_EMAIL_SOURCES)[number] | undefined {
+  return typeof value === "string" && (CLAIM_EMAIL_SOURCES as readonly string[]).includes(value)
+    ? (value as (typeof CLAIM_EMAIL_SOURCES)[number])
+    : undefined;
+}
+
 router.post(
   "/kategori/gardssalg/eier/:providerId/request",
   express.json(),
-  (req: Request, res: Response) => {
+  express.urlencoded({ extended: false }),
+  // ASYNC since SLICE 5 / AC7 — issueClaimMagicLink() is now async (it can
+  // harvest). The awaited call is wrapped in the same shape as this file's
+  // other handlers' try/catch: log with the `[gardssalg-claim]` prefix, then
+  // answer in whichever of the two response shapes this dual route is being
+  // used in. Express 5 would already funnel a rejected handler promise to its
+  // default error handler (a bare 500 HTML page) even without this, so the
+  // catch is not load-bearing for correctness — it exists so the JS-fetch
+  // client above gets a parseable `{success:false, error}` body it can turn
+  // into the page's own generic "Kunne ikke sende lenke ..." alert, instead
+  // of an HTML error page it would fail to JSON-parse and silently swallow.
+  async (req: Request, res: Response) => {
     const providerId = String((req.params as any).providerId || "");
     const wantsJson = (req.headers["content-type"] || "").includes("application/json") || (req.headers.accept || "").includes("application/json");
+    const selectedSource = parseSelectedSource((req.body as any)?.selected);
 
     const provider = getClaimProviderById(providerId);
     const redirectBase = provider?.slug ? `/kategori/gardssalg/eier/${encodeURIComponent(provider.slug)}` : null;
 
-    const result = issueClaimMagicLink(providerId);
+    let result: Awaited<ReturnType<typeof issueClaimMagicLink>>;
+    try {
+      result = await issueClaimMagicLink(providerId, undefined, { selectedSource });
+    } catch (err) {
+      console.error("[gardssalg-claim] POST /kategori/gardssalg/eier/:providerId/request error:", err);
+      if (wantsJson) return res.status(500).json({ success: false, error: "internal_error" });
+      if (!redirectBase) return res.status(404).send(notFoundPage());
+      return res.redirect(303, `${redirectBase}?status=error&reason=internal_error`);
+    }
 
     if (!result.ok) {
-      if (wantsJson) return res.status(result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : 403).json({ success: false, error: result.error });
+      const status =
+        result.error === "provider_not_found" ? 404 : result.error === "rate_limited" ? 429 : result.error === "selection_required" ? 400 : 403;
+      if (wantsJson) return res.status(status).json({ success: false, error: result.error });
       if (!redirectBase) return res.status(404).send(notFoundPage());
       return res.redirect(303, `${redirectBase}?status=error&reason=${encodeURIComponent(result.error)}`);
     }
@@ -658,6 +763,44 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", (req: Request, 
   const stats = getGardssalgOwnerStats(path);
   res.setHeader("Cache-Control", "private, max-age=60");
   return res.json({ success: true, stats });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/opplevelser/gardssalg-claim/:providerId/session-status —
+// dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil.
+//
+// The produsent profile page (src/routes/experiences-seo.ts) is a public,
+// shared-cacheable response (`Cache-Control: public, max-age=300`) — its
+// server-rendered HTML must stay byte-identical regardless of the
+// request's Cookie header, or a CDN/proxy will serve one owner's
+// personalized variant to a different visitor of the same cached URL
+// (AC4 of that dev-request). So the "does the current viewer own THIS
+// provider?" check can't happen in that route's own render at all — it
+// happens here, in a separate, `no-store` JSON endpoint the page's own
+// inline <script> calls client-side AFTER the (identically-cached) HTML
+// has already loaded. This endpoint is deliberately request-scoped and
+// per-visitor by design — the opposite cacheability contract of the page
+// that calls it.
+//
+// Answers a plain boolean, nothing more: never reveals whether a session
+// exists/is valid at all, and never reveals anything about some OTHER
+// provider — only "does the CURRENT session (if any) own THIS providerId".
+// Fails closed (isOwner:false) on any invalid/missing/errored session so a
+// caller can never be shown the wrong owner affordance.
+// ─────────────────────────────────────────────────────────────────
+router.get("/api/opplevelser/gardssalg-claim/:providerId/session-status", (req: Request, res: Response) => {
+  // Set even on the error path below — this response varies per-visitor by
+  // design and must never be cached, unlike the profile page that calls it.
+  res.setHeader("Cache-Control", "no-store");
+  const { providerId } = req.params as any;
+  try {
+    const session = sessionFromRequest(req);
+    const isOwner = !!(session.valid && providerId && session.providerId === providerId);
+    return res.json({ isOwner });
+  } catch (err) {
+    console.error("[gardssalg-claim] GET session-status error:", err);
+    return res.json({ isOwner: false });
+  }
 });
 
 export default router;

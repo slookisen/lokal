@@ -94,7 +94,15 @@ export interface GsWvSummary {
 // this module never calls fetch/network code itself, only this contract.
 // `reason` is carried through for observability but not currently surfaced
 // on the row (classification alone drives all downstream behaviour).
-export type GsWvFetchResult = { ok: true; pageText: string } | { ok: false; reason: string };
+//
+// `title` (AC4, dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet):
+// the fetched page's <title> text, already run through gardssalgPageTitle by
+// the route (the SAME place pageText is already run through gardssalgPageText
+// today) — optional so an existing/simpler fetchFn still type-checks; omitting
+// it just means gardssalgWebsiteEvidenceMatch never sees a title source for
+// that call (see its own doc comment for exactly what that does and doesn't
+// change).
+export type GsWvFetchResult = { ok: true; pageText: string; title?: string } | { ok: false; reason: string };
 export type GsWvFetchFn = (homepageUrl: string) => Promise<GsWvFetchResult>;
 
 // ─── Cohort (Part A load) ───────────────────────────────────────────────────
@@ -233,16 +241,20 @@ export async function classifyGardssalgProducerWebsite(
     return { provider_id: producer.id, name: producer.navn, hjemmeside, classification: "unverified", evidence: null };
   }
 
-  const evidence = gardssalgWebsiteEvidenceMatch(fetched.pageText, {
-    orgNr: producer.org_nr,
-    navn: producer.navn,
-    kommune: producer.kommune,
-    poststed: producer.poststed,
-    telefon: producer.telefon,
-    mobil: producer.mobil,
-    adresse: producer.adresse,
-    postnummer: producer.postnummer,
-  });
+  const evidence = gardssalgWebsiteEvidenceMatch(
+    fetched.pageText,
+    {
+      orgNr: producer.org_nr,
+      navn: producer.navn,
+      kommune: producer.kommune,
+      poststed: producer.poststed,
+      telefon: producer.telefon,
+      mobil: producer.mobil,
+      adresse: producer.adresse,
+      postnummer: producer.postnummer,
+    },
+    fetched.title
+  );
 
   // Strict boolean comparison (never a bare `if (evidence.verified)` /
   // truthy check) — deliberate, see this module's own test coverage: wiring

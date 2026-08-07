@@ -112,10 +112,24 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     const agentName: string = (agentRow && agentRow.name) ? String(agentRow.name) : "din profil";
 
     // 2. Rate-limit check
+    // created_at is stored as an ISO-8601 string (now.toISOString(), e.g.
+    // "2026-08-06T13:20:00.000Z" — see the INSERT below), while
+    // datetime('now', ...) produces SQLite's own native format (e.g.
+    // "2026-08-06 16:41:17", space separator, no milliseconds/Z). Both
+    // columns are TEXT, so comparing created_at directly against
+    // datetime('now', ...) is a plain string comparison: the date prefixes
+    // match but 'T' (0x54) > ' ' (0x20), so EVERY link from the current UTC
+    // calendar day sorted as ">= now - 1h" regardless of actual time — the
+    // rate limit degraded to "3 per UTC day" instead of "3 per rolling
+    // hour". Wrapping created_at in datetime() too routes BOTH sides
+    // through SQLite's own date normalization (verified empirically
+    // against both the legacy ISO-with-milliseconds-and-Z format already
+    // in the table and SQLite's native format — no data migration needed,
+    // old rows are handled correctly as-is).
     const recentCount = db
       .prepare(
         `SELECT COUNT(*) as count FROM magic_links
-         WHERE agent_id = ? AND created_at >= datetime('now', '-' || ? || ' hours')`
+         WHERE agent_id = ? AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`
       )
       .get(id, RATE_LIMIT_WINDOW_HOURS) as any;
 
