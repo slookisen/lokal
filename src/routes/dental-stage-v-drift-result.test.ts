@@ -27,7 +27,11 @@
  * Covers:
  *   (a) 403 without X-Admin-Key
  *   (b) 404 for a nonexistent agentId
- *   (c) 400 for field != "helfo_agreement" (forward-compat guard)
+ *   (c) 400 for field != "helfo_agreement" (forward-compat guard -- as of
+ *       slice 4b below, "treatments" IS a supported field, but this
+ *       particular request still 400s because its value ("false", a bare
+ *       string) fails the treatments array-shape validation, so this
+ *       assertion keeps passing unmodified)
  *   (d) 400 for an invalid value (not "true"|"false"|"unknown")
  *   (e) 400 for a missing/blank agentId
  *   (f) happy path: first differing observation -> 200, pending:true, DB +
@@ -38,6 +42,24 @@
  *   (h) verification_status is NEVER touched by this route, under any of
  *       the above (regression guard -- proves the needs_review/drift path
  *       stays fully independent)
+ *
+ * dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+ * item 4 / slice 4b (2026-08-07): generalized recordStageVFieldObservation +
+ * this route to also accept field:"treatments" and field:"opening_hours".
+ * Additional coverage below (sections i-n):
+ *   (i) 400 for malformed treatments values (wrong type, empty-string
+ *       element, >50 elements)
+ *   (j) 400 for malformed opening_hours values (wrong type, invalid day,
+ *       invalid HH:MM, >7 elements)
+ *   (k) treatments happy path: first differing observation -> pending, DB
+ *       unchanged; second observation with the SAME set but a DIFFERENT
+ *       element ORDER -> corrected, proving the order-insensitive
+ *       canonicalization; DB column holds the canonical (deduped+sorted)
+ *       JSON; field_provenance.treatments gains a stage_v_correction entry
+ *   (l) opening_hours happy path: same pattern with a day-reordered array
+ *   (m) unrelated field_provenance keys survive both corrections untouched
+ *   (n) verification_status untouched by the treatments/opening_hours
+ *       corrections too
  */
 
 export interface TestSummary {
@@ -159,6 +181,16 @@ export function runDentalStageVDriftResultTests(
           .get(id) as any;
       }
 
+      // slice 4b: wider row read (adds treatments/opening_hours) for the new
+      // fields' happy-path assertions below.
+      function getWideRow(id: string) {
+        return dentalDb
+          .prepare(
+            "SELECT treatments, opening_hours, field_provenance, stage_v_pending_correction, verification_status FROM dental_agents WHERE id = ?",
+          )
+          .get(id) as any;
+      }
+
       // ── (a) 403 without X-Admin-Key ─────────────────────────────────
       {
         const resp = await callRoute(dentalRouter, {
@@ -258,6 +290,187 @@ export function runDentalStageVDriftResultTests(
 
         // ── (h) verification_status STILL untouched after the correction ──
         assertEq(after.verification_status, "pending_verify", "h1: verification_status untouched even by the auto-correction itself");
+      }
+
+      // ── slice 4b setup: a fresh agent with an initial treatments +
+      // opening_hours value, plus an UNRELATED field_provenance entry (for
+      // section m below) that the treatments/opening_hours corrections must
+      // never touch. ────────────────────────────────────────────────────
+      const idB = dstore.createDentalAgent({
+        navn: "Drift Route Tannlege 4b AS",
+        org_nr: "911300222",
+        treatments: ["rotfylling", "tannregulering"],
+      } as any);
+      dstore.updateDentalAgent(idB, {
+        opening_hours: [{ day: "mon", open: "08:00", close: "16:00" }],
+        field_provenance: { adresse: [{ source_type: "manual", value: "Storgata 1", fetched_at: "2026-01-01T00:00:00.000Z" }] },
+      } as any);
+
+      // ── (i) 400 for malformed treatments values ─────────────────────
+      {
+        const wrongType = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "treatments", value: "rotfylling" },
+        });
+        assertEq(wrongType.status, 400, "i1: treatments value not an array -> 400");
+
+        const emptyElement = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "treatments", value: ["rotfylling", ""] },
+        });
+        assertEq(emptyElement.status, 400, "i2: treatments array with an empty-string element -> 400");
+
+        const tooLong = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "treatments", value: Array.from({ length: 51 }, (_, i) => `t${i}`) },
+        });
+        assertEq(tooLong.status, 400, "i3: treatments array with 51 elements (>50) -> 400");
+      }
+
+      // ── (j) 400 for malformed opening_hours values ───────────────────
+      {
+        const wrongType = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "opening_hours", value: "mon 08-16" },
+        });
+        assertEq(wrongType.status, 400, "j1: opening_hours value not an array -> 400");
+
+        const invalidDay = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "opening_hours", value: [{ day: "someday", open: "08:00", close: "16:00" }] },
+        });
+        assertEq(invalidDay.status, 400, "j2: opening_hours with an invalid day -> 400");
+
+        const invalidTime = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "opening_hours", value: [{ day: "mon", open: "8am", close: "16:00" }] },
+        });
+        assertEq(invalidTime.status, 400, "j3: opening_hours with an invalid HH:MM open time -> 400");
+
+        const tooLong = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: {
+            agentId: idB,
+            field: "opening_hours",
+            value: [
+              { day: "mon", open: "08:00", close: "16:00" },
+              { day: "tue", open: "08:00", close: "16:00" },
+              { day: "wed", open: "08:00", close: "16:00" },
+              { day: "thu", open: "08:00", close: "16:00" },
+              { day: "fri", open: "08:00", close: "16:00" },
+              { day: "sat", open: "08:00", close: "16:00" },
+              { day: "sun", open: "08:00", close: "16:00" },
+              { day: "mon", open: "09:00", close: "17:00" },
+            ],
+          },
+        });
+        assertEq(tooLong.status, 400, "j4: opening_hours with 8 entries (>7) -> 400");
+      }
+
+      // ── (k) treatments happy path: pending -> corrected, order-insensitive ──
+      {
+        const before = getWideRow(idB);
+
+        // First differing observation -> pending, DB unchanged.
+        const first = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "treatments", value: ["implantat", "rotfylling"] },
+        });
+        assertEq(first.status, 200, "k1: valid first treatments observation -> 200");
+        assertEq(first.body.pending, true, "k2: first differing treatments observation -> pending:true");
+        assertEq(first.body.corrected, false, "k3: first differing treatments observation -> corrected:false");
+        const afterFirst = getWideRow(idB);
+        assertEq(afterFirst.treatments, before.treatments, "k4: DB treatments UNCHANGED after first observation");
+        assertEq(afterFirst.field_provenance, before.field_provenance, "k5: field_provenance UNCHANGED after first treatments observation");
+
+        // Second observation: SAME set, DIFFERENT order -> proves the
+        // order-insensitive canonicalization still recognizes it as a match.
+        const second = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "treatments", value: ["rotfylling", "implantat"] },
+        });
+        assertEq(second.status, 200, "k6: second (reordered) matching treatments observation -> 200");
+        assertEq(second.body.corrected, true, "k7: second (reordered) matching treatments observation -> corrected:true");
+
+        const afterSecond = getWideRow(idB);
+        assertEq(afterSecond.treatments, JSON.stringify(["implantat", "rotfylling"]), "k8: DB treatments column now holds the canonical (sorted) JSON");
+        const prov = JSON.parse(afterSecond.field_provenance);
+        assertTrue(
+          Array.isArray(prov.treatments) && prov.treatments.some((e: any) => e.source_type === "stage_v_correction"),
+          "k9: field_provenance.treatments gained a stage_v_correction entry",
+        );
+      }
+
+      // ── (l) opening_hours happy path: pending -> corrected, order-insensitive ──
+      {
+        const observedOnce = [
+          { day: "tue", open: "09:00", close: "17:00" },
+          { day: "mon", open: "08:00", close: "16:00" },
+        ];
+        const observedReordered = [
+          { day: "mon", open: "08:00", close: "16:00" },
+          { day: "tue", open: "09:00", close: "17:00" },
+        ];
+
+        const before = getWideRow(idB);
+        const first = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "opening_hours", value: observedOnce },
+        });
+        assertEq(first.status, 200, "l1: valid first opening_hours observation -> 200");
+        assertEq(first.body.pending, true, "l2: first differing opening_hours observation -> pending:true");
+        const afterFirst = getWideRow(idB);
+        assertEq(afterFirst.opening_hours, before.opening_hours, "l3: DB opening_hours UNCHANGED after first observation");
+
+        const second = await callRoute(dentalRouter, {
+          method: "POST",
+          path: "/admin/stage-v-drift-result",
+          headers: { "x-admin-key": testKey },
+          body: { agentId: idB, field: "opening_hours", value: observedReordered },
+        });
+        assertEq(second.status, 200, "l4: second (reordered) matching opening_hours observation -> 200");
+        assertEq(second.body.corrected, true, "l5: second (reordered) matching opening_hours observation -> corrected:true");
+
+        const afterSecond = getWideRow(idB);
+        assertEq(
+          afterSecond.opening_hours,
+          JSON.stringify(observedReordered),
+          "l6: DB opening_hours column now holds the canonical (day-sorted) JSON",
+        );
+        const prov = JSON.parse(afterSecond.field_provenance);
+        assertTrue(
+          Array.isArray(prov.opening_hours) && prov.opening_hours.some((e: any) => e.source_type === "stage_v_correction"),
+          "l7: field_provenance.opening_hours gained a stage_v_correction entry",
+        );
+
+        // ── (m) unrelated field_provenance key untouched by either correction ──
+        assertTrue(
+          Array.isArray(prov.adresse) && prov.adresse.some((e: any) => e.value === "Storgata 1"),
+          "m1: unrelated field_provenance.adresse entry survives both corrections untouched",
+        );
+
+        // ── (n) verification_status untouched by treatments/opening_hours corrections ──
+        assertEq(afterSecond.verification_status, "pending_verify", "n1: verification_status untouched by the treatments/opening_hours corrections");
       }
     } catch (err: any) {
       failed++;

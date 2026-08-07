@@ -34655,6 +34655,169 @@ console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-s
   }
 })();
 
+// ── slice 4b: Stage V treatments/opening_hours auto-correction (dev-request
+// 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene, item 4,
+// 2026-08-07) ────────────────────────────────────────────────────────────
+// Generalizes slice 4a's mechanism to two more fields. Covers
+// canonicalizeStageVValue() (dedupe+sort for treatments, sort-by-day-then-
+// open for opening_hours) and recordStageVFieldObservation() directly for
+// both new fields, mirroring the slice4a block above's style. Route-level
+// (400/404/403 + order-insensitive HTTP-layer) coverage lives in
+// dental-stage-v-drift-result.test.ts (sections i-n).
+console.log("\n── slice4b: Stage V treatments/opening_hours auto-correction (dental-store) ──");
+(() => {
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFacS4b = require.resolve("../src/database/db-factory");
+  const dentalStorePathS4b = require.resolve("../src/services/dental-store");
+  delete require.cache[dbFacS4b];
+  delete require.cache[dentalStorePathS4b];
+  const dbFactoryS4b = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryS4b.__resetDbFactoryForTesting();
+  const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  try {
+    const dentalDb = dbFactoryS4b.getDb("dental");
+
+    // ── canonicalizeStageVValue: dedupe+sort (treatments), sort-by-day-
+    // then-open (opening_hours), pass-through (helfo_agreement) ──────────
+    assertEq(
+      dstore.canonicalizeStageVValue("helfo_agreement", "true"),
+      "true",
+      "s4b-01: canonicalizeStageVValue helfo_agreement is a pass-through",
+    );
+    assertEq(
+      dstore.canonicalizeStageVValue("treatments", ["b", "a", "b"]),
+      JSON.stringify(["a", "b"]),
+      "s4b-02: canonicalizeStageVValue treatments dedupes and sorts",
+    );
+    assertEq(
+      dstore.canonicalizeStageVValue("treatments", ["a", "b"]),
+      dstore.canonicalizeStageVValue("treatments", ["b", "a"]),
+      "s4b-03: canonicalizeStageVValue treatments is order-insensitive",
+    );
+    const oh1 = [
+      { day: "tue", open: "09:00", close: "17:00" },
+      { day: "mon", open: "08:00", close: "16:00" },
+    ];
+    const oh2 = [
+      { day: "mon", open: "08:00", close: "16:00" },
+      { day: "tue", open: "09:00", close: "17:00" },
+    ];
+    assertEq(
+      dstore.canonicalizeStageVValue("opening_hours", oh1),
+      dstore.canonicalizeStageVValue("opening_hours", oh2),
+      "s4b-04: canonicalizeStageVValue opening_hours is order-insensitive (sorted by day)",
+    );
+    assertEq(
+      dstore.canonicalizeStageVValue("opening_hours", oh1),
+      JSON.stringify(oh2),
+      "s4b-05: canonicalizeStageVValue opening_hours sorts by day (mon before tue)",
+    );
+
+    // ── recordStageVFieldObservation: treatments ─────────────────────────
+    const idT = dstore.createDentalAgent({
+      navn: "Treatments Tvist Tannlege AS",
+      org_nr: "911200444",
+      treatments: ["fylling", "rotfylling"],
+    } as any);
+
+    // unknown id -> found:false (same contract as helfo_agreement).
+    assertEq(
+      (dstore.recordStageVFieldObservation("no-such-id", "treatments", ["fylling"]) as any).found,
+      false,
+      "s4b-06: unknown id -> found=false (treatments)",
+    );
+
+    // first differing observation -> pending, DB unchanged.
+    let rT = dstore.recordStageVFieldObservation(idT, "treatments", ["implantat", "fylling"]) as any;
+    assertEq(rT.corrected, false, "s4b-07: first differing treatments observation -> corrected=false");
+    assertEq(rT.pending, true, "s4b-08: first differing treatments observation -> pending=true");
+    let rowT = dentalDb.prepare("SELECT treatments, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idT) as any;
+    assertEq(rowT.treatments, JSON.stringify(["fylling", "rotfylling"]), "s4b-09: DB treatments UNCHANGED after first observation");
+    assertEq(rowT.field_provenance, null, "s4b-10: field_provenance UNCHANGED after first treatments observation");
+
+    // second observation, SAME set but a DIFFERENT order -> auto-correct,
+    // proving order-insensitive canonicalization end-to-end (not just in
+    // canonicalizeStageVValue's own unit assertions above).
+    rT = dstore.recordStageVFieldObservation(idT, "treatments", ["fylling", "implantat"]) as any;
+    assertEq(rT.corrected, true, "s4b-11: second (reordered) matching treatments observation -> corrected=true");
+    assertEq(rT.new_value, JSON.stringify(["fylling", "implantat"]), "s4b-12: new_value reports the canonical (sorted) form");
+    rowT = dentalDb.prepare("SELECT treatments, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idT) as any;
+    assertEq(rowT.treatments, JSON.stringify(["fylling", "implantat"]), "s4b-13: DB treatments column now holds the canonical (sorted, deduped) JSON");
+    assertEq(rowT.stage_v_pending_correction, null, "s4b-14: pending entry cleared after correction (treatments)");
+    const provT = JSON.parse(rowT.field_provenance);
+    assertTrue(
+      Array.isArray(provT.treatments) &&
+        provT.treatments.some((e: any) => e.source_type === "stage_v_correction" && e.value === JSON.stringify(["fylling", "implantat"])),
+      "s4b-15: field_provenance.treatments carries a stage_v_correction entry with the canonical value",
+    );
+
+    // ── recordStageVFieldObservation: opening_hours ──────────────────────
+    const idH = dstore.createDentalAgent({
+      navn: "Opening Hours Tvist Tannlege AS",
+      org_nr: "911200555",
+    } as any);
+    dstore.updateDentalAgent(idH, {
+      opening_hours: [{ day: "mon", open: "08:00", close: "16:00" }],
+    } as any);
+
+    const observedOnce = [
+      { day: "tue", open: "09:00", close: "17:00" },
+      { day: "wed", open: "09:00", close: "17:00" },
+    ];
+    const observedReordered = [
+      { day: "wed", open: "09:00", close: "17:00" },
+      { day: "tue", open: "09:00", close: "17:00" },
+    ];
+
+    let rH = dstore.recordStageVFieldObservation(idH, "opening_hours", observedOnce) as any;
+    assertEq(rH.corrected, false, "s4b-16: first differing opening_hours observation -> corrected=false");
+    assertEq(rH.pending, true, "s4b-17: first differing opening_hours observation -> pending=true");
+    let rowH = dentalDb.prepare("SELECT opening_hours, field_provenance FROM dental_agents WHERE id = ?").get(idH) as any;
+    assertEq(rowH.opening_hours, JSON.stringify([{ day: "mon", open: "08:00", close: "16:00" }]), "s4b-18: DB opening_hours UNCHANGED after first observation");
+
+    rH = dstore.recordStageVFieldObservation(idH, "opening_hours", observedReordered) as any;
+    assertEq(rH.corrected, true, "s4b-19: second (reordered) matching opening_hours observation -> corrected=true");
+    rowH = dentalDb.prepare("SELECT opening_hours, field_provenance, verification_status FROM dental_agents WHERE id = ?").get(idH) as any;
+    assertEq(rowH.opening_hours, JSON.stringify(observedOnce), "s4b-20: DB opening_hours column now holds the canonical (day-sorted) JSON");
+    const provH = JSON.parse(rowH.field_provenance);
+    assertTrue(
+      Array.isArray(provH.opening_hours) && provH.opening_hours.some((e: any) => e.source_type === "stage_v_correction"),
+      "s4b-21: field_provenance.opening_hours carries a stage_v_correction entry",
+    );
+    assertEq(rowH.verification_status, "pending_verify", "s4b-22: verification_status untouched by the opening_hours auto-correction");
+
+    // ── unrelated field_provenance keys survive a correction untouched ───
+    const idU = dstore.createDentalAgent({
+      navn: "Unrelated Provenance Tannlege AS",
+      org_nr: "911200666",
+      treatments: ["fylling"],
+    } as any);
+    dstore.updateDentalAgent(idU, {
+      field_provenance: { adresse: [{ source_type: "manual", value: "Storgata 1", fetched_at: "2026-01-01T00:00:00.000Z" }] },
+    } as any);
+    dstore.recordStageVFieldObservation(idU, "treatments", ["implantat"]); // pending
+    dstore.recordStageVFieldObservation(idU, "treatments", ["implantat"]); // corrected
+    const rowU = dentalDb.prepare("SELECT field_provenance, verification_status FROM dental_agents WHERE id = ?").get(idU) as any;
+    const provU = JSON.parse(rowU.field_provenance);
+    assertTrue(
+      Array.isArray(provU.adresse) && provU.adresse.some((e: any) => e.value === "Storgata 1"),
+      "s4b-23: unrelated field_provenance.adresse entry survives a treatments correction untouched",
+    );
+    assertEq(rowU.verification_status, "pending_verify", "s4b-24: verification_status untouched (unrelated-provenance regression guard)");
+
+    console.log("  slice4b (Stage V treatments/opening_hours auto-correction): OK (24 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`slice4b Stage V treatments/opening_hours auto-correction: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
+    dbFactoryS4b.__resetDbFactoryForTesting();
+  }
+})();
+
 // ── a2a-card-v1-signing slice 1: A2A v1.0 fields dual-published on all three
 // agent cards, additive-only (legacy authentication/interfaces untouched) ──
 (() => {
