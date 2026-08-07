@@ -29805,6 +29805,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of essc.failures) failures.push("experiences-seo-site-chrome: " + f);
     console.log(`  experiences-seo-site-chrome: ${essc.passed} passed, ${essc.failed} failed`);
 
+    // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2:
+    // illustrated SVG hero scene (forside/drikke motifs) + the homepage
+    // drikkested feature section + countGardssalgProvidersByType(). Covers
+    // the gardssalgVisible() gate (present at ≥5 producers, fully absent
+    // below), aggregated type-count chips, aria-hidden/focusable + size
+    // bounds on both scene variants, the @keyframes-only-inside-
+    // prefers-reduced-motion guard, EN parity, and the drikke motif on
+    // /kategori/gardssalg. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block.
+    console.log("\n── experiences-seo-forside-drikkested: hero scene + drikkested section (S2) ──");
+    const { runExperiencesSeoForsideDrikkestedTests } = require("../src/routes/experiences-seo-forside-drikkested.test") as
+      typeof import("../src/routes/experiences-seo-forside-drikkested.test");
+    const esfd = await runExperiencesSeoForsideDrikkestedTests({ log: false });
+    passed += esfd.passed;
+    failed += esfd.failed;
+    for (const f of esfd.failures) failures.push("experiences-seo-forside-drikkested: " + f);
+    console.log(`  experiences-seo-forside-drikkested: ${esfd.passed} passed, ${esfd.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
     // ("CTA hide"): the "Driver du dette stedet?" claim-CTA aside-card on the
     // gårdssalg produsent profile page must be hidden once the provider has

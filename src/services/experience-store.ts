@@ -2517,6 +2517,28 @@ export function countGardssalgProviders(): number {
   return row.c;
 }
 
+// Per-type breakdown of the SAME provider set countGardssalgProviders()
+// counts (dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering,
+// S2 — feeds the homepage drikkested feature section's type chips; S3 will
+// reuse it). The WHERE clause is deliberately byte-for-byte the one above:
+// parens around the OR are load-bearing (without them the trailing AND binds
+// tighter than the OR and changes the set), and catalog_hidden=1 rows (the
+// hidden booking-flyt-v1 test provider) must never appear in any per-type
+// count either. producer_type comes back VERBATIM (NULL included, as its own
+// row — rfb-seed rows without a type are part of the gate's set and the
+// caller decides how to present them). Read-only; no join, very fast.
+export function countGardssalgProvidersByType(): Array<{ producer_type: string | null; count: number }> {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      "SELECT producer_type, COUNT(*) AS count FROM experience_providers " +
+      "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) " +
+      "GROUP BY producer_type"
+    )
+    .all() as Array<{ producer_type: string | null; count: number }>;
+}
+
 export type GardssalgProviderRow = {
   id: string;
   navn: string;
