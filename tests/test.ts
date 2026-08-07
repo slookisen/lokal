@@ -26909,7 +26909,12 @@ console.log("\n── gardssalg-homepage-count: live count replaces hardcoded 'K
 
   assertEq(statusGHC, 200, "ghc-01: GET / → 200");
 
-  const hrefIdxGHC = bodyGHC.indexOf("/kategori/gardssalg");
+  // NB (S1 site chrome, dev-request 2026-08-06-opplevagent-ux-loft-
+  // drikkested-lansering): the shared nav/footer now ALWAYS link
+  // /kategori/gardssalg, so a bare indexOf("/kategori/gardssalg") would land
+  // on the nav link, not the category card. Anchor on the cat-card markup
+  // instead — this block is about the CARD's live count.
+  const hrefIdxGHC = bodyGHC.indexOf('class="cat-card" href="/kategori/gardssalg"');
   assertTrue(hrefIdxGHC >= 0, "ghc-02: gardssalg card is present on the homepage grid");
   const cardBlockGHC = hrefIdxGHC >= 0 ? bodyGHC.substring(hrefIdxGHC, hrefIdxGHC + 900) : "";
 
@@ -29781,6 +29786,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += essg.failed;
     for (const f of essg.failures) failures.push("experiences-seo-sok-gardssalg: " + f);
     console.log(`  experiences-seo-sok-gardssalg: ${essg.passed} passed, ${essg.failed} failed`);
+
+    // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S1:
+    // shared site chrome — oaSiteNav()/oaSiteFooter() + the CSS-only
+    // (checkbox-hack) hamburger nav, adopted by "/" and /kategori/gardssalg.
+    // Covers hamburger elements, the gardssalg page's upgrade to brand nav +
+    // full footer, nav-link parity between the two pages, the :checked
+    // reveal rule replacing the old always-hide-below-760px rule,
+    // aria-current placement, and the focusable (not display:none) toggle.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── experiences-seo-site-chrome: shared nav/footer + hamburger (S1) ──");
+    const { runExperiencesSeoSiteChromeTests } = require("../src/routes/experiences-seo-site-chrome.test") as
+      typeof import("../src/routes/experiences-seo-site-chrome.test");
+    const essc = await runExperiencesSeoSiteChromeTests({ log: false });
+    passed += essc.passed;
+    failed += essc.failed;
+    for (const f of essc.failures) failures.push("experiences-seo-site-chrome: " + f);
+    console.log(`  experiences-seo-site-chrome: ${essc.passed} passed, ${essc.failed} failed`);
 
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
     // ("CTA hide"): the "Driver du dette stedet?" claim-CTA aside-card on the

@@ -187,6 +187,149 @@ function brandInner(variant: "light" | "dark" = "light"): string {
   return `<span class="mark" aria-hidden="true">${brandMarkSvg(variant)}</span><span class="brand-word">opplevagent<span class="tld">.no</span></span>`;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Shared opplevagent.no site chrome (dev-request
+// 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S1).
+// One nav + one footer + one CSS block, adopted page by page — S1 covers the
+// landing page ("/") and /kategori/gardssalg; later slices migrate the rest.
+// The mobile nav is a pure-CSS checkbox hack (no JS dependency): the
+// visually-hidden-but-focusable #oa-nav-toggle checkbox drives
+// `#oa-nav-toggle:checked ~ .nav-links` — the tiny inline script below only
+// adds aria-expanded as progressive enhancement.
+// ─────────────────────────────────────────────────────────────
+type OaNavActive = "hjem" | "opplevelser" | "kategorier" | "gardssalg";
+
+function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang } = {}): string {
+  const lang: Lang = opts.lang === "en" ? "en" : "no";
+  const S = homeStrings(lang);
+  const navGardssalg = lang === "en" ? "Farm sales" : "Gårdssalg";
+  // Anchor links must stay on the visitor's language: the EN landing page
+  // lives at /en, so a hardcoded "/#kategorier" would bounce EN visitors to
+  // the Norwegian front page.
+  const langPrefix = lang === "en" ? "/en" : "/";
+  const cur = (k: OaNavActive) => (opts.active === k ? ' aria-current="page"' : "");
+  // The NO/EN toggle is only rendered when the calling page is genuinely
+  // bilingual (the landing page passes `lang`; browse pages are NO-canonical
+  // and pass none) — same behavior the landing page had before this helper.
+  const langToggle = opts.lang !== undefined
+    ? `
+      <a class="lang-toggle" href="${lang === "en" ? "/" : "/en"}" hreflang="${lang === "en" ? "nb" : "en"}" aria-label="${lang === "en" ? "Bytt til norsk" : "Switch to English"}" style="border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 11px;font-size:.8rem;font-weight:600;color:var(--ink-soft)">${lang === "en" ? "NO" : "EN"}</a>`
+    : "";
+  return `<header class="site-nav">
+  <div class="nav-inner">
+    <a class="brand" href="/" aria-label="${S.brandAria}"${cur("hjem")}>${brandInner("light")}</a>
+    <input type="checkbox" id="oa-nav-toggle" class="nav-toggle">
+    <label for="oa-nav-toggle" class="nav-burger" aria-label="${lang === "en" ? "Menu" : "Meny"}"><span></span><span></span><span></span></label>
+    <nav class="nav-links" aria-label="${S.navAria}">
+      <a href="/opplevelser"${cur("opplevelser")}>${S.navAll}</a>
+      <a href="${langPrefix}#kategorier"${cur("kategorier")}>${S.navCategories}</a>
+      <a href="/kategori/gardssalg"${cur("gardssalg")}>${navGardssalg}</a>${langToggle}
+      <a class="nav-cta" href="/opplevelser">${S.navExplore}</a>
+    </nav>
+  </div>
+  <script>
+  /* Progressive enhancement only — the checkbox hack works without JS. */
+  (function(){var t=document.getElementById('oa-nav-toggle'),b=document.querySelector('label.nav-burger');if(!t||!b)return;
+  var sync=function(){b.setAttribute('aria-expanded',t.checked?'true':'false');};sync();t.addEventListener('change',sync);})();
+  </script>
+</header>`;
+}
+
+function oaSiteFooter(opts: { lang?: Lang } = {}): string {
+  const lang: Lang = opts.lang === "en" ? "en" : "no";
+  const S = homeStrings(lang);
+  // Same lang-aware anchor prefix as oaSiteNav — EN anchors live under /en.
+  const langPrefix = lang === "en" ? "/en" : "/";
+  const year = new Date().getFullYear();
+  return `<footer class="site-footer" role="contentinfo">
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <a class="brand" href="/" aria-label="${S.brandAria}">${brandInner("dark")}</a>
+      <p>${S.footTagline}</p>
+    </div>
+    <div class="footer-col">
+      <h4>${S.footExplore}</h4>
+      <a href="/opplevelser">${S.navAll}</a>
+      <a href="${langPrefix}#kategorier">${S.navCategories}</a>
+      <a href="${langPrefix}#slik-funker-det">${S.navHow}</a>
+      <a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
+    </div>
+    <div class="footer-col">
+      <h4>${S.footAgents}</h4>
+      <a href="/llms.txt" target="_blank" rel="noopener"><code>llms.txt</code></a>
+      <a href="/.well-known/agent-card.json" target="_blank" rel="noopener"><code>agent-card.json</code></a>
+      <a href="/mcp" target="_blank" rel="noopener"><code>/mcp</code> (MCP)</a>
+      <a href="/openapi.json" target="_blank" rel="noopener"><code>openapi.json</code></a>
+      <a href="/api/opplevelser/discover" target="_blank" rel="noopener"><code>/api/opplevelser</code></a>
+    </div>
+  </div>
+  <div class="footer-bottom">
+    <span>&copy; ${year} Opplevagent &middot; <a href="/personvern" style="color:rgba(255,255,255,.62)">${S.footPrivacy}</a> &middot; <a href="/vilkar" style="color:rgba(255,255,255,.62)">${S.footTerms}</a></span>
+    <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.footVerified}</span>
+  </div>
+</footer>`;
+}
+
+// Nav + footer + hamburger CSS for the shared chrome. The landing page embeds
+// this INSTEAD of its old header/footer blocks; /kategori/gardssalg appends it
+// AFTER BROWSE_CSS (whose slim `.nav-links a{…;margin-left:22px}` /
+// `.nav-inner{height:58px}` rules this deliberately overrides — hence the
+// explicit `margin-left:0`). Do NOT fold this into BROWSE_CSS itself: every
+// other browse page still renders the slim pre-chrome nav until a later slice
+// migrates it.
+const OA_CHROME_CSS = `
+  /* ── SHARED SITE CHROME: header/nav ── */
+  .site-nav{position:sticky;top:0;z-index:100;background:rgba(244,248,244,.86);backdrop-filter:saturate(160%) blur(12px);border-bottom:1px solid var(--line)}
+  .nav-inner{position:relative;max-width:var(--maxw);margin:0 auto;padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between}
+  @media(max-width:560px){.nav-inner{padding:0 16px}}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.16rem;letter-spacing:-.02em;color:var(--fjord-800);text-decoration:none}
+  .brand:hover{text-decoration:none}
+  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
+  .brand-word .tld{color:var(--fjord-600)}
+  .brand .mark{display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{display:block}
+  .nav-links{display:flex;gap:26px;align-items:center}
+  .nav-links a{font-size:.88rem;font-weight:600;color:var(--ink-soft);margin-left:0}
+  .nav-links a:hover{color:var(--fjord-700)}
+  .nav-cta{padding:8px 16px;border-radius:var(--r-pill);background:var(--fjord-800);color:#fff!important;font-size:.84rem;font-weight:700}
+  .nav-cta:hover{background:var(--fjord-700);text-decoration:none!important}
+  /* Hamburger toggle: checkbox is visually hidden but stays FOCUSABLE
+     (keyboard: tab to it, space toggles) — never display:none. */
+  .nav-toggle{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
+  .nav-toggle:focus-visible~.nav-burger{outline:3px solid var(--amber-500);outline-offset:2px;border-radius:4px}
+  .nav-burger{display:none;flex-direction:column;justify-content:center;gap:5px;width:42px;height:42px;padding:10px;cursor:pointer}
+  .nav-burger span{display:block;height:2px;width:100%;background:var(--ink);border-radius:2px}
+  /* Desktop: the checkbox hack is a mobile-only affordance — remove it from
+     the tab order entirely so keyboard users never focus an invisible
+     control (the mobile rules below never see this display:none). */
+  @media(min-width:761px){.nav-toggle{display:none}}
+  @media(max-width:760px){
+    .nav-burger{display:flex}
+    /* Collapsed by default; #oa-nav-toggle:checked reveals the panel. The
+       sticky nav itself is translucent + backdrop-blur, so the dropdown
+       panel gets a SOLID var(--surface) background for contrast. */
+    .nav-links{display:none;position:absolute;top:100%;left:0;right:0;flex-direction:column;align-items:stretch;gap:0;background:var(--surface);border-bottom:1px solid var(--line);box-shadow:var(--sh-md);padding:8px 16px 16px}
+    #oa-nav-toggle:checked~.nav-links{display:flex}
+    .nav-links a{padding:12px 8px;border-bottom:1px solid var(--line);font-size:.95rem;margin-left:0}
+    .nav-links a.lang-toggle{align-self:flex-start;border-bottom:0;margin-top:10px}
+    .nav-links a.nav-cta{margin-top:10px;text-align:center;border-bottom:0}
+  }
+  /* ── SHARED SITE CHROME: footer ── */
+  .site-footer{background:var(--fjord-900);color:rgba(255,255,255,.66);padding:54px 0 30px;margin-top:0}
+  .footer-grid{max-width:var(--maxw);margin:0 auto;padding:0 24px;display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:34px}
+  @media(max-width:760px){.footer-grid{grid-template-columns:1fr 1fr;gap:28px}}
+  @media(max-width:480px){.footer-grid{grid-template-columns:1fr}}
+  .footer-brand .brand{color:#fff;margin-bottom:12px}
+  .footer-brand p{font-size:.88rem;color:rgba(255,255,255,.6);max-width:34ch}
+  .footer-col h4{color:#fff;font-size:.78rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;margin-bottom:14px}
+  .footer-col a{display:block;color:rgba(255,255,255,.62);font-size:.88rem;margin-bottom:9px}
+  .footer-col a:hover{color:#fff}
+  .footer-col a code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}
+  .footer-bottom{max-width:var(--maxw);margin:34px auto 0;padding:18px 24px 0;border-top:1px solid rgba(255,255,255,.12);font-size:.8rem;color:rgba(255,255,255,.46);display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;justify-content:space-between}
+  .footer-bottom .verified{display:inline-flex;align-items:center;gap:7px}
+  .footer-bottom .verified svg{color:var(--teal-400);flex:0 0 15px}
+`;
+
 
 const CATEGORY_LABELS: Record<string, string> = {
   vinter_sno: "Vinter & snø",
@@ -434,7 +577,6 @@ export function homeStrings(lang: Lang) {
 
 router.get("/", (req: Request, res: Response) => {
   const url = baseUrl();
-  const year = new Date().getFullYear();
   const lang: Lang = req.lang === "en" ? "en" : "no";
   const S = homeStrings(lang);
   const canonical = lang === "en" ? `${url}/en` : url;
@@ -677,22 +819,8 @@ ${ldScripts}
   .skip-link{position:absolute;left:-9999px;top:0;background:var(--fjord-800);color:#fff;padding:10px 16px;border-radius:0 0 var(--r-sm) 0;z-index:200}
   .skip-link:focus{left:0;text-decoration:none}
 
-  /* ── HEADER / NAV ── */
-  .site-nav{position:sticky;top:0;z-index:100;background:rgba(244,248,244,.86);backdrop-filter:saturate(160%) blur(12px);border-bottom:1px solid var(--line)}
-  .nav-inner{max-width:var(--maxw);margin:0 auto;padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between}
-  @media(max-width:560px){.nav-inner{padding:0 16px}}
-  .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.16rem;letter-spacing:-.02em;color:var(--fjord-800);text-decoration:none}
-  .brand:hover{text-decoration:none}
-  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
-  .brand-word .tld{color:var(--fjord-600)}
-  .brand .mark{display:flex;align-items:center;justify-content:center}
-  .brand .mark svg{display:block}
-  .nav-links{display:flex;gap:26px;align-items:center}
-  .nav-links a{font-size:.88rem;font-weight:600;color:var(--ink-soft)}
-  .nav-links a:hover{color:var(--fjord-700)}
-  .nav-cta{padding:8px 16px;border-radius:var(--r-pill);background:var(--fjord-800);color:#fff!important;font-size:.84rem;font-weight:700}
-  .nav-cta:hover{background:var(--fjord-700);text-decoration:none!important}
-  @media(max-width:760px){.nav-links a:not(.nav-cta){display:none}}
+  /* ── HEADER / NAV + FOOTER: shared site chrome (S1) ── */
+  ${OA_CHROME_CSS}
 
   /* ── HERO ── */
   .hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(135deg,#0b2e29 0%,#0e3c36 34%,#0f5a50 56%,#12a594 82%,#ff5d3b 136%)}
@@ -819,38 +947,13 @@ ${ldScripts}
   .code-card .prm{color:#9fe9d4}
   .code-card .cmt{color:rgba(255,255,255,.5)}
 
-  /* ── FOOTER ── */
-  .site-footer{background:var(--fjord-900);color:rgba(255,255,255,.66);padding:54px 0 30px;margin-top:0}
-  .footer-grid{max-width:var(--maxw);margin:0 auto;padding:0 24px;display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:34px}
-  @media(max-width:760px){.footer-grid{grid-template-columns:1fr 1fr;gap:28px}}
-  @media(max-width:480px){.footer-grid{grid-template-columns:1fr}}
-  .footer-brand .brand{color:#fff;margin-bottom:12px}
-  .footer-brand p{font-size:.88rem;color:rgba(255,255,255,.6);max-width:34ch}
-  .footer-col h4{color:#fff;font-size:.78rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;margin-bottom:14px}
-  .footer-col a{display:block;color:rgba(255,255,255,.62);font-size:.88rem;margin-bottom:9px}
-  .footer-col a:hover{color:#fff}
-  .footer-col a code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}
-  .footer-bottom{max-width:var(--maxw);margin:34px auto 0;padding:18px 24px 0;border-top:1px solid rgba(255,255,255,.12);font-size:.8rem;color:rgba(255,255,255,.46);display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;justify-content:space-between}
-  .footer-bottom .verified{display:inline-flex;align-items:center;gap:7px}
-  .footer-bottom .verified svg{color:var(--teal-400);flex:0 0 15px}
+  /* (footer styles live in the shared chrome block above) */
 </style>
 </head>
 <body>
 <a class="skip-link" href="#hovedinnhold">${S.skip}</a>
 
-<header class="site-nav">
-  <div class="nav-inner">
-    <a class="brand" href="/" aria-label="${S.brandAria}">${brandInner("light")}</a>
-    <nav class="nav-links" aria-label="${S.navAria}">
-      <a href="/opplevelser">${S.navAll}</a>
-      <a href="#kategorier">${S.navCategories}</a>
-      <a href="#slik-funker-det">${S.navHow}</a>
-      <a href="#for-agenter">${S.navAgents}</a>
-      <a class="lang-toggle" href="${lang === "en" ? "/" : "/en"}" hreflang="${lang === "en" ? "nb" : "en"}" aria-label="${lang === "en" ? "Bytt til norsk" : "Switch to English"}" style="border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 11px;font-size:.8rem;font-weight:600;color:var(--ink-soft)">${lang === "en" ? "NO" : "EN"}</a>
-      <a class="nav-cta" href="/opplevelser">${S.navExplore}</a>
-    </nav>
-  </div>
-</header>
+${oaSiteNav({ active: "hjem", lang })}
 
 <main id="hovedinnhold">
   <section class="hero" aria-labelledby="hero-title">
@@ -1019,33 +1122,7 @@ ${ldScripts}
   </section>
 </main>
 
-<footer class="site-footer" role="contentinfo">
-  <div class="footer-grid">
-    <div class="footer-brand">
-      <a class="brand" href="/" aria-label="${S.brandAria}">${brandInner("dark")}</a>
-      <p>${S.footTagline}</p>
-    </div>
-    <div class="footer-col">
-      <h4>${S.footExplore}</h4>
-      <a href="/opplevelser">${S.navAll}</a>
-      <a href="#kategorier">${S.navCategories}</a>
-      <a href="#slik-funker-det">${S.navHow}</a>
-      <a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
-    </div>
-    <div class="footer-col">
-      <h4>${S.footAgents}</h4>
-      <a href="/llms.txt" target="_blank" rel="noopener"><code>llms.txt</code></a>
-      <a href="/.well-known/agent-card.json" target="_blank" rel="noopener"><code>agent-card.json</code></a>
-      <a href="/mcp" target="_blank" rel="noopener"><code>/mcp</code> (MCP)</a>
-      <a href="/openapi.json" target="_blank" rel="noopener"><code>openapi.json</code></a>
-      <a href="/api/opplevelser/discover" target="_blank" rel="noopener"><code>/api/opplevelser</code></a>
-    </div>
-  </div>
-  <div class="footer-bottom">
-    <span>&copy; ${year} Opplevagent &middot; <a href="/personvern" style="color:rgba(255,255,255,.62)">${S.footPrivacy}</a> &middot; <a href="/vilkar" style="color:rgba(255,255,255,.62)">${S.footTerms}</a></span>
-    <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.footVerified}</span>
-  </div>
-</footer>
+${oaSiteFooter({ lang })}
 
 <script>
 /* Progressive enhancement: an empty search should land on the full index rather
@@ -3519,17 +3596,17 @@ ${BROWSE_CSS}
 .hero-h1{font-size:2rem;font-weight:800;margin-bottom:10px;line-height:1.2}
 .hero-sub{opacity:.85;font-size:1rem;max-width:560px;line-height:1.5}
 .legal-note{font-size:.78rem;color:#7a7163;margin-top:40px;padding-top:16px;border-top:1px solid #e4ded0}
+/* S1 shared chrome (appended AFTER the BROWSE_CSS above on purpose — this
+   page is deliberately upgraded from the slim nav/mini-footer to the full
+   brand nav + footer; BROWSE_CSS itself is untouched so every other browse
+   page keeps rendering exactly as before). */
+${OA_CHROME_CSS}
 </style>
 ${mapPoints.length > 0 ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
-<nav class="site-nav" aria-label="Navigasjon">
-  <div class="nav-inner">
-    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
-    <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/#kategorier">Kategorier</a></span>
-  </div>
-</nav>
+${oaSiteNav({ active: "gardssalg" })}
 <header class="hero-section">
   <div class="container">
     <div class="hero-kicker">Gårdssalg &amp; smaking</div>
@@ -3548,9 +3625,7 @@ ${mapPoints.length > 0 ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
   ${pagination}
   <p class="legal-note">Vi formidler besøket og smakingen hos produsentene. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
 </main>
-<footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
-  <span><a href="/">Forsiden</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
-</footer>
+${oaSiteFooter({})}
 </body>
 </html>`;
 
