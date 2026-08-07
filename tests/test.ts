@@ -34144,7 +34144,7 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   const base = {
     id: "p1", navn: "Alde Sider / Ulvik Frukt & Cideri", hjemmeside: "http://www.aldesider.no",
     adresse: null, telefon: null, epost: null, lat: null, lon: null,
-    about_text: null, products: null, content_source: null,
+    about_text: null, products: null, content_source: null, field_provenance: null,
   };
 
   // (1) Strict domain match → would_enrich, copies the good fields, skips junk email.
@@ -34226,12 +34226,91 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   const rNameCollide = pickEnrichmentFields({ ...base, navn: "Fellesnavn Gård", hjemmeside: null }, new Map(), byNameCollide);
   assertEq(rNameCollide.status, "no_domain", "enrich-37: provider on a collided name → no_domain (no wrong-producer copy)");
 
-  // (4) content_source lock → never overwrite human/owner-authored rows.
+  // (4) content_source lock → 'manual' rows never overwrite human/owner-
+  // authored data (unchanged, full-row freeze).
   const r4 = pickEnrichmentFields({ ...base, content_source: "manual" }, byDomain);
   assertEq(r4.status, "locked", "enrich-15: content_source=manual → locked");
   assertEq(Object.keys(r4.copy).length, 0, "enrich-16: locked copies nothing");
-  const r4b = pickEnrichmentFields({ ...base, content_source: "claim" }, byDomain);
-  assertEq(r4b.status, "locked", "enrich-17: content_source=claim → locked");
+
+  // enrich-17 (REWRITTEN, sub-slice 3k, dev-request 2026-07-30-opplevagent-
+  // claim-epost-og-perfelt-laas): the OLD assertion here — content_source=
+  // "claim" → status "locked" — is now WRONG and replaced. A 'claim' row
+  // with NO field_provenance (no owner_locks at all) is no longer fully
+  // locked; it falls through to the normal domain/name-match + field-by-
+  // field logic, so the three owner-lock-eligible fields (about_text,
+  // products, hjemmeside) with real, non-junk RFB candidates all get
+  // copied. Uses the no-website, name-matched `alde` fixture (defined above
+  // for enrich-30..34) rather than `base` so hjemmeside is also provably
+  // fillable — a byDomain-only match wouldn't fill it since `base` already
+  // has a hjemmeside set.
+  const r4b = pickEnrichmentFields({ ...alde, content_source: "claim" }, byDomain, byName);
+  assertEq(r4b.status, "would_enrich", "enrich-17: content_source=claim, no field_provenance → would_enrich (row no longer fully locked)");
+  assertEq(typeof r4b.copy.about_text, "string", "enrich-17b: claim row about_text copied (not owner-locked)");
+  assertEq(String(r4b.copy.products), JSON.stringify(["Eplesider", "Eplemost"]), "enrich-17c: claim row products copied (not owner-locked)");
+  assertEq(r4b.copy.hjemmeside, "https://aldesider.no/", "enrich-17d: claim row hjemmeside copied (not owner-locked)");
+
+  // (4b) sub-slice 3k: per-field owner-lock split. A claim row whose
+  // field_provenance.owner_locks locks ONLY about_text (not products/
+  // hjemmeside), matched against an RFB source offering real, non-junk
+  // candidates for all three → about_text is skipped as owner_field_locked
+  // and NOT copied, while products and hjemmeside (unlocked) DO get copied.
+  // Proves the per-field split in a single case.
+  const claimPartialLock = {
+    ...alde,
+    content_source: "claim",
+    field_provenance: JSON.stringify({ owner_locks: { about_text: { locked_at: "2026-08-01T00:00:00.000Z" } } }),
+  };
+  const rPartial = pickEnrichmentFields(claimPartialLock, byDomain, byName);
+  assertTrue(rPartial.skipped.some((s) => s.field === "about_text" && s.reason === "owner_field_locked"),
+    "enrich-38: about_text owner-locked (field_provenance.owner_locks.about_text) → skipped with owner_field_locked");
+  assertEq(rPartial.copy.about_text, undefined, "enrich-39: owner-locked about_text NOT copied");
+  assertEq(typeof rPartial.copy.products, "string", "enrich-40: products NOT owner-locked → still copied");
+  assertEq(rPartial.copy.hjemmeside, "https://aldesider.no/", "enrich-41: hjemmeside NOT owner-locked → still copied");
+
+  // (4c) sub-slice 3k: a claim row where owner_locks locks ALL THREE
+  // eligible fields → copy contains none of the three, skipped names all
+  // three with owner_field_locked, and status is "nothing_to_fill" — NEVER
+  // "locked" (that value is reserved for 'manual' rows only under the new
+  // logic).
+  const claimAllLocked = {
+    ...alde,
+    content_source: "claim",
+    field_provenance: JSON.stringify({
+      owner_locks: {
+        about_text: { locked_at: "2026-08-01T00:00:00.000Z" },
+        products: { locked_at: "2026-08-01T00:00:00.000Z" },
+        hjemmeside: { locked_at: "2026-08-01T00:00:00.000Z" },
+      },
+    }),
+  };
+  const rAllLocked = pickEnrichmentFields(claimAllLocked, byDomain, byName);
+  assertEq(rAllLocked.copy.about_text, undefined, "enrich-42: all-locked claim row → about_text not copied");
+  assertEq(rAllLocked.copy.products, undefined, "enrich-43: all-locked claim row → products not copied");
+  assertEq(rAllLocked.copy.hjemmeside, undefined, "enrich-44: all-locked claim row → hjemmeside not copied");
+  assertTrue(rAllLocked.skipped.some((s) => s.field === "about_text" && s.reason === "owner_field_locked"), "enrich-45: about_text in skipped");
+  assertTrue(rAllLocked.skipped.some((s) => s.field === "products" && s.reason === "owner_field_locked"), "enrich-46: products in skipped");
+  assertTrue(rAllLocked.skipped.some((s) => s.field === "hjemmeside" && s.reason === "owner_field_locked"), "enrich-47: hjemmeside in skipped");
+  assertEq(rAllLocked.status, "nothing_to_fill", "enrich-48: all fields owner-locked, nothing else fillable → nothing_to_fill (never 'locked')");
+
+  // (4d) sub-slice 3k: adresse/telefon/epost/lat/lon are OUTSIDE
+  // GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS and must still NEVER be written for
+  // a claim row, regardless of lock state (no owner_locks at all, partial
+  // lock, or all-eligible-fields locked) — isGardssalgFieldOwnerLocked fails
+  // closed on them, so this is the pre-3k behavior, unchanged. rfbAlde/alde
+  // carry real, non-junk candidate address/phone/lat/lng values, so a
+  // regression here (missing the guard) would show up as a filled value.
+  for (const [label, row] of [
+    ["no field_provenance", { ...alde, content_source: "claim" }],
+    ["partial owner_locks", claimPartialLock],
+    ["all eligible fields owner_locks", claimAllLocked],
+  ] as const) {
+    const r = pickEnrichmentFields(row, byDomain, byName);
+    assertEq(r.copy.adresse, undefined, `enrich-49 (${label}): claim row adresse NOT copied`);
+    assertEq(r.copy.telefon, undefined, `enrich-49 (${label}): claim row telefon NOT copied`);
+    assertEq(r.copy.epost, undefined, `enrich-49 (${label}): claim row epost NOT copied`);
+    assertEq(r.copy.lat, undefined, `enrich-49 (${label}): claim row lat NOT copied`);
+    assertEq(r.copy.lon, undefined, `enrich-49 (${label}): claim row lon NOT copied`);
+  }
 
   // (5) Fill ONLY missing fields — an existing adresse is never clobbered.
   const r5 = pickEnrichmentFields({ ...base, adresse: "Egen adresse 1" }, byDomain);
@@ -34263,7 +34342,7 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   assertEq(JSON.stringify(parseProductNames("garbage")), "[]", "enrich-28: parseProductNames malformed → []");
   assertEq(JSON.stringify(parseProductNames(null)), "[]", "enrich-29: parseProductNames null → []");
 
-  console.log("  gardssalg-rfb-enrich: OK (29 assertions)");
+  console.log("  gardssalg-rfb-enrich: OK (58 assertions)");
 }
 
 

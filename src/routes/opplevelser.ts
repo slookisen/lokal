@@ -6797,7 +6797,7 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
   try {
     providers = expDb.prepare(
       `SELECT id, navn, hjemmeside, adresse, telefon, epost, lat, lon,
-              about_text, products, content_source
+              about_text, products, content_source, field_provenance
          FROM experience_providers
         WHERE rfb_seed_source = 'rfb-seed'`
     ).all() as EnrichProviderRow[];

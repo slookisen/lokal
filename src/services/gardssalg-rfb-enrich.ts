@@ -24,6 +24,7 @@
 import { normalizeDomain, normalizeName } from "./blocklist-service";
 import { isDisplayablePhone } from "./contact-normalizer";
 import { isJunkDescription } from "./description-quality";
+import { isGardssalgFieldOwnerLocked } from "./experience-store";
 
 /** Minimal shape of the seeded gårdssalg provider row we may enrich. */
 export interface EnrichProviderRow {
@@ -38,6 +39,12 @@ export interface EnrichProviderRow {
   about_text: string | null;
   products: string | null;
   content_source: string | null;
+  // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
+  // 3k — raw field_provenance JSON, read so pickEnrichmentFields can consult
+  // field_provenance.owner_locks via isGardssalgFieldOwnerLocked (same
+  // defensive-parse-in-the-helper pattern every other sub-slice already
+  // uses; this file never parses it directly).
+  field_provenance: string | null;
 }
 
 /** Minimal shape of the RFB source (agents + agent_knowledge joined). */
@@ -231,10 +238,27 @@ export function indexRfbByName(sources: RfbSource[]): Map<string, RfbSource> {
 
 /**
  * Decide what to copy from RFB into a seeded gårdssalg provider. Pure.
- *   - Locked (content_source manual/claim) → status 'locked', copy {}.
+ *   - Locked (content_source manual) → status 'locked', copy {}.
+ *   - claim rows (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-
+ *     laas, sub-slice 3k): NO LONGER a row-level bail. Only manual rows are
+ *     unconditionally 'locked' now. A claim row falls through to the normal
+ *     domain/name-match + field-by-field logic below; each of the three
+ *     owner-lock-eligible fields (about_text, products, hjemmeside — the
+ *     only GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS this function can write) is
+ *     gated individually via isGardssalgFieldOwnerLocked(provider, field)
+ *     right before it would be copied — locked IFF the owner touched that
+ *     field via the claim portal (field_provenance.owner_locks.<field>
+ *     present); otherwise it fills normally. The other fields this function
+ *     can write (adresse, telefon, epost, lat/lon) are outside the eligible
+ *     set — isGardssalgFieldOwnerLocked always fails closed on them for a
+ *     claim row, so they keep the exact pre-3k behavior of never being
+ *     filled for a claim row (guarded directly with a `content_source !==
+ *     "claim"` check at each of those sites rather than a no-op helper
+ *     call, since the helper can only ever return true there anyway).
  *   - No provider domain → 'no_domain' (flag for manual review).
  *   - No RFB source on that domain → 'no_match'.
- *   - Otherwise fill each MISSING provider field from a non-junk RFB value.
+ *   - Otherwise fill each MISSING, unlocked provider field from a non-junk
+ *     RFB value.
  */
 export function pickEnrichmentFields(
   provider: EnrichProviderRow,
@@ -243,10 +267,19 @@ export function pickEnrichmentFields(
 ): EnrichResult {
   const base: EnrichResult = { provider_id: provider.id, navn: provider.navn, status: "no_match", copy: {}, skipped: [] };
 
-  // Lock: never overwrite human/owner-authored rows.
-  if (provider.content_source === "manual" || provider.content_source === "claim") {
+  // Lock: never overwrite human/owner-authored MANUAL rows (unconditional,
+  // full-row freeze, unchanged). 'claim' rows no longer bail here — see this
+  // function's doc comment above for the per-field narrowing (sub-slice 3k).
+  if (provider.content_source === "manual") {
     return { ...base, status: "locked" };
   }
+  // Per-field owner-lock gate for the three claim-editable, rollback-eligible
+  // fields this function can write (about_text, products, hjemmeside) — same
+  // already-shipped, already-reviewed isGardssalgFieldOwnerLocked helper the
+  // other gårdssalg writers (3a-3j) gate on; no new policy logic, only wiring.
+  // Always false for any content_source other than 'claim'.
+  const isFieldOwnerLocked = (fieldName: string): boolean =>
+    provider.content_source === "claim" && isGardssalgFieldOwnerLocked(provider, fieldName);
 
   // 1) Strict website-domain match (strongest signal).
   const providerDomain = normalizeDomain(provider.hjemmeside);
@@ -272,47 +305,64 @@ export function pickEnrichmentFields(
   const skipped: Array<{ field: string; reason: string }> = [];
   const isEmpty = (v: string | null): boolean => v === null || v.trim() === "";
 
-  // about_text ← about (skip junk-description; 'about' is not a factual-inference field)
+  // about_text ← about (skip junk-description; 'about' is not a factual-
+  // inference field). GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS member — gated
+  // per-field for claim rows (sub-slice 3k).
   if (isEmpty(provider.about_text)) {
-    if (src.about && src.about.trim() && !isJunkDescription(src.about)) copy.about_text = src.about.trim();
-    else if (src.about && src.about.trim()) skipped.push({ field: "about_text", reason: "junk_description" });
+    if (src.about && src.about.trim() && !isJunkDescription(src.about)) {
+      if (isFieldOwnerLocked("about_text")) skipped.push({ field: "about_text", reason: "owner_field_locked" });
+      else copy.about_text = src.about.trim();
+    } else if (src.about && src.about.trim()) skipped.push({ field: "about_text", reason: "junk_description" });
   }
-  // adresse ← address (skip inference-only and junk/filler addresses)
-  if (isEmpty(provider.adresse) && src.address && src.address.trim()) {
+  // adresse ← address (skip inference-only and junk/filler addresses). NOT a
+  // GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS member (not claim-portal-editable) —
+  // isGardssalgFieldOwnerLocked always fails closed on it for a claim row, so
+  // a claim row keeps the exact pre-3k behavior of never filling it (guarded
+  // directly here rather than via a no-op helper call).
+  if (provider.content_source !== "claim" && isEmpty(provider.adresse) && src.address && src.address.trim()) {
     if (inference.has("address")) skipped.push({ field: "adresse", reason: "inference_only" });
     else if (isJunkAddress(src.address)) skipped.push({ field: "adresse", reason: "junk_address" });
     else copy.adresse = src.address.trim();
   }
-  // telefon ← phone (skip non-displayable / inference-only)
-  if (isEmpty(provider.telefon) && src.phone && src.phone.trim()) {
+  // telefon ← phone (skip non-displayable / inference-only). Same
+  // not-owner-lock-eligible reasoning as adresse above.
+  if (provider.content_source !== "claim" && isEmpty(provider.telefon) && src.phone && src.phone.trim()) {
     if (inference.has("phone")) skipped.push({ field: "telefon", reason: "inference_only" });
     else if (!isDisplayablePhone(src.phone)) skipped.push({ field: "telefon", reason: "not_displayable" });
     else copy.telefon = src.phone.trim();
   }
-  // epost ← email (skip placeholders/invalid)
-  if (isEmpty(provider.epost) && src.email && src.email.trim()) {
+  // epost ← email (skip placeholders/invalid). Same not-owner-lock-eligible
+  // reasoning as adresse above.
+  if (provider.content_source !== "claim" && isEmpty(provider.epost) && src.email && src.email.trim()) {
     if (isJunkEmail(src.email)) skipped.push({ field: "epost", reason: "junk_email" });
     else copy.epost = src.email.trim().toLowerCase();
   }
-  // products ← products (skip inference-only; only if non-empty list)
+  // products ← products (skip inference-only; only if non-empty list).
+  // GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS member — gated per-field for claim
+  // rows (sub-slice 3k).
   if (isEmpty(provider.products)) {
     const names = parseProductNames(src.products);
     if (names.length) {
       if (inference.has("products")) skipped.push({ field: "products", reason: "inference_only" });
+      else if (isFieldOwnerLocked("products")) skipped.push({ field: "products", reason: "owner_field_locked" });
       else copy.products = JSON.stringify(names);
     }
   }
-  // lat/lon ← agents.lat/lng (only fill both together, when provider has none)
-  if (provider.lat === null && provider.lon === null && src.lat !== null && src.lng !== null) {
+  // lat/lon ← agents.lat/lng (only fill both together, when provider has
+  // none). Same not-owner-lock-eligible reasoning as adresse above.
+  if (provider.content_source !== "claim" && provider.lat === null && provider.lon === null && src.lat !== null && src.lng !== null) {
     copy.lat = src.lat;
     copy.lon = src.lng;
   }
   // hjemmeside ← RFB producer's own site (mainly for NAME-matched rows, whose
   // provider hjemmeside is empty — that's why domain match missed them). Only a
   // real, matchable (non-generic) RFB domain is copied.
+  // GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS member — gated per-field for claim
+  // rows (sub-slice 3k).
   const srcDomain = normalizeDomain(src.url);
   if (isEmpty(provider.hjemmeside) && src.url && src.url.trim() && isMatchableDomain(srcDomain)) {
-    copy.hjemmeside = src.url.trim();
+    if (isFieldOwnerLocked("hjemmeside")) skipped.push({ field: "hjemmeside", reason: "owner_field_locked" });
+    else copy.hjemmeside = src.url.trim();
   }
 
   const status: EnrichResult["status"] = Object.keys(copy).length ? "would_enrich" : "nothing_to_fill";
