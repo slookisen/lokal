@@ -440,6 +440,85 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertEq(wManual.length, 0, "wd-6f: manual row → nothing written, regardless of owner_locks");
       }
 
+      // ── wd-11: "godkjenn-på-plass" — a candidate byte-identical to the
+      //    row's OWN current hjemmeside is not a fill-only violation, it's a
+      //    no-op re-approval: provenance gets (re)stamped and the write
+      //    succeeds instead of forever tripping the fill-only guard (which
+      //    used to strand these forever in the review queue). ─────────────
+      {
+        insertProvider.run({ id: "wd-atplace", navn: "Plassert Gard", org_nr: "911222333", kommune: "Voss", poststed: null, hjemmeside: "https://atplace-gard.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-atplace-route", navn: "Plassert Rute Gard", org_nr: "911222444", kommune: "Voss", poststed: null, hjemmeside: "https://atplace-route-gard.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({
+          id: "wd-manual-atplace", navn: "Manuell Plassert Gard", org_nr: "911222555", kommune: "Voss", poststed: null,
+          hjemmeside: "https://manuell-egen.no", catalog_hidden: null, content_source: "manual", producer_type: "sideri",
+        });
+        insertProvider.run({
+          id: "wd-locked-atplace", navn: "Kravsatt Plassert Gard", org_nr: "911222666", kommune: "Voss", poststed: null,
+          hjemmeside: "https://kravsatt-egen.no", catalog_hidden: null, content_source: "claim", producer_type: "sideri",
+          field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T12:00:00.000Z" } } }),
+        });
+
+        // (a) exact-match candidate: succeeds, value UNCHANGED, provenance
+        //     stamped, exactly one new audit row.
+        const auditBefore = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_content_audit WHERE provider_id='wd-atplace' AND field_name='hjemmeside'`).get() as any).c;
+        assertEq(auditBefore, 0, "wd-11a0: no pre-existing audit row for wd-atplace/hjemmeside");
+        const wAtPlace = expStore.applyGardssalgProviderWebsite("wd-atplace", "https://atplace-gard.no", "https://evidence-atplace.example");
+        assertEq(JSON.stringify(wAtPlace), JSON.stringify(["hjemmeside"]), 'wd-11a: at-place candidate returns ["hjemmeside"] (not [])');
+        const rowAtPlace = expDb.prepare(`SELECT hjemmeside, field_provenance FROM experience_providers WHERE id='wd-atplace'`).get() as any;
+        assertEq(rowAtPlace.hjemmeside, "https://atplace-gard.no", "wd-11b: hjemmeside column UNCHANGED by the at-place write");
+        assertEq(
+          JSON.parse(rowAtPlace.field_provenance || "{}").hjemmeside?.source_url,
+          "https://evidence-atplace.example",
+          "wd-11c: field_provenance.hjemmeside stamped with the new evidence url",
+        );
+        const auditAfter = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_content_audit WHERE provider_id='wd-atplace' AND field_name='hjemmeside'`).get() as any).c;
+        assertEq(auditAfter, 1, "wd-11d: exactly one new gardssalg_content_audit row written");
+
+        // (b) same scenario driven through the approve ROUTE with apply:true
+        //     — must land as a real write, not write_skipped_by_guards, and
+        //     must clear the queue entry.
+        expStore.upsertGardssalgWebsiteReviewQueue({
+          provider_id: "wd-atplace-route",
+          provider_name: "Plassert Rute Gard",
+          candidate_url: "https://atplace-route-gard.no",
+          final_url: "https://atplace-route-gard.no",
+          reason: "website_discovery_candidate",
+        });
+        const approveRes = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { approvals: [{ provider_id: "wd-atplace-route", url: "https://atplace-route-gard.no" }], apply: true },
+        });
+        assertEq(approveRes.body.written_count, 1, "wd-11e: approve route treats the at-place candidate as a real write (not write_skipped_by_guards)");
+        const qLeftAtPlace = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-atplace-route'`).get() as any).c;
+        assertEq(qLeftAtPlace, 0, "wd-11f: queue entry for the at-place candidate is cleared");
+
+        // (c) negative control — a DIFFERENT candidate on a row that already
+        //     carries a hjemmeside still hits the unchanged fill-only guard
+        //     (proves the non-at-place path is untouched).
+        const wDiffers = expStore.applyGardssalgProviderWebsite("wd-atplace", "https://helt-annen-url.no", "https://x");
+        assertEq(wDiffers.length, 0, "wd-11g: negative control — non-matching candidate on a filled row still refused (fill-only path unchanged)");
+        const rowDiffers = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-atplace'`).get() as any;
+        assertEq(rowDiffers.hjemmeside, "https://atplace-gard.no", "wd-11h: hjemmeside still unchanged after the refused non-matching write");
+
+        // (d) the manual / owner-lock guards must still fire BEFORE the
+        //     at-place check — isAtPlace must never bypass them, and NOTHING
+        //     (not even provenance) gets stamped for either, even though the
+        //     candidate equals the row's own current hjemmeside.
+        const wManualAtPlace = expStore.applyGardssalgProviderWebsite("wd-manual-atplace", "https://manuell-egen.no", "https://x");
+        assertEq(wManualAtPlace.length, 0, "wd-11i: manual row → still refused even when candidate equals its own hjemmeside");
+        const rowManualAtPlace = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='wd-manual-atplace'`).get() as any;
+        assertEq(rowManualAtPlace.field_provenance, null, "wd-11j: manual row's field_provenance was NOT stamped by the at-place path");
+
+        const wLockedAtPlace = expStore.applyGardssalgProviderWebsite("wd-locked-atplace", "https://kravsatt-egen.no", "https://x");
+        assertEq(wLockedAtPlace.length, 0, "wd-11k: owner-locked claim row → still refused even when candidate equals its own hjemmeside");
+        const rowLockedAtPlace = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='wd-locked-atplace'`).get() as any;
+        assertTrue(
+          !JSON.parse(rowLockedAtPlace.field_provenance || "{}").hjemmeside,
+          "wd-11l: owner-locked row's field_provenance.hjemmeside was NOT stamped by the at-place path",
+        );
+      }
+
       // ── wd-7: shared-host counter counts hidden rows, excludes test provider. ─
       {
         const counts = expStore.gardssalgSharedHostCounts();
