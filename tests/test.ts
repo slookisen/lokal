@@ -37312,3 +37312,29 @@ runSerial(async () => {
     failures.push("experience-description-enrichment: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
+// 6: GET /admin/gardssalg-epost-synthesis-audit (read-only) + POST
+// /admin/gardssalg-epost-synthesis-remediation (dry-run-by-default write) —
+// verifies (rather than assumes) that no synthesized post@<own-domain>
+// address is stored in experience_providers.epost or RFB's
+// agents.contact_email, distinguishing a genuinely-unevidenced match from a
+// producer's REAL published post@ address (the hunsfos-bryggeri.no case).
+// Tail-registered via runSerial() like the suites immediately above — see
+// this file's own "determinism gate" comments further up for why new blocks
+// land here rather than earlier in the file.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-06-aldri-gjett-epostadresse: gardssalg-epost-synthesis-audit + remediation ──");
+  try {
+    const { runOpplevelserGardssalgEpostSynthesisAuditTests } = require("../src/routes/opplevelser-gardssalg-epost-synthesis-audit.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-epost-synthesis-audit.test");
+    const gesa = await runOpplevelserGardssalgEpostSynthesisAuditTests({ log: false });
+    passed += gesa.passed;
+    failed += gesa.failed;
+    for (const f of gesa.failures) failures.push("gardssalg-epost-synthesis-audit: " + f);
+    console.log(`  gardssalg-epost-synthesis-audit: ${gesa.passed} passed, ${gesa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-epost-synthesis-audit: unexpected error: " + String(err?.message || err));
+  }
+});

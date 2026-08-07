@@ -8529,6 +8529,465 @@ router.post("/admin/gardssalg-owner-lock-backfill", requireAdmin, (req: Request,
   }
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-epost-synthesis-audit ─────────────
+// ─── POST /api/opplevelser/admin/gardssalg-epost-synthesis-remediation ──────
+//
+// dev-request 2026-08-06-aldri-gjett-epostadresse (slookisen/A2A), criterion
+// 6. Daniel's ruling: never CONSTRUCT/guess an email address for a producer —
+// only ever use addresses actually found. `deriveOrgLinkedEmailCandidates`
+// (services/gardssalg-claim.ts) still has a "guess" tier — the well-known
+// post@<verified-domain> convention address on a claimant's OWNERSHIP-
+// VERIFIED domain — but that construction is RUNTIME-ONLY: it is derived
+// fresh on every claim-link request and never written to any column (grep
+// confirms no INSERT/UPDATE anywhere in src/ builds a template-string
+// `post@...` email and persists it). This pair of routes is the audit half
+// of criterion 6: verify that claim, don't just assume it — because a
+// producer's REAL published address can ALSO happen to look exactly like
+// that pattern (hunsfos-bryggeri.no's actual contact is post@hunsfos-
+// bryggeri.no — a real business, not a synthesized one), so pattern-matching
+// alone can never distinguish "fake" from "genuinely published" and must
+// never drive an unconditional delete.
+//
+// ── Scope: two tables, two verticals ─────────────────────────────────────
+//   - experience_providers.epost, domain source = experience_providers.hjemmeside
+//   - RFB's agents.contact_email, domain source = agents.url (RFB's `agents`
+//     has no separate "own site" column — url IS the producer's site)
+//
+// ── The exact pattern ──────────────────────────────────────────────────────
+// A row matches iff its stored address's local-part is literally "post"
+// (case-insensitive) AND its domain equals that SAME row's own site domain
+// (hjemmeside/url), compared via normalizeDomain() (services/blocklist-
+// service.ts — the SAME host-normalization helper gardssalg-claim.ts's own
+// post@<verified-domain> construction already reuses; not reimplemented
+// here). Any other stored address (different domain, different local-part,
+// or a row with no site to compare against) is simply not in scope — it was
+// never a candidate the "guess" tier could have produced in the first place.
+//
+// ── Classification (per matched row) ────────────────────────────────────────
+// A pattern match alone proves NOTHING — it is equally consistent with "this
+// was synthesized" and "this producer really does publish post@own-domain".
+// So every match is further classified by whether the row carries any trace
+// of a legitimate source:
+//   - has_content_source_evidence: experience_providers.content_source is
+//     one of 'manual' | 'claim' | 'provider_site' — i.e. the row's epost was
+//     either curator/owner-authored or actually scraped off the provider's
+//     own site, not merely assumed. This is EXACTLY the hunsfos-bryggeri.no
+//     shape (content_source='provider_site' after a real crawl found it) —
+//     preserved, never a removal candidate.
+//   - has_provenance_evidence: experience_providers.field_provenance is a
+//     non-empty JSON object (any key) — some enrichment/verification step
+//     left a trace for this row. Preserved, never a removal candidate.
+//   - no_evidence_found: neither of the above. The ONLY bucket a remediation
+//     apply is ever allowed to touch.
+// experience_providers is the only table with content_source/field_provenance
+// columns of this shape — RFB's agents/agent_knowledge.field_provenance is a
+// structurally different, per-field array-tiered thing (unrelated check, see
+// admin-agent-audit*.ts) and is deliberately NOT read here. Instead, the
+// agents-side analog reuses this codebase's own established row-level lock:
+// `agents.claimed_at IS NOT NULL` — an owner-claimed agent's contact_email
+// was asserted by the actual producer (same protective intent as
+// content_source='manual'/'claim'/'provider_site'), so a claimed match lands
+// in has_content_source_evidence too. There is no agents-side analog for
+// has_provenance_evidence (deliberately — see above); an unclaimed agents
+// match with no other evidence falls straight to no_evidence_found.
+//
+// ── Read-only vs. write ──────────────────────────────────────────────────
+// GET is a pure read — zero writes, mirrors gardssalg-experience-conflict-
+// audit's / gardssalg-website-verification-audit's own read-only convention
+// exactly. POST is dry-run BY DEFAULT (apply must be an explicit truthy
+// form, same convention as every other gårdssalg admin write route in this
+// file) and, even under apply, NEVER trusts a caller-supplied row list —
+// it re-runs the SAME scan live and only ever writes rows that land in
+// no_evidence_found on that FRESH pass (fail-closed: a row that gained
+// evidence, or whose value changed, between scan and write is left alone).
+// A claimed_at re-check immediately before each write is an additional
+// defense-in-depth belt-and-suspenders measure (mirrors every other write
+// route in this file's "owner controls their own data from claim onward"
+// discipline) — largely redundant for experience_providers in practice
+// (claiming always stamps content_source='claim', see
+// issueClaimMagicLink/updateClaimedProviderProfile in gardssalg-claim.ts, so
+// a claimed provider row is already excluded via has_content_source_evidence
+// before this check even runs) but kept anyway for the same reason every
+// other route here keeps it: never rely on a single line of defense for an
+// owner's own data.
+//
+// This is expected to find close to zero real rows given the analysis above
+// — that is fine and correct, not a bug to chase.
+
+const GARDSSALG_EPOST_SYNTHESIS_MAX_LIST = 200;
+
+// ── Injectable RFB-DB seam (tests only) ─────────────────────────────────────
+// These two routes read/write the RFB `agents` table through getRfbDb()
+// (= getDb() from ../database/init), the SAME shared, module-level singleton
+// every other suite in tests/test.ts also reads/swaps. gardssalg-claim.test.ts
+// documents exactly why a test must NOT pin that singleton directly
+// (src/database/init.ts's __setDbForTesting): doing so raced live against a
+// concurrently-running, unrelated suite in the full test.ts run. So — same
+// fix as gardssalg-claim.ts's own __setRfbDbForTesting and admin-agents-
+// contact-email-write.ts's dbOverrideForTesting — one indirection a test can
+// override for ITS OWN calls, touching no global. Production code never
+// calls the setter.
+let gardssalgEpostSynthesisRfbDbOverrideForTesting: Database.Database | null = null;
+/** Test-only. Pass null to clear. Never called by production code. */
+export function __setGardssalgEpostSynthesisRfbDbForTesting(db: Database.Database | null): void {
+  gardssalgEpostSynthesisRfbDbOverrideForTesting = db;
+}
+function resolveGardssalgEpostSynthesisRfbDb(): Database.Database {
+  return gardssalgEpostSynthesisRfbDbOverrideForTesting ?? getRfbDb();
+}
+
+type EpostSynthesisTable = "experience_providers" | "agents";
+type EpostSynthesisBucket = "has_content_source_evidence" | "has_provenance_evidence" | "no_evidence_found";
+
+const EPOST_SYNTHESIS_CONTENT_SOURCE_EVIDENCE = new Set(["manual", "claim", "provider_site"]);
+
+interface EpostSynthesisRow {
+  table: EpostSynthesisTable;
+  id: string;
+  label: string | null;
+  storedEmail: string;
+  domainSource: string;
+  contentSource: string | null;
+  fieldProvenance: string | null;
+  claimedAt: string | null;
+}
+
+/**
+ * True iff `storedEmail`'s local-part is literally "post" (case-insensitive)
+ * and its domain equals `domainSource`'s own domain — the EXACT
+ * post@<own-domain> shape. Both sides go through normalizeDomain() so
+ * "www." prefixes / protocols / trailing ports never cause a false miss.
+ */
+function isGardssalgEpostSynthesisPatternMatch(
+  storedEmail: string | null | undefined,
+  domainSource: string | null | undefined,
+): boolean {
+  if (!storedEmail || !domainSource) return false;
+  const trimmed = storedEmail.trim().toLowerCase();
+  const at = trimmed.indexOf("@");
+  if (at <= 0) return false;
+  if (trimmed.slice(0, at) !== "post") return false;
+  const emailDomain = normalizeDomain(trimmed);
+  const siteDomain = normalizeDomain(domainSource);
+  if (!emailDomain || !siteDomain) return false;
+  return emailDomain === siteDomain;
+}
+
+/** True iff `json` parses to a non-empty object (any key at all). */
+function gardssalgEpostSynthesisHasProvenance(json: string | null | undefined): boolean {
+  if (!json) return false;
+  try {
+    const parsed = JSON.parse(json);
+    return !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length > 0);
+  } catch {
+    return false;
+  }
+}
+
+function classifyGardssalgEpostSynthesisRow(row: EpostSynthesisRow): EpostSynthesisBucket {
+  if (row.table === "experience_providers") {
+    if (row.contentSource && EPOST_SYNTHESIS_CONTENT_SOURCE_EVIDENCE.has(row.contentSource)) {
+      return "has_content_source_evidence";
+    }
+    if (gardssalgEpostSynthesisHasProvenance(row.fieldProvenance)) {
+      return "has_provenance_evidence";
+    }
+    return "no_evidence_found";
+  }
+  // agents/RFB side — see the file-header doc comment above for why
+  // claimed_at is this side's evidence analog.
+  if (row.claimedAt) return "has_content_source_evidence";
+  return "no_evidence_found";
+}
+
+interface EpostSynthesisScan {
+  scanned: { experience_providers: number; agents: number };
+  pattern_matches: { experience_providers: number; agents: number };
+  buckets: { has_content_source_evidence: number; has_provenance_evidence: number; no_evidence_found: number };
+  rows: Record<EpostSynthesisBucket, EpostSynthesisRow[]>;
+}
+
+/**
+ * Runs the full scan+classify pass across both tables. Always live — never
+ * cached, never trusts a caller-supplied row list. Used by BOTH the GET
+ * audit (read-only) and the POST remediation (which re-runs this exact same
+ * function immediately before writing, per the file-header note above).
+ */
+function scanGardssalgEpostSynthesis(expDb: Database.Database, rfbDb: Database.Database): EpostSynthesisScan {
+  const providerRows = expDb
+    .prepare(
+      `SELECT id, slug, epost, hjemmeside, content_source, field_provenance, claimed_at
+         FROM experience_providers
+        WHERE epost IS NOT NULL AND TRIM(epost) != ''`,
+    )
+    .all() as {
+    id: string;
+    slug: string | null;
+    epost: string;
+    hjemmeside: string | null;
+    content_source: string | null;
+    field_provenance: string | null;
+    claimed_at: string | null;
+  }[];
+
+  const agentRows = rfbDb
+    .prepare(
+      `SELECT id, name, contact_email, url, claimed_at
+         FROM agents
+        WHERE contact_email IS NOT NULL AND TRIM(contact_email) != ''`,
+    )
+    .all() as { id: string; name: string | null; contact_email: string; url: string | null; claimed_at: string | null }[];
+
+  const scanned = { experience_providers: providerRows.length, agents: agentRows.length };
+
+  const matched: EpostSynthesisRow[] = [];
+  for (const r of providerRows) {
+    if (!isGardssalgEpostSynthesisPatternMatch(r.epost, r.hjemmeside)) continue;
+    matched.push({
+      table: "experience_providers",
+      id: r.id,
+      label: r.slug,
+      storedEmail: r.epost,
+      domainSource: r.hjemmeside ?? "",
+      contentSource: r.content_source,
+      fieldProvenance: r.field_provenance,
+      claimedAt: r.claimed_at,
+    });
+  }
+  for (const r of agentRows) {
+    if (!isGardssalgEpostSynthesisPatternMatch(r.contact_email, r.url)) continue;
+    matched.push({
+      table: "agents",
+      id: r.id,
+      label: r.name,
+      storedEmail: r.contact_email,
+      domainSource: r.url ?? "",
+      contentSource: null,
+      fieldProvenance: null,
+      claimedAt: r.claimed_at,
+    });
+  }
+
+  const pattern_matches = {
+    experience_providers: matched.filter((r) => r.table === "experience_providers").length,
+    agents: matched.filter((r) => r.table === "agents").length,
+  };
+
+  const rows: Record<EpostSynthesisBucket, EpostSynthesisRow[]> = {
+    has_content_source_evidence: [],
+    has_provenance_evidence: [],
+    no_evidence_found: [],
+  };
+  for (const r of matched) rows[classifyGardssalgEpostSynthesisRow(r)].push(r);
+
+  return {
+    scanned,
+    pattern_matches,
+    buckets: {
+      has_content_source_evidence: rows.has_content_source_evidence.length,
+      has_provenance_evidence: rows.has_provenance_evidence.length,
+      no_evidence_found: rows.no_evidence_found.length,
+    },
+    rows,
+  };
+}
+
+function gardssalgEpostSynthesisRowForResponse(r: EpostSynthesisRow) {
+  return r.table === "experience_providers"
+    ? { table: r.table, id: r.id, slug: r.label, epost: r.storedEmail, hjemmeside: r.domainSource }
+    : { table: r.table, id: r.id, agent_id: r.id, contact_email: r.storedEmail, url: r.domainSource };
+}
+
+router.get("/admin/gardssalg-epost-synthesis-audit", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  const rfbDb = resolveGardssalgEpostSynthesisRfbDb();
+  try {
+    const scan = scanGardssalgEpostSynthesis(expDb, rfbDb);
+    const noEvidenceRows = scan.rows.no_evidence_found;
+    const truncated = noEvidenceRows.length > GARDSSALG_EPOST_SYNTHESIS_MAX_LIST;
+    res.json({
+      success: true,
+      scanned: scan.scanned,
+      pattern_matches: scan.pattern_matches,
+      buckets: scan.buckets,
+      no_evidence_rows: noEvidenceRows.slice(0, GARDSSALG_EPOST_SYNTHESIS_MAX_LIST).map(gardssalgEpostSynthesisRowForResponse),
+      ...(truncated ? { truncated: true } : {}),
+    });
+  } catch (err) {
+    console.error("[gardssalg-epost-synthesis-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/**
+ * Removes ONE experience_providers row's epost (sets NULL) — only ever
+ * called for a row the FRESH re-scan itself just classified as
+ * no_evidence_found. Re-reads + re-classifies from a fresh snapshot inside
+ * its own transaction (never trusts the scan-time snapshot for the actual
+ * write decision) and writes a field_provenance audit-trail entry (additive
+ * key, never clobbers any existing provenance) recording what was removed
+ * and why, PLUS a row in experience_provider_field_write_audit — the SAME
+ * generalized per-write changelog table POST .../providers/hjemmeside-write
+ * already uses for this table (field_name column, not reinvented here).
+ */
+function applyGardssalgEpostSynthesisProviderRemoval(
+  expDb: Database.Database,
+  providerId: string,
+): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" {
+  const tx = expDb.transaction((): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" => {
+    const fresh = expDb
+      .prepare(
+        `SELECT epost, hjemmeside, content_source, field_provenance, claimed_at
+           FROM experience_providers WHERE id = ?`,
+      )
+      .get(providerId) as
+      | { epost: string | null; hjemmeside: string | null; content_source: string | null; field_provenance: string | null; claimed_at: string | null }
+      | undefined;
+    if (!fresh) return "not_found";
+    if (fresh.claimed_at) return "skipped_claimed"; // defense-in-depth, see file-header note
+    const freshRow: EpostSynthesisRow = {
+      table: "experience_providers",
+      id: providerId,
+      label: null,
+      storedEmail: fresh.epost ?? "",
+      domainSource: fresh.hjemmeside ?? "",
+      contentSource: fresh.content_source,
+      fieldProvenance: fresh.field_provenance,
+      claimedAt: fresh.claimed_at,
+    };
+    if (!isGardssalgEpostSynthesisPatternMatch(fresh.epost, fresh.hjemmeside)) return "skipped_already_changed";
+    if (classifyGardssalgEpostSynthesisRow(freshRow) !== "no_evidence_found") return "skipped_already_changed";
+
+    const oldEpost = fresh.epost;
+    expDb.prepare(`UPDATE experience_providers SET epost = NULL, updated_at = datetime('now') WHERE id = ?`).run(providerId);
+
+    let provenance: Record<string, unknown> = {};
+    if (fresh.field_provenance) {
+      try {
+        const parsed = JSON.parse(fresh.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) provenance = parsed;
+      } catch {
+        /* malformed existing provenance — start a fresh object rather than fail the removal */
+      }
+    }
+    provenance.epost_synthesis_removal = {
+      removed_value: oldEpost,
+      reason: "post@<own-domain> pattern match with no content_source/field_provenance evidence of a real source",
+      removed_at: new Date().toISOString(),
+    };
+    expDb.prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`).run(JSON.stringify(provenance), providerId);
+
+    expDb
+      .prepare(
+        `INSERT INTO experience_provider_field_write_audit
+           (id, provider_id, field_name, old_value, new_value, batch_id, written_at)
+         VALUES (?, ?, 'epost', ?, NULL, ?, datetime('now'))`,
+      )
+      .run(crypto.randomUUID(), providerId, oldEpost, "gardssalg-epost-synthesis-remediation");
+
+    return "removed";
+  });
+  return tx();
+}
+
+/**
+ * Removes ONE agent's contact_email — same re-check-before-write discipline
+ * as applyGardssalgEpostSynthesisProviderRemoval above. `agents.contact_email`
+ * is TEXT NOT NULL (database/init.ts), so "removed" is stored as the EMPTY
+ * STRING, exactly like POST /admin/agents/contact-email-write's own "cleared"
+ * convention (admin-agents-contact-email-write.ts) — the outreach selector
+ * already treats "" and NULL as equivalent ("no contact"), so this drops the
+ * row out of outreach exactly as a NULL would have. Writes an
+ * agent_knowledge_audit row carrying the OLD value (same audit table/shape
+ * admin-agents-contact-email-write.ts and admin-contact-write-guard-retro-
+ * sweep.ts already use for agents.contact_email writes — not reinvented).
+ */
+function applyGardssalgEpostSynthesisAgentRemoval(
+  rfbDb: Database.Database,
+  agentId: string,
+): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" {
+  const tx = rfbDb.transaction((): "removed" | "skipped_claimed" | "skipped_already_changed" | "not_found" => {
+    const fresh = rfbDb
+      .prepare(`SELECT contact_email, url, claimed_at FROM agents WHERE id = ?`)
+      .get(agentId) as { contact_email: string | null; url: string | null; claimed_at: string | null } | undefined;
+    if (!fresh) return "not_found";
+    if (fresh.claimed_at) return "skipped_claimed";
+    if (!isGardssalgEpostSynthesisPatternMatch(fresh.contact_email, fresh.url)) return "skipped_already_changed";
+    // agents has no content_source/field_provenance evidence tier — the
+    // claimed_at check immediately above IS the full fresh re-classification
+    // (mirrors classifyGardssalgEpostSynthesisRow's agents branch exactly).
+
+    const oldValue = fresh.contact_email;
+    rfbDb.prepare(`UPDATE agents SET contact_email = '' WHERE id = ?`).run(agentId);
+    rfbDb
+      .prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, 'contact_email', ?, '', 'system', NULL, datetime('now'), ?)`,
+      )
+      .run(
+        crypto.randomUUID(),
+        agentId,
+        oldValue,
+        "gardssalg-epost-synthesis-remediation: removed post@<own-domain> pattern match with no evidence of a real source",
+      );
+    return "removed";
+  });
+  return tx();
+}
+
+router.post("/admin/gardssalg-epost-synthesis-remediation", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const dryRun = !apply;
+
+  const expDb = getExpDb("experiences");
+  const rfbDb = resolveGardssalgEpostSynthesisRfbDb();
+  try {
+    const scan = scanGardssalgEpostSynthesis(expDb, rfbDb);
+    const candidates = scan.rows.no_evidence_found;
+
+    if (dryRun) {
+      res.json({
+        success: true,
+        dry_run: true,
+        removed: 0,
+        would_remove: candidates.length,
+        buckets_recomputed: scan.buckets,
+        candidates: candidates.slice(0, GARDSSALG_EPOST_SYNTHESIS_MAX_LIST).map(gardssalgEpostSynthesisRowForResponse),
+        ...(candidates.length > GARDSSALG_EPOST_SYNTHESIS_MAX_LIST ? { truncated: true } : {}),
+      });
+      return;
+    }
+
+    let removed = 0;
+    const results: Array<{ table: EpostSynthesisTable; id: string; outcome: string }> = [];
+    for (const row of candidates) {
+      const outcome =
+        row.table === "experience_providers"
+          ? applyGardssalgEpostSynthesisProviderRemoval(expDb, row.id)
+          : applyGardssalgEpostSynthesisAgentRemoval(rfbDb, row.id);
+      if (outcome === "removed") removed++;
+      results.push({ table: row.table, id: row.id, outcome });
+    }
+
+    // Post-apply: recompute live so the response's bucket counts reflect
+    // reality after the writes just made, not the pre-write snapshot.
+    const after = scanGardssalgEpostSynthesis(expDb, rfbDb);
+
+    res.json({
+      success: true,
+      dry_run: false,
+      removed,
+      buckets_recomputed: after.buckets,
+      results,
+    });
+  } catch (err) {
+    console.error("[gardssalg-epost-synthesis-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/website-review-queues ───────────────────────
 //
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach
