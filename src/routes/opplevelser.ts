@@ -303,7 +303,14 @@ import {
 // CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
-import { fetchPage, discoverContentLinks, type FetchPageResult } from "../services/fetch-page";
+import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult } from "../services/fetch-page";
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+// hygiene, item 5 ("wrong_content_rate holdout") — the fail-closed LLM judge
+// + candidate sampler for POST /admin/experiences-wrong-content-rate below.
+import {
+  sampleEnrichedExperiencesForHoldout,
+  judgeExperienceContentMatch,
+} from "../services/experience-content-judge";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
@@ -9621,6 +9628,117 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
     res.json({ success: true, count: providers.length, providers });
   } catch (err) {
     console.error("[opplevelser] admin/providers/by-hjemmeside failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-wrong-content-rate ─────────────
+//
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+// hygiene, item 5 ("wrong_content_rate holdout"), slice claimed
+// 2026-08-07T05:56Z. Makes charters/experiences-enrichment.yaml's
+// `wrong_content_rate` guardrail (status: not_computable_yet since 06-17)
+// actually computable: samples enriched `experiences` rows, re-fetches each
+// row's own `evidence_url` (the live source page it was enriched from), and
+// asks an LLM judge whether the stored description/category/price plausibly
+// matches that source.
+//
+// READ-ONLY — this route makes ZERO writes to `experiences` or
+// `experience_providers`. It is a measurement holdout, not an auto-fix (see
+// the dev-request's own Non-goals: "No auto-fix of mismatched rows").
+//
+// Body: { sample_size?: number } — default WCR_DEFAULT_SAMPLE_SIZE (30),
+// hard-capped at WCR_MAX_SAMPLE_SIZE (100) regardless of what is requested
+// (cost control: each sampled row costs one fetchPage() call plus one LLM
+// judge call).
+//
+// Per-row outcome:
+//   - fetchPage(evidence_url) fails (any FetchFailureReason) → `unresolved`.
+//   - fetchPage succeeds but judgeExperienceContentMatch() itself fails
+//     (missing key / network / non-200 / unparseable JSON / ambiguous
+//     verdict — `{ ok: false }`) → `unresolved`.
+//   - judge renders a genuine verdict → MATCH increments `matched`,
+//     MISMATCH increments `mismatched`.
+// A row NEVER lands in `matched` just because it couldn't be checked — the
+// fleet's fail-closed convention, applied here to keep the RATE honest
+// rather than to reject a write (there is no write here to reject).
+//
+// wrong_content_rate = mismatched / (matched + mismatched). `unresolved`
+// rows are excluded from that denominator entirely (they carry no signal
+// either way). When the denominator is 0 (every sampled row was unresolved,
+// or the sample itself was empty), wrong_content_rate is `null` — never `0`
+// (which would falsely claim a perfect measured score) and never a crash
+// (a bare NaN would serialize to `null` over JSON anyway via JSON.stringify,
+// but that's accidental — this is explicit).
+const WCR_DEFAULT_SAMPLE_SIZE = 30;
+const WCR_MAX_SAMPLE_SIZE = 100;
+const WCR_THRESHOLD = 0.02;
+
+router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { sample_size?: unknown };
+
+  let requestedSampleSize =
+    typeof body.sample_size === "number" && Number.isFinite(body.sample_size)
+      ? Math.floor(body.sample_size)
+      : WCR_DEFAULT_SAMPLE_SIZE;
+  if (requestedSampleSize <= 0) requestedSampleSize = WCR_DEFAULT_SAMPLE_SIZE;
+  const sampleSize = Math.min(WCR_MAX_SAMPLE_SIZE, requestedSampleSize);
+
+  try {
+    const expDb = getExpDb("experiences");
+    const rows = sampleEnrichedExperiencesForHoldout(expDb, sampleSize);
+
+    let matched = 0;
+    let mismatched = 0;
+    let unresolved = 0;
+    const results: Array<{ experience_id: string; verdict: "MATCH" | "MISMATCH" | "unresolved"; reasoning: string }> = [];
+
+    for (const row of rows) {
+      const fetchResult = await fetchPage(row.evidence_url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+      if (!fetchResult.ok) {
+        unresolved++;
+        results.push({
+          experience_id: row.id,
+          verdict: "unresolved",
+          reasoning: `henting av evidence_url feilet: ${fetchResult.reason} (${fetchResult.detail})`,
+        });
+        continue;
+      }
+
+      const pageText = visibleTextOf(fetchResult.html);
+      const judged = await judgeExperienceContentMatch(row, pageText);
+      if (!judged.ok) {
+        unresolved++;
+        results.push({ experience_id: row.id, verdict: "unresolved", reasoning: judged.reasoning });
+        continue;
+      }
+
+      if (judged.verdict === "MATCH") matched++;
+      else mismatched++;
+      results.push({ experience_id: row.id, verdict: judged.verdict, reasoning: judged.reasoning });
+    }
+
+    const denominator = matched + mismatched;
+    const wrongContentRate = denominator > 0 ? mismatched / denominator : null;
+    // No resolvable data → nothing observed over threshold. This is a
+    // deliberate default (not asserted elsewhere by the spec), documented
+    // here rather than silently chosen: an empty/all-unresolved sample
+    // carries no evidence of a problem, so it is not reported as breaching.
+    const status: "under_threshold" | "over_threshold" =
+      wrongContentRate !== null && wrongContentRate > WCR_THRESHOLD ? "over_threshold" : "under_threshold";
+
+    res.json({
+      sample_size: rows.length,
+      matched,
+      mismatched,
+      unresolved,
+      wrong_content_rate: wrongContentRate,
+      threshold: WCR_THRESHOLD,
+      status,
+      results,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-wrong-content-rate failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
