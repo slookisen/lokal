@@ -14,8 +14,7 @@
 // The claim link is sent ONLY to an email address that provably belongs to
 // the organisation:
 //   (a) the Brreg-registered contact email for that org_nr, or
-//   (b) an address on the producer's already ownership-verified website
-//       domain (post@<verified-domain>), or
+//   (b) RETIRED 2026-08-06 — see "─── (b) RETIRED" section immediately below.
 //   (c) the provider's OWN stored `epost`, when independently backed by
 //       provenance — see "stored_epost_verified" below (dev-request
 //       2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 1 only).
@@ -35,19 +34,66 @@
 // as a claim target. deriveOrgLinkedEmail() below still has a (currently
 // always-empty) slot for a real Brreg contact email, so this dormant path
 // activates for free the day a Brreg (or Frivillighetsregisteret/other
-// authoritative) contact-email source is ever wired in — but until then,
-// every real claim in this codebase resolves via path (b).
+// authoritative) contact-email source is ever wired in — until then, every
+// real claim in this codebase resolves via path (c), the only tier a
+// provider without a live Brreg contact-email feed can ever qualify through.
 //
-// Path (b) — "ownership-verified website domain" — also needed a concrete
-// definition, since experience_providers.hjemmeside is populated from several
-// sources of VERY different trust levels (rfb-seed copy, raw homepage-crawl
-// guesses, admin-approved evidence-checked discovery, Daniel's own manual
-// entry). Treating a bare, unvetted hjemmeside value as "ownership-verified"
-// would repeat the exact "wrong producer's info on a page" harm Daniel has
-// already forbidden elsewhere in this codebase (see gardssalg-rfb-enrich.ts's
-// GENERIC_DOMAINS collision-safety discussion). So "ownership-verified" here
-// means the domain reached experience_providers.hjemmeside via a path that
-// was ALREADY evidence-checked + human-approved:
+// ─── (b) RETIRED 2026-08-06 — "never guess an email address" (Daniel, live
+// policy decision; dev-request 2026-08-06-aldri-gjett-epostadresse) ─────────
+// Tier (b) used to mint `post@<verified-domain>` — a WELL-KNOWN-CONVENTION
+// GUESS, never an address anyone actually published or that this codebase
+// ever fetched/read. Daniel's own words, verbatim from the raw quote in the
+// dev-request: "Men jeg ønsker ikke at vi noen gang skal tippe eller gjette
+// på en e-postadresse. [...] Vi kan søke og lete etter e-post adresse men
+// skal aldri gjette på den, da er det bedre at vi ikke har e-postadresse i
+// det hele tatt" — i.e. EMPTY IS BETTER THAN GUESSED. Measured live on
+// 2026-08-06 across all 10 claim-qualified producers of that day: only 1 of
+// 10 actually publishes `post@` on the domain this tier derived it from — 5
+// publish a DIFFERENT address on the same domain, 3 publish on a different
+// domain entirely, 1 has none. So the tier was wrong ~90% of the time, and a
+// wrong guess here doesn't just mis-display data — it hands a real
+// account-claim magic link to a stranger's mailbox (account takeover), which
+// is exactly the harm Daniel banned. The block that constructed
+// `post@${domain}` (guarded by isHjemmesideOwnershipVerified() +
+// isClaimableDomain()) has been DELETED from deriveOrgLinkedEmailCandidates()
+// below — not gated, not narrowed, removed outright, per Daniel's explicit
+// instruction ("Fjern alle e-poster som vi har tippet på og laget selv").
+// No code path anywhere in this repo may construct an email address from a
+// domain, full stop; a test in gardssalg-claim.test.ts exists specifically to
+// fail if this tier — or anything shaped like it — is ever reintroduced.
+//
+// What is intentionally KEPT despite the retirement, and why:
+//   - `"verified_domain_address"` stays a valid member of the
+//     OrgLinkedEmailResult/OrgLinkedEmailCandidate TypeScript unions below,
+//     and a valid HISTORICAL value on old gardssalg_claims.email_source rows
+//     issued before 2026-08-06 — those rows are a factual record of what was
+//     sent, not something to rewrite. No NEW row can ever get this value from
+//     here on; deriveOrgLinkedEmailCandidates() simply never produces it.
+//   - isHjemmesideOwnershipVerified() (below) and isClaimableDomain() /
+//     GENERIC_DOMAINS (gardssalg-rfb-enrich.ts) are NOT deleted, even though
+//     nothing in this file calls them anymore after this retirement. Per
+//     Daniel's own follow-up guidance ("Bruk epostadressene som du finner
+//     under 'kontakt oss' eller 'om oss' [...] Dersom du finner epost med
+//     samme domene er dette sikrest [...]"), a FUTURE found-address tier
+//     (dev-request 2026-08-06-aldri-gjett-epostadresse, AC2-5 — a harvest of
+//     contact-page addresses with cross-domain ambiguity resolution,
+//     deliberately NOT built in this slice) will very plausibly want exactly
+//     these two primitives: "is this hjemmeside domain the one we've actually
+//     verified belongs to this producer" (to rank a found same-domain address
+//     as the safest match, AC2 priority 1) and "is this domain a shared/
+//     generic host" — but INVERTED (AC8): GENERIC_DOMAINS must keep blocking
+//     a *derived* address forever (there is no live derivation left to
+//     protect, but the primitive stays available), while a *found* free-mail
+//     address (gmail/hotmail/outlook) on a producer's own contact page is
+//     explicitly ALLOWED by Daniel, unlike a derived one. Deleting these
+//     functions now would just mean reinventing them, less carefully, in that
+//     future slice.
+//
+// Path (b)'s old "ownership-verified website domain" definition is preserved
+// below purely as documentation for isHjemmesideOwnershipVerified()'s
+// still-exported meaning (and for reading historical verified_domain_address
+// rows) — it is not, as of this retirement, part of any live claim-
+// eligibility decision in this file:
 //   - content_source = 'manual' (Daniel personally entered/verified the row,
 //     including its hjemmeside), OR
 //   - field_provenance.hjemmeside.source_url is set — stamped ONLY by
@@ -61,16 +107,15 @@
 //     queue entry itself is cleared on approval, so it's durably queryable
 //     here.
 // A raw/unvetted hjemmeside (content_source NULL/'provider_site', no
-// field_provenance.hjemmeside) is NOT treated as verified — those providers
-// fall to the manual-fallback path, same as a provider with no domain at all.
+// field_provenance.hjemmeside) was never treated as verified either.
 //
-// Additional integrity gate (not literally required by the two bullets
-// above, but a deliberate, documented judgment call): EVERY claim path also
-// requires brreg_verified = 1 (a confident, active Brreg match) as a
-// baseline. "Provably belongs to the organisation" presupposes the
-// organisation itself is confirmed real and active — a provider that isn't
-// even Brreg-verified has no confirmed legal-entity identity to claim
-// against, regardless of which email path would otherwise apply.
+// Additional integrity gate (not literally required by anything above, but a
+// deliberate, documented judgment call): EVERY claim path also requires
+// brreg_verified = 1 (a confident, active Brreg match) as a baseline.
+// "Provably belongs to the organisation" presupposes the organisation itself
+// is confirmed real and active — a provider that isn't even Brreg-verified
+// has no confirmed legal-entity identity to claim against, regardless of
+// which email path would otherwise apply.
 //
 // ─── (c) stored_epost_verified — dev-request 2026-07-30-opplevagent-claim-
 // epost-og-perfelt-laas, item 1 ONLY (items 2-4 of that request — admin
@@ -135,10 +180,14 @@
 //     need a new write/approval endpoint, which is explicitly out of scope
 //     for this slice.
 //
-// Ordering: stored_epost_verified is checked LAST, after (a) brreg_contact
-// and (b) verified_domain_address, and only ever applies when neither of
-// those already qualifies — a lower-provenance tier must never override a
-// stronger one that would also match.
+// Ordering: stored_epost_verified is checked LAST, after (a) brreg_contact —
+// (b) verified_domain_address is retired (see above) and no longer part of
+// the ordering — and only ever applies when (a) doesn't already qualify — a
+// lower-provenance tier must never override a stronger one that would also
+// match. SLICE 2 (2026-08-07) inserts three more tiers BETWEEN (a) and (c) —
+// found_same_domain, found_contact_page, found_site_other, in that order —
+// see "─── Found-address harvest tiers" below for what they are and why they
+// rank where they do.
 //
 // deriveOrgLinkedEmail() stays a PURE function (see its own doc comment) —
 // the (b-epost) DB lookup is therefore NOT done inside it. The caller
@@ -146,13 +195,134 @@
 // wasEpostDeliveredOutreachNoBounce() itself and passes the boolean result
 // in via `opts.epostOutreachDeliveredNoBounce`, mirroring exactly how
 // brregContactEmail is already an explicit passed-in parameter above.
+//
+// ─── Found-address harvest tiers (found_same_domain / found_contact_page /
+// found_site_other) — dev-request 2026-08-06-aldri-gjett-epostadresse,
+// SLICE 2 (2026-08-07) ─────────────────────────────────────────────────────
+// Slice 1 (2026-08-06, see "(b) RETIRED" above) deleted post@<domain>
+// guessing outright and left NO replacement — a provider with a verified
+// hjemmeside but no qualifying brreg_contact/stored_epost_verified fell
+// straight to the manual fallback even when a real, published address sat
+// right there on their own homepage. This slice is that replacement: it
+// FETCHES the provider's own verified hjemmeside and its real (link-
+// discovered, never guessed) same-host sub-pages, and offers whatever email
+// addresses were ACTUALLY PRESENT in the HTML — never a constructed one.
+// AC2's required priority order (Daniel, dev-request AC2, verbatim): "(1) an
+// address on the same domain as the verified website, (2) an address found
+// on a 'kontakt oss'/'om oss' page, (3) any other address found on the
+// website. Free-mail domains (gmail, hotmail, outlook, …) are ALLOWED at all
+// three priority levels."
+//
+// Precondition (AC3's "ownership unclear -> manual fallback, never a guess
+// about whose address it is", applied to the SOURCE page this time rather
+// than the email): harvesting is attempted ONLY when
+// isHjemmesideOwnershipVerified(provider) is true. Reusing that exact gate
+// (rather than a new one) is deliberate — harvesting from an unverified/
+// unowned hjemmeside would repeat precisely the "wrong producer's info" harm
+// this whole module exists to prevent, just laundered through "but we found
+// it on A website" instead of "but we guessed it from A domain". An
+// unverified hjemmeside gets ZERO fetch attempts, not a fetch-then-discard —
+// no reason to make an outbound request (and burn a fetch budget /
+// potentially probe a URL nobody has vetted) for a result this function
+// would refuse to use anyway.
+//
+// Accept/reject gate (AC3 for the found address itself, AC8 for which list
+// governs it): isAcceptableHomepageEmail(email, hjemmeside) — imported
+// UNCHANGED from cross-source-validator.ts — decides accept/reject. It
+// accepts iff the email's registrable domain equals the (post-redirect) site's
+// own registrable domain, OR the email's domain is in that file's
+// FREE_MAIL_DOMAINS list; it always rejects a known directory/aggregator
+// host. This harvest path deliberately does NOT call isClaimableDomain() /
+// GENERIC_DOMAINS anywhere — GENERIC_DOMAINS's job (per its own doc comment
+// above) is blocking a *derived* address, which has no bearing on a *found*
+// one; conflating the two would re-reject exactly the gmail.com/hotmail.com/
+// outlook.com found-on-the-producer's-own-contact-page addresses AC2
+// explicitly says must be ALLOWED (GENERIC_DOMAINS lists those same three
+// hosts, for the opposite reason). A rejected email is dropped OUTRIGHT —
+// never becomes a candidate — so a producer whose only found address fails
+// this gate falls straight through to the module's existing "zero
+// candidates -> manual fallback" behavior, unchanged.
+//
+// Tier assignment (AC2, mutually exclusive per email — the FIRST rule that
+// matches wins, checked in this order): (1) found_same_domain — the email's
+// registrable domain equals the verified hjemmeside's own registrable domain
+// (post-redirect host, matching how buildPageEvidence/hcrFetchHomepageContent
+// already treat "final url after redirects" as the real one) — checked
+// BEFORE the page-origin check below, so a same-domain address found ON the
+// contact page still ranks as found_same_domain, never demoted; (2)
+// found_contact_page — the email was found on a page whose OWN discovered
+// URL path matches CONTACT_ABOUT_PATH_FRAGMENTS below; (3) found_site_other —
+// everything else that survived the accept gate (the home page itself, or
+// any other discovered sub-page). At most ONE candidate per tier is
+// produced — the FIRST accepted email encountered in fetch/scan order (home
+// page before sub-pages, sub-pages in discoverContentLinks' own deterministic
+// score-then-alphabetical order) — so the choice is deterministic and
+// reproducible (AC4), not "whichever the Set iterated last".
+//
+// CONTACT_ABOUT_PATH_FRAGMENTS: a short, case-insensitive URL-PATH substring
+// list, checked against the discovered link's own URL (not the page's HTML
+// content). Checked the codebase first for an existing list to reuse rather
+// than hand-rolling a third copy: admin-knowledge.ts's HCR_CONTENT_PATHS
+// (["/om-oss", "/about", "/produkter"]) is a FALLBACK GUESS-PATH list (used
+// only when link discovery finds nothing), not a classifier, and doesn't even
+// include "kontakt" — not reusable as-is. fetch-page.ts's discoverContentLinks
+// has an internal, unexported PATTERNS regex (kontakt|contact,
+// om-?oss|om-?garden|om-?gården|about|historie, produkt|...) used to SCORE
+// links for crawl-priority, not to classify an already-discovered link after
+// the fact, and isn't exported. Rather than exporting and repurposing an
+// internal scoring table for an unrelated classification decision, this is a
+// small, deliberately narrow list of its own — the same core Norwegian +
+// English fragments minus "historie" (a weaker, purely-about-us signal AC2's
+// own wording doesn't ask for) and minus the produkt/vare/butikk group
+// (AC2's tier 3 "any other" already covers those without needing to name
+// them).
+//
+// Merging into the candidate list (deriveOrgLinkedEmailCandidatesWithHarvest
+// below): the three found-tiers are inserted BETWEEN (a) brreg_contact and
+// (c) stored_epost_verified — i.e. they rank ABOVE stored_epost_verified.
+// Judgment call, written down per this file's own documentation convention:
+// stored_epost_verified's provenance is either a one-time manual entry (which
+// can go stale the moment the producer's real inbox changes, with nothing
+// re-checking it — see isHjemmesideOwnershipVerified's own KNOWN GAP note
+// above for the analogous staleness risk on the 'manual' flag) or an
+// inference from a past delivered outreach send (proves the address existed
+// and accepted mail AT SEND TIME, not that it's still the producer's
+// preferred contact today). A found_same_domain/found_contact_page address,
+// by contrast, is evidence pulled from the SAME live fetch this exact claim
+// flow just performed — as fresh as evidence gets in this codebase. Ranking
+// fresher, live-confirmed evidence above older provenance-backed-but-possibly-
+// stale evidence is the same "don't let a weaker signal override a stronger
+// one" principle the pre-existing ordering comment above already states, just
+// applied with "freshness" as part of what makes a tier stronger. This is a
+// judgment call, not a re-derivation of anything Daniel stated explicitly for
+// THIS specific sub-ordering — flagged as such for the reviewer.
+//
+// NOT LIVE-WIRED in this slice — a deliberate scope boundary, not an
+// oversight (see deriveOrgLinkedEmailCandidatesWithHarvest()'s own doc
+// comment below for the three concrete reasons: (1) it would require
+// converting issueClaimMagicLink from sync to async, cascading into ~20
+// existing synchronous call sites across three test files; (2) the public
+// GET claim-entry route's HTTP-level test harness (routes/gardssalg-
+// claim.test.ts) has no fetch-injection seam today, so wiring a live fetch
+// into that route would make its test suite perform real outbound network
+// calls against nonexistent test-fixture domains; (3) the claim entry page is
+// UNAUTHENTICATED — fetching a producer's hjemmeside on every page view with
+// no caching/rate-limiting is a real design question (cache TTL? move to the
+// existing periodic gårdssalg enrichment sweep instead of on-request?) that
+// deserves its own decision, not one implied by this slice. This exact
+// "built, tested, and correct, but not yet reachable from a live route"
+// pattern already exists in this file for tier (a) brreg_contact (see the
+// module doc's very first section) — this is the same shape, not a new one.
 
 import crypto from "crypto";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
 import { getDb as getRfbDb } from "../database/init";
-import { normalizeDomain, normalizeEmail } from "./blocklist-service";
+import { normalizeEmail } from "./blocklist-service";
 import { GENERIC_DOMAINS } from "./gardssalg-rfb-enrich";
+import { fetchPage, discoverContentLinks } from "./fetch-page";
+import { extractEmails } from "./search-enrich";
+import { isAcceptableHomepageEmail, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
 
 const VERTICAL = "experiences";
 
@@ -207,6 +377,11 @@ export function getClaimProviderBySlug(slug: string): ClaimProviderRow | null {
 }
 
 // ── Ownership-verified-domain check (see module doc above) ───────────────
+// NOT CALLED from any live code path in this file since the 2026-08-06
+// retirement of tier (b) — see the module doc's "RETIRED" section for why
+// this function is nonetheless kept, exported, and documented rather than
+// deleted (historical-row context + plausible reuse by a future found-
+// address tier).
 // KNOWN GAP (security review, 2026-07-24, non-blocking): content_source ===
 // 'manual' is treated here as a PERMANENT "hjemmeside forever verified" flag.
 // But PATCH /admin/providers/:id/hjemmeside (src/routes/opplevelser.ts,
@@ -239,24 +414,28 @@ export function isHjemmesideOwnershipVerified(row: Pick<ClaimProviderRow, "conte
   }
 }
 
-// ── Generic/shared-domain check for claim-email minting ──────────────────
+// ── Generic/shared-domain check ───────────────────────────────────────────
+// NOT CALLED from any live code path in this file (or anywhere else in this
+// repo) since the 2026-08-06 retirement of tier (b) — there is no longer a
+// domain-derivation mint for this to guard. Kept, exported, and documented
+// per the module doc's "RETIRED" section: Daniel's own guidance for the
+// future found-address tier explicitly wants this SAME generic-domain list,
+// just inverted (block a *derived* address forever; allow a *found* free-
+// mail address like gmail/hotmail when it's actually published on the
+// producer's own site) — see dev-request 2026-08-06-aldri-gjett-epostadresse,
+// AC8. The logic below predates the retirement and is left exactly as it was
+// validated then (security review, 2026-07-24, fix-up iteration 2):
 // STRICTER than gardssalg-rfb-enrich.ts's isMatchableDomain(), which is
 // exact-Set-membership only. That's appropriate for its own use (a source
 // with a colliding/generic domain just falls out of the enrichment index,
 // with a separate collision-safety net besides — see that file's doc), but
-// NOT strict enough for a one-shot, high-trust claim-email mint: exact-match
+// NOT strict enough for a one-shot, high-trust email decision: exact-match
 // alone lets "mail.gmail.com" or "sub.facebook.com" (a subdomain of a listed
 // generic host) or "gmail.com." (a trailing-FQDN-dot-padded generic host,
-// which normalizeDomain does not strip) sail through as "not generic" and
-// mint post@<that-domain> — handing a claim link to a shared/social mailbox,
-// not the org (security review finding, 2026-07-24, fix-up iteration 2).
+// which normalizeDomain does not strip) sail through as "not generic".
 // Reads the SAME GENERIC_DOMAINS list (exported from gardssalg-rfb-enrich.ts)
 // rather than hand-maintaining a second copy; only the matching rule here is
 // stricter (suffix-aware + trailing-dot-safe), not the underlying data.
-// Exported (not merely module-local) so POST /admin/gardssalg/test-provider's
-// `claimable` flag can pre-validate its ?hjemmeside against the SAME rule the
-// mint below applies, instead of hand-copying it — the second-copy hazard this
-// file's own doc warns about, one layer up.
 export function isClaimableDomain(domain: string): boolean {
   if (!domain) return false;
   const d = domain.replace(/\.+$/, ""); // strip trailing FQDN dot(s), e.g. "gmail.com." -> "gmail.com"
@@ -267,13 +446,36 @@ export function isClaimableDomain(domain: string): boolean {
   return true;
 }
 
+// "found_same_domain" | "found_contact_page" | "found_site_other" — the three
+// SLICE 2 (dev-request 2026-08-06-aldri-gjett-epostadresse, AC2) tiers, added
+// 2026-08-07. See "─── Found-address harvest tiers" below for the full
+// rationale, and deriveOrgLinkedEmailCandidatesWithHarvest() for the ONLY
+// function that can ever produce one of these three values — the pure
+// deriveOrgLinkedEmailCandidates() below never does (it stays IO-free, and
+// harvesting is inherently IO).
 export type OrgLinkedEmailResult =
-  | { eligible: true; email: string; source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified" }
+  | {
+      eligible: true;
+      email: string;
+      source:
+        | "brreg_contact"
+        | "verified_domain_address"
+        | "stored_epost_verified"
+        | "found_same_domain"
+        | "found_contact_page"
+        | "found_site_other";
+    }
   | { eligible: false; reason: "not_brreg_verified" | "no_org_linked_email" };
 
 export type OrgLinkedEmailCandidate = {
   email: string;
-  source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified";
+  source:
+    | "brreg_contact"
+    | "verified_domain_address"
+    | "stored_epost_verified"
+    | "found_same_domain"
+    | "found_contact_page"
+    | "found_site_other";
 };
 
 // Minimal shape check for a stored `epost` candidate — good enough to catch
@@ -342,7 +544,9 @@ export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefin
  * Derive the ONE email address a claim magic-link may be sent to, or
  * "not eligible" (-> manual fallback, never self-service). Pure function —
  * no DB/IO — so the decision logic is fully unit-testable without a fixture
- * database. See module doc for the full rationale of all three branches.
+ * database. See module doc for the full rationale of both live branches
+ * ((a) brreg_contact, (c) stored_epost_verified) and of (b)'s 2026-08-06
+ * retirement.
  *
  * brregContactEmail is an explicit, separate parameter (not read off the
  * provider row) because no such column/source exists yet anywhere in this
@@ -359,19 +563,18 @@ export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefin
  * object without it keep compiling unchanged — omitted is treated as null.
  */
 /**
- * Same three tiers deriveOrgLinkedEmail() has always checked — (a) Brreg
- * contact, (b) post@<verified-domain>, (c) provenance-backed stored epost —
- * but returns EVERY tier that qualifies instead of stopping at the first.
- * dev-request 2026-08-06-claim-produsent-velger-mottakeradresse: lets a
- * producer with more than one qualified address choose which one the magic
- * link goes to, rather than the fleet silently picking (b) over (c) even
- * when (b) is an unproven address-convention guess and (c) has real
- * delivery evidence. Introduces NO new qualification path — a candidate
- * appears here iff it would already have been eligible under the single-
- * result function below. Order is stable (a, b, c) but is NOT a ranking
- * once there is more than one candidate — see deriveOrgLinkedEmail(), which
- * still takes the first as its single answer for every existing caller.
- * Same purity contract: no DB/IO.
+ * The tiers deriveOrgLinkedEmail() checks — (a) Brreg contact, (c)
+ * provenance-backed stored epost; (b) post@<verified-domain> RETIRED
+ * 2026-08-06, see module doc — but returns EVERY tier that qualifies instead
+ * of stopping at the first. dev-request 2026-08-06-claim-produsent-velger-
+ * mottakeradresse: lets a producer with more than one qualified address
+ * choose which one the magic link goes to, rather than the fleet silently
+ * picking one tier over another. Introduces NO new qualification path — a
+ * candidate appears here iff it would already have been eligible under the
+ * single-result function below. Order is stable (a, then c) but is NOT a
+ * ranking once there is more than one candidate — see deriveOrgLinkedEmail(),
+ * which still takes the first as its single answer for every existing
+ * caller. Same purity contract: no DB/IO.
  */
 export function deriveOrgLinkedEmailCandidates(
   provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
@@ -391,30 +594,15 @@ export function deriveOrgLinkedEmailCandidates(
     candidates.push({ email: contact, source: "brreg_contact" });
   }
 
-  // (b) post@<ownership-verified-domain>. Deliberately NOT the (possibly
-  // scraped/unverified) experience_providers.epost — the domain itself is
-  // the thing we've verified, so the well-known "post@" convention address
-  // on it is the only address we can send to without trusting scraped data.
-  //
-  // isClaimableDomain() (above, this file) is ALSO required here, not just
-  // brreg-verification + provenance: "verified" only means the domain
-  // reached hjemmeside via a vetted path (manual entry or admin-approved
-  // evidence) — it says nothing about whether the domain is a shared/generic
-  // one (a Facebook page, a bare wixsite.com/gmail.com address — or a
-  // subdomain / trailing-dot variant of one — etc.) that isn't actually a
-  // unique identity for THIS organisation. Daniel can enter (or approve) a
-  // Facebook URL as a producer's "hjemmeside" when they have no real site;
-  // deriving post@facebook.com (or post@mail.gmail.com, post@gmail.com.,
-  // etc.) from that would hand a claim link to a shared/social mailbox, not
-  // the org — the exact "wrong producer's info on a page" harm this module
-  // exists to prevent. Falls through (no candidate added) exactly like an
-  // unvetted domain.
-  if (isHjemmesideOwnershipVerified(provider)) {
-    const domain = normalizeDomain(provider.hjemmeside);
-    if (isClaimableDomain(domain)) {
-      candidates.push({ email: `post@${domain}`, source: "verified_domain_address" });
-    }
-  }
+  // (b) RETIRED 2026-08-06 (dev-request 2026-08-06-aldri-gjett-epostadresse)
+  // — used to mint post@<ownership-verified-domain> here. DELETED, not
+  // gated/narrowed: Daniel's explicit instruction was to never construct an
+  // email address from a domain, ever, anywhere in this codebase. See the
+  // module doc's "RETIRED" section for the full rationale (measured ~90%
+  // wrong-address rate, account-takeover risk, Daniel's own "empty is better
+  // than guessed" quote) and for why isHjemmesideOwnershipVerified() /
+  // isClaimableDomain() are nonetheless still exported above, unused by this
+  // function, for a plausible future found-address tier to reuse.
 
   // (c) stored_epost_verified — the provider's OWN `epost`, but ONLY when
   // backed by real provenance (see module doc's "stored_epost_verified"
@@ -522,6 +710,178 @@ export function deriveOrgLinkedEmailCandidatesWithOutreachLookup(
   return deriveOrgLinkedEmailCandidates(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
 }
 
+// ─── Found-address harvest (SLICE 2) ─────────────────────────────────────
+// See the module doc's "Found-address harvest tiers" section above for the
+// full rationale. Everything below is IO (fetch), so none of it is called
+// from the pure deriveOrgLinkedEmailCandidates() — only from the async
+// deriveOrgLinkedEmailCandidatesWithHarvest() wrapper further down.
+
+// Same UA convention this vertical's other crawler already uses (opplevelser
+// .ts's CR_UA) — this file is opplevagent/gårdssalg-scoped, not RFB-scoped,
+// so it deliberately does NOT reuse search-enrich.ts's UA (RFB's), even
+// though that constant has the more common name in this codebase.
+const HARVEST_UA = "Lokal-Experiences-Scraper/1.0 (+https://opplevagent.no)";
+// Matches search-enrich.ts's FETCH_TIMEOUT_MS convention for this class of
+// crawl (home page + a few discovered sub-pages, not the longer single-page
+// budget fetch-page.ts's own DEFAULT_FETCH_TIMEOUT_MS gives a lone fetch).
+const HARVEST_FETCH_TIMEOUT_MS = 8_000;
+// Matches discoverContentLinks' own default `max` and buildPageEvidence's
+// existing sub-page crawl budget (home page + up to 3 discovered links).
+const HARVEST_MAX_SUBPAGES = 3;
+
+// See module doc for why this list exists and what it deliberately excludes.
+const CONTACT_ABOUT_PATH_FRAGMENTS: readonly string[] = ["kontakt", "contact", "om-oss", "om-garden", "om-gården", "about"];
+
+function isContactOrAboutPageUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  return CONTACT_ABOUT_PATH_FRAGMENTS.some((fragment) => lower.includes(fragment));
+}
+
+type HarvestTierSource = "found_same_domain" | "found_contact_page" | "found_site_other";
+
+interface HarvestedEmailHit {
+  email: string;
+  tier: HarvestTierSource;
+}
+
+/**
+ * Fetch `hjemmeside` + its real discovered same-host sub-pages (never a
+ * guessed path — see discoverContentLinks), and return every email that
+ * ACTUALLY APPEARED in the fetched HTML and passed isAcceptableHomepageEmail,
+ * tagged with its AC2 priority tier. Never throws — a fetch failure (site
+ * down, timeout, SSRF-blocked, …) simply yields zero hits, same as "this
+ * producer has no found address today", not an error.
+ *
+ * NOT exported — only reachable via deriveOrgLinkedEmailCandidatesWithHarvest
+ * below, which applies the isHjemmesideOwnershipVerified() precondition
+ * first. This function itself does not re-check that precondition — it
+ * trusts its caller, exactly like wasEpostDeliveredOutreachNoBounce() trusts
+ * its callers to have already decided the DB lookup is worth doing.
+ */
+async function harvestFoundOrgEmails(hjemmeside: string, fetchImpl?: typeof fetch): Promise<HarvestedEmailHit[]> {
+  const primary = await fetchPage(hjemmeside, { userAgent: HARVEST_UA, timeoutMs: HARVEST_FETCH_TIMEOUT_MS, fetchImpl });
+  if (!primary.ok) return [];
+
+  // Post-redirect host is the real one — same reasoning buildPageEvidence /
+  // hcrFetchHomepageContent already document: an apex->www or renamed-domain
+  // redirect must not make every found address look cross-domain.
+  const siteBase = primary.finalUrl || hjemmeside;
+  const siteHost = hostFromUrlLike(siteBase);
+  const siteRoot = siteHost ? registrableDomain(siteHost) : null;
+
+  type HarvestPage = { html: string; isContactAbout: boolean };
+  const pages: HarvestPage[] = [{ html: primary.html, isContactAbout: false }];
+
+  try {
+    const base = new URL(siteBase);
+    const discovered = discoverContentLinks(primary.html, base.toString(), HARVEST_MAX_SUBPAGES);
+    for (const link of discovered) {
+      const sub = await fetchPage(link, { userAgent: HARVEST_UA, timeoutMs: HARVEST_FETCH_TIMEOUT_MS, fetchImpl });
+      if (sub.ok) pages.push({ html: sub.html, isContactAbout: isContactOrAboutPageUrl(link) });
+    }
+  } catch {
+    /* malformed base URL — the primary page's own emails still stand */
+  }
+
+  const seenEmails = new Set<string>();
+  const hits: HarvestedEmailHit[] = [];
+  for (const page of pages) {
+    for (const email of extractEmails(page.html)) {
+      if (seenEmails.has(email)) continue; // first occurrence wins — deterministic (AC4)
+
+      // AC3/AC8: isAcceptableHomepageEmail ALONE decides accept/reject here —
+      // never isClaimableDomain/GENERIC_DOMAINS (see module doc). A reject is
+      // dropped outright, never becomes a hit/candidate.
+      if (!isAcceptableHomepageEmail(email, siteBase)) continue;
+      seenEmails.add(email);
+
+      const emailHost = hostFromUrlLike(email.split("@").pop() || "");
+      const emailRoot = emailHost ? registrableDomain(emailHost) : null;
+      const tier: HarvestTierSource =
+        siteRoot && emailRoot === siteRoot
+          ? "found_same_domain"
+          : page.isContactAbout
+            ? "found_contact_page"
+            : "found_site_other";
+      hits.push({ email, tier });
+    }
+  }
+  return hits;
+}
+
+/** At most one candidate per AC2 tier — the first hit for each, in AC2's
+ * priority order. See module doc's "Tier assignment" paragraph. */
+function pickHarvestCandidatesByTier(hits: HarvestedEmailHit[]): OrgLinkedEmailCandidate[] {
+  const tierOrder: HarvestTierSource[] = ["found_same_domain", "found_contact_page", "found_site_other"];
+  const out: OrgLinkedEmailCandidate[] = [];
+  for (const tier of tierOrder) {
+    const hit = hits.find((h) => h.tier === tier);
+    if (hit) out.push({ email: hit.email, source: tier });
+  }
+  return out;
+}
+
+/**
+ * Candidates form of deriveOrgLinkedEmailCandidatesWithOutreachLookup() that
+ * ALSO harvests found addresses from the provider's own verified hjemmeside
+ * (dev-request 2026-08-06-aldri-gjett-epostadresse, SLICE 2 — AC2/AC3/AC4/
+ * AC8). See the module doc's "Found-address harvest tiers" section for the
+ * full priority/merge/ordering rationale.
+ *
+ * Harvesting is attempted ONLY when the provider is Brreg-verified, HAS a
+ * hjemmeside, AND isHjemmesideOwnershipVerified(provider) is true — no fetch
+ * at all otherwise (see module doc for why this is "no attempt", not
+ * "attempt then discard").
+ *
+ * `opts.fetchImpl` is the SAME "injected for tests, defaults to global
+ * fetch" seam fetch-page.ts's own FetchPageOptions already uses — passed
+ * straight through to fetchPage(), never a global fetch swap (this repo's
+ * test suite runs many async blocks interleaved; see fetch-page.ts's own doc
+ * comment on FetchPageOptions.fetchImpl for why a global swap would race).
+ *
+ * NOT CALLED from any live route in this slice — see the module doc's
+ * "NOT LIVE-WIRED in this slice" paragraph for the three concrete reasons.
+ * This function is fully built, fully tested, and correct; wiring it into
+ * issueClaimMagicLink() / the public GET+POST routes (converting them from
+ * sync to async, and giving routes/gardssalg-claim.test.ts's HTTP harness a
+ * fetch-injection seam it does not have today) is left as deliberate,
+ * flagged follow-up work — the exact same shape tier (a) brreg_contact
+ * already sits in (built + tested, dormant in production) elsewhere in this
+ * file.
+ */
+export async function deriveOrgLinkedEmailCandidatesWithHarvest(
+  provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    epost?: string | null;
+  },
+  brregContactEmail?: string | null,
+  opts: { fetchImpl?: typeof fetch } = {},
+): Promise<OrgLinkedEmailCandidate[]> {
+  const baseCandidates = deriveOrgLinkedEmailCandidatesWithOutreachLookup(provider, brregContactEmail);
+
+  const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
+  const canHarvest = brregOk && !!provider.hjemmeside && isHjemmesideOwnershipVerified(provider);
+  const harvestCandidates = canHarvest
+    ? pickHarvestCandidatesByTier(await harvestFoundOrgEmails(provider.hjemmeside as string, opts.fetchImpl))
+    : [];
+
+  // Merge in the documented priority order — (a) brreg_contact, then the
+  // three found-tiers, then (c) stored_epost_verified — deduping by
+  // normalized email so the SAME address is never offered twice under two
+  // different source tags (e.g. a harvested same-domain address that
+  // happens to equal the stored, provenance-backed epost).
+  const brregContactCandidates = baseCandidates.filter((c) => c.source === "brreg_contact");
+  const storedEpostCandidates = baseCandidates.filter((c) => c.source === "stored_epost_verified");
+  const merged: OrgLinkedEmailCandidate[] = [];
+  const seen = new Set<string>();
+  for (const candidate of [...brregContactCandidates, ...harvestCandidates, ...storedEpostCandidates]) {
+    const key = candidate.email.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(candidate);
+  }
+  return merged;
+}
+
 /** Mask an email for display ("we sent it to p***t@b*******t.no") — never
  * reveal the full address on the unauthenticated entry page. */
 export function maskEmail(email: string): string {
@@ -599,7 +959,13 @@ export interface IssuedClaim {
   token: string;
   email: string;
   maskedEmail: string;
-  source: "brreg_contact" | "verified_domain_address" | "stored_epost_verified";
+  source:
+    | "brreg_contact"
+    | "verified_domain_address"
+    | "stored_epost_verified"
+    | "found_same_domain"
+    | "found_contact_page"
+    | "found_site_other";
   expiresAt: string;
   /** dev-request 2026-07-26-booking-test-send-guard — see issueClaimMagicLink. */
   isTest: boolean;
