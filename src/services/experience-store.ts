@@ -5463,10 +5463,16 @@ export function stampGardssalgWebsiteDiscoveryAttempt(providerIds: string[]): vo
  * re-check at write time — if the candidate's host is already carried by any
  * other provider in the catalog (gardssalgSharedHostCounts), the write is
  * skipped: adopting it would create exactly the shared-host situation the 5d
- * guard exists to quarantine. Stamps field_provenance.hjemmeside and a
- * gardssalg_content_audit row (field hjemmeside — in
- * GARDSSALG_ROLLBACKABLE_FIELDS, so the standard rollback lever covers it).
- * Returns the field names actually written ([] if nothing written).
+ * guard exists to quarantine. Godkjenn-på-plass: when the candidate is
+ * byte-identical to the row's OWN current hjemmeside, the fill-only and
+ * shared-host guards are skipped (neither protects against colliding with
+ * yourself) and only field_provenance is (re)stamped — this clears review-
+ * queue duplicates and unblocks the claim-time email harvester's verified-
+ * homepage gate without ever changing the stored value. Stamps
+ * field_provenance.hjemmeside and a gardssalg_content_audit row (field
+ * hjemmeside — in GARDSSALG_ROLLBACKABLE_FIELDS, so the standard rollback
+ * lever covers it). Returns the field names actually written ([] if nothing
+ * written).
  */
 export function applyGardssalgProviderWebsite(
   providerId: string,
@@ -5487,11 +5493,19 @@ export function applyGardssalgProviderWebsite(
   const cleanUrl = (url || "").trim();
   if (cleanUrl.length === 0 || cleanUrl.length > 2048) return [];
   if (!/^https?:\/\/\S+\.\S+/i.test(cleanUrl)) return [];
-  if (row.hjemmeside && row.hjemmeside.trim() !== "") return []; // fill-only
+
+  const existingUrl = (row.hjemmeside || "").trim();
+  const isAtPlace = existingUrl !== "" && existingUrl === cleanUrl;
+
+  if (!isAtPlace) {
+    if (row.hjemmeside && row.hjemmeside.trim() !== "") return []; // fill-only
+  }
 
   const host = hostFromUrlLike(cleanUrl);
   if (!host) return [];
-  if ((gardssalgSharedHostCounts().get(host) || 0) >= 1) return [];
+  if (!isAtPlace) {
+    if ((gardssalgSharedHostCounts().get(host) || 0) >= 1) return [];
+  }
 
   let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
   if (row.field_provenance) {
@@ -5507,11 +5521,19 @@ export function applyGardssalgProviderWebsite(
   provenance.hjemmeside = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
 
   const applyWithAudit = db.transaction(() => {
-    const upd = db.prepare(
-      `UPDATE experience_providers SET hjemmeside = @hjemmeside, field_provenance = @field_provenance, updated_at = datetime('now')
-        WHERE id = @id AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')`
-    ).run({ id: providerId, hjemmeside: cleanUrl, field_provenance: JSON.stringify(provenance) });
-    if (upd.changes === 0) throw new Error("hjemmeside_filled_concurrently");
+    if (isAtPlace) {
+      const upd = db.prepare(
+        `UPDATE experience_providers SET field_provenance = @field_provenance, updated_at = datetime('now')
+          WHERE id = @id AND TRIM(hjemmeside) = @hjemmeside`
+      ).run({ id: providerId, hjemmeside: cleanUrl, field_provenance: JSON.stringify(provenance) });
+      if (upd.changes === 0) throw new Error("hjemmeside_changed_concurrently");
+    } else {
+      const upd = db.prepare(
+        `UPDATE experience_providers SET hjemmeside = @hjemmeside, field_provenance = @field_provenance, updated_at = datetime('now')
+          WHERE id = @id AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')`
+      ).run({ id: providerId, hjemmeside: cleanUrl, field_provenance: JSON.stringify(provenance) });
+      if (upd.changes === 0) throw new Error("hjemmeside_filled_concurrently");
+    }
     db.prepare(
       `INSERT INTO gardssalg_content_audit
          (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
@@ -5528,7 +5550,8 @@ export function applyGardssalgProviderWebsite(
   try {
     applyWithAudit();
   } catch (e: any) {
-    if (String(e?.message) === "hjemmeside_filled_concurrently") return [];
+    const msg = String(e?.message);
+    if (msg === "hjemmeside_filled_concurrently" || msg === "hjemmeside_changed_concurrently") return [];
     throw e;
   }
 
