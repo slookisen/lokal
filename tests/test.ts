@@ -3726,14 +3726,19 @@ console.log("\n── cross-source-validator: PR-19 verdict split ──");
 }
 
 // V7. aggregateVerdict — review_required wins when no insufficient
+// Steg B (dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-
+// batchkapasitet, 2026-08-07): `address` is now the ONLY gating field, so
+// this needs ADDRESS itself (not phone) to carry the review_required verdict
+// to exercise "review_required wins over pool_eligible" — phone/
+// business_status verdicts are irrelevant to aggregateVerdict now.
 {
   const perField: Record<string, CrossSourceResult> = {
-    address: { agree: true, source_count: 2, sources_used: ["homepage","brreg"], verdict: "pool_eligible" },
-    phone:   { agree: false, source_count: 1, sources_used: ["homepage"], verdict: "review_required" },
+    address: { agree: false, source_count: 1, sources_used: ["homepage"], verdict: "review_required" },
+    phone:   { agree: true, source_count: 2, sources_used: ["homepage","brreg"], verdict: "pool_eligible" },
     business_status: { agree: true, source_count: 1, sources_used: ["owner"], verdict: "pool_eligible" },
   };
   assertEq(aggregateVerdict(perField), "review_required",
-    "pr19: review_required wins when no data_insufficient");
+    "pr19: review_required wins when no data_insufficient (address, the only gating field, is review_required)");
 }
 
 // V8. aggregateVerdict — all pool_eligible → pool_eligible
@@ -3771,15 +3776,19 @@ console.log("\n── cross-source-validator: PR-19 verdict split ──");
     "pr26: address review_required → agent review_required (address still gates)");
 }
 
-// V12. PR-26: phone review_required still gates
+// V12. Steg B (dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-
+// batchkapasitet, 2026-08-07): phone no longer gates aggregateVerdict at all
+// — GATING_FIELDS is now ["address"] only (was ["address","phone"] under
+// PR-26). A phone review_required no longer tanks the agent, mirroring how
+// PR-26 already excluded business_status (see V10 above).
 {
   const perField: Record<string, CrossSourceResult> = {
     address: { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
     phone:   { agree: false, source_count: 1, sources_used: ["homepage"], verdict: "review_required" },
     business_status: { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
   };
-  assertEq(aggregateVerdict(perField), "review_required",
-    "pr26: phone review_required → agent review_required (phone still gates)");
+  assertEq(aggregateVerdict(perField), "pool_eligible",
+    "stegB: address+business_status pool_eligible, phone review_required → pool_eligible (phone no longer gates)");
 }
 
 // V13. PR-26: data_insufficient on address still wins over phone pool_eligible
@@ -5099,7 +5108,14 @@ async function runIntegrationTests(): Promise<void> {
     assertEq(crossSourceAgreement(provData, "business_status").agree, true, "intg-2: business_status cross-source agrees");
   }
 
-  // ── Fixture 3: Owner-curated address (Tier-S) but 1-source phone → review_required
+  // ── Fixture 3: Owner-curated address (Tier-S) but 1-source phone/status ────
+  // Steg B (dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-
+  // batchkapasitet, 2026-08-07): GATING_FIELDS is now ["address"] only — a
+  // 1-source phone/business_status no longer tanks the agent (was
+  // review_required pre-Steg-B, when phone still gated). This agent's
+  // corroborated-email (agents.contact_email, non-empty, no dead DNS stamp)
+  // + fresh live website (mocked 200 probe) also clear the new Steg B
+  // email+website gate, so it reaches 'verified' and the pool.
   {
     const db = buildTestDb();
     const { getDb } = require("../src/database/init");
@@ -5113,9 +5129,9 @@ async function runIntegrationTests(): Promise<void> {
       field_provenance: {
         // address: Tier-S owner-curated → would pass alone
         address: [{ value: "Pølseveien 3, 4012 Stavanger", source_type: "owner", fetched_at: "2026-05-05T07:25Z" }],
-        // phone: only 1 homepage source → fails cross-source
+        // phone: only 1 homepage source → fails cross-source (no longer gates, Steg B)
         phone: [{ value: "51234567", source_type: "homepage", fetched_at: "2026-05-05T07:25Z" }],
-        // business_status: only 1 homepage source → fails cross-source
+        // business_status: only 1 homepage source → fails cross-source (never gated, PR-26)
         business_status: [{ value: "active", source_type: "homepage", fetched_at: "2026-05-05T07:25Z" }],
       },
     });
@@ -5127,8 +5143,10 @@ async function runIntegrationTests(): Promise<void> {
       business_status: [{ value: "active", source_type: "homepage", fetched_at: "2026-05-05T07:25Z" }],
     };
     assertEq(crossSourceAgreement(provData, "address").agree, true, "intg-3: owner-curated address → agree=true");
-    assertEq(crossSourceAgreement(provData, "phone").agree, false, "intg-3: 1-source phone → agree=false");
+    assertEq(crossSourceAgreement(provData, "phone").agree, false, "intg-3: 1-source phone → agree=false (still computed, no longer gates)");
     assertEq(crossSourceAgreement(provData, "business_status").agree, false, "intg-3: 1-source business_status → agree=false");
+    assertEq(aggregateVerdict({ address: crossSourceAgreement(provData, "address"), phone: crossSourceAgreement(provData, "phone"), business_status: crossSourceAgreement(provData, "business_status") }),
+      "pool_eligible", "intg-3: stegB — aggregate verdict is pool_eligible (only address gates)");
 
     const mockHeadProbe3 = async (_url: string) => 200 as number | null;
     const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe3 });
@@ -5136,12 +5154,20 @@ async function runIntegrationTests(): Promise<void> {
     assertTrue(!!agentResult, "intg-3: agent-partial-owner found in results");
     assertEq(
       agentResult?.new_verification_status,
-      "review_required",
-      "intg-3: owner-curated address + 1-source phone/status → review_required"
+      "verified",
+      "intg-3: stegB — owner-curated address (only gating field) + corroborated email + live website → verified"
     );
 
+    // lokal#433 requirement UNCHANGED by Steg B: outreach_ready_pool requires
+    // enrichment_status='rich' (about>=150 chars AND products>=3 AND address),
+    // independent of verification_status. This fixture's about text is only
+    // 77 chars, so computeEnrichmentStatus still returns 'partial' — the
+    // agent is 'verified' now (Steg B) but still correctly excluded from the
+    // pool by the untouched rich-only gate, proving Steg B did not weaken it.
+    assertEq(agentResult?.new_enrichment_status, "partial",
+      "intg-3: stegB — enrichment_status stays 'partial' (about=77 chars < 150) — lokal#433's rich-only bar is untouched");
     const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-partial-owner'").get();
-    assertTrue(!poolRow, "intg-3: partial-owner agent not in outreach_ready_pool");
+    assertTrue(!poolRow, "intg-3: stegB — partial-owner agent still NOT in outreach_ready_pool (enrichment_status='partial', not 'rich' — lokal#433 gate unaffected by Steg B)");
   }
 
   // ── orch-pr-16 Fixture A: free-mail (gmail) producer is NOT downgraded ──────
@@ -37617,5 +37643,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-fylke-2024-redirect: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet, Steg B
+// (2026-08-07): GATING_FIELDS narrowed to ["address"] (cross-source-
+// validator.ts) + the new corroborated-email / live-website requirement in
+// runVerifierBatch (lokal-agent-verifier.ts). Own dedicated test file (swaps
+// the shared getDb() singleton) — tail-registered via runSerial() like the
+// suites immediately above, so it is automatically folded into _serialChain
+// and counted in the final summary without needing a manual resolve/promise
+// handle (see the runSerial() comment near the top of this file).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet, Steg B: email+website gate ──");
+  try {
+    const { runLokalAgentVerifierStegBEmailWebsiteGateTests } = require("../src/agents/lokal-agent-verifier-stegb-email-website-gate.test") as
+      typeof import("../src/agents/lokal-agent-verifier-stegb-email-website-gate.test");
+    const stegB = await runLokalAgentVerifierStegBEmailWebsiteGateTests({ log: false });
+    passed += stegB.passed;
+    failed += stegB.failed;
+    for (const f of stegB.failures) failures.push("stegb-email-website-gate: " + f);
+    console.log(`  stegb-email-website-gate: ${stegB.passed} passed, ${stegB.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("stegb-email-website-gate: unexpected error: " + String(err?.message || err));
   }
 });
