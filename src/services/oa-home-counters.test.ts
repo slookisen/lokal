@@ -40,6 +40,14 @@
  *   (f) Homepage wiring: GET / (experiences-seo router) renders the counter
  *       strip container with the live numbers substituted in, and contains
  *       no client-side tracking script for it (non-goal: no client JS).
+ *   (g)+(h) "since <date>" (dev-request 2026-07-19-opplevagent-forside-
+ *       seksjoner-design, arbeidspunkt 2): getOaHomeCounters().sinceDate is
+ *       the MINIMUM created_at among the SAME is_owner-filtered,
+ *       vertical_id='experiences'-scoped row-set the traffic counters above
+ *       are drawn from (not first/last inserted, not the owner or a
+ *       different vertical's older row) — and null (not undefined, not a
+ *       throw) when there are no matching rows at all. Also checks the
+ *       homepage HTML renders/omits the formatted since-date accordingly.
  */
 
 import Database from "better-sqlite3";
@@ -285,6 +293,57 @@ export function runOaHomeCountersTests(opts: { log?: boolean } = {}): Promise<Te
       // search-form fallback — assert no NEW script referencing the counters.
       assertTrue(!/counters?["'-]?(?:\.js|Strip)?\.addEventListener|fetch\(.*counter/i.test(home.body),
         "f7: no client-side JS was added to fetch/refresh the counter strip");
+
+      // ── (g) sinceDate: MIN(created_at), is_owner-filtered, vertical-scoped ──
+      const insertPvAt = rfbDb.prepare(
+        `INSERT INTO analytics_page_views (path, session_id, is_owner, vertical_id, created_at) VALUES (?, ?, ?, ?, ?)`
+      );
+      // Three experiences-vertical, non-owner rows with distinct created_at
+      // values, inserted out of chronological order — proves sinceDate is
+      // the MINIMUM, not the first- or last-inserted row's date.
+      insertPvAt.run("/", "oa-since-1:Mozilla/5.0 (Macintosh) Chrome/120", 0, "experiences", "2026-03-15 10:00:00");
+      insertPvAt.run("/", "oa-since-2:Mozilla/5.0 (Macintosh) Chrome/120", 0, "experiences", "2026-01-10 08:30:00");
+      insertPvAt.run("/", "oa-since-3:Mozilla/5.0 (Macintosh) Chrome/120", 0, "experiences", "2026-05-01 00:00:00");
+      // Owner-flagged row OLDER than all of the above — must NOT be picked
+      // (same is_owner filter the pageViews count already excludes it by).
+      insertPvAt.run("/", "oa-since-owner:Lokal-Enricher/1.0", 1, "experiences", "2020-01-01 00:00:00");
+      // A different vertical's row, older still — must NOT affect the
+      // experiences vertical's sinceDate (vertical scoping).
+      insertPvAt.run("/", "rfb-since-old:Mozilla/5.0 (Macintosh) Chrome/120", 0, "rfb", "2019-01-01 00:00:00");
+
+      oaHomeCounters.__resetOaHomeCountersCacheForTesting();
+      const countersSince = oaHomeCounters.getOaHomeCounters();
+      assertEq(countersSince.sinceDate, "2026-01-10 08:30:00",
+        "g1: sinceDate is the MINIMUM created_at among experiences/non-owner rows — not the owner row's (older) date, not the rfb row's (older still) date, and not first/last-inserted");
+
+      // ── (h) No matching analytics_page_views rows at all -> sinceDate is
+      // null (not undefined, not a throw). Swap in a fresh, schema-init'd,
+      // empty in-memory DB so there are genuinely zero rows to match.
+      const emptyRfbDb = new Database(":memory:");
+      initMod.__initSchemaForTesting(emptyRfbDb as any);
+      initMod.__setDbForTesting(emptyRfbDb as any);
+      oaHomeCounters.__resetOaHomeCountersCacheForTesting();
+      const countersEmpty = oaHomeCounters.getOaHomeCounters();
+      assertEq(countersEmpty.sinceDate, null,
+        "h1: sinceDate is null (not undefined, not a throw) when there are no matching analytics_page_views rows");
+
+      // ── (h2) Homepage wiring for the omit-when-null path: with zero
+      // analytics rows, the rendered HTML must NOT contain the since-date
+      // i18n fragment (no "since Invalid Date"/stray fragment).
+      const homeEmpty = await callRoute(expSeoRouter, "/");
+      assertTrue(homeEmpty.handled && homeEmpty.status === 200, "h2: GET / still renders 200 with zero analytics rows");
+      assertTrue(!homeEmpty.body.includes("Tall siden"),
+        "h3: homepage HTML omits the since-date fragment entirely when sinceDate is null");
+
+      // Restore rfbDb (with the g-section fixtures) and re-render the
+      // homepage to prove the non-null path renders the formatted date.
+      initMod.__setDbForTesting(rfbDb as any);
+      oaHomeCounters.__resetOaHomeCountersCacheForTesting();
+      const homeWithSince = await callRoute(expSeoRouter, "/");
+      assertTrue(homeWithSince.handled && homeWithSince.status === 200, "h4: GET / renders 200 with analytics rows present");
+      const expectedSinceLabel = new Date("2026-01-10 08:30:00").toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric" });
+      assertTrue(homeWithSince.body.includes("Tall siden") && homeWithSince.body.includes(expectedSinceLabel),
+        `h5: homepage HTML includes the since-date fragment with the formatted MIN date (${expectedSinceLabel})`);
     } catch (err: any) {
       failed++;
       failures.push("oa-home-counters: unexpected error: " + String(err?.stack || err?.message || err));

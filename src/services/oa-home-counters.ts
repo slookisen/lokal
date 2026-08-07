@@ -43,6 +43,7 @@
  * in-memory TTL cache" shape as traffic-stats.ts's own _trafficCache.
  */
 
+import { getDb } from "../database/init";
 import { getTrafficStats } from "./traffic-stats";
 import {
   countPublishedExperiences,
@@ -68,6 +69,34 @@ export interface OaHomeCounters {
   opplevelser: number;
   tilbydere: number;
   kommuner: number;
+  /**
+   * Oldest analytics_page_views.created_at (raw SQLite datetime string, e.g.
+   * "2026-06-01 12:34:56") among the SAME row-set pageViews/etc. are computed
+   * over — same is_owner + vertical_id='experiences' filter as
+   * getTrafficStats("experiences"), so this can never claim to cover data
+   * the counters themselves exclude. `null` when there are no matching rows
+   * yet (fresh/catalog-only environment) or the query errors.
+   */
+  sinceDate: string | null;
+}
+
+/**
+ * Oldest analytics datapoint the "experiences" vertical's counters are drawn
+ * from — same (is_owner IS NULL OR is_owner = 0) AND vertical_id='experiences'
+ * filter getTrafficStats("experiences") already applies (see traffic-stats.ts),
+ * so the "since" date never claims to cover rows the counters exclude. Reads
+ * defensively: never throws, degrades to null on any error or empty result.
+ */
+function getOaSinceDate(): string | null {
+  try {
+    const db = getDb();
+    const row = db.prepare(
+      `SELECT MIN(created_at) as d FROM analytics_page_views WHERE (is_owner IS NULL OR is_owner = 0) AND vertical_id = 'experiences'`
+    ).get() as { d: string | null } | undefined;
+    return row?.d ?? null;
+  } catch {
+    return null;
+  }
 }
 
 const OA_HOME_COUNTERS_TTL_MS = 10 * 60 * 1000; // 10 min — inside the 5-15 min window
@@ -115,6 +144,7 @@ export function getOaHomeCounters(): OaHomeCounters {
     opplevelser,
     tilbydere,
     kommuner,
+    sinceDate: getOaSinceDate(),
   };
   _cache = { data, time: now };
   return data;
