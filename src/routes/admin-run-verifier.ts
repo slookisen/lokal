@@ -63,7 +63,7 @@ router.post("/", async (req: Request, res: Response) => {
   }
 
   const batchSizeRaw = (req.body && req.body.batchSize) || req.query.batchSize;
-  const batchSize = Math.min(Math.max(parseInt(String(batchSizeRaw ?? "30"), 10) || 30, 1), 100);
+  const batchSize = Math.min(Math.max(parseInt(String(batchSizeRaw ?? (process.env.VERIFY_BATCH_SIZE ?? "30")), 10) || 30, 1), 100);
 
   // PR-27: Optional reprocess-review-queue mode. When set, scope the
   // pick to review_required + data_insufficient rows (oldest first) so

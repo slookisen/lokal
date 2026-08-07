@@ -377,10 +377,29 @@ const composeSchema = z.object({
   force: z.boolean().optional(),
 });
 
+// ─── Steg C2 — server-side daily send cap ────────────────────────────
+// OUTREACH_MAX_PER_DAY (default 50): max cold-outreach (resend_send,
+// createdBy='claude') sends per UTC calendar day. Shared by the reserve
+// guard in POST /compose and the read-back in GET /sent-log so both sides
+// parse the env var identically.
+function resolveDailyOutreachCap(): number {
+  return Math.max(1, parseInt(String(process.env.OUTREACH_MAX_PER_DAY ?? "50"), 10) || 50);
+}
+
+function todayUTC(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
 router.post("/compose", async (req, res) => {
   const parsed = composeSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
   const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy, force, vertical } = parsed.data;
+  // Steg C2: set true only when this request actually reserved a daily-cap
+  // slot (i.e. the resend_send/claude/!force guard block below ran and its
+  // reservation succeeded) — gates the compensating decrement on send
+  // failure further down so a bypassed (force/daniel) or non-resend_send
+  // call, which never reserved anything, never decrements someone else's day.
+  let capReservedToday: string | null = null;
 
   try {
     // ─── Global outreach kill-switch (P0-2026-07-11) ────────────
@@ -407,6 +426,37 @@ router.post("/compose", async (req, res) => {
     // sent us an inbound message in the last 7 days, this compose is a
     // legitimate conversation response — do not rate-limit.
     if (intent === "resend_send" && createdBy === "claude" && !force) {
+      // ─── Steg C2 — atomic daily send-cap reservation (most-general
+      // guard first, matching the pause-check-first ordering above) ────
+      // A pre-flight COUNT(*) against outreach_sent_log would NOT be atomic:
+      // Node's event loop can interleave two /compose handlers across the
+      // `await emailService.sendRaw(...)` below, so two concurrent requests
+      // could each read count=49 < cap=50 before either has recorded a
+      // send, letting both through and exceeding the cap. This single
+      // synchronous better-sqlite3 statement (no await between the check
+      // and the reservation) is what makes the cap atomic: the WHERE
+      // clause on the UPDATE only lets the increment through when the
+      // reservation is still under the cap, so a second concurrent caller
+      // that races in gets `changes === 0` and is rejected.
+      const dailyCap = resolveDailyOutreachCap();
+      const today = todayUTC();
+      const reservation = getDb().prepare(`
+        INSERT INTO outreach_daily_send_cap (day, reserved_count) VALUES (?, 1)
+        ON CONFLICT(day) DO UPDATE SET reserved_count = reserved_count + 1
+          WHERE outreach_daily_send_cap.reserved_count < ?
+      `).run(today, dailyCap);
+
+      if (reservation.changes === 0) {
+        return res.status(429).json({
+          success: false,
+          error: "daily_cap_reached",
+          reason: `daily outreach cap reached: ${dailyCap} sent today (OUTREACH_MAX_PER_DAY=${dailyCap}) — try again after UTC midnight`,
+          cap: dailyCap,
+          override: "Pass createdBy=daniel and force=true to bypass (manual override)",
+        });
+      }
+      capReservedToday = today;
+
       const lookback24h = new Date(Date.now() - 24 * 3600_000).toISOString();
       const lookback7d = new Date(Date.now() - 7 * 24 * 3600_000).toISOString();
 
@@ -571,10 +621,20 @@ router.post("/compose", async (req, res) => {
         }
         crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
         crmService.updateMessageDeliveryStatus(messageId, "failed");
+        if (capReservedToday) {
+          getDb().prepare(
+            `UPDATE outreach_daily_send_cap SET reserved_count = MAX(0, reserved_count - 1) WHERE day = ?`
+          ).run(capReservedToday);
+        }
         return res.status(500).json({ success: false, error: result.error || "send failed", outboxId: queued.id, threadId });
       } catch (err: any) {
         crmService.markOutboxResult(queued.id, "failed", undefined, err.message ?? "exception");
         crmService.updateMessageDeliveryStatus(messageId, "failed");
+        if (capReservedToday) {
+          getDb().prepare(
+            `UPDATE outreach_daily_send_cap SET reserved_count = MAX(0, reserved_count - 1) WHERE day = ?`
+          ).run(capReservedToday);
+        }
         return res.status(500).json({ success: false, error: err.message ?? "exception", threadId });
       }
     }
@@ -1136,6 +1196,15 @@ router.get("/sent-log", (req, res) => {
       byStatus[m.delivery_status || "unknown"] = (byStatus[m.delivery_status || "unknown"] || 0) + 1;
     }
 
+    // Steg C3 — surface today's daily-cap reservation state alongside the
+    // sent-log so the daily brief can show it without a separate endpoint.
+    // Purely additive to the existing response shape.
+    const dailyCap = resolveDailyOutreachCap();
+    const capRow = getDb().prepare(
+      `SELECT reserved_count FROM outreach_daily_send_cap WHERE day = ?`
+    ).get(todayUTC()) as { reserved_count: number } | undefined;
+    const sentToday = capRow?.reserved_count ?? 0;
+
     res.json({
       success: true,
       count: messages.length,
@@ -1143,6 +1212,9 @@ router.get("/sent-log", (req, res) => {
       summary: { by_actor: byActor, by_channel: byChannel, by_status: byStatus },
       filters: { since_hours: sinceHours ?? "all", channel: channel ?? "all", actor: actor ?? "all", status: statusFilter ?? "all", contact_email: contactEmail ?? "all" },
       generated_at: new Date().toISOString(),
+      sent_today: sentToday,
+      cap: dailyCap,
+      remaining_today: Math.max(0, dailyCap - sentToday),
     });
   } catch (err: any) {
     res.status(500).json({ error: "sent_log_failed", detail: err.message });

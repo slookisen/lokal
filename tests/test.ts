@@ -37669,3 +37669,33 @@ runSerial(async () => {
     failures.push("stegb-email-website-gate: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet, Steg C
+// (2026-08-07): C1 — POST /admin/run-verifier's batchSize default now reads
+// VERIFY_BATCH_SIZE when the caller omits batchSize (else literal "30",
+// [1,100] clamp unchanged); C2 — a new atomic daily send-cap reservation
+// (outreach_daily_send_cap, OUTREACH_MAX_PER_DAY default 50) gates the
+// cold-outreach send point in POST /admin/crm/compose, ahead of the
+// existing cooldown/24h guards, with a compensating decrement on a failed
+// send; C3 — GET /admin/crm/sent-log additionally surfaces
+// sent_today/cap/remaining_today. Own dedicated test file (swaps the shared
+// getDb() singleton AND mocks emailService.sendRaw on the singleton
+// instance) — tail-registered via runSerial() like the suites immediately
+// above, so it is automatically folded into _serialChain and counted in the
+// final summary without needing a manual resolve/promise handle (see the
+// runSerial() comment near the top of this file).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet, Steg C: VERIFY_BATCH_SIZE + daily send-cap ──");
+  try {
+    const { runRfbPoolgateStegCTests } = require("../src/routes/rfb-poolgate-stegc.test") as
+      typeof import("../src/routes/rfb-poolgate-stegc.test");
+    const stegC = await runRfbPoolgateStegCTests({ log: false });
+    passed += stegC.passed;
+    failed += stegC.failed;
+    for (const f of stegC.failures) failures.push("rfb-poolgate-stegc: " + f);
+    console.log(`  rfb-poolgate-stegc: ${stegC.passed} passed, ${stegC.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-poolgate-stegc: unexpected error: " + String(err?.message || err));
+  }
+});
