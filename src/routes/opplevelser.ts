@@ -4901,6 +4901,56 @@ export function __setGsCxRowDelayForTesting(ms: number | null): void {
   gsCxRowDelayMs = ms ?? GS_CX_ROW_DELAY_MS;
 }
 
+// Per-host cooldown (dev-request 2026-08-07-kontaktjakt-drikkeprodusenter):
+// nedstrandbryggeri.no's aggressive rate-limiter 429s a dry-run's fetch and
+// then 429s again on the very next apply run against the same host — hammering
+// an already-rate-limited host a second time just burns the retry budget for
+// nothing. This is deliberately a small in-process map LOCAL to this route,
+// not shared/global infrastructure: an admin-triggered batch tool has no need
+// for a persistent (DB/file) rate-limit store, and the process restarting
+// (or a fresh run past the window) simply clears it.
+const GS_CX_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
+const gsCxHostCooldownUntil = new Map<string, number>();
+export function __resetGsCxCooldownForTesting(): void {
+  gsCxHostCooldownUntil.clear();
+}
+
+type GsCxFetchOutcome =
+  | { kind: "ok"; html: string; finalUrl: string }
+  | { kind: "cooldown_skipped"; host: string }
+  | { kind: "failed" };
+
+/**
+ * Fetch one URL for the contact-extraction route via the shared classified
+ * fetcher (fetchPage(), src/services/fetch-page.ts) instead of the single-shot
+ * wdFetchPage(): a transient/5xx/timeout/connection-reset failure now gets
+ * fetchPage()'s existing one-retry-with-Retry-After behaviour instead of
+ * giving up in one shot. On top of that this route adds its own per-host
+ * cooldown: a 429 (rate-limited) response parks the host for GS_CX_COOLDOWN_MS
+ * so a later fetch to the SAME host in this run (or a fresh run started within
+ * the window) is skipped outright rather than hammering it again.
+ *
+ * wdFetchPage() itself is untouched — its contract is shared with other
+ * website-discovery admin routes and out of scope here.
+ */
+async function gsCxFetchPage(url: string): Promise<GsCxFetchOutcome> {
+  const host = hostFromUrlLike(url);
+  if (host) {
+    const until = gsCxHostCooldownUntil.get(host);
+    if (until !== undefined && until > Date.now()) {
+      return { kind: "cooldown_skipped", host };
+    }
+  }
+  const result = await fetchPage(url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+  if (result.ok) {
+    return { kind: "ok", html: result.html, finalUrl: result.finalUrl };
+  }
+  if (result.reason === "http_429" && host) {
+    gsCxHostCooldownUntil.set(host, Date.now() + GS_CX_COOLDOWN_MS);
+  }
+  return { kind: "failed" };
+}
+
 router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown };
   const apply =
@@ -4926,6 +4976,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const changed: Array<{ provider_id: string; navn: string; fields: string[]; epost: string | null; telefon: string | null; source_url: string; email_source?: string; phone_cued?: boolean }> = [];
   const noContactFound: Array<{ provider_id: string; navn: string; pages_tried: number }> = [];
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
+  const cooldownSkipped: Array<{ provider_id: string; navn: string; host: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
   let clientDisconnected = false;
@@ -4940,19 +4991,27 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     // alltid får svare under en kjøring.
     await new Promise((r) => setTimeout(r, gsCxRowDelayMs));
     try {
-      const front = await wdFetchPage(t.hjemmeside);
-      if (!front) {
+      const frontOutcome = await gsCxFetchPage(t.hjemmeside);
+      if (frontOutcome.kind === "cooldown_skipped") {
+        cooldownSkipped.push({ provider_id: t.id, navn: t.navn, host: frontOutcome.host });
+        continue;
+      }
+      if (frontOutcome.kind === "failed") {
         fetchFailed.push({ provider_id: t.id, navn: t.navn });
         continue;
       }
+      const front = { html: frontOutcome.html, finalUrl: frontOutcome.finalUrl };
       const host = hostFromUrlLike(front.finalUrl) || hostFromUrlLike(t.hjemmeside) || "";
       const homeDomain = homepageRegistrableDomain(t.hjemmeside);
       // Contact-ish subpages FIRST (that's where the info is authoritative),
-      // front page as fallback.
+      // front page as fallback. A subpage that is cooldown_skipped or fails is
+      // simply not added to `pages` — same as the old wdFetchPage() null
+      // handling — the front page (already fetched above) still stands as a
+      // fallback source.
       const pages: Array<{ url: string; html: string; contactish: boolean }> = [];
       for (const sub of gardssalgContactPageLinks(front.html, host, 2)) {
-        const p = await wdFetchPage(sub);
-        if (p) pages.push({ url: p.finalUrl, html: p.html, contactish: true });
+        const subOutcome = await gsCxFetchPage(sub);
+        if (subOutcome.kind === "ok") pages.push({ url: subOutcome.finalUrl, html: subOutcome.html, contactish: true });
       }
       pages.push({ url: front.finalUrl, html: front.html, contactish: false });
 
@@ -5018,6 +5077,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     changed,
     no_contact_found: noContactFound,
     fetch_failed: fetchFailed,
+    cooldown_skipped: cooldownSkipped,
     errors,
   });
   } finally {
