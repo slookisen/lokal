@@ -335,6 +335,13 @@ import {
   backfillGardssalgOwnerLockProvenance,
 } from "../services/gardssalg-claim";
 import { emailService } from "../services/email-service";
+// Used by isGardssalgEpostSynthesisPatternMatch() below (AC6 epost-synthesis
+// audit) — re-added after the post@<domain> claim-derivation tier that used
+// to import this (dev-request 2026-08-06-aldri-gjett-epostadresse slice 1)
+// was removed; a merge with main's independently-built AC6 slice (#508)
+// silently dropped the import since neither side's diff hunk touched the
+// same line the other needed, tsc caught it as the two branches combined.
+import { normalizeDomain } from "../services/blocklist-service";
 
 // Same derivation as gardssalg-claim.ts's own constant — the verify URL must
 // point at the host that serves the claim routes.
