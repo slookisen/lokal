@@ -313,6 +313,34 @@
 // "built, tested, and correct, but not yet reachable from a live route"
 // pattern already exists in this file for tier (a) brreg_contact (see the
 // module doc's very first section) — this is the same shape, not a new one.
+//
+// ─── found_umbrella_member — dev-request 2026-08-06-aldri-gjett-epostadresse,
+// SLICE 4, AC5 (2026-08-07) ─────────────────────────────────────────────────
+// AC5 (Daniel, verbatim): "Paraply-kilde: når adressen kun finnes via en
+// paraplyorganisasjons medlemsliste, brukes produsentens adresse derfra —
+// aldri paraplyens egen. Test som feiler hvis paraplyens adresse skulle lekke
+// inn som produsentens." A FOURTH found-tier, ranked BELOW the three
+// found-tiers above (own-site evidence beats umbrella-page evidence) but
+// ABOVE nothing — it is itself the last found-tier, still ranked above
+// stored_epost_verified for the same "freshest live evidence wins" reasoning
+// already stated above, and only ever attempted as a FALLBACK when the
+// provider's own site produced zero candidates (see
+// deriveOrgLinkedEmailCandidatesWithHarvest()'s own doc comment for the exact
+// gating condition). Full lookup/harvest/attribution rationale — including
+// the hard domain exclusion that makes "the umbrella's own address" and
+// "this producer's address" mutually exclusive by construction, and the
+// name-proximity attribution guard that stands in for the "which member is
+// this actually for" verification a same-domain match would otherwise
+// provide — lives on findUmbrellaAffiliation() and
+// harvestUmbrellaMemberEmail()'s own doc comments further down (not
+// restated here to avoid the two copies drifting).
+//
+// This is the same "found, never derived" family as the three tiers above —
+// no address is ever constructed from a domain — with an added attribution
+// problem the other three don't have (an umbrella's member page names MANY
+// producers on one page, not just this one), which is why it needs its own,
+// stricter, name-matched gate rather than reusing pickHarvestCandidatesByTier
+// as-is.
 
 import crypto from "crypto";
 import { v4 as uuid } from "uuid";
@@ -463,7 +491,8 @@ export type OrgLinkedEmailResult =
         | "stored_epost_verified"
         | "found_same_domain"
         | "found_contact_page"
-        | "found_site_other";
+        | "found_site_other"
+        | "found_umbrella_member";
     }
   | { eligible: false; reason: "not_brreg_verified" | "no_org_linked_email" };
 
@@ -475,7 +504,8 @@ export type OrgLinkedEmailCandidate = {
     | "stored_epost_verified"
     | "found_same_domain"
     | "found_contact_page"
-    | "found_site_other";
+    | "found_site_other"
+    | "found_umbrella_member";
 };
 
 // Minimal shape check for a stored `epost` candidate — good enough to catch
@@ -821,6 +851,404 @@ function pickHarvestCandidatesByTier(hits: HarvestedEmailHit[]): OrgLinkedEmailC
   return out;
 }
 
+// ─── Umbrella member-list harvest (found_umbrella_member) — dev-request
+// 2026-08-06-aldri-gjett-epostadresse, SLICE 4, AC5 (2026-08-07) ───────────
+// AC5 (Daniel, verbatim): "Paraply-kilde: når adressen kun finnes via en
+// paraplyorganisasjons medlemsliste, brukes produsentens adresse derfra —
+// aldri paraplyens egen." I.e. when a producer's own site yields nothing at
+// all, its UMBRELLA organisation's own member-list page may still name it —
+// this tier fetches THAT page and offers the address it shows FOR THIS
+// PRODUCER, never the umbrella's own contact address.
+//
+// This is a FALLBACK, not a peer of found_same_domain/found_contact_page/
+// found_site_other above: only attempted when harvestFoundOrgEmails() (the
+// provider's OWN site) already ran and found ZERO hits — wired in
+// deriveOrgLinkedEmailCandidatesWithHarvest() below, not left to the caller.
+// A provider whose own site already yielded an address never needs its
+// umbrella at all; a provider with no verified/no hjemmeside is exactly the
+// population this tier exists for.
+//
+// Daniel's own risk framing (dev-request risk section, verbatim, and
+// directly binding on how this is built): "Å gjette HVEM adressen tilhører
+// er fortsatt gjetting [...] Vurderingen er navnelikhet — og tar vi feil,
+// gir vi bort kontoen til en utenforstående. Kontoovertakelse, ikke bare
+// feil visningsdata. Derfor: uavklarte tilfeller skal til manuell
+// verifisering, ikke løses med en heuristikk." I.e. WHOSE address a found
+// email belongs to is still a guess unless we can attribute it — a wrong
+// attribution here is account takeover, not a display bug. Every branch
+// below that cannot confidently attribute exactly one address to THIS
+// producer returns null, never a best guess.
+
+/**
+ * (AC5 lookup step) Resolve the producer's own ACTIVE umbrella affiliation
+ * and the umbrella's own registrable domain (the HARD EXCLUSION domain — see
+ * harvestUmbrellaMemberEmail below). Cross-references experience_providers
+ * (this vertical's own DB) against the RFB main DB's agents/agent_affiliations
+ * tables by org_nr — the same join key already used elsewhere in this
+ * codebase for exactly this vertical-to-RFB crossover (e.g. knowledge-
+ * service.ts, dental-store.ts) — since there is no direct FK between the two.
+ * Uses the SAME getRfbDb() + _rfbDbOverrideForTesting seam as
+ * wasEpostDeliveredOutreachNoBounce() above; no new DB-access mechanism.
+ *
+ * Returns null — no attempt, not attempt-then-discard, same convention this
+ * file already uses for isHjemmesideOwnershipVerified()'s own precondition
+ * — on ANY of the following, each one deliberately conservative rather than
+ * a best-effort pick (Daniel's "uavklarte tilfeller -> manuell verifisering"
+ * quote above governs every one of these):
+ *   - no org_nr on the provider at all;
+ *   - no `agents` row for this org_nr with umbrella_type IS NULL (i.e. no
+ *     matching REAL producer agent — a provider that doesn't even have an
+ *     RFB producer identity has no affiliation to look up);
+ *   - zero ACTIVE agent_affiliations rows for that producer (no affiliation
+ *     — 'pending_confirmation'/'review_required'/'rejected'/'historical' all
+ *     deliberately do NOT count, only a confirmed, currently-active one
+ *     does);
+ *   - MORE THAN ONE active affiliation (which umbrella's member page would
+ *     even be the right one to trust? — itself an ambiguous case, never
+ *     arbitrarily resolved by picking the first);
+ *   - the resolved umbrella `agents` row has no `url` (nothing to fetch).
+ */
+function findUmbrellaAffiliation(
+  provider: Pick<ClaimProviderRow, "org_nr">,
+): { umbrellaHjemmeside: string; umbrellaRegistrableDomain: string | null } | null {
+  if (!provider.org_nr) return null;
+  const db = _rfbDbOverrideForTesting ?? getRfbDb();
+
+  const producerAgent = db
+    .prepare(`SELECT id FROM agents WHERE org_nr = ? AND umbrella_type IS NULL LIMIT 1`)
+    .get(provider.org_nr) as { id: string } | undefined;
+  if (!producerAgent) return null;
+
+  const activeAffiliations = db
+    .prepare(`SELECT umbrella_id FROM agent_affiliations WHERE producer_id = ? AND status = 'active'`)
+    .all(producerAgent.id) as Array<{ umbrella_id: string }>;
+  // 0 -> no affiliation to use; >1 -> ambiguous which umbrella to trust —
+  // NEITHER is resolved with a guess (see doc comment above).
+  if (activeAffiliations.length !== 1) return null;
+
+  const umbrellaAgent = db
+    .prepare(`SELECT url FROM agents WHERE id = ?`)
+    .get(activeAffiliations[0]!.umbrella_id) as { url: string | null } | undefined;
+  if (!umbrellaAgent || !umbrellaAgent.url) return null;
+
+  const umbrellaHost = hostFromUrlLike(umbrellaAgent.url);
+  const umbrellaRegistrableDomain = umbrellaHost ? registrableDomain(umbrellaHost) : null;
+
+  return { umbrellaHjemmeside: umbrellaAgent.url, umbrellaRegistrableDomain };
+}
+
+// Minimal, purpose-built HTML->plain-text stripper for the name-proximity
+// scan below. Deliberately NOT search-enrich.ts's extractProseText(): that
+// function's whole job is to DROP high-link-density <ul>/<ol> blocks (see
+// its own isHighLinkDensityBlock use) because those are usually navigation —
+// but a member-list page's actual member directory is very often EXACTLY a
+// link-dense <ul>/<ol> of member cards, which is precisely the content this
+// scan needs to see. Reusing extractProseText here would risk silently
+// stripping the one block that matters. This stripper keeps everything
+// VISIBLE, tags out — except CSS/HTML-hidden elements (see
+// stripHiddenElements below), which are dropped content-and-all so hidden
+// tab/accordion markup common in member-list pages can't masquerade as
+// visible text for the name-proximity scan.
+function stripToPlainText(html: string): string {
+  const withoutScriptsStylesComments = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ");
+  return stripHiddenElements(withoutScriptsStylesComments)
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
+    .replace(/&AElig;/g, "Æ").replace(/&Oslash;/g, "Ø").replace(/&Aring;/g, "Å")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Does this start tag's attribute text mark the element as CSS/HTML hidden?
+// Checked (pragmatically — see stripHiddenElements's own doc comment on why
+// this isn't a full CSS engine):
+//   - the `hidden` boolean attribute (`<div hidden>`, `<div hidden="">`,
+//     `<div hidden="hidden">`) — anchored on a preceding boundary so it
+//     never fires on an unrelated attribute that merely CONTAINS "hidden"
+//     as a substring, e.g. `data-hidden-count="3"`;
+//   - an inline `style="..."` containing `display:none`/`display: none`
+//     (whitespace around the colon allowed) or `visibility:hidden`/
+//     `visibility: hidden`, single- or double-quoted.
+function elementIsHidden(attrs: string): boolean {
+  if (/(?:^|\s)hidden(?:\s|=|$)/i.test(attrs)) return true;
+  const styleMatch = attrs.match(/\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+  const styleValue = styleMatch ? styleMatch[1] ?? styleMatch[2] ?? "" : "";
+  if (!styleValue) return false;
+  return /display\s*:\s*none\b/i.test(styleValue) || /visibility\s*:\s*hidden\b/i.test(styleValue);
+}
+
+// Finds the index just past the closing tag that matches the open tag
+// `tagName` whose content starts at `searchFrom`, honoring nesting of the
+// SAME tag name in between (e.g. `<div hidden><div>x</div></div>` — the
+// inner `</div>` must not be mistaken for the outer one's close). An
+// unclosed element (malformed HTML) is treated as running to the end of the
+// document — the conservative choice, same convention search-enrich.ts's
+// own depth-aware stripBlocksByTagNames() uses for the same situation:
+// better to over-exclude possible hidden chrome than to leak it into text
+// scanned for name/email attribution.
+function findMatchingCloseTagEnd(html: string, tagName: string, searchFrom: number): number {
+  const tagRe = new RegExp(`<(/?)${tagName}(?![\\w-])[^>]*?(/?)>`, "gi");
+  tagRe.lastIndex = searchFrom;
+  let depth = 1;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(html))) {
+    const isClosing = m[1] === "/";
+    const isSelfClosing = m[2] === "/";
+    if (isSelfClosing) continue; // empty element, doesn't affect depth
+    if (isClosing) {
+      depth--;
+      if (depth === 0) return m.index + m[0].length;
+    } else {
+      depth++;
+    }
+  }
+  return html.length;
+}
+
+// Pre-pass for stripToPlainText: removes the ENTIRE content (tags + text)
+// of any element that is CSS/HTML-hidden per elementIsHidden() above —
+// `hidden` attribute, `display:none`/`display: none`, or
+// `visibility:hidden`/`visibility: hidden` — before the generic tag-strip
+// below turns everything into flat text. Without this, a hidden element's
+// text (e.g. an off-screen tab panel or accordion pane in a member-list
+// page, where several members' markup commonly sits in the DOM at once but
+// only one is visible) survives stripToPlainText intact and gets scanned
+// for name-proximity attribution identically to genuinely visible text —
+// widening the false-positive surface for the AC5 attribution question this
+// file exists to get right. A deliberately pragmatic regex/tag-scan pass —
+// same robustness level as this file's existing <script>/<style> stripping
+// above, NOT a full CSS/HTML engine (doesn't evaluate external stylesheets,
+// classes, or computed style — only inline `style="..."` and the `hidden`
+// attribute, which covers the realistic member-directory-markup case this
+// exists for).
+function stripHiddenElements(html: string): string {
+  const openTagRe = /<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*?)(\/?)>/g;
+  let result = "";
+  let cursor = 0;
+  let m: RegExpExecArray | null;
+  while ((m = openTagRe.exec(html))) {
+    if (m.index < cursor) continue; // inside a hidden range already removed below
+    const [full, tagName, attrs, selfClose] = m;
+    if (selfClose === "/") continue; // no content to hide
+    if (!elementIsHidden(attrs)) continue;
+    const contentStart = m.index + full.length;
+    const closeEnd = findMatchingCloseTagEnd(html, tagName, contentStart);
+    result += html.slice(cursor, m.index);
+    result += " "; // placeholder so words either side don't fuse together
+    cursor = closeEnd;
+    openTagRe.lastIndex = closeEnd;
+  }
+  result += html.slice(cursor);
+  return result;
+}
+
+// Unicode-aware "is this a word character" test, used to anchor the
+// name-proximity match below to real word/token boundaries. Deliberately
+// NOT a plain `\b` regex word boundary: `\b` is defined in terms of ASCII
+// `\w` ([A-Za-z0-9_]), so it does NOT treat æ/ø/å (or any other non-ASCII
+// letter) as word characters — a boundary check built on bare `\b` would
+// silently mis-anchor on the exact Norwegian names this function exists to
+// attribute correctly. `\p{L}`/`\p{N}` (with the `u` flag) are Unicode
+// property escapes that classify by the actual Unicode General_Category,
+// so "æ", "ø", "å" (and their uppercase forms) correctly count as letters.
+// Concretely verified (see the u10 test below, and this file's own test
+// suite): /[\p{L}\p{N}]/u.test("æ") -> true, .test("å") -> true.
+function isWordChar(ch: string | undefined): boolean {
+  return !!ch && /[\p{L}\p{N}]/u.test(ch);
+}
+
+/** All start indices of `needle` inside `haystack` (both already
+ * case-normalized by the caller) where the match is anchored to a real
+ * word/token boundary: the character immediately before the match and the
+ * character immediately after it (when either exists) must NOT be a
+ * (Unicode-aware) word character. This rejects a `needle` that is merely
+ * embedded inside — or a strict prefix/suffix of — a longer word or name,
+ * e.g. needle "nordgård" against haystack "nordgårds bakeri as" finds the
+ * raw substring at index 0 but then rejects it: the character immediately
+ * after the match ("s") is a word character, so "nordgård" here is only
+ * the first part of the longer, DIFFERENT word "nordgårds", not a genuine
+ * standalone occurrence of the name. Overlap-inclusive among the indices
+ * that DO qualify. Empty needle -> no matches (never "everywhere"). */
+function allIndicesOf(haystack: string, needle: string): number[] {
+  if (!needle) return [];
+  const out: number[] = [];
+  let idx = haystack.indexOf(needle);
+  while (idx !== -1) {
+    const before = idx > 0 ? haystack[idx - 1] : undefined;
+    const after = idx + needle.length < haystack.length ? haystack[idx + needle.length] : undefined;
+    if (!isWordChar(before) && !isWordChar(after)) out.push(idx);
+    idx = haystack.indexOf(needle, idx + 1);
+  }
+  return out;
+}
+
+// How close (in stripped-plain-text characters) an email must appear to an
+// occurrence of the producer's own name to count as attributed to THAT
+// producer, rather than to a neighbouring member's card. Picked to comfortably
+// span one member's own card/list-item — "Ola Nordgård – Nordgård Gård,
+// 4325 Bryne, tlf 456 78 901, ola@nordgard.no" is well under 150 characters
+// even with generous label text ("Navn:", "E-post:", …) around each field —
+// while staying much smaller than a whole rendered member-list page (which
+// after stripping easily runs into the thousands of characters and would
+// span dozens of unrelated members if used as the window). 250 gives a
+// single card real slack (multi-line address, a second phone number) without
+// reaching into an adjacent card in a typically-dense listing. This is a
+// judgment call, not a value Daniel specified — flagged as such for the
+// reviewer, same as this file's other documented judgment calls.
+const UMBRELLA_NAME_PROXIMITY_CHARS = 250;
+
+// Bare-email matcher over already-stripped plain text (no mailto: hrefs
+// survive stripToPlainText — a mailto-only address with no visible text
+// near it correctly finds no position to test proximity against, and is
+// therefore never attributed here; see harvestUmbrellaMemberEmail's own doc
+// comment). Same shape as search-enrich.ts's extractEmails() internal
+// bareRe, not exported from there, so restated locally for this
+// plain-text-only use. Used exclusively via String.prototype.matchAll below
+// (which clones the regex per call per spec), never manual .exec()/
+// lastIndex bookkeeping — this constant is module-scoped and this file's
+// harvest functions can run concurrently across providers, so no shared
+// mutable regex state may leak between calls.
+const PLAIN_TEXT_EMAIL_RE = /\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g;
+
+/**
+ * (AC5 harvest step) Fetch the affiliated umbrella's own hjemmeside + its
+ * real discovered same-host sub-pages (same fetch/discovery machinery as
+ * harvestFoundOrgEmails — HARVEST_UA/HARVEST_FETCH_TIMEOUT_MS/
+ * HARVEST_MAX_SUBPAGES, no new constants), and return the SINGLE email that
+ * can be confidently attributed to `provider.navn` on that page, or null.
+ *
+ * Only ever reachable via deriveOrgLinkedEmailCandidatesWithHarvest() below,
+ * which applies the "own-site harvest found nothing" precondition first —
+ * this function itself does not re-check that, same "trusts its caller"
+ * convention harvestFoundOrgEmails() above already documents.
+ *
+ * Step 1 — lookup (findUmbrellaAffiliation above). No affiliation resolved
+ * -> return null immediately, ZERO fetch attempts (no attempt, not
+ * attempt-then-discard — same convention this file uses everywhere else for
+ * a precondition that decides a fetch isn't worth making).
+ *
+ * Step 2 — HARD EXCLUSION (the actual AC5 requirement, non-negotiable):
+ * ANY email whose registrable domain equals the umbrella's own registrable
+ * domain is dropped outright, before any other check runs, regardless of
+ * name-proximity or anything else. This is what makes "the umbrella's own
+ * address can never leak in as the producer's" true by construction rather
+ * than by the accuracy of the name-matching heuristic below.
+ *
+ * Step 3 — accept gate: isAcceptableHomepageEmail(email, umbrella's own
+ * hjemmeside) — the SAME function/AC3/AC8 rule harvestFoundOrgEmails() uses,
+ * never GENERIC_DOMAINS/isClaimableDomain (do not re-litigate — see module
+ * doc). Passing the UMBRELLA's own site as the "site" argument means this
+ * accepts an email iff it's either on the umbrella's own domain (already
+ * excluded by Step 2 by the time this matters) OR a free-mail domain
+ * (gmail/hotmail/outlook/…). A DIFFERENT real company/producer domain found
+ * on the umbrella's page is rejected here — deliberately: unlike the
+ * found_same_domain tier, this function has no verified hjemmeside of the
+ * TARGET producer to compare a custom domain against (by design —
+ * harvestUmbrellaMemberEmail's own precondition is that the producer's site
+ * harvest found NOTHING, which includes "no hjemmeside at all"), so a
+ * third-party-looking domain sitting next to the right name on someone
+ * ELSE's page is exactly the un-verifiable case Daniel's "uavklarte
+ * tilfeller -> manuell verifisering" quote is about — a free-mail address is
+ * the one shape here that's plausibly the producer's own personal mailbox
+ * without needing a domain-ownership signal this function doesn't have.
+ *
+ * Step 4 — name-proximity attribution: an email only qualifies if it occurs
+ * within UMBRELLA_NAME_PROXIMITY_CHARS characters of an occurrence of
+ * `provider.navn` (case-insensitive) in the page's STRIPPED PLAIN TEXT (see
+ * stripToPlainText — never matched against raw HTML/tag soup). No name
+ * occurrence anywhere -> null. Name occurs but nothing qualifying nearby ->
+ * null (does NOT fall back to "the only email found on the page", however
+ * tempting — that would be exactly the "some email was found so use it"
+ * heuristic Daniel's quote forbids).
+ *
+ * Step 5 — determinism/ambiguity: if MORE THAN ONE distinct qualifying email
+ * survives steps 2-4 (e.g. the name appears twice near two different
+ * addresses, or two sub-pages each attribute a different address) this is
+ * itself an ambiguous case — return null, never pick one. This deliberately
+ * does NOT extend pickHarvestCandidatesByTier's "first hit wins" convention
+ * here: that convention arbitrates between three MUTUALLY EXCLUSIVE tiers
+ * (same page can only be exactly one of same-domain/contact-page/other), a
+ * different and much narrower kind of determinism than "two genuinely
+ * different candidate email addresses for the same producer", which is a
+ * real ambiguity this function must not silently resolve.
+ *
+ * Never throws — a fetch failure yields null, same as "nothing found today".
+ */
+export async function harvestUmbrellaMemberEmail(
+  provider: Pick<ClaimProviderRow, "navn" | "org_nr">,
+  opts: { fetchImpl?: typeof fetch } = {},
+): Promise<OrgLinkedEmailCandidate | null> {
+  const affiliation = findUmbrellaAffiliation(provider);
+  if (!affiliation) return null;
+
+  const nameLower = provider.navn.trim().toLowerCase();
+  if (!nameLower) return null; // no name to attribute against -> never a guess
+
+  const primary = await fetchPage(affiliation.umbrellaHjemmeside, {
+    userAgent: HARVEST_UA,
+    timeoutMs: HARVEST_FETCH_TIMEOUT_MS,
+    fetchImpl: opts.fetchImpl,
+  });
+  if (!primary.ok) return null;
+
+  const siteBase = primary.finalUrl || affiliation.umbrellaHjemmeside;
+  const pageHtmls: string[] = [primary.html];
+
+  try {
+    const base = new URL(siteBase);
+    const discovered = discoverContentLinks(primary.html, base.toString(), HARVEST_MAX_SUBPAGES);
+    for (const link of discovered) {
+      const sub = await fetchPage(link, { userAgent: HARVEST_UA, timeoutMs: HARVEST_FETCH_TIMEOUT_MS, fetchImpl: opts.fetchImpl });
+      if (sub.ok) pageHtmls.push(sub.html);
+    }
+  } catch {
+    /* malformed base URL — the primary page's own text still stands */
+  }
+
+  const qualifyingEmails = new Set<string>();
+
+  for (const html of pageHtmls) {
+    const plainText = stripToPlainText(html);
+    const plainTextLower = plainText.toLowerCase();
+
+    const namePositions = allIndicesOf(plainTextLower, nameLower);
+    if (namePositions.length === 0) continue; // producer's name doesn't appear on this page at all
+
+    for (const match of plainText.matchAll(PLAIN_TEXT_EMAIL_RE)) {
+      const email = match[1]!.toLowerCase();
+      const emailPos = match.index;
+
+      // Step 2 — HARD EXCLUSION, checked first and unconditionally: never
+      // the umbrella's own address, regardless of any other signal.
+      const emailHost = hostFromUrlLike(email.split("@").pop() || "");
+      const emailRoot = emailHost ? registrableDomain(emailHost) : null;
+      if (affiliation.umbrellaRegistrableDomain && emailRoot === affiliation.umbrellaRegistrableDomain) continue;
+
+      // Step 3 — AC3/AC8 accept gate (see doc comment above for why the
+      // umbrella's own site is the "site" argument here).
+      if (!isAcceptableHomepageEmail(email, siteBase)) continue;
+
+      // Step 4 — name-proximity: qualifies iff within range of ANY
+      // occurrence of the producer's name on this page.
+      const nearName = namePositions.some((namePos) => Math.abs(emailPos - namePos) <= UMBRELLA_NAME_PROXIMITY_CHARS);
+      if (!nearName) continue;
+
+      qualifyingEmails.add(email);
+    }
+  }
+
+  // Step 5 — exactly one qualifying, distinct email required; zero or
+  // multiple are both "cannot confidently attribute" -> null.
+  if (qualifyingEmails.size !== 1) return null;
+  const [email] = qualifyingEmails;
+  return { email: email!, source: "found_umbrella_member" };
+}
+
 /**
  * Candidates form of deriveOrgLinkedEmailCandidatesWithOutreachLookup() that
  * ALSO harvests found addresses from the provider's own verified hjemmeside
@@ -847,11 +1275,20 @@ function pickHarvestCandidatesByTier(hits: HarvestedEmailHit[]): OrgLinkedEmailC
  * fetch-injection seam it does not have today) is left as deliberate,
  * flagged follow-up work — the exact same shape tier (a) brreg_contact
  * already sits in (built + tested, dormant in production) elsewhere in this
- * file.
+ * file. SLICE 4's found_umbrella_member tier (see below) sits in the exact
+ * same dormant-but-correct state, for the same reasons.
+ *
+ * `navn` is added to the Pick, OPTIONAL (same "existing callers/fixtures
+ * that construct a provider object without it keep compiling unchanged"
+ * convention this file already uses for `epost` — see deriveOrgLinkedEmail's
+ * own doc comment above) — needed only by the SLICE 4 found_umbrella_member
+ * fallback below, which simply never attempts itself when navn is missing
+ * (no name, nothing to attribute against, never a guess).
  */
 export async function deriveOrgLinkedEmailCandidatesWithHarvest(
   provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
     epost?: string | null;
+    navn?: string;
   },
   brregContactEmail?: string | null,
   opts: { fetchImpl?: typeof fetch } = {},
@@ -864,16 +1301,43 @@ export async function deriveOrgLinkedEmailCandidatesWithHarvest(
     ? pickHarvestCandidatesByTier(await harvestFoundOrgEmails(provider.hjemmeside as string, opts.fetchImpl))
     : [];
 
+  // SLICE 4 / AC5 — found_umbrella_member, a FALLBACK below the three
+  // own-site found-tiers, attempted only when BOTH:
+  //   (1) the own-site harvest above found literally nothing
+  //       (harvestCandidates.length === 0) — a provider whose own site
+  //       already produced an address never needs its umbrella; and
+  //   (2) there isn't already an independently-verified stored_epost_
+  //       verified candidate — that tier's provenance is one-time-manual or
+  //       delivered-outreach, both stronger evidence than a freshly-scraped,
+  //       name-matched guess off someone else's page (same "don't spend a
+  //       fetch when it can't change the outcome" discipline
+  //       deriveOrgLinkedEmailCandidatesWithOutreachLookup's own doc comment
+  //       already applies to its RFB-DB lookup, just applied here to the
+  //       umbrella fetch instead).
+  // See harvestUmbrellaMemberEmail()'s own doc comment for the full
+  // attribution/hard-exclusion rationale.
+  const alreadyHasStoredEpost = baseCandidates.some((c) => c.source === "stored_epost_verified");
+  const umbrellaCandidate =
+    harvestCandidates.length === 0 && !alreadyHasStoredEpost && provider.navn
+      ? await harvestUmbrellaMemberEmail({ navn: provider.navn, org_nr: provider.org_nr }, { fetchImpl: opts.fetchImpl })
+      : null;
+
   // Merge in the documented priority order — (a) brreg_contact, then the
-  // three found-tiers, then (c) stored_epost_verified — deduping by
-  // normalized email so the SAME address is never offered twice under two
-  // different source tags (e.g. a harvested same-domain address that
-  // happens to equal the stored, provenance-backed epost).
+  // three own-site found-tiers, then (SLICE 4) found_umbrella_member, then
+  // (c) stored_epost_verified — deduping by normalized email so the SAME
+  // address is never offered twice under two different source tags (e.g. a
+  // harvested same-domain address that happens to equal the stored,
+  // provenance-backed epost).
   const brregContactCandidates = baseCandidates.filter((c) => c.source === "brreg_contact");
   const storedEpostCandidates = baseCandidates.filter((c) => c.source === "stored_epost_verified");
   const merged: OrgLinkedEmailCandidate[] = [];
   const seen = new Set<string>();
-  for (const candidate of [...brregContactCandidates, ...harvestCandidates, ...storedEpostCandidates]) {
+  for (const candidate of [
+    ...brregContactCandidates,
+    ...harvestCandidates,
+    ...(umbrellaCandidate ? [umbrellaCandidate] : []),
+    ...storedEpostCandidates,
+  ]) {
     const key = candidate.email.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -965,7 +1429,8 @@ export interface IssuedClaim {
     | "stored_epost_verified"
     | "found_same_domain"
     | "found_contact_page"
-    | "found_site_other";
+    | "found_site_other"
+    | "found_umbrella_member";
   expiresAt: string;
   /** dev-request 2026-07-26-booking-test-send-guard — see issueClaimMagicLink. */
   isTest: boolean;

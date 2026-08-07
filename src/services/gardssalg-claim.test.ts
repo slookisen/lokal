@@ -1281,6 +1281,355 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       assertEq(malformedAfter.about_text, "Ny tekst", "e26: the actual field write still succeeds despite malformed pre-existing field_provenance");
       const malformedProvenance = JSON.parse(malformedAfter.field_provenance);
       assertTrue(!!malformedProvenance.owner_locks?.about_text?.locked_at, "e27: a valid owner_locks.about_text stamp is produced even though the prior JSON was malformed (treated as empty, not clobbered/thrown)");
+
+      // ── found_umbrella_member — dev-request 2026-08-06-aldri-gjett-
+      // epostadresse SLICE 4, AC5 (2026-08-07). Needs BOTH the fetchImpl-
+      // injection convention (same as the h1-h9 harvest block above) AND the
+      // RFB-DB fixture (agents/agent_affiliations) already live in this
+      // scope (rfbDb, wired in via claimSvc.__setRfbDbForTesting above) — so
+      // this block lives down here rather than in the earlier DB-free
+      // harvest block. ──
+      {
+        function mockUmbrellaResponse(html: string, url: string, status = 200): Response {
+          const bytes = new TextEncoder().encode(html);
+          const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
+          return {
+            ok: status >= 200 && status < 300,
+            status,
+            statusText: `S${status}`,
+            url,
+            headers,
+            arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+          } as unknown as Response;
+        }
+        /** Same "missing key -> throws" discipline as the h1-h9 block's own
+         * fetchImplFromMap — a test only ever "expects" exactly the requests
+         * it declares. */
+        function umbrellaFetchImplFromMap(byUrl: Record<string, string>): typeof fetch {
+          return (async (input: unknown) => {
+            const url = String(input);
+            if (!(url in byUrl)) throw new Error(`mock fetch: unexpected request to ${url}`);
+            return mockUmbrellaResponse(byUrl[url]!, url);
+          }) as unknown as typeof fetch;
+        }
+        /** Records every URL requested (never throws on an unexpected one) —
+         * used where the point of the assertion IS "was this URL ever
+         * requested at all", same call-counting-spy rationale h1's own
+         * doc comment gives for why a throwing stub can't prove "zero
+         * calls" (fetchPage() never rethrows). */
+        function recordingFetchImpl(byUrl: Record<string, string>, calls: string[]): typeof fetch {
+          return (async (input: unknown) => {
+            const url = String(input);
+            calls.push(url);
+            if (!(url in byUrl)) return mockUmbrellaResponse("<html><body>unmapped</body></html>", url, 404);
+            return mockUmbrellaResponse(byUrl[url]!, url);
+          }) as unknown as typeof fetch;
+        }
+
+        const insertAgent = rfbDb.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, org_nr, umbrella_type)
+           VALUES (?, ?, 'test agent', 'test', 'x@example.no', ?, 'producer', ?, ?, ?)`,
+        );
+        const insertAffiliation = rfbDb.prepare(
+          `INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES (?, ?, ?, 'admin')`,
+        );
+
+        // (u1) THE AC5 ANTI-LEAK TEST NAMED IN THE SPEC ITSELF: the umbrella
+        // page's ONLY email is the umbrella's OWN contact address — and, the
+        // hardest version of this, it sits RIGHT NEXT TO the producer's own
+        // name (so a name-proximity check ALONE, without the hard domain
+        // exclusion, would wrongly accept it). Must still return null: the
+        // umbrella's own address can never leak in as the producer's, no
+        // matter how close the name match is.
+        insertAgent.run("agent-u1-producer", "Solgården", "https://solgarden-ukjent.no", "key-u1-p", "912340001", null);
+        insertAgent.run("agent-u1-umbrella", "Paraplyen U1", "https://paraplyen-u1.no", "key-u1-u", null, "cooperative");
+        insertAffiliation.run("agent-u1-producer", "agent-u1-umbrella", "active");
+        const u1Html = `<html><body><h1>Våre medlemmer</h1>
+          <p>Solgården er medlem hos oss. Kontakt oss på post@paraplyen-u1.no for spørsmål.</p>
+          </body></html>`;
+        const u1 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Solgården", org_nr: "912340001" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u1.no": u1Html }) },
+        );
+        assertEq(u1, null, "u1: AC5 ANTI-LEAK — the umbrella's own address (post@paraplyen-u1.no, same domain as the umbrella's own hjemmeside) is dropped by the hard exclusion even though it sits directly next to the producer's own name — never offered as the producer's address");
+
+        // (u2) Positive case: two members, each with their own name + email,
+        // separated by enough filler text that neither's card falls inside
+        // the OTHER's name-proximity window. Target producer's own address
+        // must be returned; the other member's address must never be.
+        insertAgent.run("agent-u2-producer", "Bjørkelund Gård", "https://ukjent.no", "key-u2-p", "912340002", null);
+        insertAgent.run("agent-u2-other-producer", "Fjellro Gård", "https://ukjent2.no", "key-u2-op", "912340012", null);
+        insertAgent.run("agent-u2-umbrella", "Paraplyen U2", "https://paraplyen-u2.no", "key-u2-u", null, "cooperative");
+        insertAffiliation.run("agent-u2-producer", "agent-u2-umbrella", "active");
+        insertAffiliation.run("agent-u2-other-producer", "agent-u2-umbrella", "active");
+        const u2Filler = "Fyll ".repeat(120); // ~600 chars — well over the 250-char proximity window
+        const u2Html = `<html><body><h1>Våre medlemmer</h1>
+          <div class="member"><h3>Bjørkelund Gård</h3><p>Kontakt: kari@gmail.com</p></div>
+          <p>${u2Filler}</p>
+          <div class="member"><h3>Fjellro Gård</h3><p>Kontakt: ola@hotmail.com</p></div>
+          </body></html>`;
+        const u2FetchImpl = umbrellaFetchImplFromMap({ "https://paraplyen-u2.no": u2Html });
+        const u2Target = await claimSvc.harvestUmbrellaMemberEmail({ navn: "Bjørkelund Gård", org_nr: "912340002" }, { fetchImpl: u2FetchImpl });
+        assertEq(u2Target, { email: "kari@gmail.com", source: "found_umbrella_member" }, "u2: positive case — Bjørkelund Gård is correctly attributed kari@gmail.com (its own nearby card), not ola@hotmail.com (the other member's, too far away to qualify)");
+        const u2Other = await claimSvc.harvestUmbrellaMemberEmail({ navn: "Fjellro Gård", org_nr: "912340012" }, { fetchImpl: u2FetchImpl });
+        assertEq(u2Other, { email: "ola@hotmail.com", source: "found_umbrella_member" }, "u2b: symmetric check — Fjellro Gård is correctly attributed ola@hotmail.com, not kari@gmail.com (the FIRST member's own scenario doesn't accidentally win by being scanned first)");
+
+        // (u3) agent_affiliations.status != 'active' -> no candidate, AND
+        // zero fetch attempts (findUmbrellaAffiliation must reject this
+        // BEFORE any fetch, same "no attempt, not attempt-then-discard"
+        // discipline this file uses everywhere else).
+        insertAgent.run("agent-u3-producer", "Pending Gård", "https://ukjent3.no", "key-u3-p", "912340003", null);
+        insertAgent.run("agent-u3-umbrella", "Paraplyen U3", "https://paraplyen-u3.no", "key-u3-u", null, "cooperative");
+        insertAffiliation.run("agent-u3-producer", "agent-u3-umbrella", "pending_confirmation");
+        const u3Calls: string[] = [];
+        const u3 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Pending Gård", org_nr: "912340003" },
+          { fetchImpl: recordingFetchImpl({}, u3Calls) },
+        );
+        assertEq(u3, null, "u3: a pending_confirmation (not active) affiliation -> no candidate, the tier is not triggered at all");
+        assertEq(u3Calls, [], "u3b: ...and zero fetch attempts were made — the affiliation check itself rejects this case before any network call");
+
+        // (u3c) Zero affiliations at all for an otherwise-real producer
+        // agent -> same null / zero-fetch outcome.
+        insertAgent.run("agent-u3c-producer", "Ingen Paraply Gård", "https://ukjent3c.no", "key-u3c-p", "912340013", null);
+        const u3cCalls: string[] = [];
+        const u3c = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Ingen Paraply Gård", org_nr: "912340013" },
+          { fetchImpl: recordingFetchImpl({}, u3cCalls) },
+        );
+        assertEq(u3c, null, "u3c: a producer agent with zero agent_affiliations rows at all -> no candidate");
+        assertEq(u3cCalls, [], "u3c-2: ...and zero fetch attempts");
+
+        // (u4) MORE THAN ONE active affiliation for the same producer -> an
+        // ambiguous case in its own right (which umbrella's page would even
+        // be authoritative?) -> no candidate, never an arbitrary pick of the
+        // first one, and zero fetch attempts (same precondition discipline).
+        insertAgent.run("agent-u4-producer", "Dobbel Gård", "https://ukjent4.no", "key-u4-p", "912340004", null);
+        insertAgent.run("agent-u4-umbrella-a", "Paraplyen U4A", "https://paraplyen-u4a.no", "key-u4-ua", null, "cooperative");
+        insertAgent.run("agent-u4-umbrella-b", "Paraplyen U4B", "https://paraplyen-u4b.no", "key-u4-ub", null, "cooperative");
+        insertAffiliation.run("agent-u4-producer", "agent-u4-umbrella-a", "active");
+        insertAffiliation.run("agent-u4-producer", "agent-u4-umbrella-b", "active");
+        const u4Calls: string[] = [];
+        const u4 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Dobbel Gård", org_nr: "912340004" },
+          { fetchImpl: recordingFetchImpl({}, u4Calls) },
+        );
+        assertEq(u4, null, "u4: two ACTIVE affiliations for the same producer -> ambiguous, no candidate, never an arbitrary first-pick");
+        assertEq(u4Calls, [], "u4b: ...and zero fetch attempts");
+
+        // (u6) Producer's name DOES appear on the umbrella page, but no
+        // email is within the proximity window of any occurrence -> no
+        // candidate. Proves this never falls back to "well SOME email was
+        // on the page" once a name-match exists.
+        insertAgent.run("agent-u6-producer", "Fjordblikk Gård", "https://ukjent6.no", "key-u6-p", "912340006", null);
+        insertAgent.run("agent-u6-umbrella", "Paraplyen U6", "https://paraplyen-u6.no", "key-u6-u", null, "cooperative");
+        insertAffiliation.run("agent-u6-producer", "agent-u6-umbrella", "active");
+        const u6Filler = "Fyll ".repeat(120); // ~600 chars, over the 250-char window
+        const u6Html = `<html><body><h1>Våre medlemmer</h1>
+          <p>Fjordblikk Gård er et av våre medlemmer.</p>
+          <p>${u6Filler}</p>
+          <p>Generell kontakt for spørsmål om nettsiden: webmaster@et-helt-annet-sted.no</p>
+          </body></html>`;
+        const u6 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Fjordblikk Gård", org_nr: "912340006" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u6.no": u6Html }) },
+        );
+        assertEq(u6, null, "u6: producer's name appears on the page but no email is within the proximity window of that occurrence -> no candidate, never a guess at 'the only email found'");
+
+        // (u7) Integration: deriveOrgLinkedEmailCandidatesWithHarvest() only
+        // attempts this tier when the OWN-site harvest found ZERO candidates
+        // — a provider whose own site already produced a found-tier address
+        // must never even trigger a fetch to its umbrella's page.
+        insertAgent.run("agent-u7-producer", "Eget Nettsted Gård", "https://eget-nettsted-u7.no", "key-u7-p", "912340007", null);
+        insertAgent.run("agent-u7-umbrella", "Paraplyen U7", "https://paraplyen-u7.no", "key-u7-u", null, "cooperative");
+        insertAffiliation.run("agent-u7-producer", "agent-u7-umbrella", "active");
+        const u7Calls: string[] = [];
+        const u7OwnSiteHtml = `<html><body>Kontakt: eier@eget-nettsted-u7.no</body></html>`;
+        const u7 = await claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(
+          {
+            org_nr: "912340007",
+            brreg_verified: 1,
+            hjemmeside: "https://eget-nettsted-u7.no",
+            content_source: "manual", // ownership-verified -> own-site harvest attempted
+            field_provenance: null,
+            navn: "Eget Nettsted Gård",
+          },
+          undefined,
+          { fetchImpl: recordingFetchImpl({ "https://eget-nettsted-u7.no": u7OwnSiteHtml }, u7Calls) },
+        );
+        assertEq(u7, [{ email: "eier@eget-nettsted-u7.no", source: "found_same_domain" }], "u7: own-site harvest already found an address -> that's the only candidate");
+        assertTrue(!u7Calls.includes("https://paraplyen-u7.no"), "u7b: ...and the umbrella's own page (https://paraplyen-u7.no) was NEVER fetched — the fallback tier is not attempted once the own-site harvest already succeeded");
+
+        // (u8) Integration: deriveOrgLinkedEmailCandidatesWithHarvest() also
+        // skips this tier when a stored_epost_verified candidate already
+        // qualifies (independently-verified, stronger evidence than a
+        // freshly-scraped umbrella-page guess) — even though the own-site
+        // harvest itself finds nothing (no hjemmeside at all here).
+        insertAgent.run("agent-u8-producer", "Manuell Epost Gård", "https://ukjent8.no", "key-u8-p", "912340008", null);
+        insertAgent.run("agent-u8-umbrella", "Paraplyen U8", "https://paraplyen-u8.no", "key-u8-u", null, "cooperative");
+        insertAffiliation.run("agent-u8-producer", "agent-u8-umbrella", "active");
+        const u8Calls: string[] = [];
+        const u8 = await claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(
+          {
+            org_nr: "912340008",
+            brreg_verified: 1,
+            hjemmeside: null,
+            content_source: "manual",
+            field_provenance: null,
+            epost: "post@manuellepost.no", // (c-epost) manual -> qualifies as stored_epost_verified
+            navn: "Manuell Epost Gård",
+          },
+          undefined,
+          { fetchImpl: recordingFetchImpl({}, u8Calls) },
+        );
+        assertEq(u8, [{ email: "post@manuellepost.no", source: "stored_epost_verified" }], "u8: a qualifying stored_epost_verified candidate already exists -> that's the only candidate");
+        assertEq(u8Calls, [], "u8b: ...and the umbrella tier made zero fetch attempts (an existing stored/verified address already makes it redundant)");
+
+        // (u9) Full success path through deriveOrgLinkedEmailCandidatesWithHarvest:
+        // no hjemmeside, no stored epost, but a valid umbrella affiliation
+        // whose member page names this producer -> found_umbrella_member
+        // shows up as the (only) candidate.
+        insertAgent.run("agent-u9-producer", "Nyoppdaget Gård", "https://ukjent9.no", "key-u9-p", "912340009", null);
+        insertAgent.run("agent-u9-umbrella", "Paraplyen U9", "https://paraplyen-u9.no", "key-u9-u", null, "cooperative");
+        insertAffiliation.run("agent-u9-producer", "agent-u9-umbrella", "active");
+        const u9Html = `<html><body><h1>Medlemmer</h1><p>Nyoppdaget Gård: post@nyoppdaget-gmail-erstatning.no er feil, riktig adresse er eier@gmail.com</p></body></html>`;
+        const u9 = await claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(
+          {
+            org_nr: "912340009",
+            brreg_verified: 1,
+            hjemmeside: null,
+            content_source: "provider_site",
+            field_provenance: null,
+            navn: "Nyoppdaget Gård",
+          },
+          undefined,
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u9.no": u9Html }) },
+        );
+        assertEq(u9, [{ email: "eier@gmail.com", source: "found_umbrella_member" }], "u9: end-to-end success — no own site, no stored epost, but the umbrella's member page names this producer next to a qualifying (free-mail) address -> found_umbrella_member candidate; the non-free-mail, non-umbrella-domain address on the same line is correctly rejected by the AC3/AC8 accept gate");
+
+        // (u10) REVIEW FIX — unanchored substring matching (2026-08-07
+        // fix-up, finding 1): the reviewer's adversarial scenario, restated
+        // exactly. Producer "Nordgård" never appears STANDALONE anywhere on
+        // its umbrella's page — the only occurrence of the raw substring
+        // "nordgård" is as the first part of a DIFFERENT, longer entity's
+        // name, "Nordgårds Bakeri AS" (a sponsor, not this producer), which
+        // sits right next to an otherwise-qualifying free-mail address. A
+        // raw, unanchored substring search (the pre-fix behaviour) finds
+        // "nordgård" at index 0 of "nordgårds bakeri as" and — since nothing
+        // else disqualifies it — would confidently return the sponsor's
+        // address as this producer's own found_umbrella_member candidate:
+        // exactly the account-takeover-shaped misattribution the review
+        // flagged. The fix anchors the match to real word boundaries: the
+        // character immediately after the "nordgård" substring here is "s"
+        // (part of "nordgårds"), a word character, so the match is rejected
+        // as embedded in a longer word — never even reaching Step 4's
+        // proximity check. Must return null, NOT the sponsor's address.
+        insertAgent.run("agent-u10-producer", "Nordgård", "https://ukjent10.no", "key-u10-p", "912340010", null);
+        insertAgent.run("agent-u10-umbrella", "Paraplyen U10", "https://paraplyen-u10.no", "key-u10-u", null, "cooperative");
+        insertAffiliation.run("agent-u10-producer", "agent-u10-umbrella", "active");
+        const u10Html = `<html><body><h1>Våre sponsorer</h1>
+          <p>Nordgårds Bakeri AS er stolt sponsor av laget. Kontakt: sponsor@gmail.com</p>
+          </body></html>`;
+        const u10 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Nordgård", org_nr: "912340010" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u10.no": u10Html }) },
+        );
+        assertEq(u10, null, "u10: REGRESSION (review finding 1) — producer 'Nordgård' is a strict prefix of the unrelated 'Nordgårds Bakeri AS' on the page; the substring match is correctly rejected by word-boundary anchoring (the char right after the match, 's', is a word char) so sponsor@gmail.com is NEVER attributed to this producer — must be null, not a wrong-entity guess");
+
+        // (u10b) Sanity check on the SAME page/producer name: when the
+        // producer's name genuinely DOES appear standalone (real word
+        // boundaries on both sides), the anchored match still fires
+        // normally and the tier still works — the fix must not be so
+        // strict it breaks genuine matches. (u2/u9 above already cover this
+        // for other names; this repeats it specifically for a name that
+        // ALSO happens to be a prefix of a longer name elsewhere on a page,
+        // to prove the anchoring is precise, not merely "always reject".)
+        const u10bHtml = `<html><body><h1>Våre medlemmer</h1>
+          <p>Nordgård er medlem hos oss. Kontakt: nordgard@gmail.com</p>
+          </body></html>`;
+        const u10b = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Nordgård", org_nr: "912340010" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u10.no": u10bHtml }) },
+        );
+        assertEq(u10b, { email: "nordgard@gmail.com", source: "found_umbrella_member" }, "u10b: anchoring is precise, not overbroad — 'Nordgård' occurring as a genuine standalone word (real boundaries both sides) still matches and still yields its own qualifying address");
+
+        // (u11) REVIEW FIX — CSS/HTML-hidden content (2026-08-07 fix-up,
+        // finding 2), case (a): a `hidden` boolean attribute. The producer's
+        // name AND a qualifying email exist ONLY inside a `<div hidden>` —
+        // nowhere else on the page. Before the fix, stripToPlainText left
+        // this text intact and it would be scanned exactly like visible
+        // text, yielding a candidate; after the fix, the whole hidden
+        // element (name + email) is dropped before scanning, so the name
+        // never even registers -> null.
+        insertAgent.run("agent-u11-producer", "Skjult Gård", "https://ukjent11.no", "key-u11-p", "912340011", null);
+        insertAgent.run("agent-u11-umbrella", "Paraplyen U11", "https://paraplyen-u11.no", "key-u11-u", null, "cooperative");
+        insertAffiliation.run("agent-u11-producer", "agent-u11-umbrella", "active");
+        const u11Html = `<html><body><h1>Medlemmer</h1>
+          <div hidden><p>Skjult Gård kontakt: skjult@gmail.com</p></div>
+          </body></html>`;
+        const u11 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Skjult Gård", org_nr: "912340011" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u11.no": u11Html }) },
+        );
+        assertEq(u11, null, "u11: REGRESSION (review finding 2a) — a `<div hidden>` containing the producer's name and a qualifying email is excluded entirely; the name never registers as occurring on the page at all -> null, not skjult@gmail.com");
+
+        // (u12) same review finding, case (b): `style="display:none"`
+        // (no whitespace around the colon).
+        // (org_nr 912340112, not 912340012 — the latter is already used
+        // above by u2's "Fjellro Gård")
+        insertAgent.run("agent-u12-producer", "Usynlig Gård", "https://ukjent12.no", "key-u12-p", "912340112", null);
+        insertAgent.run("agent-u12-umbrella", "Paraplyen U12", "https://paraplyen-u12.no", "key-u12-u", null, "cooperative");
+        insertAffiliation.run("agent-u12-producer", "agent-u12-umbrella", "active");
+        const u12Html = `<html><body><h1>Medlemmer</h1>
+          <div style="display:none"><p>Usynlig Gård kontakt: usynlig@gmail.com</p></div>
+          </body></html>`;
+        const u12 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Usynlig Gård", org_nr: "912340112" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u12.no": u12Html }) },
+        );
+        assertEq(u12, null, "u12: REGRESSION (review finding 2b) — `style=\"display:none\"` content is excluded entirely -> null, not usynlig@gmail.com");
+
+        // (u13) same review finding, case (c): the whitespace variant
+        // `style="display: none;"` (space after the colon, trailing
+        // semicolon) — must be recognized the same as the no-whitespace
+        // form in u12, not treated as a different/unmatched value.
+        // (org_nr 912340113, not 912340013 — the latter is already used
+        // above by u3c's "Ingen Paraply Gård")
+        insertAgent.run("agent-u13-producer", "Bortgjemt Gård", "https://ukjent13.no", "key-u13-p", "912340113", null);
+        insertAgent.run("agent-u13-umbrella", "Paraplyen U13", "https://paraplyen-u13.no", "key-u13-u", null, "cooperative");
+        insertAffiliation.run("agent-u13-producer", "agent-u13-umbrella", "active");
+        const u13Html = `<html><body><h1>Medlemmer</h1>
+          <div style="display: none;"><p>Bortgjemt Gård kontakt: bortgjemt@gmail.com</p></div>
+          </body></html>`;
+        const u13 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Bortgjemt Gård", org_nr: "912340113" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u13.no": u13Html }) },
+        );
+        assertEq(u13, null, "u13: REGRESSION (review finding 2c) — the whitespace variant `style=\"display: none;\"` is recognized identically to the tight `display:none` form -> null, not bortgjemt@gmail.com");
+
+        // (u14) same review finding, case (d): genuinely VISIBLE content in
+        // a SIBLING element must still be matched normally — proving the
+        // hidden-content fix doesn't over-strip. Uses `visibility:hidden`
+        // for the hidden sibling (the third form the fix recognizes,
+        // alongside `hidden` and `display:none`), so this test also
+        // incidentally covers that variant. Same producer name appears in
+        // BOTH the hidden sibling (next to a DIFFERENT email that must
+        // never be picked) and a visible sibling (next to its own
+        // qualifying email, which must be picked) — proving both halves at
+        // once: hidden text truly excluded, visible text truly unaffected.
+        insertAgent.run("agent-u14-producer", "Synlig Gård", "https://ukjent14.no", "key-u14-p", "912340014", null);
+        insertAgent.run("agent-u14-umbrella", "Paraplyen U14", "https://paraplyen-u14.no", "key-u14-u", null, "cooperative");
+        insertAffiliation.run("agent-u14-producer", "agent-u14-umbrella", "active");
+        const u14Html = `<html><body><h1>Medlemmer</h1>
+          <div style="visibility:hidden"><p>Synlig Gård kontakt: skjult-variant@gmail.com</p></div>
+          <p>Synlig Gård kontakt: synlig-variant@gmail.com</p>
+          </body></html>`;
+        const u14 = await claimSvc.harvestUmbrellaMemberEmail(
+          { navn: "Synlig Gård", org_nr: "912340014" },
+          { fetchImpl: umbrellaFetchImplFromMap({ "https://paraplyen-u14.no": u14Html }) },
+        );
+        assertEq(u14, { email: "synlig-variant@gmail.com", source: "found_umbrella_member" }, "u14: REGRESSION (review finding 2, `visibility:hidden` variant + no-over-stripping check) — the visibility:hidden sibling's name+email is excluded (skjult-variant@gmail.com never qualifies) while the genuinely visible sibling's own name+email is matched completely normally -> synlig-variant@gmail.com, proving the fix doesn't over-strip visible content");
+      }
     } catch (err: any) {
       failed++;
       failures.push("gardssalg-claim: unexpected error: " + String(err?.stack || err?.message || err));
