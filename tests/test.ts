@@ -29265,6 +29265,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ogecr.failures) failures.push("opplevelser-gardssalg-experience-conflict: " + f);
     console.log(`  opplevelser-gardssalg-experience-conflict: ${ogecr.passed} passed, ${ogecr.failed} failed`);
 
+    // dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering,
+    // Skive 2: the human confirmation queue over name_token/host_name
+    // candidates — GET .../gardssalg-experience-conflict-queue, POST
+    // .../gardssalg-experience-conflict-review, and the wiring of a
+    // confirmed/rejected verdict back into computeGardssalgReadinessRows's
+    // has_duplicate_conflict / name_token_conflict_candidate sets. Also
+    // covers the 14 pre-seeded 2026-08-01 spot-check decisions (13 reject +
+    // 1 confirm, database/init-experiences.ts) already counting correctly at
+    // schema-init time, before any admin call.
+    console.log("\n── opplevelser-gardssalg-experience-conflict-queue: confirmation queue (confirm/reject) ──");
+    const { runOpplevelserGardssalgExperienceConflictQueueTests } = require("../src/routes/opplevelser-gardssalg-experience-conflict-queue.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-experience-conflict-queue.test");
+    const ogecqr = await runOpplevelserGardssalgExperienceConflictQueueTests({ log: false });
+    passed += ogecqr.passed;
+    failed += ogecqr.failed;
+    for (const f of ogecqr.failures) failures.push("opplevelser-gardssalg-experience-conflict-queue: " + f);
+    console.log(`  opplevelser-gardssalg-experience-conflict-queue: ${ogecqr.passed} passed, ${ogecqr.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice: pure
     // classification-logic tests for the gårdssalg website-verification sweep

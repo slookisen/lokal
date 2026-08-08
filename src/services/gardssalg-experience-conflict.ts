@@ -1134,6 +1134,184 @@ export function planExperienceConflictRollback(
   return { restorable, skipped };
 }
 
+// ─── Skive 2 — human confirmation queue over name_token/host_name candidates
+// (dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 2)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Slice 1 (above) proved only `provider_link` pairs are trustworthy WITHOUT
+// a human — the 2026-08-01 spot-check found 13/14 name_token/host_name
+// pairs FALSE at this corpus size — and started surfacing every
+// conflict/ambiguous pair on those two bases as an informational
+// `name_token_conflict_candidate`, never pool-blocking. This is the queue
+// that lets a human turn a CANDIDATE into real evidence (CONFIRM — counts
+// exactly like provider_link from here on) or permanently dismiss it
+// (REJECT — a stable (producer_id, experience_id) key so it never resurfaces
+// even though the scan will keep re-finding it structurally; see
+// gardssalg_experience_conflict_review, database/init-experiences.ts).
+//
+// Deliberately NOT built as a NEW parallel matcher: the queue is just
+// runGardssalgExperienceConflictScan()'s own output (never touched here),
+// filtered to non-provider_link conflict/ambiguous pairs, minus whatever
+// already has a decision recorded. Same "recompute from live DB state, never
+// trust a client-supplied pair" discipline every other write route in this
+// module already uses.
+
+export type GsExpReviewVerdict = "confirmed" | "rejected";
+
+export interface GsExpReviewDecision {
+  producer_id: string;
+  experience_id: string;
+  verdict: GsExpReviewVerdict;
+  decided_by: string;
+  decided_at: string;
+  note: string | null;
+}
+
+/** Stable pair-key for the review table's composite PRIMARY KEY — the same
+ *  string used both to look decisions up (loadGardssalgExperienceConflict
+ *  ReviewDecisions) and to validate a submitted decision against the
+ *  freshly-recomputed queue (the route below), so the two can never drift
+ *  apart into two different notions of "the same pair". */
+export function gsExpReviewPairKey(producerId: string, experienceId: string): string {
+  return `${producerId}::${experienceId}`;
+}
+
+/** Every decision ever recorded, keyed by gsExpReviewPairKey() — both
+ *  verdicts, so a caller can tell "confirmed" from "rejected" from "never
+ *  decided" (absent from the map) in one lookup. Pure read. */
+export function loadGardssalgExperienceConflictReviewDecisions(
+  db: Database.Database
+): Map<string, GsExpReviewDecision> {
+  const rows = db
+    .prepare(
+      `SELECT producer_id, experience_id, verdict, decided_by, decided_at, note
+         FROM gardssalg_experience_conflict_review`
+    )
+    .all() as GsExpReviewDecision[];
+  const map = new Map<string, GsExpReviewDecision>();
+  for (const r of rows) map.set(gsExpReviewPairKey(r.producer_id, r.experience_id), r);
+  return map;
+}
+
+/** Insert-only — a pair is decided exactly once (the review route below only
+ *  ever offers a pair that is NOT already in `decisions`, so this never needs
+ *  UPDATE/upsert semantics; a PRIMARY KEY collision surfaces as a thrown
+ *  error the caller reports as a named write failure rather than silently
+ *  overwriting an earlier human verdict). */
+export function recordGardssalgExperienceConflictReviewDecision(
+  db: Database.Database,
+  decision: {
+    producer_id: string;
+    experience_id: string;
+    verdict: GsExpReviewVerdict;
+    decided_by: string;
+    note?: string | null;
+  }
+): void {
+  db.prepare(
+    `INSERT INTO gardssalg_experience_conflict_review
+       (producer_id, experience_id, verdict, decided_by, decided_at, note)
+     VALUES (@producer_id, @experience_id, @verdict, @decided_by, datetime('now'), @note)`
+  ).run({
+    producer_id: decision.producer_id,
+    experience_id: decision.experience_id,
+    verdict: decision.verdict,
+    decided_by: decision.decided_by,
+    note: decision.note ?? null,
+  });
+}
+
+/** DISPLAY-only shared-token recompute for a queue entry ("delt token" in
+ *  the spec) — NOT a second matching heuristic and not consulted by the scan
+ *  or by any status/basis decision anywhere: it reuses the SAME tokenizer
+ *  helpers the matcher above already computed with (producerTokenSet /
+ *  experienceTokenSet / sharedSignificantTokens / hostLabelToken), just
+ *  re-run against the pair's own producer_name/experience_title/
+ *  experience_booking_url so the queue can show a human WHY a pair matched
+ *  without the matcher itself exposing per-pair internals through its public
+ *  return type. host_name pairs show the host label; name_token pairs show
+ *  every significant shared token (there can be more than one); provider_link
+ *  pairs (never queued — see buildGardssalgExperienceConflictQueuePairs)
+ *  return []. Approximate for name_token in one respect: the live scan also
+ *  considers title_no when computing shared tokens, which this recompute
+ *  cannot see (GsExpMatchedPair only carries the display title) — a purely
+ *  cosmetic gap, since the queue entry's OWN match_basis/status already come
+ *  straight from the real scan, this only affects which token strings are
+ *  shown as "why", never whether the pair is queued at all. */
+export function describeMatchedPairSharedTokens(
+  pair: Pick<GsExpMatchedPair, "producer_name" | "experience_title" | "match_basis" | "experience_booking_url">
+): string[] {
+  if (pair.match_basis === "host_name") {
+    const label = hostLabelToken(pair.experience_booking_url);
+    return label ? [label] : [];
+  }
+  if (pair.match_basis === "name_token") {
+    const pTokens = producerTokenSet(pair.producer_name);
+    const eTokens = experienceTokenSet(pair.experience_title, null);
+    return sharedSignificantTokens(pTokens, eTokens);
+  }
+  return [];
+}
+
+export interface GsExpQueueEntry {
+  producer_id: string;
+  producer_name: string;
+  producer_hidden: boolean;
+  producer_hjemmeside: string | null;
+  experience_id: string;
+  experience_title: string;
+  experience_booking_url: string | null;
+  match_basis: GsExpMatchBasis;
+  status: GsExpConflictStatus;
+  shared_tokens: string[];
+}
+
+/**
+ * The pending queue: every conflict/ambiguous pair on a name_token or
+ * host_name basis (provider_link is never queued — it already blocks on its
+ * own, slice 1) that does NOT already carry a decision. Pure function over
+ * already-scanned pairs + an already-loaded decisions map — the route below
+ * is responsible for producing both fresh (never trusts a client-supplied
+ * pair list, same discipline as every other write route in this file).
+ * Deterministically sorted (producer_name, producer_id, experience_title,
+ * experience_id) — not scan order — so pagination offsets stay stable across
+ * calls and a producer's pairs (e.g. Booze Of Norway's 93) land contiguously.
+ */
+export function buildGardssalgExperienceConflictQueuePairs(
+  pairs: GsExpMatchedPair[],
+  decisions: Map<string, GsExpReviewDecision>
+): GsExpQueueEntry[] {
+  const out: GsExpQueueEntry[] = [];
+  for (const p of pairs) {
+    if (p.match_basis === "provider_link") continue;
+    if (p.status !== "conflict" && p.status !== "ambiguous") continue;
+    if (decisions.has(gsExpReviewPairKey(p.producer_id, p.experience_id))) continue;
+    out.push({
+      producer_id: p.producer_id,
+      producer_name: p.producer_name,
+      producer_hidden: p.producer_hidden,
+      producer_hjemmeside: p.producer_hjemmeside,
+      experience_id: p.experience_id,
+      experience_title: p.experience_title,
+      experience_booking_url: p.experience_booking_url,
+      match_basis: p.match_basis,
+      status: p.status,
+      shared_tokens: describeMatchedPairSharedTokens(p),
+    });
+  }
+  out.sort((a, b) => {
+    const an = a.producer_name.toLowerCase();
+    const bn = b.producer_name.toLowerCase();
+    if (an !== bn) return an < bn ? -1 : 1;
+    if (a.producer_id !== b.producer_id) return a.producer_id < b.producer_id ? -1 : 1;
+    const at = a.experience_title.toLowerCase();
+    const bt = b.experience_title.toLowerCase();
+    if (at !== bt) return at < bt ? -1 : 1;
+    return a.experience_id < b.experience_id ? -1 : 1;
+  });
+  return out;
+}
+
 /** Mirrors applyGardssalgContentRollback exactly (experience-store.ts),
  *  adapted to this table/FK: restores the field, inserts a NEW audit row
  *  (never mutates/deletes existing ones) stamped with

@@ -215,9 +215,14 @@ import {
   buildAmbiguousExperienceDetail,
   planExperienceConflictRollback,
   applyExperienceConflictRollback,
+  gsExpReviewPairKey,
+  loadGardssalgExperienceConflictReviewDecisions,
+  recordGardssalgExperienceConflictReviewDecision,
+  buildGardssalgExperienceConflictQueuePairs,
   type GsExpMatchedPair,
   type GsExpConflictPlanItem,
   type GsExpConflictRollbackPlanItem,
+  type GsExpReviewVerdict,
 } from "../services/gardssalg-experience-conflict";
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
 // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice — a new,
@@ -7387,11 +7392,33 @@ function computeGardssalgReadinessRows(
   // they feed slice 2's confirmation queue, and only a human-confirmed pair
   // will ever block again (via a basis the queue will stamp — not built yet,
   // deliberately: until then candidates never block).
+  // dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 2:
+  // a human verdict recorded in gardssalg_experience_conflict_review (the
+  // confirmation queue's own table, database/init-experiences.ts) upgrades a
+  // name_token/host_name pair to real evidence (CONFIRMED — same weight as
+  // provider_link from here on) or permanently drops it (REJECTED — never
+  // blocks, never even surfaces as a candidate again, even though the scan
+  // keeps structurally re-finding it every cycle). A pair with NO decision
+  // yet keeps slice 1's exact behavior: informational candidate only, never
+  // pool-blocking. Additive on top of slice 1's loop — the provider_link
+  // branch is completely unchanged.
+  const reviewDecisions = loadGardssalgExperienceConflictReviewDecisions(expDb);
   const duplicateConflictProducerIds = new Set<string>();
   const nameTokenConflictCandidateIds = new Set<string>();
   for (const pair of conflictPairs) {
     if (pair.status === "conflict" || pair.status === "ambiguous") {
       if (pair.match_basis === "provider_link") {
+        duplicateConflictProducerIds.add(pair.producer_id);
+        continue;
+      }
+      const decision = reviewDecisions.get(gsExpReviewPairKey(pair.producer_id, pair.experience_id));
+      if (decision?.verdict === "rejected") {
+        // Suppressed: a human already ruled this a false pair. Never a
+        // blocker, never even a candidate — the whole point of the reject
+        // verdict (spec: "Avviste par undertrykkes fra fremtidige skann").
+        continue;
+      }
+      if (decision?.verdict === "confirmed") {
         duplicateConflictProducerIds.add(pair.producer_id);
       } else {
         nameTokenConflictCandidateIds.add(pair.producer_id);
@@ -8762,6 +8789,206 @@ router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (r
     console.error("[gardssalg-experience-conflict-remediation] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-experience-conflict-queue ─────────
+//
+// dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 2:
+// the confirmation queue over the candidate pairs slice 1 started surfacing
+// as `name_token_conflict_candidate` — every conflict/ambiguous pair on a
+// name_token or host_name basis (provider_link is never queued; it already
+// blocks on its own) that a human has NOT yet decided. Same read-only,
+// admin-gated GET shape as GET /admin/website-review-queues above. Pure
+// read: re-runs the SAME scan as GET .../gardssalg-experience-conflict-audit
+// (never trusts a cached/client-supplied list) plus one SELECT over the
+// decisions table.
+//
+// Scale (measured live 2026-08-08): 345 raw candidate pairs across 42
+// producers, one producer ("Booze Of Norway") alone accounting for 93 of
+// them. The response is therefore paginated (?limit, default 100, max 500;
+// ?offset) over a DETERMINISTIC sort (producer_name, then experience_title —
+// see buildGardssalgExperienceConflictQueuePairs), and carries a
+// `producer_summary` breakdown (pending count per producer) so a caller can
+// see the Booze-of-Norway-shaped skew without paging through all of it, plus
+// an optional `?producer_id=` filter to drill into one producer's pairs
+// directly. Every pair is still individually reachable and decidable via the
+// POST review endpoint below regardless of how it's paged here.
+router.get("/admin/gardssalg-experience-conflict-queue", requireAdmin, (req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const { pairs } = runGardssalgExperienceConflictScan(expDb);
+    const decisions = loadGardssalgExperienceConflictReviewDecisions(expDb);
+    const pending = buildGardssalgExperienceConflictQueuePairs(pairs, decisions);
+
+    let confirmedTotal = 0;
+    let rejectedTotal = 0;
+    for (const d of decisions.values()) {
+      if (d.verdict === "confirmed") confirmedTotal++;
+      else if (d.verdict === "rejected") rejectedTotal++;
+    }
+
+    const producerFilter = typeof req.query?.producer_id === "string" ? req.query.producer_id.trim() : "";
+    const filtered = producerFilter ? pending.filter((p) => p.producer_id === producerFilter) : pending;
+
+    const rawLimit = Number(req.query?.limit);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 500) : 100;
+    const rawOffset = Number(req.query?.offset);
+    const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? Math.floor(rawOffset) : 0;
+    const page = filtered.slice(offset, offset + limit);
+
+    const producerCounts = new Map<string, { producer_id: string; producer_name: string; pending_count: number }>();
+    for (const p of pending) {
+      const existing = producerCounts.get(p.producer_id);
+      if (existing) existing.pending_count++;
+      else producerCounts.set(p.producer_id, { producer_id: p.producer_id, producer_name: p.producer_name, pending_count: 1 });
+    }
+    const producer_summary = Array.from(producerCounts.values()).sort((a, b) => b.pending_count - a.pending_count);
+
+    res.json({
+      success: true,
+      counts: {
+        pending_total: pending.length,
+        pending_producers: producerCounts.size,
+        confirmed_total: confirmedTotal,
+        rejected_total: rejectedTotal,
+      },
+      producer_summary,
+      pairs: page,
+      page: { limit, offset, returned: page.length, matched: filtered.length },
+    });
+  } catch (err) {
+    console.error("[gardssalg-experience-conflict-queue] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-experience-conflict-review ───────
+//
+// dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 2:
+// the confirmation queue's decide lever. Same strict confirmation-surface
+// contract as gardssalg-orgnr-review-approve / gardssalg-website-review-
+// approve / gardssalg-field-concordance-review-approve above: a human may
+// ONLY decide a pair that is CURRENTLY in the pending queue (recomputed
+// fresh from the live scan + decisions table, never a client-supplied pair
+// list) — a (producer_id, experience_id) that isn't queued (never matched,
+// already decided, or doesn't exist) is rejected with a named reason, never
+// silently accepted. dry-run by default (apply=true to actually write), same
+// truthy-check convention as every other approve lever in this file.
+//
+// Body: { decisions: [{producer_id, experience_id, verdict: "confirmed"|
+// "rejected", note?}], apply?, decided_by? } — max 200 per call (same cap as
+// the other approve levers; a producer with more pending pairs than that,
+// e.g. Booze Of Norway's 93, simply needs more than one call — the per-item
+// validation below never special-cases producer size).
+//
+// A CONFIRMED verdict becomes real evidence from the very next
+// computeGardssalgReadinessRows call (routes/opplevelser.ts, ~L7390) — same
+// weight as a provider_link pair. A REJECTED verdict is permanently
+// suppressed there too (never blocks, never resurfaces in this queue),
+// keyed on the SAME stable (producer_id, experience_id) pair-key
+// (gsExpReviewPairKey) the queue itself uses. Neither verdict writes
+// anything to experiences.booking_url — that remediation lever is skive 3,
+// out of scope here.
+router.post("/admin/gardssalg-experience-conflict-review", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { decisions?: unknown; apply?: unknown; decided_by?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.decisions) || body.decisions.length === 0) {
+    res.status(400).json({
+      error: "Body must contain a non-empty 'decisions' array of {producer_id, experience_id, verdict}",
+    });
+    return;
+  }
+  if (body.decisions.length > 200) {
+    res.status(400).json({ error: "Too many decisions (max 200 per call)" });
+    return;
+  }
+
+  const decidedBy =
+    typeof body.decided_by === "string" && body.decided_by.trim() ? body.decided_by.trim() : "admin";
+
+  const expDb = getExpDb("experiences");
+  let queue: ReturnType<typeof buildGardssalgExperienceConflictQueuePairs>;
+  try {
+    const { pairs } = runGardssalgExperienceConflictScan(expDb);
+    const existingDecisions = loadGardssalgExperienceConflictReviewDecisions(expDb);
+    queue = buildGardssalgExperienceConflictQueuePairs(pairs, existingDecisions);
+  } catch (err) {
+    console.error("[gardssalg-experience-conflict-review] failed to compute queue:", err);
+    res.status(500).json({ error: "Internal error" });
+    return;
+  }
+  const byKey = new Map(queue.map((q) => [gsExpReviewPairKey(q.producer_id, q.experience_id), q]));
+
+  const seen = new Set<string>();
+  const approved: Array<{ producer_id: string; experience_id: string; verdict: GsExpReviewVerdict }> = [];
+  const written: Array<{ producer_id: string; experience_id: string; verdict: GsExpReviewVerdict }> = [];
+  const rejected: Array<{ producer_id: string; experience_id: string; reason: string }> = [];
+
+  for (const raw of body.decisions as unknown[]) {
+    const d = (raw ?? {}) as { producer_id?: unknown; experience_id?: unknown; verdict?: unknown; note?: unknown };
+    const producerId = typeof d.producer_id === "string" ? d.producer_id.trim() : "";
+    const experienceId = typeof d.experience_id === "string" ? d.experience_id.trim() : "";
+    const verdictRaw = d.verdict;
+    if (!producerId || !experienceId || (verdictRaw !== "confirmed" && verdictRaw !== "rejected")) {
+      rejected.push({
+        producer_id: producerId || "(missing)",
+        experience_id: experienceId || "(missing)",
+        reason: "invalid_item",
+      });
+      continue;
+    }
+    const verdict: GsExpReviewVerdict = verdictRaw;
+    const key = gsExpReviewPairKey(producerId, experienceId);
+    if (seen.has(key)) {
+      rejected.push({ producer_id: producerId, experience_id: experienceId, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(key);
+
+    const q = byKey.get(key);
+    if (!q) {
+      rejected.push({ producer_id: producerId, experience_id: experienceId, reason: "not_in_queue" });
+      continue;
+    }
+
+    approved.push({ producer_id: producerId, experience_id: experienceId, verdict });
+    if (!dryRun) {
+      try {
+        const note = typeof d.note === "string" && d.note.trim() ? d.note.trim() : null;
+        recordGardssalgExperienceConflictReviewDecision(expDb, {
+          producer_id: producerId,
+          experience_id: experienceId,
+          verdict,
+          decided_by: decidedBy,
+          note,
+        });
+        written.push({ producer_id: producerId, experience_id: experienceId, verdict });
+      } catch (err: any) {
+        rejected.push({
+          producer_id: producerId,
+          experience_id: experienceId,
+          reason: `write_failed: ${err?.message ?? String(err)}`,
+        });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    approved_count: approved.length,
+    approved,
+    written_count: written.length,
+    written,
+    rejected,
+  });
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-website-verification-audit ────────
