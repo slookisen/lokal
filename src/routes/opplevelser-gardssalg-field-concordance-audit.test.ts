@@ -58,6 +58,17 @@
  *       batch, one sub-object per field
  *   (k) zero writes anywhere — a full DB dump of experience_providers is
  *       byte-identical before and after the call
+ *   (l) review fix-up (2026-08-08, unbounded-scan risk): `limit`/`offset`
+ *       pagination — no params -> byte-identical to (b)/(j)'s unpaginated
+ *       response shape (no `pagination` key at all); `limit` over the cap
+ *       -> 400, never silently clamped; `offset` without `limit` -> 400;
+ *       non-positive/non-integer `limit`, negative/non-integer `offset` ->
+ *       400; a valid `limit`+`offset` returns exactly that page (in stable
+ *       `ORDER BY id` order) AND — proven via a fetch-mock call-count
+ *       assertion, not just response contents — rows outside the page never
+ *       trigger a homepage fetch at all; `pagination`
+ *       ({total, offset, limit, returned, next_offset}) present only when
+ *       `limit` is supplied
  */
 
 export interface TestSummary {
@@ -677,6 +688,141 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       assertEq(atCap.status, 200, "i4: exactly 200 (all nonexistent) ids -> 200, not rejected");
       assertEq(atCap.body.providers.length, 0, "i5: none of the 200 nonexistent ids resolve to a row -> empty (but valid) response");
       assertEq(atCap.body.count, 0, "i6: count reflects the empty result");
+
+      // ── (l) review fix-up: limit/offset pagination ────────────────────────
+      // Full cohort, ORDER BY id, is (8 rows):
+      //   0 prov-avvik            1 prov-bakeri           2 prov-blank-fields
+      //   3 prov-fetch-fail       4 prov-full-match       5 prov-hidden-rfbseed
+      //   6 prov-no-website       7 prov-rfbseed-nullptype
+
+      // l1: no params -> byte-identical to the earlier unpaginated (b)/(j)
+      // response — same shape, no `pagination` key at all (regression).
+      const noParams = await callRoute(opplevelserRouter, { headers: authHeaders });
+      assertEq(noParams.status, 200, "l1a: no-params GET -> 200");
+      assertEq(noParams.body, full.body, "l1b: no-params response is byte-identical to the earlier unpaginated call");
+      assertTrue(!("pagination" in noParams.body), "l1c: no `pagination` key when limit is omitted");
+
+      // l2: limit over the cap (12) -> 400, never silently clamped.
+      const overCapLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=13",
+      });
+      assertEq(overCapLimit.status, 400, "l2a: limit=13 (over cap) -> 400");
+      assertTrue(/12/.test(overCapLimit.body.error || ""), "l2b: error message names the cap (12)");
+
+      // l3: offset without limit -> 400.
+      const offsetOnly = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?offset=1",
+      });
+      assertEq(offsetOnly.status, 400, "l3: offset without limit -> 400");
+
+      // l3b/c/d: malformed limit/offset -> 400, never a silent fallback.
+      const zeroLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=0",
+      });
+      assertEq(zeroLimit.status, 400, "l3b: limit=0 (non-positive) -> 400");
+
+      const negativeLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=-1",
+      });
+      assertEq(negativeLimit.status, 400, "l3c: limit=-1 -> 400");
+
+      const nonIntegerLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=abc",
+      });
+      assertEq(nonIntegerLimit.status, 400, "l3d: limit=abc (not a number) -> 400");
+
+      const negativeOffset = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=3&offset=-1",
+      });
+      assertEq(negativeOffset.status, 400, "l3e: negative offset -> 400");
+
+      // l4/l5: valid limit+offset -> exactly that page, AND rows outside the
+      // page never trigger a homepage fetch at all (fetch-mock call-count
+      // assertion, not just "absent from the response").
+      const fetchCountBeforePage = fetchCallCount;
+      const fetchedHostsLenBeforePage = fetchedHosts.length;
+      const page = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=3&offset=2",
+      });
+      assertEq(page.status, 200, "l4a: valid limit+offset -> 200");
+      assertEq(
+        page.body.providers.map((p: any) => p.provider_id),
+        ["prov-blank-fields", "prov-fetch-fail", "prov-full-match"],
+        "l4b: page returns exactly the 3 rows at offset 2 (indices 2-4), in stable ORDER BY id order",
+      );
+      assertEq(
+        page.body.pagination,
+        { total: 8, offset: 2, limit: 3, returned: 3, next_offset: 5 },
+        "l4c: pagination block matches {total, offset, limit, returned, next_offset}",
+      );
+
+      // Note on call-count: crFetchGardssalgContent fetches the primary page
+      // PLUS up to 4 sub-pages per successful homepage, and fetchPage()
+      // itself one-shot-retries a failing primary — so the raw fetch() call
+      // count per row varies (5 for a successful crawl, 2 for the simulated
+      // 500 below) and is not itself a stable "1 row = 1 call" signal. The
+      // stable, implementation-independent signal is the DISTINCT-HOST set:
+      // exactly the 3 paged rows' hosts must appear, and no others.
+      const pageFetchDelta = fetchCallCount - fetchCountBeforePage;
+      assertTrue(pageFetchDelta > 0, "l5a: at least one fetch call was made for this page (sanity)");
+      const pageFetchedHosts = fetchedHosts.slice(fetchedHostsLenBeforePage);
+      assertEq(
+        new Set(pageFetchedHosts).size,
+        3,
+        "l5a2: exactly 3 DISTINCT hosts were fetched for this page — one per paged row with a hjemmeside, never more",
+      );
+      assertTrue(
+        pageFetchedHosts.every((h) =>
+          ["mjoderi-tommefelt.example.no", "vingard-utilgjengelig.example.no", "sidergarden-fullmatch.example.no"].includes(h),
+        ),
+        "l5b: only the paged rows' homepages were fetched during this call",
+      );
+      assertTrue(
+        !pageFetchedHosts.some((h) =>
+          ["bryggeriet-avvik.example.no", "bakeriet-utenfor.example.no", "skjult-rfbseed.example.no", "rfbseed-nullptype.example.no"].includes(h),
+        ),
+        "l5c: rows OUTSIDE the requested page were never fetched during this call — not just absent from the response",
+      );
+
+      // l6: pagination present when limit is supplied, even covering the
+      // whole cohort (limit=8, offset omitted -> defaults to 0).
+      const fullViaLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=8",
+      });
+      assertEq(fullViaLimit.status, 200, "l6a: limit=8 (covers whole cohort) -> 200");
+      assertEq(
+        fullViaLimit.body.pagination,
+        { total: 8, offset: 0, limit: 8, returned: 8, next_offset: null },
+        "l6b: next_offset is null once the page reaches the end of the cohort",
+      );
+
+      // l7: limit+offset combined with providerIds — freely combinable, not
+      // mutually exclusive: providerIds narrows the eligible set via SQL,
+      // limit/offset then pages over whatever that narrowed set turns out
+      // to be (ORDER BY id).
+      const providerIdsPlusLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=prov-avvik,prov-bakeri,prov-blank-fields&limit=2",
+      });
+      assertEq(providerIdsPlusLimit.status, 200, "l7a: providerIds + limit together -> 200");
+      assertEq(
+        providerIdsPlusLimit.body.providers.map((p: any) => p.provider_id),
+        ["prov-avvik", "prov-bakeri"],
+        "l7b: limit pages over the providerIds-narrowed set (first 2 of 3, ORDER BY id)",
+      );
+      assertEq(
+        providerIdsPlusLimit.body.pagination,
+        { total: 3, offset: 0, limit: 2, returned: 2, next_offset: 2 },
+        "l7c: pagination `total` reflects the providerIds-narrowed cohort, not the full 8-row cohort",
+      );
 
       // ── (k) zero writes anywhere ──────────────────────────────────────────
       const afterDump = dumpProviders();
