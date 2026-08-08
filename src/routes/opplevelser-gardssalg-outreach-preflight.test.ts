@@ -44,6 +44,13 @@
  * computeGardssalgReadinessRows/computeGardssalgReadinessTier as the sibling
  * readiness-report test, so the gate change is proven to apply identically
  * to the preflight endpoint without a second, forked copy of the logic.
+ *
+ * Extended for dev-request
+ * 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 1 — block (j):
+ * dublettkonflikt now requires an EVIDENCE-basis pair (match_basis
+ * "provider_link"); a name_token-basis pair is candidate-only and must come
+ * back go:true from the gate (it answered go:false,
+ * reason:"dublettkonflikt" on pre-slice-1 code).
  */
 
 export interface TestSummary {
@@ -250,6 +257,28 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         id: "exp-konflikt-gard", provider_id: "prov-conflict",
         title: "Konflikt Gård — gårdsbesøk og smaking",
         booking_url: "https://uenighetsbutikk.no/produkt",
+      });
+      // name_token-basis candidate (dev-request
+      // 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice 1):
+      // otherwise fully outreach_ready, plus an UNLINKED experiences row
+      // (provider_id NULL) sharing the distinctive name token "fjellbekken"
+      // on a different registrable domain — a status="conflict",
+      // match_basis="name_token" pair. Used ONLY by the (j) block below:
+      // the gate must answer go:true (on pre-slice-1 code this id came back
+      // go:false, reason:"dublettkonflikt").
+      insertProvider.run({
+        id: "prov-nametoken", navn: "Fjellbekken Håndbryggeri AS", org_nr: "141414141", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@fjellbekkenbrygg.no", telefon: null, hjemmeside: "https://fjellbekkenbrygg.no",
+        about_text: "Om bryggeriet.", visit_text: null, opening_hours_text: null,
+        products: "Håndverksøl", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "fjellbekken-handbryggeri", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
+      });
+      insertExperience.run({
+        id: "exp-fjellbekken-kajakk", provider_id: null,
+        title: "Fjellbekken kajakktur med fjordsafari",
+        booking_url: "https://kajakkeventyr.no/turer",
       });
       // krav-2 negative fixtures (opening hours present, but that no longer
       // matters -- brreg_verified/products are the actual krav-2 gate now):
@@ -500,6 +529,30 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         "i2: prov-no-products (about_text+brreg_verified+opening_hours present, products missing) -> go:false, reason:needs_enrichment",
       );
       assertEq(krav2Negatives.body.summary, { go: 0, no_go: 2, total: 2 }, "i3: summary is all no_go for the krav-2 negative batch");
+
+      // ── (j) slice 1 (dev-request
+      // 2026-08-07-dublett-evidensbasis-og-pool-avblokkering): a name_token-
+      // basis conflict pair must NEVER reach the gate again — only
+      // provider_link (evidence) pairs may answer dublettkonflikt. This is
+      // the spec's "test som feiler hvis et navnetoken-par igjen når porten":
+      // on pre-slice-1 code prov-nametoken came back go:false,
+      // reason:"dublettkonflikt", and this block fails.
+      const nameTokenGate = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        body: { provider_ids: ["prov-nametoken", "prov-conflict"] },
+      });
+      assertEq(nameTokenGate.status, 200, "j0: name_token candidate batch -> 200");
+      assertEq(
+        nameTokenGate.body.results[0],
+        { provider_id: "prov-nametoken", name: "Fjellbekken Håndbryggeri AS", go: true, reason: null },
+        "j1: prov-nametoken (name_token-basis pair only) -> go:true — candidate flags never block the gate",
+      );
+      assertEq(
+        nameTokenGate.body.results[1],
+        { provider_id: "prov-conflict", name: "Konflikt Gård AS", go: false, reason: "dublettkonflikt" },
+        "j2: prov-conflict (provider_link evidence basis) still blocks in the SAME batch",
+      );
+      assertEq(nameTokenGate.body.summary, { go: 1, no_go: 1, total: 2 }, "j3: summary 1 GO + 1 NO-GO");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-preflight: unexpected error: " + String(err?.stack || err?.message || err));
