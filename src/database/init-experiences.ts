@@ -1177,5 +1177,226 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_outreach_sent_log failed:", err);
   }
 
+  // ─── gardssalg_experience_conflict_review (dev-request 2026-08-07-dublett-
+  // evidensbasis-og-pool-avblokkering, slice 2) ──────────────────────────────
+  // Human confirm/reject verdicts over the gårdssalg producer<->experience
+  // conflict candidates that AREN'T provider_link (name_token/host_name basis
+  // — see services/gardssalg-experience-conflict.ts's module doc comment and
+  // its "Skive 2" section just above the functions that read/write this
+  // table). PRIMARY KEY (producer_id, experience_id) IS the stable pair-key
+  // the spec calls for: once a pair is decided (either verdict), it can never
+  // be inserted again — a repeat scan keeps finding the same structural
+  // match, but this table's presence-or-absence-of-a-row is what the queue
+  // (buildGardssalgExperienceConflictQueuePairs) and the readiness gate
+  // (computeGardssalgReadinessRows, routes/opplevelser.ts) both key off, so a
+  // REJECTED pair never resurfaces and a CONFIRMED pair becomes real evidence
+  // exactly once. Deliberately NO FOREIGN KEY to experience_providers/
+  // experiences (unlike gardssalg_orgnr_review_queue et al.): this table is
+  // seeded below with real producer_id/experience_id values resolved against
+  // the LIVE PRODUCTION corpus at spot-check time, which will not exist in a
+  // fresh/local/test experiences.db — same "provider_id can never be a
+  // REFERENCES clause" reasoning experience_outreach_sent_log's own migration
+  // note above already established for a cross-environment id, applied here
+  // for a cross-TIME one instead: a hard FK would make the seed below throw
+  // (foreign_keys=ON, db-factory.ts) in every environment except the exact
+  // prod DB state it was resolved against.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_experience_conflict_review (
+        producer_id TEXT NOT NULL,
+        experience_id TEXT NOT NULL,
+        verdict TEXT NOT NULL CHECK (verdict IN ('confirmed', 'rejected')),
+        decided_by TEXT NOT NULL,
+        decided_at TEXT NOT NULL DEFAULT (datetime('now')),
+        note TEXT,
+        PRIMARY KEY (producer_id, experience_id)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_experience_conflict_review_verdict ON gardssalg_experience_conflict_review(verdict)`);
+  } catch (err) {
+    console.error("Migration gardssalg_experience_conflict_review failed:", err);
+  }
+
+  // ─── Pre-seed: the 2026-08-01 human spot-check's own 14 verdicts ─────────
+  // (dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering, slice
+  // 2, spec point 5 — "arbeidet er gjort, ikke gjør det på nytt"). Resolved
+  // from the live prod GET .../gardssalg-experience-conflict-audit dump
+  // (2026-08-08) by matching each producer-name substring below to its exact
+  // producer_id, then picking the ONE experience row whose title matches the
+  // spot-check's own "via" clue. 13 of 14 are REJECT ("falskt par" — a
+  // different real business sharing one generic place-name/word); Lervig is
+  // the sole CONFIRM ("samme virksomhet"). INSERT OR IGNORE: the PRIMARY KEY
+  // makes each row idempotent across repeated boots, so this never overwrites
+  // a later human decision on the same pair (there won't be one — these are
+  // already-decided from the day the review table shipped — but IGNORE over
+  // REPLACE is the conservative choice regardless).
+  //
+  // Judgment calls made resolving "via" to one exact experience_id (more than
+  // one candidate experience existed for these three producers):
+  //   - Booze Of Norway: 3 Hunderfossen Eventyrpark experience rows matched
+  //     (near-duplicate harvests of the same theme park under slightly
+  //     different titles/booking_urls). Picked the first
+  //     ("…Norway's Most Legendary Family Park", 1faf6b0c…) — any of the 3
+  //     would demonstrate the identical false-pair shape equally well; this
+  //     is the extreme case named in the scale note (93 total pairs for this
+  //     one producer), so the other ~90 remain live in the pending queue.
+  //   - Numedal Stasjonsbryggeri: 2 Norefjell-titled candidates ("Norefjell
+  //     Ski Resort…" and "Norefjell Ski & Fjellsenter…"). Picked the latter
+  //     (65190755…) — its title is a near-verbatim match to the spec's own
+  //     wording ("Norefjell Ski & Fjellsenter").
+  //   - Alde Sider (Ulvik): 2 kajakk-themed candidates, one status=unknown
+  //     ("Guidede havkajakkturer…") and one status=conflict ("Guidet
+  //     kajakktur i Ulvik…", d5c7b8a7…). Picked the conflict-status one — it
+  //     is both the closer title match to the spec's singular "kajakktur i
+  //     Ulvik" and the one that actually needs a REJECT verdict to leave the
+  //     candidate queue (the unknown-status row was never a candidate to
+  //     begin with, see buildGardssalgExperienceConflictQueuePairs's
+  //     status filter).
+  try {
+    const seedReviewDecision = db.prepare(`
+      INSERT OR IGNORE INTO gardssalg_experience_conflict_review
+        (producer_id, experience_id, verdict, decided_by, decided_at, note)
+      VALUES (@producer_id, @experience_id, @verdict, @decided_by, datetime('now'), @note)
+    `);
+    const SPOT_CHECK_DECIDED_BY = "session-spot-check-2026-08-01";
+    const SPOT_CHECK_SEED: Array<{
+      producer_id: string;
+      producer_name: string;
+      experience_id: string;
+      experience_title: string;
+      verdict: "confirmed" | "rejected";
+      note: string;
+    }> = [
+      {
+        producer_id: "3b2e4b86-053f-4dc8-848d-6b72b66f04a7",
+        producer_name: "Lillehammer Bryggeri",
+        experience_id: "c13170e1-19f8-47e7-9138-04e649072b03",
+        experience_title: "Birkebeineren Hotel — Lillehammer sentrum",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'lillehammer', ulike virksomheter",
+      },
+      {
+        producer_id: "0f863334-2031-4c98-8088-0be1f59e502e",
+        producer_name: "Aurora Spirit Distillery",
+        experience_id: "f28efc15-be3d-4141-acbc-4e36878b9bb1",
+        experience_title: "Northern Lights Aurora Safari — GuideGunnar",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'aurora' (GuideGunnar nordlys-safari), ulike virksomheter",
+      },
+      {
+        producer_id: "4e319c88-cde2-47c1-9858-df53a48632d8",
+        producer_name: "Booze Of Norway",
+        experience_id: "1faf6b0c-e57a-483f-baed-466154f4e914",
+        experience_title: "Hunderfossen Eventyrpark — Norway's Most Legendary Family Park",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'norway' (Hunderfossen Eventyrpark), ulike virksomheter",
+      },
+      {
+        producer_id: "da05b531-8bc5-40a4-b23f-5e1c8d28ad3e",
+        producer_name: "Ciderhuset Balestrand",
+        experience_id: "bf01cc22-dac8-4308-ad17-643b33a7e040",
+        experience_title: "Dragsvik Fjordhotell — Classic Boutique Hotel on Esefjord at Balestrand",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'balestrand', ulike virksomheter",
+      },
+      {
+        producer_id: "10b2b385-2dd6-4fbd-bcd7-45c0134e9677",
+        producer_name: "Numedal Stasjonsbryggeri",
+        experience_id: "65190755-ee78-489d-b89f-53caeb4aa92a",
+        experience_title: "Norefjell Ski & Fjellsenter — 30 løyper og 15 heiser i Numedal nær Oslo",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'numedal', ulike virksomheter",
+      },
+      {
+        producer_id: "d6508d34-d8b5-453d-ac4c-89250ef056f0",
+        producer_name: "Silver Distillery",
+        experience_id: "01a8f852-ec70-4d28-ab5a-32c35bfb2784",
+        experience_title: "Nordlandsmuseet — Bodø City Museum with Viking Silver Treasure & 10,000-Year History",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'silver' (vikingsølv), ulike virksomheter",
+      },
+      {
+        producer_id: "93e836c7-8624-491a-bf42-37d7e752e4ac",
+        producer_name: "Lindesnes Brygghus",
+        experience_id: "64ba8dfd-1924-475a-9389-ac03ee69e5cd",
+        experience_title: "Under Restaurant — Europe's First Underwater Restaurant at Lindesnes",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'lindesnes', ulike virksomheter",
+      },
+      {
+        producer_id: "e45eab21-4bc8-49bc-a629-b279c73e73c8",
+        producer_name: "Norsemen Brewery",
+        experience_id: "3372d76f-5b1d-434c-8a2c-56c1d30b212a",
+        experience_title: "Hundholmen Brygghus — Craft Brewery, Bar & In-House Beer Tasting in Bodø",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'brewery', ulike virksomheter",
+      },
+      {
+        producer_id: "713e581a-14fe-48ab-a099-bea9895a0b5c",
+        producer_name: "Tromsø Mikrobryggeri",
+        experience_id: "6b36116b-0122-4d42-975e-682a378344a4",
+        experience_title: "Fiskekompaniet — Arctic Seafood Restaurant on Tromsø Harbour",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'tromsø', ulike virksomheter",
+      },
+      {
+        producer_id: "b8a7ae72-11aa-47fc-a035-e3d9398b4a68",
+        producer_name: "Norsk Kombucha",
+        experience_id: "5a074756-ff48-4dfb-841b-39c9c46ae01d",
+        experience_title: "Bryggeloftet & Stuene — Traditional Norwegian Cuisine at Bergen's Bryggen",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'norsk'/'norwegian', ulike virksomheter",
+      },
+      {
+        producer_id: "5fda0eed-f7ba-4653-b663-0f33345ce942",
+        producer_name: "Alde Sider (Ulvik)",
+        experience_id: "d5c7b8a7-4b31-4cdd-bb9c-fab7382a490e",
+        experience_title: "Guidet kajakktur i Ulvik på Hardangerfjorden",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'ulvik' (kajakktur), ulike virksomheter",
+      },
+      {
+        producer_id: "75b8cf2d-3080-4b81-965d-229f0c21b910",
+        producer_name: "Sleeping Village Brewing",
+        experience_id: "08f93148-320a-4330-a62d-ab4e8d2ccd35",
+        experience_title: "World Sauna Award Village & Cultural Program on Oslo Waterfront — SALT",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'village' (SALT sauna village), ulike virksomheter",
+      },
+      {
+        producer_id: "7a6a7eac-a7be-48aa-b07b-0b757cb90766",
+        producer_name: "White Dragon Gin",
+        experience_id: "848101ef-e23b-4c42-be62-b8d6e0c70a0f",
+        experience_title: "Voss Active — White Water Rafting & Canyoning Voss",
+        verdict: "rejected",
+        note: "2026-08-01 spot-check: falskt par, delt token 'white' (Voss Active rafting), ulike virksomheter",
+      },
+      // ── The lone CONFIRM — a genuine same-business pair, becomes real
+      //    evidence (counts toward has_duplicate_conflict) from the first
+      //    boot onward, per computeGardssalgReadinessRows's wiring
+      //    (routes/opplevelser.ts). NOT a trigger for any booking_url
+      //    remediation write in this slice — that's skive 3, out of scope.
+      {
+        producer_id: "59db202c-3ebe-49c1-80cb-1bfb99ba0823",
+        producer_name: "Lervig",
+        experience_id: "4fb72e45-24be-4724-92e1-5bc93fccc550",
+        experience_title: "Lervig Local — Guided Beer Tasting at Stavanger Brewpub",
+        verdict: "confirmed",
+        note: "2026-08-01 spot-check: samme virksomhet (brewpub), bekreftet konflikt-bevis",
+      },
+    ];
+    for (const s of SPOT_CHECK_SEED) {
+      seedReviewDecision.run({
+        producer_id: s.producer_id,
+        experience_id: s.experience_id,
+        verdict: s.verdict,
+        decided_by: SPOT_CHECK_DECIDED_BY,
+        note: s.note,
+      });
+    }
+  } catch (err) {
+    console.error("Seed gardssalg_experience_conflict_review (2026-08-01 spot-check) failed:", err);
+  }
+
   console.log("[experiences] schema initialized");
 }
