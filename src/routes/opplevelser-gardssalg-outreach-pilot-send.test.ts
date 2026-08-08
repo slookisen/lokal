@@ -40,6 +40,14 @@
  *   (i) apply on an eligible row (real send boundary, mocked transporter)
  *       -> experience_outreach_sent_log gets exactly one new row with the
  *       right provider_id/recipient_email
+ *   (j) AC10 regression (dev-request 2026-08-07-outreach-pool-krav123-og-pilot):
+ *       a prior is_test:true send does NOT burn the real cooldown — a
+ *       test-send against a candidate followed by a dry-run for the SAME
+ *       candidate still reports would_send, not cooldown_suppressed
+ *   (k) AC10 regression, other direction: a prior REAL (is_test:false) send
+ *       still suppresses a later send to the same recipient within the
+ *       cooldown window, so the AC10 fix doesn't silently disable cooldown
+ *       altogether
  *
  * Exported runOpplevelserGardssalgOutreachPilotSendTests({log}) ->
  * TestSummary; wired into tests/test.ts. Standalone:
@@ -234,6 +242,11 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
         hjemmeside: "https://foxtrot-gard.example.no", epost: "post@fixture-foxtrot.no",
         slug: "foxtrot-gard", field_provenance: VERIFIED_STAMP,
       });
+      insertGo.run({
+        id: "prov-hotel", navn: "Hotel Gård",
+        hjemmeside: "https://hotel-gard.example.no", epost: "post@fixture-hotel.no",
+        slug: "hotel-gard", field_provenance: VERIFIED_STAMP,
+      });
 
       // NO-GO tier: needs_enrichment (no about_text/products/brreg_verified).
       expDb
@@ -390,6 +403,53 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       assertEq(foxtrotRows.length, 1, "i1: exactly one experience_outreach_sent_log row for prov-foxtrot");
       assertEq(foxtrotRows[0].provider_id, "prov-foxtrot", "i2: correct provider_id");
       assertEq(foxtrotRows[0].recipient_email, "post@fixture-foxtrot.no", "i3: correct recipient_email");
+
+      // ── (j) AC10: a prior test-send must NOT burn the real cooldown ─────
+      // prov-alpha already got an apply:true + is_test:true send in block
+      // (h) above, which wrote an is_test=1 row to experience_outreach_sent_log
+      // for post@fixture-alpha.no. Before the AC10 fix, the own-table
+      // cooldown SELECT had no `is_test = 0` filter, so that test-send row
+      // would wrongly suppress this next (real) request for 60 days. After
+      // the fix it must still report would_send.
+      sent = [];
+      const dryRunAfterTestSend = await callRoute(opplevelserRouter, {
+        headers: auth, body: { provider_ids: ["prov-alpha"] },
+      });
+      assertEq(dryRunAfterTestSend.status, 200, "j1: dry-run after a prior test-send -> 200");
+      assertEq(
+        dryRunAfterTestSend.body.results[0].status,
+        "would_send",
+        "j2: a prior is_test=1 row does NOT suppress a subsequent dry-run/send for the same recipient (AC10)",
+      );
+      assertTrue(
+        !dryRunAfterTestSend.body.results[0].reason,
+        "j3: no cooldown_suppressed (or any other skip) reason is present",
+      );
+      assertEq(sent.length, 0, "j4: dry-run still sends no email");
+
+      // ── (k) AC10 regression: a prior REAL send still enforces cooldown ──
+      // Same shape as (j) but with is_test:false (the default) both times,
+      // to prove the AC10 fix narrows the cooldown check to real sends only
+      // rather than accidentally disabling the own-table cooldown outright.
+      sent = [];
+      const hotelRealSend = await callRoute(opplevelserRouter, {
+        headers: auth, body: { provider_ids: ["prov-hotel"], apply: true },
+      });
+      assertEq(hotelRealSend.status, 200, "k1: real (non-test) send on prov-hotel -> 200");
+      assertEq(hotelRealSend.body.results[0].status, "sent", "k2: reports sent");
+      assertEq(sent.length, 1, "k3: exactly one email left the boundary");
+
+      const hotelCooldown = await callRoute(opplevelserRouter, {
+        headers: auth, body: { provider_ids: ["prov-hotel"] },
+      });
+      assertEq(hotelCooldown.status, 200, "k4: subsequent request for prov-hotel -> 200");
+      assertEq(
+        hotelCooldown.body.results[0].status,
+        "skipped",
+        "k5: a prior REAL (is_test=0) send still suppresses a later send within the cooldown window",
+      );
+      assertEq(hotelCooldown.body.results[0].reason, "cooldown_suppressed", "k6: reason is cooldown_suppressed");
+      assertEq(hotelCooldown.body.results[0].suppressed_by, "experiences", "k7: suppressed_by is this vertical (own-table)");
     } catch (err: any) {
       failed++;
       failures.push(
