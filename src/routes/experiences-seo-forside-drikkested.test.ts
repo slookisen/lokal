@@ -265,15 +265,24 @@ export function runExperiencesSeoForsideDrikkestedTests(opts: { log?: boolean } 
       }
 
       // ── (e) @keyframes ONLY inside prefers-reduced-motion:no-preference ─
+      // dev-request 2026-08-08-opplevagent-ux-loft-kategorimotiver ADDS a
+      // SECOND no-preference guard to the homepage (the new #kategorier
+      // still-sketch motif's own timeline, next to the hero steam's) — same
+      // situation the S2b gårdssalg-page fix below already handles, so this
+      // check is updated the same way: extractAllMediaBlocks (the UNION of
+      // every guarded block) instead of the single first-match
+      // extractMediaBlock. The invariant itself ("no @keyframes outside ANY
+      // guard") is unchanged.
       const motionBlock = extractMediaBlock(home.body, REDUCED_MOTION_PRELUDE);
       assertTrue(motionBlock !== null, "e1: homepage CSS has a @media (prefers-reduced-motion: no-preference) block");
       assertTrue(
         (motionBlock || "").includes("@keyframes"),
         "e2: the steam @keyframes rule lives inside that block"
       );
+      const allMotionBlocks = extractAllMediaBlocks(home.body, REDUCED_MOTION_PRELUDE);
       assertTrue(
-        countOccurrences(home.body, "@keyframes") === countOccurrences(motionBlock || "", "@keyframes"),
-        "e3: NO @keyframes exists anywhere outside the reduced-motion guard"
+        countOccurrences(home.body, "@keyframes") === countOccurrences(allMotionBlocks, "@keyframes"),
+        "e3: NO @keyframes exists anywhere outside a reduced-motion guard (union of every guarded block)"
       );
       assertTrue(
         (motionBlock || "").includes("animation:oaSteamRise"),

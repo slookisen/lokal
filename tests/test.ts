@@ -29955,6 +29955,27 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ftb.failures) failures.push("for-tilbydere: " + f);
     console.log(`  for-tilbydere: ${ftb.passed} passed, ${ftb.failed} failed`);
 
+    // dev-request 2026-08-08-opplevagent-ux-loft-kategorimotiver: generalizes
+    // the S2b gårdssalg still-sketch into a motif LOOKUP (stillSketchSvg()/
+    // stillSketchCss()) shared by three new category motifs (kultur_historie,
+    // sightseeing_transport, natur_friluft) and a homepage "hjem" motif, and
+    // upgrades /kategori/:category to the shared S1 chrome. Covers the motif
+    // lookup returning distinct SVG/CSS per key, gardssalgStillSketchSvg()
+    // dispatch identity, the shared chrome on category pages, each motif's
+    // own group classes vs. the others' absence, aria-hidden/positioning/
+    // reduced-motion discipline, the homepage motif living inside #kategorier
+    // (hero untouched), and the /kategori/gardssalg regression (still uses
+    // "oa-still-sketch", never the new "oa-motif-sketch" wrapper). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── experiences-seo-kategorimotiver: motif lookup + category chrome ──");
+    const { runExperiencesSeoKategorimotiverTests } = require("../src/routes/experiences-seo-kategorimotiver.test") as
+      typeof import("../src/routes/experiences-seo-kategorimotiver.test");
+    const eskm = await runExperiencesSeoKategorimotiverTests({ log: false });
+    passed += eskm.passed;
+    failed += eskm.failed;
+    for (const f of eskm.failures) failures.push("experiences-seo-kategorimotiver: " + f);
+    console.log(`  experiences-seo-kategorimotiver: ${eskm.passed} passed, ${eskm.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
     // ("CTA hide"): the "Driver du dette stedet?" claim-CTA aside-card on the
     // gårdssalg produsent profile page must be hidden once the provider has

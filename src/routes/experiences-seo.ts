@@ -627,6 +627,294 @@ const OA_STILL_SKETCH_CSS = `
   }
 `;
 
+// ─────────────────────────────────────────────────────────────
+// Still-sketch motif lookup (dev-request 2026-08-08-opplevagent-ux-loft-
+// kategorimotiver, generalizing S2b): the gårdssalg still above is the
+// ONLY motif with its own hand-tuned CSS (OA_STILL_SKETCH_CSS +
+// gardssalgStillSketchSvg() — both byte-for-byte UNCHANGED by this slice,
+// so /kategori/gardssalg + its type subpages keep rendering identically).
+// Every NEW motif (category pages + the homepage) reuses the exact same
+// layering/animation/crop MACHINERY — a `.oa-sketch-stage` wrapper behind
+// the page's content, two <svg> crops (wide/narrow) of one hand-written
+// composition, pathLength="1" stroke-dashoffset draw-on driven by a shared
+// 26s timeline (each group gets its own draw window), and EVERY
+// @keyframes/dasharray/animation declaration living exclusively inside
+// @media (prefers-reduced-motion: no-preference) — via buildStillSketchCss()
+// below, so the technique is written once instead of copy-pasted per motif.
+//
+// The new motifs render under a SIBLING wrapper class, `.oa-motif-sketch`
+// (not `.oa-still-sketch`) — deliberately: `.oa-still-sketch` /
+// gardssalgStillSketchSvg() carry the distillery IDENTITY Daniel restricted
+// to the gårdssalg surfaces only (S2b), and the existing S2b/S3 test suites
+// assert the literal substring "oa-still-sketch" never appears on the
+// homepage. Reusing that exact class for the new, unrelated motifs would
+// make that assertion a false positive the moment any page other than
+// gårdssalg rendered a sketch — so the new system gets its own class,
+// keeping the old identity-separation tests both passing and meaningful.
+//
+// stillSketchSvg(motif) / stillSketchCss(motif) are the ONE lookup every
+// new caller (the /kategori/:category route + the homepage) goes through.
+// ─────────────────────────────────────────────────────────────
+export type StillSketchMotif =
+  | "gardssalg"
+  | "kultur_historie"
+  | "sightseeing_transport"
+  | "natur_friluft"
+  | "hjem";
+
+interface SketchDrawGroup {
+  cls: string;           // group class name, e.g. "sk-kh-kirke"
+  keyframe: string;      // this group's own @keyframes name
+  start: number;         // draw-start percent of the shared 26s timeline
+  end: number;           // draw-end percent
+  color?: string;        // stroke override — an accent pass (e.g. the aurora)
+  width?: number;        // stroke-width override, wide crop (default inherits 2.6)
+  narrowWidth?: number;  // stroke-width override, narrow/mobile crop
+}
+
+// Generic CSS builder shared by every NEW motif below — same technique as
+// OA_STILL_SKETCH_CSS (positioning, opacity, wide/narrow swap, the
+// reduced-motion guard), parameterized by that motif's own draw groups so
+// each keyframe/class name is unique to its motif. Safe to reuse across
+// motifs because only ONE motif's sketch is ever rendered on a given page.
+// `contentSelector` lets a caller whose stage wraps something other than
+// `<main>` (the homepage wraps a `<section>`'s `.container`) keep the
+// z-index-lift rule scoped correctly.
+function buildStillSketchCss(opts: {
+  comment: string;
+  groups: SketchDrawGroup[];
+  fadeKeyframe: string;
+  contentSelector?: string;
+  narrowBaseWidth?: number;
+}): string {
+  const contentSel = opts.contentSelector ?? "main";
+  const narrowBase = opts.narrowBaseWidth ?? 4;
+  const accentWideCss = opts.groups
+    .filter((g) => g.color || g.width)
+    .map((g) => `  .oa-motif-sketch .${g.cls} path{${g.color ? `stroke:${g.color};` : ""}${g.width ? `stroke-width:${g.width}` : ""}}`)
+    .join("\n");
+  const accentNarrowCss = opts.groups
+    .filter((g) => g.narrowWidth)
+    .map((g) => `    .oa-motif-sketch .sketch-narrow .${g.cls} path{stroke-width:${g.narrowWidth}}`)
+    .join("\n");
+  const groupAnimCss = opts.groups
+    .map((g) => `    .oa-motif-sketch .${g.cls} path{animation:${g.keyframe} 26s linear infinite}`)
+    .join("\n");
+  const groupKeyframesCss = opts.groups
+    .map((g) => `    @keyframes ${g.keyframe}{0%,${g.start}%{stroke-dashoffset:1}${g.end}%,100%{stroke-dashoffset:0}}`)
+    .join("\n");
+  return `
+  /* ── ${opts.comment} (line-drawn backdrop — same draw-on machinery as the S2b gårdssalg still) ── */
+  .oa-sketch-stage{position:relative}
+  .oa-sketch-stage>${contentSel}{position:relative;z-index:1}
+  .oa-motif-sketch{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+  .oa-motif-sketch svg{display:block;width:100%;height:auto;opacity:.15}
+  .oa-motif-sketch path{fill:none;stroke:#0b2e29;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+${accentWideCss}
+  .oa-motif-sketch .sketch-narrow{display:none}
+  @media(max-width:700px){
+    .oa-motif-sketch .sketch-wide{display:none}
+    .oa-motif-sketch .sketch-narrow{display:block}
+    .oa-motif-sketch .sketch-narrow path{stroke-width:${narrowBase}}
+${accentNarrowCss}
+  }
+  @media (prefers-reduced-motion: no-preference){
+    .oa-motif-sketch path{stroke-dasharray:1}
+    .oa-motif-sketch .sk-all{animation:${opts.fadeKeyframe} 26s linear infinite}
+${groupAnimCss}
+    @keyframes ${opts.fadeKeyframe}{0%,92%{opacity:1}97%,100%{opacity:0}}
+${groupKeyframesCss}
+  }
+`;
+}
+
+// One hand-written scene, two <svg> crops (wide/narrow) — same aria-hidden +
+// focusable="false" contract as gardssalgStillSketchSvg() above, just under
+// the `.oa-motif-sketch` wrapper class instead of `.oa-still-sketch`.
+function wrapStillSketchScene(scene: string, wideViewBox: string, narrowViewBox: string): string {
+  const svg = (cls: string, viewBox: string) =>
+    `<svg class="${cls}" viewBox="${viewBox}" preserveAspectRatio="xMidYMin meet" aria-hidden="true" focusable="false">${scene}</svg>`;
+  return `<div class="oa-motif-sketch" aria-hidden="true">${svg("sketch-wide", wideViewBox)}${svg("sketch-narrow", narrowViewBox)}</div>`;
+}
+
+// ── kultur_historie: stave-church silhouette + rune stone + an old-building line ──
+const KULTUR_HISTORIE_SKETCH_GROUPS: SketchDrawGroup[] = [
+  { cls: "sk-kh-kirke", keyframe: "oaSkKhKirke", start: 2, end: 28 },
+  { cls: "sk-kh-stein", keyframe: "oaSkKhStein", start: 26, end: 46 },
+  { cls: "sk-kh-hus", keyframe: "oaSkKhHus", start: 44, end: 64 },
+  { cls: "sk-kh-bakke", keyframe: "oaSkKhBakke", start: 20, end: 70 },
+];
+function kulturHistorieStillSketchScene(): string {
+  return `<g class="sk-all">
+<g class="sk-kh-kirke">
+<path pathLength="1" d="M200 820 V620 H340 V820"/>
+<path pathLength="1" d="M184 620 L270 560 L356 620 Z"/>
+<path pathLength="1" d="M210 560 L270 518 L330 560 Z"/>
+<path pathLength="1" d="M234 518 L270 490 L306 518 Z"/>
+<path pathLength="1" d="M270 490 V460"/>
+<path pathLength="1" d="M256 460 H284 M270 460 V446"/>
+<path pathLength="1" d="M246 820 V748 H294 V820"/>
+</g>
+<g class="sk-kh-stein">
+<path pathLength="1" d="M660 820 V700 C660 664 680 644 700 644 C720 644 740 664 740 700 V820 Z"/>
+<path pathLength="1" d="M676 680 L696 720 M700 668 L700 716 M724 680 L704 720"/>
+</g>
+<g class="sk-kh-hus">
+<path pathLength="1" d="M980 820 V712 L1070 660 L1160 712 V820 Z"/>
+<path pathLength="1" d="M980 712 H1160"/>
+<path pathLength="1" d="M1000 820 V760 H1032 V820"/>
+<path pathLength="1" d="M1080 760 H1120 V796 H1080 Z"/>
+</g>
+<g class="sk-kh-bakke">
+<path pathLength="1" d="M100 820 H1340"/>
+</g>
+</g>`;
+}
+export function kulturHistorieStillSketchSvg(): string {
+  return wrapStillSketchScene(kulturHistorieStillSketchScene(), "0 0 1440 1000", "120 440 480 480");
+}
+const OA_STILL_SKETCH_KULTUR_CSS = buildStillSketchCss({
+  comment: "KULTUR & HISTORIE STILL SKETCH",
+  groups: KULTUR_HISTORIE_SKETCH_GROUPS,
+  fadeKeyframe: "oaSkKhFade",
+});
+
+// ── sightseeing_transport: fjord boat + serpentine road + bridge/viewpoint ──
+const SIGHTSEEING_TRANSPORT_SKETCH_GROUPS: SketchDrawGroup[] = [
+  { cls: "sk-st-baat", keyframe: "oaSkStBaat", start: 2, end: 26 },
+  { cls: "sk-st-vei", keyframe: "oaSkStVei", start: 24, end: 52 },
+  { cls: "sk-st-bru", keyframe: "oaSkStBru", start: 50, end: 72 },
+  { cls: "sk-st-horisont", keyframe: "oaSkStHorisont", start: 15, end: 75 },
+];
+function sightseeingTransportStillSketchScene(): string {
+  return `<g class="sk-all">
+<g class="sk-st-baat">
+<path pathLength="1" d="M180 780 H340 L300 820 H220 Z"/>
+<path pathLength="1" d="M230 780 V690"/>
+<path pathLength="1" d="M230 700 L300 730 L230 740 Z"/>
+</g>
+<g class="sk-st-vei">
+<path pathLength="1" d="M520 820 C560 780 620 780 640 740 C660 700 600 690 580 660 C560 630 620 620 660 590 C700 560 780 560 820 520"/>
+</g>
+<g class="sk-st-bru">
+<path pathLength="1" d="M980 760 C980 700 1020 656 1090 656 C1160 656 1200 700 1200 760"/>
+<path pathLength="1" d="M960 760 H1220"/>
+<path pathLength="1" d="M1000 760 V784 M1040 760 V784 M1080 760 V784 M1120 760 V784 M1160 760 V784 M1200 760 V784"/>
+</g>
+<g class="sk-st-horisont">
+<path pathLength="1" d="M100 820 H1340"/>
+</g>
+</g>`;
+}
+export function sightseeingTransportStillSketchSvg(): string {
+  return wrapStillSketchScene(sightseeingTransportStillSketchScene(), "0 0 1440 1000", "120 560 480 440");
+}
+const OA_STILL_SKETCH_SIGHTSEEING_CSS = buildStillSketchCss({
+  comment: "SIGHTSEEING & TRANSPORT STILL SKETCH",
+  groups: SIGHTSEEING_TRANSPORT_SKETCH_GROUPS,
+  fadeKeyframe: "oaSkStFade",
+});
+
+// ── natur_friluft: mountain profile + tent + trail + trees ──
+const NATUR_FRILUFT_SKETCH_GROUPS: SketchDrawGroup[] = [
+  { cls: "sk-nf-fjell", keyframe: "oaSkNfFjell", start: 2, end: 28 },
+  { cls: "sk-nf-telt", keyframe: "oaSkNfTelt", start: 26, end: 46 },
+  { cls: "sk-nf-sti", keyframe: "oaSkNfSti", start: 44, end: 68 },
+  { cls: "sk-nf-trar", keyframe: "oaSkNfTrar", start: 20, end: 72 },
+];
+function naturFriluftStillSketchScene(): string {
+  return `<g class="sk-all">
+<g class="sk-nf-fjell">
+<path pathLength="1" d="M80 820 L240 600 L320 700 L440 500 L620 820"/>
+</g>
+<g class="sk-nf-telt">
+<path pathLength="1" d="M720 820 L800 700 L880 820 Z"/>
+<path pathLength="1" d="M800 700 V820"/>
+<path pathLength="1" d="M768 820 L800 760 L832 820"/>
+</g>
+<g class="sk-nf-sti">
+<path pathLength="1" d="M940 820 C980 780 960 740 1000 710 C1040 680 1020 640 1060 610 C1100 580 1140 580 1180 550"/>
+</g>
+<g class="sk-nf-trar">
+<path pathLength="1" d="M1260 820 V780 M1230 780 H1290 M1240 750 H1280 M1250 720 H1270"/>
+<path pathLength="1" d="M1330 820 V790 M1305 790 H1355 M1313 765 H1347"/>
+</g>
+</g>`;
+}
+export function naturFriluftStillSketchSvg(): string {
+  return wrapStillSketchScene(naturFriluftStillSketchScene(), "0 0 1440 1000", "60 460 780 540");
+}
+const OA_STILL_SKETCH_NATUR_CSS = buildStillSketchCss({
+  comment: "NATUR & FRILUFT STILL SKETCH",
+  groups: NATUR_FRILUFT_SKETCH_GROUPS,
+  fadeKeyframe: "oaSkNfFade",
+});
+
+// ── hjem (homepage «Opplevelser»-seksjonen): mountain/tent + kayak + trail +
+//    an aurora streak (the one colored/accent pass, same idea as the
+//    gårdssalg still's copper liquid) ──
+const HJEM_SKETCH_GROUPS: SketchDrawGroup[] = [
+  { cls: "sk-hj-fjell", keyframe: "oaSkHjFjell", start: 2, end: 24 },
+  { cls: "sk-hj-telt", keyframe: "oaSkHjTelt", start: 22, end: 38 },
+  { cls: "sk-hj-kajakk", keyframe: "oaSkHjKajakk", start: 36, end: 58 },
+  { cls: "sk-hj-sti", keyframe: "oaSkHjSti", start: 56, end: 74 },
+  { cls: "sk-hj-nordlys", keyframe: "oaSkHjNordlys", start: 60, end: 84, color: "#12a594", width: 4, narrowWidth: 6 },
+];
+function hjemStillSketchScene(): string {
+  return `<g class="sk-all">
+<g class="sk-hj-fjell">
+<path pathLength="1" d="M60 600 L220 400 L300 500 L420 340 L560 600"/>
+</g>
+<g class="sk-hj-telt">
+<path pathLength="1" d="M640 600 L720 480 L800 600 Z"/>
+<path pathLength="1" d="M720 480 V600"/>
+</g>
+<g class="sk-hj-kajakk">
+<path pathLength="1" d="M900 520 C940 500 1060 500 1100 520 C1060 540 940 540 900 520 Z"/>
+<path pathLength="1" d="M960 460 L1040 560"/>
+<path pathLength="1" d="M960 460 L944 446 M1040 560 L1056 574"/>
+</g>
+<g class="sk-hj-sti">
+<path pathLength="1" d="M1160 580 C1190 550 1180 520 1210 500 C1240 480 1230 450 1260 430"/>
+</g>
+<g class="sk-hj-nordlys">
+<path pathLength="1" d="M40 140 Q380 60 720 140 T1400 140"/>
+<path pathLength="1" d="M40 190 Q380 110 720 190 T1400 190"/>
+</g>
+</g>`;
+}
+export function hjemStillSketchSvg(): string {
+  return wrapStillSketchScene(hjemStillSketchScene(), "0 0 1440 640", "0 40 820 560");
+}
+const OA_STILL_SKETCH_HJEM_CSS = buildStillSketchCss({
+  comment: "HOMEPAGE (OPPLEVELSER-SEKSJONEN) STILL SKETCH",
+  groups: HJEM_SKETCH_GROUPS,
+  fadeKeyframe: "oaSkHjFade",
+  contentSelector: ".container",
+});
+
+// The ONE lookup every new caller goes through. "gardssalg" dispatches to
+// the untouched S2b implementation above (byte-identical output); the rest
+// dispatch to the generic-machinery motifs just defined.
+export function stillSketchSvg(motif: StillSketchMotif): string {
+  switch (motif) {
+    case "gardssalg": return gardssalgStillSketchSvg();
+    case "kultur_historie": return kulturHistorieStillSketchSvg();
+    case "sightseeing_transport": return sightseeingTransportStillSketchSvg();
+    case "natur_friluft": return naturFriluftStillSketchSvg();
+    case "hjem": return hjemStillSketchSvg();
+  }
+}
+export function stillSketchCss(motif: StillSketchMotif): string {
+  switch (motif) {
+    case "gardssalg": return OA_STILL_SKETCH_CSS;
+    case "kultur_historie": return OA_STILL_SKETCH_KULTUR_CSS;
+    case "sightseeing_transport": return OA_STILL_SKETCH_SIGHTSEEING_CSS;
+    case "natur_friluft": return OA_STILL_SKETCH_NATUR_CSS;
+    case "hjem": return OA_STILL_SKETCH_HJEM_CSS;
+  }
+}
+
 const CATEGORY_LABELS: Record<string, string> = {
   vinter_sno: "Vinter & snø",
   sightseeing_transport: "Sightseeing & transport",
@@ -1475,6 +1763,12 @@ ${ldScripts}
   .code-card .cmt{color:rgba(255,255,255,.5)}
 
   /* (footer styles live in the shared chrome block above) */
+
+  /* ── HOMEPAGE STILL-SKETCH MOTIF (dev-request 2026-08-08-opplevagent-ux-
+     loft-kategorimotiver): discreet line-drawn backdrop for the #kategorier
+     section ONLY — never the hero, which keeps its own untouched illustrated
+     scene above. */
+  ${stillSketchCss("hjem")}
 </style>
 </head>
 <body>
@@ -1568,7 +1862,8 @@ ${oaSiteNav({ active: "hjem", lang })}
   ${counterStripHtml}
   ${drikkestedSectionHtml}
 
-  <section class="section" id="kategorier" aria-labelledby="kat-title">
+  <section class="section oa-sketch-stage" id="kategorier" aria-labelledby="kat-title">
+    ${stillSketchSvg("hjem")}
     <div class="container">
       <div class="sec-head">
         <span class="kicker">${S.catKicker}</span>
@@ -3376,6 +3671,23 @@ function renderBrowsePage(opts: {
   // the <noscript> OSM fallback link; `points` are the (already
   // publish-gated + coords-filtered) markers to plot.
   map?: { fylke: string; points: ExperienceMapPoint[] };
+  // dev-request 2026-08-08-opplevagent-ux-loft-kategorimotiver: opts-in the
+  // shared S1 chrome (oaSiteNav()/oaSiteFooter()/OA_CHROME_CSS — hamburger
+  // nav + full footer incl. "For tilbydere") instead of the legacy
+  // BROWSE_NAV/browseFooter() slim chrome. Default false/omitted, so every
+  // existing caller (/opplevelser, /fylke/:fylke, /kommune/:kommune,
+  // /tilbyder/:id, /sok) renders BYTE-IDENTICALLY to before this option
+  // existed — only the /kategori/:category handler passes true.
+  useSharedChrome?: boolean;
+  // Which oaSiteNav() item to mark aria-current="page" — only consulted
+  // when useSharedChrome is true.
+  navActive?: OaNavActive;
+  // Optional still-sketch backdrop layer (see the motif lookup above) behind
+  // <main>, wrapped in the same `.oa-sketch-stage` technique the gårdssalg
+  // catalog page uses. Omitted by every existing caller (byte-identical
+  // output preserved) — only passed by /kategori/:category for its three
+  // supported category motifs.
+  sketchMotif?: StillSketchMotif;
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -3459,6 +3771,18 @@ function renderBrowsePage(opts: {
   const ogImage = ogImageUrl(url, opts.h1);
   const ogImageAlt = `${opts.h1} | Opplevagent`;
 
+  // See the useSharedChrome/sketchMotif doc comments above — every value
+  // below is "" / the pre-existing default when neither opt is passed, so
+  // the returned HTML stays byte-identical to before this option existed.
+  const chromeCss = opts.useSharedChrome ? OA_CHROME_CSS : "";
+  const sketchCss = opts.sketchMotif ? stillSketchCss(opts.sketchMotif) : "";
+  const navHtml = opts.useSharedChrome
+    ? `<a class="skip-link" href="#main">Hopp til innhold</a>\n${oaSiteNav({ active: opts.navActive })}`
+    : BROWSE_NAV;
+  const footHtml = opts.useSharedChrome ? oaSiteFooter({}) : browseFooter();
+  const stageOpen = opts.sketchMotif ? `<div class="oa-sketch-stage">\n${stillSketchSvg(opts.sketchMotif)}\n` : "";
+  const stageClose = opts.sketchMotif ? `\n</div>` : "";
+
   return `<!doctype html>
 <html lang="nb">
 <head>
@@ -3482,12 +3806,12 @@ ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 ${ldScripts}
-<style>${BROWSE_CSS}</style>
+<style>${BROWSE_CSS}${sketchCss}${chromeCss}</style>
 ${opts.map ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
 </head>
 <body>
-${BROWSE_NAV}
-<main id="main" class="container">
+${navHtml}
+${stageOpen}<main id="main" class="container">
   <nav class="breadcrumb" aria-label="Brødsmuler">${crumbHtml}</nav>
   <header class="head">
     <h1>${escapeHtml(opts.h1)}</h1>
@@ -3498,8 +3822,8 @@ ${BROWSE_NAV}
   ${grid}
   ${opts.map ? renderFylkeMapSection(opts.map.fylke, opts.map.points, opts.lang) : ""}
   ${pager}
-</main>
-${browseFooter()}
+</main>${stageClose}
+${footHtml}
 </body>
 </html>`;
 }
@@ -6049,6 +6373,18 @@ export function buildProduktByAnswerFirstOpening(params: {
   return `${params.categoryLabel} i ${params.kommune}${fylkePart}: ${countPhrase}${providerPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
 }
 
+// Category slug -> still-sketch motif (dev-request 2026-08-08-opplevagent-
+// ux-loft-kategorimotiver): only these 3 categories get their own drawing in
+// this slice (the other 6 live category slugs — vinter_sno, dyreliv_safari,
+// overnatting_opplevelse, adrenalin_action, velvaere_spa, mat_drikke — are
+// separate future dev-requests); gardssalg keeps its own dedicated route +
+// motif above and never reaches this generic handler.
+const CATEGORY_STILL_SKETCH_MOTIF: Partial<Record<string, StillSketchMotif>> = {
+  kultur_historie: "kultur_historie",
+  sightseeing_transport: "sightseeing_transport",
+  natur_friluft: "natur_friluft",
+};
+
 // ─── GET /kategori/:category — experiences in a category ─────────────────────
 router.get("/kategori/:category", (req: Request, res: Response, next: NextFunction) => {
   const category = String(req.params.category || "");
@@ -6139,6 +6475,14 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox("", { category }),
     extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined,
+    // dev-request 2026-08-08-opplevagent-ux-loft-kategorimotiver: category
+    // pages adopt the shared S1 chrome (hamburger nav + full footer incl.
+    // "For tilbydere") — the pre-existing slim BROWSE_NAV/browseFooter() this
+    // route used to render is gone. "kategorier" is the closest oaSiteNav()
+    // item (there's no per-category active state in that nav).
+    useSharedChrome: true,
+    navActive: "kategorier",
+    sketchMotif: CATEGORY_STILL_SKETCH_MOTIF[category],
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
