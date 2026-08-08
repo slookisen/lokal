@@ -5056,6 +5056,82 @@ export function gardssalgPageTitle(html: string): string {
 }
 
 /**
+ * Embedded-content text extraction — dev-request
+ * 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens.
+ *
+ * gardssalgPageText() deliberately strips <script> blocks, which is correct
+ * for classic server-rendered pages but blinds every evidence/extraction
+ * step on sitebuilder SPAs (Wix/Squarespace/Next.js): their raw HTML renders
+ * an empty shell whose actual page content — the address line, the contact
+ * email, the place name — lives INSIDE script-embedded JSON as string
+ * literals. Measured live on 67 North Distillery (67northdistillery.no,
+ * org 925174971): visible text after stripping is 19 chars (the <title>
+ * only), while the script JSON carries "Skomakergata 13\n8250 Rognan" and
+ * "post@67northdistillery.no" — every signal the evidence matcher needs,
+ * all invisible to it.
+ *
+ * This helper extracts DECODED string literals from <script> blocks (JSON
+ * escape sequences resolved) plus the description/og:* meta-tag contents,
+ * and returns them as one whitespace-collapsed text. It extracts only what
+ * the page itself ships — nothing is inferred or fabricated — so matching
+ * registry-held signals (org_nr, registered address/phone, postnr, place)
+ * against it is the SAME evidence discipline as the visible-text layer,
+ * one layer deeper. Callers must treat matches from this layer as a
+ * SECOND-CHANCE source and report which layer verified (review-gated
+ * adoption is unchanged).
+ *
+ * Guards: per-string 2..2000 chars (skips empties and bundled blobs),
+ * base64ish runs ≥80 chars skipped, must contain a letter/digit, total
+ * output capped. Pure — exported for tests.
+ */
+const GS_EMBEDDED_TEXT_MAX_TOTAL = 300_000;
+export function gardssalgEmbeddedPageText(html: string): string {
+  const source = html || "";
+  const parts: string[] = [];
+  let total = 0;
+  const decode = (raw: string): string =>
+    raw.replace(/\\(u([0-9a-fA-F]{4})|n|t|r|"|\/|\\)/g, (_s, esc: string, hex?: string) => {
+      if (hex) return String.fromCharCode(parseInt(hex, 16));
+      if (esc === "n" || esc === "t" || esc === "r") return " ";
+      return esc;
+    });
+  const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+  let sm: RegExpExecArray | null;
+  while ((sm = scriptRe.exec(source)) !== null && total < GS_EMBEDDED_TEXT_MAX_TOTAL) {
+    const script = sm[1] || "";
+    const strRe = /"((?:[^"\\]|\\.)*)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = strRe.exec(script)) !== null && total < GS_EMBEDDED_TEXT_MAX_TOTAL) {
+      const raw = m[1] || "";
+      if (raw.length < 2 || raw.length > 2000) continue;
+      if (!/[\p{L}\p{N}]/u.test(raw)) continue;
+      if (/^[A-Za-z0-9+/=_-]{80,}$/.test(raw)) continue;
+      const decoded = decode(raw);
+      parts.push(decoded);
+      total += decoded.length + 1;
+    }
+  }
+  // Meta description / og:* content attributes — page-authored text that
+  // tag-stripping also discards (a "Destilleri i Saltdal" description is
+  // real place evidence). Attribute order varies by generator, so match the
+  // whole tag first, then read name/property and content independently.
+  const metaTagRe = /<meta\b[^>]*>/gi;
+  const metaNameRe = /(?:name|property)\s*=\s*["'](description|keywords|og:title|og:site_name|og:description)["']/i;
+  const metaContentRe = /content\s*=\s*["']([^"']*)["']/i;
+  let mm: RegExpExecArray | null;
+  while ((mm = metaTagRe.exec(source)) !== null && total < GS_EMBEDDED_TEXT_MAX_TOTAL) {
+    const tag = mm[0] || "";
+    if (!metaNameRe.test(tag)) continue;
+    const cm = tag.match(metaContentRe);
+    const content = (cm?.[1] || "").trim();
+    if (!content) continue;
+    parts.push(content);
+    total += content.length + 1;
+  }
+  return parts.join(" ").replace(/&[a-z]+;|&#\d+;/gi, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
  * Normalise a Norwegian phone number to its 8 significant digits: strips
  * +47/0047 country prefixes and every non-digit. Returns null when what
  * remains is not exactly 8 digits — a partial number must never match.
@@ -5305,6 +5381,19 @@ const CX_PLACEHOLDER_DOMAINS = new Set([
  *   3. other text addresses (incl. freemail — common for small farms) ONLY
  *      when `pageIsContactish` (found on a kontakt/om-oss page, where a
  *      listed address is overwhelmingly the site's own)
+ *   4. addresses in EMBEDDED content (script-JSON string literals /
+ *      meta tags — gardssalgEmbeddedPageText) whose registrable domain
+ *      MATCHES the homepage domain. Dev-request 2026-08-08-gardssalg-
+ *      brreg-verify-og-embedded-evidens: sitebuilder SPAs (Wix et al.)
+ *      render their contact paragraph client-side, so the address the
+ *      visitor SEES on the page exists in the raw HTML only as an escaped
+ *      JSON string ("post@67northdistillery.no" on 67northdistillery.no —
+ *      the live case that motivated this tier). Same-domain ONLY: an
+ *      embedded freemail/other-domain address is never used from this
+ *      layer (script blobs carry third-party config; a same-domain address
+ *      by construction belongs to the site's own mailbox). This is still
+ *      strictly "found on the producer's own page" — never a guess — and
+ *      it ranks BELOW every existing tier, so no current behavior changes.
  *
  * Junk localparts (noreply/postmaster/…) never match. Pure — exported for
  * tests.
@@ -5313,10 +5402,10 @@ export function extractGardssalgContactEmail(
   html: string,
   homepageDomain: string | null,
   pageIsContactish: boolean,
-): { email: string; source: "mailto" | "text_same_domain" | "text_contact_page" } | null {
-  const candidates: Array<{ email: string; viaMailto: boolean }> = [];
+): { email: string; source: "mailto" | "text_same_domain" | "text_contact_page" | "embedded_same_domain" } | null {
+  const candidates: Array<{ email: string; viaMailto: boolean; embedded: boolean }> = [];
   const seen = new Set<string>();
-  const push = (raw: string, viaMailto: boolean): void => {
+  const push = (raw: string, viaMailto: boolean, embedded = false): void => {
     const email = raw.trim().toLowerCase().replace(/^mailto:/i, "").split("?")[0]!;
     if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return;
     const local = email.split("@")[0]!;
@@ -5326,7 +5415,7 @@ export function extractGardssalgContactEmail(
     if (CX_PLACEHOLDER_DOMAINS.has(dom) || CX_PLACEHOLDER_DOMAINS.has(registrableDomain(dom) ?? dom)) return;
     if (seen.has(email)) return;
     seen.add(email);
-    candidates.push({ email, viaMailto });
+    candidates.push({ email, viaMailto, embedded });
   };
   const mailtoRe = /href\s*=\s*["']mailto:([^"'?]+)/gi;
   let m: RegExpExecArray | null;
@@ -5334,15 +5423,24 @@ export function extractGardssalgContactEmail(
   const text = gardssalgPageText(html || "");
   const textRe = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
   while ((m = textRe.exec(text)) !== null) push(m[0]!, false);
+  // Tier-4 source: embedded string content. Pushed LAST so a same address
+  // already found in visible text keeps its (higher-trust) classification.
+  const embeddedText = gardssalgEmbeddedPageText(html || "");
+  while ((m = textRe.exec(embeddedText)) !== null) push(m[0]!, false, true);
 
   const mailto = candidates.find((c) => c.viaMailto);
   if (mailto) return { email: mailto.email, source: "mailto" };
   if (homepageDomain) {
-    const same = candidates.find((c) => registrableDomain(c.email.split("@")[1]!) === homepageDomain);
+    const same = candidates.find((c) => !c.embedded && registrableDomain(c.email.split("@")[1]!) === homepageDomain);
     if (same) return { email: same.email, source: "text_same_domain" };
   }
-  if (pageIsContactish && candidates.length > 0) {
-    return { email: candidates[0]!.email, source: "text_contact_page" };
+  const visibleFirst = candidates.find((c) => !c.embedded);
+  if (pageIsContactish && visibleFirst) {
+    return { email: visibleFirst.email, source: "text_contact_page" };
+  }
+  if (homepageDomain) {
+    const emb = candidates.find((c) => c.embedded && registrableDomain(c.email.split("@")[1]!) === homepageDomain);
+    if (emb) return { email: emb.email, source: "embedded_same_domain" };
   }
   return null;
 }
@@ -5422,6 +5520,180 @@ export function selectGardssalgProvidersForContactExtraction(
     )
     .all(limit, offset) as GardssalgContactExtractionTarget[];
   return { targets, cohortTotal };
+}
+
+// ─── Gårdssalg Brreg-verifisering (dev-request 2026-08-08-gardssalg-brreg-
+//     verify-og-embedded-evidens) ──────────────────────────────────────────
+//
+// The krav-2 outreach gate (computeGardssalgReadinessTier) requires
+// brreg_verified = 1, but no lever has ever SET that flag for the seed-era
+// rows: NACE-discovered rows are born brreg_verified=1 (created straight
+// from a Brreg record) and the claim flow stamps it, while rows imported
+// from curated seed lists pre-date both paths. Measured live 2026-08-08:
+// 57 rows carry website + contact + about_text + products and are blocked
+// from the pool by this flag alone. This block is the missing lever:
+// verify a stored org_nr directly against Brreg (existence + active state +
+// exact normalised name match) and stamp brreg_verified/brreg_active with
+// audit + provenance. Evidence-only: an inexact name, a dead org, or a
+// missing org_nr NEVER writes — those rows are reported for the existing
+// org_nr review-queue path instead.
+
+export type GardssalgBrregVerifyTarget = {
+  id: string;
+  navn: string;
+  org_nr: string;
+  content_source: string | null;
+  brreg_verified: number | null;
+};
+
+/**
+ * Cohort: gårdssalg rows NOT yet brreg_verified that DO carry a 9-digit
+ * org_nr, unlocked, not the test provider. Stable total order for offset
+ * paging (same idiom as the contact-extraction selector). Also reports how
+ * many unverified rows sit OUTSIDE the cohort for lack of an org_nr — those
+ * need the org_nr review-queue path first, and the number keeps the report
+ * honest about what this lever cannot reach.
+ */
+export function selectGardssalgProvidersForBrregVerify(
+  limit: number,
+  offset: number,
+): { targets: GardssalgBrregVerifyTarget[]; cohortTotal: number; noOrgnrTotal: number } {
+  const db = getDb(VERTICAL);
+  const base = `
+    (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+    AND (brreg_verified IS NULL OR brreg_verified != 1)
+    AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+    AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`;
+  const where = `${base}
+    AND org_nr IS NOT NULL AND TRIM(org_nr) != '' AND LENGTH(TRIM(org_nr)) = 9`;
+  const cohortTotal = (db.prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${where}`).get() as { n: number }).n;
+  const noOrgnrTotal = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM experience_providers WHERE ${base}
+           AND (org_nr IS NULL OR TRIM(org_nr) = '' OR LENGTH(TRIM(org_nr)) != 9)`
+      )
+      .get() as { n: number }
+  ).n;
+  const targets = db
+    .prepare(
+      `SELECT id, navn, org_nr, content_source, brreg_verified
+         FROM experience_providers WHERE ${where}
+        ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`
+    )
+    .all(limit, offset) as GardssalgBrregVerifyTarget[];
+  return { targets, cohortTotal, noOrgnrTotal };
+}
+
+/** Explicit-target resolver for the route's providerIds override — gårdssalg-
+ * scoped and test-provider-excluded like the selector, but NOT filtered on
+ * brreg_verified/org_nr/locks (those are decided and reported by the route). */
+export function getGardssalgBrregVerifyTarget(
+  providerId: string,
+): (Omit<GardssalgBrregVerifyTarget, "org_nr"> & { org_nr: string | null }) | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, org_nr, content_source, brreg_verified
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`
+    )
+    .get(providerId) as (Omit<GardssalgBrregVerifyTarget, "org_nr"> & { org_nr: string | null }) | undefined;
+  return row ?? null;
+}
+
+// Injectable Brreg-verify function — same test seam pattern as
+// __setGardssalgWebsiteSearchForTesting: module-level override, null by
+// default (production uses the real verifyOrgNumber), settable by tests so
+// route-level tests never hit the network.
+export type GardssalgBrregVerifyFn = (orgNr: string) => Promise<import("./brreg-client").BrregVerifyResult>;
+let _gardssalgBrregVerifyOverride: GardssalgBrregVerifyFn | null = null;
+export function __setGardssalgBrregVerifyForTesting(fn: GardssalgBrregVerifyFn | null): void {
+  _gardssalgBrregVerifyOverride = fn;
+}
+export function getGardssalgBrregVerifyOverride(): GardssalgBrregVerifyFn | null {
+  return _gardssalgBrregVerifyOverride;
+}
+
+/**
+ * Stamp brreg_verified=1 (+ brreg_active=1) on one provider after a
+ * successful Brreg verification. One-directional by design: only ever flips
+ * 0/NULL → 1, never the reverse, and touches NO other data field. Same
+ * write discipline as applyGardssalgProviderContact: manual/claim lock
+ * respected, one gardssalg_content_audit row per changed field,
+ * field_provenance entry (source_url = the Brreg API URL the evidence came
+ * from), all inside one transaction. Returns the field names written
+ * ([] when locked / already verified / row missing).
+ */
+export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: string, batchId?: string): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, brreg_verified, brreg_active, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        brreg_verified: number | null;
+        brreg_active: number | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (row.brreg_verified === 1) return [];
+
+  const written: Array<{ field: string; oldValue: string | null }> = [
+    { field: "brreg_verified", oldValue: row.brreg_verified === null ? null : String(row.brreg_verified) },
+  ];
+  if (row.brreg_active !== 1) {
+    written.push({ field: "brreg_active", oldValue: row.brreg_active === null ? null : String(row.brreg_active) });
+  }
+
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance["brreg_verified"] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers
+          SET brreg_verified = 1, brreg_active = 1,
+              field_provenance = @field_provenance, updated_at = datetime('now')
+        WHERE id = @id`
+    ).run({ id: providerId, field_provenance: JSON.stringify(provenance) });
+    const insertAudit = db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    );
+    for (const w of written) {
+      insertAudit.run({
+        id: uuid(),
+        provider_id: providerId,
+        field_name: w.field,
+        old_value: w.oldValue,
+        new_value: "1",
+        source_url: evidenceUrl,
+        batch_id: batchId ?? null,
+      });
+    }
+  });
+  applyWithAudit();
+
+  return written.map((w) => w.field);
 }
 
 export type GardssalgWebsiteReviewQueueEntry = {

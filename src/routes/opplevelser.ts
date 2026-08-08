@@ -118,6 +118,17 @@ import {
   gardssalgWebsiteCandidateHosts,
   gardssalgPageText,
   gardssalgPageTitle,
+  // dev-request 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens —
+  // second-chance evidence layer for sitebuilder SPAs whose raw HTML ships
+  // the page content only as script-embedded JSON string literals (the
+  // 67 North Distillery class), plus the Brreg-verify lever that stamps the
+  // krav-2 brreg_verified flag from live registry evidence.
+  gardssalgEmbeddedPageText,
+  selectGardssalgProvidersForBrregVerify,
+  getGardssalgBrregVerifyTarget,
+  getGardssalgBrregVerifyOverride,
+  applyGardssalgBrregVerified,
+  type GardssalgBrregVerifyTarget,
   gardssalgWebsiteEvidenceMatch,
   gardssalgContactPageLinks,
   extractGardssalgContactEmail,
@@ -3081,7 +3092,11 @@ async function tryGardssalgCandidateHosts(
   },
   tried: string[],
   excludedHere: Array<{ host: string; reason: string }>,
-): Promise<{ host: string; finalUrl: string; evidence: ReturnType<typeof gardssalgWebsiteEvidenceMatch> } | null> {
+): Promise<{
+  host: string;
+  finalUrl: string;
+  evidence: ReturnType<typeof gardssalgWebsiteEvidenceMatch> & { embedded_layer_used?: boolean };
+} | null> {
   for (const host of hosts) {
     const listed = gardssalgWebsiteHostExclusionReason(host);
     if (listed) {
@@ -3117,9 +3132,28 @@ async function tryGardssalgCandidateHosts(
       adresse: target.adresse ?? null,
       postnummer: target.postnummer ?? null,
     };
-    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), evTarget, gardssalgPageTitle(page.html));
+    const visibleText = gardssalgPageText(page.html);
+    const pageTitle = gardssalgPageTitle(page.html);
+    const ev = gardssalgWebsiteEvidenceMatch(visibleText, evTarget, pageTitle);
     if (ev.verified) {
       return { host, finalUrl: page.finalUrl, evidence: ev };
+    }
+    // Embedded second chance (dev-request 2026-08-08-gardssalg-brreg-verify-
+    // og-embedded-evidens): sitebuilder SPAs render an empty visible shell —
+    // the evidence (registered address, place, phone) ships as script-JSON
+    // string literals the tag-stripper discards. Re-run the IDENTICAL
+    // evidence match over visible + embedded text; a verification from this
+    // layer is marked embedded_layer_used so the review queue (and its human
+    // approver) can see which layer the evidence came from. Signals are
+    // still matched ONLY against registry-held data — the layer changes
+    // where we read, never what counts as evidence.
+    const embeddedText = gardssalgEmbeddedPageText(page.html);
+    let evEmbedded: ReturnType<typeof gardssalgWebsiteEvidenceMatch> | null = null;
+    if (embeddedText) {
+      evEmbedded = gardssalgWebsiteEvidenceMatch(`${visibleText} ${embeddedText}`, evTarget, pageTitle);
+      if (evEmbedded.verified) {
+        return { host, finalUrl: page.finalUrl, evidence: { ...evEmbedded, embedded_layer_used: true } };
+      }
     }
     // v2: the deciding evidence (org.nr, address, phone) usually lives on
     // /kontakt or /om-oss, not the front page. When the front page shows at
@@ -3128,7 +3162,13 @@ async function tryGardssalgCandidateHosts(
     // ish same-host links and re-run the SAME evidence match per page. First
     // verified page wins, and its URL is returned as final_url so the queue
     // row records where the evidence actually was.
-    const anySignal = ev.name_found || ev.place_found || ev.phone_found || ev.address_found;
+    const anySignal =
+      ev.name_found ||
+      ev.place_found ||
+      ev.phone_found ||
+      ev.address_found ||
+      (evEmbedded !== null &&
+        (evEmbedded.name_found || evEmbedded.place_found || evEmbedded.phone_found || evEmbedded.address_found));
     if (anySignal) {
       const subpages = gardssalgContactPageLinks(page.html, host, GS_WD_SUBPAGES_PER_HOST);
       for (const sub of subpages) {
@@ -3136,9 +3176,18 @@ async function tryGardssalgCandidateHosts(
         if (!subPage) continue;
         const subHost = hostFromUrlLike(subPage.finalUrl) || host;
         if (subHost.toLowerCase().replace(/^www\./, "") !== host.toLowerCase().replace(/^www\./, "")) continue;
-        const subEv = gardssalgWebsiteEvidenceMatch(gardssalgPageText(subPage.html), evTarget, gardssalgPageTitle(subPage.html));
+        const subVisible = gardssalgPageText(subPage.html);
+        const subTitle = gardssalgPageTitle(subPage.html);
+        const subEv = gardssalgWebsiteEvidenceMatch(subVisible, evTarget, subTitle);
         if (subEv.verified) {
           return { host, finalUrl: subPage.finalUrl, evidence: subEv };
+        }
+        const subEmbeddedText = gardssalgEmbeddedPageText(subPage.html);
+        if (subEmbeddedText) {
+          const subEvEmbedded = gardssalgWebsiteEvidenceMatch(`${subVisible} ${subEmbeddedText}`, evTarget, subTitle);
+          if (subEvEmbedded.verified) {
+            return { host, finalUrl: subPage.finalUrl, evidence: { ...subEvEmbedded, embedded_layer_used: true } };
+          }
         }
       }
     }
@@ -5300,6 +5349,165 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   });
   } finally {
     gsCxRunning = false;
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-brreg-verify (admin) ─────────────
+//
+// dev-request 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens.
+//
+// The krav-2 outreach gate requires brreg_verified = 1, but nothing has ever
+// SET the flag for seed-era rows (NACE rows are born verified; claims stamp
+// it on claim). Measured live 2026-08-08: 57 rows have website + contact +
+// about_text + products and are blocked from the outreach pool by this flag
+// alone — the single largest one-lever unlock in the readiness report.
+//
+// Per target with a stored 9-digit org_nr: verifyOrgNumber() (existing,
+// cached brreg-client call) → the row VERIFIES only when the org EXISTS, is
+// ACTIVE (not konkurs/under avvikling/slettet), and its registered name
+// matches the stored name EXACTLY under the established normalisation
+// (brregDisplayName ∘ normaliseName vs gardssalgSearchName ∘ normaliseName —
+// the same pruning the NACE dedup uses). Anything less NEVER writes:
+//   orgnr_not_found — org_nr not in Brreg (stored identity is wrong; the
+//                     org_nr review-queue path owns fixing it)
+//   inactive        — dissolved/bankrupt (candidate for hiding, reported
+//                     with Brreg's flag; visibility is Daniel's lever)
+//   name_mismatch   — Brreg's name reported verbatim for human review;
+//                     an inexact match is never auto-adopted (identity rule)
+//
+// Writes go through applyGardssalgBrregVerified: one-directional
+// (0/NULL → 1 only), no other field touched, manual/claim-lås respected,
+// audit + field_provenance (source_url = the Brreg enhets-API URL), fully
+// visible in the existing audit surfaces. Dry-run by default; run-lock +
+// modest default limit per the contact-extraction hang lessons; offset
+// paging over a stable total order; cohort_total + no_orgnr_total keep the
+// remaining-work picture honest.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+const GS_BV_DEFAULT_LIMIT = 24;
+const GS_BV_HARD_CAP = 48;
+let gsBvRunning = false;
+
+router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; offset?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+  const batchTag = `brreg-verify-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  if (gsBvRunning) {
+    res.status(409).json({ error: "En gardssalg-brreg-verify-kjøring pågår allerede" });
+    return;
+  }
+  gsBvRunning = true;
+  try {
+    const skippedLocked: Array<{ provider_id: string; navn: string }> = [];
+    const alreadyVerified: Array<{ provider_id: string; navn: string }> = [];
+    const noOrgnr: Array<{ provider_id: string; navn: string }> = [];
+    const notFound: string[] = [];
+    let targets: GardssalgBrregVerifyTarget[] = [];
+    let cohortTotal = 0;
+    let noOrgnrTotal = 0;
+
+    if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+      const ids = (body.providerIds as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim());
+      if (ids.length > GS_BV_HARD_CAP) {
+        res.status(400).json({ error: `Too many providerIds (max ${GS_BV_HARD_CAP} per call)` });
+        return;
+      }
+      for (const id of ids) {
+        const t = getGardssalgBrregVerifyTarget(id);
+        if (!t) {
+          notFound.push(id);
+        } else if (t.content_source === "manual" || t.content_source === "claim") {
+          skippedLocked.push({ provider_id: t.id, navn: t.navn });
+        } else if (t.brreg_verified === 1) {
+          alreadyVerified.push({ provider_id: t.id, navn: t.navn });
+        } else if (!t.org_nr || !/^\d{9}$/.test(t.org_nr.trim())) {
+          noOrgnr.push({ provider_id: t.id, navn: t.navn });
+        } else {
+          targets.push({ ...t, org_nr: t.org_nr.trim() });
+        }
+      }
+      cohortTotal = targets.length;
+    } else {
+      const limit =
+        typeof body.limit === "number" && body.limit > 0
+          ? Math.min(Math.floor(body.limit), GS_BV_HARD_CAP)
+          : GS_BV_DEFAULT_LIMIT;
+      const offset = typeof body.offset === "number" && body.offset > 0 ? Math.floor(body.offset) : 0;
+      const sel = selectGardssalgProvidersForBrregVerify(limit, offset);
+      targets = sel.targets;
+      cohortTotal = sel.cohortTotal;
+      noOrgnrTotal = sel.noOrgnrTotal;
+    }
+
+    const verifyFn = getGardssalgBrregVerifyOverride() ?? ((orgNr: string) => verifyOrgNumber(orgNr));
+
+    const verified: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string; fields_written: string[] }> = [];
+    const nameMismatch: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string | null }> = [];
+    const inactive: Array<{ provider_id: string; navn: string; org_nr: string; flag: string | null; brreg_name: string | null }> = [];
+    const orgnrNotFound: Array<{ provider_id: string; navn: string; org_nr: string }> = [];
+    const errors: Array<{ provider_id: string; error: string }> = [];
+
+    for (const t of targets) {
+      try {
+        const result = await verifyFn(t.org_nr);
+        if (!result.exists) {
+          orgnrNotFound.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr });
+          continue;
+        }
+        if (!result.active) {
+          inactive.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, flag: result.flag, brreg_name: result.name });
+          continue;
+        }
+        const brregName = result.name || "";
+        const nameMatches =
+          brregName !== "" &&
+          (normaliseName(brregDisplayName(brregName)) === normaliseName(gardssalgSearchName(t.navn)) ||
+            normaliseName(brregName) === normaliseName(t.navn));
+        if (!nameMatches) {
+          nameMismatch.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: result.name });
+          continue;
+        }
+        const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+        if (dryRun) {
+          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: [] });
+        } else {
+          const written = applyGardssalgBrregVerified(t.id, evidenceUrl, batchTag);
+          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: written });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: t.id, error: e?.message ?? String(e) });
+      }
+    }
+
+    res.json({
+      dry_run: dryRun,
+      batch_tag: batchTag,
+      scanned: targets.length,
+      cohort_total: cohortTotal,
+      no_orgnr_total: noOrgnrTotal,
+      verified_count: verified.length,
+      verified,
+      name_mismatch: nameMismatch,
+      inactive,
+      orgnr_not_found: orgnrNotFound,
+      no_orgnr: noOrgnr,
+      skipped_locked: skippedLocked,
+      already_verified: alreadyVerified,
+      not_found: notFound,
+      errors,
+    });
+  } finally {
+    gsBvRunning = false;
   }
 });
 

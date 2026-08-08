@@ -231,7 +231,10 @@ interface ResultItem {
   agent_name?: string;
   outcome: ItemOutcome;
   email?: string | null;
-  email_source?: "mailto" | "text_same_domain" | "text_contact_page";
+  // "embedded_same_domain" added by dev-request 2026-08-08-gardssalg-brreg-
+  // verify-og-embedded-evidens: the shared extractor gained a lowest-priority
+  // same-domain tier read from script-embedded JSON (sitebuilder SPAs).
+  email_source?: "mailto" | "text_same_domain" | "text_contact_page" | "embedded_same_domain";
   source_url?: string;
   old_value?: string | null;
   detail?: string;
