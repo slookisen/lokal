@@ -29936,6 +29936,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esgt.failures) failures.push("experiences-seo-gardssalg-typesider: " + f);
     console.log(`  experiences-seo-gardssalg-typesider: ${esgt.passed} passed, ${esgt.failed} failed`);
 
+    // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S4:
+    // the /for-tilbydere provider-onboarding page + /for-tilbydere/finn
+    // search subpage + the «For tilbydere» entry in the shared S1 chrome.
+    // Covers the three-step claim explanation (explains, never duplicates,
+    // gardssalg-claim.ts), the eier-href on every /finn hit, catalog_hidden
+    // exclusion, empty-q handling, noindex on /finn, canonical + static
+    // sitemap entry for /for-tilbydere, the robots claim-path Disallow
+    // regression, NO+EN nav strings, and the negative control that the link
+    // never leaks into the old hardcoded slim-nav pages. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── for-tilbydere: provider onboarding page + global nav entry (S4) ──");
+    const { runForTilbydereTests } = require("../src/routes/for-tilbydere.test") as
+      typeof import("../src/routes/for-tilbydere.test");
+    const ftb = await runForTilbydereTests({ log: false });
+    passed += ftb.passed;
+    failed += ftb.failed;
+    for (const f of ftb.failures) failures.push("for-tilbydere: " + f);
+    console.log(`  for-tilbydere: ${ftb.passed} passed, ${ftb.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 4
     // ("CTA hide"): the "Driver du dette stedet?" claim-CTA aside-card on the
     // gårdssalg produsent profile page must be hidden once the provider has

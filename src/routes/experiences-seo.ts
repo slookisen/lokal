@@ -207,7 +207,7 @@ function brandInner(variant: "light" | "dark" = "light"): string {
 // `#oa-nav-toggle:checked ~ .nav-links` — the tiny inline script below only
 // adds aria-expanded as progressive enhancement.
 // ─────────────────────────────────────────────────────────────
-type OaNavActive = "hjem" | "opplevelser" | "kategorier" | "gardssalg";
+type OaNavActive = "hjem" | "opplevelser" | "kategorier" | "gardssalg" | "tilbydere";
 
 function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang } = {}): string {
   const lang: Lang = opts.lang === "en" ? "en" : "no";
@@ -233,7 +233,8 @@ function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang } = {}): string {
     <nav class="nav-links" aria-label="${S.navAria}">
       <a href="/opplevelser"${cur("opplevelser")}>${S.navAll}</a>
       <a href="${langPrefix}#kategorier"${cur("kategorier")}>${S.navCategories}</a>
-      <a href="/kategori/gardssalg"${cur("gardssalg")}>${navGardssalg}</a>${langToggle}
+      <a href="/kategori/gardssalg"${cur("gardssalg")}>${navGardssalg}</a>
+      <a href="/for-tilbydere"${cur("tilbydere")}>${S.navProviders}</a>${langToggle}
       <a class="nav-cta" href="/opplevelser">${S.navExplore}</a>
     </nav>
   </div>
@@ -262,6 +263,7 @@ function oaSiteFooter(opts: { lang?: Lang } = {}): string {
       <a href="/opplevelser">${S.navAll}</a>
       <a href="${langPrefix}#kategorier">${S.navCategories}</a>
       <a href="${langPrefix}#slik-funker-det">${S.navHow}</a>
+      <a href="/for-tilbydere">${S.navProviders}</a>
       <a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
     </div>
     <div class="footer-col">
@@ -879,6 +881,12 @@ export function homeStrings(lang: Lang) {
     brandAria: "Opplevagent forside",
     navAria: "Hovednavigasjon",
     navAll: "Alle opplevelser", navCategories: "Kategorier", navHow: "Slik funker det", navAgents: "For AI-agenter", navExplore: "Utforsk",
+    // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S4:
+    // the /for-tilbydere provider-onboarding page's nav/footer entry. The
+    // page itself is NO-canonical with no /en variant, so the EN nav points
+    // at the same Norwegian URL — exactly like /opplevelser and
+    // /kategori/gardssalg already do. Keep in sync with the `en` object below.
+    navProviders: "For tilbydere",
     heroPill: "A2A-markedsplass for norske opplevelser",
     heroH1: "Hva kan vi finne på ", heroAccent: "i dag?",
     heroSub: "Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.",
@@ -929,6 +937,8 @@ export function homeStrings(lang: Lang) {
     brandAria: "Opplevagent home",
     navAria: "Main navigation",
     navAll: "All experiences", navCategories: "Categories", navHow: "How it works", navAgents: "For AI agents", navExplore: "Explore",
+    // Keep in sync with the `no` object above (S4 /for-tilbydere nav entry).
+    navProviders: "For providers",
     heroPill: "A2A marketplace for Norwegian experiences",
     heroH1: "What can we do ", heroAccent: "today?",
     heroSub: "From whale safaris and treehouses to guided mountain hikes, food experiences and laser tag &mdash; a curated overview of Norwegian experiences, built to be discovered and queried by AI agents.",
@@ -1779,6 +1789,11 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     { p: "/", freq: "daily", pri: "1.0" },
     { p: "/en", freq: "daily", pri: "0.9" },
     { p: "/opplevelser", freq: "daily", pri: "0.9" },
+    // S4 (dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering):
+    // the /for-tilbydere provider-onboarding page is indexable and statically
+    // present (no DB dependency). Its /for-tilbydere/finn search subpage is
+    // noindex,follow (its own meta tag) and deliberately NOT listed here.
+    { p: "/for-tilbydere", freq: "monthly", pri: "0.6" },
     { p: "/guide-opplevelser-mcp", freq: "monthly", pri: "0.6" },
     { p: "/proveniens", freq: "monthly", pri: "0.5" },
     { p: "/llms.txt", freq: "weekly", pri: "0.8" },
@@ -7456,6 +7471,244 @@ router.get("/proveniens", (_req: Request, res: Response) => {
 <h2>What we don't do</h2><p>We don't guess facts about a provider and present the guess as confirmed. Content pulled from a provider's own page is shown as a factual summary with source attribution, not as a legal confirmation &mdash; the only field that carries a legal confirmation is the one cross-checked against Brønnøysundregistrene.</p>
 <p style="background:#f0f7f4;border-left:4px solid #12a594;border-radius:0 10px 10px 0;padding:16px 20px;margin:24px 0">As expectations around AI transparency and data provenance keep growing in Europe, we think showing our actual verification work is good practice. This page describes what we genuinely do today; it is not a claim that we meet any particular law or regulatory standard.</p>
 <h2>Contact</h2><p>Questions about a listing? <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>`));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /for-tilbydere (+ /for-tilbydere/finn) — provider onboarding door
+// (dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S4).
+//
+// A visible, indexable front door for producers: EXPLAINS the existing
+// claim flow (find your profile → «Er dette din bedrift?» → email-verified
+// takeover via magic link to the Brreg/org-linked address) and LINKS into
+// it — it never duplicates any part of gardssalg-claim.ts (auto-approve-
+// sensitive; that file is untouched by this slice). The only interactive
+// element here is a plain GET search form → /for-tilbydere/finn, which
+// reuses searchGardssalgProvidersByQuery() (its base WHERE already excludes
+// catalog_hidden=1 rows and slug-less rows — see its doc comment in
+// experience-store.ts) and links every hit to the claim ENTRY at
+// /kategori/gardssalg/eier/<slug>.
+//
+// SEO: /for-tilbydere is indexable (canonical + static sitemap entry in the
+// /sitemap.xml handler above); /for-tilbydere/finn is noindex,follow via its
+// own meta tag (same reasoning as /sok — crawlers may still fetch it, so no
+// robots.txt change; the claim paths themselves stay Disallow'd through
+// GARDSSALG_ROBOTS_DISALLOWS, also unchanged). Both pages wear the S1 shared
+// chrome (oaSiteNav()/oaSiteFooter() + BROWSE_CSS + OA_CHROME_CSS), same
+// composition as /kategori/gardssalg.
+// ═══════════════════════════════════════════════════════════
+
+// Page-specific CSS for the two /for-tilbydere pages — appended after
+// BROWSE_CSS + OA_CHROME_CSS in their <style> blocks only (never folded into
+// the shared constants; no other page changes).
+const FOR_TILBYDERE_CSS = `
+  .ft-hero{padding:10px 0 4px}
+  .ft-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin:18px 0 8px}
+  .ft-step{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:20px 18px;box-shadow:var(--sh-sm)}
+  .ft-step .n{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;background:var(--fjord-800);color:#fff;font-weight:800;font-size:.9rem;margin-bottom:10px}
+  .ft-step h3{font-size:1.02rem;font-weight:700;color:var(--fjord-900);margin-bottom:6px}
+  .ft-step p{font-size:.9rem;color:var(--ink-soft)}
+  .ft-section{margin:34px 0 0}
+  .ft-section h2{font-size:1.3rem;font-weight:800;letter-spacing:-.015em;color:var(--fjord-900);margin-bottom:8px}
+  .ft-section p{max-width:64ch}
+  .ft-badge-sample{display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1px solid #0f5a50;color:#0f5a50;border-radius:var(--r-pill);padding:5px 14px;font-size:.88rem;font-weight:700;margin:10px 0}
+  .ft-edit-list{margin:10px 0 0 20px;color:var(--ink-soft)}
+  .ft-edit-list li{margin-bottom:6px}
+  .ft-hits{list-style:none;margin:22px 0 8px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+  .ft-hit{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:18px;box-shadow:var(--sh-sm);display:flex;flex-direction:column;gap:6px}
+  .ft-hit .name{font-weight:700;font-size:1.02rem;color:var(--ink)}
+  .ft-hit .place{font-size:.84rem;color:var(--mist)}
+  .ft-hit .claim{margin-top:auto;padding-top:8px}
+  .ft-hit .claim a{display:inline-block;background:var(--fjord-800);color:#fff;font-weight:700;font-size:.86rem;padding:8px 16px;border-radius:var(--r-pill)}
+  .ft-hit .claim a:hover{background:var(--fjord-700);text-decoration:none}
+  .ft-hint{background:var(--surface);border:1px dashed var(--line);border-radius:var(--r-lg);padding:26px 24px;margin:24px 0;color:var(--ink-soft);max-width:64ch}
+`;
+
+// GET search form shared by both pages — plain form, no JS, mirrors the
+// searchBox() markup/classes so BROWSE_CSS styles it for free.
+function forTilbydereSearchForm(currentQ: string): string {
+  return `<div class="searchbar">
+    <form action="/for-tilbydere/finn" method="GET" role="search" aria-label="Finn bedriften din">
+      <span class="field">${SEARCH_SVG}
+        <label for="ft-q" class="skip-link">Søk etter bedriften din</label>
+        <input id="ft-q" name="q" type="search" autocomplete="off" placeholder="Søk: bedriftsnavn, sted eller produkt …" value="${escapeHtml(currentQ)}">
+      </span>
+      <button type="submit">Finn bedriften</button>
+    </form>
+  </div>`;
+}
+
+// Shared head/body shell for the two pages — S1 chrome composition, same
+// BROWSE_CSS-then-OA_CHROME_CSS order as renderGardssalgCatalogPage().
+function forTilbyderePage(opts: {
+  title: string;
+  metaDesc: string;
+  robotsMeta: string; // full <meta name="robots" …> tag, or "" for none
+  canonical: string;  // full <link rel="canonical" …> tag, or "" for none
+  jsonLd: string;
+  main: string;
+}): string {
+  return `<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(opts.title)}</title>
+<meta name="description" content="${escapeHtml(opts.metaDesc)}">
+${opts.robotsMeta}
+${opts.canonical}
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${opts.jsonLd}
+<style>
+${BROWSE_CSS}
+${OA_CHROME_CSS}
+${FOR_TILBYDERE_CSS}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+${oaSiteNav({ active: "tilbydere" })}
+<main id="main" class="container">
+${opts.main}
+</main>
+${oaSiteFooter({})}
+</body>
+</html>`;
+}
+
+router.get("/for-tilbydere", (_req: Request, res: Response) => {
+  const url = baseUrl();
+  const canonical = `${url}/for-tilbydere`;
+  const jsonLd = `<script type="application/ld+json">${JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "WebPage",
+    name: "For tilbydere — ta eierskap til profilen din",
+    description: "Slik tar du eierskap til bedriftsprofilen din på Opplevagent: finn profilen, be om tilgangslenke og rediger selv.",
+    url: canonical,
+  })}</script>
+<script type="application/ld+json">${JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+      { "@type": "ListItem", position: 2, name: "For tilbydere", item: canonical },
+    ],
+  })}</script>`;
+  const main = `
+  <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · For tilbydere</nav>
+  <header class="head ft-hero">
+    <h1>For tilbydere</h1>
+    <p class="lede">Driver du et gårdsutsalg, bryggeri, sideri eller annet besøkssted som allerede står på Opplevagent? Profilen din er trolig her — ta eierskap til den, gratis, og hold informasjonen oppdatert selv.</p>
+  </header>
+
+  <section class="ft-section" aria-labelledby="ft-finn-h">
+    <h2 id="ft-finn-h">Finn bedriften din</h2>
+    <p>Søk på bedriftsnavn eller sted, eller bla i <a href="/kategori/gardssalg">katalogen over gårdssalg og smaking</a>.</p>
+    ${forTilbydereSearchForm("")}
+  </section>
+
+  <section class="ft-section" aria-labelledby="ft-steg-h">
+    <h2 id="ft-steg-h">Slik tar du eierskap — tre steg</h2>
+    <div class="ft-steps">
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">1</span>
+        <h3>Finn profilen din</h3>
+        <p>Søk over, eller finn bedriften i katalogen. Hver produsent har en egen profilside på Opplevagent.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">2</span>
+        <h3>Klikk «Er dette din bedrift?»</h3>
+        <p>På profilsiden finner du knappen «Er dette din bedrift?». Den starter overtakelsen — ingen registrering eller passord.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">3</span>
+        <h3>Bekreft via e-post</h3>
+        <p>Vi sender en magisk innloggingslenke til adressen som er registrert for bedriften hos Brønnøysundregistrene eller på bedriftens egen nettside. Klikk lenken — ferdig verifisert.</p>
+      </div>
+    </div>
+    <p style="font-size:.86rem;color:var(--mist);max-width:64ch">E-postverifiseringen er hele sikkerheten: bare den som har tilgang til bedriftens registrerte adresse kan ta eierskap. Har du ikke tilgang til den adressen, hjelper vi deg manuelt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+  </section>
+
+  <section class="ft-section" aria-labelledby="ft-rediger-h">
+    <h2 id="ft-rediger-h">Hva du kan redigere som eier</h2>
+    <p>Som bekreftet eier logger du rett inn i din egen portal og styrer profilen selv:</p>
+    <ul class="ft-edit-list">
+      <li>Om-teksten og beskrivelsen av besøket</li>
+      <li>Åpningstider og praktisk informasjon</li>
+      <li>Produkter og hva gjestene kan smake</li>
+      <li>Reservasjonsforespørsler fra besøkende</li>
+    </ul>
+  </section>
+
+  <section class="ft-section" aria-labelledby="ft-merke-h">
+    <h2 id="ft-merke-h">«Bekreftet av eier»-merket</h2>
+    <span class="ft-badge-sample"><span aria-hidden="true">&#10003;</span> Bekreftet av eier</span>
+    <p>Når du har tatt eierskap, viser profilen din dette merket. Det forteller både besøkende og AI-agenter at informasjonen kommer fra eieren selv — et tillitssignal som skiller profilen din fra rene katalogoppføringer.</p>
+  </section>
+
+  <section class="ft-section" aria-labelledby="ft-login-h">
+    <h2 id="ft-login-h">Allerede tatt eierskap? Logg inn</h2>
+    <p>Gå til profilsiden din (søk den opp over) og bruk «Logg inn»-knappen i «Bekreftet av eier»-kortet — så sender vi deg en ny innloggingslenke på e-post. Ingen passord å huske.</p>
+  </section>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(forTilbyderePage({
+    title: "For tilbydere — ta eierskap til profilen din | Opplevagent",
+    metaDesc: "Driver du et gårdsutsalg, bryggeri eller sideri som står på Opplevagent? Slik tar du eierskap til profilen din: finn bedriften, be om tilgangslenke på e-post, og rediger informasjon, produkter og reservasjoner selv.",
+    robotsMeta: `<meta name="robots" content="index, follow">`,
+    canonical: `<link rel="canonical" href="${canonical}">`,
+    jsonLd,
+    main,
+  }));
+});
+
+// GET /for-tilbydere/finn?q= — search-your-business results. noindex,follow
+// (like /sok); empty/missing q renders the form + a hint, never an error.
+router.get("/for-tilbydere/finn", (req: Request, res: Response) => {
+  const q = String(req.query.q ?? "").trim();
+  let hits: GardssalgSearchByQueryRow[] = [];
+  if (q) {
+    try {
+      hits = searchGardssalgProvidersByQuery(q, 30);
+    } catch {
+      hits = []; // DB unavailable — degrade to the empty state, never crash
+    }
+  }
+  const hitCards = hits
+    .map((h) => {
+      const sted = [h.poststed || h.kommune, h.fylke].filter(Boolean).join(", ");
+      return `<li class="ft-hit">
+      <span class="name">${escapeHtml(h.navn)}</span>
+      ${sted ? `<span class="place">${escapeHtml(sted)}</span>` : ""}
+      <span class="claim"><a href="/kategori/gardssalg/eier/${encodeURIComponent(h.slug)}">Er dette din bedrift?</a></span>
+      <a href="/kategori/gardssalg/produsent/${encodeURIComponent(h.slug)}" style="font-size:.84rem">Se profilen →</a>
+    </li>`;
+    })
+    .join("\n");
+  const resultBlock = !q
+    ? `<div class="ft-hint"><p><strong>Skriv inn bedriftsnavnet</strong> (eller stedet) i feltet over, så finner vi profilen din. Du kan også bla i <a href="/kategori/gardssalg">katalogen</a>.</p></div>`
+    : hits.length === 0
+    ? `<div class="ft-hint"><p>Ingen treff på «${escapeHtml(q)}». Prøv et kortere navn eller stedet bedriften ligger på — eller bla i <a href="/kategori/gardssalg">katalogen</a>. Finner du ikke bedriften, ta kontakt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så hjelper vi deg.</p></div>`
+    : `<p class="count">${hits.length} treff — klikk «Er dette din bedrift?» på din egen oppføring for å ta eierskap.</p>
+  <ul class="ft-hits">
+${hitCards}
+  </ul>`;
+  const main = `
+  <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · <a href="/for-tilbydere">For tilbydere</a> · Finn bedriften din</nav>
+  <header class="head ft-hero">
+    <h1>Finn bedriften din</h1>
+    <p class="lede">Søk opp bedriften din og ta eierskap til profilen — <a href="/for-tilbydere">slik funker det</a>.</p>
+  </header>
+  ${forTilbydereSearchForm(q)}
+  ${resultBlock}`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(forTilbyderePage({
+    title: q ? `Finn bedriften din: «${q}» | Opplevagent` : "Finn bedriften din | Opplevagent",
+    metaDesc: "Søk opp bedriften din på Opplevagent og ta eierskap til profilen.",
+    robotsMeta: `<meta name="robots" content="noindex, follow">`,
+    canonical: "",
+    jsonLd: "",
+    main,
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════
