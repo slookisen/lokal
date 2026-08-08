@@ -31,6 +31,13 @@
  *   (l) store unit: omitted/empty filter is result-identical to the pre-S3
  *       calls; a real filter returns only (case-insensitively) matching rows,
  *       never NULL-type rows, never catalog_hidden rows.
+ *   (m) S2b (animated line-drawn still): the .oa-still-sketch backdrop
+ *       renders on the base catalog AND the type pages (aria-hidden,
+ *       pointer-events:none, absolute inset:0, wide+narrow crops, liquid
+ *       path), its animation timeline lives EXCLUSIVELY inside
+ *       @media (prefers-reduced-motion: no-preference) (reduced-motion UAs
+ *       get the static finished drawing), and it NEVER renders on the
+ *       homepage.
  *
  * Same synthetic-harness + in-memory-DB pattern as
  * experiences-seo-site-chrome.test.ts (S1) /
@@ -108,6 +115,50 @@ function invokeRoute(
   handler(req, res, () => { /* next() */ });
   return { found: true, handled, status, body, headers };
 }
+
+// Media-block helpers (same brace-matching approach as the S2 forside test —
+// a regex can't balance the nested @keyframes braces). extractAllMediaBlocks
+// concatenates EVERY matching block: the gardssalg pages carry two
+// no-preference guards (hero steam + the S2b sketch timeline).
+function extractMediaBlock(css: string, mediaPrelude: string): { block: string; rest: string } | null {
+  const start = css.indexOf(mediaPrelude);
+  if (start < 0) return null;
+  const braceStart = css.indexOf("{", start);
+  if (braceStart < 0) return null;
+  let depth = 0;
+  for (let i = braceStart; i < css.length; i++) {
+    if (css[i] === "{") depth++;
+    else if (css[i] === "}") {
+      depth--;
+      if (depth === 0) return { block: css.slice(braceStart + 1, i), rest: css.slice(i + 1) };
+    }
+  }
+  return null;
+}
+
+function extractAllMediaBlocks(css: string, mediaPrelude: string): string[] {
+  const blocks: string[] = [];
+  let rest = css;
+  for (;;) {
+    const hit = extractMediaBlock(rest, mediaPrelude);
+    if (!hit) break;
+    blocks.push(hit.block);
+    rest = hit.rest;
+  }
+  return blocks;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  let n = 0;
+  let idx = haystack.indexOf(needle);
+  while (idx >= 0) {
+    n++;
+    idx = haystack.indexOf(needle, idx + needle.length);
+  }
+  return n;
+}
+
+const REDUCED_MOTION_PRELUDE = "@media (prefers-reduced-motion: no-preference)";
 
 // One raw-SQL provider insert — same column set as the S1/S2 fixtures (there
 // is no service-layer setter for producer_type / catalog_hidden /
@@ -389,6 +440,68 @@ export function runExperiencesSeoGardssalgTypesiderTests(opts: { log?: boolean }
       assertTrue(
         store.listGardssalgProviderMapPoints().length === 6,
         "l10: unfiltered map points unchanged (all 6 visible geocoded rows)"
+      );
+
+      // ── (m) S2b: animated line-drawn still on the gardssalg surfaces ──
+      for (const [name, page] of [["base", base], ["type", brygg]] as const) {
+        // Backdrop layer present, decorative and click-through: the wrapper
+        // div AND both svg crops are aria-hidden; the CSS pins the layer
+        // absolute inset:0 under the content with pointer-events:none.
+        assertTrue(
+          page.body.includes('<div class="oa-still-sketch" aria-hidden="true">'),
+          `m1-${name}: page renders the aria-hidden .oa-still-sketch layer`
+        );
+        assertTrue(
+          /<svg class="sketch-wide"[^>]*aria-hidden="true"[^>]*focusable="false">/.test(page.body) &&
+          /<svg class="sketch-narrow"[^>]*aria-hidden="true"[^>]*focusable="false">/.test(page.body),
+          `m2-${name}: both the wide and the narrow (mobile) crop render with aria-hidden + focusable=false`
+        );
+        assertTrue(
+          page.body.includes(".oa-still-sketch{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}"),
+          `m3-${name}: sketch layer CSS is absolute inset:0 + pointer-events:none + z-index:0`
+        );
+        // The stage wrapper sits AROUND <main> so the drawing spans the
+        // whole light surface (margins included), with main lifted above it.
+        const iStage = page.body.indexOf('class="oa-sketch-stage"');
+        const iSketch = page.body.indexOf('class="oa-still-sketch"');
+        const iMain = page.body.indexOf('id="main"');
+        assertTrue(
+          iStage >= 0 && iSketch > iStage && iMain > iSketch &&
+          page.body.includes(".oa-sketch-stage>main{position:relative;z-index:1}"),
+          `m4-${name}: stage(${iStage}) wraps sketch(${iSketch}) + main(${iMain}), main z-lifted above the drawing`
+        );
+        // Liquid pass: the copper sk-vaeske group draws AFTER the black
+        // apparatus in the timeline (58–76% vs the last line window at 56%).
+        assertTrue(
+          page.body.includes('class="sk-vaeske"') && page.body.includes(".oa-still-sketch .sk-vaeske path{stroke:#c98a2b"),
+          `m5-${name}: the liquid (sk-vaeske) pass is present in copper`
+        );
+        // Reduced-motion: every @keyframes on the page (steam + all sketch
+        // windows) lives inside a no-preference guard; the sketch's
+        // dasharray/animation bindings do too, so reduce-UAs render the
+        // static finished drawing (solid strokes, nothing dashed away).
+        const guarded = extractAllMediaBlocks(page.body, REDUCED_MOTION_PRELUDE).join("\n");
+        assertTrue(
+          guarded.length > 0 && countOccurrences(page.body, "@keyframes") === countOccurrences(guarded, "@keyframes"),
+          `m6-${name}: EVERY @keyframes sits inside a prefers-reduced-motion:no-preference block`
+        );
+        for (const kf of ["oaSkKjele", "oaSkHals", "oaSkKond", "oaSkRor", "oaSkFlaske", "oaSkVaeske", "oaSkFade"]) {
+          assertTrue(guarded.includes(`@keyframes ${kf}`), `m7-${name}-${kf}: sketch timeline keyframe ${kf} is inside the guard`);
+        }
+        assertTrue(
+          countOccurrences(page.body, "stroke-dasharray:1}") === countOccurrences(guarded, "stroke-dasharray:1}"),
+          `m8-${name}: the sketch's stroke-dasharray only exists inside the guard (static render stays fully drawn)`
+        );
+      }
+      // The identity belongs to the gardssalg surfaces ONLY — never the
+      // homepage (Daniel's S2b directive).
+      const homeM = invokeRoute(router, "/", {}, "/");
+      assertTrue(homeM.found && homeM.handled && homeM.status === 200, `m9: GET / renders 200 (got ${homeM.status})`);
+      assertTrue(!homeM.body.includes("oa-still-sketch"), "m10: the still sketch NEVER renders on the homepage");
+      const sketchSvg = (seo as any).gardssalgStillSketchSvg();
+      assertTrue(
+        typeof sketchSvg === "string" && sketchSvg.length > 0 && sketchSvg.length < 50_000,
+        `m11: the still-sketch SVG stays hand-written-small — under 50 000 chars (got ${sketchSvg?.length})`
       );
     } catch (err: any) {
       failed++;

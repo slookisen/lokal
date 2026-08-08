@@ -22,6 +22,11 @@
  *   (g) countGardssalgProvidersByType(): same WHERE gate as
  *       countGardssalgProviders() — catalog_hidden=1 excluded, NULL
  *       producer_type comes back as its own row, per-type counts correct.
+ *   (h) S2b (Daniel's directive: the distillery identity belongs to the
+ *       gardssalg surfaces ONLY): the copper pot-still + steam are REMOVED
+ *       from the forside motif (landscape kept), still present in the
+ *       drikke motif, the #drikkested section is untouched, and the
+ *       gardssalg still sketch never leaks onto the homepage.
  *
  * Same synthetic-req/res harness + in-memory-DB pattern as
  * experiences-seo-site-chrome.test.ts (S1).
@@ -88,6 +93,23 @@ function extractMediaBlock(css: string, mediaPrelude: string): string | null {
     }
   }
   return null;
+}
+
+// ALL such blocks concatenated — S2b adds a SECOND no-preference guard to
+// the gardssalg page (the still-sketch timeline lives in its own guarded
+// block next to the hero steam's), so "no @keyframes outside the guard"
+// must be checked against the union of every guarded block, not just the
+// first one.
+function extractAllMediaBlocks(css: string, mediaPrelude: string): string {
+  let rest = css;
+  const parts: string[] = [];
+  for (;;) {
+    const block = extractMediaBlock(rest, mediaPrelude);
+    if (block === null) break;
+    parts.push(block);
+    rest = rest.slice(rest.indexOf(mediaPrelude) + mediaPrelude.length);
+  }
+  return parts.join("\n");
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -274,11 +296,38 @@ export function runExperiencesSeoForsideDrikkestedTests(opts: { log?: boolean } 
         "f2: gardssalg hero renders the drikke scene with aria-hidden + focusable=false"
       );
       assertTrue(!gard.body.includes("hero-scene-forside"), "f3: gardssalg page uses the drikke motif, not the forside one");
-      const gardMotion = extractMediaBlock(gard.body, REDUCED_MOTION_PRELUDE);
+      // f4 UPDATED for S2b: the gardssalg page now carries TWO
+      // no-preference blocks (hero steam + the still-sketch timeline), so
+      // the "no @keyframes outside the guard" invariant is asserted against
+      // the UNION of all guarded blocks — the invariant itself is unchanged.
+      const gardMotion = extractAllMediaBlocks(gard.body, REDUCED_MOTION_PRELUDE);
       assertTrue(
-        gardMotion !== null && countOccurrences(gard.body, "@keyframes") === countOccurrences(gardMotion || "", "@keyframes"),
-        "f4: the reduced-motion guard holds on the gardssalg page too"
+        gardMotion.length > 0 && countOccurrences(gard.body, "@keyframes") === countOccurrences(gardMotion, "@keyframes"),
+        "f4: the reduced-motion guard holds on the gardssalg page too (every @keyframes inside a no-preference block)"
       );
+
+      // ── (h) S2b: pot-still off the forside, kept on drikke; sketch
+      //        never on the homepage ─────────────────────────────────────
+      const forsideSvg = heroSceneSvg("forside");
+      const drikkeSvg = heroSceneSvg("drikke");
+      // The copper palette (rgba(201,138,43,…)) was ONLY ever used by the
+      // forside pot-still — its absence proves the whole apparatus is gone.
+      assertTrue(!forsideSvg.includes("rgba(201,138,43"), "h1: forside motif carries NO copper pot-still paths anymore");
+      assertTrue(!forsideSvg.includes('class="steam"'), "h2: the pot-still's steam group is gone from the forside motif too");
+      // The neutral landscape is KEPT: farm cluster + darkest depth layer.
+      assertTrue(
+        forsideSvg.includes('d="M660 390 L660 352 L684 332 L708 352 L708 390 Z"') &&
+        forsideSvg.includes("rgba(24,19,13,.58)"),
+        "h3: the fjord/farm landscape layers survive unchanged on the forside"
+      );
+      // The drikke motif (gardssalg hero) is untouched: kettle + steam.
+      assertTrue(
+        drikkeSvg.includes("rgba(201,138,43") && drikkeSvg.includes('class="steam"'),
+        "h4: drikke motif keeps its copper kettle + steam (unchanged)"
+      );
+      // The S2b still sketch belongs to the gardssalg surfaces ONLY.
+      assertTrue(!home.body.includes("oa-still-sketch"), "h5: the gardssalg still sketch never renders on the homepage");
+      assertTrue(gard.body.includes('class="oa-still-sketch"'), "h6: /kategori/gardssalg renders the still-sketch layer");
 
       // ── (g) countGardssalgProvidersByType() unit ──────────────────────
       const rows = A.store.countGardssalgProvidersByType();
