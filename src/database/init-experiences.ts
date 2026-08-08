@@ -544,6 +544,20 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_content_audit failed:", err);
   }
 
+  // ─── gardssalg_content_audit.notes (dev-request 2026-08-08-booking-
+  // aktivering-per-produsent) ─────────────────────────────────────────────
+  // Additive, nullable column — every existing row/insert is untouched
+  // (defaults to NULL). Mirrors agent_knowledge_audit's own `notes` column
+  // (database/init.ts, ~L2053 — this table's own header comment already
+  // names agent_knowledge_audit as the shape/purpose this table mirrors),
+  // so the admin booking-activation lever (POST
+  // /admin/gardssalg-booking-activation, routes/opplevelser.ts) can preserve
+  // the operator's written reason for flipping booking_live per audit row,
+  // without inventing a second/parallel audit table.
+  try {
+    db.exec("ALTER TABLE gardssalg_content_audit ADD COLUMN notes TEXT");
+  } catch { /* already present */ }
+
   // ─── gardssalg_orgnr_review_queue (dev-request 2026-07-18-gardssalg-
   // profilkvalitet-foer-outreach, slice 5b) ───────────────────────────────────
   // Every gårdssalg provider whose org_nr the Brreg-name-search backfill

@@ -7856,6 +7856,281 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
   }
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-booking-activation (admin) ──────
+// GET  /api/opplevelser/admin/gardssalg-booking-activation (admin) ──────────
+//
+// dev-request 2026-08-08-booking-aktivering-per-produsent: the admin lever +
+// per-provider emergency brake missing from the existing booking_live
+// mechanism. Daniel wants to turn booking ON for one named producer at a
+// time as they take over their profile, and OFF for one producer without
+// touching anyone else. Both directions ALREADY exist mechanically —
+// isBookingPaused()/bookingDispatchEnabled() (services/booking-store.ts) is
+// already a per-provider AND global gate, enforced identically on every
+// booking surface (SSR reservation form, POST /api/opplevelser/book, MCP
+// book_gardssalg). This route only adds the missing WRITE lever + audit
+// trail over that existing gate — it never touches isBookingPaused(),
+// bookingDispatchEnabled(), BOOKING_DISPATCH_ENABLED, or the booking_live
+// column's meaning in any way.
+//
+// Reuses, never reinvents:
+//   - the gate: isBookingPaused() (imported above) — UNCHANGED. This route
+//     writes the SAME booking_live column the owner-portal checkbox
+//     (gardssalg-claim.ts's updateClaimedProviderProfile, changed_by=
+//     'owner') already writes, on the SAME experience_providers table — so
+//     every surface that already reads booking_live picks up the change
+//     with zero new code on the read side.
+//   - the audit trail: gardssalg_content_audit, the SAME table/insert shape
+//     every other gårdssalg admin write in this file uses (field_name=
+//     'booking_live', changed_by='admin' — 'system'/'owner' are the other
+//     two values already in use here). A nullable `notes` column was added
+//     to that table (idempotent ALTER TABLE, init-experiences.ts) — the
+//     SAME column name/shape agent_knowledge_audit (this table's own
+//     explicit model, per its header comment) already has, so the
+//     operator's written reason for the flip survives per audit row, not
+//     just in a request log line.
+//   - the dry-run/apply convention: apply absent/false = dry-run (report
+//     only, zero writes) — identical to every sibling admin route in this
+//     file (gardssalg-producer-type-classify, gardssalg-claim-grant, the
+//     outreach-preflight/pilot-send pair just above, …).
+//   - the batch cap + per-row not-found handling: mirrors POST
+//     /admin/gardssalg-outreach-preflight above exactly — 200-id cap,
+//     first-seen-order dedup, a bad id reported per-row as `not_found`
+//     rather than failing the whole batch.
+//   - the overview (GET, below): reuses computeGardssalgReadinessRows's own
+//     `booking_status` field (isBookingPaused() under the hood) as the ONE
+//     source of truth for "is this provider currently bookable" — no
+//     parallel recomputation of that logic.
+//
+// Guard (AC3): enabled:true for a provider with no epost on file is
+// rejected with reason "no_email" — a booking notification with nobody to
+// receive it is a guest who never gets an answer (see
+// sendProducerNotification's own "SKIPPED — no epost" log, booking-
+// store.ts, which this guard keeps from ever firing for an admin-activated
+// provider). enabled:false carries NO such guard, deliberately: the
+// emergency brake must always work, even for a provider missing an email —
+// see planGardssalgBookingActivation below, which only applies the no_email
+// check when enabled === true.
+//
+// Idempotent by construction: a provider already AT the requested
+// booking_live value is reported `already_current` and generates NO write,
+// NO audit row — re-running the same call twice is always safe and never
+// pads the audit trail with no-op rows (same discipline as
+// planGardssalgContentRollback's own "already_current" skip reason,
+// experience-store.ts). booking_live is deliberately NOT added to that
+// function's GARDSSALG_ROLLBACKABLE_FIELDS allow-list (it was excluded on
+// purpose when that allow-list was built — see its own doc comment: "a
+// consent toggle with no rollback candidate") — this lever (enabled:false)
+// IS the intended undo path, per the dev-request's own rollback plan; the
+// audit row this route writes still leaves a full old/new/notes trail per
+// change for manual inspection.
+const MAX_GARDSSALG_BOOKING_ACTIVATION_BATCH = 200;
+
+export type GardssalgBookingActivationResult = {
+  provider_id: string;
+  name: string | null;
+  ok: boolean;
+  changed: boolean;
+  reason?: "not_found" | "no_email" | "already_current";
+  from?: 0 | 1;
+  to?: 0 | 1;
+};
+
+// Read-only planning pass — the SAME function backs both the dry-run
+// response and the pre-write pass of apply (see the route below), so the
+// two can never diverge on what counts as go/no-go. Always a fresh SELECT;
+// never trusts a caller-supplied row. Dedupes provider_ids while preserving
+// first-seen order, same discipline as computeGardssalgOutreachPreflight
+// above — every requested id appears exactly once, in request order.
+export function planGardssalgBookingActivation(
+  expDb: Database.Database,
+  providerIds: string[],
+  enabled: boolean,
+): GardssalgBookingActivationResult[] {
+  const seen = new Set<string>();
+  const orderedIds: string[] = [];
+  for (const rawId of providerIds) {
+    if (!seen.has(rawId)) {
+      seen.add(rawId);
+      orderedIds.push(rawId);
+    }
+  }
+
+  return orderedIds.map((id): GardssalgBookingActivationResult => {
+    const row = expDb
+      .prepare(`SELECT id, navn, epost, booking_live FROM experience_providers WHERE id = ?`)
+      .get(id) as
+      | { id: string; navn: string | null; epost: string | null; booking_live: number | null }
+      | undefined;
+    if (!row) {
+      return { provider_id: id, name: null, ok: false, changed: false, reason: "not_found" };
+    }
+    const current: 0 | 1 = row.booking_live === 1 ? 1 : 0;
+    const target: 0 | 1 = enabled ? 1 : 0;
+    const hasEmail = typeof row.epost === "string" && row.epost.trim() !== "";
+    if (enabled && !hasEmail) {
+      return { provider_id: id, name: row.navn, ok: false, changed: false, reason: "no_email", from: current };
+    }
+    if (current === target) {
+      return {
+        provider_id: id, name: row.navn, ok: true, changed: false,
+        reason: "already_current", from: current, to: target,
+      };
+    }
+    return { provider_id: id, name: row.navn, ok: true, changed: true, from: current, to: target };
+  });
+}
+
+/**
+ * Apply ONE planned booking_live flip. Re-verifies the guard fresh inside a
+ * transaction (defense in depth — planGardssalgBookingActivation's plan may
+ * be stale by the time apply actually runs, e.g. a concurrent owner-portal
+ * save) rather than trusting the caller's plan item blindly — same
+ * discipline as applyGardssalgContentRollback's own re-check right before
+ * each write (experience-store.ts). Writes ONLY booking_live (+ updated_at)
+ * — NEVER catalog_hidden, epost, or any other experience_providers column —
+ * and inserts exactly one gardssalg_content_audit row per actual change,
+ * carrying the operator's note, changed_by='admin'. Returns null (no write,
+ * no audit row) if the fresh re-check finds nothing to do: row vanished,
+ * the no_email guard now fails, or the value already matches the target.
+ */
+export function applyGardssalgBookingActivation(
+  expDb: Database.Database,
+  providerId: string,
+  enabled: boolean,
+  note: string | null,
+  batchId: string,
+): { from: 0 | 1; to: 0 | 1 } | null {
+  const txn = expDb.transaction((): { from: 0 | 1; to: 0 | 1 } | null => {
+    const row = expDb
+      .prepare(`SELECT id, epost, booking_live FROM experience_providers WHERE id = ?`)
+      .get(providerId) as { id: string; epost: string | null; booking_live: number | null } | undefined;
+    if (!row) return null;
+    const current: 0 | 1 = row.booking_live === 1 ? 1 : 0;
+    const target: 0 | 1 = enabled ? 1 : 0;
+    const hasEmail = typeof row.epost === "string" && row.epost.trim() !== "";
+    if (enabled && !hasEmail) return null;
+    if (current === target) return null;
+
+    expDb
+      .prepare(`UPDATE experience_providers SET booking_live = @target, updated_at = datetime('now') WHERE id = @id`)
+      .run({ id: providerId, target });
+    expDb
+      .prepare(
+        `INSERT INTO gardssalg_content_audit
+           (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes)
+         VALUES (@id, @provider_id, 'booking_live', @old_value, @new_value, NULL, @batch_id, 'admin', datetime('now'), @notes)`,
+      )
+      .run({
+        id: crypto.randomUUID(),
+        provider_id: providerId,
+        old_value: String(current),
+        new_value: String(target),
+        batch_id: batchId,
+        notes: note,
+      });
+    return { from: current, to: target };
+  });
+  return txn();
+}
+
+router.post("/admin/gardssalg-booking-activation", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_ids?: unknown;
+    enabled?: unknown;
+    note?: unknown;
+    apply?: unknown;
+  };
+  const rawIds = body.provider_ids;
+
+  if (
+    !Array.isArray(rawIds) ||
+    rawIds.length === 0 ||
+    !rawIds.every((v) => typeof v === "string" && v.trim() !== "")
+  ) {
+    res.status(400).json({ error: "provider_ids must be a non-empty array of strings" });
+    return;
+  }
+  if (rawIds.length > MAX_GARDSSALG_BOOKING_ACTIVATION_BATCH) {
+    res.status(400).json({ error: `provider_ids exceeds max batch size of ${MAX_GARDSSALG_BOOKING_ACTIVATION_BATCH}` });
+    return;
+  }
+  if (typeof body.enabled !== "boolean") {
+    res.status(400).json({ error: "enabled must be a boolean" });
+    return;
+  }
+  const enabled = body.enabled;
+  const note = typeof body.note === "string" && body.note.trim() !== "" ? body.note.trim().slice(0, 1000) : null;
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+
+  const expDb = getExpDb("experiences");
+  try {
+    const plan = planGardssalgBookingActivation(expDb, rawIds as string[], enabled);
+
+    if (!apply) {
+      const summary = { would_change: 0, already_current: 0, rejected: 0, not_found: 0, total: plan.length };
+      for (const r of plan) {
+        if (r.reason === "not_found") summary.not_found++;
+        else if (r.reason === "no_email") summary.rejected++;
+        else if (r.reason === "already_current") summary.already_current++;
+        else if (r.changed) summary.would_change++;
+      }
+      res.json({ success: true, dry_run: true, enabled, results: plan, summary });
+      return;
+    }
+
+    const batchId = `booking-activation-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+    const results = plan.map((item) => {
+      if (!item.ok || !item.changed) return item;
+      const applied = applyGardssalgBookingActivation(expDb, item.provider_id, enabled, note, batchId);
+      if (!applied) {
+        // Fresh-read-at-apply-time race: the plan said changed, but the
+        // re-check inside applyGardssalgBookingActivation found otherwise
+        // (row vanished, guard now fails, or someone else — e.g. the
+        // owner-portal checkbox — already set it in the same instant).
+        // Nothing was written, so nothing to report as changed either.
+        return { ...item, changed: false, reason: "already_current" as const };
+      }
+      return { ...item, from: applied.from, to: applied.to };
+    });
+
+    const summary = { changed: 0, already_current: 0, rejected: 0, not_found: 0, total: results.length };
+    for (const r of results) {
+      if (r.reason === "not_found") summary.not_found++;
+      else if (r.reason === "no_email") summary.rejected++;
+      else if (r.reason === "already_current") summary.already_current++;
+      else if (r.changed) summary.changed++;
+    }
+    res.json({ success: true, dry_run: false, enabled, results, summary });
+  } catch (err) {
+    console.error("[gardssalg-booking-activation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-booking-activation (overview) ────
+// AC6: an admin-readable list/count of providers with booking_live=1 — reuse
+// computeGardssalgReadinessRows's own `booking_status` (isBookingPaused()
+// under the hood, services/booking-store.ts) as the ONE source, rather than
+// a second, parallel recomputation of "is this provider bookable" logic.
+router.get("/admin/gardssalg-booking-activation", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const rows = computeGardssalgReadinessRows(expDb);
+    const live = rows.filter((r) => r.booking_status === "live");
+    const paused = rows.filter((r) => r.booking_status === "paused");
+    res.json({
+      success: true,
+      count_live: live.length,
+      count_paused: paused.length,
+      total: rows.length,
+      providers: live.map((r) => ({ id: r.id, name: r.name, booking_status: r.booking_status })),
+    });
+  } catch (err) {
+    console.error("[gardssalg-booking-activation] overview failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/gardssalg-verified-drinkproducer-cohort ──────
 //
 // dev-request 2026-08-02-drikkesteder-hjemmeside-verifisert-kohort-berikelse,

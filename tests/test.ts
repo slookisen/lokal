@@ -29062,6 +29062,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gops.failures) failures.push("opplevelser-gardssalg-outreach-pilot-send: " + f);
     console.log(`  opplevelser-gardssalg-outreach-pilot-send: ${gops.passed} passed, ${gops.failed} failed`);
 
+    // dev-request 2026-08-08-booking-aktivering-per-produsent: POST/GET
+    // /admin/gardssalg-booking-activation — the admin lever + per-producer
+    // emergency brake over the EXISTING booking_live gate (isBookingPaused()/
+    // bookingDispatchEnabled(), services/booking-store.ts), including the
+    // AC4 cross-surface (JSON API / MCP / SSR) leak-proof brake test. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-booking-activation: admin booking activation lever + emergency brake ──");
+    const { runOpplevelserGardssalgBookingActivationTests } = require("../src/routes/opplevelser-gardssalg-booking-activation.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-booking-activation.test");
+    const gba = await runOpplevelserGardssalgBookingActivationTests({ log: false });
+    passed += gba.passed;
+    failed += gba.failed;
+    for (const f of gba.failures) failures.push("opplevelser-gardssalg-booking-activation: " + f);
+    console.log(`  opplevelser-gardssalg-booking-activation: ${gba.passed} passed, ${gba.failed} failed`);
+
     // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
     // Slice 2 ("outreach-guard"): pure-function unit tests for
     // dedupeGardssalgOutreachRecipients (no DB) — wired into POST
