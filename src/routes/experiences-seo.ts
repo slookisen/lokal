@@ -630,6 +630,93 @@ function gardssalgVisible(): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Gårdssalg type subpages (dev-request 2026-08-06-opplevagent-ux-loft-
+// drikkested-lansering, S3): indexable per-drink-type catalog pages under
+// /kategori/gardssalg/<typeSlug>, so outreach emails can link a recipient
+// straight to their own type's page. This whitelist is the ONLY set of
+// canonical type slugs that resolve — anything else next()s to the generic
+// /kategori/:category(/…) handlers further down and ultimately the 404.
+//
+// Slugs are canonical ASCII (mjod, not mjød) — URL-safe without
+// percent-encoding. `producerTypes` are the RAW experience_providers
+// .producer_type spellings each page aggregates (lowercase-matched via the
+// store's LOWER(producer_type) IN (…) filter): both accented DB spellings
+// and the pipeline's ASCII transliterations (vingard/vingaard, mjoderi/
+// mjoederi — see DRINK_TYPE_UNACCENTED_ALIASES below). NULL producer_type
+// rows match NO type page — they render on the base catalog («Alle») only;
+// NEVER filter with isGardssalgDrinkType(), which counts NULL as drink.
+//
+// `lede` is the page's answer-first opening (same GEO discipline as
+// buildCategoryAnswerFirstOpening() below): a live count is stated upfront,
+// so it's a function of the REAL count at request time, never a canned
+// number.
+export type GardssalgTypePageDef = {
+  label: string;          // chip/breadcrumb label — same canonical labels as DRINK_TYPE_META
+  producerTypes: string[]; // raw producer_type spellings aggregated by this page
+  title: string;          // <title> (also the h1, minus the " | Opplevagent" suffix)
+  metaDesc: string;
+  lede: (count: number) => string; // answer-first opening with the live count woven in
+};
+
+export const GARDSSALG_TYPE_PAGES: Record<string, GardssalgTypePageDef> = {
+  bryggeri: {
+    label: "Bryggeri",
+    producerTypes: ["bryggeri"],
+    title: "Bryggerier med gårdssalg og smaking | Opplevagent",
+    metaDesc: "Besøk lokale bryggerier — book ølsmaking eller omvisning rett hos bryggeriet. Verifisert mot Brønnøysundregistrene.",
+    lede: (n) => `Det finnes ${n} ${n === 1 ? "bryggeri" : "bryggerier"} på Opplevagent — book en ølsmaking eller omvisning rett hos bryggeriet.`,
+  },
+  destilleri: {
+    label: "Destillat",
+    producerTypes: ["destilleri"],
+    title: "Destillerier med gårdssalg og smaking | Opplevagent",
+    metaDesc: "Besøk lokale destillerier — book smaking av destillater eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    lede: (n) => `Det finnes ${n} ${n === 1 ? "destilleri" : "destillerier"} på Opplevagent — book en smaking eller omvisning rett hos destilleriet.`,
+  },
+  sider: {
+    label: "Sider",
+    producerTypes: ["cideri", "sideri"],
+    title: "Siderier med gårdssalg og smaking | Opplevagent",
+    metaDesc: "Besøk lokale siderprodusenter — book sidersmaking eller omvisning i frukthagen rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    lede: (n) => `Det finnes ${n} ${n === 1 ? "siderprodusent" : "siderprodusenter"} på Opplevagent — book en sidersmaking rett hos produsenten.`,
+  },
+  fruktvin: {
+    label: "Fruktvin",
+    producerTypes: ["vingård", "vingard", "vingaard"],
+    title: "Fruktvin — vingårder med gårdssalg og smaking | Opplevagent",
+    metaDesc: "Besøk lokale fruktvinprodusenter — book smaking av fruktvin og en tur i vingården rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    lede: (n) => `Det finnes ${n} ${n === 1 ? "fruktvinprodusent" : "fruktvinprodusenter"} på Opplevagent — book en smaking rett hos produsenten.`,
+  },
+  mjod: {
+    label: "Mjød",
+    producerTypes: ["mjøderi", "mjoderi", "mjoederi"],
+    title: "Mjøderier med gårdssalg og smaking | Opplevagent",
+    metaDesc: "Besøk lokale mjøderier — book mjødsmaking eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    lede: (n) => `Det finnes ${n} ${n === 1 ? "mjøderi" : "mjøderier"} på Opplevagent — book en mjødsmaking rett hos produsenten.`,
+  },
+  kombucha: {
+    label: "Kombucha",
+    producerTypes: ["seltzeri"],
+    title: "Kombucha-produsenter med gårdssalg og smaking | Opplevagent",
+    metaDesc: "Besøk lokale kombucha-produsenter — book smaking eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    lede: (n) => `Det finnes ${n} ${n === 1 ? "kombucha-produsent" : "kombucha-produsenter"} på Opplevagent — book en smaking rett hos produsenten.`,
+  },
+};
+
+// Alias slugs → canonical slug, answered with a 301 to the canonical URL so
+// outreach links/typed-in raw producer_type spellings never mint duplicate
+// indexable URLs. Keys are single URL segments (lowercase ASCII).
+export const GARDSSALG_TYPE_SLUG_ALIASES: Record<string, string> = {
+  sideri: "sider",
+  cideri: "sider",
+  vingard: "fruktvin",
+  vingaard: "fruktvin",
+  mjoderi: "mjod",
+  mjoederi: "mjod",
+  seltzeri: "kombucha",
+};
+
+// ─────────────────────────────────────────────────────────────
 // Homepage UI strings (NO/EN). Phase-1 i18n: only the landing page
 // is genuinely bilingual; browse/detail stay NO-canonical for now.
 // ─────────────────────────────────────────────────────────────
@@ -1596,6 +1683,27 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
         if (p.updated_at && p.updated_at > gardssalgLastmod) gardssalgLastmod = p.updated_at;
       }
       xml += `\n  <url><loc>${url}/kategori/gardssalg</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${(gardssalgLastmod || today).slice(0, 10)}</lastmod></url>`;
+      // S3 (dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering):
+      // one entry per canonical /kategori/gardssalg/<typeSlug> page that has
+      // ≥1 matching provider — computed from the SAME already-fetched row set
+      // (no extra query), so the sitemap lists exactly the type pages the
+      // route serves (an empty type next()s to the 404 and is skipped here
+      // for the same reason). lastmod = MAX(updated_at) over the type's OWN
+      // rows (per-page freshness, same honesty rule as the aggregate above).
+      // Alias slugs (301 redirects) are deliberately never listed. NULL
+      // producer_type rows match no type page — base-catalog entry only.
+      for (const [typeSlug, typeDef] of Object.entries(GARDSSALG_TYPE_PAGES)) {
+        let typeCount = 0;
+        let typeLastmod = "";
+        for (const p of gardssalgProvidersForSitemap) {
+          const pt = p.producer_type ? p.producer_type.toLowerCase() : "";
+          if (!pt || !typeDef.producerTypes.includes(pt)) continue;
+          typeCount++;
+          if (p.updated_at && p.updated_at > typeLastmod) typeLastmod = p.updated_at;
+        }
+        if (typeCount === 0) continue;
+        xml += `\n  <url><loc>${url}/kategori/gardssalg/${typeSlug}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${(typeLastmod || today).slice(0, 10)}</lastmod></url>`;
+      }
     }
   } catch { /* experiences DB not open */ }
   try {
@@ -3778,16 +3886,75 @@ function renderMiniMapSection(point: MiniMapPoint, osmLinkHtml: string): string 
   </div>`;
 }
 
-// ─── GET /kategori/gardssalg — Gårdssalg & smaking provider catalog ──────────
+// ─── GET /kategori/gardssalg(/:typeSlug) — Gårdssalg & smaking provider
+//     catalog + indexable per-drink-type subpages ───────────────────────────
 // Gardssalg shows experience_providers (drink producers), not experiences.
 // The generic /kategori/:category route queries the experiences table and returns
 // 404 when count=0 — this special handler intercepts "gardssalg" before that.
 // Rendered as a paginated provider listing reusing the opplevagent brand/CSS.
-router.get("/kategori/gardssalg", (req: Request, res: Response) => {
-  const page = parsePage(req.query.page);
+//
+// dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S3: the
+// former inline /kategori/gardssalg handler body is refactored into the shared
+// renderGardssalgCatalogPage() below so the base catalog («Alle») and the
+// /kategori/gardssalg/<typeSlug> subpages render through ONE code path. Base
+// output stays byte-near its pre-S3 form — the only additions are the
+// searchBox (category-boosted, same as /kategori/:category pages) and the
+// type-chips row. Type pages get their own title/metaDesc/canonical/lede and
+// a filtered grid + map, and return null (→ route next()s to the 404) for an
+// unknown slug or an empty type, so no thin/empty type page is ever indexable.
+
+// Type-filter chips row — plain, indexable <a> links (no JS), shown on the
+// base catalog AND every type page. «Alle» → the base catalog; one chip per
+// canonical GARDSSALG_TYPE_PAGES slug whose aggregated live count > 0 (counts
+// from countGardssalgProvidersByType()'s raw rows, aggregated over each
+// page's producerTypes spellings). The active chip carries aria-current="page"
+// + the filled .chip-active style (both already in BROWSE_CSS — reused, not
+// copied). NULL-producer_type rows count toward «Alle»'s total only — they
+// have no honest type, so they never inflate any type chip.
+export function renderGardssalgTypeChips(
+  activeSlug: string | null,
+  typeCounts: Array<{ producer_type: string | null; count: number }>
+): string {
+  if (!typeCounts || typeCounts.length === 0) return "";
+  const bySlug = new Map<string, number>();
+  let total = 0;
+  for (const row of typeCounts) {
+    if (!row || !Number.isFinite(row.count) || row.count <= 0) continue;
+    total += row.count;
+    const raw = row.producer_type ? row.producer_type.toLowerCase() : "";
+    if (!raw) continue; // NULL-type rows: «Alle» only
+    for (const [slug, def] of Object.entries(GARDSSALG_TYPE_PAGES)) {
+      if (def.producerTypes.includes(raw)) {
+        bySlug.set(slug, (bySlug.get(slug) ?? 0) + row.count);
+        break;
+      }
+    }
+  }
+  function chip(href: string, label: string, count: number, active: boolean): string {
+    return `<a class="chip${active ? " chip-active" : ""}"${active ? ' aria-current="page"' : ""} href="${href}">${escapeHtml(label)} <span class="n">${count}</span></a>`;
+  }
+  const chips: string[] = [chip("/kategori/gardssalg", "Alle", total, activeSlug === null)];
+  for (const [slug, def] of Object.entries(GARDSSALG_TYPE_PAGES)) {
+    const count = bySlug.get(slug) ?? 0;
+    if (count <= 0) continue;
+    chips.push(chip(`/kategori/gardssalg/${slug}`, def.label, count, activeSlug === slug));
+  }
+  return `<nav class="chips gardssalg-type-chips" aria-label="Filtrer produsenter etter type">${chips.join("")}</nav>`;
+}
+
+function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: number }): string | null {
+  const typeSlug = opts.typeSlug ?? null;
+  const typeDef = typeSlug ? GARDSSALG_TYPE_PAGES[typeSlug] : undefined;
+  if (typeSlug && !typeDef) return null; // unknown slug — caller next()s
+  const typeFilter = typeDef ? { producerTypes: typeDef.producerTypes } : undefined;
+  const page = opts.page;
   const PAGE_SIZE = 24;
-  const providers = listGardssalgProviders(PAGE_SIZE, (page - 1) * PAGE_SIZE);
-  const total = countGardssalgProviders();
+  const providers = listGardssalgProviders(PAGE_SIZE, (page - 1) * PAGE_SIZE, typeFilter);
+  const total = countGardssalgProviders(typeFilter);
+  // Empty type → null (caller next()s to the 404): a zero-provider type page
+  // must never be a live, indexable thin page. The BASE catalog deliberately
+  // keeps its pre-S3 zero-state render (kg-zero in tests/test.ts).
+  if (typeDef && total === 0) return null;
   // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, arbeidspunkt 4:
   // ALL geocoded producers across every page (not just this page's slice) —
   // same "map shows the whole filtered set, not just the current page" as
@@ -3795,9 +3962,16 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
   // is passed the full fylke filter, not a page slice). Defensive try/catch
   // (same discipline as kommuneChips()/facetChips() elsewhere in this file)
   // so a query hiccup degrades to "no map" rather than a 500 — the provider
-  // grid above is the primary content and must never depend on this.
+  // grid above is the primary content and must never depend on this. On a
+  // type page the same optional filter narrows the markers in lockstep with
+  // the card grid.
   let mapPoints: GardssalgProviderMapPoint[] = [];
-  try { mapPoints = listGardssalgProviderMapPoints(); } catch { mapPoints = []; }
+  try { mapPoints = listGardssalgProviderMapPoints(typeFilter); } catch { mapPoints = []; }
+  // Chips row (base + type pages) — defensive like the map: a per-type count
+  // hiccup degrades to "no chips", never a 500.
+  let typeCounts: Array<{ producer_type: string | null; count: number }> = [];
+  try { typeCounts = countGardssalgProvidersByType(); } catch { typeCounts = []; }
+  const chipsRow = renderGardssalgTypeChips(typeSlug, typeCounts);
 
   function renderProviderCard(p: GardssalgProviderRow): string {
     const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
@@ -3850,22 +4024,64 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
     ? `<p style="color:#544a3e;margin:40px 0">Ingen drikkeprodusenter er lagt til ennå — kom tilbake snart.</p>`
     : "";
 
+  // Pagination stays on the current page's own path — a type page paginates
+  // /kategori/gardssalg/<slug>?page=N, never leaks back to the base catalog.
+  const pagePath = typeSlug ? `/kategori/gardssalg/${typeSlug}` : "/kategori/gardssalg";
   const paginationLinks: string[] = [];
   const totalPages = Math.ceil(total / PAGE_SIZE);
-  if (page > 1) paginationLinks.push(`<a href="/kategori/gardssalg?page=${page - 1}">← Forrige</a>`);
-  if (page < totalPages) paginationLinks.push(`<a href="/kategori/gardssalg?page=${page + 1}">Neste →</a>`);
+  if (page > 1) paginationLinks.push(`<a href="${pagePath}?page=${page - 1}">← Forrige</a>`);
+  if (page < totalPages) paginationLinks.push(`<a href="${pagePath}?page=${page + 1}">Neste →</a>`);
   const pagination = paginationLinks.length ? `<nav style="margin:32px 0;display:flex;gap:16px">${paginationLinks.join("")}</nav>` : "";
 
   const url = "https://opplevagent.no";
-  const html = `<!doctype html>
+  const canonical = `${url}${pagePath}`;
+  const pageTitle = typeDef ? typeDef.title : "Gårdssalg og smaking | Opplevagent";
+  const metaDesc = typeDef
+    ? typeDef.metaDesc
+    : "Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Book en smaking eller omvisning rett hos produsenten.";
+  // Type-page h1 = the <title> minus the brand suffix; base keeps its
+  // pre-S3 hero copy byte-identically.
+  const heroH1 = typeDef ? typeDef.title.replace(/ \| Opplevagent$/, "") : "Lokale drikkeprodusenter";
+  // Answer-first lede (GEO discipline, same pattern as
+  // buildCategoryAnswerFirstOpening()): the type page opens by stating the
+  // LIVE count upfront — total here is the real filtered count (>0, gated
+  // above), never a canned number.
+  const heroSub = typeDef
+    ? typeDef.lede(total)
+    : "Besøk bryggeri, sideri, mjøderi og mer — book en smaking eller omvisning rett hos produsenten.";
+  // JSON-LD: the base page keeps its pre-S3 single CollectionPage blob
+  // byte-identically; type pages get their own CollectionPage + a
+  // BreadcrumbList mirroring the visible breadcrumb.
+  const jsonLd = typeDef
+    ? `<script type="application/ld+json">${JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "CollectionPage",
+        name: heroH1,
+        description: metaDesc,
+        url: canonical,
+      })}</script>
+<script type="application/ld+json">${JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "BreadcrumbList",
+        itemListElement: [
+          { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+          { "@type": "ListItem", position: 2, name: "Gårdssalg og smaking", item: `${url}/kategori/gardssalg` },
+          { "@type": "ListItem", position: 3, name: typeDef.label, item: canonical },
+        ],
+      })}</script>`
+    : `<script type="application/ld+json">{"@context":"https://schema.org","@type":"CollectionPage","name":"Gårdssalg og smaking","description":"Lokale drikkeprodusenter med gårdsbesøk og smaking","url":"${url}/kategori/gardssalg"}</script>`;
+  const breadcrumb = typeDef
+    ? `<a href="/">Forsiden</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a> · ${escapeHtml(typeDef.label)}`
+    : `<a href="/">Forsiden</a> · <a href="/opplevelser">Alle opplevelser</a> · Gårdssalg og smaking`;
+  return `<!doctype html>
 <html lang="no">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gårdssalg og smaking | Opplevagent</title>
-<meta name="description" content="Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Book en smaking eller omvisning rett hos produsenten.">
-<link rel="canonical" href="${url}/kategori/gardssalg">
-<script type="application/ld+json">{"@context":"https://schema.org","@type":"CollectionPage","name":"Gårdssalg og smaking","description":"Lokale drikkeprodusenter med gårdsbesøk og smaking","url":"${url}/kategori/gardssalg"}</script>
+<title>${escapeHtml(pageTitle)}</title>
+<meta name="description" content="${escapeHtml(metaDesc)}">
+<link rel="canonical" href="${canonical}">
+${jsonLd}
 <style>
 ${BROWSE_CSS}
 .provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:20px;margin-top:24px}
@@ -3894,14 +4110,16 @@ ${oaSiteNav({ active: "gardssalg" })}
   ${heroSceneSvg("drikke")}
   <div class="container">
     <div class="hero-kicker">Gårdssalg &amp; smaking</div>
-    <h1 class="hero-h1">Lokale drikkeprodusenter</h1>
-    <p class="hero-sub">Besøk bryggeri, sideri, mjøderi og mer — book en smaking eller omvisning rett hos produsenten.</p>
+    <h1 class="hero-h1">${escapeHtml(heroH1)}</h1>
+    <p class="hero-sub">${escapeHtml(heroSub)}</p>
   </div>
 </header>
 <main id="main" class="container">
   <nav class="breadcrumb" aria-label="Brødsmulesti">
-    <a href="/">Forsiden</a> · <a href="/opplevelser">Alle opplevelser</a> · Gårdssalg og smaking
+    ${breadcrumb}
   </nav>
+  ${searchBox("", { category: "gardssalg" })}
+  ${chipsRow}
   ${total > 0 ? `<p style="color:#544a3e;font-size:.9rem;margin-top:8px">${total} produsent${total === 1 ? "" : "er"}</p>` : ""}
   ${emptyMsg}
   ${providers.length > 0 ? `<div class="provider-grid">${cards}</div>` : ""}
@@ -3912,7 +4130,40 @@ ${oaSiteNav({ active: "gardssalg" })}
 ${oaSiteFooter({})}
 </body>
 </html>`;
+}
 
+router.get("/kategori/gardssalg", (req: Request, res: Response) => {
+  // Base catalog never returns null (no typeSlug → neither null path applies).
+  const html = renderGardssalgCatalogPage({ page: parsePage(req.query.page) }) as string;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// GET /kategori/gardssalg/:typeSlug — indexable per-drink-type subpage (S3).
+// MUST stay registered immediately after the base catalog route above: the
+// multi-segment /kategori/gardssalg/(produsent|book|bekreft|svar|gjestesvar|
+// status)/… routes below never collide with this single-segment pattern, but
+// the generic /kategori/:category and /kategori/:category/:kommune handlers
+// further down WOULD otherwise treat e.g. /kategori/gardssalg/bryggeri as
+// category="gardssalg"/kommune="bryggeri" — registration order is the guard.
+// Alias slugs (raw producer_type spellings) 301 to the canonical URL; unknown
+// slugs and empty types next() through to the trailing 404 catch-all.
+router.get("/kategori/gardssalg/:typeSlug", (req: Request, res: Response, next: NextFunction) => {
+  const raw = String(req.params.typeSlug || "").toLowerCase();
+  // Own-property guard: plain-object lookups would otherwise match prototype
+  // keys ("constructor", "__proto__") and 301 to garbage instead of 404.
+  const aliasTarget = Object.hasOwn(GARDSSALG_TYPE_SLUG_ALIASES, raw)
+    ? GARDSSALG_TYPE_SLUG_ALIASES[raw]
+    : undefined;
+  if (aliasTarget) {
+    const page = parsePage(req.query.page);
+    res.redirect(301, `/kategori/gardssalg/${aliasTarget}${page > 1 ? `?page=${page}` : ""}`);
+    return;
+  }
+  if (!Object.hasOwn(GARDSSALG_TYPE_PAGES, raw)) return next();
+  const html = renderGardssalgCatalogPage({ typeSlug: raw, page: parsePage(req.query.page) });
+  if (html === null) return next(); // empty type — 404-guarded, never a thin page
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
   res.send(html);
