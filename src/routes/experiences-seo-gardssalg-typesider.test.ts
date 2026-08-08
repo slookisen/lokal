@@ -36,8 +36,9 @@
  *       pointer-events:none, absolute inset:0, wide+narrow crops, liquid
  *       path), its animation timeline lives EXCLUSIVELY inside
  *       @media (prefers-reduced-motion: no-preference) (reduced-motion UAs
- *       get the static finished drawing), and it NEVER renders on the
- *       homepage.
+ *       get the static finished drawing), and the pot-still motif NEVER
+ *       renders on the homepage (which since dev-request 2026-08-08 has its
+ *       own, different motif — see m10).
  *
  * Same synthetic-harness + in-memory-DB pattern as
  * experiences-seo-site-chrome.test.ts (S1) /
@@ -493,12 +494,18 @@ export function runExperiencesSeoGardssalgTypesiderTests(opts: { log?: boolean }
           `m8-${name}: the sketch's stroke-dasharray only exists inside the guard (static render stays fully drawn)`
         );
       }
-      // The identity belongs to the gardssalg surfaces ONLY — never the
-      // homepage (Daniel's S2b directive).
+      // The DISTILLERY identity belongs to the gardssalg surfaces ONLY —
+      // never the homepage (Daniel's S2b directive, still in force).
+      // (Updated by dev-request 2026-08-08-opplevagent-per-kategori-visuell-
+      // identitet, S1: the homepage now carries its OWN line-art motif in the
+      // light «Opplevelser» band, so "no .oa-still-sketch layer at all" is no
+      // longer the right assertion — what must never appear there is the pot
+      // still, which is exactly what this now checks. The per-motif isolation
+      // itself is covered in experiences-seo-kategori-identitet.test.ts.)
       const homeM = invokeRoute(router, "/", {}, "/");
       assertTrue(homeM.found && homeM.handled && homeM.status === 200, `m9: GET / renders 200 (got ${homeM.status})`);
-      assertTrue(!homeM.body.includes("oa-still-sketch"), "m10: the still sketch NEVER renders on the homepage");
       const sketchSvg = (seo as any).gardssalgStillSketchSvg();
+      assertTrue(!homeM.body.includes(sketchSvg), "m10: the gardssalg still NEVER renders on the homepage");
       assertTrue(
         typeof sketchSvg === "string" && sketchSvg.length > 0 && sketchSvg.length < 50_000,
         `m11: the still-sketch SVG stays hand-written-small — under 50 000 chars (got ${sketchSvg?.length})`

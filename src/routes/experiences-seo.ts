@@ -470,51 +470,114 @@ const OA_HERO_SCENE_CSS = `
   }
 `;
 
-// ─────────────────────────────────────────────────────────────
-// Gardssalg still sketch (dev-request 2026-08-06-opplevagent-ux-loft-
-// drikkested-lansering, S2b — Daniel's directive: the distillery identity
-// belongs to /kategori/gardssalg + its type subpages ONLY, never the
-// homepage). A discreet black line drawing of a pot still (kjele →
-// svanehals → kjølekar/kondensator → rør → flaske) composed across the
-// WHOLE light catalog surface — including the page margins beside the
-// content column — as an absolutely positioned backdrop UNDER the cards
-// (`.oa-sketch-stage` wraps <main>; the sketch layer is inset:0,
-// pointer-events:none, z-index:0; main gets z-index:1). Legibility is
-// protected by the whole layer sitting at opacity ~.15 with thin
-// #0b2e29 strokes.
+// ═════════════════════════════════════════════════════════════
+// SCENE SKETCHES — per-surface line-art identity
+// (S2b introduced this for /kategori/gardssalg; dev-request
+// 2026-08-08-opplevagent-per-kategori-visuell-identitet, S1 generalised the
+// machinery so every surface that deserves one gets its OWN motif in the
+// same discreet style.)
 //
-// Animation (pure CSS, no JS — see OA_STILL_SKETCH_CSS below): ONE shared
-// 26s timeline. Each component group has its own draw window inside that
-// timeline (every path carries pathLength="1", so `stroke-dasharray:1` +
-// a dashoffset 1→0 keyframe draws it "pen on paper"): kjele 2–16%, hals
-// 15–24%, kjølekar 23–36%, rør 35–45%, flaske 44–54%, margin décor
-// 20–56%; then the LIQUID (class sk-vaeske — a thicker copper path laid
-// over the black pipework, from the kettle through the swan neck, down
-// through the worm tub, along the pipe and into the bottle) flows in at
-// 58–76%; the finished picture holds until ~92%, fades out by 97%, and
-// the cycle loops from blank. All dasharray/animation declarations —
-// and every @keyframes — live EXCLUSIVELY inside
-// @media (prefers-reduced-motion: no-preference) (same discipline as the
-// hero steam above), so reduced-motion UAs get the STATIC fully drawn
-// picture, liquid included, without ever parsing a motion definition.
+// A motif is a discreet black line drawing composed across the WHOLE light
+// surface of a page — including the page margins beside the content column —
+// as an absolutely positioned backdrop UNDER the cards (`.oa-sketch-stage`
+// wraps the content element; the sketch layer is inset:0, pointer-events:none,
+// z-index:0; the content is z-lifted to 1). Legibility is protected by the
+// whole layer sitting at opacity ~.15 with thin #0b2e29 strokes — text
+// contrast on the surface is untouched.
 //
-// Responsive: two <svg> crops of the SAME hand-written composition
-// (viewBox 0 0 1440 1560). `.sketch-wide` (full-width, xMidYMin meet —
-// deterministic scaling, art also lands in the side margins) renders
-// above 700px; `.sketch-narrow` shows the simplified central crop
-// (kettle → swan neck → worm tub + the barrel) for phones, so a ~360px
-// screen reads a real drawing instead of a smeared full scene. Only one
-// is displayed at a time (CSS media query) and neither can cause
-// horizontal scroll (the layer is inset:0 + overflow:hidden).
+// ── ONE timeline, N motifs ───────────────────────────────────────────────
+// The animation (pure CSS, no JS — see OA_STILL_SKETCH_CSS below) is ONE
+// shared 26s timeline with SEVEN fixed draw windows. Adding a motif adds
+// ZERO keyframes and ZERO animation bindings: a motif is nothing but path
+// data assigned to the existing phase groups. The phase class names are
+// historical — they were the pot still's component groups in S2b, and the
+// gardssalg output must stay byte-identical, so the names stay and are now
+// read as motif-agnostic PHASE SLOTS (use the SK_PHASE aliases below):
 //
-// Exported for the S2b tests' size assertion — the whole layer must stay
-// hand-written and < 50 000 chars.
-// ─────────────────────────────────────────────────────────────
-export function gardssalgStillSketchSvg(): string {
-  // One shared inner scene; the two <svg> wrappers below only differ in
-  // class + viewBox (the narrow one is a crop, not a second drawing). No
-  // ids anywhere, so the duplication can't collide.
-  const scene = `<g class="sk-all">
+//   sk-kjele  → phase 1   draws  2–16%   the motif's primary mass
+//   sk-hals   → phase 2   draws 15–24%
+//   sk-kond   → phase 3   draws 23–36%
+//   sk-ror    → phase 4   draws 35–45%
+//   sk-flaske → phase 5   draws 44–54%
+//   sk-dekor  → décor     draws 20–56%   long, quiet background/margin marks
+//   sk-vaeske → accent    draws 58–76%   THICK copper (#c98a2b) accent stroke,
+//                                        the one warm line that arrives last
+//
+// Every path carries pathLength="1", so `stroke-dasharray:1` + a dashoffset
+// 1→0 keyframe draws it "pen on paper". The finished picture holds until
+// ~92%, fades out by 97%, and the cycle loops from blank. All dasharray/
+// animation declarations — and every @keyframes — live EXCLUSIVELY inside
+// @media (prefers-reduced-motion: no-preference) (same discipline as the hero
+// steam above), so reduced-motion UAs get the STATIC fully drawn picture,
+// accent included, without ever parsing a motion definition.
+//
+// ── Responsive ───────────────────────────────────────────────────────────
+// Each motif renders as two <svg> crops of the SAME hand-written composition:
+// `.sketch-wide` (the full canvas, xMidYMin meet — deterministic scaling, art
+// also lands in the side margins) above 700px, and `.sketch-narrow` (a tight
+// viewBox crop of the motif's core, thicker strokes) at ≤700px, so a ~360px
+// screen reads a real drawing instead of a smeared full scene. Only one is
+// displayed at a time (CSS media query) and neither can cause horizontal
+// scroll (the layer is inset:0 + overflow:hidden).
+//
+// ── Canvas heights ───────────────────────────────────────────────────────
+// gardssalg keeps its original 1440×1560 canvas (byte-identity). The three
+// category motifs use 1440×820 and the homepage motif 1440×640 — the
+// backdrop is top-aligned and bottom-cropped to the surface it sits on, so a
+// motif's canvas is sized to the surface it has to fill (the homepage's
+// #kategorier band is short and wide; a category listing is tall).
+//
+// ── WHERE A MOTIF IS ACTUALLY SEEN (read this before drawing one) ───────
+// The content column is 1120px wide and centred, so at a 1440px viewport the
+// cards cover x≈184–1256 and everything behind them is invisible. A motif is
+// only ever read in three places:
+//   1. the TOP BAND (canvas y ≲ 340 on the 820-tall category canvas) — above
+//      the card grid, where only the breadcrumb/H1/lede/searchbox sit, and
+//      those occupy just the left half, so x ≳ 700 up there is wide open;
+//   2. the LEFT MARGIN  (x ≲ 184);
+//   3. the RIGHT MARGIN (x ≳ 1256) and the thin gaps between card rows.
+// So: put the motif's LOAD-BEARING shapes in the top band and the margins,
+// and use the middle only for quiet filler that keeps the surface covered.
+// A beautiful drawing centred at x≈700, y≈600 is a drawing nobody sees.
+//
+// sceneSketchSvg() is own-property guarded (same lesson as the S3 type-page
+// slugs): an unknown surface — or a prototype key like "constructor" —
+// resolves to NO drawing, never to some other surface's motif.
+// ═════════════════════════════════════════════════════════════
+type SketchMotif = {
+  wideViewBox: string;
+  narrowViewBox: string;
+  scene: string;
+};
+
+// Phase slots of the shared timeline — see the table above. Referenced from
+// the motif scenes below so a new motif never has to know the historical
+// class names.
+const SK_PHASE = {
+  p1: "sk-kjele",
+  p2: "sk-hals",
+  p3: "sk-kond",
+  p4: "sk-ror",
+  p5: "sk-flaske",
+  decor: "sk-dekor",
+  accent: "sk-vaeske",
+} as const;
+
+const OA_SKETCH_MOTIFS: Record<string, SketchMotif> = {
+  // ── gardssalg: the pot still (kjele → svanehals → kjølekar/kondensator →
+  // rør → flaske) with the copper liquid flowing through it last. UNCHANGED
+  // from S2b, byte for byte — the gardssalg surfaces must keep exactly this
+  // drawing (this is why the phase classes below are still spelled with the
+  // pot still's component names).
+  gardssalg: {
+    wideViewBox: "0 0 1440 1560",
+    // The narrow crop frames the apparatus core (kettle + swan neck + worm
+    // tub, steam included) tightly: on a ~360px phone the single-column cards
+    // cover almost the full width, so only the top band above the grid and
+    // the side slivers stay visible — a tight crop keeps what IS visible
+    // reading as a real drawing instead of stray fragments.
+    narrowViewBox: "120 260 700 620",
+    scene: `<g class="sk-all">
 <g class="sk-kjele">
 <path pathLength="1" d="M132 648 C114 540 160 446 252 440 C344 446 390 540 372 648"/>
 <path pathLength="1" d="M148 648 C180 664 324 664 356 648"/>
@@ -574,23 +637,391 @@ export function gardssalgStillSketchSvg(): string {
 <path pathLength="1" d="M1300 540 V736"/>
 <path pathLength="1" d="M1258 746 C1290 738 1312 738 1344 746"/>
 </g>
-</g>`;
+</g>`,
+  },
+
+  // ── kultur_historie: a stavkirke silhouette (tiered roofs, dragon-head
+  // gables, spire) as the primary mass, a runestone to the right, a loft/
+  // stabbur on staver in the bottom-left margin and a stone ruin arch
+  // bottom-right. The copper accent is the church's own silhouette traced
+  // from finial to gallery, plus the carved rune band on the stone.
+  kultur_historie: {
+    wideViewBox: "0 0 1440 820",
+    narrowViewBox: "470 20 480 560",
+    scene: `<g class="sk-all">
+<g class="${SK_PHASE.p1}">
+<path pathLength="1" d="M500 470 L710 355 L920 470"/>
+<path pathLength="1" d="M500 470 V560"/>
+<path pathLength="1" d="M920 470 V560"/>
+<path pathLength="1" d="M480 562 H940"/>
+<path pathLength="1" d="M560 560 V482"/>
+<path pathLength="1" d="M626 560 V482"/>
+<path pathLength="1" d="M710 560 V478"/>
+<path pathLength="1" d="M794 560 V482"/>
+<path pathLength="1" d="M860 560 V482"/>
+<path pathLength="1" d="M588 462 V370"/>
+<path pathLength="1" d="M832 462 V370"/>
+</g>
+<g class="${SK_PHASE.p2}">
+<path pathLength="1" d="M560 370 L710 276 L860 370"/>
+<path pathLength="1" d="M630 276 V226"/>
+<path pathLength="1" d="M790 276 V226"/>
+<path pathLength="1" d="M604 226 L710 160 L816 226"/>
+<path pathLength="1" d="M676 160 V122 H744 V160"/>
+<path pathLength="1" d="M658 122 L710 56 L762 122"/>
+<path pathLength="1" d="M710 56 V26"/>
+<path pathLength="1" d="M692 40 H728"/>
+<path pathLength="1" d="M560 370 C538 358 530 340 544 328 C554 320 566 324 568 334"/>
+<path pathLength="1" d="M860 370 C882 358 890 340 876 328 C866 320 854 324 852 334"/>
+</g>
+<g class="${SK_PHASE.p3}">
+<path pathLength="1" d="M1128 620 C1108 528 1106 436 1140 364 C1174 328 1236 334 1258 372 C1282 458 1278 538 1264 620 Z"/>
+<path pathLength="1" d="M1080 624 H1330"/>
+<path pathLength="1" d="M1150 598 C1136 520 1136 446 1160 386"/>
+<path pathLength="1" d="M1240 598 C1250 520 1250 452 1232 392"/>
+</g>
+<g class="${SK_PHASE.p4}">
+<path pathLength="1" d="M92 660 L250 586 L408 660"/>
+<path pathLength="1" d="M128 660 V752 H372 V660"/>
+<path pathLength="1" d="M128 722 H372"/>
+<path pathLength="1" d="M128 692 H372"/>
+<path pathLength="1" d="M102 752 H398"/>
+<path pathLength="1" d="M142 752 V812"/>
+<path pathLength="1" d="M216 752 V812"/>
+<path pathLength="1" d="M290 752 V812"/>
+<path pathLength="1" d="M362 752 V812"/>
+<path pathLength="1" d="M126 816 H158"/>
+<path pathLength="1" d="M200 816 H232"/>
+<path pathLength="1" d="M274 816 H306"/>
+<path pathLength="1" d="M346 816 H378"/>
+<path pathLength="1" d="M218 752 V682 H282 V752"/>
+</g>
+<g class="${SK_PHASE.p5}">
+<path pathLength="1" d="M958 820 V700 C958 636 1138 636 1138 700 V820"/>
+<path pathLength="1" d="M996 820 V708 C996 668 1100 668 1100 708 V820"/>
+<path pathLength="1" d="M958 760 H996"/>
+<path pathLength="1" d="M1100 760 H1138"/>
+<path pathLength="1" d="M958 712 H996"/>
+<path pathLength="1" d="M1100 712 H1138"/>
+<path pathLength="1" d="M1032 642 L1046 662 L1060 642"/>
+</g>
+<g class="${SK_PHASE.decor}">
+<path pathLength="1" d="M60 564 H1400"/>
+<path pathLength="1" d="M1010 560 V420"/>
+<path pathLength="1" d="M1010 490 L964 444"/>
+<path pathLength="1" d="M1010 474 L1058 428"/>
+<path pathLength="1" d="M1010 448 L986 412"/>
+<path pathLength="1" d="M1010 438 L1040 406"/>
+<path pathLength="1" d="M64 180 C102 216 64 252 102 288 C140 324 102 360 140 396"/>
+<path pathLength="1" d="M140 180 C102 216 140 252 102 288 C64 324 102 360 64 396"/>
+<path pathLength="1" d="M1180 790 H1420"/>
+<path pathLength="1" d="M1180 760 H1420"/>
+<path pathLength="1" d="M1210 744 V812"/>
+<path pathLength="1" d="M1300 744 V812"/>
+<path pathLength="1" d="M1390 744 V812"/>
+<path pathLength="1" d="M300 110 c16 -14 32 -14 48 0"/>
+<path pathLength="1" d="M366 140 c16 -14 32 -14 48 0"/>
+<path pathLength="1" d="M1096 612 C1092 592 1098 580 1104 572"/>
+<path pathLength="1" d="M1296 614 C1292 594 1298 582 1304 574"/>
+</g>
+<g class="${SK_PHASE.accent}">
+<path pathLength="1" d="M710 30 L710 58 L660 124 L632 160 L606 226 L586 276 L562 370 L542 432 L502 470"/>
+<path pathLength="1" d="M710 58 L760 124 L788 160 L814 226 L834 276 L858 370 L878 432 L918 470"/>
+<path pathLength="1" d="M1164 600 C1150 520 1152 450 1176 392 C1188 366 1216 362 1226 392 C1244 456 1244 528 1234 598"/>
+</g>
+</g>`,
+  },
+
+  // ── sightseeing_transport: a fjord vessel and a suspension bridge share the
+  // TOP BAND (boat left, straddling the left margin; bridge right, reaching
+  // into the right margin), the serpentine mountain road switchbacks up the
+  // RIGHT MARGIN strip to a cantilevered viewpoint at its foot, and the fjord
+  // itself runs down the left margin. The cliff profile is deliberately quiet
+  // filler in the card band. The copper accent is the JOURNEY: the route line
+  // off the boat, across the fjord, up through every hairpin, and along the
+  // bridge deck.
+  sightseeing_transport: {
+    wideViewBox: "0 0 1440 820",
+    narrowViewBox: "60 16 470 320",
+    scene: `<g class="sk-all">
+<g class="${SK_PHASE.p1}">
+<path pathLength="1" d="M90 210 H500 C520 210 526 220 516 234 L480 292 C474 302 464 306 450 306 H160 C144 306 132 298 124 284 L84 224 C78 214 82 210 90 210 Z"/>
+<path pathLength="1" d="M100 210 H500"/>
+<path pathLength="1" d="M200 210 V130 H410 V210"/>
+<path pathLength="1" d="M240 130 V76 H372 V130"/>
+<path pathLength="1" d="M224 172 H386"/>
+<path pathLength="1" d="M260 150 V186"/>
+<path pathLength="1" d="M300 150 V186"/>
+<path pathLength="1" d="M340 150 V186"/>
+<path pathLength="1" d="M280 76 V26 H332 V76"/>
+<path pathLength="1" d="M160 210 V66"/>
+<path pathLength="1" d="M130 96 H190"/>
+<path pathLength="1" d="M160 66 L212 82 L160 98"/>
+</g>
+<g class="${SK_PHASE.p2}">
+<path pathLength="1" d="M900 250 H1440"/>
+<path pathLength="1" d="M900 266 H1440"/>
+<path pathLength="1" d="M920 250 C1010 60 1330 60 1420 250"/>
+<path pathLength="1" d="M990 250 V166"/>
+<path pathLength="1" d="M1060 250 V118"/>
+<path pathLength="1" d="M1140 250 V96"/>
+<path pathLength="1" d="M1230 250 V112"/>
+<path pathLength="1" d="M1330 250 V160"/>
+<path pathLength="1" d="M960 266 V340"/>
+<path pathLength="1" d="M1370 266 V340"/>
+<path pathLength="1" d="M900 236 H1440"/>
+<path pathLength="1" d="M950 236 V250"/>
+<path pathLength="1" d="M1040 236 V250"/>
+<path pathLength="1" d="M1130 236 V250"/>
+<path pathLength="1" d="M1220 236 V250"/>
+<path pathLength="1" d="M1310 236 V250"/>
+<path pathLength="1" d="M1400 236 V250"/>
+</g>
+<g class="${SK_PHASE.p3}">
+<path pathLength="1" d="M1440 704 L1288 676 C1236 666 1234 632 1288 624 L1418 602 C1442 598 1444 566 1416 560 L1276 534 C1224 524 1222 492 1276 484 L1440 458"/>
+<path pathLength="1" d="M1440 730 L1282 702 C1210 690 1206 640 1284 630 L1414 608 C1470 600 1472 552 1412 542 L1272 516 C1200 504 1196 456 1272 446 L1440 418"/>
+</g>
+<g class="${SK_PHASE.p4}">
+<path pathLength="1" d="M1240 760 H1440"/>
+<path pathLength="1" d="M1240 760 L1266 776 H1440"/>
+<path pathLength="1" d="M1252 690 H1440"/>
+<path pathLength="1" d="M1270 760 V686"/>
+<path pathLength="1" d="M1340 760 V686"/>
+<path pathLength="1" d="M1410 760 V686"/>
+<path pathLength="1" d="M1266 776 L1300 820"/>
+<path pathLength="1" d="M1400 776 L1370 820"/>
+</g>
+<g class="${SK_PHASE.p5}">
+<path pathLength="1" d="M560 470 L660 360 L740 420 L840 330 L960 430 L1080 350 L1200 450"/>
+<path pathLength="1" d="M600 520 L720 452 L840 500 L960 440 L1100 500 L1220 460"/>
+</g>
+<g class="${SK_PHASE.decor}">
+<path pathLength="1" d="M0 312 H900"/>
+<path pathLength="1" d="M0 360 C140 344 300 344 440 360"/>
+<path pathLength="1" d="M0 420 C160 402 340 402 500 420"/>
+<path pathLength="1" d="M0 486 C140 468 320 468 480 486"/>
+<path pathLength="1" d="M0 556 C120 540 280 540 440 556"/>
+<path pathLength="1" d="M0 630 C140 614 300 614 460 630"/>
+<path pathLength="1" d="M0 706 C120 690 280 690 440 706"/>
+<path pathLength="1" d="M56 800 L88 800 L80 748 H64 Z"/>
+<path pathLength="1" d="M72 748 V722"/>
+<path pathLength="1" d="M56 722 H88"/>
+<path pathLength="1" d="M660 60 c16 -14 32 -14 48 0"/>
+<path pathLength="1" d="M736 92 c16 -14 32 -14 48 0"/>
+<path pathLength="1" d="M600 110 c14 -12 28 -12 42 0"/>
+<path pathLength="1" d="M1330 660 L1370 654"/>
+<path pathLength="1" d="M1320 542 L1360 536"/>
+<path pathLength="1" d="M96 820 V736"/>
+<path pathLength="1" d="M96 750 H216 L240 766 L216 782 H96"/>
+</g>
+<g class="${SK_PHASE.accent}">
+<path pathLength="1" d="M300 306 C420 316 560 330 700 342 C860 356 1060 380 1180 430 C1240 456 1268 478 1274 490"/>
+<path pathLength="1" d="M1274 490 C1240 500 1244 522 1284 528 L1420 552 C1454 558 1452 588 1418 594 L1290 616 C1248 624 1250 654 1294 662 L1440 690"/>
+<path pathLength="1" d="M906 258 H1434"/>
+</g>
+</g>`,
+  },
+
+  // ── natur_friluft: the CAMP vocabulary. A big tent straddles the left
+  // margin in the top band with a bare tripod + hanging kettle standing
+  // clear of it (no crossed logs, no flames — that stack read as a scribble
+  // at this opacity), and ONE rounded, cragged massif with a summit cairn
+  // fills the top-right. Spruces stand in BOTH margins; a soft treeline is
+  // the quiet filler in the card band. Deliberately NOT the homepage motif:
+  // no long zig-zag range, no water, no kayak — the two surfaces must not
+  // read as the same drawing twice. The copper accent is the TRAIL climbing
+  // from the bottom-left margin past the camp to the cairn.
+  natur_friluft: {
+    wideViewBox: "0 0 1440 820",
+    narrowViewBox: "0 30 640 400",
+    scene: `<g class="sk-all">
+<g class="${SK_PHASE.p1}">
+<path pathLength="1" d="M20 330 L220 100 L420 330 Z"/>
+<path pathLength="1" d="M220 112 L184 330"/>
+<path pathLength="1" d="M220 112 L258 330"/>
+<path pathLength="1" d="M220 100 V64"/>
+<path pathLength="1" d="M20 330 L4 348"/>
+<path pathLength="1" d="M420 330 L470 352"/>
+<path pathLength="1" d="M0 334 H460"/>
+</g>
+<g class="${SK_PHASE.p2}">
+<path pathLength="1" d="M760 330 C830 300 872 250 920 190 C960 140 1000 96 1050 74 C1100 52 1140 78 1180 120 C1230 172 1290 240 1360 286 C1390 306 1414 320 1440 330"/>
+<path pathLength="1" d="M860 330 C910 296 950 254 990 210 C1020 178 1050 168 1080 186"/>
+<path pathLength="1" d="M1010 130 L1050 96 L1090 130"/>
+<path pathLength="1" d="M1028 148 L1050 130 L1074 148"/>
+<path pathLength="1" d="M1036 74 c-14 -8 -14 -18 0 -24 c-12 -8 -12 -18 2 -22 c-10 -8 -8 -16 4 -20"/>
+<path pathLength="1" d="M1022 76 H1066"/>
+</g>
+<g class="${SK_PHASE.p3}">
+<path pathLength="1" d="M480 330 L556 176 L632 330"/>
+<path pathLength="1" d="M520 254 H592"/>
+<path pathLength="1" d="M556 176 V196"/>
+<path pathLength="1" d="M520 196 H592 L582 254 H530 Z"/>
+<path pathLength="1" d="M520 200 C548 172 564 172 592 200"/>
+</g>
+<g class="${SK_PHASE.p4}">
+<path pathLength="1" d="M1330 380 L1284 448 L1308 448 L1268 508 L1300 508 L1250 580 L1410 580 L1360 508 L1392 508 L1352 448 L1376 448 Z"/>
+<path pathLength="1" d="M1330 580 V620"/>
+<path pathLength="1" d="M1420 470 L1384 528 L1404 528 L1372 578 L1394 578 L1358 640 L1482 640 L1446 578 L1468 578 L1436 528 L1456 528 Z"/>
+<path pathLength="1" d="M1420 640 V676"/>
+<path pathLength="1" d="M84 470 L44 532 L66 532 L30 590 L58 590 L14 660 L154 660 L110 590 L138 590 L102 532 L124 532 Z"/>
+<path pathLength="1" d="M84 660 V700"/>
+<path pathLength="1" d="M0 668 H200"/>
+<path pathLength="1" d="M1240 626 H1440"/>
+</g>
+<g class="${SK_PHASE.p5}">
+<path pathLength="1" d="M180 470 C340 452 520 450 680 466"/>
+<path pathLength="1" d="M240 540 C420 522 640 520 820 538"/>
+<path pathLength="1" d="M300 618 C480 600 700 598 880 616"/>
+<path pathLength="1" d="M380 700 C560 682 780 680 960 698"/>
+<path pathLength="1" d="M520 466 L500 430 L540 430 Z"/>
+<path pathLength="1" d="M600 462 L582 428 L618 428 Z"/>
+<path pathLength="1" d="M680 466 L662 434 L698 434 Z"/>
+</g>
+<g class="${SK_PHASE.decor}">
+<path pathLength="1" d="M30 760 C26 730 34 716 40 706"/>
+<path pathLength="1" d="M46 762 C42 736 50 718 58 710"/>
+<path pathLength="1" d="M1290 720 C1286 690 1294 676 1300 666"/>
+<path pathLength="1" d="M1306 722 C1302 696 1310 678 1318 670"/>
+<path pathLength="1" d="M600 60 c18 -16 36 -16 54 0"/>
+<path pathLength="1" d="M676 96 c18 -16 36 -16 54 0"/>
+<path pathLength="1" d="M96 820 V740"/>
+<path pathLength="1" d="M96 754 H214 L238 770 L214 786 H96"/>
+<path pathLength="1" d="M980 748 c22 -24 56 -24 78 0 Z"/>
+<path pathLength="1" d="M1100 786 c16 -18 42 -18 58 0 Z"/>
+</g>
+<g class="${SK_PHASE.accent}">
+<path pathLength="1" d="M60 816 C160 740 130 668 214 620 C300 570 300 520 372 480 C450 436 540 400 640 372 C760 338 880 260 960 168 C990 134 1016 106 1036 80"/>
+<path pathLength="1" d="M372 480 C470 496 580 500 676 488"/>
+</g>
+</g>`,
+  },
+
+  // ── forside: the homepage's own motif in the light «Opplevelser» band
+  // under the hero — the COASTAL vocabulary: a long zig-zag range gathering
+  // the horizon, a kayak with a paddler out on open water, skerries to the
+  // right, a small tent and the path up to it on the left. The copper accent
+  // is a NORTHERN-LIGHTS sweep across the top: three long curtains that
+  // arrive last and tie the whole band together. Deliberately NOT
+  // natur_friluft's camp vocabulary (no tripod, no cairn, no spruces here —
+  // the aurora, the water and the kayak are the homepage's alone) and
+  // deliberately NOT the pot still — the homepage never wears the gardssalg
+  // identity (Daniel's S2b directive still holds).
+  forside: {
+    wideViewBox: "0 0 1440 640",
+    narrowViewBox: "640 60 600 500",
+    scene: `<g class="sk-all">
+<g class="${SK_PHASE.p1}">
+<path pathLength="1" d="M0 230 L150 140 L250 200 L380 96 L500 190 L620 130 L760 210 L900 120 L1040 206 L1180 140 L1300 210 L1440 160"/>
+<path pathLength="1" d="M0 320 L180 210 L300 280 L440 170 L580 274 L700 220 L860 310 L1000 250 L1160 320 L1300 260 L1440 330"/>
+<path pathLength="1" d="M406 150 L440 172 L474 150"/>
+</g>
+<g class="${SK_PHASE.p2}">
+<path pathLength="1" d="M96 470 L182 372 L268 470 Z"/>
+<path pathLength="1" d="M182 380 L164 470"/>
+<path pathLength="1" d="M182 380 L202 470"/>
+<path pathLength="1" d="M182 372 V352"/>
+<path pathLength="1" d="M96 470 L64 486"/>
+<path pathLength="1" d="M268 470 L300 486"/>
+</g>
+<g class="${SK_PHASE.p3}">
+<path pathLength="1" d="M760 470 C830 440 1010 440 1080 470 C1010 500 830 500 760 470 Z"/>
+<path pathLength="1" d="M792 466 C860 452 980 452 1048 466"/>
+<path pathLength="1" d="M900 456 c-22 0 -34 8 -34 14 c0 6 12 14 34 14 c22 0 34 -8 34 -14 c0 -6 -12 -14 -34 -14 Z"/>
+<path pathLength="1" d="M910 456 V404"/>
+<path pathLength="1" d="M910 396 m-14 0 a14 14 0 1 0 28 0 a14 14 0 1 0 -28 0"/>
+<path pathLength="1" d="M868 420 L910 434 L956 414"/>
+<path pathLength="1" d="M828 366 L994 474"/>
+<path pathLength="1" d="M828 366 L806 336 L836 320 L856 350 Z"/>
+<path pathLength="1" d="M994 474 L1016 504 L986 520 L966 490 Z"/>
+</g>
+<g class="${SK_PHASE.p4}">
+<path pathLength="1" d="M1176 470 c32 -36 94 -36 126 0 Z"/>
+<path pathLength="1" d="M1330 486 c22 -26 68 -26 90 0 Z"/>
+<path pathLength="1" d="M1246 502 c18 -20 52 -20 70 0 Z"/>
+<path pathLength="1" d="M600 520 C760 502 1000 502 1160 520"/>
+<path pathLength="1" d="M540 566 C720 546 1020 546 1200 566"/>
+<path pathLength="1" d="M660 612 C800 596 1040 596 1180 612"/>
+</g>
+<g class="${SK_PHASE.p5}">
+<path pathLength="1" d="M60 640 C140 560 120 512 210 476"/>
+<path pathLength="1" d="M170 640 C240 566 214 522 286 486"/>
+<path pathLength="1" d="M300 560 c16 -18 42 -18 56 0 Z"/>
+<path pathLength="1" d="M370 604 c14 -16 34 -16 46 0 Z"/>
+<path pathLength="1" d="M420 484 C560 466 700 462 780 468"/>
+</g>
+<g class="${SK_PHASE.decor}">
+<path pathLength="1" d="M0 486 H620"/>
+<path pathLength="1" d="M40 520 C36 498 42 486 48 478"/>
+<path pathLength="1" d="M56 522 C52 502 58 488 66 480"/>
+<path pathLength="1" d="M480 120 c14 -12 28 -12 42 0"/>
+<path pathLength="1" d="M540 148 c14 -12 28 -12 42 0"/>
+<path pathLength="1" d="M1400 620 c-16 -10 -16 -22 0 -30 c-14 -10 -14 -22 2 -28 c-12 -10 -10 -20 4 -26"/>
+</g>
+<g class="${SK_PHASE.accent}">
+<path pathLength="1" d="M40 210 C260 60 520 30 780 62 C1000 88 1220 150 1420 96"/>
+<path pathLength="1" d="M60 292 C300 150 560 116 820 152 C1040 182 1240 236 1420 186"/>
+<path pathLength="1" d="M120 130 C320 30 600 4 860 26"/>
+</g>
+</g>`,
+  },
+};
+
+// Render a motif's backdrop layer. Own-property guarded: an unknown surface —
+// or a prototype key ("constructor", "__proto__", "toString") — gets NO
+// drawing, never another surface's motif (same lesson as the S3 type-page
+// slug whitelist). Exported for the identity tests; gardssalg's own wrapper
+// below is kept for the S2b tests' size assertion.
+export function sceneSketchSvg(motif: string): string {
+  if (!Object.hasOwn(OA_SKETCH_MOTIFS, motif)) return "";
+  const m = OA_SKETCH_MOTIFS[motif];
+  // One shared inner scene per motif; the two <svg> wrappers below only
+  // differ in class + viewBox (the narrow one is a crop, not a second
+  // drawing). No ids anywhere, so the duplication can't collide.
   const svg = (cls: string, viewBox: string) =>
-    `<svg class="${cls}" viewBox="${viewBox}" preserveAspectRatio="xMidYMin meet" aria-hidden="true" focusable="false">${scene}</svg>`;
-  // The narrow crop frames the apparatus core (kettle + swan neck + worm
-  // tub, steam included) tightly: on a ~360px phone the single-column cards
-  // cover almost the full width, so only the top band above the grid and
-  // the side slivers stay visible — a tight crop keeps what IS visible
-  // reading as a real drawing instead of stray fragments.
-  return `<div class="oa-still-sketch" aria-hidden="true">${svg("sketch-wide", "0 0 1440 1560")}${svg("sketch-narrow", "120 260 700 620")}</div>`;
+    `<svg class="${cls}" viewBox="${viewBox}" preserveAspectRatio="xMidYMin meet" aria-hidden="true" focusable="false">${m.scene}</svg>`;
+  return `<div class="oa-still-sketch" aria-hidden="true">${svg("sketch-wide", m.wideViewBox)}${svg("sketch-narrow", m.narrowViewBox)}</div>`;
 }
 
-// Layout + the S2b sketch animation timeline. Structure rules (positioning,
+// The gardssalg surfaces' motif. Byte-identical to the S2b output.
+export function gardssalgStillSketchSvg(): string {
+  return sceneSketchSvg("gardssalg");
+}
+
+// Which category slug owns which motif. Categories NOT listed here get no
+// drawing at all — never some other category's motif. Kept separate from
+// OA_SKETCH_MOTIFS on purpose: "forside" is a motif but not a category, and
+// a DB-driven category slug must never be able to reach it.
+const OA_CATEGORY_SKETCH_MOTIF: Record<string, string> = {
+  kultur_historie: "kultur_historie",
+  sightseeing_transport: "sightseeing_transport",
+  natur_friluft: "natur_friluft",
+};
+
+// Exported so the own-property guard can be tested DIRECTLY. Going through
+// the route can't prove it: /kategori/constructor 404s on the empty-count
+// guard long before it would reach a motif, so a route-level test stays green
+// even with the guard deleted.
+export function categorySketchMotif(category: string): string | undefined {
+  return Object.hasOwn(OA_CATEGORY_SKETCH_MOTIF, category)
+    ? OA_CATEGORY_SKETCH_MOTIF[category]
+    : undefined;
+}
+
+// Layout + the shared sketch animation timeline. Structure rules (positioning,
 // stroke styling, the wide/narrow swap) are unguarded; EVERY motion-related
 // declaration — stroke-dasharray, animation bindings and all @keyframes —
 // lives inside the @media (prefers-reduced-motion: no-preference) block, so
 // a reduced-motion UA renders the static finished drawing (solid strokes,
 // dashoffset never touched) without parsing any motion definition.
+//
+// This block is MOTIF-INDEPENDENT and byte-for-byte the S2b original: adding a
+// motif adds no selector and no keyframe here (see the phase table above), so
+// the CSS weight of the identity is a constant, not a per-motif cost — and the
+// gardssalg pages keep rendering exactly the bytes they rendered before. That
+// byte-freeze is also why the block's own `GARDSSALG STILL SKETCH` CSS comment
+// below still says "gardssalg": it labels the SHARED machinery now, not one
+// motif — renaming it would change the gardssalg pages' output.
 const OA_STILL_SKETCH_CSS = `
   /* ── GARDSSALG STILL SKETCH (S2b line-drawn backdrop) ── */
   .oa-sketch-stage{position:relative}
@@ -625,6 +1056,14 @@ const OA_STILL_SKETCH_CSS = `
     @keyframes oaSkDekor{0%,20%{stroke-dashoffset:1}56%,100%{stroke-dashoffset:0}}
     @keyframes oaSkVaeske{0%,58%{stroke-dashoffset:1}76%,100%{stroke-dashoffset:0}}
   }
+`;
+
+// The stage lifts its content child above the drawing. OA_STILL_SKETCH_CSS
+// only knows `>main` (the catalog/browse pages' content element) and must stay
+// byte-identical for the gardssalg surfaces — so a stage whose content child is
+// a <section> (the homepage's «Opplevelser» band) appends this ONE extra rule
+// instead. Emitted only by that page; every other sketch surface is unchanged.
+const OA_SKETCH_STAGE_SECTION_CSS = `  .oa-sketch-stage>.section{position:relative;z-index:1}
 `;
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -1474,6 +1913,12 @@ ${ldScripts}
   .code-card .prm{color:#9fe9d4}
   .code-card .cmt{color:rgba(255,255,255,.5)}
 
+  /* ── FRONT-PAGE SCENE SKETCH (dev-request 2026-08-08, S1): the homepage's
+     own line-art motif in the light «Opplevelser» band under the hero. Same
+     shared layer/timeline CSS every other sketch surface uses — the only
+     addition is the stage's <section> content lift (the catalog pages lift a
+     <main> instead). The dark hero above is untouched. */
+${OA_STILL_SKETCH_CSS}${OA_SKETCH_STAGE_SECTION_CSS}
   /* (footer styles live in the shared chrome block above) */
 </style>
 </head>
@@ -1568,6 +2013,8 @@ ${oaSiteNav({ active: "hjem", lang })}
   ${counterStripHtml}
   ${drikkestedSectionHtml}
 
+  <div class="oa-sketch-stage">
+${sceneSketchSvg("forside")}
   <section class="section" id="kategorier" aria-labelledby="kat-title">
     <div class="container">
       <div class="sec-head">
@@ -1581,6 +2028,7 @@ ${oaSiteNav({ active: "hjem", lang })}
       ${catNote}
     </div>
   </section>
+  </div>
   ${fylkeSectionHtml}
 
   <section class="section section-alt" id="slik-funker-det" aria-labelledby="slik-title">
@@ -3376,6 +3824,19 @@ function renderBrowsePage(opts: {
   // the <noscript> OSM fallback link; `points` are the (already
   // publish-gated + coords-filtered) markers to plot.
   map?: { fylke: string; points: ExperienceMapPoint[] };
+  // dev-request 2026-08-08-opplevagent-per-kategori-visuell-identitet, S1:
+  // OPT-IN adoption of the shared site chrome (oaSiteNav()/oaSiteFooter() +
+  // OA_CHROME_CSS — the hamburger nav and the «For tilbydere» entry) in place
+  // of this page type's slim pre-chrome BROWSE_NAV/browseFooter(). Only
+  // /kategori/:category passes it in this slice; every other caller
+  // (/opplevelser, /fylke/:fylke, /kommune/:kommune, /tilbyder/:id, /sok, and
+  // /kategori/:category/:kommune) omits it and renders byte-identically to
+  // before, so the migration stays observable page by page.
+  chrome?: boolean;
+  // Same slice: OPT-IN line-art backdrop, keyed by motif name (see
+  // sceneSketchSvg()). An unknown/absent motif renders NO drawing and no
+  // sketch CSS at all — a page never inherits another surface's identity.
+  sketchMotif?: string;
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -3459,6 +3920,22 @@ function renderBrowsePage(opts: {
   const ogImage = ogImageUrl(url, opts.h1);
   const ogImageAlt = `${opts.h1} | Opplevagent`;
 
+  // Opt-in chrome + backdrop (see opts.chrome / opts.sketchMotif above). Every
+  // branch below collapses to the empty string for callers that opt out, so
+  // their markup is byte-identical to the pre-S1 output.
+  const sketch = opts.sketchMotif ? sceneSketchSvg(opts.sketchMotif) : "";
+  // OA_CHROME_CSS is appended AFTER BROWSE_CSS on purpose (whose slim
+  // `.nav-inner{height:58px}` / `.nav-links a{margin-left:22px}` rules it
+  // deliberately overrides) — exactly the order renderGardssalgCatalogPage()
+  // uses. BROWSE_CSS itself stays untouched.
+  const extraCss = (opts.chrome ? `\n${OA_CHROME_CSS}` : "") + (sketch ? `\n${OA_STILL_SKETCH_CSS}` : "");
+  const navHtml = opts.chrome
+    ? `<a class="skip-link" href="#main">Hopp til innhold</a>\n${oaSiteNav({})}`
+    : BROWSE_NAV;
+  const footHtml = opts.chrome ? oaSiteFooter({}) : browseFooter();
+  const stageOpen = sketch ? `<div class="oa-sketch-stage">\n${sketch}\n` : "";
+  const stageClose = sketch ? `\n</div>` : "";
+
   return `<!doctype html>
 <html lang="nb">
 <head>
@@ -3482,12 +3959,12 @@ ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 ${ldScripts}
-<style>${BROWSE_CSS}</style>
+<style>${BROWSE_CSS}${extraCss}</style>
 ${opts.map ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
 </head>
 <body>
-${BROWSE_NAV}
-<main id="main" class="container">
+${navHtml}
+${stageOpen}<main id="main" class="container">
   <nav class="breadcrumb" aria-label="Brødsmuler">${crumbHtml}</nav>
   <header class="head">
     <h1>${escapeHtml(opts.h1)}</h1>
@@ -3498,8 +3975,8 @@ ${BROWSE_NAV}
   ${grid}
   ${opts.map ? renderFylkeMapSection(opts.map.fylke, opts.map.points, opts.lang) : ""}
   ${pager}
-</main>
-${browseFooter()}
+</main>${stageClose}
+${footHtml}
 </body>
 </html>`;
 }
@@ -6139,6 +6616,14 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox("", { category }),
     extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined,
+    // dev-request 2026-08-08-opplevagent-per-kategori-visuell-identitet, S1:
+    // the category pages were the last high-traffic opplevagent surface still
+    // on the pre-S1 slim nav (no hamburger, no «For tilbydere» entry) — they
+    // adopt the shared chrome here, and the three categories that own a motif
+    // also get their line-art identity. A category with no motif gets the
+    // chrome and NO drawing (never another category's).
+    chrome: true,
+    sketchMotif: categorySketchMotif(category),
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");

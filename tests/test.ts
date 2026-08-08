@@ -29936,6 +29936,27 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esgt.failures) failures.push("experiences-seo-gardssalg-typesider: " + f);
     console.log(`  experiences-seo-gardssalg-typesider: ${esgt.passed} passed, ${esgt.failed} failed`);
 
+    // dev-request 2026-08-08-opplevagent-per-kategori-visuell-identitet, S1:
+    // the generalised scene-sketch machinery (one shared 26s timeline, N
+    // motifs), the three new category motifs (kultur_historie /
+    // sightseeing_transport / natur_friluft), the homepage's own motif, and
+    // the shared-chrome adoption on /kategori/:category. Covers per-surface
+    // motif isolation (each motif on its own page, on none of the others),
+    // the own-property-guarded lookup (prototype keys → no drawing), the
+    // motif-less fallback (no drawing, never the wrong one), reduced-motion
+    // discipline + the constant 8-keyframe timeline, the aria-hidden /
+    // pointer-events / z-index layer contract, wide+narrow crops, and the
+    // gardssalg regression. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block.
+    console.log("\n── experiences-seo-kategori-identitet: per-category line-art identity + chrome (S1) ──");
+    const { runExperiencesSeoKategoriIdentitetTests } = require("../src/routes/experiences-seo-kategori-identitet.test") as
+      typeof import("../src/routes/experiences-seo-kategori-identitet.test");
+    const eski = await runExperiencesSeoKategoriIdentitetTests({ log: false });
+    passed += eski.passed;
+    failed += eski.failed;
+    for (const f of eski.failures) failures.push("experiences-seo-kategori-identitet: " + f);
+    console.log(`  experiences-seo-kategori-identitet: ${eski.passed} passed, ${eski.failed} failed`);
+
     // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S4:
     // the /for-tilbydere provider-onboarding page + /for-tilbydere/finn
     // search subpage + the «For tilbydere» entry in the shared S1 chrome.

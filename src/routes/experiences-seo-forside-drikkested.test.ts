@@ -15,9 +15,14 @@
  *       focusable="false", the old .hero-range strip is gone, and EACH
  *       motif variant is < 50 000 chars.
  *   (d) the /en render shows the EN strings in the section (NO/EN parity).
- *   (e) the ONE steam @keyframes rule lives strictly INSIDE the
+ *   (e) EVERY @keyframes rule on the homepage lives strictly INSIDE a
  *       @media (prefers-reduced-motion: no-preference) block — no motion
- *       definition is parsed by reduced-motion UAs.
+ *       definition is parsed by reduced-motion UAs. (dev-request
+ *       2026-08-08-opplevagent-per-kategori-visuell-identitet, S1: the
+ *       homepage gained a SECOND guarded block — the front-page scene
+ *       sketch's timeline next to the hero steam's — so the invariant is
+ *       now checked against the union of every guarded block, exactly as
+ *       the gardssalg page already was in (f).)
  *   (f) /kategori/gardssalg renders the drikke motif behind its hero.
  *   (g) countGardssalgProvidersByType(): same WHERE gate as
  *       countGardssalgProviders() — catalog_hidden=1 excluded, NULL
@@ -265,8 +270,8 @@ export function runExperiencesSeoForsideDrikkestedTests(opts: { log?: boolean } 
       }
 
       // ── (e) @keyframes ONLY inside prefers-reduced-motion:no-preference ─
-      const motionBlock = extractMediaBlock(home.body, REDUCED_MOTION_PRELUDE);
-      assertTrue(motionBlock !== null, "e1: homepage CSS has a @media (prefers-reduced-motion: no-preference) block");
+      const motionBlock = extractAllMediaBlocks(home.body, REDUCED_MOTION_PRELUDE);
+      assertTrue(motionBlock.length > 0, "e1: homepage CSS has a @media (prefers-reduced-motion: no-preference) block");
       assertTrue(
         (motionBlock || "").includes("@keyframes"),
         "e2: the steam @keyframes rule lives inside that block"
@@ -325,8 +330,15 @@ export function runExperiencesSeoForsideDrikkestedTests(opts: { log?: boolean } 
         drikkeSvg.includes("rgba(201,138,43") && drikkeSvg.includes('class="steam"'),
         "h4: drikke motif keeps its copper kettle + steam (unchanged)"
       );
-      // The S2b still sketch belongs to the gardssalg surfaces ONLY.
-      assertTrue(!home.body.includes("oa-still-sketch"), "h5: the gardssalg still sketch never renders on the homepage");
+      // The S2b still sketch belongs to the gardssalg surfaces ONLY. (S1 of
+      // dev-request 2026-08-08 gave the homepage its OWN, different line-art
+      // motif in the light band under the hero, so the assertion is about the
+      // DISTILLERY drawing specifically — not about the absence of any
+      // sketch layer.)
+      assertTrue(
+        !home.body.includes((A.seo as any).gardssalgStillSketchSvg()),
+        "h5: the gardssalg still sketch never renders on the homepage"
+      );
       assertTrue(gard.body.includes('class="oa-still-sketch"'), "h6: /kategori/gardssalg renders the still-sketch layer");
 
       // ── (g) countGardssalgProvidersByType() unit ──────────────────────
