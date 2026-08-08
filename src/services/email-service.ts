@@ -395,7 +395,7 @@ export class EmailService {
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     return await this.sendEmail({
       to,
-      subject: `${providerName} er nå synlig for AI-assistenter — se over profilen deres`,
+      subject: `${providerName} har fått en profil på Opplevagent — vil dere se over den?`,
       htmlContent: buildGardssalgOutreachHtml(providerName, profileUrl),
       textContent: buildGardssalgOutreachText(providerName, profileUrl),
       replyTo: "kontakt@opplevagent.no",
@@ -1107,47 +1107,51 @@ https://opplevagent.no
 function buildGardssalgOutreachHtml(providerName: string, profileUrl: string): string {
   const safeName = epEscape(providerName);
   const safeUrl = epEscape(profileUrl);
+  // Every style is INLINE, and there is deliberately no <style> block.
+  // 2026-08-08: a <style>-block version of this template was observed in a
+  // real inbox with the whole CSS rule-set rendered as visible body text (the
+  // tags had been stripped upstream, the text content had not). Inline
+  // attributes cannot fail that way — if they are dropped, the mail degrades
+  // to unstyled but READABLE text, never to CSS-as-prose. Same reason the
+  // signature below uses separate <p> elements rather than <br>: a stripped
+  // <br> silently glues "Rett fra Bonden" onto the address on the next line.
+  const P = `margin:0 0 14px;font-size:15px;line-height:1.7;color:#333`;
   return `<!DOCTYPE html>
 <html lang="nb">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 0; }
-    .container { background: #ffffff; padding: 40px 20px; }
-    .header { margin-bottom: 24px; border-bottom: 3px solid #0f5a50; padding-bottom: 16px; }
-    .logo { font-size: 22px; font-weight: 700; color: #0f5a50; }
-    h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
-    p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
-    ol { margin: 12px 0; padding-left: 22px; font-size: 15px; line-height: 1.7; }
-    li { margin: 8px 0; }
-    a { color: #0f5a50; }
-    .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
-  </style>
 </head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div class="logo">opplevagent.no</div>
+<body style="margin:0;padding:0;background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',sans-serif;color:#333">
+  <div style="max-width:600px;margin:0 auto;padding:40px 20px;background:#ffffff">
+    <div style="margin-bottom:24px;border-bottom:3px solid #0f5a50;padding-bottom:16px">
+      <span style="font-size:22px;font-weight:700;color:#0f5a50">opplevagent.no</span>
     </div>
 
-    <h1>Hei,</h1>
+    <p style="${P}">Hei,</p>
 
-    <p>Jeg heter Daniel og driver Opplevagent (opplevagent.no) — en norsk katalog over gårdssalg, bryggerier, siderier og destillerier, bygget for å være synlig der folk faktisk leter nå: i AI-assistenter som ChatGPT og Claude.</p>
+    <p style="${P}"><strong>${safeName}</strong> har fått en profil på Opplevagent, bygget på offentlige kilder &mdash; Brønnøysundregistrene og deres egen nettside. Jeg vil gjerne at dere ser over den: <a href="${safeUrl}" style="color:#0f5a50">${safeUrl}</a></p>
 
-    <p><strong>${safeName}</strong> har allerede en profil hos oss, basert på offentlige kilder (Brønnøysundregistrene og deres egen nettside): <a href="${safeUrl}">${safeUrl}</a></p>
+    <p style="${P}">Grunnen til at jeg tar kontakt nå: regjeringens forslag om utvidet gårdssalg av alkohol er på høring med frist 5. september. Slik forslaget er formulert, skal salget knyttes til et betalt besøk med faglig innhold &mdash; omvisning, smaking eller foredrag. Blir det vedtatt, blir det å ta imot besøk en praktisk forutsetning for salg, ikke bare et hyggelig tillegg.</p>
 
-    <p>Tre ting dere kan gjøre — alt er gratis:</p>
-    <ol>
-      <li><strong>Se over profilen.</strong> Stemmer beskrivelsen og produktene? Si fra, så retter vi.</li>
-      <li><strong>Overta profilen.</strong> Da styrer dere innholdet selv og ser besøkstallene til profilen — inkludert hvor stor del av trafikken som kommer fra AI-assistenter.</li>
-      <li><strong>Ta imot besøk?</strong> Tilbyr dere smaking eller omvisning, kan gjester melde seg på direkte via profilen — dere bekrefter hver påmelding selv, og det koster ingenting.</li>
+    <p style="${P}">Kort om meg: jeg har bygget rettfrabonden.com, en katalog over norske matprodusenter laget for at AI-assistenter som ChatGPT og Claude skal kunne hente informasjon derfra og gi den videre til folk som spør. Mange produsenter har overtatt profilen sin der og fylt den ut selv. Opplevagent er det samme for opplevelser, og jeg har begynt med drikkeprodusenter.</p>
+
+    <p style="${P}">Tre ting dere kan gjøre &mdash; alt er gratis:</p>
+    <ol style="margin:0 0 14px;padding-left:22px;font-size:15px;line-height:1.7;color:#333">
+      <li style="margin:8px 0"><strong>Se over profilen.</strong> Stemmer beskrivelsen og produktene? Si fra, så retter jeg.</li>
+      <li style="margin:8px 0"><strong>Overta profilen.</strong> Da styrer dere innholdet selv, og ser hvor ofte profilen blir besøkt &mdash; inkludert hvor stor del av trafikken som kommer fra AI-assistenter.</li>
+      <li style="margin:8px 0"><strong>Ta imot besøk.</strong> Hver profil har et påmeldingssystem dere kan velge å skru på. Gjesten melder seg på, dere bekrefter hver påmelding selv.</li>
     </ol>
 
-    <p>Ingen betaling, ingen binding — katalogen er gratis for produsenter. Vil dere ikke stå oppført, fjerner vi profilen umiddelbart.</p>
+    <p style="${P}">Slik det fungerer i dag, henter AI-assistenter informasjon herfra og gir den videre til den som spør. På sikt er målet at profilen deres skal kunne svare gjestens assistent direkte. Mer om hvordan det henger sammen: <a href="https://opplevagent.no/slik-fungerer-det" style="color:#0f5a50">opplevagent.no/slik-fungerer-det</a></p>
 
-    <div class="footer">
-      <p>Vennlig hilsen<br>Daniel Fredriksen<br>Opplevagent / Rett fra Bonden<br>kontakt@opplevagent.no</p>
+    <p style="${P}">Dette er et prosjekt under utvikling, så ting vil endre seg underveis &mdash; jeg setter stor pris på tilbakemeldinger. Vil dere ikke stå oppført, si fra, så fjerner jeg profilen med en gang.</p>
+
+    <div style="margin-top:36px;padding-top:18px;border-top:1px solid #eee">
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#666">Med vennlig hilsen</p>
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#666">Daniel Fredriksen</p>
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#666">Opplevagent</p>
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#666"><a href="mailto:kontakt@opplevagent.no" style="color:#0f5a50">kontakt@opplevagent.no</a></p>
     </div>
   </div>
 </body>
@@ -1157,27 +1161,41 @@ function buildGardssalgOutreachHtml(providerName: string, profileUrl: string): s
 function buildGardssalgOutreachText(providerName: string, profileUrl: string): string {
   return `Hei,
 
-Jeg heter Daniel og driver Opplevagent (opplevagent.no) — en norsk katalog over
-gårdssalg, bryggerier, siderier og destillerier, bygget for å være synlig der folk
-faktisk leter nå: i AI-assistenter som ChatGPT og Claude.
+${providerName} har fått en profil på Opplevagent, bygget på offentlige kilder —
+Brønnøysundregistrene og deres egen nettside. Jeg vil gjerne at dere ser over den:
+${profileUrl}
 
-${providerName} har allerede en profil hos oss, basert på offentlige kilder
-(Brønnøysundregistrene og deres egen nettside): ${profileUrl}
+Grunnen til at jeg tar kontakt nå: regjeringens forslag om utvidet gårdssalg av
+alkohol er på høring med frist 5. september. Slik forslaget er formulert, skal
+salget knyttes til et betalt besøk med faglig innhold — omvisning, smaking eller
+foredrag. Blir det vedtatt, blir det å ta imot besøk en praktisk forutsetning for
+salg, ikke bare et hyggelig tillegg.
+
+Kort om meg: jeg har bygget rettfrabonden.com, en katalog over norske
+matprodusenter laget for at AI-assistenter som ChatGPT og Claude skal kunne hente
+informasjon derfra og gi den videre til folk som spør. Mange produsenter har
+overtatt profilen sin der og fylt den ut selv. Opplevagent er det samme for
+opplevelser, og jeg har begynt med drikkeprodusenter.
 
 Tre ting dere kan gjøre — alt er gratis:
-1. Se over profilen. Stemmer beskrivelsen og produktene? Si fra, så retter vi.
-2. Overta profilen. Da styrer dere innholdet selv og ser besøkstallene til
-   profilen — inkludert hvor stor del av trafikken som kommer fra AI-assistenter.
-3. Ta imot besøk? Tilbyr dere smaking eller omvisning, kan gjester melde seg på
-   direkte via profilen — dere bekrefter hver påmelding selv, og det koster
-   ingenting.
+1. Se over profilen. Stemmer beskrivelsen og produktene? Si fra, så retter jeg.
+2. Overta profilen. Da styrer dere innholdet selv, og ser hvor ofte profilen blir
+   besøkt — inkludert hvor stor del av trafikken som kommer fra AI-assistenter.
+3. Ta imot besøk. Hver profil har et påmeldingssystem dere kan velge å skru på.
+   Gjesten melder seg på, dere bekrefter hver påmelding selv.
 
-Ingen betaling, ingen binding — katalogen er gratis for produsenter. Vil dere ikke
-stå oppført, fjerner vi profilen umiddelbart.
+Slik det fungerer i dag, henter AI-assistenter informasjon herfra og gir den videre
+til den som spør. På sikt er målet at profilen deres skal kunne svare gjestens
+assistent direkte. Mer om hvordan det henger sammen:
+https://opplevagent.no/slik-fungerer-det
 
-Vennlig hilsen
+Dette er et prosjekt under utvikling, så ting vil endre seg underveis — jeg setter
+stor pris på tilbakemeldinger. Vil dere ikke stå oppført, si fra, så fjerner jeg
+profilen med en gang.
+
+Med vennlig hilsen
 Daniel Fredriksen
-Opplevagent / Rett fra Bonden
+Opplevagent
 kontakt@opplevagent.no
 `;
 }
