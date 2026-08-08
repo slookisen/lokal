@@ -8499,25 +8499,39 @@ function parseGfcProviderIdsFilter(rawList: string[]): { ids: string[] } | { err
 // Extracted from the original inline GET route body (dev-request 2026-08-03-
 // gardssalg-field-concordance-write) so the write-side POST route below can
 // run the EXACT same scan rather than duplicating the cohort query + fetch
-// loop. Loads the verified drink-producer cohort (producer_type IN
-// DRINK_PRODUCER_TYPES AND isHjemmesideVerified(field_provenance) —
-// unchanged from before this refactor), fetches each producer's homepage via
-// crFetchGardssalgContent/gardssalgPageText (the SAME SSRF-guarded pipeline
-// content-refresh/website-verification already use), and builds each row via
-// buildProviderConcordanceRow. Zero writes — this function itself never
-// touches the DB beyond the initial SELECT.
+// loop. Loads the "all gårdssalg providers with an ownership-verified
+// hjemmeside" cohort (dev-request 2026-08-08-gardssalg-epost-korreksjon-
+// utvidelse, criterion 1 — widened from the original verified-drink-producer-
+// only cohort) AND isHjemmesideVerified(field_provenance), fetches each
+// producer's homepage via crFetchGardssalgContent/gardssalgPageText (the
+// SAME SSRF-guarded pipeline content-refresh/website-verification already
+// use), and builds each row via buildProviderConcordanceRow. Zero writes —
+// this function itself never touches the DB beyond the initial SELECT.
+//
+// GFC_GARDSSALG_PRODUCER_TYPE_SQL / GFC_TEST_GARDSSALG_EXCLUSION_SQL
+// intentionally MIRROR GS_WV_GARDSSALG_PRODUCER_TYPE_SQL /
+// GS_WV_TEST_GARDSSALG_EXCLUSION_SQL in services/gardssalg-website-
+// verification.ts (that file's `cohort=all` WHERE-clause) — duplicated here
+// as local string constants rather than imported, since those constants are
+// not exported from that file and this route module already has enough
+// surface exposed from it. Keep the two definitions byte-identical if either
+// changes so the two cohort definitions can never silently diverge.
+//
+// Deliberately no catalog_hidden filter — this endpoint has never scoped by
+// visibility, and the widened cohort explicitly covers BOTH visible AND
+// hidden rows (dev-request 2026-08-08, criterion 1).
+const GFC_GARDSSALG_PRODUCER_TYPE_SQL = `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+const GFC_TEST_GARDSSALG_EXCLUSION_SQL = `(producer_type IS NULL OR producer_type != 'test-gardssalg')`;
+
 async function runGardssalgFieldConcordanceScan(
   expDb: Database.Database,
   providerIdsFilter?: string[],
 ): Promise<{ providers: GfcProviderResult[] }> {
-  const drinkTypes = Array.from(DRINK_PRODUCER_TYPES);
-  const typePlaceholders = drinkTypes.map(() => "?").join(", ");
-
   let sql = `SELECT id, navn, hjemmeside, epost, telefon, mobil, adresse, postnummer, poststed,
                     opening_hours_text, field_provenance
                FROM experience_providers
-              WHERE producer_type IN (${typePlaceholders})`;
-  const params: string[] = [...drinkTypes];
+              WHERE ${GFC_GARDSSALG_PRODUCER_TYPE_SQL} AND ${GFC_TEST_GARDSSALG_EXCLUSION_SQL}`;
+  const params: string[] = [];
   if (providerIdsFilter) {
     const idPlaceholders = providerIdsFilter.map(() => "?").join(", ");
     sql += ` AND id IN (${idPlaceholders})`;
