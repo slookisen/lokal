@@ -762,13 +762,19 @@ export interface GsExpConflictSkip {
     // ~93%-false-positive-rate candidate class. See planGardssalgExperience
     // ConflictRemediation's own doc comment for the full reasoning.
     | "not_evidence_basis"
-    // Gap B ("the Lervig lesson", slice 3): the CURRENT booking_url is
-    // already a specific, working deep link (a non-trivial path/query
-    // beyond the bare domain root — isDeepLinkUrl() below) that differs from
-    // the producer's homepage. Overwriting it with the producer's bare
-    // hjemmeside (or nulling it) would replace a useful, specific value with
-    // a strictly-worse one, so remediation leaves it alone for a human to
-    // look at instead.
+    // Gap B ("the Lervig lesson", slice 3; widened post-deploy 2026-08-08):
+    // the CURRENT booking_url is already a specific, working value that
+    // differs from the producer's homepage — either because it carries a
+    // non-trivial path/query beyond the bare domain root (isDeepLinkUrl()
+    // below), OR because it resolves to a registrable domain that EXTENDS
+    // the producer's own hjemmeside domain with a suffix
+    // (existingBookingUrlOnDifferentHost() below — the literal live Lervig
+    // case: lerviglocal.no extends lervig.no, bare root on both sides, no
+    // path difference at all; see that function's own doc comment for why
+    // this is directional rather than a bare domain-inequality check).
+    // Overwriting it with the producer's bare hjemmeside (or nulling it)
+    // would replace a useful, specific value with a strictly-worse one, so
+    // remediation leaves it alone for a human to look at instead.
     | "existing_deep_link_preserved";
 }
 
@@ -783,9 +789,10 @@ export interface GsExpConflictSkip {
  * 2026-08-01 spot-check found (Lervig) would ALSO have gotten a WRONG
  * remediation write under the pre-slice-3 logic — the producer's homepage
  * (`lervig.no`) would have overwritten a correct, working brewpub BOOKING
- * deep-link (`lerviglocal.no/...`) with just the generic homepage, replacing
- * a useful, specific URL with a strictly-worse one. planGardssalgExperience
- * ConflictRemediation() below checks this BEFORE deciding to
+ * link (`lerviglocal.no...`) with just the generic homepage, replacing a
+ * useful, specific URL with a strictly-worse one. planGardssalgExperience
+ * ConflictRemediation() below checks this (OR'd with
+ * existingBookingUrlOnDifferentHost() below) BEFORE deciding to
  * correct/null a pair's booking_url, and skips it (reason
  * "existing_deep_link_preserved") instead, whether the planned action would
  * otherwise have been a "corrected" (copy producer homepage) or a "nulled"
@@ -793,10 +800,25 @@ export interface GsExpConflictSkip {
  * destroying a specific working link in favor of nothing or a generic root
  * is the same failure mode this exists to prevent.
  *
- * A path of "" or "/" (with no query) is NOT a deep link — that case is
- * unaffected by this gate, so the existing corrected/nulled behavior for a
- * root-only/blank booking_url is unchanged (acceptance criterion: no
- * regression on the existing correct path).
+ * IMPORTANT — this function alone is NOT sufficient to catch the Lervig case:
+ * it only looks at PATH/QUERY depth. The real live production pair that
+ * exposed this (post-deploy dry-run probe, 2026-08-08) was
+ * `booking_url=https://lerviglocal.no` — a BARE ROOT URL, no path, no
+ * query — on a domain different from the producer's `hjemmeside`. Since it
+ * has no path, this function correctly-per-its-own-definition returns
+ * `false` for it; existingBookingUrlOnDifferentHost() below is what actually
+ * catches that shape, by comparing registrable domains instead of path
+ * depth. The two checks are OR'd together at the call site — this one alone
+ * only ever protected the subset of Gap B cases that also happen to carry a
+ * path.
+ *
+ * A path of "" or "/" (with no query) is NOT a deep link by THIS function's
+ * own definition — that case is unaffected by THIS gate, so the existing
+ * corrected/nulled behavior for a root-only/blank booking_url whose domain
+ * also matches the producer's is unchanged (acceptance criterion: no
+ * regression on the existing correct path). A root-only booking_url on a
+ * DIFFERENT domain is now caught by existingBookingUrlOnDifferentHost()
+ * instead.
  *
  * Pure string parsing — no URL() construction, no network fetch. This route
  * is synchronous and not fetch-based (see field-rule (a) discussion on
@@ -818,6 +840,85 @@ function isDeepLinkUrl(urlLike: string | null | undefined): boolean {
   const trivialPath = path === "" || path === "/";
   const trivialQuery = query === "";
   return !(trivialPath && trivialQuery);
+}
+
+/**
+ * True when the CURRENT booking_url resolves to a registrable domain that is
+ * the producer's OWN homepage domain label EXTENDED with a suffix (e.g.
+ * `lerviglocal` extends `lervig`) — the other half of Gap B ("the Lervig
+ * lesson"), found live in production (post-deploy dry-run probe, 2026-08-08):
+ * isDeepLinkUrl() alone only protects a current value that has a non-trivial
+ * PATH/QUERY beyond its domain root, but the real Lervig pair is
+ * `booking_url=https://lerviglocal.no` vs `hjemmeside=https://www.lervig.no`
+ * — BARE ROOT on both sides, zero path, zero query, just a different domain
+ * (`lerviglocal.no`, a purpose-built booking site, vs the generic
+ * `lervig.no` corporate homepage). isDeepLinkUrl() correctly-per-its-own-
+ * definition says "not a deep link" for a bare root, so that check alone
+ * never caught this shape and would have let `apply=true` overwrite a
+ * correct, working, more-specific URL with a strictly worse generic one.
+ *
+ * IMPORTANT — this is deliberately NOT a plain "the two domains differ"
+ * check, even though that is the literal shape of the dev-request/incident
+ * report that motivated this fix. Every pair this function is ever called on
+ * is already status==="conflict" (planGardssalgExperienceConflictRemediation
+ * only ever receives conflicting pairs — see its own doc comment), and
+ * "conflict" is BY DEFINITION producerDomain !== experienceDomain (see the
+ * status-decision block in findGardssalgProducerExperienceMatches() above) —
+ * so a bare inequality check is true for every single conflicting pair with
+ * a non-blank current booking_url, which would silently disable the entire
+ * corrected/nulled remediation path this endpoint exists to perform. This
+ * was VERIFIED empirically against this repo's own existing test suite
+ * (2026-08-08 fix-up): a bare-inequality version of this function regresses
+ * the Atlungstad fixture (dev-request Funn 2's own confirmed concrete case —
+ * `hjemmeside=atlungstadbrenneri.no` vs the WRONG, different-business
+ * `booking_url=atlungstad.no`, also bare-root/no-path/different-domain) from
+ * `corrected` to wrongly `skipped`, plus the dedicated acceptance-criterion-3
+ * provider_link regression-guard fixture (root-only booking_url on an
+ * unrelated placeholder domain, meant to stay `corrected`) — i.e. it is
+ * provably too broad, not merely theoretically risky.
+ *
+ * The DIRECTIONAL extension check here is the narrowest rule that closes the
+ * real live gap without that regression: `lerviglocal` (current) extending
+ * `lervig` (producer) is a plausible "producer's own brand + suffix" domain
+ * (a dedicated booking/local variant of the SAME business) — worth
+ * preserving. The Atlungstad shape is the OPPOSITE direction — the SHORTER,
+ * wrong-business label (`atlungstad`) is a prefix of the producer's own
+ * LONGER domain (`atlungstadbrenneri`), not the other way around — which is
+ * exactly the "a different real business with a similar/overlapping name"
+ * false-positive class this whole module's matching design (see the module
+ * doc comment's host_name section) already treats as untrustworthy on its
+ * own; this function does not extend trust in that direction either.
+ *
+ * Reuses urlRegistrableDomain() (this file, above) unchanged for the host
+ * comparison — the SAME hostFromUrlLike()->registrableDomain() pipeline
+ * this file already uses to decide "agree" vs "conflict" status in
+ * findGardssalgProducerExperienceMatches() above, so "domain" means the same
+ * thing everywhere in this module. hostFromUrlLike() already lowercases and
+ * strips a leading "www." before registrableDomain() ever runs, so
+ * `www.lervig.no` and `lervig.no` compare equal here exactly as they do for
+ * the conflict/agree decision — no separate host-normalization helper
+ * invented for this. HOST_TOKEN_MIN_LEN (this file, above — the existing
+ * floor for a host label being meaningful on its own) guards the producer
+ * label so a very short/generic root can't trivially "extend" into a false
+ * match.
+ *
+ * A blank/unparseable current booking_url, or a producer homepage that
+ * itself doesn't resolve to a domain, has nothing to compare — this returns
+ * false and the existing corrected/nulled path is unaffected (no regression
+ * on that path).
+ */
+function existingBookingUrlOnDifferentHost(
+  currentBookingUrl: string | null | undefined,
+  producerHomepage: string
+): boolean {
+  if (!currentBookingUrl || !currentBookingUrl.trim()) return false;
+  const currentDomain = urlRegistrableDomain(currentBookingUrl);
+  const producerDomain = urlRegistrableDomain(producerHomepage);
+  if (!currentDomain || !producerDomain || currentDomain === producerDomain) return false;
+  const currentLabel = currentDomain.split(".")[0] ?? "";
+  const producerLabel = producerDomain.split(".")[0] ?? "";
+  if (producerLabel.length < HOST_TOKEN_MIN_LEN) return false;
+  return currentLabel.startsWith(producerLabel);
 }
 
 /**
@@ -915,8 +1016,17 @@ export function planGardssalgExperienceConflictRemediation(
     }
 
     // Gap B — never silently replace/null a working deep link (see
-    // isDeepLinkUrl's own doc comment / "the Lervig lesson" above).
-    if (isDeepLinkUrl(row.booking_url)) {
+    // isDeepLinkUrl's own doc comment / "the Lervig lesson" above). Two
+    // independent triggers, either sufficient — post-deploy fix (2026-08-08):
+    // the path/query-depth check (isDeepLinkUrl) alone missed the literal
+    // Lervig acceptance example itself, which has no path on either side;
+    // existingBookingUrlOnDifferentHost() closes that by also firing when
+    // the current value is on a different domain than the producer's own
+    // homepage, regardless of path depth. This is a strictly additive OR —
+    // the original path/query check still fires exactly as before for a
+    // same-host-but-deep-path current value (e.g. producer.no/old-page vs
+    // producer.no).
+    if (isDeepLinkUrl(row.booking_url) || existingBookingUrlOnDifferentHost(row.booking_url, producerHomepage)) {
       skipped.push({
         experience_id: pair.experience_id,
         producer_id: pair.producer_id,
