@@ -33,9 +33,21 @@
  *       fetch failure (never fetched, never crashes)
  *   (f) all-blank stored fields -> every field ikke_funnet_på_siden even
  *       though the page has real content (nothing stored to confirm)
- *   (g) cohort membership: a non-drink producer_type (bakeri) and an
- *       unverified drink-producer row are BOTH excluded from the cohort —
- *       never fetched, never appear in the response
+ *   (g) cohort membership: an unverified drink-producer row is excluded
+ *       from the cohort — never fetched, never appears in the response. A
+ *       non-drink producer_type (bakeri, a recognised NON_DRINK_PRODUCER_
+ *       TYPE) IS now included per the widened cohort (see g2 below) — this
+ *       reflects the widening, not a regression.
+ *   (g2) cohort widening (dev-request 2026-08-08-gardssalg-epost-korreksjon-
+ *       utvidelse, criterion 1): an rfb-seed row with producer_type IS NULL
+ *       but a verified hjemmeside now IS included (was previously excluded
+ *       when the cohort was drink-producer-type-only); a genuinely
+ *       non-gårdssalg row (no producer_type, no rfb_seed_source) is still
+ *       excluded even with a verified hjemmeside (regression guard against
+ *       "audit everything"); a producer_type = 'test-gardssalg' row is still
+ *       excluded even with a verified hjemmeside; a catalog_hidden=1 rfb-seed
+ *       row with a verified hjemmeside IS included (hidden rows are now in
+ *       scope, not just visible ones)
  *   (h) providerIds filter: comma-separated query narrows to a subset;
  *       repeated-key (array) form is also accepted; an id outside the
  *       cohort is silently absent (never crashes the rest of the batch);
@@ -46,6 +58,17 @@
  *       batch, one sub-object per field
  *   (k) zero writes anywhere — a full DB dump of experience_providers is
  *       byte-identical before and after the call
+ *   (l) review fix-up (2026-08-08, unbounded-scan risk): `limit`/`offset`
+ *       pagination — no params -> byte-identical to (b)/(j)'s unpaginated
+ *       response shape (no `pagination` key at all); `limit` over the cap
+ *       -> 400, never silently clamped; `offset` without `limit` -> 400;
+ *       non-positive/non-integer `limit`, negative/non-integer `offset` ->
+ *       400; a valid `limit`+`offset` returns exactly that page (in stable
+ *       `ORDER BY id` order) AND — proven via a fetch-mock call-count
+ *       assertion, not just response contents — rows outside the page never
+ *       trigger a homepage fetch at all; `pagination`
+ *       ({total, offset, limit, returned, next_offset}) present only when
+ *       `limit` is supplied
  */
 
 export interface TestSummary {
@@ -261,10 +284,17 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
         field_provenance: VERIFIED_STAMP,
       });
 
-      // ── (g) cohort-membership exclusions ─────────────────────────────────
+      // ── (g) cohort-membership ─────────────────────────────────────────────
+      // "bakeri" is a recognised NON_DRINK_PRODUCER_TYPE (route-corridor-
+      // service.ts) — a real gårdssalg producer type, just not a drink one.
+      // Under the OLD (pre-widening) drink-producer-type-only cohort this
+      // row was excluded; under the WIDENED "all gårdssalg" cohort
+      // (producer_type IS NOT NULL is sufficient, regardless of WHICH
+      // producer_type) it is now correctly INCLUDED — this is the intended
+      // effect of criterion 1, not a regression. See g2/g4 below.
       insertProvider.run({
         id: "prov-bakeri",
-        navn: "Bakeriet Utenfor Kohort",
+        navn: "Bakeriet Nå I Kohort",
         hjemmeside: "https://bakeriet-utenfor.example.no",
         epost: "post@bakeriet.no",
         telefon: null,
@@ -273,7 +303,7 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
         postnummer: null,
         poststed: null,
         opening_hours_text: null,
-        producer_type: "bakeri", // NOT a drink producer type
+        producer_type: "bakeri", // non-drink gårdssalg producer type
         rfb_seed_source: null,
         catalog_hidden: 0,
         field_provenance: VERIFIED_STAMP,
@@ -293,6 +323,89 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
         rfb_seed_source: null,
         catalog_hidden: 0,
         field_provenance: null, // never verified -> excluded from cohort
+      });
+
+      // ── (g2) cohort widening (dev-request 2026-08-08-gardssalg-epost-
+      //     korreksjon-utvidelse, criterion 1) ─────────────────────────────
+
+      // rfb-seed row, producer_type IS NULL, verified hjemmeside -> NOW
+      // included (the dev-request's own stated acceptance test).
+      insertProvider.run({
+        id: "prov-rfbseed-nullptype",
+        navn: "Rfb-seed Uten Producertype",
+        hjemmeside: "https://rfbseed-nullptype.example.no",
+        epost: "post@rfbseednull.no",
+        telefon: "93334455",
+        mobil: null,
+        adresse: "Fjordveien 7",
+        postnummer: "2000",
+        poststed: "Lillestrøm",
+        opening_hours_text: "Lø 10-14",
+        producer_type: null,
+        rfb_seed_source: "rfb-seed",
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // Genuinely outside gårdssalg entirely — no producer_type, no
+      // rfb_seed_source — must stay excluded even with a verified
+      // hjemmeside (regression guard: not "audit everything").
+      insertProvider.run({
+        id: "prov-non-gardssalg",
+        navn: "Ren Opplevelse Utenfor Gårdssalg",
+        hjemmeside: "https://ikke-gardssalg.example.no",
+        epost: "post@ikkegardssalg.no",
+        telefon: null,
+        mobil: null,
+        adresse: null,
+        postnummer: null,
+        poststed: null,
+        opening_hours_text: null,
+        producer_type: null,
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // producer_type = 'test-gardssalg' — still excluded even with a
+      // verified hjemmeside (regression guard on the existing synthetic-
+      // fixture exclusion).
+      insertProvider.run({
+        id: "prov-test-gardssalg",
+        navn: "Synthetic Test Provider",
+        hjemmeside: "https://test-gardssalg-fixture.example.no",
+        epost: "post@testgardssalg.no",
+        telefon: null,
+        mobil: null,
+        adresse: null,
+        postnummer: null,
+        poststed: null,
+        opening_hours_text: null,
+        producer_type: "test-gardssalg",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // catalog_hidden=1, rfb-seed, verified hjemmeside -> IS included
+      // (hidden rows are now in scope, not just visible ones — the endpoint
+      // has never filtered on catalog_hidden, and the widened cohort
+      // explicitly covers both).
+      insertProvider.run({
+        id: "prov-hidden-rfbseed",
+        navn: "Skjult Rfb-seed",
+        hjemmeside: "https://skjult-rfbseed.example.no",
+        epost: "post@skjultrfbseed.no",
+        telefon: "94445566",
+        mobil: null,
+        adresse: "Skogveien 9",
+        postnummer: "7000",
+        poststed: "Trondheim",
+        opening_hours_text: "Etter avtale",
+        producer_type: null,
+        rfb_seed_source: "rfb-seed",
+        catalog_hidden: 1,
+        field_provenance: VERIFIED_STAMP,
       });
 
       // ── DB snapshot BEFORE any route call (zero-writes proof, section k) ─
@@ -350,8 +463,33 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
             headers: { get: () => null }, url: urlStr,
           } as unknown as Response;
         }
-        // Should never be reached — bakeriet/uverifisert are excluded from
-        // the cohort and prov-no-website has no hjemmeside to fetch.
+        if (host === "rfbseed-nullptype.example.no") {
+          // (g2) widened-cohort fixture: producer_type IS NULL, rfb-seed —
+          // full match, every field bekreftet.
+          const html = `<html><body><p>Kontakt: post@rfbseednull.no, ring 933 34 455.</p>
+            <p>Adresse: Fjordveien 7, 2000 Lillestrøm.</p>
+            <p>Åpningstider: Lø 10-14.</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        if (host === "skjult-rfbseed.example.no") {
+          // (g2) widened-cohort fixture: catalog_hidden=1, rfb-seed — full
+          // match, every field bekreftet. Hidden rows are now in scope.
+          const html = `<html><body><p>Kontakt: post@skjultrfbseed.no, ring 944 45 566.</p>
+            <p>Adresse: Skogveien 9, 7000 Trondheim.</p>
+            <p>Åpningstider: Etter avtale.</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        // Should never be reached — bakeriet/uverifisert/non-gardssalg/
+        // test-gardssalg are excluded from the cohort and prov-no-website
+        // has no hjemmeside to fetch.
         return {
           ok: false, status: 404, statusText: "Not Found", text: async () => "",
           arrayBuffer: async () => new ArrayBuffer(0),
@@ -376,12 +514,41 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       const providers: any[] = full.body.providers;
       assertTrue(Array.isArray(providers), "full3: providers is an array");
 
-      // ── (g) cohort membership — bakeri and unverified excluded ───────────
-      assertEq(providers.length, 5, "g1: exactly 5 cohort members (bakeri + unverified excluded)");
-      assertTrue(!providers.some((p) => p.provider_id === "prov-bakeri"), "g2: non-drink producer_type never appears");
+      // ── (g) cohort membership — unverified excluded; bakeri (non-drink
+      //     producer_type) now included per the widened cohort ─────────────
+      assertEq(providers.length, 8, "g1: exactly 8 cohort members (unverified + non-gardssalg + test-gardssalg excluded; bakeri now included)");
+      assertTrue(providers.some((p) => p.provider_id === "prov-bakeri"), "g2: non-drink producer_type (bakeri) IS now in the cohort (widened cohort — see g2w below)");
       assertTrue(!providers.some((p) => p.provider_id === "prov-unverified"), "g3: unverified drink producer never appears");
-      assertTrue(!fetchedHosts.includes("bakeriet-utenfor.example.no"), "g4: excluded bakeri homepage never fetched");
+      assertTrue(fetchedHosts.includes("bakeriet-utenfor.example.no"), "g4: now-included bakeri homepage IS fetched");
       assertTrue(!fetchedHosts.includes("sideri-uverifisert.example.no"), "g5: excluded unverified homepage never fetched");
+
+      // ── (g2) cohort widening (dev-request 2026-08-08-gardssalg-epost-
+      //     korreksjon-utvidelse, criterion 1) ─────────────────────────────
+      assertTrue(
+        providers.some((p) => p.provider_id === "prov-rfbseed-nullptype"),
+        "g2w1: rfb-seed row with producer_type IS NULL and a verified hjemmeside NOW is in the cohort",
+      );
+      const rfbSeedNullType = providers.find((p) => p.provider_id === "prov-rfbseed-nullptype");
+      assertEq(rfbSeedNullType.epost, { verdict: "bekreftet", current: "post@rfbseednull.no", found: "post@rfbseednull.no" }, "g2w2: rfb-seed-null-producer-type row scanned correctly (epost bekreftet)");
+
+      assertTrue(
+        !providers.some((p) => p.provider_id === "prov-non-gardssalg"),
+        "g2w3: a row with no producer_type AND no rfb_seed_source stays excluded (regression guard — not \"audit everything\")",
+      );
+      assertTrue(!fetchedHosts.includes("ikke-gardssalg.example.no"), "g2w4: excluded non-gardssalg homepage never fetched");
+
+      assertTrue(
+        !providers.some((p) => p.provider_id === "prov-test-gardssalg"),
+        "g2w5: producer_type = 'test-gardssalg' stays excluded even with a verified hjemmeside",
+      );
+      assertTrue(!fetchedHosts.includes("test-gardssalg-fixture.example.no"), "g2w6: excluded test-gardssalg homepage never fetched");
+
+      assertTrue(
+        providers.some((p) => p.provider_id === "prov-hidden-rfbseed"),
+        "g2w7: catalog_hidden=1 row with a verified hjemmeside IS included (hidden rows now in scope)",
+      );
+      const hiddenRfbSeed = providers.find((p) => p.provider_id === "prov-hidden-rfbseed");
+      assertEq(hiddenRfbSeed.epost, { verdict: "bekreftet", current: "post@skjultrfbseed.no", found: "post@skjultrfbseed.no" }, "g2w8: hidden rfb-seed row scanned correctly (epost bekreftet)");
 
       // ── (b) full match -> every field bekreftet ──────────────────────────
       const fullMatch = providers.find((p) => p.provider_id === "prov-full-match");
@@ -443,10 +610,10 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       assertTrue(!!s && !!s.epost && !!s.telefon, "j1: summary carries per-field sub-objects");
       assertEq(
         s.epost,
-        { bekreftet: 1, avvik: 1, ikke_funnet_på_siden: 3 },
-        "j2: epost summary — full-match(bekreftet) + avvik(avvik) + fetch-fail/no-website/blank(ikke_funnet_på_siden x3)",
+        { bekreftet: 3, avvik: 1, ikke_funnet_på_siden: 4 },
+        "j2: epost summary — full-match+rfbseed-nullptype+hidden-rfbseed(bekreftet x3) + avvik(avvik) + fetch-fail/no-website/blank/bakeri(ikke_funnet_på_siden x4, bakeri fails closed on its unmocked/404 fetch)",
       );
-      assertEq(full.body.count, 5, "j3: top-level count matches providers.length");
+      assertEq(full.body.count, 8, "j3: top-level count matches providers.length");
 
       // ── (h) providerIds filter ────────────────────────────────────────────
       const filtered = await callRoute(opplevelserRouter, {
@@ -472,9 +639,12 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
 
       // An id outside the cohort (unknown + a real-but-excluded id) mixed
       // into a real id -> silently absent, never crashes the rest.
+      // prov-non-gardssalg (no producer_type, no rfb_seed_source) is used
+      // here as the "real-but-excluded" id — prov-bakeri no longer qualifies
+      // for this role since the widened cohort now includes it (see g2).
       const withUnknown = await callRoute(opplevelserRouter, {
         headers: authHeaders,
-        url: "/admin/gardssalg-field-concordance-audit?providerIds=prov-full-match,prov-does-not-exist,prov-bakeri",
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=prov-full-match,prov-does-not-exist,prov-non-gardssalg",
       });
       assertEq(withUnknown.status, 200, "h7: batch with unknown/excluded ids -> 200, no crash");
       assertEq(withUnknown.body.providers.length, 1, "h8: only the one real cohort member survives");
@@ -518,6 +688,141 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       assertEq(atCap.status, 200, "i4: exactly 200 (all nonexistent) ids -> 200, not rejected");
       assertEq(atCap.body.providers.length, 0, "i5: none of the 200 nonexistent ids resolve to a row -> empty (but valid) response");
       assertEq(atCap.body.count, 0, "i6: count reflects the empty result");
+
+      // ── (l) review fix-up: limit/offset pagination ────────────────────────
+      // Full cohort, ORDER BY id, is (8 rows):
+      //   0 prov-avvik            1 prov-bakeri           2 prov-blank-fields
+      //   3 prov-fetch-fail       4 prov-full-match       5 prov-hidden-rfbseed
+      //   6 prov-no-website       7 prov-rfbseed-nullptype
+
+      // l1: no params -> byte-identical to the earlier unpaginated (b)/(j)
+      // response — same shape, no `pagination` key at all (regression).
+      const noParams = await callRoute(opplevelserRouter, { headers: authHeaders });
+      assertEq(noParams.status, 200, "l1a: no-params GET -> 200");
+      assertEq(noParams.body, full.body, "l1b: no-params response is byte-identical to the earlier unpaginated call");
+      assertTrue(!("pagination" in noParams.body), "l1c: no `pagination` key when limit is omitted");
+
+      // l2: limit over the cap (12) -> 400, never silently clamped.
+      const overCapLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=13",
+      });
+      assertEq(overCapLimit.status, 400, "l2a: limit=13 (over cap) -> 400");
+      assertTrue(/12/.test(overCapLimit.body.error || ""), "l2b: error message names the cap (12)");
+
+      // l3: offset without limit -> 400.
+      const offsetOnly = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?offset=1",
+      });
+      assertEq(offsetOnly.status, 400, "l3: offset without limit -> 400");
+
+      // l3b/c/d: malformed limit/offset -> 400, never a silent fallback.
+      const zeroLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=0",
+      });
+      assertEq(zeroLimit.status, 400, "l3b: limit=0 (non-positive) -> 400");
+
+      const negativeLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=-1",
+      });
+      assertEq(negativeLimit.status, 400, "l3c: limit=-1 -> 400");
+
+      const nonIntegerLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=abc",
+      });
+      assertEq(nonIntegerLimit.status, 400, "l3d: limit=abc (not a number) -> 400");
+
+      const negativeOffset = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=3&offset=-1",
+      });
+      assertEq(negativeOffset.status, 400, "l3e: negative offset -> 400");
+
+      // l4/l5: valid limit+offset -> exactly that page, AND rows outside the
+      // page never trigger a homepage fetch at all (fetch-mock call-count
+      // assertion, not just "absent from the response").
+      const fetchCountBeforePage = fetchCallCount;
+      const fetchedHostsLenBeforePage = fetchedHosts.length;
+      const page = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=3&offset=2",
+      });
+      assertEq(page.status, 200, "l4a: valid limit+offset -> 200");
+      assertEq(
+        page.body.providers.map((p: any) => p.provider_id),
+        ["prov-blank-fields", "prov-fetch-fail", "prov-full-match"],
+        "l4b: page returns exactly the 3 rows at offset 2 (indices 2-4), in stable ORDER BY id order",
+      );
+      assertEq(
+        page.body.pagination,
+        { total: 8, offset: 2, limit: 3, returned: 3, next_offset: 5 },
+        "l4c: pagination block matches {total, offset, limit, returned, next_offset}",
+      );
+
+      // Note on call-count: crFetchGardssalgContent fetches the primary page
+      // PLUS up to 4 sub-pages per successful homepage, and fetchPage()
+      // itself one-shot-retries a failing primary — so the raw fetch() call
+      // count per row varies (5 for a successful crawl, 2 for the simulated
+      // 500 below) and is not itself a stable "1 row = 1 call" signal. The
+      // stable, implementation-independent signal is the DISTINCT-HOST set:
+      // exactly the 3 paged rows' hosts must appear, and no others.
+      const pageFetchDelta = fetchCallCount - fetchCountBeforePage;
+      assertTrue(pageFetchDelta > 0, "l5a: at least one fetch call was made for this page (sanity)");
+      const pageFetchedHosts = fetchedHosts.slice(fetchedHostsLenBeforePage);
+      assertEq(
+        new Set(pageFetchedHosts).size,
+        3,
+        "l5a2: exactly 3 DISTINCT hosts were fetched for this page — one per paged row with a hjemmeside, never more",
+      );
+      assertTrue(
+        pageFetchedHosts.every((h) =>
+          ["mjoderi-tommefelt.example.no", "vingard-utilgjengelig.example.no", "sidergarden-fullmatch.example.no"].includes(h),
+        ),
+        "l5b: only the paged rows' homepages were fetched during this call",
+      );
+      assertTrue(
+        !pageFetchedHosts.some((h) =>
+          ["bryggeriet-avvik.example.no", "bakeriet-utenfor.example.no", "skjult-rfbseed.example.no", "rfbseed-nullptype.example.no"].includes(h),
+        ),
+        "l5c: rows OUTSIDE the requested page were never fetched during this call — not just absent from the response",
+      );
+
+      // l6: pagination present when limit is supplied, even covering the
+      // whole cohort (limit=8, offset omitted -> defaults to 0).
+      const fullViaLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?limit=8",
+      });
+      assertEq(fullViaLimit.status, 200, "l6a: limit=8 (covers whole cohort) -> 200");
+      assertEq(
+        fullViaLimit.body.pagination,
+        { total: 8, offset: 0, limit: 8, returned: 8, next_offset: null },
+        "l6b: next_offset is null once the page reaches the end of the cohort",
+      );
+
+      // l7: limit+offset combined with providerIds — freely combinable, not
+      // mutually exclusive: providerIds narrows the eligible set via SQL,
+      // limit/offset then pages over whatever that narrowed set turns out
+      // to be (ORDER BY id).
+      const providerIdsPlusLimit = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        url: "/admin/gardssalg-field-concordance-audit?providerIds=prov-avvik,prov-bakeri,prov-blank-fields&limit=2",
+      });
+      assertEq(providerIdsPlusLimit.status, 200, "l7a: providerIds + limit together -> 200");
+      assertEq(
+        providerIdsPlusLimit.body.providers.map((p: any) => p.provider_id),
+        ["prov-avvik", "prov-bakeri"],
+        "l7b: limit pages over the providerIds-narrowed set (first 2 of 3, ORDER BY id)",
+      );
+      assertEq(
+        providerIdsPlusLimit.body.pagination,
+        { total: 3, offset: 0, limit: 2, returned: 2, next_offset: 2 },
+        "l7c: pagination `total` reflects the providerIds-narrowed cohort, not the full 8-row cohort",
+      );
 
       // ── (k) zero writes anywhere ──────────────────────────────────────────
       const afterDump = dumpProviders();

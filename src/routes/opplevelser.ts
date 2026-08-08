@@ -8496,28 +8496,129 @@ function parseGfcProviderIdsFilter(rawList: string[]): { ids: string[] } | { err
   return { ids: ordered };
 }
 
+// Review fix-up (2026-08-08, follow-up to criterion-1 cohort widening
+// above): the widened cohort ("all gårdssalg providers with verified
+// hjemmeside") is now the same order of magnitude (~87 rows) as the sibling
+// GET/POST .../gardssalg-website-verification-* routes' own cohort — see
+// MAX_GARDSSALG_AUDIT_LIMIT's doc comment a few thousand lines below for the
+// live latency measurements (?limit=5 ~7.8s, ?limit=20 ~77.4s, non-linear
+// per-batch growth) that calibrated 12 as the ceiling. This scan performs
+// the identical per-row live homepage fetch at the same CR_CONCURRENCY=3, so
+// it carries exactly the same unbounded-scan risk (PR #432) that constant
+// exists to prevent. Defined as an INDEPENDENT constant here (same value,
+// same reasoning) rather than importing MAX_GARDSSALG_AUDIT_LIMIT, which is
+// declared later in this file for an unrelated route family — keep the two
+// numbers in sync if either is ever recalibrated for the same underlying
+// reason.
+const MAX_GARDSSALG_FIELD_CONCORDANCE_LIMIT = 12;
+
+// Shared limit/offset validation for both the GET audit route and the POST
+// remediation route below — mirrors GET .../gardssalg-website-verification-
+// audit's own inline validation (below in this file) byte-for-byte in
+// behavior: `limit` must be a positive integer, `offset` (if given) a
+// non-negative integer, `limit` over MAX_GARDSSALG_FIELD_CONCORDANCE_LIMIT is
+// a 400 (never silently clamped), and `offset` without `limit` is ALSO a 400
+// (there is no sane default page size to guess). Callers pass the raw
+// query/body values straight through; this function does not care which.
+function parseGfcPagination(
+  rawLimit: unknown,
+  rawOffset: unknown,
+): { limit?: number; offset?: number } | { error: string } {
+  let limit: number | undefined;
+  let offset: number | undefined;
+  if (rawLimit !== undefined) {
+    const parsedLimit = Number(rawLimit);
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+      return { error: "Ugyldig limit — må være et positivt heltall." };
+    }
+    if (parsedLimit > MAX_GARDSSALG_FIELD_CONCORDANCE_LIMIT) {
+      return { error: `Ugyldig limit — maks er ${MAX_GARDSSALG_FIELD_CONCORDANCE_LIMIT}.` };
+    }
+    limit = parsedLimit;
+  }
+  if (rawOffset !== undefined) {
+    const parsedOffset = Number(rawOffset);
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      return { error: "Ugyldig offset — må være et ikke-negativt heltall." };
+    }
+    offset = parsedOffset;
+  }
+  if (limit === undefined && offset !== undefined) {
+    return { error: "Ugyldig offset — må være et ikke-negativt heltall." };
+  }
+  return { limit, offset };
+}
+
+// Builds the `pagination` response block shared by the GET audit route and
+// both branches (dry-run/apply) of the POST remediation route — `undefined`
+// when `limit` was never supplied, so the response shape stays byte-for-byte
+// identical to before this fix-up for callers who never paginate. Same
+// `{total, offset, limit, returned, next_offset}` shape as GET
+// .../gardssalg-website-verification-audit's own pagination block.
+function buildGfcPaginationBlock(
+  limit: number | undefined,
+  offset: number | undefined,
+  total: number,
+  returned: number,
+): { total: number; offset: number; limit: number; returned: number; next_offset: number | null } | undefined {
+  if (limit === undefined) return undefined;
+  const pageOffset = offset ?? 0;
+  const nextOffset = pageOffset + returned < total ? pageOffset + returned : null;
+  return { total, offset: pageOffset, limit, returned, next_offset: nextOffset };
+}
+
 // Extracted from the original inline GET route body (dev-request 2026-08-03-
 // gardssalg-field-concordance-write) so the write-side POST route below can
 // run the EXACT same scan rather than duplicating the cohort query + fetch
-// loop. Loads the verified drink-producer cohort (producer_type IN
-// DRINK_PRODUCER_TYPES AND isHjemmesideVerified(field_provenance) —
-// unchanged from before this refactor), fetches each producer's homepage via
-// crFetchGardssalgContent/gardssalgPageText (the SAME SSRF-guarded pipeline
-// content-refresh/website-verification already use), and builds each row via
-// buildProviderConcordanceRow. Zero writes — this function itself never
-// touches the DB beyond the initial SELECT.
+// loop. Loads the "all gårdssalg providers with an ownership-verified
+// hjemmeside" cohort (dev-request 2026-08-08-gardssalg-epost-korreksjon-
+// utvidelse, criterion 1 — widened from the original verified-drink-producer-
+// only cohort) AND isHjemmesideVerified(field_provenance), fetches each
+// producer's homepage via crFetchGardssalgContent/gardssalgPageText (the
+// SAME SSRF-guarded pipeline content-refresh/website-verification already
+// use), and builds each row via buildProviderConcordanceRow. Zero writes —
+// this function itself never touches the DB beyond the initial SELECT.
+//
+// GFC_GARDSSALG_PRODUCER_TYPE_SQL / GFC_TEST_GARDSSALG_EXCLUSION_SQL
+// intentionally MIRROR GS_WV_GARDSSALG_PRODUCER_TYPE_SQL /
+// GS_WV_TEST_GARDSSALG_EXCLUSION_SQL in services/gardssalg-website-
+// verification.ts (that file's `cohort=all` WHERE-clause) — duplicated here
+// as local string constants rather than imported, since those constants are
+// not exported from that file and this route module already has enough
+// surface exposed from it. Keep the two definitions byte-identical if either
+// changes so the two cohort definitions can never silently diverge.
+//
+// Deliberately no catalog_hidden filter — this endpoint has never scoped by
+// visibility, and the widened cohort explicitly covers BOTH visible AND
+// hidden rows (dev-request 2026-08-08, criterion 1).
+const GFC_GARDSSALG_PRODUCER_TYPE_SQL = `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
+const GFC_TEST_GARDSSALG_EXCLUSION_SQL = `(producer_type IS NULL OR producer_type != 'test-gardssalg')`;
+
+// limit/offset (review fix-up, 2026-08-08, unbounded-scan risk): optional
+// pagination over the (providerIdsFilter-narrowed, if given) cohort, applied
+// AFTER the isHjemmesideVerified() filter below — that filter reads
+// field_provenance JSON in JS and cannot be pushed into the SQL WHERE
+// clause, so unlike a plain SQL LIMIT/OFFSET this slices the already-
+// verified, already-ORDER-BY-id-sorted in-memory array instead. This is the
+// SAME mechanism GET .../gardssalg-website-verification-audit's own
+// pagination uses (loadGardssalgWebsiteVerificationCohort loads the full
+// cohort, the route slices it, THEN scans only the slice) — not a
+// different, weaker pattern: either way, the point is that the expensive
+// part (the per-row live homepage fetch below) only ever runs for rows
+// inside the requested page. Rows outside the page are never fetched.
+// `limit` undefined -> the full cohort is scanned, byte-for-byte the same
+// as before this fix-up existed (regression-safe default).
 async function runGardssalgFieldConcordanceScan(
   expDb: Database.Database,
   providerIdsFilter?: string[],
-): Promise<{ providers: GfcProviderResult[] }> {
-  const drinkTypes = Array.from(DRINK_PRODUCER_TYPES);
-  const typePlaceholders = drinkTypes.map(() => "?").join(", ");
-
+  limit?: number,
+  offset?: number,
+): Promise<{ providers: GfcProviderResult[]; total: number }> {
   let sql = `SELECT id, navn, hjemmeside, epost, telefon, mobil, adresse, postnummer, poststed,
                     opening_hours_text, field_provenance
                FROM experience_providers
-              WHERE producer_type IN (${typePlaceholders})`;
-  const params: string[] = [...drinkTypes];
+              WHERE ${GFC_GARDSSALG_PRODUCER_TYPE_SQL} AND ${GFC_TEST_GARDSSALG_EXCLUSION_SQL}`;
+  const params: string[] = [];
   if (providerIdsFilter) {
     const idPlaceholders = providerIdsFilter.map(() => "?").join(", ");
     sql += ` AND id IN (${idPlaceholders})`;
@@ -8548,6 +8649,14 @@ async function runGardssalgFieldConcordanceScan(
   // Same fail-closed gate as GET /admin/gardssalg-verified-drinkproducer-
   // cohort above — verified === true only, never a truthy/ambiguous check.
   const cohort = rows.filter((p) => isHjemmesideVerified(p.field_provenance));
+  const total = cohort.length;
+
+  // Page the cohort BEFORE the fetch loop below — see this function's own
+  // doc comment above for why this is a JS slice, not a SQL LIMIT/OFFSET.
+  // `limit` undefined -> scan the full cohort, unchanged from before this
+  // fix-up (regression-safe default).
+  const pageOffset = offset ?? 0;
+  const scanTargets = limit === undefined ? cohort : cohort.slice(pageOffset, pageOffset + limit);
 
   const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
     const fetched = await crFetchGardssalgContent(homepageUrl);
@@ -8556,8 +8665,8 @@ async function runGardssalgFieldConcordanceScan(
   };
 
   const providers: GfcProviderResult[] = [];
-  for (let i = 0; i < cohort.length; i += CR_CONCURRENCY) {
-    const slice = cohort.slice(i, i + CR_CONCURRENCY);
+  for (let i = 0; i < scanTargets.length; i += CR_CONCURRENCY) {
+    const slice = scanTargets.slice(i, i + CR_CONCURRENCY);
     const sliceResults = await Promise.all(
       slice.map(async (p) => {
         const hjemmeside = p.hjemmeside && p.hjemmeside.trim() !== "" ? p.hjemmeside.trim() : null;
@@ -8593,7 +8702,7 @@ async function runGardssalgFieldConcordanceScan(
     providers.push(...sliceResults);
   }
 
-  return { providers };
+  return { providers, total };
 }
 
 router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req: Request, res: Response) => {
@@ -8611,15 +8720,32 @@ router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req:
     providerIdsFilter = parsed.ids;
   }
 
+  // limit/offset (review fix-up, 2026-08-08): freely combinable with
+  // providerIds above — providerIds (if given) narrows WHICH rows are
+  // eligible via the SQL IN(...) clause; limit/offset then page over
+  // whatever that (ORDER BY id) eligible set turns out to be. Not mutually
+  // exclusive: a caller who already knows a large explicit id list can still
+  // ask for just one page of it. Strictly validated, same discipline as
+  // providerIds — never a silent clamp/default.
+  const paginationParsed = parseGfcPagination(req.query.limit, req.query.offset);
+  if ("error" in paginationParsed) {
+    res.status(400).json({ error: paginationParsed.error });
+    return;
+  }
+  const { limit, offset } = paginationParsed;
+
   const expDb = getExpDb("experiences");
   try {
-    const { providers } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter);
-    res.json({
+    const { providers, total } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter, limit, offset);
+    const responseBody: Record<string, unknown> = {
       success: true,
       count: providers.length,
       summary: summarizeGfc(providers),
       providers,
-    });
+    };
+    const pagination = buildGfcPaginationBlock(limit, offset, total, providers.length);
+    if (pagination) responseBody.pagination = pagination;
+    res.json(responseBody);
   } catch (err) {
     if (err instanceof GfcQueryError) {
       res.status(500).json({ error: err.message });
@@ -8659,7 +8785,13 @@ router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req:
 // experience_providers directly, under any circumstance — see that
 // function's own doc comment for the full write contract.
 router.post("/admin/gardssalg-field-concordance-remediation", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { apply?: unknown; providerIds?: unknown; batch_id?: unknown };
+  const body = (req.body ?? {}) as {
+    apply?: unknown;
+    providerIds?: unknown;
+    batch_id?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+  };
   const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
   const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
 
@@ -8677,10 +8809,24 @@ router.post("/admin/gardssalg-field-concordance-remediation", requireAdmin, asyn
     providerIdsFilter = parsed.ids;
   }
 
+  // limit/offset (review fix-up, 2026-08-08): SAME contract as the GET audit
+  // route above — including free coexistence with providerIds — but read
+  // from the request BODY (this is a POST), not the query string. Paginating
+  // BEFORE the scan also bounds `apply=true`'s write blast-radius to the
+  // paged rows only, same rationale as the sibling POST .../gardssalg-
+  // website-verification-remediation route's own body-sourced pagination.
+  const paginationParsed = parseGfcPagination(body.limit, body.offset);
+  if ("error" in paginationParsed) {
+    res.status(400).json({ error: paginationParsed.error });
+    return;
+  }
+  const { limit, offset } = paginationParsed;
+
   const expDb = getExpDb("experiences");
   try {
-    const { providers } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter);
+    const { providers, total } = await runGardssalgFieldConcordanceScan(expDb, providerIdsFilter, limit, offset);
     const summary = summarizeGfc(providers);
+    const pagination = buildGfcPaginationBlock(limit, offset, total, providers.length);
 
     if (!apply) {
       const would_queue: Array<{
@@ -8702,19 +8848,23 @@ router.post("/admin/gardssalg-field-concordance-remediation", requireAdmin, asyn
           }
         }
       }
-      res.json({ success: true, dry_run: true, would_queue, summary });
+      const responseBody: Record<string, unknown> = { success: true, dry_run: true, would_queue, summary };
+      if (pagination) responseBody.pagination = pagination;
+      res.json(responseBody);
       return;
     }
 
     const { applied, provenance_written, total_queued } = applyGardssalgFieldConcordance(expDb, providers, batchId);
-    res.json({
+    const responseBody: Record<string, unknown> = {
       success: true,
       dry_run: false,
       provenance_written,
       queued: total_queued,
       applied,
       summary,
-    });
+    };
+    if (pagination) responseBody.pagination = pagination;
+    res.json(responseBody);
   } catch (err) {
     if (err instanceof GfcQueryError) {
       res.status(500).json({ error: err.message });

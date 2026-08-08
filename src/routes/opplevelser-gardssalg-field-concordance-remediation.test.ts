@@ -29,6 +29,16 @@
  *       apply=true
  *   (g) a re-run with apply=true reaching the same avvik conclusion does not
  *       duplicate/pointlessly bump the existing queue row
+ *   (h) review fix-up (2026-08-08, unbounded-scan risk): `limit`/`offset`
+ *       pagination read from the request BODY (not query string, since this
+ *       is a POST) — no params -> same response shape as before (no
+ *       `pagination` key); `limit` over the cap -> 400; `offset` without
+ *       `limit` -> 400; malformed limit/offset -> 400; a valid
+ *       `limit`+`offset` scans only that page in BOTH dry-run and apply=true
+ *       modes (apply's write blast-radius is bounded to the paged rows
+ *       too), proven via a fetch-mock call-count assertion that rows
+ *       outside the page are never fetched at all; `pagination` block
+ *       present only when `limit` is supplied
  */
 
 export interface TestSummary {
@@ -197,9 +207,17 @@ export function runOpplevelserGardssalgFieldConcordanceRemediationTests(
           (r) => JSON.stringify(r),
         );
 
+      // fetchCallCount/fetchedHosts (review fix-up, 2026-08-08): tracks every
+      // mocked fetch invocation, keyed by hostname — used by the pagination
+      // block below to prove (via call-count, not just response contents)
+      // that rows outside a requested page are never fetched at all.
+      let fetchCallCount = 0;
+      const fetchedHosts: string[] = [];
       globalThis.fetch = (async (url: string | URL | Request) => {
         const urlStr = String(url);
+        fetchCallCount++;
         const host = new URL(urlStr).hostname;
+        fetchedHosts.push(host);
         if (host === "bryggeriet-avvik.example.no") {
           const html = `<html><body><p>Bryggeriet — kontakt: ny@avvikgard.no</p>
             <p>Ring 900 00 009 (dagtid).</p></body></html>`;
@@ -214,6 +232,26 @@ export function runOpplevelserGardssalgFieldConcordanceRemediationTests(
             <p>Kontakt oss: post@sidergarden.no eller ring 912 34 567 / 998 87 766.</p>
             <p>Adresse: Gardsveien 12, 5750 Odda.</p>
             <p>Åpningstider: Ma-Fr 10-16.</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        // (h) pagination fixtures, inserted later just before the pagination
+        // test block below — kept in this same mock so no re-wiring is
+        // needed. Both verbatim-match their stored epost (bekreftet) to keep
+        // would_queue/avvik noise out of the pagination-focused assertions.
+        if (host === "page-a-paginering.example.no") {
+          const html = `<html><body><p>Kontakt: epost-a@page.no</p></body></html>`;
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        if (host === "page-b-paginering.example.no") {
+          const html = `<html><body><p>Kontakt: epost-b@page.no</p></body></html>`;
           return {
             ok: true, status: 200, text: async () => html,
             arrayBuffer: async () => new TextEncoder().encode(html).buffer,
@@ -345,6 +383,137 @@ export function runOpplevelserGardssalgFieldConcordanceRemediationTests(
         .get() as any;
       assertEq(countAfterRerun.n, 1, "g2: still exactly one epost queue row for prov-avvik after multiple re-runs reaching the same avvik");
       assertEq(rowsAfterRerun.updated_at, rowsBeforeRerun.updated_at, "g3: updated_at is not bumped by a re-run reaching the identical conclusion");
+
+      // ── (h) review fix-up: limit/offset pagination (body-sourced) ────────
+      // Two new fixtures, added now (after the existing (b)-(g) assertions
+      // above have already run against the smaller 2-row cohort, so their
+      // provenance_written/queued counts stay correct) so the pagination
+      // block below has a clean, unqueued/unstamped 4-row cohort to page
+      // over. ORDER BY id: prov-avvik, prov-full-match, prov-page-a,
+      // prov-page-b.
+      insertProvider.run({
+        id: "prov-page-a",
+        navn: "Page A Test",
+        hjemmeside: "https://page-a-paginering.example.no",
+        epost: "epost-a@page.no",
+        telefon: null,
+        mobil: null,
+        adresse: null,
+        postnummer: null,
+        poststed: null,
+        opening_hours_text: null,
+        producer_type: "sideri",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+      insertProvider.run({
+        id: "prov-page-b",
+        navn: "Page B Test",
+        hjemmeside: "https://page-b-paginering.example.no",
+        epost: "epost-b@page.no",
+        telefon: null,
+        mobil: null,
+        adresse: null,
+        postnummer: null,
+        poststed: null,
+        opening_hours_text: null,
+        producer_type: "sideri",
+        rfb_seed_source: null,
+        catalog_hidden: 0,
+        field_provenance: VERIFIED_STAMP,
+      });
+
+      // h1: no params -> same response shape as before this fix-up (no
+      // `pagination` key at all). Content differs from the very first
+      // dry-run above (state has moved on — more fixtures, prior applies),
+      // so this checks SHAPE (top-level key set), not byte-for-byte content.
+      const noParamsAfterFixtures = await callRoute(opplevelserRouter, { headers: authHeaders, body: {} });
+      assertEq(noParamsAfterFixtures.status, 200, "h1a: no-params dry-run -> 200");
+      assertEq(
+        Object.keys(noParamsAfterFixtures.body).sort(),
+        ["dry_run", "success", "summary", "would_queue"].sort(),
+        "h1b: no-params response has the SAME top-level key set as before this fix-up — no `pagination` key",
+      );
+
+      // h2: limit over the cap (12) -> 400, never silently clamped.
+      const overCapLimit = await callRoute(opplevelserRouter, { headers: authHeaders, body: { limit: 13 } });
+      assertEq(overCapLimit.status, 400, "h2a: limit=13 (over cap) -> 400");
+      assertTrue(/12/.test(overCapLimit.body.error || ""), "h2b: error message names the cap (12)");
+
+      // h3: offset without limit -> 400.
+      const offsetOnly = await callRoute(opplevelserRouter, { headers: authHeaders, body: { offset: 1 } });
+      assertEq(offsetOnly.status, 400, "h3: offset without limit -> 400");
+
+      // h4: malformed limit/offset -> 400.
+      const zeroLimit = await callRoute(opplevelserRouter, { headers: authHeaders, body: { limit: 0 } });
+      assertEq(zeroLimit.status, 400, "h4a: limit=0 -> 400");
+      const negativeLimit = await callRoute(opplevelserRouter, { headers: authHeaders, body: { limit: -1 } });
+      assertEq(negativeLimit.status, 400, "h4b: limit=-1 -> 400");
+      const nonIntegerLimit = await callRoute(opplevelserRouter, { headers: authHeaders, body: { limit: "abc" } });
+      assertEq(nonIntegerLimit.status, 400, "h4c: limit=\"abc\" -> 400");
+      const negativeOffset = await callRoute(opplevelserRouter, { headers: authHeaders, body: { limit: 2, offset: -1 } });
+      assertEq(negativeOffset.status, 400, "h4d: negative offset -> 400");
+
+      // h5/h6: valid limit+offset, dry-run mode -> exactly that page, AND a
+      // fetch-mock call-count assertion that rows outside the page (indices
+      // 0-1: prov-avvik, prov-full-match) are never fetched at all during
+      // this call.
+      const dryRunFetchCountBefore = fetchCallCount;
+      const dryRunFetchedHostsLenBefore = fetchedHosts.length;
+      const dryRunPage = await callRoute(opplevelserRouter, { headers: authHeaders, body: { limit: 2, offset: 2 } });
+      assertEq(dryRunPage.status, 200, "h5a: valid limit+offset (dry-run) -> 200");
+      assertEq(
+        dryRunPage.body.pagination,
+        { total: 4, offset: 2, limit: 2, returned: 2, next_offset: null },
+        "h5b: pagination block matches {total, offset, limit, returned, next_offset}",
+      );
+      assertTrue(
+        !dryRunPage.body.would_queue.some((w: any) => w.provider_id === "prov-avvik" || w.provider_id === "prov-full-match"),
+        "h5c: would_queue never contains entries for rows outside the requested page",
+      );
+      const dryRunPageHosts = new Set(fetchedHosts.slice(dryRunFetchedHostsLenBefore));
+      assertTrue(fetchCallCount > dryRunFetchCountBefore, "h6a: at least one fetch call was made for this page (sanity)");
+      assertEq(
+        dryRunPageHosts,
+        new Set(["page-a-paginering.example.no", "page-b-paginering.example.no"]),
+        "h6b: exactly the 2 paged rows' hosts were fetched — never bryggeriet-avvik/sidergarden-fullmatch (outside the page)",
+      );
+
+      // h7/h8: valid limit+offset, apply=true mode -> the write blast-radius
+      // (provenance_written + queue) is bounded to the paged row(s) only,
+      // AND the same fetch-mock call-count proof as h6 applies here too.
+      const applyFetchCountBefore = fetchCallCount;
+      const applyFetchedHostsLenBefore = fetchedHosts.length;
+      const applyPage = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        body: { apply: true, limit: 1, offset: 2, batch_id: "batch-page-a" },
+      });
+      assertEq(applyPage.status, 200, "h7a: valid limit+offset (apply=true) -> 200");
+      assertEq(applyPage.body.provenance_written, 1, "h7b: provenance_written counts ONLY the one paged row (prov-page-a)");
+      assertEq(
+        applyPage.body.pagination,
+        { total: 4, offset: 2, limit: 1, returned: 1, next_offset: 3 },
+        "h7c: pagination block reflects the 1-row page out of the 4-row total",
+      );
+      const pageAProvenance = JSON.parse(
+        (expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id = 'prov-page-a'`).get() as any).field_provenance,
+      );
+      assertTrue(!!pageAProvenance.field_concordance, "h7d: prov-page-a (the paged row) DOES get a field_concordance stamp");
+      const pageBProvenance = JSON.parse(
+        (expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id = 'prov-page-b'`).get() as any).field_provenance,
+      );
+      assertTrue(
+        !pageBProvenance.field_concordance,
+        "h7e: prov-page-b (OUTSIDE the page) gets NO field_concordance stamp — apply's write blast-radius is bounded to the page",
+      );
+      const applyPageHosts = new Set(fetchedHosts.slice(applyFetchedHostsLenBefore));
+      assertTrue(fetchCallCount > applyFetchCountBefore, "h8a: at least one fetch call was made for this page (sanity)");
+      assertEq(
+        applyPageHosts,
+        new Set(["page-a-paginering.example.no"]),
+        "h8b: apply=true with limit+offset fetches ONLY the paged row's host — prov-page-b (outside the page) is never fetched",
+      );
     } catch (err: any) {
       failed++;
       failures.push(
