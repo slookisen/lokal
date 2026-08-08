@@ -8,6 +8,21 @@
  *   - POST /admin/gardssalg-content-rollback with entity_type: "experience"
  *     (rollback lever for Part B's writes, wired into the EXISTING endpoint)
  *
+ * Also covers dev-request 2026-08-07-dublett-evidensbasis-og-pool-
+ * avblokkering, slice 3's two remediation write-layer gaps (see (c-gapA)/
+ * (c-gapB)/(f-gapA)/(f-gapB) below):
+ *
+ *   - Gap A: a name_token/host_name pair is only write-eligible with a
+ *     "confirmed" gardssalg_experience_conflict_review verdict (slice 2's
+ *     queue table) — no decision, or a "rejected" one, lands in `skipped`
+ *     with reason "not_evidence_basis", never in `planned`/`applied`.
+ *     provider_link pairs are unaffected (always eligible, as before).
+ *   - Gap B ("the Lervig lesson"): even a write-eligible pair is never
+ *     written when its CURRENT booking_url is already a working, specific
+ *     deep link (non-trivial path/query) that differs from the producer's
+ *     bare homepage — `skipped`/"existing_deep_link_preserved" instead of
+ *     overwriting a useful URL with a strictly-worse generic one.
+ *
  * The pure matching-logic tests (findGardssalgProducerExperienceMatches,
  * incl. the Atlungstad case) live in
  * services/gardssalg-experience-conflict.test.ts — this file exercises the
@@ -202,10 +217,16 @@ export function runOpplevelserGardssalgExperienceConflictTests(
         hjemmeside: "https://hanen.no/gardsutsalg/aggregatorgaarden", catalog_hidden: 0,
         producer_type: "bryggeri", rfb_seed_source: null, content_source: "provider_site",
       });
+      // booking_url is deliberately ROOT-ONLY (no path) — this fixture's
+      // purpose is isolating the aggregator-hjemmeside-nulls-instead-of-
+      // copies rule (e1-e3 below) from slice 3's Gap B deep-link-preservation
+      // rule (a non-trivial path would trip THAT gate instead and the pair
+      // would be skipped rather than nulled — see exp-lervig below for that
+      // case tested on its own).
       insertExperience.run({
         id: "exp-aggregator-home", provider_id: null,
         title: "Aggregatorgaarden — bryggeribesøk", title_no: null,
-        booking_url: "https://wrong-host.example/aggregatorgaarden", content_source: null,
+        booking_url: "https://wrong-host.example", content_source: null,
         verification_status: "pending_verify",
       });
 
@@ -263,6 +284,122 @@ export function runOpplevelserGardssalgExperienceConflictTests(
         booking_url: "https://turoperator.example/galdhopiggen", content_source: null,
         verification_status: "pending_verify",
       });
+
+      // ── Slice 3 (dev-request 2026-08-07-dublett-evidensbasis-og-pool-
+      //    avblokkering) fixtures — Gap A (evidence-basis write-eligibility)
+      //    and Gap B (deep-link preservation). ──────────────────────────────
+
+      // (i) provider_link basis, root-only current booking_url — regression
+      //     guard: provider_link pairs are ALWAYS write-eligible (never
+      //     gated by Gap A), and a root-only booking_url is NOT a deep link,
+      //     so this must still get planned/applied as "corrected" exactly as
+      //     before slice 3 (acceptance criterion 3).
+      insertProvider.run({
+        id: "prod-providerlink", navn: "Providerlink Gard",
+        hjemmeside: "https://providerlinkgard.no", catalog_hidden: 0,
+        producer_type: "gardsbutikk", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertExperience.run({
+        id: "exp-providerlink", provider_id: "prod-providerlink",
+        title: "En helt annen tittel uten delte token", title_no: null,
+        booking_url: "https://wrong-host4.example", content_source: null,
+        verification_status: "pending_verify",
+      });
+
+      // (ii) name_token basis, NO review decision recorded at all — Gap A:
+      //      must be planned as `skipped` with reason "not_evidence_basis",
+      //      never in `planned`, regardless of what its booking_url looks
+      //      like (evidence-basis is checked before the deep-link check).
+      insertProvider.run({
+        id: "prod-nodecision", navn: "Kanonbryggeriet Spesial",
+        hjemmeside: "https://kanonbryggeriet.no", catalog_hidden: 0,
+        producer_type: "bryggeri", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertExperience.run({
+        id: "exp-nodecision", provider_id: null,
+        title: "Kanonbryggeriet Ølsmaking", title_no: null,
+        booking_url: "https://wrong-host5.example/smaking", content_source: null,
+        verification_status: "pending_verify",
+      });
+
+      // (iii) name_token basis, REJECTED review decision — Gap A: a rejected
+      //       verdict must ALSO land in `skipped`/"not_evidence_basis" (not
+      //       a distinct "rejected" reason) — rejected is exactly as
+      //       ineligible as "no decision yet".
+      insertProvider.run({
+        id: "prod-rejected", navn: "Stjerneskudd Gardsutsalg",
+        hjemmeside: "https://stjerneskudd.no", catalog_hidden: 0,
+        producer_type: "gardsbutikk", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertExperience.run({
+        id: "exp-rejected", provider_id: null,
+        title: "Stjerneskudd Sommeraktivitet", title_no: null,
+        booking_url: "https://wrong-host6.example/aktivitet", content_source: null,
+        verification_status: "pending_verify",
+      });
+
+      // (iv) name_token basis, CONFIRMED review decision, AND the current
+      //      booking_url is a working, specific deep link that differs from
+      //      the producer's bare homepage — "the Lervig lesson" (Gap B):
+      //      must be planned as `skipped`/"existing_deep_link_preserved",
+      //      NEVER silently overwritten with the generic producer homepage,
+      //      even though the pair has real (human-confirmed) evidence.
+      insertProvider.run({
+        id: "prod-lervig", navn: "Lervig Bryggeri",
+        hjemmeside: "https://lervig.no", catalog_hidden: 0,
+        producer_type: "bryggeri", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertExperience.run({
+        id: "exp-lervig", provider_id: null,
+        title: "Lervig Ølsmaking og bryggeribesøk", title_no: null,
+        booking_url: "https://lerviglocal.no/book", content_source: null,
+        verification_status: "pending_verify",
+      });
+
+      const conflictService = require("../services/gardssalg-experience-conflict") as
+        typeof import("../services/gardssalg-experience-conflict");
+
+      // Confirmed decisions for the three PRE-EXISTING name_token/host_name
+      // fixtures above ((b)-(h)): under slice 3's Gap A, a candidate pair is
+      // no longer write-eligible without one, so — since those fixtures'
+      // whole point is exercising the corrected/nulled/locked remediation
+      // paths, not Gap A itself — they need a "confirmed" verdict recorded to
+      // keep exercising exactly what they did before this slice.
+      conflictService.recordGardssalgExperienceConflictReviewDecision(expDb, {
+        producer_id: "atlungstad-brenneri--bbe4185d",
+        experience_id: "norway-s-oldest-distillery-tours-tastings--68220487",
+        verdict: "confirmed",
+        decided_by: "test-seed",
+      });
+      conflictService.recordGardssalgExperienceConflictReviewDecision(expDb, {
+        producer_id: "prod-aggregator-home",
+        experience_id: "exp-aggregator-home",
+        verdict: "confirmed",
+        decided_by: "test-seed",
+      });
+      conflictService.recordGardssalgExperienceConflictReviewDecision(expDb, {
+        producer_id: "prod-locked",
+        experience_id: "exp-locked",
+        verdict: "confirmed",
+        decided_by: "test-seed",
+      });
+      // (iii)'s rejected decision.
+      conflictService.recordGardssalgExperienceConflictReviewDecision(expDb, {
+        producer_id: "prod-rejected",
+        experience_id: "exp-rejected",
+        verdict: "rejected",
+        decided_by: "test-seed",
+      });
+      // (iv)'s confirmed decision — evidence-basis alone is NOT enough to
+      // overwrite the deep link; Gap B must still catch it.
+      conflictService.recordGardssalgExperienceConflictReviewDecision(expDb, {
+        producer_id: "prod-lervig",
+        experience_id: "exp-lervig",
+        verdict: "confirmed",
+        decided_by: "test-seed",
+      });
+      // (ii) — prod-nodecision/exp-nodecision deliberately gets NO decision
+      // recorded at all.
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
@@ -395,6 +532,31 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertEq(afterDryRun.booking_url, "https://atlungstad.no", "c7: dry-run performed ZERO writes — booking_url completely unchanged");
       assertEq(getConflictAuditRows("norway-s-oldest-distillery-tours-tastings--68220487").length, 0, "c8: dry-run inserted zero audit rows");
 
+      // ── (c-gapA/c-gapB) slice 3 — Gap A (evidence-basis write-eligibility)
+      //     and Gap B (deep-link preservation), dry-run ────────────────────
+      const dryRunProviderlink = dryRunRes.body.planned.find((a: any) => a.experience_id === "exp-providerlink");
+      assertTrue(!!dryRunProviderlink, "c9: provider_link pair with root-only booking_url IS planned (acceptance criterion 3 — no regression)");
+      assertEq(dryRunProviderlink?.would_write, "https://providerlinkgard.no", "c10: provider_link pair's plan targets the producer hjemmeside");
+      assertEq(dryRunProviderlink?.action, "corrected", "c11: provider_link pair's action is 'corrected'");
+
+      const dryRunNoDecisionPlanned = dryRunRes.body.planned.some((a: any) => a.experience_id === "exp-nodecision");
+      assertTrue(!dryRunNoDecisionPlanned, "c12: name_token pair with NO review decision NEVER appears in 'planned' (Gap A)");
+      const skippedNoDecision = dryRunRes.body.skipped.find((s: any) => s.experience_id === "exp-nodecision");
+      assertTrue(!!skippedNoDecision, "c13: name_token pair with no decision IS in 'skipped' (never silently dropped)");
+      assertEq(skippedNoDecision?.reason, "not_evidence_basis", "c14: reason is 'not_evidence_basis'");
+
+      const dryRunRejectedPlanned = dryRunRes.body.planned.some((a: any) => a.experience_id === "exp-rejected");
+      assertTrue(!dryRunRejectedPlanned, "c15: name_token pair with a REJECTED decision NEVER appears in 'planned' (Gap A)");
+      const skippedRejected = dryRunRes.body.skipped.find((s: any) => s.experience_id === "exp-rejected");
+      assertTrue(!!skippedRejected, "c16: rejected-decision pair IS in 'skipped'");
+      assertEq(skippedRejected?.reason, "not_evidence_basis", "c17: a REJECTED decision gets the SAME reason as no decision — 'not_evidence_basis', not a distinct 'rejected' reason");
+
+      const dryRunLervigPlanned = dryRunRes.body.planned.some((a: any) => a.experience_id === "exp-lervig");
+      assertTrue(!dryRunLervigPlanned, "c18: Lervig-shaped pair (confirmed, existing deep link) NEVER appears in 'planned' — Gap B (acceptance criterion 2)");
+      const skippedLervig = dryRunRes.body.skipped.find((s: any) => s.experience_id === "exp-lervig");
+      assertTrue(!!skippedLervig, "c19: Lervig-shaped pair IS in 'skipped'");
+      assertEq(skippedLervig?.reason, "existing_deep_link_preserved", "c20: reason is 'existing_deep_link_preserved' — evidence-basis alone does not license overwriting a working deep link");
+
       // ── (d) apply=true — the real write, PLUS the agreeing pair must be
       //     left completely untouched ──────────────────────────────────────
       const batchId = "test-batch-steg2";
@@ -464,6 +626,45 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertTrue(
         applyRes.body.skipped.some((s: any) => s.experience_id === "exp-locked" && s.reason === "locked"),
         "f3: apply response reports exp-locked skipped with reason 'locked'",
+      );
+
+      // ── (f-gapA/f-gapB) slice 3 — Gap A/Gap B on apply=true: eligible pairs
+      //     get written for real; ineligible/deep-link pairs are genuinely
+      //     never touched, not just absent from a dry-run preview ──────────
+      const providerlinkAfterApply = getExperienceRow("exp-providerlink");
+      assertEq(providerlinkAfterApply.booking_url, "https://providerlinkgard.no", "f4: provider_link pair WAS written on apply (acceptance criterion 3 — no regression)");
+      assertEq(getConflictAuditRows("exp-providerlink").length, 1, "f5: provider_link pair's write is audited");
+      assertTrue(
+        applyRes.body.applied.some((a: any) => a.experience_id === "exp-providerlink" && a.action === "corrected"),
+        "f6: apply response's 'applied' array reports the provider_link write",
+      );
+
+      const noDecisionAfterApply = getExperienceRow("exp-nodecision");
+      assertEq(noDecisionAfterApply.booking_url, "https://wrong-host5.example/smaking", "f7: name_token pair with no decision — booking_url completely untouched by apply=true (Gap A)");
+      assertEq(getConflictAuditRows("exp-nodecision").length, 0, "f8: no audit row for the undecided pair");
+      assertTrue(
+        applyRes.body.skipped.some((s: any) => s.experience_id === "exp-nodecision" && s.reason === "not_evidence_basis"),
+        "f9: apply response reports exp-nodecision skipped with reason 'not_evidence_basis'",
+      );
+
+      const rejectedAfterApply = getExperienceRow("exp-rejected");
+      assertEq(rejectedAfterApply.booking_url, "https://wrong-host6.example/aktivitet", "f10: rejected-decision pair — booking_url completely untouched by apply=true (Gap A)");
+      assertEq(getConflictAuditRows("exp-rejected").length, 0, "f11: no audit row for the rejected pair");
+      assertTrue(
+        applyRes.body.skipped.some((s: any) => s.experience_id === "exp-rejected" && s.reason === "not_evidence_basis"),
+        "f12: apply response reports exp-rejected skipped with reason 'not_evidence_basis' (same as no-decision, not a distinct 'rejected' reason)",
+      );
+
+      const lervigAfterApply = getExperienceRow("exp-lervig");
+      assertEq(
+        lervigAfterApply.booking_url,
+        "https://lerviglocal.no/book",
+        "f13: 'the Lervig lesson' — a CONFIRMED pair whose current booking_url is a working deep link is NEVER overwritten with the generic producer homepage, even on apply=true (acceptance criterion 2)",
+      );
+      assertEq(getConflictAuditRows("exp-lervig").length, 0, "f14: no audit row for the deep-link-preserved pair — genuinely never written, not just skipped-in-response");
+      assertTrue(
+        applyRes.body.skipped.some((s: any) => s.experience_id === "exp-lervig" && s.reason === "existing_deep_link_preserved"),
+        "f15: apply response reports exp-lervig skipped with reason 'existing_deep_link_preserved'",
       );
 
       // ── (g) POST .../gardssalg-content-rollback { entity_type: "experience" } ──

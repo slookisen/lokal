@@ -8727,7 +8727,16 @@ router.post("/admin/gardssalg-experience-conflict-remediation", requireAdmin, (r
   try {
     const { pairs } = runGardssalgExperienceConflictScan(expDb);
     const conflicting: GsExpMatchedPair[] = pairs.filter((p) => p.status === "conflict");
-    const { applicable, skipped } = planGardssalgExperienceConflictRemediation(expDb, conflicting);
+    // Gap A (dev-request 2026-08-07-dublett-evidensbasis-og-pool-
+    // avblokkering, slice 3): same review-decisions lookup the queue route
+    // (GET .../gardssalg-experience-conflict-queue above) and the readiness
+    // gate (computeGardssalgReadinessRows, ~L7405) already use — loaded
+    // fresh here too (never trusts a client-supplied decision), so
+    // planGardssalgExperienceConflictRemediation can restrict write-
+    // eligibility to provider_link pairs + human-CONFIRMED candidate pairs
+    // only. See that function's own doc comment for the full reasoning.
+    const reviewDecisions = loadGardssalgExperienceConflictReviewDecisions(expDb);
+    const { applicable, skipped } = planGardssalgExperienceConflictRemediation(expDb, conflicting, reviewDecisions);
 
     if (!apply) {
       res.json({
