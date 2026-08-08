@@ -37827,3 +37827,55 @@ runSerial(async () => {
     failures.push("rfb-poolgate-stegc: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-08-crm-html-sanitizer-oedelegger-utgaaende-epost: the
+// global sanitizeInput middleware stripped HTML tags out of EVERY string in
+// every request body, including `bodyHtml` on the CRM compose/reply routes —
+// whose contract IS html. A producer-facing test send landed in a real inbox
+// on 2026-08-08 with its <style> rule-set as visible prose and its signature
+// lines glued together. Own dedicated test file: proves the path+field
+// allowlist keeps bodyHtml byte-identical while every sibling field on the
+// same request is still sanitized, that the XSS defence is intact, and that
+// the two corrected regexes no longer eat ordinary Norwegian text
+// ("sesong=") or legitimate HTML entities. Synchronous — registered like the
+// other middleware suites.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-08-crm-html-sanitizer: sanitizeInput HTML-field allowlist ──");
+  try {
+    const { runSecuritySanitizeHtmlFieldsTests } = require("../src/middleware/security-sanitize-html-fields.test") as
+      typeof import("../src/middleware/security-sanitize-html-fields.test");
+    const san = runSecuritySanitizeHtmlFieldsTests({ log: false });
+    passed += san.passed;
+    failed += san.failed;
+    for (const f of san.failures) failures.push("security-sanitize-html-fields: " + f);
+    console.log(`  security-sanitize-html-fields: ${san.passed} passed, ${san.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("security-sanitize-html-fields: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-08-opplevagent-slik-fungerer-det: the producer-facing
+// explainer page the gårdssalg outreach email points at ("hva er dette, og
+// hvordan havner vi i ChatGPT?"). Beyond the render/SEO/cross-link checks,
+// this suite carries the HONESTY guards for the page: booking described as
+// off-by-default and producer-confirmed, no payment handling claimed, the
+// not-yet-built "profile answers the guest's assistant" capability confined
+// to the «På vei» section, and the legal paragraph kept as a description of
+// a proposal on høring rather than a claim that the law has changed. Loads
+// the seo module, so it is registered like the sibling for-tilbydere suite.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-08-opplevagent-slik-fungerer-det: GET /slik-fungerer-det ──");
+  try {
+    const { runSlikFungererDetTests } = require("../src/routes/slik-fungerer-det.test") as
+      typeof import("../src/routes/slik-fungerer-det.test");
+    const sf = await runSlikFungererDetTests({ log: false });
+    passed += sf.passed;
+    failed += sf.failed;
+    for (const f of sf.failures) failures.push("slik-fungerer-det: " + f);
+    console.log(`  slik-fungerer-det: ${sf.passed} passed, ${sf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("slik-fungerer-det: unexpected error: " + String(err?.message || err));
+  }
+});

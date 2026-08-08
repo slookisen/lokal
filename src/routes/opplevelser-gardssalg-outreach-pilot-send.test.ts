@@ -396,6 +396,44 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       assertEq(sent[0].to, "post@fixture-foxtrot.no", "h12: without is_test, the REAL recipient is used, not the redirect address");
       assertTrue(!String(sent[0].subject || "").startsWith("[TESTSENDING]"), "h13: subject is not marked as a test send");
 
+      // ── (h2) the copy Daniel signed off on 2026-08-08 — asserted against
+      // the REAL envelope, so a template edit that breaks one of these has to
+      // be a deliberate act. The /slik-fungerer-det link in particular is a
+      // cross-file contract: the page must exist (see slik-fungerer-det.test.ts)
+      // or this email points producers at a 404.
+      // Collapse whitespace before matching: the plain-text template is hard
+      // wrapped at ~80 columns, so a sentence that reads as one phrase spans
+      // a newline in the source. Asserting on the wrapped form would make
+      // these tests fail on a harmless re-wrap.
+      const flat = (s: unknown) => String(s || "").replace(/\s+/g, " ");
+      const htmlBody = flat(sent[0].html);
+      const textBody = flat(sent[0].text);
+      assertTrue(
+        String(sent[0].subject || "").includes("har fått en profil på Opplevagent"),
+        "h14: subject uses the approved 2026-08-08 line",
+      );
+      assertTrue(
+        htmlBody.includes("opplevagent.no/slik-fungerer-det") && textBody.includes("opplevagent.no/slik-fungerer-det"),
+        "h15: both parts link to the /slik-fungerer-det explainer the copy promises",
+      );
+      assertTrue(
+        htmlBody.includes("5. september") && textBody.includes("5. september"),
+        "h16: the høringsfrist hook is present in both parts",
+      );
+      assertTrue(
+        htmlBody.includes("fjerner jeg profilen") && textBody.includes("fjerner jeg profilen"),
+        "h17: the opt-out sentence is present in both parts (never ship cold outreach without it)",
+      );
+      assertTrue(
+        !htmlBody.includes("kontakt@rettfrabonden.com") && !textBody.includes("kontakt@rettfrabonden.com"),
+        "h18: exactly ONE reply address — a second address would misroute replies into the RFB CRM bucket",
+      );
+      // The 2026-08-08 inbox incident: a <style> block whose tags get stripped
+      // renders its CSS as visible prose. This template carries no <style> at
+      // all, and no <br> that could silently glue signature lines together.
+      assertTrue(!/<style[\s>]/i.test(htmlBody), "h19: the HTML part carries no <style> block (inline styles only)");
+      assertTrue(!/<br\s*\/?>/i.test(htmlBody), "h20: the HTML part uses no <br> (stripped <br> glued the signature together)");
+
       // ── (i) apply writes exactly one row for the eligible provider ──
       const foxtrotRows = expDb
         .prepare(`SELECT provider_id, recipient_email FROM experience_outreach_sent_log WHERE provider_id = 'prov-foxtrot'`)

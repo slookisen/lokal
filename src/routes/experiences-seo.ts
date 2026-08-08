@@ -264,6 +264,12 @@ function oaSiteFooter(opts: { lang?: Lang } = {}): string {
       <a href="${langPrefix}#kategorier">${S.navCategories}</a>
       <a href="${langPrefix}#slik-funker-det">${S.navHow}</a>
       <a href="/for-tilbydere">${S.navProviders}</a>
+      <!-- dev-request 2026-08-08-opplevagent-slik-fungerer-det: the producer-
+           facing explainer the outreach email points at. NO-only for now —
+           the page itself is Norwegian, so an EN footer link would promise a
+           translation that does not exist (same honesty rule the rest of this
+           file follows for language). -->
+      ${lang === "en" ? "" : `<a href="/slik-fungerer-det">Slik fungerer det</a>`}
       <a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
     </div>
     <div class="footer-col">
@@ -2089,6 +2095,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     // present (no DB dependency). Its /for-tilbydere/finn search subpage is
     // noindex,follow (its own meta tag) and deliberately NOT listed here.
     { p: "/for-tilbydere", freq: "monthly", pri: "0.6" },
+    { p: "/slik-fungerer-det", freq: "monthly", pri: "0.6" },
     { p: "/guide-opplevelser-mcp", freq: "monthly", pri: "0.6" },
     { p: "/proveniens", freq: "monthly", pri: "0.5" },
     { p: "/llms.txt", freq: "weekly", pri: "0.8" },
@@ -7865,6 +7872,18 @@ const FOR_TILBYDERE_CSS = `
   .ft-hit .claim a{display:inline-block;background:var(--fjord-800);color:#fff;font-weight:700;font-size:.86rem;padding:8px 16px;border-radius:var(--r-pill)}
   .ft-hit .claim a:hover{background:var(--fjord-700);text-decoration:none}
   .ft-hint{background:var(--surface);border:1px dashed var(--line);border-radius:var(--r-lg);padding:26px 24px;margin:24px 0;color:var(--ink-soft);max-width:64ch}
+  /* /slik-fungerer-det (dev-request 2026-08-08-opplevagent-slik-fungerer-det):
+     reuses .ft-section/.ft-steps above; only the flow diagram, the callout and
+     the Q&A blocks below are new. */
+  .sf-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin:18px 0 6px;counter-reset:sf}
+  .sf-flow li{list-style:none;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:18px 16px;box-shadow:var(--sh-sm);position:relative}
+  .sf-flow li b{display:block;font-size:.98rem;color:var(--fjord-900);margin-bottom:5px}
+  .sf-flow li span{font-size:.88rem;color:var(--ink-soft)}
+  .sf-note{background:var(--surface);border-left:4px solid var(--fjord-800);border-radius:0 var(--r-md) var(--r-md) 0;padding:18px 20px;margin:20px 0;max-width:64ch;color:var(--ink-soft)}
+  .sf-note b{color:var(--fjord-900)}
+  .sf-qa{margin:14px 0 0;max-width:64ch}
+  .sf-qa h3{font-size:1rem;font-weight:700;color:var(--fjord-900);margin:16px 0 4px}
+  .sf-qa p{font-size:.93rem;color:var(--ink-soft)}
 `;
 
 // GET search form shared by both pages — plain form, no JS, mirrors the
@@ -7942,6 +7961,7 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
   <header class="head ft-hero">
     <h1>For tilbydere</h1>
     <p class="lede">Driver du et gårdsutsalg, bryggeri, sideri eller annet besøkssted som allerede står på Opplevagent? Profilen din er trolig her — ta eierskap til den, gratis, og hold informasjonen oppdatert selv.</p>
+    <p style="font-size:.9rem;color:var(--ink-soft)">Lurer du på hva Opplevagent er og hvordan AI-assistenter bruker profilen din? Les <a href="/slik-fungerer-det">slik fungerer det</a>.</p>
   </header>
 
   <section class="ft-section" aria-labelledby="ft-finn-h">
@@ -7998,6 +8018,149 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
   res.send(forTilbyderePage({
     title: "For tilbydere — ta eierskap til profilen din | Opplevagent",
     metaDesc: "Driver du et gårdsutsalg, bryggeri eller sideri som står på Opplevagent? Slik tar du eierskap til profilen din: finn bedriften, be om tilgangslenke på e-post, og rediger informasjon, produkter og reservasjoner selv.",
+    robotsMeta: `<meta name="robots" content="index, follow">`,
+    canonical: `<link rel="canonical" href="${canonical}">`,
+    jsonLd,
+    main,
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /slik-fungerer-det — the producer-facing "how this platform works"
+// page (dev-request 2026-08-08-opplevagent-slik-fungerer-det).
+//
+// WHY a separate page from /for-tilbydere and from /proveniens: the three
+// answer different questions and each already has a job.
+//   /for-tilbydere → "how do I take over my profile" (the claim mechanics)
+//   /proveniens    → "where does your data come from / how is it verified"
+//   here           → "what IS this, how does an AI assistant end up
+//                     recommending us, and what happens when a guest books"
+// The outreach email points here, so this page has to answer a cold
+// recipient's first question without them having to reply to ask.
+//
+// Audience is deliberately the PRODUCER (a brewery owner), not a developer:
+// the agent-facing endpoints already have their own surfaces (llms.txt,
+// agent-card.json, /mcp, /guide-opplevelser-mcp) and are linked from the
+// footer — this page links to them once, at the end, and otherwise stays in
+// plain language.
+//
+// Every factual claim here must match what the platform actually does today,
+// and forward-looking items must be visibly marked as such (the "På vei"
+// section) — same honesty discipline as /proveniens and the dark-launch
+// booking notice. Reuses forTilbyderePage()'s shell + FOR_TILBYDERE_CSS.
+// ═══════════════════════════════════════════════════════════
+router.get("/slik-fungerer-det", (_req: Request, res: Response) => {
+  const url = baseUrl();
+  const canonical = `${url}/slik-fungerer-det`;
+  const jsonLd = `<script type="application/ld+json">${JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "WebPage",
+    name: "Slik fungerer Opplevagent",
+    description:
+      "Hvordan AI-assistenter henter informasjon om norske drikkeprodusenter fra Opplevagent, hva du får ved å overta profilen din, og hvordan booking av besøk fungerer.",
+    url: canonical,
+  })}</script>
+<script type="application/ld+json">${JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+      { "@type": "ListItem", position: 2, name: "Slik fungerer det", item: canonical },
+    ],
+  })}</script>`;
+  const main = `
+  <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · Slik fungerer det</nav>
+  <header class="head ft-hero">
+    <h1>Slik fungerer Opplevagent</h1>
+    <p class="lede">Stadig flere finner fram ved å spørre en AI-assistent i stedet for å søke seg gjennom trefflister. Opplevagent er bygget for at assistenten skal finne riktig svar om norske drikkeprodusenter — og for at du som produsent skal eie det svaret.</p>
+  </header>
+
+  <section class="ft-section" aria-labelledby="sf-flyt-h">
+    <h2 id="sf-flyt-h">Fra spørsmål til besøk</h2>
+    <p>En gjest spør assistenten sin om noe konkret — «finnes det et bryggeri i nærheten av Voss vi kan besøke i helgen?». Da skjer dette:</p>
+    <ol class="sf-flow">
+      <li><b>1. Gjesten spør</b><span>I ChatGPT, Claude eller en annen assistent — med vanlige ord, ikke søkeord.</span></li>
+      <li><b>2. Assistenten slår opp</b><span>Den henter strukturerte data direkte fra Opplevagent: hvem dere er, hvor dere holder til, hva dere lager.</span></li>
+      <li><b>3. Gjesten får svaret</b><span>Med navn, sted og lenke til profilen deres — ikke en annonseplass, men et oppslag.</span></li>
+      <li><b>4. Gjesten kan melde seg på</b><span>Har dere skrudd på booking, kan besøket avtales med én gang. Dere bekrefter selv.</span></li>
+    </ol>
+    <p style="font-size:.86rem;color:var(--mist);max-width:64ch">Forskjellen fra vanlig søk: assistenten trenger ikke å tolke nettsiden deres. Den leser et maskinlesbart oppslagsverk der informasjonen allerede står ryddig — så dere konkurrerer ikke om plassering, dere er enten i oppslagsverket eller ikke.</p>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-profil-h">
+    <h2 id="sf-profil-h">Hvor profilen deres kommer fra</h2>
+    <p>Profilen finnes sannsynligvis allerede, uten at dere har gjort noe. Den er bygget på offentlige kilder: <strong>Brønnøysundregistrene</strong> for at det står et aktivt, registrert selskap bak, og bedriftens egen nettside for beskrivelse og produkter. Vi gjetter ikke — mangler vi noe, står feltet tomt heller enn å bli fylt med noe sannsynlig.</p>
+    <p>Detaljene om hvordan vi verifiserer, står på <a href="/proveniens">siden om datagrunnlaget vårt</a>.</p>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-overta-h">
+    <h2 id="sf-overta-h">Hva dere får ved å overta profilen</h2>
+    <p>Å overta profilen er gratis, tar noen minutter og krever verken registrering eller passord — bare en e-postbekreftelse til adressen som er registrert for bedriften. <a href="/for-tilbydere">Slik gjør dere det</a>.</p>
+    <ul class="ft-edit-list">
+      <li><strong>Dere styrer innholdet.</strong> Beskrivelse, produkter, åpningstider og praktisk info — det dere skriver er det assistentene henter.</li>
+      <li><strong>Dere ser besøkstallene.</strong> Hvor mange som har vært innom profilen de siste 90 dagene, og hvor stor del av trafikken som kommer fra AI-assistenter og roboter kontra mennesker.</li>
+      <li><strong>Dere får «Bekreftet av eier»-merket.</strong> Et tillitssignal både for gjester og for assistentene som leser profilen.</li>
+      <li><strong>Dere bestemmer over booking.</strong> Av som standard — se under.</li>
+    </ul>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-booking-h">
+    <h2 id="sf-booking-h">Booking av besøk — slik virker den</h2>
+    <p>Hver profil har et påmeldingssystem for besøk. Det er <strong>avslått som standard</strong>, og ingen kan booke hos dere før dere selv skrur det på i eierportalen.</p>
+    <ol class="sf-flow">
+      <li><b>1. Gjesten melder seg på</b><span>Velger tidspunkt og antall personer på profilen deres — eller via assistenten sin.</span></li>
+      <li><b>2. Dere får forespørselen</b><span>På e-posten deres, med navn, tidspunkt og antall.</span></li>
+      <li><b>3. Dere bekrefter selv</b><span>Ingenting er avtalt før dere har sagt ja. Dere kan foreslå et annet tidspunkt eller avslå.</span></li>
+    </ol>
+    <div class="sf-note"><b>Det koster ingenting.</b> Verken profilen, overtakelsen eller påmeldingene. Vi tar ikke betalt fra gjesten og tar ingen andel av et salg — Opplevagent håndterer ikke betaling i det hele tatt, og selger ikke alkohol. Systemet avtaler et besøk; alt annet skjer hos dere.</div>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-lov-h">
+    <h2 id="sf-lov-h">Hvorfor dette er aktuelt nå</h2>
+    <p>Regjeringen har sendt på høring et forslag om utvidet gårdssalg av alkohol, med høringsfrist 5. september 2026. Slik forslaget er formulert, skal salget knyttes til et betalt besøksarrangement med et faglig innhold — omvisning, smaking, foredrag eller overnatting — og med årlige tak for hvor mye som kan selges fra produksjonsstedet.</p>
+    <p>Blir det vedtatt, blir det å ta imot besøk — og kunne håndtere en påmelding — en praktisk forutsetning for salg, ikke bare et hyggelig tillegg. Det er en av grunnene til at vi begynte med drikkeprodusenter. Vi følger prosessen, men vi er ikke part i den: dette er en beskrivelse av et forslag på høring, ikke juridisk rådgivning, og dere må selv forholde dere til reglene som gjelder for deres bevilling.</p>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-paavei-h">
+    <h2 id="sf-paavei-h">På vei</h2>
+    <p>Dette er et prosjekt under utvikling, og vi vil heller si hva som ennå ikke finnes enn å love det bort:</p>
+    <ul class="ft-edit-list">
+      <li><strong>Profilen som samtalepartner.</strong> I dag <em>henter</em> assistenter informasjon herfra. Målet er at profilen deres selv skal kunne svare på spørsmål fra gjestens assistent — om ledige tider, sesong eller hva som er på fat akkurat nå.</li>
+      <li><strong>Produsent-oppdatert tilgjengelighet.</strong> At dere kan si fra når noe er utsolgt eller stengt, og at assistentene får det med seg samme dag.</li>
+    </ul>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-sporsmal-h">
+    <h2 id="sf-sporsmal-h">Vanlige spørsmål</h2>
+    <div class="sf-qa">
+      <h3>Må vi betale for å stå oppført?</h3>
+      <p>Nei. Katalogen er gratis for produsenter, og vi selger ikke plassering.</p>
+      <h3>Vi vil ikke stå oppført. Hva gjør vi?</h3>
+      <p>Si fra til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>, så fjerner vi profilen med en gang. Ingen begrunnelse nødvendig.</p>
+      <h3>Hva om noe på profilen er feil?</h3>
+      <p>Send oss en melding, så retter vi det — eller overta profilen og rett det selv.</p>
+      <h3>Kan vi ha profilen uten booking?</h3>
+      <p>Ja. Booking er avslått til dere selv skrur den på, og kan skrus av igjen når som helst.</p>
+      <h3>Hvem kan overta profilen vår?</h3>
+      <p>Bare den som har tilgang til bedriftens registrerte e-postadresse. Innloggingslenken sendes dit — det er hele sikkerheten.</p>
+    </div>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-teknisk-h">
+    <h2 id="sf-teknisk-h">For deg som vil se maskineriet</h2>
+    <p>Dataene er åpent tilgjengelige for AI-assistenter og utviklere gjennom etablerte standarder — <a href="/mcp">MCP</a>, <a href="/.well-known/agent-card.json">agent-card</a>, <a href="/openapi.json">OpenAPI</a> og <a href="/llms.txt">llms.txt</a>. <a href="/guide-opplevelser-mcp">Guiden for å koble til fra din egen assistent</a> viser oppsettet.</p>
+  </section>
+
+  <section class="ft-section" aria-labelledby="sf-kontakt-h">
+    <h2 id="sf-kontakt-h">Spørsmål?</h2>
+    <p>Send en e-post til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Det er en reell innboks, og du får svar fra et menneske.</p>
+  </section>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(forTilbyderePage({
+    title: "Slik fungerer Opplevagent — for produsenter | Opplevagent",
+    metaDesc:
+      "Hvordan AI-assistenter finner og anbefaler norske drikkeprodusenter via Opplevagent, hva du får ved å overta profilen din, og hvordan påmelding til besøk fungerer. Gratis for produsenter.",
     robotsMeta: `<meta name="robots" content="index, follow">`,
     canonical: `<link rel="canonical" href="${canonical}">`,
     jsonLd,

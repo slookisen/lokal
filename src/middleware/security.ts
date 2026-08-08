@@ -65,10 +65,24 @@ function sanitizeValue(value: any): any {
   if (typeof value === "string") {
     return value
       .replace(/<[^>]*>/g, "")          // strip HTML tags
-      .replace(/&#\d+;/g, "")           // strip numeric HTML entities
-      .replace(/&#x[0-9a-fA-F]+;/g, "") // strip hex HTML entities
-      .replace(/javascript:/gi, "")      // strip javascript: URIs
-      .replace(/on\w+\s*=/gi, "");       // strip inline event handlers
+      // dev-request 2026-08-08-crm-html-sanitizer-oedelegger-utgaaende-epost:
+      // the inline-event-handler pattern used to be /on\w+\s*=/gi, which
+      // matches INSIDE ordinary words that merely contain "on" before an "="
+      // — Norwegian text is full of them, so `sesong=` silently became `ses`
+      // and `stasjon=1` became `stasj1`. \b anchors the match to a word
+      // START, which is the only position a real HTML attribute can occupy
+      // (`<a onclick=…>`, ` onerror=…`); an event handler never begins
+      // mid-word, so nothing that was caught for a security reason stops
+      // being caught.
+      .replace(/\bon\w+\s*=/gi, "")      // strip inline event handlers
+      .replace(/javascript:/gi, "");     // strip javascript: URIs
+    // The two numeric/hex HTML-entity strippers that used to sit here are
+    // deliberately GONE (same dev-request). They removed `&#39;`/`&#x27;`
+    // from every string in every request body — legitimate text harvested
+    // from producer websites included — while defending nothing on their
+    // own: an entity is inert until something renders it, and every surface
+    // that renders user data escapes at output (escapeHtml/epEscape). What
+    // they actually did was corrupt stored data.
   }
   if (Array.isArray(value)) {
     return value.map(sanitizeValue);
@@ -83,9 +97,64 @@ function sanitizeValue(value: any): any {
   return value;
 }
 
+// ─── HTML-bearing fields, exempt from tag-stripping ──────────
+// dev-request 2026-08-08-crm-html-sanitizer-oedelegger-utgaaende-epost.
+//
+// A few admin-key-gated endpoints take a field whose CONTRACT is HTML —
+// `bodyHtml` on the CRM compose/reply routes is an operator-authored email
+// body. Running it through sanitizeValue() removes the tags but keeps their
+// text content, so a <style> block arrives as visible CSS prose and <br>
+// glues neighbouring lines together. That is exactly what a producer-facing
+// test send looked like in a real inbox on 2026-08-08.
+//
+// The allowlist is defined SERVER-side and keyed on (path prefix, field
+// name): a request can never ask to skip sanitization, only land on a route
+// that already declares one of its own fields as HTML. Everything else on
+// the very same request — subject, bodyText, contactName — is sanitized
+// exactly as before. The routes named here are all behind the admin key.
+// `path` matches exactly; `pathPrefix` is for parameterized routes (a thread
+// id sits in the middle) and matches only on a "/" boundary — so
+// "/admin/crm/composer-anything" never inherits "/admin/crm/compose"'s
+// exemption by accident.
+const HTML_BEARING_FIELDS: ReadonlyArray<
+  { path?: string; pathPrefix?: string; fields: readonly string[] }
+> = [
+  { path: "/admin/crm/compose", fields: ["bodyHtml"] },
+  { pathPrefix: "/admin/crm/threads/", fields: ["bodyHtml"] },
+];
+
+/** The HTML-bearing field names declared for this request's path, if any. */
+function htmlBearingFieldsFor(path: string): readonly string[] | null {
+  const normalized = path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+  for (const entry of HTML_BEARING_FIELDS) {
+    if (entry.path && normalized === entry.path) return entry.fields;
+    if (entry.pathPrefix && normalized.startsWith(entry.pathPrefix)) return entry.fields;
+  }
+  return null;
+}
+
 export function sanitizeInput(req: Request, _res: Response, next: NextFunction) {
   if (req.body && typeof req.body === "object") {
-    req.body = sanitizeValue(req.body);
+    // req.path is the path WITHIN the mounted router; req.originalUrl carries
+    // the full mount path the allowlist is written against. Query string is
+    // irrelevant here, so compare against the path portion only.
+    const fullPath = (req.originalUrl || req.url || "").split("?")[0];
+    const exempt = htmlBearingFieldsFor(fullPath);
+    if (exempt && !Array.isArray(req.body)) {
+      // Preserve the exempt fields verbatim, sanitize everything else.
+      const preserved = new Map<string, unknown>();
+      for (const field of exempt) {
+        if (typeof (req.body as Record<string, unknown>)[field] === "string") {
+          preserved.set(field, (req.body as Record<string, unknown>)[field]);
+        }
+      }
+      req.body = sanitizeValue(req.body);
+      for (const [field, original] of preserved) {
+        (req.body as Record<string, unknown>)[field] = original;
+      }
+    } else {
+      req.body = sanitizeValue(req.body);
+    }
   }
   next();
 }
