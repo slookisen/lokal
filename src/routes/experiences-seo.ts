@@ -349,15 +349,18 @@ const OA_CHROME_CSS = `
 // motifs, one palette (the page's own tokens only — fjord silhuettes as
 // rgba(#0b2e29)/rgba(#18130d), copper #c98a2b at low opacity, #12a594/#ff5d3b
 // glows via <radialGradient>):
-//   "forside" — fjord/farm silhouettes in three depth layers + a discreet
-//               copper pot-still in the right field (replaces the old
-//               two-path .hero-range mountain strip, whose role the darkest
-//               bottom layer takes over).
+//   "forside" — neutral fjord/farm silhouettes in three depth layers
+//               (replaces the old two-path .hero-range mountain strip, whose
+//               role the darkest bottom layer takes over). S2b (dev-request
+//               2026-08-06, Daniel's directive): the distillery identity
+//               belongs to the gardssalg surfaces ONLY, so the copper
+//               pot-still + its steam were REMOVED from this motif — the
+//               landscape itself is byte-identical to its S2 form.
 //   "drikke"  — copper kettle + barrels + apple-orchard/hop hints; used on
 //               the /kategori/gardssalg hero (and only there — the homepage
 //               keeps the broader forside motif).
-// The kettle steam (class="steam") animates via ONE @keyframes rule that
-// lives EXCLUSIVELY inside @media (prefers-reduced-motion: no-preference)
+// The drikke kettle steam (class="steam") animates via ONE @keyframes rule
+// that lives EXCLUSIVELY inside @media (prefers-reduced-motion: no-preference)
 // in OA_HERO_SCENE_CSS below — reduced-motion visitors get a static wisp.
 // No JS anywhere. Every layer's fill opacity stays ≤ .6 under the text zone.
 // Exported for the S2 test suite's per-variant size assertion (each variant
@@ -376,10 +379,10 @@ export function heroSceneSvg(motif: "forside" | "drikke"): string {
     // only x≈303–1137 at 1280px viewport (x≈253–1187 at 1440px) and
     // x≈596–844 on a 360px phone. Every figurative element therefore lives
     // in-band: the farm cluster (tree/house/barn/fence/tree) spans x≈600–856
-    // so the PHONE crop gets real character around x≈720, and the copper
-    // pot-still spans x≈956–1110 so it's fully visible from 1280px up. The
-    // x<300 / x>1140 margins carry only depth layers + edge trees that
-    // progressively appear on wider viewports — nothing load-bearing.
+    // so the PHONE crop gets real character around x≈720. The x<300 / x>1140
+    // margins carry only depth layers + edge trees that progressively appear
+    // on wider viewports — nothing load-bearing. (S2b removed the copper
+    // pot-still that used to sit at x≈956–1110 — see the motif comment above.)
     return `${open("hero-scene-forside")}
 <defs>
 <radialGradient id="oaHsF-teal" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#12a594" stop-opacity=".30"/><stop offset="100%" stop-color="#12a594" stop-opacity="0"/></radialGradient>
@@ -406,17 +409,6 @@ export function heroSceneSvg(motif: "forside" | "drikke"): string {
 <path d="M118 452 L129 412 L140 452 Z"/>
 <path d="M1244 446 L1258 398 L1272 446 Z"/>
 <path d="M1284 448 L1296 410 L1308 448 Z"/>
-</g>
-<g>
-<path fill="rgba(201,138,43,.32)" d="M956 448 C956 410 972 390 1004 390 C1036 390 1052 410 1052 448 Z"/>
-<path fill="rgba(201,138,43,.32)" d="M978 390 C981 372 991 363 1004 363 C1017 363 1027 372 1030 390 Z"/>
-<path fill="none" stroke="rgba(201,138,43,.36)" stroke-width="6" stroke-linecap="round" d="M1004 363 C1004 350 1012 344 1026 343 C1060 340 1080 354 1086 378 L1092 448"/>
-<rect x="1074" y="412" width="36" height="36" rx="5" fill="rgba(201,138,43,.22)"/>
-<path fill="none" stroke="rgba(201,138,43,.28)" stroke-width="3" d="M964 426 H1044"/>
-</g>
-<g class="steam" fill="none" stroke="rgba(255,255,255,.28)" stroke-width="5" stroke-linecap="round">
-<path d="M996 346 C990 330 1000 320 994 304 C989 291 997 281 993 266"/>
-<path d="M1014 350 C1022 336 1012 324 1020 310 C1026 299 1018 288 1024 274"/>
 </g>
 </svg>`;
   }
@@ -473,6 +465,163 @@ const OA_HERO_SCENE_CSS = `
   @media (prefers-reduced-motion: no-preference){
     .hero-scene .steam{animation:oaSteamRise 10s ease-in-out infinite}
     @keyframes oaSteamRise{0%{transform:translateY(0);opacity:0}18%{opacity:.55}70%{opacity:.3}100%{transform:translateY(-46px);opacity:0}}
+  }
+`;
+
+// ─────────────────────────────────────────────────────────────
+// Gardssalg still sketch (dev-request 2026-08-06-opplevagent-ux-loft-
+// drikkested-lansering, S2b — Daniel's directive: the distillery identity
+// belongs to /kategori/gardssalg + its type subpages ONLY, never the
+// homepage). A discreet black line drawing of a pot still (kjele →
+// svanehals → kjølekar/kondensator → rør → flaske) composed across the
+// WHOLE light catalog surface — including the page margins beside the
+// content column — as an absolutely positioned backdrop UNDER the cards
+// (`.oa-sketch-stage` wraps <main>; the sketch layer is inset:0,
+// pointer-events:none, z-index:0; main gets z-index:1). Legibility is
+// protected by the whole layer sitting at opacity ~.15 with thin
+// #0b2e29 strokes.
+//
+// Animation (pure CSS, no JS — see OA_STILL_SKETCH_CSS below): ONE shared
+// 26s timeline. Each component group has its own draw window inside that
+// timeline (every path carries pathLength="1", so `stroke-dasharray:1` +
+// a dashoffset 1→0 keyframe draws it "pen on paper"): kjele 2–16%, hals
+// 15–24%, kjølekar 23–36%, rør 35–45%, flaske 44–54%, margin décor
+// 20–56%; then the LIQUID (class sk-vaeske — a thicker copper path laid
+// over the black pipework, from the kettle through the swan neck, down
+// through the worm tub, along the pipe and into the bottle) flows in at
+// 58–76%; the finished picture holds until ~92%, fades out by 97%, and
+// the cycle loops from blank. All dasharray/animation declarations —
+// and every @keyframes — live EXCLUSIVELY inside
+// @media (prefers-reduced-motion: no-preference) (same discipline as the
+// hero steam above), so reduced-motion UAs get the STATIC fully drawn
+// picture, liquid included, without ever parsing a motion definition.
+//
+// Responsive: two <svg> crops of the SAME hand-written composition
+// (viewBox 0 0 1440 1560). `.sketch-wide` (full-width, xMidYMin meet —
+// deterministic scaling, art also lands in the side margins) renders
+// above 700px; `.sketch-narrow` shows the simplified central crop
+// (kettle → swan neck → worm tub + the barrel) for phones, so a ~360px
+// screen reads a real drawing instead of a smeared full scene. Only one
+// is displayed at a time (CSS media query) and neither can cause
+// horizontal scroll (the layer is inset:0 + overflow:hidden).
+//
+// Exported for the S2b tests' size assertion — the whole layer must stay
+// hand-written and < 50 000 chars.
+// ─────────────────────────────────────────────────────────────
+export function gardssalgStillSketchSvg(): string {
+  // One shared inner scene; the two <svg> wrappers below only differ in
+  // class + viewBox (the narrow one is a crop, not a second drawing). No
+  // ids anywhere, so the duplication can't collide.
+  const scene = `<g class="sk-all">
+<g class="sk-kjele">
+<path pathLength="1" d="M132 648 C114 540 160 446 252 440 C344 446 390 540 372 648"/>
+<path pathLength="1" d="M148 648 C180 664 324 664 356 648"/>
+<path pathLength="1" d="M170 660 L158 736 H346 L334 660"/>
+<path pathLength="1" d="M226 736 C230 706 274 706 278 736"/>
+<path pathLength="1" d="M210 442 C204 400 220 368 252 362 C284 368 300 400 294 442"/>
+<path pathLength="1" d="M206 444 H298"/>
+</g>
+<g class="sk-hals">
+<path pathLength="1" d="M252 362 C254 316 278 292 320 288 C400 282 468 320 524 380 C556 414 584 442 610 468"/>
+<path pathLength="1" d="M262 366 C266 330 284 306 322 302 C396 296 458 330 512 388 C544 422 572 450 598 474"/>
+</g>
+<g class="sk-kond">
+<path pathLength="1" d="M600 472 C600 456 864 456 864 472 C864 488 600 488 600 472"/>
+<path pathLength="1" d="M600 474 C596 548 596 622 604 692"/>
+<path pathLength="1" d="M864 474 C868 548 868 622 860 692"/>
+<path pathLength="1" d="M604 692 C660 706 804 706 860 692"/>
+<path pathLength="1" d="M612 516 C700 534 764 534 852 516"/>
+<path pathLength="1" d="M614 562 C702 580 766 580 850 562"/>
+<path pathLength="1" d="M616 608 C704 626 768 626 848 608"/>
+</g>
+<g class="sk-ror">
+<path pathLength="1" d="M860 648 H1002 C1062 648 1100 610 1140 570 C1180 530 1238 510 1286 510 C1296 510 1302 516 1302 524"/>
+<path pathLength="1" d="M1000 634 V662"/>
+<path pathLength="1" d="M988 634 H1012"/>
+<path pathLength="1" d="M1142 572 V704"/>
+<path pathLength="1" d="M1126 704 H1158"/>
+</g>
+<g class="sk-flaske">
+<path pathLength="1" d="M1283 512 V548 C1262 568 1254 598 1254 638 V754 C1254 768 1262 776 1276 776 H1326 C1340 776 1348 768 1348 754 V638 C1348 598 1340 568 1319 548 V512"/>
+<path pathLength="1" d="M1279 512 H1323"/>
+<path pathLength="1" d="M1268 664 H1334"/>
+<path pathLength="1" d="M1268 700 H1334"/>
+</g>
+<g class="sk-dekor">
+<path pathLength="1" d="M236 344 C228 324 240 310 232 288"/>
+<path pathLength="1" d="M268 346 C278 328 266 312 276 292"/>
+<path pathLength="1" d="M92 744 H430"/>
+<path pathLength="1" d="M566 712 H900"/>
+<path pathLength="1" d="M1234 782 H1368"/>
+<path pathLength="1" d="M96 1188 C86 1252 86 1330 96 1390"/>
+<path pathLength="1" d="M244 1188 C254 1252 254 1330 244 1390"/>
+<path pathLength="1" d="M96 1188 C140 1176 200 1176 244 1188"/>
+<path pathLength="1" d="M96 1390 C140 1402 200 1402 244 1390"/>
+<path pathLength="1" d="M90 1248 C140 1258 200 1258 250 1248"/>
+<path pathLength="1" d="M90 1330 C140 1340 200 1340 250 1330"/>
+<path pathLength="1" d="M70 1398 H280"/>
+<path pathLength="1" d="M1168 1290 H1384 V1392 H1168 Z"/>
+<path pathLength="1" d="M1168 1330 H1384"/>
+<path pathLength="1" d="M1276 1290 V1392"/>
+<path pathLength="1" d="M1198 1290 V1252 C1198 1244 1202 1240 1208 1240 H1216 C1222 1240 1226 1244 1226 1252 V1290"/>
+<path pathLength="1" d="M1264 1290 V1252 C1264 1244 1268 1240 1274 1240 H1282 C1288 1240 1292 1244 1292 1252 V1290"/>
+<path pathLength="1" d="M1330 1290 V1252 C1330 1244 1334 1240 1340 1240 H1348 C1354 1240 1358 1244 1358 1252 V1290"/>
+</g>
+<g class="sk-vaeske">
+<path pathLength="1" d="M252 596 V372 C256 322 282 300 322 296 C398 290 462 326 518 384 C550 418 578 446 606 470 C688 528 768 592 854 644 C862 648 872 650 880 650 H1002 C1060 650 1098 612 1138 572 C1178 532 1236 518 1282 518 C1292 518 1296 524 1296 532"/>
+<path pathLength="1" d="M1300 540 V736"/>
+<path pathLength="1" d="M1258 746 C1290 738 1312 738 1344 746"/>
+</g>
+</g>`;
+  const svg = (cls: string, viewBox: string) =>
+    `<svg class="${cls}" viewBox="${viewBox}" preserveAspectRatio="xMidYMin meet" aria-hidden="true" focusable="false">${scene}</svg>`;
+  // The narrow crop frames the apparatus core (kettle + swan neck + worm
+  // tub, steam included) tightly: on a ~360px phone the single-column cards
+  // cover almost the full width, so only the top band above the grid and
+  // the side slivers stay visible — a tight crop keeps what IS visible
+  // reading as a real drawing instead of stray fragments.
+  return `<div class="oa-still-sketch" aria-hidden="true">${svg("sketch-wide", "0 0 1440 1560")}${svg("sketch-narrow", "120 260 700 620")}</div>`;
+}
+
+// Layout + the S2b sketch animation timeline. Structure rules (positioning,
+// stroke styling, the wide/narrow swap) are unguarded; EVERY motion-related
+// declaration — stroke-dasharray, animation bindings and all @keyframes —
+// lives inside the @media (prefers-reduced-motion: no-preference) block, so
+// a reduced-motion UA renders the static finished drawing (solid strokes,
+// dashoffset never touched) without parsing any motion definition.
+const OA_STILL_SKETCH_CSS = `
+  /* ── GARDSSALG STILL SKETCH (S2b line-drawn backdrop) ── */
+  .oa-sketch-stage{position:relative}
+  .oa-sketch-stage>main{position:relative;z-index:1}
+  .oa-still-sketch{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+  .oa-still-sketch svg{display:block;width:100%;height:auto;opacity:.15}
+  .oa-still-sketch path{fill:none;stroke:#0b2e29;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+  .oa-still-sketch .sk-vaeske path{stroke:#c98a2b;stroke-width:5}
+  .oa-still-sketch .sketch-narrow{display:none}
+  @media(max-width:700px){
+    .oa-still-sketch .sketch-wide{display:none}
+    .oa-still-sketch .sketch-narrow{display:block}
+    .oa-still-sketch .sketch-narrow path{stroke-width:4}
+    .oa-still-sketch .sketch-narrow .sk-vaeske path{stroke-width:7}
+  }
+  @media (prefers-reduced-motion: no-preference){
+    .oa-still-sketch path{stroke-dasharray:1}
+    .oa-still-sketch .sk-all{animation:oaSkFade 26s linear infinite}
+    .oa-still-sketch .sk-kjele path{animation:oaSkKjele 26s linear infinite}
+    .oa-still-sketch .sk-hals path{animation:oaSkHals 26s linear infinite}
+    .oa-still-sketch .sk-kond path{animation:oaSkKond 26s linear infinite}
+    .oa-still-sketch .sk-ror path{animation:oaSkRor 26s linear infinite}
+    .oa-still-sketch .sk-flaske path{animation:oaSkFlaske 26s linear infinite}
+    .oa-still-sketch .sk-dekor path{animation:oaSkDekor 26s linear infinite}
+    .oa-still-sketch .sk-vaeske path{animation:oaSkVaeske 26s linear infinite}
+    @keyframes oaSkFade{0%,92%{opacity:1}97%,100%{opacity:0}}
+    @keyframes oaSkKjele{0%,2%{stroke-dashoffset:1}16%,100%{stroke-dashoffset:0}}
+    @keyframes oaSkHals{0%,15%{stroke-dashoffset:1}24%,100%{stroke-dashoffset:0}}
+    @keyframes oaSkKond{0%,23%{stroke-dashoffset:1}36%,100%{stroke-dashoffset:0}}
+    @keyframes oaSkRor{0%,35%{stroke-dashoffset:1}45%,100%{stroke-dashoffset:0}}
+    @keyframes oaSkFlaske{0%,44%{stroke-dashoffset:1}54%,100%{stroke-dashoffset:0}}
+    @keyframes oaSkDekor{0%,20%{stroke-dashoffset:1}56%,100%{stroke-dashoffset:0}}
+    @keyframes oaSkVaeske{0%,58%{stroke-dashoffset:1}76%,100%{stroke-dashoffset:0}}
   }
 `;
 
@@ -4091,6 +4240,7 @@ ${BROWSE_CSS}
    z-index technique as the homepage hero (.hero-inner has z-index:1). */
 .hero-section>.container{position:relative;z-index:1}
 ${OA_HERO_SCENE_CSS}
+${OA_STILL_SKETCH_CSS}
 .hero-kicker{font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.7;margin-bottom:8px}
 .hero-h1{font-size:2rem;font-weight:800;margin-bottom:10px;line-height:1.2}
 .hero-sub{opacity:.85;font-size:1rem;max-width:560px;line-height:1.5}
@@ -4114,6 +4264,8 @@ ${oaSiteNav({ active: "gardssalg" })}
     <p class="hero-sub">${escapeHtml(heroSub)}</p>
   </div>
 </header>
+<div class="oa-sketch-stage">
+${gardssalgStillSketchSvg()}
 <main id="main" class="container">
   <nav class="breadcrumb" aria-label="Brødsmulesti">
     ${breadcrumb}
@@ -4127,6 +4279,7 @@ ${oaSiteNav({ active: "gardssalg" })}
   ${pagination}
   <p class="legal-note">Vi formidler besøket og smakingen hos produsentene. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
 </main>
+</div>
 ${oaSiteFooter({})}
 </body>
 </html>`;
