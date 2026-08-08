@@ -29062,6 +29062,36 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gops.failures) failures.push("opplevelser-gardssalg-outreach-pilot-send: " + f);
     console.log(`  opplevelser-gardssalg-outreach-pilot-send: ${gops.passed} passed, ${gops.failed} failed`);
 
+    // dev-request 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens:
+    // POST /admin/gardssalg-brreg-verify — the missing lever that stamps
+    // krav-2's brreg_verified flag from live Brreg evidence (exists + active
+    // + exact normalised name match; anything less never writes). Same
+    // in-memory-DB pattern (Brreg stubbed via
+    // __setGardssalgBrregVerifyForTesting), runs sequentially inside this
+    // same gated block.
+    console.log("\n── opplevelser-gardssalg-brreg-verify: admin Brreg-verification lever ──");
+    const { runOpplevelserGardssalgBrregVerifyTests } = require("../src/routes/opplevelser-gardssalg-brreg-verify.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-brreg-verify.test");
+    const gbv = await runOpplevelserGardssalgBrregVerifyTests({ log: false });
+    passed += gbv.passed;
+    failed += gbv.failed;
+    for (const f of gbv.failures) failures.push("opplevelser-gardssalg-brreg-verify: " + f);
+    console.log(`  opplevelser-gardssalg-brreg-verify: ${gbv.passed} passed, ${gbv.failed} failed`);
+
+    // dev-request 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens:
+    // gardssalgEmbeddedPageText + the embedded evidence/email tier — pure
+    // helpers (no DB, no network), reproducing the live 67 North Distillery
+    // sitebuilder-SPA case: content exists only as script-embedded JSON
+    // string literals, invisible to gardssalgPageText's tag-stripping.
+    console.log("\n── gardssalg-embedded-evidence: embedded-content evidence layer ──");
+    const { runGardssalgEmbeddedEvidenceTests } = require("../src/services/gardssalg-embedded-evidence.test") as
+      typeof import("../src/services/gardssalg-embedded-evidence.test");
+    const gee = await runGardssalgEmbeddedEvidenceTests({ log: false });
+    passed += gee.passed;
+    failed += gee.failed;
+    for (const f of gee.failures) failures.push("gardssalg-embedded-evidence: " + f);
+    console.log(`  gardssalg-embedded-evidence: ${gee.passed} passed, ${gee.failed} failed`);
+
     // dev-request 2026-08-08-booking-aktivering-per-produsent: POST/GET
     // /admin/gardssalg-booking-activation — the admin lever + per-producer
     // emergency brake over the EXISTING booking_live gate (isBookingPaused()/
