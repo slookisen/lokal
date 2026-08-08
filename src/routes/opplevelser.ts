@@ -7768,7 +7768,7 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
       const ownPrior = expDb
         .prepare(
           `SELECT sent_at FROM experience_outreach_sent_log
-            WHERE LOWER(recipient_email) = LOWER(?) AND sent_at >= ?
+            WHERE LOWER(recipient_email) = LOWER(?) AND sent_at >= ? AND is_test = 0
             ORDER BY sent_at DESC LIMIT 1`,
         )
         .get(email, cooldownCutoff) as { sent_at: string } | undefined;
