@@ -10,7 +10,7 @@
  *
  * Also covers dev-request 2026-08-07-dublett-evidensbasis-og-pool-
  * avblokkering, slice 3's two remediation write-layer gaps (see (c-gapA)/
- * (c-gapB)/(f-gapA)/(f-gapB) below):
+ * (c-gapB)/(c-gapB-nulled)/(f-gapA)/(f-gapB)/(f-gapB-nulled) below):
  *
  *   - Gap A: a name_token/host_name pair is only write-eligible with a
  *     "confirmed" gardssalg_experience_conflict_review verdict (slice 2's
@@ -21,7 +21,13 @@
  *     written when its CURRENT booking_url is already a working, specific
  *     deep link (non-trivial path/query) that differs from the producer's
  *     bare homepage — `skipped`/"existing_deep_link_preserved" instead of
- *     overwriting a useful URL with a strictly-worse generic one.
+ *     overwriting a useful URL with a strictly-worse generic one. Covered on
+ *     BOTH sides of the corrected/nulled branch: exp-lervig (would-be
+ *     "corrected" — producer's own hjemmeside is a normal site) and
+ *     exp-aggregator-deeplink (would-be "nulled" — producer's own hjemmeside
+ *     is itself a directory/aggregator host) — review fix-up, since
+ *     isDeepLinkUrl() runs before that branch decides and nulling a deep
+ *     link is just as destructive as overwriting it.
  *
  * The pure matching-logic tests (findGardssalgProducerExperienceMatches,
  * incl. the Atlungstad case) live in
@@ -356,6 +362,31 @@ export function runOpplevelserGardssalgExperienceConflictTests(
         verification_status: "pending_verify",
       });
 
+      // (v) provider_link basis (always write-eligible, no review decision
+      //     needed), producer's OWN hjemmeside is itself a directory/
+      //     aggregator host (hanen.no — same curated host exp-aggregator-home
+      //     above exercises), AND the current booking_url is a working,
+      //     specific deep link. Absent Gap B this would plan as action
+      //     "nulled" (aggregator hjemmeside -> newValue=null, same rule
+      //     exp-aggregator-home exercises) — this fixture combines that with
+      //     Gap B's deep-link current value to prove isDeepLinkUrl() is
+      //     checked BEFORE the corrected/nulled branch decides, not only on
+      //     the "would have been corrected" path exp-lervig above covers
+      //     (review CHANGES-REQUESTED finding: nulling a deep link is just as
+      //     destructive as overwriting it, and was previously unverified by
+      //     any test).
+      insertProvider.run({
+        id: "prod-aggregator-deeplink", navn: "Dyplenkegaarden",
+        hjemmeside: "https://hanen.no/gardsutsalg/dyplenkegaarden", catalog_hidden: 0,
+        producer_type: "gardsbutikk", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertExperience.run({
+        id: "exp-aggregator-deeplink", provider_id: "prod-aggregator-deeplink",
+        title: "Dyplenkegaarden — gårdsbutikk med nettbestilling", title_no: null,
+        booking_url: "https://wrong-host7.example/bestill-omvisning", content_source: null,
+        verification_status: "pending_verify",
+      });
+
       const conflictService = require("../services/gardssalg-experience-conflict") as
         typeof import("../services/gardssalg-experience-conflict");
 
@@ -557,6 +588,29 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertTrue(!!skippedLervig, "c19: Lervig-shaped pair IS in 'skipped'");
       assertEq(skippedLervig?.reason, "existing_deep_link_preserved", "c20: reason is 'existing_deep_link_preserved' — evidence-basis alone does not license overwriting a working deep link");
 
+      // ── (c-gapB-nulled) Gap B guards the NULLED path too, not only the
+      //     corrected-would-be path exp-lervig covers above — a write-
+      //     eligible (provider_link) pair whose producer's OWN hjemmeside is
+      //     an aggregator host (so absent Gap B the plan would be action
+      //     "nulled") must ALSO be skipped when the current booking_url is a
+      //     deep link, never appear in 'planned' as 'applicable'/'nulled'.
+      const dryRunAggregatorDeeplinkPlanned = dryRunRes.body.planned.some(
+        (a: any) => a.experience_id === "exp-aggregator-deeplink",
+      );
+      assertTrue(
+        !dryRunAggregatorDeeplinkPlanned,
+        "c21: aggregator-hjemmeside pair (would-be 'nulled') with an existing deep link NEVER appears in 'planned' — Gap B guards the nulled path too",
+      );
+      const skippedAggregatorDeeplink = dryRunRes.body.skipped.find(
+        (s: any) => s.experience_id === "exp-aggregator-deeplink",
+      );
+      assertTrue(!!skippedAggregatorDeeplink, "c22: aggregator-hjemmeside + deep-link pair IS in 'skipped'");
+      assertEq(
+        skippedAggregatorDeeplink?.reason,
+        "existing_deep_link_preserved",
+        "c23: reason is 'existing_deep_link_preserved', not 'not_evidence_basis' — provider_link is always evidence-eligible, Gap B is what catches this pair",
+      );
+
       // ── (d) apply=true — the real write, PLUS the agreeing pair must be
       //     left completely untouched ──────────────────────────────────────
       const batchId = "test-batch-steg2";
@@ -665,6 +719,35 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertTrue(
         applyRes.body.skipped.some((s: any) => s.experience_id === "exp-lervig" && s.reason === "existing_deep_link_preserved"),
         "f15: apply response reports exp-lervig skipped with reason 'existing_deep_link_preserved'",
+      );
+
+      // ── (f-gapB-nulled) same as (c-gapB-nulled) above, but for real: on
+      //     apply=true, the aggregator-hjemmeside + deep-link pair must be
+      //     genuinely UNWRITTEN — booking_url unchanged in the DB (not just
+      //     absent from the response), and no audit row inserted. Without
+      //     this fixture, isDeepLinkUrl() being checked before the
+      //     corrected/nulled branch was unverified by any test — a bug here
+      //     would silently NULL a working deep link.
+      const aggregatorDeeplinkAfterApply = getExperienceRow("exp-aggregator-deeplink");
+      assertEq(
+        aggregatorDeeplinkAfterApply.booking_url,
+        "https://wrong-host7.example/bestill-omvisning",
+        "f16: aggregator-hjemmeside + deep-link pair — booking_url completely unchanged by apply=true (NOT nulled, NOT overwritten)",
+      );
+      assertEq(
+        getConflictAuditRows("exp-aggregator-deeplink").length,
+        0,
+        "f17: no audit row for exp-aggregator-deeplink — genuinely never written, not just skipped-in-response",
+      );
+      assertTrue(
+        applyRes.body.skipped.some(
+          (s: any) => s.experience_id === "exp-aggregator-deeplink" && s.reason === "existing_deep_link_preserved",
+        ),
+        "f18: apply response reports exp-aggregator-deeplink skipped with reason 'existing_deep_link_preserved'",
+      );
+      assertTrue(
+        !applyRes.body.applied.some((a: any) => a.experience_id === "exp-aggregator-deeplink"),
+        "f19: exp-aggregator-deeplink never appears in 'applied' (not written as 'nulled' or otherwise)",
       );
 
       // ── (g) POST .../gardssalg-content-rollback { entity_type: "experience" } ──
