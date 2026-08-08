@@ -28,6 +28,14 @@
  *     is itself a directory/aggregator host) — review fix-up, since
  *     isDeepLinkUrl() runs before that branch decides and nulling a deep
  *     link is just as destructive as overwriting it.
+ *   - Gap B host-mismatch widening (post-deploy fix, found live 2026-08-08
+ *     via a production dry-run probe of the shipped slice-3 code): the
+ *     original Gap B check (isDeepLinkUrl) only looked at PATH/QUERY depth,
+ *     so a bare-root current booking_url on a DIFFERENT domain than the
+ *     producer's own bare-root hjemmeside — the literal live Lervig
+ *     acceptance example itself (lerviglocal.no vs lervig.no, no path on
+ *     either side) — was NOT protected and would have been overwritten on
+ *     apply=true. exp-fjordblink-bareroot below reproduces that exact shape.
  *
  * The pure matching-logic tests (findGardssalgProducerExperienceMatches,
  * incl. the Atlungstad case) live in
@@ -387,6 +395,38 @@ export function runOpplevelserGardssalgExperienceConflictTests(
         verification_status: "pending_verify",
       });
 
+      // (vi) — POST-DEPLOY REGRESSION FIXTURE (found live 2026-08-08 via a
+      //       production dry-run probe of PR #530, the shipped slice-3 code):
+      //       name_token basis, CONFIRMED review decision, producer's
+      //       hjemmeside is a BARE-ROOT domain (with a "www." prefix — must
+      //       be treated as the SAME host as the bare domain for this
+      //       comparison), and the experience's CURRENT booking_url is ALSO
+      //       a BARE-ROOT URL — empty path, no query, so isDeepLinkUrl()
+      //       alone (the original slice-3 Gap B check) does NOT fire for
+      //       it — but on a DIFFERENT registrable domain than the producer's
+      //       homepage. This is the exact shape of the literal live Lervig
+      //       acceptance example itself (lerviglocal.no vs lervig.no, no
+      //       path on either side) — deliberately NOT reusing the
+      //       prod-lervig/exp-lervig ids/tokens above (which already share
+      //       the "lervig" token and would collide into "ambiguous" via the
+      //       same-experience/multiple-producer guard if reused here), same
+      //       conceptual shape with a different brand name instead. Must be
+      //       planned as `skipped`/"existing_deep_link_preserved" on BOTH
+      //       dry-run and apply=true, with a DB read-back confirming
+      //       booking_url is unchanged and zero new audit rows — this is
+      //       the regression the host-mismatch widening exists to fix.
+      insertProvider.run({
+        id: "prod-fjordblink-bareroot", navn: "Fjordblink Bryggeri",
+        hjemmeside: "https://www.fjordblink.no", catalog_hidden: 0,
+        producer_type: "bryggeri", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertExperience.run({
+        id: "exp-fjordblink-bareroot", provider_id: null,
+        title: "Fjordblink Ølsmaking direkte fra bryggeriet", title_no: null,
+        booking_url: "https://fjordblinklokal.no", content_source: null,
+        verification_status: "pending_verify",
+      });
+
       const conflictService = require("../services/gardssalg-experience-conflict") as
         typeof import("../services/gardssalg-experience-conflict");
 
@@ -426,6 +466,16 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       conflictService.recordGardssalgExperienceConflictReviewDecision(expDb, {
         producer_id: "prod-lervig",
         experience_id: "exp-lervig",
+        verdict: "confirmed",
+        decided_by: "test-seed",
+      });
+      // (vi)'s confirmed decision — post-deploy regression fixture (bare-root
+      // domains on both sides, different hosts): evidence-basis alone must
+      // still not be enough to overwrite it — the host-mismatch widening of
+      // Gap B is what has to catch this one.
+      conflictService.recordGardssalgExperienceConflictReviewDecision(expDb, {
+        producer_id: "prod-fjordblink-bareroot",
+        experience_id: "exp-fjordblink-bareroot",
         verdict: "confirmed",
         decided_by: "test-seed",
       });
@@ -588,6 +638,17 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertTrue(!!skippedLervig, "c19: Lervig-shaped pair IS in 'skipped'");
       assertEq(skippedLervig?.reason, "existing_deep_link_preserved", "c20: reason is 'existing_deep_link_preserved' — evidence-basis alone does not license overwriting a working deep link");
 
+      // ── (c-gapB-bareroot) POST-DEPLOY REGRESSION — the literal live shape
+      //     that broke: both the producer's hjemmeside and the experience's
+      //     CURRENT booking_url are bare-root URLs (no path, no query), so
+      //     the original path/query-depth check (isDeepLinkUrl) does NOT fire
+      //     for either side — only the host-mismatch widening catches this.
+      const dryRunFjordblinkPlanned = dryRunRes.body.planned.some((a: any) => a.experience_id === "exp-fjordblink-bareroot");
+      assertTrue(!dryRunFjordblinkPlanned, "c24: bare-root-on-both-sides, cross-domain pair (confirmed) NEVER appears in 'planned' — Gap B host-mismatch widening");
+      const skippedFjordblink = dryRunRes.body.skipped.find((s: any) => s.experience_id === "exp-fjordblink-bareroot");
+      assertTrue(!!skippedFjordblink, "c25: bare-root cross-domain pair IS in 'skipped'");
+      assertEq(skippedFjordblink?.reason, "existing_deep_link_preserved", "c26: reason is 'existing_deep_link_preserved' — a host mismatch protects a bare-root current value exactly like a deep path does");
+
       // ── (c-gapB-nulled) Gap B guards the NULLED path too, not only the
       //     corrected-would-be path exp-lervig covers above — a write-
       //     eligible (provider_link) pair whose producer's OWN hjemmeside is
@@ -719,6 +780,29 @@ export function runOpplevelserGardssalgExperienceConflictTests(
       assertTrue(
         applyRes.body.skipped.some((s: any) => s.experience_id === "exp-lervig" && s.reason === "existing_deep_link_preserved"),
         "f15: apply response reports exp-lervig skipped with reason 'existing_deep_link_preserved'",
+      );
+
+      // ── (f-gapB-bareroot) same regression as (c-gapB-bareroot) above, but
+      //     for real on apply=true: the DB read-back must show booking_url
+      //     genuinely unchanged and zero new audit rows — this is the exact
+      //     production shape (POST /admin/gardssalg-experience-conflict-
+      //     remediation dry-run, 2026-08-08) that would otherwise have
+      //     written `www.lervig.no`-shaped overwrites over a correct,
+      //     working, more-specific booking domain.
+      const fjordblinkAfterApply = getExperienceRow("exp-fjordblink-bareroot");
+      assertEq(
+        fjordblinkAfterApply.booking_url,
+        "https://fjordblinklokal.no",
+        "f20: bare-root cross-domain pair — booking_url completely unchanged by apply=true (host-mismatch widening, not just the path/query check)",
+      );
+      assertEq(getConflictAuditRows("exp-fjordblink-bareroot").length, 0, "f21: no audit row for the bare-root cross-domain pair — genuinely never written, not just skipped-in-response");
+      assertTrue(
+        applyRes.body.skipped.some((s: any) => s.experience_id === "exp-fjordblink-bareroot" && s.reason === "existing_deep_link_preserved"),
+        "f22: apply response reports exp-fjordblink-bareroot skipped with reason 'existing_deep_link_preserved'",
+      );
+      assertTrue(
+        !applyRes.body.applied.some((a: any) => a.experience_id === "exp-fjordblink-bareroot"),
+        "f23: exp-fjordblink-bareroot never appears in 'applied'",
       );
 
       // ── (f-gapB-nulled) same as (c-gapB-nulled) above, but for real: on
