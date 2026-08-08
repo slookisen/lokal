@@ -748,7 +748,76 @@ export interface GsExpConflictPlanItem {
 export interface GsExpConflictSkip {
   experience_id: string;
   producer_id: string;
-  reason: "locked" | "already_current" | "no_producer_hjemmeside";
+  reason:
+    | "locked"
+    | "already_current"
+    | "no_producer_hjemmeside"
+    // Gap A (dev-request 2026-08-07-dublett-evidensbasis-og-pool-
+    // avblokkering, slice 3): the pair's match_basis is name_token/host_name
+    // and it carries no CONFIRMED verdict in gardssalg_experience_conflict_
+    // review (no decision yet, or a rejected one) — the same evidence-basis
+    // restriction slice 1 already applies to the readiness gate (see
+    // computeGardssalgReadinessRows, routes/opplevelser.ts) now also gates
+    // the WRITE layer, so remediation can never silently act on the
+    // ~93%-false-positive-rate candidate class. See planGardssalgExperience
+    // ConflictRemediation's own doc comment for the full reasoning.
+    | "not_evidence_basis"
+    // Gap B ("the Lervig lesson", slice 3): the CURRENT booking_url is
+    // already a specific, working deep link (a non-trivial path/query
+    // beyond the bare domain root — isDeepLinkUrl() below) that differs from
+    // the producer's homepage. Overwriting it with the producer's bare
+    // hjemmeside (or nulling it) would replace a useful, specific value with
+    // a strictly-worse one, so remediation leaves it alone for a human to
+    // look at instead.
+    | "existing_deep_link_preserved";
+}
+
+/**
+ * True when `urlLike` carries a non-trivial path or query STRING beyond the
+ * bare domain root — i.e. it looks like a specific, working deep link
+ * (`https://lerviglocal.no/book`, `https://x.no/online-booking?x=1`) rather
+ * than a generic homepage root (`https://lervig.no`, `https://lervig.no/`).
+ *
+ * Gap B / "the Lervig lesson" (dev-request 2026-08-07-dublett-evidensbasis-
+ * og-pool-avblokkering, slice 3): the one genuinely-true conflict pair the
+ * 2026-08-01 spot-check found (Lervig) would ALSO have gotten a WRONG
+ * remediation write under the pre-slice-3 logic — the producer's homepage
+ * (`lervig.no`) would have overwritten a correct, working brewpub BOOKING
+ * deep-link (`lerviglocal.no/...`) with just the generic homepage, replacing
+ * a useful, specific URL with a strictly-worse one. planGardssalgExperience
+ * ConflictRemediation() below checks this BEFORE deciding to
+ * correct/null a pair's booking_url, and skips it (reason
+ * "existing_deep_link_preserved") instead, whether the planned action would
+ * otherwise have been a "corrected" (copy producer homepage) or a "nulled"
+ * (producer homepage is itself an aggregator host) write — either way,
+ * destroying a specific working link in favor of nothing or a generic root
+ * is the same failure mode this exists to prevent.
+ *
+ * A path of "" or "/" (with no query) is NOT a deep link — that case is
+ * unaffected by this gate, so the existing corrected/nulled behavior for a
+ * root-only/blank booking_url is unchanged (acceptance criterion: no
+ * regression on the existing correct path).
+ *
+ * Pure string parsing — no URL() construction, no network fetch. This route
+ * is synchronous and not fetch-based (see field-rule (a) discussion on
+ * planGardssalgExperienceConflictRemediation's doc comment); this check only
+ * looks at the STRING shape of the already-stored value, it never resolves
+ * anything.
+ */
+function isDeepLinkUrl(urlLike: string | null | undefined): boolean {
+  if (!urlLike || !urlLike.trim()) return false;
+  let s = urlLike.trim();
+  s = s.replace(/^https?:\/\//i, "").replace(/^\/\//, "");
+  const hashIdx = s.indexOf("#");
+  if (hashIdx !== -1) s = s.slice(0, hashIdx); // fragment carries no server-side routing info
+  const qIdx = s.indexOf("?");
+  const beforeQuery = qIdx === -1 ? s : s.slice(0, qIdx);
+  const query = qIdx === -1 ? "" : s.slice(qIdx + 1);
+  const slashIdx = beforeQuery.indexOf("/");
+  const path = slashIdx === -1 ? "" : beforeQuery.slice(slashIdx);
+  const trivialPath = path === "" || path === "/";
+  const trivialQuery = query === "";
+  return !(trivialPath && trivialQuery);
 }
 
 /**
@@ -758,15 +827,61 @@ export interface GsExpConflictSkip {
  * trusting a client-supplied list). Re-reads each experience's CURRENT row
  * (never trusts the pair's snapshot) so a plan is always computed against
  * live data, same discipline as planGardssalgContentRollback.
+ *
+ * `reviewDecisions` — the same Map loadGardssalgExperienceConflictReviewDecisions
+ * (Skive 2) returns, keyed via gsExpReviewPairKey — is REQUIRED (Gap A, slice
+ * 3): a pair is only ever write-eligible when its match_basis is
+ * "provider_link" (an existing FK, always trusted — slice 1's exact rule),
+ * OR it carries a "confirmed" verdict here (a human has vouched it's the
+ * same real business). A name_token/host_name pair with no decision, or a
+ * "rejected" one, is never eligible — it is planned as `skipped` with reason
+ * "not_evidence_basis", never silently dropped from the response and never
+ * written. This is the write-layer half of the SAME restriction slice 1
+ * already applies to the readiness/pool gate (computeGardssalgReadinessRows,
+ * routes/opplevelser.ts) — without it, `apply=true` would silently undo
+ * slice 1/2's whole safety fix by writing remediation for the
+ * ~93%-false-positive-rate candidate class slice 1 exists to keep from
+ * blocking anything.
+ *
+ * Field-rule (a) ("overwrite only when the CURRENT value provably belongs
+ * to a different business — content evidence, same standard as
+ * gardssalgWebsiteEvidenceMatch") is satisfied by construction here, not by
+ * an additional live content-fetch: every pair this function is willing to
+ * treat as write-eligible is either FK-verified (provider_link) or
+ * human-confirmed (a "confirmed" queue verdict) — i.e. a hard database link
+ * or an actual person, never a bare heuristic, has already vouched that the
+ * experience really is the same business as the producer. A synchronous
+ * live-fetch content check is deliberately NOT added on top of that (it
+ * would be a materially larger architecture change to a route that isn't
+ * currently async/fetch-based, unlike the separate website-verification code
+ * path) — the evidence-basis restriction is judged sufficient given slice
+ * 1/2's own work establishing exactly this evidentiary bar.
  */
 export function planGardssalgExperienceConflictRemediation(
   db: Database.Database,
-  conflictingPairs: GsExpMatchedPair[]
+  conflictingPairs: GsExpMatchedPair[],
+  reviewDecisions: Map<string, GsExpReviewDecision>
 ): { applicable: GsExpConflictPlanItem[]; skipped: GsExpConflictSkip[] } {
   const applicable: GsExpConflictPlanItem[] = [];
   const skipped: GsExpConflictSkip[] = [];
 
   for (const pair of conflictingPairs) {
+    // Gap A — evidence-basis restriction (see this function's own doc
+    // comment above). Checked FIRST, before any DB read: a pair that isn't
+    // write-eligible on evidence grounds is never even a candidate for the
+    // other skip reasons below.
+    if (pair.match_basis !== "provider_link") {
+      const decision = reviewDecisions.get(gsExpReviewPairKey(pair.producer_id, pair.experience_id));
+      if (decision?.verdict !== "confirmed") {
+        skipped.push({
+          experience_id: pair.experience_id,
+          producer_id: pair.producer_id,
+          reason: "not_evidence_basis",
+        });
+        continue;
+      }
+    }
+
     const row = db
       .prepare(`SELECT booking_url, content_source, verification_status FROM experiences WHERE id = ?`)
       .get(pair.experience_id) as
@@ -796,6 +911,17 @@ export function planGardssalgExperienceConflictRemediation(
 
     if ((row.booking_url ?? null) === newValue) {
       skipped.push({ experience_id: pair.experience_id, producer_id: pair.producer_id, reason: "already_current" });
+      continue;
+    }
+
+    // Gap B — never silently replace/null a working deep link (see
+    // isDeepLinkUrl's own doc comment / "the Lervig lesson" above).
+    if (isDeepLinkUrl(row.booking_url)) {
+      skipped.push({
+        experience_id: pair.experience_id,
+        producer_id: pair.producer_id,
+        reason: "existing_deep_link_preserved",
+      });
       continue;
     }
 
