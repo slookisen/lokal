@@ -737,6 +737,189 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     }
   }
 
+  // ── applyGardssalgFieldConcordanceClear (dev-request 2026-08-09-epost-
+  //    korrigering-paa-plass) — own isolated in-memory DB block, same
+  //    convention as the mojibake block above. This function is the narrow,
+  //    epost-only lever that nulls a stored epost once a CALLER has already
+  //    proven genuine absence on a fresh homepage fetch — this unit test
+  //    exercises only the store function's own guard chain/write recipe, not
+  //    the fetch/verdict judgment (that's the route's job, tested at the
+  //    route level in opplevelser-gardssalg-field-concordance-clear.test.ts). ──
+  {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("./experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const db = dbFactory.getDb("experiences");
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+
+      const insertProvider = db.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, hjemmeside, epost, content_source, field_provenance,
+            producer_type, enrichment_state, verification_status, source, confidence)
+         VALUES
+           (@id, @navn, 'experiences', @hjemmeside, @epost, @content_source, @field_provenance,
+            'bryggeri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+      );
+
+      // gfc-owner-locked: content_source='manual' -> always owner_locked for
+      // epost (epost is never in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS).
+      insertProvider.run({
+        id: "gfc-owner-locked", navn: "Gard Owner Locked",
+        hjemmeside: "https://gfc-owner-locked.example.no", epost: "gammel@ownerlocked.no",
+        content_source: "manual", field_provenance: null,
+      });
+
+      // gfc-vetoed: a human rolled epost back (latest gardssalg_content_audit
+      // row is the rollback marker) -> rollback_vetoed.
+      insertProvider.run({
+        id: "gfc-vetoed", navn: "Gard Vetoed",
+        hjemmeside: "https://gfc-vetoed.example.no", epost: "fortsatt@vetoed.no",
+        content_source: null, field_provenance: null,
+      });
+      db.prepare(
+        `INSERT INTO gardssalg_content_audit
+           (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+         VALUES ('gfc-vetoed-write', 'gfc-vetoed', 'epost', NULL, 'fortsatt@vetoed.no', 'https://gfc-vetoed.example.no', NULL, 'system', datetime('now'))`
+      ).run();
+      db.prepare(
+        `INSERT INTO gardssalg_content_audit
+           (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+         VALUES ('gfc-vetoed-rollback', 'gfc-vetoed', 'epost', 'fortsatt@vetoed.no', NULL, 'internal://rollback', NULL, 'system', datetime('now'))`
+      ).run();
+      // The rollback set epost back to NULL — reflect that on the row itself
+      // so the fixture is internally consistent (the veto guard fires
+      // regardless, but a stale row value would be a confusing fixture).
+      db.prepare(`UPDATE experience_providers SET epost = NULL WHERE id = 'gfc-vetoed'`).run();
+
+      // gfc-already-blank: stored epost is already NULL.
+      insertProvider.run({
+        id: "gfc-already-blank", navn: "Gard Already Blank",
+        hjemmeside: "https://gfc-already-blank.example.no", epost: null,
+        content_source: null, field_provenance: null,
+      });
+
+      // gfc-happy: non-blank epost, no lock/veto -> the clear should succeed.
+      insertProvider.run({
+        id: "gfc-happy", navn: "Gard Happy",
+        hjemmeside: "https://gfc-happy.example.no", epost: "gammel@happy.no",
+        content_source: null,
+        field_provenance: JSON.stringify({ hjemmeside_verification: { verified: true } }),
+      });
+
+      const dumpProviders = () =>
+        (db.prepare(`SELECT * FROM experience_providers ORDER BY id`).all() as unknown[]).map((r) => JSON.stringify(r));
+      const dumpAudit = () =>
+        (db.prepare(`SELECT * FROM gardssalg_content_audit ORDER BY rowid`).all() as unknown[]).map((r) => JSON.stringify(r));
+
+      // ── owner_locked ──────────────────────────────────────────────────
+      const beforeLocked = dumpProviders();
+      const lockedResult = expStore.applyGardssalgFieldConcordanceClear(
+        "gfc-owner-locked", "https://gfc-owner-locked.example.no"
+      );
+      assertEq(
+        lockedResult,
+        { provider_id: "gfc-owner-locked", field_name: "epost", written: false, reason: "owner_locked" },
+        "gfc-clear-1a: manual content_source -> owner_locked, zero writes",
+      );
+      assertEq(dumpProviders(), beforeLocked, "gfc-clear-1b: experience_providers byte-identical after owner_locked rejection");
+
+      // ── rollback_vetoed ───────────────────────────────────────────────
+      const beforeVetoed = dumpProviders();
+      const beforeVetoedAudit = dumpAudit();
+      const vetoedResult = expStore.applyGardssalgFieldConcordanceClear(
+        "gfc-vetoed", "https://gfc-vetoed.example.no"
+      );
+      assertEq(
+        vetoedResult,
+        { provider_id: "gfc-vetoed", field_name: "epost", written: false, reason: "rollback_vetoed" },
+        "gfc-clear-2a: latest audit row is a rollback -> rollback_vetoed, zero writes",
+      );
+      assertEq(dumpProviders(), beforeVetoed, "gfc-clear-2b: experience_providers byte-identical after rollback_vetoed rejection");
+      assertEq(dumpAudit(), beforeVetoedAudit, "gfc-clear-2c: no new gardssalg_content_audit row inserted");
+
+      // ── already_blank ─────────────────────────────────────────────────
+      const beforeBlank = dumpProviders();
+      const blankResult = expStore.applyGardssalgFieldConcordanceClear(
+        "gfc-already-blank", "https://gfc-already-blank.example.no"
+      );
+      assertEq(
+        blankResult,
+        { provider_id: "gfc-already-blank", field_name: "epost", written: false, reason: "already_blank" },
+        "gfc-clear-3a: already-blank stored epost -> already_blank, zero writes",
+      );
+      assertEq(dumpProviders(), beforeBlank, "gfc-clear-3b: experience_providers byte-identical after already_blank rejection");
+      const blankRow = db.prepare(`SELECT field_provenance FROM experience_providers WHERE id = 'gfc-already-blank'`).get() as { field_provenance: string | null };
+      assertEq(blankRow.field_provenance, null, "gfc-clear-3c: field_provenance untouched (still NULL) on the already_blank rejection");
+
+      // ── not_found ─────────────────────────────────────────────────────
+      const notFoundResult = expStore.applyGardssalgFieldConcordanceClear(
+        "gfc-does-not-exist", "https://nowhere.example.no"
+      );
+      assertEq(
+        notFoundResult,
+        { provider_id: "gfc-does-not-exist", field_name: "epost", written: false, reason: "not_found" },
+        "gfc-clear-4a: unknown provider_id -> not_found, zero writes",
+      );
+
+      // ── happy path ────────────────────────────────────────────────────
+      const beforeHappyAudit = dumpAudit();
+      const happyResult = expStore.applyGardssalgFieldConcordanceClear(
+        "gfc-happy", "https://gfc-happy.example.no", "batch-gfc-clear-1"
+      );
+      assertEq(
+        happyResult,
+        { provider_id: "gfc-happy", field_name: "epost", written: true },
+        "gfc-clear-5a: non-blank epost, no lock/veto -> written:true, no reason",
+      );
+      const happyRow = db.prepare(`SELECT epost, field_provenance FROM experience_providers WHERE id = 'gfc-happy'`).get() as { epost: string | null; field_provenance: string };
+      assertEq(happyRow.epost, null, "gfc-clear-5b: epost column is now NULL");
+      const happyProvenance = JSON.parse(happyRow.field_provenance);
+      assertTrue(!!happyProvenance.epost?.fetched_at, "gfc-clear-5c: field_provenance.epost is stamped");
+      assertEq(happyProvenance.epost.source_url, "https://gfc-happy.example.no", "gfc-clear-5d: field_provenance.epost.source_url is the evidence URL passed in");
+      assertTrue(!!happyProvenance.hjemmeside_verification?.verified, "gfc-clear-5e: pre-existing field_provenance.hjemmeside_verification key is NOT clobbered");
+
+      const afterHappyAudit = dumpAudit();
+      assertEq(afterHappyAudit.length, beforeHappyAudit.length + 1, "gfc-clear-5f: exactly one new gardssalg_content_audit row");
+      const happyAuditRow = db
+        .prepare(`SELECT * FROM gardssalg_content_audit WHERE provider_id = 'gfc-happy' AND field_name = 'epost' ORDER BY rowid DESC LIMIT 1`)
+        .get() as { old_value: string | null; new_value: string | null; source_url: string; batch_id: string | null };
+      assertEq(happyAuditRow.old_value, "gammel@happy.no", "gfc-clear-5g: audit old_value is the true pre-write epost");
+      assertEq(happyAuditRow.new_value, null, "gfc-clear-5h: audit new_value is NULL");
+      assertEq(happyAuditRow.source_url, "https://gfc-happy.example.no", "gfc-clear-5i: audit source_url is the evidence URL");
+      assertEq(happyAuditRow.batch_id, "batch-gfc-clear-1", "gfc-clear-5j: audit batch_id carried through");
+
+      // Idempotency: clearing the same (now-blank) provider a second time
+      // never double-clears or errors ambiguously — it's just already_blank.
+      const secondClearResult = expStore.applyGardssalgFieldConcordanceClear(
+        "gfc-happy", "https://gfc-happy.example.no"
+      );
+      assertEq(
+        secondClearResult,
+        { provider_id: "gfc-happy", field_name: "epost", written: false, reason: "already_blank" },
+        "gfc-clear-6: a second clear of the same (now-blank) provider -> already_blank, never a double-clear/ambiguous error",
+      );
+    } catch (err: any) {
+      failed++;
+      failures.push("gardssalg-field-concordance-clear (experience-store): unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch { /* best-effort */ }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+  }
+
   return { passed, failed, failures };
 }
 

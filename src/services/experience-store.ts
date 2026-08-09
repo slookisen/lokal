@@ -6242,7 +6242,13 @@ export type GfcApprovalResult = {
   provider_id: string;
   field_name: string;
   written: boolean;
-  reason?: "invalid_field" | "not_found" | "owner_locked" | "stale_current_value" | "rollback_vetoed";
+  reason?:
+    | "invalid_field"
+    | "not_found"
+    | "owner_locked"
+    | "stale_current_value"
+    | "rollback_vetoed"
+    | "already_blank";
 };
 
 /**
@@ -6380,6 +6386,139 @@ export function applyGardssalgFieldConcordanceApproval(
   applyWithAudit();
 
   return { provider_id: providerId, field_name: fieldName, written: true };
+}
+
+// ─── Gårdssalg field-concordance CLEAR (2026-08-09, dev-request 2026-08-09-
+// epost-korrigering-paa-plass) ──────────────────────────────────────────────
+//
+// applyGardssalgFieldConcordanceApproval above CORRECTS epost/telefon/mobil —
+// it always writes a caller-supplied non-blank newValue. It has no way to
+// express "this field should become blank": a `field_concordance` scan that
+// finds NOTHING on the page verdicts ikke_funnet_på_siden, which (per that
+// module's own doc comment) deliberately conflates "genuinely absent from a
+// successfully-fetched page" with "the page couldn't even be fetched" —
+// there is no approval lever that can act on the former without also being
+// exposed to the latter's fail-open risk.
+//
+// This function is that lever, but DELIBERATELY NOT a generalization of
+// applyGardssalgFieldConcordanceApproval — it is narrower on purpose:
+//   - fieldName is NOT a parameter. It is hardcoded to "epost" inside this
+//     function's own body, never selected by a caller. This is the ONE path
+//     in this codebase that can null out a previously-non-blank contact
+//     field, so its blast radius must stay structurally scoped to epost
+//     only — a generalized "clear any field" lever would let one careless
+//     caller null telefon/mobil/hjemmeside/etc. through the same door, and
+//     each of those has different downstream consumers and different risk.
+//     If a future dev-request needs the same lever for another field, that
+//     is a new, equally narrow function, not a widened version of this one.
+//   - This function does NOT fetch anything and does NOT decide "genuinely
+//     absent" — that judgment is the CALLER's (the route below) to make,
+//     via a FRESH, same-request, successful crFetchGardssalgContent +
+//     checkEmailField(...) === "ikke_funnet_på_siden" check. This function
+//     only performs the guarded write once that judgment has already been
+//     made; it trusts its caller completely on that point, so every caller
+//     MUST have just proven genuine absence on a live page, never on a
+//     cached/batched verdict (the exact ambiguity the module doc comment
+//     above warns about).
+//
+// Guard order (first failing gate wins, no DB write on any of them) — SAME
+// three guards applyGardssalgFieldConcordanceApproval runs, in the same
+// order, plus one this function alone needs:
+//   1. provider not found -> "not_found".
+//   2. isGardssalgFieldOwnerLocked(row, "epost") -> "owner_locked" (mobil/
+//      epost/telefon are never in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS, so
+//      for content_source='claim' rows this always falls into that helper's
+//      "any other fieldName -> always locked" branch, same as the approval
+//      lever above).
+//   3. gardssalgContactFieldWasRolledBack(providerId, "epost") ->
+//      "rollback_vetoed" — same "an undo that un-undoes itself" gap the
+//      approval lever's own guard closes (see its doc comment), equally
+//      real here: a human who deliberately rolled epost back to a specific
+//      (possibly non-blank) value must not have that decision silently
+//      overwritten by an unrelated "the page doesn't show anything anymore"
+//      clear.
+//   4. the row's CURRENT epost (trimmed) is already blank/null ->
+//      "already_blank" — nothing to clear, and nulling an already-NULL
+//      column would still be a no-op write with a misleading audit row, so
+//      this is refused before touching the DB rather than silently
+//      succeeding at nothing.
+//
+// On success: read-modify-write field_provenance.epost (defensive JSON
+// parse, malformed/missing -> {}, never clobbers other keys — same recipe as
+// applyGardssalgFieldConcordanceApproval), UPDATE epost to NULL, and insert
+// one gardssalg_content_audit row (old_value = the true pre-write trimmed
+// epost value, new_value = NULL, source_url = evidenceUrl) — all inside one
+// db.transaction. Returns `{written: true}` (no `reason`).
+export function applyGardssalgFieldConcordanceClear(
+  providerId: string,
+  evidenceUrl: string,
+  batchId?: string
+): GfcApprovalResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, epost, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        epost: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) {
+    return { provider_id: providerId, field_name: "epost", written: false, reason: "not_found" };
+  }
+
+  if (isGardssalgFieldOwnerLocked(row, "epost")) {
+    return { provider_id: providerId, field_name: "epost", written: false, reason: "owner_locked" };
+  }
+
+  if (gardssalgContactFieldWasRolledBack(providerId, "epost")) {
+    return { provider_id: providerId, field_name: "epost", written: false, reason: "rollback_vetoed" };
+  }
+
+  const currentValue = (row.epost || "").trim() || null;
+  if (!currentValue) {
+    return { provider_id: providerId, field_name: "epost", written: false, reason: "already_blank" };
+  }
+
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.epost = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET epost = NULL, field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`
+    ).run({ id: providerId, field_provenance: JSON.stringify(provenance) });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      field_name: "epost",
+      old_value: currentValue,
+      new_value: null,
+      source_url: evidenceUrl,
+      batch_id: batchId ?? null,
+    });
+  });
+  applyWithAudit();
+
+  return { provider_id: providerId, field_name: "epost", written: true };
 }
 
 // ─── Gårdssalg rollback-veto override (2026-08-09, criterion 4 — closes the

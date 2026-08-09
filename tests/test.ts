@@ -29204,6 +29204,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gfcrq.failures) failures.push("opplevelser-gardssalg-field-concordance-review-approve: " + f);
     console.log(`  opplevelser-gardssalg-field-concordance-review-approve: ${gfcrq.passed} passed, ${gfcrq.failed} failed`);
 
+    // dev-request 2026-08-09-epost-korrigering-paa-plass: the narrow,
+    // epost-only clear lever — POST /admin/gardssalg-field-concordance-clear.
+    // Same in-memory-DB + mocked-router harness, runs sequentially inside
+    // this same gated block.
+    console.log("\n── opplevelser-gardssalg-field-concordance-clear: epost clear endpoint ──");
+    const { runOpplevelserGardssalgFieldConcordanceClearTests } = require("../src/routes/opplevelser-gardssalg-field-concordance-clear.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-field-concordance-clear.test");
+    const gfcc = await runOpplevelserGardssalgFieldConcordanceClearTests({ log: false });
+    passed += gfcc.passed;
+    failed += gfcc.failed;
+    for (const f of gfcc.failures) failures.push("opplevelser-gardssalg-field-concordance-clear: " + f);
+    console.log(`  opplevelser-gardssalg-field-concordance-clear: ${gfcc.passed} passed, ${gfcc.failed} failed`);
+
     // dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
     // acceptance criterion 5: GET /admin/gardssalg/bookings-count — read-only
     // count + non-PII listing of existing gardssalg_bookings rows. Same
