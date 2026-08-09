@@ -96,6 +96,7 @@ import {
   BookingInputSchema,
   sendBookingConfirmation,
   sendProducerNotification,
+  BOOKING_NOT_ACTIVATED_MSG,
 } from "../services/booking-store";
 
 import { jsonRpcLimiter } from "../middleware/security";
@@ -899,8 +900,8 @@ function registerExperienceTools(
                 rejected: true,
                 reason: "not_live",
                 message:
-                  "Reservasjoner er ikke aktive ennå for denne produsenten — kommer snart. / " +
-                  "Bookings are not open yet for this producer — coming soon.",
+                  BOOKING_NOT_ACTIVATED_MSG +
+                  " / Booking is not activated for this producer yet.",
               }, null, 2),
             }],
           };

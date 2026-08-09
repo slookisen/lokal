@@ -431,6 +431,8 @@ import {
   sendBookingConfirmation,
   // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0
   isBookingPaused,
+  // dev-request 2026-08-09-gardssalg-kommer-snart-fjernes-eier-aktivert-booking
+  BOOKING_NOT_ACTIVATED_MSG,
   sendProducerNotification,
   // booking-flyt-v1 slice 2: pre-visit reminder + auto-expiry engine
   processBookingFollowups,
@@ -12812,7 +12814,7 @@ router.post("/book", async (req: Request, res: Response) => {
     res.status(200).json({
       success: false,
       paused: true,
-      message: "Reservasjoner er ikke aktive ennå — kommer snart.",
+      message: BOOKING_NOT_ACTIVATED_MSG,
     });
     return;
   }

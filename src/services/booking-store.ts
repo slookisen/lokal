@@ -64,6 +64,19 @@ export function isBookingPaused(
   return !bookingDispatchEnabled();
 }
 
+// ─── Honest paused-state copy (dev-request 2026-08-09-gardssalg-kommer-
+// snart-fjernes-eier-aktivert-booking) ──────────────────────────────────────
+// "Kommer snart" promised a timeline nobody controls; activation is the
+// owner's call (the claim-portal checkbox / the admin lever), so every
+// surface now states the plain fact instead. ONE source for the copy — the
+// web API, the SSR panel, the profile page and the MCP tool all render
+// these strings, never a re-worded inline variant.
+export const BOOKING_NOT_ACTIVATED_MSG =
+  "Booking er ikke aktivert for denne produsenten ennå.";
+export const BOOKING_NOT_ACTIVATED_INTEREST_MSG =
+  BOOKING_NOT_ACTIVATED_MSG +
+  " Du kan sende en interessemelding, men ingen reservasjon blir bekreftet før booking er aktivert.";
+
 export type BookingStatus =
   | "reserved"
   | "confirmed_attended"
