@@ -25,7 +25,9 @@ import {
   checkOpeningHoursField,
   buildProviderConcordanceRow,
   summarizeGfc,
+  summarizeGfcFetchStatus,
   type GfcProducerRow,
+  type GfcProviderResult,
 } from "./gardssalg-field-concordance";
 
 export interface TestSummary {
@@ -289,9 +291,14 @@ export function runGardssalgFieldConcordanceTests(opts: { log?: boolean } = {}):
         poststed: "Odda",
         opening_hours_text: "Ma-Fr 10-16",
       });
-      const failedRow = buildProviderConcordanceRow(producer, null);
+      const failedRow = buildProviderConcordanceRow(producer, null, "fetch_failed");
       assertEq(failedRow.provider_id, "prov-1", "buildProviderConcordanceRow: provider_id passthrough");
       assertEq(failedRow.provider_name, "Test Gård", "buildProviderConcordanceRow: provider_name passthrough");
+      assertEq(
+        failedRow.fetch_status,
+        "fetch_failed",
+        "buildProviderConcordanceRow: fetchStatus='fetch_failed' passed through onto fetch_status",
+      );
       for (const f of ["epost", "telefon", "mobil", "adresse", "postnummer", "poststed", "opening_hours_text"] as const) {
         assertEq(
           (failedRow as any)[f].verdict,
@@ -310,10 +317,33 @@ export function runGardssalgFieldConcordanceTests(opts: { log?: boolean } = {}):
         "buildProviderConcordanceRow: fetch failure — presence-only field carries no current/found keys",
       );
 
+      // ── buildProviderConcordanceRow: fetchStatus='no_hjemmeside' (no
+      //     hjemmeside on file at all — distinct from a fetch that was
+      //     attempted and failed) ─────────────────────────────────────────
+      const noHjemmesideRow = buildProviderConcordanceRow(producer, null, "no_hjemmeside");
+      assertEq(
+        noHjemmesideRow.fetch_status,
+        "no_hjemmeside",
+        "buildProviderConcordanceRow: fetchStatus='no_hjemmeside' passed through onto fetch_status",
+      );
+      for (const f of ["epost", "telefon", "mobil", "adresse", "postnummer", "poststed", "opening_hours_text"] as const) {
+        assertEq(
+          (noHjemmesideRow as any)[f].verdict,
+          "ikke_funnet_på_siden",
+          `buildProviderConcordanceRow: fetchStatus='no_hjemmeside' -> ${f} still verdicts ikke_funnet_på_siden (fail-closed unchanged)`,
+        );
+      }
+
       // ── buildProviderConcordanceRow: real page text, mixed verdicts ──────
       const okRow = buildProviderConcordanceRow(
         producer,
         "Kontakt: post@gard.no, ring 912 34 567. Gardsveien 12, 5750 Odda. Ma-Fr 10-16.",
+        "fetched",
+      );
+      assertEq(
+        okRow.fetch_status,
+        "fetched",
+        "buildProviderConcordanceRow: fetchStatus='fetched' passed through onto fetch_status, field verdicts unaffected",
       );
       assertEq(okRow.epost.verdict, "bekreftet", "buildProviderConcordanceRow (ok): epost bekreftet");
       assertEq(okRow.telefon.verdict, "bekreftet", "buildProviderConcordanceRow (ok): telefon bekreftet");
@@ -347,6 +377,24 @@ export function runGardssalgFieldConcordanceTests(opts: { log?: boolean } = {}):
         summary.adresse,
         { bekreftet: 1, avvik: 0, ikke_funnet_på_siden: 1 },
         "summarizeGfc: adresse counts across both rows",
+      );
+
+      // ── summarizeGfcFetchStatus ───────────────────────────────────────────
+      const fetchStatusFixture: GfcProviderResult[] = [failedRow, okRow, noHjemmesideRow, okRow];
+      assertEq(
+        summarizeGfcFetchStatus(fetchStatusFixture),
+        { fetched: 2, fetch_failed: 1, no_hjemmeside: 1 },
+        "summarizeGfcFetchStatus: counts rows per fetch_status bucket correctly",
+      );
+      assertEq(
+        summarizeGfcFetchStatus([]),
+        { fetched: 0, fetch_failed: 0, no_hjemmeside: 0 },
+        "summarizeGfcFetchStatus: empty rows -> all buckets present and zero, not undefined",
+      );
+      assertEq(
+        summarizeGfcFetchStatus([okRow]),
+        { fetched: 1, fetch_failed: 0, no_hjemmeside: 0 },
+        "summarizeGfcFetchStatus: a single-status batch still reports every bucket (absent statuses are zero, not undefined)",
       );
     } catch (err: any) {
       failed++;
