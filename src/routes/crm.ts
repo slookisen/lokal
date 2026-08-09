@@ -329,6 +329,48 @@ router.post("/threads/:id/send", async (req, res) => {
   });
 
   if (intent === "resend_send") {
+    // ─── Reserve the crm_messages row BEFORE the await below ──────────────
+    // Bug fix (post-review): the double-send guard above only ever saw
+    // ALREADY-RECORDED sends, because recordOutboundReply() used to run
+    // AFTER `await emailService.sendRaw(...)` resolved. Two genuinely
+    // concurrent identical requests both pass findRecentIdenticalOutbound()
+    // (neither has recorded anything yet), both await the send, and both
+    // record a message — the guard never actually closed the race it exists
+    // for. Confirmed via two Promise.all-fired identical resend_send
+    // requests against a stubbed transport: both created a crm_messages row.
+    //
+    // Fix: record the reservation (delivery_status='queued', same "not yet
+    // confirmed" state the gmail_draft path already uses) synchronously,
+    // right here — before the first `await` in this branch. Everything from
+    // the duplicate-check above through this insert runs in one synchronous
+    // stretch of the event loop (better-sqlite3 calls are synchronous, and
+    // nothing in between awaits), so Node cannot interleave a second
+    // request's handler into the middle of it. A second, genuinely-
+    // concurrent identical request therefore either fully completes its own
+    // reservation before this one starts (and this one's duplicate-check
+    // catches IT), or runs its duplicate-check after this reservation is
+    // already committed (and it gets rejected by this one). Either way,
+    // only one of the two can ever get past the check — the crm_messages
+    // row is now the single source of truth for "is a send in flight",
+    // closing the actual race, not just the already-recorded case.
+    //
+    // outboxId links this message back onto the crm_outbox row it belongs
+    // to (crm_outbox.crm_message_id) so /outbox/:id/result can resolve
+    // "the" message for THIS outbox item explicitly instead of guessing via
+    // getLatestOutboundMessageId's "most recent for thread" heuristic —
+    // see that route handler for the ambiguity this closes.
+    const reserved = crmService.recordOutboundReply({
+      threadId,
+      vertical: thread.vertical_id,
+      toEmails,
+      ccEmails,
+      subject,
+      bodyText,
+      bodyHtml,
+      deliveryStatus: "queued",
+      outboxId: queued.id,
+    });
+
     // Process immediately via SMTP
     try {
       // Steg 3: brand + reply-to come from the THREAD's platform, same source of
@@ -352,54 +394,29 @@ router.post("/threads/:id/send", async (req, res) => {
         // the fix. internalMessageId in the action payload mirrors the
         // compose route's convention so the Sendt-logg's actor lookup can
         // match this crm_messages row exactly, not just fall back to the
-        // thread-level outbox heuristic.
-        const recorded = crmService.recordOutboundReply({
-          threadId,
-          vertical: thread.vertical_id,
-          toEmails,
-          ccEmails,
-          subject,
-          bodyText,
-          bodyHtml,
-          deliveryStatus: "sent",
-        });
+        // thread-level outbox heuristic. The row already exists (reserved
+        // above) — flip it from 'queued' to the real outcome instead of
+        // inserting a second row.
+        crmService.updateMessageDeliveryStatus(reserved.messageId, "sent");
         crmService.logAction({
           threadId,
           contactId: thread.contact_id,
           type: "sent",
           actor: createdBy,
-          payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", internalMessageId: recorded.messageId },
+          payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", internalMessageId: reserved.messageId },
         });
-        return res.json({ success: true, outboxId: queued.id, messageId: result.messageId, internalMessageId: recorded.messageId, channel: "resend_smtp" });
+        return res.json({ success: true, outboxId: queued.id, messageId: result.messageId, internalMessageId: reserved.messageId, channel: "resend_smtp" });
       } else {
         crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
-        // Record the failed attempt too (delivery_status='failed', no
-        // sent_at) — matches composeNewThread/updateMessageDeliveryStatus's
-        // existing "failed sends are still visible in the thread" convention.
-        crmService.recordOutboundReply({
-          threadId,
-          vertical: thread.vertical_id,
-          toEmails,
-          ccEmails,
-          subject,
-          bodyText,
-          bodyHtml,
-          deliveryStatus: "failed",
-        });
+        // Flip the reserved row to 'failed' (no sent_at) — matches
+        // composeNewThread/updateMessageDeliveryStatus's existing "failed
+        // sends are still visible in the thread" convention.
+        crmService.updateMessageDeliveryStatus(reserved.messageId, "failed");
         return res.status(500).json({ success: false, error: result.error || "send failed", outboxId: queued.id });
       }
     } catch (err: any) {
       crmService.markOutboxResult(queued.id, "failed", undefined, err.message ?? "exception");
-      crmService.recordOutboundReply({
-        threadId,
-        vertical: thread.vertical_id,
-        toEmails,
-        ccEmails,
-        subject,
-        bodyText,
-        bodyHtml,
-        deliveryStatus: "failed",
-      });
+      crmService.updateMessageDeliveryStatus(reserved.messageId, "failed");
       return res.status(500).json({ success: false, error: err.message ?? "exception" });
     }
   }
@@ -408,7 +425,10 @@ router.post("/threads/:id/send", async (req, res) => {
   // thread immediately) and flipped to 'draft_in_gmail' by the existing
   // /outbox/:id/result -> updateMessageDeliveryStatus path once the CS-agent
   // reports the draft was created — same lifecycle composeNewThread's
-  // gmail_draft path already uses.
+  // gmail_draft path already uses. This whole branch is synchronous (no
+  // `await` anywhere in it), so — same reasoning as the resend_send
+  // reservation above — it can never interleave with a concurrent request
+  // either; outboxId links it to the crm_outbox row for /outbox/:id/result.
   const recorded = crmService.recordOutboundReply({
     threadId,
     vertical: thread.vertical_id,
@@ -418,6 +438,7 @@ router.post("/threads/:id/send", async (req, res) => {
     bodyText,
     bodyHtml,
     deliveryStatus: "queued",
+    outboxId: queued.id,
   });
   res.json({
     success: true,
@@ -1104,7 +1125,7 @@ router.post("/outbox/:id/result", (req, res) => {
 
   // Look up outbox row to log action
   const db = getDb();
-  const row = db.prepare("SELECT thread_id, contact_id, intent, created_by FROM crm_outbox WHERE id = ?").get(req.params.id) as any;
+  const row = db.prepare("SELECT thread_id, contact_id, intent, created_by, crm_message_id FROM crm_outbox WHERE id = ?").get(req.params.id) as any;
   if (row) {
     crmService.logAction({
       threadId: row.thread_id,
@@ -1123,7 +1144,25 @@ router.post("/outbox/:id/result", (req, res) => {
     // recordOutboundReply() now leaves the same 'queued' row for a reply,
     // where before this fix no crm_messages row existed for a reply at all
     // and this lookup was a guaranteed no-op on that path).
-    const msgId = crmService.getLatestOutboundMessageId(row.thread_id);
+    //
+    // Bug fix (post-review): getLatestOutboundMessageId(threadId) picks the
+    // thread's most-recent outbound crm_messages row with NO link back to
+    // which outbox row produced it. That was safe before this PR (only a
+    // brand-new thread ever got a single 'queued' message at a time), but
+    // recordOutboundReply() now also leaves 'queued' rows for replies on
+    // EXISTING threads — so a thread can have several outstanding queued
+    // replies at once, and "most recent" can name the WRONG one when
+    // results come back out of order (confirmed: two gmail_draft replies
+    // queued on the same thread, resolving outbox-item-2 first updated
+    // message 1 instead, leaving message 2 stuck at 'queued' forever).
+    //
+    // Fix: crm_outbox.crm_message_id (populated by recordOutboundReply()
+    // when it's given this outbox row's id — see POST /threads/:id/send)
+    // is the explicit, unambiguous link for every row created going
+    // forward. getLatestOutboundMessageId is kept ONLY as a fallback for
+    // outbox rows that predate this column (e.g. rows from before this
+    // migration shipped) — those still behave exactly as before.
+    const msgId = row.crm_message_id ?? crmService.getLatestOutboundMessageId(row.thread_id);
     if (msgId) {
       const newStatus = parsed.data.status === "completed"
         ? (row.intent === "gmail_draft" ? "draft_in_gmail" : "sent")

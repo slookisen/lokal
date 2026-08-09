@@ -820,6 +820,25 @@ function initSchema(db: Database.Database): void {
     // column already exists — fine
   }
 
+  // crm_outbox.crm_message_id — added dev-request
+  // 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk (post-review bugfix).
+  // Before this column, /outbox/:id/result resolved "the" crm_messages row
+  // for an outbox item via getLatestOutboundMessageId(threadId) — "most
+  // recent outbound message on this thread". That was safe when only a
+  // brand-new thread ever got a single 'queued' message at a time, but
+  // recordOutboundReply() (this same dev-request) also leaves 'queued' rows
+  // for replies on EXISTING threads, so a thread can now have several
+  // outstanding queued replies — and "most recent" can name the wrong one
+  // when results come back out of order. Explicitly linking the outbox row
+  // to the message it produced (set by recordOutboundReply's outboxId
+  // param) removes the ambiguity. NULL on existing/legacy rows is fine —
+  // crmService.getLatestOutboundMessageId() remains the fallback for those.
+  try {
+    db.exec("ALTER TABLE crm_outbox ADD COLUMN crm_message_id TEXT REFERENCES crm_messages(id) ON DELETE SET NULL");
+  } catch (e) {
+    // column already exists — fine
+  }
+
   // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch
   // the "duplicate column" error and ignore it.
   try {

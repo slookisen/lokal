@@ -24,6 +24,18 @@
  *           status='completed' outbox row with no crm_messages row gets one
  *           on the next schema boot, idempotently (re-running the boot does
  *           not double-insert or double-count message_count).
+ *   m13-m17 post-review bugfix — the double-send guard closes the RACE, not
+ *           just the already-recorded case: two genuinely concurrent
+ *           identical resend_send requests (fired back-to-back before
+ *           either's first `await`, against a latency-stubbed transport)
+ *           produce exactly one 200 and one 409, and only one crm_messages
+ *           row / one message_count increment.
+ *   m18-m24 post-review bugfix — /outbox/:id/result resolves the RIGHT
+ *           message via the new crm_outbox.crm_message_id link once a
+ *           thread has more than one outstanding queued reply: resolving
+ *           the second-queued outbox item before the first updates the
+ *           SECOND message, leaving the first untouched (not the
+ *           "most recent" heuristic's wrong answer).
  *
  * Standalone: npx tsx src/routes/crm-send-message-history.test.ts
  * Wired into tests/test.ts via runCrmSendMessageHistoryTests().
@@ -255,6 +267,152 @@ export async function runCrmSendMessageHistoryTests(opts: { log?: boolean } = {}
       const afterSecondBoot = crmService.getThreadDetail(backfillThreadId) as any;
       assertEq(afterSecondBoot.messages.length, 2, "m12: re-running the migration a second time does not create a duplicate row");
       assertEq(afterSecondBoot.thread.message_count, 2, "m12b: …or double-count message_count");
+    }
+    // ═══════════════════════════════════════════════════════════════
+    // m13-m17 — double-send guard closes the RACE, not just the
+    // already-recorded case (post-review bugfix).
+    //
+    // Before the fix, findRecentIdenticalOutbound() was checked BEFORE
+    // `await emailService.sendRaw(...)`, but the crm_messages row that makes
+    // the guard "see" a send was only written AFTER that await resolved. Two
+    // genuinely concurrent identical resend_send requests both passed the
+    // pre-check before either had recorded anything, so both went through —
+    // reproduced below by firing two identical requests back-to-back
+    // (synchronously, before either's first `await`) against a
+    // latency-stubbed transport, exactly like two real concurrent HTTP
+    // requests would interleave at the `await`.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const raceThreadId = "send-history-race-thread-1";
+      db.prepare(`
+        INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id, message_count)
+        VALUES (?, ?, 'Race-test sak', 'innkommende', 'normal', 'rfb', 1)
+      `).run(raceThreadId, contact.id);
+      db.prepare(`
+        INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, sent_at, delivery_status, vertical_id)
+        VALUES ('inbound-race-1', ?, 'in', 'kunde@example.no', '[]', '[]', 'Race-test sak', 'Hei, har et spørsmål.', datetime('now','-1 hour'), 'sent', 'rfb')
+      `).run(raceThreadId);
+
+      const emailMod = require("../services/email-service") as any;
+      const svc = emailMod.emailService;
+      const realSendRaw = svc.sendRaw.bind(svc);
+      let sendCount = 0;
+      // Latency stub — the send only resolves after a delay, so the window
+      // between the synchronous duplicate-check/reservation and the actual
+      // send outcome is wide open, same as the real Resend round-trip that
+      // produced the observed double-send.
+      svc.sendRaw = async () => {
+        sendCount++;
+        await new Promise((r) => setTimeout(r, 20));
+        return { success: true, messageId: `stub-race-${sendCount}` };
+      };
+
+      try {
+        const beforeRace = crmService.getThreadDetail(raceThreadId) as any;
+        assertEq(beforeRace.thread.message_count, 1, "m13: race thread starts with just the seeded inbound message");
+
+        const payload = {
+          intent: "resend_send",
+          toEmails: ["kunde@example.no"],
+          subject: "Re: Race-test sak",
+          bodyText: "Identisk svar sendt to ganger samtidig.",
+          createdBy: "daniel",
+        };
+        // Fire both requests synchronously, back-to-back — this is what
+        // Promise.all([...]) does: both `call()` invocations run (and each
+        // async route handler starts executing) before either Promise is
+        // awaited, so this reproduces two genuinely concurrent requests
+        // hitting the same synchronous JS event loop, exactly like two
+        // real concurrent HTTP requests interleaving at the same `await`.
+        const p1 = call("POST", `/threads/${raceThreadId}/send`, payload);
+        const p2 = call("POST", `/threads/${raceThreadId}/send`, payload);
+        const [r1, r2] = await Promise.all([p1, p2]);
+
+        const statuses = [r1.status, r2.status].sort();
+        assertEq(statuses, [200, 409], "m14: of two genuinely concurrent identical sends, exactly ONE succeeds and ONE is hard-rejected as a duplicate — the guard now actually closes the race it exists for");
+
+        const rejected = r1.status === 409 ? r1 : r2;
+        assertEq(rejected.body?.error, "duplicate_send", "m14b: the rejected one carries the duplicate_send error code");
+
+        const afterRace = crmService.getThreadDetail(raceThreadId) as any;
+        assertEq(afterRace.thread.message_count, 2, "m15: message_count grew by exactly ONE (1 -> 2), not two — no double-send got through");
+        const raceReplies = (afterRace.messages as any[]).filter((m: any) => m.direction === "out");
+        assertEq(raceReplies.length, 1, "m16: exactly ONE crm_messages row exists for the reply, not two");
+        assertEq(raceReplies[0]?.delivery_status, "sent", "m17: …and it reflects the real, confirmed outcome ('sent'), not left dangling at 'queued'");
+      } finally {
+        svc.sendRaw = realSendRaw;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // m18-m24 — /outbox/:id/result resolves the RIGHT message once a
+    // thread has more than one outstanding queued reply (post-review
+    // bugfix).
+    //
+    // Before the fix, getLatestOutboundMessageId(threadId) picked the
+    // thread's most-recent outbound crm_messages row with no link back to
+    // which crm_outbox row produced it. With recordOutboundReply() now
+    // leaving 'queued' rows for replies on EXISTING threads too, a thread
+    // can have multiple outstanding queued replies — reproduced below by
+    // queuing two distinct gmail_draft replies on the same thread, then
+    // resolving the SECOND-queued outbox item FIRST (out of order).
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const multiThreadId = "send-history-multi-pending-thread-1";
+      db.prepare(`
+        INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id, message_count)
+        VALUES (?, ?, 'Flere ubesvarte utkast', 'innkommende', 'normal', 'rfb', 1)
+      `).run(multiThreadId, contact.id);
+      db.prepare(`
+        INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, sent_at, delivery_status, vertical_id)
+        VALUES ('inbound-multi-1', ?, 'in', 'kunde@example.no', '[]', '[]', 'Flere ubesvarte utkast', 'Første spørsmål.', datetime('now','-2 hour'), 'sent', 'rfb')
+      `).run(multiThreadId);
+
+      const reply1 = await call("POST", `/threads/${multiThreadId}/send`, {
+        intent: "gmail_draft",
+        toEmails: ["kunde@example.no"],
+        subject: "Re: Flere ubesvarte utkast (svar 1)",
+        bodyText: "Første svar-utkast.",
+        createdBy: "daniel",
+      });
+      assertEq(reply1.status, 200, "m18: first queued reply on the thread succeeds");
+      const reply2 = await call("POST", `/threads/${multiThreadId}/send`, {
+        intent: "gmail_draft",
+        toEmails: ["kunde@example.no"],
+        subject: "Re: Flere ubesvarte utkast (svar 2)",
+        bodyText: "Andre, distinkte svar-utkast.",
+        createdBy: "daniel",
+      });
+      assertEq(reply2.status, 200, "m19: a second, DISTINCT queued reply on the SAME thread also succeeds — the thread now has two outstanding 'queued' messages");
+
+      const outboxId1 = reply1.body?.outboxId as string;
+      const outboxId2 = reply2.body?.outboxId as string;
+      const messageId1 = reply1.body?.internalMessageId as string;
+      const messageId2 = reply2.body?.internalMessageId as string;
+      assertTrue(typeof outboxId1 === "string" && typeof outboxId2 === "string" && outboxId1 !== outboxId2, "m20: the two replies produced two DIFFERENT crm_outbox ids");
+
+      const linkedOutbox1 = db.prepare("SELECT crm_message_id FROM crm_outbox WHERE id = ?").get(outboxId1) as any;
+      const linkedOutbox2 = db.prepare("SELECT crm_message_id FROM crm_outbox WHERE id = ?").get(outboxId2) as any;
+      assertEq(linkedOutbox1?.crm_message_id, messageId1, "m20b: crm_outbox row 1 is explicitly linked to crm_messages row 1");
+      assertEq(linkedOutbox2?.crm_message_id, messageId2, "m20c: crm_outbox row 2 is explicitly linked to crm_messages row 2 — NOT row 1");
+
+      // Resolve the SECOND-queued item FIRST — the exact out-of-order
+      // sequence the bug report reproduced.
+      const result2 = await call("POST", `/outbox/${outboxId2}/result`, { status: "completed", resultId: "draft-2" });
+      assertEq(result2.status, 200, "m21: resolving outbox item 2 (out of order, before item 1) succeeds");
+
+      const afterResult2 = crmService.getThreadDetail(multiThreadId) as any;
+      const msg1AfterResult2 = (afterResult2.messages as any[]).find((m: any) => m.id === messageId1);
+      const msg2AfterResult2 = (afterResult2.messages as any[]).find((m: any) => m.id === messageId2);
+      assertEq(msg2AfterResult2?.delivery_status, "draft_in_gmail", "m22: message 2 (the one outbox item 2 actually produced) is updated to 'draft_in_gmail'");
+      assertEq(msg1AfterResult2?.delivery_status, "queued", "m23: message 1 is UNTOUCHED, still 'queued' — this is the bug: before the fix, 'most recent' would have wrongly updated message 1 here instead");
+
+      // Now resolve item 1 — it must land on message 1, not double-update message 2.
+      const result1 = await call("POST", `/outbox/${outboxId1}/result`, { status: "completed", resultId: "draft-1" });
+      assertEq(result1.status, 200, "m24: resolving outbox item 1 afterwards also succeeds");
+      const afterResult1 = crmService.getThreadDetail(multiThreadId) as any;
+      const msg1Final = (afterResult1.messages as any[]).find((m: any) => m.id === messageId1);
+      assertEq(msg1Final?.delivery_status, "draft_in_gmail", "m24b: message 1 is now ALSO correctly updated to 'draft_in_gmail', resolved via its own explicit link");
     }
   } catch (err) {
     failed++;

@@ -671,6 +671,15 @@ class CrmService {
    *                      too, closing the "reply-from-thread sends don't
    *                      create crm_messages, so this no-ops" gap noted at
    *                      that call site).
+   *
+   * outboxId (optional): when the caller has the crm_outbox row this message
+   * belongs to, pass its id and this writes it back onto
+   * crm_outbox.crm_message_id — the explicit link /outbox/:id/result uses to
+   * resolve "the" message for THAT outbox row instead of falling back to
+   * getLatestOutboundMessageId's "most recent for thread" heuristic, which
+   * misattributes results once a thread has more than one outstanding queued
+   * reply (see POST /threads/:id/send and /outbox/:id/result for the bug
+   * this closes).
    */
   recordOutboundReply(params: {
     threadId: string;
@@ -684,6 +693,8 @@ class CrmService {
     /** ISO timestamp. Only meaningful when deliveryStatus === 'sent'; ignored otherwise. */
     sentAt?: string | null;
     rawMetadata?: Record<string, any>;
+    /** crm_outbox.id this message belongs to — see doc comment above. */
+    outboxId?: string;
   }): { messageId: string } {
     const db = getDb();
     const v = assertVertical(params.vertical, "recordOutboundReply");
@@ -708,6 +719,10 @@ class CrmService {
       params.deliveryStatus,
       v,
     );
+
+    if (params.outboxId) {
+      db.prepare(`UPDATE crm_outbox SET crm_message_id = ? WHERE id = ?`).run(messageId, params.outboxId);
+    }
 
     this.recomputeThreadStats(params.threadId);
     return { messageId };
@@ -854,8 +869,14 @@ class CrmService {
   }
 
   /**
-   * Find the most recent outbound crm_messages id for a thread, for use
-   * when the caller has only the threadId (e.g. /outbox/:id/result).
+   * Find the most recent outbound crm_messages id for a thread.
+   *
+   * FALLBACK ONLY as of the crm_outbox.crm_message_id link (see
+   * recordOutboundReply's outboxId param): "most recent" is ambiguous
+   * whenever a thread has more than one outstanding queued reply, which
+   * POST /threads/:id/send now makes possible. /outbox/:id/result prefers
+   * the explicit crm_outbox.crm_message_id and only calls this for outbox
+   * rows that predate that column.
    */
   getLatestOutboundMessageId(threadId: string): string | null {
     const db = getDb();
