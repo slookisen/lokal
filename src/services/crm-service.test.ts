@@ -135,6 +135,44 @@ export function runCrmServiceTests(opts: { log?: boolean } = {}): TestSummary {
     assertEq(rows.length, 0, "unknown contact_email returns empty array");
   }
 
+  // ─── getThreadDetail() must surface c.provider_id ───────────────────────
+  // Regression guard: the SELECT in getThreadDetail() read c.agent_id but not
+  // c.provider_id, so GET /admin/crm/threads/:id had no way to tell a caller
+  // (e.g. the customer-service routine) which Opplevagent producer a
+  // experiences-vertical thread's contact was matched to. Fixed by adding
+  // `c.provider_id AS provider_id` to the SELECT — pure additive read, no
+  // schema change.
+  {
+    // rfb-vertical contact: agent_id set, provider_id must come back null.
+    // agent_id is a real FK into `agents`, so seed the row it points at first.
+    db.prepare(`
+      INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
+      VALUES ('agent-123', 'Test Agent', 'x', 'test', 'rfb@example.no', 'https://example.no', 'producer', 'test-key-123', 1)
+    `).run();
+    db.prepare(`
+      INSERT INTO crm_contacts (id, type, email, name, vertical_id, agent_id)
+      VALUES ('contact-rfb', 'producer', 'rfb@example.no', 'RFB Contact', 'rfb', 'agent-123')
+    `).run();
+    insertThread("thread-rfb1", "contact-rfb", "awaiting_review", "RFB thread");
+
+    const rfbDetail = crmService.getThreadDetail("thread-rfb1") as any;
+    assertTrue(rfbDetail?.thread !== null && rfbDetail?.thread !== undefined, "getThreadDetail(rfb thread) returns a thread");
+    assertEq(rfbDetail.thread.agent_id, "agent-123", "rfb thread detail carries agent_id");
+    assertEq(rfbDetail.thread.provider_id, null, "rfb thread detail's provider_id is null — regression guard");
+
+    // experiences-vertical contact: provider_id set, must be returned.
+    db.prepare(`
+      INSERT INTO crm_contacts (id, type, email, name, vertical_id, provider_id)
+      VALUES ('contact-exp', 'producer', 'exp@example.no', 'Experiences Contact', 'experiences', 'provider-456')
+    `).run();
+    insertThread("thread-exp1", "contact-exp", "awaiting_review", "Experiences thread");
+
+    const expDetail = crmService.getThreadDetail("thread-exp1") as any;
+    assertTrue(expDetail?.thread !== null && expDetail?.thread !== undefined, "getThreadDetail(experiences thread) returns a thread");
+    assertEq(expDetail.thread.provider_id, "provider-456", "experiences thread detail carries provider_id — the bug this test guards against");
+    assertEq(expDetail.thread.agent_id, null, "experiences thread detail's agent_id is null");
+  }
+
   return { passed, failed, failures };
 }
 
