@@ -22,6 +22,11 @@
  *   +   — POST /api/opplevelser/book against a paused provider returns the
  *         shared constant as its message (the panel JS renders res.data
  *         .message verbatim, so this IS the panel's live copy).
+ *   AC5 — both options (chosen by Daniel in-session 2026-08-09): cards
+ *         carry POSITIVE markers only — «Booking tilgjengelig» exactly on
+ *         !isBookingPaused() rows, «✓ Eier-bekreftet» exactly on
+ *         claimed_at-stamped rows; a page of paused+unclaimed rows shows
+ *         no markers at all.
  *
  * (AC3 — the owner-portal activation switch — already existed: the portal's
  * field_booking_live checkbox + updateClaimedProviderProfile audit trail,
@@ -274,6 +279,24 @@ export function runExperiencesSeoGardssalgBookingIkkeAktivertTests(opts: { log?:
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/book/pauset-uclaimet-bryggeri?error=paused");
         assertTrue(r.handled && r.status === 200, `i1: panel with ?error=paused renders (status ${r.status})`);
         assertTrue(r.body.includes(BOOKING_NOT_ACTIVATED_INTEREST_MSG), "i2: the error banner uses the shared copy");
+      }
+
+      // ── AC5 options: positive card markers, exact-count discipline ──────
+      // Fixture census: 7 visible rows — gs-bna-live is the ONLY activated
+      // one (booking_live=1, dispatch on) and is claimed; gs-bna-paused-
+      // claimed is the only other claimed row; everything else is paused +
+      // unclaimed. So: «Booking tilgjengelig» ×1, «Eier-bekreftet» ×2.
+      {
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg");
+        const count = (s: string, needle: string) => s.split(needle).length - 1;
+        assertTrue(count(r.body, "Booking tilgjengelig") === 1, `k1: exactly the activated row's card carries 'Booking tilgjengelig' (got ${count(r.body, "Booking tilgjengelig")})`);
+        assertTrue(count(r.body, "Eier-bekreftet") === 2, `k2: exactly the two claimed rows carry '✓ Eier-bekreftet' (got ${count(r.body, "Eier-bekreftet")})`);
+      }
+      {
+        // The bryggeri type page holds only paused+unclaimed fixtures — a
+        // marker-free grid, proving markers never render as filler noise.
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/bryggeri");
+        assertTrue(!r.body.includes("Booking tilgjengelig") && !r.body.includes("Eier-bekreftet"), "k3: paused+unclaimed-only type page shows no markers");
       }
 
       // ── The JSON API's paused message IS the shared constant — the panel
