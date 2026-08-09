@@ -29264,6 +29264,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
 
+    // 2026-08-09 (rollback-veto-override, criterion 4): the deliberate-
+    // override lever for a gardssalgContactFieldWasRolledBack veto —
+    // planGardssalgRollbackVetoOverride/applyGardssalgRollbackVetoOverride
+    // (experience-store.ts) + POST /admin/gardssalg-rollback-veto-override
+    // (opplevelser.ts). Same in-memory-DB pattern, runs sequentially inside
+    // this same gated block for the same reason. (The companion
+    // rollback_vetoed guard added to applyGardssalgFieldConcordanceApproval
+    // is tested in opplevelser-gardssalg-field-concordance-review-approve.test.ts's
+    // own item 9, above.)
+    console.log("\n── opplevelser-gardssalg-rollback-veto-override: rollback-veto override lever ──");
+    const { runOpplevelserGardssalgRollbackVetoOverrideTests } = require("../src/routes/opplevelser-gardssalg-rollback-veto-override.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-rollback-veto-override.test");
+    const grvo = await runOpplevelserGardssalgRollbackVetoOverrideTests({ log: false });
+    passed += grvo.passed;
+    failed += grvo.failed;
+    for (const f of grvo.failures) failures.push("opplevelser-gardssalg-rollback-veto-override: " + f);
+    console.log(`  opplevelser-gardssalg-rollback-veto-override: ${grvo.passed} passed, ${grvo.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-
     // slice 3i: wires the already-shipped isGardssalgFieldOwnerLocked()
     // per-field owner-lock helper through applyGardssalgProviderContent's

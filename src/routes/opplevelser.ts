@@ -203,6 +203,13 @@ import {
   listGardssalgFieldConcordanceReviewQueue,
   clearGardssalgFieldConcordanceReviewQueueEntry,
   applyGardssalgFieldConcordanceApproval,
+  // 2026-08-09 rollback-veto-override — the deliberate-override lever for a
+  // gardssalgContactFieldWasRolledBack veto (see applyGardssalgFieldConcordance
+  // Approval's new rollback_vetoed guard). Backs POST /admin/gardssalg-
+  // rollback-veto-override below, near the existing gardssalg-content-rollback
+  // route.
+  planGardssalgRollbackVetoOverride,
+  applyGardssalgRollbackVetoOverride,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -6483,6 +6490,98 @@ router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, re
     });
   } catch (err: any) {
     console.error("[opplevelser] gardssalg-content-rollback failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-rollback-veto-override (admin) ──
+//
+// 2026-08-09 (rollback-veto-override): the deliberate-override lever for a
+// gardssalgContactFieldWasRolledBack veto — closes the gap where
+// applyGardssalgFieldConcordanceApproval's new `rollback_vetoed` guard (see
+// its own doc comment in experience-store.ts) would otherwise make a
+// human-rolled-back epost/telefon/mobil field PERMANENTLY unwritable via the
+// concordance-approval path, with no way back short of a direct DB edit.
+//
+// Single-item lever ONLY (one provider_id + field_name per call) — no
+// bulk/array mode, and this is never wired into any batch/cron/auto-run
+// path anywhere in the codebase; a human/orchestrator must explicitly
+// justify and trigger every override.
+//
+// Body: { provider_id, field_name, justification, batch_id?, apply? }.
+// provider_id/field_name/justification are all REQUIRED — missing/blank ->
+// 400 before any DB read (mirrors this file's existing "Body field 'X' is
+// required" convention, e.g. PATCH /admin/providers/:id/hjemmeside above).
+//
+// apply: dry-run by default (same truthy-check convention as every other
+// admin route in this file: apply === true/1/"1"/"true" in the body, or
+// ?apply=1/true in the query string). Dry-run calls
+// planGardssalgRollbackVetoOverride — a pure read, zero DB writes — and
+// reports the SAME reason codes the apply path would produce. apply=true
+// calls applyGardssalgRollbackVetoOverride for real: this changes ONLY the
+// audit trail (one new gardssalg_content_audit row, source_url the new
+// rollback-veto-override sentinel) — it NEVER touches the field's stored
+// value on experience_providers, and it NEVER mutates/deletes the
+// pre-existing rollback-marker row (the table is insert-only).
+router.post("/admin/gardssalg-rollback-veto-override", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    field_name?: unknown;
+    justification?: unknown;
+    batch_id?: unknown;
+    apply?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "Body field 'provider_id' is required" });
+    return;
+  }
+  const fieldName = typeof body.field_name === "string" ? body.field_name.trim() : "";
+  if (!fieldName) {
+    res.status(400).json({ error: "Body field 'field_name' is required" });
+    return;
+  }
+  const justification = typeof body.justification === "string" ? body.justification : "";
+  if (justification.trim() === "") {
+    res.status(400).json({ error: "Body field 'justification' is required" });
+    return;
+  }
+  const batchId =
+    typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : undefined;
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
+  try {
+    if (!apply) {
+      const result = planGardssalgRollbackVetoOverride(providerId, fieldName, justification);
+      res.json({
+        success: true,
+        dry_run: true,
+        provider_id: result.provider_id,
+        field_name: result.field_name,
+        would_override: result.overridden,
+        reason: result.reason,
+      });
+      return;
+    }
+
+    const result = applyGardssalgRollbackVetoOverride(providerId, fieldName, justification, batchId);
+    res.json({
+      success: true,
+      dry_run: false,
+      provider_id: result.provider_id,
+      field_name: result.field_name,
+      overridden: result.overridden,
+      reason: result.reason,
+    });
+  } catch (err: any) {
+    console.error("[opplevelser] gardssalg-rollback-veto-override failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
