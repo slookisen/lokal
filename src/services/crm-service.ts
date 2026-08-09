@@ -1146,7 +1146,7 @@ class CrmService {
   getThreadDetail(threadId: string): any {
     const db = getDb();
     const thread = db.prepare(`
-      SELECT t.*, c.email AS contact_email, c.name AS contact_name, c.type AS contact_type, c.agent_id
+      SELECT t.*, c.email AS contact_email, c.name AS contact_name, c.type AS contact_type, c.agent_id, c.provider_id AS provider_id
       FROM crm_threads t
       JOIN crm_contacts c ON c.id = t.contact_id
       WHERE t.id = ?
