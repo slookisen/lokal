@@ -105,6 +105,14 @@ const ingestSchema = z.object({
   }
 });
 
+// ─── Double-send guard window (steg 1.3, dev-request
+// 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk) ────────────────────
+// See crmService.findRecentIdenticalOutbound() for the finding and the
+// hard-reject-on-exact-duplicate rationale. 30s comfortably covers a
+// double-click/double-submit (the observed incident was 4s apart) without
+// being long enough to ever catch a human re-reading and re-sending later.
+const DUPLICATE_SEND_WINDOW_SECONDS = 30;
+
 const sendSchema = z.object({
   intent: z.enum(["gmail_draft", "resend_send"]),
   toEmails: z.array(z.string().email()).min(1),
@@ -286,6 +294,25 @@ router.post("/threads/:id/send", async (req, res) => {
     });
   }
 
+  // ─── Double-send guard ────────────────────────────────────────
+  // Hard reject on a byte-identical subject+body sent to this same thread
+  // within DUPLICATE_SEND_WINDOW_SECONDS. See
+  // crmService.findRecentIdenticalOutbound() for the finding this is based
+  // on and why identical-content is the line, not merely "recent".
+  const duplicate = crmService.findRecentIdenticalOutbound(threadId, subject, bodyText, DUPLICATE_SEND_WINDOW_SECONDS);
+  if (duplicate) {
+    return res.status(409).json({
+      error: "duplicate_send",
+      detail:
+        `identical subject+body already sent on this thread at ${duplicate.received_at} ` +
+        `(crm_messages ${duplicate.id}) — refusing to send the same reply twice within ` +
+        `${DUPLICATE_SEND_WINDOW_SECONDS}s. If this is genuinely a second, deliberate reply, ` +
+        `change the subject or body and resend.`,
+      duplicateMessageId: duplicate.id,
+      duplicateAt: duplicate.received_at,
+    });
+  }
+
   // Always enqueue (even for resend_send — keeps audit trail)
   const queued = crmService.enqueueOutbox({
     threadId,
@@ -320,29 +347,83 @@ router.post("/threads/:id/send", async (req, res) => {
       });
       if (result.success) {
         crmService.markOutboxResult(queued.id, "completed", result.messageId);
+        // Steg 1: the reply now becomes part of the thread's own message
+        // history (message_count grows, last_outbound_at moves) — this is
+        // the fix. internalMessageId in the action payload mirrors the
+        // compose route's convention so the Sendt-logg's actor lookup can
+        // match this crm_messages row exactly, not just fall back to the
+        // thread-level outbox heuristic.
+        const recorded = crmService.recordOutboundReply({
+          threadId,
+          vertical: thread.vertical_id,
+          toEmails,
+          ccEmails,
+          subject,
+          bodyText,
+          bodyHtml,
+          deliveryStatus: "sent",
+        });
         crmService.logAction({
           threadId,
           contactId: thread.contact_id,
           type: "sent",
           actor: createdBy,
-          payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp" },
+          payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", internalMessageId: recorded.messageId },
         });
-        return res.json({ success: true, outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp" });
+        return res.json({ success: true, outboxId: queued.id, messageId: result.messageId, internalMessageId: recorded.messageId, channel: "resend_smtp" });
       } else {
         crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
+        // Record the failed attempt too (delivery_status='failed', no
+        // sent_at) — matches composeNewThread/updateMessageDeliveryStatus's
+        // existing "failed sends are still visible in the thread" convention.
+        crmService.recordOutboundReply({
+          threadId,
+          vertical: thread.vertical_id,
+          toEmails,
+          ccEmails,
+          subject,
+          bodyText,
+          bodyHtml,
+          deliveryStatus: "failed",
+        });
         return res.status(500).json({ success: false, error: result.error || "send failed", outboxId: queued.id });
       }
     } catch (err: any) {
       crmService.markOutboxResult(queued.id, "failed", undefined, err.message ?? "exception");
+      crmService.recordOutboundReply({
+        threadId,
+        vertical: thread.vertical_id,
+        toEmails,
+        ccEmails,
+        subject,
+        bodyText,
+        bodyHtml,
+        deliveryStatus: "failed",
+      });
       return res.status(500).json({ success: false, error: err.message ?? "exception" });
     }
   }
 
-  // gmail_draft → wait for agent
+  // gmail_draft → wait for agent. Recorded as 'queued' now (visible in the
+  // thread immediately) and flipped to 'draft_in_gmail' by the existing
+  // /outbox/:id/result -> updateMessageDeliveryStatus path once the CS-agent
+  // reports the draft was created — same lifecycle composeNewThread's
+  // gmail_draft path already uses.
+  const recorded = crmService.recordOutboundReply({
+    threadId,
+    vertical: thread.vertical_id,
+    toEmails,
+    ccEmails,
+    subject,
+    bodyText,
+    bodyHtml,
+    deliveryStatus: "queued",
+  });
   res.json({
     success: true,
     outboxId: queued.id,
     intent: "gmail_draft",
+    internalMessageId: recorded.messageId,
     note: "Queued — will appear in your Gmail Drafts after next CS-agent run.",
   });
 });
@@ -1036,9 +1117,12 @@ router.post("/outbox/:id/result", (req, res) => {
     });
 
     // Bring crm_messages.delivery_status in sync with the actual outcome.
-    // Only applies when this outbox item was created from a /compose call
-    // (which leaves a 'queued' message row).  Reply-from-thread sends don't
-    // create crm_messages, so this no-ops in that case.
+    // Applies to BOTH a /compose call (which leaves a 'queued' message row)
+    // AND a gmail_draft reply from POST /threads/:id/send (dev-request
+    // 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk, skive 1 —
+    // recordOutboundReply() now leaves the same 'queued' row for a reply,
+    // where before this fix no crm_messages row existed for a reply at all
+    // and this lookup was a guaranteed no-op on that path).
     const msgId = crmService.getLatestOutboundMessageId(row.thread_id);
     if (msgId) {
       const newStatus = parsed.data.status === "completed"

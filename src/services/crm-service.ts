@@ -594,6 +594,36 @@ class CrmService {
     }
 
     // Recompute denormalized fields
+    const totalMessages = this.recomputeThreadStats(threadId);
+
+    // Log ingest
+    if (newMessages > 0) {
+      this.logAction({
+        threadId,
+        contactId,
+        type: "imported",
+        actor: "system",
+        payload: { newMessages, totalMessages },
+      });
+    }
+
+    return { threadId, contactId, newMessages };
+  }
+
+  /**
+   * Recompute a thread's denormalized rollup fields (message_count,
+   * last_message_at, last_inbound_at, last_outbound_at) from its actual
+   * crm_messages rows. Pulled out of ingestThread() so recordOutboundReply()
+   * (dev-request 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk, skive 1)
+   * can share the exact same derivation — the two write paths (inbound
+   * ingest, outbound reply) must never disagree about how message_count is
+   * computed, or the dashboard/CS-agent read one thing while a second query
+   * computed another. Pure recompute from source data: calling it twice in a
+   * row is a no-op, so every caller can call it unconditionally after any
+   * crm_messages write.
+   */
+  private recomputeThreadStats(threadId: string): number {
+    const db = getDb();
     const stats = db.prepare(`
       SELECT
         COUNT(*) AS cnt,
@@ -609,18 +639,116 @@ class CrmService {
       WHERE id = ?
     `).run(stats.cnt ?? 0, stats.last_msg, stats.last_in, stats.last_out, threadId);
 
-    // Log ingest
-    if (newMessages > 0) {
-      this.logAction({
-        threadId,
-        contactId,
-        type: "imported",
-        actor: "system",
-        payload: { newMessages, totalMessages: stats.cnt },
-      });
-    }
+    return stats.cnt ?? 0;
+  }
 
-    return { threadId, contactId, newMessages };
+  /**
+   * Record an outbound reply on an EXISTING thread — the POST
+   * /threads/:id/send path (dev-request
+   * 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk, skive 1).
+   *
+   * Before this, /threads/:id/send queued a crm_outbox row, sent the
+   * message, and logged a crm_actions row — but never touched crm_messages.
+   * A thread that HAD been answered kept its pre-reply message_count and
+   * looked unanswered to anyone (dashboard, or the CS-agent itself) reading
+   * the thread's message history, risking a second reply to the same
+   * enquiry.
+   *
+   * Unlike composeNewThread(), this does NOT create a thread or contact —
+   * both already exist for a reply on an existing thread. It only appends
+   * the message row and recomputes the thread's denormalized counters via
+   * the same recomputeThreadStats() ingestThread() uses.
+   *
+   * delivery_status is the ACTUAL outcome, never assumed:
+   *   - 'sent'           resend_send succeeded — sentAt should be the real
+   *                      send time.
+   *   - 'failed'         resend_send failed or threw — sentAt stays null; a
+   *                      failed attempt is still recorded (audit trail),
+   *                      matching composeNewThread's own failure handling.
+   *   - 'queued'         gmail_draft — flips to 'draft_in_gmail' later via
+   *                      the existing /outbox/:id/result -> updateMessageDeliveryStatus
+   *                      path (getLatestOutboundMessageId now finds this row
+   *                      too, closing the "reply-from-thread sends don't
+   *                      create crm_messages, so this no-ops" gap noted at
+   *                      that call site).
+   */
+  recordOutboundReply(params: {
+    threadId: string;
+    vertical: CrmVertical;
+    toEmails: string[];
+    ccEmails?: string[];
+    subject: string;
+    bodyText: string;
+    bodyHtml?: string | null;
+    deliveryStatus: "sent" | "queued" | "draft_in_gmail" | "failed";
+    /** ISO timestamp. Only meaningful when deliveryStatus === 'sent'; ignored otherwise. */
+    sentAt?: string | null;
+    rawMetadata?: Record<string, any>;
+  }): { messageId: string } {
+    const db = getDb();
+    const v = assertVertical(params.vertical, "recordOutboundReply");
+    const messageId = `msg-${randomUUID()}`;
+    const recordedSentAt = params.deliveryStatus === "sent" ? (params.sentAt ?? new Date().toISOString()) : null;
+
+    db.prepare(`
+      INSERT INTO crm_messages
+        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata, delivery_status, vertical_id)
+      VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      messageId,
+      params.threadId,
+      JSON.stringify(params.toEmails),
+      JSON.stringify(params.ccEmails ?? []),
+      params.subject,
+      params.bodyText,
+      params.bodyHtml ?? null,
+      (params.bodyText || "").slice(0, 200),
+      recordedSentAt,
+      JSON.stringify(params.rawMetadata ?? {}),
+      params.deliveryStatus,
+      v,
+    );
+
+    this.recomputeThreadStats(params.threadId);
+    return { messageId };
+  }
+
+  /**
+   * Double-send guard (dev-request
+   * 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk, skive 1.3).
+   *
+   * Finding: on 2026-08-09 two `sent` crm_actions landed on the same thread
+   * 4 seconds apart (15:30:32 / 15:30:36, DB time). Whether that was one
+   * accidental double-click or two deliberate replies could not be
+   * established after the fact — /threads/:id/send never wrote a
+   * crm_messages row before this fix, so there was no stored body/subject to
+   * compare the two sends against; only the (identical-shaped) crm_actions
+   * log survived, which does not carry the reply text.
+   *
+   * Rather than guess at that one incident, the guard is scoped to the one
+   * case a legitimate caller never has a reason to hit: BYTE-IDENTICAL
+   * subject+body sent on the SAME thread within a short window. Two
+   * genuinely different replies — even a second apart — are unaffected, so
+   * this can never block a real second, distinct answer. Hard reject (409),
+   * not a soft warning: there is no legitimate reason to send the exact same
+   * reply twice within `windowSeconds`, so there is nothing for a human to
+   * weigh — this is closer to a validation error than a judgment call.
+   */
+  findRecentIdenticalOutbound(
+    threadId: string,
+    subject: string,
+    bodyText: string,
+    windowSeconds = 30,
+  ): { id: string; received_at: string } | null {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT id, received_at FROM crm_messages
+      WHERE thread_id = ? AND direction = 'out'
+        AND subject = ? AND body_text = ?
+        AND received_at >= datetime('now', '-' || ? || ' seconds')
+      ORDER BY received_at DESC LIMIT 1
+    `).get(threadId, subject, bodyText, windowSeconds) as { id: string; received_at: string } | undefined;
+    return row ?? null;
   }
 
   // ─── Compose a brand-new outbound thread ──────────────────
