@@ -820,6 +820,25 @@ function initSchema(db: Database.Database): void {
     // column already exists — fine
   }
 
+  // crm_outbox.crm_message_id — added dev-request
+  // 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk (post-review bugfix).
+  // Before this column, /outbox/:id/result resolved "the" crm_messages row
+  // for an outbox item via getLatestOutboundMessageId(threadId) — "most
+  // recent outbound message on this thread". That was safe when only a
+  // brand-new thread ever got a single 'queued' message at a time, but
+  // recordOutboundReply() (this same dev-request) also leaves 'queued' rows
+  // for replies on EXISTING threads, so a thread can now have several
+  // outstanding queued replies — and "most recent" can name the wrong one
+  // when results come back out of order. Explicitly linking the outbox row
+  // to the message it produced (set by recordOutboundReply's outboxId
+  // param) removes the ambiguity. NULL on existing/legacy rows is fine —
+  // crmService.getLatestOutboundMessageId() remains the fallback for those.
+  try {
+    db.exec("ALTER TABLE crm_outbox ADD COLUMN crm_message_id TEXT REFERENCES crm_messages(id) ON DELETE SET NULL");
+  } catch (e) {
+    // column already exists — fine
+  }
+
   // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch
   // the "duplicate column" error and ignore it.
   try {
@@ -1323,6 +1342,107 @@ function initSchema(db: Database.Database): void {
     }
   } catch (err) {
     console.error("Migration backfill_last_outbound_at_v1 failed:", err);
+  }
+
+  // ─── dev-request 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk,
+  // skive 1.2 — backfill crm_outbox 'completed' rows into crm_messages ──────
+  //
+  // PROBLEM: POST /threads/:id/send has always queued a crm_outbox row,
+  // sent (or drafted) the message, and logged a crm_actions row — but never
+  // wrote a crm_messages row. So every reply sent through that route before
+  // this fix is invisible in the thread's own message history: message_count
+  // never grew, the thread looked unanswered, and a human or the CS-agent
+  // reading the thread could not tell it had already been answered.
+  //
+  // FIX (forward-looking): crmService.recordOutboundReply(), called from the
+  // route now, closes this for every NEW send. This block is the backward
+  // half — it promotes every EXISTING crm_outbox row with status='completed'
+  // into the crm_messages row it always should have produced, using the
+  // outcome recorded on the outbox row itself (intent='resend_send' ->
+  // delivery_status='sent'; intent='gmail_draft' -> 'draft_in_gmail', since
+  // "completed" for a gmail_draft means the CS-agent created the draft, not
+  // that Daniel actually sent it — see the sibling /outbox/:id/result
+  // handler, which makes the exact same distinction).
+  //
+  // IDEMPOTENT: the backfilled row's id is deterministic —
+  // 'msg-backfill-<outboxId>' — and the INSERT is OR IGNORE, so re-running
+  // this block (even outside the migrations-table gate below) can never
+  // double-insert. Only outbox rows with a live thread_id are eligible
+  // (thread_id is nullable on crm_outbox but NOT NULL on crm_messages).
+  //
+  // After the insert, recompute the denormalized thread rollups
+  // (message_count / last_message_at / last_inbound_at / last_outbound_at)
+  // for every affected thread — the AFTER INSERT trigger above only touches
+  // last_outbound_at, and only for delivery_status='sent' rows.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRanOutboxBackfill = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'backfill_outbox_completed_to_crm_messages_v1'"
+    ).get();
+    if (!alreadyRanOutboxBackfill) {
+      const outboxBackfillResult = db.prepare(`
+        INSERT OR IGNORE INTO crm_messages
+          (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet,
+           sent_at, received_at, raw_metadata, delivery_status, vertical_id)
+        SELECT
+          'msg-backfill-' || o.id,
+          o.thread_id,
+          'out',
+          'kontakt@rettfrabonden.com',
+          o.to_emails,
+          COALESCE(o.cc_emails, '[]'),
+          o.subject,
+          o.body_text,
+          o.body_html,
+          SUBSTR(COALESCE(o.body_text, ''), 1, 200),
+          CASE WHEN o.intent = 'resend_send' THEN COALESCE(o.processed_at, o.created_at) ELSE NULL END,
+          COALESCE(o.processed_at, o.created_at),
+          json_object('source', 'backfill-outbox-to-crm-messages-v1', 'outboxId', o.id, 'intent', o.intent, 'createdBy', o.created_by),
+          CASE WHEN o.intent = 'resend_send' THEN 'sent' ELSE 'draft_in_gmail' END,
+          COALESCE(o.vertical_id, 'rfb')
+        FROM crm_outbox o
+        WHERE o.status = 'completed'
+          AND o.thread_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_messages m WHERE m.id = 'msg-backfill-' || o.id
+          )
+          -- Belt-and-suspenders against double-counting a send this migration
+          -- never needed to touch: this gate is only meant for outbox rows
+          -- that predate crmService.recordOutboundReply() (which now writes a
+          -- LIVE crm_messages row synchronously at send time, going forward).
+          -- In production the migrations-table gate above means this whole
+          -- block runs exactly once, at the first boot after deploy, before
+          -- any new send can happen — so this can never fire there. It matters
+          -- for a DB that is migrated more than once in its lifetime (e.g. a
+          -- test harness re-booting schema on a live DB): without it, an
+          -- already-recorded live send would get a SECOND, redundant
+          -- crm_messages row here and double-count message_count.
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_messages m2
+            WHERE m2.thread_id = o.thread_id AND m2.direction = 'out'
+              AND m2.subject = o.subject AND m2.body_text = o.body_text
+          )
+      `).run();
+
+      if (outboxBackfillResult.changes > 0) {
+        const recompute = db.prepare(`
+          UPDATE crm_threads
+          SET message_count = (SELECT COUNT(*) FROM crm_messages WHERE crm_messages.thread_id = crm_threads.id),
+              last_message_at = (SELECT MAX(sent_at) FROM crm_messages WHERE crm_messages.thread_id = crm_threads.id),
+              last_inbound_at = (SELECT MAX(sent_at) FROM crm_messages WHERE crm_messages.thread_id = crm_threads.id AND direction = 'in'),
+              last_outbound_at = (SELECT MAX(sent_at) FROM crm_messages WHERE crm_messages.thread_id = crm_threads.id AND direction = 'out' AND delivery_status = 'sent'),
+              updated_at = datetime('now')
+          WHERE id IN (
+            SELECT DISTINCT thread_id FROM crm_outbox WHERE status = 'completed' AND thread_id IS NOT NULL
+          )
+        `).run();
+        console.log(`🧹 Migration backfill_outbox_completed_to_crm_messages_v1: inserted ${outboxBackfillResult.changes} crm_messages row(s), recomputed rollups on ${recompute.changes} thread(s)`);
+      }
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_outbox_completed_to_crm_messages_v1')").run();
+    }
+  } catch (err) {
+    console.error("Migration backfill_outbox_completed_to_crm_messages_v1 failed:", err);
   }
 
 

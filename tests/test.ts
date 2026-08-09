@@ -37092,6 +37092,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk: skive 1 (send-path crm_messages + backfill + double-send guard) ──");
+  try {
+    const { runCrmSendMessageHistoryTests } = require("../src/routes/crm-send-message-history.test") as
+      typeof import("../src/routes/crm-send-message-history.test");
+    const csh = await runCrmSendMessageHistoryTests({ log: false });
+    passed += csh.passed;
+    failed += csh.failed;
+    for (const f of csh.failures) failures.push("crm-send-message-history: " + f);
+    console.log(`  crm-send-message-history: ${csh.passed} passed, ${csh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-send-message-history: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ crm-send-message-history: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 5 (retro-tagging, dry-run + godkjenningsgate) ──");
   try {
     const { runCrmRetroTaggingTests } = require("../src/services/crm-retro-tagging.test") as
