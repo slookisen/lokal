@@ -31,6 +31,12 @@
 //                            stored to confirm or contradict, so there is
 //                            nothing to report as bekreftet/avvik.
 //
+// Each row also carries `fetch_status` ("fetched"/"fetch_failed"/
+// "no_hjemmeside"), so batch-level reporting can tell a genuinely-checked-
+// and-absent page apart from a fetch failure or no-hjemmeside-on-file row —
+// field-level verdicts stay fail-closed either way (see above), this is
+// reporting only.
+//
 // adresse/postnummer/poststed/opening_hours_text are PRESENCE-ONLY by this
 // slice's explicit spec — deliberately NO avvik/competing-value detection
 // for those four fields (out of scope: free-text competing-value extraction
@@ -42,6 +48,14 @@ import { normaliseNorwegianPhone } from "./experience-store";
 import { normaliseName } from "./brreg-client";
 
 export type GfcFieldVerdict = "bekreftet" | "avvik" | "ikke_funnet_på_siden";
+
+// Whole-provider fetch outcome — distinct from the per-field verdict above.
+// "fetched": hjemmeside present and the fetch succeeded (pageText is real,
+// possibly still yielding ikke_funnet_på_siden per field if genuinely
+// absent from the page). "fetch_failed": hjemmeside present but the fetch
+// itself failed/threw. "no_hjemmeside": no usable hjemmeside on file at
+// all, so no fetch was ever attempted.
+export type GfcFetchStatus = "fetched" | "fetch_failed" | "no_hjemmeside";
 
 export interface GfcAvvikCapableField {
   verdict: GfcFieldVerdict;
@@ -68,6 +82,7 @@ export interface GfcProducerRow {
 export interface GfcProviderResult {
   provider_id: string;
   provider_name: string;
+  fetch_status: GfcFetchStatus;
   epost: GfcAvvikCapableField;
   telefon: GfcAvvikCapableField;
   mobil: GfcAvvikCapableField;
@@ -285,12 +300,17 @@ export function checkOpeningHoursField(stored: string | null, pageText: string):
  * Build one producer's full concordance row. `pageText === null` means the
  * homepage fetch failed (or there was no usable hjemmeside to fetch at all)
  * — fail-closed: EVERY field verdicts `ikke_funnet_på_siden`, never guessed,
- * never thrown. Pure (the route performs the actual fetch and hands the
- * result in here).
+ * never thrown. `fetchStatus` is supplied by the caller (the route), which
+ * already knows definitively which case occurred (no hjemmeside on file vs.
+ * a fetch that was attempted and failed) — this function never infers it
+ * from pageText, keeping the three-way distinction exact rather than
+ * reconstructed from a two-way null-check. Pure (the route performs the
+ * actual fetch and hands the result in here).
  */
 export function buildProviderConcordanceRow(
   producer: GfcProducerRow,
   pageText: string | null,
+  fetchStatus: GfcFetchStatus,
 ): GfcProviderResult {
   if (pageText === null) {
     const blankAvvikCapable = (stored: string | null): GfcAvvikCapableField => ({
@@ -301,6 +321,7 @@ export function buildProviderConcordanceRow(
     return {
       provider_id: producer.id,
       provider_name: producer.navn,
+      fetch_status: fetchStatus,
       epost: blankAvvikCapable(producer.epost),
       telefon: blankAvvikCapable(producer.telefon),
       mobil: blankAvvikCapable(producer.mobil),
@@ -314,6 +335,7 @@ export function buildProviderConcordanceRow(
   return {
     provider_id: producer.id,
     provider_name: producer.navn,
+    fetch_status: fetchStatus,
     epost: checkEmailField(producer.epost, pageText),
     telefon: checkPhoneField(producer.telefon, pageText),
     mobil: checkPhoneField(producer.mobil, pageText),
@@ -343,6 +365,23 @@ export function summarizeGfc(rows: GfcProviderResult[]): GfcSummary {
     for (const f of GFC_ALL_FIELDS) {
       summary[f][r[f].verdict]++;
     }
+  }
+  return summary;
+}
+
+/** Whole-batch fetch_status counts — how many rows were genuinely checked
+ *  vs. unreliable due to a fetch problem/missing hjemmeside. Mirrors
+ *  summarizeGfc's per-batch counting shape, one flat object instead of
+ *  one-per-field. Pure. */
+export interface GfcFetchSummary {
+  fetched: number;
+  fetch_failed: number;
+  no_hjemmeside: number;
+}
+export function summarizeGfcFetchStatus(rows: GfcProviderResult[]): GfcFetchSummary {
+  const summary: GfcFetchSummary = { fetched: 0, fetch_failed: 0, no_hjemmeside: 0 };
+  for (const r of rows) {
+    summary[r.fetch_status]++;
   }
   return summary;
 }

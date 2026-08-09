@@ -69,6 +69,13 @@
  *       trigger a homepage fetch at all; `pagination`
  *       ({total, offset, limit, returned, next_offset}) present only when
  *       `limit` is supplied
+ *   (m) fetch_status / fetch_summary (AC1 follow-up, dev-request 2026-08-09-
+ *       epost-korrigering-paa-plass): a successfully-fetched row carries
+ *       `fetch_status: "fetched"`, a simulated-fetch-failure row (case d)
+ *       carries `fetch_status: "fetch_failed"`, a blank-hjemmeside row
+ *       (case e) carries `fetch_status: "no_hjemmeside"`; the top-level
+ *       `fetch_summary` sums fetch_status across the whole batch and is
+ *       present regardless of pagination, same as `summary`
  */
 
 export interface TestSummary {
@@ -561,6 +568,7 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       assertEq(fullMatch.postnummer, { verdict: "bekreftet" }, "b7: postnummer bekreftet");
       assertEq(fullMatch.poststed, { verdict: "bekreftet" }, "b8: poststed bekreftet");
       assertEq(fullMatch.opening_hours_text, { verdict: "bekreftet" }, "b9: opening_hours_text bekreftet");
+      assertEq(fullMatch.fetch_status, "fetched", "b10: successful-fetch row carries fetch_status: 'fetched'");
 
       // ── (c) avvik fixture ─────────────────────────────────────────────────
       const avvik = providers.find((p) => p.provider_id === "prov-avvik");
@@ -578,6 +586,7 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       assertEq(avvik.postnummer.verdict, "ikke_funnet_på_siden", "c6: postnummer not on page -> ikke_funnet_på_siden (never avvik)");
       assertEq(avvik.poststed.verdict, "ikke_funnet_på_siden", "c7: poststed not on page -> ikke_funnet_på_siden (never avvik)");
       assertEq(avvik.opening_hours_text.verdict, "ikke_funnet_på_siden", "c8: opening_hours_text not on page -> ikke_funnet_på_siden (never avvik)");
+      assertEq(avvik.fetch_status, "fetched", "c9: successful-fetch (avvik) row also carries fetch_status: 'fetched'");
 
       // ── (d) fetch failure -> every field ikke_funnet_på_siden ────────────
       const fetchFail = providers.find((p) => p.provider_id === "prov-fetch-fail");
@@ -589,6 +598,7 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       assertEq(fetchFail.postnummer, { verdict: "ikke_funnet_på_siden" }, "d6: postnummer fails closed");
       assertEq(fetchFail.poststed, { verdict: "ikke_funnet_på_siden" }, "d7: poststed fails closed");
       assertEq(fetchFail.opening_hours_text, { verdict: "ikke_funnet_på_siden" }, "d8: opening_hours_text fails closed");
+      assertEq(fetchFail.fetch_status, "fetch_failed", "d9: simulated fetch failure (500) -> fetch_status: 'fetch_failed'");
 
       // ── (e) blank hjemmeside -> never fetched, fails closed ──────────────
       const noWebsite = providers.find((p) => p.provider_id === "prov-no-website");
@@ -596,6 +606,7 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
       assertEq(noWebsite.epost.verdict, "ikke_funnet_på_siden", "e2: epost fails closed (no hjemmeside)");
       assertEq(noWebsite.telefon.verdict, "ikke_funnet_på_siden", "e3: telefon fails closed (no hjemmeside)");
       assertTrue(!fetchedHosts.some((h) => h.includes("utensted")), "e4: no-website provider is never fetched at all");
+      assertEq(noWebsite.fetch_status, "no_hjemmeside", "e5: blank hjemmeside -> fetch_status: 'no_hjemmeside' (never fetch_failed)");
 
       // ── (f) all-blank stored fields -> ikke_funnet_på_siden despite real
       //     page content (nothing stored to confirm) ────────────────────────
@@ -614,6 +625,25 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
         "j2: epost summary — full-match+rfbseed-nullptype+hidden-rfbseed(bekreftet x3) + avvik(avvik) + fetch-fail/no-website/blank/bakeri(ikke_funnet_på_siden x4, bakeri fails closed on its unmocked/404 fetch)",
       );
       assertEq(full.body.count, 8, "j3: top-level count matches providers.length");
+
+      // ── (m) fetch_summary — sums fetch_status across the whole batch ─────
+      // 5 successful fetches (avvik, blank-fields, full-match, hidden-
+      // rfbseed, rfbseed-nullptype) + 2 fetch failures (fetch-fail's
+      // simulated 500, AND bakeri — its host isn't mocked so it falls to
+      // the catch-all 404 stub, correctly counted as fetch_failed) + 1
+      // no_hjemmeside (no-website) = 8, matching count/providers.length.
+      const expectedFetchSummary = { fetched: 0, fetch_failed: 0, no_hjemmeside: 0 };
+      for (const p of providers) expectedFetchSummary[p.fetch_status as keyof typeof expectedFetchSummary]++;
+      assertEq(
+        full.body.fetch_summary,
+        expectedFetchSummary,
+        "m1: fetch_summary sums correctly across the batch (matches counting fetch_status across all returned providers)",
+      );
+      assertEq(
+        full.body.fetch_summary,
+        { fetched: 5, fetch_failed: 2, no_hjemmeside: 1 },
+        "m2: fetch_summary — 5 fetched (avvik/blank-fields/full-match/hidden-rfbseed/rfbseed-nullptype), 2 fetch_failed (fetch-fail 500 + bakeri unmocked-404), 1 no_hjemmeside (no-website)",
+      );
 
       // ── (h) providerIds filter ────────────────────────────────────────────
       const filtered = await callRoute(opplevelserRouter, {
@@ -761,6 +791,17 @@ export function runOpplevelserGardssalgFieldConcordanceAuditTests(
         page.body.pagination,
         { total: 8, offset: 2, limit: 3, returned: 3, next_offset: 5 },
         "l4c: pagination block matches {total, offset, limit, returned, next_offset}",
+      );
+      assertTrue(
+        !!page.body.fetch_summary,
+        "m3: fetch_summary is present even when paginated — same as `summary`, unaffected by limit/offset",
+      );
+      const expectedPageFetchSummary = { fetched: 0, fetch_failed: 0, no_hjemmeside: 0 };
+      for (const p of page.body.providers) expectedPageFetchSummary[p.fetch_status as keyof typeof expectedPageFetchSummary]++;
+      assertEq(
+        page.body.fetch_summary,
+        expectedPageFetchSummary,
+        "m4: paginated fetch_summary sums fetch_status only across the returned (paged) providers, same discipline as `summary`",
       );
 
       // Note on call-count: crFetchGardssalgContent fetches the primary page

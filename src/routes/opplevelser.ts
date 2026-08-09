@@ -286,10 +286,12 @@ import {
 import {
   buildProviderConcordanceRow,
   summarizeGfc,
+  summarizeGfcFetchStatus,
   applyGardssalgFieldConcordance,
   GFC_AVVIK_CAPABLE_FIELDS,
   type GfcProviderResult,
   type GfcFieldName,
+  type GfcFetchStatus,
   // 2026-08-09 field-concordance CLEAR (dev-request 2026-08-09-epost-
   // korrigering-paa-plass) — POST /admin/gardssalg-field-concordance-clear
   // below runs this SAME pure epost verdict check fresh, on its own
@@ -8872,17 +8874,27 @@ async function runGardssalgFieldConcordanceScan(
       slice.map(async (p) => {
         const hjemmeside = p.hjemmeside && p.hjemmeside.trim() !== "" ? p.hjemmeside.trim() : null;
         let pageText: string | null = null;
+        let fetchStatus: GfcFetchStatus;
         if (hjemmeside) {
           try {
             const fetched = await fetchFn(hjemmeside);
-            pageText = fetched.ok ? fetched.pageText : null;
+            if (fetched.ok) {
+              pageText = fetched.pageText;
+              fetchStatus = "fetched";
+            } else {
+              pageText = null;
+              fetchStatus = "fetch_failed";
+            }
           } catch {
             // fetchFn's own contract never throws in practice, but this
             // route treats a throw exactly like a reported failure —
             // fail-closed either way, never an uncaught rejection, never a
             // crashed batch.
             pageText = null;
+            fetchStatus = "fetch_failed";
           }
+        } else {
+          fetchStatus = "no_hjemmeside";
         }
         return buildProviderConcordanceRow(
           {
@@ -8897,6 +8909,7 @@ async function runGardssalgFieldConcordanceScan(
             opening_hours_text: p.opening_hours_text,
           },
           pageText,
+          fetchStatus,
         );
       }),
     );
@@ -8942,6 +8955,7 @@ router.get("/admin/gardssalg-field-concordance-audit", requireAdmin, async (req:
       success: true,
       count: providers.length,
       summary: summarizeGfc(providers),
+      fetch_summary: summarizeGfcFetchStatus(providers),
       providers,
     };
     const pagination = buildGfcPaginationBlock(limit, offset, total, providers.length);
