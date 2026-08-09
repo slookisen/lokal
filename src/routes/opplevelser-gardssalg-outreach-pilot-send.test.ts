@@ -192,11 +192,21 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       origConfigured = emailSvc.isConfigured;
       origTransporter = emailSvc.transporter;
       let sent: Array<Record<string, any>> = [];
+      let stubMessageSeq = 0;
       emailSvc.isConfigured = true;
       emailSvc.transporter = {
         sendMail: async (mailOptions: Record<string, any>) => {
           sent.push(mailOptions);
-          return { messageId: `stub-${sent.length}` };
+          // Counter is deliberately INDEPENDENT of `sent.length`: several
+          // blocks below reset `sent` to [], so deriving the id from its
+          // length reissued "stub-1" repeatedly. Once the route began filing
+          // sends in the CRM (dev-request
+          // 2026-08-09-outreach-send-uten-crm-spor), a repeated messageId hit
+          // crm_messages' INSERT OR IGNORE and the second send silently
+          // recorded nothing — a harness artefact that looked exactly like a
+          // product bug. Real transports never reissue a Message-ID.
+          stubMessageSeq += 1;
+          return { messageId: `stub-${stubMessageSeq}` };
         },
       };
 
@@ -246,6 +256,23 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
         id: "prov-hotel", navn: "Hotel Gård",
         hjemmeside: "https://hotel-gard.example.no", epost: "post@fixture-hotel.no",
         slug: "hotel-gard", field_provenance: VERIFIED_STAMP,
+      });
+      // Used only by block (l) — the CRM-record assertions (dev-request
+      // 2026-08-09-outreach-send-uten-crm-spor).
+      insertGo.run({
+        id: "prov-india", navn: "India Gård",
+        hjemmeside: "https://india-gard.example.no", epost: "post@fixture-india.no",
+        slug: "india-gard", field_provenance: VERIFIED_STAMP,
+      });
+      insertGo.run({
+        id: "prov-juliett", navn: "Juliett Gård",
+        hjemmeside: "https://juliett-gard.example.no", epost: "post@fixture-juliett.no",
+        slug: "juliett-gard", field_provenance: VERIFIED_STAMP,
+      });
+      insertGo.run({
+        id: "prov-kilo", navn: "Kilo Gård",
+        hjemmeside: "https://kilo-gard.example.no", epost: "post@fixture-kilo.no",
+        slug: "kilo-gard", field_provenance: VERIFIED_STAMP,
       });
 
       // NO-GO tier: needs_enrichment (no about_text/products/brreg_verified).
@@ -488,6 +515,104 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       );
       assertEq(hotelCooldown.body.results[0].reason, "cooldown_suppressed", "k6: reason is cooldown_suppressed");
       assertEq(hotelCooldown.body.results[0].suppressed_by, "experiences", "k7: suppressed_by is this vertical (own-table)");
+
+      // ── (l) the send is FILED IN THE CRM (dev-request
+      // 2026-08-09-outreach-send-uten-crm-spor) ─────────────────────────
+      //
+      // Pilot 1 (2026-08-08) emailed four real producers and left no CRM
+      // trace at all: the dashboard showed zero producer contacts for the
+      // experiences platform while four producers had been contacted, and a
+      // reply would have arrived with no outbound thread to attach to.
+      // crmService writes into the SAME in-memory RFB db this suite injected
+      // via __setDbForTesting, so these assertions read the real rows.
+      sent = [];
+      const indiaSend = await callRoute(opplevelserRouter, {
+        headers: auth, body: { provider_ids: ["prov-india"], apply: true },
+      });
+      assertEq(indiaSend.status, 200, "l0: real send on prov-india -> 200");
+      assertEq(indiaSend.body.results[0].status, "sent", "l1: reports sent");
+      assertEq(indiaSend.body.results[0].crm_recorded, true, "l2: the row reports crm_recorded:true");
+
+      const indiaThread = rfbDb
+        .prepare(`SELECT id, vertical_id, subject FROM crm_threads WHERE id = ?`)
+        .get("opplevagent-outreach-prov-india") as any;
+      assertTrue(!!indiaThread, "l3: a crm_threads row exists under the stable per-producer threadId");
+      assertEq(indiaThread?.vertical_id, "experiences", "l4: the thread is filed on the experiences platform, never rfb");
+      assertTrue(
+        String(indiaThread?.subject || "").includes("India Gård"),
+        "l5: the thread subject carries the producer name",
+      );
+
+      const indiaMsg = rfbDb
+        .prepare(`SELECT direction, from_email, to_emails, body_text, body_html FROM crm_messages WHERE thread_id = ?`)
+        .all("opplevagent-outreach-prov-india") as any[];
+      assertEq(indiaMsg.length, 1, "l6: exactly one message row for the send");
+      assertEq(indiaMsg[0]?.direction, "out", "l7: recorded as an OUTBOUND message");
+      assertTrue(
+        String(indiaMsg[0]?.to_emails || "").includes("post@fixture-india.no"),
+        "l8: the recipient is the producer, not the operator",
+      );
+      // The recorded copy must be the copy that actually went out — same
+      // renderer, so a template edit can never leave the CRM showing text the
+      // producer never received.
+      const wireText = String(sent[0]?.text || "").replace(/\s+/g, " ");
+      const filedText = String(indiaMsg[0]?.body_text || "").replace(/\s+/g, " ");
+      assertEq(filedText, wireText, "l9: the filed bodyText is BYTE-IDENTICAL to what left the send boundary");
+      assertTrue(
+        String(indiaMsg[0]?.body_html || "").includes("opplevagent.no/slik-fungerer-det"),
+        "l10: the filed html is the real template, not a summary",
+      );
+
+      // A repeat ingest of the same send must not duplicate the message row
+      // (the route uses a deterministic threadId + Resend's messageId).
+      const contactRows = rfbDb
+        .prepare(`SELECT COUNT(*) AS n FROM crm_contacts WHERE LOWER(email) = LOWER(?)`)
+        .get("post@fixture-india.no") as any;
+      assertEq(contactRows?.n, 1, "l11: exactly one contact row for the producer");
+
+      // ── test sends are deliberately NOT filed ────────────────────────
+      sent = [];
+      const juliettTest = await callRoute(opplevelserRouter, {
+        headers: auth, body: { provider_ids: ["prov-juliett"], is_test: true, apply: true },
+      });
+      assertEq(juliettTest.body.results[0].status, "sent", "l12: the test send still reports sent");
+      assertEq(juliettTest.body.results[0].crm_recorded, undefined, "l13: no crm_recorded flag on a test send");
+      const juliettThread = rfbDb
+        .prepare(`SELECT id FROM crm_threads WHERE id = ?`)
+        .get("opplevagent-outreach-prov-juliett") as any;
+      assertTrue(
+        !juliettThread,
+        "l14: a redirected TEST send creates NO producer thread — the producer never saw that mail",
+      );
+
+      // ── a CRM failure must never turn a delivered send into an error ──
+      //
+      // The mail has already left the building by the time the CRM write
+      // runs. Reporting `error` here would invite the caller to retry and
+      // email the producer twice — the one outcome worse than a missing CRM
+      // row. Force the failure at the real seam rather than simulating it.
+      sent = [];
+      const crmMod = require("../services/crm-service") as any;
+      const origIngest = crmMod.crmService.ingestThread;
+      crmMod.crmService.ingestThread = () => {
+        throw new Error("simulated CRM outage");
+      };
+      let kiloSend: any;
+      try {
+        kiloSend = await callRoute(opplevelserRouter, {
+          headers: auth, body: { provider_ids: ["prov-kilo"], apply: true },
+        });
+      } finally {
+        crmMod.crmService.ingestThread = origIngest;
+      }
+      assertEq(kiloSend.status, 200, "l15: a CRM outage still returns 200");
+      assertEq(kiloSend.body.results[0].status, "sent", "l16: the send is still reported SENT — the email did leave");
+      assertEq(kiloSend.body.results[0].crm_recorded, false, "l17: crm_recorded:false makes the gap visible instead of silent");
+      assertEq(sent.length, 1, "l18: exactly one email left the boundary");
+      const kiloLog = expDb
+        .prepare(`SELECT COUNT(*) AS n FROM experience_outreach_sent_log WHERE provider_id = 'prov-kilo'`)
+        .get() as any;
+      assertEq(kiloLog?.n, 1, "l19: the sent-log row is written even when the CRM write fails (cooldown still protects the producer)");
     } catch (err: any) {
       failed++;
       failures.push(

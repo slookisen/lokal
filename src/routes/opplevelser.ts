@@ -361,7 +361,16 @@ import {
   hasActiveNonRevokedClaim,
   backfillGardssalgOwnerLockProvenance,
 } from "../services/gardssalg-claim";
-import { emailService } from "../services/email-service";
+import {
+  emailService,
+  // dev-request 2026-08-09-outreach-send-uten-crm-spor: the pilot-send route
+  // files each send in the CRM, and it records the SAME rendered copy the
+  // mail carried — never a second hand-written version that could drift.
+  renderGardssalgOutreach,
+  GARDSSALG_OUTREACH_REPLY_TO,
+} from "../services/email-service";
+import { crmService } from "../services/crm-service";
+import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // Used by isGardssalgEpostSynthesisPatternMatch() below (AC6 epost-synthesis
 // audit) — re-added after the post@<domain> claim-derivation tier that used
 // to import this (dev-request 2026-08-06-aldri-gjett-epostadresse slice 1)
@@ -8028,6 +8037,11 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     last_sent_at?: string;
     suppressed_by?: string;
     cross_platform?: boolean;
+    // dev-request 2026-08-09-outreach-send-uten-crm-spor: present only on a
+    // real (non-test) `sent` row — true when the send was filed in the CRM,
+    // false when the mail went out but the CRM write failed. Absent on test
+    // sends, which are deliberately not filed.
+    crm_recorded?: boolean;
   };
 
   const expDb = getExpDb("experiences");
@@ -8123,6 +8137,9 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
 
       const providerName = providerRow?.navn || providerId;
       const profileUrl = `https://opplevagent.no/kategori/gardssalg/produsent/${providerRow?.slug ?? ""}`;
+      // One timestamp per provider, captured BEFORE the send so the CRM row's
+      // sentAt and its fallback messageId are derived from the same instant.
+      const sentAtIso = new Date().toISOString();
 
       try {
         const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
@@ -8138,7 +8155,77 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
              VALUES (?, ?, 'email', ?, ?)`,
           )
           .run(providerId, email, sendResult.messageId ?? null, isTest ? 1 : 0);
-        results.push({ provider_id: providerId, status: "sent" });
+
+        // ── File the send in the CRM (dev-request
+        // 2026-08-09-outreach-send-uten-crm-spor) ────────────────────────
+        //
+        // Pilot 1 (2026-08-08) went out to four real producers and left NO
+        // trace in the CRM: this route's only write was the sent-log row
+        // above, so the dashboard showed zero producer contacts for the
+        // experiences platform while four producers had in fact been
+        // emailed. The RFB marketing lane has always ingested its sends;
+        // this lane simply never got that step.
+        //
+        // Why it matters beyond bookkeeping: when the producer replies, the
+        // reply arrives at kontakt@opplevagent.no and is ingested as an
+        // INBOUND message. Without an outbound thread already on file, that
+        // reply lands as a context-free new enquiry — whoever answers cannot
+        // see what we said to them. Filing the send under a stable
+        // per-producer threadId is what lets the reply thread onto it.
+        //
+        // Deliberately NOT fatal: the email has already left the building by
+        // the time we get here. A CRM hiccup must never turn a delivered
+        // send into a reported error, or the caller would retry and mail the
+        // producer twice. The outcome is reported per row as
+        // `crm_recorded` instead.
+        //
+        // Test sends are skipped on purpose: is_test mail is redirected to
+        // the operator by the send guard, so filing it as a producer thread
+        // would put a conversation in the CRM that the producer never saw.
+        // The sent-log row above already records it, flagged is_test=1.
+        let crmRecorded: boolean | undefined;
+        if (!isTest) {
+          try {
+            const rendered = renderGardssalgOutreach(providerName, profileUrl);
+            crmService.ingestThread(
+              {
+                threadId: `opplevagent-outreach-${providerId}`,
+                subject: rendered.subject,
+                category: "marketing",
+                messages: [
+                  {
+                    // Resend's own id when we have it. The fallback is
+                    // deterministic per (provider, send) so a retry of the
+                    // SAME send cannot create a duplicate message row.
+                    messageId: sendResult.messageId ?? `outreach-${providerId}-${sentAtIso}`,
+                    direction: "out",
+                    fromEmail: CRM_SENDER_ADDRESS,
+                    toEmails: [email],
+                    subject: rendered.subject,
+                    bodyText: rendered.text,
+                    bodyHtml: rendered.html,
+                    sentAt: sentAtIso,
+                    rawMetadata: {
+                      source: "gardssalg-outreach-pilot-send",
+                      provider_id: providerId,
+                      reply_to: GARDSSALG_OUTREACH_REPLY_TO,
+                    },
+                  },
+                ],
+              },
+              email,
+              "experiences",
+            );
+            crmRecorded = true;
+          } catch (crmErr) {
+            crmRecorded = false;
+            console.error(
+              "[gardssalg-outreach-pilot-send] CRM ingest failed after a SUCCESSFUL send",
+              { providerId, email, error: crmErr instanceof Error ? crmErr.message : String(crmErr) },
+            );
+          }
+        }
+        results.push({ provider_id: providerId, status: "sent", ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }) });
       } catch (err) {
         results.push({
           provider_id: providerId,

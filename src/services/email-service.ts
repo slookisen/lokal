@@ -393,12 +393,13 @@ export class EmailService {
     profileUrl: string,
     opts: { isTestSend?: boolean } = {},
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const rendered = renderGardssalgOutreach(providerName, profileUrl);
     return await this.sendEmail({
       to,
-      subject: `${providerName} har fått en profil på Opplevagent — vil dere se over den?`,
-      htmlContent: buildGardssalgOutreachHtml(providerName, profileUrl),
-      textContent: buildGardssalgOutreachText(providerName, profileUrl),
-      replyTo: "kontakt@opplevagent.no",
+      subject: rendered.subject,
+      htmlContent: rendered.html,
+      textContent: rendered.text,
+      replyTo: GARDSSALG_OUTREACH_REPLY_TO,
       from: crmFromHeader("experiences"),
       isTestSend: opts.isTestSend,
     });
@@ -1104,6 +1105,31 @@ https://opplevagent.no
 // sendGardssalgOutreach()'s doc comment for why this is its own template
 // rather than reusing buildGardssalgClaimMagicLinkHtml/Text above (different
 // email entirely — cold outreach, not a magic-link login).
+/** Where a producer's reply to the outreach mail lands. Exported so the CRM
+ *  record of a send can name the same address the recipient actually sees. */
+export const GARDSSALG_OUTREACH_REPLY_TO = "kontakt@opplevagent.no";
+
+/**
+ * The rendered gårdssalg outreach mail — subject + both body parts, exactly as
+ * sendGardssalgOutreach() will put them on the wire.
+ *
+ * dev-request 2026-08-09-outreach-send-uten-crm-spor: the pilot-send route has
+ * to file what it sent into the CRM, and a second hand-written copy of the copy
+ * would drift from the real template the first time either changed. So the
+ * renderer is the single source of truth and both callers go through it — the
+ * sender to send it, the route to record it.
+ */
+export function renderGardssalgOutreach(
+  providerName: string,
+  profileUrl: string,
+): { subject: string; text: string; html: string } {
+  return {
+    subject: `${providerName} har fått en profil på Opplevagent — vil dere se over den?`,
+    text: buildGardssalgOutreachText(providerName, profileUrl),
+    html: buildGardssalgOutreachHtml(providerName, profileUrl),
+  };
+}
+
 function buildGardssalgOutreachHtml(providerName: string, profileUrl: string): string {
   const safeName = epEscape(providerName);
   const safeUrl = epEscape(profileUrl);
