@@ -182,6 +182,22 @@ function digitRunPresent(pageText: string, digits: string): boolean {
   return new RegExp(`(?<!\\d)${digits}(?!\\d)`).test(digitCollapsed);
 }
 
+// Generic (role-based) mailbox local-parts — the "By Brenneri rule" (dev-
+// request 2026-08-08-gardssalg-epost-korreksjon-utvidelse, criterion 2):
+// when a page carries several own-domain addresses, a generic/shared
+// mailbox is preferred over a personal one as the reported "found" value.
+// Same house style as CX_SKIP_LOCALPARTS in experience-store.ts — an
+// anchored, case-insensitive alternation tested against the local-part
+// before the "@".
+const GFC_GENERIC_LOCALPARTS = /^(post|kontakt|hei|info|kontor|salg|booking|order)$/i;
+
+/** True if `email`'s local-part (before "@") is a generic/shared-mailbox
+ *  local-part per GFC_GENERIC_LOCALPARTS. Pure — exported for tests. */
+export function isGenericLocalEmail(email: string): boolean {
+  const local = (email || "").split("@")[0] || "";
+  return GFC_GENERIC_LOCALPARTS.test(local);
+}
+
 /** epost verdict — see module doc comment for the full rule. Pure. */
 export function checkEmailField(stored: string | null, pageText: string): GfcAvvikCapableField {
   const storedTrim = (stored || "").trim();
@@ -192,7 +208,9 @@ export function checkEmailField(stored: string | null, pageText: string): GfcAvv
     return { verdict: "bekreftet", current: storedTrim, found: storedTrim };
   }
   if (storedTrim && extracted.length > 0) {
-    const different = extracted.find((e) => e !== storedLower) ?? extracted[0]!;
+    const differing = extracted.filter((e) => e !== storedLower);
+    const genericDiffering = differing.find((e) => isGenericLocalEmail(e));
+    const different = genericDiffering ?? differing[0] ?? extracted[0]!;
     return { verdict: "avvik", current: storedTrim, found: different };
   }
   return { verdict: "ikke_funnet_på_siden", current: storedTrim || null, found: null };

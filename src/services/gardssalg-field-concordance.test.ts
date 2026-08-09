@@ -16,6 +16,7 @@
 import {
   extractAllEmails,
   extractAllPhoneRuns,
+  isGenericLocalEmail,
   checkEmailField,
   checkPhoneField,
   checkAdresseField,
@@ -143,6 +144,37 @@ export function runGardssalgFieldConcordanceTests(opts: { log?: boolean } = {}):
         checkEmailField(null, "Ingen kontaktinfo."),
         { verdict: "ikke_funnet_på_siden", current: null, found: null },
         "checkEmailField: stored blank, page has nothing -> ikke_funnet_på_siden",
+      );
+
+      // ── checkEmailField: policy priority (kriterium 2, "By Brenneri rule") ─
+      // When several own-domain addresses are on the page, prefer the
+      // generic/shared mailbox over a personal one as the reported found
+      // value — regardless of scrape order. A lone personal address (no
+      // generic candidate at all) must still be reported unchanged (the
+      // "Graff case").
+      assertTrue(isGenericLocalEmail("post@x.no"), "isGenericLocalEmail: post@ is generic");
+      assertTrue(isGenericLocalEmail("KONTAKT@x.no"), "isGenericLocalEmail: case-insensitive match");
+      assertTrue(!isGenericLocalEmail("martin@x.no"), "isGenericLocalEmail: a personal name is not generic");
+
+      assertEq(
+        checkEmailField("gammel@x.no", "Skriv til martin@x.no eller post@x.no for spørsmål."),
+        { verdict: "avvik", current: "gammel@x.no", found: "post@x.no" },
+        "checkEmailField: personal-first-in-page, generic-second -> generic wins over scrape order",
+      );
+      assertEq(
+        checkEmailField("gammel@x.no", "Skriv til post@x.no eller martin@x.no for spørsmål."),
+        { verdict: "avvik", current: "gammel@x.no", found: "post@x.no" },
+        "checkEmailField: generic-first-in-page, personal-second -> generic still wins (matches scrape order here too)",
+      );
+      assertEq(
+        checkEmailField("gammel@x.no", "Kontakt martin@x.no direkte, han svarer raskest."),
+        { verdict: "avvik", current: "gammel@x.no", found: "martin@x.no" },
+        "checkEmailField: only a personal address published (no generic candidate) -> personal reported unchanged (Graff case)",
+      );
+      assertEq(
+        checkEmailField("gammel@x.no", "Skriv til kontakt@x.no eller post@x.no."),
+        { verdict: "avvik", current: "gammel@x.no", found: "kontakt@x.no" },
+        "checkEmailField: two generic candidates, no personal -> first-scraped generic wins (first-seen tie-break preserved among generics)",
       );
 
       // ── checkPhoneField (telefon/mobil share this function) ──────────────
