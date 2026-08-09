@@ -35,6 +35,15 @@
  *   8. a provider with TWO queued fields (epost + telefon) — approving one
  *      leaves the OTHER queue row intact (UNIQUE(provider_id, field_name)
  *      DELETE scoping)
+ *   9. (2026-08-09 rollback-veto gap fix) a field whose LATEST
+ *      gardssalg_content_audit row is a rollback (source_url ===
+ *      "internal://rollback") -> applyGardssalgFieldConcordanceApproval now
+ *      returns written:false, reason:"rollback_vetoed", zero write to
+ *      experience_providers — exercised both via the route (apply=true) and
+ *      via a direct call, checked BEFORE the pre-existing
+ *      stale_current_value guard (the queued current_value still matches
+ *      the post-rollback stored value, so this rejection can only be
+ *      rollback_vetoed, never stale_current_value)
  *
  * Run standalone:
  *   npx tsx src/routes/opplevelser-gardssalg-field-concordance-review-approve.test.ts
@@ -302,6 +311,42 @@ export function runOpplevelserGardssalgFieldConcordanceReviewApproveTests(
         batch_id: null,
       });
 
+      // prov-vetoed — epost was written by content-refresh, then a human
+      // deliberately rolled it back (POST /admin/gardssalg-content-rollback),
+      // whose own audit row (source_url = the rollback marker) is the
+      // LATEST row for (prov-vetoed, epost). The queued avvik's
+      // current_value matches the field's actual post-rollback stored value
+      // (null), so absent the new guard this would otherwise sail through
+      // as a normal (non-stale) approval.
+      insertProvider.run({
+        id: "prov-vetoed",
+        navn: "Bryggeriet Vetoed",
+        ...baseProvider({ epost: null }),
+      });
+      insertQueueRow.run({
+        id: "q-vetoed-epost",
+        provider_id: "prov-vetoed",
+        provider_name: "Bryggeriet Vetoed",
+        field_name: "epost",
+        current_value: null,
+        found_value: "reappears@vetoed.no",
+        batch_id: null,
+      });
+      expDb
+        .prepare(
+          `INSERT INTO gardssalg_content_audit
+             (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+           VALUES ('aud-vetoed-write', 'prov-vetoed', 'epost', NULL, 'was-here@vetoed.no', 'https://vetoed.no', NULL, 'system', datetime('now'))`,
+        )
+        .run();
+      expDb
+        .prepare(
+          `INSERT INTO gardssalg_content_audit
+             (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+           VALUES ('aud-vetoed-rollback', 'prov-vetoed', 'epost', 'was-here@vetoed.no', NULL, 'internal://rollback', NULL, 'system', datetime('now'))`,
+        )
+        .run();
+
       const dumpProviders = () =>
         (expDb.prepare(`SELECT * FROM experience_providers ORDER BY id`).all() as unknown[]).map((r) => JSON.stringify(r));
       const dumpQueue = () =>
@@ -329,7 +374,7 @@ export function runOpplevelserGardssalgFieldConcordanceReviewApproveTests(
         headers: authHeaders,
       });
       assertEq(getQueue.status, 200, "get1: GET review-queue -> 200");
-      assertEq(getQueue.body.count, 8, "get2: GET review-queue count reflects all 8 fixture rows");
+      assertEq(getQueue.body.count, 9, "get2: GET review-queue count reflects all 9 fixture rows");
       assertTrue(Array.isArray(getQueue.body.entries), "get3: entries is an array");
 
       // ── 1. dry-run makes zero writes ────────────────────────────────────
@@ -453,6 +498,45 @@ export function runOpplevelserGardssalgFieldConcordanceReviewApproveTests(
       const twoFieldsProviderRow = expDb.prepare(`SELECT epost, telefon FROM experience_providers WHERE id = 'prov-two-fields'`).get() as any;
       assertEq(twoFieldsProviderRow.epost, "ny@tofelt.no", "8c: epost was written");
       assertEq(twoFieldsProviderRow.telefon, "90000010", "8d: telefon untouched (still pending, not approved yet)");
+
+      // ── 9. rollback_vetoed (2026-08-09 gap fix) ─────────────────────────
+      const beforeVetoedProviders = dumpProviders();
+      const beforeVetoedAudit = dumpAudit();
+      const vetoedApprove = await callRoute(opplevelserRouter, {
+        headers: authHeaders,
+        body: { apply: true, approvals: [{ provider_id: "prov-vetoed", field_name: "epost", found_value: "reappears@vetoed.no" }] },
+      });
+      assertEq(
+        vetoedApprove.body.rejected,
+        [{ provider_id: "prov-vetoed", field_name: "epost", reason: "rollback_vetoed" }],
+        "9a: a field whose latest audit row is a rollback -> rollback_vetoed, not written",
+      );
+      assertEq(vetoedApprove.body.written_count, 0, "9b: rollback_vetoed writes nothing");
+      const afterVetoedProviders = dumpProviders();
+      assertEq(afterVetoedProviders, beforeVetoedProviders, "9c: experience_providers byte-identical, no write happened");
+      const afterVetoedAudit = dumpAudit();
+      assertEq(afterVetoedAudit.length, beforeVetoedAudit.length, "9d: no new gardssalg_content_audit row inserted");
+      const vetoedQueueAfter = expDb
+        .prepare(`SELECT * FROM gardssalg_field_concordance_review_queue WHERE provider_id = 'prov-vetoed'`)
+        .all() as any[];
+      assertEq(vetoedQueueAfter.length, 1, "9e: queue row NOT cleared (rejection, not an approval)");
+
+      // Direct call (bypassing the route) confirms the same guard fires
+      // independent of the route layer, and that it fires BEFORE
+      // stale_current_value would (the queued current_value of null still
+      // matches the post-rollback stored value, so a stale_current_value
+      // result here would indicate the new guard is missing/misordered).
+      const directVetoed = experienceStore.applyGardssalgFieldConcordanceApproval(
+        "prov-vetoed",
+        "epost",
+        null,
+        "reappears@vetoed.no",
+      );
+      assertEq(
+        directVetoed,
+        { provider_id: "prov-vetoed", field_name: "epost", written: false, reason: "rollback_vetoed" },
+        "9f: direct call also returns rollback_vetoed (not stale_current_value)",
+      );
     } catch (err: any) {
       failed++;
       failures.push(

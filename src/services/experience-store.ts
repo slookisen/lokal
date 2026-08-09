@@ -5915,6 +5915,19 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
 // planGardssalgContentRollback tell the two apart for idempotency (see its
 // doc comment) without a dedicated boolean column.
 const GARDSSALG_ROLLBACK_MARKER = "internal://rollback";
+// source_url marker stamped on the ONE audit row applyGardssalgRollbackVetoOverride
+// inserts (2026-08-09 rollback-veto-override lever, ~line 6355 below) — records
+// that an admin deliberately overrode a gardssalgContactFieldWasRolledBack veto
+// for a (provider, field) pair, WITHOUT itself changing the field's stored
+// value (old_value/new_value are both the untouched current value; only the
+// audit trail — and thus future eligibility — changes). Deliberately distinct
+// from GARDSSALG_ROLLBACK_MARKER: gardssalgContactFieldWasRolledBack only ever
+// treats a LATEST row whose source_url === GARDSSALG_ROLLBACK_MARKER as a live
+// veto, so inserting a row stamped with THIS marker instead is exactly what
+// lifts the veto (the override row becomes the new "latest", and it is not
+// the rollback marker) — see applyGardssalgRollbackVetoOverride's own doc
+// comment.
+const GARDSSALG_ROLLBACK_VETO_OVERRIDE_MARKER = "internal://rollback-veto-override";
 
 export type GardssalgRollbackTarget = {
   provider_id?: string;
@@ -6229,7 +6242,7 @@ export type GfcApprovalResult = {
   provider_id: string;
   field_name: string;
   written: boolean;
-  reason?: "invalid_field" | "not_found" | "owner_locked" | "stale_current_value";
+  reason?: "invalid_field" | "not_found" | "owner_locked" | "stale_current_value" | "rollback_vetoed";
 };
 
 /**
@@ -6252,7 +6265,21 @@ export type GfcApprovalResult = {
  *      GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS, so for content_source='claim'
  *      rows it always falls into that helper's "any other fieldName ->
  *      always locked" branch, same as epost/telefon today).
- *   4. the row's CURRENT value for fieldName (trimmed, blank -> null)
+ *   4. gardssalgContactFieldWasRolledBack(providerId, fieldName) -> true ->
+ *      "rollback_vetoed" (2026-08-09 gap fix). Without this gate a human who
+ *      deliberately rolled back a bad epost/telefon/mobil value (POST
+ *      /admin/gardssalg-content-rollback) could have that exact value
+ *      silently re-written the next time the field-concordance scanner
+ *      re-flags it as an avvik and someone approves the (now stale, but
+ *      byte-identical-looking) finding — the same "an undo that un-undoes
+ *      itself" failure applyGardssalgProviderContact already guards against
+ *      for its own fill-only writes (see gardssalgContactFieldWasRolledBack's
+ *      own doc comment). Fail-closed: checked BEFORE staleness, so a vetoed
+ *      field is rejected as vetoed even if expectedCurrentValue happens to
+ *      still match. The lever to deliberately override this veto is
+ *      applyGardssalgRollbackVetoOverride below — this function itself never
+ *      bypasses it.
+ *   5. the row's CURRENT value for fieldName (trimmed, blank -> null)
  *      doesn't match `expectedCurrentValue` (same normalisation) ->
  *      "stale_current_value" — something else already changed the field
  *      since this finding was queued; approving the stale finding would
@@ -6302,6 +6329,10 @@ export function applyGardssalgFieldConcordanceApproval(
     return { provider_id: providerId, field_name: fieldName, written: false, reason: "owner_locked" };
   }
 
+  if (gardssalgContactFieldWasRolledBack(providerId, fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, written: false, reason: "rollback_vetoed" };
+  }
+
   const normalise = (v: string | null | undefined): string | null => {
     if (v === null || v === undefined) return null;
     const trimmed = String(v).trim();
@@ -6349,6 +6380,143 @@ export function applyGardssalgFieldConcordanceApproval(
   applyWithAudit();
 
   return { provider_id: providerId, field_name: fieldName, written: true };
+}
+
+// ─── Gårdssalg rollback-veto override (2026-08-09, criterion 4 — closes the
+// gap opened by applyGardssalgFieldConcordanceApproval's new rollback_vetoed
+// guard above) ───────────────────────────────────────────────────────────────
+// A rollback veto (gardssalgContactFieldWasRolledBack) is a deliberate,
+// permanent-until-overridden human decision — correct as a default, but a
+// human/orchestrator sometimes DOES want to let a field become writable again
+// (e.g. the original rollback turns out to have been a mistake, or new
+// evidence supersedes it). This is that lever: a single-item, explicitly
+// justified override that changes ONLY eligibility, never the field's stored
+// content — it must never be confused with (or substitute for) actually
+// approving a new value, which still goes through
+// applyGardssalgFieldConcordanceApproval's own guard chain afterwards.
+
+export type GardssalgRollbackVetoOverrideResult = {
+  provider_id: string;
+  field_name: string;
+  overridden: boolean;
+  reason?: "invalid_field" | "justification_required" | "not_found" | "not_vetoed";
+};
+
+/**
+ * Read-only precheck for applyGardssalgRollbackVetoOverride: computes and
+ * returns the SAME result the apply path would, without ever writing to the
+ * DB (backs the dry-run branch of POST /admin/gardssalg-rollback-veto-
+ * override). Guard order mirrors the apply function exactly — see its doc
+ * comment.
+ */
+export function planGardssalgRollbackVetoOverride(
+  providerId: string,
+  fieldName: string,
+  justification: string
+): GardssalgRollbackVetoOverrideResult {
+  if (!GFC_APPROVAL_FIELDS.has(fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "invalid_field" };
+  }
+
+  const trimmedJustification = typeof justification === "string" ? justification.trim() : "";
+  if (trimmedJustification === "") {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "justification_required" };
+  }
+
+  const db = getDb(VERTICAL);
+  const row = db.prepare(`SELECT id FROM experience_providers WHERE id = ?`).get(providerId) as
+    | { id: string }
+    | undefined;
+  if (!row) {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "not_found" };
+  }
+
+  if (!gardssalgContactFieldWasRolledBack(providerId, fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "not_vetoed" };
+  }
+
+  return { provider_id: providerId, field_name: fieldName, overridden: true };
+}
+
+/**
+ * Deliberately override a live rollback veto (gardssalgContactFieldWasRolledBack)
+ * for ONE (provider_id, fieldName) pair, so the field becomes writable again
+ * by the normal fill-only / concordance-approval paths. `fieldName` is
+ * validated against the SAME GFC_APPROVAL_FIELDS allow-list
+ * applyGardssalgFieldConcordanceApproval uses (epost/telefon/mobil only) —
+ * BEFORE any SQL, defense in depth, since fieldName can arrive from an admin
+ * request body one hop up.
+ *
+ * Guard order (first failing gate wins):
+ *   1. fieldName not in GFC_APPROVAL_FIELDS -> "invalid_field", no SQL at all.
+ *   2. justification missing/blank (after .trim()) -> "justification_required",
+ *      no write, and — unlike every other guard here — checked BEFORE the DB
+ *      is ever queried for the provider at all: an override with no stated
+ *      reason should never even reveal whether the provider/veto exist.
+ *   3. provider not found -> "not_found".
+ *   4. gardssalgContactFieldWasRolledBack(providerId, fieldName) is false ->
+ *      "not_vetoed" — nothing to override, avoided as a no-op rather than
+ *      silently "succeeding" at doing nothing.
+ *
+ * On success: inserts exactly ONE new gardssalg_content_audit row —
+ * old_value AND new_value both set to the field's CURRENT stored value (this
+ * lever changes eligibility only; it NEVER touches experience_providers, so
+ * the field's content is byte-identical before and after), source_url the
+ * new GARDSSALG_ROLLBACK_VETO_OVERRIDE_MARKER sentinel (distinct from
+ * GARDSSALG_ROLLBACK_MARKER — see its own doc comment for why that
+ * distinction is what actually lifts the veto), notes the trimmed
+ * justification silently truncated to 1000 chars (mirrors the
+ * gardssalg-booking-activation `note` truncation convention, except this
+ * field is REQUIRED rather than optional), changed_by 'admin', batch_id
+ * carried through if given. The table is insert-only — this NEVER
+ * UPDATEs/DELETEs the pre-existing rollback-marker row or any other audit
+ * row.
+ */
+export function applyGardssalgRollbackVetoOverride(
+  providerId: string,
+  fieldName: string,
+  justification: string,
+  batchId?: string
+): GardssalgRollbackVetoOverrideResult {
+  if (!GFC_APPROVAL_FIELDS.has(fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "invalid_field" };
+  }
+
+  const trimmedJustification = typeof justification === "string" ? justification.trim() : "";
+  if (trimmedJustification === "") {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "justification_required" };
+  }
+  const notes = trimmedJustification.slice(0, 1000);
+
+  const db = getDb(VERTICAL);
+  const row = db.prepare(`SELECT id, ${fieldName} AS current_value FROM experience_providers WHERE id = ?`).get(
+    providerId
+  ) as { id: string; current_value: string | null } | undefined;
+  if (!row) {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "not_found" };
+  }
+
+  if (!gardssalgContactFieldWasRolledBack(providerId, fieldName)) {
+    return { provider_id: providerId, field_name: fieldName, overridden: false, reason: "not_vetoed" };
+  }
+
+  const currentValue = row.current_value ?? null;
+  db.prepare(
+    `INSERT INTO gardssalg_content_audit
+       (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, notes, changed_at)
+     VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'admin', @notes, datetime('now'))`
+  ).run({
+    id: uuid(),
+    provider_id: providerId,
+    field_name: fieldName,
+    old_value: currentValue,
+    new_value: currentValue,
+    source_url: GARDSSALG_ROLLBACK_VETO_OVERRIDE_MARKER,
+    batch_id: batchId ?? null,
+    notes,
+  });
+
+  return { provider_id: providerId, field_name: fieldName, overridden: true };
 }
 
 export type GardssalgFieldConcordanceReviewQueueEntry = {
