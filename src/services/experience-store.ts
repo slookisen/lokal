@@ -5766,6 +5766,19 @@ export function stampGardssalgWebsiteDiscoveryAttempt(providerIds: string[]): vo
 }
 
 /**
+ * Normalizes a URL string for AT-PLACE COMPARISON PURPOSES ONLY (AC9
+ * follow-up, dev-request 2026-08-07-kontaktjakt-drikkeprodusenter): strips a
+ * single leading http(s):// scheme and exactly one trailing slash. Nothing
+ * else — no lowercasing, no www. stripping, no path/query normalization.
+ * Deliberately narrow so it can never paper over an actual host difference;
+ * see applyGardssalgProviderWebsite's isAtPlace check below.
+ */
+function normalizeUrlForAtPlaceComparison(value: string): string {
+  const withoutScheme = value.trim().replace(/^https?:\/\//i, "");
+  return withoutScheme.endsWith("/") ? withoutScheme.slice(0, -1) : withoutScheme;
+}
+
+/**
  * Apply an approved website candidate to ONE gårdssalg provider. Same
  * discipline as applyGardssalgProviderOrgnr: lock guard, FILL-ONLY (an
  * existing hjemmeside is never replaced), URL sanity, and an identity
@@ -5773,15 +5786,19 @@ export function stampGardssalgWebsiteDiscoveryAttempt(providerIds: string[]): vo
  * other provider in the catalog (gardssalgSharedHostCounts), the write is
  * skipped: adopting it would create exactly the shared-host situation the 5d
  * guard exists to quarantine. Godkjenn-på-plass: when the candidate is
- * byte-identical to the row's OWN current hjemmeside, the fill-only and
- * shared-host guards are skipped (neither protects against colliding with
- * yourself) and only field_provenance is (re)stamped — this clears review-
- * queue duplicates and unblocks the claim-time email harvester's verified-
- * homepage gate without ever changing the stored value. Stamps
- * field_provenance.hjemmeside and a gardssalg_content_audit row (field
- * hjemmeside — in GARDSSALG_ROLLBACKABLE_FIELDS, so the standard rollback
- * lever covers it). Returns the field names actually written ([] if nothing
- * written).
+ * byte-identical to the row's OWN current hjemmeside — OR merely differs by
+ * scheme (http/https) and/or a single trailing slash (AC9 follow-up; see
+ * normalizeUrlForAtPlaceComparison) — the fill-only and shared-host guards
+ * are skipped (neither protects against colliding with yourself) and only
+ * field_provenance is (re)stamped — this clears review-queue duplicates and
+ * unblocks the claim-time email harvester's verified-homepage gate without
+ * ever changing the stored value. Stamps field_provenance.hjemmeside and a
+ * gardssalg_content_audit row (field hjemmeside — in
+ * GARDSSALG_ROLLBACKABLE_FIELDS, so the standard rollback lever covers it;
+ * old_value/new_value are both the row's actual unchanged stored value on
+ * the at-place path, never the candidate, so the audit trail never claims a
+ * URL changed when it didn't). Returns the field names actually written ([]
+ * if nothing written).
  */
 export function applyGardssalgProviderWebsite(
   providerId: string,
@@ -5801,10 +5818,23 @@ export function applyGardssalgProviderWebsite(
 
   const cleanUrl = (url || "").trim();
   if (cleanUrl.length === 0 || cleanUrl.length > 2048) return [];
-  if (!/^https?:\/\/\S+\.\S+/i.test(cleanUrl)) return [];
 
   const existingUrl = (row.hjemmeside || "").trim();
-  const isAtPlace = existingUrl !== "" && existingUrl === cleanUrl;
+  const isAtPlace =
+    existingUrl !== "" &&
+    (existingUrl === cleanUrl ||
+      normalizeUrlForAtPlaceComparison(existingUrl) === normalizeUrlForAtPlaceComparison(cleanUrl));
+
+  // The http(s):// scheme sanity gate only matters for candidates that could
+  // actually be WRITTEN (the fill path stores cleanUrl verbatim). A
+  // normalized-only at-place match (e.g. Brreg-sourced "www.foo.no" with no
+  // scheme) never gets written — the at-place branch below stamps
+  // provenance only and leaves the column exactly as existingUrl (which was
+  // already schema-validated when it was first stored) — so a scheme-less
+  // candidate is safe to accept here PURELY for comparison purposes. A
+  // scheme-less candidate on a row that turns out NOT at-place still hits
+  // this gate exactly as before.
+  if (!isAtPlace && !/^https?:\/\/\S+\.\S+/i.test(cleanUrl)) return [];
 
   if (!isAtPlace) {
     if (row.hjemmeside && row.hjemmeside.trim() !== "") return []; // fill-only
@@ -5831,10 +5861,14 @@ export function applyGardssalgProviderWebsite(
 
   const applyWithAudit = db.transaction(() => {
     if (isAtPlace) {
+      // Optimistic-concurrency compare against existingUrl (the value
+      // actually read from the row), NOT cleanUrl (the candidate) — under a
+      // normalized-only match the two are textually different, and this
+      // clause must still match the row it read.
       const upd = db.prepare(
         `UPDATE experience_providers SET field_provenance = @field_provenance, updated_at = datetime('now')
           WHERE id = @id AND TRIM(hjemmeside) = @hjemmeside`
-      ).run({ id: providerId, hjemmeside: cleanUrl, field_provenance: JSON.stringify(provenance) });
+      ).run({ id: providerId, hjemmeside: existingUrl, field_provenance: JSON.stringify(provenance) });
       if (upd.changes === 0) throw new Error("hjemmeside_changed_concurrently");
     } else {
       const upd = db.prepare(
@@ -5851,7 +5885,12 @@ export function applyGardssalgProviderWebsite(
       id: uuid(),
       provider_id: providerId,
       old_value: row.hjemmeside ?? null,
-      new_value: cleanUrl,
+      // At-place path never actually changes the stored value, so new_value
+      // must be existingUrl (the actual unchanged stored value), not
+      // cleanUrl (the candidate) — under exact match these already coincide;
+      // this only matters for the normalized-match case. Non-at-place path
+      // (fill) is unaffected: cleanUrl there IS the real new value.
+      new_value: isAtPlace ? existingUrl : cleanUrl,
       source_url: evidenceUrl,
       batch_id: batchId ?? null,
     });

@@ -457,6 +457,17 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
           hjemmeside: "https://kravsatt-egen.no", catalog_hidden: null, content_source: "claim", producer_type: "sideri",
           field_provenance: JSON.stringify({ owner_locks: { hjemmeside: { locked_at: "2026-08-01T12:00:00.000Z" } } }),
         });
+        // wd-11m-r fixtures — normalized at-place (AC9 follow-up, dev-request
+        // 2026-08-07-kontaktjakt-drikkeprodusenter): scheme/trailing-slash-
+        // only textual differences from the queue vs. production
+        // 2026-08-07T15:1x Z apply run (8/19 candidates rejected purely on
+        // this superficial formatting, e.g. www.auroraspirit.com vs.
+        // https://www.auroraspirit.com).
+        insertProvider.run({ id: "wd-atplace-norm-scheme", navn: "Aurora Spirit Norm", org_nr: "911222777", kommune: "Voss", poststed: null, hjemmeside: "https://www.auroraspirit.com", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-atplace-norm-slash", navn: "Foo Trailing Test", org_nr: "911222888", kommune: "Voss", poststed: null, hjemmeside: "https://foo-trailing-test.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-atplace-norm-both", navn: "Foo Both Test", org_nr: "911222999", kommune: "Voss", poststed: null, hjemmeside: "https://foo-both-test.no/", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-atplace-norm-neg", navn: "Foo Neg Test", org_nr: "911223000", kommune: "Voss", poststed: null, hjemmeside: "https://foo-neg-test.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-atplace-norm-route", navn: "Aurora Spirit Norm Route", org_nr: "911223111", kommune: "Voss", poststed: null, hjemmeside: "https://www.auroraspirit-route.com", catalog_hidden: null, content_source: null, producer_type: "sideri" });
 
         // (a) exact-match candidate: succeeds, value UNCHANGED, provenance
         //     stamped, exactly one new audit row.
@@ -517,6 +528,105 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
           !JSON.parse(rowLockedAtPlace.field_provenance || "{}").hjemmeside,
           "wd-11l: owner-locked row's field_provenance.hjemmeside was NOT stamped by the at-place path",
         );
+
+        // (e/m) normalized at-place — scheme-only difference (candidate has
+        //     no http(s):// prefix; stored value does).
+        const wNormScheme = expStore.applyGardssalgProviderWebsite(
+          "wd-atplace-norm-scheme", "www.auroraspirit.com", "https://evidence-norm-scheme.example",
+        );
+        assertEq(JSON.stringify(wNormScheme), JSON.stringify(["hjemmeside"]),
+          'wd-11m: scheme-only-different candidate is treated as at-place, returns ["hjemmeside"]');
+        const rowNormScheme = expDb.prepare(`SELECT hjemmeside, field_provenance FROM experience_providers WHERE id='wd-atplace-norm-scheme'`).get() as any;
+        assertEq(rowNormScheme.hjemmeside, "https://www.auroraspirit.com", "wd-11n: hjemmeside column UNCHANGED (still carries the scheme)");
+        assertEq(
+          JSON.parse(rowNormScheme.field_provenance || "{}").hjemmeside?.source_url,
+          "https://evidence-norm-scheme.example",
+          "wd-11o: field_provenance.hjemmeside stamped with the new evidence url",
+        );
+        const auditNormScheme = expDb.prepare(
+          `SELECT old_value, new_value FROM gardssalg_content_audit WHERE provider_id='wd-atplace-norm-scheme' AND field_name='hjemmeside'`
+        ).all() as any[];
+        assertEq(auditNormScheme.length, 1, "wd-11p: exactly one new audit row for the scheme-normalized at-place write");
+        assertEq(auditNormScheme[0]?.old_value, "https://www.auroraspirit.com", "wd-11q: audit old_value is the ORIGINAL stored value");
+        assertEq(auditNormScheme[0]?.new_value, "https://www.auroraspirit.com",
+          "wd-11r: audit new_value is the ORIGINAL stored value too (not the scheme-less candidate) — the write never actually changed the column");
+
+        // (f/n) normalized at-place — trailing-slash-only difference
+        //     (candidate carries a trailing slash the stored value lacks).
+        const wNormSlash = expStore.applyGardssalgProviderWebsite(
+          "wd-atplace-norm-slash", "https://foo-trailing-test.no/", "https://evidence-norm-slash.example",
+        );
+        assertEq(JSON.stringify(wNormSlash), JSON.stringify(["hjemmeside"]),
+          'wd-11s: trailing-slash-only-different candidate is treated as at-place, returns ["hjemmeside"]');
+        const rowNormSlash = expDb.prepare(`SELECT hjemmeside, field_provenance FROM experience_providers WHERE id='wd-atplace-norm-slash'`).get() as any;
+        assertEq(rowNormSlash.hjemmeside, "https://foo-trailing-test.no", "wd-11t: hjemmeside column UNCHANGED (no trailing slash)");
+        assertEq(
+          JSON.parse(rowNormSlash.field_provenance || "{}").hjemmeside?.source_url,
+          "https://evidence-norm-slash.example",
+          "wd-11u: field_provenance.hjemmeside stamped with the new evidence url",
+        );
+        const auditNormSlash = expDb.prepare(
+          `SELECT old_value, new_value FROM gardssalg_content_audit WHERE provider_id='wd-atplace-norm-slash' AND field_name='hjemmeside'`
+        ).all() as any[];
+        assertEq(auditNormSlash.length, 1, "wd-11v: exactly one new audit row for the slash-normalized at-place write");
+        assertEq(auditNormSlash[0]?.new_value, "https://foo-trailing-test.no",
+          "wd-11w: audit new_value is the ORIGINAL stored value (no trailing slash), not the slashed candidate");
+
+        // (g/o) normalized at-place — BOTH scheme and trailing slash
+        //     stripped from the candidate.
+        const wNormBoth = expStore.applyGardssalgProviderWebsite(
+          "wd-atplace-norm-both", "foo-both-test.no", "https://evidence-norm-both.example",
+        );
+        assertEq(JSON.stringify(wNormBoth), JSON.stringify(["hjemmeside"]),
+          'wd-11x: scheme-AND-trailing-slash-different candidate is treated as at-place, returns ["hjemmeside"]');
+        const rowNormBoth = expDb.prepare(`SELECT hjemmeside, field_provenance FROM experience_providers WHERE id='wd-atplace-norm-both'`).get() as any;
+        assertEq(rowNormBoth.hjemmeside, "https://foo-both-test.no/", "wd-11y: hjemmeside column UNCHANGED (still carries scheme + trailing slash)");
+        assertEq(
+          JSON.parse(rowNormBoth.field_provenance || "{}").hjemmeside?.source_url,
+          "https://evidence-norm-both.example",
+          "wd-11z: field_provenance.hjemmeside stamped with the new evidence url",
+        );
+        const auditNormBoth = expDb.prepare(
+          `SELECT old_value, new_value FROM gardssalg_content_audit WHERE provider_id='wd-atplace-norm-both' AND field_name='hjemmeside'`
+        ).all() as any[];
+        assertEq(auditNormBoth.length, 1, "wd-11aa: exactly one new audit row for the both-normalized at-place write");
+        assertEq(auditNormBoth[0]?.new_value, "https://foo-both-test.no/",
+          "wd-11ab: audit new_value is the ORIGINAL stored value (scheme + trailing slash), not the bare candidate");
+
+        // (h/p) negative control — a www. prefix difference is NOT scheme
+        //     or trailing-slash, so it must NOT be treated as at-place: the
+        //     normalization is narrowly scoped and this is a real host
+        //     difference, refused exactly like today (fill-only guard fires
+        //     because the row already carries a hjemmeside).
+        const wNormNeg = expStore.applyGardssalgProviderWebsite(
+          "wd-atplace-norm-neg", "https://www.foo-neg-test.no", "https://evidence-norm-neg.example",
+        );
+        assertEq(wNormNeg.length, 0, "wd-11ac: www.-prefix-only difference is NOT at-place — refused (narrow normalization scope)");
+        const rowNormNeg = expDb.prepare(`SELECT hjemmeside, field_provenance FROM experience_providers WHERE id='wd-atplace-norm-neg'`).get() as any;
+        assertEq(rowNormNeg.hjemmeside, "https://foo-neg-test.no", "wd-11ad: hjemmeside unchanged after the refused www.-prefix write");
+        assertEq(rowNormNeg.field_provenance, null, "wd-11ae: field_provenance NOT stamped for the refused www.-prefix write");
+
+        // (i/q) same normalized-match scenario driven through the approve
+        //     ROUTE with apply:true — written_count reflects the real write
+        //     (not write_skipped_by_guards), and the queue entry is cleared.
+        expStore.upsertGardssalgWebsiteReviewQueue({
+          provider_id: "wd-atplace-norm-route",
+          provider_name: "Aurora Spirit Norm Route",
+          candidate_url: "www.auroraspirit-route.com",
+          final_url: "www.auroraspirit-route.com",
+          reason: "website_discovery_candidate",
+        });
+        const approveResNorm = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { approvals: [{ provider_id: "wd-atplace-norm-route", url: "www.auroraspirit-route.com" }], apply: true },
+        });
+        assertEq(approveResNorm.body.written_count, 1,
+          "wd-11af: approve route treats the normalized (scheme-stripped) at-place candidate as a real write (not write_skipped_by_guards)");
+        const qLeftNorm = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-atplace-norm-route'`).get() as any).c;
+        assertEq(qLeftNorm, 0, "wd-11ag: queue entry for the normalized at-place candidate is cleared");
+        const rowNormRoute = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-atplace-norm-route'`).get() as any;
+        assertEq(rowNormRoute.hjemmeside, "https://www.auroraspirit-route.com", "wd-11ah: hjemmeside column UNCHANGED by the route-driven normalized at-place write");
       }
 
       // ── wd-7: shared-host counter counts hidden rows, excludes test provider. ─
