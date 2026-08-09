@@ -210,6 +210,14 @@ import {
   // route.
   planGardssalgRollbackVetoOverride,
   applyGardssalgRollbackVetoOverride,
+  // 2026-08-09 field-concordance CLEAR (dev-request 2026-08-09-epost-
+  // korrigering-paa-plass) — the narrow, epost-only lever for a stored
+  // contact field that a FRESH same-request homepage fetch proves is
+  // genuinely absent from the page (see its own doc comment for why this is
+  // deliberately not a generalization of applyGardssalgFieldConcordanceApproval
+  // above). Backs POST /admin/gardssalg-field-concordance-clear below, near
+  // the existing gardssalg-field-concordance routes.
+  applyGardssalgFieldConcordanceClear,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -282,6 +290,11 @@ import {
   GFC_AVVIK_CAPABLE_FIELDS,
   type GfcProviderResult,
   type GfcFieldName,
+  // 2026-08-09 field-concordance CLEAR (dev-request 2026-08-09-epost-
+  // korrigering-paa-plass) — POST /admin/gardssalg-field-concordance-clear
+  // below runs this SAME pure epost verdict check fresh, on its own
+  // just-fetched page text, never a cached/batched verdict.
+  checkEmailField,
 } from "../services/gardssalg-field-concordance";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
@@ -9191,6 +9204,174 @@ router.post("/admin/gardssalg-field-concordance-review-approve", requireAdmin, (
     written,
     rejected,
   });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-field-concordance-clear (admin) ──
+//
+// dev-request 2026-08-09-epost-korrigering-paa-plass. The field-concordance
+// verdict space (gardssalg-field-concordance.ts's own doc comment) collapses
+// "genuinely absent from a successfully-fetched page" and "we failed to
+// fetch the page at all" into the SAME ikke_funnet_på_siden verdict — by
+// design, since a batch scan must fail closed on a transient fetch failure.
+// That's exactly right for a scan/audit, but it means neither
+// applyGardssalgFieldConcordanceApproval (which only ever CORRECTS to a
+// caller-supplied non-blank value) nor any existing lever can act on the
+// genuinely-absent case: there was no safe way to null out a stored epost
+// that the producer's own homepage no longer shows, without risking a null
+// on a merely-unreachable page.
+//
+// This route is that lever — single-provider, epost-only (see
+// applyGardssalgFieldConcordanceClear's own doc comment in experience-store.ts
+// for why this is deliberately NOT a generalized field-selectable clear: the
+// request body below has no field_name key at all, so there is structurally
+// no way to name a different field). It runs its OWN fresh, same-request
+// homepage fetch + checkEmailField verdict — the EXACT SAME
+// crFetchGardssalgContent + gardssalgPageText pipeline
+// runGardssalgFieldConcordanceScan above uses, never a new fetch path, and
+// NEVER a cached/batched verdict from a prior scan — and only proceeds to a
+// (dry-run or real) clear when that fresh check comes back
+// "ikke_funnet_på_siden" AND the fetch itself succeeded, so that verdict can
+// only mean genuine absence on a real, loaded page, never a disguised fetch
+// failure.
+//
+// Body: { provider_id: string, apply?: boolean }.
+//
+// Order of checks (first failing gate wins):
+//   1. provider_id missing/blank -> 400, no DB/network call at all.
+//   2. provider not found -> 404 {reason: "not_found"}.
+//   3. stored epost (trimmed) already blank/null -> 400 {reason:
+//      "already_blank"} — checked BEFORE any fetch, so a no-op call never
+//      costs a wasted homepage crawl.
+//   4. no usable hjemmeside on the row -> 409 {reason: "no_homepage"} — this
+//      route can never verify absence without a page to check, so it never
+//      clears blind.
+//   5. hjemmeside present but NOT ownership-verified
+//      (isHjemmesideVerified(field_provenance) === false) -> 409 {reason:
+//      "homepage_unverified"}, zero fetch, zero writes. Mirrors the
+//      website-verification gate every other write-decision path in this
+//      subsystem applies BEFORE trusting a hjemmeside's content as evidence
+//      (see runGardssalgFieldConcordanceScan's cohort filter above, and the
+//      isHjemmesideVerified() doc comment) — a real incident here
+//      (experience-store.ts ~line 5029) showed most sibling-TLD candidate
+//      homepages were flatly wrong (squatted/unrelated). Without this gate,
+//      a provider whose hjemmeside was never verified (or is an
+//      aggregator/wrong-domain page) but whose stored epost is a real,
+//      correct address from an unrelated channel would have that WRONG page
+//      fetched, checkEmailField would correctly find nothing on it (not
+//      because the email is invalid — because it's the wrong page), and
+//      apply:true would silently NULL a genuinely correct address. Checked
+//      BEFORE the fetch, same as no_homepage above.
+//   6. the fresh fetch itself fails (fetched.ok === false) -> 409 {reason:
+//      "fetch_failed", detail: fetched.reason}, zero writes. This is the
+//      core safety property this whole route exists to guarantee: a
+//      transient network failure must never be able to trigger a clear.
+//   7. checkEmailField(row.epost, pageText) run fresh on the just-fetched
+//      text:
+//        - "bekreftet" -> 409 {reason: "still_confirmed"}, zero writes (the
+//          address is genuinely still there).
+//        - "avvik" -> 409 {reason: "correction_available", found: <the
+//          found value>}, zero writes — a DIFFERENT address exists on the
+//          page, which is a correction via the existing approval/
+//          remediation route above, not a clear.
+//        - "ikke_funnet_på_siden" (and the fetch succeeded, so this now
+//          means genuine absence on a real, loaded page) -> proceed.
+//   8. apply !== true (default, dry-run) -> 200 {dry_run: true, would_clear:
+//      true, provider_id, current_epost}, zero writes.
+//   9. apply === true -> calls applyGardssalgFieldConcordanceClear(provider_id,
+//      hjemmeside); responds 200 with its result verbatim (merged with
+//      `success: true`) — including any owner_locked/rollback_vetoed/
+//      already_blank/not_found reason it might still return. Checks 2-5
+//      above are a fast-path for a clean error response; the store
+//      function's own guards are the final authority and run again
+//      regardless.
+router.post("/admin/gardssalg-field-concordance-clear", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { provider_id?: unknown; apply?: unknown };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ success: false, error: "Body field 'provider_id' is required" });
+    return;
+  }
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
+  try {
+    const expDb = getExpDb("experiences");
+    const row = expDb
+      .prepare(`SELECT id, navn, hjemmeside, epost, field_provenance FROM experience_providers WHERE id = ?`)
+      .get(providerId) as
+      | { id: string; navn: string; hjemmeside: string | null; epost: string | null; field_provenance: string | null }
+      | undefined;
+
+    if (!row) {
+      res.status(404).json({ success: false, reason: "not_found" });
+      return;
+    }
+
+    const currentEpost = (row.epost || "").trim();
+    if (!currentEpost) {
+      res.status(400).json({ success: false, reason: "already_blank" });
+      return;
+    }
+
+    const hjemmeside = row.hjemmeside && row.hjemmeside.trim() !== "" ? row.hjemmeside.trim() : null;
+    if (!hjemmeside) {
+      res.status(409).json({ success: false, reason: "no_homepage" });
+      return;
+    }
+
+    // Website-verification gate — before any fetch, fail-closed, mirroring
+    // every other write-decision path in this subsystem (see
+    // isHjemmesideVerified()'s doc comment and runGardssalgFieldConcordanceScan's
+    // cohort filter above): a hjemmeside the website-verification sweep has
+    // not stamped verified=true must never be trusted as evidence that a
+    // stored field is genuinely absent.
+    if (!isHjemmesideVerified(row.field_provenance)) {
+      res.status(409).json({ success: false, reason: "homepage_unverified" });
+      return;
+    }
+
+    const fetched = await crFetchGardssalgContent(hjemmeside);
+    if (!fetched.ok) {
+      res.status(409).json({ success: false, reason: "fetch_failed", detail: fetched.reason });
+      return;
+    }
+    const pageText = gardssalgPageText(fetched.combinedHtml);
+    const verdict = checkEmailField(currentEpost, pageText);
+
+    if (verdict.verdict === "bekreftet") {
+      res.status(409).json({ success: false, reason: "still_confirmed" });
+      return;
+    }
+    if (verdict.verdict === "avvik") {
+      res.status(409).json({ success: false, reason: "correction_available", found: verdict.found });
+      return;
+    }
+
+    // verdict.verdict === "ikke_funnet_på_siden", and the fetch itself
+    // succeeded (checked above) -> genuine absence on a real, loaded page.
+    if (!apply) {
+      res.json({
+        success: true,
+        dry_run: true,
+        would_clear: true,
+        provider_id: providerId,
+        current_epost: currentEpost,
+      });
+      return;
+    }
+
+    const result = applyGardssalgFieldConcordanceClear(providerId, hjemmeside);
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    console.error("[opplevelser] gardssalg-field-concordance-clear failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-provider-dedup-audit ───────────────
