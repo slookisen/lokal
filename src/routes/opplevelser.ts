@@ -5484,7 +5484,7 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
 
     const verifyFn = getGardssalgBrregVerifyOverride() ?? ((orgNr: string) => verifyOrgNumber(orgNr));
 
-    const verified: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string; fields_written: string[] }> = [];
+    const verified: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string; antall_ansatte: number | null; fields_written: string[] }> = [];
     const nameMismatch: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string | null }> = [];
     const inactive: Array<{ provider_id: string; navn: string; org_nr: string; flag: string | null; brreg_name: string | null }> = [];
     const orgnrNotFound: Array<{ provider_id: string; navn: string; org_nr: string }> = [];
@@ -5511,11 +5511,19 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
           continue;
         }
         const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+        // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+        // stoerrelsesgate): antall_ansatte rides along on this SAME verify
+        // call — result.employees is read off the SAME GET /enheter/{orgNr}
+        // response, no second HTTP call. `undefined` (a test double that
+        // predates this field) and `null` (Brreg genuinely has no figure)
+        // both normalise to `null` here — reported, and only ever written on
+        // apply below.
+        const employees = typeof result.employees === "number" ? result.employees : null;
         if (dryRun) {
-          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: [] });
+          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, antall_ansatte: employees, fields_written: [] });
         } else {
-          const written = applyGardssalgBrregVerified(t.id, evidenceUrl, batchTag);
-          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: written });
+          const written = applyGardssalgBrregVerified(t.id, evidenceUrl, batchTag, employees);
+          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, antall_ansatte: employees, fields_written: written });
         }
       } catch (e: any) {
         errors.push({ provider_id: t.id, error: e?.message ?? String(e) });
@@ -7550,6 +7558,20 @@ router.get("/admin/gardssalg-contact-coverage", requireAdmin, (_req: Request, re
 // binary request/paused UI label.
 type OutreachBookingStatus = "live" | "paused" | "none";
 
+// dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+// Skive 1: the antall_ansatte size-gate (pure classifier + DB-backed L1
+// knob) — see services/gardssalg-outreach-size-gate.ts's own module doc
+// comment for why the knob is DB-backed rather than a repo-tracked YAML
+// file (the Dockerfile doesn't COPY a config/ directory, so a file there
+// would need a redeploy to take effect — the opposite of what krav 3/6
+// ask for).
+import {
+  computeGardssalgSizeFlag,
+  getGardssalgSizeGateConfig,
+  setGardssalgSizeGateConfig,
+  type GardssalgSizeFlag,
+} from "../services/gardssalg-outreach-size-gate";
+
 function computeBookingStatus(
   bookingLive: number | null,
   catalogHidden: number | null,
@@ -7661,6 +7683,12 @@ function computeGardssalgReadinessRows(
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
+  // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate) — additive, informational regardless of readiness_tier
+  // or the size-gate's own enabled/disabled switch: Daniel sees the size
+  // signal on every row, always, even when the gate itself is toggled off.
+  antall_ansatte: number | null;
+  size_flag: GardssalgSizeFlag;
 }> {
   let rows: Array<{
     id: string;
@@ -7680,6 +7708,7 @@ function computeGardssalgReadinessRows(
     slug: string | null;
     field_provenance: string | null;
     brreg_verified: number | null;
+    antall_ansatte: number | null;
   }> = [];
 
   // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
@@ -7689,7 +7718,7 @@ function computeGardssalgReadinessRows(
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
-                field_provenance, brreg_verified
+                field_provenance, brreg_verified, antall_ansatte
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
   const params: string[] = [];
@@ -7759,6 +7788,13 @@ function computeGardssalgReadinessRows(
     }
   }
 
+  // Skive 1 size gate: ONE config read per call (not per-row) — same
+  // discipline as the conflict scan above. Threshold applies to size_flag
+  // unconditionally (informational, always shown); only preflight's
+  // blocking override (computeGardssalgOutreachPreflight, below) reads
+  // `enabled`.
+  const sizeGateThreshold = getGardssalgSizeGateConfig(expDb).threshold;
+
   return rows.map((p) => {
     const has_website = present(p.hjemmeside);
     const has_about_text = present(p.about_text);
@@ -7775,6 +7811,7 @@ function computeGardssalgReadinessRows(
     const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
     const name_token_conflict_candidate = nameTokenConflictCandidateIds.has(p.id);
     const brreg_verified = p.brreg_verified === 1;
+    const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold);
 
     const readiness_tier = computeGardssalgReadinessTier({
       has_website,
@@ -7809,6 +7846,8 @@ function computeGardssalgReadinessRows(
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
+      antall_ansatte: p.antall_ansatte,
+      size_flag,
     };
   });
 }
@@ -7920,6 +7959,29 @@ export function computeGardssalgOutreachPreflight(
       }
       return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
     });
+
+  // ── Skive 1 size gate (dev-request 2026-08-09-daglig-outreach-
+  // klargjoering-og-stoerrelsesgate): a SECOND override pass, AFTER the
+  // tier-based go/no_go pass above (unchanged) and BEFORE the Slice-2
+  // outreach-guard dedupe below — a large-company exclusion must never "win"
+  // a shared-domain dedupe slot over a legitimate smaller candidate. Only
+  // ever turns an already-go:true row go:false; "liten"/"ukjent" rows (and
+  // any row already go:false for a content-readiness reason) are left
+  // completely alone — krav 5: "Gaten utelukker, den godkjenner aldri."
+  // Toggleable off entirely via the DB-backed knob's `enabled` switch (krav
+  // 6), with NO code change and NO deploy required — see
+  // services/gardssalg-outreach-size-gate.ts.
+  const sizeGateConfig = getGardssalgSizeGateConfig(expDb);
+  if (sizeGateConfig.enabled) {
+    for (const result of results) {
+      if (!result.go) continue;
+      const row = byId.get(result.provider_id);
+      if (row && row.size_flag === "stor") {
+        result.go = false;
+        result.reason = "large_company_excluded";
+      }
+    }
+  }
 
   // ── Slice 2 outreach-guard: cross-row dedup over THIS batch's go:true
   // rows only. Fetch email separately (does NOT touch
@@ -8077,6 +8139,23 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     for (const providerId of providerIds) {
       const pf = preflightById.get(providerId);
       if (!pf || !pf.go) {
+        // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+        // stoerrelsesgate), krav 4: the size gate is "enforced on the actual
+        // send path itself, not just in the readiness/preflight report" — it
+        // is, via the SAME computeGardssalgOutreachPreflight call just above
+        // (single source of truth, never a forked GO/NO-GO copy), so this
+        // branch already blocks a "stor"-flagged id even against a caller
+        // who skips the separate preflight call and goes straight here with
+        // apply:true. Surfaced as a direct top-level `reason` (not nested
+        // under the generic preflight_no_go/preflight_reason wrapper every
+        // other tier-based NO-GO uses below) — this is a deliberate exclusion
+        // policy, not a content-readiness gap, and Daniel/a routine grepping
+        // outcomes for "large_company_excluded" should find it without
+        // having to know about the wrapper shape.
+        if (pf?.reason === "large_company_excluded") {
+          results.push({ provider_id: providerId, status: "skipped", reason: "large_company_excluded" });
+          continue;
+        }
         results.push({
           provider_id: providerId,
           status: "skipped",
@@ -8263,6 +8342,85 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     res.json({ dry_run: !apply, results, summary });
   } catch (err) {
     console.error("[gardssalg-outreach-pilot-send] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET  /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
+// ─── POST /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
+//
+// dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+// Skive 1, krav 3 + 6: the L1 knob behind the size gate above
+// (computeGardssalgOutreachPreflight's "large_company_excluded" override,
+// computeGardssalgReadinessRows' size_flag). GET reports the current
+// effective config (or the documented default when nobody has ever set it);
+// POST updates it — same dry-run/apply convention as every sibling admin
+// lever in this file (gardssalg-booking-activation, outreach-preflight/
+// pilot-send just above). See services/gardssalg-outreach-size-gate.ts for
+// why this is DB-backed (a Fly-volume-persisted row, live on the very next
+// call) rather than a repo-tracked config file (would need a redeploy).
+router.get("/admin/gardssalg-outreach-size-gate", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const config = getGardssalgSizeGateConfig(expDb);
+    res.json({ success: true, config });
+  } catch (err) {
+    console.error("[gardssalg-outreach-size-gate] read failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+router.post("/admin/gardssalg-outreach-size-gate", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { enabled?: unknown; threshold?: unknown; note?: unknown; apply?: unknown };
+
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    res.status(400).json({ error: "enabled must be a boolean" });
+    return;
+  }
+  if (
+    body.threshold !== undefined &&
+    !(typeof body.threshold === "number" && Number.isInteger(body.threshold) && body.threshold > 0)
+  ) {
+    res.status(400).json({ error: "threshold must be a positive integer" });
+    return;
+  }
+  if (body.enabled === undefined && body.threshold === undefined) {
+    res.status(400).json({ error: "at least one of enabled/threshold must be provided" });
+    return;
+  }
+  if (body.note !== undefined && typeof body.note !== "string" && body.note !== null) {
+    res.status(400).json({ error: "note must be a string or null" });
+    return;
+  }
+
+  const note = typeof body.note === "string" && body.note.trim() !== "" ? body.note.trim().slice(0, 1000) : null;
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+
+  const expDb = getExpDb("experiences");
+  try {
+    const current = getGardssalgSizeGateConfig(expDb);
+    const wouldBe = {
+      enabled: typeof body.enabled === "boolean" ? body.enabled : current.enabled,
+      threshold: typeof body.threshold === "number" ? body.threshold : current.threshold,
+    };
+
+    if (!apply) {
+      res.json({ success: true, dry_run: true, current, would_be: wouldBe });
+      return;
+    }
+
+    const patch: { enabled?: boolean; threshold?: number; note?: string | null } = {};
+    if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+    if (typeof body.threshold === "number") patch.threshold = body.threshold;
+    // Only touch `note` when the caller actually sent the field — omitting it
+    // must leave the persisted note untouched (unlike an explicit `note: null`
+    // or `note: ""`, both of which are treated as "clear it").
+    if (body.note !== undefined) patch.note = note;
+    const config = setGardssalgSizeGateConfig(expDb, patch, "admin");
+    res.json({ success: true, dry_run: false, config });
+  } catch (err) {
+    console.error("[gardssalg-outreach-size-gate] write failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
