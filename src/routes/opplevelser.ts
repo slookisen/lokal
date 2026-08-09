@@ -9245,11 +9245,27 @@ router.post("/admin/gardssalg-field-concordance-review-approve", requireAdmin, (
 //   4. no usable hjemmeside on the row -> 409 {reason: "no_homepage"} — this
 //      route can never verify absence without a page to check, so it never
 //      clears blind.
-//   5. the fresh fetch itself fails (fetched.ok === false) -> 409 {reason:
+//   5. hjemmeside present but NOT ownership-verified
+//      (isHjemmesideVerified(field_provenance) === false) -> 409 {reason:
+//      "homepage_unverified"}, zero fetch, zero writes. Mirrors the
+//      website-verification gate every other write-decision path in this
+//      subsystem applies BEFORE trusting a hjemmeside's content as evidence
+//      (see runGardssalgFieldConcordanceScan's cohort filter above, and the
+//      isHjemmesideVerified() doc comment) — a real incident here
+//      (experience-store.ts ~line 5029) showed most sibling-TLD candidate
+//      homepages were flatly wrong (squatted/unrelated). Without this gate,
+//      a provider whose hjemmeside was never verified (or is an
+//      aggregator/wrong-domain page) but whose stored epost is a real,
+//      correct address from an unrelated channel would have that WRONG page
+//      fetched, checkEmailField would correctly find nothing on it (not
+//      because the email is invalid — because it's the wrong page), and
+//      apply:true would silently NULL a genuinely correct address. Checked
+//      BEFORE the fetch, same as no_homepage above.
+//   6. the fresh fetch itself fails (fetched.ok === false) -> 409 {reason:
 //      "fetch_failed", detail: fetched.reason}, zero writes. This is the
 //      core safety property this whole route exists to guarantee: a
 //      transient network failure must never be able to trigger a clear.
-//   6. checkEmailField(row.epost, pageText) run fresh on the just-fetched
+//   7. checkEmailField(row.epost, pageText) run fresh on the just-fetched
 //      text:
 //        - "bekreftet" -> 409 {reason: "still_confirmed"}, zero writes (the
 //          address is genuinely still there).
@@ -9259,12 +9275,12 @@ router.post("/admin/gardssalg-field-concordance-review-approve", requireAdmin, (
 //          remediation route above, not a clear.
 //        - "ikke_funnet_på_siden" (and the fetch succeeded, so this now
 //          means genuine absence on a real, loaded page) -> proceed.
-//   7. apply !== true (default, dry-run) -> 200 {dry_run: true, would_clear:
+//   8. apply !== true (default, dry-run) -> 200 {dry_run: true, would_clear:
 //      true, provider_id, current_epost}, zero writes.
-//   8. apply === true -> calls applyGardssalgFieldConcordanceClear(provider_id,
+//   9. apply === true -> calls applyGardssalgFieldConcordanceClear(provider_id,
 //      hjemmeside); responds 200 with its result verbatim (merged with
 //      `success: true`) — including any owner_locked/rollback_vetoed/
-//      already_blank/not_found reason it might still return. Checks 2-4
+//      already_blank/not_found reason it might still return. Checks 2-5
 //      above are a fast-path for a clean error response; the store
 //      function's own guards are the final authority and run again
 //      regardless.
@@ -9287,8 +9303,10 @@ router.post("/admin/gardssalg-field-concordance-clear", requireAdmin, async (req
   try {
     const expDb = getExpDb("experiences");
     const row = expDb
-      .prepare(`SELECT id, navn, hjemmeside, epost FROM experience_providers WHERE id = ?`)
-      .get(providerId) as { id: string; navn: string; hjemmeside: string | null; epost: string | null } | undefined;
+      .prepare(`SELECT id, navn, hjemmeside, epost, field_provenance FROM experience_providers WHERE id = ?`)
+      .get(providerId) as
+      | { id: string; navn: string; hjemmeside: string | null; epost: string | null; field_provenance: string | null }
+      | undefined;
 
     if (!row) {
       res.status(404).json({ success: false, reason: "not_found" });
@@ -9304,6 +9322,17 @@ router.post("/admin/gardssalg-field-concordance-clear", requireAdmin, async (req
     const hjemmeside = row.hjemmeside && row.hjemmeside.trim() !== "" ? row.hjemmeside.trim() : null;
     if (!hjemmeside) {
       res.status(409).json({ success: false, reason: "no_homepage" });
+      return;
+    }
+
+    // Website-verification gate — before any fetch, fail-closed, mirroring
+    // every other write-decision path in this subsystem (see
+    // isHjemmesideVerified()'s doc comment and runGardssalgFieldConcordanceScan's
+    // cohort filter above): a hjemmeside the website-verification sweep has
+    // not stamped verified=true must never be trusted as evidence that a
+    // stored field is genuinely absent.
+    if (!isHjemmesideVerified(row.field_provenance)) {
+      res.status(409).json({ success: false, reason: "homepage_unverified" });
       return;
     }
 
