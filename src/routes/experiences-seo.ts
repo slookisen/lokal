@@ -145,6 +145,8 @@ import {
   type GardssalgBooking,
   osloDatetimeLocalToUtcIso,
   defaultBookingSlotAtDatetimeLocal,
+  BOOKING_NOT_ACTIVATED_MSG,
+  BOOKING_NOT_ACTIVATED_INTEREST_MSG,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
@@ -4494,20 +4496,15 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     const link = bookHref
       ? `<a href="${bookHref}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
       : "";
-    // Discreet "coming soon" marker (dev-request 2026-07-12-gardssalg-dark-
-    // launch-stop, slice 0) — small and unobtrusive by design (the prominent
-    // version lives on the booking panel/produsent profile); uses the shared
-    // var(--) tokens from BROWSE_CSS (included in this page's <style> below)
-    // rather than hardcoded hex, same discipline as the produsent-profil
-    // section even though the rest of this particular card still predates
-    // that convention.
-    const soonBadge = isBookingPaused(p.booking_live, p.catalog_hidden)
-      ? `<span style="display:inline-block;font-size:.68rem;font-weight:600;color:var(--mist);background:var(--canvas-2);border:1px solid var(--line);border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle">Kommer snart</span>`
-      : "";
+    // No booking-status marker on cards (dev-request 2026-08-09-gardssalg-
+    // kommer-snart-fjernes-eier-aktivert-booking): the old "Kommer snart"
+    // chip wrapped unpredictably next to long names and contradicted the
+    // "Book besøk" button beside it. The honest "ikke aktivert" state lives
+    // where the action happens — the profile page and the booking panel.
     return `<article style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
   <div style="padding:16px 16px 12px">
     ${sted ? `<div style="font-size:.78rem;color:#7a7163;margin-bottom:4px">${escapeHtml(sted)}</div>` : ""}
-    <div style="margin-bottom:6px">${nameHtml}${soonBadge}</div>
+    <div style="margin-bottom:6px">${nameHtml}</div>
     ${badge}
   </div>
   ${link ? `<div style="padding:0 16px 16px;margin-top:auto">${link}</div>` : ""}
@@ -5038,7 +5035,7 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
     <aside>
       <div class="aside-card">
         <h2>Reserver</h2>
-        ${isBookingPaused(provider.booking_live, provider.catalog_hidden) ? `<p class="reserve-notice">Reservasjoner er ikke aktive ennå — kommer snart.</p>` : ""}
+        ${isBookingPaused(provider.booking_live, provider.catalog_hidden) ? `<p class="reserve-notice">${BOOKING_NOT_ACTIVATED_MSG}${isClaimed ? "" : ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`}</p>` : ""}
         <a id="reserve-cta" class="reserve-cta" href="${bookHref}">Reserver besøk</a>
       </div>
       <div class="aside-card">
@@ -5137,9 +5134,11 @@ function bookingErrorMessage(code: string): string {
       return "Noe gikk galt på våre servere. Prøv igjen om litt.";
     // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0 — the no-JS
     // POST fallback redirects here with ?error=paused when the hard-stop
-    // gate (isBookingPaused()) blocks a submission.
+    // gate (isBookingPaused()) blocks a submission. Copy from booking-store
+    // (dev-request 2026-08-09-gardssalg-kommer-snart-fjernes-eier-aktivert-
+    // booking): plain "not activated" fact, no "coming soon" promise.
     case "paused":
-      return "Reservasjoner er ikke aktive ennå — kommer snart. Du kan sende en interessemelding, men ingen reservasjon blir bekreftet ennå.";
+      return BOOKING_NOT_ACTIVATED_INTEREST_MSG;
     default:
       return "Noe gikk galt. Prøv igjen.";
   }
@@ -5177,8 +5176,16 @@ router.get(
     // banner shown AFTER a blocked submit attempt); this one is unmissable
     // up front so nothing on the page implies booking works today.
     const notLive = isBookingPaused(provider.booking_live, provider.catalog_hidden);
+    // Same claim-CTA coupling as the profile page's reserve-notice: an
+    // unclaimed provider's paused state doubles as the owner's on-ramp
+    // ("take over the profile and switch booking on"); a claimed provider's
+    // owner already has the portal, so no CTA there (and the claimed-badge
+    // invariant — no "Er dette din bedrift?" on claimed surfaces — holds).
+    const panelClaimCta = provider.claimed_at == null
+      ? ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`
+      : "";
     const pausedNotice = notLive
-      ? `<div class="notice-paused" role="status"><strong>Kommer snart</strong>Reservasjoner er ikke aktive ennå — kommer snart. Du kan sende en interessemelding, men ingen reservasjon blir bekreftet ennå.</div>`
+      ? `<div class="notice-paused" role="status"><strong>Booking ikke aktivert</strong>${BOOKING_NOT_ACTIVATED_INTEREST_MSG}${panelClaimCta}</div>`
       : "";
 
     const html = `<!doctype html>
@@ -5289,7 +5296,7 @@ ${BROWSE_CSS}
         }
         if (btn) btn.disabled = false;
         if (res.data && res.data.paused) {
-          if (status) status.textContent = res.data.message || "Reservasjoner er ikke aktive ennå — kommer snart.";
+          if (status) status.textContent = res.data.message || ${JSON.stringify(BOOKING_NOT_ACTIVATED_MSG)};
           return;
         }
         if (status) status.textContent = "Noe gikk galt. Sjekk feltene og prøv igjen, eller last siden på nytt uten javascript.";

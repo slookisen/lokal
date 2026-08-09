@@ -27399,16 +27399,18 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   // what's actually blocked — see gdl-06 — not the form's visibility).
   const panelGDL = invokeSeoGDL("get", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`);
-  // NOTE: assertions below key off the `notice-paused` CSS class, not a raw
-  // substring match on "ikke aktive ennå"/"kommer snart" — the panel's inline
-  // <script> ALSO embeds "Reservasjoner er ikke aktive ennå — kommer snart."
-  // as its client-side fallback message (shown if a submit races a flag
-  // flip), so that phrase is present in the page source in BOTH the
-  // live and paused states. The server-rendered notice block is the only
-  // paused-specific signal.
+  // NOTE: assertions below key off the `notice-paused` CSS class and the
+  // notice's <strong> heading, not a raw substring match on "ikke aktivert"
+  // — the panel's inline <script> ALSO embeds the shared
+  // BOOKING_NOT_ACTIVATED_MSG copy as its client-side fallback message
+  // (shown if a submit races a flag flip), so that phrase is present in the
+  // page source in BOTH the live and paused states. The server-rendered
+  // notice block is the only paused-specific signal. (Copy changed from
+  // "kommer snart" to the honest "ikke aktivert" state by dev-request
+  // 2026-08-09-gardssalg-kommer-snart-fjernes-eier-aktivert-booking.)
   assertEq(panelGDL.status, 200, "gdl-03a: GET booking panel still 200 when paused");
-  assertTrue(panelGDL.body.includes('class="notice-paused"'), "gdl-03b: panel shows the server-rendered 'not active yet' notice block");
-  assertTrue(panelGDL.body.includes("ikke aktive ennå"), "gdl-03c: panel notice text includes 'ikke aktive ennå'");
+  assertTrue(panelGDL.body.includes('class="notice-paused"'), "gdl-03b: panel shows the server-rendered 'not activated' notice block");
+  assertTrue(panelGDL.body.includes("<strong>Booking ikke aktivert</strong>"), "gdl-03c: panel notice heading is 'Booking ikke aktivert'");
   assertTrue(!panelGDL.body.includes("Du betaler ingenting nå — dette er en reservasjon."),
     "gdl-03d: panel does NOT show the 'this is a reservation' microcopy that would imply it works today");
   assertTrue(panelGDL.body.includes('method="POST"'), "gdl-03e: the reservation <form> itself is still present (only submission is blocked)");
@@ -27424,10 +27426,13 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
     "gdl-04c: profile CTA href is unchanged");
   assertTrue(profileGDL.body.includes("Reserver besøk"), "gdl-04d: profile CTA button text is unchanged");
 
-  // gdl-05: category browse page — discreet "kommer snart" badge on the card.
+  // gdl-05: category browse page — NO booking-status marker on the cards
+  // (the original discreet "Kommer snart" badge was removed by dev-request
+  // 2026-08-09-gardssalg-kommer-snart-fjernes-eier-aktivert-booking; the
+  // paused state lives on the profile/booking panel only).
   const listGDL = invokeSeoGDL("get", "/kategori/gardssalg", {}, "/kategori/gardssalg");
   assertEq(listGDL.status, 200, "gdl-05a: GET category page still 200");
-  assertTrue(listGDL.body.includes("Kommer snart"), "gdl-05b: category card shows the discreet 'Kommer snart' badge");
+  assertTrue(!listGDL.body.includes("Kommer snart"), "gdl-05b: category card shows NO 'Kommer snart' badge (removed 2026-08-09)");
 
   // gdl-06: POST no-JS fallback while paused → 303 redirect back to the
   // panel with ?error=paused, NO booking row created, NO emails attempted.
@@ -27447,7 +27452,7 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   const errBannerGDL = invokeSeoGDL("get", "/kategori/gardssalg/book/:providerSlug",
     { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`, { query: { error: "paused" } });
   assertTrue(errBannerGDL.body.includes('role="alert"'), "gdl-07a: ?error=paused renders the role=alert error banner");
-  assertTrue(errBannerGDL.body.includes("ikke aktive ennå"), "gdl-07b: ?error=paused banner shows the same honest copy");
+  assertTrue(errBannerGDL.body.includes("før booking er aktivert"), "gdl-07b: ?error=paused banner shows the same honest 'ikke aktivert' copy");
 
   // gdl-08: POST /api/opplevelser/book (JSON API) while paused → explicit
   // paused/coming-soon JSON (200, so the panel's fetch() script doesn't treat
@@ -30085,6 +30090,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += esgcb.failed;
     for (const f of esgcb.failures) failures.push("experiences-seo-gardssalg-claimed-badge: " + f);
     console.log(`  experiences-seo-gardssalg-claimed-badge: ${esgcb.passed} passed, ${esgcb.failed} failed`);
+
+    // dev-request 2026-08-09-gardssalg-kommer-snart-fjernes-eier-aktivert-
+    // booking: the "Kommer snart" chip is gone from catalog/type-page cards,
+    // and the paused state is the honest "Booking er ikke aktivert ..." copy
+    // (shared constants in services/booking-store.ts) with a claim-CTA
+    // coupling on unclaimed surfaces only. Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block.
+    console.log("\n── experiences-seo-gardssalg-booking-ikke-aktivert: honest paused-state ──");
+    const { runExperiencesSeoGardssalgBookingIkkeAktivertTests } = require("../src/routes/experiences-seo-gardssalg-booking-ikke-aktivert.test") as
+      typeof import("../src/routes/experiences-seo-gardssalg-booking-ikke-aktivert.test");
+    const esgbna = await runExperiencesSeoGardssalgBookingIkkeAktivertTests({ log: false });
+    passed += esgbna.passed;
+    failed += esgbna.failed;
+    for (const f of esgbna.failures) failures.push("experiences-seo-gardssalg-booking-ikke-aktivert: " + f);
+    console.log(`  experiences-seo-gardssalg-booking-ikke-aktivert: ${esgbna.passed} passed, ${esgbna.failed} failed`);
 
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
