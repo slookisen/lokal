@@ -1412,5 +1412,24 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Seed gardssalg_experience_conflict_review (2026-08-01 spot-check) failed:", err);
   }
 
+  // ─── antall_ansatte / antall_ansatte_hentet_at (dev-request 2026-08-09-
+  // daglig-outreach-klargjoering-og-stoerrelsesgate, Skive 1) ────────────────
+  // Additive, nullable Brreg-sourced company-size signal on
+  // experience_providers, feeding the outreach size gate
+  // (computeGardssalgReadinessRows / computeGardssalgOutreachPreflight,
+  // routes/opplevelser.ts). `antall_ansatte` is the employee count last
+  // fetched from Brreg's GET /enheter/{orgNr} (`antallAnsatte`, see
+  // services/brreg-client.ts verifyOrgNumber); NULL means Brreg has no
+  // registered figure for this org and must NEVER be treated as "small"
+  // downstream. `antall_ansatte_hentet_at` is the ISO timestamp of that
+  // fetch. Same idempotent ALTER TABLE idiom as every other additive column
+  // in this file.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN antall_ansatte INTEGER");
+  } catch { /* already present */ }
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN antall_ansatte_hentet_at TEXT");
+  } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

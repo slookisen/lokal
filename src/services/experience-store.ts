@@ -5626,12 +5626,29 @@ export function getGardssalgBrregVerifyOverride(): GardssalgBrregVerifyFn | null
  * field_provenance entry (source_url = the Brreg API URL the evidence came
  * from), all inside one transaction. Returns the field names written
  * ([] when locked / already verified / row missing).
+ *
+ * `antallAnsatte` (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ * stoerrelsesgate, Skive 1) is optional and additive: when the caller passes
+ * it (the SAME verifyOrgNumber() result that produced this verification —
+ * i.e. only once identity is confirmed, never for a name-mismatch/inactive
+ * result), it's written in the SAME transaction/UPDATE as brreg_verified,
+ * with its own field_provenance + audit entry, following the file's
+ * existing per-field provenance idiom. `undefined` (the default) means "no
+ * size figure to write" and leaves antall_ansatte/antall_ansatte_hentet_at
+ * untouched — callers that don't pass it keep today's behaviour exactly.
+ * `null` IS written (Brreg has no registered figure for this org — a
+ * genuine, meaningful value, distinct from "not provided").
  */
-export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: string, batchId?: string): string[] {
+export function applyGardssalgBrregVerified(
+  providerId: string,
+  evidenceUrl: string,
+  batchId?: string,
+  antallAnsatte?: number | null,
+): string[] {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, content_source, brreg_verified, brreg_active, field_provenance
+      `SELECT id, content_source, brreg_verified, brreg_active, antall_ansatte, field_provenance
          FROM experience_providers WHERE id = ?`
     )
     .get(providerId) as
@@ -5640,6 +5657,7 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
         content_source: string | null;
         brreg_verified: number | null;
         brreg_active: number | null;
+        antall_ansatte: number | null;
         field_provenance: string | null;
       }
     | undefined;
@@ -5653,6 +5671,10 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
   if (row.brreg_active !== 1) {
     written.push({ field: "brreg_active", oldValue: row.brreg_active === null ? null : String(row.brreg_active) });
   }
+  const writeAntallAnsatte = antallAnsatte !== undefined;
+  if (writeAntallAnsatte) {
+    written.push({ field: "antall_ansatte", oldValue: row.antall_ansatte === null ? null : String(row.antall_ansatte) });
+  }
 
   let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
   if (row.field_provenance) {
@@ -5665,15 +5687,34 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
       /* malformed existing JSON -> treat as empty rather than clobber the write */
     }
   }
-  provenance["brreg_verified"] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+  const fetchedAt = new Date().toISOString();
+  provenance["brreg_verified"] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+  if (writeAntallAnsatte) {
+    provenance["antall_ansatte"] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+  }
 
   const applyWithAudit = db.transaction(() => {
-    db.prepare(
-      `UPDATE experience_providers
-          SET brreg_verified = 1, brreg_active = 1,
-              field_provenance = @field_provenance, updated_at = datetime('now')
-        WHERE id = @id`
-    ).run({ id: providerId, field_provenance: JSON.stringify(provenance) });
+    if (writeAntallAnsatte) {
+      db.prepare(
+        `UPDATE experience_providers
+            SET brreg_verified = 1, brreg_active = 1,
+                antall_ansatte = @antall_ansatte, antall_ansatte_hentet_at = @antall_ansatte_hentet_at,
+                field_provenance = @field_provenance, updated_at = datetime('now')
+          WHERE id = @id`
+      ).run({
+        id: providerId,
+        antall_ansatte: antallAnsatte,
+        antall_ansatte_hentet_at: fetchedAt,
+        field_provenance: JSON.stringify(provenance),
+      });
+    } else {
+      db.prepare(
+        `UPDATE experience_providers
+            SET brreg_verified = 1, brreg_active = 1,
+                field_provenance = @field_provenance, updated_at = datetime('now')
+          WHERE id = @id`
+      ).run({ id: providerId, field_provenance: JSON.stringify(provenance) });
+    }
     const insertAudit = db.prepare(
       `INSERT INTO gardssalg_content_audit
          (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
@@ -5685,7 +5726,7 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
         provider_id: providerId,
         field_name: w.field,
         old_value: w.oldValue,
-        new_value: "1",
+        new_value: w.field === "antall_ansatte" ? (antallAnsatte === null ? null : String(antallAnsatte)) : "1",
         source_url: evidenceUrl,
         batch_id: batchId ?? null,
       });

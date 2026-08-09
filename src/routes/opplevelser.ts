@@ -5514,7 +5514,7 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
         if (dryRun) {
           verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: [] });
         } else {
-          const written = applyGardssalgBrregVerified(t.id, evidenceUrl, batchTag);
+          const written = applyGardssalgBrregVerified(t.id, evidenceUrl, batchTag, result.antallAnsatte);
           verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: written });
         }
       } catch (e: any) {
@@ -7590,6 +7590,37 @@ export type GardssalgReadinessTier =
   | "nettsted_uverifisert"
   | "dublettkonflikt";
 
+// ─── Company-size signal (dev-request 2026-08-09-daglig-outreach-
+// klargjoering-og-stoerrelsesgate, Skive 1) ─────────────────────────────────
+//
+// GardssalgSizeFlag is deliberately SEPARATE from GardssalgReadinessTier —
+// it is never folded into the tier's precedence chain (computeGardssalgReadinessTier
+// above is completely unchanged). It's read alongside the tier by both the
+// readiness report and the outreach preflight's own extra gating pass
+// (computeGardssalgOutreachPreflight, below).
+//
+// Threshold is a plain process.env read with a numeric default fallback at
+// CALL time (same knob idiom as OUTREACH_COOLDOWN_DAYS in routes/crm.ts and
+// routes/opplevelser.ts) — no caching across calls, so Daniel can move it
+// without a deploy and the next request sees the new value immediately
+// (AC4).
+export type GardssalgSizeFlag = "stor" | "liten" | "ukjent";
+
+export function gardssalgSizeGateThreshold(): number {
+  return Math.max(1, parseInt(String(process.env.GARDSSALG_SIZE_THRESHOLD ?? "25"), 10) || 25);
+}
+
+/**
+ * Pure — derives the size_flag from a possibly-null employee count and the
+ * (already-resolved) threshold. `null` (Brreg has no registered figure for
+ * this org) ALWAYS maps to "ukjent", never "liten" — treating "no data" as
+ * "small" is exactly the failure mode this gate exists to avoid.
+ */
+export function computeGardssalgSizeFlag(antallAnsatte: number | null, threshold: number): GardssalgSizeFlag {
+  if (antallAnsatte === null) return "ukjent";
+  return antallAnsatte >= threshold ? "stor" : "liten";
+}
+
 export function computeGardssalgReadinessTier(input: {
   has_website: boolean;
   has_about_text: boolean;
@@ -7661,6 +7692,8 @@ function computeGardssalgReadinessRows(
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
+  antall_ansatte: number | null;
+  size_flag: GardssalgSizeFlag;
 }> {
   let rows: Array<{
     id: string;
@@ -7680,6 +7713,7 @@ function computeGardssalgReadinessRows(
     slug: string | null;
     field_provenance: string | null;
     brreg_verified: number | null;
+    antall_ansatte: number | null;
   }> = [];
 
   // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
@@ -7689,7 +7723,7 @@ function computeGardssalgReadinessRows(
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
-                field_provenance, brreg_verified
+                field_provenance, brreg_verified, antall_ansatte
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
   const params: string[] = [];
@@ -7759,6 +7793,11 @@ function computeGardssalgReadinessRows(
     }
   }
 
+  // Read at call time, not once at module load — the whole point of the
+  // env-knob idiom is that a threshold change takes effect on the NEXT call
+  // with no deploy/restart (AC4).
+  const sizeThreshold = gardssalgSizeGateThreshold();
+
   return rows.map((p) => {
     const has_website = present(p.hjemmeside);
     const has_about_text = present(p.about_text);
@@ -7775,6 +7814,7 @@ function computeGardssalgReadinessRows(
     const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
     const name_token_conflict_candidate = nameTokenConflictCandidateIds.has(p.id);
     const brreg_verified = p.brreg_verified === 1;
+    const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeThreshold);
 
     const readiness_tier = computeGardssalgReadinessTier({
       has_website,
@@ -7809,6 +7849,8 @@ function computeGardssalgReadinessRows(
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
+      antall_ansatte: p.antall_ansatte,
+      size_flag,
     };
   });
 }
@@ -7946,6 +7988,37 @@ export function computeGardssalgOutreachPreflight(
       if (reason) {
         result.go = false;
         result.reason = reason;
+      }
+    }
+  }
+
+  // ── Size gate (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate, Skive 1): THIRD pass, after both the tier pass above
+  // and the Slice-2 outreach-guard dedup pass. Flips any REMAINING go:true
+  // result to go:false/"large_company_excluded" when that provider's
+  // size_flag is "stor" (>= GARDSSALG_SIZE_THRESHOLD registered employees).
+  // Runs on this same function pilot-send calls for its own GO/NO-GO
+  // (below), so this blocks the real send path, not just the readiness
+  // report — including on an apply:true call (a large company must be
+  // skipped even on a real send attempt).
+  //
+  // Excludes only — never approves: a "liten"/"ukjent" row's go/no_go is
+  // left exactly as the tier + dedup passes above already decided it (a row
+  // already go:false from an earlier pass is left untouched here, not
+  // "upgraded" to go:true just because size_flag isn't "stor").
+  //
+  // GARDSSALG_SIZE_GATE_ENABLED kill-switch — same boolean-env idiom as
+  // OUTREACH_PAUSED (routes/admin-outreach-candidates.ts): enabled by
+  // default, a no-op only when explicitly set to the literal string
+  // "false", so Daniel can disable the gate without a deploy.
+  const sizeGateEnabled = process.env.GARDSSALG_SIZE_GATE_ENABLED !== "false";
+  if (sizeGateEnabled) {
+    for (const result of results) {
+      if (!result.go) continue;
+      const row = byId.get(result.provider_id);
+      if (row && row.size_flag === "stor") {
+        result.go = false;
+        result.reason = "large_company_excluded";
       }
     }
   }

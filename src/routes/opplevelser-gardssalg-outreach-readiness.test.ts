@@ -62,6 +62,16 @@
  *   (d) a non-gårdssalg provider (no producer_type, not rfb-seed) is
  *       excluded, same scoping as the sibling contact-coverage report
  *   (e) zero-provider edge case
+ *
+ * Extended for dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ * stoerrelsesgate, Skive 1:
+ *   (g) AK1: a row's antall_ansatte and derived size_flag are exposed;
+ *       Macks Ølbryggeri (org 975967093, antall_ansatte 119) tiers
+ *       size_flag "stor"
+ *   (h) AK2: a row with antall_ansatte NULL gets size_flag "ukjent" — never
+ *       "liten"
+ *   (i) AK4: changing GARDSSALG_SIZE_THRESHOLD moves a row's size_flag
+ *       between "stor"/"liten" on the NEXT call, no caching across calls
  */
 
 export interface TestSummary {
@@ -159,13 +169,13 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
            (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
             epost, telefon, hjemmeside, about_text, visit_text, opening_hours_text,
             products, content_source, booking_live, catalog_hidden, slug, field_provenance,
-            brreg_verified,
+            brreg_verified, antall_ansatte,
             enrichment_state, verification_status, source, confidence)
          VALUES
            (@id, @navn, 'experiences', @org_nr, @kommune, @rfb_seed_source, @producer_type,
             @epost, @telefon, @hjemmeside, @about_text, @visit_text, @opening_hours_text,
             @products, @content_source, @booking_live, @catalog_hidden, @slug, @field_provenance,
-            @brreg_verified,
+            @brreg_verified, @antall_ansatte,
             'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
       // For the dublettkonflikt fixture below — a minimal `experiences` row
@@ -205,6 +215,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Sider, cider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 0, slug: "klar-gard-as", field_provenance: VERIFIED_PROVENANCE,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       // needs_enrichment: has website + email but no about_text/products/
       // brreg_verified at all. Fails before the Steg-4 checks are even
@@ -217,6 +228,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
         brreg_verified: 0,
+        antall_ansatte: null,
       });
       // needs_enrichment (negative case for krav 2's brreg_verified leg):
       // about_text, products, AND opening_hours_text/visit_text are ALL
@@ -231,6 +243,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
         brreg_verified: 0,
+        antall_ansatte: null,
       });
       // needs_enrichment (negative case for krav 2's products leg):
       // about_text, brreg_verified, AND opening_hours_text are ALL present --
@@ -245,6 +258,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       // no_website: has a phone (reachable) but no hjemmeside at all.
       // Fails before the Steg-4 checks are even reached -- no slug/provenance.
@@ -256,6 +270,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: null, content_source: null,
         booking_live: null, catalog_hidden: null, slug: null, field_provenance: null,
         brreg_verified: 0,
+        antall_ansatte: null,
       });
       // unreachable: no email AND no phone at all, even though it otherwise
       // looks fully content-complete -- unreachable must win regardless.
@@ -268,6 +283,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Eplemost", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       // hidden (catalog_hidden=1) row -- must still appear, marked visible:false.
       // Fully content-complete under krav 2 (about_text + products +
@@ -285,6 +301,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Sider", content_source: "provider_site",
         booking_live: 1, catalog_hidden: 1, slug: "skjult-test-gard", field_provenance: VERIFIED_PROVENANCE,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       // manually-claimed row -- must still appear, claim_status carries the
       // raw content_source value ('manual'), never excluded. No slug and no
@@ -299,6 +316,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Eplevin", content_source: "manual",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       // nettsted_uverifisert: content-complete under krav 2, has a slug
       // (searchable), not hidden -- but field_provenance carries no verified
@@ -311,6 +329,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Most", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "uverifisert-gard", field_provenance: null,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       // dublettkonflikt: content-complete under krav 2, searchable,
       // website-verified, not hidden -- but a matching `experiences` row
@@ -325,6 +344,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "konflikt-gard", field_provenance: VERIFIED_PROVENANCE,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       insertExperience.run({
         id: "exp-konflikt-gard", provider_id: "prov-conflict",
@@ -351,6 +371,7 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Håndverksøl", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "fjellbekken-handbryggeri", field_provenance: VERIFIED_PROVENANCE,
         brreg_verified: 1,
+        antall_ansatte: null,
       });
       insertExperience.run({
         id: "exp-fjellbekken-kajakk", provider_id: null,
@@ -367,6 +388,49 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         products: "Noe", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
         brreg_verified: 1,
+        antall_ansatte: null,
+      });
+
+      // ── (g)/(h)/(i) size-signal fixtures (dev-request 2026-08-09-daglig-
+      // outreach-klargjoering-og-stoerrelsesgate, Skive 1) — otherwise
+      // outreach_ready-shaped so size_flag can be observed independently of
+      // readiness_tier (proving the two fields never bleed into each other).
+      // AK1's own fixture: Macks Ølbryggeri, org 975967093, antall_ansatte
+      // 119 -> size_flag "stor" under the default threshold (25).
+      insertProvider.run({
+        id: "prov-large", navn: "Macks Ølbryggeri", org_nr: "975967093", kommune: "Stavanger",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@macks.no", telefon: null, hjemmeside: "https://macks.no",
+        about_text: "Om bryggeriet.", visit_text: null, opening_hours_text: null,
+        products: "Øl", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "macks-olbryggeri", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
+        antall_ansatte: 119,
+      });
+      // AK2's own fixture: antall_ansatte NULL (Brreg has no registered
+      // figure) -> size_flag "ukjent", never "liten".
+      insertProvider.run({
+        id: "prov-unknown-size", navn: "Ukjent Størrelse Gård AS", org_nr: "191919191", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@ukjentstorrelse.no", telefon: null, hjemmeside: "https://ukjentstorrelse.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "ukjent-storrelse-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
+        antall_ansatte: null,
+      });
+      // AK4's own fixture: a plain small figure well under the default
+      // threshold (25) but comfortably ABOVE a lowered one (e.g. 5), so the
+      // (i) block can move it stor<->liten by changing the env knob alone.
+      insertProvider.run({
+        id: "prov-mid-size", navn: "Middels Gård AS", org_nr: "292929292", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@middelsgard.no", telefon: null, hjemmeside: "https://middelsgard.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Cider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "middels-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1,
+        antall_ansatte: 10,
       });
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
@@ -398,11 +462,14 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         "prov-unverified": "Uverifisert Gård AS",
         "prov-conflict": "Konflikt Gård AS",
         "prov-nametoken": "Fjellbekken Håndbryggeri AS",
+        "prov-large": "Macks Ølbryggeri",
+        "prov-unknown-size": "Ukjent Størrelse Gård AS",
+        "prov-mid-size": "Middels Gård AS",
       };
       const byId = (id: string) =>
         (ok.body.providers as any[]).find((r) => r.name === NAME_BY_FIXTURE_ID[id]);
 
-      assertEq(ok.body.providers.length, 11, "d1: total providers is 11 (non-gårdssalg row excluded)");
+      assertEq(ok.body.providers.length, 14, "d1: total providers is 14 (non-gårdssalg row excluded)");
 
       const ready = byId("prov-ready");
       assertTrue(!!ready, "b3: outreach_ready fixture present");
@@ -497,6 +564,23 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       assertEq(conflict?.name_token_conflict_candidate, false, "f5: prov-conflict (provider_link basis) does NOT carry the candidate flag — the two fields never bleed into each other");
       assertEq(ready?.name_token_conflict_candidate, false, "f6: prov-ready (no matching experience at all) carries no candidate flag");
 
+      // ── (g) AK1: antall_ansatte + derived size_flag exposed per row ─────
+      assertEq(ready?.antall_ansatte, null, "g0: prov-ready antall_ansatte null (not set)");
+      assertEq(ready?.size_flag, "ukjent", "g0a: prov-ready size_flag ukjent (antall_ansatte null, default-threshold branch)");
+
+      const large = byId("prov-large");
+      assertTrue(!!large, "g1: prov-large (Macks Ølbryggeri) fixture present");
+      assertEq(large?.org_nr, "975967093", "g2: prov-large org_nr is Macks Ølbryggeri's real org number");
+      assertEq(large?.antall_ansatte, 119, "g3: prov-large antall_ansatte 119 passthrough");
+      assertEq(large?.size_flag, "stor", "g4: prov-large size_flag stor (119 >= default threshold 25) — AK1");
+      assertEq(large?.readiness_tier, "outreach_ready", "g5: prov-large readiness_tier is unaffected by size_flag — the two fields never fold into each other");
+
+      // ── (h) AK2: antall_ansatte NULL -> size_flag ukjent, never liten ───
+      const unknownSize = byId("prov-unknown-size");
+      assertTrue(!!unknownSize, "h1: prov-unknown-size fixture present");
+      assertEq(unknownSize?.antall_ansatte, null, "h2: prov-unknown-size antall_ansatte null");
+      assertEq(unknownSize?.size_flag, "ukjent", "h3: prov-unknown-size size_flag ukjent, NEVER liten — AK2");
+
       // No non-gårdssalg row leaked in.
       assertTrue(
         !(ok.body.providers as any[]).some((r) => r.name === "Ikke Gårdssalg AS"),
@@ -504,13 +588,16 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
       );
 
       // ── (c) summary ──────────────────────────────────────────────────────
-      // 11 fixtures: prov-ready + prov-nametoken (outreach_ready, 2),
+      // 14 fixtures: prov-ready + prov-nametoken + prov-large +
+      // prov-unknown-size + prov-mid-size (outreach_ready, 5 — the three
+      // size-signal fixtures are deliberately shaped outreach_ready so
+      // size_flag can be observed independently of readiness_tier),
       // prov-enrich + prov-no-brreg + prov-no-products (needs_enrichment, 3),
       // prov-noweb (no_website), prov-unreach (unreachable), prov-hidden
       // (skjult), prov-claimed (ikke_soekbar), prov-unverified
       // (nettsted_uverifisert), prov-conflict (dublettkonflikt).
-      assertEq(ok.body.summary.total, 11, "c1: summary.total is 11");
-      assertEq(ok.body.summary.outreach_ready, 2, "c2: summary.outreach_ready counts prov-ready + prov-nametoken (slice 1: the candidate no longer blocks)");
+      assertEq(ok.body.summary.total, 14, "c1: summary.total is 14");
+      assertEq(ok.body.summary.outreach_ready, 5, "c2: summary.outreach_ready counts prov-ready + prov-nametoken + prov-large + prov-unknown-size + prov-mid-size");
       assertEq(ok.body.summary.needs_enrichment, 3, "c3: summary.needs_enrichment counts prov-enrich + prov-no-brreg + prov-no-products");
       assertEq(ok.body.summary.no_website, 1, "c4: summary.no_website counts prov-noweb");
       assertEq(ok.body.summary.unreachable, 1, "c5: summary.unreachable counts prov-unreach");
@@ -525,6 +612,32 @@ export function runOpplevelserGardssalgOutreachReadinessTests(
         ok.body.summary.nettsted_uverifisert + ok.body.summary.dublettkonflikt;
       assertEq(summarySum, ok.body.summary.total, "c6: per-tier summary counts (all 8 tiers) sum to total (every row tiered exactly once)");
       assertEq(ok.body.summary.name_token_conflict_candidates, 1, "c7: summary.name_token_conflict_candidates counts prov-nametoken only (informational, NOT a tier — excluded from the c6 sum)");
+
+      // ── (i) AK4: threshold is read fresh on every call, no caching ──────
+      // prov-mid-size has antall_ansatte 10 — "liten" under the default
+      // threshold (25), "stor" once the threshold is lowered to 5, and back
+      // to "liten" again once restored — proving the read happens at CALL
+      // time, not once at module load.
+      const midSize = byId("prov-mid-size");
+      assertTrue(!!midSize, "i0: prov-mid-size fixture present");
+      assertEq(midSize?.antall_ansatte, 10, "i0a: prov-mid-size antall_ansatte 10");
+      assertEq(midSize?.size_flag, "liten", "i1: prov-mid-size size_flag liten under the default threshold (25)");
+
+      const prevSizeThreshold = process.env.GARDSSALG_SIZE_THRESHOLD;
+      try {
+        process.env.GARDSSALG_SIZE_THRESHOLD = "5";
+        const lowered = await callRoute(opplevelserRouter, { headers: { "x-admin-key": testKey } });
+        const midSizeLowered = (lowered.body.providers as any[]).find((r) => r.name === "Middels Gård AS");
+        assertEq(midSizeLowered?.size_flag, "stor", "i2: prov-mid-size size_flag flips to stor once GARDSSALG_SIZE_THRESHOLD=5 (10 >= 5) — AK4");
+
+        process.env.GARDSSALG_SIZE_THRESHOLD = "25";
+        const restored = await callRoute(opplevelserRouter, { headers: { "x-admin-key": testKey } });
+        const midSizeRestored = (restored.body.providers as any[]).find((r) => r.name === "Middels Gård AS");
+        assertEq(midSizeRestored?.size_flag, "liten", "i3: prov-mid-size size_flag flips back to liten once the threshold is restored to 25 — no caching across calls");
+      } finally {
+        if (prevSizeThreshold === undefined) delete process.env.GARDSSALG_SIZE_THRESHOLD;
+        else process.env.GARDSSALG_SIZE_THRESHOLD = prevSizeThreshold;
+      }
 
       // ── (e) zero-provider edge case ─────────────────────────────────────
       expDb.prepare("DELETE FROM experiences").run();

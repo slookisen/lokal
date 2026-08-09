@@ -206,6 +206,13 @@ export interface BrregVerifyResult {
   registrertDato: string | null;
   slettetDato: string | null;
   flag: BrregFlag;           // "dissolved" if slettetDato set, "bankrupt" if konkurs, else null when active+exists
+  // ─── dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+  // Skive 1 ─────────────────────────────────────────────────────────────────
+  // Brreg's registered employee count for the org (`antallAnsatte` on the
+  // same GET /enheter/{orgNr} response). null means Brreg has no registered
+  // figure for this org — NOT "zero employees" — callers must never treat
+  // null as "small".
+  antallAnsatte: number | null;
 }
 
 type RawEnhetDetail = {
@@ -224,6 +231,10 @@ type RawEnhetDetail = {
   // never has, so their addition here is a no-op for every existing caller.
   forretningsadresse?: RawBrregAddress | null;
   postadresse?: RawBrregAddress | null;
+  // Additive (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate, Skive 1) — verifyOrgNumber() now reads this; no other
+  // existing reader of RawEnhetDetail is affected.
+  antallAnsatte?: number | null;
 };
 
 const SAFE_DEFAULT_VERIFY_RESULT: BrregVerifyResult = {
@@ -234,6 +245,7 @@ const SAFE_DEFAULT_VERIFY_RESULT: BrregVerifyResult = {
   registrertDato: null,
   slettetDato: null,
   flag: "no_orgnr",
+  antallAnsatte: null,
 };
 
 // Tiny separate per-process cache keyed by orgNr — org-nr lookups are cheap
@@ -321,6 +333,7 @@ export async function verifyOrgNumber(
     registrertDato: json.registreringsdatoEnhetsregisteret ?? null,
     slettetDato,
     flag,
+    antallAnsatte: typeof json.antallAnsatte === "number" ? json.antallAnsatte : null,
   };
   verifyCache.set(cleanOrgNr, result);
   return { ...result };

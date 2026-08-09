@@ -89,6 +89,7 @@ export async function runBrregClientTests(opts: { log?: boolean } = {}): Promise
         slettedato: null,
         registreringsdatoEnhetsregisteret: "2015-03-01",
         naeringskode1: { kode: "47.210" },
+        antallAnsatte: 42,
       });
     });
     const r: BrregVerifyResult = await verifyOrgNumber("910244132", fetchImpl);
@@ -99,6 +100,7 @@ export async function runBrregClientTests(opts: { log?: boolean } = {}): Promise
     assertEq(r.registrertDato, "2015-03-01", "active: registrertDato populated");
     assertEq(r.slettetDato, null, "active: slettetDato null");
     assertEq(r.flag, null, "active: flag null (active + exists)");
+    assertEq(r.antallAnsatte, 42, "active: antallAnsatte read from Brreg's antallAnsatte field");
   }
 
   // ── (b) Dissolved (slettedato set) ─────────────────────────────────────
@@ -191,6 +193,72 @@ export async function runBrregClientTests(opts: { log?: boolean } = {}): Promise
     const empty = await verifyOrgNumber("", fetchImpl);
     assertEq(empty.exists, false, "empty org-nr: returns safe default without calling fetch");
     assertEq(empty.flag, "no_orgnr", "empty org-nr: flag === 'no_orgnr'");
+    assertEq(empty.antallAnsatte, null, "empty org-nr: antallAnsatte === null (safe default)");
+  }
+
+  // ── antallAnsatte (dev-request 2026-08-09-daglig-outreach-klargjoering-
+  //    og-stoerrelsesgate, Skive 1) ──────────────────────────────────────
+  {
+    // (a) Brreg has no registered antallAnsatte field at all -> null, NOT 0
+    //     or any other "small" default — null means "no data", must never be
+    //     conflated with "small" by a downstream caller.
+    __clearBrregVerifyCacheForTesting();
+    const fetchImplAbsent = makeFetch(() =>
+      jsonResponse(200, {
+        organisasjonsnummer: "975967093",
+        navn: "Ingen Ansatte-Felt AS",
+        konkurs: false,
+        underAvvikling: false,
+        underTvangsavviklingEllerTvangsopplosning: false,
+        slettedato: null,
+        naeringskode1: { kode: "11.050" },
+        // no antallAnsatte key at all
+      })
+    );
+    const absent = await verifyOrgNumber("975967093", fetchImplAbsent);
+    assertEq(absent.antallAnsatte, null, "antallAnsatte: absent field -> null");
+
+    // (b) antallAnsatte present as a genuine number -> passed through as-is
+    //     (large-company case: Macks Ølbryggeri, org 975967093, 119 ansatte
+    //     per the dev-request's own AK1 fixture).
+    __clearBrregVerifyCacheForTesting();
+    const fetchImplLarge = makeFetch(() =>
+      jsonResponse(200, {
+        organisasjonsnummer: "975967093",
+        navn: "MACKS ØLBRYGGERI AS",
+        konkurs: false,
+        underAvvikling: false,
+        underTvangsavviklingEllerTvangsopplosning: false,
+        slettedato: null,
+        naeringskode1: { kode: "11.050" },
+        antallAnsatte: 119,
+      })
+    );
+    const large = await verifyOrgNumber("975967093", fetchImplLarge);
+    assertEq(large.antallAnsatte, 119, "antallAnsatte: Macks Ølbryggeri (119) passed through unchanged");
+
+    // (c) antallAnsatte present but not a number (defensive parse) -> null,
+    //     never coerced/NaN'd through to the caller.
+    __clearBrregVerifyCacheForTesting();
+    const fetchImplBadType = makeFetch(() =>
+      jsonResponse(200, {
+        organisasjonsnummer: "910244136",
+        navn: "Rart Felt AS",
+        konkurs: false,
+        underAvvikling: false,
+        underTvangsavviklingEllerTvangsopplosning: false,
+        slettedato: null,
+        antallAnsatte: "22" as unknown as number, // wrong type on the wire
+      })
+    );
+    const badType = await verifyOrgNumber("910244136", fetchImplBadType);
+    assertEq(badType.antallAnsatte, null, "antallAnsatte: non-number value on the wire -> null, not coerced");
+
+    // (d) 404 -> safe default, antallAnsatte null.
+    __clearBrregVerifyCacheForTesting();
+    const fetchImpl404 = makeFetch(() => jsonResponse(404, { message: "not found" }));
+    const notFound = await verifyOrgNumber("000000001", fetchImpl404);
+    assertEq(notFound.antallAnsatte, null, "antallAnsatte: 404 -> null (safe default)");
   }
 
   // ── pickBrregActivityDescription / fetchBrregActivityDescription ────────

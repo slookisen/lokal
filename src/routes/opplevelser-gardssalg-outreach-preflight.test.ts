@@ -51,6 +51,15 @@
  * "provider_link"); a name_token-basis pair is candidate-only and must come
  * back go:true from the gate (it answered go:false,
  * reason:"dublettkonflikt" on pre-slice-1 code).
+ *
+ * Extended for dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ * stoerrelsesgate, Skive 1 — block (k): the THIRD gating pass, after the
+ * tier pass and the Slice-2 outreach-guard dedup pass. An otherwise
+ * outreach_ready row with size_flag "stor" flips to go:false,
+ * reason:"large_company_excluded"; "liten"/"ukjent" rows are left exactly as
+ * the earlier passes decided (the gate excludes, it never approves); the
+ * GARDSSALG_SIZE_GATE_ENABLED="false" kill-switch turns the pass into a
+ * no-op.
  */
 
 export interface TestSummary {
@@ -357,6 +366,57 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         brreg_verified: 1,
       });
 
+      // ── size-gate fixtures (dev-request 2026-08-09-daglig-outreach-
+      // klargjoering-og-stoerrelsesgate, Skive 1) — used ONLY by the (k)
+      // block below. Otherwise outreach_ready-shaped (own unique email
+      // domains so the Slice-2 outreach-guard never cross-suppresses them).
+      const insertProviderSized = expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
+            epost, telefon, hjemmeside, about_text, visit_text, opening_hours_text,
+            products, content_source, booking_live, catalog_hidden, slug, field_provenance,
+            brreg_verified, antall_ansatte,
+            enrichment_state, verification_status, source, confidence)
+         VALUES
+           (@id, @navn, 'experiences', @org_nr, @kommune, @rfb_seed_source, @producer_type,
+            @epost, @telefon, @hjemmeside, @about_text, @visit_text, @opening_hours_text,
+            @products, @content_source, @booking_live, @catalog_hidden, @slug, @field_provenance,
+            @brreg_verified, @antall_ansatte,
+            'raw', 'pending_verify', 'test-fixture', 'medium')`,
+      );
+      // size_flag "stor" -- must be excluded by the third gating pass.
+      insertProviderSized.run({
+        id: "prov-large", navn: "Macks Ølbryggeri", org_nr: "975967093", kommune: "Stavanger",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@macks.no", telefon: null, hjemmeside: "https://macks.no",
+        about_text: "Om bryggeriet.", visit_text: null, opening_hours_text: null,
+        products: "Øl", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "macks-olbryggeri", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 119,
+      });
+      // size_flag "liten" -- must stay go:true (the gate excludes, never
+      // upgrades, but also never downgrades a liten row).
+      insertProviderSized.run({
+        id: "prov-small", navn: "Liten Gård AS", org_nr: "343434343", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@litengard.no", telefon: null, hjemmeside: "https://litengard.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "liten-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 3,
+      });
+      // size_flag "ukjent" (antall_ansatte NULL) -- must ALSO stay go:true —
+      // "ukjent" is never treated as "stor", requirement 5/6 of the spec.
+      insertProviderSized.run({
+        id: "prov-unknown", navn: "Ukjent Gård AS", org_nr: "353535353", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@ukjentgard.no", telefon: null, hjemmeside: "https://ukjentgard.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Most", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "ukjent-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: null,
+      });
+
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       // ── (a) auth gate ────────────────────────────────────────────────────
@@ -553,6 +613,63 @@ export function runOpplevelserGardssalgOutreachPreflightTests(
         "j2: prov-conflict (provider_link evidence basis) still blocks in the SAME batch",
       );
       assertEq(nameTokenGate.body.summary, { go: 1, no_go: 1, total: 2 }, "j3: summary 1 GO + 1 NO-GO");
+
+      // ── (k) size gate (dev-request 2026-08-09-daglig-outreach-
+      // klargjoering-og-stoerrelsesgate, Skive 1) ─────────────────────────
+      const sizeGateIds = ["prov-large", "prov-small", "prov-unknown"];
+      const sizeGate = await callRoute(opplevelserRouter, { headers: authHeaders, body: { provider_ids: sizeGateIds } });
+      assertEq(sizeGate.status, 200, "k0: size-gate batch -> 200");
+      assertEq(
+        sizeGate.body.results[0],
+        { provider_id: "prov-large", name: "Macks Ølbryggeri", go: false, reason: "large_company_excluded" },
+        "k1: prov-large (size_flag stor) -> go:false, reason:large_company_excluded",
+      );
+      assertEq(
+        sizeGate.body.results[1],
+        { provider_id: "prov-small", name: "Liten Gård AS", go: true, reason: null },
+        "k2: prov-small (size_flag liten) -> stays go:true — the gate excludes, never upgrades OR downgrades a liten row",
+      );
+      assertEq(
+        sizeGate.body.results[2],
+        { provider_id: "prov-unknown", name: "Ukjent Gård AS", go: true, reason: null },
+        "k3: prov-unknown (size_flag ukjent, antall_ansatte NULL) -> stays go:true — ukjent is never treated as stor",
+      );
+      assertEq(sizeGate.body.summary, { go: 2, no_go: 1, total: 3 }, "k4: summary 2 GO + 1 NO-GO");
+
+      // Kill-switch: GARDSSALG_SIZE_GATE_ENABLED="false" makes the third
+      // pass a no-op — the large-company row reverts to whatever the tier +
+      // dedup passes alone would have decided (outreach_ready -> go:true).
+      const prevSizeGateEnabled = process.env.GARDSSALG_SIZE_GATE_ENABLED;
+      try {
+        process.env.GARDSSALG_SIZE_GATE_ENABLED = "false";
+        const gateOff = await callRoute(opplevelserRouter, { headers: authHeaders, body: { provider_ids: ["prov-large"] } });
+        assertEq(
+          gateOff.body.results[0],
+          { provider_id: "prov-large", name: "Macks Ølbryggeri", go: true, reason: null },
+          "k5: GARDSSALG_SIZE_GATE_ENABLED=false -> prov-large (size_flag stor) reverts to go:true, no deploy needed",
+        );
+      } finally {
+        if (prevSizeGateEnabled === undefined) delete process.env.GARDSSALG_SIZE_GATE_ENABLED;
+        else process.env.GARDSSALG_SIZE_GATE_ENABLED = prevSizeGateEnabled;
+      }
+
+      // Threshold knob: raising GARDSSALG_SIZE_THRESHOLD above prov-large's
+      // antall_ansatte (119) flips its size_flag to liten, so the gate no
+      // longer excludes it — same env-knob idiom, no deploy needed (AC4's
+      // preflight-side counterpart).
+      const prevSizeThreshold = process.env.GARDSSALG_SIZE_THRESHOLD;
+      try {
+        process.env.GARDSSALG_SIZE_THRESHOLD = "200";
+        const raisedThreshold = await callRoute(opplevelserRouter, { headers: authHeaders, body: { provider_ids: ["prov-large"] } });
+        assertEq(
+          raisedThreshold.body.results[0],
+          { provider_id: "prov-large", name: "Macks Ølbryggeri", go: true, reason: null },
+          "k6: GARDSSALG_SIZE_THRESHOLD=200 -> prov-large (119 < 200, size_flag liten) no longer excluded",
+        );
+      } finally {
+        if (prevSizeThreshold === undefined) delete process.env.GARDSSALG_SIZE_THRESHOLD;
+        else process.env.GARDSSALG_SIZE_THRESHOLD = prevSizeThreshold;
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-preflight: unexpected error: " + String(err?.stack || err?.message || err));

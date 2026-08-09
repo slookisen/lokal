@@ -48,6 +48,13 @@
  *       still suppresses a later send to the same recipient within the
  *       cooldown window, so the AC10 fix doesn't silently disable cooldown
  *       altogether
+ *   (m) AK3 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ *       stoerrelsesgate, Skive 1): a size_flag "stor" provider is skipped
+ *       even with apply:true — status:"skipped", reason:"preflight_no_go",
+ *       preflight_reason:"large_company_excluded" verbatim, and ZERO send
+ *       attempts (the block asserts against the real send boundary, not a
+ *       stub of the route's own preflight call) — proving the gate blocks
+ *       the actual send path, not just the dry-run readiness report.
  *
  * Exported runOpplevelserGardssalgOutreachPilotSendTests({log}) ->
  * TestSummary; wired into tests/test.ts. Standalone:
@@ -274,6 +281,26 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
         hjemmeside: "https://kilo-gard.example.no", epost: "post@fixture-kilo.no",
         slug: "kilo-gard", field_provenance: VERIFIED_STAMP,
       });
+
+      // Large-company fixture (dev-request 2026-08-09-daglig-outreach-
+      // klargjoering-og-stoerrelsesgate, Skive 1) — otherwise identically
+      // outreach_ready-shaped to the insertGo fixtures above (same columns
+      // insertGo covers), PLUS antall_ansatte, so it needs its own INSERT
+      // (insertGo's column list has no antall_ansatte). Used ONLY by block
+      // (m) below.
+      expDb
+        .prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, hjemmeside, epost, about_text, products, brreg_verified,
+              catalog_hidden, slug, field_provenance, producer_type, antall_ansatte,
+              enrichment_state, verification_status, source, confidence)
+           VALUES
+             ('prov-mike', 'Macks Ølbryggeri', 'experiences', 'https://macks-gard.example.no',
+              'post@fixture-mike.no', 'En fin gård.', 'Cider, sider', 1,
+              0, 'macks-gard', @field_provenance, 'sideri', 119,
+              'raw', 'pending_verify', 'test-fixture', 'medium')`,
+        )
+        .run({ field_provenance: VERIFIED_STAMP });
 
       // NO-GO tier: needs_enrichment (no about_text/products/brreg_verified).
       expDb
@@ -613,6 +640,40 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
         .prepare(`SELECT COUNT(*) AS n FROM experience_outreach_sent_log WHERE provider_id = 'prov-kilo'`)
         .get() as any;
       assertEq(kiloLog?.n, 1, "l19: the sent-log row is written even when the CRM write fails (cooldown still protects the producer)");
+
+      // ── (m) AK3: large-company size gate holds on the REAL send path,
+      // including apply:true ────────────────────────────────────────────
+      const sentBeforeSizeGate = sent.length;
+      const logCountBeforeSizeGate = (
+        expDb.prepare(`SELECT COUNT(*) n FROM experience_outreach_sent_log`).get() as any
+      ).n;
+      const sizeGateApply = await callRoute(opplevelserRouter, {
+        headers: auth, body: { provider_ids: ["prov-mike"], apply: true },
+      });
+      assertEq(sizeGateApply.status, 200, "m1: apply:true against a size_flag stor provider -> 200 (reported, not rejected)");
+      assertEq(sizeGateApply.body.dry_run, false, "m2: dry_run false (apply:true was passed)");
+      assertEq(sizeGateApply.body.results[0].status, "skipped", "m3: status is skipped, even with apply:true");
+      assertEq(sizeGateApply.body.results[0].reason, "preflight_no_go", "m4: reason is preflight_no_go");
+      assertEq(
+        sizeGateApply.body.results[0].preflight_reason,
+        "large_company_excluded",
+        "m5: preflight_reason is large_company_excluded verbatim — AK3",
+      );
+      assertEq(sent.length, sentBeforeSizeGate, "m6: zero send attempts reached the real send boundary");
+      const logCountAfterSizeGate = (
+        expDb.prepare(`SELECT COUNT(*) n FROM experience_outreach_sent_log`).get() as any
+      ).n;
+      assertEq(logCountAfterSizeGate, logCountBeforeSizeGate, "m7: no new experience_outreach_sent_log row was written");
+
+      // Same id, dry-run (apply absent) — same reason, confirming the gate
+      // is not an apply-only special case.
+      const sizeGateDry = await callRoute(opplevelserRouter, { headers: auth, body: { provider_ids: ["prov-mike"] } });
+      assertEq(sizeGateDry.body.results[0].status, "skipped", "m8: dry-run also reports skipped for the same provider");
+      assertEq(
+        sizeGateDry.body.results[0].preflight_reason,
+        "large_company_excluded",
+        "m9: dry-run preflight_reason matches the apply:true case exactly",
+      );
     } catch (err: any) {
       failed++;
       failures.push(

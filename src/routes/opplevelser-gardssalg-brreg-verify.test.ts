@@ -25,6 +25,13 @@
  *       override reports skipped_locked / already_verified / no_orgnr /
  *       not_found buckets
  *   (f) idempotence: second apply run finds an empty cohort
+ *   (g) dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ *       stoerrelsesgate, Skive 1: a verifying row whose Brreg result carries
+ *       antallAnsatte gets antall_ansatte + antall_ansatte_hentet_at written
+ *       in the SAME apply, "antall_ansatte" appears in fields_written, and a
+ *       genuine gardssalg_content_audit row is filed for it too — reusing
+ *       applyGardssalgBrregVerified's existing write mechanism, not a
+ *       parallel one.
  */
 
 export interface TestSummary {
@@ -140,6 +147,22 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
         brreg_active: 0,
         field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://x.no", fetched_at: "2026-01-01T00:00:00Z" } }),
       });
+      // Size-signal row (dev-request 2026-08-09-daglig-outreach-klargjoering-
+      // og-stoerrelsesgate, Skive 1): a verifying row whose Brreg answer
+      // carries antallAnsatte — proves the write path persists it alongside
+      // brreg_verified/brreg_active in the same apply.
+      insertProvider.run({
+        id: "bv-size",
+        navn: "Macks Ølbryggeri",
+        org_nr: "975967093",
+        kommune: "Stavanger",
+        rfb_seed_source: "rfb-seed",
+        producer_type: null,
+        content_source: "provider_site",
+        brreg_verified: 0,
+        brreg_active: 0,
+        field_provenance: null,
+      });
       // Name-mismatch row: Brreg will answer with a different company name.
       insertProvider.run({
         id: "bv-mismatch",
@@ -254,6 +277,11 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
           exists: true, active: true, name: "ULVIK FRUKT OG CIDERI AS",
           nace: ["11.030"], registrertDato: "2015-01-01", slettetDato: null, flag: null,
         },
+        "975967093": {
+          exists: true, active: true, name: "MACKS ØLBRYGGERI AS",
+          nace: ["11.050"], registrertDato: "1876-01-01", slettetDato: null, flag: null,
+          antallAnsatte: 119,
+        },
         "888777666": {
           exists: true, active: false, name: "KONKURS BRYGGERI AS",
           nace: ["11.050"], registrertDato: "2016-01-01", slettetDato: null, flag: "bankrupt",
@@ -281,10 +309,11 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
       const dry = await callRoute(opplevelserRouter, { headers: { "x-admin-key": testKey }, body: {} });
       assertEq(dry.status, 200, "(b) dry-run 200");
       assertEq(dry.body.dry_run, true, "(b) dry-run default without apply");
-      assertEq(dry.body.cohort_total, 4, "(b) cohort = the 4 unverified org_nr rows (done/noorg/locked/test/outside excluded)");
+      assertEq(dry.body.cohort_total, 5, "(b) cohort = the 5 unverified org_nr rows (done/noorg/locked/test/outside excluded)");
       assertEq(dry.body.no_orgnr_total, 1, "(b) no_orgnr_total counts the org_nr-less unverified row");
-      assertEq(dry.body.verified_count, 1, "(b) exactly one row verifies (exact name match)");
-      assertEq(dry.body.verified[0]?.provider_id, "bv-ok", "(b) the verifying row is bv-ok");
+      assertEq(dry.body.verified_count, 2, "(b) two rows verify (exact name match): bv-ok + bv-size");
+      assertEq(dry.body.verified[0]?.provider_id, "bv-ok", "(b) the first verifying row is bv-ok");
+      assertEq(dry.body.verified[1]?.provider_id, "bv-size", "(b) the second verifying row is bv-size");
       assertEq(dry.body.name_mismatch[0]?.provider_id, "bv-mismatch", "(b) mismatch row reported");
       assertEq(dry.body.name_mismatch[0]?.brreg_name, "ULVIK FRUKT OG CIDERI AS", "(b) Brreg's name reported verbatim");
       assertEq(dry.body.inactive[0]?.provider_id, "bv-dead", "(b) inactive row reported");
@@ -298,11 +327,11 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
       // ── (c) apply ─────────────────────────────────────────────────────────
       const applyRes = await callRoute(opplevelserRouter, { headers: { "x-admin-key": testKey }, body: { apply: true } });
       assertEq(applyRes.body.dry_run, false, "(c) apply run");
-      assertEq(applyRes.body.verified_count, 1, "(c) one row written");
+      assertEq(applyRes.body.verified_count, 2, "(c) two rows written: bv-ok + bv-size");
       assertEq(
         applyRes.body.verified[0]?.fields_written,
         ["brreg_verified", "brreg_active"],
-        "(c) both flags written (0 -> 1)",
+        "(c) bv-ok: both flags written (0 -> 1), no antall_ansatte (stub answer carries none)",
       );
       const okRow = expDb
         .prepare(`SELECT brreg_verified, brreg_active, field_provenance FROM experience_providers WHERE id = 'bv-ok'`)
@@ -348,6 +377,50 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
       };
       assertEq(lockedRow.brreg_verified, 0, "(e) claim-locked row untouched by auto-cohort apply");
 
+      // ── (g) size-signal write (dev-request 2026-08-09-daglig-outreach-
+      // klargjoering-og-stoerrelsesgate, Skive 1) ──────────────────────────
+      assertEq(
+        applyRes.body.verified[1]?.fields_written,
+        ["brreg_verified", "brreg_active", "antall_ansatte"],
+        "(g) bv-size: antall_ansatte joins the SAME write as brreg_verified/brreg_active",
+      );
+      const sizeRow = expDb
+        .prepare(
+          `SELECT brreg_verified, antall_ansatte, antall_ansatte_hentet_at, field_provenance
+             FROM experience_providers WHERE id = 'bv-size'`,
+        )
+        .get() as {
+        brreg_verified: number;
+        antall_ansatte: number | null;
+        antall_ansatte_hentet_at: string | null;
+        field_provenance: string;
+      };
+      assertEq(sizeRow.brreg_verified, 1, "(g) bv-size: brreg_verified = 1 persisted");
+      assertEq(sizeRow.antall_ansatte, 119, "(g) bv-size: antall_ansatte = 119 (Brreg's antallAnsatte) persisted");
+      assertTrue(
+        typeof sizeRow.antall_ansatte_hentet_at === "string" && sizeRow.antall_ansatte_hentet_at.length > 0,
+        "(g) bv-size: antall_ansatte_hentet_at stamped with an ISO timestamp",
+      );
+      const sizeProv = JSON.parse(sizeRow.field_provenance || "{}");
+      assertTrue(
+        typeof sizeProv.antall_ansatte?.source_url === "string" && sizeProv.antall_ansatte.source_url.includes("/enheter/975967093"),
+        "(g) bv-size: field_provenance.antall_ansatte carries the Brreg enhets-API URL",
+      );
+      const sizeAudits = expDb
+        .prepare(
+          `SELECT field_name, old_value, new_value FROM gardssalg_content_audit WHERE provider_id = 'bv-size' ORDER BY field_name`,
+        )
+        .all() as Array<{ field_name: string; old_value: string | null; new_value: string }>;
+      assertEq(
+        sizeAudits,
+        [
+          { field_name: "antall_ansatte", old_value: null, new_value: "119" },
+          { field_name: "brreg_active", old_value: "0", new_value: "1" },
+          { field_name: "brreg_verified", old_value: "0", new_value: "1" },
+        ],
+        "(g) bv-size: one audit row per changed field, including antall_ansatte with its true pre-write null old_value",
+      );
+
       // ── (e) providerIds override buckets ─────────────────────────────────
       const byIds = await callRoute(opplevelserRouter, {
         headers: { "x-admin-key": testKey },
@@ -362,7 +435,7 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
 
       // ── (f) idempotence ──────────────────────────────────────────────────
       const secondApply = await callRoute(opplevelserRouter, { headers: { "x-admin-key": testKey }, body: { apply: true } });
-      assertEq(secondApply.body.cohort_total, 3, "(f) verified row left the cohort (4 -> 3)");
+      assertEq(secondApply.body.cohort_total, 3, "(f) both verified rows left the cohort (5 -> 3)");
       assertEq(secondApply.body.verified_count, 0, "(f) second apply verifies nothing new");
       const auditCount = expDb
         .prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = 'bv-ok'`)
