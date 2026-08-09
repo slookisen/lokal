@@ -953,14 +953,27 @@ class CrmService {
     createdBy: "claude" | "daniel";
     /** Which platform this send belongs to. Required — see assertVertical. */
     vertical: CrmVertical;
+    /**
+     * The crm_messages row this outbox item exists to send, when one has
+     * already been created before enqueue (e.g. composeNewThread() runs
+     * before enqueueOutbox() in POST /compose). Sets crm_outbox.crm_message_id
+     * directly at insert time so /outbox/:id/result can resolve "the"
+     * message for this outbox row unambiguously — same link
+     * recordOutboundReply()'s outboxId param establishes for the reply path,
+     * just set from the other direction because compose's message already
+     * exists by the time the outbox row is created. See
+     * /outbox/:id/result for why "most recent for thread" is not safe once
+     * a thread can have more than one outstanding queued send.
+     */
+    crmMessageId?: string | null;
   }): { id: string } {
     const db = getDb();
     const v = assertVertical(params.vertical, "enqueueOutbox");
     const id = randomUUID();
     db.prepare(`
       INSERT INTO crm_outbox
-        (id, thread_id, contact_id, intent, to_emails, cc_emails, subject, body_text, body_html, reply_to_message_id, created_by, vertical_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, thread_id, contact_id, intent, to_emails, cc_emails, subject, body_text, body_html, reply_to_message_id, created_by, vertical_id, crm_message_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       params.threadId ?? null,
@@ -973,7 +986,8 @@ class CrmService {
       params.bodyHtml ?? null,
       params.replyToMessageId ?? null,
       params.createdBy,
-      v
+      v,
+      params.crmMessageId ?? null
     );
     this.logAction({
       threadId: params.threadId,

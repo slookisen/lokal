@@ -36,6 +36,14 @@
  *           the second-queued outbox item before the first updates the
  *           SECOND message, leaving the first untouched (not the
  *           "most recent" heuristic's wrong answer).
+ *   m25-m30 post-review bugfix (iteration 2) — POST /compose's outbox row
+ *           now links crm_message_id too: a /compose draft (message A,
+ *           outbox O) followed by a distinct /threads/:id/send reply
+ *           (message B) on the same thread, then POST /outbox/O/result,
+ *           correctly resolves message A and leaves B untouched — before
+ *           the fix, /compose's outbox row was never linked, so this fell
+ *           through to the "most recent for thread" fallback and wrongly
+ *           flipped B instead.
  *
  * Standalone: npx tsx src/routes/crm-send-message-history.test.ts
  * Wired into tests/test.ts via runCrmSendMessageHistoryTests().
@@ -413,6 +421,81 @@ export async function runCrmSendMessageHistoryTests(opts: { log?: boolean } = {}
       const afterResult1 = crmService.getThreadDetail(multiThreadId) as any;
       const msg1Final = (afterResult1.messages as any[]).find((m: any) => m.id === messageId1);
       assertEq(msg1Final?.delivery_status, "draft_in_gmail", "m24b: message 1 is now ALSO correctly updated to 'draft_in_gmail', resolved via its own explicit link");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // m25-m30 — post-review bugfix (iteration 2): POST /compose's outbox
+    // row now links crm_message_id too, not just POST /threads/:id/send's.
+    //
+    // Before this fix, composeNewThread() created message A and
+    // enqueueOutbox() created outbox O right after — but nothing set
+    // O.crm_message_id, so it stayed NULL forever. /outbox/O/result then
+    // fell through to getLatestOutboundMessageId(threadId) ("most recent
+    // outbound for thread"), which is wrong as soon as a SECOND outbound
+    // message lands on that same thread before O's result comes back.
+    //
+    // Reproduced exactly as the reviewer found it: a /compose draft
+    // (message A, outbox O) on a brand-new thread, then a DISTINCT
+    // /threads/:id/send reply (message B) on that SAME thread, then
+    // POST /outbox/O/result. Before the fix this wrongly flipped B and
+    // left A stuck at 'queued' forever; after the fix it must resolve A.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const composeRes = await call("POST", "/compose", {
+        to: "ny-kontakt@example.no",
+        subject: "Velkommen",
+        bodyText: "Her er informasjonen du ba om.",
+        intent: "gmail_draft",
+        createdBy: "daniel",
+        vertical: "rfb",
+      });
+      assertEq(composeRes.status, 200, "m25: POST /compose (gmail_draft) succeeds");
+      const composeThreadId = composeRes.body?.threadId as string;
+      const outboxIdA = composeRes.body?.outboxId as string;
+      assertTrue(typeof composeThreadId === "string" && typeof outboxIdA === "string", "m25b: …and returns a threadId and outboxId");
+
+      const linkedComposeOutbox = db.prepare("SELECT crm_message_id FROM crm_outbox WHERE id = ?").get(outboxIdA) as any;
+      const composeMessageId = (db.prepare(
+        "SELECT id FROM crm_messages WHERE thread_id = ? AND direction = 'out' ORDER BY received_at ASC LIMIT 1"
+      ).get(composeThreadId) as any)?.id as string;
+      assertTrue(typeof composeMessageId === "string", "m26: the compose draft produced a crm_messages row (message A)");
+      assertEq(linkedComposeOutbox?.crm_message_id, composeMessageId,
+        "m26b: THE FIX — crm_outbox row from /compose is explicitly linked to message A, not left NULL");
+
+      // Backdate message A's received_at. SQLite datetime('now') is
+      // 1-second granularity, so a fast in-memory test can otherwise create
+      // A and B in the same second — making the OLD "most recent for
+      // thread" fallback's tie-break coincidental rather than a real
+      // reproduction of the reported bug. Backdating forces B to be
+      // unambiguously the most recent, which is what actually exposes the
+      // misattribution without the crm_message_id link.
+      db.prepare("UPDATE crm_messages SET received_at = datetime('now', '-10 seconds') WHERE id = ?").run(composeMessageId);
+
+      // A second, DISTINCT reply lands on the SAME thread before O's result
+      // comes back — the exact ambiguity that broke the old "most recent
+      // for thread" fallback.
+      const replyB = await call("POST", `/threads/${composeThreadId}/send`, {
+        intent: "gmail_draft",
+        toEmails: ["ny-kontakt@example.no"],
+        subject: "Re: Velkommen",
+        bodyText: "Oppfølging: her er mer informasjon.",
+        createdBy: "daniel",
+      });
+      assertEq(replyB.status, 200, "m27: a second, distinct reply on the same thread also succeeds");
+      const messageIdB = replyB.body?.internalMessageId as string;
+      assertTrue(typeof messageIdB === "string" && messageIdB !== composeMessageId, "m27b: …producing a DIFFERENT message (B), newer than A");
+
+      // Now resolve outbox O — the one /compose created for message A.
+      const resultA = await call("POST", `/outbox/${outboxIdA}/result`, { status: "completed", resultId: "draft-compose-a" });
+      assertEq(resultA.status, 200, "m28: resolving outbox O (compose's outbox row) succeeds");
+
+      const afterResultA = crmService.getThreadDetail(composeThreadId) as any;
+      const msgAAfter = (afterResultA.messages as any[]).find((m: any) => m.id === composeMessageId);
+      const msgBAfter = (afterResultA.messages as any[]).find((m: any) => m.id === messageIdB);
+      assertEq(msgAAfter?.delivery_status, "draft_in_gmail",
+        "m29: message A (the one outbox O actually produced) is updated to 'draft_in_gmail'");
+      assertEq(msgBAfter?.delivery_status, "queued",
+        "m30: message B is UNTOUCHED, still 'queued' — this is the reported bug: before the fix, the 'most recent for thread' fallback would have wrongly flipped B here instead of A");
     }
   } catch (err) {
     failed++;

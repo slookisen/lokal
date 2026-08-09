@@ -689,6 +689,13 @@ router.post("/compose", async (req, res) => {
       bodyHtml,
       replyToMessageId: null,
       createdBy,
+      // composeNewThread() above already created this message row — link
+      // this outbox row to it explicitly so /outbox/:id/result resolves
+      // THIS compose's message, not "most recent for thread" (wrong as
+      // soon as a reply is queued on the same thread before this result
+      // comes back). Mirrors recordOutboundReply()'s outboxId link on the
+      // /threads/:id/send path.
+      crmMessageId: messageId,
     });
 
     if (intent === "resend_send") {
