@@ -4496,16 +4496,32 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     const link = bookHref
       ? `<a href="${bookHref}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
       : "";
-    // No booking-status marker on cards (dev-request 2026-08-09-gardssalg-
-    // kommer-snart-fjernes-eier-aktivert-booking): the old "Kommer snart"
-    // chip wrapped unpredictably next to long names and contradicted the
-    // "Book besøk" button beside it. The honest "ikke aktivert" state lives
-    // where the action happens — the profile page and the booking panel.
+    // Cards carry POSITIVE markers only (dev-request 2026-08-09-gardssalg-
+    // kommer-snart-fjernes-eier-aktivert-booking, AC5 options — Daniel
+    // in-session 2026-08-09): the paused state stays off the cards (the
+    // "Kommer snart" chip removal from the same dev-request), so a marker
+    // here always asserts something currently true — booking genuinely
+    // works (same isBookingPaused() source as every other surface; the
+    // hidden test provider never reaches this renderer, the list query
+    // filters catalog_hidden=1) / the owner has verified the profile (same
+    // historical claimed_at basis as the profile page's badge). Rendered as
+    // their own wrap-safe flex row UNDER the type badge — never inline
+    // after the name, which is exactly the wrapping mess the old chip made.
+    const cardMarkers: string[] = [];
+    if (!isBookingPaused(p.booking_live, p.catalog_hidden)) {
+      cardMarkers.push(`<span style="display:inline-block;font-size:.7rem;font-weight:700;color:#fff;background:#0f5a50;border-radius:4px;padding:2px 8px">Booking tilgjengelig</span>`);
+    }
+    if (p.claimed_at != null) {
+      cardMarkers.push(`<span style="display:inline-block;font-size:.7rem;font-weight:600;color:#0f5a50;background:#fff;border:1px solid #0f5a50;border-radius:4px;padding:2px 7px">&#10003; Eier-bekreftet</span>`);
+    }
+    const markerRow = cardMarkers.length
+      ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">${cardMarkers.join("")}</div>`
+      : "";
     return `<article style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
   <div style="padding:16px 16px 12px">
     ${sted ? `<div style="font-size:.78rem;color:#7a7163;margin-bottom:4px">${escapeHtml(sted)}</div>` : ""}
     <div style="margin-bottom:6px">${nameHtml}</div>
-    ${badge}
+    ${badge}${markerRow}
   </div>
   ${link ? `<div style="padding:0 16px 16px;margin-top:auto">${link}</div>` : ""}
 </article>`;
