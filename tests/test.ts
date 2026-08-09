@@ -29067,6 +29067,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gops.failures) failures.push("opplevelser-gardssalg-outreach-pilot-send: " + f);
     console.log(`  opplevelser-gardssalg-outreach-pilot-send: ${gops.passed} passed, ${gops.failed} failed`);
 
+    // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+    // Skive 1: antall_ansatte size signal + hard exclusion gate layered onto
+    // the readiness/preflight/pilot-send trio above, plus the new DB-backed
+    // L1 knob endpoints GET/POST /admin/gardssalg-outreach-size-gate. Same
+    // in-memory-DB + fake-transporter pattern, runs sequentially inside this
+    // same gated block.
+    console.log("\n── opplevelser-gardssalg-outreach-size-gate: antall_ansatte size gate (Skive 1) ──");
+    const { runOpplevelserGardssalgOutreachSizeGateTests } = require("../src/routes/opplevelser-gardssalg-outreach-size-gate.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-size-gate.test");
+    const gosg = await runOpplevelserGardssalgOutreachSizeGateTests({ log: false });
+    passed += gosg.passed;
+    failed += gosg.failed;
+    for (const f of gosg.failures) failures.push("opplevelser-gardssalg-outreach-size-gate: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-size-gate: ${gosg.passed} passed, ${gosg.failed} failed`);
+
     // dev-request 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens:
     // POST /admin/gardssalg-brreg-verify — the missing lever that stamps
     // krav-2's brreg_verified flag from live Brreg evidence (exists + active
