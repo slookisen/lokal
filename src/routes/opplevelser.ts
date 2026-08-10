@@ -135,6 +135,7 @@ import {
   extractGardssalgContactPhone,
   selectGardssalgProvidersForContactExtraction,
   isUmbrellaContactEmail,
+  UMBRELLA_EMAIL_DOMAINS,
   homepageRegistrableDomain,
   upsertGardssalgWebsiteReviewQueue,
   clearGardssalgWebsiteReviewQueueEntry,
@@ -219,6 +220,20 @@ import {
   // above). Backs POST /admin/gardssalg-field-concordance-clear below, near
   // the existing gardssalg-field-concordance routes.
   applyGardssalgFieldConcordanceClear,
+  // dev-request 2026-08-10-veien-til-pool-berikelseskjede-og-koedrenering,
+  // Skive 3 — Norske Destilleriers medlemsliste (norskedestillerier.no/
+  // medlemmer/) confirms/enriches EXISTING gårdssalg rows by DOMAIN match
+  // (never creates a row). Backs POST /admin/gardssalg-medlemsliste-bekreft
+  // below, near the other gardssalg-*-review-approve/content-clear routes.
+  selectGardssalgProvidersForMedlemslisteMatch,
+  getGardssalgProviderMedlemslisteTarget,
+  applyGardssalgMedlemslisteEnrichment,
+  type GardssalgMedlemslisteMatchCandidate,
+  type GardssalgMedlemslisteEnrichmentCandidate,
+  // reused for the dry-run preview's veto check, so a dry-run's `written`
+  // preview can never claim a field the real apply path's own veto would
+  // actually refuse (see applyGardssalgMedlemslisteEnrichment's doc comment).
+  gardssalgContactFieldWasRolledBack,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -10338,6 +10353,537 @@ router.post("/admin/gardssalg-veien-til-pool", requireAdmin, async (req: Request
   } finally {
     gsVtpRunning = false;
   }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-medlemsliste-bekreft (admin) ────
+//
+// dev-request 2026-08-10-veien-til-pool-berikelseskjede-og-koedrenering,
+// Skive 3. Norske Destilleriers own member list
+// (norskedestillerier.no/medlemmer/) publishes each member's own
+// name/address/postnummer/telefon/epost/nettside — a producer-owned source,
+// but an UMBRELLA one: Daniel's own framing ("benytt denne for å bekrefte
+// informasjon på destilleriene vi har som finnes der") is CONFIRM/ENRICH,
+// never create. This route:
+//   1. Fetches + parses the member list (paginated — 29 members measured
+//      2026-08-10 across 4 pages).
+//   2. Matches each member to an EXISTING experience_providers row by
+//      DOMAIN — the member's own website/email domain against the row's
+//      stored hjemmeside — never by name alone (a name-only agreement is
+//      reported `needs_review`, never auto-written; session's own manual
+//      cross-check 2026-08-10 found 8 domain hits + 2 name-only hits + 19
+//      no-match, which this route's own live dry-run should reproduce).
+//   3. Fill-only writes adresse/postnummer/poststed/telefon/epost for a
+//      DOMAIN match, via applyGardssalgMedlemslisteEnrichment — a field
+//      already populated (whether confirmed on the producer's own live
+//      site or from any other source) is never touched (AK10); the member
+//      list only ever fills a currently-blank field.
+//
+// Never creates a provider row — no code path here calls createProvider.
+// Dry-run by default (apply gate, same idiom as every sibling gardssalg
+// admin route); providerIds narrows the PROVIDER side of the match to
+// explicit rows (same explicit-target convention as gardssalg-content-clear
+// / gardssalg-veien-til-pool) — the MEMBER side always comes from the full
+// fetched list (there is no "half the member list" concept to narrow).
+
+const ND_MEDLEMMER_BASE_URL = "https://norskedestillerier.no/medlemmer/";
+// Measured 2026-08-10: 4 pages, 29 members. Capped well above that so
+// future member-count growth doesn't silently truncate the list, while
+// still bounding one call's worst-case fetch count.
+const ND_MEDLEMMER_MAX_PAGES = 10;
+const ND_MEDLEM_HARD_CAP = 48; // same "~48 gårdssalg providers total" bound every sibling route uses
+
+export interface NdMedlemslisteMember {
+  name: string; // producer name with the list's own trailing ", <sted>" stripped
+  raw_title: string; // untouched <h2> text (entities decoded), kept for audit/debug
+  source_url: string; // the member's own norskedestillerier.no/lokasjon/... page
+  adresse: string | null;
+  postnummer: string | null;
+  poststed: string | null;
+  telefon: string | null;
+  epost: string | null;
+  website: string | null;
+}
+
+/**
+ * Minimal HTML-entity decode for the handful of entities the member list's
+ * WordPress/Beaver-Builder markup actually emits (en-dash in "X – Y" names,
+ * &amp;, numeric entities). This codebase has no HTML parser anywhere (see
+ * gardssalgPageTitle's own doc comment) — regex-only, same house style.
+ */
+function ndDecodeEntities(s: string): string {
+  return s
+    .replace(/&#(\d+);/g, (_m, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&amp;/gi, "&")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Parse ONE fetched medlemmer page (page 1 or /medlemmer/page/N/) into its
+ * member rows. Pure, regex-only (no network/IO) — exported for tests.
+ * Real-page structure (verified against the live page 2026-08-10): each
+ * member is a `.fl-post-grid-post` block with an `<h2 class="fl-post-title">`
+ * (name + trailing ", <sted>", linking to the member's own
+ * norskedestillerier.no detail page) and a `.fl-post-excerpt` of
+ * `<br />`-separated lines: 1-2 free-form address lines, then "<postnr>
+ * <poststed>", then "Tlf. …", "E-post: …", "Nettside: …" — any of those
+ * last three MAY be blank (e.g. the live Svalbard Bivrost Distillery entry
+ * has an empty Nettside line). A member whose excerpt carries no "<postnr>
+ * <poststed>" line at all keeps every excerpt line as `adresse` rather than
+ * guessing which line is which (fail closed: never mis-file a phone/email
+ * line as an address).
+ */
+export function parseNorskeDestillererMedlemmerPage(html: string): NdMedlemslisteMember[] {
+  const members: NdMedlemslisteMember[] = [];
+  const blockRe =
+    /<div class="fl-post-grid-post[^"]*"[\s\S]*?(?=<div class="fl-post-grid-post|<div class="fl-builder-pagination|$)/g;
+  const blocks = html.match(blockRe) || [];
+  for (const block of blocks) {
+    const titleMatch = block.match(/<h2 class="fl-post-title"><a href='([^']*)'[^>]*>([\s\S]*?)<\/a><\/h2>/);
+    if (!titleMatch) continue;
+    const sourceUrl = (titleMatch[1] || "").trim();
+    const rawTitle = ndDecodeEntities(titleMatch[2] || "");
+    if (!sourceUrl || !rawTitle) continue;
+    const lastComma = rawTitle.lastIndexOf(",");
+    const name = (lastComma > 0 ? rawTitle.slice(0, lastComma) : rawTitle).trim();
+    if (!name) continue;
+
+    const excerptMatch = block.match(/<div class="fl-post-excerpt">([\s\S]*?)<\/div>/);
+    const lines = excerptMatch
+      ? excerptMatch[1]
+          .split(/<br\s*\/?>/i)
+          .map((l) => ndDecodeEntities(l))
+          .filter((l) => l.length > 0)
+      : [];
+
+    let postnummer: string | null = null;
+    let poststed: string | null = null;
+    let postalIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i]!.match(/^(\d{4})\s+(.+)$/);
+      if (m) {
+        postnummer = m[1] ?? null;
+        poststed = (m[2] ?? "").trim() || null;
+        postalIdx = i;
+        break;
+      }
+    }
+    const addressLines = postalIdx >= 0 ? lines.slice(0, postalIdx) : lines;
+    const remaining = postalIdx >= 0 ? lines.slice(postalIdx + 1) : [];
+
+    let telefon: string | null = null;
+    let epost: string | null = null;
+    let website: string | null = null;
+    for (const line of remaining) {
+      const tlfM = line.match(/^Tlf\.?:?\s*(.*)$/i);
+      if (tlfM) {
+        const v = (tlfM[1] || "").trim();
+        if (v) telefon = v;
+        continue;
+      }
+      const epM = line.match(/^E-?post:?\s*(.*)$/i);
+      if (epM) {
+        const v = (epM[1] || "").trim();
+        if (v && v.includes("@")) epost = v;
+        continue;
+      }
+      const webM = line.match(/^Nettside:?\s*(.*)$/i);
+      if (webM) {
+        const v = (webM[1] || "").trim();
+        // Some entries list a second/alternate site ("X.no - https://Y.com")
+        // — only the FIRST is taken as the member's primary domain signal.
+        if (v) website = v.split(/\s+-\s+|\s+/)[0] || null;
+        continue;
+      }
+    }
+
+    members.push({
+      name,
+      raw_title: rawTitle,
+      source_url: sourceUrl,
+      adresse: addressLines.length > 0 ? addressLines.join(", ") : null,
+      postnummer,
+      poststed,
+      telefon,
+      epost,
+      website,
+    });
+  }
+  return members;
+}
+
+/**
+ * Fetch + parse the FULL paginated member list (page 1 + /page/N/ while
+ * pagination continues), reusing crFetchPage — the SAME SSRF-guarded,
+ * classified, one-shot-retried fetcher every other gårdssalg fetch in this
+ * file uses (never a bare fetch()). A page-1 fetch failure is fatal for the
+ * whole call (there is nothing to report members against) and is
+ * distinguished from "reached the end of pagination": a page N>1 that
+ * classifies `persistence:"permanent"` (http_404/dns_not_found — exactly
+ * what requesting a page past the last one returns) ends pagination
+ * normally; any OTHER failure on a later page (timeout, 5xx, …) stops the
+ * walk but is flagged `fetch_incomplete` rather than silently treated as
+ * "no more members" — the same "hentefeil ≠ fravær" discipline
+ * gsVtpProcessProvider already applies to a single producer's homepage.
+ */
+async function fetchNorskeDestillererMedlemsliste(): Promise<
+  | {
+      ok: true;
+      members: NdMedlemslisteMember[];
+      pages_fetched: number;
+      fetch_incomplete: boolean;
+      pages_capped: boolean;
+    }
+  | { ok: false; reason: string; pages_fetched: number }
+> {
+  const members: NdMedlemslisteMember[] = [];
+  let pagesFetched = 0;
+  let fetchIncomplete = false;
+  let pagesCapped = false;
+  for (let page = 1; page <= ND_MEDLEMMER_MAX_PAGES; page++) {
+    const url = page === 1 ? ND_MEDLEMMER_BASE_URL : `${ND_MEDLEMMER_BASE_URL}page/${page}/`;
+    const result = await crFetchPage(url);
+    if (!result.ok) {
+      if (page === 1) {
+        return { ok: false, reason: result.reason, pages_fetched: 0 };
+      }
+      if (result.persistence !== "permanent") {
+        fetchIncomplete = true;
+      }
+      break; // permanent (past the last real page) OR a flagged-incomplete stop — either way, stop walking
+    }
+    pagesFetched = page;
+    members.push(...parseNorskeDestillererMedlemmerPage(result.html));
+    if (page === ND_MEDLEMMER_MAX_PAGES) pagesCapped = true;
+  }
+  return { ok: true, members, pages_fetched: pagesFetched, fetch_incomplete: fetchIncomplete, pages_capped: pagesCapped };
+}
+
+/**
+ * Registrable-domain-of a member's website OR email. Website is checked
+ * first (krav 13's own ordering: "medlemmets nettside/e-postdomene") —
+ * `hjemmeside` on our own row is what a domain match compares against, so a
+ * website value is the primary signal; an email-only member (e.g. the live
+ * Svalbard Bivrost Distillery row, whose Nettside line is empty) still gets
+ * a domain to match on via its epost. Returns null if neither yields a
+ * parseable host. Pure — exported for tests.
+ */
+export function ndMemberDomain(member: { website: string | null; epost: string | null }): string | null {
+  if (member.website) {
+    const host = hostFromUrlLike(member.website);
+    if (host) return registrableDomain(host);
+  }
+  if (member.epost && member.epost.includes("@")) {
+    const host = hostFromUrlLike(member.epost.split("@").pop() || "");
+    if (host) return registrableDomain(host);
+  }
+  return null;
+}
+
+/**
+ * Same registrable-domain extraction for a provider's own stored
+ * hjemmeside. Pure — exported for tests.
+ */
+export function ndProviderDomain(hjemmeside: string | null | undefined): string | null {
+  if (!hjemmeside) return null;
+  const host = hostFromUrlLike(hjemmeside);
+  return host ? registrableDomain(host) : null;
+}
+
+/**
+ * Hyphen-insensitive registrable-domain equality — same rationale as
+ * cross-source-validator.ts's own collapseDomain (PR-126: "lia-gard.no" and
+ * "liagard.no" are the same registrable entity's cosmetic alias),
+ * reproduced locally since that helper isn't exported from that module.
+ * Pure — exported for tests.
+ */
+export function ndDomainsEqual(a: string, b: string): boolean {
+  return a.replace(/-/g, "") === b.replace(/-/g, "");
+}
+
+export type NdMatchVerdict =
+  | { tier: "domain_match"; provider_id: string }
+  | { tier: "ambiguous_domain_match"; provider_ids: string[] }
+  | { tier: "name_only"; provider_id: string }
+  | { tier: "ambiguous_name_match"; provider_ids: string[] }
+  | { tier: "umbrella_self_reference" }
+  | { tier: "no_match" };
+
+/**
+ * Match ONE member to the (already-loaded) provider universe. Pure —
+ * exported for tests. Domain match takes strict priority over name match,
+ * per krav 12 ("Matching på domene ... ikke på navn alene") — the domain
+ * tier is the ONLY one this route may ever auto-write from; name_only is
+ * `needs_review` (krav 12: "2 navnetreff til verifisering" — a genuine name
+ * agreement with no domain corroboration must still go to a human, never
+ * auto-write). Multiple providers sharing one domain, or multiple providers
+ * name-overlapping one member, are both `ambiguous_*` — reported, never
+ * written (never guess between candidates). `umbrella_self_reference` is a
+ * defensive backstop (not observed in the real 2026-08-10 list — every
+ * member's own website/epost resolved to the member's OWN domain, never
+ * back to norskedestillerier.no itself) for the case a row's contact data
+ * somehow resolves to the association's own domain — never matched, never a
+ * lead, reusing the SAME UMBRELLA_EMAIL_DOMAINS deny-list Skive 1's
+ * contact-extraction umbrella guard already established.
+ */
+export function matchNdMember(
+  member: NdMedlemslisteMember,
+  providers: GardssalgMedlemslisteMatchCandidate[]
+): NdMatchVerdict {
+  const domain = ndMemberDomain(member);
+  if (
+    domain &&
+    (UMBRELLA_EMAIL_DOMAINS.has(domain) || Array.from(UMBRELLA_EMAIL_DOMAINS).some((u) => domain.endsWith(`.${u}`)))
+  ) {
+    return { tier: "umbrella_self_reference" };
+  }
+  if (domain) {
+    const domainHits = providers.filter((p) => {
+      const pd = ndProviderDomain(p.hjemmeside);
+      return pd !== null && ndDomainsEqual(pd, domain);
+    });
+    if (domainHits.length === 1) return { tier: "domain_match", provider_id: domainHits[0]!.id };
+    if (domainHits.length > 1) return { tier: "ambiguous_domain_match", provider_ids: domainHits.map((p) => p.id) };
+  }
+  const nameHits = providers.filter((p) => brregNameOverlapsProviderName(p.navn, member.name));
+  if (nameHits.length === 1) return { tier: "name_only", provider_id: nameHits[0]!.id };
+  if (nameHits.length > 1) return { tier: "ambiguous_name_match", provider_ids: nameHits.map((p) => p.id) };
+  return { tier: "no_match" };
+}
+
+router.post("/admin/gardssalg-medlemsliste-bekreft", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  let explicitIds: string[] | undefined;
+  if (body.providerIds !== undefined) {
+    if (!Array.isArray(body.providerIds) || body.providerIds.length === 0) {
+      res.status(400).json({ error: "providerIds must be a non-empty array of strings when provided" });
+      return;
+    }
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+          .map((v) => v.trim())
+      )
+    );
+    if (ids.length === 0) {
+      res.status(400).json({ error: "providerIds must be a non-empty array of strings when provided" });
+      return;
+    }
+    if (ids.length > ND_MEDLEM_HARD_CAP) {
+      res.status(400).json({ error: `Too many providerIds (max ${ND_MEDLEM_HARD_CAP} per call)` });
+      return;
+    }
+    explicitIds = ids;
+  }
+
+  let fetchResult: Awaited<ReturnType<typeof fetchNorskeDestillererMedlemsliste>>;
+  try {
+    fetchResult = await fetchNorskeDestillererMedlemsliste();
+  } catch (err) {
+    console.error("[gardssalg-medlemsliste-bekreft] medlemsliste fetch threw:", err);
+    res.status(500).json({ error: "Internal error" });
+    return;
+  }
+  if (!fetchResult.ok) {
+    // Source-fetch failure — never inferred as "no members" (hentefeil ≠
+    // fravær, the same discipline every other gårdssalg fetch step in this
+    // file applies). 200, not 500: an unreachable third-party page is an
+    // expected external condition, not an internal bug.
+    res.json({
+      success: false,
+      dry_run: dryRun,
+      error: "medlemsliste_fetch_failed",
+      reason: fetchResult.reason,
+      pages_fetched: fetchResult.pages_fetched,
+    });
+    return;
+  }
+
+  const notFound: string[] = [];
+  let providers: GardssalgMedlemslisteMatchCandidate[];
+  if (explicitIds) {
+    providers = [];
+    for (const id of explicitIds) {
+      const p = getGardssalgProviderMedlemslisteTarget(id);
+      if (p) providers.push(p);
+      else notFound.push(id);
+    }
+  } else {
+    providers = selectGardssalgProvidersForMedlemslisteMatch();
+  }
+
+  const domainMatch: Array<{
+    provider_id: string;
+    navn: string;
+    member_name: string;
+    member_source_url: string;
+    written: string[];
+    owner_locked: boolean;
+  }> = [];
+  const needsReview: Array<{
+    member_name: string;
+    member_source_url: string;
+    reason: string;
+    candidate_provider_ids: string[];
+  }> = [];
+  const noMatch: Array<{
+    member_name: string;
+    member_source_url: string;
+    member_website: string | null;
+    member_email: string | null;
+  }> = [];
+  const skippedUmbrella: Array<{ member_name: string; member_source_url: string }> = [];
+
+  const providerById = new Map(providers.map((p) => [p.id, p]));
+  const batchId = `medlemsliste-bekreft-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  try {
+    for (const member of fetchResult.members) {
+      const verdict = matchNdMember(member, providers);
+      if (verdict.tier === "umbrella_self_reference") {
+        skippedUmbrella.push({ member_name: member.name, member_source_url: member.source_url });
+        continue;
+      }
+      if (verdict.tier === "no_match") {
+        noMatch.push({
+          member_name: member.name,
+          member_source_url: member.source_url,
+          member_website: member.website,
+          member_email: member.epost,
+        });
+        continue;
+      }
+      if (verdict.tier === "ambiguous_domain_match" || verdict.tier === "ambiguous_name_match") {
+        needsReview.push({
+          member_name: member.name,
+          member_source_url: member.source_url,
+          reason: verdict.tier,
+          candidate_provider_ids: verdict.provider_ids,
+        });
+        continue;
+      }
+      if (verdict.tier === "name_only") {
+        needsReview.push({
+          member_name: member.name,
+          member_source_url: member.source_url,
+          reason: "name_only_match",
+          candidate_provider_ids: [verdict.provider_id],
+        });
+        continue;
+      }
+
+      // domain_match — the ONLY tier this route may write from.
+      const provider = providerById.get(verdict.provider_id);
+      if (!provider) continue; // defensive — verdict was computed from `providers` itself, always present
+      const candidate: GardssalgMedlemslisteEnrichmentCandidate = {
+        adresse: member.adresse,
+        postnummer: member.postnummer,
+        poststed: member.poststed,
+        telefon: member.telefon,
+        epost: member.epost,
+      };
+
+      if (dryRun) {
+        // Preview-only: the SAME isBlank-per-field fill-only decision (incl.
+        // the rollback veto on telefon/epost)
+        // applyGardssalgMedlemslisteEnrichment itself makes, computed here
+        // against a FRESH read so a dry-run can never claim a write the real
+        // apply path wouldn't also make.
+        const fresh = getProviderById(provider.id) as
+          | {
+              id: string;
+              navn?: string | null;
+              content_source?: string | null;
+              adresse?: string | null;
+              postnummer?: string | null;
+              poststed?: string | null;
+              telefon?: string | null;
+              epost?: string | null;
+            }
+          | null;
+        const locked = fresh?.content_source === "manual" || fresh?.content_source === "claim";
+        const isBlank = (v: unknown) => v === null || v === undefined || String(v).trim() === "";
+        const wouldWrite: string[] = [];
+        if (!locked && fresh) {
+          if (isBlank(fresh.adresse) && candidate.adresse?.trim()) wouldWrite.push("adresse");
+          if (isBlank(fresh.postnummer) && candidate.postnummer?.trim()) wouldWrite.push("postnummer");
+          if (isBlank(fresh.poststed) && candidate.poststed?.trim()) wouldWrite.push("poststed");
+          if (
+            isBlank(fresh.telefon) &&
+            candidate.telefon?.trim() &&
+            !gardssalgContactFieldWasRolledBack(provider.id, "telefon")
+          ) {
+            wouldWrite.push("telefon");
+          }
+          if (
+            isBlank(fresh.epost) &&
+            candidate.epost?.trim() &&
+            !gardssalgContactFieldWasRolledBack(provider.id, "epost")
+          ) {
+            wouldWrite.push("epost");
+          }
+        }
+        domainMatch.push({
+          provider_id: provider.id,
+          navn: fresh?.navn ?? provider.navn,
+          member_name: member.name,
+          member_source_url: member.source_url,
+          written: wouldWrite,
+          owner_locked: locked,
+        });
+        continue;
+      }
+
+      const written = applyGardssalgMedlemslisteEnrichment(provider.id, candidate, member.source_url, batchId);
+      domainMatch.push({
+        provider_id: provider.id,
+        navn: provider.navn,
+        member_name: member.name,
+        member_source_url: member.source_url,
+        written,
+        owner_locked: provider.content_source === "manual" || provider.content_source === "claim",
+      });
+    }
+  } catch (err) {
+    console.error("[gardssalg-medlemsliste-bekreft] matching/write pass failed:", err);
+    res.status(500).json({ error: "Internal error" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    dry_run: dryRun,
+    mode: explicitIds ? "providerIds" : "cohort",
+    source: {
+      url: ND_MEDLEMMER_BASE_URL,
+      pages_fetched: fetchResult.pages_fetched,
+      fetch_incomplete: fetchResult.fetch_incomplete,
+      pages_capped: fetchResult.pages_capped,
+    },
+    members_found: fetchResult.members.length,
+    not_found: notFound,
+    domain_match: domainMatch,
+    needs_review: needsReview,
+    no_match: noMatch,
+    skipped_umbrella_self_reference: skippedUmbrella,
+    counts: {
+      members_total: fetchResult.members.length,
+      domain_match: domainMatch.length,
+      needs_review: needsReview.length,
+      no_match: noMatch.length,
+    },
+  });
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-booking-activation (admin) ──────

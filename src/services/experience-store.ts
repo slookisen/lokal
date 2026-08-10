@@ -4513,6 +4513,249 @@ export function applyGardssalgProviderOrgnr(
   return ["org_nr"];
 }
 
+// ─── Gårdssalg Norske Destillerier medlemsliste-bekreftelse (dev-request
+// 2026-08-10-veien-til-pool-berikelseskjede-og-koedrenering, Skive 3) ────────
+//
+// Norske Destillerier's own member list (norskedestillerier.no/medlemmer/)
+// publishes each member's OWN address/postal/phone/email/website — a
+// producer-owned source, but a paraply/umbrella one: the association's copy
+// can be stale (67 North: the list's `www.67-north.no` doesn't answer, while
+// the producer's live site publishes a different, working address). The
+// route (POST /admin/gardssalg-medlemsliste-bekreft) matches members to
+// EXISTING experience_providers rows by DOMAIN, never creates a row, and
+// this function is the fill-only writer behind that route's `apply` gate.
+
+export interface GardssalgMedlemslisteEnrichmentCandidate {
+  adresse?: string | null;
+  postnummer?: string | null;
+  poststed?: string | null;
+  telefon?: string | null;
+  epost?: string | null;
+}
+
+/**
+ * Apply a Norske Destillerier medlemsliste candidate to ONE gårdssalg
+ * provider. Same lock guard as every sibling gårdssalg writer (NEVER writes
+ * if content_source is 'manual'/'claim'). FILL-ONLY per field — adresse/
+ * postnummer/poststed/telefon/epost are each written only if the row's
+ * CURRENT value is blank; a field already populated — whether confirmed on
+ * the producer's own live website or filled from any other source — is never
+ * touched (AK10). This is the sole enforcement point: since a field that
+ * already carries a producer-own-website value is, BY CONSTRUCTION, no
+ * longer blank, the isBlank() guard below is what makes the umbrella source
+ * unable to ever overwrite a fresher first-hand finding — no separate
+ * "is this fresher" comparison is needed or attempted.
+ *
+ * telefon/epost additionally honour gardssalgContactFieldWasRolledBack (the
+ * same veto applyGardssalgProviderContact already applies to those two
+ * fields — an admin's earlier rollback of a bad contact value must not be
+ * silently re-written by this, a different source feeding the same fields).
+ * adresse/postnummer/poststed do NOT carry that veto, mirroring
+ * applyGardssalgProviderAddress's own established convention for those three
+ * fields (no rollback-veto check there either).
+ *
+ * field_provenance gets a read-modify-write merge (preserves every other
+ * field's existing entry) — each written field's entry carries BOTH the
+ * generic {source_url, fetched_at} shape every other gårdssalg writer here
+ * uses AND the explicit {source: "norskedestillerier_medlemsliste",
+ * confirmed_at} tag the dev-request asks for by name, so the write is
+ * auditable/rollback-capable by the existing generic tooling (gardssalg_
+ * content_audit + content-rollback) while also being self-describing about
+ * which lever wrote it. Same transaction/audit shape as
+ * applyGardssalgProviderAddress/applyGardssalgProviderContact — one
+ * gardssalg_content_audit row per field actually written. Returns the field
+ * names actually written (empty array if nothing to write).
+ */
+export function applyGardssalgMedlemslisteEnrichment(
+  providerId: string,
+  candidate: GardssalgMedlemslisteEnrichmentCandidate,
+  sourceUrl: string,
+  batchId?: string
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, adresse, postnummer, poststed, telefon, epost, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        adresse: string | null;
+        postnummer: string | null;
+        poststed: string | null;
+        telefon: string | null;
+        epost: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+
+  function isBlank(v: unknown): boolean {
+    return v === null || v === undefined || String(v).trim() === "";
+  }
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: providerId };
+  const written: string[] = [];
+  // Pre-write snapshot — captured BEFORE any write below, so the audit
+  // trail's old_value is always the true pre-write value.
+  const oldValues: Record<string, string | null> = {
+    adresse: row.adresse,
+    postnummer: row.postnummer,
+    poststed: row.poststed,
+    telefon: row.telefon,
+    epost: row.epost,
+  };
+
+  if (isBlank(row.adresse) && candidate.adresse?.trim()) {
+    sets.push("adresse = @adresse");
+    params.adresse = candidate.adresse.trim();
+    written.push("adresse");
+  }
+  if (isBlank(row.postnummer) && candidate.postnummer?.trim()) {
+    sets.push("postnummer = @postnummer");
+    params.postnummer = candidate.postnummer.trim();
+    written.push("postnummer");
+  }
+  if (isBlank(row.poststed) && candidate.poststed?.trim()) {
+    sets.push("poststed = @poststed");
+    params.poststed = candidate.poststed.trim();
+    written.push("poststed");
+  }
+  if (
+    isBlank(row.telefon) &&
+    candidate.telefon?.trim() &&
+    !gardssalgContactFieldWasRolledBack(providerId, "telefon")
+  ) {
+    sets.push("telefon = @telefon");
+    params.telefon = candidate.telefon.trim();
+    written.push("telefon");
+  }
+  if (
+    isBlank(row.epost) &&
+    candidate.epost?.trim() &&
+    !gardssalgContactFieldWasRolledBack(providerId, "epost")
+  ) {
+    sets.push("epost = @epost");
+    params.epost = candidate.epost.trim();
+    written.push("epost");
+  }
+
+  if (sets.length === 0) return [];
+
+  sets.push("updated_at = datetime('now')");
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  let provenance: Record<string, Record<string, unknown>> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, Record<string, unknown>>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  const confirmedAt = new Date().toISOString();
+  for (const f of written) {
+    provenance[f] = {
+      source_url: sourceUrl,
+      fetched_at: confirmedAt,
+      source: "norskedestillerier_medlemsliste",
+      confirmed_at: confirmedAt,
+    };
+  }
+  sets.push("field_provenance = @field_provenance");
+  params.field_provenance = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = @id`).run(params);
+    const insertAudit = db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    );
+    for (const f of written) {
+      insertAudit.run({
+        id: uuid(),
+        provider_id: providerId,
+        field_name: f,
+        old_value: oldValues[f] ?? null,
+        new_value: (params[f] as string | undefined) ?? null,
+        source_url: sourceUrl,
+        batch_id: batchId ?? null,
+      });
+    }
+  });
+  applyWithAudit();
+
+  return written;
+}
+
+export interface GardssalgMedlemslisteMatchCandidate {
+  id: string;
+  navn: string;
+  hjemmeside: string | null;
+  content_source: string | null;
+}
+
+const GS_MEDLEM_MATCH_COLUMNS = `id, navn, hjemmeside, content_source`;
+
+/**
+ * Auto-select the gårdssalg provider universe for the medlemsliste-bekreft
+ * route's cohort (no `providerIds`) mode. Same "gårdssalg providers"
+ * predicate every sibling selector in this file uses (producer_type set OR
+ * rfb-seed), and — mirroring the gardssalg-veien-til-pool review fix-up
+ * (finding 1) — excludes the synthetic producer_type='test-gardssalg'
+ * canary row and catalog_hidden=1 rows from the AUTOMATIC cohort, so a sweep
+ * can never touch either; an explicit providerIds call still can (see
+ * getGardssalgProviderMedlemslisteTarget below), the same deliberate-act
+ * distinction gardssalg-veien-til-pool draws. Unlike the address/orgnr
+ * backfill selectors, this does NOT filter on any field already being
+ * blank — matching is by DOMAIN (against whatever `hjemmeside` the row
+ * already holds, or lack of one for the name-only tier), and per-field
+ * fill-only is enforced downstream by applyGardssalgMedlemslisteEnrichment
+ * itself. No limit/cap: the gårdssalg population is ~48 rows total (see
+ * GS_CR_HARD_CAP's own comment), a single indexed scan.
+ */
+export function selectGardssalgProvidersForMedlemslisteMatch(): GardssalgMedlemslisteMatchCandidate[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT ${GS_MEDLEM_MATCH_COLUMNS}
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+        ORDER BY created_at ASC`
+    )
+    .all() as GardssalgMedlemslisteMatchCandidate[];
+}
+
+/**
+ * Resolve an explicit providerId for the medlemsliste-bekreft route's
+ * `providerIds` override — scoped to the gårdssalg predicate only (NOT the
+ * test-canary/catalog_hidden exclusions above), mirroring
+ * getGardssalgProviderAddressTarget's own override semantics: an admin
+ * naming a specific row is a deliberate act, categorically different from an
+ * automated sweep picking it up incidentally.
+ */
+export function getGardssalgProviderMedlemslisteTarget(providerId: string): GardssalgMedlemslisteMatchCandidate | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT ${GS_MEDLEM_MATCH_COLUMNS}
+         FROM experience_providers
+        WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get(providerId) as GardssalgMedlemslisteMatchCandidate | undefined;
+  return row ?? null;
+}
+
 /**
  * True when this provider's LATEST org_nr audit row is a rollback (an admin
  * deliberately undid an earlier backfill). The backfill route treats such
