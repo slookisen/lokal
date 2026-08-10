@@ -9656,7 +9656,7 @@ function gsVtpReadRow(expDb: Database.Database, providerId: string): GsVtpRawRow
     .get(providerId) as GsVtpRawRow | undefined;
 }
 
-function gsVtpPresent(v: string | null): boolean {
+function gsVtpPresent(v: string | null): v is string {
   return v !== null && v.trim() !== "";
 }
 
@@ -9765,21 +9765,52 @@ async function gsVtpProcessProvider(
     } else if (!gsVtpPresent(row0.hjemmeside)) {
       steps.website = { status: "no_website_no_candidate" };
     } else {
-      const verifyResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-verification-remediation", {
-        providerIds: [providerId],
-        apply,
-      });
-      const summary = verifyResp.body?.summary as
-        | { verified?: number; unverified?: number; aggregator?: number; missing_source?: number }
-        | undefined;
-      if (summary?.verified) {
-        steps.website = { status: apply ? "verified" : "would_verify" };
-      } else if (summary?.unverified) {
-        steps.website = { status: "queued_verification_failed" };
-      } else if (summary?.aggregator) {
-        steps.website = { status: "aggregator_host" };
+      // Review fix-up pass, finding 3: classifyGardssalgProducerWebsite
+      // (gardssalg-website-verification.ts) maps a fetch FAILURE to
+      // classification:"unverified" — its own doc comment discloses this is
+      // deliberate fail-closed behaviour for ITS purpose, but it is
+      // indistinguishable from "fetched fine, found no evidence" to any
+      // caller. applyGardssalgWebsiteVerification then durably WRITES
+      // field_provenance.hjemmeside_verification={verified:false,...} from
+      // that classification. Reproduced live: an ECONNRESET on a producer's
+      // stored homepage got permanently stamped verified:false from a pure
+      // network blip that never reached the site — worse than the org.nr
+      // gap above because it corrupts the authoritative provenance column
+      // (which gates the content step's own isHjemmesideVerified check,
+      // see below), not just an advisory queue entry. classifyGardssalgProducerWebsite/
+      // applyGardssalgWebsiteVerification are shared (gardssalg-claim.ts,
+      // gardssalg-field-concordance.ts, the GET/POST audit+remediation
+      // routes) so they are not touched here. Instead: this step does its
+      // OWN pre-check fetch — the SAME crFetchGardssalgContent the
+      // remediation route's own fetchFn adapter calls internally, and the
+      // same aggregator-host skip classifyGardssalgProducerWebsite itself
+      // applies before ever fetching — and only calls the remediation
+      // endpoint (with apply:true, i.e. an actual write) once that pre-check
+      // has proven the site is actually reachable. A pre-check failure
+      // reports retry_later and skips calling the remediation endpoint
+      // entirely for this run, so nothing gets written from a network blip.
+      const gsVtpHost = hostFromUrlLike(row0.hjemmeside);
+      const gsVtpIsAggregator = !!gsVtpHost && isDirectoryOrAggregatorHost(gsVtpHost);
+      const gsVtpPrecheck = gsVtpIsAggregator ? null : await crFetchGardssalgContent(row0.hjemmeside);
+      if (gsVtpPrecheck && !gsVtpPrecheck.ok) {
+        steps.website = { status: "retry_later", detail: gsVtpPrecheck.reason };
       } else {
-        steps.website = { status: "no_website_no_candidate" };
+        const verifyResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-verification-remediation", {
+          providerIds: [providerId],
+          apply,
+        });
+        const summary = verifyResp.body?.summary as
+          | { verified?: number; unverified?: number; aggregator?: number; missing_source?: number }
+          | undefined;
+        if (summary?.verified) {
+          steps.website = { status: apply ? "verified" : "would_verify" };
+        } else if (summary?.unverified) {
+          steps.website = { status: "queued_verification_failed" };
+        } else if (summary?.aggregator) {
+          steps.website = { status: "aggregator_host" };
+        } else {
+          steps.website = { status: "no_website_no_candidate" };
+        }
       }
     }
   }
@@ -9891,8 +9922,30 @@ async function gsVtpProcessProvider(
       // never auto-approved here (see this function's own doc comment).
       steps.orgnr = { status: "queued", reason: unresolved.reason };
     } else if (err) {
-      // AK8 — findOrgnumberByName's own network/parse failure, distinct
-      // from a genuine "no candidate" (which lands in `unresolved` above).
+      // Review fix-up pass, finding 2: this comment previously claimed a
+      // Brreg-search network/parse failure lands HERE, distinct from a
+      // genuine "no candidate" (which lands in `unresolved` above) — that
+      // claim was FALSE, verified live. findOrgnumberByName (brreg-client.ts)
+      // catches every failure internally (network error, timeout, parse
+      // error) and resolves to null, IDENTICAL to a genuine empty search
+      // result. gardssalg-orgnr-backfill's own try/catch around that call
+      // (routes/opplevelser.ts, the /admin/gardssalg-orgnr-backfill handler)
+      // therefore can never observe the difference either: a real Brreg
+      // fetch failure (e.g. an ECONNRESET during the name search) is
+      // reported as `unresolved`/"no_brreg_candidate" above, misreporting a
+      // hentefeil as a genuine absence — the exact same class of gap the
+      // brreg-verifisering step below already discloses for
+      // verifyOrgNumber's `orgnr_not_found_or_unreachable`. findOrgnumberByName
+      // is shared by many other callers (experience-store.ts, marketplace.ts,
+      // dental.ts, debio-cross-check.ts, local-orgnr-candidates.ts, ...), so
+      // fixing the underlying conflation touches shared client code well
+      // beyond this routine's scope — flagged here honestly rather than
+      // silently leaving a comment implying a distinction this call site
+      // cannot actually make. This `err` branch is not unreachable dead
+      // code — it still fires for some OTHER failure inside the backfill
+      // route itself (e.g. a review-queue/DB write error) — it just never
+      // fires for a Brreg search failure specifically, contrary to what this
+      // comment used to say.
       steps.orgnr = { status: "retry_later", detail: err.error };
     } else {
       steps.orgnr = { status: "no_action" };
@@ -10027,9 +10080,45 @@ router.post("/admin/gardssalg-veien-til-pool", requireAdmin, async (req: Request
       });
       cohortTotal = targetIds.length;
     } else {
+      // BLOCKING FIX (review fix-up pass, finding 1): computeGardssalgReadinessRows
+      // is deliberately UNFILTERED — it's a reporting function, every row
+      // must appear (see its own doc comment) — but cohort mode here reuses
+      // that same row set as a WRITE-TARGET list, which is a different
+      // contract entirely. Every other write-capable gårdssalg cohort
+      // selector in this codebase excludes the synthetic
+      // producer_type='test-gardssalg' canary row (experience-store.ts's
+      // selectGardssalgProvidersForContactExtraction/
+      // selectGardssalgProvidersForBrregVerify, gardssalg-website-
+      // verification.ts's GS_WV_TEST_GARDSSALG_EXCLUSION_SQL) — this was the
+      // only cohort-mode selector that didn't. Reproduced live: seeding a
+      // producer_type='test-gardssalg' row and calling with apply:true and
+      // no providerIds got it selected AND actually written to (a fake
+      // org_nr landed on the canary row). Filtered here on the already-
+      // computed rows rather than re-querying producer_type twice.
+      // catalog_hidden rows are excluded too — non-blocking per the review,
+      // but the identical fix over the identical row set, so done in the
+      // same pass. `r.visible` is exactly `catalog_hidden !== 1`
+      // (computeGardssalgReadinessRows' own field) — no extra query needed
+      // for that half.
+      //
+      // Explicit providerIds mode (above) deliberately keeps TODAY's
+      // behaviour and is NOT given this guard: naming a specific row is a
+      // deliberate operator act (e.g. exercising this exact routine against
+      // the test-gardssalg fixture on purpose to verify it end-to-end),
+      // categorically different from an automated cohort sweep silently
+      // picking a canary row up along with everything else.
+      const testGardssalgIds = new Set(
+        (
+          expDb
+            .prepare(`SELECT id FROM experience_providers WHERE producer_type = 'test-gardssalg'`)
+            .all() as Array<{ id: string }>
+        ).map((r) => r.id)
+      );
       const allRows = computeGardssalgReadinessRows(expDb);
       const notReadyIds = allRows
         .filter((r) => r.readiness_tier !== "outreach_ready")
+        .filter((r) => r.visible)
+        .filter((r) => !testGardssalgIds.has(r.id))
         .map((r) => r.id)
         .sort();
       cohortTotal = notReadyIds.length;

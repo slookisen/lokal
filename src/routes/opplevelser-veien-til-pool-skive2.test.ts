@@ -43,6 +43,17 @@
  *   vtp2-21          AK9: the queue-age report surfaces an old,
  *                    artificially-backdated queue row as `stale:true` and
  *                    first in `oldest_first`, on every run.
+ *   vtp2-22          Review fix-up pass, finding 1 (BLOCKING): cohort mode
+ *                    (no providerIds) never selects — nor writes to — a
+ *                    seeded producer_type='test-gardssalg' canary row or a
+ *                    catalog_hidden row; both are excluded from cohort_total
+ *                    itself, not just from the paged slice.
+ *   vtp2-23          Review fix-up pass, finding 3: a classified fetch
+ *                    FAILURE on the nettsted step's own homepage fetch (not
+ *                    a mismatch, an actual thrown ECONNRESET) reports
+ *                    retry_later and leaves field_provenance untouched —
+ *                    never durably stamped verified:false from a network
+ *                    blip.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/routes/opplevelser-veien-til-pool-skive2.test.ts
@@ -262,6 +273,12 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
         if (u.startsWith("https://cr-fail-vtp2.example")) {
           throw Object.assign(new Error("read ECONNRESET"), { cause: { code: "ECONNRESET" } });
         }
+        // ── nettsted-steget: rein hentefeil på selve homepage-fetchen (review
+        // fix-up pass, finding 3) — MÅ rapporteres retry_later, ALDRI
+        // queued_verification_failed, og MÅ IKKE stemple field_provenance.
+        if (u.startsWith("https://nettsted-fail-vtp2.example")) {
+          throw Object.assign(new Error("read ECONNRESET"), { cause: { code: "ECONNRESET" } });
+        }
         // ── org.nr-steget: Brreg navnesøk, ingen treff ──
         if (u.includes("/enheter?navn=")) {
           return { ok: true, status: 200, json: async () => ({ _embedded: { enheter: [] } }) } as unknown as Response;
@@ -441,6 +458,73 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
         assertEq(res.body.queues.orgnr_review_queue.oldest_first[0]?.provider_id, "vtp2-agecheck",
           "vtp2-21d: eldste rad står FØRST (oldest-first)");
         assertTrue(res.body.queues?.website_review_queue !== undefined, "vtp2-21e: nettsted-køen rapporteres samtidig");
+      }
+
+      // ═══ vtp2-22: review fix-up, finding 1 (BLOCKING) — kohort-modus (ingen
+      // providerIds) må ALDRI velge eller skrive til en test-gardssalg-
+      // kanarirad eller en catalog_hidden-rad, verken i den pagede sida ELLER
+      // i selve cohort_total-telligen ═══
+      {
+        // Baseline BEFORE the two canary rows exist below — dry-run (no
+        // `apply`), no providerIds -> the same cohort branch the fix targets.
+        // cohort_total is computed BEFORE the offset/limit slice inside the
+        // route, so it is stable regardless of `limit`/how many rows this
+        // particular call happens to walk.
+        const baseline = await callVtp({});
+        assertEq(baseline.body.mode, "cohort", "vtp2-22a: sanity — dette er kohort-modus (ingen providerIds sendt)");
+        const baselineTotal = baseline.body.cohort_total as number;
+
+        seed({
+          id: "vtp2-canary-test", navn: "Test Gardssalg Kanari", pt: "test-gardssalg",
+          hj: null, created: "2026-01-12",
+        });
+        seed({
+          id: "vtp2-canary-hidden", navn: "Skjult Gard Kanari", catalog_hidden: 1,
+          hj: null, created: "2026-01-13",
+        });
+
+        const res = await callVtp({ apply: true }); // kohort-modus, apply:true — den reproduserte reelle skrivingen
+        assertEq(res.body.mode, "cohort", "vtp2-22b: fortsatt kohort-modus");
+        assertEq(res.body.cohort_total, baselineTotal,
+          "vtp2-22c: cohort_total er UENDRET etter at én test-gardssalg-rad og én catalog_hidden-rad ble lagt til — begge ekskluderes fra selve telligen, ikke bare fra den pagede siden");
+        assertTrue(!(res.body.providers as any[]).some((p) => p.provider_id === "vtp2-canary-test"),
+          "vtp2-22d: test-gardssalg-kanarien ble ALDRI valgt som mål i kohort-modus");
+        assertTrue(!(res.body.providers as any[]).some((p) => p.provider_id === "vtp2-canary-hidden"),
+          "vtp2-22e: den skjulte (catalog_hidden) raden ble ALDRI valgt som mål i kohort-modus");
+
+        const canaryTest = expDb
+          .prepare(`SELECT org_nr, hjemmeside, epost, telefon, about_text FROM experience_providers WHERE id='vtp2-canary-test'`)
+          .get() as any;
+        assertTrue(
+          canaryTest.org_nr === null && canaryTest.hjemmeside === null && canaryTest.epost === null && canaryTest.about_text === null,
+          "vtp2-22f: test-gardssalg-kanarien er fullstendig urørt — dette var reviewerens reelle repro (en falsk org_nr havnet på kanariraden)"
+        );
+        const canaryHidden = expDb
+          .prepare(`SELECT org_nr, hjemmeside, epost, telefon FROM experience_providers WHERE id='vtp2-canary-hidden'`)
+          .get() as any;
+        assertTrue(
+          canaryHidden.org_nr === null && canaryHidden.hjemmeside === null,
+          "vtp2-22g: den skjulte raden er også fullstendig urørt"
+        );
+      }
+
+      // ═══ vtp2-23: review fix-up, finding 3 — en klassifisert hentefeil på
+      // selve nettsted-fetchen (ikke en mismatch — en reell thrown feil)
+      // rapporteres retry_later og lar field_provenance stå urørt ═══
+      {
+        seed({ id: "vtp2-nettstedfail", navn: "Nettsted Fail Gard", hj: "https://nettsted-fail-vtp2.example", created: "2026-01-14" });
+        const before = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='vtp2-nettstedfail'`).get() as any;
+
+        const res = await callVtp({ providerIds: ["vtp2-nettstedfail"], apply: true });
+        const row = (res.body.providers as any[]).find((p) => p.provider_id === "vtp2-nettstedfail");
+        assertEq(row.steps.website.status, "retry_later",
+          "vtp2-23a: en klassifisert hentefeil på selve nettsted-fetchen -> retry_later, ALDRI queued_verification_failed");
+        assertTrue(row.steps.website.status !== "queued_verification_failed",
+          "vtp2-23b: eksplisitt IKKE forvekslet med et reelt gjennomført, uverifisert funn");
+
+        const after = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='vtp2-nettstedfail'`).get() as any;
+        assertEq(after.field_provenance, before.field_provenance,
+          "vtp2-23c: field_provenance er IKKE skrevet/endret av en ren nettverksfeil på fetchen (var durably stemplet verified:false før denne fiksen)");
       }
     } catch (err: any) {
       failed++;
