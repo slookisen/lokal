@@ -408,6 +408,8 @@ import {
   hostFromUrlLike,
   registrableDomain,
   PLACEHOLDER_EMAIL_DOMAINS,
+  FREE_MAIL_DOMAINS,
+  hasHomepageEvidence,
 } from "../services/cross-source-validator";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
 // Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
@@ -5523,7 +5525,7 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
 
     const verifyFn = getGardssalgBrregVerifyOverride() ?? ((orgNr: string) => verifyOrgNumber(orgNr));
 
-    const verified: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string; fields_written: string[] }> = [];
+    const verified: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string; antall_ansatte: number | null; fields_written: string[] }> = [];
     const nameMismatch: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string | null }> = [];
     const inactive: Array<{ provider_id: string; navn: string; org_nr: string; flag: string | null; brreg_name: string | null }> = [];
     const orgnrNotFound: Array<{ provider_id: string; navn: string; org_nr: string }> = [];
@@ -5550,11 +5552,19 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
           continue;
         }
         const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+        // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+        // stoerrelsesgate): antall_ansatte rides along on this SAME verify
+        // call — result.employees is read off the SAME GET /enheter/{orgNr}
+        // response, no second HTTP call. `undefined` (a test double that
+        // predates this field) and `null` (Brreg genuinely has no figure)
+        // both normalise to `null` here — reported, and only ever written on
+        // apply below.
+        const employees = typeof result.employees === "number" ? result.employees : null;
         if (dryRun) {
-          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: [] });
+          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, antall_ansatte: employees, fields_written: [] });
         } else {
-          const written = applyGardssalgBrregVerified(t.id, evidenceUrl, batchTag);
-          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, fields_written: written });
+          const written = applyGardssalgBrregVerified(t.id, evidenceUrl, batchTag, employees);
+          verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, antall_ansatte: employees, fields_written: written });
         }
       } catch (e: any) {
         errors.push({ provider_id: t.id, error: e?.message ?? String(e) });
@@ -7826,6 +7836,20 @@ router.get("/admin/gardssalg-contact-coverage", requireAdmin, (_req: Request, re
 // binary request/paused UI label.
 type OutreachBookingStatus = "live" | "paused" | "none";
 
+// dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+// Skive 1: the antall_ansatte size-gate (pure classifier + DB-backed L1
+// knob) — see services/gardssalg-outreach-size-gate.ts's own module doc
+// comment for why the knob is DB-backed rather than a repo-tracked YAML
+// file (the Dockerfile doesn't COPY a config/ directory, so a file there
+// would need a redeploy to take effect — the opposite of what krav 3/6
+// ask for).
+import {
+  computeGardssalgSizeFlag,
+  getGardssalgSizeGateConfig,
+  setGardssalgSizeGateConfig,
+  type GardssalgSizeFlag,
+} from "../services/gardssalg-outreach-size-gate";
+
 function computeBookingStatus(
   bookingLive: number | null,
   catalogHidden: number | null,
@@ -7937,6 +7961,12 @@ function computeGardssalgReadinessRows(
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
+  // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate) — additive, informational regardless of readiness_tier
+  // or the size-gate's own enabled/disabled switch: Daniel sees the size
+  // signal on every row, always, even when the gate itself is toggled off.
+  antall_ansatte: number | null;
+  size_flag: GardssalgSizeFlag;
 }> {
   let rows: Array<{
     id: string;
@@ -7956,6 +7986,7 @@ function computeGardssalgReadinessRows(
     slug: string | null;
     field_provenance: string | null;
     brreg_verified: number | null;
+    antall_ansatte: number | null;
   }> = [];
 
   // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
@@ -7965,7 +7996,7 @@ function computeGardssalgReadinessRows(
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
-                field_provenance, brreg_verified
+                field_provenance, brreg_verified, antall_ansatte
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
   const params: string[] = [];
@@ -8035,6 +8066,13 @@ function computeGardssalgReadinessRows(
     }
   }
 
+  // Skive 1 size gate: ONE config read per call (not per-row) — same
+  // discipline as the conflict scan above. Threshold applies to size_flag
+  // unconditionally (informational, always shown); only preflight's
+  // blocking override (computeGardssalgOutreachPreflight, below) reads
+  // `enabled`.
+  const sizeGateThreshold = getGardssalgSizeGateConfig(expDb).threshold;
+
   return rows.map((p) => {
     const has_website = present(p.hjemmeside);
     const has_about_text = present(p.about_text);
@@ -8051,6 +8089,7 @@ function computeGardssalgReadinessRows(
     const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
     const name_token_conflict_candidate = nameTokenConflictCandidateIds.has(p.id);
     const brreg_verified = p.brreg_verified === 1;
+    const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold);
 
     const readiness_tier = computeGardssalgReadinessTier({
       has_website,
@@ -8085,6 +8124,8 @@ function computeGardssalgReadinessRows(
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
+      antall_ansatte: p.antall_ansatte,
+      size_flag,
     };
   });
 }
@@ -8167,6 +8208,7 @@ const MAX_GARDSSALG_PREFLIGHT_BATCH = 200;
 export function computeGardssalgOutreachPreflight(
   expDb: Database.Database,
   providerIds: string[],
+  opts?: { skipRecipientDedupe?: boolean },
 ): {
   results: Array<{ provider_id: string; name: string | null; go: boolean; reason: string | null }>;
   summary: { go: number; no_go: number; total: number };
@@ -8197,31 +8239,67 @@ export function computeGardssalgOutreachPreflight(
       return { provider_id: id, name: row.name, go: false, reason: row.readiness_tier };
     });
 
+  // ── Skive 1 size gate (dev-request 2026-08-09-daglig-outreach-
+  // klargjoering-og-stoerrelsesgate): a SECOND override pass, AFTER the
+  // tier-based go/no_go pass above (unchanged) and BEFORE the Slice-2
+  // outreach-guard dedupe below — a large-company exclusion must never "win"
+  // a shared-domain dedupe slot over a legitimate smaller candidate. Only
+  // ever turns an already-go:true row go:false; "liten"/"ukjent" rows (and
+  // any row already go:false for a content-readiness reason) are left
+  // completely alone — krav 5: "Gaten utelukker, den godkjenner aldri."
+  // Toggleable off entirely via the DB-backed knob's `enabled` switch (krav
+  // 6), with NO code change and NO deploy required — see
+  // services/gardssalg-outreach-size-gate.ts.
+  const sizeGateConfig = getGardssalgSizeGateConfig(expDb);
+  if (sizeGateConfig.enabled) {
+    for (const result of results) {
+      if (!result.go) continue;
+      const row = byId.get(result.provider_id);
+      if (row && row.size_flag === "stor") {
+        result.go = false;
+        result.reason = "large_company_excluded";
+      }
+    }
+  }
+
   // ── Slice 2 outreach-guard: cross-row dedup over THIS batch's go:true
   // rows only. Fetch email separately (does NOT touch
   // computeGardssalgReadinessRows's signature/return type — that function
   // is also used, unmodified, by GET /admin/gardssalg-outreach-readiness).
-  const goIds = results.filter((r) => r.go).map((r) => r.provider_id);
-  if (goIds.length > 0) {
-    const placeholders = goIds.map(() => "?").join(", ");
-    const emailRows = expDb
-      .prepare(`SELECT id, epost FROM experience_providers WHERE id IN (${placeholders})`)
-      .all(...goIds) as Array<{ id: string; epost: string | null }>;
-    const emailById = new Map(emailRows.map((r) => [r.id, r.epost]));
+  //
+  // opts.skipRecipientDedupe (default false — every EXISTING caller keeps
+  // this block exactly as before, byte-for-byte): added for GET /admin/
+  // gardssalg-outreach-daily-prep's own bugfix (PR review, MEDIUM finding —
+  // see that route's module doc comment). That route needs Skive 1 (the
+  // tier check above + the size gate just above this block) WITHOUT this
+  // batch-email dedup, so it can run Skive 3's address/profile-text/
+  // industry checks first and only dedup among candidates that already
+  // survived everything else. POST /admin/gardssalg-outreach-preflight and
+  // computeGardssalgOutreachSendEligibility's other callers (pilot-send)
+  // never pass this option, so their own gating is completely unchanged.
+  if (!opts?.skipRecipientDedupe) {
+    const goIds = results.filter((r) => r.go).map((r) => r.provider_id);
+    if (goIds.length > 0) {
+      const placeholders = goIds.map(() => "?").join(", ");
+      const emailRows = expDb
+        .prepare(`SELECT id, epost FROM experience_providers WHERE id IN (${placeholders})`)
+        .all(...goIds) as Array<{ id: string; epost: string | null }>;
+      const emailById = new Map(emailRows.map((r) => [r.id, r.epost]));
 
-    // orderedIds order, restricted to the go:true candidates — first-seen
-    // in the ORIGINAL batch order wins the dedup, not query result order.
-    const candidates = orderedIds
-      .filter((id) => emailById.has(id))
-      .map((id) => ({ provider_id: id, email: emailById.get(id) ?? null }));
+      // orderedIds order, restricted to the go:true candidates — first-seen
+      // in the ORIGINAL batch order wins the dedup, not query result order.
+      const candidates = orderedIds
+        .filter((id) => emailById.has(id))
+        .map((id) => ({ provider_id: id, email: emailById.get(id) ?? null }));
 
-    const { suppressed } = dedupeGardssalgOutreachRecipients(candidates);
+      const { suppressed } = dedupeGardssalgOutreachRecipients(candidates);
 
-    for (const result of results) {
-      const reason = suppressed.get(result.provider_id);
-      if (reason) {
-        result.go = false;
-        result.reason = reason;
+      for (const result of results) {
+        const reason = suppressed.get(result.provider_id);
+        if (reason) {
+          result.go = false;
+          result.reason = reason;
+        }
       }
     }
   }
@@ -8262,6 +8340,162 @@ router.post("/admin/gardssalg-outreach-preflight", requireAdmin, (req: Request, 
     res.status(500).json({ error: "Internal error" });
   }
 });
+
+// ─── computeGardssalgOutreachSendEligibility ───────────────────────────────
+//
+// Extracted for dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+// stoerrelsesgate, Skive 2 (daily prep): the per-id ELIGIBILITY determination
+// that used to live only inline in POST /admin/gardssalg-outreach-pilot-send's
+// loop — preflight GO/NO-GO (which itself already folds in Skive 1's size
+// gate), no_email, blocklist, own-table cooldown, cross-platform cooldown —
+// is now a standalone, side-effect-free (no email sent, no row written)
+// function, so the new GET /admin/gardssalg-outreach-daily-prep route further
+// below can run the EXACT SAME dry-run eligibility check pilot-send's own
+// dry-run (`apply` absent) path runs, never a second/forked copy. Behavior-
+// preserving extraction: POST /admin/gardssalg-outreach-pilot-send below now
+// calls this too instead of repeating the checks inline — same order, same
+// reasons, same cooldown SQL, same cooldown-window derivation. Only the
+// ACTUAL send (emailService.sendGardssalgOutreach + the
+// experience_outreach_sent_log write + CRM filing) stays inline in that
+// route's handler, completely untouched — this function never reaches that
+// code path and has no `apply` parameter at all.
+export type GardssalgOutreachEligibility =
+  | {
+      provider_id: string;
+      eligible: false;
+      status: "skipped";
+      reason: string;
+      preflight_reason?: string;
+      last_sent_at?: string;
+      suppressed_by?: string;
+      cross_platform?: boolean;
+    }
+  | {
+      provider_id: string;
+      eligible: true;
+      status: "would_send";
+      navn: string | null;
+      slug: string | null;
+      epost: string; // trimmed, non-empty — guaranteed present when eligible:true
+    };
+
+export function computeGardssalgOutreachSendEligibility(
+  expDb: Database.Database,
+  providerIds: string[],
+  opts?: { skipRecipientDedupe?: boolean },
+): GardssalgOutreachEligibility[] {
+  // Single preflight pass, reused per-provider below — same tiering
+  // logic/outcome as POST /admin/gardssalg-outreach-preflight, folding in
+  // the Skive-1 size gate and the Slice-2 cross-row outreach-guard dedupe.
+  //
+  // opts.skipRecipientDedupe passes straight through to
+  // computeGardssalgOutreachPreflight (see its own doc comment) — default
+  // false/unset, so POST /admin/gardssalg-outreach-pilot-send (which calls
+  // this function with no third argument at all) is completely unaffected.
+  const { results: preflightResults } = computeGardssalgOutreachPreflight(expDb, providerIds, opts);
+  const preflightById = new Map(preflightResults.map((r) => [r.provider_id, r]));
+
+  // Same cooldown-window derivation as routes/crm.ts ~L441 and the (former)
+  // inline copy in POST /admin/gardssalg-outreach-pilot-send.
+  const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
+  const cooldownCutoff = new Date(Date.now() - cooldownDays * 86400_000).toISOString();
+
+  const out: GardssalgOutreachEligibility[] = [];
+
+  for (const providerId of providerIds) {
+    const pf = preflightById.get(providerId);
+    if (!pf || !pf.go) {
+      // Surfaced as a direct top-level reason (mirrors pilot-send's own
+      // handling below) — large_company_excluded is a deliberate exclusion
+      // policy, not a generic content-readiness gap.
+      if (pf?.reason === "large_company_excluded") {
+        out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "large_company_excluded" });
+        continue;
+      }
+      out.push({
+        provider_id: providerId,
+        eligible: false,
+        status: "skipped",
+        reason: "preflight_no_go",
+        preflight_reason: pf?.reason ?? "ikke_funnet",
+      });
+      continue;
+    }
+
+    const providerRow = expDb
+      .prepare(`SELECT navn, slug, epost FROM experience_providers WHERE id = ?`)
+      .get(providerId) as { navn: string | null; slug: string | null; epost: string | null } | undefined;
+
+    const email = providerRow?.epost?.trim();
+    if (!email) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "no_email" });
+      continue;
+    }
+
+    const blockCheck = isBlocked({ email });
+    if (blockCheck.blocked) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "blocklisted" });
+      continue;
+    }
+
+    // ── Own-table cooldown: this vertical's persistent send log ─────────
+    const ownPrior = expDb
+      .prepare(
+        `SELECT sent_at FROM experience_outreach_sent_log
+          WHERE LOWER(recipient_email) = LOWER(?) AND sent_at >= ? AND is_test = 0
+          ORDER BY sent_at DESC LIMIT 1`,
+      )
+      .get(email, cooldownCutoff) as { sent_at: string } | undefined;
+
+    if (ownPrior) {
+      out.push({
+        provider_id: providerId,
+        eligible: false,
+        status: "skipped",
+        reason: "cooldown_suppressed",
+        last_sent_at: ownPrior.sent_at,
+        suppressed_by: "experiences",
+      });
+      continue;
+    }
+
+    // ── Cross-platform cooldown: read-only, existing RFB outreach_sent_log
+    const rfbDb = getRfbDb();
+    const crossPrior = rfbDb
+      .prepare(
+        `SELECT sent_at, vertical_id FROM outreach_sent_log
+          WHERE recipient_email IS NOT NULL
+            AND LOWER(recipient_email) = LOWER(?)
+            AND sent_at >= ?
+          ORDER BY sent_at DESC LIMIT 1`,
+      )
+      .get(email, cooldownCutoff) as { sent_at: string; vertical_id: string } | undefined;
+
+    if (crossPrior) {
+      out.push({
+        provider_id: providerId,
+        eligible: false,
+        status: "skipped",
+        reason: "cooldown_suppressed",
+        last_sent_at: crossPrior.sent_at,
+        suppressed_by: crossPrior.vertical_id,
+        cross_platform: true,
+      });
+      continue;
+    }
+
+    out.push({
+      provider_id: providerId,
+      eligible: true,
+      status: "would_send",
+      navn: providerRow?.navn ?? null,
+      slug: providerRow?.slug ?? null,
+      epost: email,
+    });
+  }
+
+  return out;
+}
 
 // ─── POST /api/opplevelser/admin/gardssalg-outreach-pilot-send ─────────────
 //
@@ -8341,95 +8575,51 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
   const results: PilotResultRow[] = [];
 
   try {
-    // Single preflight pass, reused per-provider below — same tiering
-    // logic/outcome as POST /admin/gardssalg-outreach-preflight.
-    const { results: preflightResults } = computeGardssalgOutreachPreflight(expDb, providerIds);
-    const preflightById = new Map(preflightResults.map((r) => [r.provider_id, r]));
+    // Single eligibility pass, reused per-provider below — computes preflight
+    // GO/NO-GO (which itself folds in the Skive-1 size gate), no_email,
+    // blocklist, own-table cooldown, and cross-platform cooldown, in that
+    // order. Extracted to computeGardssalgOutreachSendEligibility just above
+    // so GET /admin/gardssalg-outreach-daily-prep (further below) can run the
+    // exact same dry-run check — single source of truth, never a
+    // second/forked copy.
+    const eligibility = computeGardssalgOutreachSendEligibility(expDb, providerIds);
 
-    // Same cooldown-window derivation as routes/crm.ts ~L441.
-    const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
-    const cooldownCutoff = new Date(Date.now() - cooldownDays * 86400_000).toISOString();
-
-    for (const providerId of providerIds) {
-      const pf = preflightById.get(providerId);
-      if (!pf || !pf.go) {
+    for (const elig of eligibility) {
+      if (!elig.eligible) {
+        // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+        // stoerrelsesgate), krav 4: the size gate is "enforced on the actual
+        // send path itself, not just in the readiness/preflight report" — it
+        // is, via computeGardssalgOutreachSendEligibility's own preflight
+        // call (single source of truth, never a forked GO/NO-GO copy), so
+        // this branch already blocks a "stor"-flagged id even against a
+        // caller who skips the separate preflight call and goes straight
+        // here with apply:true. `reason`/`preflight_reason`/`last_sent_at`/
+        // `suppressed_by`/`cross_platform` are copied through as-is —
+        // JSON.stringify drops the ones left undefined, so an id skipped for
+        // e.g. `no_email` still serializes with no stray `last_sent_at` key,
+        // identical to the previous inline behavior.
         results.push({
-          provider_id: providerId,
-          status: "skipped",
-          reason: "preflight_no_go",
-          preflight_reason: pf?.reason ?? "ikke_funnet",
+          provider_id: elig.provider_id,
+          status: elig.status,
+          reason: elig.reason,
+          preflight_reason: elig.preflight_reason,
+          last_sent_at: elig.last_sent_at,
+          suppressed_by: elig.suppressed_by,
+          cross_platform: elig.cross_platform,
         });
-        continue; // NO-GO: no provider-row fetch, no email lookup, no send attempt.
-      }
-
-      const providerRow = expDb
-        .prepare(`SELECT navn, slug, epost FROM experience_providers WHERE id = ?`)
-        .get(providerId) as { navn: string | null; slug: string | null; epost: string | null } | undefined;
-
-      const email = providerRow?.epost?.trim();
-      if (!email) {
-        results.push({ provider_id: providerId, status: "skipped", reason: "no_email" });
-        continue;
-      }
-
-      const blockCheck = isBlocked({ email });
-      if (blockCheck.blocked) {
-        results.push({ provider_id: providerId, status: "skipped", reason: "blocklisted" });
-        continue;
-      }
-
-      // ── Own-table cooldown: this vertical's persistent send log ─────────
-      const ownPrior = expDb
-        .prepare(
-          `SELECT sent_at FROM experience_outreach_sent_log
-            WHERE LOWER(recipient_email) = LOWER(?) AND sent_at >= ? AND is_test = 0
-            ORDER BY sent_at DESC LIMIT 1`,
-        )
-        .get(email, cooldownCutoff) as { sent_at: string } | undefined;
-
-      if (ownPrior) {
-        results.push({
-          provider_id: providerId,
-          status: "skipped",
-          reason: "cooldown_suppressed",
-          last_sent_at: ownPrior.sent_at,
-          suppressed_by: "experiences",
-        });
-        continue;
-      }
-
-      // ── Cross-platform cooldown: read-only, existing RFB outreach_sent_log
-      const rfbDb = getRfbDb();
-      const crossPrior = rfbDb
-        .prepare(
-          `SELECT sent_at, vertical_id FROM outreach_sent_log
-            WHERE recipient_email IS NOT NULL
-              AND LOWER(recipient_email) = LOWER(?)
-              AND sent_at >= ?
-            ORDER BY sent_at DESC LIMIT 1`,
-        )
-        .get(email, cooldownCutoff) as { sent_at: string; vertical_id: string } | undefined;
-
-      if (crossPrior) {
-        results.push({
-          provider_id: providerId,
-          status: "skipped",
-          reason: "cooldown_suppressed",
-          last_sent_at: crossPrior.sent_at,
-          suppressed_by: crossPrior.vertical_id,
-          cross_platform: true,
-        });
-        continue;
+        continue; // NO-GO / skipped: no send attempt.
       }
 
       // ── Eligible ──────────────────────────────────────────────────────
       if (!apply) {
-        results.push({ provider_id: providerId, status: "would_send" });
+        results.push({ provider_id: elig.provider_id, status: "would_send" });
         continue;
       }
 
-      const providerName = providerRow?.navn || providerId;
-      const profileUrl = `https://opplevagent.no/kategori/gardssalg/produsent/${providerRow?.slug ?? ""}`;
+      const providerId = elig.provider_id;
+      const email = elig.epost;
+      const providerName = elig.navn || providerId;
+      const profileUrl = `https://opplevagent.no/kategori/gardssalg/produsent/${elig.slug ?? ""}`;
       // One timestamp per provider, captured BEFORE the send so the CRM row's
       // sentAt and its fallback messageId are derived from the same instant.
       const sentAtIso = new Date().toISOString();
@@ -8539,6 +8729,601 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     res.json({ dry_run: !apply, results, summary });
   } catch (err) {
     console.error("[gardssalg-outreach-pilot-send] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-outreach-daily-prep ─────────────
+//
+// dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+// Skive 2: the read-only "daily prep" computation. Daniel wants, each
+// morning, a short list (up to 4) of vetted outreach candidates he can
+// approve with one word ("GO") — this route NEVER sends anything itself, it
+// only computes and reports. The actual daily 07:00 UTC cron wiring and the
+// Norwegian-language report file it feeds are a SEPARATE future slice
+// (a scheduled-agents SKILL file outside this repo) — this route is the
+// read-only data source that future slice will call; it is not itself "the
+// report".
+//
+// Zero write/apply capability — GET-only, calls only the dry-run paths of
+// the reused logic below (computeGardssalgReadinessRows,
+// computeGardssalgOutreachPreflight via computeGardssalgOutreachSendEligibility
+// — neither of which ever sets `apply: true` or touches
+// experience_outreach_sent_log / emailService.sendGardssalgOutreach / the CRM).
+// This is a hard requirement: an acceptance test greps this route's code
+// path for `apply:\s*true` / `apply: true` and expects it absent, and
+// asserts experience_outreach_sent_log is unchanged after calling it.
+//
+// Pipeline, reusing EXACTLY the same functions/logic the sibling
+// readiness/preflight/pilot-send routes above use — never a forked copy:
+//   1. computeGardssalgReadinessRows(expDb) -> the full corpus, tiered
+//      (same function GET /admin/gardssalg-outreach-readiness uses).
+//   2. Narrow to readiness_tier === "outreach_ready" -> the current
+//      outreach_ready cohort (same tier that GET's `summary.outreach_ready`
+//      counts).
+//   3. computeGardssalgOutreachSendEligibility(expDb, readyIds) -> the SAME
+//      preflight (incl. Skive-1 size gate + Slice-2 cross-row dedupe) +
+//      no_email/blocklist/cooldown dry-run check POST /admin/gardssalg-
+//      outreach-pilot-send runs when `apply` is omitted — never a
+//      duplicated copy of that logic (both routes now call the one
+//      extracted function, see its own doc comment above).
+//   4. Cap the eligible ("would_send") rows at DAILY_PREP_MAX_CANDIDATES (4,
+//      hard default) — no filling to 4 if fewer are eligible ("Ingen
+//      fylling", krav 11).
+//   5. Every outreach_ready row that did NOT make the final selection —
+//      whether skipped by step 3's dry-run or simply bumped past the step-4
+//      cap despite being eligible — is reported in `excluded`, each with a
+//      reason (an eligible-but-bumped row gets the cap's own reason,
+//      `daily_cap_reached` — a description of THIS route's own selection
+//      cap, not a preflight/pilot-send finding).
+//
+// Ordering: readyIds are sorted by provider id ascending before step 3, so
+// which candidates land in the first 4 is deterministic run-to-run (and
+// test-to-test) rather than depending on SQLite's incidental row order.
+// Nothing in the dev-request specifies a priority order among equally-
+// eligible candidates, so plain id order is the simplest stable choice.
+//
+// Skive 3 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+// stoerrelsesgate): the four further checks Daniel was doing BY HAND before
+// proposing candidates, now folded into this same route as additional
+// automated checks, applied to the FULL eligible list — BEFORE the
+// DAILY_PREP_MAX_CANDIDATES cap below — so a candidate excluded by one of
+// these checks is genuinely replaced by the next eligible candidate in id
+// order, never silently occupying one of the 4 slots:
+//   1. address-domain-vs-producer-domain — `address_basis` above already
+//      computes this label; Skive 2 left it purely informational (see its
+//      own doc comment), Skive 3 is where "unverified" graduates into an
+//      actual exclusion (reason `address_domain_mismatch`).
+//   2. profile-text sanity — reuses meetsAboutCheapBar (search-enrich.ts),
+//      the SAME synchronous, no-network cheap prefilter gårdssalg's own
+//      content-quality gate (meetsGardssalgAboutQualityBar) already runs
+//      before ever invoking its LLM judge — never a parallel heuristic.
+//      meetsGardssalgAboutQualityBar itself is NOT used here: it is async
+//      and calls an LLM, and this route is a zero-network, zero-LLM,
+//      synchronous handler by design (reason `profile_text_low_quality`).
+//   3. correct-industry — a candidate with a producer_type already set is
+//      checked via isGardssalgDrinkType (route-corridor-service.ts, the
+//      platform's one existing drink-vs-non-drink classification). That
+//      function's own documented policy defaults an UNSET producer_type to
+//      "assume drink" (most of the pool isn't classified yet, and this
+//      route isn't the place to start rejecting every unclassified row) —
+//      but that default is exactly what let a real salmon-farming company
+//      (an rfb-seed row with no producer_type at all) through Daniel's
+//      manual check. So, ADDITIONALLY here (daily-prep only — deliberately
+//      NOT pushed into isGardssalgDrinkType itself, which stays unchanged
+//      for its other callers): when producer_type is unset, fall back to
+//      the row's own Brreg naeringskode (NACE code) — division "03" is
+//      "Fiske, fangst og akvakultur" (fish/aquaculture farming, the exact
+//      salmon-farming shape), unambiguously not a gårdssalg drink/food
+//      producer. Any other/missing naeringskode keeps the existing
+//      "can't tell -> allow" default — this does not invent a broader
+//      taxonomy beyond the one concrete, named false-positive class
+//      (reason `wrong_industry`).
+//   4. shared-recipient-across-batch — ALREADY fully handled: computeGard-
+//      ssalgOutreachSendEligibility (step 3 above) runs the SAME preflight
+//      pass pilot-send uses, which folds in the Slice-2 outreach-guard
+//      (dedupeGardssalgOutreachRecipients) over the ENTIRE readyIds batch,
+//      first-seen-in-ascending-id-order wins, reasons `duplikat_epost` /
+//      `duplikat_epost_domene` (surfaced as `preflight_reason` under the
+//      top-level `preflight_no_go` reason). No new code needed for this one
+//      — see the test file for a dedicated regression test proving it.
+//
+// Deliberately scoped to THIS route only — checks 1-3 are NOT folded into
+// computeGardssalgOutreachSendEligibility/computeGardssalgOutreachPreflight
+// (unlike the size gate / batch dedupe, which those DO share with
+// pilot-send): the dev-request's own non-goal is that pilot-send gains no
+// NEW blocking behavior beyond what Skive 2 already shares. Daily-prep-only
+// until Daniel asks for these on the send path too.
+import { isGardssalgDrinkType } from "../services/route-corridor-service";
+
+/**
+ * Check 3 (correct-industry) — see the module doc comment above for the
+ * full rationale. PURE, synchronous, no network/LLM.
+ */
+function gardssalgDailyPrepWrongIndustry(
+  producerType: string | null,
+  naeringskode: string | null,
+): boolean {
+  const type = (producerType ?? "").trim();
+  if (type !== "") {
+    return !isGardssalgDrinkType(type);
+  }
+  // producer_type unset: fall back to naeringskode's NACE division (the part
+  // before the first ".", e.g. "03.211" -> "03"). Only the one concrete,
+  // named false-positive class (division "03" — fish/aquaculture farming) is
+  // checked; any other/missing naeringskode keeps the existing "can't tell ->
+  // allow" default rather than inventing a broader taxonomy.
+  const division = (naeringskode ?? "").trim().split(".")[0];
+  return division === "03";
+}
+
+const DAILY_PREP_MAX_CANDIDATES = 4;
+
+// Address-basis classification (krav 7: "adressegrunnlag — samme domene /
+// publisert på nettstedet / freemail som peker på produsenten"). A PURE,
+// INFORMATIONAL label surfaced on each returned candidate — it derives from
+// data the platform already stores, via already-exported helpers
+// (hostFromUrlLike/registrableDomain/FREE_MAIL_DOMAINS — the exact same
+// simple-registrable-domain-equality precedent
+// dedupeGardssalgOutreachRecipients, gardssalg-outreach-dedupe.ts, already
+// uses; hasHomepageEvidence — the exact homepage-evidence helper
+// domainCoherenceCheck's own email-anchor rescue already uses). It is NOT a
+// new verification/exclusion mechanism and NEVER blocks a candidate —
+// address-domain-vs-producer-domain BLOCKING (the Hardanger Saft
+// nils.j.lekve@ulvik.org case from the dev-request's own measurement) is
+// Skive 3, a separate not-yet-built slice; this label only SURFACES what is
+// already knowable from stored data, it does not gate on it.
+export type GardssalgAddressBasis =
+  | "same_domain_as_website"
+  | "published_on_producer_site"
+  | "freemail_pointing_to_producer"
+  | "unverified";
+
+export function computeGardssalgAddressBasis(
+  epost: string | null,
+  hjemmeside: string | null,
+  fieldProvenanceRaw: string | null,
+): GardssalgAddressBasis {
+  const email = (epost ?? "").trim().toLowerCase();
+  if (!email || !email.includes("@")) return "unverified";
+  const emailDomainPart = email.split("@").pop() ?? "";
+  const emailHost = emailDomainPart ? hostFromUrlLike(emailDomainPart) : null;
+  const emailRoot = emailHost ? registrableDomain(emailHost) : null;
+
+  const websiteHost = hjemmeside && hjemmeside.trim() ? hostFromUrlLike(hjemmeside) : null;
+  const websiteRoot = websiteHost ? registrableDomain(websiteHost) : null;
+
+  // Strongest signal first: the recipient address and the producer's own
+  // website share a registrable domain.
+  if (emailRoot && websiteRoot && emailRoot === websiteRoot) {
+    return "same_domain_as_website";
+  }
+
+  // Second: the email value was itself extracted FROM the producer's own
+  // homepage (a field_provenance record with source_type:"homepage" whose
+  // value matches this exact email and whose source_url resolves to the
+  // website's own host) — "published on the producer's own site", even when
+  // the mailbox domain differs from the website domain (e.g. a Google
+  // Workspace address advertised on a .no site).
+  if (websiteHost && fieldProvenanceRaw) {
+    try {
+      const parsed: unknown = JSON.parse(fieldProvenanceRaw);
+      const emailProvenance =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>).email
+          : undefined;
+      if (hasHomepageEvidence(emailProvenance, epost, websiteHost)) {
+        return "published_on_producer_site";
+      }
+    } catch {
+      // Malformed field_provenance JSON -> fail closed, fall through to the
+      // remaining checks (never throw out of a GET report route).
+    }
+  }
+
+  // Third: a free-mail domain (gmail.com, online.no, …) is not itself
+  // ownership evidence, but it is also not a THIRD PARTY's business domain —
+  // it is the weakest of the three positive bases the dev-request names, so
+  // it is checked last.
+  if (emailRoot && FREE_MAIL_DOMAINS.includes(emailRoot)) {
+    return "freemail_pointing_to_producer";
+  }
+
+  // Address is on a domain that is neither the website's own domain, nor
+  // homepage-evidenced, nor recognized free-mail — e.g. exactly the
+  // Hardanger Saft (nils.j.lekve@ulvik.org) class the dev-request measured.
+  // Surfaced honestly as "unverified" rather than guessed at; Skive 3 is
+  // where this signal graduates into an actual exclusion.
+  return "unverified";
+}
+
+router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  let rows: ReturnType<typeof computeGardssalgReadinessRows>;
+  try {
+    rows = computeGardssalgReadinessRows(expDb);
+  } catch (err) {
+    console.error("[gardssalg-outreach-daily-prep] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const generatedAt = new Date().toISOString();
+  // Cheap, already-computed count — no new machinery, krav 12's refill hint.
+  const needsEnrichmentCount = rows.filter((r) => r.readiness_tier === "needs_enrichment").length;
+
+  // Deterministic order (see module doc comment above) — plain id ascending.
+  const readyRows = rows
+    .filter((r) => r.readiness_tier === "outreach_ready")
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+  if (readyRows.length === 0) {
+    // Pool is entirely empty of outreach_ready candidates — krav 12: say so
+    // explicitly, offer the cheap refill hint (needs_enrichment count), omit
+    // the quarantine hint gracefully (computing it requires running the
+    // dry-run eligibility check below, which needs at least one id to check).
+    res.json({
+      generated_at: generatedAt,
+      candidates: [],
+      excluded: [],
+      pool: { outreach_ready_total: 0, eligible_total: 0, selected: 0, excluded_total: 0 },
+      dry: true,
+      missing: { count: DAILY_PREP_MAX_CANDIDATES, reason: "pool_exhausted" },
+      note: "No outreach_ready candidates exist right now — the pool is exhausted.",
+      refill_hints: { needs_enrichment_count: needsEnrichmentCount },
+    });
+    return;
+  }
+
+  const readyIds = readyRows.map((r) => r.id);
+  const readyById = new Map(readyRows.map((r) => [r.id, r]));
+
+  let eligibility: GardssalgOutreachEligibility[];
+  try {
+    // skipRecipientDedupe: true — PR review fix (MEDIUM finding). The raw
+    // preflight go/no-go list must NOT be deduped by recipient email before
+    // Skive 3's own address/profile-text/industry checks run: the id-ordered
+    // "winner" of a same-recipient pair might itself fail a Skive 3 check
+    // later, which used to wrongly strand its "loser" counterpart as an
+    // excluded duplicate of a candidate that was never actually going to be
+    // proposed. Individual per-candidate gating (tier/size gate/no_email/
+    // blocklist/cooldown) is completely unaffected by this flag — only the
+    // cross-candidate batch dedup is deferred. The same-recipient dedup
+    // itself now runs further below, AFTER Skive 3, over `afterSkive3` only
+    // (see that block's own comment).
+    eligibility = computeGardssalgOutreachSendEligibility(expDb, readyIds, { skipRecipientDedupe: true });
+  } catch (err) {
+    console.error("[gardssalg-outreach-daily-prep] failed to compute eligibility:", err);
+    res.status(500).json({ error: "Internal error" });
+    return;
+  }
+
+  const eligible = eligibility.filter(
+    (e): e is Extract<GardssalgOutreachEligibility, { eligible: true }> => e.eligible,
+  );
+  const skippedList = eligibility.filter(
+    (e): e is Extract<GardssalgOutreachEligibility, { eligible: false }> => !e.eligible,
+  );
+
+  type DailyPrepExcludedRow = {
+    provider_id: string;
+    name: string | null;
+    reason: string;
+    preflight_reason?: string;
+    last_sent_at?: string;
+    suppressed_by?: string;
+    cross_platform?: boolean;
+    quarantine_until?: string;
+  };
+
+  // ── producer_type / naeringskode / hjemmeside / field_provenance /
+  // about_text: fetched ONCE for the FULL eligible list (never more than the
+  // outreach_ready cohort, which stays small at this pool size) — reused for
+  // BOTH the Skive 3 checks just below AND the candidate-shaping step
+  // further down (address_basis/producer_type), so there is only ever the
+  // one extra query, never a duplicate.
+  const extraById = new Map<
+    string,
+    {
+      producer_type: string | null;
+      naeringskode: string | null;
+      hjemmeside: string | null;
+      field_provenance: string | null;
+      about_text: string | null;
+    }
+  >();
+  if (eligible.length > 0) {
+    const placeholders = eligible.map(() => "?").join(", ");
+    const extraRows = expDb
+      .prepare(
+        `SELECT id, producer_type, naeringskode, hjemmeside, field_provenance, about_text
+           FROM experience_providers WHERE id IN (${placeholders})`,
+      )
+      .all(...eligible.map((e) => e.provider_id)) as Array<{
+      id: string;
+      producer_type: string | null;
+      naeringskode: string | null;
+      hjemmeside: string | null;
+      field_provenance: string | null;
+      about_text: string | null;
+    }>;
+    for (const r of extraRows) extraById.set(r.id, r);
+  }
+
+  // ── Skive 3 checks 1-3 (see the module doc comment above the route) —
+  // run over the FULL eligible list, in order, BEFORE the daily cap. First
+  // failing check wins per candidate; a candidate that fails none of them
+  // passes through to `afterSkive3` unchanged.
+  const skive3Excluded: DailyPrepExcludedRow[] = [];
+  const afterSkive3: typeof eligible = [];
+  for (const e of eligible) {
+    const extra = extraById.get(e.provider_id);
+    const addressBasis = computeGardssalgAddressBasis(
+      e.epost,
+      extra?.hjemmeside ?? null,
+      extra?.field_provenance ?? null,
+    );
+    if (addressBasis === "unverified") {
+      skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "address_domain_mismatch" });
+      continue;
+    }
+    if (!meetsAboutCheapBar(extra?.about_text ?? null)) {
+      skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "profile_text_low_quality" });
+      continue;
+    }
+    if (gardssalgDailyPrepWrongIndustry(extra?.producer_type ?? null, extra?.naeringskode ?? null)) {
+      skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "wrong_industry" });
+      continue;
+    }
+    afterSkive3.push(e);
+  }
+
+  // ── Same-recipient-email dedup (Skive 3 check 4) — PR review fix (MEDIUM
+  // finding). Deliberately run HERE: AFTER Skive 1 (tier + size gate, above,
+  // via skipRecipientDedupe:true bypassing only the raw preflight's OWN
+  // internal dedup pass) and AFTER Skive 3 (address/profile-text/industry,
+  // just above), over `afterSkive3` — the candidates that have ALREADY
+  // survived every other check — never over the raw eligible/preflight
+  // list. `afterSkive3` preserves readyIds' ascending-id order (eligible
+  // built from readyIds in order, filters preserve relative order), so
+  // first-in-ascending-id-order still wins the dedup, same tiebreak as
+  // before. This is what fixes the bug where the id-ordered dedup "winner"
+  // could still be excluded by a later check, wrongly stranding its
+  // duplicate counterpart as an excluded "duplicate" of a candidate that
+  // was never actually going to be proposed — a candidate that fails on its
+  // own merits now always carries ITS OWN failure reason, never a borrowed
+  // duplicate reason. Reuses dedupeGardssalgOutreachRecipients directly
+  // (already imported above) — same pure function, same reasons
+  // (duplikat_epost / duplikat_epost_domene), surfaced under the same
+  // top-level preflight_no_go/preflight_reason shape Skive 2's batch dedup
+  // already used, so existing consumers of `excluded` see no shape change.
+  const dedupeCandidates = afterSkive3.map((e) => ({ provider_id: e.provider_id, email: e.epost }));
+  const { suppressed: recipientDedupeSuppressed } = dedupeGardssalgOutreachRecipients(dedupeCandidates);
+
+  const recipientDedupeExcluded: DailyPrepExcludedRow[] = [];
+  const afterDedup: typeof afterSkive3 = [];
+  for (const e of afterSkive3) {
+    const reason = recipientDedupeSuppressed.get(e.provider_id);
+    if (reason) {
+      recipientDedupeExcluded.push({
+        provider_id: e.provider_id,
+        name: e.navn,
+        reason: "preflight_no_go",
+        preflight_reason: reason,
+      });
+      continue;
+    }
+    afterDedup.push(e);
+  }
+
+  const selected = afterDedup.slice(0, DAILY_PREP_MAX_CANDIDATES);
+  const overflow = afterDedup.slice(DAILY_PREP_MAX_CANDIDATES);
+
+  const candidates = selected.map((e) => {
+    const readyRow = readyById.get(e.provider_id);
+    const extra = extraById.get(e.provider_id);
+    const profileUrl = `https://opplevagent.no/kategori/gardssalg/produsent/${e.slug ?? ""}`;
+    return {
+      provider_id: e.provider_id,
+      name: e.navn ?? readyRow?.name ?? null,
+      profile_url: profileUrl,
+      recipient_email: e.epost,
+      address_basis: computeGardssalgAddressBasis(e.epost, extra?.hjemmeside ?? null, extra?.field_provenance ?? null),
+      producer_type: extra?.producer_type ?? null,
+      antall_ansatte: readyRow?.antall_ansatte ?? null,
+      kommune: readyRow?.kommune ?? null,
+      // krav 7: "hvilke sjekker som ble kjørt" — every check this candidate
+      // already passed to get here, surfaced as-is. Skive 3's three checks
+      // (address_domain/profile_text/industry) are always "pass" here by
+      // construction — a candidate that failed any of them was already
+      // routed into `excluded` above and never reaches this .map() at all.
+      checks: {
+        readiness_tier: readyRow?.readiness_tier ?? "outreach_ready",
+        size_gate: readyRow?.size_flag ?? "ukjent",
+        preflight: "go",
+        dedupe: "pass",
+        blocklist: "pass",
+        cooldown_own: "pass",
+        cooldown_cross_platform: "pass",
+        pilot_send_dry_run: "would_send",
+        address_domain: "pass",
+        profile_text: "pass",
+        industry: "pass",
+      },
+    };
+  });
+
+  // Same cooldown-window derivation as computeGardssalgOutreachSendEligibility
+  // above / routes/crm.ts ~L441 — used here only to render a human-facing
+  // `quarantine_until` display value on cooldown-excluded rows and in the
+  // dry-pool refill hint below; the eligibility decision itself was already
+  // made by computeGardssalgOutreachSendEligibility.
+  const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
+  const quarantineUntil = (lastSentAt: string): string =>
+    new Date(new Date(lastSentAt).getTime() + cooldownDays * 86400_000).toISOString();
+
+  const excluded: DailyPrepExcludedRow[] = [];
+  for (const s of skippedList) {
+    excluded.push({
+      provider_id: s.provider_id,
+      name: readyById.get(s.provider_id)?.name ?? null,
+      reason: s.reason,
+      preflight_reason: s.preflight_reason,
+      last_sent_at: s.last_sent_at,
+      suppressed_by: s.suppressed_by,
+      cross_platform: s.cross_platform,
+      quarantine_until: s.last_sent_at ? quarantineUntil(s.last_sent_at) : undefined,
+    });
+  }
+  // Skive 3 checks 1-3 exclusions (address/profile-text/industry) — computed
+  // further above, over the full eligible list, before the daily cap.
+  for (const s3 of skive3Excluded) {
+    excluded.push(s3);
+  }
+  // Same-recipient-email dedup exclusions (Skive 3 check 4) — computed
+  // further above, AFTER Skive 3 checks 1-3, over afterSkive3 only (see that
+  // block's own comment for why this ordering is the actual bugfix).
+  for (const dup of recipientDedupeExcluded) {
+    excluded.push(dup);
+  }
+  for (const o of overflow) {
+    excluded.push({
+      provider_id: o.provider_id,
+      name: o.navn ?? readyById.get(o.provider_id)?.name ?? null,
+      // This route's OWN selection cap — not a preflight/pilot-send finding.
+      // The row would_send just like the selected ones; it simply didn't
+      // fit in today's batch of DAILY_PREP_MAX_CANDIDATES.
+      reason: "daily_cap_reached",
+    });
+  }
+
+  const missingCount = Math.max(0, DAILY_PREP_MAX_CANDIDATES - selected.length);
+  let missingReason: "all_excluded" | "fewer_than_cap" | null = null;
+  let note: string | null = null;
+  if (missingCount > 0) {
+    if (afterDedup.length === 0) {
+      missingReason = "all_excluded";
+      note = `${readyRows.length} outreach_ready candidate(s) exist, but this route's checks (preflight/pilot-send dry-run, address/profile-text/industry) excluded all of them today.`;
+    } else {
+      missingReason = "fewer_than_cap";
+      note = `${missingCount} of ${DAILY_PREP_MAX_CANDIDATES} missing — only ${selected.length} eligible candidate(s) exist right now (never padded).`;
+    }
+  }
+
+  // krav 12: pool "effectively dry" refill hint — best-effort, cheap-only.
+  // needs_enrichment_count was already computed above; the quarantine hint
+  // is only cheaply available here (eligibility was already computed for
+  // this exact request), so it is included only in this branch.
+  let refillHints: { needs_enrichment_count: number; quarantined_count: number; quarantine_earliest_release_at: string | null } | undefined;
+  if (afterDedup.length === 0) {
+    const quarantineSkips = skippedList.filter((s) => s.reason === "cooldown_suppressed" && s.last_sent_at);
+    let quarantineEarliestReleaseAt: string | null = null;
+    if (quarantineSkips.length > 0) {
+      const releases = quarantineSkips
+        .map((s) => quarantineUntil(s.last_sent_at as string))
+        .sort();
+      quarantineEarliestReleaseAt = releases[0];
+    }
+    refillHints = {
+      needs_enrichment_count: needsEnrichmentCount,
+      quarantined_count: quarantineSkips.length,
+      quarantine_earliest_release_at: quarantineEarliestReleaseAt,
+    };
+  }
+
+  res.json({
+    generated_at: generatedAt,
+    candidates,
+    excluded,
+    pool: {
+      outreach_ready_total: readyRows.length,
+      eligible_total: eligible.length,
+      selected: selected.length,
+      excluded_total: excluded.length,
+    },
+    dry: afterDedup.length === 0,
+    missing: { count: missingCount, reason: missingReason },
+    note,
+    ...(refillHints ? { refill_hints: refillHints } : {}),
+  });
+});
+
+// ─── GET  /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
+// ─── POST /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
+//
+// dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+// Skive 1, krav 3 + 6: the L1 knob behind the size gate above
+// (computeGardssalgOutreachPreflight's "large_company_excluded" override,
+// computeGardssalgReadinessRows' size_flag). GET reports the current
+// effective config (or the documented default when nobody has ever set it);
+// POST updates it — same dry-run/apply convention as every sibling admin
+// lever in this file (gardssalg-booking-activation, outreach-preflight/
+// pilot-send just above). See services/gardssalg-outreach-size-gate.ts for
+// why this is DB-backed (a Fly-volume-persisted row, live on the very next
+// call) rather than a repo-tracked config file (would need a redeploy).
+router.get("/admin/gardssalg-outreach-size-gate", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const config = getGardssalgSizeGateConfig(expDb);
+    res.json({ success: true, config });
+  } catch (err) {
+    console.error("[gardssalg-outreach-size-gate] read failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+router.post("/admin/gardssalg-outreach-size-gate", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { enabled?: unknown; threshold?: unknown; note?: unknown; apply?: unknown };
+
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    res.status(400).json({ error: "enabled must be a boolean" });
+    return;
+  }
+  if (
+    body.threshold !== undefined &&
+    !(typeof body.threshold === "number" && Number.isInteger(body.threshold) && body.threshold > 0)
+  ) {
+    res.status(400).json({ error: "threshold must be a positive integer" });
+    return;
+  }
+  if (body.enabled === undefined && body.threshold === undefined) {
+    res.status(400).json({ error: "at least one of enabled/threshold must be provided" });
+    return;
+  }
+  if (body.note !== undefined && typeof body.note !== "string" && body.note !== null) {
+    res.status(400).json({ error: "note must be a string or null" });
+    return;
+  }
+
+  const note = typeof body.note === "string" && body.note.trim() !== "" ? body.note.trim().slice(0, 1000) : null;
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+
+  const expDb = getExpDb("experiences");
+  try {
+    const current = getGardssalgSizeGateConfig(expDb);
+    const wouldBe = {
+      enabled: typeof body.enabled === "boolean" ? body.enabled : current.enabled,
+      threshold: typeof body.threshold === "number" ? body.threshold : current.threshold,
+    };
+
+    if (!apply) {
+      res.json({ success: true, dry_run: true, current, would_be: wouldBe });
+      return;
+    }
+
+    const patch: { enabled?: boolean; threshold?: number; note?: string | null } = {};
+    if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+    if (typeof body.threshold === "number") patch.threshold = body.threshold;
+    // Only touch `note` when the caller actually sent the field — omitting it
+    // must leave the persisted note untouched (unlike an explicit `note: null`
+    // or `note: ""`, both of which are treated as "clear it").
+    if (body.note !== undefined) patch.note = note;
+    const config = setGardssalgSizeGateConfig(expDb, patch, "admin");
+    res.json({ success: true, dry_run: false, config });
+  } catch (err) {
+    console.error("[gardssalg-outreach-size-gate] write failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

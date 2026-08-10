@@ -5688,12 +5688,27 @@ export function getGardssalgBrregVerifyOverride(): GardssalgBrregVerifyFn | null
  * field_provenance entry (source_url = the Brreg API URL the evidence came
  * from), all inside one transaction. Returns the field names written
  * ([] when locked / already verified / row missing).
+ *
+ * `antallAnsatte` (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ * stoerrelsesgate, Skive 1) piggybacks the antall_ansatte column onto this
+ * SAME one-time write — no new Brreg HTTP call, no new endpoint. Optional:
+ * `undefined` (a caller/stub that doesn't know about this field, e.g. every
+ * pre-existing test double of GardssalgBrregVerifyFn) is a strict no-op for
+ * this column, same as omitting any other optional param. Only written to
+ * `gardssalg_content_audit`/reported in the return value when it actually
+ * CHANGES the stored value — a `null` (or absent) fetched figure over an
+ * already-null column is not a change worth an audit row.
  */
-export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: string, batchId?: string): string[] {
+export function applyGardssalgBrregVerified(
+  providerId: string,
+  evidenceUrl: string,
+  batchId?: string,
+  antallAnsatte?: number | null,
+): string[] {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, content_source, brreg_verified, brreg_active, field_provenance
+      `SELECT id, content_source, brreg_verified, brreg_active, field_provenance, antall_ansatte
          FROM experience_providers WHERE id = ?`
     )
     .get(providerId) as
@@ -5703,6 +5718,7 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
         brreg_verified: number | null;
         brreg_active: number | null;
         field_provenance: string | null;
+        antall_ansatte: number | null;
       }
     | undefined;
   if (!row) return [];
@@ -5714,6 +5730,14 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
   ];
   if (row.brreg_active !== 1) {
     written.push({ field: "brreg_active", oldValue: row.brreg_active === null ? null : String(row.brreg_active) });
+  }
+  const hasAntallAnsatte = antallAnsatte !== undefined;
+  const nextAntallAnsatte = hasAntallAnsatte ? antallAnsatte : row.antall_ansatte;
+  if (hasAntallAnsatte && nextAntallAnsatte !== row.antall_ansatte) {
+    written.push({
+      field: "antall_ansatte",
+      oldValue: row.antall_ansatte === null ? null : String(row.antall_ansatte),
+    });
   }
 
   let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
@@ -5728,14 +5752,22 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
     }
   }
   provenance["brreg_verified"] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+  if (hasAntallAnsatte) {
+    provenance["antall_ansatte"] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+  }
 
   const applyWithAudit = db.transaction(() => {
     db.prepare(
       `UPDATE experience_providers
           SET brreg_verified = 1, brreg_active = 1,
+              antall_ansatte = @antall_ansatte,
               field_provenance = @field_provenance, updated_at = datetime('now')
         WHERE id = @id`
-    ).run({ id: providerId, field_provenance: JSON.stringify(provenance) });
+    ).run({
+      id: providerId,
+      antall_ansatte: nextAntallAnsatte,
+      field_provenance: JSON.stringify(provenance),
+    });
     const insertAudit = db.prepare(
       `INSERT INTO gardssalg_content_audit
          (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
@@ -5747,7 +5779,7 @@ export function applyGardssalgBrregVerified(providerId: string, evidenceUrl: str
         provider_id: providerId,
         field_name: w.field,
         old_value: w.oldValue,
-        new_value: "1",
+        new_value: w.field === "antall_ansatte" ? String(nextAntallAnsatte ?? "") : "1",
         source_url: evidenceUrl,
         batch_id: batchId ?? null,
       });

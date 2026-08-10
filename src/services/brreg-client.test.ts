@@ -99,6 +99,32 @@ export async function runBrregClientTests(opts: { log?: boolean } = {}): Promise
     assertEq(r.registrertDato, "2015-03-01", "active: registrertDato populated");
     assertEq(r.slettetDato, null, "active: slettetDato null");
     assertEq(r.flag, null, "active: flag null (active + exists)");
+    assertEq(r.employees, null, "active: employees null when the Brreg response omits antallAnsatte entirely (never 0, never undefined)");
+  }
+
+  // ── (f) antallAnsatte present (dev-request 2026-08-09-daglig-outreach-
+  //    klargjoering-og-stoerrelsesgate, Skive 1) — read off the SAME
+  //    GET /enheter/{orgNr} response every other field above already comes
+  //    from; no second HTTP call. ────────────────────────────────────────
+  {
+    __clearBrregVerifyCacheForTesting();
+    const fetchImpl = makeFetch((url) => {
+      assertTrue(url.includes("/enheter/975967093"), "employees: URL hits /enheter/{orgnr} direct endpoint");
+      return jsonResponse(200, {
+        organisasjonsnummer: "975967093",
+        navn: "Macks Ølbryggeri AS",
+        konkurs: false,
+        underAvvikling: false,
+        underTvangsavviklingEllerTvangsopplosning: false,
+        slettedato: null,
+        registreringsdatoEnhetsregisteret: "1876-01-01",
+        naeringskode1: { kode: "11.050" },
+        antallAnsatte: 119,
+      });
+    });
+    const r = await verifyOrgNumber("975967093", fetchImpl);
+    assertEq(r.exists, true, "employees: exists === true");
+    assertEq(r.employees, 119, "employees: employees === 119, parsed from antallAnsatte");
   }
 
   // ── (b) Dissolved (slettedato set) ─────────────────────────────────────

@@ -206,6 +206,18 @@ export interface BrregVerifyResult {
   registrertDato: string | null;
   slettetDato: string | null;
   flag: BrregFlag;           // "dissolved" if slettetDato set, "bankrupt" if konkurs, else null when active+exists
+  // Additive (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate, Skive 1) — read from the SAME GET /enheter/{orgNr}
+  // response verifyOrgNumber() already fetches; no second HTTP call. Optional
+  // (not just nullable) so existing callers that stub this whole result type
+  // with a plain object (e.g. opplevelser-gardssalg-brreg-verify.test.ts,
+  // written before this field existed) keep compiling untouched — a stub
+  // that omits it reads back as `undefined`, which callers must treat
+  // identically to `null` ("Brreg has no registered figure"; never "small").
+  // null specifically means Brreg's response had no antallAnsatte at all
+  // (common for enkeltpersonforetak / very small orgs); it must never be
+  // treated as zero or as "liten" by a caller.
+  employees?: number | null;
 }
 
 type RawEnhetDetail = {
@@ -224,6 +236,12 @@ type RawEnhetDetail = {
   // never has, so their addition here is a no-op for every existing caller.
   forretningsadresse?: RawBrregAddress | null;
   postadresse?: RawBrregAddress | null;
+  // Additive (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate) — the real Enhetsregisteret field for registered
+  // employee count. Absent from the JSON entirely for many small/no-staff
+  // orgs (not "0" — genuinely absent), which is exactly why `employees`
+  // above is nullable rather than defaulting to 0.
+  antallAnsatte?: number;
 };
 
 const SAFE_DEFAULT_VERIFY_RESULT: BrregVerifyResult = {
@@ -234,6 +252,7 @@ const SAFE_DEFAULT_VERIFY_RESULT: BrregVerifyResult = {
   registrertDato: null,
   slettetDato: null,
   flag: "no_orgnr",
+  employees: null,
 };
 
 // Tiny separate per-process cache keyed by orgNr — org-nr lookups are cheap
@@ -321,6 +340,7 @@ export async function verifyOrgNumber(
     registrertDato: json.registreringsdatoEnhetsregisteret ?? null,
     slettetDato,
     flag,
+    employees: typeof json.antallAnsatte === "number" ? json.antallAnsatte : null,
   };
   verifyCache.set(cleanOrgNr, result);
   return { ...result };

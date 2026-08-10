@@ -1412,5 +1412,40 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Seed gardssalg_experience_conflict_review (2026-08-01 spot-check) failed:", err);
   }
 
+  // ─── gardssalg_outreach_size_gate_config (dev-request 2026-08-09-daglig-
+  // outreach-klargjoering-og-stoerrelsesgate, Skive 1) ───────────────────────
+  // Single-row (id='singleton') L1 knob for the antall_ansatte outreach
+  // size-gate: `threshold` (antall_ansatte >= threshold => "stor") and
+  // `enabled` (the whole gate's off switch — Daniel said "inntil videre").
+  // Deliberately DB-backed rather than a repo-tracked YAML/JSON file: the
+  // Dockerfile COPYs only src/, tsconfig.json, openapi.yaml, verticals/,
+  // mcp-server*/ into the image, so a new top-level config/ dir would need a
+  // rebuild+redeploy before an edit ever reached the running container —
+  // exactly the "uten deploy" property this knob exists to have. This table
+  // lives on the SAME Fly volume (/app/data/experiences.db) every other row
+  // in this file already lives on, survives restarts/redeploys untouched,
+  // and is written via an authenticated admin endpoint (POST
+  // /admin/gardssalg-outreach-size-gate) — same shape as the existing
+  // booking_live admin lever (POST /admin/gardssalg-booking-activation,
+  // routes/opplevelser.ts) that already proves this pattern in prod.
+  // Absence of the singleton row (fresh DB, never configured) is NOT an
+  // error — getGardssalgSizeGateConfig() (services/gardssalg-outreach-size-
+  // gate.ts) falls back to the documented default (enabled:1, threshold:25)
+  // rather than requiring a seed row here.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_outreach_size_gate_config (
+        id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        threshold INTEGER NOT NULL DEFAULT 25,
+        updated_at TEXT,
+        updated_by TEXT,
+        note TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_outreach_size_gate_config failed:", err);
+  }
+
   console.log("[experiences] schema initialized");
 }
