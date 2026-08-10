@@ -8487,14 +8487,80 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
 // Nothing in the dev-request specifies a priority order among equally-
 // eligible candidates, so plain id order is the simplest stable choice.
 //
-// Non-goal (Skive 3, a separate future slice, NOT built here): address-
-// domain-vs-producer-domain validation, scraped-nav-text detection,
-// industry/vertical sanity, shared-recipient dedup ACROSS days. If the
-// existing preflight/pilot-send dry-run already happens to catch one of
-// these (e.g. the Slice-2 outreach-guard's same-batch email/domain dedupe,
-// folded into step 3 above), it is surfaced as-is; no new detection logic is
-// added by this route. `address_basis` below is a purely INFORMATIONAL label
-// (never a gate) for exactly this reason — see its own doc comment.
+// Skive 3 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+// stoerrelsesgate): the four further checks Daniel was doing BY HAND before
+// proposing candidates, now folded into this same route as additional
+// automated checks, applied to the FULL eligible list — BEFORE the
+// DAILY_PREP_MAX_CANDIDATES cap below — so a candidate excluded by one of
+// these checks is genuinely replaced by the next eligible candidate in id
+// order, never silently occupying one of the 4 slots:
+//   1. address-domain-vs-producer-domain — `address_basis` above already
+//      computes this label; Skive 2 left it purely informational (see its
+//      own doc comment), Skive 3 is where "unverified" graduates into an
+//      actual exclusion (reason `address_domain_mismatch`).
+//   2. profile-text sanity — reuses meetsAboutCheapBar (search-enrich.ts),
+//      the SAME synchronous, no-network cheap prefilter gårdssalg's own
+//      content-quality gate (meetsGardssalgAboutQualityBar) already runs
+//      before ever invoking its LLM judge — never a parallel heuristic.
+//      meetsGardssalgAboutQualityBar itself is NOT used here: it is async
+//      and calls an LLM, and this route is a zero-network, zero-LLM,
+//      synchronous handler by design (reason `profile_text_low_quality`).
+//   3. correct-industry — a candidate with a producer_type already set is
+//      checked via isGardssalgDrinkType (route-corridor-service.ts, the
+//      platform's one existing drink-vs-non-drink classification). That
+//      function's own documented policy defaults an UNSET producer_type to
+//      "assume drink" (most of the pool isn't classified yet, and this
+//      route isn't the place to start rejecting every unclassified row) —
+//      but that default is exactly what let a real salmon-farming company
+//      (an rfb-seed row with no producer_type at all) through Daniel's
+//      manual check. So, ADDITIONALLY here (daily-prep only — deliberately
+//      NOT pushed into isGardssalgDrinkType itself, which stays unchanged
+//      for its other callers): when producer_type is unset, fall back to
+//      the row's own Brreg naeringskode (NACE code) — division "03" is
+//      "Fiske, fangst og akvakultur" (fish/aquaculture farming, the exact
+//      salmon-farming shape), unambiguously not a gårdssalg drink/food
+//      producer. Any other/missing naeringskode keeps the existing
+//      "can't tell -> allow" default — this does not invent a broader
+//      taxonomy beyond the one concrete, named false-positive class
+//      (reason `wrong_industry`).
+//   4. shared-recipient-across-batch — ALREADY fully handled: computeGard-
+//      ssalgOutreachSendEligibility (step 3 above) runs the SAME preflight
+//      pass pilot-send uses, which folds in the Slice-2 outreach-guard
+//      (dedupeGardssalgOutreachRecipients) over the ENTIRE readyIds batch,
+//      first-seen-in-ascending-id-order wins, reasons `duplikat_epost` /
+//      `duplikat_epost_domene` (surfaced as `preflight_reason` under the
+//      top-level `preflight_no_go` reason). No new code needed for this one
+//      — see the test file for a dedicated regression test proving it.
+//
+// Deliberately scoped to THIS route only — checks 1-3 are NOT folded into
+// computeGardssalgOutreachSendEligibility/computeGardssalgOutreachPreflight
+// (unlike the size gate / batch dedupe, which those DO share with
+// pilot-send): the dev-request's own non-goal is that pilot-send gains no
+// NEW blocking behavior beyond what Skive 2 already shares. Daily-prep-only
+// until Daniel asks for these on the send path too.
+import { isGardssalgDrinkType } from "../services/route-corridor-service";
+
+/**
+ * Check 3 (correct-industry) — see the module doc comment above for the
+ * full rationale. PURE, synchronous, no network/LLM.
+ */
+function gardssalgDailyPrepWrongIndustry(
+  producerType: string | null,
+  naeringskode: string | null,
+): boolean {
+  const type = (producerType ?? "").trim();
+  if (type !== "") {
+    return !isGardssalgDrinkType(type);
+  }
+  // producer_type unset: fall back to naeringskode's NACE division (the part
+  // before the first ".", e.g. "03.211" -> "03"). Only the one concrete,
+  // named false-positive class (division "03" — fish/aquaculture farming) is
+  // checked; any other/missing naeringskode keeps the existing "can't tell ->
+  // allow" default rather than inventing a broader taxonomy.
+  const division = (naeringskode ?? "").trim().split(".")[0];
+  return division === "03";
+}
+
 const DAILY_PREP_MAX_CANDIDATES = 4;
 
 // Address-basis classification (krav 7: "adressegrunnlag — samme domene /
@@ -8633,33 +8699,81 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     (e): e is Extract<GardssalgOutreachEligibility, { eligible: false }> => !e.eligible,
   );
 
-  const selected = eligible.slice(0, DAILY_PREP_MAX_CANDIDATES);
-  const overflow = eligible.slice(DAILY_PREP_MAX_CANDIDATES);
+  type DailyPrepExcludedRow = {
+    provider_id: string;
+    name: string | null;
+    reason: string;
+    preflight_reason?: string;
+    last_sent_at?: string;
+    suppressed_by?: string;
+    cross_platform?: boolean;
+    quarantine_until?: string;
+  };
 
-  // ── producer_type / hjemmeside / field_provenance: fetch ONLY for the
-  // small selected set (never more than DAILY_PREP_MAX_CANDIDATES rows) —
-  // mirrors the existing precedent (preflight's email-only fetch,
-  // pilot-send's providerRow fetch) of never widening
-  // computeGardssalgReadinessRows' own return shape for a single caller's
-  // extra fields.
+  // ── producer_type / naeringskode / hjemmeside / field_provenance /
+  // about_text: fetched ONCE for the FULL eligible list (never more than the
+  // outreach_ready cohort, which stays small at this pool size) — reused for
+  // BOTH the Skive 3 checks just below AND the candidate-shaping step
+  // further down (address_basis/producer_type), so there is only ever the
+  // one extra query, never a duplicate.
   const extraById = new Map<
     string,
-    { producer_type: string | null; hjemmeside: string | null; field_provenance: string | null }
-  >();
-  if (selected.length > 0) {
-    const placeholders = selected.map(() => "?").join(", ");
-    const extraRows = expDb
-      .prepare(
-        `SELECT id, producer_type, hjemmeside, field_provenance FROM experience_providers WHERE id IN (${placeholders})`,
-      )
-      .all(...selected.map((e) => e.provider_id)) as Array<{
-      id: string;
+    {
       producer_type: string | null;
+      naeringskode: string | null;
       hjemmeside: string | null;
       field_provenance: string | null;
+      about_text: string | null;
+    }
+  >();
+  if (eligible.length > 0) {
+    const placeholders = eligible.map(() => "?").join(", ");
+    const extraRows = expDb
+      .prepare(
+        `SELECT id, producer_type, naeringskode, hjemmeside, field_provenance, about_text
+           FROM experience_providers WHERE id IN (${placeholders})`,
+      )
+      .all(...eligible.map((e) => e.provider_id)) as Array<{
+      id: string;
+      producer_type: string | null;
+      naeringskode: string | null;
+      hjemmeside: string | null;
+      field_provenance: string | null;
+      about_text: string | null;
     }>;
     for (const r of extraRows) extraById.set(r.id, r);
   }
+
+  // ── Skive 3 checks 1-3 (see the module doc comment above the route) —
+  // run over the FULL eligible list, in order, BEFORE the daily cap. First
+  // failing check wins per candidate; a candidate that fails none of them
+  // passes through to `afterSkive3` unchanged.
+  const skive3Excluded: DailyPrepExcludedRow[] = [];
+  const afterSkive3: typeof eligible = [];
+  for (const e of eligible) {
+    const extra = extraById.get(e.provider_id);
+    const addressBasis = computeGardssalgAddressBasis(
+      e.epost,
+      extra?.hjemmeside ?? null,
+      extra?.field_provenance ?? null,
+    );
+    if (addressBasis === "unverified") {
+      skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "address_domain_mismatch" });
+      continue;
+    }
+    if (!meetsAboutCheapBar(extra?.about_text ?? null)) {
+      skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "profile_text_low_quality" });
+      continue;
+    }
+    if (gardssalgDailyPrepWrongIndustry(extra?.producer_type ?? null, extra?.naeringskode ?? null)) {
+      skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "wrong_industry" });
+      continue;
+    }
+    afterSkive3.push(e);
+  }
+
+  const selected = afterSkive3.slice(0, DAILY_PREP_MAX_CANDIDATES);
+  const overflow = afterSkive3.slice(DAILY_PREP_MAX_CANDIDATES);
 
   const candidates = selected.map((e) => {
     const readyRow = readyById.get(e.provider_id);
@@ -8675,7 +8789,10 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       antall_ansatte: readyRow?.antall_ansatte ?? null,
       kommune: readyRow?.kommune ?? null,
       // krav 7: "hvilke sjekker som ble kjørt" — every check this candidate
-      // already passed to get here, surfaced as-is (no new checks added).
+      // already passed to get here, surfaced as-is. Skive 3's three checks
+      // (address_domain/profile_text/industry) are always "pass" here by
+      // construction — a candidate that failed any of them was already
+      // routed into `excluded` above and never reaches this .map() at all.
       checks: {
         readiness_tier: readyRow?.readiness_tier ?? "outreach_ready",
         size_gate: readyRow?.size_flag ?? "ukjent",
@@ -8685,6 +8802,9 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
         cooldown_own: "pass",
         cooldown_cross_platform: "pass",
         pilot_send_dry_run: "would_send",
+        address_domain: "pass",
+        profile_text: "pass",
+        industry: "pass",
       },
     };
   });
@@ -8698,17 +8818,6 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
   const quarantineUntil = (lastSentAt: string): string =>
     new Date(new Date(lastSentAt).getTime() + cooldownDays * 86400_000).toISOString();
 
-  type DailyPrepExcludedRow = {
-    provider_id: string;
-    name: string | null;
-    reason: string;
-    preflight_reason?: string;
-    last_sent_at?: string;
-    suppressed_by?: string;
-    cross_platform?: boolean;
-    quarantine_until?: string;
-  };
-
   const excluded: DailyPrepExcludedRow[] = [];
   for (const s of skippedList) {
     excluded.push({
@@ -8721,6 +8830,11 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       cross_platform: s.cross_platform,
       quarantine_until: s.last_sent_at ? quarantineUntil(s.last_sent_at) : undefined,
     });
+  }
+  // Skive 3 checks 1-3 exclusions (address/profile-text/industry) — computed
+  // further above, over the full eligible list, before the daily cap.
+  for (const s3 of skive3Excluded) {
+    excluded.push(s3);
   }
   for (const o of overflow) {
     excluded.push({
@@ -8737,9 +8851,9 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
   let missingReason: "all_excluded" | "fewer_than_cap" | null = null;
   let note: string | null = null;
   if (missingCount > 0) {
-    if (eligible.length === 0) {
+    if (afterSkive3.length === 0) {
       missingReason = "all_excluded";
-      note = `${readyRows.length} outreach_ready candidate(s) exist, but the preflight/pilot-send dry-run excluded all of them today.`;
+      note = `${readyRows.length} outreach_ready candidate(s) exist, but this route's checks (preflight/pilot-send dry-run, address/profile-text/industry) excluded all of them today.`;
     } else {
       missingReason = "fewer_than_cap";
       note = `${missingCount} of ${DAILY_PREP_MAX_CANDIDATES} missing — only ${selected.length} eligible candidate(s) exist right now (never padded).`;
@@ -8751,7 +8865,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
   // is only cheaply available here (eligibility was already computed for
   // this exact request), so it is included only in this branch.
   let refillHints: { needs_enrichment_count: number; quarantined_count: number; quarantine_earliest_release_at: string | null } | undefined;
-  if (eligible.length === 0) {
+  if (afterSkive3.length === 0) {
     const quarantineSkips = skippedList.filter((s) => s.reason === "cooldown_suppressed" && s.last_sent_at);
     let quarantineEarliestReleaseAt: string | null = null;
     if (quarantineSkips.length > 0) {
@@ -8777,7 +8891,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       selected: selected.length,
       excluded_total: excluded.length,
     },
-    dry: eligible.length === 0,
+    dry: afterSkive3.length === 0,
     missing: { count: missingCount, reason: missingReason },
     note,
     ...(refillHints ? { refill_hints: refillHints } : {}),
