@@ -57,6 +57,7 @@ import {
   gardssalgWebsiteEvidenceMatch,
 } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
+import { mergeFieldProvenance } from "./admin-knowledge";
 
 // ─── agents_website_review_queue (lazy, ensureXTable pattern) ──────────────
 //
@@ -449,10 +450,38 @@ function upsertRfbWebsiteReviewQueue(
 
 const router = Router();
 
+// External-candidate intake item shape (dev-request 2026-08-10-rfb-
+// hjemmesidejakt-full-loype, punkt 4a): a caller (web-search session/routine)
+// proposes a SPECIFIC url for a SPECIFIC agent instead of relying on this
+// route's own name-guessed hosts. The proposed url gets the EXACT same
+// treatment a guessed host gets — host exclusion (social/directory),
+// shared-host guards, server-side fetch, redirect re-check, ownership-
+// evidence match — before it may enter the review queue. The 2026-08-10
+// pilot measured why this intake is needed: name-guessing scored 0/25 and
+// 0/9 on cohorts where interactive web search scored 12/20, but the searcher
+// had no governed way to hand its finds to the queue.
+interface RfbWdExternalCandidate {
+  agentId: string;
+  url: string;
+}
+
+function parseExternalCandidates(raw: unknown): RfbWdExternalCandidate[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: RfbWdExternalCandidate[] = [];
+  for (const item of raw) {
+    const o = item as { agentId?: unknown; url?: unknown };
+    const agentId = typeof o?.agentId === "string" ? o.agentId.trim() : "";
+    const url = typeof o?.url === "string" ? o.url.trim() : "";
+    if (!agentId || !url) return null; // malformed item poisons the whole call — 400, never a silent partial run
+    out.push({ agentId, url });
+  }
+  return out;
+}
+
 router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; mode?: unknown };
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; mode?: unknown; candidates?: unknown };
   // "blank" (default/omitted) — unchanged, byte-identical behaviour: targets
   // producer rows with NO website on file. "aggregator_replace" is the new
   // mode: targets rows whose CURRENT website is itself a directory/
@@ -467,6 +496,125 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   const notFound: string[] = [];
   const alreadyHasWebsite: Array<{ agent_id: string; agent_name: string; reason?: string }> = [];
   let targets: RfbWdTargetRow[] = [];
+
+  // ── External-candidate intake (punkt 4a) — mutually exclusive with every
+  //    other selection path so a call's cohort is never ambiguous ───────────
+  if (body.candidates !== undefined) {
+    if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
+      res.status(400).json({ error: "candidates og agentIds kan ikke kombineres i samme kall" });
+      return;
+    }
+    if (mode === "aggregator_replace") {
+      res.status(400).json({ error: "candidates støtter kun blank-modus (fill-only)" });
+      return;
+    }
+    const candidates = parseExternalCandidates(body.candidates);
+    if (candidates === null || candidates.length === 0) {
+      res.status(400).json({ error: "candidates må være en ikke-tom array av {agentId, url}" });
+      return;
+    }
+    if (candidates.length > RFB_WD_HARD_CAP) {
+      res.status(400).json({ error: `Too many candidates (max ${RFB_WD_HARD_CAP} per call)` });
+      return;
+    }
+
+    const existingHostsExt = rfbWdExistingWebsiteHosts(db);
+    const hostsProposedExt = new Set<string>();
+    const proposedExt: Array<{
+      agent_id: string;
+      agent_name: string;
+      candidate_url: string;
+      final_url: string;
+      evidence: RfbWdEvidence;
+      confidence: number;
+    }> = [];
+    const rejectedExt: Array<{
+      agent_id: string;
+      agent_name: string;
+      reason: string;
+      tried: string[];
+      excluded: Array<{ host: string; reason: string }>;
+    }> = [];
+    const seenAgentIds = new Set<string>();
+
+    for (const c of candidates) {
+      if (seenAgentIds.has(c.agentId)) {
+        rejectedExt.push({ agent_id: c.agentId, agent_name: "", reason: "duplicate_agent_in_request", tried: [], excluded: [] });
+        continue;
+      }
+      seenAgentIds.add(c.agentId);
+
+      const t = getRfbWebsiteDiscoveryTarget(db, c.agentId);
+      if (!t) {
+        notFound.push(c.agentId);
+        continue;
+      }
+      if (t.website && t.website.trim() !== "") {
+        alreadyHasWebsite.push({ agent_id: t.id, agent_name: t.name });
+        continue;
+      }
+
+      const host = rfbWdHostFromUrl(c.url);
+      if (!host) {
+        rejectedExt.push({ agent_id: t.id, agent_name: t.name, reason: "invalid_candidate_url", tried: [], excluded: [] });
+        continue;
+      }
+
+      const evidenceTarget = {
+        orgNr: t.org_nr,
+        navn: t.name,
+        kommune: t.city,
+        poststed: null as string | null,
+        telefon: t.phone,
+        mobil: null as string | null,
+        adresse: t.address,
+        postnummer: t.postal_code,
+      };
+      const tried: string[] = [];
+      const excludedHere: Array<{ host: string; reason: string }> = [];
+      const hit = await tryRfbWebsiteCandidateHost(host, evidenceTarget, existingHostsExt, hostsProposedExt, tried, excludedHere);
+
+      if (hit) {
+        hostsProposedExt.add(hit.host);
+        let candidateUrl: string;
+        try {
+          const u = new URL(hit.finalUrl);
+          candidateUrl = `${u.protocol}//${u.host.toLowerCase()}`;
+        } catch {
+          candidateUrl = `https://${hit.host}`;
+        }
+        const confidence = rfbWdConfidence(hit.evidence);
+        upsertRfbWebsiteReviewQueue(db, {
+          agent_id: t.id,
+          agent_name: t.name,
+          candidate_url: candidateUrl,
+          final_url: hit.finalUrl,
+          evidence: hit.evidence,
+          confidence,
+          batch_id: batchId,
+          reason: "website_discovery_candidate_external",
+        });
+        proposedExt.push({ agent_id: t.id, agent_name: t.name, candidate_url: candidateUrl, final_url: hit.finalUrl, evidence: hit.evidence, confidence });
+      } else {
+        let reason: string;
+        if (excludedHere.length > 0) reason = excludedHere[0].reason;
+        else reason = "no_candidate_verified";
+        rejectedExt.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere });
+      }
+    }
+
+    res.json({
+      success: true,
+      mode: "external_candidates",
+      batch_id: batchId,
+      scanned: seenAgentIds.size,
+      proposed: proposedExt,
+      rejected: rejectedExt,
+      already_has_website: alreadyHasWebsite,
+      not_found: notFound,
+    });
+    return;
+  }
 
   if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
     const ids = (body.agentIds as unknown[])
@@ -652,6 +800,233 @@ router.get("/rfb-website-review-queue", (req: Request, res: Response) => {
     .prepare(`SELECT * FROM agents_website_review_queue WHERE status = 'pending' ORDER BY created_at DESC`)
     .all();
   res.json({ success: true, count: rows.length, queue: rows });
+});
+
+// ─── POST /admin/rfb-website-review-approve (punkt 4b — the apply slice) ────
+//
+// The adoption lever for queued website candidates — the RFB mirror of
+// POST /api/opplevelser/admin/gardssalg-website-review-approve
+// (routes/opplevelser.ts), same strict confirmation-surface contract:
+// ONLY the queued (agent_id, candidate_url) pair can be approved; a
+// different URL is rejected (mismatch_with_queued_candidate), a non-queued
+// agent is rejected (not_in_review_queue). Never an arbitrary-write surface.
+//
+// Writes go through applyRfbAgentWebsite below: fill-only (the row's
+// agent_knowledge.website must STILL be blank at write time), owner-claim
+// lock (agents.claimed_at), per-field curated lock
+// (agent_knowledge.curated_fields.website), host-exclusion re-check, and
+// shared-host re-check — all re-read from a FRESH row snapshot inside the
+// write's own transaction (same re-check-before-write convention as the
+// contact-write-guard retro-sweep). A confirmed write also merges a
+// field_provenance record (source_type "homepage" — the evidence WAS the
+// producer's own live page, verified at queue time) via the SAME
+// mergeFieldProvenance every other provenance writer uses, appends an
+// agent_knowledge_audit row, and flips the queue entry to status='applied'.
+//
+// Dry-run by default (apply === true/1/"1"/"true" in body, or ?apply=1/true
+// — the exact truthy-check every other approve lever uses). NOTE the
+// enrichment write-pause discipline (controller/enrichment-write-pause.yaml,
+// slookisen/A2A): while a vertical's pause is enabled, callers must not
+// invoke this lever with apply=true — the discipline lives in WHO calls it,
+// same as the retro-sweep's own apply contract.
+
+type RfbWdApplyResult =
+  | { written: true }
+  | { written: false; reason: string };
+
+export function applyRfbAgentWebsite(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  candidateUrl: string,
+  finalUrl: string,
+  batchId: string | null,
+): RfbWdApplyResult {
+  const host = rfbWdHostFromUrl(candidateUrl);
+  if (!host) return { written: false, reason: "invalid_candidate_url" };
+  const exclusion = rfbWebsiteHostExclusionReason(host);
+  if (exclusion) return { written: false, reason: exclusion };
+
+  let result: RfbWdApplyResult = { written: false, reason: "write_skipped_by_guards" };
+  const tx = db.transaction(() => {
+    // Fresh snapshot inside the transaction — never trust the queue row's
+    // vintage for lock/fill state.
+    const fresh = db
+      .prepare(
+        `SELECT a.claimed_at AS claimed_at, k.website AS website,
+                k.curated_fields AS curated_fields, k.field_provenance AS field_provenance
+           FROM agents a
+           JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.id = ?`,
+      )
+      .get(agentId) as
+      | { claimed_at: string | null; website: string | null; curated_fields: string | null; field_provenance: string | null }
+      | undefined;
+    if (!fresh) {
+      result = { written: false, reason: "agent_not_found" };
+      return;
+    }
+    if (fresh.claimed_at !== null) {
+      result = { written: false, reason: "owner_claimed_row_locked" };
+      return;
+    }
+    let curated: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(fresh.curated_fields || "{}");
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) curated = parsed;
+    } catch {
+      /* malformed curated_fields → treat as no locks (matches canCorrectFactualField's tolerance) */
+    }
+    if (Object.prototype.hasOwnProperty.call(curated, "website")) {
+      result = { written: false, reason: "curated_field_locked" };
+      return;
+    }
+    if (fresh.website && fresh.website.trim() !== "") {
+      result = { written: false, reason: "no_longer_blank" };
+      return;
+    }
+    // Shared-host re-check at write time: the host must not have been taken
+    // by ANOTHER agent between queue time and now. rfbWdExistingWebsiteHosts
+    // collects every non-blank website host; this row's own is blank (checked
+    // above), so a hit here is always another agent's.
+    if (rfbWdExistingWebsiteHosts(db).has(host)) {
+      result = { written: false, reason: "host_already_in_use" };
+      return;
+    }
+
+    const upd = db
+      .prepare(
+        `UPDATE agent_knowledge
+            SET website = ?, updated_at = datetime('now')
+          WHERE agent_id = ? AND (website IS NULL OR TRIM(website) = '')`,
+      )
+      .run(candidateUrl, agentId);
+    if (upd.changes !== 1) {
+      result = { written: false, reason: "no_longer_blank" };
+      return;
+    }
+
+    // Provenance: same merge helper as every other provenance writer.
+    let existingProv: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(fresh.field_provenance || "{}");
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existingProv = parsed;
+    } catch {
+      /* malformed → start clean; merge helper rebuilds well-formed shape */
+    }
+    const merged = mergeFieldProvenance(existingProv, {
+      website: {
+        sources: [
+          {
+            source_type: "homepage",
+            value: candidateUrl,
+            source_url: finalUrl,
+            fetched_at: new Date().toISOString(),
+          },
+        ],
+      },
+    });
+    db.prepare(`UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?`).run(
+      JSON.stringify(merged),
+      agentId,
+    );
+
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, 'website', NULL, ?, 'admin', NULL, datetime('now'), ?)`,
+    ).run(uuid(), agentId, candidateUrl, `batch:${batchId ?? "manual"} source:rfb-website-review-approve`);
+
+    db.prepare(
+      `UPDATE agents_website_review_queue
+          SET status = 'applied', updated_at = datetime('now')
+        WHERE agent_id = ? AND status = 'pending'`,
+    ).run(agentId);
+
+    result = { written: true };
+  });
+  tx();
+  return result;
+}
+
+router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {agent_id, url}" });
+    return;
+  }
+  if (body.approvals.length > 200) {
+    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+    return;
+  }
+
+  const db = getDb();
+  ensureRfbWebsiteReviewQueueTable(db);
+  const pending = db
+    .prepare(`SELECT * FROM agents_website_review_queue WHERE status = 'pending'`)
+    .all() as Array<{ agent_id: string; candidate_url: string; final_url: string | null; batch_id: string | null }>;
+  const byAgent = new Map(pending.map((q) => [q.agent_id, q]));
+
+  const seen = new Set<string>();
+  const approved: Array<{ agent_id: string; url: string }> = [];
+  const written: Array<{ agent_id: string; url: string }> = [];
+  const rejected: Array<{ agent_id: string; reason: string }> = [];
+
+  for (const raw of body.approvals as unknown[]) {
+    const a = raw as { agent_id?: unknown; url?: unknown };
+    const aid = typeof a?.agent_id === "string" ? a.agent_id.trim() : "";
+    const url = typeof a?.url === "string" ? a.url.trim() : "";
+    if (!aid || !url) {
+      rejected.push({ agent_id: aid || "(missing)", reason: "invalid_item" });
+      continue;
+    }
+    if (seen.has(aid)) {
+      rejected.push({ agent_id: aid, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(aid);
+    const q = byAgent.get(aid);
+    if (!q) {
+      rejected.push({ agent_id: aid, reason: "not_in_review_queue" });
+      continue;
+    }
+    if (q.candidate_url !== url) {
+      rejected.push({ agent_id: aid, reason: "mismatch_with_queued_candidate" });
+      continue;
+    }
+    approved.push({ agent_id: aid, url });
+    if (!dryRun) {
+      try {
+        const w = applyRfbAgentWebsite(db, aid, q.candidate_url, q.final_url || q.candidate_url, q.batch_id);
+        if (w.written) {
+          written.push({ agent_id: aid, url: q.candidate_url });
+        } else {
+          rejected.push({ agent_id: aid, reason: w.reason });
+        }
+      } catch (err: any) {
+        rejected.push({ agent_id: aid, reason: `write_failed: ${err?.message ?? String(err)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    approved_count: approved.length,
+    approved,
+    written_count: written.length,
+    written,
+    rejected,
+  });
 });
 
 export default router;

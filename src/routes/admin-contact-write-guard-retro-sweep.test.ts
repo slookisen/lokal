@@ -194,7 +194,7 @@ export function runAdminContactWriteGuardRetroSweepTests(
       insertAgent.run("agent-phone-curated-only", "PhoneCuratedOnly AS", "key-phone-curated", null, "rfb", null);
       insertKnowledge.run(
         "agent-phone-curated-only",
-        "19991231",
+        "20111231",
         "Valmen 54, 2460 Osen Adresse",
         JSON.stringify({ phone: { locked_at: "2026-01-01T00:00:00.000Z", by: "rfb-customer-service" } }),
       );
@@ -332,7 +332,7 @@ export function runAdminContactWriteGuardRetroSweepTests(
       insertAgent.run("agent-phone-curated-only", "PhoneCuratedOnly AS", "key-phone-curated", null, "rfb", null);
       insertKnowledge.run(
         "agent-phone-curated-only",
-        "19991231",
+        "20111231",
         "Valmen 54, 2460 Osen Adresse",
         JSON.stringify({ phone: { locked_at: "2026-01-01T00:00:00.000Z", by: "rfb-customer-service" } }),
       );
@@ -399,7 +399,7 @@ export function runAdminContactWriteGuardRetroSweepTests(
         .get("agent-phone-curated-only") as { phone: string | null; address: string | null };
       assertEq(
         curatedRowAfter.phone,
-        "19991231",
+        "20111231",
         "cwgrs-38: agent-phone-curated-only's phone UNCHANGED under apply (curated_fields locks 'phone')",
       );
       assertEq(

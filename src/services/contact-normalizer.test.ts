@@ -22,6 +22,8 @@ import {
   phonesMatch,
   splitAddress,
   isDisplayablePhone,
+  national8,
+  classifyPhoneForWrite,
 } from "./contact-normalizer";
 import { crossSourceAgreement, type ProvenanceRecord } from "./cross-source-validator";
 
@@ -86,6 +88,22 @@ export function runContactNormalizerTests(opts: { log?: boolean } = {}): TestSum
     assertTrue(!isDisplayablePhone(null), "isDisplayablePhone NEG: null");
     assertTrue(!isDisplayablePhone(undefined), "isDisplayablePhone NEG: undefined");
     assertTrue(!isDisplayablePhone("ring oss i dag"), "isDisplayablePhone NEG: garbage text");
+  }
+
+  // ── national8: leading-digit rule (W33 2026-08-10 — Norwegian numbering plan:
+  //    8-digit subscriber numbers start 2-9, never 0/1) ─────────────────────────
+  {
+    assertEq(national8("02812441"), null, "national8 NEG: W33 breach value 02812441 (leading 0) rejected");
+    assertEq(national8("12345678"), null, "national8 NEG: leading 1 rejected (short-code range)");
+    assertEq(national8("4702812441"), null, "national8 NEG: 47-prefixed value with leading-0 national part rejected");
+    assertEq(national8("40190940"), "40190940", "national8 POS: Myrdal Gård's real number (leading 4) accepted");
+    assertEq(national8("21234567"), "21234567", "national8 POS: leading 2 (geographic) accepted");
+    assertEq(national8("80012345"), "80012345", "national8 POS: leading 8 (special services) accepted");
+    assertEq(national8("4791122333"), "91122333", "national8 POS: 47-prefixed valid number still reduces");
+    assertTrue(!isDisplayablePhone("02812441"), "isDisplayablePhone NEG: leading-0 value never rendered");
+    const w33 = classifyPhoneForWrite("02812441", "912345678");
+    assertTrue(w33.rejected && w33.failedRules.includes("shape"), "classifyPhoneForWrite: 02812441 rejected on shape rule");
+    assertTrue(!phonesMatch("02812441", "02812441"), "phonesMatch NEG: two identical invalid values never vacuously agree");
   }
 
   // ── normalizeAddress ─────────────────────────────────────────────────────────

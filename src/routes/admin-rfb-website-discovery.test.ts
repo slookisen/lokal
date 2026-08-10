@@ -505,6 +505,159 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const countRow = testDb.prepare("SELECT COUNT(*) AS n FROM agents_website_review_queue WHERE agent_id = 'wd-ok'").get() as { n: number };
       assertEq(countRow.n, 1, "o7: refresh, don't pile up — still exactly one row for wd-ok");
     }
+
+    // ═══ punkt 4a (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype):
+    //     external-candidate intake ═══
+
+    // ── (p) a caller-proposed URL with evidence verifies and queues with the
+    //     external reason — even when the host is NOT name-guessable --
+    {
+      insertAgent({ id: "wd-ext-ok", name: "Bakkely Ysteri", orgNr: "955555555", city: "Voss" });
+      fixtures.set(
+        "https://bakkely-ysteri-butikk.no",
+        htmlResponse("<html><body>Bakkely Ysteri på Voss — org.nr 955 555 555</body></html>", { finalUrl: "https://bakkely-ysteri-butikk.no" }),
+      );
+      const r = await callDiscovery({ candidates: [{ agentId: "wd-ext-ok", url: "https://bakkely-ysteri-butikk.no/om-oss" }] });
+      assertEq(r.status, 200, "p1: 200");
+      assertEq(r.body.mode, "external_candidates", "p2: response mode is external_candidates");
+      assertEq(r.body.proposed.length, 1, "p3: exactly one proposal");
+      assertEq(r.body.proposed[0].candidate_url, "https://bakkely-ysteri-butikk.no", "p4: candidate_url reduced to origin (path dropped)");
+      assertEq(r.body.proposed[0].evidence.org_nr_found, true, "p5: verified via org_nr on the page");
+      const row = readQueueRow("wd-ext-ok");
+      assertTrue(!!row, "p6: queue row inserted");
+      assertEq(row.reason, "website_discovery_candidate_external", "p7: queue reason marks external intake");
+      assertEq(row.status, "pending", "p8: status pending");
+    }
+
+    // ── (q) external candidate on a social host is excluded pre-fetch --
+    {
+      insertAgent({ id: "wd-ext-fb", name: "Lien Gard", orgNr: "977777777", city: "Førde" });
+      const before = fetchCalls.length;
+      const r = await callDiscovery({ candidates: [{ agentId: "wd-ext-fb", url: "https://www.facebook.com/liengard" }] });
+      assertEq(r.body.proposed.length, 0, "q1: nothing proposed");
+      assertEq(r.body.rejected.length, 1, "q2: one rejection");
+      assertEq(r.body.rejected[0].reason, "social_media_host", "q3: social host excluded");
+      assertEq(fetchCalls.length, before, "q4: the excluded host was never fetched");
+      assertTrue(!readQueueRow("wd-ext-fb"), "q5: nothing queued");
+    }
+
+    // ── (r) intake input contract: ambiguous/malformed calls are 400 --
+    {
+      const both = await callDiscovery({ candidates: [{ agentId: "x", url: "https://x.no" }], agentIds: ["y"] });
+      assertEq(both.status, 400, "r1: candidates+agentIds combined -> 400");
+      const malformed = await callDiscovery({ candidates: [{ agentId: "x" }] });
+      assertEq(malformed.status, 400, "r2: malformed candidate item -> 400");
+      const wrongMode = await callDiscovery({ candidates: [{ agentId: "x", url: "https://x.no" }], mode: "aggregator_replace" });
+      assertEq(wrongMode.status, 400, "r3: aggregator_replace with candidates -> 400");
+    }
+
+    // ── (s) external candidate for a row that already has a website --
+    {
+      insertAgent({ id: "wd-ext-has", name: "Solheim Gartneri", website: "https://solheimgartneri.no" });
+      const r = await callDiscovery({ candidates: [{ agentId: "wd-ext-has", url: "https://annen-side.no" }] });
+      assertEq(r.body.already_has_website.length, 1, "s1: reported in already_has_website");
+      assertEq(r.body.already_has_website[0].agent_id, "wd-ext-has", "s2: the right agent");
+      assertTrue(!readQueueRow("wd-ext-has"), "s3: nothing queued");
+    }
+
+    // ═══ punkt 4b: the approve/apply lever ═══
+
+    const postApprove = getHandler("post", "/rfb-website-review-approve");
+    async function callApprove(
+      body: Record<string, unknown>,
+      headers: Record<string, string> = { "x-admin-key": ADMIN_KEY },
+    ): Promise<{ status: number; body: any }> {
+      const res = fakeRes();
+      await postApprove({ headers, body, query: {} } as any, res as any);
+      return { status: res.statusCode, body: res.body };
+    }
+
+    // ── (t) approve: dry-run default confirms without writing --
+    {
+      const r = await callApprove({ approvals: [{ agent_id: "wd-ext-ok", url: "https://bakkely-ysteri-butikk.no" }] });
+      assertEq(r.status, 200, "t1: 200");
+      assertEq(r.body.dry_run, true, "t2: dry-run is the default");
+      assertEq(r.body.approved_count, 1, "t3: pair confirmed approvable");
+      assertEq(r.body.written_count, 0, "t4: nothing written in dry-run");
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-ext-ok'").get() as any;
+      assertTrue(!k.website, "t5: website column still blank after dry-run");
+      assertEq(readQueueRow("wd-ext-ok").status, "pending", "t6: queue row still pending");
+    }
+
+    // ── (u) approve: apply writes column + provenance + audit, flips queue --
+    {
+      const r = await callApprove({ approvals: [{ agent_id: "wd-ext-ok", url: "https://bakkely-ysteri-butikk.no" }], apply: true });
+      assertEq(r.body.dry_run, false, "u1: apply mode");
+      assertEq(r.body.written_count, 1, "u2: exactly one write");
+      const k = testDb.prepare("SELECT website, field_provenance FROM agent_knowledge WHERE agent_id = 'wd-ext-ok'").get() as any;
+      assertEq(k.website, "https://bakkely-ysteri-butikk.no", "u3: website column written (fill-only)");
+      const prov = JSON.parse(k.field_provenance || "{}");
+      assertTrue(
+        Array.isArray(prov.website) && prov.website.length === 1 && prov.website[0].source_type === "homepage",
+        "u4: field_provenance merged with a homepage-source record",
+      );
+      const audit = testDb
+        .prepare("SELECT * FROM agent_knowledge_audit WHERE agent_id = 'wd-ext-ok' AND field_name = 'website'")
+        .get() as any;
+      assertTrue(!!audit && audit.new_value === "https://bakkely-ysteri-butikk.no", "u5: agent_knowledge_audit row appended");
+      const q = testDb.prepare("SELECT status FROM agents_website_review_queue WHERE agent_id = 'wd-ext-ok'").get() as any;
+      assertEq(q.status, "applied", "u6: queue row flipped to 'applied'");
+      const g = await callQueue();
+      assertTrue(!g.body.queue.find((x: any) => x.agent_id === "wd-ext-ok"), "u7: no longer listed as pending");
+    }
+
+    // ── (v) approve: strict confirmation surface — wrong URL / non-queued
+    //     agent are rejected, nothing written --
+    {
+      const r = await callApprove({
+        approvals: [
+          { agent_id: "wd-ok", url: "https://feil-domene.no" },
+          { agent_id: "wd-aldri-koet", url: "https://x.no" },
+        ],
+        apply: true,
+      });
+      const reasons = new Map(r.body.rejected.map((x: any) => [x.agent_id, x.reason]));
+      assertEq(reasons.get("wd-ok"), "mismatch_with_queued_candidate", "v1: a different URL than queued is rejected");
+      assertEq(reasons.get("wd-aldri-koet"), "not_in_review_queue", "v2: a non-queued agent is rejected");
+      assertEq(r.body.written_count, 0, "v3: nothing written");
+    }
+
+    // ── (w) approve: owner-claimed row is guard-skipped at write time --
+    {
+      insertAgent({ id: "wd-claimed", name: "Haugtun Gard", orgNr: "933333333", city: "Gol" });
+      fixtures.set(
+        "https://haugtungard.no",
+        htmlResponse("<html><body>Haugtun Gard i Gol — org.nr 933 333 333</body></html>", { finalUrl: "https://haugtungard.no" }),
+      );
+      await callDiscovery({ agentIds: ["wd-claimed"] });
+      assertTrue(!!readQueueRow("wd-claimed"), "w1: queued via normal discovery");
+      testDb.prepare("UPDATE agents SET claimed_at = datetime('now') WHERE id = 'wd-claimed'").run();
+      const r = await callApprove({ approvals: [{ agent_id: "wd-claimed", url: "https://haugtungard.no" }], apply: true });
+      assertEq(r.body.written_count, 0, "w2: nothing written");
+      const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-claimed");
+      assertEq(rej?.reason, "owner_claimed_row_locked", "w3: claimed-row lock respected");
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-claimed'").get() as any;
+      assertTrue(!k.website, "w4: website column untouched");
+    }
+
+    // ── (x) approve: fill-only — a website set between queue time and apply
+    //     is never overwritten --
+    {
+      insertAgent({ id: "wd-race", name: "Nystu Gard", orgNr: "922222222", city: "Alvdal" });
+      fixtures.set(
+        "https://nystugard.no",
+        htmlResponse("<html><body>Nystu Gard i Alvdal — org.nr 922 222 222</body></html>", { finalUrl: "https://nystugard.no" }),
+      );
+      await callDiscovery({ agentIds: ["wd-race"] });
+      assertTrue(!!readQueueRow("wd-race"), "x0: queued");
+      testDb.prepare("UPDATE agent_knowledge SET website = 'https://allerede-satt.no' WHERE agent_id = 'wd-race'").run();
+      const r = await callApprove({ approvals: [{ agent_id: "wd-race", url: "https://nystugard.no" }], apply: true });
+      assertEq(r.body.written_count, 0, "x1: nothing written");
+      const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-race");
+      assertEq(rej?.reason, "no_longer_blank", "x2: fill-only guard fired");
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-race'").get() as any;
+      assertEq(k.website, "https://allerede-satt.no", "x3: the existing value is untouched");
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));

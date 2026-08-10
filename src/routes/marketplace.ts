@@ -22,7 +22,7 @@ import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, 
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
-import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isDisplayablePhone, national8 } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
@@ -5256,6 +5256,12 @@ export function extractPhone(html: string): string | null {
     const before = m.index > 0 ? text[m.index - 1] : "";
     const after = groupEnd < text.length ? text[groupEnd] : "";
     if (/\d/.test(before) || /\d/.test(after)) continue;
+    // Bug fix 3 (W33 2026-08-10): reject 8-digit runs that violate the
+    // Norwegian numbering plan's leading-digit rule (subscriber numbers
+    // start 2-9, never 0/1 — e.g. the live-written "02812441"). Delegates
+    // to the SAME national8 the write-guard uses (single implementation,
+    // contact-normalizer.ts) and keeps scanning for a real number.
+    if (national8(digits) === null) continue;
     return digits;
   }
   return null;

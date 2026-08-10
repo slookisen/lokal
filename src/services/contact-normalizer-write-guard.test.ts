@@ -111,14 +111,32 @@ export function runContactNormalizerWriteGuardTests(opts: { log?: boolean } = {}
       "validatePhoneForWrite: rule2-only — matches org-nr's last-8-digits, valid 8-digit shape otherwise",
     );
 
-    // Rule 3 ONLY: "19991231" is a valid 8-digit shape (rule 1 passes) and
-    // does not match any org-nr (orgNr null, rule 2 not applicable) — only
-    // the date-plausibility check catches this. Removing rule 3 (keeping
-    // rules 1+2) would let this through.
+    // Rule 3 ONLY: "20101231" is a valid 8-digit shape (rule 1 passes —
+    // leading 2 satisfies the W33 numbering-plan rule) and does not match
+    // any org-nr (orgNr null, rule 2 not applicable) — only the
+    // date-plausibility check catches this. Removing rule 3 (keeping
+    // rules 1+2) would let this through. (The fixture was "19991231" before
+    // the W33 leading-digit hardening; a 19xx date now ALSO fails shape, so
+    // a 20xx date is the rule3-ONLY shape — see the both-rules case below.)
+    assertEq(
+      validatePhoneForWrite("20101231", null),
+      null,
+      "validatePhoneForWrite: rule3-only — plausible YYYYMMDD date, no org-nr conflict",
+    );
+
+    // W33 (2026-08-10): a 19xx date violates BOTH the numbering-plan
+    // leading-digit rule (shape) and the date rule — still rejected, and
+    // both rules report truthfully.
     assertEq(
       validatePhoneForWrite("19991231", null),
       null,
-      "validatePhoneForWrite: rule3-only — plausible YYYYMMDD date, no org-nr conflict",
+      "validatePhoneForWrite: 19xx date still rejected after leading-digit hardening",
+    );
+    // The exact W33 breach value: leading 0, not a date — shape-only.
+    assertEq(
+      validatePhoneForWrite("02812441", null),
+      null,
+      "validatePhoneForWrite: W33 breach value 02812441 rejected",
     );
 
     // Regression: bare (no "+"/"00") "47"-prefixed 10-digit value whose
@@ -180,11 +198,27 @@ export function runContactNormalizerWriteGuardTests(opts: { log?: boolean } = {}
       "classifyPhoneForWrite: rule2-only fixture fails EXACTLY 'org_nr_collision', nothing else",
     );
 
-    assertAgree("19991231", null, "rule3-only plausible date");
+    assertAgree("20101231", null, "rule3-only plausible date");
     assertEq(
-      classifyPhoneForWrite("19991231", null).failedRules,
+      classifyPhoneForWrite("20101231", null).failedRules,
       ["date_shape"],
       "classifyPhoneForWrite: rule3-only fixture fails EXACTLY 'date_shape', nothing else",
+    );
+
+    // W33 (2026-08-10): 19xx dates fail BOTH shape (leading 1) and
+    // date_shape — the per-rule buckets deliberately overlap here.
+    assertAgree("19991231", null, "19xx date fails both shape and date_shape");
+    assertEq(
+      classifyPhoneForWrite("19991231", null).failedRules,
+      ["shape", "date_shape"],
+      "classifyPhoneForWrite: 19xx date fails BOTH 'shape' and 'date_shape'",
+    );
+    // The exact W33 breach value: leading 0, year 0281 is not a plausible
+    // date — shape-only.
+    assertEq(
+      classifyPhoneForWrite("02812441", null).failedRules,
+      ["shape"],
+      "classifyPhoneForWrite: W33 breach value 02812441 fails EXACTLY 'shape'",
     );
 
     // Regression fixture: bare-47-prefixed value reduces to org-nr's last-8

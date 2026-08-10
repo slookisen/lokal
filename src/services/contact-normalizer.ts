@@ -97,16 +97,34 @@ export function phonesMatch(a: string, b: string): boolean {
   return ea === eb;
 }
 
+// Norwegian numbering plan (Nkom / E.164 +47): an 8-digit SUBSCRIBER number
+// always starts with 2-9 (2/3/5/6/7 geographic+fixed, 4/9 mobile, 8 special
+// services like 800/815). A leading 0 is the trunk/international access
+// prefix and a leading 1 is the short-code range (1xx) — neither can ever
+// begin a real 8-digit subscriber number. W33 breach (2026-08-10,
+// platform-alerts/2026-08-10-rfb-enrichment-spotcheck-breach.md): the value
+// "02812441" was written as a phone because the shape rule accepted ANY
+// 8-digit string; this leading-digit rule closes that class structurally.
+const NORWEGIAN_SUBSCRIBER_LEAD = /^[2-9]/;
+
 /**
  * Reduce a digit string to the canonical 8-digit Norwegian national number, or
  * null if it cannot be confidently interpreted as one.
- *   • exactly 8 digits          → as-is
- *   • 10 digits starting "47"   → drop the leading "47" (un-prefixed country code)
- *   • anything else             → null (do not guess)
+ *   • exactly 8 digits starting 2-9  → as-is
+ *   • "47" + 8 digits starting 2-9   → drop the leading "47" (un-prefixed country code)
+ *   • 8 digits starting 0 or 1       → null (structurally impossible subscriber
+ *                                      number per the numbering plan — see
+ *                                      NORWEGIAN_SUBSCRIBER_LEAD above)
+ *   • anything else                  → null (do not guess)
  */
 export function national8(digits: string): string | null {
-  if (/^\d{8}$/.test(digits)) return digits;
-  if (/^47\d{8}$/.test(digits)) return digits.slice(2);
+  if (/^\d{8}$/.test(digits)) {
+    return NORWEGIAN_SUBSCRIBER_LEAD.test(digits) ? digits : null;
+  }
+  if (/^47\d{8}$/.test(digits)) {
+    const national = digits.slice(2);
+    return NORWEGIAN_SUBSCRIBER_LEAD.test(national) ? national : null;
+  }
   return null;
 }
 
@@ -200,9 +218,16 @@ export function classifyPhoneForWrite(
   const failedRules: PhoneWriteRule[] = [];
   if (!raw) return { rejected: true, failedRules }; // nothing to validate; caller treats as reject
 
-  // Rule 1 — exact-8-digit shape (delegates to the existing, already-trusted
-  // national8/normalizePhone logic; not reimplemented here).
-  const reduced = national8(normalizePhone(raw));
+  const rawDigits = normalizePhone(raw);
+
+  // Rule 1 — exact-8-digit shape INCLUDING the numbering-plan leading-digit
+  // rule (delegates to the existing, already-trusted national8/normalizePhone
+  // logic; not reimplemented here). Since the W33 leading-digit hardening, an
+  // 8-digit value starting 0/1 fails this rule too — so a 19xx-dated value
+  // like "19991231" now fails BOTH shape and date_shape (each rule is
+  // evaluated independently and truthfully; the audit sweep's per-rule
+  // buckets deliberately may overlap for such values).
+  const reduced = national8(rawDigits);
   if (reduced === null) {
     failedRules.push("shape");
   }
@@ -211,7 +236,6 @@ export function classifyPhoneForWrite(
   // result (checked here unconditionally on the digit-only forms) so a value
   // that ALSO happens to look like a valid 8-digit number is still caught.
   if (orgNr) {
-    const rawDigits = normalizePhone(raw);
     const orgDigits = normalizePhone(orgNr);
     if (orgDigits) {
       const orgLast8 = orgDigits.length >= 8 ? orgDigits.slice(-8) : orgDigits;
@@ -221,12 +245,20 @@ export function classifyPhoneForWrite(
     }
   }
 
-  // Rule 3 — not a plausible calendar date (only applicable once we know the
-  // value is exactly 8 digits, i.e. `reduced` came from the 8-digit branch of
-  // national8 rather than the "47"-prefixed 10-digit branch, or from a
-  // shape-failing value that nonetheless isn't null — guarded by the null
-  // check below).
-  if (reduced !== null && /^\d{8}$/.test(reduced) && looksLikeYyyymmdd(reduced)) {
+  // Rule 3 — not a plausible calendar date. Evaluated on the 8-digit national
+  // candidate INDEPENDENT of rule 1's verdict (previously it read `reduced`
+  // and was skipped whenever shape failed — harmless before the W33
+  // leading-digit hardening, but afterwards a 19xx date would have silently
+  // moved from the date_shape bucket to shape-only; evaluating independently
+  // keeps the per-rule diagnosis truthful for values that violate both).
+  const dateCandidate =
+    reduced ??
+    (/^\d{8}$/.test(rawDigits)
+      ? rawDigits
+      : /^47\d{8}$/.test(rawDigits)
+        ? rawDigits.slice(2)
+        : null);
+  if (dateCandidate !== null && looksLikeYyyymmdd(dateCandidate)) {
     failedRules.push("date_shape");
   }
 
