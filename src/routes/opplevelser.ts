@@ -134,6 +134,7 @@ import {
   extractGardssalgContactEmail,
   extractGardssalgContactPhone,
   selectGardssalgProvidersForContactExtraction,
+  isUmbrellaContactEmail,
   homepageRegistrableDomain,
   upsertGardssalgWebsiteReviewQueue,
   clearGardssalgWebsiteReviewQueueEntry,
@@ -1858,6 +1859,9 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
 }
 
 const GS_CR_DEFAULT_LIMIT = 25;
+// Cap for POST /admin/gardssalg-content-clear. Small on purpose: the lever
+// blanks content, so it is meant for named remediation, never a sweep.
+const GS_CONTENT_CLEAR_MAX_IDS = 25;
 const GS_CR_HARD_CAP = 48; // there are only 48 gårdssalg providers total
 
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
@@ -5252,7 +5256,7 @@ async function gsCxFetchPage(url: string): Promise<GsCxFetchOutcome> {
 }
 
 router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { limit?: unknown; offset?: unknown; apply?: unknown; providerIds?: unknown };
   const apply =
     body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true" ||
     req.query?.apply === "1" || req.query?.apply === "true";
@@ -5260,6 +5264,25 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const limit =
     typeof body.limit === "number" && body.limit > 0 ? Math.min(Math.floor(body.limit), 48) : GS_CX_DEFAULT_LIMIT;
   const offset = typeof body.offset === "number" && body.offset >= 0 ? Math.floor(body.offset) : 0;
+  // providerIds narrows the cohort to named rows (dev-request 2026-08-10-veien-
+  // til-pool-…, AK1). Same shape as content-refresh: strings only, trimmed,
+  // de-duplicated, capped at the batch limit so a targeted call can never
+  // out-run the cohort cap.
+  let providerIds: string[] | undefined;
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+          .map((v) => v.trim())
+      )
+    ).slice(0, limit);
+    if (ids.length === 0) {
+      res.status(400).json({ error: "providerIds must contain at least one non-blank string" });
+      return;
+    }
+    providerIds = ids;
+  }
 
   // Kjørelås — sjekket og satt FØR noe arbeid. finally-blokken under er eneste
   // som slipper den, så en kastet feil aldri etterlater låsen hengende.
@@ -5271,10 +5294,13 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   try {
   const batchId = `contact-extraction-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
-  const { targets, cohortTotal } = selectGardssalgProvidersForContactExtraction(limit, offset);
+  const { targets, cohortTotal } = selectGardssalgProvidersForContactExtraction(limit, offset, providerIds);
 
   const changed: Array<{ provider_id: string; navn: string; fields: string[]; epost: string | null; telefon: string | null; source_url: string; email_source?: string; phone_cued?: boolean }> = [];
   const noContactFound: Array<{ provider_id: string; navn: string; pages_tried: number }> = [];
+  // Addresses refused because they belong to a trade body / members'
+  // association rather than the producer (AK2). Reported, never written.
+  const umbrellaRejected: Array<{ provider_id: string; navn: string; epost: string; source_url: string }> = [];
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
   const cooldownSkipped: Array<{ provider_id: string; navn: string; host: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
@@ -5333,6 +5359,17 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
         if ((!needEmail || email) && (!needPhone || phone)) break;
       }
 
+      // Paraply-vern (dev-request 2026-08-10-veien-til-pool-…, AK2). Checked
+      // AFTER extraction and BEFORE the "found nothing" branch, so a provider
+      // whose ONLY discoverable address is an association inbox correctly ends
+      // up as no_contact_found rather than silently acquiring the trade body's
+      // address. A phone found on the same pages is unaffected.
+      if (email && isUmbrellaContactEmail(email.email)) {
+        umbrellaRejected.push({ provider_id: t.id, navn: t.navn, epost: email.email, source_url: emailUrl });
+        email = null;
+        emailUrl = "";
+      }
+
       if (!email && !phone) {
         noContactFound.push({ provider_id: t.id, navn: t.navn, pages_tried: pages.length });
         continue;
@@ -5374,8 +5411,10 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     scanned: targets.length,
     providers_enriched: changed.length,
     aborted_client_disconnect: clientDisconnected,
+    targeted: providerIds ? providerIds.length : 0,
     changed,
     no_contact_found: noContactFound,
+    umbrella_address_rejected: umbrellaRejected,
     fetch_failed: fetchFailed,
     cooldown_skipped: cooldownSkipped,
     errors,
@@ -6289,7 +6328,185 @@ router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, 
 // Body: { approvals: [{provider_id, org_nr}], apply? } — dry-run by default.
 // Response buckets: approved / rejected (reason per item) — every submitted
 // item lands in exactly one.
-router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, (req: Request, res: Response) => {
+// ─── POST /api/opplevelser/admin/gardssalg-content-clear ────────────────────
+//
+// dev-request 2026-08-10-veien-til-pool-berikelseskjede-og-koedrenering, AK6.
+//
+// The enrichment pipeline is fill-only by design: gardssalg-content-refresh
+// writes a field that is blank or thin, and steps over one that is already
+// populated. That is the right default — it is what stops a re-run from
+// trampling good text — but it leaves a genuine hole: a field populated with
+// WRONG content can never be corrected by the machinery that produced it.
+// Measured 2026-08-10: Geiranger Bryggeri's about_text held a single beer's
+// tasting notes ("Vikingstøa er ein spenstig pale ale … IBU 29, EBC 15"),
+// Silver Distillery's and Norumbryggeriet's held scraped navigation menus.
+// gardssalg-content-rollback could not help either: it restores the PREVIOUS
+// audited value, which for Geiranger was itself scraped, and the chain then
+// reports already_current.
+//
+// This endpoint breaks that lock the boring way — clear, then let the existing
+// fill-only refresh re-fetch. It writes NOTHING of its own: it delegates to
+// applyGardssalgRetroScanNull(), the already-reviewed helper that nulls a
+// field with a gardssalg_content_audit row (old_value = the contaminated
+// text) plus field_provenance removal, so gardssalg-content-rollback can undo
+// an unwanted clear like any other content write.
+//
+// Deliberately NO cohort mode and NO "clear all": explicit providerIds are the
+// entire point. A lever that can blank content is exactly the lever that must
+// never be able to sweep. Blast radius is bounded by what the caller names.
+router.post("/admin/gardssalg-content-clear", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; field_name?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const CLEARABLE = new Set(["about_text", "visit_text"]);
+  const fieldName = typeof body.field_name === "string" ? body.field_name.trim() : "";
+  if (!CLEARABLE.has(fieldName)) {
+    res.status(400).json({
+      error: "field_name must be one of: about_text, visit_text",
+      detail: "only the free-text content fields are clearable through this lever",
+    });
+    return;
+  }
+
+  if (!Array.isArray(body.providerIds) || body.providerIds.length === 0) {
+    res.status(400).json({ error: "providerIds must be a non-empty array of strings" });
+    return;
+  }
+  const providerIds = Array.from(
+    new Set(
+      (body.providerIds as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim())
+    )
+  );
+  if (providerIds.length === 0) {
+    res.status(400).json({ error: "providerIds must contain at least one non-blank string" });
+    return;
+  }
+  if (providerIds.length > GS_CONTENT_CLEAR_MAX_IDS) {
+    res.status(400).json({ error: `providerIds exceeds max of ${GS_CONTENT_CLEAR_MAX_IDS} per call` });
+    return;
+  }
+
+  const batchId = `content-clear-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+  const cleared: Array<{ provider_id: string; navn: string | null; field_name: string; previous_value_preview: string }> = [];
+  const skipped: Array<{ provider_id: string; reason: string }> = [];
+
+  try {
+    for (const providerId of providerIds) {
+      const row = getProviderById(providerId) as
+        | { id: string; navn?: string | null; about_text?: string | null; visit_text?: string | null }
+        | null;
+      if (!row) {
+        skipped.push({ provider_id: providerId, reason: "not_found" });
+        continue;
+      }
+      const current = (fieldName === "about_text" ? row.about_text : row.visit_text) ?? "";
+      if (current.trim() === "") {
+        skipped.push({ provider_id: providerId, reason: "already_blank" });
+        continue;
+      }
+      if (dryRun) {
+        cleared.push({
+          provider_id: providerId,
+          navn: row.navn ?? null,
+          field_name: fieldName,
+          previous_value_preview: current.slice(0, 160),
+        });
+        continue;
+      }
+      const written = applyGardssalgRetroScanNull(
+        providerId,
+        [fieldName as "about_text" | "visit_text"],
+        `admin:gardssalg-content-clear:${batchId}`,
+        batchId
+      );
+      if (written.length > 0) {
+        cleared.push({
+          provider_id: providerId,
+          navn: row.navn ?? null,
+          field_name: fieldName,
+          previous_value_preview: current.slice(0, 160),
+        });
+      } else {
+        // Owner-locked / manual row, or a concurrent write beat us. The helper
+        // is the enforcement point; a refusal here is correct, not an error.
+        skipped.push({ provider_id: providerId, reason: "write_refused_locked_or_manual" });
+      }
+    }
+  } catch (err) {
+    console.error("[gardssalg-content-clear] failed:", err);
+    res.status(500).json({ error: "content clear failed" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    dry_run: dryRun,
+    batch_id: batchId,
+    field_name: fieldName,
+    requested: providerIds.length,
+    cleared_count: cleared.length,
+    cleared,
+    skipped,
+  });
+});
+
+/**
+ * Loose name agreement between a provider row and Brreg's registered name,
+ * used ONLY by the manual_verified approval path below.
+ *
+ * Deliberately token-overlap rather than equality: the registered name is
+ * routinely a legal entity that reads differently from the trading name —
+ * "Ciderhuset Balholm" is BALHOLM AS, "Sjuragarden" is
+ * "KARIN MO VALLAND / SJURAGARDEN", "Hebnes Vingård" is "ARILD HEBNES". An
+ * equality check would refuse all three. Suffix/filler tokens are dropped so
+ * that "AS" alone can never constitute agreement, and tokens must be >2 chars
+ * so single letters cannot either.
+ */
+export function brregNameOverlapsProviderName(
+  providerName: string | null | undefined,
+  brregName: string | null | undefined,
+): boolean {
+  const norm = (s: string | null | undefined): string[] => {
+    const base = (s ?? "")
+      .toLowerCase()
+      .replace(/ø/g, "o")
+      .replace(/æ/g, "ae")
+      .replace(/å/g, "a")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+    // Two classes are dropped. Legal-form and filler words ("AS", "og") so a
+    // suffix can never constitute agreement. AND generic industry words —
+    // measured 2026-08-10, "Alde Sider / Ulvik Frukt & Cideri" matched the
+    // unrelated "SIDER AS" in Aure, hundreds of km away, on the shared word
+    // "sider" alone. An industry noun describes what a producer MAKES; it does
+    // not identify WHICH producer, so it must not be able to bind on its own.
+    // Compound trading names keep their force: "Sideriet", "Gardsbrenneriet"
+    // and "Mikrobryggeriet X" are distinct tokens and survive this filter.
+    const filler = new Set([
+      "as", "asa", "sa", "ba", "da", "ans", "og", "the", "norge", "norway", "gard", "gaard",
+      "sider", "cider", "sideri", "cideri", "bryggeri", "mikrobryggeri", "handbryggeri",
+      "brygghus", "brenneri", "destilleri", "distillery", "vingard", "mjoderi", "safteri",
+      "gardsutsalg", "frukt",
+    ]);
+    return base.split(/\s+/).filter((t) => t.length > 2 && !filler.has(t));
+  };
+  const a = new Set(norm(providerName));
+  const b = new Set(norm(brregName));
+  if (a.size === 0 || b.size === 0) return false;
+  for (const t of a) if (b.has(t)) return true;
+  return false;
+}
+
+router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
   const apply =
     body.apply === true ||
@@ -6308,14 +6525,15 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, (req: Request
   const queue = listGardssalgOrgnrReviewQueue();
   const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
 
-  const approved: Array<{ provider_id: string; org_nr: string }> = [];
-  const rejected: Array<{ provider_id: string; reason: string }> = [];
+  const approved: Array<{ provider_id: string; org_nr: string; manual_verified?: true; brreg_name?: string }> = [];
+  const rejected: Array<{ provider_id: string; reason: string; brreg_name?: string }> = [];
   const seen = new Set<string>();
 
   for (const raw of body.approvals as unknown[]) {
-    const a = (raw ?? {}) as { provider_id?: unknown; org_nr?: unknown };
+    const a = (raw ?? {}) as { provider_id?: unknown; org_nr?: unknown; manual_verified?: unknown };
     const providerId = typeof a.provider_id === "string" ? a.provider_id.trim() : "";
     const orgNr = typeof a.org_nr === "string" ? a.org_nr.replace(/\s+/g, "") : "";
+    const manualVerified = a.manual_verified === true;
     if (!providerId || !orgNr) {
       rejected.push({ provider_id: providerId || "<mangler>", reason: "invalid_item" });
       continue;
@@ -6332,10 +6550,68 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, (req: Request
       continue;
     }
     if (!entry.candidate_orgnr || entry.candidate_orgnr.trim() !== orgNr) {
-      // The human must approve the QUEUED candidate — a different org_nr in
-      // the request is a data-entry error or an attempt to use this as an
+      // Default path: the human approves the QUEUED candidate — a different
+      // org_nr is a data-entry error or an attempt to use this as an
       // arbitrary-write surface. Either way: rejected, nothing written.
-      rejected.push({ provider_id: providerId, reason: "mismatch_with_queued_candidate" });
+      //
+      // manual_verified path (dev-request 2026-08-10-veien-til-pool-…, AK4):
+      // the queue's matcher resolves nothing for a large share of rows —
+      // measured 2026-08-10, 26 of 26 gårdssalg rows without an org_nr came
+      // back no_brreg_candidate, so `candidate_orgnr` is null and there was NO
+      // way to record an org_nr a human had verified against Brreg by hand.
+      // That is what stranded 7 verified numbers.
+      //
+      // The flag alone proves nothing — it is a REQUEST, not evidence. The
+      // server therefore re-verifies against Brreg itself before writing:
+      // the unit must exist, be active, and its registered name must share a
+      // real token with the provider name. A caller cannot assert its way past
+      // any of those.
+      if (!manualVerified) {
+        rejected.push({ provider_id: providerId, reason: "mismatch_with_queued_candidate" });
+        continue;
+      }
+      if (!/^\d{9}$/.test(orgNr)) {
+        rejected.push({ provider_id: providerId, reason: "manual_verify_invalid_orgnr_format" });
+        continue;
+      }
+      const verdict = await verifyOrgNumber(orgNr);
+      if (!verdict.exists) {
+        rejected.push({ provider_id: providerId, reason: "manual_verify_orgnr_not_found_in_brreg" });
+        continue;
+      }
+      if (!verdict.active) {
+        rejected.push({
+          provider_id: providerId,
+          reason: `manual_verify_orgnr_not_active${verdict.flag ? `_${verdict.flag}` : ""}`,
+          brreg_name: verdict.name ?? undefined,
+        });
+        continue;
+      }
+      if (!brregNameOverlapsProviderName(entry.provider_name, verdict.name)) {
+        rejected.push({
+          provider_id: providerId,
+          reason: "manual_verify_name_mismatch",
+          brreg_name: verdict.name ?? undefined,
+        });
+        continue;
+      }
+      if (dryRun) {
+        approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        continue;
+      }
+      try {
+        const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`;
+        const written = applyGardssalgProviderOrgnr(providerId, orgNr, evidenceUrl);
+        if (written.length > 0) {
+          clearGardssalgOrgnrReviewQueueEntry(providerId);
+          approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        } else {
+          rejected.push({ provider_id: providerId, reason: "write_refused_filled_locked_or_conflict" });
+        }
+      } catch (err) {
+        console.error("[gardssalg-orgnr-review-approve] manual_verified write failed:", err);
+        rejected.push({ provider_id: providerId, reason: "write_failed" });
+      }
       continue;
     }
 

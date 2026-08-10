@@ -5500,26 +5500,88 @@ export type GardssalgContactExtractionTarget = {
  * order (created_at, id) so offset paging walks the whole cohort exactly once
  * — same idiom as the Brreg contact backfill.
  */
+/**
+ * Cohort selector for contact extraction.
+ *
+ * `providerIds` (dev-request 2026-08-10-veien-til-pool-berikelseskjede-og-
+ * koedrenering, AK1) NARROWS the cohort to exactly those rows — it never
+ * widens it. Every existing guard still applies, so a targeted call can no
+ * more overwrite a stored address, touch a claimed row or hit the test
+ * provider than a cohort call can. Before this parameter existed the route
+ * could only run over the whole cohort, so a batch containing ONE bad
+ * candidate had to be abandoned wholesale — which is exactly how 67 North
+ * Distillery's own correct address stayed unwritten while two umbrella
+ * addresses blocked the run.
+ */
 export function selectGardssalgProvidersForContactExtraction(
   limit: number,
   offset: number,
+  providerIds?: string[],
 ): { targets: GardssalgContactExtractionTarget[]; cohortTotal: number } {
   const db = getDb(VERTICAL);
+  const ids = (providerIds ?? []).filter((v) => typeof v === "string" && v.trim() !== "");
+  const idFilter = ids.length > 0 ? ` AND id IN (${ids.map(() => "?").join(", ")})` : "";
   const where = `
     (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
     AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
     AND ((epost IS NULL OR TRIM(epost) = '') OR (telefon IS NULL OR TRIM(telefon) = ''))
     AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
-    AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`;
-  const cohortTotal = (db.prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${where}`).get() as { n: number }).n;
+    AND (producer_type IS NULL OR producer_type != 'test-gardssalg')${idFilter}`;
+  const cohortTotal = (
+    db.prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${where}`).get(...ids) as { n: number }
+  ).n;
   const targets = db
     .prepare(
       `SELECT id, navn, hjemmeside, epost, telefon, content_source
          FROM experience_providers WHERE ${where}
         ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`
     )
-    .all(limit, offset) as GardssalgContactExtractionTarget[];
+    .all(...ids, limit, offset) as GardssalgContactExtractionTarget[];
   return { targets, cohortTotal };
+}
+
+// ─── Paraply-/foreningsvern (dev-request 2026-08-10-veien-til-pool-…, AK2) ──
+//
+// Daniel's standing email rule: an address may come from the producer's own
+// site, or from their umbrella organisation's listing — but it must be the
+// PRODUCER's address, "ikke e-post til paraply men til dem". A trade body's
+// own inbox reaches the association, not the producer, so outreach sent
+// there is both wrong and embarrassing.
+//
+// Measured 2026-08-10: a cohort run would have written
+// post@norskedestillerier.no to Norstill (Norske Destillerier is an interest
+// organisation founded 2024 for ~40 craft distilleries) and
+// post@mosseolets-venner.no to Moss Bryggeri (a members' association, not
+// the brewery).
+//
+// Deliberately a CURATED DENY-LIST, not a heuristic. A "does the domain look
+// like the producer?" rule would reject plenty of legitimate addresses —
+// By Brenneri publishes hermod.fledsberg@by-gaard.no, Inderøy Brenneri uses
+// info@berg-gaard.no — and Daniel's instruction for this pipeline is
+// explicitly "ikke blokker unødvendig". Off-domain addresses are therefore
+// REPORTED (see offDomain on the route) but not blocked; only these known
+// association domains are refused outright.
+export const UMBRELLA_EMAIL_DOMAINS = new Set<string>([
+  "norskedestillerier.no",
+  "mosseolets-venner.no",
+  "bryggeriforeningen.no",
+  "nortura.no",
+  "hanen.no",
+]);
+
+/**
+ * True when `email`'s registrable domain belongs to a known umbrella /
+ * trade-association inbox. Case- and whitespace-insensitive; a blank or
+ * malformed address is never "umbrella" (it simply is not an address).
+ */
+export function isUmbrellaContactEmail(email: string | null | undefined): boolean {
+  const at = (email ?? "").trim().toLowerCase().lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = (email ?? "").trim().toLowerCase().slice(at + 1);
+  if (!domain) return false;
+  if (UMBRELLA_EMAIL_DOMAINS.has(domain)) return true;
+  // www./mail. style hosts and any sub-domain of a listed umbrella host
+  return Array.from(UMBRELLA_EMAIL_DOMAINS).some((u) => domain.endsWith(`.${u}`));
 }
 
 // ─── Gårdssalg Brreg-verifisering (dev-request 2026-08-08-gardssalg-brreg-
