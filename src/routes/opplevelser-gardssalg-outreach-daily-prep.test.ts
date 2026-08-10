@@ -2,13 +2,19 @@
  * opplevelser-gardssalg-outreach-daily-prep.test.ts — tests for
  * GET /admin/gardssalg-outreach-daily-prep (src/routes/opplevelser.ts), added
  * for dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
- * Skive 2: the read-only "daily prep" computation. Given the current
- * outreach_ready cohort, this route runs the SAME preflight/pilot-send
- * dry-run check POST /admin/gardssalg-outreach-pilot-send runs (via the
- * extracted computeGardssalgOutreachSendEligibility, shared by both routes),
- * keeps only candidates that would actually be sent, caps the result at 4
- * (no padding), and reports every outreach_ready row that did NOT make the
- * cut with its reason. Zero write/apply capability.
+ * Skive 2 (the read-only "daily prep" computation) and Skive 3 (three further
+ * automated checks folded into the SAME route, run over the full eligible
+ * list before the daily cap — see the route's own module doc comment for the
+ * full rationale of each). Given the current outreach_ready cohort, this
+ * route runs the SAME preflight/pilot-send dry-run check POST /admin/
+ * gardssalg-outreach-pilot-send runs (via the extracted
+ * computeGardssalgOutreachSendEligibility, shared by both routes), then
+ * Skive 3's address-domain / profile-text / correct-industry checks
+ * (daily-prep-only, NOT shared with pilot-send), keeps only candidates that
+ * survive all of it, caps the result at 4 (no padding, with genuine
+ * backfill — an excluded candidate is replaced by the next eligible one in
+ * order, never leaves a gap), and reports every outreach_ready row that did
+ * NOT make the cut with its reason. Zero write/apply capability.
  *
  * Mirrors opplevelser-gardssalg-outreach-size-gate.test.ts's setup
  * (EXPERIENCES_DB_PATH=":memory:", fresh require of db-factory + opplevelser
@@ -16,7 +22,10 @@
  * X-Admin-Key via headers, method/url configurable for a GET route).
  *
  * Fixture layout (ids sorted ascending, since the route selects/caps in id
- * order for determinism):
+ * order for determinism). about_text on every "would otherwise send" fixture
+ * below is realistic Norwegian prose (>=80 chars, no boilerplate) so it
+ * clears Skive 3's profile-text check — a dedicated separate fixture
+ * (prov-f-thinabout, block (i) below) covers the check ITSELF failing:
  *   prov-a-freemail       outreach_ready, would_send, address_basis
  *                         "freemail_pointing_to_producer" (gmail.com)
  *   prov-b-homepage       outreach_ready, would_send, address_basis
@@ -24,36 +33,63 @@
  *                         email on a different domain than the website)
  *   prov-c-samedomain     outreach_ready, would_send, address_basis
  *                         "same_domain_as_website"
- *   prov-d-unverified     outreach_ready, would_send, address_basis
+ *   prov-d-unverified     outreach_ready readiness-tier-wise, but address
  *                         "unverified" (neither website domain, nor
- *                         homepage-evidenced, nor free-mail — Skive 3 would
- *                         eventually gate this; Skive 2 only labels it)
- *   prov-e-overflow       outreach_ready, would_send, but bumped past the
- *                         4-candidate cap -> excluded/daily_cap_reached
+ *                         homepage-evidenced, nor free-mail — the Hardanger
+ *                         Saft nils.j.lekve@ulvik.org shape) -> Skive 3
+ *                         check 1 now excludes it, reason
+ *                         address_domain_mismatch (Skive 2 only labelled
+ *                         this; Skive 3 is where it gates)
+ *   prov-e-overflow       outreach_ready, would_send, clears every Skive 3
+ *                         check too -> backfills into the 4th slot vacated
+ *                         by prov-d-unverified above (proves genuine
+ *                         batch-assembly-time backfill, not just "the first
+ *                         4 before any exclusion")
  *   prov-macks-large      outreach_ready but size_flag "stor" -> excluded/
  *                         large_company_excluded (same Macks-style fixture
- *                         as the size-gate test)
+ *                         as the size-gate test) — excluded upstream of
+ *                         Skive 3, so its about_text is irrelevant here
  *   prov-quarantine       outreach_ready but own-table-cooldown-suppressed
  *                         (a prior real send within the cooldown window) ->
- *                         excluded/cooldown_suppressed + quarantine_until
+ *                         excluded/cooldown_suppressed + quarantine_until —
+ *                         also excluded upstream of Skive 3
  *   prov-needs-enrichment NOT outreach_ready at all (missing products) —
  *                         must appear in neither candidates nor excluded,
  *                         only folds into refill_hints.needs_enrichment_count
  *
+ * Skive-3-dedicated fixtures, each inserted/asserted/deleted in its own
+ * isolated block (h)/(i)/(j) below, after the shared 8-fixture set above has
+ * been fully exercised and cleared out:
+ *   prov-g-salmon          rfb-seed, producer_type NULL, naeringskode
+ *                          "03.211" (Fiskeoppdrett i sjøvann — salmon
+ *                          farming, the dev-request's own named false-
+ *                          positive) -> excluded/wrong_industry
+ *   prov-f-thinabout       about_text "Om gården." (10 chars, present but
+ *                          nowhere near meetsAboutCheapBar's 80-char floor)
+ *                          -> excluded/profile_text_low_quality
+ *   prov-j-dup-1/-2        two DIFFERENT providers, IDENTICAL recipient
+ *                          email -> only -1 (first in ascending id order)
+ *                          survives; -2 excluded/preflight_no_go with
+ *                          preflight_reason duplikat_epost (Skive 2's own
+ *                          Slice-2 outreach-guard, batch-scoped — proves
+ *                          Skive 3 krav 4 needed NO new code)
+ *
  * Covers:
  *   (a) auth: missing/wrong X-Admin-Key -> 403
- *   (b) full batch: exactly 4 candidates (a,b,c,d — e bumped by the cap),
- *       each with all required fields (name/profile_url/recipient_email/
- *       address_basis/producer_type/antall_ansatte/kommune/checks), the
- *       three positive address_basis values plus "unverified" all present
- *       across the 4
+ *   (b) full batch: exactly 4 candidates (a,b,c,e — d excluded by the new
+ *       address-domain check, e backfills into its slot), each with all
+ *       required fields (name/profile_url/recipient_email/address_basis/
+ *       producer_type/antall_ansatte/kommune/checks), the three positive
+ *       address_basis values all present across the 4
  *   (c) excluded list: large_company_excluded (Macks) + cooldown_suppressed
  *       with last_sent_at + quarantine_until (quarantine) +
- *       daily_cap_reached (overflow) all present with reasons; a
+ *       address_domain_mismatch (d) all present with reasons; a
  *       needs_enrichment-tier row never appears in excluded (it was never
- *       outreach_ready)
- *   (d) fewer-than-4 case: a narrower fixture set with only 2 eligible ids
- *       -> returns exactly 2, missing.count 2, reason "fewer_than_cap", note
+ *       outreach_ready); pool counters unchanged in shape from Skive 2 (d
+ *       and e simply swap which bucket they land in)
+ *   (d) fewer-than-4 case: a narrower fixture set with only 1 surviving
+ *       eligible id (c; d is excluded by the address check even here) ->
+ *       returns exactly 1, missing.count 3, reason "fewer_than_cap", note
  *       present, never padded
  *   (e) zero-eligible-but-nonzero-pool case: outreach_ready rows exist but
  *       all are excluded -> dry:true, missing.reason "all_excluded",
@@ -63,6 +99,14 @@
  *   (g) no-apply-path: a testKey call never triggers a write —
  *       experience_outreach_sent_log row count is identical before/after,
  *       and the route's own source slice carries no `apply: true` literal
+ *   (h) Skive 3 check 3 (correct-industry): a salmon-farming NACE code with
+ *       no producer_type set -> excluded/wrong_industry, never a candidate
+ *   (i) Skive 3 check 2 (profile-text sanity): a too-short about_text ->
+ *       excluded/profile_text_low_quality, never a candidate
+ *   (j) Skive 3 check 4 (shared-recipient-across-batch): already fully
+ *       implemented by Skive 2's own batch dedupe (no new production code) —
+ *       two candidates sharing one recipient email collapse to exactly one
+ *       kept (first in id order) + one excluded/preflight_no_go
  */
 
 import * as fs from "fs";
@@ -119,6 +163,16 @@ function callRoute(
 const VERIFIED_PROVENANCE = JSON.stringify({
   hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-08-09T00:00:00.000Z" },
 });
+
+// Skive 3 check 2 (profile-text sanity, meetsAboutCheapBar): realistic,
+// >=80-char Norwegian prose with no boilerplate markers — used on every
+// fixture below that must still clear the new profile-text gate. Plain
+// "Om gården."-style placeholders (10 chars) now fail that gate on purpose;
+// prov-f-thinabout (block (i)) keeps exactly that short placeholder to
+// prove the gate actually fires.
+const REALISTIC_ABOUT_TEXT =
+  "Vi driver et lite gårdsbruk og lager drikke av råvarer fra vår egen gård. " +
+  "Produktene selges direkte fra gårdsutsalget til besøkende gjennom hele sesongen.";
 
 // prov-b-homepage's field_provenance: the email was extracted from the
 // producer's OWN homepage (source_url resolves to the website's own host),
@@ -235,13 +289,13 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
            (id, navn, vertical, org_nr, kommune, rfb_seed_source, producer_type,
             epost, telefon, hjemmeside, about_text, visit_text, opening_hours_text,
             products, content_source, booking_live, catalog_hidden, slug, field_provenance,
-            brreg_verified, antall_ansatte,
+            brreg_verified, antall_ansatte, naeringskode,
             enrichment_state, verification_status, source, confidence)
          VALUES
            (@id, @navn, 'experiences', @org_nr, @kommune, @rfb_seed_source, @producer_type,
             @epost, @telefon, @hjemmeside, @about_text, @visit_text, @opening_hours_text,
             @products, @content_source, @booking_live, @catalog_hidden, @slug, @field_provenance,
-            @brreg_verified, @antall_ansatte,
+            @brreg_verified, @antall_ansatte, @naeringskode,
             'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
 
@@ -250,10 +304,10 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         id: "prov-a-freemail", navn: "Alpha Freemail Gård", org_nr: "100000001", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
         epost: "alpha.freemail@gmail.com", telefon: null, hjemmeside: "https://alpha-freemail.example.no",
-        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "alpha-freemail-gard", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1, antall_ansatte: 4,
+        brreg_verified: 1, antall_ansatte: 4, naeringskode: null,
       });
 
       // ── prov-b-homepage: would_send, address_basis published_on_producer_site
@@ -261,11 +315,11 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         id: "prov-b-homepage", navn: "Beta Homepage Gård", org_nr: "100000002", kommune: "Ulvik",
         rfb_seed_source: "rfb-seed", producer_type: "bryggeri",
         epost: "kontakt@mailhost-beta.example.com", telefon: null, hjemmeside: "https://beta-homepage.example.no",
-        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
         products: "Øl", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "beta-homepage-gard",
         field_provenance: homepageEmailProvenance("kontakt@mailhost-beta.example.com", "https://beta-homepage.example.no"),
-        brreg_verified: 1, antall_ansatte: null,
+        brreg_verified: 1, antall_ansatte: null, naeringskode: null,
       });
 
       // ── prov-c-samedomain: would_send, address_basis same_domain_as_website
@@ -273,17 +327,20 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         id: "prov-c-samedomain", navn: "Gamma Samedomain Gård", org_nr: "100000003", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
         epost: "post@gamma-samedomain-fixture.no", telefon: null, hjemmeside: "https://gamma-samedomain-fixture.no",
-        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
         products: "Cider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "gamma-samedomain-gard", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1, antall_ansatte: 12,
+        brreg_verified: 1, antall_ansatte: 12, naeringskode: null,
       });
 
-      // ── prov-d-unverified: would_send, address_basis unverified (address on
-      // a THIRD domain — neither the website's own domain, nor homepage-
-      // evidenced, nor free-mail; the Hardanger-Saft class the dev-request
-      // itself measured — Skive 3 would eventually gate this, Skive 2 only
-      // labels it, so it must still surface as a candidate).
+      // ── prov-d-unverified: readiness-tier outreach_ready, but address_basis
+      // "unverified" (address on a THIRD domain — neither the website's own
+      // domain, nor homepage-evidenced, nor free-mail; the Hardanger-Saft
+      // nils.j.lekve@ulvik.org shape the dev-request itself measured). Skive
+      // 2 only labelled this; Skive 3 check 1 now EXCLUDES it, reason
+      // address_domain_mismatch (block (b)/(c) below) — about_text left as
+      // the short placeholder deliberately: the address check fires first
+      // regardless, so it never reaches the profile-text check either way.
       insertProvider.run({
         id: "prov-d-unverified", navn: "Delta Uverifisert Gård", org_nr: "100000004", kommune: "Aurland",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
@@ -291,24 +348,29 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         about_text: "Om gården.", visit_text: null, opening_hours_text: null,
         products: "Most", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "delta-unverified-gard", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1, antall_ansatte: 7,
+        brreg_verified: 1, antall_ansatte: 7, naeringskode: null,
       });
 
-      // ── prov-e-overflow: would_send too, but the 5th in id order — must be
-      // bumped past the 4-candidate cap into excluded/daily_cap_reached.
+      // ── prov-e-overflow: clears every Skive 2 AND Skive 3 check, 5th in id
+      // order — under Skive 2 alone this was bumped past the 4-candidate cap
+      // (excluded/daily_cap_reached); now that prov-d-unverified above is
+      // excluded by the new address check, this backfills into the 4th slot
+      // instead — proving genuine batch-assembly-time backfill.
       insertProvider.run({
         id: "prov-e-overflow", navn: "Epsilon Overflow Gård", org_nr: "100000005", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
         epost: "post@epsilon-overflow-fixture.no", telefon: null, hjemmeside: "https://epsilon-overflow-fixture.no",
-        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "epsilon-overflow-gard", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1, antall_ansatte: 2,
+        brreg_verified: 1, antall_ansatte: 2, naeringskode: null,
       });
 
       // ── prov-macks-large: otherwise outreach_ready, antall_ansatte 119 —
       // excluded/large_company_excluded (same fixture shape as the size-gate
-      // test's own Macks fixture).
+      // test's own Macks fixture). Excluded upstream of Skive 3 (the size
+      // gate runs inside computeGardssalgOutreachSendEligibility, before
+      // Skive 3's checks even run), so its about_text is irrelevant here.
       insertProvider.run({
         id: "prov-macks-large", navn: "Macks Ølbryggeri", org_nr: "975967093", kommune: "Tromsø",
         rfb_seed_source: "rfb-seed", producer_type: "bryggeri",
@@ -316,11 +378,12 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         about_text: "Om bryggeriet.", visit_text: null, opening_hours_text: null,
         products: "Øl", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "macks-daily-prep", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1, antall_ansatte: 119,
+        brreg_verified: 1, antall_ansatte: 119, naeringskode: null,
       });
 
       // ── prov-quarantine: otherwise outreach_ready — a prior REAL send
       // within the cooldown window suppresses it (own-table cooldown).
+      // Excluded upstream of Skive 3 too — its about_text is irrelevant.
       insertProvider.run({
         id: "prov-quarantine", navn: "Karantene Gård", org_nr: "100000006", kommune: "Voss",
         rfb_seed_source: "rfb-seed", producer_type: "sideri",
@@ -328,7 +391,7 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         about_text: "Om gården.", visit_text: null, opening_hours_text: null,
         products: "Sider", content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: "karantene-gard", field_provenance: VERIFIED_PROVENANCE,
-        brreg_verified: 1, antall_ansatte: 3,
+        brreg_verified: 1, antall_ansatte: 3, naeringskode: null,
       });
       const quarantineSentAt = "2026-08-08T09:00:00.000Z"; // recent -> inside the 60-day cooldown
       expDb
@@ -347,7 +410,7 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         about_text: null, visit_text: null, opening_hours_text: null,
         products: null, content_source: "provider_site",
         booking_live: 0, catalog_hidden: 0, slug: null, field_provenance: null,
-        brreg_verified: 0, antall_ansatte: null,
+        brreg_verified: 0, antall_ansatte: null, naeringskode: null,
       });
 
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
@@ -369,8 +432,9 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       assertEq(full.body.candidates.length, 4, "b2: exactly 4 candidates (never more than DAILY_PREP_MAX_CANDIDATES)");
       assertEq(
         (full.body.candidates as any[]).map((c) => c.provider_id),
-        ["prov-a-freemail", "prov-b-homepage", "prov-c-samedomain", "prov-d-unverified"],
-        "b3: the first 4 eligible ids in ascending id order (e bumped by the cap)",
+        ["prov-a-freemail", "prov-b-homepage", "prov-c-samedomain", "prov-e-overflow"],
+        "b3: the 4 remaining eligible ids in ascending id order — prov-d-unverified excluded by the new " +
+          "address-domain check, prov-e-overflow backfills into its slot (genuine batch-assembly-time backfill)",
       );
 
       const REQUIRED_FIELDS = [
@@ -388,7 +452,11 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       assertEq(byId.get("prov-a-freemail")?.address_basis, "freemail_pointing_to_producer", "b6: prov-a-freemail address_basis");
       assertEq(byId.get("prov-b-homepage")?.address_basis, "published_on_producer_site", "b7: prov-b-homepage address_basis");
       assertEq(byId.get("prov-c-samedomain")?.address_basis, "same_domain_as_website", "b8: prov-c-samedomain address_basis");
-      assertEq(byId.get("prov-d-unverified")?.address_basis, "unverified", "b9: prov-d-unverified address_basis (Skive 3 not built -- surfaced, not gated)");
+      assertEq(byId.get("prov-e-overflow")?.address_basis, "same_domain_as_website", "b9: prov-e-overflow address_basis (the backfilled candidate)");
+      assertTrue(!byId.has("prov-d-unverified"), "b9b: prov-d-unverified is NOT a candidate (Skive 3 check 1 now excludes it)");
+      assertEq(byId.get("prov-c-samedomain")?.checks?.address_domain, "pass", "b9c: checks.address_domain surfaced as pass for a real candidate");
+      assertEq(byId.get("prov-c-samedomain")?.checks?.profile_text, "pass", "b9d: checks.profile_text surfaced as pass for a real candidate");
+      assertEq(byId.get("prov-c-samedomain")?.checks?.industry, "pass", "b9e: checks.industry surfaced as pass for a real candidate");
       assertEq(byId.get("prov-c-samedomain")?.producer_type, "sideri", "b10: producer_type passthrough");
       assertEq(byId.get("prov-c-samedomain")?.antall_ansatte, 12, "b11: antall_ansatte passthrough (Skive 1 field)");
       assertEq(byId.get("prov-c-samedomain")?.kommune, "Voss", "b12: kommune passthrough");
@@ -407,11 +475,12 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         new Date(excludedById.get("prov-quarantine")?.quarantine_until).getTime() > new Date(quarantineSentAt).getTime(),
         "c5: quarantine_until is after last_sent_at (last_sent_at + cooldown window)",
       );
-      assertEq(excludedById.get("prov-e-overflow")?.reason, "daily_cap_reached", "c6: 5th eligible id excluded, reason daily_cap_reached");
+      assertEq(excludedById.get("prov-d-unverified")?.reason, "address_domain_mismatch", "c6: prov-d-unverified excluded, reason address_domain_mismatch (Skive 3 check 1)");
+      assertTrue(!excludedById.has("prov-e-overflow"), "c6b: prov-e-overflow is NOT excluded anymore — it backfilled into a candidate slot instead");
       assertTrue(!excludedById.has("prov-needs-enrichment"), "c7: a needs_enrichment-tier row (never outreach_ready) is absent from excluded");
       assertTrue(!byId.has("prov-needs-enrichment"), "c8: a needs_enrichment-tier row is absent from candidates too");
-      assertEq(full.body.excluded.length, 3, "c9: excluded has exactly 3 rows (macks, quarantine, overflow)");
-      assertEq(full.body.pool, { outreach_ready_total: 7, eligible_total: 5, selected: 4, excluded_total: 3 }, "c10: pool counters");
+      assertEq(full.body.excluded.length, 3, "c9: excluded has exactly 3 rows (macks, quarantine, prov-d-unverified)");
+      assertEq(full.body.pool, { outreach_ready_total: 7, eligible_total: 5, selected: 4, excluded_total: 3 }, "c10: pool counters (unchanged in shape from Skive 2 — d and e simply swapped buckets)");
       assertEq(full.body.missing, { count: 0, reason: null }, "c11: full batch -> missing.count 0, reason null");
       assertEq(full.body.dry, false, "c12: dry:false (eligible_total > 0)");
 
@@ -426,16 +495,20 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       // SAME db, but call preflight/pilot-send style narrowing is not
       // available on this GET route (it always scans the whole cohort), so
       // instead assert the fewer-than-4 behavior by deleting three of the
-      // four eligible candidates, leaving exactly 2 eligible (c, d) plus the
-      // 3 already-excluded rows.
+      // four eligible candidates, leaving eligible ids c and d — but d is
+      // STILL excluded by the Skive 3 address check even in this narrower
+      // batch (that check runs regardless of how many other candidates
+      // exist), so exactly 1 candidate (c) survives.
       expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('prov-a-freemail', 'prov-b-homepage', 'prov-e-overflow')`).run();
       const fewer = await callRoute(opplevelserRouter, { headers: auth });
       assertEq(fewer.status, 200, "d1: fewer-than-4 batch -> 200");
-      assertEq(fewer.body.candidates.length, 2, "d2: exactly 2 candidates (never padded to 4)");
-      assertEq(fewer.body.missing, { count: 2, reason: "fewer_than_cap" }, "d3: missing.count 2, reason fewer_than_cap");
+      assertEq(fewer.body.candidates.length, 1, "d2: exactly 1 candidate (c only — d still excluded by the address check; never padded)");
+      assertEq(fewer.body.missing, { count: 3, reason: "fewer_than_cap" }, "d3: missing.count 3, reason fewer_than_cap");
       assertTrue(typeof fewer.body.note === "string" && fewer.body.note.length > 0, "d4: an explicit note is present");
-      assertTrue(fewer.body.note.includes("2"), "d5: the note names the missing count");
-      assertEq(fewer.body.dry, false, "d6: dry:false (2 eligible > 0)");
+      assertTrue(fewer.body.note.includes("3"), "d5: the note names the missing count");
+      assertEq(fewer.body.dry, false, "d6: dry:false (1 eligible > 0)");
+      const fewerExcludedById = new Map((fewer.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertEq(fewerExcludedById.get("prov-d-unverified")?.reason, "address_domain_mismatch", "d7: prov-d-unverified still excluded here too, reason address_domain_mismatch");
 
       // ══ (e) zero-eligible-but-nonzero-pool case ══════════════════════════
       expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('prov-c-samedomain', 'prov-d-unverified')`).run();
@@ -471,6 +544,170 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         dry.body.refill_hints.quarantined_count === undefined,
         "f9: refill_hints in the pool_exhausted branch carries no quarantined_count key (never cheaply computable without at least one id to check)",
       );
+
+      // Clean slate for the three dedicated Skive 3 scenario blocks below —
+      // only the never-outreach_ready prov-needs-enrichment row is left.
+      expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-needs-enrichment'`).run();
+
+      // ══ (h) Skive 3 check 3: correct-industry (salmon-farming false positive) ══
+      // rfb-seed, producer_type NULL (never classified as a drink producer —
+      // exactly the shape the real Daniel-caught false positive had), but
+      // naeringskode "03.211" (Fiskeoppdrett i sjøvann — salmon farming, NACE
+      // division "03" = Fiske, fangst og akvakultur). Otherwise fully
+      // outreach_ready/would_send-shaped (own-domain email so the address
+      // check can't ALSO fire, realistic about_text so the profile-text
+      // check can't ALSO fire) — isolates check 3 specifically.
+      insertProvider.run({
+        id: "prov-g-salmon", navn: "Salmon Farming AS", org_nr: "100000008", kommune: "Bodø",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@salmon-farming-fixture.no", telefon: null, hjemmeside: "https://salmon-farming-fixture.no",
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Laks", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "salmon-farming-as", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 10, naeringskode: "03.211",
+      });
+      const salmon = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(salmon.status, 200, "h1: salmon-farming batch -> 200");
+      assertEq(salmon.body.candidates.length, 0, "h2: salmon-farming candidate never proposed");
+      const salmonExcludedById = new Map((salmon.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertEq(salmonExcludedById.get("prov-g-salmon")?.reason, "wrong_industry", "h3: salmon-farming excluded, reason wrong_industry");
+      expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-g-salmon'`).run();
+
+      // ══ (i) Skive 3 check 2: profile-text sanity (thin about_text) ══════════
+      // Otherwise fully outreach_ready/would_send-shaped (own-domain email,
+      // a recognized drink producer_type) — isolates check 2 specifically.
+      // about_text "Om gården." (10 chars) is present (has_about_text=true,
+      // so readiness_tier still reaches outreach_ready) but nowhere near
+      // meetsAboutCheapBar's 80-char floor.
+      insertProvider.run({
+        id: "prov-f-thinabout", navn: "Tynn Beskrivelse Gård", org_nr: "100000009", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "post@thinabout-fixture.no", telefon: null, hjemmeside: "https://thinabout-fixture.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "thinabout-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      const thinAbout = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(thinAbout.status, 200, "i1: thin-about-text batch -> 200");
+      assertEq(thinAbout.body.candidates.length, 0, "i2: thin-about-text candidate never proposed");
+      const thinAboutExcludedById = new Map((thinAbout.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertEq(thinAboutExcludedById.get("prov-f-thinabout")?.reason, "profile_text_low_quality", "i3: thin-about-text excluded, reason profile_text_low_quality");
+      expDb.prepare(`DELETE FROM experience_providers WHERE id = 'prov-f-thinabout'`).run();
+
+      // ══ (j) Skive 3 check 4: shared-recipient-across-batch (no new code) ════
+      // Two DIFFERENT providers, the SAME recipient email — proves Skive 2's
+      // own Slice-2 outreach-guard (dedupeGardssalgOutreachRecipients, folded
+      // into computeGardssalgOutreachPreflight, reused by
+      // computeGardssalgOutreachSendEligibility) already collapses this to
+      // one kept + one excluded, batch-scoped, first-in-id-order wins —
+      // krav 4 needed ZERO new production code.
+      // The SAME email on a freemail domain deliberately (not each provider's
+      // own distinct website domain): a non-freemail cross-domain shared
+      // address would ALSO trip Skive 3 check 1 (address_domain_mismatch)
+      // for both rows, which would confound this test's isolation of check 4
+      // specifically — freemail cleanly clears check 1 (see its own doc
+      // comment: "email pointing at the producer itself is fine even on
+      // freemail" for the domain check; the shared-recipient batch dedupe
+      // below is a SEPARATE, exact-email-match rule that doesn't care about
+      // freemail status either way).
+      insertProvider.run({
+        id: "prov-j-dup-1", navn: "Dup En Gård", org_nr: "100000010", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "shared.recipient.dailyprep@gmail.com", telefon: null, hjemmeside: "https://dup-en-fixture.no",
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "dup-en-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      insertProvider.run({
+        id: "prov-j-dup-2", navn: "Dup To Gård", org_nr: "100000011", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "shared.recipient.dailyprep@gmail.com", telefon: null, hjemmeside: "https://dup-to-fixture.no",
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "dup-to-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      const dup = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(dup.status, 200, "j1: shared-recipient batch -> 200");
+      assertEq(dup.body.candidates.length, 1, "j2: exactly 1 of the 2 same-recipient candidates kept");
+      assertEq(
+        (dup.body.candidates as any[])[0]?.provider_id,
+        "prov-j-dup-1",
+        "j3: the first-in-id-order candidate is the one kept",
+      );
+      const dupExcludedById = new Map((dup.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertEq(dupExcludedById.get("prov-j-dup-2")?.reason, "preflight_no_go", "j4: the second same-recipient candidate excluded, reason preflight_no_go");
+      assertEq(dupExcludedById.get("prov-j-dup-2")?.preflight_reason, "duplikat_epost", "j5: preflight_reason names the exact-email batch dedupe");
+      assertTrue(!dupExcludedById.has("prov-j-dup-1"), "j6: the kept candidate is not ALSO listed as excluded");
+      expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('prov-j-dup-1', 'prov-j-dup-2')`).run();
+
+      // ══ (k) PR review regression — dedup-winner-fails-Skive-3 ordering bug ══
+      // Independent reviewer's confirmed repro (CHANGES-REQUESTED, MEDIUM):
+      // two providers share a recipient email (like block (j) above), but
+      // this time the LOWER-id one ("winner" of an id-ordered dedup) has thin
+      // about_text that fails Skive 3 check 2 on its own, while the
+      // HIGHER-id one is otherwise fully valid. Before the fix, dedup ran
+      // BEFORE Skive 3: the lower-id row won the dedup slot and suppressed
+      // the higher-id row as "duplikat_epost"/preflight_no_go, then Skive 3
+      // excluded the lower-id row anyway for profile_text_low_quality —
+      // BOTH ended up excluded (candidates: []) even though the higher-id
+      // row alone should have been proposed. After the fix, dedup only runs
+      // among candidates that already survived Skive 1 + Skive 3, so the
+      // higher-id row is not penalized for a "winner" that was never
+      // actually going to be proposed.
+      //
+      // Both share a freemail recipient (gmail.com) so the SAME-email dedup
+      // rule applies (not the cross-domain rule) and neither trips Skive 3
+      // check 1 (address_domain_mismatch) on its own — isolates the
+      // interaction to check 2 (profile-text) exactly like the reviewer's
+      // repro.
+      insertProvider.run({
+        id: "prov-k-dup-1-thinabout", navn: "Kappa Dup Tynn Gård", org_nr: "100000012", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "shared.recipient.orderingbug@gmail.com", telefon: null, hjemmeside: "https://kappa-dup-thin-fixture.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "kappa-dup-thin-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      insertProvider.run({
+        id: "prov-k-dup-2-valid", navn: "Kappa Dup Gyldig Gård", org_nr: "100000013", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "shared.recipient.orderingbug@gmail.com", telefon: null, hjemmeside: "https://kappa-dup-valid-fixture.no",
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "kappa-dup-valid-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      const orderingBug = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(orderingBug.status, 200, "k1: dedup-vs-skive3-ordering batch -> 200");
+      assertEq(
+        orderingBug.body.candidates.length,
+        1,
+        "k2: exactly 1 candidate proposed (not both wrongly excluded — the historic bug produced 0)",
+      );
+      assertEq(
+        (orderingBug.body.candidates as any[])[0]?.provider_id,
+        "prov-k-dup-2-valid",
+        "k3: the higher-id, actually-valid candidate is the one proposed, NOT the lower-id dedup 'winner'",
+      );
+      const orderingBugExcludedById = new Map((orderingBug.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertEq(
+        orderingBugExcludedById.get("prov-k-dup-1-thinabout")?.reason,
+        "profile_text_low_quality",
+        "k4: the lower-id candidate is excluded for its OWN disqualifying reason (profile_text_low_quality), not lumped in as a duplicate",
+      );
+      assertTrue(
+        !("preflight_reason" in (orderingBugExcludedById.get("prov-k-dup-1-thinabout") ?? {})),
+        "k5: the lower-id candidate's exclusion carries no preflight_reason — it was never a genuine dedup victim",
+      );
+      assertTrue(
+        !orderingBugExcludedById.has("prov-k-dup-2-valid"),
+        "k6: the proposed candidate is not ALSO listed as excluded",
+      );
+      expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('prov-k-dup-1-thinabout', 'prov-k-dup-2-valid')`).run();
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-daily-prep: unexpected error: " + String(err?.stack || err?.message || err));
