@@ -273,6 +273,75 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
       assertEq(a.signals.provenance_source_counts.address, 2, "g4: per-field provenance source count surfaced");
     }
 
+    // ── (i) skive A: guard 3 (domain coherence) and guard 4 (email
+    //     ownership) are surfaced as blockers. Live 2026-08-10: 19 of 45
+    //     review_required rows had BOTH gating fields pool_eligible and were
+    //     blocked solely by these two — this route used to report them as
+    //     having no blockers at all. --
+    {
+      insertAgent({
+        id: "pbe-dc",
+        name: "Larsagarden-lignende",
+        website: "https://plattformvert.example",
+        aUrl: "https://egetdomene.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        enrichmentStatus: "rich",
+        email: "post@egetdomene.no",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-dc'`,
+      ).run(JSON.stringify({
+        domain_coherence: {
+          coherent: false,
+          reason: "knowledge.website host plattformvert.example != agents.url host egetdomene.no",
+        },
+      }));
+
+      insertAgent({
+        id: "pbe-eo",
+        name: "Frimeil-produsent",
+        website: "https://frimeil.no",
+        about: "Gard i test.",
+        verificationStatus: "review_required",
+        enrichmentStatus: "rich",
+        email: "produsent@gmail.com",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'pbe-eo'`,
+      ).run(JSON.stringify({ email_ownership_unproven: true }));
+
+      const r = await callExplain({ agentIds: "pbe-dc,pbe-eo" });
+      const dc = r.body.agents.find((x: any) => x.agent_id === "pbe-dc");
+      const eo = r.body.agents.find((x: any) => x.agent_id === "pbe-eo");
+
+      assertTrue(
+        dc.pool_blockers.some((b: string) => b.startsWith("domain_incoherent")),
+        "i1: domain-incoherent row names the domain_incoherent blocker",
+      );
+      assertTrue(
+        String(dc.pool_blockers.find((b: string) => b.startsWith("domain_incoherent"))).includes("egetdomene.no"),
+        "i2: the blocker carries the verifier's own reason text",
+      );
+      assertEq(dc.signals.domain_coherence.coherent, false, "i3: raw domain_coherence signal surfaced");
+      assertTrue(
+        eo.pool_blockers.some((b: string) => b.startsWith("email_ownership_unproven")),
+        "i4: free-mail row names the email_ownership_unproven blocker",
+      );
+      assertEq(eo.signals.email_ownership_unproven, true, "i5: raw email-ownership signal surfaced");
+      // A row with a clean stored verdict must NOT gain phantom blockers.
+      const clean = await callExplain({ agentId: "pbe-pool" });
+      assertEq(clean.body.agents[0].pool_blockers, [], "i6: a clean row still reports no blockers");
+      assertEq(
+        clean.body.agents[0].signals.email_ownership_unproven, false,
+        "i7: absent stored verdict is reported as false, never null/undefined",
+      );
+    }
+
     // ── (h) read-only: no writes happen --
     {
       const before = testDb.prepare("SELECT * FROM agent_knowledge WHERE agent_id = 'pbe-f1'").get();

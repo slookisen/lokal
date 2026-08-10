@@ -325,7 +325,11 @@ export function pickBatch(db: any, limit = 30): any[] {
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE k.verification_status NOT IN ('opt_out')
-     ORDER BY CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
+     -- Round-robin: same ordering rationale as pickBatchBiased's ORDER
+     -- constant below (skive F) — sweep_processed_at first so every agent
+     -- is processed once before any repeat, dead-URL priority as tie-break.
+     ORDER BY COALESCE(k.sweep_processed_at, '1970-01-01') ASC,
+              CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
               COALESCE(k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
     )
@@ -499,7 +503,30 @@ export function pickBatchBiased(
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id`;
 
-  const ORDER = `ORDER BY CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
+  // ── Round-robin ordering (dev-request 2026-08-10-verifier-portkjede-og-
+  // provenansrydding, skive F — Daniel: «Unngå å kjøre gjennom de samme
+  // agentene hver runde, kun prosesser hver agent en gang per runde, og
+  // ikke på nytt»).
+  //
+  // The previous ORDER put `last_http_status >= 400` FIRST as an absolute
+  // key, so the dead-website cohort occupied the head of every bucket's
+  // queue on every single round. With this picker's per-status quota
+  // (limit 40 → 7 pending_verify slots), a dead-URL cohort larger than the
+  // quota meant healthy pending_verify agents were never reachable at all —
+  // measured live 2026-08-10: 24 consecutive rounds moved pending_verify
+  // only 1017→1015 while all 45 review_required rows were re-processed
+  // ~3.5× each.
+  //
+  // `sweep_processed_at` (stamped on EVERY verifier write by
+  // applyVerifierOutcome below, column added by orch-pr-87) is now the
+  // PRIMARY key: never-swept agents (NULL → '1970-01-01') come first, and a
+  // just-processed agent goes to the back of the queue. That is exactly
+  // "each agent once per round, then the next round" — a full rotation is
+  // guaranteed before any agent repeats. The dead-URL priority is preserved
+  // as a TIE-BREAK among agents with equal sweep recency, so it still front-
+  // loads broken sites within a round without being able to starve a round.
+  const ORDER = `ORDER BY COALESCE(k.sweep_processed_at, '1970-01-01') ASC,
+              CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
               COALESCE(k.last_verified_at, '1970-01-01') ASC`;
 
   // Priority order matters: statuses earlier in this list get the

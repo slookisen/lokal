@@ -2858,7 +2858,13 @@ console.log("── human-visits strip: referral classification + aggregation �
       outreach_eligible_at TEXT,
       last_verified_at TEXT, last_http_check_at TEXT, last_http_status INTEGER,
       field_provenance TEXT NOT NULL DEFAULT '{}',
-      verification_review_reason TEXT NOT NULL DEFAULT '{}'
+      verification_review_reason TEXT NOT NULL DEFAULT '{}',
+      -- Added with skive F (dev-request 2026-08-10-verifier-portkjede-og-
+      -- provenansrydding): pickBatch now orders round-robin on
+      -- sweep_processed_at. The column has existed in the real schema since
+      -- orch-pr-87 (database/init.ts) — this minimal test replica simply
+      -- predates it.
+      sweep_processed_at TEXT
     );
   `);
   wo8db.prepare("INSERT INTO agents (id,name,role,city) VALUES ('a-1','Test Gård','producer','Oslo'),('a-2','Old Gård','producer','Bergen')").run();
@@ -15060,6 +15066,80 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
     assertTrue(hasReviewRequired,
       "orch-pr-20260718-slice3: growth bucket includes at least one review_required row despite 1000 fresh unverified rows");
     db.close();
+  }
+
+  // Test 3c (dev-request 2026-08-10-verifier-portkjede-og-provenansrydding,
+  // skive F — Daniel: «Unngå å kjøre gjennom de samme agentene hver runde,
+  // kun prosesser hver agent en gang per runde, og ikke på nytt»).
+  //
+  // Two regressions this locks down, both measured live 2026-08-10:
+  //  (a) STARVATION — `last_http_status >= 400` used to be the ORDER's
+  //      absolute first key, so a dead-URL cohort larger than the per-status
+  //      quota occupied the head of the queue on EVERY round and healthy
+  //      agents were unreachable. 24 consecutive live rounds moved
+  //      pending_verify only 1017 -> 1015.
+  //  (b) NO ROTATION — an already-processed agent could be re-picked
+  //      immediately, so rounds re-ground the same rows.
+  // sweep_processed_at (stamped by applyVerifierOutcome) is now the primary
+  // ordering key: never-swept first, just-swept last.
+  {
+    const db = makeDb();
+    const insA = db.prepare("INSERT INTO agents (id,name,role,city) VALUES (?, ?, 'producer', 'Oslo')");
+    const insK = db.prepare(
+      `INSERT INTO agent_knowledge (agent_id, email, website, verification_status,
+                                    last_verified_at, last_http_status, sweep_processed_at)
+       VALUES (?, ?, ?, 'pending_verify', ?, ?, ?)`
+    );
+
+    // 10 dead-URL agents ALREADY swept this round (would have monopolised
+    // every round under the old ordering), and 10 healthy agents never swept.
+    for (let i = 0; i < 10; i++) {
+      const id = `dead-${i}`;
+      insA.run(id, `Agent ${id}`);
+      insK.run(id, `${id}@x.no`, `https://${id}.no`, "2026-01-01T00:00:00Z", 503, "2026-08-10T12:00:00Z");
+    }
+    for (let i = 0; i < 10; i++) {
+      const id = `fresh-${i}`;
+      insA.run(id, `Agent ${id}`);
+      insK.run(id, `${id}@x.no`, `https://${id}.no`, "2026-01-01T00:00:00Z", 200, null);
+    }
+
+    const batch = pickBatchBiased(db, 10, 1.0);
+    const ids = batch.map((r: any) => r.id);
+    const deadPicked = ids.filter((id: string) => id.startsWith("dead-")).length;
+    const freshPicked = ids.filter((id: string) => id.startsWith("fresh-")).length;
+
+    assertEq(freshPicked, 10,
+      `skive F: all 10 never-swept agents are picked before any already-swept one (got ${freshPicked})`);
+    assertEq(deadPicked, 0,
+      `skive F: already-swept dead-URL agents do NOT monopolise the round (got ${deadPicked})`);
+    assertEq(new Set(ids).size, ids.length,
+      "skive F: no agent appears twice within one round");
+
+    // Dead-URL priority must survive as a TIE-BREAK among equally-unswept
+    // agents — the fix must not throw away the broken-site prioritisation.
+    const db2 = makeDb();
+    const insA2 = db2.prepare("INSERT INTO agents (id,name,role,city) VALUES (?, ?, 'producer', 'Oslo')");
+    const insK2 = db2.prepare(
+      `INSERT INTO agent_knowledge (agent_id, email, website, verification_status,
+                                    last_verified_at, last_http_status, sweep_processed_at)
+       VALUES (?, ?, ?, 'pending_verify', ?, ?, NULL)`
+    );
+    for (let i = 0; i < 5; i++) {
+      insA2.run(`ok-${i}`, `Agent ok-${i}`);
+      insK2.run(`ok-${i}`, `ok-${i}@x.no`, `https://ok-${i}.no`, "2026-01-01T00:00:00Z", 200);
+    }
+    for (let i = 0; i < 5; i++) {
+      insA2.run(`broken-${i}`, `Agent broken-${i}`);
+      insK2.run(`broken-${i}`, `broken-${i}@x.no`, `https://broken-${i}.no`, "2026-01-01T00:00:00Z", 503);
+    }
+    const batch2 = pickBatchBiased(db2, 5, 1.0);
+    const brokenFirst = batch2.filter((r: any) => String(r.id).startsWith("broken-")).length;
+    assertEq(brokenFirst, 5,
+      `skive F: among equally-unswept agents, dead-URL rows still come first (got ${brokenFirst})`);
+
+    db.close();
+    db2.close();
   }
 
   // Test 4: getSweepStatus shape + processed-count math
