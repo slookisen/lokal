@@ -5631,15 +5631,33 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
           inactive.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, flag: result.flag, brreg_name: result.name });
           continue;
         }
-        const brregName = result.name || "";
-        const nameMatches =
-          brregName !== "" &&
-          (normaliseName(brregDisplayName(brregName)) === normaliseName(gardssalgSearchName(t.navn)) ||
-            normaliseName(brregName) === normaliseName(t.navn));
-        if (!nameMatches) {
-          nameMismatch.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: result.name });
-          continue;
-        }
+        // Identity is established WHERE THE ORG_NR IS WRITTEN, not here.
+        //
+        // This lever used to also require the Brreg-registered name to match
+        // the provider name exactly, and rejected the row as name_mismatch
+        // otherwise. Measured against prod 2026-08-10 that rule rejected 8 of
+        // the 9 rows in the cohort — every one of them correct. Registered
+        // names diverge from trading names as a matter of course for small
+        // producers: Ciderhuset Balholm is BALHOLM AS, Hebnes Vingård is
+        // ARILD HEBNES, Sjuragarden is "KARIN MO VALLAND / SJURAGARDEN", and
+        // the legal "AS" suffix is routinely absent from the name a company
+        // actually trades under.
+        //
+        // Daniel's call, 2026-08-10: "verifiseringen [skal] kun forholde seg
+        // til org.nr og ikke navnet, siden navn ofte kan være endret fra brreg
+        // til hva selskapet har valgt å benytte offentlig".
+        //
+        // So the responsibilities split cleanly instead of being litigated
+        // twice under different rules: whoever WRITES an org_nr proves it
+        // belongs to this producer (NACE discovery is born from the Brreg
+        // record; the claim flow is the producer themselves; the review-queue
+        // path checks name overlap server-side before writing). This lever
+        // answers the remaining question — does that org exist, and is it
+        // still alive — which is what brreg_verified is actually claiming.
+        //
+        // The exists/active checks above are untouched and still veto: a
+        // dissolved or bankrupt company never reaches the pool (Fjordfolk
+        // Mikrobryggeri was caught that way the same day).
         const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
         // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
         // stoerrelsesgate): antall_ansatte rides along on this SAME verify
@@ -5648,6 +5666,10 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
         // predates this field) and `null` (Brreg genuinely has no figure)
         // both normalise to `null` here — reported, and only ever written on
         // apply below.
+        // Reported for the operator's eye, not gated on — see the identity
+        // note above. Kept in the response precisely so a genuinely wrong
+        // org_nr stays VISIBLE in the report even though it no longer blocks.
+        const brregName = result.name || "";
         const employees = typeof result.employees === "number" ? result.employees : null;
         if (dryRun) {
           verified.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, antall_ansatte: employees, fields_written: [] });
