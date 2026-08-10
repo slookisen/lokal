@@ -80,6 +80,8 @@ interface ExplainRow {
   k_address: string | null;
   about: string | null;
   field_provenance: string | null;
+  verification_review_reason: string | null;
+  last_verified_at: string | null;
   curated_fields: string | null;
   url_last_status: number | null;
   url_last_probed: string | null;
@@ -113,6 +115,44 @@ function provenanceSourceCounts(raw: string | null): Record<string, number> {
     else out[field] = 0;
   }
   return out;
+}
+
+// ── Guards 3 and 4, read from the verifier's own stored verdict ────────────
+//
+// dev-request 2026-08-10-verifier-portkjede-og-provenansrydding, skive A.
+// The pool gate is a chain of FOUR independent guards, but this route's
+// first version modelled only two (the pool-VIEW columns and the
+// cross-source field verdicts). Measured live 2026-08-10: of 45
+// review_required rows, 19 had BOTH gating fields `pool_eligible` and were
+// blocked solely by guard 3 (domain coherence — the Eidsmo wrong-entity
+// check) or guard 4 (email-ownership proof: free-mail/ISP address with no
+// corroborating evidence). Reporting those rows as "no blockers" was a real
+// defect in this diagnosis surface.
+//
+// These two guards live in the verifier's own evaluation
+// (cross-source-validator.ts, applied in runVerifierBatch), not in any
+// column this route can re-derive cheaply — so rather than re-implement
+// (and risk drifting from) that logic, this reads the verdict the verifier
+// already persisted in `agent_knowledge.verification_review_reason`. That
+// makes the reported blocker exactly what the verifier concluded on its
+// last pass, with `stale_as_of` so a caller can see how fresh it is.
+interface VerifierStoredVerdict {
+  domain_coherence?: { coherent?: boolean; reason?: string } | null;
+  email_ownership_unproven?: boolean | null;
+  [key: string]: unknown;
+}
+
+function parseReviewReason(raw: string | null): VerifierStoredVerdict | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as VerifierStoredVerdict;
+    }
+  } catch {
+    /* malformed → treat as absent, same tolerance as the provenance parser */
+  }
+  return null;
 }
 
 function withinDays(iso: string | null, days: number, nowMs: number): boolean {
@@ -152,7 +192,10 @@ router.get("/", (req: Request, res: Response) => {
            k.website AS k_website, k.verification_status AS verification_status,
            k.enrichment_status AS enrichment_status, k.email AS k_email,
            k.phone AS k_phone, k.address AS k_address, k.about AS about,
-           k.field_provenance AS field_provenance, k.curated_fields AS curated_fields,
+           k.field_provenance AS field_provenance,
+           k.verification_review_reason AS verification_review_reason,
+           k.last_verified_at AS last_verified_at,
+           k.curated_fields AS curated_fields,
            k.url_last_status AS url_last_status, k.url_last_probed AS url_last_probed,
            k.homepage_unreachable_since AS homepage_unreachable_since,
            k.pending_verify_parked_since AS pending_verify_parked_since,
@@ -212,6 +255,22 @@ router.get("/", (req: Request, res: Response) => {
     }
     if (row.contacted_at) poolBlockers.push("already_contacted");
 
+    // Guards 3 + 4 (skive A) — the verifier's own stored verdict. These block
+    // promotion to `verified` even when every column leg above is clean, so
+    // they belong in the same list rather than in a separate section.
+    const storedVerdict = parseReviewReason(row.verification_review_reason);
+    const domainCoherence = storedVerdict?.domain_coherence ?? null;
+    const domainIncoherent = !!domainCoherence && domainCoherence.coherent === false;
+    const emailOwnershipUnproven = storedVerdict?.email_ownership_unproven === true;
+    if (domainIncoherent) {
+      poolBlockers.push(
+        `domain_incoherent (${domainCoherence?.reason ?? "agents.url vs knowledge.website/email host mismatch"})`,
+      );
+    }
+    if (emailOwnershipUnproven) {
+      poolBlockers.push("email_ownership_unproven (free-mail/ISP address with no corroborating evidence)");
+    }
+
     // ── Funnel B: homepage-provenance-batch default auto-select legs
     //    (routes/marketplace.ts selector, same order) ─────────────────────
     const crawlBlockers: string[] = [];
@@ -262,6 +321,13 @@ router.get("/", (req: Request, res: Response) => {
         backoff_active: backoffActive,
         claimed: row.claimed_at !== null,
         contacted_at: row.contacted_at,
+        // Guards 3+4 as raw signals alongside the blocker strings, so a
+        // caller can act on them without string-parsing.
+        domain_coherence: domainCoherence,
+        email_ownership_unproven: emailOwnershipUnproven,
+        // The verifier's verdict is only as fresh as its last pass over this
+        // agent — surfaced so a stale verdict is never mistaken for a live one.
+        verifier_verdict_as_of: row.last_verified_at,
       },
       pool_blockers: poolBlockers,
       crawl_auto_select: {
