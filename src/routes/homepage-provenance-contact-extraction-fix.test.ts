@@ -210,6 +210,80 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "phone-11: an 8-digit run starting with 1 is never extracted",
   );
 
+  // ── Bug 4 (slice D, 2026-08-10): extractPhone — context-corroboration
+  //    gate. Real repro: Austrått — a valid-SHAPED but WRONG number
+  //    ("79656569") was written as phone because it passed every shape
+  //    check (W33 leading digit, not a date, not a digit-run substring) yet
+  //    was scraped from unrelated page content, nowhere near a contact
+  //    label. ─────────────────────────────────────────────────────────────
+
+  // The exact live breach shape: a syntactically valid 8-digit run sitting
+  // in unrelated footer/widget text with no contact-context label anywhere
+  // nearby -> must NOT be extracted.
+  const htmlAustrattNoContext =
+    "<html><body><footer>Levert av InfoWeb Solutions. Kundenr 79656569 for support hos leverandøren.</footer></body></html>";
+  assertEq(
+    extractPhone(htmlAustrattNoContext),
+    null,
+    "phone-12 (Austrått repro): a valid-shaped 8-digit run with no nearby contact-label context is NOT extracted",
+  );
+
+  // Same unrelated number PLUS a real, properly-labelled phone elsewhere on
+  // the page -> the scan must skip the uncorroborated one and return the
+  // labelled real number instead.
+  const htmlAustrattWithRealPhoneElsewhere =
+    "<html><body>" +
+    "<footer>Levert av InfoWeb Solutions. Kundenr 79656569 for support hos leverandøren.</footer>" +
+    "<p>Ring oss på Tlf: 91234567</p>" +
+    "</body></html>";
+  assertEq(
+    extractPhone(htmlAustrattWithRealPhoneElsewhere),
+    "91234567",
+    "phone-13: uncorroborated valid-shaped run is skipped in favour of the properly-labelled real phone later on the page",
+  );
+
+  // Positive control: "Kontakt" as the nearby label (not just Tlf/Telefon/Ring).
+  const htmlKontaktLabelPhone = "<html><body><p>Kontakt: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktLabelPhone),
+    "91234567",
+    "phone-14: a 'Kontakt:' label counts as valid contact context",
+  );
+
+  // ── Bug 5 (slice D, 2026-08-10): extractAddress — leading contact-label /
+  //    company-name box glued onto the street. Real repro: Oceanfood AS —
+  //    a flattened "Kontakt" heading immediately followed by the producer's
+  //    own company name (ending in a legal-entity suffix), with no
+  //    punctuation boundary before the real street, got swallowed into the
+  //    street capture. ─────────────────────────────────────────────────────
+
+  const htmlOceanfoodLeadingLabel =
+    "<html><body><p>Kontakt Oceanfood AS Storhaugen 26, 5527 Haugesund</p></body></html>";
+  assertEq(
+    extractAddress(htmlOceanfoodLeadingLabel),
+    "Storhaugen 26, 5527 Haugesund",
+    "addr-05 (Oceanfood repro): leading 'Kontakt <Firmanavn> AS' box heading is stripped from the street, not written as part of the address",
+  );
+
+  // Bare leading label, no company name in between — the simpler shape.
+  const htmlBareLeadingLabel =
+    "<html><body><p>Kontakt Storhaugen 26, 5527 Haugesund</p></body></html>";
+  assertEq(
+    extractAddress(htmlBareLeadingLabel),
+    "Storhaugen 26, 5527 Haugesund",
+    "addr-06: a bare leading 'Kontakt' label (no company name) is also stripped",
+  );
+
+  // Positive control: a real street name is never mistaken for a leading
+  // label — must extract unchanged.
+  const htmlNoLeadingLabel =
+    "<html><body><p>Storhaugen 26, 5527 Haugesund</p></body></html>";
+  assertEq(
+    extractAddress(htmlNoLeadingLabel),
+    "Storhaugen 26, 5527 Haugesund",
+    "addr-07: an address with no leading label at all extracts unchanged (fix doesn't regress the common case)",
+  );
+
   return { passed, failed, failures };
 }
 

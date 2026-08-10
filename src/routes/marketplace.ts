@@ -22,7 +22,7 @@ import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, 
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
-import { isDisplayablePhone, national8 } from "../services/contact-normalizer";
+import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
@@ -5223,6 +5223,33 @@ function looksLikeDate(digits: string): boolean {
   return year >= 1900 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
 }
 
+// Contact-context labels a genuine phone number is normally found near on a
+// producer's own site (a "Tlf:"/"Ring oss"/"Kontakt" style block) —
+// case-insensitive, whole-word. Slice D (2026-08-10, Austrått live repro):
+// a SYNTACTICALLY valid 8-digit number ("79656569") was written as the
+// producer's phone despite being the WRONG number — none of the existing
+// shape checks (W33 leading-digit, date-shape, digit-run-substring) catch a
+// value that is merely valid-shaped but factually unrelated to this
+// producer, because it was scraped from unrelated page content (e.g. a
+// different business's number embedded on a shared-hosting/widget page).
+// Requiring the candidate to sit near a recognisable contact label is a
+// cheap, conservative proxy for "this number is actually being presented AS
+// a phone number on this page", not just "8 digits that happen to look
+// phone-shaped somewhere on the page".
+const PHONE_CONTEXT_LABEL = /\b(?:tlf\.?|telefon|ring|mob\.?|mobil|kontakt|sms|call)\b/i;
+// How far (in characters, in the tag-stripped text) around a candidate match
+// to look for a contact label. Generous enough for "Ring oss på <number>" /
+// "Telefon: <number>" / "<number> (Tlf)" shapes without being so wide it
+// picks up an unrelated label elsewhere on a dense contact block.
+const PHONE_CONTEXT_WINDOW_BEFORE = 40;
+const PHONE_CONTEXT_WINDOW_AFTER = 20;
+
+function hasPhoneContext(text: string, matchStart: number, groupEnd: number): boolean {
+  const windowStart = Math.max(0, matchStart - PHONE_CONTEXT_WINDOW_BEFORE);
+  const windowEnd = Math.min(text.length, groupEnd + PHONE_CONTEXT_WINDOW_AFTER);
+  return PHONE_CONTEXT_LABEL.test(text.slice(windowStart, windowEnd));
+}
+
 /**
  * Extract a Norwegian phone number from HTML text.
  *
@@ -5235,6 +5262,13 @@ function looksLikeDate(digits: string): boolean {
  *      inspecting the raw text immediately before/after the matched digit
  *      group; if either neighbour is itself a digit, the candidate is part
  *      of a longer run and is skipped rather than returned.
+ *
+ * Slice D (2026-08-10, Austrått live repro): a fourth check — the candidate
+ * must sit near a recognisable contact-context label (see
+ * PHONE_CONTEXT_LABEL above). A valid-shaped 8-digit run with no such
+ * context nearby is skipped, not returned — same "false negative is safe,
+ * false positive is not" posture as every other check here: leaving the
+ * phone field blank is always safer than writing a confidently-wrong number.
  */
 export function extractPhone(html: string): string | null {
   // Strip HTML tags for cleaner matching.
@@ -5262,6 +5296,9 @@ export function extractPhone(html: string): string | null {
     // to the SAME national8 the write-guard uses (single implementation,
     // contact-normalizer.ts) and keeps scanning for a real number.
     if (national8(digits) === null) continue;
+    // Bug fix 4 (slice D, 2026-08-10): reject a valid-shaped candidate with
+    // no recognisable contact-context label nearby — see hasPhoneContext.
+    if (!hasPhoneContext(text, m.index, groupEnd)) continue;
     return digits;
   }
   return null;
@@ -5284,6 +5321,19 @@ const ADDRESS_CONTACT_LABELS = new Set([
  * punctuation boundary in between (e.g. "... 2460 Osen Telefon: ..." must
  * yield poststed "Osen", not "Osen Telefon"). Street/postcode groups are
  * untouched.
+ *
+ * Slice D (2026-08-10, Oceanfood AS live repro): the STREET group's leading
+ * side has the mirror-image bug — a flattened "Kontakt" box heading (and
+ * often the producer's own company name right after it, e.g. "Kontakt
+ * Oceanfood AS ...") with no punctuation boundary before the real street
+ * gets swallowed into the street capture ("Kontakt Oceanfood AS Storhaugen
+ * 26, 5527 Haugesund" instead of "Storhaugen 26, 5527 Haugesund"), because
+ * the regex's leftmost-match search accepts the whole letters+spaces run
+ * starting at "Kontakt". stripLeadingContactLabel (contact-normalizer.ts —
+ * the leading-side sibling of the trailing-label stripper already used at
+ * the write-time guard) is applied to the captured street text before the
+ * length sanity check / return, same reused single-implementation posture
+ * as the phone checks above.
  */
 export function extractAddress(html: string): string | null {
   const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
@@ -5297,9 +5347,11 @@ export function extractAddress(html: string): string | null {
       words.pop();
     }
     const poststed = words.join(" ");
-    const candidate = `${m[1].trim()}, ${m[2]} ${poststed}`;
+    const rawStreet = m[1].trim();
+    const street = (stripLeadingContactLabel(rawStreet) ?? rawStreet).trim();
+    const candidate = `${street}, ${m[2]} ${poststed}`;
     // Sanity: skip obviously bad matches (< 10 chars of street part).
-    if (m[1].trim().length >= 6) return candidate;
+    if (street.length >= 6) return candidate;
   }
   return null;
 }

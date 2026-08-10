@@ -1,7 +1,7 @@
 import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
-import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel } from "./contact-normalizer";
+import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
 import { isJunkDescription } from "./description-quality";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
@@ -402,7 +402,12 @@ class KnowledgeService {
       data = { ...data, phone: validatedPhone ?? undefined };
     }
     if (data.address) {
-      data = { ...data, address: stripTrailingContactLabel(data.address) ?? undefined };
+      // dev-request 2026-08-10-verifier-portkjede-og-provenansrydding (slice
+      // D): strip a LEADING label/company-name-box run first (e.g. "Kontakt
+      // Oceanfood AS ..."), then the existing trailing-label strip — the two
+      // are independent (a value could in principle carry both) and neither
+      // depends on the other's output shape.
+      data = { ...data, address: stripTrailingContactLabel(stripLeadingContactLabel(data.address)) ?? undefined };
     }
 
     // Normalize products: extract prices from name field before storage
