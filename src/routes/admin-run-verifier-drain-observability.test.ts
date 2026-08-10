@@ -29,6 +29,12 @@
  *   - Re-running the SAME unchanged candidate a second time correctly
  *     reports status_transitions=0 for it (persisted, not a bug) while
  *     `persisted` stays true both times.
+ *   - `transitioned` (added for dev-request
+ *     2026-08-10-verifier-portkjede-og-provenansrydding, Skive B) mirrors
+ *     `status_transitions` under the name that dev-request's root-cause
+ *     report asked for, and `by_new_status` breaks those transitions down
+ *     by resulting status — so a bulk-sweep caller never again mistakes a
+ *     high `passed` count (basic-gate re-passes) for real promotions.
  *
  * Exported runAdminRunVerifierDrainObservabilityTests({log}) -> TestSummary;
  * wired into tests/test.ts.
@@ -201,6 +207,8 @@ export function runAdminRunVerifierDrainObservabilityTests(
       assertTrue(!!row1.last_verified_at, "obs-5: last_verified_at was stamped (proves the UPDATE ran, not just the response)");
       assertEq(round1.body.status_transitions, 1, "obs-6: status_transitions=1 (genuine review_required -> pending_verify transition, persisted)");
       assertEq(round1.body.status_transitions <= round1.body.processed, true, "obs-7: status_transitions never exceeds processed");
+      assertEq(round1.body.transitioned, 1, "obs-6b: transitioned mirrors status_transitions (Skive B)");
+      assertEq(round1.body.by_new_status?.pending_verify, 1, "obs-6c: by_new_status names the resulting status of the one real transition");
 
       const firstStamp = row1.last_verified_at;
 
@@ -223,6 +231,8 @@ export function runAdminRunVerifierDrainObservabilityTests(
       assertEq(round2.body.persisted, true, "obs-8: round 2 persisted=true (still unconditional, not a one-time fluke)");
       assertEq(round2.body.status_transitions, 0, "obs-9: round 2 status_transitions=0 (still correctly unchanged)");
       assertEq(round2.body.pool_added, 0, "obs-10: round 2 pool_added=0 (no first-time promotion — consistent with status_transitions=0)");
+      assertEq(round2.body.transitioned, 0, "obs-9b: transitioned=0 on a re-confirmation round (this is the exact case the dev-request's root-cause report was misled by when it read `passed` instead)");
+      assertEq(Object.keys(round2.body.by_new_status ?? {}).length, 0, "obs-9c: by_new_status is empty when nothing transitioned");
 
       const row2 = db
         .prepare(`SELECT last_verified_at FROM agent_knowledge WHERE agent_id = ?`)
@@ -269,6 +279,12 @@ export function runAdminRunVerifierDrainObservabilityTests(
         round3.body.status_transitions <= round3.body.processed,
         `obs-14: status_transitions (${round3.body.status_transitions}) never exceeds processed (${round3.body.processed})`,
       );
+      assertEq(round3.body.transitioned, round3.body.status_transitions, "obs-14b: transitioned always equals status_transitions");
+      const byNewStatusSum = Object.values(round3.body.by_new_status ?? {}).reduce(
+        (a: number, b: any) => a + (b as number),
+        0,
+      );
+      assertEq(byNewStatusSum, round3.body.transitioned, "obs-14c: by_new_status counts sum to transitioned exactly (no double counting, no dropped rows)");
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
