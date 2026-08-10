@@ -128,6 +128,7 @@ import {
   getGardssalgBrregVerifyTarget,
   getGardssalgBrregVerifyOverride,
   applyGardssalgBrregVerified,
+  applyGardssalgBrregEmployeesRefresh,
   type GardssalgBrregVerifyTarget,
   gardssalgWebsiteEvidenceMatch,
   gardssalgContactPageLinks,
@@ -5697,7 +5698,13 @@ const GS_BV_HARD_CAP = 48;
 let gsBvRunning = false;
 
 router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; offset?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+    apply?: unknown;
+    refreshEmployees?: unknown;
+  };
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -5706,6 +5713,12 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // Skive 4 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate): opt-in-only, providerIds-mode-only. Default false ⇒
+  // every existing caller (incl. every existing test) is byte-for-byte
+  // unchanged — an already-verified row still buckets into alreadyVerified
+  // below exactly as before.
+  const refreshEmployees = body.refreshEmployees === true;
   const batchTag = `brreg-verify-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 
   if (gsBvRunning) {
@@ -5719,6 +5732,11 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
     const noOrgnr: Array<{ provider_id: string; navn: string }> = [];
     const notFound: string[] = [];
     let targets: GardssalgBrregVerifyTarget[] = [];
+    // Skive 4: already-verified rows opted into refreshEmployees, split out
+    // of alreadyVerified so their antall_ansatte can be backfilled below —
+    // never re-runs brreg_verified/brreg_active (that stays owned by the
+    // main targets loop below, unreachable from here).
+    const employeesRefreshTargets: GardssalgBrregVerifyTarget[] = [];
     let cohortTotal = 0;
     let noOrgnrTotal = 0;
 
@@ -5737,7 +5755,16 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
         } else if (t.content_source === "manual" || t.content_source === "claim") {
           skippedLocked.push({ provider_id: t.id, navn: t.navn });
         } else if (t.brreg_verified === 1) {
-          alreadyVerified.push({ provider_id: t.id, navn: t.navn });
+          if (
+            refreshEmployees &&
+            (t.antall_ansatte === null || t.antall_ansatte === undefined) &&
+            t.org_nr &&
+            /^\d{9}$/.test(t.org_nr.trim())
+          ) {
+            employeesRefreshTargets.push({ ...t, org_nr: t.org_nr.trim() });
+          } else {
+            alreadyVerified.push({ provider_id: t.id, navn: t.navn });
+          }
         } else if (!t.org_nr || !/^\d{9}$/.test(t.org_nr.trim())) {
           noOrgnr.push({ provider_id: t.id, navn: t.navn });
         } else {
@@ -5764,6 +5791,10 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
     const inactive: Array<{ provider_id: string; navn: string; org_nr: string; flag: string | null; brreg_name: string | null }> = [];
     const orgnrNotFound: Array<{ provider_id: string; navn: string; org_nr: string }> = [];
     const errors: Array<{ provider_id: string; error: string }> = [];
+    // Skive 4: kept separate from `verified` (first-time verification) —
+    // these rows were already brreg_verified going in; only antall_ansatte
+    // ever changes for them.
+    const employeesRefreshed: Array<{ provider_id: string; navn: string; org_nr: string; brreg_name: string; antall_ansatte: number | null; fields_written: string[] }> = [];
 
     for (const t of targets) {
       try {
@@ -5827,6 +5858,38 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
       }
     }
 
+    // Skive 4: same verifyFn call (still one GET /enheter/{orgNr}, no new
+    // HTTP integration), but writes go through applyGardssalgBrregEmployeesRefresh
+    // instead — that function owns antall_ansatte only and refuses to touch
+    // brreg_verified/brreg_active. An org found dead/gone during a refresh is
+    // reported (existing buckets) but nothing is written for it: a row
+    // already stamped brreg_verified=1 keeps that stamp untouched here — see
+    // dev-request Skive 4 spec for why re-stamping is explicitly out of scope.
+    for (const t of employeesRefreshTargets) {
+      try {
+        const result = await verifyFn(t.org_nr);
+        if (!result.exists) {
+          orgnrNotFound.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr });
+          continue;
+        }
+        if (!result.active) {
+          inactive.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, flag: result.flag, brreg_name: result.name });
+          continue;
+        }
+        const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+        const brregName = result.name || "";
+        const employees = typeof result.employees === "number" ? result.employees : null;
+        if (dryRun) {
+          employeesRefreshed.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, antall_ansatte: employees, fields_written: [] });
+        } else {
+          const written = applyGardssalgBrregEmployeesRefresh(t.id, evidenceUrl, batchTag, employees);
+          employeesRefreshed.push({ provider_id: t.id, navn: t.navn, org_nr: t.org_nr, brreg_name: brregName, antall_ansatte: employees, fields_written: written });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: t.id, error: e?.message ?? String(e) });
+      }
+    }
+
     res.json({
       dry_run: dryRun,
       batch_tag: batchTag,
@@ -5843,6 +5906,7 @@ router.post("/admin/gardssalg-brreg-verify", requireAdmin, async (req: Request, 
       already_verified: alreadyVerified,
       not_found: notFound,
       errors,
+      employees_refreshed: employeesRefreshed,
     });
   } finally {
     gsBvRunning = false;

@@ -5849,6 +5849,11 @@ export type GardssalgBrregVerifyTarget = {
   org_nr: string;
   content_source: string | null;
   brreg_verified: number | null;
+  // Skive 4 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+  // stoerrelsesgate): carried so the route can decide whether an
+  // already-verified row is eligible for the antall_ansatte-only refresh
+  // path (refreshEmployees) without a second query.
+  antall_ansatte: number | null;
 };
 
 /**
@@ -5882,7 +5887,7 @@ export function selectGardssalgProvidersForBrregVerify(
   ).n;
   const targets = db
     .prepare(
-      `SELECT id, navn, org_nr, content_source, brreg_verified
+      `SELECT id, navn, org_nr, content_source, brreg_verified, antall_ansatte
          FROM experience_providers WHERE ${where}
         ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`
     )
@@ -5899,7 +5904,7 @@ export function getGardssalgBrregVerifyTarget(
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, org_nr, content_source, brreg_verified
+      `SELECT id, navn, org_nr, content_source, brreg_verified, antall_ansatte
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
@@ -6031,6 +6036,95 @@ export function applyGardssalgBrregVerified(
   applyWithAudit();
 
   return written.map((w) => w.field);
+}
+
+/**
+ * Etterfyllingsvei for `antall_ansatte` på rader som er brreg_verified FRA
+ * FØR (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ * stoerrelsesgate, Skive 4 — supervisor-inbox/2026-08-10-priority-headsup-
+ * stoerrelsesgaten-er-inert-antall-ansatte-mangler.md). Uten denne var
+ * antall_ansatte umulig å etterfylle på nesten hele poolen, fordi
+ * applyGardssalgBrregVerified over har `if (row.brreg_verified === 1) return
+ * [];` — riktig for førstegangs-verifisering (idempotent), men det stenger
+ * samtidig den eneste veien inn for et felt som ble lagt til ETTER at raden
+ * allerede var verifisert. Denne funksjonen eier KUN antall_ansatte-kolonnen:
+ * krever brreg_verified === 1 inn (den etablerer aldri verifisering — det er
+ * fortsatt eneansvaret til applyGardssalgBrregVerified), er en no-op
+ * (returnerer `[]`, ingen audit-rad) hvis antall_ansatte allerede har en
+ * verdi (NULL→verdi only; periodisk ferskvare-refresh av et allerede fylt
+ * tall er bevisst utenfor scope for denne skiven) eller hvis det innhentede
+ * Brreg-tallet selv er null/undefined (ingenting å skrive), og respekterer
+ * manual/claim-lås som alle andre skriveveier i denne fila. Samme
+ * transaksjon+audit+field_provenance-mønster som naboen over — bare
+ * begrenset til én kolonne.
+ */
+export function applyGardssalgBrregEmployeesRefresh(
+  providerId: string,
+  evidenceUrl: string,
+  batchId: string | undefined,
+  antallAnsatte: number | null | undefined,
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, brreg_verified, field_provenance, antall_ansatte
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        brreg_verified: number | null;
+        field_provenance: string | null;
+        antall_ansatte: number | null;
+      }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (row.brreg_verified !== 1) return [];
+  if (row.antall_ansatte !== null && row.antall_ansatte !== undefined) return [];
+  if (antallAnsatte === null || antallAnsatte === undefined) return [];
+
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance["antall_ansatte"] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers
+          SET antall_ansatte = @antall_ansatte,
+              field_provenance = @field_provenance, updated_at = datetime('now')
+        WHERE id = @id`
+    ).run({
+      id: providerId,
+      antall_ansatte: antallAnsatte,
+      field_provenance: JSON.stringify(provenance),
+    });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'antall_ansatte', @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: row.antall_ansatte === null ? null : String(row.antall_ansatte),
+      new_value: String(antallAnsatte),
+      source_url: evidenceUrl,
+      batch_id: batchId ?? null,
+    });
+  });
+  applyWithAudit();
+
+  return ["antall_ansatte"];
 }
 
 export type GardssalgWebsiteReviewQueueEntry = {

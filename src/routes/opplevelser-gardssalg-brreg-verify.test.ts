@@ -30,6 +30,16 @@
  *       override reports skipped_locked / already_verified / no_orgnr /
  *       not_found buckets
  *   (f) idempotence: second apply run finds an empty cohort
+ *   (g) Skive 4 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
+ *       stoerrelsesgate — supervisor-inbox/2026-08-10-priority-headsup-
+ *       stoerrelsesgaten-er-inert-antall-ansatte-mangler.md): opt-in
+ *       `refreshEmployees` on providerIds mode backfills antall_ansatte on
+ *       ALREADY-verified rows (AK11) without ever re-stamping
+ *       brreg_verified/brreg_active; default (no flag) is byte-for-byte
+ *       unchanged (AK12); a row whose antall_ansatte is already set is a
+ *       no-op (AK13); an unverified row with the flag set takes the normal
+ *       first-time-verify path unaffected (AK14); manual/claim lock still
+ *       wins over the refresh path (AK15).
  */
 
 export interface TestSummary {
@@ -266,6 +276,16 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
         "777666555": {
           exists: false, active: false, name: null, nace: [], registrertDato: null, slettetDato: null, flag: "no_orgnr",
         },
+        // Skive 4 fixtures — bv-done itself reuses "111222333" (already
+        // verified, antall_ansatte still NULL, exactly the Macks-in-prod shape).
+        "111222333": {
+          exists: true, active: true, name: "FERDIG VERIFISERT AS",
+          nace: ["11.050"], registrertDato: "2012-01-01", slettetDato: null, flag: null, employees: 119,
+        },
+        "222333444": {
+          exists: true, active: true, name: "FERSK MED FLAGG AS",
+          nace: ["11.050"], registrertDato: "2018-01-01", slettetDato: null, flag: null, employees: 30,
+        },
       };
       const calls: string[] = [];
       expStore.__setGardssalgBrregVerifyForTesting(async (orgNr: string) => {
@@ -388,6 +408,147 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
         .prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = 'bv-ok'`)
         .get() as { n: number };
       assertEq(auditCount.n, 2, "(f) no duplicate audit rows on re-run");
+
+      // ── (g) Skive 4: antall_ansatte refresh for already-verified rows ────
+      // New fixtures inserted here (not in the shared setup above) so the
+      // fixed cohort/verified counts asserted in (b)/(c)/(e)/(f) above stay
+      // unchanged — those ran against the ORIGINAL fixture set only.
+      insertProvider.run({
+        id: "bv-fresh-with-flag",
+        navn: "Fersk Med Flagg",
+        org_nr: "222333444",
+        kommune: "Oslo",
+        rfb_seed_source: "rfb-seed",
+        producer_type: null,
+        content_source: "provider_site",
+        brreg_verified: 0,
+        brreg_active: 0,
+        field_provenance: null,
+      });
+      insertProvider.run({
+        id: "bv-locked-done",
+        navn: "Låst Og Ferdig",
+        org_nr: "555444333",
+        kommune: "Oslo",
+        rfb_seed_source: "rfb-seed",
+        producer_type: null,
+        content_source: "claim",
+        brreg_verified: 1,
+        brreg_active: 1,
+        field_provenance: null,
+      });
+
+      // AK11 — dry-run: reports the Brreg employee count for an
+      // already-verified row, writes nothing.
+      const refreshDry = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["bv-done"], refreshEmployees: true },
+      });
+      assertEq(refreshDry.body.dry_run, true, "(g) AK11: dry-run default even with refreshEmployees:true");
+      assertEq(refreshDry.body.already_verified.length, 0, "(g) AK11: refresh-eligible row does NOT land in already_verified");
+      assertEq(
+        (refreshDry.body.employees_refreshed as Array<{ provider_id: string; antall_ansatte: number | null }>)
+          .find((r) => r.provider_id === "bv-done")?.antall_ansatte,
+        119,
+        "(g) AK11: dry-run reports Macks-shape row's Brreg employee count",
+      );
+      const beforeWrite = expDb
+        .prepare(`SELECT antall_ansatte FROM experience_providers WHERE id = 'bv-done'`)
+        .get() as { antall_ansatte: number | null };
+      assertEq(beforeWrite.antall_ansatte, null, "(g) AK11: dry-run writes NOTHING");
+
+      // AK11 — apply: writes ONLY antall_ansatte, brreg_verified/brreg_active untouched.
+      const refreshApply = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["bv-done"], refreshEmployees: true, apply: true },
+      });
+      assertEq(
+        (refreshApply.body.employees_refreshed as Array<{ provider_id: string; fields_written: string[] }>)
+          .find((r) => r.provider_id === "bv-done")?.fields_written,
+        ["antall_ansatte"],
+        "(g) AK11: apply writes ONLY antall_ansatte",
+      );
+      const doneRowAfter = expDb
+        .prepare(`SELECT antall_ansatte, brreg_verified, brreg_active FROM experience_providers WHERE id = 'bv-done'`)
+        .get() as { antall_ansatte: number; brreg_verified: number; brreg_active: number };
+      assertEq(doneRowAfter.antall_ansatte, 119, "(g) AK11: antall_ansatte persisted");
+      assertEq(doneRowAfter.brreg_verified, 1, "(g) AK11: brreg_verified untouched (never re-stamped)");
+      assertEq(doneRowAfter.brreg_active, 1, "(g) AK11: brreg_active untouched");
+      const doneAudit = expDb
+        .prepare(
+          `SELECT field_name, old_value, new_value FROM gardssalg_content_audit WHERE provider_id = 'bv-done' ORDER BY field_name`,
+        )
+        .all() as Array<{ field_name: string; old_value: string | null; new_value: string }>;
+      assertEq(
+        doneAudit,
+        [{ field_name: "antall_ansatte", old_value: null, new_value: "119" }],
+        "(g) AK11: exactly one audit row, for antall_ansatte only",
+      );
+
+      // AK13 — no-op once antall_ansatte is already set. Proven directly
+      // against the store function: the route itself now buckets bv-done
+      // back into already_verified (antall_ansatte no longer null), so the
+      // refresh code path is unreachable for it via the route from here on.
+      const noopWritten = expStore.applyGardssalgBrregEmployeesRefresh(
+        "bv-done",
+        "https://data.brreg.no/enhetsregisteret/api/enheter/111222333",
+        "test-batch",
+        200,
+      );
+      assertEq(noopWritten, [], "(g) AK13: applyGardssalgBrregEmployeesRefresh no-ops when antall_ansatte is already set");
+      const doneRowUnchanged = expDb
+        .prepare(`SELECT antall_ansatte FROM experience_providers WHERE id = 'bv-done'`)
+        .get() as { antall_ansatte: number };
+      assertEq(doneRowUnchanged.antall_ansatte, 119, "(g) AK13: existing value NEVER overwritten by a second refresh");
+      const refreshSecondRoute = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["bv-done"], refreshEmployees: true, apply: true },
+      });
+      assertEq(
+        refreshSecondRoute.body.already_verified[0]?.provider_id,
+        "bv-done",
+        "(g) AK13 (route level): once antall_ansatte is set, the row falls back to already_verified even with refreshEmployees:true",
+      );
+
+      // AK14 — an UNVERIFIED row with refreshEmployees:true takes the
+      // normal first-time-verify path, unaffected by the new flag.
+      const freshWithFlag = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["bv-fresh-with-flag"], refreshEmployees: true, apply: true },
+      });
+      assertEq(freshWithFlag.body.scanned, 1, "(g) AK14: unverified row still takes the normal first-time-verify path");
+      assertEq(
+        (freshWithFlag.body.verified as Array<{ provider_id: string; fields_written: string[] }>)
+          .find((r) => r.provider_id === "bv-fresh-with-flag")?.fields_written,
+        ["brreg_verified", "brreg_active", "antall_ansatte"],
+        "(g) AK14: first-time verify still stamps all three fields, unaffected by refreshEmployees",
+      );
+      assertEq(
+        (freshWithFlag.body.employees_refreshed as unknown[]).length,
+        0,
+        "(g) AK14: nothing routed through the refresh-only path for a not-yet-verified row",
+      );
+
+      // AK15 — manual/claim lock still wins over refreshEmployees for an
+      // already-verified row.
+      const lockedDoneRefresh = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["bv-locked-done"], refreshEmployees: true, apply: true },
+      });
+      assertEq(
+        lockedDoneRefresh.body.skipped_locked[0]?.provider_id,
+        "bv-locked-done",
+        "(g) AK15: manual/claim lock still wins over refreshEmployees for an already-verified row",
+      );
+      assertEq(
+        (lockedDoneRefresh.body.employees_refreshed as unknown[]).length,
+        0,
+        "(g) AK15: locked row never reaches the refresh path",
+      );
+      const lockedDoneRow = expDb
+        .prepare(`SELECT antall_ansatte FROM experience_providers WHERE id = 'bv-locked-done'`)
+        .get() as { antall_ansatte: number | null };
+      assertEq(lockedDoneRow.antall_ansatte, null, "(g) AK15: locked row's antall_ansatte never written");
 
       expStore.__setGardssalgBrregVerifyForTesting(null);
       return { passed, failed, failures };
