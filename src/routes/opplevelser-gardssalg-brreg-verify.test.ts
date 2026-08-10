@@ -3,7 +3,7 @@
  * POST /admin/gardssalg-brreg-verify (src/routes/opplevelser.ts), added for
  * dev-request 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens: the
  * missing lever that stamps krav-2's brreg_verified flag from live Brreg
- * evidence (org exists + active + exact normalised name match), measured as
+ * evidence (org exists + is still active), measured as
  * the single largest one-lever pool unlock (57 rows blocked by the flag
  * alone on 2026-08-08).
  *
@@ -17,8 +17,13 @@
  *   (b) dry-run default: verified candidates reported, NOTHING written
  *   (c) apply: brreg_verified=1 + brreg_active=1 written, audit rows +
  *       field_provenance.brreg_verified stamped, readiness flag flips
- *   (d) evidence gates that must NEVER write: name_mismatch (Brreg name
- *       reported verbatim), inactive (bankrupt/dissolved), orgnr_not_found
+ *   (d) evidence gates that must NEVER write: inactive (bankrupt/dissolved),
+ *       orgnr_not_found. NOTE (Daniel, 2026-08-10): a divergent Brreg name is
+ *       NO LONGER a gate — registered names legitimately differ from the name
+ *       a company trades under ("AS" above all), and the exact-match rule
+ *       rejected 8 of 9 correct rows in prod. Identity is settled where the
+ *       org_nr is written; this lever answers exists + active. The name is
+ *       still reported on the verified row so a wrong org_nr stays visible.
  *   (e) cohort discipline: already-verified rows and rows without org_nr
  *       excluded from auto-selection (no_orgnr_total reported); locked
  *       (manual/claim) and test-provider rows never touched; providerIds
@@ -283,10 +288,23 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
       assertEq(dry.body.dry_run, true, "(b) dry-run default without apply");
       assertEq(dry.body.cohort_total, 4, "(b) cohort = the 4 unverified org_nr rows (done/noorg/locked/test/outside excluded)");
       assertEq(dry.body.no_orgnr_total, 1, "(b) no_orgnr_total counts the org_nr-less unverified row");
-      assertEq(dry.body.verified_count, 1, "(b) exactly one row verifies (exact name match)");
-      assertEq(dry.body.verified[0]?.provider_id, "bv-ok", "(b) the verifying row is bv-ok");
-      assertEq(dry.body.name_mismatch[0]?.provider_id, "bv-mismatch", "(b) mismatch row reported");
-      assertEq(dry.body.name_mismatch[0]?.brreg_name, "ULVIK FRUKT OG CIDERI AS", "(b) Brreg's name reported verbatim");
+      // Daniel, 2026-08-10: verification answers for the ORG NUMBER, not the
+      // name — registered names legitimately diverge from the name a company
+      // trades under (the legal "AS" suffix above all). A divergent name no
+      // longer blocks; existence and active status still do.
+      assertEq(dry.body.verified_count, 2, "(b) both live, existing org numbers verify — name no longer gates");
+      assertEq(
+        (dry.body.verified as Array<{ provider_id: string }>).map((r) => r.provider_id).sort(),
+        ["bv-mismatch", "bv-ok"],
+        "(b) the row whose Brreg name differs verifies too (Alde Sider / ULVIK FRUKT OG CIDERI AS)",
+      );
+      assertEq((dry.body.name_mismatch as unknown[]).length, 0, "(b) nothing is rejected for a divergent name any more");
+      assertEq(
+        (dry.body.verified as Array<{ provider_id: string; brreg_name: string }>)
+          .find((r) => r.provider_id === "bv-mismatch")?.brreg_name,
+        "ULVIK FRUKT OG CIDERI AS",
+        "(b) Brreg's name is still reported verbatim — visible to the operator, just not a gate",
+      );
       assertEq(dry.body.inactive[0]?.provider_id, "bv-dead", "(b) inactive row reported");
       assertEq(dry.body.inactive[0]?.flag, "bankrupt", "(b) inactive flag carried through");
       assertEq(dry.body.orgnr_not_found[0]?.provider_id, "bv-gone", "(b) 404 org_nr reported");
@@ -298,9 +316,10 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
       // ── (c) apply ─────────────────────────────────────────────────────────
       const applyRes = await callRoute(opplevelserRouter, { headers: { "x-admin-key": testKey }, body: { apply: true } });
       assertEq(applyRes.body.dry_run, false, "(c) apply run");
-      assertEq(applyRes.body.verified_count, 1, "(c) one row written");
+      assertEq(applyRes.body.verified_count, 2, "(c) both live rows written");
       assertEq(
-        applyRes.body.verified[0]?.fields_written,
+        (applyRes.body.verified as Array<{ provider_id: string; fields_written: string[] }>)
+          .find((r) => r.provider_id === "bv-ok")?.fields_written,
         ["brreg_verified", "brreg_active"],
         "(c) both flags written (0 -> 1)",
       );
@@ -334,7 +353,8 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
       const mismatchRow = expDb
         .prepare(`SELECT brreg_verified FROM experience_providers WHERE id = 'bv-mismatch'`)
         .get() as { brreg_verified: number };
-      assertEq(mismatchRow.brreg_verified, 0, "(d) name_mismatch row NOT written on apply");
+      assertEq(mismatchRow.brreg_verified, 1,
+        "(d) a live org with a divergent registered name IS written — identity was settled when the org_nr was stored");
       const deadRow = expDb.prepare(`SELECT brreg_verified FROM experience_providers WHERE id = 'bv-dead'`).get() as {
         brreg_verified: number;
       };
@@ -362,7 +382,7 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
 
       // ── (f) idempotence ──────────────────────────────────────────────────
       const secondApply = await callRoute(opplevelserRouter, { headers: { "x-admin-key": testKey }, body: { apply: true } });
-      assertEq(secondApply.body.cohort_total, 3, "(f) verified row left the cohort (4 -> 3)");
+      assertEq(secondApply.body.cohort_total, 2, "(f) both verified rows left the cohort (4 -> 2)");
       assertEq(secondApply.body.verified_count, 0, "(f) second apply verifies nothing new");
       const auditCount = expDb
         .prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = 'bv-ok'`)
