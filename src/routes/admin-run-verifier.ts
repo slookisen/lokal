@@ -124,6 +124,24 @@ router.post("/", async (req: Request, res: Response) => {
     const statusTransitions = results.filter(
       (r) => r.prior_verification_status !== r.new_verification_status
     ).length;
+    // dev-request 2026-08-10-verifier-portkjede-og-provenansrydding (Skive B):
+    // `passed` is the basic-gate result ONLY (computeKvalitetsGate: http_status,
+    // email, website, about, products, brreg) — it says nothing about whether the
+    // stricter cross-source/domain-coherence/email-ownership guards let the agent
+    // through, and nothing about whether this run actually changed anything. A
+    // high `passed` count over a backlog sweep can co-exist with near-zero real
+    // promotions when most candidates were already `verified` and simply re-pass
+    // the basic gate every round (see the dev-request's root-cause report). Expose
+    // the transition count under the name the report's fix asked for (`transitioned`,
+    // same value as the pre-existing `status_transitions` — kept for compatibility)
+    // plus a breakdown of what those transitions actually became, so a caller reading
+    // the response never again has to infer promotion counts from `passed`.
+    const transitioned = statusTransitions;
+    const byNewStatus: Record<string, number> = {};
+    for (const r of results) {
+      if (r.prior_verification_status === r.new_verification_status) continue;
+      byNewStatus[r.new_verification_status] = (byNewStatus[r.new_verification_status] ?? 0) + 1;
+    }
 
     // Build envelope and record directly via service (no HTTP roundtrip)
     const envelope: any = buildRunEnvelope({
@@ -157,6 +175,8 @@ router.post("/", async (req: Request, res: Response) => {
       thin_content,
       pool_added: pooledNew,
       status_transitions: statusTransitions,
+      transitioned,
+      by_new_status: byNewStatus,
       persisted: true,
       envelope_recorded: envelopeRecorded,
       hour_utc: hourUTC,
