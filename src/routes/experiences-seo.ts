@@ -35,6 +35,7 @@ import * as path from "path";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
+import { generalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
@@ -7235,7 +7236,7 @@ function renderNearMeBox(q: string, activeTags: ExperienceTag[], radiusKm: numbe
 // ONLY: omitting lat/lng/sted leaves every branch below completely unused —
 // discoverExperiences() is never called, rows/ordering are byte-identical to
 // before this feature existed.
-router.get("/sok", async (req: Request, res: Response) => {
+router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const q = String(req.query.q ?? "").trim();
   const activeTags = EXPERIENCE_TAGS.filter((t) => String(req.query[t] ?? "") === "1");
 

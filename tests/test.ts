@@ -36967,6 +36967,32 @@ runSerial(async () => {
   }
 });
 
+// 2026-07-26 code review follow-up ("egen sak"): /sok had no rate limiter on
+// either host while its sibling /reise did, even though /sok now does live
+// geocoding fan-out (Kartverket calls) for route-intent queries — a more
+// expensive unauthenticated path than a plain search, with zero abuse
+// protection. Fixed by wiring the existing, already-exported
+// generalLimiter (src/middleware/security.ts) directly onto both routers'
+// GET /sok handlers. Pure router-introspection (no DB, no server) — see
+// sok-rate-limit.test.ts's own header comment for why this is deterministic
+// and still catches the regression (identity-checked against the real
+// generalLimiter instance, not a re-implementation).
+runSerial(async () => {
+  console.log("\n── 2026-07-26 review follow-up: /sok rate-limit wiring (seo.ts + experiences-seo.ts) ──");
+  try {
+    const { runSokRateLimitTests } = require("../src/routes/sok-rate-limit.test") as
+      typeof import("../src/routes/sok-rate-limit.test");
+    const srl = runSokRateLimitTests({ log: false });
+    passed += srl.passed;
+    failed += srl.failed;
+    for (const f of srl.failures) failures.push("sok-rate-limit: " + f);
+    console.log(`  sok-rate-limit: ${srl.passed} passed, ${srl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("sok-rate-limit: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a +
 // 1c — the RFB coordinate foundation. 948 of 1 499 active producers had
 // seed-time coordinates of unrecorded provenance and 551 had NONE at all
