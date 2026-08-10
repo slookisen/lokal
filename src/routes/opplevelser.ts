@@ -1394,7 +1394,20 @@ async function crFetchHtml(url: string): Promise<string | null> {
  * null only if the primary homepage cannot be fetched.
  */
 type CrFetchOutcome =
-  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
+  | {
+      ok: true;
+      primaryHtml: string;
+      combinedHtml: string;
+      fetchUrl: string;
+      // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1
+      // (diagnose): ADDITIVE, optional — which of GARDSSALG_CONTENT_PATHS were
+      // actually fetched/included for this call. Only ever populated by
+      // crFetchGardssalgContent below; crFetchHomepageContent (the other
+      // producer of this same union) never sets it, which is fine because it's
+      // optional — no existing caller/test that destructures a CrFetchOutcome
+      // is affected by an unset optional field.
+      pagesFetchedPaths?: string[];
+    }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
 // dev-request 2026-08-02-enrichment-kadens-og-kildekvalitet, AC3-slice: the
@@ -1827,6 +1840,13 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   const primaryHtml = primary.html;
   let combinedHtml = primaryHtml;
   let pagesFetched = 1;
+  // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1:
+  // which GARDSSALG_CONTENT_PATHS sub-pages actually made it into combinedHtml
+  // for THIS call — surfaced via the additive pagesFetchedPaths field below so
+  // the products-extraction diagnostic can report it per row. Does not include
+  // the homepage itself (that's implicit — primary always succeeded to get
+  // this far).
+  const fetchedPaths: string[] = [];
   try {
     // Final url, not the requested one — a cross-host redirect otherwise leaves
     // the whole sub-page crawl pointed at a host that no longer serves the site.
@@ -1853,12 +1873,13 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
       if (sub) {
         combinedHtml += "\n" + sub;
         pagesFetched++;
+        fetchedPaths.push(path);
       }
     }
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths };
 }
 
 const GS_CR_DEFAULT_LIMIT = 25;
@@ -1988,6 +2009,33 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // (never lumped into skipped_locked/excluded_shared_domain) so a run's
   // report always makes visible how many rows were skipped for this reason.
   const excludedUnverifiedWebsite: Array<{ provider_id: string; reason: string }> = [];
+  // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1
+  // (diagnose — NO behavior change, reporting only). 28 of 30 content-blocked
+  // gårdssalg rows are blocked on `products` alone; this bucket exists to
+  // measure WHY generateGardssalgProductList comes back empty on producers
+  // who plainly do sell products, per the dev-request's three hypotheses
+  // (char-cap truncation eating the source before it reaches the product
+  // page; sub-page discovery missing the product page entirely; or the model
+  // legitimately finding no products in what it was given). Populated for
+  // EVERY row that enters the products-extraction branch below
+  // (gardssalgProductsEligible(t.products) === true), independent of whether
+  // that row ends up in `changed` — a sentinel/null result or an
+  // already-satisfied about_text/visit_text means the row would otherwise
+  // never appear anywhere in this report at all (see changed's early return
+  // once wouldWrite.length === 0), which would silently hide exactly the
+  // rows this diagnostic exists to explain.
+  type GardssalgProductsOutcome =
+    | "products_found"
+    | "sentinel_no_products"
+    | "invalid_unparseable"
+    | "infra_failure";
+  const productsDiagnostic: Array<{
+    provider_id: string;
+    content_chars_full: number;
+    truncated: boolean;
+    pages_fetched_paths: string[];
+    outcome: GardssalgProductsOutcome;
+  }> = [];
 
   async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -2289,7 +2337,27 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // convention as the slice 5a rewrite path above.
     let productsCandidate: string[] | null = null;
     if (gardssalgProductsEligible(t.products)) {
-      productsCandidate = await generateGardssalgProductList(contentText);
+      // Skive 1 diagnostic capture — see productsDiagnostic's doc comment
+      // above. contentText here is the FULL, pre-cap combined page text (the
+      // same value handed to generateGardssalgProductList below); the cap
+      // itself is applied INSIDE that function via
+      // GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP, so comparing contentText.length
+      // against that same constant tells us whether this row's source text
+      // was actually truncated before the model ever saw it (hypothesis 1).
+      // The diagnosticOut out-param is purely additive on
+      // generateGardssalgProductList's signature (optional, unused by every
+      // pre-existing call site) — it does not change what that function
+      // returns, so productsCandidate's value and every write decision
+      // downstream of it are byte-for-byte unchanged from before this diff.
+      const diagnosticOut: GardssalgProductsExtractionDiagnostic = {};
+      productsCandidate = await generateGardssalgProductList(contentText, diagnosticOut);
+      productsDiagnostic.push({
+        provider_id: providerId,
+        content_chars_full: contentText.length,
+        truncated: contentText.length > GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP,
+        pages_fetched_paths: fetched.pagesFetchedPaths ?? [],
+        outcome: diagnosticOut.outcome ?? "infra_failure",
+      });
       if (productsCandidate && productsCandidate.length > 0) {
         wouldWriteActions.products = "filled";
         provenance.products = {
@@ -2414,6 +2482,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // is not stamped verified=true by the website-verification sweep —
     // additive bucket; every excluded provider is visible, never dropped.
     excluded_unverified_website: excludedUnverifiedWebsite,
+    // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1:
+    // per-row diagnostic for every row that entered the products-extraction
+    // branch this run (see productsDiagnostic's doc comment above) — additive
+    // bucket, reporting-only, changes no write behavior.
+    products_diagnostic: productsDiagnostic,
   });
 });
 
@@ -15697,9 +15770,33 @@ const GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP = 6000;
 const GARDSSALG_PRODUCTS_MAX_ITEMS = 20;
 const GARDSSALG_PRODUCTS_MAX_ITEM_LEN = 60;
 
-export async function generateGardssalgProductList(sourceText: string): Promise<string[] | null> {
+// dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1
+// (diagnose): ADDITIVE out-param — when the caller passes a diagnosticOut
+// object, this function stamps its `outcome` field with WHICH of the
+// no-products paths below was taken (the function's own return value stays
+// `string[] | null` either way, so no existing behavior/caller/test is
+// affected by this — omitting the second argument, as every pre-existing
+// call site does, reproduces the exact prior behavior byte-for-byte).
+// "invalid_unparseable" covers every shape/parse failure that is NOT the
+// model's own explicit "no products" sentinel (non-string text, non-JSON
+// response, non-array JSON, or an array that filters down to nothing);
+// "infra_failure" covers failures before the model's answer is even in hand
+// (missing API key, network error, non-2xx, unparseable response body) —
+// keeping these apart from "sentinel_no_products" is the whole point of this
+// diagnostic pass (see the dev-request's three hypotheses).
+export interface GardssalgProductsExtractionDiagnostic {
+  outcome?: "products_found" | "sentinel_no_products" | "invalid_unparseable" | "infra_failure";
+}
+
+export async function generateGardssalgProductList(
+  sourceText: string,
+  diagnosticOut?: GardssalgProductsExtractionDiagnostic
+): Promise<string[] | null> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) {
+    if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
+    return null;
+  }
 
   const cappedSource = (sourceText || "").slice(0, GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP);
   const prompt = `Lag en liste over produkter/drikkevarer denne gårdsprodusenten selger, KUN basert på kildeteksten under.
@@ -15725,31 +15822,46 @@ Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der.
       }),
     });
   } catch {
+    if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
     return null; // network/fetch failure — never fabricate
   }
 
-  if (!response.ok) return null;
+  if (!response.ok) {
+    if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
+    return null;
+  }
 
   let result: any;
   try {
     result = await response.json();
   } catch {
+    if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
     return null; // unparseable JSON body — never fabricate
   }
 
   const contentArr = Array.isArray(result?.content) ? result.content : [];
   const text = contentArr.find((c: any) => c?.type === "text")?.text;
-  if (typeof text !== "string") return null;
+  if (typeof text !== "string") {
+    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
+    return null;
+  }
   const cleaned = text.trim();
-  if (cleaned === GARDSSALG_PRODUCTS_SENTINEL) return null; // explicit "no products" escape
+  if (cleaned === GARDSSALG_PRODUCTS_SENTINEL) {
+    if (diagnosticOut) diagnosticOut.outcome = "sentinel_no_products";
+    return null; // explicit "no products" escape
+  }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
   } catch {
+    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
     return null; // not valid JSON — never fabricate/guess a list from prose
   }
-  if (!Array.isArray(parsed)) return null;
+  if (!Array.isArray(parsed)) {
+    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
+    return null;
+  }
 
   const seen = new Set<string>();
   const items: string[] = [];
@@ -15764,7 +15876,12 @@ Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der.
     if (items.length >= GARDSSALG_PRODUCTS_MAX_ITEMS) break;
   }
 
-  return items.length > 0 ? items : null;
+  if (items.length === 0) {
+    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
+    return null;
+  }
+  if (diagnosticOut) diagnosticOut.outcome = "products_found";
+  return items;
 }
 
 // Calls the Anthropic API the same way ClaudeVisionProvider.analyze() does
