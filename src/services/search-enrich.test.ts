@@ -320,6 +320,22 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(products.includes("fish"), "complaint/Bomstad: reker IS in lexicon → fish (Bomstad absence is genuine)");
   }
 
+  // ── W33 — Myrdal Gård Ysteri: goat-DAIRY, bare 'geit' must not imply meat ──
+  // Real breach: a goat-cheese dairy with NO meat products got categories/
+  // products = "meat,dairy" because the bare "geit" (goat) keyword fired on
+  // any mention of the animal, even in a pure milk/cheese sentence. Unlike
+  // Bomstad (which explicitly sells "geitekjøtt"), this page never mentions
+  // meat at all — only goat MILK used to make cheese.
+  {
+    const text = extractVisibleText(
+      "<h1>Myrdal Gård Ysteri</h1><p>Vi produserer forskjellige oster av kjøpt " +
+      "geit og kumelk, og driver eget ysteri.</p>",
+    );
+    const products = extractProductMentions(text);
+    assertTrue(!products.includes("meat"), "myrdalgard/W33: bare 'geit' (goat-dairy context) must NOT trigger meat");
+    assertTrue(products.includes("dairy"), "myrdalgard/W33: ysteri/geitost still triggers dairy");
+  }
+
   // extractProductMentions: empty / no-hit cases.
   {
     assertEq(extractProductMentions(""), [], "extractProductMentions: empty → []");
