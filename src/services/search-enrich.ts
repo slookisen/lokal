@@ -811,7 +811,7 @@ const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[
   ["meat", [
     "kjott", "meat", "lam", "lammekjott", "svin", "svinekjott", "storfe",
     "storfekjott", "kylling", "vilt", "elg", "hjort", "rein", "reinsdyr",
-    "polser", "spekemat", "fenalar", "ribbe", "pinnekjott", "geit", "geitekjott",
+    "polser", "spekemat", "fenalar", "ribbe", "pinnekjott", "geitekjott",
   ]],
   ["fish", [
     "fisk", "fish", "sjomat", "laks", "torsk", "reker", "krabbe", "blaskjell",
