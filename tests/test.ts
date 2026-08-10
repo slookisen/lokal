@@ -5241,6 +5241,66 @@ async function runIntegrationTests(): Promise<void> {
     );
   }
 
+  // ── Fixture A2 (Daniel 2026-08-10): free-mail WITHOUT homepage evidence is
+  // report-only, never a quarantine ──────────────────────────────────────────
+  // Daniel: «gmail domener og forsåvidt hotmail og andre er ok å bruke. Vi
+  // sender ikke sensitiv data, men du skal ikke lage fiktive eposter.»
+  // (daniel-responses/2026-08-10-frimeil-policy-og-ingen-fiktive-eposter.md)
+  //
+  // Same shape as Fixture A above but with NO field_provenance.email record and
+  // agents.is_verified = 0 — i.e. exactly the cohort the guard used to hold at
+  // review_required (18 live rows, measured 2026-08-10). The flag must still be
+  // RAISED (we keep watching wrong contacts) while the OUTCOME is untouched.
+  {
+    const sqlite = require("better-sqlite3");
+    const db = new sqlite(":memory:");
+    const { __setDbForTesting, __initSchemaForTesting } = require("../src/database/init");
+    __initSchemaForTesting(db);
+    const { getDb } = require("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-gmail-noevidence", "Solhaug Gard", {
+      email: "solhaug.gard@gmail.com",
+      website: "https://solhaug.no",
+      about: "Familiedrevet gard i Trøndelag som sel egg, honning og grønsaker direkte frå garden.",
+      products: JSON.stringify([{ name: "Egg" }, { name: "Honning" }, { name: "Grønsaker" }, { name: "Poteter" }]),
+      field_provenance: {
+        address: [
+          { value: "Solhaugvegen 8, 7288 Soknedal", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Solhaugvegen 8, 7288 Soknedal", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "95011044", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "95011044", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        // NB: deliberately NO email record — this is the whole point of the fixture.
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-gmail-noevidence");
+    assertTrue(!!ar, "intg-g16A2: unevidenced free-mail agent found");
+    assertTrue(
+      ar!.email_ownership_unproven,
+      "intg-g16A2: the signal is STILL raised — we keep watching wrong contacts",
+    );
+    assertTrue(
+      ar!.email_ownership_report_only,
+      "intg-g16A2: report-only for every agent now, not just already-verified ones",
+    );
+    assertTrue(
+      !ar!.flags.includes("email_ownership_unproven"),
+      "intg-g16A2: no gate flag is pushed — the flag drove the quarantine",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "verified",
+      "intg-g16A2: free-mail WITHOUT homepage evidence now reaches verified (Daniel 2026-08-10)",
+    );
+  }
+
   // ── orch-pr-16 Fixture B: inference-only factual field → quarantined ────────
   // products + phone come ONLY from inference (seasonal_knowledge / web_search).
   // The agent must be quarantined (review_required, not in pool) with an

@@ -1109,23 +1109,37 @@ export async function runVerifierBatch(opts: {
     const emailHomepageEvidence = hasHomepageEvidence(fieldProv.email, agent.email, agentUrlRoot);
     const emailManuallyVerified = agent.is_verified === 1 || agent.is_verified === true;
     const emailOwnershipUnproven = isFreeMailForOwnership && !emailHomepageEvidence && !emailManuallyVerified;
-    let emailOwnershipReportOnly = false;
+    // ── REPORT-ONLY FOR EVERY AGENT (Daniel, 2026-08-10 — binding) ──────────
+    //
+    //   «gmail domener og forsåvidt hotmail og andre er ok å bruke. Vi sender
+    //    ikke sensitiv data, men du skal ikke lage fiktive eposter.»
+    //   (daniel-responses/2026-08-10-frimeil-policy-og-ingen-fiktive-eposter.md)
+    //
+    // The quarantine effect is retired; the SIGNAL is kept. Rationale, in the
+    // words of the decision: a free-mail DOMAIN is a perfectly normal contact
+    // address for a small Norwegian producer — many have no domain mailbox at
+    // all — and outreach carries no sensitive data, so the domain alone must
+    // never cost an agent its place in the pool. Measured 2026-08-10: 18 rows
+    // were held out of the pool by this check alone.
+    //
+    // What this does NOT relax: the incident that motivated the guard
+    // (norskott@online.no attached to the WRONG producer, "Dalheim Gårdsysteri")
+    // was a wrong-ENTITY failure, not a free-mail failure. The defences against
+    // that are untouched — domain coherence, cross-source agreement, the
+    // website-ownership check, and `wrong_contact_rate` as a charter hard-block.
+    // The anti-fabrication rule ("aldri konstruer en adresse") lives on the
+    // WRITE side (enrichment SKILL §2E + the existing junk/placeholder gates),
+    // which is where an invented address would have to be born.
+    //
+    // The flag, the console line and the envelope counter all stay, so a rise
+    // in wrong contacts remains observable — this is a policy change about the
+    // CONSEQUENCE, not a decision to stop looking.
+    const emailOwnershipReportOnly = emailOwnershipUnproven;
     if (emailOwnershipUnproven) {
-      if (!wasInPool) {
-        gate.flags.push("email_ownership_unproven");
-        if (newVerification === "verified") newVerification = "review_required";
-        (crossSourceResults as Record<string, unknown>).email_ownership_unproven = true;
-        console.log(
-          `[verifier] ${agent.id} (${agent.name ?? "?"}) free-mail email ownership unproven (no homepage evidence, agents.is_verified=${agent.is_verified ?? 0}) — quarantined from pool`,
-        );
-      } else {
-        // Already verified — report-only, per Daniel's monotonic-pool
-        // instruction above. Must NOT touch newVerification.
-        emailOwnershipReportOnly = true;
-        console.log(
-          `[verifier] ${agent.id} (${agent.name ?? "?"}) free-mail email ownership unproven but agent already verified — report-only, outcome unchanged`,
-        );
-      }
+      (crossSourceResults as Record<string, unknown>).email_ownership_unproven = true;
+      console.log(
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) free-mail email ownership unproven (no homepage evidence, agents.is_verified=${agent.is_verified ?? 0}) — report-only per Daniel 2026-08-10, outcome unchanged`,
+      );
     }
 
     // ── Steg B (dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-
