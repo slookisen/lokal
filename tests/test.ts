@@ -29082,6 +29082,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gosg.failures) failures.push("opplevelser-gardssalg-outreach-size-gate: " + f);
     console.log(`  opplevelser-gardssalg-outreach-size-gate: ${gosg.passed} passed, ${gosg.failed} failed`);
 
+    // dev-request 2026-08-09-daglig-outreach-klargjoering-og-stoerrelsesgate,
+    // Skive 2: GET /admin/gardssalg-outreach-daily-prep — the read-only daily
+    // prep computation (up to 4 vetted candidates, capped, never padded,
+    // plus an excluded list with reasons), reusing
+    // computeGardssalgOutreachSendEligibility (the same extracted dry-run
+    // check pilot-send's own dry-run path now also calls) — never a forked
+    // copy. Same in-memory-DB pattern, runs sequentially inside this same
+    // gated block.
+    console.log("\n── opplevelser-gardssalg-outreach-daily-prep: read-only daily prep (Skive 2) ──");
+    const { runOpplevelserGardssalgOutreachDailyPrepTests } = require("../src/routes/opplevelser-gardssalg-outreach-daily-prep.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-daily-prep.test");
+    const godp = await runOpplevelserGardssalgOutreachDailyPrepTests({ log: false });
+    passed += godp.passed;
+    failed += godp.failed;
+    for (const f of godp.failures) failures.push("opplevelser-gardssalg-outreach-daily-prep: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-daily-prep: ${godp.passed} passed, ${godp.failed} failed`);
+
     // dev-request 2026-08-08-gardssalg-brreg-verify-og-embedded-evidens:
     // POST /admin/gardssalg-brreg-verify — the missing lever that stamps
     // krav-2's brreg_verified flag from live Brreg evidence (exists + active
