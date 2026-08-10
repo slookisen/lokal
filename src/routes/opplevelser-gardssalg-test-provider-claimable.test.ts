@@ -62,6 +62,34 @@
  *   (n) the claimable row must not enter the FETCH cohorts (independent of
  *       this route now, since it never writes hjemmeside — see that
  *       section's own comment for why a directly-seeded fixture is used)
+ *
+ * EXTENDED 2026-08-10 (dev-request 2026-08-10-gardssalg-eier-flyt-e2e-
+ * repeterbar-revoke-og-editable-fixtur, item B) for the new
+ * `claimableEditable: true` opt-in — sibling to `claimable`, but stamps
+ * content_source='claim' instead of 'manual' so the owner portal
+ * (updateClaimedProviderProfile / the portal GET route — both gate strictly
+ * on content_source === 'manual', confirmed directly against that code)
+ * stays EDITABLE once a real claim is verified against the row (unlike
+ * `claimable`'s own row, which — per section (d)/(e) above — is
+ * PERMANENTLY locked, since verifyClaimToken() never downgrades an existing
+ * 'manual' content_source). Covers:
+ *   (o) `claimableEditable: true` sets content_source='claim' (not
+ *       'manual') and brreg_verified=1, reusing the SAME `claimEmail`/epost
+ *       mechanism as `claimable` (default .invalid address unless supplied)
+ *   (p) `claimable: true` and `claimableEditable: true` together -> a clean
+ *       400, no write at all
+ *   (q) the org_nr pin refuses a claimableEditable write against a real
+ *       provider's slug, exactly like `claimable` does
+ *   (r) the response reports both `claimable` and `claimableEditable`
+ *       booleans plus the actual `content_source` value written
+ *   (s) SPEC-DOCUMENTED LIMITATION, verified against the real code: a
+ *       claimableEditable row (content_source='claim') is NOT self-serve
+ *       claim-eligible via deriveOrgLinkedEmail() — tier (c)'s adminEntered
+ *       sub-case requires content_source === 'manual' specifically, and
+ *       'claim' does not satisfy it. This pins that as an accepted,
+ *       documented fact (see the route's own "SPEC DISCREPANCY" comment in
+ *       opplevelser.ts) rather than silently assuming the row behaves like
+ *       `claimable`'s.
  */
 
 export interface TestSummary {
@@ -448,6 +476,73 @@ export function runOpplevelserGardssalgTestProviderClaimableTests(
       });
       assertEq(plainHijack.status, 409, "h1: a real provider's slug is refused even without claimable");
       assertEq(diffRows(realBefore, readRow("prov-real")), [], "h2: ...and NO column on that row changed either");
+
+      // ── (o) claimableEditable: true — content_source='claim', not
+      //     'manual' ─────────────────────────────────────────────────────
+      const editable = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimableEditable: true },
+      });
+      assertEq(editable.status, 200, "o1: claimableEditable upsert -> 200");
+      assertEq(editable.body.provider_id, plainId, "o2: idempotent — same row, not a duplicate");
+      const editableRow = readRow(plainId);
+      assertEq(editableRow.brreg_verified, 1, "o3: brreg_verified = 1, same as claimable");
+      assertEq(editableRow.content_source, "claim", "o4: content_source = 'claim' (NOT 'manual') — this is the whole point of the flag");
+      assertEq(editableRow.epost, "claim-test@test-ikke-book.invalid", "o5: claim epost defaults to the same safe .invalid address as claimable");
+
+      // A caller-supplied claimEmail is honoured here too — same mechanism,
+      // same column, as claimable's own (c9)/(c10) coverage above.
+      const editableCustomEmail = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimableEditable: true, claimEmail: "eier@editablefixtur.invalid" },
+      });
+      assertEq(editableCustomEmail.status, 200, "o6: caller-supplied claimEmail with claimableEditable -> 200");
+      assertEq(readRow(plainId).epost, "eier@editablefixtur.invalid", "o7: ...and it's what got stored");
+
+      // ── (p) claimable + claimableEditable together -> 400, no write ─────
+      const beforeBoth = readRow(plainId);
+      const both = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimable: true, claimableEditable: true },
+      });
+      assertEq(both.status, 400, "p1: both flags true at once -> 400");
+      assertEq(diffRows(beforeBoth, readRow(plainId)), [], "p2: ...and the row is completely untouched (whole-row diff)");
+
+      // ── (r) response reports both booleans + the actual content_source
+      //     written ───────────────────────────────────────────────────────
+      const editableAgain = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimableEditable: true },
+      });
+      assertEq(editableAgain.body.claimable, false, "r1: response reports claimable:false for a claimableEditable call");
+      assertEq(editableAgain.body.claimableEditable, true, "r2: ...and claimableEditable:true");
+      assertEq(editableAgain.body.content_source, "claim", "r3: ...and content_source:'claim' — the value actually written");
+
+      const plainAgain = await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com" } });
+      assertEq(plainAgain.body.claimable, false, "r4: a plain (no-flag) call reports claimable:false");
+      assertEq(plainAgain.body.claimableEditable, false, "r5: ...and claimableEditable:false");
+      assertTrue(!("content_source" in plainAgain.body), "r6: ...and no content_source key at all (claimReady is false)");
+
+      // ── (s) documented limitation: content_source='claim' is NOT
+      //     self-serve claim-eligible via the REAL deriveOrgLinkedEmail() ──
+      // Re-set to the claimableEditable state (r4/r5 above left the row
+      // claim-less) before checking eligibility.
+      await callRoute(opplevelserRouter, { headers: auth, body: { email: "daniel@example.com", claimableEditable: true } });
+      assertEq(
+        claimService.deriveOrgLinkedEmail(readRow(plainId)),
+        { eligible: false, reason: "no_org_linked_email" },
+        "s1: a claimableEditable row is claim-INELIGIBLE via self-serve deriveOrgLinkedEmail() — tier (c)'s adminEntered requires content_source==='manual', not 'claim' (see this route's own 'SPEC DISCREPANCY' comment in opplevelser.ts). Claiming it repeatably goes through POST /admin/gardssalg-claim-grant instead.",
+      );
+
+      // ── (q) the org_nr pin refuses claimableEditable against a real
+      //     provider's slug, exactly like claimable does (f1-f5 above) ────
+      const realBeforeEditable = readRow("prov-real");
+      const hijackEditable = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { email: "daniel@example.com", claimableEditable: true, slug: "ekte-bryggeri" },
+      });
+      assertEq(hijackEditable.status, 409, "q1: claimableEditable write against a real provider's slug -> 409, refused");
+      assertEq(diffRows(realBeforeEditable, readRow("prov-real")), [], "q2: NO column on the real row changed (whole-row diff)");
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
