@@ -273,6 +273,7 @@ import {
   type GsWvFetchFn,
   type GsWvScope,
   type GsWvCohort,
+  type GsWvProducerRow,
 } from "../services/gardssalg-website-verification";
 // orchestrator dev-request 2026-08-03-gardssalg-field-concordance:
 // GET /admin/gardssalg-field-concordance-audit — read-only per-field
@@ -9325,6 +9326,944 @@ router.post("/admin/gardssalg-outreach-size-gate", requireAdmin, (req: Request, 
   } catch (err) {
     console.error("[gardssalg-outreach-size-gate] write failed:", err);
     res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-veien-til-pool (admin) ──────────
+//
+// dev-request 2026-08-10-veien-til-pool-berikelseskjede-og-koedrenering,
+// Skive 2 — the "veien til pool" routine. Skive 1 (PR #554, `ea34294`) fixed
+// three leaks that stopped the chain from ever completing; this route is the
+// chain itself: it takes a batch of gårdssalg providers that are NOT
+// `outreach_ready` and walks each one, in order, as far as the evidence
+// allows — nettsted → kontakt → innhold → org.nr → brreg-verifisering → ny
+// tiering — reusing the EXISTING guarded endpoints for every write, never a
+// forked copy of their logic:
+//
+//   nettsted  -> POST .../gardssalg-website-review-approve (a queued
+//                candidate with genuine DOMAIN-AFFILIATION, see
+//                gardssalgWebsiteDomainAffiliated below) and/or
+//                POST .../gardssalg-website-verification-remediation (the
+//                real fetch-based classifier that actually sets
+//                field_provenance.hjemmeside_verification — approving a
+//                queued candidate alone never sets that key, see
+//                applyGardssalgProviderWebsite's own doc comment).
+//   kontakt   -> POST .../gardssalg-contact-extraction (already takes
+//                providerIds as of Skive 1 — AK1).
+//   innhold   -> POST .../gardssalg-content-refresh (fill-only; its own
+//                internal LLM-judge cascade is what rejects scraped
+//                navigation dressed up as profile text — krav 10).
+//   org.nr    -> POST .../gardssalg-orgnr-backfill (generates a Brreg
+//                name-search candidate AND applies its own strict
+//                exact-tier auto-write bar — never
+//                .../gardssalg-orgnr-review-approve; see the module doc
+//                comment on gsVtpProcessProvider for why that lever is
+//                deliberately NOT called autonomously here).
+//   brreg     -> POST .../gardssalg-brreg-verify (sets brreg_verified from
+//                live registry evidence once org_nr is present).
+//   tiering   -> computeGardssalgReadinessRows/computeGardssalgReadinessTier
+//                (the SAME function GET .../gardssalg-outreach-readiness
+//                uses) — read AGAIN after the walk, never a second/forked
+//                tier computation.
+//
+// Every "reuse EXISTING endpoint" arrow above is a genuine in-process call
+// into that endpoint's OWN Express handler via router.handle() — the exact
+// same fake-req/fake-res idiom this repo's own test harness already uses
+// (see opplevelser-veien-til-pool.test.ts's `call()` helper) — never an HTTP
+// self-call over the network, and never a hand-rolled re-implementation of
+// what that handler does. This means every existing rejection control inside
+// those handlers (umbrella-address deny-list, inactive-company/name-mismatch
+// Brreg gates, fill-only/owner-lock guards, the content-quality judge
+// cascade) fires exactly as it does when Daniel calls the endpoint by hand —
+// this routine cannot bypass any of them, by construction, because it is
+// not a second code path to any of them.
+//
+// Dry-run by default (apply:true to write — same idiom as every sibling
+// gårdssalg admin route). BOTH batch modes are supported, deliberately,
+// per the dev-request's own spec text ("per kjøring... en bunke produsenter
+// som IKKE er outreach_ready" reads as an intended cohort sweep, unlike
+// gardssalg-content-clear which explicitly forbids one):
+//   - providerIds (Skive 1's own narrowing convention) — explicit rows only.
+//   - no providerIds -> cohort mode: every NOT-`outreach_ready` provider,
+//     ordered by id ascending (same "simplest stable choice" precedent as
+//     GET .../gardssalg-outreach-daily-prep), paged via limit/offset.
+// A row that IS already `outreach_ready` is never processed — reported in
+// `already_outreach_ready` (providerIds mode only; cohort mode excludes it
+// from selection by construction) rather than silently re-run.
+//
+// Cost note on the default/hard-cap sizing: unlike its leaf endpoints (which
+// each do ONE kind of network work), a single provider walked through this
+// routine can fan out into up to 5 further in-process calls, several of
+// which themselves fetch pages or call Brreg — so this routine's own
+// default limit (5) and hard cap (20) are deliberately smaller than any one
+// leaf endpoint's own (24-48), bounding one call's total wall-clock/network
+// cost to roughly what manually calling all five levers once per provider
+// would already cost.
+//
+// Dry-run honesty note: a dry-run's per-step decisions are evaluated against
+// the CURRENTLY STORED row, never a hypothetically-already-written one — a
+// step downstream of a would-write step (e.g. kontakt, when nettsted would
+// fill+verify the website this run) reports against TODAY's data, exactly
+// like calling that leaf endpoint by hand today would. This routine does not
+// simulate a multi-step write cascade inside one dry run (that would require
+// duplicating every downstream endpoint's own write-decision logic against a
+// simulated post-write row — exactly the "fork, don't reuse" anti-pattern
+// this whole routine exists to avoid). apply:true is what actually completes
+// the cascade; a dry-run tells you what TODAY's state would do at each step.
+//
+// Non-goals (unchanged from the dev-request): no outbound sending, no
+// `human_consent_evidence`, no touching the email rule or
+// renderGardssalgOutreach, and no gardssalg-website-discovery /
+// member-list ingestion (Skive 3) — website candidate GENERATION beyond
+// what is already queued is deliberately out of scope here; see
+// gsVtpProcessProvider's own doc comment for why.
+const GS_VTP_DEFAULT_LIMIT = 5;
+const GS_VTP_HARD_CAP = 20;
+// Queue-drainage threshold (krav 8/AK9): no existing "stale queue" day
+// convention exists elsewhere in this codebase to reuse (checked
+// gardssalg-outreach-daily-prep and the cooldown-window constants — those
+// are all send-cooldown windows, a different concept), so this picks a
+// sane, testable default: a week. A named constant, not a magic number, so
+// a future dev-request can retune it without hunting through the function.
+export const GS_VTP_QUEUE_STALE_DAYS = 7;
+let gsVtpRunning = false;
+
+/**
+ * Domain-affiliation gate for a website-review-queue candidate (krav 7).
+ * `evidence.verified === true` (gardssalgWebsiteEvidenceMatch's own verdict,
+ * baked into the queue row's `evidence` column) is NOT sufficient on its own
+ * to auto-write from the queue — measured 2026-08-10, 2 of 3 "verified" rows
+ * were wrong (Himkok Rtd -> olssonbarbieri.com, a design agency; Måge Sider
+ * -> tastehardanger.com, a tourism site) because page-TEXT evidence can
+ * incidentally fire on a page that isn't the producer's own. This is an
+ * INDEPENDENT, additional gate over the DOMAIN STRING itself, never page
+ * content: the candidate's registrable domain must tie to the producer by
+ * name, org_nr, or address — exactly the three bases the spec names
+ * ("navn/org/adresse"). Anything else stays queued.
+ *
+ * Name check: the producer's normalised (æøå-folded, whitespace-collapsed)
+ * name and the domain's own label (TLD stripped, non-alphanumerics
+ * stripped) must share a run of >=5 characters in either direction — the
+ * same length floor NAME_TOKEN_MIN_LEN uses elsewhere in this file's sibling
+ * dedup-conflict module for "long enough to be a genuine mention, not an
+ * incidental short fragment". "67northdistillery.no" vs "67 North
+ * Distillery" concatenates to an exact match; "olssonbarbieri.com" vs
+ * "Himkok Rtd" and "tastehardanger.com" vs "Måge Sider" share nothing and
+ * correctly fail.
+ * Org_nr check: the producer's 9-digit org_nr found verbatim in the domain
+ * label — vanishingly rare in practice, but the spec names it as a valid
+ * basis, so it is honoured for completeness.
+ * Address check: a normalised address run >=6 characters (mirrors
+ * gardssalgWebsiteEvidenceMatch's own address_found floor) found in the
+ * domain label.
+ *
+ * Pure, synchronous, no network/DB — exported for tests.
+ */
+export function gardssalgWebsiteDomainAffiliated(
+  candidateUrl: string,
+  producer: { navn: string; org_nr?: string | null; adresse?: string | null }
+): boolean {
+  const host = hostFromUrlLike(candidateUrl);
+  if (!host) return false;
+  const domain = registrableDomain(host) ?? host;
+  const label = domain.includes(".") ? domain.slice(0, domain.lastIndexOf(".")) : domain;
+  const domainConcat = label.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (domainConcat.length < 4) return false; // too short to ever be a genuine mention either direction
+
+  const nameConcat = normaliseName(producer.navn).replace(/\s+/g, "");
+  if (
+    nameConcat.length >= 5 &&
+    (domainConcat.includes(nameConcat) || nameConcat.includes(domainConcat))
+  ) {
+    return true;
+  }
+
+  const orgNr = (producer.org_nr ?? "").trim();
+  if (/^\d{9}$/.test(orgNr) && domainConcat.includes(orgNr)) return true;
+
+  const addrConcat = normaliseName(producer.adresse ?? "").replace(/\s+/g, "");
+  if (addrConcat.length >= 6 && domainConcat.includes(addrConcat)) return true;
+
+  return false;
+}
+
+/**
+ * Per-provider "what's still missing to reach pool" (AK7) — derived purely
+ * from computeGardssalgReadinessRows' own already-computed booleans (never a
+ * second/forked tier decision) plus the raw brreg_verified flag (not exposed
+ * on that function's return type, since GET .../gardssalg-outreach-readiness
+ * has never needed it split out — only this routine's per-field report
+ * does). Returns [] once the row is `outreach_ready`. Pure — exported for
+ * tests.
+ */
+export function computeGardssalgVeienTilPoolMissing(
+  readinessRow: ReturnType<typeof computeGardssalgReadinessRows>[number],
+  brregVerified: boolean
+): string[] {
+  if (readinessRow.readiness_tier === "outreach_ready") return [];
+  const missing: string[] = [];
+  if (!readinessRow.has_email && !readinessRow.has_phone) missing.push("contact_method");
+  if (!readinessRow.has_website) missing.push("hjemmeside");
+  if (!readinessRow.has_about_text) missing.push("about_text");
+  if (!readinessRow.has_products) missing.push("products");
+  if (!brregVerified) missing.push("brreg_verified");
+  if (!readinessRow.website_verified) missing.push("website_verified");
+  if (readinessRow.readiness_tier === "skjult") missing.push("catalog_hidden");
+  if (readinessRow.readiness_tier === "ikke_soekbar") missing.push("is_searchable");
+  if (readinessRow.readiness_tier === "dublettkonflikt") missing.push("duplicate_conflict");
+  return missing;
+}
+
+/**
+ * SQLite `datetime('now')` is always stored as a UTC, space-separated,
+ * zone-less string ("2026-08-10 09:30:00" — see the established convention
+ * at GET .../providers/recently-enriched's own DEFAULT_SINCE_DAYS comment
+ * above). `new Date()` must be told this is UTC explicitly (a bare
+ * space-separated string is engine-dependent, some parse it as LOCAL time),
+ * so this normalises to ISO-with-Z before parsing. Pure — exported for
+ * tests.
+ */
+export function gsVtpParseSqliteUtcMs(raw: string): number {
+  const iso = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const withZone = /[zZ]$|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`;
+  const ms = Date.parse(withZone);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+export interface GsVtpQueueAgeRow {
+  provider_id: string;
+  name: string | null;
+  reason: string | null;
+  age_days: number;
+  stale: boolean;
+}
+
+/**
+ * Count + age (oldest-first) report for ONE approval queue (AK9). Always
+ * computed over the FULL current queue table — never scoped to a single
+ * batch's providers — because a queue's own drainage is a platform-wide
+ * question this routine must answer on every run regardless of which rows
+ * this particular call happened to walk. An unparseable `created_at`
+ * (should not happen — the column has a NOT NULL DEFAULT) reports age_days:0
+ * rather than throwing, so one bad row can never take down the whole report.
+ * Pure (caller supplies `nowMs`) — exported for tests.
+ */
+export function computeGardssalgQueueAgeReport(
+  entries: Array<{ provider_id: string; provider_name?: string | null; created_at: string; reason?: string | null }>,
+  nowMs: number = Date.now()
+): {
+  count: number;
+  stale_count: number;
+  stale_threshold_days: number;
+  oldest_first: GsVtpQueueAgeRow[];
+} {
+  const rows: GsVtpQueueAgeRow[] = entries.map((e) => {
+    const createdMs = gsVtpParseSqliteUtcMs(e.created_at);
+    const ageDays = Number.isFinite(createdMs) ? Math.max(0, Math.floor((nowMs - createdMs) / 86_400_000)) : 0;
+    return {
+      provider_id: e.provider_id,
+      name: e.provider_name ?? null,
+      reason: e.reason ?? null,
+      age_days: ageDays,
+      stale: ageDays > GS_VTP_QUEUE_STALE_DAYS,
+    };
+  });
+  rows.sort((a, b) => b.age_days - a.age_days);
+  return {
+    count: rows.length,
+    stale_count: rows.filter((r) => r.stale).length,
+    stale_threshold_days: GS_VTP_QUEUE_STALE_DAYS,
+    oldest_first: rows,
+  };
+}
+
+/**
+ * In-process call into ANOTHER route on this SAME router, via Express's own
+ * Router.handle() dispatch — never a fetch()/HTTP round-trip to this
+ * process's own server. This is the exact fake-req/fake-res idiom this
+ * repo's test harness already uses to exercise routes without a real HTTP
+ * server (see opplevelser-veien-til-pool.test.ts's `call()` helper) —
+ * promoted here to production code so gardssalg-veien-til-pool can reuse a
+ * sibling endpoint's FULL guarded logic (its requireAdmin check included)
+ * without duplicating a single line of it. `x-admin-key` is set from
+ * getAdminKey() — safe to do unconditionally, because reaching this function
+ * at all means THIS request's own requireAdmin already matched that exact
+ * value.
+ */
+function callGardssalgAdminRouteInProcess(
+  path: string,
+  body: Record<string, unknown>
+): Promise<{ status: number; body: any }> {
+  const innerReq: any = {
+    method: "POST",
+    url: path,
+    originalUrl: `/api/opplevelser${path}`,
+    path,
+    query: {},
+    body,
+    headers: { "x-admin-key": getAdminKey() },
+    get(name: string) {
+      return this.headers[String(name).toLowerCase()];
+    },
+  };
+  let settle!: () => void;
+  const done = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  const innerRes: any = {
+    statusCode: 200,
+    _body: undefined,
+    status(code: number) {
+      this.statusCode = code;
+      return this;
+    },
+    json(payload: any) {
+      this._body = payload;
+      settle();
+      return this;
+    },
+    send(payload: any) {
+      this._body = payload;
+      settle();
+      return this;
+    },
+  };
+  (router as any).handle(innerReq, innerRes, () => settle());
+  return done.then(() => ({ status: innerRes.statusCode, body: innerRes._body }));
+}
+
+interface GsVtpRawRow {
+  id: string;
+  navn: string;
+  hjemmeside: string | null;
+  epost: string | null;
+  telefon: string | null;
+  org_nr: string | null;
+  adresse: string | null;
+  field_provenance: string | null;
+  content_source: string | null;
+  about_text: string | null;
+  products: string | null;
+  brreg_verified: number | null;
+}
+
+function gsVtpReadRow(expDb: Database.Database, providerId: string): GsVtpRawRow | undefined {
+  return expDb
+    .prepare(
+      `SELECT id, navn, hjemmeside, epost, telefon, org_nr, adresse, field_provenance,
+              content_source, about_text, products, brreg_verified
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as GsVtpRawRow | undefined;
+}
+
+// Review fix-up pass, finding 3b (single-fetch nettsted step): GsVtpRawRow
+// above deliberately doesn't carry every column classifyGardssalgProducerWebsite
+// needs for gardssalgWebsiteEvidenceMatch (kommune, poststed, mobil,
+// postnummer, catalog_hidden) — every OTHER step in this chain never needed
+// them. Rather than widen the shared GsVtpRawRow/gsVtpReadRow (used by every
+// step, row0/row1/row2) just for this one step's direct call into
+// scanGardssalgWebsiteVerificationRows/applyGardssalgWebsiteVerification,
+// this is its own narrow read of exactly the columns
+// loadGardssalgWebsiteVerificationCohort itself selects (same shape, same
+// column list) — a fresh, uncohorted single-row lookup, since this step must
+// still process whatever provider the caller targeted (explicit providerIds
+// mode is deliberately unfiltered by cohort/visibility — see the cohort-mode
+// BLOCKING FIX above), not just rows that happen to fall inside the
+// gardssalg/visible cohort's WHERE clause.
+function gsVtpReadWvProducerRow(expDb: Database.Database, providerId: string): GsWvProducerRow | undefined {
+  return expDb
+    .prepare(
+      `SELECT id, navn, hjemmeside, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer, catalog_hidden
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as GsWvProducerRow | undefined;
+}
+
+function gsVtpPresent(v: string | null): v is string {
+  return v !== null && v.trim() !== "";
+}
+
+/**
+ * Walks ONE provider through the full chain (krav 6-9). Every step is
+ * independent of the others' OUTCOME (only of their natural precondition —
+ * kontakt needs a website at all, innhold needs a VERIFIED one, brreg needs
+ * an org_nr) — a step that fails, errors, or queues never stops the others
+ * for this provider, and never stops the caller's loop over other
+ * providers (this function never throws; every branch below is a plain
+ * report).
+ *
+ * org.nr deliberately calls ONLY .../gardssalg-orgnr-backfill, never
+ * .../gardssalg-orgnr-review-approve (not even its Skive-1 `manual_verified`
+ * path). backfill generates its OWN Brreg name-search candidate and applies
+ * its OWN strict exact-tier+liveness auto-write bar — a genuine "write where
+ * the evidence is there" lever with no human in the loop, safe to call
+ * autonomously. review-approve's contract is the opposite: its default path
+ * only rubber-stamps a candidate a human already reviewed, and its
+ * `manual_verified` path exists specifically for a HUMAN-asserted org_nr the
+ * server then Brreg-verifies — asserting that flag from an autonomous
+ * routine, with no human having verified anything, would misrepresent the
+ * write's own provenance even though the server-side Brreg check still
+ * guards it. Rows backfill can't confidently resolve stay queued and are
+ * reported via the orgnr_review_queue age report instead (krav 8) — genuine
+ * doubt stays a queue item with an owner (whoever reads that report) and an
+ * implicit deadline (the staleness threshold), never an autonomous approval.
+ *
+ * nettsted deliberately never calls .../gardssalg-website-discovery: that
+ * endpoint's tier 2 is a PAID search API call (Brave Search), explicitly
+ * flagged in its own module doc comment as needing Daniel's direct GO the
+ * day it was built ("L4 — Daniels GO gitt ordrett samme dag") — a
+ * qualitatively different risk (autonomous spend) than every other call
+ * this function makes, all of which are either free SSRF-guarded fetches
+ * already used elsewhere in this same chain, or a registry lookup
+ * (Brreg) with no per-call cost flagged anywhere in this codebase. A
+ * provider with a blank hjemmeside and no queued candidate stays
+ * `no_website_no_candidate` — genuinely nothing this routine can do without
+ * crossing into that separate spend decision.
+ */
+async function gsVtpProcessProvider(
+  expDb: Database.Database,
+  providerId: string,
+  apply: boolean,
+  websiteQueueByProvider: Map<string, ReturnType<typeof listGardssalgWebsiteReviewQueue>[number]>
+): Promise<{ provider_id: string; steps: Record<string, unknown> }> {
+  const steps: Record<string, unknown> = {};
+
+  const row0 = gsVtpReadRow(expDb, providerId);
+  if (!row0) {
+    return { provider_id: providerId, steps: { error: "provider_not_found" } };
+  }
+
+  // ── STEP 1: nettsted ──────────────────────────────────────────────
+  if (isHjemmesideVerified(row0.field_provenance)) {
+    steps.website = { status: "ok" };
+  } else {
+    const queueEntry = websiteQueueByProvider.get(providerId);
+    if (queueEntry) {
+      const affiliated = gardssalgWebsiteDomainAffiliated(queueEntry.candidate_url, {
+        navn: row0.navn,
+        org_nr: row0.org_nr,
+        adresse: row0.adresse,
+      });
+      if (!affiliated) {
+        steps.website = {
+          status: "queued_needs_domain_affiliation",
+          candidate_url: queueEntry.candidate_url,
+          queued_since: queueEntry.created_at,
+        };
+      } else {
+        const approveResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-review-approve", {
+          approvals: [{ provider_id: providerId, url: queueEntry.candidate_url }],
+          apply,
+        });
+        const ab = approveResp.body ?? {};
+        const wroteOrWouldWrite = apply
+          ? (ab.written ?? []).some((w: any) => w.provider_id === providerId)
+          : (ab.approved ?? []).some((a: any) => a.provider_id === providerId);
+        if (!wroteOrWouldWrite) {
+          const rej = (ab.rejected ?? []).find((r: any) => r.provider_id === providerId);
+          steps.website = { status: "write_rejected", reason: rej?.reason ?? "unknown" };
+        } else if (!apply) {
+          steps.website = { status: "would_write", candidate_url: queueEntry.candidate_url };
+        } else {
+          // Approving a queued candidate only writes `hjemmeside` — it never
+          // stamps field_provenance.hjemmeside_verification (see
+          // applyGardssalgProviderWebsite's own doc comment). The real,
+          // fetch-based classifier is what actually unblocks kontakt/innhold
+          // below, so it is called here too, reusing that SAME endpoint
+          // rather than hand-stamping "verified" from the queue's own
+          // (page-text-based, already-domain-checked-above) evidence.
+          const verifyResp = await callGardssalgAdminRouteInProcess(
+            "/admin/gardssalg-website-verification-remediation",
+            { providerIds: [providerId], apply: true }
+          );
+          const summary = verifyResp.body?.summary as
+            | { verified?: number; unverified?: number; aggregator?: number; missing_source?: number }
+            | undefined;
+          steps.website = {
+            status: summary?.verified ? "written_and_verified" : "written_pending_verification",
+            candidate_url: queueEntry.candidate_url,
+          };
+        }
+      }
+    } else if (!gsVtpPresent(row0.hjemmeside)) {
+      steps.website = { status: "no_website_no_candidate" };
+    } else {
+      // Review fix-up pass, finding 3: classifyGardssalgProducerWebsite
+      // (gardssalg-website-verification.ts) maps a fetch FAILURE to
+      // classification:"unverified" — its own doc comment discloses this is
+      // deliberate fail-closed behaviour for ITS purpose, but it is
+      // indistinguishable from "fetched fine, found no evidence" to any
+      // caller. applyGardssalgWebsiteVerification then durably WRITES
+      // field_provenance.hjemmeside_verification={verified:false,...} from
+      // that classification. Reproduced live: an ECONNRESET on a producer's
+      // stored homepage got permanently stamped verified:false from a pure
+      // network blip that never reached the site — worse than the org.nr
+      // gap above because it corrupts the authoritative provenance column
+      // (which gates the content step's own isHjemmesideVerified check,
+      // see below), not just an advisory queue entry.
+      //
+      // Second independent review, closing the SAME finding one layer down:
+      // the first fix-up round above (this exact comment block, previously)
+      // did a pre-check fetch here and then STILL called the
+      // .../gardssalg-website-verification-remediation ROUTE (Router.handle,
+      // apply:true) to do the real classify+write — but that route's own
+      // fetchFn adapter (see it below, ~line 12210) does its OWN,
+      // completely independent second fetch internally. That meant a real
+      // producer homepage got fetched TWICE per run for this one step, AND
+      // reopened the exact race this fix-up round exists to close: the
+      // pre-check could succeed while the route's own internal fetch failed
+      // moments later (or vice versa), which could still let a transient
+      // network blip reach applyGardssalgWebsiteVerification and durably
+      // write verified:false.
+      //
+      // Fix: exactly ONE fetch. classifyGardssalgProducerWebsite/
+      // applyGardssalgWebsiteVerification are shared (gardssalg-claim.ts,
+      // gardssalg-field-concordance.ts, the GET/POST audit+remediation
+      // routes) so they are still never forked — but instead of reaching
+      // them via Router.handle() into the HTTP route (which forces a second,
+      // independent fetch), this step now calls
+      // scanGardssalgWebsiteVerificationRows/applyGardssalgWebsiteVerification
+      // DIRECTLY (both already imported above), handing them a GsWvFetchFn
+      // closure that simply replays the ONE real fetch this step already
+      // did — never a second network call. If that one fetch fails, this
+      // step reports retry_later and never calls scan/apply at all, so
+      // nothing gets written from a network blip. The aggregator-host skip
+      // classifyGardssalgProducerWebsite itself applies (never fetches an
+      // aggregator/directory host at all) still fires unchanged — it runs
+      // inside classifyGardssalgProducerWebsite, called from
+      // scanGardssalgWebsiteVerificationRows below, so an aggregator host
+      // never invokes gsVtpFetchFn either.
+      const gsVtpHost = hostFromUrlLike(row0.hjemmeside);
+      const gsVtpIsAggregator = !!gsVtpHost && isDirectoryOrAggregatorHost(gsVtpHost);
+
+      let gsVtpFetchResult: { ok: true; pageText: string; title?: string } | undefined;
+      if (!gsVtpIsAggregator) {
+        const gsVtpFetch = await crFetchGardssalgContent(row0.hjemmeside);
+        if (!gsVtpFetch.ok) {
+          steps.website = { status: "retry_later", detail: gsVtpFetch.reason };
+        } else {
+          gsVtpFetchResult = {
+            ok: true,
+            pageText: gardssalgPageText(gsVtpFetch.combinedHtml),
+            title: gardssalgPageTitle(gsVtpFetch.primaryHtml),
+          };
+        }
+      }
+
+      if (gsVtpIsAggregator || gsVtpFetchResult) {
+        const gsVtpProducerRow = gsVtpReadWvProducerRow(expDb, providerId);
+        if (!gsVtpProducerRow) {
+          steps.website = { status: "no_website_no_candidate" };
+        } else {
+          const gsVtpAlreadyFetched = gsVtpFetchResult;
+          const gsVtpFetchFn: GsWvFetchFn = async () =>
+            // Reachable only on the non-aggregator path, and even then
+            // invoked at most once by classifyGardssalgProducerWebsite (one
+            // producer row in, one classify call) — this NEVER performs a
+            // second network call, it only ever replays the single real
+            // fetch already done above. The fallback branch is unreachable
+            // in practice (aggregator hosts never call fetchFn at all) —
+            // kept fail-closed rather than throwing, consistent with this
+            // whole module's fail-closed discipline.
+            Promise.resolve(gsVtpAlreadyFetched ?? { ok: false, reason: "unexpected_missing_fetch_result" });
+
+          const { rows, summary } = await scanGardssalgWebsiteVerificationRows([gsVtpProducerRow], gsVtpFetchFn, 1);
+          if (apply) {
+            applyGardssalgWebsiteVerification(expDb, rows, null);
+          }
+          if (summary.verified) {
+            steps.website = { status: apply ? "verified" : "would_verify" };
+          } else if (summary.unverified) {
+            steps.website = { status: "queued_verification_failed" };
+          } else if (summary.aggregator) {
+            steps.website = { status: "aggregator_host" };
+          } else {
+            steps.website = { status: "no_website_no_candidate" };
+          }
+        }
+      }
+    }
+  }
+
+  // ── STEP 2: kontakt ───────────────────────────────────────────────
+  const row1 = gsVtpReadRow(expDb, providerId) ?? row0;
+  if (gsVtpPresent(row1.epost) && gsVtpPresent(row1.telefon)) {
+    steps.contact = { status: "ok" };
+  } else if (!gsVtpPresent(row1.hjemmeside)) {
+    steps.contact = { status: "blocked_no_website" };
+  } else {
+    const cxResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-contact-extraction", {
+      providerIds: [providerId],
+      apply,
+    });
+    if (cxResp.status === 409) {
+      // Another contact-extraction run (manual or a concurrent
+      // veien-til-pool provider) already holds the herding lock — genuinely
+      // "try again", never a fetch outcome for THIS provider at all.
+      steps.contact = { status: "retry_later", detail: "contact_extraction_busy" };
+    } else {
+      const cb = cxResp.body ?? {};
+      const changed = (cb.changed ?? []).find((c: any) => c.provider_id === providerId);
+      const umbrella = (cb.umbrella_address_rejected ?? []).find((u: any) => u.provider_id === providerId);
+      const fetchFailed = (cb.fetch_failed ?? []).some((f: any) => f.provider_id === providerId);
+      const cooldown = (cb.cooldown_skipped ?? []).find((c: any) => c.provider_id === providerId);
+      const noContact = (cb.no_contact_found ?? []).some((n: any) => n.provider_id === providerId);
+      const err = (cb.errors ?? []).find((e: any) => e.provider_id === providerId);
+      if (changed) {
+        steps.contact = { status: apply ? "written" : "would_write", fields: changed.fields };
+      } else if (umbrella) {
+        // krav 10 — the umbrella deny-list still fires exactly as it does
+        // when contact-extraction is called by hand; never written here.
+        steps.contact = { status: "umbrella_address_rejected", epost: umbrella.epost };
+      } else if (fetchFailed) {
+        // AK8 — a classified fetch FAILURE, never treated as "not found".
+        steps.contact = { status: "retry_later", detail: "fetch_failed" };
+      } else if (cooldown) {
+        steps.contact = { status: "retry_later", detail: `host_cooldown:${cooldown.host}` };
+      } else if (noContact) {
+        // Genuine absence — the page(s) fetched fine, nothing matched.
+        steps.contact = { status: "no_contact_found" };
+      } else if (err) {
+        steps.contact = { status: "error", detail: err.error };
+      } else {
+        steps.contact = { status: "no_action" };
+      }
+    }
+  }
+
+  // ── STEP 3: innhold ───────────────────────────────────────────────
+  const row2 = gsVtpReadRow(expDb, providerId) ?? row1;
+  if (gsVtpPresent(row2.about_text) && gsVtpPresent(row2.products)) {
+    steps.content = { status: "ok" };
+  } else {
+    const crResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-content-refresh", {
+      providerIds: [providerId],
+      apply,
+    });
+    const crb = crResp.body ?? {};
+    const changed = (crb.changed ?? []).find((c: any) => c.provider_id === providerId);
+    const unverifiedWebsite = (crb.excluded_unverified_website ?? []).some((e: any) => e.provider_id === providerId);
+    const sharedDomain = (crb.excluded_shared_domain ?? []).find((e: any) => e.provider_id === providerId);
+    const lockedRow = (crb.skipped_locked ?? []).includes(providerId);
+    const lockedField = (crb.owner_field_locked ?? []).find((o: any) => o.provider_id === providerId);
+    const err = (crb.errors ?? []).find((e: any) => e.provider_id === providerId);
+    if (changed) {
+      steps.content = { status: apply ? "written" : "would_write", fields: changed.fields };
+    } else if (unverifiedWebsite) {
+      steps.content = { status: "blocked_website_unverified" };
+    } else if (sharedDomain) {
+      steps.content = { status: "excluded_shared_domain", reason: sharedDomain.reason };
+    } else if (lockedRow) {
+      steps.content = { status: "skipped_locked" };
+    } else if (lockedField) {
+      steps.content = { status: "owner_field_locked", fields: lockedField.fields };
+    } else if (err) {
+      // AK8 — persistence "transient" is a classified fetch FAILURE (same
+      // parking-exclusion discipline as the leaf endpoint's own comment);
+      // never reported as absence, and this routine never clears anything.
+      steps.content = { status: err.persistence === "transient" ? "retry_later" : "error", detail: err.error };
+    } else {
+      steps.content = { status: "no_action" };
+    }
+  }
+
+  // ── STEP 4: org.nr ────────────────────────────────────────────────
+  const row3 = gsVtpReadRow(expDb, providerId) ?? row2;
+  if (gsVtpPresent(row3.org_nr)) {
+    steps.orgnr = { status: "ok" };
+  } else {
+    const obResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-orgnr-backfill", {
+      providerIds: [providerId],
+      apply,
+    });
+    const ob = obResp.body ?? {};
+    const changed = (ob.changed ?? []).find((c: any) => c.provider_id === providerId);
+    const lockedRow = (ob.skipped_locked ?? []).includes(providerId);
+    const unresolved = (ob.unresolved ?? []).find((u: any) => u.provider_id === providerId);
+    const err = (ob.errors ?? []).find((e: any) => e.provider_id === providerId);
+    if (changed) {
+      steps.orgnr = { status: apply ? "written" : "would_write", org_nr: changed.org_nr };
+    } else if (lockedRow) {
+      steps.orgnr = { status: "skipped_locked" };
+    } else if (unresolved) {
+      // Genuine doubt (no Brreg candidate, ambiguous ties, name mismatch,
+      // previously rolled back, …) — queued via gardssalg_orgnr_review_queue
+      // by the backfill route itself; reported via the queue age report,
+      // never auto-approved here (see this function's own doc comment).
+      steps.orgnr = { status: "queued", reason: unresolved.reason };
+    } else if (err) {
+      // Review fix-up pass, finding 2: this comment previously claimed a
+      // Brreg-search network/parse failure lands HERE, distinct from a
+      // genuine "no candidate" (which lands in `unresolved` above) — that
+      // claim was FALSE, verified live. findOrgnumberByName (brreg-client.ts)
+      // catches every failure internally (network error, timeout, parse
+      // error) and resolves to null, IDENTICAL to a genuine empty search
+      // result. gardssalg-orgnr-backfill's own try/catch around that call
+      // (routes/opplevelser.ts, the /admin/gardssalg-orgnr-backfill handler)
+      // therefore can never observe the difference either: a real Brreg
+      // fetch failure (e.g. an ECONNRESET during the name search) is
+      // reported as `unresolved`/"no_brreg_candidate" above, misreporting a
+      // hentefeil as a genuine absence — the exact same class of gap the
+      // brreg-verifisering step below already discloses for
+      // verifyOrgNumber's `orgnr_not_found_or_unreachable`. findOrgnumberByName
+      // is shared by many other callers (experience-store.ts, marketplace.ts,
+      // dental.ts, debio-cross-check.ts, local-orgnr-candidates.ts, ...), so
+      // fixing the underlying conflation touches shared client code well
+      // beyond this routine's scope — flagged here honestly rather than
+      // silently leaving a comment implying a distinction this call site
+      // cannot actually make. This `err` branch is not unreachable dead
+      // code — it still fires for some OTHER failure inside the backfill
+      // route itself (e.g. a review-queue/DB write error) — it just never
+      // fires for a Brreg search failure specifically, contrary to what this
+      // comment used to say.
+      steps.orgnr = { status: "retry_later", detail: err.error };
+    } else {
+      steps.orgnr = { status: "no_action" };
+    }
+  }
+
+  // ── STEP 5: brreg-verifisering ────────────────────────────────────
+  const row4 = gsVtpReadRow(expDb, providerId) ?? row3;
+  if (row4.brreg_verified === 1) {
+    steps.brreg = { status: "ok" };
+  } else if (!gsVtpPresent(row4.org_nr) || !/^\d{9}$/.test((row4.org_nr ?? "").trim())) {
+    steps.brreg = { status: "blocked_no_orgnr" };
+  } else {
+    const bvResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-brreg-verify", {
+      providerIds: [providerId],
+      apply,
+    });
+    if (bvResp.status === 409) {
+      steps.brreg = { status: "retry_later", detail: "brreg_verify_busy" };
+    } else {
+      const bv = bvResp.body ?? {};
+      const verified = (bv.verified ?? []).some((v: any) => v.provider_id === providerId);
+      const nameMismatch = (bv.name_mismatch ?? []).find((n: any) => n.provider_id === providerId);
+      const inactive = (bv.inactive ?? []).find((i: any) => i.provider_id === providerId);
+      const notFoundInBrreg = (bv.orgnr_not_found ?? []).some((n: any) => n.provider_id === providerId);
+      const err = (bv.errors ?? []).find((e: any) => e.provider_id === providerId);
+      if (verified) {
+        steps.brreg = { status: apply ? "written" : "would_write" };
+      } else if (nameMismatch) {
+        steps.brreg = { status: "name_mismatch", brreg_name: nameMismatch.brreg_name };
+      } else if (inactive) {
+        steps.brreg = { status: "inactive_company", flag: inactive.flag };
+      } else if (notFoundInBrreg) {
+        // NB: verifyOrgNumber() (brreg-client.ts) does not currently
+        // distinguish a genuine Brreg 404 from its OWN network/timeout
+        // failure — both resolve to `exists:false` (see that function's own
+        // doc comment). This is a pre-existing gap shared by every caller of
+        // verifyOrgNumber, not introduced here; fixing it touches shared
+        // client code well beyond this routine's scope, so it is flagged in
+        // this PR's own report rather than patched silently inside it. AK8
+        // is still satisfied end-to-end by this routine (see the kontakt/
+        // innhold steps above, whose fetch layers DO preserve the
+        // distinction) — this specific sub-step just cannot independently
+        // re-prove it today.
+        steps.brreg = { status: "orgnr_not_found_or_unreachable" };
+      } else if (err) {
+        steps.brreg = { status: "retry_later", detail: err.error };
+      } else {
+        steps.brreg = { status: "no_action" };
+      }
+    }
+  }
+
+  return { provider_id: providerId, steps };
+}
+
+router.post("/admin/gardssalg-veien-til-pool", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+    apply?: unknown;
+  };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
+  let explicitIds: string[] | undefined;
+  if (body.providerIds !== undefined) {
+    if (!Array.isArray(body.providerIds) || body.providerIds.length === 0) {
+      res.status(400).json({ error: "providerIds must be a non-empty array of strings when provided" });
+      return;
+    }
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+          .map((v) => v.trim())
+      )
+    );
+    if (ids.length === 0) {
+      res.status(400).json({ error: "providerIds must be a non-empty array of strings when provided" });
+      return;
+    }
+    if (ids.length > GS_VTP_HARD_CAP) {
+      res.status(400).json({ error: `Too many providerIds (max ${GS_VTP_HARD_CAP} per call)` });
+      return;
+    }
+    explicitIds = ids;
+  }
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_VTP_DEFAULT_LIMIT,
+    GS_VTP_HARD_CAP
+  );
+  const offset = typeof body.offset === "number" && body.offset >= 0 ? Math.floor(body.offset) : 0;
+
+  if (gsVtpRunning) {
+    res.status(409).json({
+      error: "run_in_progress",
+      detail: "en gardssalg-veien-til-pool-kjøring pågår allerede — vent til den er ferdig",
+    });
+    return;
+  }
+  gsVtpRunning = true;
+  try {
+    const expDb = getExpDb("experiences");
+
+    const notFound: string[] = [];
+    const alreadyOutreachReady: Array<{ provider_id: string; navn: string | null }> = [];
+    let targetIds: string[];
+    let cohortTotal: number;
+
+    if (explicitIds) {
+      const rows = computeGardssalgReadinessRows(expDb, explicitIds);
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      for (const id of explicitIds) {
+        if (!byId.has(id)) notFound.push(id);
+      }
+      targetIds = explicitIds.filter((id) => {
+        const r = byId.get(id);
+        if (!r) return false;
+        if (r.readiness_tier === "outreach_ready") {
+          alreadyOutreachReady.push({ provider_id: id, navn: r.name });
+          return false;
+        }
+        return true;
+      });
+      cohortTotal = targetIds.length;
+    } else {
+      // BLOCKING FIX (review fix-up pass, finding 1): computeGardssalgReadinessRows
+      // is deliberately UNFILTERED — it's a reporting function, every row
+      // must appear (see its own doc comment) — but cohort mode here reuses
+      // that same row set as a WRITE-TARGET list, which is a different
+      // contract entirely. Every other write-capable gårdssalg cohort
+      // selector in this codebase excludes the synthetic
+      // producer_type='test-gardssalg' canary row (experience-store.ts's
+      // selectGardssalgProvidersForContactExtraction/
+      // selectGardssalgProvidersForBrregVerify, gardssalg-website-
+      // verification.ts's GS_WV_TEST_GARDSSALG_EXCLUSION_SQL) — this was the
+      // only cohort-mode selector that didn't. Reproduced live: seeding a
+      // producer_type='test-gardssalg' row and calling with apply:true and
+      // no providerIds got it selected AND actually written to (a fake
+      // org_nr landed on the canary row). Filtered here on the already-
+      // computed rows rather than re-querying producer_type twice.
+      // catalog_hidden rows are excluded too — non-blocking per the review,
+      // but the identical fix over the identical row set, so done in the
+      // same pass. `r.visible` is exactly `catalog_hidden !== 1`
+      // (computeGardssalgReadinessRows' own field) — no extra query needed
+      // for that half.
+      //
+      // Explicit providerIds mode (above) deliberately keeps TODAY's
+      // behaviour and is NOT given this guard: naming a specific row is a
+      // deliberate operator act (e.g. exercising this exact routine against
+      // the test-gardssalg fixture on purpose to verify it end-to-end),
+      // categorically different from an automated cohort sweep silently
+      // picking a canary row up along with everything else.
+      const testGardssalgIds = new Set(
+        (
+          expDb
+            .prepare(`SELECT id FROM experience_providers WHERE producer_type = 'test-gardssalg'`)
+            .all() as Array<{ id: string }>
+        ).map((r) => r.id)
+      );
+      const allRows = computeGardssalgReadinessRows(expDb);
+      const notReadyIds = allRows
+        .filter((r) => r.readiness_tier !== "outreach_ready")
+        .filter((r) => r.visible)
+        .filter((r) => !testGardssalgIds.has(r.id))
+        .map((r) => r.id)
+        .sort();
+      cohortTotal = notReadyIds.length;
+      targetIds = notReadyIds.slice(offset, offset + limit);
+    }
+
+    const websiteQueueByProvider = new Map(listGardssalgWebsiteReviewQueue().map((q) => [q.provider_id, q]));
+
+    const beforeRows = targetIds.length > 0 ? computeGardssalgReadinessRows(expDb, targetIds) : [];
+    const beforeById = new Map(beforeRows.map((r) => [r.id, r]));
+
+    const walked: Array<{ provider_id: string; steps: Record<string, unknown> }> = [];
+    let clientDisconnected = false;
+    for (const id of targetIds) {
+      // Same "an abandoned run must not silently keep going" check as
+      // gardssalg-contact-extraction's own loop — this routine's per-provider
+      // work is strictly larger, so the same lesson applies at least as much.
+      if ((req as any).aborted === true || res.writableEnded || (res as any).destroyed === true) {
+        clientDisconnected = true;
+        break;
+      }
+      walked.push(await gsVtpProcessProvider(expDb, id, apply, websiteQueueByProvider));
+    }
+
+    const walkedIds = walked.map((w) => w.provider_id);
+    const afterRows = walkedIds.length > 0 ? computeGardssalgReadinessRows(expDb, walkedIds) : [];
+    const afterById = new Map(afterRows.map((r) => [r.id, r]));
+    const brregVerifiedAfterById = new Map<string, boolean>();
+    if (walkedIds.length > 0) {
+      const placeholders = walkedIds.map(() => "?").join(", ");
+      const bvRows = expDb
+        .prepare(`SELECT id, brreg_verified FROM experience_providers WHERE id IN (${placeholders})`)
+        .all(...walkedIds) as Array<{ id: string; brreg_verified: number | null }>;
+      for (const r of bvRows) brregVerifiedAfterById.set(r.id, r.brreg_verified === 1);
+    }
+
+    const providers = walked.map((w) => {
+      const before = beforeById.get(w.provider_id);
+      const after = afterById.get(w.provider_id);
+      return {
+        provider_id: w.provider_id,
+        navn: after?.name ?? before?.name ?? null,
+        tier_before: before?.readiness_tier ?? null,
+        tier_after: after?.readiness_tier ?? null,
+        steps: w.steps,
+        missing_for_pool: after ? computeGardssalgVeienTilPoolMissing(after, brregVerifiedAfterById.get(w.provider_id) ?? false) : [],
+      };
+    });
+
+    // AK9 — count + age of BOTH approval queues, EVERY run, over the FULL
+    // current queue table (never scoped to just this batch's providers).
+    const websiteQueueReport = computeGardssalgQueueAgeReport(listGardssalgWebsiteReviewQueue());
+    const orgnrQueueReport = computeGardssalgQueueAgeReport(listGardssalgOrgnrReviewQueue());
+
+    res.json({
+      dry_run: !apply,
+      mode: explicitIds ? "providerIds" : "cohort",
+      cohort_total: cohortTotal,
+      ...(explicitIds ? {} : { limit, offset }),
+      scanned: providers.length,
+      aborted_client_disconnect: clientDisconnected,
+      not_found: notFound,
+      already_outreach_ready: alreadyOutreachReady,
+      providers,
+      queues: {
+        website_review_queue: websiteQueueReport,
+        orgnr_review_queue: orgnrQueueReport,
+      },
+    });
+  } catch (err) {
+    console.error("[gardssalg-veien-til-pool] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  } finally {
+    gsVtpRunning = false;
   }
 });
 
