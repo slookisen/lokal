@@ -641,6 +641,73 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       assertEq(dupExcludedById.get("prov-j-dup-2")?.reason, "preflight_no_go", "j4: the second same-recipient candidate excluded, reason preflight_no_go");
       assertEq(dupExcludedById.get("prov-j-dup-2")?.preflight_reason, "duplikat_epost", "j5: preflight_reason names the exact-email batch dedupe");
       assertTrue(!dupExcludedById.has("prov-j-dup-1"), "j6: the kept candidate is not ALSO listed as excluded");
+      expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('prov-j-dup-1', 'prov-j-dup-2')`).run();
+
+      // ══ (k) PR review regression — dedup-winner-fails-Skive-3 ordering bug ══
+      // Independent reviewer's confirmed repro (CHANGES-REQUESTED, MEDIUM):
+      // two providers share a recipient email (like block (j) above), but
+      // this time the LOWER-id one ("winner" of an id-ordered dedup) has thin
+      // about_text that fails Skive 3 check 2 on its own, while the
+      // HIGHER-id one is otherwise fully valid. Before the fix, dedup ran
+      // BEFORE Skive 3: the lower-id row won the dedup slot and suppressed
+      // the higher-id row as "duplikat_epost"/preflight_no_go, then Skive 3
+      // excluded the lower-id row anyway for profile_text_low_quality —
+      // BOTH ended up excluded (candidates: []) even though the higher-id
+      // row alone should have been proposed. After the fix, dedup only runs
+      // among candidates that already survived Skive 1 + Skive 3, so the
+      // higher-id row is not penalized for a "winner" that was never
+      // actually going to be proposed.
+      //
+      // Both share a freemail recipient (gmail.com) so the SAME-email dedup
+      // rule applies (not the cross-domain rule) and neither trips Skive 3
+      // check 1 (address_domain_mismatch) on its own — isolates the
+      // interaction to check 2 (profile-text) exactly like the reviewer's
+      // repro.
+      insertProvider.run({
+        id: "prov-k-dup-1-thinabout", navn: "Kappa Dup Tynn Gård", org_nr: "100000012", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "shared.recipient.orderingbug@gmail.com", telefon: null, hjemmeside: "https://kappa-dup-thin-fixture.no",
+        about_text: "Om gården.", visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "kappa-dup-thin-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      insertProvider.run({
+        id: "prov-k-dup-2-valid", navn: "Kappa Dup Gyldig Gård", org_nr: "100000013", kommune: "Voss",
+        rfb_seed_source: "rfb-seed", producer_type: "sideri",
+        epost: "shared.recipient.orderingbug@gmail.com", telefon: null, hjemmeside: "https://kappa-dup-valid-fixture.no",
+        about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+        products: "Sider", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "kappa-dup-valid-gard", field_provenance: VERIFIED_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+      });
+      const orderingBug = await callRoute(opplevelserRouter, { headers: auth });
+      assertEq(orderingBug.status, 200, "k1: dedup-vs-skive3-ordering batch -> 200");
+      assertEq(
+        orderingBug.body.candidates.length,
+        1,
+        "k2: exactly 1 candidate proposed (not both wrongly excluded — the historic bug produced 0)",
+      );
+      assertEq(
+        (orderingBug.body.candidates as any[])[0]?.provider_id,
+        "prov-k-dup-2-valid",
+        "k3: the higher-id, actually-valid candidate is the one proposed, NOT the lower-id dedup 'winner'",
+      );
+      const orderingBugExcludedById = new Map((orderingBug.body.excluded as any[]).map((e) => [e.provider_id, e]));
+      assertEq(
+        orderingBugExcludedById.get("prov-k-dup-1-thinabout")?.reason,
+        "profile_text_low_quality",
+        "k4: the lower-id candidate is excluded for its OWN disqualifying reason (profile_text_low_quality), not lumped in as a duplicate",
+      );
+      assertTrue(
+        !("preflight_reason" in (orderingBugExcludedById.get("prov-k-dup-1-thinabout") ?? {})),
+        "k5: the lower-id candidate's exclusion carries no preflight_reason — it was never a genuine dedup victim",
+      );
+      assertTrue(
+        !orderingBugExcludedById.has("prov-k-dup-2-valid"),
+        "k6: the proposed candidate is not ALSO listed as excluded",
+      );
+      expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('prov-k-dup-1-thinabout', 'prov-k-dup-2-valid')`).run();
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-daily-prep: unexpected error: " + String(err?.stack || err?.message || err));
