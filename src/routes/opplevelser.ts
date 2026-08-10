@@ -273,6 +273,7 @@ import {
   type GsWvFetchFn,
   type GsWvScope,
   type GsWvCohort,
+  type GsWvProducerRow,
 } from "../services/gardssalg-website-verification";
 // orchestrator dev-request 2026-08-03-gardssalg-field-concordance:
 // GET /admin/gardssalg-field-concordance-audit — read-only per-field
@@ -9656,6 +9657,29 @@ function gsVtpReadRow(expDb: Database.Database, providerId: string): GsVtpRawRow
     .get(providerId) as GsVtpRawRow | undefined;
 }
 
+// Review fix-up pass, finding 3b (single-fetch nettsted step): GsVtpRawRow
+// above deliberately doesn't carry every column classifyGardssalgProducerWebsite
+// needs for gardssalgWebsiteEvidenceMatch (kommune, poststed, mobil,
+// postnummer, catalog_hidden) — every OTHER step in this chain never needed
+// them. Rather than widen the shared GsVtpRawRow/gsVtpReadRow (used by every
+// step, row0/row1/row2) just for this one step's direct call into
+// scanGardssalgWebsiteVerificationRows/applyGardssalgWebsiteVerification,
+// this is its own narrow read of exactly the columns
+// loadGardssalgWebsiteVerificationCohort itself selects (same shape, same
+// column list) — a fresh, uncohorted single-row lookup, since this step must
+// still process whatever provider the caller targeted (explicit providerIds
+// mode is deliberately unfiltered by cohort/visibility — see the cohort-mode
+// BLOCKING FIX above), not just rows that happen to fall inside the
+// gardssalg/visible cohort's WHERE clause.
+function gsVtpReadWvProducerRow(expDb: Database.Database, providerId: string): GsWvProducerRow | undefined {
+  return expDb
+    .prepare(
+      `SELECT id, navn, hjemmeside, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer, catalog_hidden
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as GsWvProducerRow | undefined;
+}
+
 function gsVtpPresent(v: string | null): v is string {
   return v !== null && v.trim() !== "";
 }
@@ -9777,39 +9801,86 @@ async function gsVtpProcessProvider(
       // network blip that never reached the site — worse than the org.nr
       // gap above because it corrupts the authoritative provenance column
       // (which gates the content step's own isHjemmesideVerified check,
-      // see below), not just an advisory queue entry. classifyGardssalgProducerWebsite/
+      // see below), not just an advisory queue entry.
+      //
+      // Second independent review, closing the SAME finding one layer down:
+      // the first fix-up round above (this exact comment block, previously)
+      // did a pre-check fetch here and then STILL called the
+      // .../gardssalg-website-verification-remediation ROUTE (Router.handle,
+      // apply:true) to do the real classify+write — but that route's own
+      // fetchFn adapter (see it below, ~line 12210) does its OWN,
+      // completely independent second fetch internally. That meant a real
+      // producer homepage got fetched TWICE per run for this one step, AND
+      // reopened the exact race this fix-up round exists to close: the
+      // pre-check could succeed while the route's own internal fetch failed
+      // moments later (or vice versa), which could still let a transient
+      // network blip reach applyGardssalgWebsiteVerification and durably
+      // write verified:false.
+      //
+      // Fix: exactly ONE fetch. classifyGardssalgProducerWebsite/
       // applyGardssalgWebsiteVerification are shared (gardssalg-claim.ts,
       // gardssalg-field-concordance.ts, the GET/POST audit+remediation
-      // routes) so they are not touched here. Instead: this step does its
-      // OWN pre-check fetch — the SAME crFetchGardssalgContent the
-      // remediation route's own fetchFn adapter calls internally, and the
-      // same aggregator-host skip classifyGardssalgProducerWebsite itself
-      // applies before ever fetching — and only calls the remediation
-      // endpoint (with apply:true, i.e. an actual write) once that pre-check
-      // has proven the site is actually reachable. A pre-check failure
-      // reports retry_later and skips calling the remediation endpoint
-      // entirely for this run, so nothing gets written from a network blip.
+      // routes) so they are still never forked — but instead of reaching
+      // them via Router.handle() into the HTTP route (which forces a second,
+      // independent fetch), this step now calls
+      // scanGardssalgWebsiteVerificationRows/applyGardssalgWebsiteVerification
+      // DIRECTLY (both already imported above), handing them a GsWvFetchFn
+      // closure that simply replays the ONE real fetch this step already
+      // did — never a second network call. If that one fetch fails, this
+      // step reports retry_later and never calls scan/apply at all, so
+      // nothing gets written from a network blip. The aggregator-host skip
+      // classifyGardssalgProducerWebsite itself applies (never fetches an
+      // aggregator/directory host at all) still fires unchanged — it runs
+      // inside classifyGardssalgProducerWebsite, called from
+      // scanGardssalgWebsiteVerificationRows below, so an aggregator host
+      // never invokes gsVtpFetchFn either.
       const gsVtpHost = hostFromUrlLike(row0.hjemmeside);
       const gsVtpIsAggregator = !!gsVtpHost && isDirectoryOrAggregatorHost(gsVtpHost);
-      const gsVtpPrecheck = gsVtpIsAggregator ? null : await crFetchGardssalgContent(row0.hjemmeside);
-      if (gsVtpPrecheck && !gsVtpPrecheck.ok) {
-        steps.website = { status: "retry_later", detail: gsVtpPrecheck.reason };
-      } else {
-        const verifyResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-verification-remediation", {
-          providerIds: [providerId],
-          apply,
-        });
-        const summary = verifyResp.body?.summary as
-          | { verified?: number; unverified?: number; aggregator?: number; missing_source?: number }
-          | undefined;
-        if (summary?.verified) {
-          steps.website = { status: apply ? "verified" : "would_verify" };
-        } else if (summary?.unverified) {
-          steps.website = { status: "queued_verification_failed" };
-        } else if (summary?.aggregator) {
-          steps.website = { status: "aggregator_host" };
+
+      let gsVtpFetchResult: { ok: true; pageText: string; title?: string } | undefined;
+      if (!gsVtpIsAggregator) {
+        const gsVtpFetch = await crFetchGardssalgContent(row0.hjemmeside);
+        if (!gsVtpFetch.ok) {
+          steps.website = { status: "retry_later", detail: gsVtpFetch.reason };
         } else {
+          gsVtpFetchResult = {
+            ok: true,
+            pageText: gardssalgPageText(gsVtpFetch.combinedHtml),
+            title: gardssalgPageTitle(gsVtpFetch.primaryHtml),
+          };
+        }
+      }
+
+      if (gsVtpIsAggregator || gsVtpFetchResult) {
+        const gsVtpProducerRow = gsVtpReadWvProducerRow(expDb, providerId);
+        if (!gsVtpProducerRow) {
           steps.website = { status: "no_website_no_candidate" };
+        } else {
+          const gsVtpAlreadyFetched = gsVtpFetchResult;
+          const gsVtpFetchFn: GsWvFetchFn = async () =>
+            // Reachable only on the non-aggregator path, and even then
+            // invoked at most once by classifyGardssalgProducerWebsite (one
+            // producer row in, one classify call) — this NEVER performs a
+            // second network call, it only ever replays the single real
+            // fetch already done above. The fallback branch is unreachable
+            // in practice (aggregator hosts never call fetchFn at all) —
+            // kept fail-closed rather than throwing, consistent with this
+            // whole module's fail-closed discipline.
+            Promise.resolve(gsVtpAlreadyFetched ?? { ok: false, reason: "unexpected_missing_fetch_result" });
+
+          const { rows, summary } = await scanGardssalgWebsiteVerificationRows([gsVtpProducerRow], gsVtpFetchFn, 1);
+          if (apply) {
+            applyGardssalgWebsiteVerification(expDb, rows, null);
+          }
+          if (summary.verified) {
+            steps.website = { status: apply ? "verified" : "would_verify" };
+          } else if (summary.unverified) {
+            steps.website = { status: "queued_verification_failed" };
+          } else if (summary.aggregator) {
+            steps.website = { status: "aggregator_host" };
+          } else {
+            steps.website = { status: "no_website_no_candidate" };
+          }
         }
       }
     }

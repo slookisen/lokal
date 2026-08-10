@@ -50,10 +50,18 @@
  *                    itself, not just from the paged slice.
  *   vtp2-23          Review fix-up pass, finding 3: a classified fetch
  *                    FAILURE on the nettsted step's own homepage fetch (not
- *                    a mismatch, an actual thrown ECONNRESET) reports
+ *                    a mismatch, an actual thrown ENOTFOUND) reports
  *                    retry_later and leaves field_provenance untouched —
  *                    never durably stamped verified:false from a network
- *                    blip.
+ *                    blip. Round 2 (closing the SAME finding one layer down,
+ *                    second independent review): the nettsted step now does
+ *                    exactly ONE fetch and feeds it directly into
+ *                    scanGardssalgWebsiteVerificationRows/
+ *                    applyGardssalgWebsiteVerification instead of routing a
+ *                    SECOND, independent fetch through the ...-remediation
+ *                    HTTP route — vtp2-16d/vtp2-23d prove this via call-count
+ *                    assertions on the fetch mock (isolated to just this
+ *                    step by pre-filling contact/content/org.nr fields).
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/routes/opplevelser-veien-til-pool-skive2.test.ts
@@ -255,14 +263,36 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
         ({ ok: false, status: 404, statusText: "Not Found", url: u, headers: mockHeaders,
            arrayBuffer: async () => new ArrayBuffer(0), json: async () => ({}) }) as unknown as Response;
 
+      // Review fix-up pass, round 2 (finding 3, closed one layer down): the
+      // nettsted step now does exactly ONE fetch and feeds that single
+      // result directly into scanGardssalgWebsiteVerificationRows/
+      // applyGardssalgWebsiteVerification — it no longer goes through
+      // Router.handle() into the ...-remediation ROUTE, which used to do its
+      // OWN, independent second fetch internally. This counter is the
+      // coverage gap the second independent review found: the OLD test's
+      // mock threw unconditionally for nettsted-fail-vtp2.example, so
+      // retry_later was satisfied whether the pre-check's fetch failed AND a
+      // (never-reached) second fetch would also have failed, or genuinely
+      // only one fetch ever happened — it could never tell the two apart.
+      // Counting invocations per host here proves directly that exactly ONE
+      // real fetch happens for this step now, for both the failure path
+      // (vtp2-23) and the happy path (vtp2-16), not just that the final
+      // status happens to come out right.
+      const fetchCallCounts = new Map<string, number>();
+      function countFetchCall(label: string): void {
+        fetchCallCounts.set(label, (fetchCallCounts.get(label) ?? 0) + 1);
+      }
+
       globalThis.fetch = (async (url: string | URL | Request) => {
         const u = String(url);
         // ── nettsted: domenetilknyttet kandidat, live-verifisering lykkes ──
         if (u.startsWith("https://nordlygard.no")) {
+          countFetchCall("nordlygard.no");
           return htmlResponse(u, `<html><body>Nordly Gard, org.nr 912340001, alt om oss</body></html>`);
         }
         // ── nettsted: hjemmeside finnes men uverifisert -> live-sjekk feiler ──
         if (u.startsWith("https://mismatch-vtp2.example")) {
+          countFetchCall("mismatch-vtp2.example");
           return htmlResponse(u, `<html><body>Helt urelatert forsidetekst uten noen treff</body></html>`);
         }
         // ── kontakt-steget: klassifisert HENTEFEIL (AK8) ──
@@ -276,8 +306,17 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
         // ── nettsted-steget: rein hentefeil på selve homepage-fetchen (review
         // fix-up pass, finding 3) — MÅ rapporteres retry_later, ALDRI
         // queued_verification_failed, og MÅ IKKE stemple field_provenance.
+        // ENOTFOUND (not ECONNRESET, unlike cx-fail/cr-fail above) is
+        // deliberate: it classifies as dns_not_found/"permanent" in
+        // fetch-page.ts's own isRetryable(), i.e. NOT retried — so the
+        // call-count assertion below (vtp2-23d) can assert the mock URL was
+        // invoked exactly once, a clean proof unclouded by that unrelated,
+        // pre-existing one-shot-retry policy (conn_reset/timeout/5xx ARE
+        // retried once, which is correct existing behaviour, just not what
+        // this particular assertion is trying to isolate).
         if (u.startsWith("https://nettsted-fail-vtp2.example")) {
-          throw Object.assign(new Error("read ECONNRESET"), { cause: { code: "ECONNRESET" } });
+          countFetchCall("nettsted-fail-vtp2.example");
+          throw Object.assign(new Error("getaddrinfo ENOTFOUND nettsted-fail-vtp2.example"), { cause: { code: "ENOTFOUND" } });
         }
         // ── org.nr-steget: Brreg navnesøk, ingen treff ──
         if (u.includes("/enheter?navn=")) {
@@ -369,8 +408,20 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
 
       // ═══ vtp2-16: nettsted — eksisterende, uverifisert hjemmeside; live-sjekk feiler -> havner i kø ═══
       {
-        seed({ id: "vtp2-mismatch", navn: "Mismatch Gard", hj: "https://mismatch-vtp2.example", created: "2026-01-06" });
+        // Contact/content/org.nr fields are pre-filled ("ok"/short-circuited
+        // for those OTHER steps, see krav 6/9's own preconditions above) so
+        // this test producer's homepage is touched by ONLY the nettsted
+        // step — kontakt-extraction/content-refresh would otherwise ALSO
+        // fetch this same host for their own steps and inflate the call
+        // count below with fetches this fix-up round never touched.
+        seed({
+          id: "vtp2-mismatch", navn: "Mismatch Gard", hj: "https://mismatch-vtp2.example",
+          ep: "post@mismatch-vtp2.example", tlf: "91234567", org_nr: "912340098", brreg_verified: 1,
+          ab: "Eksisterende tekst om Mismatch Gard, lang nok til å telle som utfylt.",
+          products: JSON.stringify(["sider"]), created: "2026-01-06",
+        });
         const before = expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_website_review_queue`).get() as any;
+        const fetchesBefore = fetchCallCounts.get("mismatch-vtp2.example") ?? 0;
 
         const res = await callVtp({ providerIds: ["vtp2-mismatch"], apply: true });
         const row = (res.body.providers as any[]).find((p) => p.provider_id === "vtp2-mismatch");
@@ -380,6 +431,23 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
         assertTrue(after.n > before.n, "vtp2-16b: …og køen faktisk fikk en ny rad (matbar, ikke bare lesbar)");
         const stillThere = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='vtp2-mismatch'`).get() as any;
         assertEq(stillThere.hjemmeside, "https://mismatch-vtp2.example", "vtp2-16c: den eksisterende hjemmesiden er urørt, ikke tømt");
+        // Review fix-up pass, round 2 — the happy/real-fetch path (fetch
+        // succeeds, real content, classifies and queues) must ALSO make
+        // exactly one crFetchGardssalgContent CALL, not two: the OLD
+        // Router.handle()-into-the-...-remediation-ROUTE design fetched this
+        // same homepage a second, fully independent time internally, even
+        // when the pre-check itself had already succeeded. This mock
+        // answers 200 OK for every path under the host, so ONE
+        // crFetchGardssalgContent call (homepage + up to 4 GARDSSALG_
+        // CONTENT_PATHS sub-pages, capped at GARDSSALG_MAX_PAGES=5 total)
+        // is deterministically exactly 5 raw invocations — the OLD
+        // double-call design would have produced 10. Isolated to just this
+        // step (contact/content/org.nr pre-filled to "ok" above), so every
+        // one of these invocations can only have come from the nettsted
+        // step's own fetch.
+        const fetchesAfter = fetchCallCounts.get("mismatch-vtp2.example") ?? 0;
+        assertEq(fetchesAfter - fetchesBefore, 5,
+          "vtp2-16d: nøyaktig 5 rå HTTP-kall (= ÉN crFetchGardssalgContent-kall: forside + 4 underspider) — IKKE 10, som en gjenværende andre-kall-bug ville gitt");
       }
 
       // ═══ vtp2-17: AK8 — kontakt-steget, klassifisert hentefeil ═══
@@ -512,8 +580,18 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
       // selve nettsted-fetchen (ikke en mismatch — en reell thrown feil)
       // rapporteres retry_later og lar field_provenance stå urørt ═══
       {
-        seed({ id: "vtp2-nettstedfail", navn: "Nettsted Fail Gard", hj: "https://nettsted-fail-vtp2.example", created: "2026-01-14" });
+        // Contact/content/org.nr pre-filled to "ok" (same reasoning as
+        // vtp2-16 above) so this producer's homepage is touched by ONLY the
+        // nettsted step — isolating the call-count assertion below to
+        // exactly the fetch this fix-up round is about.
+        seed({
+          id: "vtp2-nettstedfail", navn: "Nettsted Fail Gard", hj: "https://nettsted-fail-vtp2.example",
+          ep: "post@nettstedfail-vtp2.example", tlf: "91234567", org_nr: "912340097", brreg_verified: 1,
+          ab: "Eksisterende tekst om Nettsted Fail Gard, lang nok til å telle som utfylt.",
+          products: JSON.stringify(["sider"]), created: "2026-01-14",
+        });
         const before = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='vtp2-nettstedfail'`).get() as any;
+        const fetchesBefore = fetchCallCounts.get("nettsted-fail-vtp2.example") ?? 0;
 
         const res = await callVtp({ providerIds: ["vtp2-nettstedfail"], apply: true });
         const row = (res.body.providers as any[]).find((p) => p.provider_id === "vtp2-nettstedfail");
@@ -525,6 +603,19 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
         const after = expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='vtp2-nettstedfail'`).get() as any;
         assertEq(after.field_provenance, before.field_provenance,
           "vtp2-23c: field_provenance er IKKE skrevet/endret av en ren nettverksfeil på fetchen (var durably stemplet verified:false før denne fiksen)");
+        // Review fix-up pass, round 2 — the exact coverage gap the second
+        // independent review found: the OLD mock threw unconditionally for
+        // this host, so "retry_later" alone couldn't prove there was only
+        // ONE fetch attempt (a would-be second fetch would have failed
+        // identically, masking the double-fetch/race bug entirely). Now
+        // there IS no second call — prove it directly by counting. ENOTFOUND
+        // (set up above) is classified non-retryable, so a single
+        // crFetchGardssalgContent call is exactly ONE raw invocation here
+        // (unlike vtp2-16's 200-OK/multi-page-crawl case) — a clean,
+        // literal "called exactly once".
+        const fetchesAfter = fetchCallCounts.get("nettsted-fail-vtp2.example") ?? 0;
+        assertEq(fetchesAfter - fetchesBefore, 1,
+          "vtp2-23d: nøyaktig ÉN reell fetch mot nettstedet ble forsøkt totalt for dette steget — ingen andre-fetch fra en (nå fjernet) intern remediation-kalls fetchFn");
       }
     } catch (err: any) {
       failed++;
