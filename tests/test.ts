@@ -37235,6 +37235,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-08-10-veien-til-pool: Norske Destilleriers medlemsliste-bekreftelse (skive 3) ──");
+  try {
+    const { runGardssalgMedlemslisteBekreftTests } = require("../src/routes/opplevelser-gardssalg-medlemsliste-bekreft.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-medlemsliste-bekreft.test");
+    const nd = await runGardssalgMedlemslisteBekreftTests({ log: false });
+    passed += nd.passed;
+    failed += nd.failed;
+    for (const f of nd.failures) failures.push("gardssalg-medlemsliste-bekreft: " + f);
+    console.log(`  gardssalg-medlemsliste-bekreft: ${nd.passed} passed, ${nd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-medlemsliste-bekreft: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ gardssalg-medlemsliste-bekreft: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 6 (kontakt ↔ opplevagent-produsent-kobling) ──");
   try {
     const { runCrmContactProviderLinkTests } = require("../src/services/crm-contact-provider-link.test") as
