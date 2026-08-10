@@ -312,6 +312,57 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "phone-19: 'Ring <nummer>' direct adjacency still extracts (doesn't regress the common call-to-action shape)",
   );
 
+  // ── Bug 4 code-review follow-up ROUND 2 (2026-08-10): round 1 narrowed
+  //    "Kontakt"/"Ring" to require heading/CTA usage, but still tested that
+  //    usage against the WHOLE 40/20-char WINDOW — so a real "Kontakt:"
+  //    heading or "Ring oss" CTA sitting a whole unrelated clause away from
+  //    an unrelated reference number still wrongly corroborated it. Fix:
+  //    "Kontakt"/"Ring" now require DIRECT, IMMEDIATE adjacency to the
+  //    candidate digits (see PHONE_CONTEXT_ADJACENT) — not "found somewhere
+  //    in the window". These fixtures pin the round-2 fix. ─────────────────
+
+  // The reviewer's exact repro 1: a real "Kontakt:" HEADING, but for a
+  // DIFFERENT block — the digits that actually follow are a property/
+  // matrikkel number ("Gårds- og bruksnr"), not a phone. Must NOT extract.
+  const htmlKontaktHeadingWrongBlock =
+    '<html><body><div class="kontakt-boks"><h3>Kontakt:</h3><p>Gårds- og bruksnr: 79656569. Se kart for veibeskrivelse.</p></div></body></html>';
+  assertEq(
+    extractPhone(htmlKontaktHeadingWrongBlock),
+    null,
+    "phone-20 (reviewer repro): a 'Kontakt:' heading elsewhere on the page does NOT corroborate an unrelated matrikkel-shaped number in a different block",
+  );
+
+  // The reviewer's exact repro 2: real "Ring oss" CTA text, but for a
+  // DIFFERENT number entirely (an order/booking reference in the footer).
+  // Must NOT extract.
+  const htmlRingCtaWrongNumber =
+    "<html><body><button>Ring oss for mer info</button><footer>Bestillingsref: 79656569</footer></body></html>";
+  assertEq(
+    extractPhone(htmlRingCtaWrongNumber),
+    null,
+    "phone-21 (reviewer repro): 'Ring oss' CTA text elsewhere on the page does NOT corroborate an unrelated order-reference number",
+  );
+
+  // Simpler variant of repro 1: "Kontakt:" heading followed by an unrelated
+  // sentence, then an order number.
+  const htmlKontaktThenUnrelatedOrderNr =
+    "<html><body><p>Kontakt: se venstre meny. Ordrenr 79656569 registrert.</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktThenUnrelatedOrderNr),
+    null,
+    "phone-22: 'Kontakt:' followed by an unrelated sentence and an order number does NOT extract the order number",
+  );
+
+  // Simpler variant of repro 2: "Ring oss" CTA followed by an unrelated
+  // sentence, then an org-nr.
+  const htmlRingOssThenUnrelatedOrgNr =
+    "<html><body><p>Ring oss i dag. Org.nr 79656569 finner du i registeret.</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingOssThenUnrelatedOrgNr),
+    null,
+    "phone-23: 'Ring oss' followed by an unrelated sentence and an org-nr does NOT extract the org-nr",
+  );
+
   // ── Bug 5 (slice D, 2026-08-10): extractAddress — leading contact-label /
   //    company-name box glued onto the street. Real repro: Oceanfood AS —
   //    a flattened "Kontakt" heading immediately followed by the producer's

@@ -5237,51 +5237,57 @@ function looksLikeDate(digits: string): boolean {
 // a phone number on this page", not just "8 digits that happen to look
 // phone-shaped somewhere on the page".
 //
-// Code-review follow-up (2026-08-10, same slice): the FIRST version of this
-// gate treated bare "\bring\b" and "\bkontakt\b" as always-valid context
-// anywhere in the window — but both are common generic Norwegian words with
-// no phone connection at all ("Ring 3" = a ring road; "kontakt" in an
-// electrical/skin-contact-warning sense, or just "kontakt oss for mer info"
-// several sentences away from an unrelated reference number). Reviewer
-// reproduced the EXACT bug class this slice was meant to close via that
-// gap: "Kjør Ring 3 til avkjørsel. Kundenr 79656569 for support." — "Ring"
-// sat within the window of an unrelated 8-digit reference number and
-// wrongly corroborated it. Fixed by splitting the label set into:
-//   • GENERIC labels — unambiguous, phone-specific words (tlf/telefon/
-//     mob/mobil/sms/call): safe to accept anywhere in the window, they have
-//     no unrelated everyday meaning.
-//   • "Kontakt" — only counts as context when used as a heading/label,
-//     i.e. followed by a colon ("Kontakt:", "Kontaktinfo:"), OR when it
-//     directly, immediately precedes the candidate itself (see
-//     ADJACENT_LABEL below) — never as a bare mention anywhere in the
-//     window (too generic a word on its own).
-//   • "Ring" — only counts as context when used as an actual call-to-action:
-//     the verb form directly followed by "oss"/"på"/"nå"/"meg" ("Ring
-//     oss/på/nå/meg", anywhere in the window), OR when it directly,
-//     immediately precedes the candidate itself ("Ring 91234567" — the
-//     classic "call THIS number" shape) — never a bare "\bring\b" mention.
+// Code-review follow-up round 1 (2026-08-10, same slice): the FIRST version
+// of this gate treated bare "\bring\b" and "\bkontakt\b" as always-valid
+// context anywhere in the window — but both are common generic Norwegian
+// words with no phone connection at all ("Ring 3" = a ring road; "kontakt"
+// in an electrical/skin-contact-warning sense). Reproduced live: "Kjør Ring
+// 3 til avkjørsel. Kundenr 79656569 for support." — "Ring" sat within the
+// window of an unrelated 8-digit reference number and wrongly corroborated
+// it. Round-1 fix split the label set into GENERIC (unambiguous, phone-
+// specific words — safe anywhere in the window) vs. "Kontakt"/"Ring", which
+// were only meant to count as context near an ACTUAL heading/CTA use.
+//
+// Code-review follow-up round 2 (2026-08-10, same slice): round 1 still
+// tested the "Kontakt:" heading / "Ring oss/på/nå/meg" CTA phrase against
+// the WHOLE 40-char-before/20-char-after WINDOW — same mistake as the
+// original flat list, just one door narrower. A real "Kontakt:" heading or
+// "Ring oss" CTA button text sitting a whole (unrelated) clause away from
+// an unrelated reference number still corroborated it:
+//   "<h3>Kontakt:</h3><p>Gårds- og bruksnr: 79656569. Se kart ...</p>"
+//   "<button>Ring oss for mer info</button><footer>Bestillingsref: 79656569</footer>"
+// Fix: "Kontakt"/"Ring" now ONLY count when DIRECTLY, IMMEDIATELY adjacent
+// to the candidate digits — nothing but whitespace/colon/comma (and, for
+// "Ring", the CTA words themselves, e.g. "Ring nå på") between the label
+// and the digit run — via PHONE_CONTEXT_ADJACENT below, the same posture
+// the original adjacency check already used for the bare "Ring <nummer>"
+// shape, now generalised to also cover "Kontakt:"/"Kontaktinfo:" and the
+// full "Ring oss/på/nå/meg" CTA phrase. GENERIC labels are UNCHANGED — they
+// have no non-phone Norwegian meaning, so window-wide matching for them was
+// never the problem; only "Kontakt"/"Ring" needed narrowing.
 const PHONE_CONTEXT_GENERIC = /\b(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\b/i;
-const PHONE_CONTEXT_KONTAKT_HEADING = /\bkontakt(?:info(?:rmasjon)?)?\s*:/i;
-// Trailing boundary is a negative lookahead (not `\b`) because JS `\b` only
-// recognises ASCII `\w` — "å" is NOT a word character to `\b`, so `\bnå\b` /
-// `\bpå\b` silently fail to match "nå " / "på " (both extremely common,
-// since these words are almost always followed by whitespace). The
-// lookahead requires the next character (if any) not be a letter/digit,
-// which correctly handles "nå"/"på" the same way `\b` handles ASCII words.
-const PHONE_CONTEXT_RING_CTA = /\bring\b\s+(?:oss|på|nå|meg)(?![\p{L}\p{N}])/iu;
-// Matches when the candidate is DIRECTLY, immediately preceded by "ring" or
-// "kontakt"/"kontaktinfo(rmasjon)" (only whitespace/colon/comma in between,
-// no other words) — the "Ring <nummer>" / "Kontakt: <nummer>" attachment
-// shape, as opposed to the word merely appearing somewhere earlier in a
-// wide window.
-const PHONE_CONTEXT_ADJACENT_LABEL = /\b(?:ring|kontakt(?:info(?:rmasjon)?)?)[:,]?\s*$/i;
+// Matches ONLY when the candidate is DIRECTLY, IMMEDIATELY preceded (only
+// whitespace/colon/comma in between — no unrelated word or sentence) by:
+//   • "Kontakt"/"Kontaktinfo"/"Kontaktinformasjon", optionally with a
+//     trailing colon ("Kontakt:", "Kontaktinformasjon:"), or
+//   • "Ring", optionally followed by one or more of the CTA words
+//     oss/på/nå/meg in sequence ("Ring", "Ring oss", "Ring nå på").
+// Tested with `$` against the slice ending exactly at the candidate's start
+// — not "found somewhere in a wide window" — so an unrelated word/clause
+// between the label and the digits (e.g. "Kontakt: ... Ordrenr 79656569",
+// "Ring oss ... Bestillingsref: 79656569") correctly does NOT match.
+// (?:oss|på|nå|meg) has no trailing `\b`/lookahead of its own because the
+// group is itself anchored by the surrounding `\s*[:,]?\s*$` — nothing can
+// follow it but optional punctuation/whitespace up to the digits.
+const PHONE_CONTEXT_ADJACENT =
+  /\b(?:kontakt(?:info(?:rmasjon)?)?|ring(?:\s+(?:oss|på|nå|meg))*)\s*[:,]?\s*$/iu;
 // How far (in characters, in the tag-stripped text) around a candidate match
-// to look for a GENERIC contact label / the ring-CTA phrase / the kontakt-
-// heading colon. Generous enough for "Ring oss på <number>" / "Telefon:
+// to look for a GENERIC contact label. Generous enough for "Telefon:
 // <number>" / "<number> (Tlf)" shapes without being so wide it picks up an
 // unrelated label elsewhere on a dense contact block. The adjacency check
-// above is intentionally NOT window-based — it only looks at what
-// immediately precedes the candidate, no matter how wide this window is.
+// above is intentionally NOT window-based in the same sense — it only looks
+// at what immediately, contiguously precedes the candidate; the window
+// bound below just caps how far back it's even worth looking.
 const PHONE_CONTEXT_WINDOW_BEFORE = 40;
 const PHONE_CONTEXT_WINDOW_AFTER = 20;
 
@@ -5290,10 +5296,8 @@ function hasPhoneContext(text: string, matchStart: number, groupEnd: number): bo
   const windowEnd = Math.min(text.length, groupEnd + PHONE_CONTEXT_WINDOW_AFTER);
   const window = text.slice(windowStart, windowEnd);
   if (PHONE_CONTEXT_GENERIC.test(window)) return true;
-  if (PHONE_CONTEXT_KONTAKT_HEADING.test(window)) return true;
-  if (PHONE_CONTEXT_RING_CTA.test(window)) return true;
   const immediatelyBefore = text.slice(windowStart, matchStart);
-  if (PHONE_CONTEXT_ADJACENT_LABEL.test(immediatelyBefore)) return true;
+  if (PHONE_CONTEXT_ADJACENT.test(immediatelyBefore)) return true;
   return false;
 }
 
