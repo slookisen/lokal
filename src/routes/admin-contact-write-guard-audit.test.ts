@@ -187,7 +187,7 @@ export function runAdminContactWriteGuardAuditTests(
       // rfb/dental/experiences even though the original incident was
       // discovered via rfb).
       insertAgent.run("agent-dental-date-phone", "DentalDatePhone AS", "key-dental-date-phone", null, "dental");
-      insertKnowledge.run("agent-dental-date-phone", "19991231", null);
+      insertKnowledge.run("agent-dental-date-phone", "20111231", null);
 
       // (8) A row with no phone and no address at all — must not crash and
       // must not appear in any violation bucket.

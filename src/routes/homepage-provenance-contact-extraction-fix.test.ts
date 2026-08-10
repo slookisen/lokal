@@ -180,6 +180,36 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "phone-08: a '+47' prefix glued to the digits after a 'Telefon:' label still extracts the phone",
   );
 
+  // ── Bug 3 (W33 2026-08-10): leading-digit rule — 8-digit runs starting 0/1
+  //    violate the Norwegian numbering plan and must never be extracted ─────
+
+  // The exact live breach value: "02812441" was extracted from a producer
+  // page and written as phone (Myrdal Gård Ysteri) — real number 40190940.
+  const htmlLeadingZeroOnly = "<html><body><p>Ref 02812441</p></body></html>";
+  assertEq(
+    extractPhone(htmlLeadingZeroOnly),
+    null,
+    "phone-09: an 8-digit run starting with 0 (W33 breach value) is never extracted",
+  );
+
+  // Leading-0 junk first, real phone later — the scan must SKIP the junk and
+  // keep going, not give up (mirrors phone-01's date-then-phone shape).
+  const htmlLeadingZeroThenPhone =
+    "<html><body><p>Ref 02812441</p><p>Ring eller SMS 40190940</p></body></html>";
+  assertEq(
+    extractPhone(htmlLeadingZeroThenPhone),
+    "40190940",
+    "phone-10: leading-0 junk is skipped and the real phone later in the page is extracted",
+  );
+
+  // Leading-1 variant (short-code range) — same rule, other invalid lead.
+  const htmlLeadingOneOnly = "<html><body><p>Sak 12345678</p></body></html>";
+  assertEq(
+    extractPhone(htmlLeadingOneOnly),
+    null,
+    "phone-11: an 8-digit run starting with 1 is never extracted",
+  );
+
   return { passed, failed, failures };
 }
 

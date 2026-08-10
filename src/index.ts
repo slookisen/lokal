@@ -65,6 +65,7 @@ import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-em
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
+import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
@@ -697,6 +698,11 @@ app.use("/admin", adminLimiter, descriptionTruncationSweepRouter);
 // agent_knowledge directly. POST /admin/rfb-website-discovery,
 // GET /admin/rfb-website-review-queue (read-only, pending rows only).
 app.use("/admin", adminLimiter, adminRfbWebsiteDiscoveryRoutes);
+// dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype punkt 2: READ-ONLY
+// per-agent gate diagnosis — names which pool-VIEW leg and which
+// homepage-provenance-batch auto-select leg blocks a given agent, with the
+// same predicates production uses. GET /admin/pool-blocker-explain.
+app.use("/admin/pool-blocker-explain", adminLimiter, adminPoolBlockerExplainRoutes);
 // dev-requests/2026-08-07-rfb-contact-extraction.md: corroborated contact-
 // email extraction from a producer's own website for RFB `agents` rows whose
 // contact_email is blank or DNS-flagged-dead — writes agents.contact_email
