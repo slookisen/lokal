@@ -20,6 +20,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService } from "../services/knowledge-service";
 import { getConfig } from "../config/vertical-config";
+import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
@@ -1329,7 +1330,7 @@ const SEARCH_CSS = `
   @media (max-width: 768px) { .results-grid { grid-template-columns: 1fr; } }
 `;
 
-router.get("/sok", async (req: Request, res: Response) => {
+router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const lang = req.lang;
   const q = typeof req.query.q === "string" ? req.query.q : "";
   const frontendLat = parseFloat(req.query.lat as string);
