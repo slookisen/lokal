@@ -328,16 +328,21 @@ function looksLikeYyyymmdd(digits8: string): boolean {
 // separator. Anchored with `\b` + `$` so "Kontaktveien 3" (label embedded as
 // part of a real street name) is never matched — only a label that is its
 // own trailing token is.
-const TRAILING_CONTACT_LABEL = /[\s,:]+(?:Telefon|Tlf\.?|E-?post|Adresse|Kontakt)[:,]?$/i;
+//
+// Kept in sync with LEADING_LABEL_WORD below and PHONE_CONTEXT_KONTAKT_HEADING
+// (routes/marketplace.ts) — the "Kontakt(info(rmasjon)?)?" alternation is the
+// SAME label vocabulary in all three places (code-review follow-up, 2026-08-10).
+const TRAILING_CONTACT_LABEL = /[\s,:]+(?:Telefon|Tlf\.?|E-?post|Adresse|Kontakt(?:info(?:rmasjon)?)?)[:,]?$/i;
 
 /**
  * Strip a trailing standalone contact-field label ("Telefon", "Tlf", "Tlf.",
- * "E-post"/"Epost", "Adresse", "Kontakt" — case-insensitive) from the end of
- * an address string, if present. Conservative: only strips when the label is
- * the LAST whitespace/punctuation-delimited token, so it never touches a
- * label that's part of a real street name ("Kontaktveien 3"). If stripping
- * would leave the string empty, the original is returned unchanged instead —
- * an address must never become blank via this function.
+ * "E-post"/"Epost", "Adresse", "Kontakt"/"Kontaktinfo"/"Kontaktinformasjon" —
+ * case-insensitive) from the end of an address string, if present.
+ * Conservative: only strips when the label is the LAST whitespace/
+ * punctuation-delimited token, so it never touches a label that's part of a
+ * real street name ("Kontaktveien 3"). If stripping would leave the string
+ * empty, the original is returned unchanged instead — an address must never
+ * become blank via this function.
  *
  * `null`/`undefined` pass through unchanged.
  */
@@ -377,7 +382,10 @@ export function stripTrailingContactLabel(
 // (bare label only) is the fallback for the simple case with no company name
 // in between. Same conservative posture as the trailing version: no match ⇒
 // unchanged; stripping-to-blank ⇒ unchanged (original returned).
-const LEADING_LABEL_WORD = "(?:Telefon|Tlf\\.?|E-?post|Adresse|Kontakt(?:info)?)";
+// Kept in sync with TRAILING_CONTACT_LABEL above and
+// PHONE_CONTEXT_KONTAKT_HEADING (routes/marketplace.ts) — same label
+// vocabulary, including the "Kontaktinformasjon" long form.
+const LEADING_LABEL_WORD = "(?:Telefon|Tlf\\.?|E-?post|Adresse|Kontakt(?:info(?:rmasjon)?)?)";
 const LEGAL_SUFFIX_WORD = "(?:AS|ASA|SA|DA|ANS|ENK|BA|NUF)";
 const LEADING_CONTACT_LABEL_WITH_ENTITY = new RegExp(
   `^${LEADING_LABEL_WORD}[:,]?[\\s,:]+(?:\\p{L}[\\p{L}'-]*[\\s,:]+){0,4}?${LEGAL_SUFFIX_WORD}[\\s,:]+`,

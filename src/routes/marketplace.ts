@@ -5224,7 +5224,7 @@ function looksLikeDate(digits: string): boolean {
 }
 
 // Contact-context labels a genuine phone number is normally found near on a
-// producer's own site (a "Tlf:"/"Ring oss"/"Kontakt" style block) —
+// producer's own site (a "Tlf:"/"Ring oss"/"Kontakt:" style block) —
 // case-insensitive, whole-word. Slice D (2026-08-10, Austrått live repro):
 // a SYNTACTICALLY valid 8-digit number ("79656569") was written as the
 // producer's phone despite being the WRONG number — none of the existing
@@ -5236,18 +5236,65 @@ function looksLikeDate(digits: string): boolean {
 // cheap, conservative proxy for "this number is actually being presented AS
 // a phone number on this page", not just "8 digits that happen to look
 // phone-shaped somewhere on the page".
-const PHONE_CONTEXT_LABEL = /\b(?:tlf\.?|telefon|ring|mob\.?|mobil|kontakt|sms|call)\b/i;
+//
+// Code-review follow-up (2026-08-10, same slice): the FIRST version of this
+// gate treated bare "\bring\b" and "\bkontakt\b" as always-valid context
+// anywhere in the window — but both are common generic Norwegian words with
+// no phone connection at all ("Ring 3" = a ring road; "kontakt" in an
+// electrical/skin-contact-warning sense, or just "kontakt oss for mer info"
+// several sentences away from an unrelated reference number). Reviewer
+// reproduced the EXACT bug class this slice was meant to close via that
+// gap: "Kjør Ring 3 til avkjørsel. Kundenr 79656569 for support." — "Ring"
+// sat within the window of an unrelated 8-digit reference number and
+// wrongly corroborated it. Fixed by splitting the label set into:
+//   • GENERIC labels — unambiguous, phone-specific words (tlf/telefon/
+//     mob/mobil/sms/call): safe to accept anywhere in the window, they have
+//     no unrelated everyday meaning.
+//   • "Kontakt" — only counts as context when used as a heading/label,
+//     i.e. followed by a colon ("Kontakt:", "Kontaktinfo:"), OR when it
+//     directly, immediately precedes the candidate itself (see
+//     ADJACENT_LABEL below) — never as a bare mention anywhere in the
+//     window (too generic a word on its own).
+//   • "Ring" — only counts as context when used as an actual call-to-action:
+//     the verb form directly followed by "oss"/"på"/"nå"/"meg" ("Ring
+//     oss/på/nå/meg", anywhere in the window), OR when it directly,
+//     immediately precedes the candidate itself ("Ring 91234567" — the
+//     classic "call THIS number" shape) — never a bare "\bring\b" mention.
+const PHONE_CONTEXT_GENERIC = /\b(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\b/i;
+const PHONE_CONTEXT_KONTAKT_HEADING = /\bkontakt(?:info(?:rmasjon)?)?\s*:/i;
+// Trailing boundary is a negative lookahead (not `\b`) because JS `\b` only
+// recognises ASCII `\w` — "å" is NOT a word character to `\b`, so `\bnå\b` /
+// `\bpå\b` silently fail to match "nå " / "på " (both extremely common,
+// since these words are almost always followed by whitespace). The
+// lookahead requires the next character (if any) not be a letter/digit,
+// which correctly handles "nå"/"på" the same way `\b` handles ASCII words.
+const PHONE_CONTEXT_RING_CTA = /\bring\b\s+(?:oss|på|nå|meg)(?![\p{L}\p{N}])/iu;
+// Matches when the candidate is DIRECTLY, immediately preceded by "ring" or
+// "kontakt"/"kontaktinfo(rmasjon)" (only whitespace/colon/comma in between,
+// no other words) — the "Ring <nummer>" / "Kontakt: <nummer>" attachment
+// shape, as opposed to the word merely appearing somewhere earlier in a
+// wide window.
+const PHONE_CONTEXT_ADJACENT_LABEL = /\b(?:ring|kontakt(?:info(?:rmasjon)?)?)[:,]?\s*$/i;
 // How far (in characters, in the tag-stripped text) around a candidate match
-// to look for a contact label. Generous enough for "Ring oss på <number>" /
-// "Telefon: <number>" / "<number> (Tlf)" shapes without being so wide it
-// picks up an unrelated label elsewhere on a dense contact block.
+// to look for a GENERIC contact label / the ring-CTA phrase / the kontakt-
+// heading colon. Generous enough for "Ring oss på <number>" / "Telefon:
+// <number>" / "<number> (Tlf)" shapes without being so wide it picks up an
+// unrelated label elsewhere on a dense contact block. The adjacency check
+// above is intentionally NOT window-based — it only looks at what
+// immediately precedes the candidate, no matter how wide this window is.
 const PHONE_CONTEXT_WINDOW_BEFORE = 40;
 const PHONE_CONTEXT_WINDOW_AFTER = 20;
 
 function hasPhoneContext(text: string, matchStart: number, groupEnd: number): boolean {
   const windowStart = Math.max(0, matchStart - PHONE_CONTEXT_WINDOW_BEFORE);
   const windowEnd = Math.min(text.length, groupEnd + PHONE_CONTEXT_WINDOW_AFTER);
-  return PHONE_CONTEXT_LABEL.test(text.slice(windowStart, windowEnd));
+  const window = text.slice(windowStart, windowEnd);
+  if (PHONE_CONTEXT_GENERIC.test(window)) return true;
+  if (PHONE_CONTEXT_KONTAKT_HEADING.test(window)) return true;
+  if (PHONE_CONTEXT_RING_CTA.test(window)) return true;
+  const immediatelyBefore = text.slice(windowStart, matchStart);
+  if (PHONE_CONTEXT_ADJACENT_LABEL.test(immediatelyBefore)) return true;
+  return false;
 }
 
 /**
@@ -5264,11 +5311,11 @@ function hasPhoneContext(text: string, matchStart: number, groupEnd: number): bo
  *      of a longer run and is skipped rather than returned.
  *
  * Slice D (2026-08-10, Austrått live repro): a fourth check — the candidate
- * must sit near a recognisable contact-context label (see
- * PHONE_CONTEXT_LABEL above). A valid-shaped 8-digit run with no such
- * context nearby is skipped, not returned — same "false negative is safe,
- * false positive is not" posture as every other check here: leaving the
- * phone field blank is always safer than writing a confidently-wrong number.
+ * must sit near a recognisable contact-context label (see hasPhoneContext /
+ * PHONE_CONTEXT_* above). A valid-shaped 8-digit run with no such context
+ * nearby is skipped, not returned — same "false negative is safe, false
+ * positive is not" posture as every other check here: leaving the phone
+ * field blank is always safer than writing a confidently-wrong number.
  */
 export function extractPhone(html: string): string | null {
   // Strip HTML tags for cleaner matching.

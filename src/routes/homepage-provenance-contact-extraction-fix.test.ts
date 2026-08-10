@@ -250,6 +250,68 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "phone-14: a 'Kontakt:' label counts as valid contact context",
   );
 
+  // ── Bug 4 code-review follow-up (2026-08-10): bare "ring"/"kontakt"
+  //    anywhere in the window is TOO permissive — both are common generic
+  //    Norwegian words unrelated to phones ("Ring 3" = a ring road;
+  //    "kontakt" in an unrelated sense). The reviewer reproduced the exact
+  //    Austrått bug class through this gap; these fixtures pin the fix. ────
+
+  // The reviewer's exact repro: "Ring 3" (a road) sits within the window of
+  // an unrelated 8-digit reference number ("Kundenr ...") — must NOT be
+  // extracted. A bare "\bring\b" mention is no longer sufficient context.
+  const htmlRingRoadFalsePositive =
+    "<html><body><p>Kjør Ring 3 til avkjørsel. Kundenr 79656569 for support.</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingRoadFalsePositive),
+    null,
+    "phone-15 (reviewer repro): 'Ring 3' (a road reference, not a call-to-action) does NOT corroborate an unrelated 8-digit reference number",
+  );
+
+  // Same road-reference false lead PLUS a real "Ring nå på <nummer>"
+  // call-to-action elsewhere on the page -> the scan must skip the
+  // uncorroborated one and return the real, properly-flagged number.
+  const htmlRingRoadThenRealCta =
+    "<html><body>" +
+    "<p>Kjør Ring 3 til avkjørsel. Kundenr 79656569 for support.</p>" +
+    "<p>Ring nå på 91234567.</p>" +
+    "</body></html>";
+  assertEq(
+    extractPhone(htmlRingRoadThenRealCta),
+    "91234567",
+    "phone-16: 'Ring 3' road reference is skipped; the real 'Ring nå på <nummer>' call-to-action elsewhere is extracted",
+  );
+
+  // A bare "kontakt" mention with no colon and no direct adjacency to the
+  // candidate digits must NOT corroborate an unrelated number either.
+  const htmlBareKontaktFalsePositive =
+    "<html><body><p>Vær forsiktig ved kontakt med strøm. Serienr 55667788 på enheten.</p></body></html>";
+  assertEq(
+    extractPhone(htmlBareKontaktFalsePositive),
+    null,
+    "phone-17: a bare 'kontakt' mention (no colon, not adjacent) does NOT corroborate an unrelated 8-digit serial number",
+  );
+
+  // Positive control: the long-form "Kontaktinformasjon:" heading (aligned
+  // with stripLeadingContactLabel's label vocabulary) still counts as valid
+  // context when used as an actual heading.
+  const htmlKontaktinformasjonHeading =
+    "<html><body><p>Kontaktinformasjon: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktinformasjonHeading),
+    "91234567",
+    "phone-18: 'Kontaktinformasjon:' (long-form heading) counts as valid contact context",
+  );
+
+  // Positive control: "Ring 91234567" — the direct call-to-action shape
+  // (label immediately, adjacently attached to the real candidate) must
+  // still work after narrowing the bare-"ring" window match to adjacency.
+  const htmlRingDirectlyAdjacent = "<html><body><p>Ring 91234567 i dag!</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingDirectlyAdjacent),
+    "91234567",
+    "phone-19: 'Ring <nummer>' direct adjacency still extracts (doesn't regress the common call-to-action shape)",
+  );
+
   // ── Bug 5 (slice D, 2026-08-10): extractAddress — leading contact-label /
   //    company-name box glued onto the street. Real repro: Oceanfood AS —
   //    a flattened "Kontakt" heading immediately followed by the producer's
