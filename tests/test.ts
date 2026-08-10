@@ -37201,6 +37201,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-08-10-veien-til-pool: berikelseskjede + køderenering (skive 1) ──");
+  try {
+    const { runVeienTilPoolTests } = require("../src/routes/opplevelser-veien-til-pool.test") as
+      typeof import("../src/routes/opplevelser-veien-til-pool.test");
+    const vp = await runVeienTilPoolTests({ log: false });
+    passed += vp.passed;
+    failed += vp.failed;
+    for (const f of vp.failures) failures.push("veien-til-pool: " + f);
+    console.log(`  veien-til-pool: ${vp.passed} passed, ${vp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("veien-til-pool: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ veien-til-pool: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 6 (kontakt ↔ opplevagent-produsent-kobling) ──");
   try {
     const { runCrmContactProviderLinkTests } = require("../src/services/crm-contact-provider-link.test") as
