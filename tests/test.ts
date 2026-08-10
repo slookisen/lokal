@@ -29829,6 +29829,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcg.failures) failures.push("opplevelser-gardssalg-claim-grant: " + f);
     console.log(`  opplevelser-gardssalg-claim-grant: ${gcg.passed} passed, ${gcg.failed} failed`);
 
+    // dev-request 2026-08-10-gardssalg-eier-flyt-e2e-repeterbar-revoke-og-
+    // editable-fixtur, item A: admin claim-revoke — POST
+    // /admin/gardssalg-claim-revoke (src/routes/opplevelser.ts). Closes the
+    // "no way to un-claim a claimed test row" gap found running the
+    // owner-claim E2E live against prod — revokes ALL active, non-revoked
+    // gardssalg_claims rows for a provider (dry-run by default), so a fresh
+    // gardssalg-claim-grant/request can succeed again afterwards instead of
+    // permanently hitting 409 already_claimed. Same in-memory-DB pattern,
+    // runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-claim-revoke: admin claim-revoke lever ──");
+    const { runOpplevelserGardssalgClaimRevokeTests } = require("../src/routes/opplevelser-gardssalg-claim-revoke.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-claim-revoke.test");
+    const gcr = await runOpplevelserGardssalgClaimRevokeTests({ log: false });
+    passed += gcr.passed;
+    failed += gcr.failed;
+    for (const f of gcr.failures) failures.push("opplevelser-gardssalg-claim-revoke: " + f);
+    console.log(`  opplevelser-gardssalg-claim-revoke: ${gcr.passed} passed, ${gcr.failed} failed`);
+
     // dev-request 2026-07-26-booking-test-send-guard: per-transaction test
     // flag that redirects EVERY outgoing email of that one transaction to
     // TEST_SEND_REDIRECT_EMAIL (services/send-guard.ts, applied inside

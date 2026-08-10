@@ -392,6 +392,9 @@ import {
   issueAdminGrantedClaimMagicLink,
   hasActiveNonRevokedClaim,
   backfillGardssalgOwnerLockProvenance,
+  // dev-request 2026-08-10-gardssalg-eier-flyt-e2e-repeterbar-revoke-og-
+  // editable-fixtur — POST /admin/gardssalg-claim-revoke below.
+  maskEmail,
 } from "../services/gardssalg-claim";
 import {
   emailService,
@@ -5222,6 +5225,148 @@ router.post("/admin/gardssalg-claim-grant", requireAdmin, (req: Request, res: Re
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-claim-revoke (admin) ────────────
+//
+// dev-request 2026-08-10-gardssalg-eier-flyt-e2e-repeterbar-revoke-og-
+// editable-fixtur, item (A). Closes a gap found running the owner-claim E2E
+// live against prod on the hidden test-provider row: once a claim is
+// verified (used=1), NOTHING in this codebase could ever un-claim it again
+// — hasActiveNonRevokedClaim()'s "already claimed, non-revoked" guard (see
+// its own doc comment in gardssalg-claim.ts) then permanently blocks both
+// POST /admin/gardssalg-claim-grant and the public self-serve .../request
+// route with 409 already_claimed, making the E2E a one-shot, not a
+// repeatable one. revokeClaimToken() (gardssalg-claim.ts) already existed —
+// but was only ever CALLED from the owner's own POST .../logout route,
+// keyed off the caller's OWN session cookie. There was no admin lever to
+// revoke on a producer's BEHALF (e.g. to reset a test fixture, or to help a
+// producer who lost access to their claim email). This route is that lever.
+//
+// Body: { provider_id: string, apply?: boolean }.
+//
+// dry-run by default (same convention as every other admin write route in
+// this file — see POST /admin/gardssalg-claim-grant above, POST
+// /admin/gardssalg-booking-activation below): a bare POST reports which
+// claims WOULD be revoked and writes nothing. apply MUST be the literal
+// boolean `true` (not merely truthy) — same strict-true convention this
+// file already uses for every other opt-in boolean flag (see e.g. POST
+// /admin/gardssalg/test-provider's `claimable` flag) — a stray
+// apply:"false" or apply:0 must never accidentally read as "go ahead".
+//
+// "Active, non-revoked" is EXACTLY hasActiveNonRevokedClaim()'s own
+// definition (used = 1 AND revoked_at IS NULL) — this route selects the
+// same rows that function would find, not a re-derivation of the rule.
+// There can be more than one such row for a provider in principle (e.g. a
+// second producer link claimed the same profile before either was
+// revoked), so ALL of them are revoked, not just the first.
+//
+// NEVER touches claimed_at (the historical "claimed by" badge — see
+// verifyClaimToken()'s own doc comment: "the ONLY place claimed_at is ever
+// set — never on issue/send, only on use") or content_source: this route
+// only sets gardssalg_claims.revoked_at, exactly like revokeClaimToken()
+// itself does. A provider revoked here keeps its public "Bekreftet av
+// eier" badge and whatever content_source lock it already had — only
+// ACCESS is revoked, not history.
+//
+// Idempotent: a second apply:true call against the same row finds zero
+// active/non-revoked claims left (revoked_at IS NOT NULL now) and revokes
+// (and audits) nothing further — same "already_current -> no write, no
+// audit row" discipline as applyGardssalgBookingActivation below.
+//
+// Audit: reuses gardssalg_content_audit — the SAME table/insert shape every
+// other gårdssalg admin write in this file already uses (see
+// applyGardssalgProducerType above, applyGardssalgBookingActivation below)
+// — rather than inventing a second, parallel audit mechanism. One row per
+// ACTUAL revoke (field_name='gardssalg_claim_revoked', old_value=the
+// revoked claim's id, new_value='revoked', changed_by='admin'), so a
+// dry-run or a no-op apply (nothing left to revoke) never pads the trail.
+//
+// Auth: X-Admin-Key via requireAdmin, matching every sibling admin route in
+// this file byte-for-byte (403 on missing/invalid key — this route does
+// not introduce a second auth convention).
+router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    return res.status(400).json({ success: false, error: "provider_id_required" });
+  }
+
+  const provider = getClaimProviderById(providerId);
+  if (!provider) {
+    return res.status(404).json({ success: false, error: "provider_not_found" });
+  }
+
+  // Strict-true parse only — same convention as every other opt-in apply
+  // flag in this file (see POST /admin/gardssalg/test-provider's
+  // `claimable`, this same route's own sibling POST /admin/gardssalg-claim-
+  // grant's `apply`).
+  const apply = body.apply === true;
+
+  const expDb = getExpDb("experiences");
+
+  // Fresh read every time — never trusts a caller-supplied list. Exactly
+  // hasActiveNonRevokedClaim()'s own "used = 1 AND revoked_at IS NULL"
+  // definition, just returning the ROWS instead of a boolean.
+  const activeClaims = expDb
+    .prepare(
+      `SELECT id, email, email_source, used_at, created_at
+         FROM gardssalg_claims
+        WHERE provider_id = @provider_id AND used = 1 AND revoked_at IS NULL
+        ORDER BY created_at ASC`,
+    )
+    .all({ provider_id: providerId }) as Array<{
+    id: string;
+    email: string;
+    email_source: string;
+    used_at: string | null;
+    created_at: string;
+  }>;
+
+  if (!apply) {
+    return res.json({
+      success: true,
+      dry_run: true,
+      provider_id: providerId,
+      would_revoke: activeClaims.map((c) => ({
+        claim_id: c.id,
+        email_masked: maskEmail(c.email),
+        email_source: c.email_source,
+        used_at: c.used_at,
+      })),
+    });
+  }
+
+  const batchId = `claim-revoke-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+  const revoked: Array<{ claim_id: string; email_masked: string; email_source: string }> = [];
+
+  const txn = expDb.transaction(() => {
+    for (const claim of activeClaims) {
+      // Re-checked inside the transaction (defense in depth, same
+      // discipline as applyGardssalgBookingActivation's own fresh re-check)
+      // — `changes === 0` means this exact row was already revoked between
+      // the SELECT above and this UPDATE (e.g. a concurrent owner logout),
+      // so nothing to audit for it either.
+      const result = expDb
+        .prepare(`UPDATE gardssalg_claims SET revoked_at = datetime('now') WHERE id = @id AND revoked_at IS NULL`)
+        .run({ id: claim.id });
+      if (result.changes === 0) continue;
+
+      expDb
+        .prepare(
+          `INSERT INTO gardssalg_content_audit
+             (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+           VALUES (@id, @provider_id, 'gardssalg_claim_revoked', @old_value, 'revoked', NULL, @batch_id, 'admin', datetime('now'))`,
+        )
+        .run({ id: crypto.randomUUID(), provider_id: providerId, old_value: claim.id, batch_id: batchId });
+
+      revoked.push({ claim_id: claim.id, email_masked: maskEmail(claim.email), email_source: claim.email_source });
+    }
+  });
+  txn();
+
+  res.json({ success: true, dry_run: false, provider_id: providerId, revoked });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-contact-backfill (admin) ─────────
 //
 // dev-request 2026-07-26-brreg-kontakt-backfill.
@@ -7532,6 +7677,49 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // redirect), the stored address cannot reach a real third party. Mirrors the
 // exact same reasoning this route used to apply to the (now-removed)
 // hjemmeside default.
+//
+// ── `claimableEditable: true` (dev-request 2026-08-10-gardssalg-eier-flyt-
+// e2e-repeterbar-revoke-og-editable-fixtur, item B) ─────────────────────────
+// See the flag's own comment further down (next to where it's parsed) for
+// the full "why content_source='claim' instead of 'manual'" rationale.
+//
+// SPEC DISCREPANCY, verified directly against the code (flagged for the
+// reviewer, per this dev-request's own "note the discrepancy" instruction):
+// the dev-request's text asserts that stamping content_source='claim' here
+// makes the row "claimable via the existing tier-(c) stored_epost_verified
+// path in deriveOrgLinkedEmail()". That is NOT what the code does.
+// deriveOrgLinkedEmailCandidates()'s c-epost sub-case (services/
+// gardssalg-claim.ts) reads literally
+// `const adminEntered = provider.content_source === "manual";` — 'claim' is
+// not 'manual', so a claimableEditable row (content_source='claim') is
+// self-serve claim-INELIGIBLE: GET /kategori/gardssalg/eier/:slug will show
+// ZERO candidates (falls to the manual-fallback message) and POST
+// .../request will fail with no_org_linked_email. This is the SAME
+// content_source='manual'-vs-editable-portal tension the plain `claimable`
+// flag's own header comment already documents (see
+// opplevelser-gardssalg-test-provider-claimable.test.ts's header) — the two
+// requirements ("self-serve tier-c eligible before claim" and "editable
+// after claim") are mutually exclusive under the EXISTING, unmodified
+// deriveOrgLinkedEmailCandidates()/verifyClaimToken() logic, and this dev-
+// request's own scope (item B only touches THIS route) does not permit
+// changing either of those to reconcile it.
+//
+// RESOLUTION (judgment call, not a re-derivation of anything the dev-request
+// states explicitly): implemented literally as specified
+// (content_source='claim', claim email in the same `epost` column via
+// `claimEmail`, pinned to TEST_PROVIDER_ORG_NR exactly like `claimable`) —
+// this DOES achieve the actual motivating goal (portal booking-toggle +
+// text/product fields genuinely editable post-claim, since verifyClaimToken()
+// never changes a content_source that is already 'claim'). But claiming a
+// claimableEditable row repeatably must go through the ALREADY-EXISTING
+// admin lever POST /admin/gardssalg-claim-grant
+// (issueAdminGrantedClaimMagicLink) — which never reads content_source or
+// calls deriveOrgLinkedEmail() at all, only hasActiveNonRevokedClaim() — not
+// the public self-serve .../request route. Combined with THIS dev-request's
+// new POST /admin/gardssalg-claim-revoke (item A), the full repeatable cycle
+// is: test-provider{claimableEditable:true} -> gardssalg-claim-grant{apply:
+// true} -> click the emailed link (verifyClaimToken) -> portal is editable
+// -> gardssalg-claim-revoke{apply:true} to reset -> grant again.
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
@@ -7560,21 +7748,56 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
   // only the literal JSON boolean `true` turns the claim fields on.
   const claimable = req.body?.claimable === true;
 
+  // `claimableEditable` — dev-request 2026-08-10-gardssalg-eier-flyt-e2e-
+  // repeterbar-revoke-og-editable-fixtur, item (B). The pre-existing
+  // `claimable` flag stamps content_source='manual', which is exactly what
+  // LOCKS the owner portal read-only forever (see updateClaimedProviderProfile
+  // / the portal GET route: both gate strictly on content_source === 'manual'
+  // — verified directly against that code, not assumed). A claim E2E built on
+  // `claimable` can therefore exercise "does the magic link issue and verify"
+  // but never "is the portal editable post-claim" — that gap is what this
+  // flag closes: it stamps content_source='claim' instead, which
+  // verifyClaimToken() (unchanged, not touched by this dev-request) leaves
+  // exactly alone once already set (its own guard only ever upgrades NULL/
+  // other values to 'claim', never downgrades an existing 'manual' one — so a
+  // row that starts at 'claim' simply STAYS 'claim' through a real claim/
+  // verify cycle), leaving the portal's booking-toggle and text/product
+  // fields genuinely editable for a live E2E run.
+  //
+  // Mutually exclusive with `claimable` — both are opt-in ways of driving
+  // content_source to a DIFFERENT value ('manual' vs 'claim') on the exact
+  // same row/column, so both `true` at once is a contradiction in the
+  // request itself, not something to silently resolve by picking one.
+  const claimableEditable = req.body?.claimableEditable === true;
+  if (claimable && claimableEditable) {
+    res.status(400).json({
+      error: "'claimable' og 'claimableEditable' er gjensidig utelukkende — velg én",
+    });
+    return;
+  }
+  // Whichever of the two flags is set (if either) — used everywhere below
+  // that used to say `claimable`, so the shared claimEmail/pin/response
+  // logic covers both flags without duplicating it.
+  const claimVariant: "manual" | "claim" | null = claimable ? "manual" : claimableEditable ? "claim" : null;
+
   // `claimEmail` — the tier (c) stored_epost_verified address (see this
   // route's doc comment above for why this is deliberately NOT the same
   // field as the required `email`). Only meaningful, and only accepted, with
-  // `claimable: true` — same "refuse rather than silently discard" contract
-  // hjemmeside used to follow for tier (b).
-  if (!claimable) {
+  // `claimable: true` OR `claimableEditable: true` — same "refuse rather
+  // than silently discard" contract hjemmeside used to follow for tier (b).
+  // Reuses this SAME field/column for both flags (do not invent a second
+  // one) — the only difference between the two flags is the content_source
+  // value written, not where the claim-target address is stored.
+  if (!claimVariant) {
     if (typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim()) {
       res.status(400).json({
-        error: "'claimEmail' krever { claimable: true } — uten flagget skrives den ikke",
+        error: "'claimEmail' krever { claimable: true } eller { claimableEditable: true } — uten et av flaggene skrives den ikke",
       });
       return;
     }
   }
   let claimEmail = TEST_PROVIDER_DEFAULT_CLAIM_EMAIL;
-  if (claimable && typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim()) {
+  if (claimVariant && typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim()) {
     const candidate = req.body.claimEmail.trim();
     // Plausible shape only — NOT the URL-host-match / isClaimableDomain
     // checks the old hjemmeside-derivation path required. Those existed
@@ -7660,16 +7883,17 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       )
       .run({ id: providerId, navn: name, email, slug });
 
-    // ── claimable opt-in (see this route's doc comment) ──────────────────
+    // ── claimable / claimableEditable opt-in (see this route's doc comment) ──
     // Sets exactly the two fields tier (c) stored_epost_verified needs:
-    // content_source='manual' (adminEntered — deriveOrgLinkedEmailCandidates()
-    // reads this literally) and `epost` = claimEmail. No field_provenance
-    // touch anymore (tier (b)'s hjemmeside evidence stamp is retired along
-    // with the tier itself), so a pre-existing field_provenance value on this
-    // row — e.g. an unrelated hjemmeside_verification stamp from a prior test
-    // run — is left completely alone; nothing to merge, nothing to clobber.
+    // content_source (='manual' for `claimable`, ='claim' for
+    // `claimableEditable` — see claimVariant above) and `epost` = claimEmail.
+    // No field_provenance touch anymore (tier (b)'s hjemmeside evidence stamp
+    // is retired along with the tier itself), so a pre-existing
+    // field_provenance value on this row — e.g. an unrelated
+    // hjemmeside_verification stamp from a prior test run — is left
+    // completely alone; nothing to merge, nothing to clobber.
     let claimReady = false;
-    if (claimable) {
+    if (claimVariant) {
       // The UPDATE's `AND org_nr = @testOrgNr` is belt to the pre-write guard's
       // braces. That guard already turns a real-provider slug into a 409 before
       // anything is written, so this pin should be unreachable — but it is what
@@ -7678,15 +7902,18 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       // note that if it ever DID fire, the unconditional UPDATE above would
       // already have run, so the 409 below would be reporting a partial write.
       // That is precisely the defect the pre-write guard was added to remove —
-      // keep them in that order.
+      // keep them in that order. content_source is bound as a parameter (not
+      // string-interpolated) even though claimVariant is a closed internal
+      // union, not request input — same discipline as every other bound
+      // param on this statement.
       const result = expDb
         .prepare(
           `UPDATE experience_providers
-              SET brreg_verified = 1, content_source = 'manual', epost = @claimEmail,
+              SET brreg_verified = 1, content_source = @content_source, epost = @claimEmail,
                   updated_at = datetime('now')
             WHERE id = @id AND org_nr = @testOrgNr`
         )
-        .run({ id: providerId, claimEmail, testOrgNr: TEST_PROVIDER_ORG_NR });
+        .run({ id: providerId, content_source: claimVariant, claimEmail, testOrgNr: TEST_PROVIDER_ORG_NR });
 
       if (result.changes === 0) {
         res.status(409).json({
@@ -7700,14 +7927,15 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       claimReady = true;
     }
 
-    // The row's ACTUAL current epost — claimEmail when claimable overwrote
-    // it, the general `email` otherwise (see this route's doc comment's
-    // "JUDGMENT CALL" note on why these can differ).
+    // The row's ACTUAL current epost — claimEmail when claimable/
+    // claimableEditable overwrote it, the general `email` otherwise (see
+    // this route's doc comment's "JUDGMENT CALL" note on why these can
+    // differ).
     const currentEpost = claimReady ? claimEmail : email;
 
     console.log(
       `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${currentEpost} ` +
-        `(catalog_hidden=1, booking_live=1, claimable=${claimReady})`
+        `(catalog_hidden=1, booking_live=1, claimable=${claimable}, claimableEditable=${claimableEditable})`
     );
 
     res.json({
@@ -7716,7 +7944,8 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       slug,
       booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
       epost: currentEpost,
-      claimable: claimReady,
+      claimable,
+      claimableEditable,
       ...(claimReady
         ? {
             claim_url: `${APP_URL}/kategori/gardssalg/eier/${slug}`,
@@ -7725,6 +7954,13 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
             // the send — nothing is ever sent to it by this route (it sends
             // no email at all).
             claim_epost: claimEmail,
+            // The content_source value actually written — 'manual' for
+            // `claimable` (portal stays LOCKED post-claim, verifyClaimToken()
+            // never downgrades an existing 'manual' row) or 'claim' for
+            // `claimableEditable` (portal stays EDITABLE post-claim — see
+            // this route's doc comment above). Reported so an operator/E2E
+            // script never has to re-derive which trade-off this call chose.
+            content_source: claimVariant,
           }
         : {}),
     });
