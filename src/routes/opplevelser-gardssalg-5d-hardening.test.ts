@@ -252,7 +252,11 @@ export function runOpplevelserGardssalg5dHardeningTests(
           "5h-b9: stored page itself fetched");
         assertTrue(fetchedPageUrls.some((u) => u.startsWith("https://aleine.example.no/side/gard/")),
           "5h-b10: sub-pages crawled UNDER the extensionless stored path (M1 no-slash form)");
-        assertTrue(!fetchedPageUrls.some((u) => /^https:\/\/aleine\.example\.no\/(om-oss|om|besok|besøk|smaking|smaksprover|smaksprøver|kontakt|apningstider|åpningstider)$/.test(u)),
+        // Path list kept in sync with GARDSSALG_CONTENT_PATHS (dev-request
+        // 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 2 added
+        // the product-oriented entries) — this assertion is only meaningful
+        // if it covers every candidate the crawl actually tries.
+        assertTrue(!fetchedPageUrls.some((u) => /^https:\/\/aleine\.example\.no\/(produkter|nettbutikk|kontakt|sortiment|besok|produkt|besøk|vare-produkter|om-oss|varer|om|ol|øl|smaking|smaksprover|smaksprøver|apningstider|åpningstider)$/.test(u)),
           "5h-b11: host-root sub-pages never fetched for a deep-path hjemmeside");
       }
 

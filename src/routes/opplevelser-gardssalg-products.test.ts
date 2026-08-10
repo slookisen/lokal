@@ -538,20 +538,22 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(getAuditRows("prov-pg-blank").length, 0, "pg-r1i: dry-run created no audit row");
 
       // ── pg-r1j..n (dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-
-      //    28-rader, Skive 1): products_diagnostic reports this row even
-      //    though it's the SAME dry-run response that already reports it in
-      //    changed[] — proving the new bucket is additive, not a replacement.
-      //    plainPage's real text is a couple dozen characters and every
-      //    candidate sub-page in this mock 200s (host-only match), so the
-      //    homepage + the first 4 GARDSSALG_CONTENT_PATHS entries
-      //    (/om-oss, /om, /besok, /besøk) all get concatenated in — still
-      //    nowhere near the 6000-char cap. ─────────────────────────────────
+      //    28-rader, Skive 1; path list updated for Skive 2): products_diagnostic
+      //    reports this row even though it's the SAME dry-run response that
+      //    already reports it in changed[] — proving the new bucket is
+      //    additive, not a replacement. plainPage's real text is a couple
+      //    dozen characters and every candidate sub-page in this mock 200s
+      //    (host-only match), so the homepage + the first 4
+      //    GARDSSALG_CONTENT_PATHS entries (/produkter, /nettbutikk,
+      //    /kontakt, /sortiment — Skive 2's product-prioritized front of the
+      //    list) all get concatenated in — still nowhere near the 6000-char
+      //    cap. ─────────────────────────────────────────────────────────────
       const dryDiag = dryRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-blank");
       assertTrue(!!dryDiag, "pg-r1j: prov-pg-blank appears in dry-run products_diagnostic");
       assertEq(dryDiag.outcome, "products_found", "pg-r1k: dry-run diagnostic outcome is products_found");
       assertEq(dryDiag.truncated, false, "pg-r1l: dry-run diagnostic truncated=false — plainPage is far under the 6000-char cap");
       assertTrue(typeof dryDiag.content_chars_full === "number" && dryDiag.content_chars_full > 0, "pg-r1m: dry-run diagnostic content_chars_full is a positive number");
-      assertEq(dryDiag.pages_fetched_paths, ["/om-oss", "/om", "/besok", "/besøk"], "pg-r1n: dry-run diagnostic lists exactly the 4 sub-pages this mock actually fetched, in GARDSSALG_CONTENT_PATHS order");
+      assertEq(dryDiag.pages_fetched_paths, ["/produkter", "/nettbutikk", "/kontakt", "/sortiment"], "pg-r1n: dry-run diagnostic lists exactly the 4 sub-pages this mock actually fetched, in GARDSSALG_CONTENT_PATHS order");
 
       // ── pg-r2: apply mode on prov-pg-blank → actually writes through
       //    applyGardssalgProviderContent, with a matching audit row +
@@ -771,11 +773,16 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(overCapDiag.content_chars_full, 6001, "pg-r9h: content_chars_full is exactly 6001 for a homepage body of exactly 6001 characters");
       assertEq(overCapDiag.truncated, true, "pg-r9i: truncated=true one character OVER the cap");
 
-      // ── pg-r10 (Skive 1): pages_fetched_paths names the SPECIFIC
-      //    GARDSSALG_CONTENT_PATHS entries that succeeded, not just a count —
-      //    here only /om-oss and /kontakt 200, everything else 404s, and the
-      //    two non-adjacent successes must both be reported in path-list
-      //    order. ─────────────────────────────────────────────────────────
+      // ── pg-r10 (Skive 1; path list updated for Skive 2): pages_fetched_paths
+      //    names the SPECIFIC GARDSSALG_CONTENT_PATHS entries that succeeded,
+      //    not just a count — here only /om-oss and /kontakt 200, everything
+      //    else 404s, and the two non-adjacent successes must both be
+      //    reported in path-list order. Skive 2 moved /kontakt ahead of
+      //    /om-oss in GARDSSALG_CONTENT_PATHS (product-path prioritization,
+      //    with /kontakt kept as one of the guaranteed-early generic slots),
+      //    so the expected order below is now ["/kontakt", "/om-oss"], not
+      //    ["/om-oss", "/kontakt"] — this test is exactly the kind of
+      //    path-priority coverage the Skive 2 change needs. ────────────────
       insertProvider.run({
         id: "prov-pg-paths", navn: "Prov PG Paths Gard", hjemmeside: "https://prov-pg-paths.example.no",
         content_source: null, about_text: SILENT_LONG_TEXT, visit_text: SILENT_LONG_TEXT, opening_hours_text: null, products: null,
@@ -809,7 +816,7 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(pathsRes.status, 200, "pg-r10a: paths-tracking provider call -> 200");
       const pathsDiag = pathsRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-paths");
       assertTrue(!!pathsDiag, "pg-r10b: prov-pg-paths appears in products_diagnostic");
-      assertEq(pathsDiag.pages_fetched_paths, ["/om-oss", "/kontakt"], "pg-r10c: pages_fetched_paths lists exactly the 2 sub-pages that 200'd, in GARDSSALG_CONTENT_PATHS order — not the 8 that 404'd");
+      assertEq(pathsDiag.pages_fetched_paths, ["/kontakt", "/om-oss"], "pg-r10c: pages_fetched_paths lists exactly the 2 sub-pages that 200'd, in GARDSSALG_CONTENT_PATHS order (kontakt now precedes om-oss) — not the rest that 404'd");
 
       // ── pg-r8: rollback — the products write from pg-r2 is restorable via
       //    the existing GARDSSALG_ROLLBACKABLE_FIELDS-driven rollback route,

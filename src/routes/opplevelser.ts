@@ -1830,13 +1830,44 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 
 // Gårdssalg-specific candidate sub-pages — a bigger list than CR_CONTENT_PATHS
-// because these producers' useful content (visit/tasting/hours) tends to live
-// on dedicated sub-pages rather than the homepage itself. crFetchGardssalgContent
-// stops once it has fetched 5 pages total (homepage + up to 4 of these), not
-// all 10 — bounding requests per producer to the dev-request's "~5 sider" cap.
+// because these producers' useful content (visit/tasting/hours/products) tends
+// to live on dedicated sub-pages rather than the homepage itself.
+// crFetchGardssalgContent stops once it has fetched 5 pages total (homepage +
+// up to 4 of these), not all of the list below — bounding requests per
+// producer to the dev-request's "~5 sider" cap.
+//
+// dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 2:
+// measured root cause was that this list contained ZERO product-oriented
+// paths, so generateGardssalgProductList() could never see product content
+// for producers whose product info lives on a dedicated page — it was never
+// even fetched. Fix: product-ish paths ("/produkter", "/nettbutikk", …) are
+// now INTERLEAVED near the front, not just appended, because the fetch loop
+// below stops at 4 successful sub-pages and tries paths in array order — a
+// path buried at position 9 only ever gets a slot on a site that fails on
+// everything earlier. Plain append-at-end would have re-created the same bug
+// class this dev-request exists to fix (front-of-list paths structurally
+// starving out back-of-list ones), just for products this time instead of
+// against them.
+//
+// Deliberately NOT fully front-loaded: combinedHtml (built from this same
+// list) is shared with summarizeVisit()/extractOpeningHours() for
+// visit_text/opening_hours_text (about_text is exempt — summarizeAbout()
+// reads only the primary homepage HTML, never combinedHtml, so it cannot be
+// affected by this list or its order at all). A few generic paths
+// ("/kontakt", "/besok") are kept in the front interleave, not pushed past
+// position 4, so a site with several product-ish pages can't reliably crowd
+// out every generic slot at once — see the products test suite's
+// path-priority coverage note in the Skive 2 build report for how narrow
+// this protection actually is (it's a placement choice, not a reserved
+// quota: a real site can still fill all 4 slots with product-ish hits if
+// every one of /produkter, /nettbutikk, /kontakt and /sortiment resolves,
+// which is plausible but not the common case).
 const GARDSSALG_CONTENT_PATHS: readonly string[] = [
-  "/om-oss", "/om", "/besok", "/besøk", "/smaking",
-  "/smaksprover", "/smaksprøver", "/kontakt", "/apningstider", "/åpningstider",
+  "/produkter", "/nettbutikk", "/kontakt", "/sortiment",
+  "/besok", "/produkt", "/besøk", "/vare-produkter",
+  "/om-oss", "/varer", "/om", "/ol", "/øl",
+  "/smaking", "/smaksprover", "/smaksprøver",
+  "/apningstider", "/åpningstider",
 ];
 const GARDSSALG_MAX_PAGES = 5; // homepage + up to 4 sub-pages
 
