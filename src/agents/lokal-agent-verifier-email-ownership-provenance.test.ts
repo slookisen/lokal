@@ -267,16 +267,25 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
       assertTrue(!r1.flags.includes("email_ownership_unproven"),
         "eop-04: report-only case does NOT push the advisory gate.flags entry (zero effect on outcome)");
 
-      // ── Case 2 assertions (enforcement) ─────────────────────────────────
+      // ── Case 2 assertions — POLICY CHANGED 2026-08-10 (Daniel) ──────────
+      // Was: "enforcement" — a not-already-verified agent with an unproven
+      // free-mail address was quarantined to review_required. Daniel:
+      //   «gmail domener og forsåvidt hotmail og andre er ok å bruke. Vi
+      //    sender ikke sensitiv data, men du skal ikke lage fiktive eposter.»
+      //   (daniel-responses/2026-08-10-frimeil-policy-og-ingen-fiktive-eposter.md)
+      // A free-mail DOMAIN is a normal contact address for a small Norwegian
+      // producer, so it must never cost an agent its pool place. The signal is
+      // kept (flag + envelope counter) so wrong contacts stay observable; only
+      // the consequence is retired. These assertions now encode the new policy.
       const r2 = resultFor("agent-not-yet-verified");
-      assertEq(r2.new_verification_status, "review_required",
-        "eop-05: NOT-already-verified agent with unproven free-mail email is quarantined to review_required (not verified)");
-      assertTrue(r2.flags.includes("email_ownership_unproven"),
-        "eop-06: enforced case DOES push the advisory gate.flags entry");
-      assertEq(r2.email_ownership_report_only, false,
-        "eop-07: enforced case is NOT report-only");
+      assertEq(r2.new_verification_status, "verified",
+        "eop-05: NOT-already-verified agent with unproven free-mail email is NO LONGER quarantined (Daniel 2026-08-10)");
+      assertTrue(!r2.flags.includes("email_ownership_unproven"),
+        "eop-06: no advisory gate.flags entry is pushed — that flag drove the quarantine");
+      assertEq(r2.email_ownership_report_only, true,
+        "eop-07: report-only now applies to every agent, not just already-verified ones");
       assertEq(r2.email_ownership_unproven, true,
-        "eop-08: enforced case is flagged unproven");
+        "eop-08: the unproven SIGNAL is still raised — we keep watching wrong contacts");
 
       // ── Case 3 assertions (evidence path A) ─────────────────────────────
       const r3 = resultFor("agent-homepage-evidence");
@@ -314,12 +323,15 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
       const r6 = resultFor("agent-stale-homepage-evidence");
       assertEq(r6.email_ownership_unproven, true,
         "eop-19b: homepage evidence whose source_url host != this agent's own agent_url host does NOT clear the unproven flag (fail closed)");
-      assertEq(r6.email_ownership_report_only, false,
-        "eop-19c: not-already-verified, so the host-mismatched-evidence case is enforced, not report-only");
-      assertEq(r6.new_verification_status, "review_required",
-        "eop-19d: host-mismatched homepage evidence does not rescue — agent is quarantined to review_required");
-      assertTrue(r6.flags.includes("email_ownership_unproven"),
-        "eop-19e: host-mismatched-evidence case pushes the advisory gate.flags entry");
+      // Policy 2026-08-10: the host-mismatch check still refuses to COUNT the
+      // stale evidence (eop-19b above, unchanged — fail closed on evidence),
+      // but the unproven signal no longer quarantines anyone.
+      assertEq(r6.email_ownership_report_only, true,
+        "eop-19c: host-mismatched-evidence case is report-only like every other free-mail row now");
+      assertEq(r6.new_verification_status, "verified",
+        "eop-19d: unproven free-mail no longer quarantines — outcome follows the other guards only");
+      assertTrue(!r6.flags.includes("email_ownership_unproven"),
+        "eop-19e: no advisory gate.flags entry is pushed under the new policy");
 
       // ── DB write-through sanity: case 1 truly left verification_status
       // untouched in agent_knowledge (not just in the in-memory result). ──
@@ -332,8 +344,8 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
       const dbRow2 = db
         .prepare("SELECT verification_status FROM agent_knowledge WHERE agent_id = ?")
         .get("agent-not-yet-verified") as { verification_status: string };
-      assertEq(dbRow2.verification_status, "review_required",
-        "eop-21: agent_knowledge.verification_status for the enforced agent is written as 'review_required'");
+      assertEq(dbRow2.verification_status, "verified",
+        "eop-21: agent_knowledge.verification_status for the formerly-enforced agent is now written as 'verified' (DB write matches the new policy)");
 
       // ── buildRunEnvelope claims from this same real run ─────────────────
       const envelope = buildRunEnvelope({
@@ -349,17 +361,21 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
       );
       assertTrue(!!enforcedClaim, "eop-22: buildRunEnvelope includes the enforced-count claim");
       assertTrue(!!reportOnlyClaim, "eop-23: buildRunEnvelope includes the report-only claim");
-      assertEq(enforcedClaim?.value, 2,
-        `eop-24: enforced claim counts agent-not-yet-verified + agent-stale-homepage-evidence (got ${enforcedClaim?.value})`);
-      assertEq(reportOnlyClaim?.value, 1,
-        `eop-25: report-only claim counts exactly agent-already-verified (got ${reportOnlyClaim?.value})`);
+      // Policy 2026-08-10: with the quarantine retired, every unproven
+      // free-mail row is report-only — so the enforced count falls to 0 and
+      // all three unproven agents land in the report-only bucket. The claims
+      // themselves are unchanged (still emitted, still counted) — that is the
+      // point of keeping the signal.
+      assertEq(enforcedClaim?.value, 0,
+        `eop-24: enforced claim is now always 0 — nothing is quarantined for free-mail (got ${enforcedClaim?.value})`);
+      assertEq(reportOnlyClaim?.value, 3,
+        `eop-25: report-only claim counts all three unproven free-mail agents (got ${reportOnlyClaim?.value})`);
       const examples = (reportOnlyClaim?.meta as any)?.examples as Array<{ agent_id: string; name: string | null }>;
       assertTrue(Array.isArray(examples), "eop-26: report-only claim meta.examples is an array");
-      assertEq(examples?.length, 1, `eop-27: report-only claim has exactly 1 example (got ${examples?.length})`);
-      assertEq(examples?.[0]?.agent_id, "agent-already-verified",
-        "eop-28: report-only example has the right agent_id");
-      assertEq(examples?.[0]?.name, "Alreadygard AS",
-        "eop-29: report-only example includes the agent name");
+      assertEq(examples?.length, 3, `eop-27: report-only claim has one example per unproven agent (got ${examples?.length})`);
+      assertTrue(
+        examples?.some((e) => e.agent_id === "agent-already-verified" && e.name === "Alreadygard AS"),
+        "eop-28/29: the originally-report-only agent is still present, with its name");
 
       // ── Case 6: buildRunEnvelope shape with a synthetic mixed batch, incl.
       // the >5-examples cap. Built directly (not via runVerifierBatch) so we
