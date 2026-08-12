@@ -37,7 +37,7 @@ import { getJWKS } from "../services/agent-card-signing";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { generalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isJunkDescription } from "../services/description-quality";
+import { isJunkDescription, looksTruncatedMidWord } from "../services/description-quality";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
@@ -4706,8 +4706,22 @@ router.get("/kategori/gardssalg/:typeSlug", (req: Request, res: Response, next: 
 // type-general placeholder as before (not a fabricated specific claim about
 // any one producer — keeps the faithfulness guard's spirit). The
 // practical-info table only ever renders rows it has real data for.
+// 2026-08-12 (arbeidspunkt 5 of dev-request
+// 2026-07-19-opplevagent-forside-seksjoner-design): collapse consecutive
+// duplicate values (case-insensitive, trimmed) so poststed==kommune (a real
+// live bug — e.g. both "Stange") doesn't render "Stange, Stange, Innlandet"
+// on the hero subtitle, <title>, meta description, JSON-LD address, and map
+// label — every one of which derives from this single function. Only
+// ADJACENT duplicates collapse (matching the field order poststed → kommune
+// → fylke, where a real duplicate is always the neighbor), so this stays a
+// narrow fix for the exact observed bug, not a general dedup of the trio.
 function drivingSted(p: GardssalgProviderRow): string {
-  return [p.poststed, p.kommune, p.fylke].filter(Boolean).join(", ");
+  const parts = [p.poststed, p.kommune, p.fylke].filter(Boolean) as string[];
+  const deduped = parts.filter((part, i) => {
+    if (i === 0) return true;
+    return part.trim().toLowerCase() !== parts[i - 1].trim().toLowerCase();
+  });
+  return deduped.join(", ");
 }
 
 // Generic, type-general "what a visit typically includes" copy — intentionally
@@ -4790,6 +4804,10 @@ router.get(
     // doc comment on it). A revoked/expired session must NOT flip this back to
     // "unclaimed" (AC6) — claimed_at means "has been claimed at some point".
     const isClaimed = provider.claimed_at != null;
+    // 2026-08-12 (arbeidspunkt 5): computed once, reused by both the
+    // reserve-notice AND the reserve-CTA's class/label below so they can
+    // never disagree about paused state.
+    const bookingPaused = isBookingPaused(provider.booking_live, provider.catalog_hidden);
     const sted = drivingSted(provider);
     const meta = drinkTypeMeta(provider.producer_type);
     const badge = drinkBadge(provider.producer_type);
@@ -4817,19 +4835,35 @@ router.get(
     // "Om produsenten" — real enriched copy (about_text) when the multi-page-
     // crawl slice has filled it; otherwise the same honest fallback as before
     // (real hjemmeside link when we have one, placeholder copy otherwise).
-    const aboutBody = provider.about_text && provider.about_text.trim()
-      ? `<p>${escapeHtml(provider.about_text)}</p>`
+    //
+    // 2026-08-12 (arbeidspunkt 5): a render-guard-only check — content-
+    // quality/enrichment ownership is unchanged, this is purely "don't
+    // render obviously-broken text regardless of what's in the DB".
+    // isJunkDescription() catches scraped nav-boilerplate;
+    // looksTruncatedMidWord() catches a raw byte-range scrape slice that
+    // begins/ends inside a word (see description-quality.ts). Either one
+    // failing means the field is treated as absent, same as today's
+    // missing-value fallback.
+    const hasRealAbout = !!(provider.about_text && provider.about_text.trim())
+      && !isJunkDescription(provider.about_text)
+      && !looksTruncatedMidWord(provider.about_text);
+    const aboutBody = hasRealAbout
+      ? `<p>${escapeHtml(provider.about_text as string)}</p>`
       : site
       ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
       : `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Utfyllende presentasjon publiseres fortløpende.</p>`;
 
     // "Besøket" — real enriched copy (visit_text) when present; otherwise the
     // existing type-general orientation, explicitly not a per-producer claim.
+    // Same dual render-guard as about_text above.
     const visitCopy = provider.producer_type
       ? VISIT_TYPE_COPY[provider.producer_type.toLowerCase()]
       : null;
-    const visitBody = provider.visit_text && provider.visit_text.trim()
-      ? `<p>${escapeHtml(provider.visit_text)}</p>`
+    const hasRealVisit = !!(provider.visit_text && provider.visit_text.trim())
+      && !isJunkDescription(provider.visit_text)
+      && !looksTruncatedMidWord(provider.visit_text);
+    const visitBody = hasRealVisit
+      ? `<p>${escapeHtml(provider.visit_text as string)}</p>`
       : visitCopy
       ? `<p>Et besøk hos ${escapeHtml(provider.navn)} inkluderer typisk ${visitCopy}. Nøyaktig program avtales ved reservasjon.</p>`
       : `<p>Detaljer om hva besøket hos ${escapeHtml(provider.navn)} inneholder, publiseres fortløpende. Book et besøk for å avtale program direkte med produsenten.</p>`;
@@ -4840,7 +4874,11 @@ router.get(
     const facts: Array<[string, string]> = [];
     if (sted) facts.push(["Sted", escapeHtml(sted)]);
     if (provider.adresse) facts.push(["Adresse", escapeHtml(provider.adresse)]);
-    if (provider.opening_hours_text && provider.opening_hours_text.trim()) facts.push(["Åpningstider", escapeHtml(provider.opening_hours_text)]);
+    if (
+      provider.opening_hours_text && provider.opening_hours_text.trim()
+      && !isJunkDescription(provider.opening_hours_text)
+      && !looksTruncatedMidWord(provider.opening_hours_text)
+    ) facts.push(["Åpningstider", escapeHtml(provider.opening_hours_text)]);
     if (site) facts.push(["Nettside", `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
     if (isDisplayablePhone(provider.telefon)) facts.push(["Telefon", `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
     if (provider.epost) facts.push(["E-post", `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
@@ -4912,9 +4950,11 @@ router.get(
     // description: real enriched about_text (truncated to ~300 chars, same cap
     // discipline as summarizeAbout) when present — a more accurate/faithful
     // structured-data description than the generic metaDesc; otherwise metaDesc
-    // as before.
-    const ldDescription = provider.about_text && provider.about_text.trim()
-      ? (provider.about_text.trim().length > 300 ? provider.about_text.trim().slice(0, 300).trim() + "…" : provider.about_text.trim())
+    // as before. Gated on the same `hasRealAbout` render-guard as aboutBody
+    // above (2026-08-12, arbeidspunkt 5) — a junk/truncated about_text must
+    // not leak into JSON-LD just because it's hidden from the visible body.
+    const ldDescription = hasRealAbout
+      ? (provider.about_text!.trim().length > 300 ? provider.about_text!.trim().slice(0, 300).trim() + "…" : provider.about_text!.trim())
       : metaDesc;
     const ld: Record<string, unknown> = {
       "@context": "https://schema.org",
@@ -5003,6 +5043,13 @@ ${BROWSE_CSS}
 .aside-card h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:12px}
 .reserve-cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4)}
 .reserve-cta:hover{text-decoration:none;filter:brightness(1.04)}
+/* 2026-08-12 (arbeidspunkt 5): paused-booking variant — same pill shape/
+   sizing as .reserve-cta for layout consistency, but a neutral/muted style
+   so the CTA never visually promises an active reservation it can't
+   deliver while booking is paused (the .reserve-notice right above it
+   already says so in words; this fix is the matching visual signal). */
+.reserve-cta-paused{display:block;text-align:center;background:var(--canvas-2);color:var(--ink-soft);font-weight:800;padding:14px 18px;border-radius:var(--r-pill);border:1px solid var(--line);box-shadow:none}
+.reserve-cta-paused:hover{text-decoration:none;background:var(--line)}
 .reserve-notice{font-size:.8rem;font-weight:600;color:var(--fjord-800);background:var(--canvas-2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:10px}
 .map-card{display:flex;align-items:center;gap:12px;color:var(--ink-soft);background:var(--canvas-2);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
 .map-card:hover{text-decoration:none;border-color:var(--fjord-600)}
@@ -5052,8 +5099,8 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
     <aside>
       <div class="aside-card">
         <h2>Reserver</h2>
-        ${isBookingPaused(provider.booking_live, provider.catalog_hidden) ? `<p class="reserve-notice">${BOOKING_NOT_ACTIVATED_MSG}${isClaimed ? "" : ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`}</p>` : ""}
-        <a id="reserve-cta" class="reserve-cta" href="${bookHref}">Reserver besøk</a>
+        ${bookingPaused ? `<p class="reserve-notice">${BOOKING_NOT_ACTIVATED_MSG}${isClaimed ? "" : ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`}</p>` : ""}
+        <a id="reserve-cta" class="${bookingPaused ? "reserve-cta-paused" : "reserve-cta"}" href="${bookHref}">${bookingPaused ? "Meld interesse" : "Reserver besøk"}</a>
       </div>
       <div class="aside-card">
         <h2>Sted</h2>
