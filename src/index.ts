@@ -66,6 +66,7 @@ import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
+import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
@@ -703,6 +704,12 @@ app.use("/admin", adminLimiter, adminRfbWebsiteDiscoveryRoutes);
 // homepage-provenance-batch auto-select leg blocks a given agent, with the
 // same predicates production uses. GET /admin/pool-blocker-explain.
 app.use("/admin/pool-blocker-explain", adminLimiter, adminPoolBlockerExplainRoutes);
+// dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 3 follow-up:
+// READ-ONLY, paginated listing of the agent IDs POST /admin/homepage-
+// provenance-batch's default auto-select would pick next (identical
+// predicate) — the enumeration primitive Skive 3's "batches of 25 until the
+// cohort is exhausted" plan needed but never had. GET /admin/homepage-provenance-cohort.
+app.use("/admin/homepage-provenance-cohort", adminLimiter, adminHomepageProvenanceCohortRoutes);
 // dev-requests/2026-08-07-rfb-contact-extraction.md: corroborated contact-
 // email extraction from a producer's own website for RFB `agents` rows whose
 // contact_email is blank or DNS-flagged-dead — writes agents.contact_email
