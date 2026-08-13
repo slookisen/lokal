@@ -47,7 +47,7 @@ import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
-import adminRunVerifierRoutes from "./routes/admin-run-verifier";
+import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { runDispatchTick } from "./routes/admin-loop-dispatch";
 import { resolveTickIntervalMin } from "./services/loop-dispatch";
@@ -1143,6 +1143,43 @@ if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
       console.error("[salgskanal-sync] failed:", err);
     }
   }, 60 * 60_000); // hourly check
+}
+
+// ─── dev-request 2026-08-13-verifier-rutine-stub-og-kadens: internal ─────
+// hourly lokal-agent-verifier scheduler ───────────────────────────────
+//
+// The real verifier (src/agents/lokal-agent-verifier.ts) is supposed to run
+// 9x/night (22:00-06:00 UTC, hourly) via POST /admin/run-verifier, but
+// nothing drove it on that cadence — it only fired ~4x/night from incidental
+// calls by other routines (declared_daily_rate=9, observed_daily_rate=4.0).
+// This closes that gap the same way the debio-sync / salgskanal-sync blocks
+// above do: hourly wakeup, self-gated on the window, calling the SAME code
+// path admin-run-verifier.ts's POST / handler uses (runVerifierTick) rather
+// than re-implementing it or doing an HTTP self-call.
+//
+// Gated OFF by default — only runs when VERIFIER_SCHEDULER_ENABLED=1 (see
+// fly.toml). Any other value, or omitting the var, is a no-op.
+let verifierTickRunning = false;
+if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
+  setInterval(async () => {
+    if (!isVerifierWindowHour(new Date().getUTCHours())) return;
+    if (verifierTickRunning) {
+      console.warn("[verifier-scheduler] tick skipped — a previous tick is still running");
+      return;
+    }
+    verifierTickRunning = true;
+    try {
+      const r = await runVerifierTick({ batchSize: 30 });
+      console.log(
+        `[verifier-scheduler] run_id=${r.run_id} processed=${r.processed} passed=${r.passed} ` +
+        `pending_verify=${r.pending_verify} review_required=${r.review_required} pool_added=${r.pool_added}`
+      );
+    } catch (err) {
+      console.error("[verifier-scheduler] tick failed:", err);
+    } finally {
+      verifierTickRunning = false;
+    }
+  }, 60 * 60_000); // hourly check, self-gated on the 22-06 UTC window
 }
 
 // ─── PR-103 (2026-06-03): Backend dental geocoding worker ───────────
