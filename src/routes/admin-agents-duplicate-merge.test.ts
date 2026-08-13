@@ -246,6 +246,37 @@ export function runAdminAgentsDuplicateMergeTests(opts: { log?: boolean } = {}):
       insertAgent.run("dm-dup-8b", "Duplicate Eight B AS", "post@dup8b.no", "key-dm-dup-8b", null);
       insertKnowledge.run("dm-dup-8b", null, null, null, null, null, null, "{}", "{}");
 
+      // (9) SURVIVOR is itself an already-merged/inactive row (was merged
+      //     into some earlier root "dm-root-9" by a prior pair) — repro from
+      //     the review finding: must not become a re-merge target.
+      insertAgent.run("dm-root-9", "Root Nine AS", "", "key-dm-root-9", null);
+      insertKnowledge.run("dm-root-9", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-surv-9", "Survivor Nine AS (dead)", "", "key-dm-surv-9", null);
+      db.prepare(`UPDATE agents SET is_active = 0, merged_into = ? WHERE id = ?`).run("dm-root-9", "dm-surv-9");
+      insertKnowledge.run("dm-surv-9", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-dup-9", "Duplicate Nine AS (live)", "post@dup9.no", "key-dm-dup-9", null);
+      insertKnowledge.run(
+        "dm-dup-9",
+        "Reell adresse 9",
+        "9999",
+        "https://dup9.no",
+        "90009000",
+        "kontakt@dup9.no",
+        "Reell gård 9.",
+        "{}",
+        "{}",
+      );
+
+      // (10) DUPLICATE already has merged_into set from a PRIOR merge into a
+      //      different survivor — must not be re-targeted at a new survivor.
+      insertAgent.run("dm-orig-surv-10", "Original Survivor Ten AS", "post@origsurv10.no", "key-dm-orig-surv-10", null);
+      insertKnowledge.run("dm-orig-surv-10", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-dup-10", "Duplicate Ten AS (already merged)", "", "key-dm-dup-10", null);
+      db.prepare(`UPDATE agents SET is_active = 0, merged_into = ? WHERE id = ?`).run("dm-orig-surv-10", "dm-dup-10");
+      insertKnowledge.run("dm-dup-10", null, null, null, null, null, null, "{}", "{}");
+      insertAgent.run("dm-surv-10", "New Would-Be Survivor Ten AS", "", "key-dm-surv-10", null);
+      insertKnowledge.run("dm-surv-10", null, null, null, null, null, null, "{}", "{}");
+
       delete require.cache[require.resolve("./admin-agents-duplicate-merge")];
       const routeMod = require("./admin-agents-duplicate-merge");
       const router = routeMod.default;
@@ -333,8 +364,8 @@ export function runAdminAgentsDuplicateMergeTests(opts: { log?: boolean } = {}):
       const fieldNames1 = audit1.map((a) => a.field_name).sort();
       assertEq(
         fieldNames1,
-        ["about", "address", "contact_email", "email", "phone", "postal_code", "website"].sort(),
-        "dm-21: one audit row per changed field on survivor",
+        ["about", "address", "contact_email", "email", "field_provenance", "phone", "postal_code", "website"].sort(),
+        "dm-21: one audit row per changed field on survivor, plus the field_provenance audit row",
       );
       const contactAudit1 = audit1.find((a) => a.field_name === "contact_email");
       assertEq(contactAudit1?.old_value, "", "dm-22: contact_email audit carries OLD value (reversible)");
@@ -411,6 +442,49 @@ export function runAdminAgentsDuplicateMergeTests(opts: { log?: boolean } = {}):
       assertEq(prov7.about?.length, 2, "dm-56: provenance APPENDED (2 entries), not overwritten");
       assertEq(prov7.about?.[0]?.value, "old-about-prov-noop", "dm-57: survivor's original provenance entry preserved first");
       assertEq(prov7.about?.[1]?.value, "Om gård 7", "dm-58: duplicate's provenance entry appended second");
+
+      // ── field_provenance change captured in audit trail (Finding 2) ─────
+      const provAudit7 = auditFor("dm-surv-7").find((a) => a.field_name === "field_provenance");
+      assertTrue(!!provAudit7, "dm-58a: a field_provenance audit row exists after a merge with a knowledge fill");
+      assertEq(
+        provAudit7?.old_value,
+        JSON.stringify({
+          about: [{ value: "old-about-prov-noop", source_type: "owner", fetched_at: "2026-01-01T00:00:00.000Z" }],
+        }),
+        "dm-58b: field_provenance audit old_value is the PRE-merge provenance blob",
+      );
+      assertEq(provAudit7?.new_value, kn7?.field_provenance, "dm-58c: field_provenance audit new_value matches the written blob");
+
+      // ── Finding 1: already-merged/dead-row guard ─────────────────────────
+      // (9) SURVIVOR is itself already merged-away -> reject, no writes at all
+      r = await post(PAIR("dm-surv-9", "dm-dup-9"), testKey, { apply: "1" });
+      assertEq(r.body?.results?.[0]?.outcome, "skipped_already_merged", "dm-59a: already-merged SURVIVOR -> skipped_already_merged");
+      assertEq(agentRow("dm-surv-9")?.contact_email, "", "dm-59b: dead survivor-9 contact_email untouched");
+      assertEq(agentRow("dm-surv-9")?.merged_into, "dm-root-9", "dm-59c: dead survivor-9's own merged_into NOT touched/clobbered");
+      assertEq(agentRow("dm-surv-9")?.is_active, 0, "dm-59d: dead survivor-9 still inactive");
+      assertEq(agentRow("dm-dup-9")?.contact_email, "post@dup9.no", "dm-59e: live duplicate-9's data untouched");
+      assertEq(agentRow("dm-dup-9")?.is_active, 1, "dm-59f: live duplicate-9 NOT deactivated (pair rejected)");
+      assertEq(agentRow("dm-dup-9")?.merged_into, null, "dm-59g: live duplicate-9 merged_into left null");
+      assertEq(knowledgeRow("dm-dup-9")?.address, "Reell adresse 9", "dm-59h: duplicate-9's real data never written anywhere else");
+      assertEq(auditFor("dm-surv-9").length, 0, "dm-59i: no audit rows written for dead survivor-9");
+      assertEq(auditFor("dm-dup-9").length, 0, "dm-59j: no audit rows written for duplicate-9");
+
+      // Dry-run must report the same rejection (not just the apply path).
+      r = await post(PAIR("dm-surv-9", "dm-dup-9"));
+      assertEq(r.body?.results?.[0]?.outcome, "skipped_already_merged", "dm-59k: dry-run also reports skipped_already_merged");
+
+      // (10) DUPLICATE already has merged_into set from a prior merge -> reject,
+      //      its existing merged_into must NOT be clobbered/retargeted, and no
+      //      data reaches the new would-be survivor.
+      r = await post(PAIR("dm-surv-10", "dm-dup-10"), testKey, { apply: "1" });
+      assertEq(r.body?.results?.[0]?.outcome, "skipped_already_merged", "dm-60a: already-merged DUPLICATE -> skipped_already_merged");
+      assertEq(agentRow("dm-dup-10")?.merged_into, "dm-orig-surv-10", "dm-60b: duplicate-10's merged_into NOT retargeted to new survivor");
+      assertEq(agentRow("dm-dup-10")?.is_active, 0, "dm-60c: duplicate-10 still inactive");
+      assertEq(agentRow("dm-surv-10")?.contact_email, "", "dm-60d: new would-be survivor-10 got no data written");
+      assertEq(knowledgeRow("dm-surv-10")?.address, null, "dm-60e: new would-be survivor-10 knowledge untouched");
+      assertEq(agentRow("dm-orig-surv-10")?.contact_email, "post@origsurv10.no", "dm-60f: original survivor-10 (untouched party) unaffected");
+      assertEq(auditFor("dm-surv-10").length, 0, "dm-60g: no audit rows written for would-be survivor-10");
+      assertEq(auditFor("dm-dup-10").length, 0, "dm-60h: no NEW audit rows written for duplicate-10");
 
       // ── (h) admin-key already covered above (dm-01/02) ────────────────────
 

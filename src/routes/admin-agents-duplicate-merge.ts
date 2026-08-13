@@ -174,6 +174,8 @@ interface AgentSnapshot {
   id: string;
   claimedAt: string | null;
   contactEmail: string | null;
+  isActive: boolean;
+  mergedInto: string | null;
   hasKnowledgeRow: boolean;
   knowledge: Record<KnowledgeMergeField, string | null>;
   curatedFields: string | null;
@@ -190,6 +192,7 @@ function readAgentSnapshot(db: ReturnType<typeof getDb>, id: string): AgentSnaps
   const row = db
     .prepare(
       `SELECT a.id AS a_id, a.claimed_at AS a_claimed_at, a.contact_email AS a_contact_email,
+              a.is_active AS a_is_active, a.merged_into AS a_merged_into,
               k.agent_id AS k_agent_id, k.address AS k_address, k.postal_code AS k_postal_code,
               k.website AS k_website, k.phone AS k_phone, k.email AS k_email, k.about AS k_about,
               k.curated_fields AS k_curated_fields, k.field_provenance AS k_field_provenance
@@ -197,24 +200,29 @@ function readAgentSnapshot(db: ReturnType<typeof getDb>, id: string): AgentSnaps
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.id = ?`,
     )
-    .get(id) as Record<string, string | null> | undefined;
+    .get(id) as Record<string, string | number | null> | undefined;
 
   if (!row) return null;
   return {
     id: row.a_id as string,
-    claimedAt: row.a_claimed_at,
-    contactEmail: row.a_contact_email,
+    claimedAt: row.a_claimed_at as string | null,
+    contactEmail: row.a_contact_email as string | null,
+    // agents.is_active is SQLite INTEGER DEFAULT 1 — 0 is false, anything
+    // else (including NULL, defensively) is truthy/active, same convention
+    // as claimed_at truthiness elsewhere in this file.
+    isActive: row.a_is_active !== 0,
+    mergedInto: row.a_merged_into as string | null,
     hasKnowledgeRow: row.k_agent_id !== null,
     knowledge: {
-      address: row.k_address,
-      postal_code: row.k_postal_code,
-      website: row.k_website,
-      phone: row.k_phone,
-      email: row.k_email,
-      about: row.k_about,
+      address: row.k_address as string | null,
+      postal_code: row.k_postal_code as string | null,
+      website: row.k_website as string | null,
+      phone: row.k_phone as string | null,
+      email: row.k_email as string | null,
+      about: row.k_about as string | null,
     },
-    curatedFields: row.k_curated_fields,
-    fieldProvenance: row.k_field_provenance,
+    curatedFields: row.k_curated_fields as string | null,
+    fieldProvenance: row.k_field_provenance as string | null,
   };
 }
 
@@ -268,6 +276,25 @@ function computeFillPlan(survivor: AgentSnapshot, duplicate: AgentSnapshot): Mer
 
 function curatedDetail(curatedSkipped: string[]): string | undefined {
   return curatedSkipped.length > 0 ? curatedSkipped.map((f) => `skipped_curated_field:${f}`).join(",") : undefined;
+}
+
+/**
+ * True iff this pair must be rejected as a re-merge of an already-merged/dead
+ * row. Two distinct conditions, either one is fatal to the pair:
+ *   - the SURVIVOR is not active (it was itself already merged away as a
+ *     duplicate by some earlier pair) — writing fills onto it would bury
+ *     real data on a row invisible to any live-facing query.
+ *   - the DUPLICATE already has a non-null merged_into (it was already
+ *     merged into some other survivor) — retargeting it here would silently
+ *     redirect it away from its original survivor and re-run the
+ *     fill/deactivate logic on a row that's already resolved.
+ * Deliberately does NOT block on the duplicate simply being is_active=0 with
+ * no merged_into (e.g. deactivated for an unrelated reason), and does NOT
+ * block on the survivor having some unrelated merged_into value — only the
+ * two conditions above are the defect this guards against.
+ */
+function isAlreadyMergedPair(survivor: AgentSnapshot, duplicate: AgentSnapshot): boolean {
+  return !survivor.isActive || duplicate.mergedInto !== null;
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────
@@ -327,6 +354,17 @@ function applyMergeWrites(
       ).run(randomUUID(), survivor.id, f.field, oldValue, f.newValue, `${batchTag}: ${reason}`);
       fieldsFilled.push(f.field);
     }
+
+    // field_provenance itself changed on the survivor row (append-only merge
+    // above) but is never one of KNOWLEDGE_MERGE_FIELDS, so the per-field
+    // loop above never captures it — without this row the provenance change
+    // would be un-reversible from the audit trail alone (see header comment,
+    // "rollback recipe reconstructable from audit old_values").
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, 'field_provenance', ?, ?, 'system', NULL, datetime('now'), ?)`,
+    ).run(randomUUID(), survivor.id, survivor.fieldProvenance, mergedProvenance, `${batchTag}: ${reason}`);
   }
 
   // Mandatory, independent of whether any field above was fillable: the
@@ -345,6 +383,7 @@ type PairOutcome =
   | "would_merge"
   | "merged"
   | "skipped_claimed"
+  | "skipped_already_merged"
   | "skipped_same_id"
   | "not_found"
   | "rejected_invalid_item"
@@ -362,6 +401,7 @@ function planMergePair(db: ReturnType<typeof getDb>, survivorId: string, duplica
   const duplicate = readAgentSnapshot(db, duplicateId);
   if (!survivor || !duplicate) return { outcome: "not_found" };
   if (survivor.claimedAt || duplicate.claimedAt) return { outcome: "skipped_claimed" };
+  if (isAlreadyMergedPair(survivor, duplicate)) return { outcome: "skipped_already_merged" };
 
   const plan = computeFillPlan(survivor, duplicate);
   return {
@@ -391,6 +431,7 @@ function applyMergePair(
       const duplicate = readAgentSnapshot(db, duplicateId);
       if (!survivor || !duplicate) return { outcome: "not_found" };
       if (survivor.claimedAt || duplicate.claimedAt) return { outcome: "skipped_claimed" };
+      if (isAlreadyMergedPair(survivor, duplicate)) return { outcome: "skipped_already_merged" };
 
       const plan = computeFillPlan(survivor, duplicate);
       const { fieldsFilled } = applyMergeWrites(db, survivor, duplicate, plan, reason, batchTag);
