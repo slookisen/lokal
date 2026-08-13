@@ -38,6 +38,159 @@ function requireAdmin(req: Request, res: Response): boolean {
   return true;
 }
 
+// isVerifierWindowHour — the SAME 22:00-06:00 UTC gate this route enforces,
+// exposed so other in-process callers (e.g. index.ts's internal hourly
+// scheduler, dev-request 2026-08-13-verifier-rutine-stub-og-kadens) can
+// self-gate on the identical window logic instead of redeclaring the hour
+// array.
+export function isVerifierWindowHour(hourUTC: number): boolean {
+  return ALLOWED_UTC_HOURS.includes(hourUTC);
+}
+
+// runVerifierTick — the actual verifier-batch-run + stat-computation +
+// envelope-record logic, extracted out of the POST / handler below so it
+// can be called directly from in-process schedulers (dev-request
+// 2026-08-13-verifier-rutine-stub-og-kadens) without an HTTP self-call.
+// This is the exact body that used to live inline in the route handler —
+// a refactor, not a behavior change: the route handler (below) still
+// produces byte-identical JSON responses by calling this and shaping the
+// result the same way it always did.
+export async function runVerifierTick(opts: {
+  batchSize?: number;
+  reprocessReviewQueue?: boolean;
+  biasGrowth?: boolean;
+} = {}): Promise<{
+  success: true;
+  run_id: string;
+  processed: number;
+  passed: number;
+  review_required: number;
+  pending_verify: number;
+  data_insufficient: number;
+  http_unreachable: number;
+  brreg_inactive: number;
+  domain_incoherent: number;
+  email_domain_mismatch: number;
+  thin_content: number;
+  pool_added: number;
+  status_transitions: number;
+  transitioned: number;
+  by_new_status: Record<string, number>;
+  persisted: true;
+  envelope_recorded: boolean;
+  reprocess_review_queue: boolean;
+  bias_growth: boolean;
+}> {
+  const batchSize = Math.min(
+    Math.max(parseInt(String(opts.batchSize ?? (process.env.VERIFY_BATCH_SIZE ?? "30")), 10) || 30, 1),
+    100
+  );
+  const reprocessReviewQueue = !!opts.reprocessReviewQueue;
+  // orch-pr-87: bias_growth flag (default true) — use pickBatchBiased
+  // (70/30 growth-reservoir split) unless explicitly disabled. Has no
+  // effect when reprocessReviewQueue is set (review-queue drain mode
+  // still uses pickReviewQueueBatch).
+  const biasGrowth = opts.biasGrowth === undefined ? true : !!opts.biasGrowth;
+
+  const batchResult = await runVerifierBatch(
+    reprocessReviewQueue
+      ? { batchSize, pickFn: pickReviewQueueBatch }
+      : biasGrowth
+        ? { batchSize, pickFn: pickBatchBiased }
+        : { batchSize }
+  );
+  const results = batchResult.results;
+
+  const passed = results.filter((r) => r.passed).length;
+  const reviewRequired = results.filter((r) => r.new_verification_status === "review_required").length;
+  const pendingVerify = results.filter((r) => r.new_verification_status === "pending_verify").length;
+  const dataInsufficient = results.filter((r) => r.new_verification_status === "data_insufficient").length;
+  const httpUnreachable = results.filter((r) => r.flags.includes("website_unreachable")).length;
+  const brregInactive = results.filter((r) =>
+    r.flags.some((f: string) => f === "brreg_inactive" || f === "brreg_konkurs")
+  ).length;
+  // orch-PR-20260512-33: domain-coherence overrides (Eidsmo fix)
+  const domainIncoherent = results.filter((r) => r.domain_incoherent).length;
+  const pooledNew = results.filter((r) => r.outreach_eligible_at !== null).length;
+  // orch-pr-20260614-4: flag-level observability so operators can measure
+  // the free-mail exemption effect and track thin-content prevalence.
+  const email_domain_mismatch = results.filter((r) => r.flags.includes("email_domain_mismatch")).length;
+  const thin_content = results.filter((r) => r.flags.includes("thin_content")).length;
+  // dev-request 2026-07-19-verifier-drain-persistens-og-throughput: this
+  // endpoint's outcomes are ALWAYS written to agent_knowledge (every
+  // candidate goes through applyVerifierOutcome unconditionally — there
+  // is no evaluate-only/dry-run mode today). `persisted` makes that
+  // explicit so a caller never again has to infer it from an unrelated
+  // field. `status_transitions` distinguishes a real status change from
+  // a re-confirmation of the same status (e.g. a review_required agent
+  // whose underlying evidence hasn't changed since the last pass will
+  // correctly persist review_required again — that is NOT a sign the
+  // write failed; `passed` alone (the basic quality-gate result, which
+  // can be true even when a stricter downstream guard still routes the
+  // agent to review_required) cannot tell these two cases apart.
+  const statusTransitions = results.filter(
+    (r) => r.prior_verification_status !== r.new_verification_status
+  ).length;
+  // dev-request 2026-08-10-verifier-portkjede-og-provenansrydding (Skive B):
+  // `passed` is the basic-gate result ONLY (computeKvalitetsGate: http_status,
+  // email, website, about, products, brreg) — it says nothing about whether the
+  // stricter cross-source/domain-coherence/email-ownership guards let the agent
+  // through, and nothing about whether this run actually changed anything. A
+  // high `passed` count over a backlog sweep can co-exist with near-zero real
+  // promotions when most candidates were already `verified` and simply re-pass
+  // the basic gate every round (see the dev-request's root-cause report). Expose
+  // the transition count under the name the report's fix asked for (`transitioned`,
+  // same value as the pre-existing `status_transitions` — kept for compatibility)
+  // plus a breakdown of what those transitions actually became, so a caller reading
+  // the response never again has to infer promotion counts from `passed`.
+  const transitioned = statusTransitions;
+  const byNewStatus: Record<string, number> = {};
+  for (const r of results) {
+    if (r.prior_verification_status === r.new_verification_status) continue;
+    byNewStatus[r.new_verification_status] = (byNewStatus[r.new_verification_status] ?? 0) + 1;
+  }
+
+  // Build envelope and record directly via service (no HTTP roundtrip)
+  const envelope: any = buildRunEnvelope({
+    run_id: batchResult.run_id,
+    started_at: batchResult.started_at,
+    finished_at: batchResult.finished_at,
+    results,
+  });
+  if (!envelope.evidence) envelope.evidence = [];
+
+  let envelopeRecorded = false;
+  try {
+    recordRun(envelope);
+    envelopeRecorded = true;
+  } catch (e: any) {
+    console.error(`[admin/run-verifier] envelope record failed:`, e?.message || e);
+  }
+
+  return {
+    success: true,
+    run_id: batchResult.run_id,
+    processed: results.length,
+    passed,
+    review_required: reviewRequired,
+    pending_verify: pendingVerify,
+    data_insufficient: dataInsufficient,
+    http_unreachable: httpUnreachable,
+    brreg_inactive: brregInactive,
+    domain_incoherent: domainIncoherent,
+    email_domain_mismatch,
+    thin_content,
+    pool_added: pooledNew,
+    status_transitions: statusTransitions,
+    transitioned,
+    by_new_status: byNewStatus,
+    persisted: true,
+    envelope_recorded: envelopeRecorded,
+    reprocess_review_queue: reprocessReviewQueue,
+    bias_growth: biasGrowth,
+  };
+}
+
 // POST /admin/run-verifier
 //   Optional body: { batchSize?: number, force?: boolean }
 //   Optional query: ?force=1
@@ -85,104 +238,31 @@ router.post("/", async (req: Request, res: Response) => {
     : !(biasGrowthRaw === "0" || biasGrowthRaw === 0 || biasGrowthRaw === false || biasGrowthRaw === "false");
 
   try {
-    const batchResult = await runVerifierBatch(
-      reprocessReviewQueue
-        ? { batchSize, pickFn: pickReviewQueueBatch }
-        : biasGrowth
-          ? { batchSize, pickFn: pickBatchBiased }
-          : { batchSize }
-    );
-    const results = batchResult.results;
-
-    const passed = results.filter((r) => r.passed).length;
-    const reviewRequired = results.filter((r) => r.new_verification_status === "review_required").length;
-    const pendingVerify = results.filter((r) => r.new_verification_status === "pending_verify").length;
-    const dataInsufficient = results.filter((r) => r.new_verification_status === "data_insufficient").length;
-    const httpUnreachable = results.filter((r) => r.flags.includes("website_unreachable")).length;
-    const brregInactive = results.filter((r) =>
-      r.flags.some((f: string) => f === "brreg_inactive" || f === "brreg_konkurs")
-    ).length;
-    // orch-PR-20260512-33: domain-coherence overrides (Eidsmo fix)
-    const domainIncoherent = results.filter((r) => r.domain_incoherent).length;
-    const pooledNew = results.filter((r) => r.outreach_eligible_at !== null).length;
-    // orch-pr-20260614-4: flag-level observability so operators can measure
-    // the free-mail exemption effect and track thin-content prevalence.
-    const email_domain_mismatch = results.filter((r) => r.flags.includes("email_domain_mismatch")).length;
-    const thin_content = results.filter((r) => r.flags.includes("thin_content")).length;
-    // dev-request 2026-07-19-verifier-drain-persistens-og-throughput: this
-    // endpoint's outcomes are ALWAYS written to agent_knowledge (every
-    // candidate goes through applyVerifierOutcome unconditionally — there
-    // is no evaluate-only/dry-run mode today). `persisted` makes that
-    // explicit so a caller never again has to infer it from an unrelated
-    // field. `status_transitions` distinguishes a real status change from
-    // a re-confirmation of the same status (e.g. a review_required agent
-    // whose underlying evidence hasn't changed since the last pass will
-    // correctly persist review_required again — that is NOT a sign the
-    // write failed; `passed` alone (the basic quality-gate result, which
-    // can be true even when a stricter downstream guard still routes the
-    // agent to review_required) cannot tell these two cases apart.
-    const statusTransitions = results.filter(
-      (r) => r.prior_verification_status !== r.new_verification_status
-    ).length;
-    // dev-request 2026-08-10-verifier-portkjede-og-provenansrydding (Skive B):
-    // `passed` is the basic-gate result ONLY (computeKvalitetsGate: http_status,
-    // email, website, about, products, brreg) — it says nothing about whether the
-    // stricter cross-source/domain-coherence/email-ownership guards let the agent
-    // through, and nothing about whether this run actually changed anything. A
-    // high `passed` count over a backlog sweep can co-exist with near-zero real
-    // promotions when most candidates were already `verified` and simply re-pass
-    // the basic gate every round (see the dev-request's root-cause report). Expose
-    // the transition count under the name the report's fix asked for (`transitioned`,
-    // same value as the pre-existing `status_transitions` — kept for compatibility)
-    // plus a breakdown of what those transitions actually became, so a caller reading
-    // the response never again has to infer promotion counts from `passed`.
-    const transitioned = statusTransitions;
-    const byNewStatus: Record<string, number> = {};
-    for (const r of results) {
-      if (r.prior_verification_status === r.new_verification_status) continue;
-      byNewStatus[r.new_verification_status] = (byNewStatus[r.new_verification_status] ?? 0) + 1;
-    }
-
-    // Build envelope and record directly via service (no HTTP roundtrip)
-    const envelope: any = buildRunEnvelope({
-      run_id: batchResult.run_id,
-      started_at: batchResult.started_at,
-      finished_at: batchResult.finished_at,
-      results,
-    });
-    if (!envelope.evidence) envelope.evidence = [];
-
-    let envelopeRecorded = false;
-    try {
-      recordRun(envelope);
-      envelopeRecorded = true;
-    } catch (e: any) {
-      console.error(`[admin/run-verifier] envelope record failed:`, e?.message || e);
-    }
+    const tick = await runVerifierTick({ batchSize, reprocessReviewQueue, biasGrowth });
 
     res.json({
       success: true,
-      run_id: batchResult.run_id,
-      processed: results.length,
-      passed,
-      review_required: reviewRequired,
-      pending_verify: pendingVerify,
-      data_insufficient: dataInsufficient,
-      http_unreachable: httpUnreachable,
-      brreg_inactive: brregInactive,
-      domain_incoherent: domainIncoherent,
-      email_domain_mismatch,
-      thin_content,
-      pool_added: pooledNew,
-      status_transitions: statusTransitions,
-      transitioned,
-      by_new_status: byNewStatus,
-      persisted: true,
-      envelope_recorded: envelopeRecorded,
+      run_id: tick.run_id,
+      processed: tick.processed,
+      passed: tick.passed,
+      review_required: tick.review_required,
+      pending_verify: tick.pending_verify,
+      data_insufficient: tick.data_insufficient,
+      http_unreachable: tick.http_unreachable,
+      brreg_inactive: tick.brreg_inactive,
+      domain_incoherent: tick.domain_incoherent,
+      email_domain_mismatch: tick.email_domain_mismatch,
+      thin_content: tick.thin_content,
+      pool_added: tick.pool_added,
+      status_transitions: tick.status_transitions,
+      transitioned: tick.transitioned,
+      by_new_status: tick.by_new_status,
+      persisted: tick.persisted,
+      envelope_recorded: tick.envelope_recorded,
       hour_utc: hourUTC,
       forced: !!force,
-      reprocess_review_queue: !!reprocessReviewQueue,
-      bias_growth: !!biasGrowth,
+      reprocess_review_queue: tick.reprocess_review_queue,
+      bias_growth: tick.bias_growth,
     });
   } catch (err: any) {
     res.status(500).json({

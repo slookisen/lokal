@@ -21,6 +21,13 @@ primary_region = 'arn'
   # so turning this on routes the notification solely to that test provider's email.
   # To pause again: set to 'false' (fail-safe: anything but the literal "true" = off).
   BOOKING_DISPATCH_ENABLED = 'true'
+  # dev-request 2026-08-13-verifier-rutine-stub-og-kadens: turns on the
+  # internal hourly lokal-agent-verifier scheduler in src/index.ts. The code
+  # defaults OFF (gate is `=== "1"`, so this line — set to the exact string
+  # '1' — is what actually turns it on). Setting it to any other value (e.g.
+  # 'true') or removing the line entirely turns it back off, with no
+  # redeploy-side-effects beyond that.
+  VERIFIER_SCHEDULER_ENABLED = '1'
 
 [[mounts]]
   source = 'lokal_data'
