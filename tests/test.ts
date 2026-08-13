@@ -30195,6 +30195,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of essc.failures) failures.push("experiences-seo-site-chrome: " + f);
     console.log(`  experiences-seo-site-chrome: ${essc.passed} passed, ${essc.failed} failed`);
 
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 7
+    // (fylkesblokk-kompaktering): max-width:560px media query compacting the
+    // homepage "Utforsk etter fylke" grid to 2 columns on mobile (same
+    // markup/data, denser only below the mobile breakpoint).
+    console.log("\n── experiences-seo-fylke-mobile-compact: fylkesblokk 2-col mobile (arbeidspunkt 7) ──");
+    const { runExperiencesSeoFylkeMobileCompactTests } = require("../src/routes/experiences-seo-fylke-mobile-compact.test") as
+      typeof import("../src/routes/experiences-seo-fylke-mobile-compact.test");
+    const esfmc = await runExperiencesSeoFylkeMobileCompactTests({ log: false });
+    passed += esfmc.passed;
+    failed += esfmc.failed;
+    for (const f of esfmc.failures) failures.push("experiences-seo-fylke-mobile-compact: " + f);
+    console.log(`  experiences-seo-fylke-mobile-compact: ${esfmc.passed} passed, ${esfmc.failed} failed`);
+
     // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2:
     // illustrated SVG hero scene (forside/drikke motifs) + the homepage
     // drikkested feature section + countGardssalgProvidersByType(). Covers
