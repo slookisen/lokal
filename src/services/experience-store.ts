@@ -6256,16 +6256,24 @@ export function applyGardssalgProviderWebsite(
     (existingUrl === cleanUrl ||
       normalizeUrlForAtPlaceComparison(existingUrl) === normalizeUrlForAtPlaceComparison(cleanUrl));
 
-  // The http(s):// scheme sanity gate only matters for candidates that could
-  // actually be WRITTEN (the fill path stores cleanUrl verbatim). A
-  // normalized-only at-place match (e.g. Brreg-sourced "www.foo.no" with no
-  // scheme) never gets written — the at-place branch below stamps
-  // provenance only and leaves the column exactly as existingUrl (which was
-  // already schema-validated when it was first stored) — so a scheme-less
-  // candidate is safe to accept here PURELY for comparison purposes. A
-  // scheme-less candidate on a row that turns out NOT at-place still hits
-  // this gate exactly as before.
-  if (!isAtPlace && !/^https?:\/\/\S+\.\S+/i.test(cleanUrl)) return [];
+  // Sanity gate: reject garbage (no dot, whitespace-only, etc.) on the fill
+  // path — the at-place branch below never writes cleanUrl at all (it only
+  // stamps provenance and leaves the column as existingUrl, which was
+  // already schema-validated when first stored), so it's exempt.
+  //
+  // 2026-08-13 (dev-request 2026-08-07-kontaktjakt-drikkeprodusenter,
+  // Daniel-ordered live fix): the scheme (http(s)://) used to be REQUIRED
+  // here even on the fill path. That silently blocked exactly the
+  // Brreg-sourced and website-discovery candidates this table already
+  // stores scheme-less elsewhere (e.g. existing hjemmeside values like
+  // "cervisiam.no", "northbrew.no" with no protocol) — a genuinely NEW,
+  // well-evidenced candidate (brreg_registered_hjemmeside reason, real
+  // org.nr match) could reach this function and still be silently refused
+  // as write_skipped_by_guards for no reason other than missing "https://".
+  // The scheme is now optional; cleanUrl is still stored verbatim below
+  // either way, so a scheme-less accepted candidate is persisted scheme-less
+  // — consistent with what's already in this column today.
+  if (!isAtPlace && !/^(https?:\/\/)?\S+\.\S+/i.test(cleanUrl)) return [];
 
   if (!isAtPlace) {
     if (row.hjemmeside && row.hjemmeside.trim() !== "") return []; // fill-only
