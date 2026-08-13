@@ -234,8 +234,17 @@ async function defaultRenderImpl(
 ): Promise<{ html: string; finalUrl: string }> {
   let chromium: any;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    ({ chromium } = await import("playwright-core"));
+    // The specifier is built at runtime, NOT written as a literal, and that is
+    // load-bearing rather than stylistic: `await import("playwright-core")`
+    // makes TypeScript resolve the module at COMPILE time, so `npx tsc` fails
+    // with TS2307 anywhere the package is absent — which is every clean
+    // install, including CI and the production build. This module's whole
+    // premise is that it ships inert without the dependency; a version that
+    // cannot compile without it breaks the build instead. (Caught by CI on
+    // slookisen/lokal#573 after a local typecheck passed only because a
+    // --no-save install had left the package lying around.)
+    const spec = "playwright-core";
+    ({ chromium } = await import(spec));
   } catch {
     throw new Error("PLAYWRIGHT_UNAVAILABLE: playwright-core is not installed in this environment");
   }
