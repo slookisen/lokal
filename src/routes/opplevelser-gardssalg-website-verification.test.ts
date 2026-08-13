@@ -320,7 +320,7 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
 
       assertEq(
         auditRes.body.summary,
-        { verified: 1, unverified: 1, aggregator: 1, missing_source: 1, total: 4 },
+        { verified: 1, unverified: 1, aggregator: 1, missing_source: 1, unreachable_transient: 0, total: 4 },
         "b11: summary counts every bucket exactly once over the visible cohort",
       );
 
@@ -390,7 +390,7 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       );
       assertEq(
         page1.body.summary,
-        { verified: 0, unverified: 0, aggregator: 1, missing_source: 0, total: 1 },
+        { verified: 0, unverified: 0, aggregator: 1, missing_source: 0, unreachable_transient: 0, total: 1 },
         "j10: summary reflects ONLY the returned page, not the full cohort",
       );
 
@@ -518,7 +518,7 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       assertEq(wouldEnqueue[0]?.provider_id, "prov-unverified-404", "d4: the would-be-enqueued row is the unverified producer");
       assertEq(
         dryRunRes.body.summary,
-        { verified: 1, unverified: 1, aggregator: 1, missing_source: 1, total: 4 },
+        { verified: 1, unverified: 1, aggregator: 1, missing_source: 1, unreachable_transient: 0, total: 4 },
         "d5: dry-run summary matches the GET report",
       );
 
@@ -602,7 +602,7 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       });
       assertEq(scopedRes.status, 200, "g1: scoped dry-run -> 200");
       assertEq(scopedRes.body.summary.total, 1, "g2: providerIds override scopes the scan to exactly the requested producer");
-      assertEq(scopedRes.body.summary, { verified: 1, unverified: 0, aggregator: 0, missing_source: 0, total: 1 }, "g3: scoped summary reflects only the requested producer");
+      assertEq(scopedRes.body.summary, { verified: 1, unverified: 0, aggregator: 0, missing_source: 0, unreachable_transient: 0, total: 1 }, "g3: scoped summary reflects only the requested producer");
 
       // ── (h) visibility scope — Daniel's 2026-08-01 live override: the
       //     sweep must reach hidden producers too, as an explicit per-call

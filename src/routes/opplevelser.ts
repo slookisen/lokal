@@ -11846,7 +11846,10 @@ async function runGardssalgFieldConcordanceScan(
 
   const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
     const fetched = await crFetchGardssalgContent(homepageUrl);
-    if (!fetched.ok) return { ok: false, reason: fetched.reason };
+    // Pass `persistence` through. Dropping it (as this adapter used to) is
+    // what let a transient 5xx be recorded as a durable verified:false — see
+    // GsWvClassification's doc comment for the measured 2026-08-13 incident.
+    if (!fetched.ok) return { ok: false, reason: fetched.reason, persistence: fetched.persistence };
     return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
   };
 

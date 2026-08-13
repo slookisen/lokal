@@ -274,7 +274,11 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
       assertEq(rows.length, 4, "i1: one row per producer");
       assertEq(
         summary,
-        { verified: 1, unverified: 1, aggregator: 1, missing_source: 1, total: 4 },
+        // unreachable_transient added 2026-08-13 — asserted explicitly at 0
+        // rather than dropped from the expectation, so this stays a full-shape
+        // check: a future classification silently folding into the wrong
+        // bucket must still fail here.
+        { verified: 1, unverified: 1, aggregator: 1, missing_source: 1, unreachable_transient: 0, total: 4 },
         "i2: summary counts every bucket exactly once"
       );
       assertEq(summarizeGardssalgWebsiteVerification(rows), summary, "i3: summarize() re-derives the same summary from the rows alone");
@@ -471,6 +475,70 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
       assertEq(row.evidence?.title_found, true, "m3: the producer's own name IS in the title this time");
       assertEq(row.evidence?.verified, true, "m4: name+place+matching title verifies");
       assertEq(row.classification, "verified", "m5: classifies as verified");
+    }
+
+    // ── (t) transient unreachability is NOT a verdict ─────────────────────
+    //
+    // Daniel, live session 2026-08-13. Measured on the remediation run over
+    // the 15 `nettsted_uverifisert` rows: Tromsø Mikrobryggeri's
+    // `bryggeri13.no` answered HTTP 5xx and was durably stamped
+    // hjemmeside_verification={verified:false} — a pure network blip recorded
+    // permanently as "this is not the producer's website".
+    //
+    // The invariant: only `persistence:"transient"` is exempt. A dead domain
+    // IS a statement about the stored URL and must keep collapsing into
+    // `unverified` so it gets queued for review.
+    {
+      const producer = blankProducer({
+        id: "p-transient",
+        navn: "Tromsø Mikrobryggeri",
+        org_nr: "915180329",
+        hjemmeside: "https://bryggeri13.no",
+        kommune: "Tromsø",
+      });
+
+      const transient: GsWvFetchFn = async () => ({ ok: false, reason: "http_5xx", persistence: "transient" });
+      const rowTransient = await classifyGardssalgProducerWebsite(producer, transient);
+      assertEq(
+        rowTransient.classification,
+        "unreachable_transient",
+        "t1: a transient 5xx classifies as unreachable_transient, NOT as a negative verdict",
+      );
+      assertEq(rowTransient.evidence, null, "t2: no evidence object is invented for a page we never read");
+
+      const permanent: GsWvFetchFn = async () => ({ ok: false, reason: "dns_not_found", persistence: "permanent" });
+      assertEq(
+        (await classifyGardssalgProducerWebsite(producer, permanent)).classification,
+        "unverified",
+        "t3: a PERMANENT failure (dead domain) still classifies as unverified — it IS a statement about the stored URL",
+      );
+
+      const blocked: GsWvFetchFn = async () => ({ ok: false, reason: "http_401", persistence: "blocked" });
+      assertEq(
+        (await classifyGardssalgProducerWebsite(producer, blocked)).classification,
+        "unverified",
+        "t4: a BLOCKED failure (login wall) still classifies as unverified",
+      );
+
+      // The safe default: an adapter that does not report persistence must
+      // keep the old fail-closed behaviour rather than silently earning the
+      // exemption.
+      const noPersistence: GsWvFetchFn = async () => ({ ok: false, reason: "fetch_threw" });
+      assertEq(
+        (await classifyGardssalgProducerWebsite(producer, noPersistence)).classification,
+        "unverified",
+        "t5: a fetchFn that reports no persistence stays fail-closed as unverified",
+      );
+
+      // Summary must count the new class, and must NOT fold it into unverified.
+      const scanned = await scanGardssalgWebsiteVerificationRows([producer], transient, 1);
+      assertEq(scanned.summary.unreachable_transient, 1, "t6: the summary counts unreachable_transient");
+      assertEq(scanned.summary.unverified, 0, "t7: unreachable_transient is NOT counted as unverified");
+
+      // The review queue exists to fix bad URLs. A site that was merely down
+      // has no URL to fix, so it must not be queued.
+      const planned = planGardssalgWebsiteVerificationRemediation(scanned.rows);
+      assertEq(planned.wouldEnqueue.length, 0, "t8: an unreachable_transient row is never queued for URL review");
     }
   })().then(() => ({ passed, failed, failures }));
 }
