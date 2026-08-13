@@ -909,6 +909,19 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // ─── admin-agents-duplicate-merge: merged_into ──────────────
+  // Set to the survivor agent's id when this row is deactivated by
+  // POST /admin/agents/duplicate-merge (dev-request duplicate-merge lever).
+  // NULL means "not merged away". Combined with is_active = 0 on the same
+  // write, this is what marks a row as a resolved duplicate rather than a
+  // regular deactivation. Idempotent ALTER, same pattern as
+  // claimed_by_user_id/claimed_at/claimed_via directly above.
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN merged_into TEXT`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── Add is_owner column to analytics tables ─────────────────
   // Allows filtering out owner/developer traffic in dashboard
   for (const table of ["analytics_page_views", "analytics_queries", "analytics_agent_views"]) {

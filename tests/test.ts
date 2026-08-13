@@ -36864,6 +36864,29 @@ runSerial(async () => {
   }
 });
 
+// POST /admin/agents/duplicate-merge — explicit-pair duplicate merge lever.
+// Fill-only survivor writes, append-only field_provenance merge, mandatory
+// duplicate deactivation (is_active=0 + merged_into), claimed-row and
+// curated-field locks, reversible via agent_knowledge_audit. Never detects
+// duplicates itself — only executes a caller-supplied decision. Own
+// in-memory DB via its own seam (same discipline as contact-email-write
+// above: never pins the shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── admin-agents-duplicate-merge: duplicate-pair merge lever ──");
+  try {
+    const { runAdminAgentsDuplicateMergeTests } = require("../src/routes/admin-agents-duplicate-merge.test") as
+      typeof import("../src/routes/admin-agents-duplicate-merge.test");
+    const dm = await runAdminAgentsDuplicateMergeTests({ log: false });
+    passed += dm.passed;
+    failed += dm.failed;
+    for (const f of dm.failures) failures.push("duplicate-merge: " + f);
+    console.log(`  duplicate-merge: ${dm.passed} passed, ${dm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("duplicate-merge: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/agents/contact-email-dns-check — diagnostic-only DNS-liveness
 // stamp on agent_knowledge.field_provenance.contact_email_dns_check. Detects
 // (never gates on, never writes contact_email/email, never touches

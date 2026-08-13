@@ -64,6 +64,7 @@ import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
+import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
@@ -614,6 +615,10 @@ app.use("/admin/agents/contact-email-dns-check", adminLimiter, adminAgentsContac
 // POST /admin/agents/url-write (dev-request 2026-08-01-rfb-agents-url-skrivespak).
 // Same ordering rule as the sibling above — mount BEFORE /admin/agents.
 app.use("/admin/agents/url-write", adminLimiter, adminAgentsUrlWriteRoutes);
+// POST /admin/agents/duplicate-merge — explicit-pair duplicate merge lever
+// (dev-request duplicate-merge lever). Same ordering rule as the siblings
+// above — mount BEFORE /admin/agents.
+app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMergeRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
