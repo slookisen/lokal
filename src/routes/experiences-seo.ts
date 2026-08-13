@@ -1734,6 +1734,12 @@ ${ldScripts}
   .fylke-card:hover{transform:translateY(-3px);box-shadow:var(--sh-md);border-color:var(--teal-400);text-decoration:none}
   .fylke-card-name{display:block;font-weight:700;color:var(--ink);font-size:1rem;letter-spacing:-.01em}
   .fylke-card-count{display:block;margin-top:4px;font-size:.82rem;color:var(--mist)}
+  @media(max-width:560px){
+    .fylke-grid{grid-template-columns:1fr 1fr;gap:10px}
+    .fylke-card{padding:12px 10px}
+    .fylke-card-name{font-size:.86rem}
+    .fylke-card-count{font-size:.72rem;margin-top:2px}
+  }
   .fylke-kommuner{margin-top:36px}
   .fylke-kommuner h3{font-size:.95rem;font-weight:700;color:var(--ink);margin-bottom:12px}
   .chips{display:flex;flex-wrap:wrap;gap:8px}
