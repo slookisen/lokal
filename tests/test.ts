@@ -724,6 +724,32 @@ runSerial(async () => {
   }
 });
 
+// ── Daniel, live session 2026-08-13: headless-render fallback for JS-built
+// producer sites (services/render-page.ts). 67northdistillery.no serves 180 KB
+// of HTML that yields 19 visible characters, so `about_text`/`products` can
+// never be extracted from the raw source and the row is stuck in
+// needs_enrichment forever.
+//
+// Browser-free BY CONSTRUCTION: renderPage() takes an injected renderImpl, so
+// this block never launches Chromium. That is load-bearing, not incidental —
+// production runs on node:20-alpine with no browser at all, and a gate that
+// needed one could not run there.
+runSerial(async () => {
+  console.log("\n── render-page: headless-render fallback (escalation + classified failure) ──");
+  try {
+    const { runRenderPageTests } = require("../src/services/render-page.test") as
+      typeof import("../src/services/render-page.test");
+    const r = await runRenderPageTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("render-page: " + f);
+    console.log(`  render-page: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("render-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-27-harvest-hjemmeside-feltnavn-tapes: the harvest
 // SKILL sends `hjemmeside`, BulkRowSchema only accepted `website`, and
 // z.object() strips unknown keys silently — so every harvested homepage was

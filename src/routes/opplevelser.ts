@@ -8403,6 +8403,8 @@ function computeGardssalgReadinessRows(
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
+  /** The stored homepage URL. See the construction site below for why. */
+  hjemmeside: string | null;
   // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
   // stoerrelsesgate) — additive, informational regardless of readiness_tier
   // or the size-gate's own enabled/disabled switch: Daniel sees the size
@@ -8566,6 +8568,15 @@ function computeGardssalgReadinessRows(
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
+      // Daniel, live session 2026-08-13: the stored homepage, surfaced.
+      // `has_website` (a boolean) was already here, but NO read-only route in
+      // this file returned the URL itself — so an operator holding a list of
+      // needs_enrichment rows had no way to learn WHICH sites to look at
+      // without a write-path call. That gap is what blocked running the
+      // headless-render pass (services/render-page.ts) over the 41 stuck rows.
+      // Purely additive: the column is already SELECTed above, this only stops
+      // discarding it. Same admin gate, same cohort, no new query.
+      hjemmeside: p.hjemmeside,
       antall_ansatte: p.antall_ansatte,
       size_flag,
     };
