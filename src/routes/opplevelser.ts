@@ -1932,13 +1932,55 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
       dir = lastSeg.includes(".") ? dir.replace(/[^/]*$/, "") : `${dir}/`;
     }
     const base = `${u.protocol}//${u.host}${dir === "/" ? "" : dir.replace(/\/$/, "")}`;
-    for (const path of GARDSSALG_CONTENT_PATHS) {
+    // ── Link-driven discovery FIRST, fixed paths only as a fallback ────────
+    //
+    // Daniel, live session 2026-08-14. GARDSSALG_CONTENT_PATHS is blind
+    // guessing, and measured against the 12 reachable `nettsted_uverifisert`
+    // producer sites on 2026-08-14 it is close to useless:
+    //
+    //   92 path attempts -> 7 hits (8%)
+    //   7 of 12 sites yielded ZERO sub-pages
+    //
+    // Seven producers were therefore verified on their FRONT PAGE ALONE — the
+    // /kontakt page carrying the evidence was never read, even though the
+    // front page linked straight to it. On the same 12 sites, following the
+    // real links found 27 sub-pages, at zero extra network cost (the HTML is
+    // already in hand).
+    //
+    // discoverContentLinks (services/fetch-page.ts) was built for exactly this
+    // and documents the same failure from the other side: the four fixed paths
+    // it replaced returned 404 twelve times out of twelve on three measured
+    // sites. This fetcher simply never adopted it.
+    //
+    // SECTION SCOPE IS PRESERVED, and that is load-bearing: discoverContent-
+    // Links is same-HOST but not same-SECTION, so a deep-path hjemmeside (a
+    // directory listing) could otherwise walk onto whatever else the host
+    // serves — the exact 2026-07-19 hanen.no cross-contamination the `base`
+    // computation above exists to prevent. Discovered links are filtered to
+    // the same `base` prefix the fixed paths are built from.
+    // Either/or, not both — the same shape crFetchHomepageContent (~line 1495)
+    // already uses on the RFB side. Topping the discovered links up with blind
+    // guesses would reintroduce exactly the wasted requests this removes.
+    // Fallback fires only when discovery yields nothing INSIDE the section,
+    // which is the site shape fetch-page.ts documents as having no crawlable
+    // internal links at all.
+    const discovered = discoverContentLinks(primaryHtml, primary.finalUrl || fetchUrl, GARDSSALG_MAX_PAGES)
+      .filter((href) => href.startsWith(base));
+
+    const targets: Array<{ url: string; label: string }> =
+      discovered.length > 0
+        ? // Recorded relative to `base` so pagesFetchedPaths keeps the shape
+          // the products diagnostic already reads.
+          discovered.map((href) => ({ url: href, label: href.slice(base.length) || "/" }))
+        : GARDSSALG_CONTENT_PATHS.map((p) => ({ url: `${base}${p}`, label: p }));
+
+    for (const t of targets) {
       if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
-      const sub = await crFetchHtml(`${base}${path}`);
+      const sub = await crFetchHtml(t.url);
       if (sub) {
         combinedHtml += "\n" + sub;
         pagesFetched++;
-        fetchedPaths.push(path);
+        fetchedPaths.push(t.label);
       }
     }
   } catch {
