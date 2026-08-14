@@ -29610,6 +29610,43 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ogwvr.failures) failures.push("opplevelser-gardssalg-website-verification: " + f);
     console.log(`  opplevelser-gardssalg-website-verification: ${ogwvr.passed} passed, ${ogwvr.failed} failed`);
 
+    // dev-request 2026-08-14-dublett-auto-triage (DRY-RUN / REPORT ONLY):
+    // pure classification-logic tests for classifyGardssalgExperienceConflict
+    // Pair (services/gardssalg-experience-conflict-triage.ts) — the two-page
+    // auto_confirm/auto_reject/pending verdict classifier backing GET
+    // /admin/gardssalg-experience-conflict-auto-triage. No network, no DB,
+    // fully synchronous — covers every mandatory case from the dev-request
+    // spec, including the transient-forces-pending override from both
+    // directions and the name-token-alone-is-not-sufficient negative control.
+    console.log("\n── gardssalg-experience-conflict-triage: auto-triage classifier (pure) ──");
+    const { runGardssalgExperienceConflictTriageTests } = require("../src/services/gardssalg-experience-conflict-triage.test") as
+      typeof import("../src/services/gardssalg-experience-conflict-triage.test");
+    const gectr = await runGardssalgExperienceConflictTriageTests({ log: false });
+    passed += gectr.passed;
+    failed += gectr.failed;
+    for (const f of gectr.failures) failures.push("gardssalg-experience-conflict-triage: " + f);
+    console.log(`  gardssalg-experience-conflict-triage: ${gectr.passed} passed, ${gectr.failed} failed`);
+
+    // dev-request 2026-08-14-dublett-auto-triage (route-level): GET
+    // /admin/gardssalg-experience-conflict-auto-triage — end-to-end through
+    // the real HTTP route, a real DB, and the real crFetchGardssalgContent +
+    // gardssalgWebsiteEvidenceMatch plumbing (mocked fetch, keyed by
+    // hostname, same convention as opplevelser-gardssalg-website-
+    // verification.test.ts above). Confirms mandatory-limit validation,
+    // auto_confirm/auto_reject/pending bucketing over real fetched evidence
+    // (incl. a genuinely flaky 503 host proving the transient override live),
+    // confidence-descending sort of the pending bucket, the linked-vs-
+    // unlinked experience org.nr sourcing, and — the hard non-negotiable for
+    // this DRY-RUN/REPORT-ONLY slice — zero DB writes anywhere.
+    console.log("\n── opplevelser-gardssalg-experience-conflict-triage: auto-triage sweep (routes) ──");
+    const { runOpplevelserGardssalgExperienceConflictTriageTests } = require("../src/routes/opplevelser-gardssalg-experience-conflict-triage.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-experience-conflict-triage.test");
+    const ogectr = await runOpplevelserGardssalgExperienceConflictTriageTests({ log: false });
+    passed += ogectr.passed;
+    failed += ogectr.failed;
+    for (const f of ogectr.failures) failures.push("opplevelser-gardssalg-experience-conflict-triage: " + f);
+    console.log(`  opplevelser-gardssalg-experience-conflict-triage: ${ogectr.passed} passed, ${ogectr.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 3
     // (route-level): POST /admin/gardssalg-owner-lock-backfill — the
     // one-time catch-up that backfills field_provenance.owner_locks.<field>

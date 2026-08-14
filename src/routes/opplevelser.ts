@@ -266,7 +266,22 @@ import {
   type GsExpConflictPlanItem,
   type GsExpConflictRollbackPlanItem,
   type GsExpReviewVerdict,
+  type GsExpMatchBasis,
+  type GsExpConflictStatus,
 } from "../services/gardssalg-experience-conflict";
+// dev-request 2026-08-14-dublett-auto-triage (DRY-RUN / REPORT ONLY — see the
+// route below, GET /admin/gardssalg-experience-conflict-auto-triage, for the
+// full non-negotiable rationale): the pure two-page verdict classifier that
+// pre-sorts the pending queue above into auto_confirm/auto_reject/pending,
+// so a human only has to look closely at the genuinely ambiguous middle.
+// Purely additive — never modifies anything in gardssalg-experience-
+// conflict.ts imported above.
+import {
+  classifyGardssalgExperienceConflictPair,
+  sortByConfidenceDesc,
+  type GsExpTriageSide,
+  type GsExpTriageEvidence,
+} from "../services/gardssalg-experience-conflict-triage";
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
 // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice — a new,
 // independent sweep that checks each gårdssalg producer's stored hjemmeside
@@ -13019,6 +13034,327 @@ router.post("/admin/gardssalg-experience-conflict-review", requireAdmin, (req: R
     written,
     rejected,
   });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-experience-conflict-auto-triage ───
+//
+// dev-request 2026-08-14-dublett-auto-triage. DRY-RUN / REPORT ONLY — this
+// route performs ZERO database writes anywhere: no INSERT/UPDATE/DELETE
+// exists in this route or in services/gardssalg-experience-conflict-triage.ts
+// (grep either for those keywords and you will find none). It never writes
+// to gardssalg_experience_conflict_review, never touches a producer or
+// experience row. This is a hard, non-negotiable constraint for THIS slice
+// — an apply/write path for this exact class of decision (duplicate-pair
+// resolution) already caused a real production data-corruption incident
+// once (protocols/orchestrator-failures/2026-08-01-gardssalg-steg2-apply-
+// data-corruption-reverted.md, slookisen/A2A — not in this repo, but the
+// lesson is): 137 rows were written minutes after a fix landed, on a
+// precision-flawed heuristic that misread shared place-names/common words
+// as identity evidence, and had to be reverted. The remedy embedded in this
+// slice's own dev-request spec: build the evidence-gathering +
+// classification REPORT first, get a human calibration pass on the actual
+// numbers, THEN build/gate a SEPARATE, Daniel-gated write step in a future
+// wake. Not this one.
+//
+// For every currently-pending pair in the human confirmation queue (GET
+// .../gardssalg-experience-conflict-queue above — SAME live scan, reused via
+// runGardssalgExperienceConflictScan + loadGardssalgExperienceConflictReview
+// Decisions + buildGardssalgExperienceConflictQueuePairs, never
+// reimplemented), bounded by a mandatory `limit` (+ optional `offset`), this
+// route:
+//
+//   1. Fetches BOTH sides' pages — producer.hjemmeside and experience.
+//      booking_url — via crFetchGardssalgContent, the SAME SSRF-guarded
+//      fetcher + fetch-page.ts persistence classification (persistenceOf)
+//      GET .../gardssalg-website-verification-audit already uses for the
+//      producer side alone (GsWvFetchFn's own adapter shape, mirrored here
+//      for both sides).
+//   2. Extracts identity signals via the EXISTING gardssalgWebsiteEvidenceMatch
+//      (experience-store.ts, imported and reused unchanged — never
+//      reimplemented), called exactly once per side, against that side's own
+//      target identity. See services/gardssalg-experience-conflict-triage.ts's
+//      module doc comment for exactly what "own target identity" means per
+//      side: experience_providers rows carry a real registered identity
+//      (org.nr included); experiences rows only inherit one when currently
+//      linked to some OTHER producer via provider_id (never the SAME id as
+//      the candidate producer here — that shape is match_basis
+//      "provider_link", never queued in the first place) — otherwise (the
+//      common, unmatched case) the experience side falls back to its own
+//      title/kommune PLUS the CANDIDATE producer's own org.nr (org_nr is
+//      UNIQUE on experience_providers, so an unlinked experience can never
+//      have a genuine "own" org.nr of its own to test — the only org.nr
+//      question worth asking is whether the CANDIDATE's number also shows
+//      up on the experience's page).
+//   3. Classifies the pair via the new PURE classifyGardssalgExperience
+//      ConflictPair (same new file) into auto_confirm / auto_reject /
+//      pending. See that function's own doc comment for the exact decision
+//      table — including the non-negotiable rule that a `persistence ===
+//      "transient"` fetch outcome on EITHER side forces "pending", full
+//      stop, never a confirm/reject verdict regardless of any signal on the
+//      other side.
+//
+// Response buckets pairs into `auto_confirm` / `auto_reject` / `pending`
+// (the last sorted by confidence, best-evidence-first, via
+// sortByConfidenceDesc — so a human working the pending bucket sees the
+// most-resolvable pairs before the murkiest ones), each row carrying both
+// sides' collected evidence so the human review itself goes faster,
+// per-request `summary` counts, and a `pagination` block over the full
+// live-scanned queue (not just this page) so a caller can walk the whole
+// ~331-pair backlog across repeated calls.
+//
+// MAX_GARDSSALG_TRIAGE_LIMIT: this route fetches TWO pages per pair (vs. one
+// page per row on the verification-audit route below), so its per-call
+// fetch volume at any given `limit` is double that route's. Capping at 6
+// pairs (= 12 total page fetches per call, at 3 pairs/CR_CONCURRENCY batch x
+// 2 concurrent fetches per pair) lands on the exact same total-fetch order
+// of magnitude that route's own live measurement already established as
+// safe (MAX_GARDSSALG_AUDIT_LIMIT=12 — see that constant's own doc comment
+// a little further down) rather than re-deriving a new ceiling from
+// scratch. `limit` is mandatory here (never optional-with-a-small-default,
+// unlike that route's own cohort=gardssalg case): unlike that route's
+// ~87-row default cohort, THIS queue has no small-and-safe unpaginated
+// case at all — it is ~331 pairs today, so an omitted `limit` has no sane
+// unbounded fallback to fall back to.
+const MAX_GARDSSALG_TRIAGE_LIMIT = 6;
+
+router.get("/admin/gardssalg-experience-conflict-auto-triage", requireAdmin, async (req: Request, res: Response) => {
+  if (req.query.limit === undefined) {
+    res.status(400).json({
+      error: `Ugyldig — limit er påkrevd (maks ${MAX_GARDSSALG_TRIAGE_LIMIT}; køen er for stor for et enkelt kall uten paginering).`,
+    });
+    return;
+  }
+  const parsedLimit = Number(String(req.query.limit));
+  if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+    res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
+    return;
+  }
+  if (parsedLimit > MAX_GARDSSALG_TRIAGE_LIMIT) {
+    res.status(400).json({ error: `Ugyldig limit — maks er ${MAX_GARDSSALG_TRIAGE_LIMIT}.` });
+    return;
+  }
+  const limit = parsedLimit;
+
+  let offset = 0;
+  if (req.query.offset !== undefined) {
+    const parsedOffset = Number(String(req.query.offset));
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+      return;
+    }
+    offset = parsedOffset;
+  }
+
+  const expDb = getExpDb("experiences");
+  try {
+    const { pairs } = runGardssalgExperienceConflictScan(expDb);
+    const decisions = loadGardssalgExperienceConflictReviewDecisions(expDb);
+    const pendingQueue = buildGardssalgExperienceConflictQueuePairs(pairs, decisions);
+    const total = pendingQueue.length;
+    const page = pendingQueue.slice(offset, offset + limit);
+
+    type GsExpTriageProducerIdentityRow = {
+      id: string;
+      navn: string;
+      org_nr: string | null;
+      kommune: string | null;
+      poststed: string | null;
+      telefon: string | null;
+      mobil: string | null;
+      adresse: string | null;
+      postnummer: string | null;
+    };
+    type GsExpTriageIdentityTarget = {
+      orgNr: string | null;
+      navn: string;
+      kommune: string | null;
+      poststed: string | null;
+      telefon: string | null;
+      mobil: string | null;
+      adresse: string | null;
+      postnummer: string | null;
+    };
+    const getProducerIdentityStmt = expDb.prepare(
+      `SELECT id, navn, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer
+         FROM experience_providers WHERE id = ?`
+    );
+    const getExperienceLinkStmt = expDb.prepare(
+      `SELECT provider_id, kommune, title, title_no FROM experiences WHERE id = ?`
+    );
+
+    function gsExpTriageDomainOf(urlLike: string | null): string | null {
+      if (!urlLike || !urlLike.trim()) return null;
+      const host = hostFromUrlLike(urlLike);
+      return host ? registrableDomain(host) : null;
+    }
+
+    // Fetches ONE side's page (or reports no-URL/failure) and, on success,
+    // runs gardssalgWebsiteEvidenceMatch exactly once against `target` — the
+    // one and only evidence-extraction call for this side (never a second
+    // heuristic). Domain is derived from the stored URL regardless of fetch
+    // outcome (crFetchGardssalgContent's success shape does not expose a
+    // post-redirect final host, and a domain comparison does not need page
+    // content anyway — only fetching does).
+    async function gsExpTriageFetchSide(url: string | null, target: GsExpTriageIdentityTarget): Promise<GsExpTriageSide> {
+      const domain = gsExpTriageDomainOf(url);
+      if (!url || !url.trim()) {
+        return { fetch_ok: false, persistence: null, org_nr: target.orgNr, domain, evidence: null };
+      }
+      const fetched = await crFetchGardssalgContent(url.trim());
+      if (!fetched.ok) {
+        return { fetch_ok: false, persistence: fetched.persistence, org_nr: target.orgNr, domain, evidence: null };
+      }
+      const pageText = gardssalgPageText(fetched.combinedHtml);
+      const pageTitle = gardssalgPageTitle(fetched.primaryHtml);
+      const evidenceResult = gardssalgWebsiteEvidenceMatch(pageText, target, pageTitle);
+      return { fetch_ok: true, persistence: null, org_nr: target.orgNr, domain, evidence: evidenceResult };
+    }
+
+    const triaged: Array<{
+      producer_id: string;
+      producer_name: string;
+      producer_hidden: boolean;
+      producer_hjemmeside: string | null;
+      experience_id: string;
+      experience_title: string;
+      experience_booking_url: string | null;
+      match_basis: GsExpMatchBasis;
+      status: GsExpConflictStatus;
+      verdict: string;
+      reasons: string[];
+      confidence: number;
+      name_token_support: boolean;
+      evidence: { producer: GsExpTriageSide; experience: GsExpTriageSide };
+    }> = [];
+
+    // Bounded concurrency: CR_CONCURRENCY pairs per batch (same throttle
+    // every other gårdssalg admin sweep in this file shares), each pair's
+    // two sides fetched concurrently via Promise.all — see
+    // MAX_GARDSSALG_TRIAGE_LIMIT's doc comment above for the resulting peak
+    // (6 concurrent fetches) and total-request bound (<=12 at the max limit).
+    for (let i = 0; i < page.length; i += CR_CONCURRENCY) {
+      const slice = page.slice(i, i + CR_CONCURRENCY);
+      const results = await Promise.all(
+        slice.map(async (entry) => {
+          const producerRow = getProducerIdentityStmt.get(entry.producer_id) as GsExpTriageProducerIdentityRow | undefined;
+          const experienceLinkRow = getExperienceLinkStmt.get(entry.experience_id) as
+            | { provider_id: string | null; kommune: string | null; title: string; title_no: string | null }
+            | undefined;
+
+          const producerTarget: GsExpTriageIdentityTarget = {
+            orgNr: producerRow?.org_nr ?? null,
+            navn: producerRow?.navn ?? entry.producer_name,
+            kommune: producerRow?.kommune ?? null,
+            poststed: producerRow?.poststed ?? null,
+            telefon: producerRow?.telefon ?? null,
+            mobil: producerRow?.mobil ?? null,
+            adresse: producerRow?.adresse ?? null,
+            postnummer: producerRow?.postnummer ?? null,
+          };
+
+          let experienceTarget: GsExpTriageIdentityTarget;
+          if (experienceLinkRow?.provider_id && experienceLinkRow.provider_id !== entry.producer_id) {
+            const linkedRow = getProducerIdentityStmt.get(experienceLinkRow.provider_id) as
+              | GsExpTriageProducerIdentityRow
+              | undefined;
+            experienceTarget = {
+              orgNr: linkedRow?.org_nr ?? null,
+              navn: linkedRow?.navn ?? entry.experience_title,
+              kommune: linkedRow?.kommune ?? experienceLinkRow.kommune ?? null,
+              poststed: linkedRow?.poststed ?? null,
+              telefon: linkedRow?.telefon ?? null,
+              mobil: linkedRow?.mobil ?? null,
+              adresse: linkedRow?.adresse ?? null,
+              postnummer: linkedRow?.postnummer ?? null,
+            };
+          } else {
+            // Not linked to any producer of its own — experience_providers.
+            // org_nr is UNIQUE (database/init-experiences.ts), so there is
+            // no OTHER real org.nr this experience could legitimately carry
+            // anyway. The only org.nr question that can be asked here is
+            // "does this page ALSO show evidence of the CANDIDATE
+            // producer's own org.nr" — so fall back to testing the
+            // candidate's own org.nr against the experience's page (navn/
+            // kommune still come from the experience's own title/kommune,
+            // never the candidate's). See this route's own doc comment and
+            // gardssalg-experience-conflict-triage.ts's module doc comment
+            // for the full reasoning.
+            experienceTarget = {
+              orgNr: producerTarget.orgNr,
+              navn: experienceLinkRow?.title_no || experienceLinkRow?.title || entry.experience_title,
+              kommune: experienceLinkRow?.kommune ?? null,
+              poststed: null,
+              telefon: null,
+              mobil: null,
+              adresse: null,
+              postnummer: null,
+            };
+          }
+
+          const [producerSide, experienceSide] = await Promise.all([
+            gsExpTriageFetchSide(entry.producer_hjemmeside, producerTarget),
+            gsExpTriageFetchSide(entry.experience_booking_url, experienceTarget),
+          ]);
+
+          const verdictResult = classifyGardssalgExperienceConflictPair({
+            producer_name: entry.producer_name,
+            experience_name: entry.experience_title,
+            producer: producerSide,
+            experience: experienceSide,
+          });
+
+          return {
+            producer_id: entry.producer_id,
+            producer_name: entry.producer_name,
+            producer_hidden: entry.producer_hidden,
+            producer_hjemmeside: entry.producer_hjemmeside,
+            experience_id: entry.experience_id,
+            experience_title: entry.experience_title,
+            experience_booking_url: entry.experience_booking_url,
+            match_basis: entry.match_basis,
+            status: entry.status,
+            verdict: verdictResult.verdict,
+            reasons: verdictResult.reasons,
+            confidence: verdictResult.confidence,
+            name_token_support: verdictResult.name_token_support,
+            evidence: { producer: producerSide, experience: experienceSide },
+          };
+        })
+      );
+      triaged.push(...results);
+    }
+
+    const autoConfirmRows = triaged.filter((r) => r.verdict === "auto_confirm");
+    const autoRejectRows = triaged.filter((r) => r.verdict === "auto_reject");
+    // Best-evidence-first within the pending bucket only (per spec) — the
+    // auto_confirm/auto_reject buckets are already-decided, ordering them
+    // by confidence would add nothing a human needs to act on.
+    const pendingRows = sortByConfidenceDesc(
+      triaged.filter((r) => r.verdict === "pending"),
+      (r) => r.confidence,
+      (r) => `${r.producer_id}::${r.experience_id}`
+    );
+
+    const returned = triaged.length;
+    const nextOffset = offset + returned < total ? offset + returned : null;
+
+    res.json({
+      success: true,
+      summary: {
+        auto_confirm: autoConfirmRows.length,
+        auto_reject: autoRejectRows.length,
+        pending: pendingRows.length,
+        total: returned,
+      },
+      auto_confirm: autoConfirmRows,
+      auto_reject: autoRejectRows,
+      pending: pendingRows,
+      pagination: { total, offset, limit, returned, next_offset: nextOffset },
+    });
+  } catch (err) {
+    console.error("[gardssalg-experience-conflict-auto-triage] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-website-verification-audit ────────
