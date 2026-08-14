@@ -3375,6 +3375,9 @@ assertEq(tierForSource("homepage"), "A", "tier: homepage=A");
 assertEq(tierForSource("google_places"), "A", "tier: google_places=A");
 assertEq(tierForSource("brreg"), "B", "tier: brreg=B");
 assertEq(tierForSource("facebook_official_page"), "B", "tier: facebook_official_page=B");
+// BM-harvest AC4 (2026-08-14): curated 3rd-party directory listing, same trust
+// class as brreg/facebook_official_page.
+assertEq(tierForSource("directory_listing"), "B", "tier: directory_listing=B");
 assertEq(tierForSource("aggregator"), "C", "tier: aggregator=C");
 assertEq(tierForSource("instagram"), "C", "tier: instagram=C");
 assertEq(tierForSource("unknown_source"), "C", "tier: unknown defaults to C");
@@ -3470,6 +3473,24 @@ function prov(value: string, source_type: string): ProvenanceRecord {
     "address"
   );
   assertEq(r.agree, true, "cs: 2 Tier-A agree + 1 Tier-B disagrees → agree=true");
+}
+
+// 6a. BM-harvest AC4 (2026-08-14): Tier-B directory_listing agrees with
+// Tier-B brreg on address → agree=true, verdict='pool_eligible' (2
+// high-quality sources is sufficient regardless of which Tier A/B mix).
+{
+  const r = crossSourceAgreement(
+    {
+      address: [
+        prov("Haugerudveien 17, 3302 Hokksund", "directory_listing"),
+        prov("Haugerudveien 17, 3302 Hokksund", "brreg"),
+      ],
+    },
+    "address"
+  );
+  assertEq(r.agree, true, "cs: directory_listing + brreg agreeing → agree=true");
+  assertEq(r.source_count, 2, "cs: directory_listing + brreg agreeing → source_count=2");
+  assertEq(r.verdict, "pool_eligible", "cs: directory_listing + brreg agreeing → verdict=pool_eligible");
 }
 
 // 7. Phone normalization: "+47 911 93 602" === "91193602"

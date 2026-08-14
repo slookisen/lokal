@@ -60,7 +60,13 @@ const TIER_S: readonly string[] = ["owner"];
 // address/phone — those continue to use "homepage"/"google_places" — so no
 // existing address/phone provenance record's tier or count changes.
 const TIER_A: readonly string[] = ["homepage", "website_homepage", "google_places"];
-const TIER_B: readonly string[] = ["brreg", "facebook_official_page"];
+// "directory_listing" (BM-harvest AC4, 2026-08-14): a curated 3rd-party
+// directory listing surfaced by the Bondens Marked harvest. Not owner-published
+// so it does not qualify for Tier S/A, but it is a curated (not scraped/guessed)
+// listing — the same trust class as brreg/facebook_official_page — so it is
+// added to Tier B to co-count toward the 2-high-quality-source `address`
+// agreement gate.
+const TIER_B: readonly string[] = ["brreg", "facebook_official_page", "directory_listing"];
 
 export function tierForSource(sourceType: string): SourceTier {
   if (TIER_S.includes(sourceType)) return "S";
