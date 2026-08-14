@@ -22,6 +22,12 @@
  *   (d) aggregator-host candidate rejected: a producer name whose first
  *       candidate host is a curated directory domain -> rejected reason
  *       'blocklisted_directory_domain', that host never fetched.
+ *   (d2) rfbWebsiteHostExclusionReason unit coverage for RFB_WD_KNOWN_BAD_HOSTS
+ *       (individually-known-bad hosts, e.g. the hijacked storbuktgard.no —
+ *       distinct from the aggregator/directory set covered by (d)):
+ *       "storbuktgard.no" -> 'known_hijacked_domain'; the "www." variant
+ *       matches via the same parent-suffix walk as the other two sets; an
+ *       unrelated host ("example.no") still returns null.
  *   (e) shared-host guard (existing table): a candidate host already carried
  *       by a DIFFERENT agent's live agent_knowledge.website -> rejected
  *       reason 'host_already_in_use', never fetched.
@@ -186,7 +192,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     const routeModule = require("../routes/admin-rfb-website-discovery") as
       typeof import("../routes/admin-rfb-website-discovery");
     const routerModule = routeModule.default;
-    const { RFB_WD_HARD_CAP } = routeModule;
+    const { RFB_WD_HARD_CAP, rfbWebsiteHostExclusionReason } = routeModule;
 
     function getHandler(method: "get" | "post", path: string) {
       const layer = routerModule.stack.find(
@@ -319,6 +325,28 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(
         !fetchCalls.includes("https://hanen.no"),
         "d3: the excluded host is never fetched (rejected BEFORE the network call)",
+      );
+    }
+
+    // ── (d2) rfbWebsiteHostExclusionReason: RFB_WD_KNOWN_BAD_HOSTS (individually-
+    //    known-bad hosts, e.g. the hijacked storbuktgard.no) — direct unit
+    //    coverage of the exported pure function, mirroring how (d) proves the
+    //    directory-host set via the route but exercising the function itself --
+    {
+      assertEq(
+        rfbWebsiteHostExclusionReason("storbuktgard.no"),
+        "known_hijacked_domain",
+        "d2-1: storbuktgard.no is excluded as a known hijacked domain",
+      );
+      assertEq(
+        rfbWebsiteHostExclusionReason("www.storbuktgard.no"),
+        "known_hijacked_domain",
+        "d2-2: www.storbuktgard.no matches via the same parent-suffix walk",
+      );
+      assertEq(
+        rfbWebsiteHostExclusionReason("example.no"),
+        null,
+        "d2-3: an unrelated host is not a false positive",
       );
     }
 

@@ -180,6 +180,24 @@ export const RFB_WD_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "wikipedia.org",
 ]);
 
+// Individually-known-bad hosts — NOT aggregators/directories (those live in
+// RFB_WD_DIRECTORY_HOSTS above) and NOT social platforms (RFB_WD_SOCIAL_HOSTS)
+// but specific producer-owned-looking domains independently confirmed to be
+// hijacked, dead, or now belonging to a different entity than the RFB
+// producer the domain name suggests. First entry: storbuktgard.no (Storbukt
+// Gård — Balsfjord, agent 711c3807-17ab-4742-b13f-3c0162176a94) — its former
+// site now 308-redirects to a spam site (correos.se.cemeterybook.com), per
+// enrichment-reports/2026-08-10-hjemmesidejakt-pilot-20-rfb.md (row 12, §5
+// F3) and the accompanying kandidater.json (slookisen/A2A, ~lines 205-219).
+// This agent's agent_knowledge.website is currently blank (not wrongly set)
+// — this entry is preventative, defense in depth, so no future
+// discovery/verification pass can ever write this hijacked domain as the
+// producer's own site even though today's evidence-match gate already
+// happens to reject it independently.
+export const RFB_WD_KNOWN_BAD_HOSTS: ReadonlySet<string> = new Set([
+  "storbuktgard.no",
+]);
+
 // Exported (dev-request rfb-contact-extraction slice) so the sibling
 // POST /admin/rfb-contact-extraction route (admin-rfb-contact-extraction.ts)
 // can apply the SAME aggregator/social-media host exclusion to its own,
@@ -198,6 +216,10 @@ export function rfbWebsiteHostExclusionReason(host: string | null): string | nul
   for (let i = 0; i + 2 <= labels.length; i++) {
     const suffix = labels.slice(i).join(".");
     if (RFB_WD_DIRECTORY_HOSTS.has(suffix)) return "blocklisted_directory_domain";
+  }
+  for (let i = 0; i + 2 <= labels.length; i++) {
+    const suffix = labels.slice(i).join(".");
+    if (RFB_WD_KNOWN_BAD_HOSTS.has(suffix)) return "known_hijacked_domain";
   }
   return null;
 }
