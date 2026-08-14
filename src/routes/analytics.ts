@@ -67,7 +67,7 @@ const router = Router();
 // ─── Simple auth check ──────────────────────────────────────────
 // In production, replace with proper JWT or session auth
 function requireAdminAuth(req: Request, res: Response, next: Function): void {
-  const expectedKey = process.env.ANALYTICS_ADMIN_KEY || process.env.ADMIN_API_KEY || "";
+  const expectedKey = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
   if (!expectedKey) {
     res.status(503).json({ error: "Analytics not configured: ANALYTICS_ADMIN_KEY not set" });
     return;
@@ -86,7 +86,7 @@ function requireAdminAuth(req: Request, res: Response, next: Function): void {
 // Visit /admin/analytics/mark-owner?key=ADMIN_KEY to tag your browser.
 // All subsequent page views and searches will be marked as owner traffic.
 router.get("/mark-owner", (req: Request, res: Response) => {
-  const expectedKey = process.env.ANALYTICS_ADMIN_KEY || process.env.ADMIN_API_KEY || "";
+  const expectedKey = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
   const key = req.query.key as string;
   if (!expectedKey || key !== expectedKey) {
     res.status(401).json({ error: "Ugyldig nøkkel" });

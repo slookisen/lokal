@@ -196,8 +196,12 @@ import conversationUiRouter, {
 //     og restores den IDENTISKE kanoniske verdien (benigne no-ops), mens
 //     standalone-kjøring er uendret. Bevisste unntak: crm.test.ts (tester
 //     selve nøkkel-presedensen fra PR #455 og MÅ variere nøklene — kjører
-//     i runSerial-kjeden, post-barriere, dermed uten samtidige lesere) og
-//     korte delete-vinduer i negative tester (samme post-barriere-argument).
+//     i runSerial-kjeden, post-barriere, dermed uten samtidige lesere),
+//     analytics-adminkey.test.ts (samme unntak, samme grunn — tester
+//     nøkkel-presedensen for analytics.ts sine to call sites, dev-request
+//     2026-07-28-visibility-admin-key-naar-ikke-frem, registrert rett etter
+//     crm-auth i samme kjede) og korte delete-vinduer i negative tester
+//     (samme post-barriere-argument).
 //     Re-assert-før-dispatch-mitigeringen i DENNE filens blokker beholdes
 //     som belte-og-bukser mot delete-vinduene.
 // ─────────────────────────────────────────────────────────────────────────
@@ -14160,9 +14164,18 @@ const _pr74Promise = (async () => {
   // ── A2 + A3: combined check via real router ─────────────────────────
   // Inject in-memory DB and load the analytics router fresh, then mount
   // on a tiny Express app to call the actual route handler.
-  // Admin key is the suite-wide canonical ANALYTICS_ADMIN_KEY constant — no
+  // Admin key is the suite-wide canonical SUITE_ADMIN_KEY constant — no
   // process.env mutation (kriterium 2; this site used to set it and never
   // restore it, leaking a bespoke key for the rest of the process).
+  // dev-request 2026-07-28-visibility-admin-key-naar-ikke-frem (analytics.ts
+  // slice): requireAdminAuth() now checks ADMIN_KEY (primary) before
+  // ANALYTICS_ADMIN_KEY (legacy fallback) — same fleet-wide precedence
+  // crm.ts got in dev-request 2026-08-02-crm-summary-401-auth. ADMIN_KEY is
+  // pinned suite-wide (see SUITE_ADMIN_KEY) and always truthy in this
+  // process, so this block must now send/re-pin ADMIN_KEY, not
+  // ANALYTICS_ADMIN_KEY, or the suite-wide ADMIN_KEY value wins instead and
+  // this block's key is ignored (mirrors the same fix applied to
+  // crm-vertical.test.ts for the crm.ts precedence change).
   const initMod = require("../src/database/init");
   initMod.__setDbForTesting(pr74db);
 
@@ -14201,10 +14214,14 @@ const _pr74Promise = (async () => {
   async function call(urlPath: string, _retriesLeft = 4): Promise<{ status: number; body: any }> {
     // Re-assert against the residual, out-of-scope external hazard: sibling
     // src/**/*.test.ts helper suites required elsewhere in this file still
-    // mutate process.env.ANALYTICS_ADMIN_KEY with their own bespoke values
-    // (kriterium 2 only covers this file's own blocks, which no longer
-    // touch it — this pr-74 block used to leak its own value forever with
-    // no restore at all, so this re-pin is a net-new hardening).
+    // mutate process.env.ADMIN_KEY / ANALYTICS_ADMIN_KEY with their own
+    // bespoke values (kriterium 2 only covers this file's own blocks, which
+    // no longer touch it — this pr-74 block used to leak its own value
+    // forever with no restore at all, so this re-pin is a net-new
+    // hardening). ADMIN_KEY is the one that matters for analytics.ts's
+    // auth check now (see comment above) — ANALYTICS_ADMIN_KEY is re-pinned
+    // too, belt-and-suspenders, though it's only consulted as the fallback.
+    process.env.ADMIN_KEY = SUITE_ADMIN_KEY;
     process.env.ANALYTICS_ADMIN_KEY = SUITE_ANALYTICS_ADMIN_KEY;
     initMod.__setDbForTesting(pr74db);
     const result = await new Promise<{ status: number; body: any }>(resolve => {
@@ -14213,7 +14230,7 @@ const _pr74Promise = (async () => {
         port,
         path: urlPath,
         method: "GET",
-        headers: { "X-Admin-Key": SUITE_ANALYTICS_ADMIN_KEY },
+        headers: { "X-Admin-Key": SUITE_ADMIN_KEY },
       }, (res: any) => {
         let buf = "";
         res.on("data", (c: any) => buf += c);
@@ -30471,13 +30488,19 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     const initMod = require("../src/database/init");
     const analyticsMod = await import("../src/routes/analytics");
 
-    // Suite-wide canonical ANALYTICS_ADMIN_KEY (never mutated — kriterium 2).
+    // Suite-wide canonical ADMIN_KEY (never mutated — kriterium 2).
     // This block used to invent its own value and set it directly, which is
     // exactly the pr-74 leak the comment on req() below used to warn about
     // (pr-74, far earlier in this file, used to set ANALYTICS_ADMIN_KEY and
     // never restore it) — that leak is now impossible because pr-74 no
     // longer touches process.env at all.
-    const ADMIN_KEY = SUITE_ANALYTICS_ADMIN_KEY;
+    // dev-request 2026-07-28-visibility-admin-key-naar-ikke-frem (analytics.ts
+    // slice): requireAdminAuth() now checks ADMIN_KEY (primary) before
+    // ANALYTICS_ADMIN_KEY (legacy fallback), same precedence crm.ts already
+    // got. ADMIN_KEY is pinned suite-wide and always truthy, so this local
+    // const (and the header/re-pins below) must source from SUITE_ADMIN_KEY,
+    // not SUITE_ANALYTICS_ADMIN_KEY, or the suite-wide value wins instead.
+    const ADMIN_KEY = SUITE_ADMIN_KEY;
 
     const tpaDb = new sqlite(":memory:");
     initMod.__setDbForTesting(tpaDb as any);
@@ -30588,17 +30611,21 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     // req() wraps rawReq() with a defensive retry-on-{401,500}. This suite
     // runs dozens of independent test blocks as CONCURRENT top-level async
     // IIFEs sharing one Node process and one getDb() singleton:
-    //  - ANALYTICS_ADMIN_KEY used to be a shared-mutation hazard among THIS
-    //    file's own blocks too (pr-74, far earlier in this file, used to set
-    //    it directly and never restore it) — that specific hazard is fixed
-    //    (kriterium 2): ANALYTICS_ADMIN_KEY is the suite-wide canonical
+    //  - ADMIN_KEY used to be (as ANALYTICS_ADMIN_KEY) a shared-mutation
+    //    hazard among THIS file's own blocks too (pr-74, far earlier in this
+    //    file, used to set it directly and never restore it) — that specific
+    //    hazard is fixed (kriterium 2): ADMIN_KEY is the suite-wide canonical
     //    constant, assigned exactly once for this file's own blocks, and
     //    pr-74 no longer reassigns it. It is, however, still mutated by
     //    sibling src/**/*.test.ts helper suites required elsewhere in this
     //    file (their own bespoke values) — out of scope for this slice, same
     //    class of residual hazard as the getDb()-singleton one below — so
     //    re-pinning it every attempt is kept as real, still-needed defense,
-    //    not just cheap insurance.
+    //    not just cheap insurance. Re-pins ADMIN_KEY specifically (not
+    //    ANALYTICS_ADMIN_KEY) since dev-request
+    //    2026-07-28-visibility-admin-key-naar-ikke-frem made requireAdminAuth()
+    //    check ADMIN_KEY first — that's the one a foreign mutation could now
+    //    actually knock this block's auth over.
     //  - Many blocks (including this one) call __setDbForTesting() to pin
     //    the shared getDb() singleton to their own in-memory DB for the
     //    duration of their requests; a fresh HTTP request (unlike our
@@ -30616,7 +30643,7 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
       opts: { headers?: Record<string, string>; json?: unknown } = {}
     ): Promise<{ status: number; body: string; json: any }> {
       for (let attempt = 0; attempt < 25; attempt++) {
-        process.env.ANALYTICS_ADMIN_KEY = ADMIN_KEY;
+        process.env.ADMIN_KEY = ADMIN_KEY;
         initMod.__setDbForTesting(tpaDb as any);
         const resp = await rawReq(method, urlPath, opts);
         if (resp.status !== 401 && resp.status !== 500) return resp;
@@ -30625,7 +30652,7 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
       // Give up after many retries — pin both globals once more and return
       // whatever the final attempt yields so the assertion messages show
       // the real (unexpected) status rather than looping forever.
-      process.env.ANALYTICS_ADMIN_KEY = ADMIN_KEY;
+      process.env.ADMIN_KEY = ADMIN_KEY;
       initMod.__setDbForTesting(tpaDb as any);
       return rawReq(method, urlPath, opts);
     }
@@ -33067,7 +33094,9 @@ const _rfbAgentsRetroScanPromise: Promise<void> = new Promise<void>(r => {
 // prosess-globale verdiene midt i kjøringen — så timing-skift kan ikke lenger
 // gi fremmed-nøkkel-403 mellom blokker. (crm.test.ts er bevisst unntatt: den
 // TESTER nøkkel-presedensen fra PR #455 og må variere nøklene — den kjører i
-// runSerial-kjeden og er nettopp derfor ufarlig ETTER denne barrieren.)
+// runSerial-kjeden og er nettopp derfor ufarlig ETTER denne barrieren.
+// analytics-adminkey.test.ts er unntatt av samme grunn — den kjører rett
+// etter crm.test.ts i samme kjede, altså også post-barriere.)
 //
 // Listen speiler rapporthalens await-liste (~linje 24446) minus _serialChain
 // (kjede-medlem kan ikke vente på kjeden). _contentRefreshCharsetPromise,
@@ -37528,6 +37557,23 @@ runSerial(async () => {
     failed++;
     failures.push("crm-auth: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ crm-auth: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-28-visibility-admin-key-naar-ikke-frem (analytics.ts slice): analytics admin auth (ADMIN_KEY primary / ANALYTICS_ADMIN_KEY fallback) ──");
+  try {
+    const { runAnalyticsAdminKeyTests } = require("../src/routes/analytics-adminkey.test") as
+      typeof import("../src/routes/analytics-adminkey.test");
+    const aat = await runAnalyticsAdminKeyTests({ log: false });
+    passed += aat.passed;
+    failed += aat.failed;
+    for (const f of aat.failures) failures.push("analytics-auth: " + f);
+    console.log(`  analytics-auth: ${aat.passed} passed, ${aat.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-auth: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ analytics-auth: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
