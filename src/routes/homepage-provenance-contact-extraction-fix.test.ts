@@ -397,6 +397,114 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "addr-07: an address with no leading label at all extracts unchanged (fix doesn't regress the common case)",
   );
 
+  // ── Bug 4 code-review follow-up ROUND 3 (2026-08-13/14, Daniel-authorized
+  //    4th round, daniel-responses/2026-08-13-brief-svar.md): rounds 1/2
+  //    narrowed "Kontakt"/"Ring" to direct adjacency, but GENERIC labels
+  //    (tlf/telefon/mob/mobil/sms/call) were left matching anywhere in the
+  //    WHOLE 40/20-char window — the exact same flaw, just on the other half
+  //    of the label set. A real GENERIC label sitting a whole (unrelated)
+  //    clause away from an unrelated reference number still wrongly
+  //    corroborated it. Fix: GENERIC labels now also require direct,
+  //    immediate adjacency (leading OR trailing shape) — these fixtures pin
+  //    the round-3 fix. ────────────────────────────────────────────────────
+
+  // Reviewer repro 1: "Mob/SMS" is real phone-context vocabulary, but the
+  // digit run that follows is an unrelated reference number in the next
+  // clause — must NOT extract.
+  const htmlMobSmsUnrelatedRef =
+    "<html><body><p>Mob/SMS venligst. Referansenr 79656569.</p></body></html>";
+  assertEq(
+    extractPhone(htmlMobSmsUnrelatedRef),
+    null,
+    "phone-24 (round-3 repro): 'Mob/SMS' sitting in an unrelated clause does NOT corroborate an unrelated reference number",
+  );
+
+  // Reviewer repro 2: "call" (from "Please call us") is real phone-context
+  // vocabulary, but the digit run is an unrelated order reference in a
+  // different element entirely — must NOT extract.
+  const htmlCallUsUnrelatedOrderRef =
+    "<html><body><button>Please call us</button><footer>Order ref 79656569</footer></body></html>";
+  assertEq(
+    extractPhone(htmlCallUsUnrelatedOrderRef),
+    null,
+    "phone-25 (round-3 repro): 'Please call us' button text elsewhere does NOT corroborate an unrelated order-reference number in a different element",
+  );
+
+  // Reviewer repro 3: "tlf." appears (inside "tlf.kort"), but the digit run
+  // that follows is an unrelated matrikkel (Gnr/bnr) number — must NOT
+  // extract.
+  const htmlTlfKortUnrelatedMatrikkel =
+    "<html><body><p>Se tlf.kort i skuffen. Gnr/bnr 79656569 for eiendommen.</p></body></html>";
+  assertEq(
+    extractPhone(htmlTlfKortUnrelatedMatrikkel),
+    null,
+    "phone-26 (round-3 repro): 'tlf.' mentioned in an unrelated clause does NOT corroborate an unrelated matrikkel number",
+  );
+
+  // Reviewer repro 4: "Telefon" is present, but the digit run is an
+  // unrelated order number in the next sentence — must NOT extract.
+  const htmlTelefonUnrelatedOrderNr =
+    "<html><body><p>Telefon ligger i skuffen. Ordrenr 79656569</p></body></html>";
+  assertEq(
+    extractPhone(htmlTelefonUnrelatedOrderNr),
+    null,
+    "phone-27 (round-3 repro): 'Telefon' mentioned in an unrelated clause does NOT corroborate an unrelated order number",
+  );
+
+  // Positive control: leading GENERIC label directly adjacent, combined with
+  // a "Ring oss på" CTA prefix even further back — proves the fix isn't
+  // overly narrow to a single label touching the digits.
+  const htmlRingOssPaTlfLabel =
+    "<html><body><p>Ring oss på Tlf: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingOssPaTlfLabel),
+    "91234567",
+    "phone-28: 'Ring oss på Tlf: <nummer>' still extracts — the directly-adjacent 'Tlf:' label corroborates it",
+  );
+
+  // Positive control: plain "Telefon: <nummer>" (the most common shape)
+  // still extracts after narrowing GENERIC to adjacency.
+  const htmlTelefonDirectlyAdjacent = "<html><body><p>Telefon: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlTelefonDirectlyAdjacent),
+    "91234567",
+    "phone-29: 'Telefon: <nummer>' direct adjacency still extracts (does not regress the most common shape)",
+  );
+
+  // Positive control: trailing GENERIC label shape ("<nummer> (Tlf)") — the
+  // AFTER-adjacency half of the fix, documented by PHONE_CONTEXT_WINDOW_*
+  // but not previously covered by a test.
+  const htmlTrailingTlfLabel = "<html><body><p>91234567 (Tlf)</p></body></html>";
+  assertEq(
+    extractPhone(htmlTrailingTlfLabel),
+    "91234567",
+    "phone-30: a trailing '(Tlf)' label directly after the digits still extracts",
+  );
+
+  // ── Bug 4 code-review follow-up ROUND 3, part 2 (2026-08-13/14): "Kontakt"
+  //    gets the same CTA-word extension "Ring" already has, so "Kontakt oss
+  //    på <nummer>" — a very common Norwegian contact-box phrase — extracts
+  //    instead of wrongly returning null. ─────────────────────────────────
+
+  // The new shape this part fixes: "Kontakt oss på <nummer>" now extracts.
+  const htmlKontaktOssPa = "<html><body><p>Kontakt oss på 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktOssPa),
+    "91234567",
+    "phone-31: 'Kontakt oss på <nummer>' (Kontakt's CTA-word extension) now extracts, mirroring 'Ring oss på <nummer>'",
+  );
+
+  // Negative control: the CTA extension must not overreach — "Kontakt oss"
+  // followed by an unrelated clause and an unrelated reference number must
+  // still return null (fail-closed direction preserved).
+  const htmlKontaktOssUnrelatedOrderNr =
+    "<html><body><p>Kontakt oss i morgen. Ordrenr 79656569.</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktOssUnrelatedOrderNr),
+    null,
+    "phone-32: 'Kontakt oss' followed by an unrelated clause and an order number still does NOT extract (CTA extension doesn't overreach)",
+  );
+
   return { passed, failed, failures };
 }
 

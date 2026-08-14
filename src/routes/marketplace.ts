@@ -5262,14 +5262,39 @@ function looksLikeDate(digits: string): boolean {
 // and the digit run — via PHONE_CONTEXT_ADJACENT below, the same posture
 // the original adjacency check already used for the bare "Ring <nummer>"
 // shape, now generalised to also cover "Kontakt:"/"Kontaktinfo:" and the
-// full "Ring oss/på/nå/meg" CTA phrase. GENERIC labels are UNCHANGED — they
-// have no non-phone Norwegian meaning, so window-wide matching for them was
-// never the problem; only "Kontakt"/"Ring" needed narrowing.
-const PHONE_CONTEXT_GENERIC = /\b(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\b/i;
+// full "Ring oss/på/nå/meg" CTA phrase.
+//
+// Code-review follow-up round 3 (2026-08-13/14, Daniel-authorized 4th round,
+// daniel-responses/2026-08-13-brief-svar.md): the comment directly above used
+// to end here with "GENERIC labels are UNCHANGED — they have no non-phone
+// Norwegian meaning, so window-wide matching for them was never the problem".
+// That reasoning conflated "unambiguous word" with "provably related to THIS
+// candidate" — they're different questions. A word being phone-specific only
+// means it's never a false lead on its own (no "Ring 3 the road" problem);
+// it says nothing about whether it's talking about the digit run 30+
+// characters away in an unrelated clause. Reproduced live/round-3:
+//   "Mob/SMS venligst. Referansenr 79656569."
+//   "<button>Please call us</button><footer>Order ref 79656569</footer>"
+//   "Se tlf.kort i skuffen. Gnr/bnr 79656569 for eiendommen."
+//   "Telefon ligger i skuffen. Ordrenr 79656569"
+// — in every case the GENERIC label is real and present in the window, but
+// sits in a clause that has nothing to do with the nearby digit run. Fix:
+// GENERIC labels now get the SAME direct-adjacency discipline PHONE_CONTEXT_
+// ADJACENT already applies to "Kontakt"/"Ring" — split into a BEFORE form
+// ("Telefon: 91234567", "Tlf 91234567") tested `$`-anchored against the text
+// immediately, contiguously preceding the candidate, and an AFTER form
+// ("91234567 (Tlf)") tested `^`-anchored against the text immediately,
+// contiguously following it — never "found somewhere in the wide window".
+const PHONE_CONTEXT_GENERIC_BEFORE =
+  /\b(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\s*[:,]?\s*$/iu;
+const PHONE_CONTEXT_GENERIC_AFTER =
+  /^\s*[(,]?\s*(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\b/iu;
 // Matches ONLY when the candidate is DIRECTLY, IMMEDIATELY preceded (only
 // whitespace/colon/comma in between — no unrelated word or sentence) by:
-//   • "Kontakt"/"Kontaktinfo"/"Kontaktinformasjon", optionally with a
-//     trailing colon ("Kontakt:", "Kontaktinformasjon:"), or
+//   • "Kontakt"/"Kontaktinfo"/"Kontaktinformasjon", optionally followed by
+//     one or more of the CTA words oss/på in sequence ("Kontakt oss",
+//     "Kontakt oss på"), and optionally a trailing colon ("Kontakt:",
+//     "Kontaktinformasjon:"), or
 //   • "Ring", optionally followed by one or more of the CTA words
 //     oss/på/nå/meg in sequence ("Ring", "Ring oss", "Ring nå på").
 // Tested with `$` against the slice ending exactly at the candidate's start
@@ -5279,24 +5304,41 @@ const PHONE_CONTEXT_GENERIC = /\b(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\b/i;
 // (?:oss|på|nå|meg) has no trailing `\b`/lookahead of its own because the
 // group is itself anchored by the surrounding `\s*[:,]?\s*$` — nothing can
 // follow it but optional punctuation/whitespace up to the digits.
+//
+// Code-review follow-up round 3, part 2 (2026-08-13/14, Daniel-authorized,
+// same round as the GENERIC fix above — a safe fail-closed-direction fix
+// bundled into the same round rather than opened as a separate one):
+// "Ring" already got a CTA-word extension (oss/på/nå/meg) so "Ring oss på
+// <nummer>" — a very common Norwegian call-to-action phrase — extracts
+// correctly. "Kontakt" had no equivalent, so the equally common contact-box
+// phrase "Kontakt oss på <nummer>" wrongly returned null (a false negative —
+// safe, but overly conservative). Fixed by mirroring Ring's CTA-word
+// extension onto Kontakt with the analogous words (oss/på). This does not
+// change the fail-closed posture: it still requires DIRECT adjacency, so
+// "Kontakt oss i morgen. Ordrenr 79656569" (CTA phrase, unrelated clause,
+// then an unrelated number) still correctly returns null — the CTA words are
+// only recognised when they sit immediately between the label and the digits,
+// same as Ring's.
 const PHONE_CONTEXT_ADJACENT =
-  /\b(?:kontakt(?:info(?:rmasjon)?)?|ring(?:\s+(?:oss|på|nå|meg))*)\s*[:,]?\s*$/iu;
+  /\b(?:kontakt(?:info(?:rmasjon)?)?(?:\s+(?:oss|på))*|ring(?:\s+(?:oss|på|nå|meg))*)\s*[:,]?\s*$/iu;
 // How far (in characters, in the tag-stripped text) around a candidate match
 // to look for a GENERIC contact label. Generous enough for "Telefon:
 // <number>" / "<number> (Tlf)" shapes without being so wide it picks up an
-// unrelated label elsewhere on a dense contact block. The adjacency check
-// above is intentionally NOT window-based in the same sense — it only looks
-// at what immediately, contiguously precedes the candidate; the window
-// bound below just caps how far back it's even worth looking.
+// unrelated label elsewhere on a dense contact block. Both the GENERIC
+// adjacency checks and PHONE_CONTEXT_ADJACENT are NOT window-based in the
+// "found anywhere" sense — they only look at what immediately, contiguously
+// precedes/follows the candidate; the window bounds below just cap how far
+// back/forward it's even worth looking.
 const PHONE_CONTEXT_WINDOW_BEFORE = 40;
 const PHONE_CONTEXT_WINDOW_AFTER = 20;
 
 function hasPhoneContext(text: string, matchStart: number, groupEnd: number): boolean {
   const windowStart = Math.max(0, matchStart - PHONE_CONTEXT_WINDOW_BEFORE);
   const windowEnd = Math.min(text.length, groupEnd + PHONE_CONTEXT_WINDOW_AFTER);
-  const window = text.slice(windowStart, windowEnd);
-  if (PHONE_CONTEXT_GENERIC.test(window)) return true;
   const immediatelyBefore = text.slice(windowStart, matchStart);
+  if (PHONE_CONTEXT_GENERIC_BEFORE.test(immediatelyBefore)) return true;
+  const immediatelyAfter = text.slice(groupEnd, windowEnd);
+  if (PHONE_CONTEXT_GENERIC_AFTER.test(immediatelyAfter)) return true;
   if (PHONE_CONTEXT_ADJACENT.test(immediatelyBefore)) return true;
   return false;
 }
