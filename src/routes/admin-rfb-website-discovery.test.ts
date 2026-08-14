@@ -51,6 +51,22 @@
  *   (o) mode omitted/"blank" — response and DB effect are unchanged (no
  *       regression versus (b)-(i) above, which all run with mode omitted).
  *
+ * Skive 6 + 7 (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, punkt
+ * 5/6 — root-caused in enrichment-reports/2026-08-13-websoek-jakt-wrong-
+ * contact-og-wilsgaard.md):
+ *   (y) Skive 6 (umbrella-filter) — a row with umbrella_type set (e.g.
+ *       'venue') is excluded from default auto-select's target cohort even
+ *       though it otherwise matches role/vertical/status/blank-website
+ *       criteria, and its candidate host is never fetched; a regular
+ *       producer row (umbrella_type IS NULL) alongside it is still scanned
+ *       and proposed — no regression.
+ *   (z) Skive 7 (pick-strategy) — default auto-select's ORDER BY is no
+ *       longer purely a.created_at ASC: a source-text check confirms
+ *       ORDER BY RANDOM() is used (and that aggregator_replace mode's own
+ *       ordering is untouched), plus a functional smoke test that a
+ *       strictly-newer row CAN be selected ahead of the single oldest
+ *       eligible row at LIMIT 1 across repeated calls.
+ *
  * globalThis.fetch is mocked directly, keyed on URL (same convention as the
  * closest sibling test file, opplevelser-gardssalg-website-discovery.test.ts)
  * — safe here because this suite is run standalone (see the file-scoping
@@ -210,6 +226,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       role?: string;
       verticalId?: string | null;
       createdAt?: string;
+      umbrellaType?: string | null;
     }): void {
       testDb.prepare(
         `INSERT INTO agents (
@@ -228,6 +245,12 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         o.id, o.website ?? null, o.verificationStatus ?? "pending_verify",
         o.postalCode ?? null, o.phone ?? null, o.address ?? null, new Date().toISOString(),
       );
+      // umbrella_type isn't in the base agents INSERT column list above (kept
+      // untouched so every pre-existing insertAgent() call site stays
+      // byte-identical) — set separately, only when a caller opts in.
+      if (o.umbrellaType !== undefined && o.umbrellaType !== null) {
+        testDb.prepare(`UPDATE agents SET umbrella_type = ? WHERE id = ?`).run(o.umbrellaType, o.id);
+      }
     }
 
     function readQueueRow(agentId: string): any {
@@ -708,6 +731,95 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(rej?.reason, "no_longer_blank", "x2: fill-only guard fired");
       const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-race'").get() as any;
       assertEq(k.website, "https://allerede-satt.no", "x3: the existing value is untouched");
+    }
+
+    // ═══ Skive 6 + 7 (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype) ═══
+
+    // ── (y) Skive 6: umbrella_type IS NULL filter on the shared rfbWdSelectSql
+    //     WHERE — a venue/umbrella row is excluded from default auto-select's
+    //     target cohort (never even fetched), a regular producer row
+    //     alongside it is still scanned + proposed --
+    {
+      insertAgent({ id: "wd-umbrella-1", name: "Zqvex Umbrellamarked Torget", umbrellaType: "venue" });
+      insertAgent({ id: "wd-regular-included", name: "Zqvex Regularproducer Torget", city: "Testby" });
+      fixtures.set(
+        "https://zqvexregularproducertorget.no",
+        htmlResponse("<html><body>Zqvex Regularproducer Torget ligger i Testby</body></html>", {
+          finalUrl: "https://zqvexregularproducertorget.no",
+        }),
+      );
+
+      const fetchCallsBefore = fetchCalls.length;
+      // No agentIds/candidates -> default auto-select path, i.e.
+      // selectRfbWebsiteDiscoveryTargets (the exact function rfbWdSelectSql's
+      // new umbrella clause and Skive 7's new ORDER BY both apply to). Limit
+      // comfortably covers every blank-website eligible row accumulated by
+      // this suite so far (well under RFB_WD_HARD_CAP).
+      const r = await callDiscovery({ limit: RFB_WD_HARD_CAP });
+      assertEq(r.status, 200, "y1: 200");
+      const seenIds = new Set<string>([
+        ...r.body.proposed.map((p: any) => p.agent_id),
+        ...r.body.rejected.map((x: any) => x.agent_id),
+      ]);
+      assertTrue(!seenIds.has("wd-umbrella-1"), "y2: umbrella row (umbrella_type='venue') never enters the scanned target set");
+      assertTrue(
+        !fetchCalls.slice(fetchCallsBefore).some((u) => u.includes("umbrellamarked")),
+        "y3: umbrella row's guessed candidate host is never fetched — excluded at the SQL layer, not by evidence",
+      );
+      assertTrue(seenIds.has("wd-regular-included"), "y4: regular producer row (umbrella_type IS NULL) is still scanned — no regression");
+      const prop = r.body.proposed.find((p: any) => p.agent_id === "wd-regular-included");
+      assertTrue(!!prop, "y5: regular producer row is proposed (verified against its fixture)");
+      if (prop) {
+        assertEq(prop.candidate_url, "https://zqvexregularproducertorget.no", "y6: proposed candidate_url as expected");
+      }
+    }
+
+    // ── (z) Skive 7: default auto-select's pick strategy is no longer
+    //     purely oldest-first --
+    {
+      // (z1-z3) Direct confirmation of mechanism (the "simpler" option this
+      // route's own dev-request test-coverage instructions call out): the
+      // SQL text for selectRfbWebsiteDiscoveryTargets now uses
+      // ORDER BY RANDOM(), the old oldest-first-with-LIMIT ordering is gone,
+      // and selectRfbWebsiteReplacementTargets's own ordering (aggregator_
+      // replace mode, deliberately out of scope for Skive 7) is untouched.
+      const fs = require("fs");
+      const path = require("path");
+      const srcText: string = fs.readFileSync(path.join(__dirname, "admin-rfb-website-discovery.ts"), "utf8");
+      assertTrue(srcText.includes("ORDER BY RANDOM() LIMIT ?"), "z1: selectRfbWebsiteDiscoveryTargets's SQL text uses ORDER BY RANDOM()");
+      assertTrue(
+        !srcText.includes("ORDER BY a.created_at ASC, a.id ASC LIMIT ?"),
+        "z2: the old oldest-first-with-LIMIT ordering is gone",
+      );
+      assertTrue(
+        srcText.includes("ORDER BY a.created_at ASC, a.id ASC"),
+        "z3: aggregator_replace mode's own ordering (selectRfbWebsiteReplacementTargets) is left untouched",
+      );
+
+      // (z4) Functional smoke test: seed one row strictly older than every
+      // other eligible row accumulated by this whole suite, plus several
+      // strictly newer rows. Under the old ORDER BY a.created_at ASC, a
+      // LIMIT-1 auto-select would deterministically return the oldest row
+      // on every single call. Under ORDER BY RANDOM(), it should not.
+      insertAgent({ id: "wd-pick-oldest", name: "Zqvex Pickstrategy Oldest Gard", city: "Testby", createdAt: "1999-01-01 00:00:00" });
+      insertAgent({ id: "wd-pick-new-1", name: "Zqvex Pickstrategy Newone Gard", city: "Testby", createdAt: "2026-08-01 00:00:00" });
+      insertAgent({ id: "wd-pick-new-2", name: "Zqvex Pickstrategy Newtwo Gard", city: "Testby", createdAt: "2026-08-05 00:00:00" });
+      insertAgent({ id: "wd-pick-new-3", name: "Zqvex Pickstrategy Newthree Gard", city: "Testby", createdAt: "2026-08-10 00:00:00" });
+      // No fixtures set for any of these hosts — every attempt is rejected
+      // (no_candidate_verified), but that's irrelevant here: the pick
+      // strategy only governs WHICH row(s) selectRfbWebsiteDiscoveryTargets
+      // returns from the eligible cohort, not whether they later verify.
+
+      const pickedFirst = new Set<string>();
+      for (let i = 0; i < 20; i++) {
+        const r = await callDiscovery({ limit: 1 });
+        const ids = [...r.body.proposed, ...r.body.rejected].map((x: any) => x.agent_id);
+        if (ids.length > 0) pickedFirst.add(ids[0]);
+      }
+      assertTrue(
+        !(pickedFirst.size === 1 && pickedFirst.has("wd-pick-oldest")),
+        "z4: LIMIT-1 auto-select is not deterministically always the single oldest eligible row across 20 repeated calls",
+      );
     }
   } catch (err: any) {
     failed++;
