@@ -24834,6 +24834,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
+  try { await _homepageProvenanceHeadlessFallbackPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -33129,6 +33130,44 @@ const _rfbAgentsRetroScanPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-08-14-fetch-vegg-headless-fallback (Slice 2, 2nd
+// consumer): headless-render fallback on POST /admin/homepage-provenance-batch
+// (src/routes/marketplace.ts, processAgent()) — same shared services/
+// render-page.ts module RFB website discovery already uses. Flag-gated
+// (HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED, default OFF); when ON, a
+// plain-fetch page that fails the ownership name-match AND looks like a JS
+// shell is retried through a headless browser (injected via
+// __setRenderPageImplForTesting) before conceding ownership_unverified. Own
+// dedicated test file (own in-memory prod-schema DB, swaps the shared
+// getDb() singleton) — chained after _rfbAgentsRetroScanPromise, the current
+// tail of this serial chain.
+let _homepageProvenanceHeadlessFallbackResolve: () => void = () => {};
+const _homepageProvenanceHeadlessFallbackPromise: Promise<void> = new Promise<void>(r => {
+  _homepageProvenanceHeadlessFallbackResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_rfbAgentsRetroScanPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-08-14-fetch-vegg-headless-fallback: homepage-provenance-batch headless fallback ──");
+  try {
+    const { runHomepageProvenanceHeadlessFallbackTests } = require("../src/routes/homepage-provenance-headless-fallback.test") as
+      typeof import("../src/routes/homepage-provenance-headless-fallback.test");
+    const hf = await runHomepageProvenanceHeadlessFallbackTests({ log: false });
+    passed += hf.passed;
+    failed += hf.failed;
+    for (const f of hf.failures) failures.push("homepage-provenance-headless-fallback: " + f);
+    console.log(`  homepage-provenance-headless-fallback: ${hf.passed} passed, ${hf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-provenance-headless-fallback: unexpected error: " + String(err?.message || err));
+  } finally {
+    _homepageProvenanceHeadlessFallbackResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
 // Dette er barrieren filheaderens "NOT yet fixed"-punkt 2 beskriver: frem til
@@ -33184,6 +33223,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
   _expNoYieldBackoffPromise, _contentRefreshErrorsByPersistencePromise, _lowQualitySelectorPromise,
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
+  _homepageProvenanceHeadlessFallbackPromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);
