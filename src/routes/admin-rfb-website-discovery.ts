@@ -57,6 +57,7 @@ import {
   gardssalgWebsiteEvidenceMatch,
 } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
+import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { mergeFieldProvenance } from "./admin-knowledge";
 
 // ─── agents_website_review_queue (lazy, ensureXTable pattern) ──────────────
@@ -135,6 +136,65 @@ export const RFB_WD_DEFAULT_LIMIT = 25;
 export const RFB_WD_HARD_CAP = 48;
 
 const RFB_WD_USER_AGENT = "Lokal-RFB-WebsiteDiscovery/1.0";
+
+// ─── Headless-render fallback (dev-request 2026-08-14-rfb-wd-headless-
+// fallback) ──────────────────────────────────────────────────────────────
+//
+// Daniel measured 2026-08-13: 5/5 manually-checked website-discovery
+// candidates were wrongly rejected `no_candidate_verified` even though the
+// sites are real and live in a browser — the plain fetcher
+// (services/fetch-page.ts) only ever sees the pre-script HTML, and a
+// JS-built producer site (Wix/Squarespace-class) renders its actual content
+// client-side, so evidence-matching against the raw fetch finds nothing to
+// match against. services/render-page.ts (merged 2026-08-13, commits
+// 8a51d85/f79ea4b) exists exactly for this: a headless-browser re-fetch of
+// the SAME url, gated behind shouldEscalateToRender() so it only fires on
+// pages that actually look like a JS shell (big + scripted + near-empty
+// visible text), never on every miss.
+//
+// Flag-gated, default OFF — mirrors this codebase's existing boolean-env-
+// flag idiom exactly (grep `process.env.\w+ === "true"`, e.g.
+// admin-homepage-provenance-cohort.ts's HOMEPAGE_PARKING_DISABLED,
+// admin-agents.ts's BRREG_VERIFY_ON_REGISTER). Unset/anything-other-than-
+// the-literal-string-"true" = disabled = today's exact behaviour, zero
+// regression risk — this is the "flag off = byte-identical to before" claim
+// the dev-request makes.
+function rfbWdHeadlessFallbackEnabled(): boolean {
+  return process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED === "true";
+}
+
+// Deliberately BELOW render-page.ts's own DEFAULT_RENDER_TIMEOUT_MS (20s).
+// A single discovery call can walk up to RFB_WD_HARD_CAP (48) targets, each
+// trying several name-guessed hosts before giving up, and the fallback can
+// in principle fire more than once per call — a smaller per-render bound
+// caps the worst-case wall-clock this still-rare, opt-in path can add to one
+// batch without touching render-page.ts's own tested default (which other,
+// future, non-batched callers may still want in full).
+export const RFB_WD_RENDER_TIMEOUT_MS = 12_000;
+
+// Per-call fallback counters, threaded through tryRfbWebsiteCandidateHost by
+// mutable reference so both response shapes that call it (the external-
+// candidates path and the auto-select/agentIds path) can report the same
+// two numbers without a second code path to keep in sync.
+interface RfbWdFallbackCounters {
+  attempted: number;
+  verified: number;
+}
+
+// Test-only injection point for renderPage (mirrors __setRfbCxRowDelayForTesting,
+// admin-rfb-contact-extraction.ts): this codebase's esbuild/tsx toolchain
+// compiles `import { renderPage } from ...` to a live binding that cannot be
+// monkeypatched from OUTSIDE this module (see the file-header note in
+// opplevelser-content-refresh-errors-by-persistence.test.ts) — a reference
+// held INSIDE the module can still be swapped, though, same trick
+// render-page.ts's own `renderImpl` option uses one level down. Production
+// code always leaves this null and gets the real renderPage (and therefore
+// the real, lazily-imported playwright-core — `renderer_unavailable`
+// wherever it isn't installed, exactly as documented in render-page.ts).
+let renderPageImplForTesting: typeof renderPage | null = null;
+export function __setRfbWdRenderPageImplForTesting(impl: typeof renderPage | null): void {
+  renderPageImplForTesting = impl;
+}
 
 // ─── Local, RFB-scoped re-implementation of the aggregator/directory +
 // social-media host exclusion opplevelser.ts's gardssalg website-discovery
@@ -401,6 +461,32 @@ interface RfbWdHit {
 // (rfb, dental, experiences)", not an opplevagent-vertical file, so importing
 // it does not violate the "don't call into opplevelser.ts" scoping rule) ->
 // final-host re-check after any redirect -> ownership-evidence match.
+// Shared "final host after a redirect" exclusion re-check — used after BOTH
+// a plain-fetch redirect and (headless fallback) a render redirect, so the
+// two paths can never drift apart. Pushes the rejection reason into
+// excludedHere and returns true when the host must be rejected.
+function rfbWdCheckFinalHostExclusion(
+  finalHost: string,
+  existingHosts: Set<string>,
+  hostsProposedThisBatch: Set<string>,
+  excludedHere: Array<{ host: string; reason: string }>,
+): boolean {
+  const finalReason = rfbWebsiteHostExclusionReason(finalHost);
+  if (finalReason) {
+    excludedHere.push({ host: finalHost, reason: finalReason });
+    return true;
+  }
+  if (existingHosts.has(finalHost)) {
+    excludedHere.push({ host: finalHost, reason: "host_already_in_use" });
+    return true;
+  }
+  if (hostsProposedThisBatch.has(finalHost)) {
+    excludedHere.push({ host: finalHost, reason: "host_already_proposed_this_batch" });
+    return true;
+  }
+  return false;
+}
+
 async function tryRfbWebsiteCandidateHost(
   host: string,
   evidenceTarget: Parameters<typeof gardssalgWebsiteEvidenceMatch>[1],
@@ -408,6 +494,7 @@ async function tryRfbWebsiteCandidateHost(
   hostsProposedThisBatch: Set<string>,
   tried: string[],
   excludedHere: Array<{ host: string; reason: string }>,
+  fallbackCounters: RfbWdFallbackCounters,
 ): Promise<RfbWdHit | null> {
   const preReason = rfbWebsiteHostExclusionReason(host);
   if (preReason) {
@@ -432,26 +519,51 @@ async function tryRfbWebsiteCandidateHost(
 
   const finalHost = rfbWdHostFromUrl(result.finalUrl) || host;
   if (finalHost !== host) {
-    const finalReason = rfbWebsiteHostExclusionReason(finalHost);
-    if (finalReason) {
-      excludedHere.push({ host: finalHost, reason: finalReason });
-      return null;
-    }
-    if (existingHosts.has(finalHost)) {
-      excludedHere.push({ host: finalHost, reason: "host_already_in_use" });
-      return null;
-    }
-    if (hostsProposedThisBatch.has(finalHost)) {
-      excludedHere.push({ host: finalHost, reason: "host_already_proposed_this_batch" });
+    if (rfbWdCheckFinalHostExclusion(finalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
       return null;
     }
   }
 
   const pageText = gardssalgPageText(result.html);
   const evidence = gardssalgWebsiteEvidenceMatch(pageText, evidenceTarget);
-  if (!evidence.verified) return null;
+  if (evidence.verified) {
+    return { host: finalHost, finalUrl: result.finalUrl, evidence };
+  }
 
-  return { host: finalHost, finalUrl: result.finalUrl, evidence };
+  // ── Headless-render fallback ──────────────────────────────────────────
+  // Only for a page that (a) really did fetch, (b) really did fail plain
+  // evidence-matching, and (c) really does look like a JS shell — never a
+  // blanket retry of every miss. A genuinely unreachable host never reaches
+  // here at all (the `!result.ok` return above already left).
+  if (rfbWdHeadlessFallbackEnabled() && shouldEscalateToRender(result.html)) {
+    fallbackCounters.attempted++;
+    const renderFn = renderPageImplForTesting ?? renderPage;
+    const rendered = await renderFn(`https://${finalHost}`, {
+      userAgent: RFB_WD_USER_AGENT,
+      timeoutMs: RFB_WD_RENDER_TIMEOUT_MS,
+    });
+    if (rendered.ok) {
+      const renderedFinalHost = rfbWdHostFromUrl(rendered.finalUrl) || finalHost;
+      if (renderedFinalHost !== finalHost) {
+        if (rfbWdCheckFinalHostExclusion(renderedFinalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
+          return null;
+        }
+      }
+      const renderedPageText = gardssalgPageText(rendered.html);
+      const renderedEvidence = gardssalgWebsiteEvidenceMatch(renderedPageText, evidenceTarget);
+      if (renderedEvidence.verified) {
+        fallbackCounters.verified++;
+        return { host: renderedFinalHost, finalUrl: rendered.finalUrl, evidence: renderedEvidence };
+      }
+    }
+    // !rendered.ok (including `renderer_unavailable` — this machine simply
+    // cannot render, never a statement about the site) or render succeeded
+    // but still didn't verify: fall through to the same `no candidate`
+    // outcome as if no fallback had ever been attempted. Never a throw,
+    // never a negative signal recorded against the producer.
+  }
+
+  return null;
 }
 
 function rfbWdConfidence(evidence: RfbWdEvidence): number {
@@ -587,6 +699,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
 
     const existingHostsExt = rfbWdExistingWebsiteHosts(db);
     const hostsProposedExt = new Set<string>();
+    const fallbackCountersExt: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
     const proposedExt: Array<{
       agent_id: string;
       agent_name: string;
@@ -642,7 +755,15 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       };
       const tried: string[] = [];
       const excludedHere: Array<{ host: string; reason: string }> = [];
-      const hit = await tryRfbWebsiteCandidateHost(host, evidenceTarget, existingHostsExt, hostsProposedExt, tried, excludedHere);
+      const hit = await tryRfbWebsiteCandidateHost(
+        host,
+        evidenceTarget,
+        existingHostsExt,
+        hostsProposedExt,
+        tried,
+        excludedHere,
+        fallbackCountersExt,
+      );
 
       if (hit) {
         hostsProposedExt.add(hit.host);
@@ -682,6 +803,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       rejected: rejectedExt,
       already_has_website: alreadyHasWebsite,
       not_found: notFound,
+      headless_fallback_attempted: fallbackCountersExt.attempted,
+      headless_fallback_verified: fallbackCountersExt.verified,
     });
     return;
   }
@@ -755,6 +878,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
 
   const existingHosts = rfbWdExistingWebsiteHosts(db);
   const hostsProposedThisBatch = new Set<string>();
+  const fallbackCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
 
   const proposed: Array<{
     agent_id: string;
@@ -791,7 +915,15 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
 
     let hit: RfbWdHit | null = null;
     for (const host of hosts) {
-      hit = await tryRfbWebsiteCandidateHost(host, evidenceTarget, existingHosts, hostsProposedThisBatch, tried, excludedHere);
+      hit = await tryRfbWebsiteCandidateHost(
+        host,
+        evidenceTarget,
+        existingHosts,
+        hostsProposedThisBatch,
+        tried,
+        excludedHere,
+        fallbackCounters,
+      );
       if (hit) break;
     }
 
@@ -858,6 +990,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     rejected,
     already_has_website: alreadyHasWebsite,
     not_found: notFound,
+    headless_fallback_attempted: fallbackCounters.attempted,
+    headless_fallback_verified: fallbackCounters.verified,
   });
 });
 
