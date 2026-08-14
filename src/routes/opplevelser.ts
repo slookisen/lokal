@@ -17342,7 +17342,10 @@ ABSOLUTTE REGLER:
 - Du skal ALDRI finne på fakta. Ingen priser, klokkeslett, datoer, årstall, avstander, adresser, stedsnavn, severdigheter, fjell, fossefall, personer, historie, utstyr, måltider eller antall som ikke står i listen.
 - Ikke bruk tall som ikke står i faktalisten. Skriv heller tall som ord der det er naturlig.
 - Ikke gjett hva opplevelsen "sannsynligvis" inneholder, og ikke lån detaljer fra liknende opplevelser du kjenner til.
-- Du KAN utdype og forklare de oppgitte faktaene, og gi tydelig generelle, praktiske råd som følger direkte av dem (for eksempel at utendørsaktiviteter krever klær etter været). Slike generelle råd må aldri formuleres som en konkret opplysning om nettopp denne opplevelsen.
+- Du KAN utdype og forklare de oppgitte faktaene, og gi tydelig generelle, praktiske råd som følger direkte av dem (for eksempel at en opplevelse med lang varighet gjerne krever at man setter av god tid). Slike generelle råd må aldri formuleres som en konkret opplysning om nettopp denne opplevelsen.
+- Nevn ALDRI et sted, en region, en fjord, et fjell eller en severdighet som ikke står i faktalisten — heller ikke et sted du "vet" ligger i nærheten eller naturlig hører med. Står det ikke i listen, finnes det ikke i teksten.
+- Skriv ALDRI om årstid, klima eller vær knyttet til et bestemt sted eller en bestemt region. Generelle, stedsnavn- og årstidsløse råd om aktivitetsklær er greit (for eksempel at det gjerne lønner seg å kle seg etter forholdene ved utendørsaktiviteter), men så snart rådet nevner et sted, en region eller en årstid, er det ikke lenger tillatt.
+- Ikke skriv generelle beskrivelser av landsdelen eller regionen opplevelsen ligger i, med mindre hver enkelt påstand er direkte forankret i en oppgitt fakta.
 - Skriv på norsk bokmål, i sammenhengende avsnitt. Ingen overskrifter, ingen punktlister, ingen markdown, ingen lenker, ingen HTML.
 - Teksten skal være minst ${EXP_DESC_MIN_WORDS} ord og høyst ${EXP_DESC_MAX_WORDS} ord.
 - Ikke gjenta setninger eller fyll ut med tomme fraser.
