@@ -8405,6 +8405,8 @@ function computeGardssalgReadinessRows(
   readiness_tier: GardssalgReadinessTier;
   /** The stored homepage URL. See the construction site below for why. */
   hjemmeside: string | null;
+  /** The stored outreach address. See the construction site below for why. */
+  epost: string | null;
   // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
   // stoerrelsesgate) — additive, informational regardless of readiness_tier
   // or the size-gate's own enabled/disabled switch: Daniel sees the size
@@ -8577,6 +8579,23 @@ function computeGardssalgReadinessRows(
       // Purely additive: the column is already SELECTed above, this only stops
       // discarding it. Same admin gate, same cohort, no new query.
       hjemmeside: p.hjemmeside,
+      // Daniel, live session 2026-08-14: the stored outreach address, surfaced
+      // for the SAME reason hjemmeside was the day before.
+      //
+      // Daniel's standing rule is that an outreach address must be one we found
+      // published on the producer's own website — never guessed, never
+      // constructed from the domain. Verifying that means comparing the STORED
+      // address against what the site actually publishes. Until now no
+      // read-only route returned the stored address at all: daily-prep exposes
+      // it, but only for the <=4 rows it selects, so every other eligible row
+      // was unverifiable without a write-path call.
+      //
+      // That gap is exactly the shape of the Wilsgård incident (2026-08-13),
+      // where a row's stored address turned out to belong to a different
+      // company than its org.nr, and no guard could see it because nothing
+      // compared the two. Purely additive: the column is already SELECTed
+      // above, this only stops discarding it. Same admin gate, no new query.
+      epost: p.epost,
       antall_ansatte: p.antall_ansatte,
       size_flag,
     };
