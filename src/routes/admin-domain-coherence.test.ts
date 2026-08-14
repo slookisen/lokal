@@ -612,6 +612,139 @@ export function runAdminDomainCoherenceSweepTests(
       }
     }
 
+    // ── Own-platform-domain guard (dev-request 2026-08-14 domain-coherence
+    // own-domain-guard finding, separate, isolated DB). An agent whose
+    // agents.url host resolves to one of OUR OWN platform domains
+    // (rettfrabonden.com / opplevagent.no) must NEVER be auto-fixed — that
+    // shape means agents.url itself is the corrupted field, not
+    // knowledge.website (the confirmed live Solvang Gård case:
+    // agents.url=https://rettfrabonden.com, knowledge.website correctly
+    // solvanggard.com). Must land in manual_review_needed with a reason
+    // distinct from the ordinary knowledge.email-mismatch shape, and
+    // apply:true must never write it. A normal producer-domain mismatch
+    // fixture in the SAME run proves the guard doesn't weaken ordinary
+    // auto_fixable classification.
+    {
+      const prevDb4 = initMod.getDb();
+      const testKey4 = process.env.ADMIN_KEY || "admin-domain-coherence-own-domain-test-key";
+      const prevAdminKey4 = process.env.ADMIN_KEY;
+      process.env.ADMIN_KEY = testKey4;
+      const db4 = new Database(":memory:");
+      try {
+        initMod.__setDbForTesting(db4 as any);
+        initMod.__initSchemaForTesting(db4 as any);
+
+        const insertAgent4 = db4.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type)
+           VALUES (?, ?, 'test agent', 'test', 'x@example.com', ?, 'producer', ?, NULL)`,
+        );
+        const insertKnowledge4 = db4.prepare(
+          `INSERT INTO agent_knowledge (agent_id, website, email, about, field_provenance, verification_status, verification_review_reason)
+           VALUES (?, ?, NULL, 'A test farm shop', '{}', 'review_required', '{}')`,
+        );
+
+        // Solvang-Gård-shaped fixture: agents.url wrongly set to our OWN
+        // platform domain, knowledge.website correctly holds the real
+        // producer domain. Must be caught by the guard.
+        insertAgent4.run("agent-own-domain-rfb", "OwnDomainRfb AS", "https://rettfrabonden.com", "key-own-domain-rfb");
+        insertKnowledge4.run("agent-own-domain-rfb", "https://solvanggard-like.no");
+
+        // Same shape, other own domain (opplevagent.no).
+        insertAgent4.run("agent-own-domain-oa", "OwnDomainOa AS", "https://opplevagent.no", "key-own-domain-oa");
+        insertKnowledge4.run("agent-own-domain-oa", "https://some-other-real-producer.no");
+
+        // Regression control: ordinary auto_fixable shape (normal producer
+        // domain mismatch, agents.url is NOT one of our own domains) —
+        // proves the guard doesn't over-fire.
+        insertAgent4.run("agent-normal-webmismatch", "NormalWebmismatch AS", "https://normal-real-producer.no", "key-normal-webmismatch");
+        insertKnowledge4.run("agent-normal-webmismatch", "https://totally-different-host.no");
+
+        delete require.cache[require.resolve("./admin-domain-coherence")];
+        const routeMod4 = require("./admin-domain-coherence");
+        const router4 = routeMod4.default;
+
+        function post4(body: any): Promise<RouteResult> {
+          return callRoute(router4, {
+            method: "POST",
+            url: "/",
+            headers: { "content-type": "application/json", "x-admin-key": testKey4 },
+            body,
+          });
+        }
+
+        let r = await post4({});
+        assertEq(r.status, 200, "dc-66: own-platform-domain fixture dry-run -> 200");
+
+        assertTrue(
+          !r.body.auto_fixable.some((a: any) => a.agent_id === "agent-own-domain-rfb"),
+          "dc-67: agents.url=rettfrabonden.com agent is NOT auto_fixable",
+        );
+        assertTrue(
+          !r.body.auto_fixable.some((a: any) => a.agent_id === "agent-own-domain-oa"),
+          "dc-68: agents.url=opplevagent.no agent is NOT auto_fixable",
+        );
+
+        const rfbEntry = r.body.manual_review_needed.find((a: any) => a.agent_id === "agent-own-domain-rfb");
+        assertTrue(!!rfbEntry, "dc-69: rettfrabonden.com agent lands in manual_review_needed");
+        assertEq(
+          rfbEntry.reason,
+          "agents.url host rettfrabonden.com is our own platform domain — needs manual correction of agents.url, not knowledge.website",
+          "dc-70: reason string identifies the own-platform-domain guard, distinct from the email-mismatch reason shape",
+        );
+
+        const oaEntry = r.body.manual_review_needed.find((a: any) => a.agent_id === "agent-own-domain-oa");
+        assertTrue(!!oaEntry, "dc-71: opplevagent.no agent lands in manual_review_needed");
+        assertEq(
+          oaEntry.reason,
+          "agents.url host opplevagent.no is our own platform domain — needs manual correction of agents.url, not knowledge.website",
+          "dc-72: reason string uses the actual agentHost (opplevagent.no) for the other own domain",
+        );
+
+        assertTrue(
+          !r.body.circular_scramble_candidates.some((a: any) => a.agent_id === "agent-own-domain-rfb" || a.agent_id === "agent-own-domain-oa"),
+          "dc-73: own-platform-domain agents are not misclassified as circular_scramble_candidates",
+        );
+
+        // Regression: the ordinary producer-mismatch fixture is unaffected.
+        assertTrue(
+          r.body.auto_fixable.some((a: any) => a.agent_id === "agent-normal-webmismatch"),
+          "dc-74: ordinary producer-domain mismatch (agents.url NOT one of our own domains) is still classified auto_fixable — the guard doesn't over-fire",
+        );
+
+        // apply:true must never write either own-platform-domain row, and
+        // must not count them in `written`.
+        r = await post4({ apply: true });
+        assertEq(r.status, 200, "dc-75: own-platform-domain fixture apply POST -> 200");
+
+        const rfbRow = db4.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-own-domain-rfb'").get() as { website: string };
+        assertEq(rfbRow.website, "https://solvanggard-like.no",
+          "dc-76: apply:true does NOT overwrite knowledge.website for the rettfrabonden.com-guarded agent (no UPDATE fired)");
+
+        const oaRow = db4.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-own-domain-oa'").get() as { website: string };
+        assertEq(oaRow.website, "https://some-other-real-producer.no",
+          "dc-77: apply:true does NOT overwrite knowledge.website for the opplevagent.no-guarded agent (no UPDATE fired)");
+
+        // written count reflects only the genuinely auto-fixed row.
+        assertEq(r.body.written, 1, "dc-78: written count excludes both own-platform-domain-guarded rows, includes only the normal control fixture");
+
+        const normalRow = db4.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-normal-webmismatch'").get() as { website: string };
+        assertEq(normalRow.website, "https://normal-real-producer.no",
+          "dc-79: the ordinary control fixture IS written under apply:true (proves apply still works normally alongside the guard)");
+
+        // Guarded agents get parked as manual_review_needed under apply:true,
+        // same as any other manual_review_needed row.
+        const rfbPark = db4.prepare(
+          "SELECT domain_reconciliation_checked_at, domain_reconciliation_outcome FROM agent_knowledge WHERE agent_id = 'agent-own-domain-rfb'"
+        ).get() as { domain_reconciliation_checked_at: string | null; domain_reconciliation_outcome: string | null };
+        assertTrue(!!rfbPark.domain_reconciliation_checked_at, "dc-80: own-platform-domain-guarded agent gets a parking timestamp under apply:true");
+        assertEq(rfbPark.domain_reconciliation_outcome, "manual_review_needed", "dc-81: own-platform-domain-guarded agent's parking outcome is manual_review_needed");
+      } finally {
+        initMod.__setDbForTesting(prevDb4);
+        if (prevAdminKey4 === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKey4;
+      }
+    }
+
     return { passed, failed, failures };
   })();
 }

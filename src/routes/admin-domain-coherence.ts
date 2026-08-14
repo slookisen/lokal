@@ -60,7 +60,26 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { domainCoherenceCheck, type ProvenanceRecord } from "../services/cross-source-validator";
+import { domainCoherenceCheck, registrableDomain, type ProvenanceRecord } from "../services/cross-source-validator";
+
+// Own-platform-domain guard (dev-request 2026-08-14 domain-coherence
+// own-domain-guard finding): agents.url is normally trusted as this route's
+// identity anchor (see the module doc-comment above), but it can never
+// legitimately equal one of OUR OWN platform's domains — a producer's real
+// website is never rettfrabonden.com or opplevagent.no. When agents.url
+// points at one of these, that's a data bug in agents.url itself, not in
+// knowledge.website. Confirmed live: Solvang Gård (agent_id
+// b787303c-b3bb-4922-b7a5-ac89dc9cbacf) has agents.url=https://rettfrabonden.com
+// while knowledge.website correctly holds solvanggard.com — auto-"fixing"
+// that row would overwrite the CORRECT website with our own domain, active
+// data corruption. This set is intentionally narrow (just our two known
+// domains) — it is NOT a "legitimate platform-seller vs. wrong entity"
+// heuristic for other hosts (bylofoten.no, lustramat.com, etc.); that
+// judgment stays human, per an explicit product decision already on file.
+const OWN_PLATFORM_DOMAINS: ReadonlySet<string> = new Set([
+  "rettfrabonden.com",
+  "opplevagent.no",
+]);
 
 // Parse field_provenance (may be a JSON string from SQLite, already an
 // object, or null/missing) into the shape domainCoherenceCheck's opts
@@ -275,7 +294,28 @@ router.post("/", (req: Request, res: Response) => {
         }
         continue;
       }
-      if (entry.bucket === "auto_fixable" && entry.agentHost) {
+      if (
+        entry.bucket === "auto_fixable" &&
+        entry.agentHost &&
+        OWN_PLATFORM_DOMAINS.has(registrableDomain(entry.agentHost))
+      ) {
+        // Own-platform-domain guard: agents.url's host resolves to one of
+        // OUR OWN domains — never a legitimate producer website. Do not
+        // auto-fix; route to manual_review_needed with a reason distinct
+        // from the ordinary email-mismatch shape so a human corrects
+        // agents.url itself.
+        manual_review_needed.push({
+          agent_id: entry.row.agent_id,
+          name: entry.row.name,
+          reason: `agents.url host ${entry.agentHost} is our own platform domain — needs manual correction of agents.url, not knowledge.website`,
+          agent_url: entry.row.agent_url,
+          current_website: entry.row.website,
+          current_email: entry.row.email,
+        });
+        if (apply) {
+          stampParking(db, entry.row.agent_id, "manual_review_needed", entry.row.verification_review_reason);
+        }
+      } else if (entry.bucket === "auto_fixable" && entry.agentHost) {
         auto_fixable.push({
           agent_id: entry.row.agent_id,
           name: entry.row.name,
