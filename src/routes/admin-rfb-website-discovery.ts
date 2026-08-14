@@ -230,6 +230,13 @@ interface RfbWdTargetRow {
 // override lookup — real column names verified against src/database/init.ts
 // (website/verification_status/postal_code/address/phone live on
 // agent_knowledge, joined by agent_id; org_nr/city live directly on agents).
+// `a.umbrella_type IS NULL` mirrors the canonical Phase 5.11 A4.1 umbrella-
+// agent exclusion verbatim (src/database/init.ts, outreach_ready_pool view,
+// ~line 2081) — an umbrella/venue row (REKO-ring, Bondens marked/torg) can
+// structurally never have its own producer website, so it should never have
+// been a discovery candidate. Measured 2026-08-13
+// (enrichment-reports/2026-08-13-websoek-jakt-wrong-contact-og-wilsgaard.md,
+// Funn A): 64% of the then-current discovery queue (30/47) were such rows.
 function rfbWdSelectSql(extraWhere: string): string {
   return `
     SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.city AS city,
@@ -239,17 +246,28 @@ function rfbWdSelectSql(extraWhere: string): string {
       JOIN agent_knowledge k ON k.agent_id = a.id
      WHERE a.role = 'producer'
        AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+       AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
        ${extraWhere}
   `;
 }
 
+// Pick strategy: ORDER BY RANDOM() (mirrors the getRelatedBySameCity /
+// dental "recently-enriched" / marketplace "recently-enriched" precedent —
+// grep `ORDER BY RANDOM()` in src/ — SQLite's native random ordering, no new
+// helper needed) rather than oldest-first. Measured 2026-08-13
+// (enrichment-reports/2026-08-13-websoek-jakt-wrong-contact-og-wilsgaard.md,
+// Funn B): oldest-first concentrated the head of the queue on old
+// Oslo-market-era rows, tanking the discovery hit-rate from 60% (random
+// sample) to 6% (auto-select head). Deliberately scoped to THIS function
+// only — selectRfbWebsiteReplacementTargets (aggregator_replace mode) keeps
+// its own a.created_at ASC ordering untouched.
 function selectRfbWebsiteDiscoveryTargets(db: ReturnType<typeof getDb>, limit: number): RfbWdTargetRow[] {
   return db
     .prepare(
       `${rfbWdSelectSql(
         `AND k.verification_status IN ('pending_verify','review_required')
          AND (k.website IS NULL OR TRIM(k.website) = '')`,
-      )} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`,
+      )} ORDER BY RANDOM() LIMIT ?`,
     )
     .all(limit) as RfbWdTargetRow[];
 }
