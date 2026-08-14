@@ -1358,6 +1358,49 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
 ];
 
 /**
+ * Which single reason (if any) meetsAboutCheapBar's four independent checks
+ * would reject `text` for — "ok" if it clears all four. Reason precedence
+ * (mangled > boilerplate > foreign > too_short) is arbitrary among the first
+ * three (a real string never trips more than one of those in practice) but
+ * DELIBERATELY checks length LAST: this is what lets a caller (e.g.
+ * rfbRetroScanShouldNull, dev-request 2026-07-25-rfb-kvalitetsgate-og-
+ * retroskann kriterium 7) distinguish "genuinely deterministic garbage"
+ * (mangled/boilerplate/foreign — reject outright, no judgment call needed)
+ * from "merely thin" (too_short — short is not evidence of being WRONG, only
+ * of being incomplete; that's a judgment call, not a deterministic one).
+ */
+export type AboutCheapBarFailure = "ok" | "mangled" | "boilerplate" | "foreign" | "too_short";
+
+export function classifyAboutCheapBar(text: string | null | undefined, minLen = 80): AboutCheapBarFailure {
+  if (!text) return "too_short";
+  const trimmed = String(text).replace(/\s+/g, " ").trim();
+
+  // Reject text carrying the Unicode replacement character — a sign of a
+  // mangled/mid-character truncation somewhere upstream (see meetsAboutCheapBar
+  // doc comment).
+  if (trimmed.includes("�")) return "mangled";
+
+  const lower = trimmed.toLowerCase();
+  const lowerAscii = stripNorwegianAccents(lower);
+
+  // Reject boilerplate (cookie/consent/placeholder dominates the snippet).
+  for (const marker of GENERIC_ABOUT_MARKERS) {
+    if (lowerAscii.includes(marker)) return "boilerplate";
+  }
+
+  // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
+  // (Pad with spaces so word-markers match at the string edges too.)
+  const hasNordicLetter = /[æøåÆØÅ]/.test(trimmed);
+  const padded = ` ${lower} `;
+  const hasNorwegianWord = NORWEGIAN_WORD_MARKERS.some((w) => padded.includes(w));
+  if (!hasNordicLetter && !hasNorwegianWord) return "foreign";
+
+  if (trimmed.length < minLen) return "too_short";
+
+  return "ok";
+}
+
+/**
  * The CHEAP, deterministic, universal quality prefilter — the part of the
  * about/description quality gate that needs no semantic judgment: length,
  * mangled-Unicode rejection, generic boilerplate/cookie/consent rejection,
@@ -1388,33 +1431,11 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
  *     word (rejects an English cookie/marketing snippet).
  *
  * Returns false for empty/short/mangled/boilerplate/foreign text. minLen is
- * overridable for tests.
+ * overridable for tests. Delegates to classifyAboutCheapBar above (same
+ * checks, unchanged order-independent result) so the two never drift apart.
  */
 export function meetsAboutCheapBar(text: string | null | undefined, minLen = 80): boolean {
-  if (!text) return false;
-  const trimmed = String(text).replace(/\s+/g, " ").trim();
-  if (trimmed.length < minLen) return false;
-
-  // Reject text carrying the Unicode replacement character — a sign of a
-  // mangled/mid-character truncation somewhere upstream (see doc comment).
-  if (trimmed.includes("�")) return false;
-
-  const lower = trimmed.toLowerCase();
-  const lowerAscii = stripNorwegianAccents(lower);
-
-  // Reject boilerplate (cookie/consent/placeholder dominates the snippet).
-  for (const marker of GENERIC_ABOUT_MARKERS) {
-    if (lowerAscii.includes(marker)) return false;
-  }
-
-  // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
-  // (Pad with spaces so word-markers match at the string edges too.)
-  const hasNordicLetter = /[æøåÆØÅ]/.test(trimmed);
-  const padded = ` ${lower} `;
-  const hasNorwegianWord = NORWEGIAN_WORD_MARKERS.some((w) => padded.includes(w));
-  if (!hasNordicLetter && !hasNorwegianWord) return false;
-
-  return true;
+  return classifyAboutCheapBar(text, minLen) === "ok";
 }
 
 /**

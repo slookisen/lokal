@@ -63,7 +63,7 @@ import { canCorrectFactualField, mergeFieldProvenance } from "./admin-knowledge"
 // Unicode/boilerplate/Norwegian-language check — never the nav-menu-leakage/
 // umbrella-membership regex heuristic layer (meetsAboutQualityBar), which
 // stays exactly as-is for its existing caller (admin-knowledge.ts).
-import { meetsAboutCheapBar } from "../services/search-enrich";
+import { meetsAboutCheapBar, classifyAboutCheapBar } from "../services/search-enrich";
 // POST /org-nr-backfill below: RFB producer names carry the same "Navn —
 // Sted" display suffix convention gårdssalg does — reuse the existing,
 // already-tested stripper rather than re-implementing it.
@@ -3042,34 +3042,66 @@ function getRfbAgentRetroScanTarget(db: ReturnType<typeof getDb>, agentId: strin
   return row;
 }
 
+/** Which of rfbRetroScanShouldNull's two decision paths a flagged field went
+ * through — surfaced by the retro-scan report's by_cause_class breakdown
+ * (dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann kriterium 7,
+ * acceptance (a): the report must show 0 rows flagged on length alone
+ * without an LLM verdict). "deterministic_*" fields never call the judge;
+ * "llm_rejected" is the ONLY class a too-short-but-otherwise-clean value can
+ * land in. */
+export type RfbRetroScanCauseClass =
+  | "deterministic_mangled"
+  | "deterministic_boilerplate"
+  | "deterministic_foreign"
+  | "llm_rejected";
+
 /**
  * Decide whether ONE currently-stored description/about value should be
- * nulled by the retro-scan: a deterministic meetsAboutCheapBar fail is
- * confident, real information (never "doubt") and nulls outright; a
- * cheap-bar pass is then judged by the LLM, and ONLY a genuine (non-infra-
- * failure) rejection nulls — an infra failure leaves the field untouched
- * (fail-closed toward NOT destroying data, per this route's own contract).
- * Blank values are never flagged (nothing to judge). Mirrors
- * gardssalgRetroScanShouldNull exactly (routes/opplevelser.ts).
+ * nulled by the retro-scan.
+ *
+ * Kriterium 7 (2026-08-14, Daniel live sign-off after the 278-row stikkprøve
+ * showed 13-14/15 flagged rows were legitimate-but-short prose, not garbage):
+ * pure LENGTH is evidence of INCOMPLETE, not evidence of WRONG — it is no
+ * longer treated as deterministic garbage. Only classifyAboutCheapBar's three
+ * genuine garbage classes (mangled Unicode, boilerplate/cookie chrome,
+ * non-Norwegian) still null outright, with no judgment call. Everything else
+ * — including a value that is short but otherwise clean, which used to
+ * short-circuit here without ever reaching the judge — goes to the SAME
+ * existing LLM-judge cascade a cheap-bar PASS already used, and ONLY a
+ * genuine (non-infra-failure) rejection nulls; an infra failure leaves the
+ * field untouched (fail-closed toward NOT destroying data, per this route's
+ * own contract). Blank values are never flagged (nothing to judge). Mirrors
+ * gardssalgRetroScanShouldNull's overall shape (routes/opplevelser.ts), with
+ * the cheap-bar split kept local to RFB's retro-scan only — meetsRfbAbout-
+ * QualityBar (the LIVE-write gate a brand-new candidate must clear before it
+ * is ever written) is UNCHANGED: this split applies only to re-judging
+ * content that is already live, where "too short" and "never verified" are
+ * different claims.
  */
 async function rfbRetroScanShouldNull(
   value: string | null | undefined,
   producerName: string,
   kind: "description" | "about"
-): Promise<{ shouldNull: boolean; reason: string | null }> {
+): Promise<{ shouldNull: boolean; reason: string | null; causeClass: RfbRetroScanCauseClass | null }> {
   if (value === null || value === undefined || String(value).trim() === "") {
-    return { shouldNull: false, reason: null };
+    return { shouldNull: false, reason: null, causeClass: null };
   }
-  if (!meetsAboutCheapBar(value)) {
-    return { shouldNull: true, reason: "fails the cheap bar (too short/boilerplate/mangled/foreign)" };
+  const cheapBarClass = classifyAboutCheapBar(value);
+  if (cheapBarClass === "mangled" || cheapBarClass === "boilerplate" || cheapBarClass === "foreign") {
+    return {
+      shouldNull: true,
+      reason: `fails the cheap bar (${cheapBarClass})`,
+      causeClass: `deterministic_${cheapBarClass}`,
+    };
   }
+  // cheapBarClass is "ok" or "too_short" — both now reach the judge.
   const verdict = await judgeRfbAboutCandidate(value, producerName, kind);
-  if (verdict.approved) return { shouldNull: false, reason: null };
+  if (verdict.approved) return { shouldNull: false, reason: null, causeClass: null };
   if (isRfbJudgeInfraFailure(verdict)) {
     // Never destroy data on doubt — leave the field exactly as it is.
-    return { shouldNull: false, reason: null };
+    return { shouldNull: false, reason: null, causeClass: null };
   }
-  return { shouldNull: true, reason: verdict.reasoning };
+  return { shouldNull: true, reason: verdict.reasoning, causeClass: "llm_rejected" };
 }
 
 /**
@@ -3280,6 +3312,16 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
     description: { flagged: 0, nulled: 0 },
     about: { flagged: 0, nulled: 0 },
   };
+  // Per-cause-class flagged counts (kriterium 7, acceptance (a)): proves by
+  // construction, not by assertion, that nothing is ever flagged on length
+  // alone without an LLM verdict — "too_short" simply never appears as a key
+  // here, since rfbRetroScanShouldNull no longer produces that cause class.
+  const byCauseClass: Record<RfbRetroScanCauseClass, number> = {
+    deterministic_mangled: 0,
+    deterministic_boilerplate: 0,
+    deterministic_foreign: 0,
+    llm_rejected: 0,
+  };
   const changed: Array<{ agent_id: string; fields: string[]; reasons: Record<string, string> }> = [];
   const skippedLocked: string[] = [];
   const skippedCurated: Array<{ agent_id: string; fields: string[] }> = [];
@@ -3303,13 +3345,16 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
 
       const wouldNullFields: Array<"description" | "about"> = [];
       const reasons: Record<string, string> = {};
+      const causeClasses: Partial<Record<"description" | "about", RfbRetroScanCauseClass>> = {};
       if (descVerdict.shouldNull) {
         wouldNullFields.push("description");
         reasons.description = descVerdict.reason!;
+        causeClasses.description = descVerdict.causeClass!;
       }
       if (aboutVerdict.shouldNull) {
         wouldNullFields.push("about");
         reasons.about = aboutVerdict.reason!;
+        causeClasses.about = aboutVerdict.causeClass!;
       }
       if (wouldNullFields.length === 0) return;
 
@@ -3324,7 +3369,10 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
       }
       if (nonCuratedFields.length === 0) return;
 
-      for (const f of nonCuratedFields) byField[f].flagged += 1;
+      for (const f of nonCuratedFields) {
+        byField[f].flagged += 1;
+        byCauseClass[causeClasses[f]!] += 1;
+      }
 
       if (dryRun) {
         changed.push({ agent_id: t.agent_id, fields: nonCuratedFields, reasons });
@@ -3352,6 +3400,7 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
     offset,
     total_eligible: totalEligible,
     by_field: byField,
+    by_cause_class: byCauseClass,
     changed,
     skipped_locked: skippedLocked,
     skipped_curated: skippedCurated,
