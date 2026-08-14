@@ -335,6 +335,68 @@ export function runOpplevelserGardssalg5dHardeningTests(
         ).get() as any;
         assertEq(queued.c, 4, "5h-c9: every veto landed a durable review-queue entry");
       }
+
+      // ── (d) link-driven sub-page crawl stays inside the stored section ───
+      //
+      // Daniel, live session 2026-08-14. crFetchGardssalgContent now follows
+      // the page's REAL links (discoverContentLinks) instead of guessing fixed
+      // paths, because the guessing was measured at 7 hits per 92 attempts and
+      // left 7 of 12 producer sites with no sub-page read at all.
+      //
+      // The existing 5h-b10/b11 assertions above cannot cover this: their
+      // fixture HTML has no <a> elements, so discovery returns nothing and the
+      // crawl falls through to the fixed-path fallback. They guard the FALLBACK
+      // branch only. This block serves HTML that DOES link out — including a
+      // link that escapes the stored section — so the section filter on the new
+      // primary branch is actually exercised.
+      //
+      // Escaping matters: discoverContentLinks is same-HOST but not
+      // same-SECTION, and a deep-path hjemmeside is exactly the 2026-07-19
+      // hanen.no shape where the host root describes a different organisation.
+      {
+        const seen: string[] = [];
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const urlStr = String(url);
+          if (urlStr.includes("data.brreg.no") || urlStr.includes("api.anthropic.com")) {
+            throw new Error(`unexpected non-page fetch in 5h-d: ${urlStr}`);
+          }
+          seen.push(urlStr);
+          const html =
+            `<html><head><meta property="og:description" content="Aleine gard med gardsbutikk og omvisning for grupper heile sesongen."></head>` +
+            `<body><p>Velkomen.</p>` +
+            `<a href="/side/gard/kontakt-oss">Kontakt oss</a>` +
+            `<a href="/andre/produkter">Produkter hos ein annan aktør</a>` +
+            `</body></html>`;
+          return {
+            ok: true, status: 200,
+            text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-content-refresh",
+          body: { providerIds: ["p5-alone"], apply: true },
+        });
+        assertEq(r.status, 200, "5h-d1: content-refresh 200 on the link-driven path");
+
+        assertTrue(
+          seen.some((u) => u === "https://aleine.example.no/side/gard/kontakt-oss"),
+          "5h-d2: the real in-section link IS followed — this is the branch that was never reached before",
+        );
+        assertTrue(
+          !seen.some((u) => u.includes("/andre/produkter")),
+          "5h-d3: a same-host link OUTSIDE the stored section is NOT followed (hanen.no cross-contamination guard holds on the discovery branch)",
+        );
+        // With real links present the fixed-path sweep must not also run —
+        // topping discovered links up with guesses is the waste this replaced.
+        assertTrue(
+          !seen.some((u) => /\/side\/gard\/(produkter|nettbutikk|sortiment|varer|smaking)$/.test(u)),
+          "5h-d4: fixed-path guessing is skipped entirely when real links were found",
+        );
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-5d-hardening: unexpected error: " + String(err?.stack || err?.message || err));
