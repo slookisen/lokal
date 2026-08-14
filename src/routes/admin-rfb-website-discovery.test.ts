@@ -73,6 +73,32 @@
  *       strictly-newer row CAN be selected ahead of the single oldest
  *       eligible row at LIMIT 1 across repeated calls.
  *
+ * dev-request 2026-08-14-rfb-wd-headless-fallback (headless-render fallback
+ * for JS-shell candidate pages, services/render-page.ts, flag
+ * RFB_WD_HEADLESS_FALLBACK_ENABLED, default OFF):
+ *   (hf-a) flag OFF (default/unset) — fallback never attempted, byte-
+ *       identical rejection even for a fixture that WOULD escalate if the
+ *       flag were on.
+ *   (hf-b) flag ON, plain fetch already verifies — fallback never
+ *       attempted (no wasted render on a page that didn't need one).
+ *   (hf-c) flag ON, plain fetch unverified + shouldEscalateToRender true —
+ *       fallback attempted, renders, verifies -> hit returned using the
+ *       RENDERED text/finalUrl, headless_fallback_attempted/_verified both 1.
+ *   (hf-d) flag ON, fallback returns `renderer_unavailable` — never a
+ *       throw, never a negative signal against the producer: falls through
+ *       to the same generic `no_candidate_verified` rejection reason as
+ *       every other unverified miss.
+ *   (hf-e) flag ON, plain fetch unverified but shouldEscalateToRender is
+ *       false (a genuinely small static page, no <script>) — fallback
+ *       never attempted.
+ * renderPage() itself is injected via the module-level
+ * __setRfbWdRenderPageImplForTesting() test hook (mirrors
+ * __setRfbCxRowDelayForTesting, admin-rfb-contact-extraction.ts) rather than
+ * monkeypatched from outside the module — this codebase's esbuild/tsx
+ * toolchain compiles ES imports to live bindings that cannot be reassigned
+ * externally (see the file-header note in
+ * opplevelser-content-refresh-errors-by-persistence.test.ts).
+ *
  * globalThis.fetch is mocked directly, keyed on URL (same convention as the
  * closest sibling test file, opplevelser-gardssalg-website-discovery.test.ts)
  * — safe here because this suite is run standalone (see the file-scoping
@@ -158,7 +184,14 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
   })();
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+  const prevHeadlessFallbackEnabled = process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
   const prevFetch = globalThis.fetch;
+  // Hoisted so `finally` (a sibling block scope of `try`) can still reach it
+  // to reset the render-page injection point back to null even if an
+  // assertion throws mid-suite.
+  let setRfbWdRenderPageImplForTesting:
+    | typeof import("../routes/admin-rfb-website-discovery")["__setRfbWdRenderPageImplForTesting"]
+    | undefined;
 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -192,7 +225,8 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     const routeModule = require("../routes/admin-rfb-website-discovery") as
       typeof import("../routes/admin-rfb-website-discovery");
     const routerModule = routeModule.default;
-    const { RFB_WD_HARD_CAP, rfbWebsiteHostExclusionReason } = routeModule;
+    const { RFB_WD_HARD_CAP, rfbWebsiteHostExclusionReason, __setRfbWdRenderPageImplForTesting } = routeModule;
+    setRfbWdRenderPageImplForTesting = __setRfbWdRenderPageImplForTesting;
 
     function getHandler(method: "get" | "post", path: string) {
       const layer = routerModule.stack.find(
@@ -849,6 +883,174 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         "z4: LIMIT-1 auto-select is not deterministically always the single oldest eligible row across 20 repeated calls",
       );
     }
+
+    // ═══ dev-request 2026-08-14-rfb-wd-headless-fallback: headless-render
+    //     fallback for JS-shell candidate pages ═══
+    //
+    // A "JS shell" fixture: big enough (>= RENDER_ESCALATION_MIN_BYTES),
+    // carries a <script>, and its visible text (after gardssalgPageText /
+    // visibleTextOf strip the script body) is a few characters — the exact
+    // shape shouldEscalateToRender() (services/render-page.ts) looks for.
+    // No evidence anywhere in the visible text, so plain-fetch evidence-
+    // matching must fail every time this fixture is used.
+    const jsShellPadding = "x".repeat(2500);
+    function jsShellHtml(): string {
+      return `<html><body><script>var pad = "${jsShellPadding}";</script><div id="root">App</div></body></html>`;
+    }
+    // A genuinely small, static, evidence-free page — no <script> at all —
+    // so shouldEscalateToRender() must return false for it (condition 3 in
+    // its own contract: no script, no escalation).
+    const staticSmallHtml = "<html><body>Parkert side</body></html>";
+
+    // ── (hf-a) flag OFF (default/unset) — fallback never attempted, byte-
+    //     identical to today even for a fixture that WOULD escalate if the
+    //     flag were on --
+    {
+      delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+      let renderCalls = 0;
+      setRfbWdRenderPageImplForTesting!(async () => {
+        renderCalls++;
+        throw new Error("renderPage must never be called while the flag is off");
+      });
+
+      insertAgent({ id: "wd-hf-off", name: "Hf Off Gard", orgNr: "911100001", city: "Voss" });
+      fixtures.set("https://hfoffgard.no", htmlResponse(jsShellHtml(), { finalUrl: "https://hfoffgard.no" }));
+
+      const r = await callDiscovery({ agentIds: ["wd-hf-off"] });
+      assertEq(r.body.proposed.length, 0, "hf-a1: nothing proposed (flag off, unchanged behaviour)");
+      const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-hf-off");
+      assertEq(rej?.reason, "no_candidate_verified", "hf-a2: same rejection reason as before this slice existed");
+      assertEq(renderCalls, 0, "hf-a3: renderPage was never invoked");
+      assertEq(r.body.headless_fallback_attempted, 0, "hf-a4: headless_fallback_attempted is 0");
+      assertEq(r.body.headless_fallback_verified, 0, "hf-a5: headless_fallback_verified is 0");
+      assertTrue(!readQueueRow("wd-hf-off"), "hf-a6: nothing queued");
+
+      setRfbWdRenderPageImplForTesting!(null);
+    }
+
+    // ── (hf-b) flag ON, plain fetch already verifies — fallback never
+    //     attempted (no wasted render on a page that didn't need one) --
+    {
+      process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
+      let renderCalls = 0;
+      setRfbWdRenderPageImplForTesting!(async () => {
+        renderCalls++;
+        throw new Error("renderPage must never be called when plain-fetch evidence already verified");
+      });
+
+      insertAgent({ id: "wd-hf-plain-ok", name: "Hf Plainok Gard", orgNr: "911100002", city: "Voss" });
+      fixtures.set(
+        "https://hfplainokgard.no",
+        htmlResponse("<html><body>Hf Plainok Gard — org.nr 911 100 002</body></html>", { finalUrl: "https://hfplainokgard.no" }),
+      );
+
+      const r = await callDiscovery({ agentIds: ["wd-hf-plain-ok"] });
+      assertEq(r.body.proposed.length, 1, "hf-b1: proposed via the plain fetch alone");
+      assertEq(renderCalls, 0, "hf-b2: renderPage was never invoked");
+      assertEq(r.body.headless_fallback_attempted, 0, "hf-b3: headless_fallback_attempted is 0");
+      assertEq(r.body.headless_fallback_verified, 0, "hf-b4: headless_fallback_verified is 0");
+    }
+
+    // ── (hf-c) flag ON, plain fetch unverified + shouldEscalateToRender
+    //     true — fallback attempted, renders, verifies -> hit returned,
+    //     using the RENDERED text/finalUrl --
+    {
+      process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
+      let renderCalls = 0;
+      setRfbWdRenderPageImplForTesting!(async (url: string) => {
+        renderCalls++;
+        return {
+          ok: true,
+          html: "<html><body>Hf Escalates Gard — org.nr 911 100 003</body></html>",
+          text: "Hf Escalates Gard — org.nr 911 100 003",
+          finalUrl: url,
+          elapsedMs: 42,
+        };
+      });
+
+      insertAgent({ id: "wd-hf-escalates", name: "Hf Escalates Gard", orgNr: "911100003", city: "Voss" });
+      fixtures.set("https://hfescalatesgard.no", htmlResponse(jsShellHtml(), { finalUrl: "https://hfescalatesgard.no" }));
+
+      const r = await callDiscovery({ agentIds: ["wd-hf-escalates"] });
+      assertEq(r.body.proposed.length, 1, "hf-c1: proposed via the render fallback");
+      const prop = r.body.proposed[0];
+      assertEq(prop.agent_id, "wd-hf-escalates", "hf-c2: proposal is for the right agent");
+      assertEq(prop.candidate_url, "https://hfescalatesgard.no", "hf-c3: candidate_url from the rendered finalUrl");
+      assertEq(prop.evidence.org_nr_found, true, "hf-c4: verified via org_nr found in the RENDERED text");
+      assertEq(renderCalls, 1, "hf-c5: renderPage was invoked exactly once");
+      assertEq(r.body.headless_fallback_attempted, 1, "hf-c6: headless_fallback_attempted is 1");
+      assertEq(r.body.headless_fallback_verified, 1, "hf-c7: headless_fallback_verified is 1");
+      const row = readQueueRow("wd-hf-escalates");
+      assertTrue(!!row, "hf-c8: a queue row was inserted from the render-verified hit");
+      assertEq(row.candidate_url, "https://hfescalatesgard.no", "hf-c9: queue row candidate_url matches");
+
+      setRfbWdRenderPageImplForTesting!(null);
+    }
+
+    // ── (hf-d) flag ON, fallback returns renderer_unavailable — treated as
+    //     no-candidate, no throw, nothing recorded as a negative signal
+    //     against the producer (still falls through to the generic
+    //     no_candidate_verified reason, never a renderer-specific one) --
+    {
+      process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
+      let renderCalls = 0;
+      setRfbWdRenderPageImplForTesting!(async () => {
+        renderCalls++;
+        return {
+          ok: false,
+          reason: "renderer_unavailable",
+          detail: "PLAYWRIGHT_UNAVAILABLE: playwright-core is not installed in this environment",
+          elapsedMs: 3,
+        };
+      });
+
+      insertAgent({ id: "wd-hf-unavail", name: "Hf Unavail Gard", orgNr: "911100004", city: "Voss" });
+      fixtures.set("https://hfunavailgard.no", htmlResponse(jsShellHtml(), { finalUrl: "https://hfunavailgard.no" }));
+
+      let threw = false;
+      let r: { status: number; body: any } | undefined;
+      try {
+        r = await callDiscovery({ agentIds: ["wd-hf-unavail"] });
+      } catch {
+        threw = true;
+      }
+      assertTrue(!threw, "hf-d1: renderer_unavailable never throws / never crashes the batch");
+      assertEq(r!.body.proposed.length, 0, "hf-d2: nothing proposed");
+      const rej = r!.body.rejected.find((x: any) => x.agent_id === "wd-hf-unavail");
+      assertEq(rej?.reason, "no_candidate_verified", "hf-d3: generic no-candidate reason, NOT a renderer-specific/negative one");
+      assertEq(renderCalls, 1, "hf-d4: renderPage was invoked exactly once");
+      assertEq(r!.body.headless_fallback_attempted, 1, "hf-d5: an attempt IS still counted (renderer_unavailable is about the machine, not the site)");
+      assertEq(r!.body.headless_fallback_verified, 0, "hf-d6: never counted as a verified flip");
+      assertTrue(!readQueueRow("wd-hf-unavail"), "hf-d7: nothing queued");
+
+      setRfbWdRenderPageImplForTesting!(null);
+    }
+
+    // ── (hf-e) flag ON, plain fetch unverified but shouldEscalateToRender
+    //     is false (a genuinely small static page, no <script>) — fallback
+    //     never attempted --
+    {
+      process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
+      let renderCalls = 0;
+      setRfbWdRenderPageImplForTesting!(async () => {
+        renderCalls++;
+        throw new Error("renderPage must never be called when shouldEscalateToRender is false");
+      });
+
+      insertAgent({ id: "wd-hf-small", name: "Hf Small Gard", orgNr: "911100005", city: "Voss" });
+      fixtures.set("https://hfsmallgard.no", htmlResponse(staticSmallHtml, { finalUrl: "https://hfsmallgard.no" }));
+
+      const r = await callDiscovery({ agentIds: ["wd-hf-small"] });
+      assertEq(r.body.proposed.length, 0, "hf-e1: nothing proposed");
+      const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-hf-small");
+      assertEq(rej?.reason, "no_candidate_verified", "hf-e2: rejected exactly as before this slice existed");
+      assertEq(renderCalls, 0, "hf-e3: renderPage was never invoked — not a JS-shell shape");
+      assertEq(r.body.headless_fallback_attempted, 0, "hf-e4: headless_fallback_attempted is 0");
+      assertEq(r.body.headless_fallback_verified, 0, "hf-e5: headless_fallback_verified is 0");
+
+      setRfbWdRenderPageImplForTesting!(null);
+      delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -858,6 +1060,13 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
     else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
+    if (prevHeadlessFallbackEnabled === undefined) delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+    else process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = prevHeadlessFallbackEnabled;
+    try {
+      if (setRfbWdRenderPageImplForTesting) setRfbWdRenderPageImplForTesting(null);
+    } catch {
+      /* best-effort restore */
+    }
     try {
       if (prevDb) __setDbForTesting(prevDb);
     } catch {
