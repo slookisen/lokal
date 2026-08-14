@@ -38652,3 +38652,45 @@ runSerial(async () => {
     failures.push("slik-fungerer-det: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 2: bondensmarked.no
+// producer-page harvest (services/bm-producer-harvest.ts) — sitemap slug
+// discovery, LocalBusiness ld+json parsing (selecting the right block among
+// several on the page), directory-host website exclusion + @bondensmarked.no
+// email exclusion, and catalog matching gated by BOTH a name-similarity
+// threshold and a city/locality anchor. READ-ONLY/DRY-RUN ONLY slice — no
+// DB writes anywhere in the module under test.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 2: bm-producer-harvest (service) ──");
+  try {
+    const { runBmProducerHarvestTests } = require("../src/services/bm-producer-harvest.test") as
+      typeof import("../src/services/bm-producer-harvest.test");
+    const bmph = await runBmProducerHarvestTests({ log: false });
+    passed += bmph.passed;
+    failed += bmph.failed;
+    for (const f of bmph.failures) failures.push("bm-producer-harvest: " + f);
+    console.log(`  bm-producer-harvest: ${bmph.passed} passed, ${bmph.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bm-producer-harvest: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Sibling ROUTE-level suite: GET /admin/bm-producer-harvest?dry_run=false
+// must 501 and perform truly zero work (zero fetch calls, zero DB queries) —
+// the apply-mode branch is a stub only, not partially-working code.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 2: admin-bm-producer-harvest (route) ──");
+  try {
+    const { runAdminBmProducerHarvestTests } = require("../src/routes/admin-bm-producer-harvest.test") as
+      typeof import("../src/routes/admin-bm-producer-harvest.test");
+    const abmph = await runAdminBmProducerHarvestTests({ log: false });
+    passed += abmph.passed;
+    failed += abmph.failed;
+    for (const f of abmph.failures) failures.push("admin-bm-producer-harvest: " + f);
+    console.log(`  admin-bm-producer-harvest: ${abmph.passed} passed, ${abmph.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-bm-producer-harvest: unexpected error: " + String(err?.message || err));
+  }
+});
