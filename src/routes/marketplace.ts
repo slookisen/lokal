@@ -29,6 +29,7 @@ import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
+import { renderPage, shouldEscalateToRender } from "../services/render-page";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -5449,6 +5450,49 @@ export function extractAddress(html: string): string | null {
   return null;
 }
 
+// ─── Headless-render fallback (dev-request 2026-08-14-fetch-vegg-headless-
+// fallback, 2nd consumer) ───────────────────────────────────────────────────
+//
+// Same shared services/render-page.ts module already wired into RFB website
+// discovery (admin-rfb-website-discovery.ts's tryRfbWebsiteCandidateHost) —
+// here the analogous failure to escalate on is not a failed evidence match
+// but a failed pageMentionsProducer ownership check: the plain fetch
+// succeeded, but the page looks like a JS shell (shouldEscalateToRender) and
+// the raw pre-script HTML never mentions the producer, so a headless
+// re-render is tried before conceding `ownership_unverified`.
+//
+// Flag-gated, default OFF — mirrors this codebase's existing boolean-env-flag
+// idiom (grep `process.env.\w+ === "true"`, e.g. admin-homepage-provenance-
+// cohort.ts's HOMEPAGE_PARKING_DISABLED, RFB's RFB_WD_HEADLESS_FALLBACK_
+// ENABLED). Unset/anything-other-than-the-literal-string-"true" = disabled =
+// today's exact behaviour, zero regression risk.
+function homepageProvenanceHeadlessFallbackEnabled(): boolean {
+  return process.env.HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED === "true";
+}
+
+// Deliberately BELOW render-page.ts's own DEFAULT_RENDER_TIMEOUT_MS (20s) —
+// same reasoning as RFB's RFB_WD_RENDER_TIMEOUT_MS: this route walks a whole
+// batch of agents, so a smaller per-render bound caps the worst-case
+// wall-clock this still-rare, opt-in path can add to one call.
+export const HOMEPAGE_PROVENANCE_RENDER_TIMEOUT_MS = 12_000;
+
+// Same user-agent string the plain fetch below sends — the render must look
+// like the same client, not a different crawler, to the target site.
+const HOMEPAGE_PROVENANCE_FETCH_USER_AGENT = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
+
+// Test-only injection point for renderPage (mirrors RFB's
+// __setRfbWdRenderPageImplForTesting, admin-rfb-website-discovery.ts): this
+// codebase's esbuild/tsx toolchain compiles `import { renderPage } from ...`
+// to a live binding that cannot be monkeypatched from OUTSIDE this module — a
+// reference held INSIDE the module can still be swapped. Production code
+// always leaves this null and gets the real renderPage (and therefore the
+// real, lazily-imported playwright-core — `renderer_unavailable` wherever
+// it isn't installed, exactly as documented in render-page.ts).
+let renderPageImplForTesting: typeof renderPage | null = null;
+export function __setRenderPageImplForTesting(impl: typeof renderPage | null): void {
+  renderPageImplForTesting = impl;
+}
+
 router.post("/admin/homepage-provenance-batch", async (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
   const expectedKey = getAdminKey();
@@ -5789,6 +5833,11 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   const PARK_BACKOFF_MS = 30 * 86_400_000;
   const parkedNow: string[] = [];
 
+  // Per-call headless-fallback counters (dev-request 2026-08-14-fetch-vegg-
+  // headless-fallback, 2nd consumer) — purely additive observability, same
+  // shape as RFB website discovery's RfbWdFallbackCounters.
+  const fallbackCounters = { attempted: 0, verified: 0 };
+
   function recordHomepageFetchFailure(agentId: string): void {
     // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
     // stamp attempt/outcome in the SAME statement that already increments
@@ -5884,11 +5933,6 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       "UPDATE agent_knowledge SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE agent_id = ?"
     ).run(agentId);
 
-    // Extract contact fields.
-    const extractedEmail = extractEmail(html);
-    const extractedPhone = extractPhone(html);
-    const extractedAddress = extractAddress(html);
-
     // ── Guard #1: website-ownership name-match (orchestrator-pr-16) ──────────
     // Before recording ANY homepage (Tier-A) provenance from this page, verify
     // the producer's own name is actually reflected by the page/host. This is
@@ -5899,10 +5943,64 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // so the verifier quarantines the agent from the pool (advisory — the
     // producer is never deleted and contactability is untouched).
     const producerName = (agentRow?.name ?? "").toString().trim();
-    const pageText = extractPageText(html);
-    const ownershipVerified = producerName
-      ? pageMentionsProducer(producerName, { pageText, host: fetchUrl })
-      : true; // no name on file → cannot judge → conservative (do not downgrade)
+
+    // Extract contact fields + run the ownership check on a given HTML/url
+    // pair. Factored out so the SAME logic runs once on the plain-fetched
+    // html and, only on headless-fallback escalation below, a second time on
+    // rendered html — never a copy-pasted duplicate block.
+    function extractAndVerifyOwnership(pageHtml: string, pageUrl: string) {
+      const email = extractEmail(pageHtml);
+      const phone = extractPhone(pageHtml);
+      const address = extractAddress(pageHtml);
+      const pageText = extractPageText(pageHtml);
+      const verified = producerName
+        ? pageMentionsProducer(producerName, { pageText, host: pageUrl })
+        : true; // no name on file → cannot judge → conservative (do not downgrade)
+      return { email, phone, address, pageText, verified };
+    }
+
+    let extraction = extractAndVerifyOwnership(html, fetchUrl);
+    // Tracks which URL the (eventually accepted) extraction actually came
+    // from — the original fetchUrl unless a headless-render escalation below
+    // both succeeds AND newly verifies ownership, in which case every
+    // downstream provenance write must use the RENDERED page's final URL.
+    let effectiveUrl = fetchUrl;
+
+    // ── Headless-render fallback (flag-gated, default OFF) ──────────────────
+    // Only for a page that (a) already fetched fine, (b) really did fail the
+    // plain ownership check, and (c) really does look like a JS shell — never
+    // a blanket retry of every ownership miss. Mirrors RFB website
+    // discovery's tryRfbWebsiteCandidateHost escalation exactly, minus the
+    // host-exclusion re-check (this route has no host-exclusion mechanism for
+    // homepageUrl — none is invented here).
+    if (
+      !extraction.verified &&
+      homepageProvenanceHeadlessFallbackEnabled() &&
+      shouldEscalateToRender(html)
+    ) {
+      fallbackCounters.attempted++;
+      const renderFn = renderPageImplForTesting ?? renderPage;
+      const rendered = await renderFn(fetchUrl, {
+        userAgent: HOMEPAGE_PROVENANCE_FETCH_USER_AGENT,
+        timeoutMs: HOMEPAGE_PROVENANCE_RENDER_TIMEOUT_MS,
+      });
+      if (rendered.ok) {
+        const renderedExtraction = extractAndVerifyOwnership(rendered.html, rendered.finalUrl);
+        if (renderedExtraction.verified) {
+          fallbackCounters.verified++;
+          extraction = renderedExtraction;
+          effectiveUrl = rendered.finalUrl;
+        }
+      }
+      // !rendered.ok (including `renderer_unavailable` — this machine simply
+      // cannot render, never a statement about the site) or render succeeded
+      // but still didn't verify: fall through to the exact same
+      // `ownership_unverified` outcome as if no fallback had ever been
+      // attempted. Never a throw, never an extra negative signal recorded
+      // against the producer.
+    }
+
+    const { email: extractedEmail, phone: extractedPhone, address: extractedAddress, verified: ownershipVerified } = extraction;
 
     if (!ownershipVerified) {
       // Record an advisory marker (no homepage provenance written). Merge into
@@ -5956,19 +6054,19 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // (which happen to share the producer's URL) would be written as the
     // producer's contact — and different-company emails from contaminated pages
     // (the Eidsmo distributor case) would silently overwrite correct data.
-    if (extractedEmail && isAcceptableHomepageEmail(extractedEmail, fetchUrl)) {
+    if (extractedEmail && isAcceptableHomepageEmail(extractedEmail, effectiveUrl)) {
       incomingProv.email = {
-        sources: [{ source_type: "homepage", value: extractedEmail, fetched_at: nowIso, source_url: fetchUrl }],
+        sources: [{ source_type: "homepage", value: extractedEmail, fetched_at: nowIso, source_url: effectiveUrl }],
       };
     }
     if (extractedPhone) {
       incomingProv.phone = {
-        sources: [{ source_type: "homepage", value: extractedPhone, fetched_at: nowIso, source_url: fetchUrl }],
+        sources: [{ source_type: "homepage", value: extractedPhone, fetched_at: nowIso, source_url: effectiveUrl }],
       };
     }
     if (extractedAddress) {
       incomingProv.address = {
-        sources: [{ source_type: "homepage", value: extractedAddress, fetched_at: nowIso, source_url: fetchUrl }],
+        sources: [{ source_type: "homepage", value: extractedAddress, fetched_at: nowIso, source_url: effectiveUrl }],
       };
     }
 
@@ -6177,6 +6275,11 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       // Agents that crossed the 3-failure parking threshold during this run
       // (dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction).
       parked_now: parkedNow,
+      // Headless-render fallback counters (dev-request 2026-08-14-fetch-vegg-
+      // headless-fallback, 2nd consumer) — purely additive, both 0 whenever
+      // HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED is unset/not "true".
+      headless_fallback_attempted: fallbackCounters.attempted,
+      headless_fallback_verified: fallbackCounters.verified,
     },
   });
 });
