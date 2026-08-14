@@ -17660,15 +17660,39 @@ export function expDescHasUngroundedNumbers(text: string, factsBlock: string): b
  *
  * Returns null for a thin row WITHOUT calling the LLM at all.
  */
-export async function generateExperienceDescriptionNo(
+/**
+ * Which specific internal gate produced a `null` from
+ * generateExperienceDescriptionNo(). Diagnostic-only — added 2026-08-14 after
+ * item 1(a)'s post-deploy probe found 17/17 real candidates collapsing into
+ * the single `generation_failed` skip_reason with no way to tell which gate
+ * fired (dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 1b).
+ * Never affects control flow — every branch below returns exactly the same
+ * `text` value it always did; `reason` is read-only bookkeeping alongside it.
+ */
+export type ExpDescGenFailReason =
+  | "thin_data"
+  | "no_api_key"
+  | "network_error"
+  | "http_error"
+  | "unparseable_json"
+  | "unexpected_response_shape"
+  | "empty_response"
+  | "sentinel"
+  | "sentinel_smuggled"
+  | "char_cap_exceeded"
+  | "below_word_floor"
+  | "above_word_ceiling"
+  | "ungrounded_numbers";
+
+export async function generateExperienceDescriptionNoDetailed(
   row: ExperienceDescriptionCandidate,
   fetchImpl: typeof fetch = fetch
-): Promise<string | null> {
+): Promise<{ text: string | null; reason: ExpDescGenFailReason | null }> {
   const facts = buildExperienceDescriptionFacts(row);
-  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) return null; // thin -> never call the LLM
+  if (facts.length < EXP_DESC_MIN_FACT_FIELDS) return { text: null, reason: "thin_data" }; // thin -> never call the LLM
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) return { text: null, reason: "no_api_key" };
 
   const factsBlock = renderExperienceDescriptionFactsBlock(row, facts);
   const prompt = `Du skriver produktbeskrivelser for opplevagent.no, en norsk markedsplass for opplevelser. Skriv beskrivelsen av opplevelsen under.
@@ -17708,34 +17732,42 @@ Svar med kun selve beskrivelsen (eller ${EXP_DESC_SENTINEL}). Ingen innledning, 
       }),
     });
   } catch {
-    return null; // network/fetch failure — never fabricate
+    return { text: null, reason: "network_error" }; // network/fetch failure — never fabricate
   }
 
-  if (!response.ok) return null;
+  if (!response.ok) return { text: null, reason: "http_error" };
 
   let result: any;
   try {
     result = await response.json();
   } catch {
-    return null; // unparseable JSON body — never fabricate
+    return { text: null, reason: "unparseable_json" }; // unparseable JSON body — never fabricate
   }
 
   const contentArr = Array.isArray(result?.content) ? result.content : [];
   const text = contentArr.find((c: any) => c?.type === "text")?.text;
-  if (typeof text !== "string") return null;
+  if (typeof text !== "string") return { text: null, reason: "unexpected_response_shape" };
 
   const cleaned = text.trim();
-  if (!cleaned) return null;
-  if (cleaned === EXP_DESC_SENTINEL) return null; // explicit "too thin" escape
-  if (cleaned.includes(EXP_DESC_SENTINEL)) return null; // sentinel smuggled into prose
-  if (cleaned.length > EXP_DESC_MAX_CHARS) return null;
+  if (!cleaned) return { text: null, reason: "empty_response" };
+  if (cleaned === EXP_DESC_SENTINEL) return { text: null, reason: "sentinel" }; // explicit "too thin" escape
+  if (cleaned.includes(EXP_DESC_SENTINEL)) return { text: null, reason: "sentinel_smuggled" }; // sentinel smuggled into prose
+  if (cleaned.length > EXP_DESC_MAX_CHARS) return { text: null, reason: "char_cap_exceeded" };
 
   const words = expDescWordCount(cleaned);
-  if (words < EXP_DESC_MIN_WORDS || words > EXP_DESC_MAX_WORDS) return null;
+  if (words < EXP_DESC_MIN_WORDS) return { text: null, reason: "below_word_floor" };
+  if (words > EXP_DESC_MAX_WORDS) return { text: null, reason: "above_word_ceiling" };
 
-  if (expDescHasUngroundedNumbers(cleaned, factsBlock)) return null;
+  if (expDescHasUngroundedNumbers(cleaned, factsBlock)) return { text: null, reason: "ungrounded_numbers" };
 
-  return cleaned;
+  return { text: cleaned, reason: null };
+}
+
+export async function generateExperienceDescriptionNo(
+  row: ExperienceDescriptionCandidate,
+  fetchImpl: typeof fetch = fetch
+): Promise<string | null> {
+  return (await generateExperienceDescriptionNoDetailed(row, fetchImpl)).text;
 }
 
 export interface ExperienceDescriptionJudgeVerdict {
@@ -17848,6 +17880,10 @@ export type ExperienceDescriptionOutcome = {
   judge_approved: boolean | null;
   judge_reasoning: string | null;
   skip_reason: "thin_data" | "generation_failed" | "judge_rejected" | null;
+  /** Diagnostic-only breakdown of WHICH gate produced skip_reason
+   *  "generation_failed" — see ExpDescGenFailReason. Always null for the
+   *  other two skip_reason values. Never read by the write path. */
+  generation_fail_reason: ExpDescGenFailReason | null;
 };
 
 /**
@@ -17868,14 +17904,16 @@ export async function enrichOneExperienceDescription(
     return {
       ...base, thin: true, proposed_description: null, word_count: 0,
       judge_approved: null, judge_reasoning: null, skip_reason: "thin_data",
+      generation_fail_reason: null,
     };
   }
 
-  const proposed = await generateExperienceDescriptionNo(row, fetchImpl);
+  const { text: proposed, reason: genFailReason } = await generateExperienceDescriptionNoDetailed(row, fetchImpl);
   if (!proposed) {
     return {
       ...base, thin: false, proposed_description: null, word_count: 0,
       judge_approved: null, judge_reasoning: null, skip_reason: "generation_failed",
+      generation_fail_reason: genFailReason,
     };
   }
 
@@ -17889,6 +17927,7 @@ export async function enrichOneExperienceDescription(
     judge_approved: verdict.approved,
     judge_reasoning: verdict.reasoning,
     skip_reason: verdict.approved ? null : "judge_rejected",
+    generation_fail_reason: null,
   };
 }
 
