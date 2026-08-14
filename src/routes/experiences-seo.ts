@@ -152,6 +152,27 @@ import {
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
+// dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4
+// (gårdssalg-kort-konsistens): the SAME "Navn — Sted" display-suffix parser
+// admin-agents.ts already reuses for RFB producer names (its own doc comment
+// at "gardssalgSearchName() «— Sted» strip") — used below to keep the
+// gårdssalg catalog card's title from ever repeating the place name its own
+// kommune-etikett shows.
+// DEFECT FIX (2026-08-14, independent review, CHANGES-REQUESTED): also pulls
+// in normaliseHint() — parseNameLocationSuffix()'s own doc comment is
+// explicit that its location_hint is an UNVALIDATED corroboration signal
+// ("any ' - ', en/em-dash, or trailing '(...)' is a candidate", no check
+// that the text is an actual place). The review reproduced a false positive
+// on the very first plausible non-location hyphenated name tried: a
+// provider named "Ren - Ekte Gard" (a tagline, not a place) with no
+// poststed/kommune/fylke in the DB got its title silently truncated to
+// "Ren" and "Ekte Gard" displayed as if it were a kommune-etikett. Fix:
+// gardssalgCardTitleAndSted() below now only strips the title / shows a
+// label when a REAL DB poststed/kommune/fylke value corroborates the parsed
+// suffix — normaliseHint() lets that comparison use the exact same
+// normalisation the parser itself already applies to location_hint, instead
+// of re-implementing it here.
+import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
 
 const router = Router();
 
@@ -4446,6 +4467,75 @@ export function renderGardssalgTypeChips(
   return `<nav class="chips gardssalg-type-chips" aria-label="Filtrer produsenter etter type">${chips.join("")}</nav>`;
 }
 
+// dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4
+// (gårdssalg-kort-konsistens), Daniel's design review finding 2: many
+// provider names carry a "Navn — Sted" display suffix (the same Hanen-import
+// convention parseNameLocationSuffix() already parses for corroboration
+// matching elsewhere — see admin-agents.ts's reuse of it for the identical
+// convention on RFB producer names). Two symptoms this fixes together:
+//   - a card whose poststed/kommune/fylke are ALL empty rendered no
+//     kommune-etikett at all, even though the name embeds a real place
+//     ("Bryggeriet på Hvaler" with no separate label) — the suffix becomes
+//     the label instead of being silently dropped.
+//   - a card that DOES have poststed/kommune/fylke duplicated the same place
+//     in the title too ("Bryggeriet på Hvaler — Hvaler" + etikett "Hvaler").
+//
+// DEFECT FIX (2026-08-14, independent review, CHANGES-REQUESTED — see
+// PR discussion): the FIRST version of this function used the parsed
+// suffix as a freestanding label source whenever the row had no
+// poststed/kommune/fylke — i.e. exactly the "no structured data" case.
+// parseNameLocationSuffix() is documented (its own header) as a low-stakes
+// *corroboration* signal ONLY — it treats any " - ", en/em-dash, or
+// trailing "(...)" as a location-suffix CANDIDATE, with no check that the
+// text is an actual place name. Reviewer repro: a provider named
+// "Ren - Ekte Gard" (a hyphenated tagline, not a location) with no DB
+// poststed/kommune/fylke had its title silently truncated to "Ren" and
+// "Ekte Gard" shown as if it were the kommune-etikett — on the very first
+// plausible non-location hyphenated name tried.
+//
+// Fix (reviewer's option (b), the narrower/safer one): the label ALWAYS
+// comes from real DB poststed/kommune/fylke, never from unvalidated parsed
+// text. The parsed suffix is used ONLY to decide whether to strip the
+// title's "— X" tail, and only when a real DB value CORROBORATES it (i.e.
+// the normalised suffix equals one of poststed/kommune/fylke, the same
+// normalisation parseNameLocationSuffix() itself applies to location_hint —
+// see normaliseHint()). Consequences:
+//   - no DB location data at all -> nothing to corroborate against -> title
+//     stays exactly as-is (whole name, suffix and all) and NO etikett is
+//     shown. Same as this card's behavior before this dev-request touched
+//     anything for that case — no false positive, no regression.
+//   - DB location data present AND it matches the parsed suffix -> existing
+//     good behavior, unchanged: title stripped, etikett = the DB value.
+//   - DB location data present but it does NOT match the parsed suffix
+//     (e.g. a coincidental hyphen in the name) -> etikett still shows the
+//     real DB value, but the title is left untouched (never strip on an
+//     unconfirmed guess).
+function gardssalgCardTitleAndSted(p: GardssalgProviderRow): { title: string; sted: string } {
+  const navn = (p.navn || "").trim();
+  const dbFields = [p.poststed, p.kommune, p.fylke];
+  const dbSted = dbFields.find((v): v is string => !!v);
+  // No real, DB-sourced location data on this row at all -> there is
+  // nothing to corroborate a parsed suffix against, so never invent a
+  // label from unvalidated parsed text and never strip the title either.
+  if (!dbSted) return { title: navn, sted: "" };
+
+  const { core_name, location_hint } = parseNameLocationSuffix(navn);
+  if (location_hint) {
+    const normalisedHint = normaliseHint(location_hint);
+    const hintParts = normalisedHint.split(",").map((s) => s.trim()).filter(Boolean);
+    const corroborated = dbFields.some((v) => {
+      if (!v) return false;
+      const normalisedDbValue = normaliseHint(v);
+      if (!normalisedDbValue) return false;
+      return hintParts.includes(normalisedDbValue);
+    });
+    if (corroborated) return { title: core_name, sted: dbSted };
+  }
+  // Suffix absent, or present but not corroborated by real DB data — the
+  // etikett still shows the real DB value, but the title is left untouched.
+  return { title: navn, sted: dbSted };
+}
+
 function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: number }): string | null {
   const typeSlug = opts.typeSlug ?? null;
   const typeDef = typeSlug ? GARDSSALG_TYPE_PAGES[typeSlug] : undefined;
@@ -4478,7 +4568,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
   const chipsRow = renderGardssalgTypeChips(typeSlug, typeCounts);
 
   function renderProviderCard(p: GardssalgProviderRow): string {
-    const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
+    const { title, sted } = gardssalgCardTitleAndSted(p);
     const badge = drinkBadge(p.producer_type);
     // BEHAVIOR CHANGE (2026-07-02 gårdssalg-book fix): the "Book besøk" CTA
     // points at the new SSR reservation panel (/kategori/gardssalg/book/<slug>)
@@ -4498,10 +4588,20 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     const bookHref = p.slug ? `/kategori/gardssalg/book/${encodeURIComponent(p.slug)}` : null;
     const profileHref = p.slug ? `/kategori/gardssalg/produsent/${encodeURIComponent(p.slug)}` : null;
     const nameHtml = profileHref
-      ? `<a href="${profileHref}" style="color:inherit;font-weight:700;font-size:1rem;text-decoration:none">${escapeHtml(p.navn)}</a>`
-      : `<span style="font-weight:700;font-size:1rem">${escapeHtml(p.navn)}</span>`;
+      ? `<a href="${profileHref}" style="color:inherit;font-weight:700;font-size:1rem;text-decoration:none">${escapeHtml(title)}</a>`
+      : `<span style="font-weight:700;font-size:1rem">${escapeHtml(title)}</span>`;
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
+    // 4, Daniel's design review finding 4: the "Book besøk" CTA led to a
+    // paused (dark-launch) booking form for every provider not yet
+    // booking_live — same isBookingPaused() source (never a new parallel
+    // check) and same class-naming convention (a neutral "…-paused" class
+    // instead of the active fill) already shipped on the produsent-profil
+    // page's own reserve-CTA (arbeidspunkt 5, PR #571's .reserve-cta-paused).
+    // Distinct from the 2026-08-09 "positive markers only" decision above —
+    // that was about the badge/marker row, not this button's own label.
+    const bookingPaused = isBookingPaused(p.booking_live, p.catalog_hidden);
     const link = bookHref
-      ? `<a href="${bookHref}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
+      ? `<a href="${bookHref}" class="${bookingPaused ? "gs-card-cta-paused" : "gs-card-cta"}">${bookingPaused ? "Meld interesse" : "Book besøk"}</a>`
       : "";
     // Cards carry POSITIVE markers only (dev-request 2026-08-09-gardssalg-
     // kommer-snart-fjernes-eier-aktivert-booking, AC5 options — Daniel
@@ -4515,7 +4615,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     // their own wrap-safe flex row UNDER the type badge — never inline
     // after the name, which is exactly the wrapping mess the old chip made.
     const cardMarkers: string[] = [];
-    if (!isBookingPaused(p.booking_live, p.catalog_hidden)) {
+    if (!bookingPaused) {
       cardMarkers.push(`<span style="display:inline-block;font-size:.7rem;font-weight:700;color:#fff;background:#0f5a50;border-radius:4px;padding:2px 8px">Booking tilgjengelig</span>`);
     }
     if (p.claimed_at != null) {
@@ -4601,6 +4701,16 @@ ${jsonLd}
 ${BROWSE_CSS}
 .provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:20px;margin-top:24px}
 @media(max-width:560px){.provider-grid{grid-template-columns:1fr}}
+/* dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4:
+   .gs-card-cta keeps the pre-existing active "Book besøk" styling verbatim
+   (was inline); .gs-card-cta-paused mirrors the produsent-profil page's own
+   .reserve-cta-paused convention (arbeidspunkt 5, PR #571) — a neutral,
+   non-gradient style for "Meld interesse" so the button never looks bookable
+   while it isn't. */
+.gs-card-cta{display:inline-block;margin-top:10px;padding:8px 16px;background:var(--fjord-700);color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none}
+.gs-card-cta:hover{text-decoration:none}
+.gs-card-cta-paused{display:inline-block;margin-top:10px;padding:8px 16px;background:var(--canvas-2);color:var(--ink-soft);border:1px solid var(--line);border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none}
+.gs-card-cta-paused:hover{text-decoration:none;background:var(--line)}
 .hero-section{position:relative;overflow:hidden;background:linear-gradient(135deg,#0e3c36 0%,#0f5a50 100%);color:#fff;padding:48px 0 40px;margin-bottom:32px}
 /* S2: the illustrated drikke scene sits BEHIND the hero copy — same
    z-index technique as the homepage hero (.hero-inner has z-index:1). */
