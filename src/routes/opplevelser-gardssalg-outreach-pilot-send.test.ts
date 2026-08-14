@@ -435,9 +435,16 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       const flat = (s: unknown) => String(s || "").replace(/\s+/g, " ");
       const htmlBody = flat(sent[0].html);
       const textBody = flat(sent[0].text);
-      assertTrue(
-        String(sent[0].subject || "").includes("har fått en profil på Opplevagent"),
-        "h14: subject uses the approved 2026-08-08 line",
+      // Subject changed 2026-08-14 (Daniel). The old line ANNOUNCED something
+      // done to the recipient; this one asks a question, borrowing the formula
+      // from the RFB campaign that gets 14% on identical infrastructure.
+      // Asserted on the FULL rendered subject, not a substring of it: the
+      // producer name must actually be interpolated, since a template that
+      // silently dropped it would still pass a loose contains-check.
+      assertEq(
+        String(sent[0].subject || ""),
+        "Stemmer det vi har om Foxtrot Gård?",
+        "h14: subject uses the approved 2026-08-14 question form, with the producer name interpolated",
       );
       assertTrue(
         htmlBody.includes("opplevagent.no/slik-fungerer-det") && textBody.includes("opplevagent.no/slik-fungerer-det"),

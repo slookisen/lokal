@@ -1124,7 +1124,21 @@ export function renderGardssalgOutreach(
   profileUrl: string,
 ): { subject: string; text: string; html: string } {
   return {
-    subject: `${providerName} har fått en profil på Opplevagent — vil dere se over den?`,
+    // Daniel, live session 2026-08-14. The previous subject was
+    // «${providerName} har fått en profil på Opplevagent — vil dere se over den?»
+    //
+    // It ANNOUNCES something done to the recipient by a sender they have never
+    // heard of, and «har fått en profil» reads to some as having been signed up
+    // for something. The RFB campaign — same From address, same domain, same
+    // DKIM, same Resend infrastructure — instead asks a question («Har vi info
+    // riktig om X?») and got 9 replies from 64 sends over the same 14-day
+    // window (14%), against Opplevagent's 1 of 24 (4%). Same plumbing, 3-4x the
+    // reply rate, so the difference is the approach, not deliverability.
+    //
+    // This borrows that formula: a short question that asks a small favour and
+    // presumes nothing. Changed as the ONLY variable on the next batch, so any
+    // movement is attributable — see the copy assessment of 2026-08-14.
+    subject: `Stemmer det vi har om ${providerName}?`,
     text: buildGardssalgOutreachText(providerName, profileUrl),
     html: buildGardssalgOutreachHtml(providerName, profileUrl),
   };
