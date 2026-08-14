@@ -335,6 +335,28 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertTrue(prompt.includes("Bruk KUN faktaopplysningene"), "gen-3g: prompt carries the kun-kildebasert instruction");
         assertTrue(prompt.includes("UTILSTREKKELIG_GRUNNLAG"), "gen-3h: prompt carries the too-thin escape sentinel");
         assertTrue(prompt.includes("minst 400 ord"), "gen-3i: prompt carries the ≥400-word floor");
+
+        // ── gen-3j..m: the tightened ABSOLUTTE REGLER against ungrounded
+        //    place/season/weather flavor text (lokal PR #482 finding: 3/11
+        //    dry-run candidates were correctly judge-rejected for exactly
+        //    this class of fabrication — naming a place not in the facts,
+        //    or asserting weather/season tied to unlisted geography). ─────
+        assertTrue(
+          prompt.includes("Nevn ALDRI et sted, en region, en fjord, et fjell eller en severdighet som ikke står i faktalisten"),
+          "gen-3j: prompt forbids naming any place/region/fjord/mountain/landmark not in the facts list",
+        );
+        assertTrue(
+          prompt.includes("Skriv ALDRI om årstid, klima eller vær knyttet til et bestemt sted eller en bestemt region"),
+          "gen-3k: prompt forbids season/climate/weather claims tied to a specific place or region",
+        );
+        assertTrue(
+          prompt.includes("Ikke skriv generelle beskrivelser av landsdelen eller regionen opplevelsen ligger i, med mindre hver enkelt påstand er direkte forankret i en oppgitt fakta"),
+          "gen-3l: prompt forbids ungrounded general regional description",
+        );
+        assertTrue(
+          !prompt.includes("utendørsaktiviteter krever klær etter været"),
+          "gen-3m: the old weather-flavored worked example (the exact failure class it invited) is gone from the prompt",
+        );
       }
 
       // ── gen-4: the escape sentinel -> null (never padded into prose). ──
