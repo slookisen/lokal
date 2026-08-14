@@ -328,16 +328,21 @@ function looksLikeYyyymmdd(digits8: string): boolean {
 // separator. Anchored with `\b` + `$` so "Kontaktveien 3" (label embedded as
 // part of a real street name) is never matched — only a label that is its
 // own trailing token is.
-const TRAILING_CONTACT_LABEL = /[\s,:]+(?:Telefon|Tlf\.?|E-?post|Adresse|Kontakt)[:,]?$/i;
+//
+// Kept in sync with LEADING_LABEL_WORD below and PHONE_CONTEXT_KONTAKT_HEADING
+// (routes/marketplace.ts) — the "Kontakt(info(rmasjon)?)?" alternation is the
+// SAME label vocabulary in all three places (code-review follow-up, 2026-08-10).
+const TRAILING_CONTACT_LABEL = /[\s,:]+(?:Telefon|Tlf\.?|E-?post|Adresse|Kontakt(?:info(?:rmasjon)?)?)[:,]?$/i;
 
 /**
  * Strip a trailing standalone contact-field label ("Telefon", "Tlf", "Tlf.",
- * "E-post"/"Epost", "Adresse", "Kontakt" — case-insensitive) from the end of
- * an address string, if present. Conservative: only strips when the label is
- * the LAST whitespace/punctuation-delimited token, so it never touches a
- * label that's part of a real street name ("Kontaktveien 3"). If stripping
- * would leave the string empty, the original is returned unchanged instead —
- * an address must never become blank via this function.
+ * "E-post"/"Epost", "Adresse", "Kontakt"/"Kontaktinfo"/"Kontaktinformasjon" —
+ * case-insensitive) from the end of an address string, if present.
+ * Conservative: only strips when the label is the LAST whitespace/
+ * punctuation-delimited token, so it never touches a label that's part of a
+ * real street name ("Kontaktveien 3"). If stripping would leave the string
+ * empty, the original is returned unchanged instead — an address must never
+ * become blank via this function.
  *
  * `null`/`undefined` pass through unchanged.
  */
@@ -352,6 +357,73 @@ export function stripTrailingContactLabel(
   if (!match) return address;
 
   const stripped = trimmed.slice(0, match.index).replace(/[\s,:]+$/g, "").trim();
+  if (!stripped) return address; // never let the field go blank
+
+  return stripped;
+}
+
+// ─── Leading contact-label stripping (dev-request
+// 2026-08-10-verifier-portkjede-og-provenansrydding, slice D) ───────────────
+//
+// stripTrailingContactLabel above only ever matched a label at the END of a
+// string. Live repro (Oceanfood AS, 2026-08-10 recrawl): a flattened
+// "Kontakt" box heading (no punctuation boundary from the scraper's tag-strip)
+// glued a LEADING label onto the front of an otherwise-real address —
+// "Kontakt Oceanfood AS Storhaugen 26, 5527 Haugesund" instead of "Storhaugen
+// 26, 5527 Haugesund". A bare "Kontakt " prefix is the same shape as
+// stripTrailingContactLabel's label, just anchored at the start; but the
+// Norwegian "Kontakt oss" box pattern commonly also glues the producer's OWN
+// company name (ending in a legal-entity suffix — AS/ASA/SA/DA/ANS/ENK/BA/NUF)
+// between the label and the real street, since that's a separate box
+// element (company-name heading) with no punctuation before the address line
+// either. `LEADING_CONTACT_LABEL_WITH_ENTITY` matches that combined shape
+// FIRST (label + up to 4 title-case words + a legal-suffix word) so the whole
+// "Kontakt Oceanfood AS" run is removed in one pass; `LEADING_CONTACT_LABEL`
+// (bare label only) is the fallback for the simple case with no company name
+// in between. Same conservative posture as the trailing version: no match ⇒
+// unchanged; stripping-to-blank ⇒ unchanged (original returned).
+// Kept in sync with TRAILING_CONTACT_LABEL above and
+// PHONE_CONTEXT_KONTAKT_HEADING (routes/marketplace.ts) — same label
+// vocabulary, including the "Kontaktinformasjon" long form.
+const LEADING_LABEL_WORD = "(?:Telefon|Tlf\\.?|E-?post|Adresse|Kontakt(?:info(?:rmasjon)?)?)";
+const LEGAL_SUFFIX_WORD = "(?:AS|ASA|SA|DA|ANS|ENK|BA|NUF)";
+const LEADING_CONTACT_LABEL_WITH_ENTITY = new RegExp(
+  `^${LEADING_LABEL_WORD}[:,]?[\\s,:]+(?:\\p{L}[\\p{L}'-]*[\\s,:]+){0,4}?${LEGAL_SUFFIX_WORD}[\\s,:]+`,
+  "iu",
+);
+const LEADING_CONTACT_LABEL = new RegExp(`^${LEADING_LABEL_WORD}[:,]?[\\s,:]+`, "i");
+
+/**
+ * Strip a leading standalone contact-field label ("Telefon", "Tlf", "Tlf.",
+ * "E-post"/"Epost", "Adresse", "Kontakt"/"Kontaktinfo" — case-insensitive)
+ * from the FRONT of an address string, if present — the mirror image of
+ * `stripTrailingContactLabel`. Also handles the common "Kontakt <Firmanavn>
+ * AS ..." shape (a flattened "Kontakt oss" box heading directly followed by
+ * the producer's own company name ending in a Norwegian legal-entity
+ * suffix), stripping the whole label+company-name run in one pass so the
+ * real street name is what remains. Conservative: the company-name variant
+ * only fires when a legal-suffix word appears within the next few tokens; a
+ * street name that merely happens to start with a label-shaped word but has
+ * no legal-suffix nearby only has the bare label stripped, same as the
+ * trailing version. If stripping would leave the string empty, the original
+ * is returned unchanged instead — an address must never become blank via
+ * this function.
+ *
+ * `null`/`undefined` pass through unchanged.
+ */
+export function stripLeadingContactLabel(
+  address: string | null | undefined,
+): string | null | undefined {
+  if (address === null || address === undefined) return address;
+  if (typeof address !== "string") return address;
+
+  const trimmed = address.trim();
+
+  const entityMatch = trimmed.match(LEADING_CONTACT_LABEL_WITH_ENTITY);
+  const match = entityMatch ?? trimmed.match(LEADING_CONTACT_LABEL);
+  if (!match) return address;
+
+  const stripped = trimmed.slice(match[0].length).trim();
   if (!stripped) return address; // never let the field go blank
 
   return stripped;

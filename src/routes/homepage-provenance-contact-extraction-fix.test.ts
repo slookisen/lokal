@@ -210,6 +210,301 @@ export function runHomepageProvenanceContactExtractionFixTests(
     "phone-11: an 8-digit run starting with 1 is never extracted",
   );
 
+  // ── Bug 4 (slice D, 2026-08-10): extractPhone — context-corroboration
+  //    gate. Real repro: Austrått — a valid-SHAPED but WRONG number
+  //    ("79656569") was written as phone because it passed every shape
+  //    check (W33 leading digit, not a date, not a digit-run substring) yet
+  //    was scraped from unrelated page content, nowhere near a contact
+  //    label. ─────────────────────────────────────────────────────────────
+
+  // The exact live breach shape: a syntactically valid 8-digit run sitting
+  // in unrelated footer/widget text with no contact-context label anywhere
+  // nearby -> must NOT be extracted.
+  const htmlAustrattNoContext =
+    "<html><body><footer>Levert av InfoWeb Solutions. Kundenr 79656569 for support hos leverandøren.</footer></body></html>";
+  assertEq(
+    extractPhone(htmlAustrattNoContext),
+    null,
+    "phone-12 (Austrått repro): a valid-shaped 8-digit run with no nearby contact-label context is NOT extracted",
+  );
+
+  // Same unrelated number PLUS a real, properly-labelled phone elsewhere on
+  // the page -> the scan must skip the uncorroborated one and return the
+  // labelled real number instead.
+  const htmlAustrattWithRealPhoneElsewhere =
+    "<html><body>" +
+    "<footer>Levert av InfoWeb Solutions. Kundenr 79656569 for support hos leverandøren.</footer>" +
+    "<p>Ring oss på Tlf: 91234567</p>" +
+    "</body></html>";
+  assertEq(
+    extractPhone(htmlAustrattWithRealPhoneElsewhere),
+    "91234567",
+    "phone-13: uncorroborated valid-shaped run is skipped in favour of the properly-labelled real phone later on the page",
+  );
+
+  // Positive control: "Kontakt" as the nearby label (not just Tlf/Telefon/Ring).
+  const htmlKontaktLabelPhone = "<html><body><p>Kontakt: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktLabelPhone),
+    "91234567",
+    "phone-14: a 'Kontakt:' label counts as valid contact context",
+  );
+
+  // ── Bug 4 code-review follow-up (2026-08-10): bare "ring"/"kontakt"
+  //    anywhere in the window is TOO permissive — both are common generic
+  //    Norwegian words unrelated to phones ("Ring 3" = a ring road;
+  //    "kontakt" in an unrelated sense). The reviewer reproduced the exact
+  //    Austrått bug class through this gap; these fixtures pin the fix. ────
+
+  // The reviewer's exact repro: "Ring 3" (a road) sits within the window of
+  // an unrelated 8-digit reference number ("Kundenr ...") — must NOT be
+  // extracted. A bare "\bring\b" mention is no longer sufficient context.
+  const htmlRingRoadFalsePositive =
+    "<html><body><p>Kjør Ring 3 til avkjørsel. Kundenr 79656569 for support.</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingRoadFalsePositive),
+    null,
+    "phone-15 (reviewer repro): 'Ring 3' (a road reference, not a call-to-action) does NOT corroborate an unrelated 8-digit reference number",
+  );
+
+  // Same road-reference false lead PLUS a real "Ring nå på <nummer>"
+  // call-to-action elsewhere on the page -> the scan must skip the
+  // uncorroborated one and return the real, properly-flagged number.
+  const htmlRingRoadThenRealCta =
+    "<html><body>" +
+    "<p>Kjør Ring 3 til avkjørsel. Kundenr 79656569 for support.</p>" +
+    "<p>Ring nå på 91234567.</p>" +
+    "</body></html>";
+  assertEq(
+    extractPhone(htmlRingRoadThenRealCta),
+    "91234567",
+    "phone-16: 'Ring 3' road reference is skipped; the real 'Ring nå på <nummer>' call-to-action elsewhere is extracted",
+  );
+
+  // A bare "kontakt" mention with no colon and no direct adjacency to the
+  // candidate digits must NOT corroborate an unrelated number either.
+  const htmlBareKontaktFalsePositive =
+    "<html><body><p>Vær forsiktig ved kontakt med strøm. Serienr 55667788 på enheten.</p></body></html>";
+  assertEq(
+    extractPhone(htmlBareKontaktFalsePositive),
+    null,
+    "phone-17: a bare 'kontakt' mention (no colon, not adjacent) does NOT corroborate an unrelated 8-digit serial number",
+  );
+
+  // Positive control: the long-form "Kontaktinformasjon:" heading (aligned
+  // with stripLeadingContactLabel's label vocabulary) still counts as valid
+  // context when used as an actual heading.
+  const htmlKontaktinformasjonHeading =
+    "<html><body><p>Kontaktinformasjon: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktinformasjonHeading),
+    "91234567",
+    "phone-18: 'Kontaktinformasjon:' (long-form heading) counts as valid contact context",
+  );
+
+  // Positive control: "Ring 91234567" — the direct call-to-action shape
+  // (label immediately, adjacently attached to the real candidate) must
+  // still work after narrowing the bare-"ring" window match to adjacency.
+  const htmlRingDirectlyAdjacent = "<html><body><p>Ring 91234567 i dag!</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingDirectlyAdjacent),
+    "91234567",
+    "phone-19: 'Ring <nummer>' direct adjacency still extracts (doesn't regress the common call-to-action shape)",
+  );
+
+  // ── Bug 4 code-review follow-up ROUND 2 (2026-08-10): round 1 narrowed
+  //    "Kontakt"/"Ring" to require heading/CTA usage, but still tested that
+  //    usage against the WHOLE 40/20-char WINDOW — so a real "Kontakt:"
+  //    heading or "Ring oss" CTA sitting a whole unrelated clause away from
+  //    an unrelated reference number still wrongly corroborated it. Fix:
+  //    "Kontakt"/"Ring" now require DIRECT, IMMEDIATE adjacency to the
+  //    candidate digits (see PHONE_CONTEXT_ADJACENT) — not "found somewhere
+  //    in the window". These fixtures pin the round-2 fix. ─────────────────
+
+  // The reviewer's exact repro 1: a real "Kontakt:" HEADING, but for a
+  // DIFFERENT block — the digits that actually follow are a property/
+  // matrikkel number ("Gårds- og bruksnr"), not a phone. Must NOT extract.
+  const htmlKontaktHeadingWrongBlock =
+    '<html><body><div class="kontakt-boks"><h3>Kontakt:</h3><p>Gårds- og bruksnr: 79656569. Se kart for veibeskrivelse.</p></div></body></html>';
+  assertEq(
+    extractPhone(htmlKontaktHeadingWrongBlock),
+    null,
+    "phone-20 (reviewer repro): a 'Kontakt:' heading elsewhere on the page does NOT corroborate an unrelated matrikkel-shaped number in a different block",
+  );
+
+  // The reviewer's exact repro 2: real "Ring oss" CTA text, but for a
+  // DIFFERENT number entirely (an order/booking reference in the footer).
+  // Must NOT extract.
+  const htmlRingCtaWrongNumber =
+    "<html><body><button>Ring oss for mer info</button><footer>Bestillingsref: 79656569</footer></body></html>";
+  assertEq(
+    extractPhone(htmlRingCtaWrongNumber),
+    null,
+    "phone-21 (reviewer repro): 'Ring oss' CTA text elsewhere on the page does NOT corroborate an unrelated order-reference number",
+  );
+
+  // Simpler variant of repro 1: "Kontakt:" heading followed by an unrelated
+  // sentence, then an order number.
+  const htmlKontaktThenUnrelatedOrderNr =
+    "<html><body><p>Kontakt: se venstre meny. Ordrenr 79656569 registrert.</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktThenUnrelatedOrderNr),
+    null,
+    "phone-22: 'Kontakt:' followed by an unrelated sentence and an order number does NOT extract the order number",
+  );
+
+  // Simpler variant of repro 2: "Ring oss" CTA followed by an unrelated
+  // sentence, then an org-nr.
+  const htmlRingOssThenUnrelatedOrgNr =
+    "<html><body><p>Ring oss i dag. Org.nr 79656569 finner du i registeret.</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingOssThenUnrelatedOrgNr),
+    null,
+    "phone-23: 'Ring oss' followed by an unrelated sentence and an org-nr does NOT extract the org-nr",
+  );
+
+  // ── Bug 5 (slice D, 2026-08-10): extractAddress — leading contact-label /
+  //    company-name box glued onto the street. Real repro: Oceanfood AS —
+  //    a flattened "Kontakt" heading immediately followed by the producer's
+  //    own company name (ending in a legal-entity suffix), with no
+  //    punctuation boundary before the real street, got swallowed into the
+  //    street capture. ─────────────────────────────────────────────────────
+
+  const htmlOceanfoodLeadingLabel =
+    "<html><body><p>Kontakt Oceanfood AS Storhaugen 26, 5527 Haugesund</p></body></html>";
+  assertEq(
+    extractAddress(htmlOceanfoodLeadingLabel),
+    "Storhaugen 26, 5527 Haugesund",
+    "addr-05 (Oceanfood repro): leading 'Kontakt <Firmanavn> AS' box heading is stripped from the street, not written as part of the address",
+  );
+
+  // Bare leading label, no company name in between — the simpler shape.
+  const htmlBareLeadingLabel =
+    "<html><body><p>Kontakt Storhaugen 26, 5527 Haugesund</p></body></html>";
+  assertEq(
+    extractAddress(htmlBareLeadingLabel),
+    "Storhaugen 26, 5527 Haugesund",
+    "addr-06: a bare leading 'Kontakt' label (no company name) is also stripped",
+  );
+
+  // Positive control: a real street name is never mistaken for a leading
+  // label — must extract unchanged.
+  const htmlNoLeadingLabel =
+    "<html><body><p>Storhaugen 26, 5527 Haugesund</p></body></html>";
+  assertEq(
+    extractAddress(htmlNoLeadingLabel),
+    "Storhaugen 26, 5527 Haugesund",
+    "addr-07: an address with no leading label at all extracts unchanged (fix doesn't regress the common case)",
+  );
+
+  // ── Bug 4 code-review follow-up ROUND 3 (2026-08-13/14, Daniel-authorized
+  //    4th round, daniel-responses/2026-08-13-brief-svar.md): rounds 1/2
+  //    narrowed "Kontakt"/"Ring" to direct adjacency, but GENERIC labels
+  //    (tlf/telefon/mob/mobil/sms/call) were left matching anywhere in the
+  //    WHOLE 40/20-char window — the exact same flaw, just on the other half
+  //    of the label set. A real GENERIC label sitting a whole (unrelated)
+  //    clause away from an unrelated reference number still wrongly
+  //    corroborated it. Fix: GENERIC labels now also require direct,
+  //    immediate adjacency (leading OR trailing shape) — these fixtures pin
+  //    the round-3 fix. ────────────────────────────────────────────────────
+
+  // Reviewer repro 1: "Mob/SMS" is real phone-context vocabulary, but the
+  // digit run that follows is an unrelated reference number in the next
+  // clause — must NOT extract.
+  const htmlMobSmsUnrelatedRef =
+    "<html><body><p>Mob/SMS venligst. Referansenr 79656569.</p></body></html>";
+  assertEq(
+    extractPhone(htmlMobSmsUnrelatedRef),
+    null,
+    "phone-24 (round-3 repro): 'Mob/SMS' sitting in an unrelated clause does NOT corroborate an unrelated reference number",
+  );
+
+  // Reviewer repro 2: "call" (from "Please call us") is real phone-context
+  // vocabulary, but the digit run is an unrelated order reference in a
+  // different element entirely — must NOT extract.
+  const htmlCallUsUnrelatedOrderRef =
+    "<html><body><button>Please call us</button><footer>Order ref 79656569</footer></body></html>";
+  assertEq(
+    extractPhone(htmlCallUsUnrelatedOrderRef),
+    null,
+    "phone-25 (round-3 repro): 'Please call us' button text elsewhere does NOT corroborate an unrelated order-reference number in a different element",
+  );
+
+  // Reviewer repro 3: "tlf." appears (inside "tlf.kort"), but the digit run
+  // that follows is an unrelated matrikkel (Gnr/bnr) number — must NOT
+  // extract.
+  const htmlTlfKortUnrelatedMatrikkel =
+    "<html><body><p>Se tlf.kort i skuffen. Gnr/bnr 79656569 for eiendommen.</p></body></html>";
+  assertEq(
+    extractPhone(htmlTlfKortUnrelatedMatrikkel),
+    null,
+    "phone-26 (round-3 repro): 'tlf.' mentioned in an unrelated clause does NOT corroborate an unrelated matrikkel number",
+  );
+
+  // Reviewer repro 4: "Telefon" is present, but the digit run is an
+  // unrelated order number in the next sentence — must NOT extract.
+  const htmlTelefonUnrelatedOrderNr =
+    "<html><body><p>Telefon ligger i skuffen. Ordrenr 79656569</p></body></html>";
+  assertEq(
+    extractPhone(htmlTelefonUnrelatedOrderNr),
+    null,
+    "phone-27 (round-3 repro): 'Telefon' mentioned in an unrelated clause does NOT corroborate an unrelated order number",
+  );
+
+  // Positive control: leading GENERIC label directly adjacent, combined with
+  // a "Ring oss på" CTA prefix even further back — proves the fix isn't
+  // overly narrow to a single label touching the digits.
+  const htmlRingOssPaTlfLabel =
+    "<html><body><p>Ring oss på Tlf: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlRingOssPaTlfLabel),
+    "91234567",
+    "phone-28: 'Ring oss på Tlf: <nummer>' still extracts — the directly-adjacent 'Tlf:' label corroborates it",
+  );
+
+  // Positive control: plain "Telefon: <nummer>" (the most common shape)
+  // still extracts after narrowing GENERIC to adjacency.
+  const htmlTelefonDirectlyAdjacent = "<html><body><p>Telefon: 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlTelefonDirectlyAdjacent),
+    "91234567",
+    "phone-29: 'Telefon: <nummer>' direct adjacency still extracts (does not regress the most common shape)",
+  );
+
+  // Positive control: trailing GENERIC label shape ("<nummer> (Tlf)") — the
+  // AFTER-adjacency half of the fix, documented by PHONE_CONTEXT_WINDOW_*
+  // but not previously covered by a test.
+  const htmlTrailingTlfLabel = "<html><body><p>91234567 (Tlf)</p></body></html>";
+  assertEq(
+    extractPhone(htmlTrailingTlfLabel),
+    "91234567",
+    "phone-30: a trailing '(Tlf)' label directly after the digits still extracts",
+  );
+
+  // ── Bug 4 code-review follow-up ROUND 3, part 2 (2026-08-13/14): "Kontakt"
+  //    gets the same CTA-word extension "Ring" already has, so "Kontakt oss
+  //    på <nummer>" — a very common Norwegian contact-box phrase — extracts
+  //    instead of wrongly returning null. ─────────────────────────────────
+
+  // The new shape this part fixes: "Kontakt oss på <nummer>" now extracts.
+  const htmlKontaktOssPa = "<html><body><p>Kontakt oss på 91234567</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktOssPa),
+    "91234567",
+    "phone-31: 'Kontakt oss på <nummer>' (Kontakt's CTA-word extension) now extracts, mirroring 'Ring oss på <nummer>'",
+  );
+
+  // Negative control: the CTA extension must not overreach — "Kontakt oss"
+  // followed by an unrelated clause and an unrelated reference number must
+  // still return null (fail-closed direction preserved).
+  const htmlKontaktOssUnrelatedOrderNr =
+    "<html><body><p>Kontakt oss i morgen. Ordrenr 79656569.</p></body></html>";
+  assertEq(
+    extractPhone(htmlKontaktOssUnrelatedOrderNr),
+    null,
+    "phone-32: 'Kontakt oss' followed by an unrelated clause and an order number still does NOT extract (CTA extension doesn't overreach)",
+  );
+
   return { passed, failed, failures };
 }
 

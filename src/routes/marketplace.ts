@@ -22,7 +22,7 @@ import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, 
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
-import { isDisplayablePhone, national8 } from "../services/contact-normalizer";
+import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
@@ -5223,6 +5223,126 @@ function looksLikeDate(digits: string): boolean {
   return year >= 1900 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
 }
 
+// Contact-context labels a genuine phone number is normally found near on a
+// producer's own site (a "Tlf:"/"Ring oss"/"Kontakt:" style block) —
+// case-insensitive, whole-word. Slice D (2026-08-10, Austrått live repro):
+// a SYNTACTICALLY valid 8-digit number ("79656569") was written as the
+// producer's phone despite being the WRONG number — none of the existing
+// shape checks (W33 leading-digit, date-shape, digit-run-substring) catch a
+// value that is merely valid-shaped but factually unrelated to this
+// producer, because it was scraped from unrelated page content (e.g. a
+// different business's number embedded on a shared-hosting/widget page).
+// Requiring the candidate to sit near a recognisable contact label is a
+// cheap, conservative proxy for "this number is actually being presented AS
+// a phone number on this page", not just "8 digits that happen to look
+// phone-shaped somewhere on the page".
+//
+// Code-review follow-up round 1 (2026-08-10, same slice): the FIRST version
+// of this gate treated bare "\bring\b" and "\bkontakt\b" as always-valid
+// context anywhere in the window — but both are common generic Norwegian
+// words with no phone connection at all ("Ring 3" = a ring road; "kontakt"
+// in an electrical/skin-contact-warning sense). Reproduced live: "Kjør Ring
+// 3 til avkjørsel. Kundenr 79656569 for support." — "Ring" sat within the
+// window of an unrelated 8-digit reference number and wrongly corroborated
+// it. Round-1 fix split the label set into GENERIC (unambiguous, phone-
+// specific words — safe anywhere in the window) vs. "Kontakt"/"Ring", which
+// were only meant to count as context near an ACTUAL heading/CTA use.
+//
+// Code-review follow-up round 2 (2026-08-10, same slice): round 1 still
+// tested the "Kontakt:" heading / "Ring oss/på/nå/meg" CTA phrase against
+// the WHOLE 40-char-before/20-char-after WINDOW — same mistake as the
+// original flat list, just one door narrower. A real "Kontakt:" heading or
+// "Ring oss" CTA button text sitting a whole (unrelated) clause away from
+// an unrelated reference number still corroborated it:
+//   "<h3>Kontakt:</h3><p>Gårds- og bruksnr: 79656569. Se kart ...</p>"
+//   "<button>Ring oss for mer info</button><footer>Bestillingsref: 79656569</footer>"
+// Fix: "Kontakt"/"Ring" now ONLY count when DIRECTLY, IMMEDIATELY adjacent
+// to the candidate digits — nothing but whitespace/colon/comma (and, for
+// "Ring", the CTA words themselves, e.g. "Ring nå på") between the label
+// and the digit run — via PHONE_CONTEXT_ADJACENT below, the same posture
+// the original adjacency check already used for the bare "Ring <nummer>"
+// shape, now generalised to also cover "Kontakt:"/"Kontaktinfo:" and the
+// full "Ring oss/på/nå/meg" CTA phrase.
+//
+// Code-review follow-up round 3 (2026-08-13/14, Daniel-authorized 4th round,
+// daniel-responses/2026-08-13-brief-svar.md): the comment directly above used
+// to end here with "GENERIC labels are UNCHANGED — they have no non-phone
+// Norwegian meaning, so window-wide matching for them was never the problem".
+// That reasoning conflated "unambiguous word" with "provably related to THIS
+// candidate" — they're different questions. A word being phone-specific only
+// means it's never a false lead on its own (no "Ring 3 the road" problem);
+// it says nothing about whether it's talking about the digit run 30+
+// characters away in an unrelated clause. Reproduced live/round-3:
+//   "Mob/SMS venligst. Referansenr 79656569."
+//   "<button>Please call us</button><footer>Order ref 79656569</footer>"
+//   "Se tlf.kort i skuffen. Gnr/bnr 79656569 for eiendommen."
+//   "Telefon ligger i skuffen. Ordrenr 79656569"
+// — in every case the GENERIC label is real and present in the window, but
+// sits in a clause that has nothing to do with the nearby digit run. Fix:
+// GENERIC labels now get the SAME direct-adjacency discipline PHONE_CONTEXT_
+// ADJACENT already applies to "Kontakt"/"Ring" — split into a BEFORE form
+// ("Telefon: 91234567", "Tlf 91234567") tested `$`-anchored against the text
+// immediately, contiguously preceding the candidate, and an AFTER form
+// ("91234567 (Tlf)") tested `^`-anchored against the text immediately,
+// contiguously following it — never "found somewhere in the wide window".
+const PHONE_CONTEXT_GENERIC_BEFORE =
+  /\b(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\s*[:,]?\s*$/iu;
+const PHONE_CONTEXT_GENERIC_AFTER =
+  /^\s*[(,]?\s*(?:tlf\.?|telefon|mob\.?|mobil|sms|call)\b/iu;
+// Matches ONLY when the candidate is DIRECTLY, IMMEDIATELY preceded (only
+// whitespace/colon/comma in between — no unrelated word or sentence) by:
+//   • "Kontakt"/"Kontaktinfo"/"Kontaktinformasjon", optionally followed by
+//     one or more of the CTA words oss/på in sequence ("Kontakt oss",
+//     "Kontakt oss på"), and optionally a trailing colon ("Kontakt:",
+//     "Kontaktinformasjon:"), or
+//   • "Ring", optionally followed by one or more of the CTA words
+//     oss/på/nå/meg in sequence ("Ring", "Ring oss", "Ring nå på").
+// Tested with `$` against the slice ending exactly at the candidate's start
+// — not "found somewhere in a wide window" — so an unrelated word/clause
+// between the label and the digits (e.g. "Kontakt: ... Ordrenr 79656569",
+// "Ring oss ... Bestillingsref: 79656569") correctly does NOT match.
+// (?:oss|på|nå|meg) has no trailing `\b`/lookahead of its own because the
+// group is itself anchored by the surrounding `\s*[:,]?\s*$` — nothing can
+// follow it but optional punctuation/whitespace up to the digits.
+//
+// Code-review follow-up round 3, part 2 (2026-08-13/14, Daniel-authorized,
+// same round as the GENERIC fix above — a safe fail-closed-direction fix
+// bundled into the same round rather than opened as a separate one):
+// "Ring" already got a CTA-word extension (oss/på/nå/meg) so "Ring oss på
+// <nummer>" — a very common Norwegian call-to-action phrase — extracts
+// correctly. "Kontakt" had no equivalent, so the equally common contact-box
+// phrase "Kontakt oss på <nummer>" wrongly returned null (a false negative —
+// safe, but overly conservative). Fixed by mirroring Ring's CTA-word
+// extension onto Kontakt with the analogous words (oss/på). This does not
+// change the fail-closed posture: it still requires DIRECT adjacency, so
+// "Kontakt oss i morgen. Ordrenr 79656569" (CTA phrase, unrelated clause,
+// then an unrelated number) still correctly returns null — the CTA words are
+// only recognised when they sit immediately between the label and the digits,
+// same as Ring's.
+const PHONE_CONTEXT_ADJACENT =
+  /\b(?:kontakt(?:info(?:rmasjon)?)?(?:\s+(?:oss|på))*|ring(?:\s+(?:oss|på|nå|meg))*)\s*[:,]?\s*$/iu;
+// How far (in characters, in the tag-stripped text) around a candidate match
+// to look for a GENERIC contact label. Generous enough for "Telefon:
+// <number>" / "<number> (Tlf)" shapes without being so wide it picks up an
+// unrelated label elsewhere on a dense contact block. Both the GENERIC
+// adjacency checks and PHONE_CONTEXT_ADJACENT are NOT window-based in the
+// "found anywhere" sense — they only look at what immediately, contiguously
+// precedes/follows the candidate; the window bounds below just cap how far
+// back/forward it's even worth looking.
+const PHONE_CONTEXT_WINDOW_BEFORE = 40;
+const PHONE_CONTEXT_WINDOW_AFTER = 20;
+
+function hasPhoneContext(text: string, matchStart: number, groupEnd: number): boolean {
+  const windowStart = Math.max(0, matchStart - PHONE_CONTEXT_WINDOW_BEFORE);
+  const windowEnd = Math.min(text.length, groupEnd + PHONE_CONTEXT_WINDOW_AFTER);
+  const immediatelyBefore = text.slice(windowStart, matchStart);
+  if (PHONE_CONTEXT_GENERIC_BEFORE.test(immediatelyBefore)) return true;
+  const immediatelyAfter = text.slice(groupEnd, windowEnd);
+  if (PHONE_CONTEXT_GENERIC_AFTER.test(immediatelyAfter)) return true;
+  if (PHONE_CONTEXT_ADJACENT.test(immediatelyBefore)) return true;
+  return false;
+}
+
 /**
  * Extract a Norwegian phone number from HTML text.
  *
@@ -5235,6 +5355,13 @@ function looksLikeDate(digits: string): boolean {
  *      inspecting the raw text immediately before/after the matched digit
  *      group; if either neighbour is itself a digit, the candidate is part
  *      of a longer run and is skipped rather than returned.
+ *
+ * Slice D (2026-08-10, Austrått live repro): a fourth check — the candidate
+ * must sit near a recognisable contact-context label (see hasPhoneContext /
+ * PHONE_CONTEXT_* above). A valid-shaped 8-digit run with no such context
+ * nearby is skipped, not returned — same "false negative is safe, false
+ * positive is not" posture as every other check here: leaving the phone
+ * field blank is always safer than writing a confidently-wrong number.
  */
 export function extractPhone(html: string): string | null {
   // Strip HTML tags for cleaner matching.
@@ -5262,6 +5389,9 @@ export function extractPhone(html: string): string | null {
     // to the SAME national8 the write-guard uses (single implementation,
     // contact-normalizer.ts) and keeps scanning for a real number.
     if (national8(digits) === null) continue;
+    // Bug fix 4 (slice D, 2026-08-10): reject a valid-shaped candidate with
+    // no recognisable contact-context label nearby — see hasPhoneContext.
+    if (!hasPhoneContext(text, m.index, groupEnd)) continue;
     return digits;
   }
   return null;
@@ -5284,6 +5414,19 @@ const ADDRESS_CONTACT_LABELS = new Set([
  * punctuation boundary in between (e.g. "... 2460 Osen Telefon: ..." must
  * yield poststed "Osen", not "Osen Telefon"). Street/postcode groups are
  * untouched.
+ *
+ * Slice D (2026-08-10, Oceanfood AS live repro): the STREET group's leading
+ * side has the mirror-image bug — a flattened "Kontakt" box heading (and
+ * often the producer's own company name right after it, e.g. "Kontakt
+ * Oceanfood AS ...") with no punctuation boundary before the real street
+ * gets swallowed into the street capture ("Kontakt Oceanfood AS Storhaugen
+ * 26, 5527 Haugesund" instead of "Storhaugen 26, 5527 Haugesund"), because
+ * the regex's leftmost-match search accepts the whole letters+spaces run
+ * starting at "Kontakt". stripLeadingContactLabel (contact-normalizer.ts —
+ * the leading-side sibling of the trailing-label stripper already used at
+ * the write-time guard) is applied to the captured street text before the
+ * length sanity check / return, same reused single-implementation posture
+ * as the phone checks above.
  */
 export function extractAddress(html: string): string | null {
   const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
@@ -5297,9 +5440,11 @@ export function extractAddress(html: string): string | null {
       words.pop();
     }
     const poststed = words.join(" ");
-    const candidate = `${m[1].trim()}, ${m[2]} ${poststed}`;
+    const rawStreet = m[1].trim();
+    const street = (stripLeadingContactLabel(rawStreet) ?? rawStreet).trim();
+    const candidate = `${street}, ${m[2]} ${poststed}`;
     // Sanity: skip obviously bad matches (< 10 chars of street part).
-    if (m[1].trim().length >= 6) return candidate;
+    if (street.length >= 6) return candidate;
   }
   return null;
 }

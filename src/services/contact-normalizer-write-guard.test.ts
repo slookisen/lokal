@@ -30,7 +30,7 @@
  */
 
 import Database from "better-sqlite3";
-import { validatePhoneForWrite, stripTrailingContactLabel, classifyPhoneForWrite } from "./contact-normalizer";
+import { validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel, classifyPhoneForWrite } from "./contact-normalizer";
 
 export interface TestSummary {
   passed: number;
@@ -309,6 +309,58 @@ export function runContactNormalizerWriteGuardTests(opts: { log?: boolean } = {}
     );
   }
 
+  // ── stripLeadingContactLabel (slice D, 2026-08-10 — Oceanfood AS repro) ──
+  {
+    assertEq(
+      stripLeadingContactLabel("Kontakt Oceanfood AS Storhaugen 26, 5527 Haugesund"),
+      "Storhaugen 26, 5527 Haugesund",
+      "stripLeadingContactLabel: real breach — leading 'Kontakt <Firmanavn> AS' box heading stripped",
+    );
+    assertEq(
+      stripLeadingContactLabel("Kontakt: Storgata 5"),
+      "Storgata 5",
+      "stripLeadingContactLabel: leading 'Kontakt:' (label + separator) stripped",
+    );
+    assertEq(
+      stripLeadingContactLabel("Adresse Storgata 5"),
+      "Storgata 5",
+      "stripLeadingContactLabel: leading 'Adresse' label (no punctuation) stripped",
+    );
+    assertEq(
+      stripLeadingContactLabel("Kontaktveien 3"),
+      "Kontaktveien 3",
+      "stripLeadingContactLabel NEG: label embedded in a real street name is NOT stripped",
+    );
+    assertEq(
+      stripLeadingContactLabel(null),
+      null,
+      "stripLeadingContactLabel: null passthrough",
+    );
+    assertEq(
+      stripLeadingContactLabel(undefined),
+      undefined,
+      "stripLeadingContactLabel: undefined passthrough",
+    );
+    // Would-become-blank guard: stripping the label would leave nothing but
+    // the trailing whitespace/punctuation ⇒ must return the original.
+    assertEq(
+      stripLeadingContactLabel("Kontakt"),
+      "Kontakt",
+      "stripLeadingContactLabel NEG: bare label with nothing following it is left unchanged",
+    );
+    assertEq(
+      stripLeadingContactLabel("Kontakt: "),
+      "Kontakt: ",
+      "stripLeadingContactLabel NEG: stripping would leave the address blank ⇒ original returned unchanged",
+    );
+    // Positive control: a value with no leading label at all is untouched.
+    assertEq(
+      stripLeadingContactLabel("Storgata 5, 0150 Oslo"),
+      "Storgata 5, 0150 Oslo",
+      "stripLeadingContactLabel NEG: no leading label present ⇒ unchanged",
+    );
+  }
+
   // ── Integration: KnowledgeService.upsertKnowledge() ──────────────────────
   {
     const { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } = require("../database/init") as
@@ -370,6 +422,17 @@ export function runContactNormalizerWriteGuardTests(opts: { log?: boolean } = {}
       } as any);
       const row3 = testDb.prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?").get("agent-insert-address-label") as any;
       assertEq(row3?.address, "Valmen 54, 2460 Osen", "upsertKnowledge INSERT: trailing 'Telefon' label stripped from address before storage");
+
+      // (4) INSERT path (slice D, 2026-08-10 — Oceanfood AS repro): address
+      // with a LEADING "Kontakt <Firmanavn> AS" box heading gets cleaned
+      // before storage too.
+      insertAgent("agent-insert-leading-label", null);
+      knowledgeService.upsertKnowledge("agent-insert-leading-label", {
+        address: "Kontakt Oceanfood AS Storhaugen 26, 5527 Haugesund",
+        dataSource: "auto",
+      } as any);
+      const row4 = testDb.prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?").get("agent-insert-leading-label") as any;
+      assertEq(row4?.address, "Storhaugen 26, 5527 Haugesund", "upsertKnowledge INSERT: leading 'Kontakt Oceanfood AS' label stripped from address before storage");
     } catch (err) {
       failed++;
       failures.push(`contact-normalizer-write-guard: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
