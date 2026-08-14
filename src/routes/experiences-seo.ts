@@ -158,7 +158,21 @@ import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/ex
 // at "gardssalgSearchName() «— Sted» strip") — used below to keep the
 // gårdssalg catalog card's title from ever repeating the place name its own
 // kommune-etikett shows.
-import { parseNameLocationSuffix } from "../services/location-suffix-parser";
+// DEFECT FIX (2026-08-14, independent review, CHANGES-REQUESTED): also pulls
+// in normaliseHint() — parseNameLocationSuffix()'s own doc comment is
+// explicit that its location_hint is an UNVALIDATED corroboration signal
+// ("any ' - ', en/em-dash, or trailing '(...)' is a candidate", no check
+// that the text is an actual place). The review reproduced a false positive
+// on the very first plausible non-location hyphenated name tried: a
+// provider named "Ren - Ekte Gard" (a tagline, not a place) with no
+// poststed/kommune/fylke in the DB got its title silently truncated to
+// "Ren" and "Ekte Gard" displayed as if it were a kommune-etikett. Fix:
+// gardssalgCardTitleAndSted() below now only strips the title / shows a
+// label when a REAL DB poststed/kommune/fylke value corroborates the parsed
+// suffix — normaliseHint() lets that comparison use the exact same
+// normalisation the parser itself already applies to location_hint, instead
+// of re-implementing it here.
+import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
 
 const router = Router();
 
@@ -4465,28 +4479,61 @@ export function renderGardssalgTypeChips(
 //     the label instead of being silently dropped.
 //   - a card that DOES have poststed/kommune/fylke duplicated the same place
 //     in the title too ("Bryggeriet på Hvaler — Hvaler" + etikett "Hvaler").
-// Both are solved the same way: whenever a suffix is detected, the title
-// NEVER carries it (title = core_name) — so the two can never say the same
-// place twice — and the label prefers the row's own structured
-// poststed/kommune/fylke data, falling back to the suffix only when that
-// structured data is missing entirely.
-// parseNameLocationSuffix()'s own `location_hint` is normalized (lowercased,
-// accents stripped) for matching, not fit for display — so the raw suffix
-// text is sliced back out of the original name here rather than displaying
-// the normalized form.
+//
+// DEFECT FIX (2026-08-14, independent review, CHANGES-REQUESTED — see
+// PR discussion): the FIRST version of this function used the parsed
+// suffix as a freestanding label source whenever the row had no
+// poststed/kommune/fylke — i.e. exactly the "no structured data" case.
+// parseNameLocationSuffix() is documented (its own header) as a low-stakes
+// *corroboration* signal ONLY — it treats any " - ", en/em-dash, or
+// trailing "(...)" as a location-suffix CANDIDATE, with no check that the
+// text is an actual place name. Reviewer repro: a provider named
+// "Ren - Ekte Gard" (a hyphenated tagline, not a location) with no DB
+// poststed/kommune/fylke had its title silently truncated to "Ren" and
+// "Ekte Gard" shown as if it were the kommune-etikett — on the very first
+// plausible non-location hyphenated name tried.
+//
+// Fix (reviewer's option (b), the narrower/safer one): the label ALWAYS
+// comes from real DB poststed/kommune/fylke, never from unvalidated parsed
+// text. The parsed suffix is used ONLY to decide whether to strip the
+// title's "— X" tail, and only when a real DB value CORROBORATES it (i.e.
+// the normalised suffix equals one of poststed/kommune/fylke, the same
+// normalisation parseNameLocationSuffix() itself applies to location_hint —
+// see normaliseHint()). Consequences:
+//   - no DB location data at all -> nothing to corroborate against -> title
+//     stays exactly as-is (whole name, suffix and all) and NO etikett is
+//     shown. Same as this card's behavior before this dev-request touched
+//     anything for that case — no false positive, no regression.
+//   - DB location data present AND it matches the parsed suffix -> existing
+//     good behavior, unchanged: title stripped, etikett = the DB value.
+//   - DB location data present but it does NOT match the parsed suffix
+//     (e.g. a coincidental hyphen in the name) -> etikett still shows the
+//     real DB value, but the title is left untouched (never strip on an
+//     unconfirmed guess).
 function gardssalgCardTitleAndSted(p: GardssalgProviderRow): { title: string; sted: string } {
-  const dbSted = [p.poststed, p.kommune, p.fylke].find((v): v is string => !!v);
   const navn = (p.navn || "").trim();
+  const dbFields = [p.poststed, p.kommune, p.fylke];
+  const dbSted = dbFields.find((v): v is string => !!v);
+  // No real, DB-sourced location data on this row at all -> there is
+  // nothing to corroborate a parsed suffix against, so never invent a
+  // label from unvalidated parsed text and never strip the title either.
+  if (!dbSted) return { title: navn, sted: "" };
+
   const { core_name, location_hint } = parseNameLocationSuffix(navn);
-  if (!location_hint) return { title: navn, sted: dbSted ?? "" };
-  const rawSuffix = navn
-    .slice(core_name.length)
-    .trim()
-    .replace(/^[—–-]\s*/, "")
-    .replace(/^\(\s*/, "")
-    .replace(/\s*\)$/, "")
-    .trim();
-  return { title: core_name, sted: dbSted || rawSuffix };
+  if (location_hint) {
+    const normalisedHint = normaliseHint(location_hint);
+    const hintParts = normalisedHint.split(",").map((s) => s.trim()).filter(Boolean);
+    const corroborated = dbFields.some((v) => {
+      if (!v) return false;
+      const normalisedDbValue = normaliseHint(v);
+      if (!normalisedDbValue) return false;
+      return hintParts.includes(normalisedDbValue);
+    });
+    if (corroborated) return { title: core_name, sted: dbSted };
+  }
+  // Suffix absent, or present but not corroborated by real DB data — the
+  // etikett still shows the real DB value, but the title is left untouched.
+  return { title: navn, sted: dbSted };
 }
 
 function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: number }): string | null {

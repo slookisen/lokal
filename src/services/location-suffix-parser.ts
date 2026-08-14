@@ -46,7 +46,14 @@
 const MAX_HINT_LENGTH = 60;
 const MAX_PAREN_LENGTH = 30;
 
-function normaliseHint(s: string): string {
+// Exported (2026-08-14, gårdssalg-card-consistency defect fix) so callers
+// that need to CORROBORATE a parsed location_hint against a real,
+// DB-sourced value (rather than just parsing) can normalise both sides the
+// same way instead of re-implementing this. See experiences-seo.ts's
+// gardssalgCardTitleAndSted() for the corroboration use — this parser's own
+// contract above is explicit that a bare location_hint is an unvalidated
+// "corroboration signal", never fit to display or trust on its own.
+export function normaliseHint(s: string): string {
   if (!s) return "";
   return s
     .normalize("NFC")

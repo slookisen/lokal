@@ -27,9 +27,23 @@
  *   (a) a card whose name carries a "Navn — Sted" suffix AND has a matching
  *       structured kommune: title is stripped of the suffix, the etikett
  *       shows the place exactly once (never "…Hvaler — Hvaler" + "Hvaler").
- *   (b) a card whose name carries the suffix but has NO structured
- *       poststed/kommune/fylke at all: the suffix becomes the kommune-
- *       etikett (previously silently absent) and is stripped from the title.
+ *   (b) a card whose name carries a suffix but has NO structured
+ *       poststed/kommune/fylke at all: DEFECT FIX (2026-08-14, independent
+ *       review, CHANGES-REQUESTED) — the first version of this slice made
+ *       the suffix become the kommune-etikett here, but
+ *       parseNameLocationSuffix() is only a low-stakes, UNVALIDATED
+ *       corroboration signal (its own doc comment): any " - ", dash, or
+ *       "(...)" tail is a candidate, with no check it's an actual place.
+ *       Reviewer repro: a name like "Ren - Ekte Gard" (a tagline, not a
+ *       location) got its title silently truncated to "Ren" and
+ *       "Ekte Gard" shown as if it were a real kommune-etikett. Corrected
+ *       behavior: with no DB location data to corroborate against, the
+ *       title is left FULLY UNCHANGED and NO etikett is shown at all — same
+ *       as this card's pre-existing behavior before this dev-request ever
+ *       touched it. See (b) below for the repro fixture and (b') for a
+ *       suffix that legitimately corroborates via a DIFFERENT structured
+ *       field (fylke, not poststed/kommune) to prove the corroboration
+ *       check isn't accidentally scoped to just one field.
  *   (c) a card with no suffix and real structured data: unaffected — title
  *       is the plain name, etikett is the structured value.
  *   (d) producer_type badge renders (visible label) when producer_type is
@@ -132,7 +146,7 @@ export function runExperiencesSeoGardssalgCardConsistencyTests(opts: { log?: boo
 
       // ── Fixtures — same raw-insert shape as
       // experiences-seo-gardssalg-claimed-badge.test.ts (createProvider()
-      // doesn't support producer_type/slug). 6 rows ≥ the
+      // doesn't support producer_type/slug). 7 rows ≥ the
       // GARDSSALG_VISIBILITY_THRESHOLD (5) so the base catalog renders. ────
       const insertProvider = db.prepare(
         `INSERT INTO experience_providers
@@ -148,10 +162,25 @@ export function runExperiencesSeoGardssalgCardConsistencyTests(opts: { log?: boo
         id: "gsc-suffix-dup", navn: "Bryggeriet på Hvaler — Hvaler", fylke: "Østfold", kommune: "Hvaler",
         poststed: null, producer_type: "bryggeri", booking_live: 0, slug: "bryggeriet-pa-hvaler",
       });
-      // (b) title suffix is the ONLY location signal — no structured data at all.
+      // (b) DEFECT-FIX REPRO (2026-08-14, independent review,
+      // CHANGES-REQUESTED): a name with an incidental " - " that is NOT a
+      // location — a tagline-style business name — and NO structured
+      // poststed/kommune/fylke on the row at all. Before the fix this
+      // false-positived: title silently truncated to "Ren", "Ekte Gard"
+      // shown as if it were the kommune-etikett. Corrected behavior: no DB
+      // data to corroborate against -> title stays fully unchanged, no
+      // etikett at all.
       insertProvider.run({
-        id: "gsc-suffix-only", navn: "Solheim Sideri — Ullensvang", fylke: null, kommune: null,
-        poststed: null, producer_type: "sideri", booking_live: 0, slug: "solheim-sideri",
+        id: "gsc-suffix-no-db", navn: "Ren - Ekte Gard", fylke: null, kommune: null,
+        poststed: null, producer_type: "sideri", booking_live: 0, slug: "ren-ekte-gard",
+      });
+      // (b') a title suffix that DOES corroborate, but only via the fylke
+      // field (poststed/kommune both null) — proves the corroboration check
+      // isn't accidentally scoped to just one structured field: title is
+      // still stripped, etikett still shows the real DB value.
+      insertProvider.run({
+        id: "gsc-suffix-fylke", navn: "Kyststad Bryggeri — Møre og Romsdal", fylke: "Møre og Romsdal",
+        kommune: null, poststed: null, producer_type: "bryggeri", booking_live: 0, slug: "kyststad-bryggeri",
       });
       // (c) plain name, no suffix, real structured data — unaffected baseline.
       insertProvider.run({
@@ -210,14 +239,34 @@ export function runExperiencesSeoGardssalgCardConsistencyTests(opts: { log?: boo
       // never survives.
       assertTrue(!hvalerCard.includes(" — Hvaler"), "a3: the ' — Hvaler' title suffix does not survive anywhere on the card");
 
-      // ── (b) suffix-only: becomes the etikett, stripped from the title ───
-      const sideriCard = cardSliceFor("Solheim Sideri");
-      assertTrue(sideriCard.includes(">Solheim Sideri<"), "b1: title is stripped of the ' — Ullensvang' suffix");
-      assertTrue(!sideriCard.includes("Solheim Sideri — Ullensvang"), "b2: the raw un-stripped name never appears on the card");
+      // ── (b) DEFECT-FIX REPRO: hyphenated tagline name, NO structured DB
+      // location at all — must NEVER be treated as a suffix to strip or a
+      // label to invent. This is the exact reviewer repro ("Ren - Ekte
+      // Gard"): before the fix, title truncated to "Ren" and "Ekte Gard"
+      // rendered as if it were a real kommune-etikett. ───────────────────
+      const reneEkteGardCard = cardSliceFor("Ren - Ekte Gard");
+      assertTrue(reneEkteGardCard.includes(">Ren - Ekte Gard<"), "b1: title renders IN FULL, un-truncated — no unvalidated suffix strip");
+      assertTrue(!reneEkteGardCard.includes(">Ren<"), "b2: 'Ren' never renders as a standalone (falsely-stripped) title");
+      // The kommune-etikett <div> is only ever emitted when `sted` is
+      // non-empty (see renderProviderCard()'s `${sted ? ... : ""}`) — so its
+      // complete absence here (no poststed/kommune/fylke to corroborate
+      // against) proves no etikett div was invented from the parsed suffix.
       assertTrue(
-        sideriCard.includes(">Ullensvang<"),
-        "b3: the suffix becomes this card's kommune-etikett (previously would have had NONE — no poststed/kommune/fylke)",
+        !/font-size:\.78rem;color:#7a7163[^>]*>Ekte Gard</.test(reneEkteGardCard),
+        "b3: 'Ekte Gard' never renders as a kommune-etikett (it is not a place name)",
       );
+      assertTrue(
+        !reneEkteGardCard.includes('font-size:.78rem;color:#7a7163'),
+        "b4: no kommune-etikett div at all renders for this card — nothing real to show",
+      );
+
+      // ── (b') suffix corroborated via fylke ONLY (poststed/kommune both
+      // null) — proves the corroboration check isn't scoped to a single
+      // structured field: title IS stripped, etikett shows the real value ──
+      const kyststadCard = cardSliceFor("Kyststad Bryggeri");
+      assertTrue(kyststadCard.includes(">Kyststad Bryggeri<"), "b'1: title is stripped of the ' — Møre og Romsdal' suffix (corroborated via fylke)");
+      assertTrue(!kyststadCard.includes("Kyststad Bryggeri — Møre og Romsdal"), "b'2: the raw un-stripped name never appears on the card");
+      assertTrue(kyststadCard.includes(">Møre og Romsdal<"), "b'3: the etikett shows the real DB fylke value");
 
       // ── (c) plain name + real data — unaffected ──────────────────────────
       assertTrue(r.body.includes(">Trysil Bryggeri<"), "c1: a name with no suffix renders unchanged");
