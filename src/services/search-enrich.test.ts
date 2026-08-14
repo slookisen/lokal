@@ -34,6 +34,11 @@ import {
   // the extracted cheap/universal prefilter shared by meetsAboutQualityBar
   // and gårdssalg's own LLM-judge cascade (routes/opplevelser.ts).
   meetsAboutCheapBar,
+  // dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann kriterium 7:
+  // per-reason classification underneath meetsAboutCheapBar, so a caller can
+  // tell "too short" (a judgment call) apart from genuine deterministic
+  // garbage (mangled/boilerplate/foreign).
+  classifyAboutCheapBar,
   PLATFORM_CATEGORIES,
   // orch-experiences-content-refresh: experiences-vertical category mapper (PURE).
   mapToExperienceCategories,
@@ -1099,6 +1104,58 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       "Hopp til innhold. Velkommen til gårdsbutikken vår hvor du finner ferske grønnsaker, egg og kjøtt fra egen produksjon.";
     assertTrue(!meetsAboutQualityBar(navSkipLink), "cheapBar sanity: skip-link marker text still fails the FULL bar");
     assertTrue(meetsAboutCheapBar(navSkipLink), "cheapBar: skip-link marker text PASSES the cheap bar alone");
+  }
+
+  // ── dev-request 2026-07-25-rfb-kvalitetsgate-og-retroskann kriterium 7:
+  //    classifyAboutCheapBar — pins that (a) it agrees with meetsAboutCheapBar
+  //    on every case above (ok ⟺ meetsAboutCheapBar true, no drift from the
+  //    delegation refactor), and (b) a too-short-but-otherwise-CLEAN value is
+  //    classified "too_short" specifically — NOT lumped in with the three
+  //    genuine garbage classes (mangled/boilerplate/foreign), which is what
+  //    lets rfbRetroScanShouldNull route it to the LLM judge instead of
+  //    nulling it outright. ─────────────────────────────────────────────────
+  {
+    const good = "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
+    assertEq(classifyAboutCheapBar(good), "ok", "classify: substantive Norwegian about -> ok");
+
+    const shortClean = "Ost fra egen gard.";
+    assertTrue(shortClean.length < 80, "classify sanity: shortClean is under the 80-char floor");
+    assertEq(classifyAboutCheapBar(shortClean), "too_short", "classify: short-but-clean Norwegian text -> too_short (not a garbage class)");
+    assertEq(classifyAboutCheapBar(shortClean, 10), "ok", "classify: minLen override honoured — same text clears a lower floor");
+
+    assertEq(classifyAboutCheapBar(null), "too_short", "classify: null -> too_short");
+    assertEq(classifyAboutCheapBar(undefined), "too_short", "classify: undefined -> too_short");
+    assertEq(classifyAboutCheapBar(""), "too_short", "classify: empty -> too_short");
+
+    const english = "Welcome to our family farm shop where we sell fresh produce, eggs and homemade jam every weekend.";
+    assertEq(classifyAboutCheapBar(english), "foreign", "classify: long English snippet -> foreign");
+
+    const cookie = "Vi bruker informasjonskapsler (cookies) for å gi deg en bedre opplevelse. Ved å fortsette godtar du vår personvern.";
+    assertEq(classifyAboutCheapBar(cookie), "boilerplate", "classify: cookie/consent boilerplate -> boilerplate");
+
+    const mangledTrailing = good.slice(0, 60) + " opplevelser p�";
+    assertEq(classifyAboutCheapBar(mangledTrailing), "mangled", "classify: trailing replacement-char -> mangled");
+    const mangledInterior = good.slice(0, 40) + "�" + good.slice(40);
+    assertEq(classifyAboutCheapBar(mangledInterior), "mangled", "classify: interior replacement-char -> mangled");
+
+    // A SHORT mangled/boilerplate/foreign value is still its garbage class,
+    // never "too_short" — the garbage checks run before the length check.
+    const shortMangled = "Kort p�.";
+    assertTrue(shortMangled.length < 80, "classify sanity: shortMangled is under the 80-char floor");
+    assertEq(classifyAboutCheapBar(shortMangled), "mangled", "classify: SHORT mangled text is still 'mangled', not 'too_short'");
+
+    // classifyAboutCheapBar and meetsAboutCheapBar never disagree on ok-ness,
+    // across every fixture defined in the block above.
+    for (const [label, text] of [
+      ["good", good], ["shortClean", shortClean], ["english", english], ["cookie", cookie],
+      ["mangledTrailing", mangledTrailing], ["mangledInterior", mangledInterior], ["shortMangled", shortMangled],
+    ] as const) {
+      assertEq(
+        classifyAboutCheapBar(text) === "ok",
+        meetsAboutCheapBar(text),
+        `classify/meets agreement: ${label}`,
+      );
+    }
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

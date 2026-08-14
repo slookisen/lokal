@@ -155,7 +155,12 @@ export function runAdminAgentsRetroScanTests(
         // part of the producer NAME "Draopar Sideri" used on fixtures below,
         // so checking for "Draopar" would incorrectly match prompts judging
         // a perfectly good candidate belonging to that same producer).
-        const verdict = prompt.includes("Sidersortar") ? "AVVIS" : "GODKJENN";
+        // "tynnprosa" is kriterium 7's short-but-clean-REJECT fixture's
+        // unique marker word (see section (k) below) — kept distinct from
+        // "Sidersortar" (CONTAMINATED) and "Draopar" (the producer NAME
+        // shared by several fixtures below) for the same reason those two
+        // are kept distinct from each other.
+        const verdict = prompt.includes("Sidersortar") || prompt.includes("tynnprosa") ? "AVVIS" : "GODKJENN";
         const reasoning = verdict === "AVVIS"
           ? "Dette er en lenkeliste fra en navigasjonsmeny, ikke ekte prosa om produsenten."
           : "Ren, konkret prosa om produsenten.";
@@ -659,6 +664,105 @@ export function runAdminAgentsRetroScanTests(
         const boolOffsetRes = await callRetroScan({ apply: false, offset: true });
         assertEq(boolOffsetRes.status, 400, "rs-j37: offset:true -> 400");
         assertEq(anthropicCallCount, callsBeforeNonScalar, "rs-j38: none of the non-scalar offset calls made any judge calls");
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (k) kriterium 7 (dev-request 2026-07-25-rfb-kvalitetsgate-og-
+      //     retroskann, 2026-08-14 Daniel sign-off): a pure-length cheap-bar
+      //     failure no longer nulls deterministically — it now reaches the
+      //     SAME LLM judge a cheap-bar PASS already used. The three genuine
+      //     garbage classes (mangled/boilerplate/foreign) still null WITHOUT
+      //     ever calling the judge. by_cause_class in the response proves
+      //     acceptance (a): nothing is ever flagged on length alone without
+      //     an LLM verdict — "too_short" is structurally not one of its keys.
+      // ═══════════════════════════════════════════════════════════════════
+      clearAll();
+      {
+        // Short (<80 chars), otherwise CLEAN Norwegian text the stub judge
+        // approves (default GODKJENN — no "Sidersortar"/"tynnprosa" marker).
+        const SHORT_CLEAN_APPROVE = "Ost frå ein liten fjellgard.";
+        assertTrue(SHORT_CLEAN_APPROVE.length < 80, "rs-k sanity: SHORT_CLEAN_APPROVE is under the 80-char floor");
+        // Short (<80 chars), otherwise CLEAN Norwegian text — stub judge
+        // AVVIS via the unique "tynnprosa" marker (see stubFetch above).
+        const SHORT_CLEAN_REJECT = "Vi har bare tynnprosa her, ingenting mer.";
+        assertTrue(SHORT_CLEAN_REJECT.length < 80, "rs-k sanity: SHORT_CLEAN_REJECT is under the 80-char floor");
+
+        insertAgent({ id: "rs-k-approve", name: "Kort Godkjent Gard", description: SHORT_CLEAN_APPROVE });
+        insertAgent({ id: "rs-k-reject", name: "Kort Avvist Gard", description: SHORT_CLEAN_REJECT });
+
+        const callsBefore = anthropicCallCount;
+        const dry = await callRetroScan({ agentIds: ["rs-k-approve", "rs-k-reject"], apply: false });
+        assertTrue(anthropicCallCount > callsBefore, "rs-k1: the short-but-clean candidates DID reach the judge (not deterministically nulled)");
+
+        assertTrue(
+          !dry.body.changed.some((c: any) => c.agent_id === "rs-k-approve"),
+          "rs-k2: a short-but-clean value the judge APPROVES is left untouched, despite failing on length alone",
+        );
+        const rejectEntry = dry.body.changed.find((c: any) => c.agent_id === "rs-k-reject");
+        assertTrue(!!rejectEntry, "rs-k3: a short-but-clean value the judge REJECTS is flagged");
+        assertTrue(
+          rejectEntry.reasons.description !== "fails the cheap bar (too short/boilerplate/mangled/foreign)",
+          "rs-k4: the flagged reason is the judge's own reasoning, not the old blanket cheap-bar phrase",
+        );
+        assertEq(dry.body.by_cause_class.llm_rejected, 1, "rs-k5: by_cause_class.llm_rejected counts the short-but-clean rejection");
+        assertEq(
+          (dry.body.by_cause_class as any).too_short,
+          undefined,
+          "rs-k6: 'too_short' is not a cause class the report ever emits (acceptance (a))",
+        );
+      }
+
+      // Genuine garbage classes still null WITHOUT ever calling the judge.
+      clearAll();
+      {
+        const good60 = "Kinn Bryggeri er et lite håndverksbryggeri på Vågsøy som brygger";
+        const MANGLED = good60 + " opplevelser p�";
+        const BOILERPLATE =
+          "Vi bruker informasjonskapsler (cookies) for å gi deg en bedre opplevelse. Ved å fortsette godtar du vår personvern.";
+        const FOREIGN =
+          "Welcome to our family farm shop where we sell fresh produce, eggs and homemade jam every weekend.";
+
+        insertAgent({ id: "rs-k-mangled", name: "Mangled Gard", description: MANGLED });
+        insertAgent({ id: "rs-k-boilerplate", name: "Boilerplate Gard", description: BOILERPLATE });
+        insertAgent({ id: "rs-k-foreign", name: "Foreign Gard", description: FOREIGN });
+
+        const callsBefore2 = anthropicCallCount;
+        const applyRes = await callRetroScan({
+          agentIds: ["rs-k-mangled", "rs-k-boilerplate", "rs-k-foreign"],
+          apply: true,
+        });
+        assertEq(anthropicCallCount, callsBefore2, "rs-k7: NONE of the three genuine garbage classes ever called the judge");
+
+        const mangledEntry = applyRes.body.changed.find((c: any) => c.agent_id === "rs-k-mangled");
+        assertTrue(!!mangledEntry, "rs-k8: mangled candidate is nulled");
+        assertEq(mangledEntry.reasons.description, "fails the cheap bar (mangled)", "rs-k9: mangled reason names its class");
+
+        const boilerplateEntry = applyRes.body.changed.find((c: any) => c.agent_id === "rs-k-boilerplate");
+        assertTrue(!!boilerplateEntry, "rs-k10: boilerplate candidate is nulled");
+        assertEq(boilerplateEntry.reasons.description, "fails the cheap bar (boilerplate)", "rs-k11: boilerplate reason names its class");
+
+        const foreignEntry = applyRes.body.changed.find((c: any) => c.agent_id === "rs-k-foreign");
+        assertTrue(!!foreignEntry, "rs-k12: foreign-language candidate is nulled");
+        assertEq(foreignEntry.reasons.description, "fails the cheap bar (foreign)", "rs-k13: foreign reason names its class");
+
+        assertEq(applyRes.body.by_cause_class.deterministic_mangled, 1, "rs-k14: by_cause_class.deterministic_mangled counts it");
+        assertEq(applyRes.body.by_cause_class.deterministic_boilerplate, 1, "rs-k15: by_cause_class.deterministic_boilerplate counts it");
+        assertEq(applyRes.body.by_cause_class.deterministic_foreign, 1, "rs-k16: by_cause_class.deterministic_foreign counts it");
+      }
+
+      // A SHORT genuine-garbage value (e.g. short AND mangled) is still
+      // deterministic — the garbage check runs before the length check, so
+      // shortness never "rescues" real garbage into the judge path.
+      clearAll();
+      {
+        const SHORT_MANGLED = "Kort tekst p�.";
+        insertAgent({ id: "rs-k-short-mangled", name: "Kort Mangled Gard", description: SHORT_MANGLED });
+        const callsBefore3 = anthropicCallCount;
+        const res3 = await callRetroScan({ agentIds: ["rs-k-short-mangled"], apply: false });
+        assertEq(anthropicCallCount, callsBefore3, "rs-k17: a SHORT mangled value still never reaches the judge");
+        const entry = res3.body.changed.find((c: any) => c.agent_id === "rs-k-short-mangled");
+        assertTrue(!!entry, "rs-k18: SHORT mangled value is still flagged deterministically");
+        assertEq(entry.reasons.description, "fails the cheap bar (mangled)", "rs-k19: still classified 'mangled', not 'too_short'");
       }
     } catch (err) {
       failed++;
