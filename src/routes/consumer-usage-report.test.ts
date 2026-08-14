@@ -83,13 +83,21 @@ export async function runConsumerUsageReportTests(opts: { log?: boolean } = {}):
     }
   }
 
-  const prevAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+  const prevAdminKey = process.env.ADMIN_KEY;
+  const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   const prevDb = initMod.getDb();
   const db = new Database(":memory:");
   try {
     // Determinisme (2026-08-02): adopter suitens kanoniske nøkkel når den
     // finnes (se SHARED GLOBAL STATE-kontrakten i tests/test.ts).
-    const usageKey = process.env.ANALYTICS_ADMIN_KEY || "test-consumer-usage-key";
+    // dev-request 2026-07-28-visibility-admin-key-naar-ikke-frem
+    // (analytics.ts slice): requireAdminAuth() now checks ADMIN_KEY
+    // (primary) before ANALYTICS_ADMIN_KEY (legacy fallback) — GET
+    // /admin/analytics/consumer-usage below is gated by it, so this key
+    // must adopt ADMIN_KEY first, or the suite-wide ADMIN_KEY value
+    // (always set — see tests/test.ts's SUITE_ADMIN_KEY) wins instead.
+    const usageKey = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "test-consumer-usage-key";
+    process.env.ADMIN_KEY = usageKey;
     process.env.ANALYTICS_ADMIN_KEY = usageKey;
     initMod.__setDbForTesting(db as any);
     initMod.__initSchemaForTesting(db as any);
@@ -192,8 +200,10 @@ export async function runConsumerUsageReportTests(opts: { log?: boolean } = {}):
     failures.push(`consumer-usage-report: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   } finally {
     initMod.__setDbForTesting(prevDb);
-    if (prevAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
-    else process.env.ANALYTICS_ADMIN_KEY = prevAdminKey;
+    if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKey;
+    if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
+    else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
   }
 
   return { passed, failed, failures };
