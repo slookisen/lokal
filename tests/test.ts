@@ -30262,6 +30262,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esfmc.failures) failures.push("experiences-seo-fylke-mobile-compact: " + f);
     console.log(`  experiences-seo-fylke-mobile-compact: ${esfmc.passed} passed, ${esfmc.failed} failed`);
 
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4
+    // (gårdssalg-kort-konsistens, slice 5): kommune-etikett never duplicates a
+    // "Navn — Sted" title suffix (and the suffix becomes the etikett when no
+    // structured poststed/kommune/fylke exists), producer_type badge presence/
+    // absence, no per-card "Kommer snart" badge, and a state-driven "Book
+    // besøk"/"Meld interesse" CTA off the same isBookingPaused() source used
+    // elsewhere on this route.
+    console.log("\n── experiences-seo-gardssalg-card-consistency: kommune-etikett/badge/CTA (arbeidspunkt 4) ──");
+    const { runExperiencesSeoGardssalgCardConsistencyTests } = require("../src/routes/experiences-seo-gardssalg-card-consistency.test") as
+      typeof import("../src/routes/experiences-seo-gardssalg-card-consistency.test");
+    const esgccons = await runExperiencesSeoGardssalgCardConsistencyTests({ log: false });
+    passed += esgccons.passed;
+    failed += esgccons.failed;
+    for (const f of esgccons.failures) failures.push("experiences-seo-gardssalg-card-consistency: " + f);
+    console.log(`  experiences-seo-gardssalg-card-consistency: ${esgccons.passed} passed, ${esgccons.failed} failed`);
+
     // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2:
     // illustrated SVG hero scene (forside/drikke motifs) + the homepage
     // drikkested feature section + countGardssalgProvidersByType(). Covers
