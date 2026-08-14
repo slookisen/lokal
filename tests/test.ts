@@ -36992,6 +36992,30 @@ runSerial(async () => {
   }
 });
 
+// POST /admin/agents/deactivate — standalone-row catalog-hygiene deactivate
+// lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
+// Deactivates (is_active=0 only, merged_into untouched) one or more
+// STANDALONE agents rows given an explicit caller-supplied
+// {id, reason, evidence} decision. Row-lock on claimed_at / any-truthy
+// curated_fields key, reversible via agent_knowledge_audit. Own in-memory DB
+// via its own seam (same discipline as duplicate-merge above: never pins
+// the shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── admin-agents-deactivate: standalone-row deactivate lever ──");
+  try {
+    const { runAdminAgentsDeactivateTests } = require("../src/routes/admin-agents-deactivate.test") as
+      typeof import("../src/routes/admin-agents-deactivate.test");
+    const dz = await runAdminAgentsDeactivateTests({ log: false });
+    passed += dz.passed;
+    failed += dz.failed;
+    for (const f of dz.failures) failures.push("agents-deactivate: " + f);
+    console.log(`  agents-deactivate: ${dz.passed} passed, ${dz.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-deactivate: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/agents/contact-email-dns-check — diagnostic-only DNS-liveness
 // stamp on agent_knowledge.field_provenance.contact_email_dns_check. Detects
 // (never gates on, never writes contact_email/email, never touches
