@@ -340,6 +340,14 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
       // BOTH cohorts (unconditional exclusion, unrelated to which cohort is
       // selected).
       insert.run({ id: "d-test-gardssalg", navn: "TEST — Ikke book", catalog_hidden: 0, producer_type: "test-gardssalg", rfb_seed_source: null });
+      // e: producer_type IS NULL AND rfb_seed_source IS NULL (both blank —
+      // the ordinary shape of a generic, non-gårdssalg provider; c above only
+      // covers rfb_seed_source SET to a non-'rfb-seed' value, not NULL). This
+      // is the exact row shape that a naive `NOT (gårdssalg predicate)`
+      // negation would silently drop via SQL three-valued logic (see
+      // GS_WV_NON_GARDSSALG_PRODUCER_TYPE_SQL's own doc comment) — load-
+      // bearing for j7 below.
+      insert.run({ id: "e-generic-both-null", navn: "E Generic", catalog_hidden: 0, producer_type: null, rfb_seed_source: null });
 
       const defaultCohort = loadGardssalgWebsiteVerificationCohort(db, "visible");
       assertEq(
@@ -359,15 +367,46 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
       const allCohort = loadGardssalgWebsiteVerificationCohort(db, "visible", "all");
       assertEq(
         allCohort.map((r) => r.id),
-        ["a-gardssalg", "b-rfbseed", "c-outside-gardssalg"],
-        "j4: cohort='all' widens to include the producer_type-IS-NULL/non-rfb-seed row the gårdssalg cohort excluded"
+        ["a-gardssalg", "b-rfbseed", "c-outside-gardssalg", "e-generic-both-null"],
+        "j4: cohort='all' widens to include both producer_type-IS-NULL rows the gårdssalg cohort excluded, regardless of rfb_seed_source"
       );
       assertTrue(
         !allCohort.some((r) => r.id === "d-test-gardssalg"),
         "j5: the synthetic test-gardssalg row stays excluded even under cohort='all' — that exclusion is unconditional"
       );
 
-      assertEq(GS_WV_COHORTS, ["gardssalg", "all"], "j6: GS_WV_COHORTS lists exactly the two valid values, gardssalg first (the default)");
+      // ── non_gardssalg — the exact complement of 'gardssalg' (dev-request
+      //    2026-08-14-exp-website-verification-stamp) ────────────────────────
+      const nonGardssalgCohort = loadGardssalgWebsiteVerificationCohort(db, "visible", "non_gardssalg");
+      assertEq(
+        nonGardssalgCohort.map((r) => r.id).sort(),
+        ["c-outside-gardssalg", "e-generic-both-null"],
+        "j7: cohort='non_gardssalg' contains exactly the two rows outside the gårdssalg predicate, INCLUDING the rfb_seed_source-IS-NULL " +
+          "shape a naive `NOT(...)` negation would have dropped via SQL three-valued logic"
+      );
+      assertTrue(
+        !nonGardssalgCohort.some((r) => r.id === "a-gardssalg" || r.id === "b-rfbseed"),
+        "j8: neither gårdssalg-cohort row (producer_type set, or rfb_seed_source='rfb-seed') leaks into non_gardssalg"
+      );
+      assertTrue(
+        !nonGardssalgCohort.some((r) => r.id === "d-test-gardssalg"),
+        "j9: the synthetic test-gardssalg row is excluded from non_gardssalg too (producer_type is set, so the predicate alone excludes it)"
+      );
+      // gardssalg and non_gardssalg are a strict partition of (all minus the
+      // synthetic test row): together they reproduce cohort='all' exactly,
+      // with zero overlap and zero omission.
+      const unionIds = [...explicitGardssalg.map((r) => r.id), ...nonGardssalgCohort.map((r) => r.id)].sort();
+      assertEq(
+        unionIds,
+        [...allCohort.map((r) => r.id)].sort(),
+        "j10: gardssalg ∪ non_gardssalg == all (a strict partition, no double-count, no gap)"
+      );
+
+      assertEq(
+        GS_WV_COHORTS,
+        ["gardssalg", "all", "non_gardssalg"],
+        "j6: GS_WV_COHORTS lists exactly the three valid values, gardssalg first (the default)"
+      );
 
       db.close();
     }

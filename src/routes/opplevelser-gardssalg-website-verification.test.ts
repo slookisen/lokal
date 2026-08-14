@@ -985,6 +985,95 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       );
       assertEq(noBodyFieldsRegression.body.cohort, "gardssalg", "l19c: cohort defaults to 'gardssalg' when omitted, same as the GET route");
 
+      // ── (m) `cohort=non_gardssalg` — dev-request 2026-08-14-exp-website-
+      //     verification-stamp: the exact complement of the default
+      //     `gardssalg` cohort, added so a routine sweep can reach the
+      //     generic (non-gårdssalg) provider population — the one that feeds
+      //     the generic experiences content-refresh selector's
+      //     isHjemmesideVerified() gate — WITHOUT re-touching (re-fetching,
+      //     re-classifying) the gårdssalg cohort on every tick, the way
+      //     cohort=all would. Reuses the SAME prov-outside-gardssalg fixture
+      //     (producer_type IS NULL, rfb_seed_source IS NULL) sections (k)/(l)
+      //     above already established is outside the gårdssalg cohort — this
+      //     section only adds the NEW cohort value's own behavior on top. ────
+
+      // m1: same mandatory-pagination guard as cohort=all, checked before any
+      // DB load/fetch — and the error message now names the ACTUAL cohort
+      // requested (not a hardcoded "cohort=all"), unlike before this cohort
+      // existed.
+      const fetchCountBeforeNonGardssalgGuard = fetchCallCount;
+      const nonGardssalgNoLimit = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=non_gardssalg",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(nonGardssalgNoLimit.status, 400, "m1: cohort=non_gardssalg without limit -> 400 (mandatory pagination)");
+      assertEq(
+        nonGardssalgNoLimit.body.error,
+        "Ugyldig — limit er påkrevd når cohort=non_gardssalg (kohorten er for stor for et enkelt kall uten paginering).",
+        "m1b: error message names the actual cohort requested"
+      );
+      assertEq(fetchCallCount, fetchCountBeforeNonGardssalgGuard, "m1c: the mandatory-limit guard fires before any homepage fetch");
+
+      // m2-m5: cohort=non_gardssalg with a valid limit -> 200, contains
+      // EXACTLY prov-outside-gardssalg (visible scope) — none of the four
+      // gårdssalg-cohort rows, and not the synthetic test-gardssalg row.
+      const nonGardssalgAudit = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-website-verification-audit?cohort=non_gardssalg&limit=12",
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(nonGardssalgAudit.status, 200, "m2: cohort=non_gardssalg&limit=12 -> 200");
+      assertEq(nonGardssalgAudit.body.cohort, "non_gardssalg", "m3: response echoes cohort=non_gardssalg");
+      const nonGardssalgIds = nonGardssalgAudit.body.rows.map((r: any) => r.provider_id);
+      assertEq(
+        nonGardssalgIds,
+        ["prov-outside-gardssalg"],
+        "m4: cohort=non_gardssalg (visible scope) contains exactly the one row outside the gårdssalg producer-type restriction"
+      );
+      assertTrue(
+        !nonGardssalgIds.some((id: string) =>
+          ["prov-verified-orgnr", "prov-unverified-404", "prov-aggregator", "prov-missing-source", "prov-test-gardssalg"].includes(id)
+        ),
+        "m5: none of the gårdssalg-cohort rows or the synthetic test row leak into non_gardssalg"
+      );
+
+      // m6: gardssalg (default, 4 rows — section b/c) + non_gardssalg (1 row,
+      // just measured) together equal cohort=all&scope=visible's own total of
+      // 5 (pinned at k11) — the partition composes exactly, on the real HTTP
+      // routes, not just the pure loader tested in the service-level suite.
+      assertEq(
+        rows.length + nonGardssalgAudit.body.rows.length,
+        cohortAllVisible.body.pagination.total,
+        "m6: gardssalg ∪ non_gardssalg (visible scope) accounts for the whole cohort=all&scope=visible population, no gap/overlap"
+      );
+
+      // m7-m9: the write endpoint carries the identical cohort + mandatory-
+      // pagination discipline. apply=true with a bounded limit writes
+      // provenance for exactly the non-gårdssalg row, without ever touching
+      // (fetching, re-classifying) any gårdssalg-cohort row.
+      const nonGardssalgNoLimitPost = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { cohort: "non_gardssalg" },
+      });
+      assertEq(nonGardssalgNoLimitPost.status, 400, "m7: POST cohort=non_gardssalg without limit -> 400");
+
+      const nonGardssalgApply = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { apply: true, cohort: "non_gardssalg", limit: 12, batch_id: "test-batch-wv-non-gardssalg" },
+      });
+      assertEq(nonGardssalgApply.status, 200, "m8: POST apply=true cohort=non_gardssalg&limit=12 -> 200");
+      assertEq(nonGardssalgApply.body.provenance_written, 1, "m9: provenance written for exactly the one non-gårdssalg row");
+      const nonGardssalgProvenance = JSON.parse(getProviderRow("prov-outside-gardssalg").field_provenance);
+      assertEq(
+        nonGardssalgProvenance.hjemmeside_verification?.classification,
+        "missing_source",
+        "m10: the row's provenance stamp reflects its own (blank-hjemmeside) classification — the SAME field_provenance." +
+          "hjemmeside_verification key isHjemmesideVerified() reads for the generic content-refresh gate"
+      );
+
       // ── (i) GET /admin/website-review-queues — the read side both queues
       //     lacked. Semantics differ per table BY DESIGN and the assertions
       //     pin exactly that: the gardssalg table has no status column

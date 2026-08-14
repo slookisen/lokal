@@ -193,9 +193,30 @@ export const GS_WV_SCOPES: readonly GsWvScope[] = ["visible", "hidden", "all"] a
 //     platform-wide, vs. today's ~87-row gårdssalg cohort) — callers on this
 //     cohort MUST paginate (see MAX_GARDSSALG_AUDIT_LIMIT enforcement at the
 //     route layer, which makes `limit` mandatory whenever cohort=all).
-export type GsWvCohort = "gardssalg" | "all";
+//   non_gardssalg (dev-request 2026-08-14-exp-website-verification-stamp) —
+//     the exact COMPLEMENT of `gardssalg`: producer_type IS NULL AND
+//     rfb_seed_source is not 'rfb-seed'. Added because the generic (non-
+//     gårdssalg) experiences content-refresh path (POST /admin/content-refresh,
+//     routes/opplevelser.ts) gates every provider on isHjemmesideVerified(
+//     field_provenance) — the SAME stamp this file's applyGardssalgWebsite
+//     Verification writes — but nothing ever swept the non-gårdssalg
+//     population to produce that stamp: the fleet's routine sweep of this
+//     vertical always ran with the default cohort=gardssalg, so every
+//     generic provider's field_provenance.hjemmeside_verification stayed
+//     permanently absent and isHjemmesideVerified() failed closed on all of
+//     them (measured: the generic content-refresh selector's own report
+//     shows scanned=0 candidates). `cohort=all` already technically reaches
+//     these rows too (it is the union of `gardssalg` and `non_gardssalg`),
+//     but a routine sweep on `all` would also re-classify the entire
+//     gårdssalg cohort on every tick — wasted outbound fetches against
+//     producers this vertical already tracks on its own outreach-driven
+//     cadence. `non_gardssalg` lets a sweep target exactly the previously-
+//     uncovered population without re-touching gårdssalg rows at all.
+//     Classification/fetch/write mechanics are 100% unchanged — this is a
+//     new SQL predicate only, nothing else in this file branches on it.
+export type GsWvCohort = "gardssalg" | "all" | "non_gardssalg";
 
-export const GS_WV_COHORTS: readonly GsWvCohort[] = ["gardssalg", "all"] as const;
+export const GS_WV_COHORTS: readonly GsWvCohort[] = ["gardssalg", "all", "non_gardssalg"] as const;
 
 // The `producer_type != 'test-gardssalg'` leg is the SAME exclusion every
 // other gårdssalg selector in this codebase already carries (experience-store
@@ -214,9 +235,28 @@ const GS_WV_TEST_GARDSSALG_EXCLUSION_SQL = `(producer_type IS NULL OR producer_t
 // The gårdssalg producer-type restriction — dropped entirely for cohort=all.
 const GS_WV_GARDSSALG_PRODUCER_TYPE_SQL = `(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
 
+// The exact complement of GS_WV_GARDSSALG_PRODUCER_TYPE_SQL above — written
+// out explicitly rather than as `NOT (${GS_WV_GARDSSALG_PRODUCER_TYPE_SQL})`.
+// SQL three-valued logic makes that naive negation wrong: for a row with
+// producer_type IS NULL and rfb_seed_source IS NULL, the gårdssalg predicate
+// evaluates `FALSE OR NULL` = NULL (not FALSE, since `rfb_seed_source =
+// 'rfb-seed'` against a NULL column is NULL, not FALSE), and NOT(NULL) is
+// itself NULL, which a WHERE clause treats as excluding the row — silently
+// dropping exactly the rows this cohort exists to include (the common case:
+// a generic provider with neither column ever set). Same null-safe-form
+// discipline as GS_WV_TEST_GARDSSALG_EXCLUSION_SQL/GS_WV_SCOPE_ONLY_SQL.visible
+// above — this file has already been burned once by a bare `!=`/negation
+// silently eating NULL rows.
+const GS_WV_NON_GARDSSALG_PRODUCER_TYPE_SQL = `(producer_type IS NULL AND (rfb_seed_source IS NULL OR rfb_seed_source != 'rfb-seed'))`;
+
 const GS_WV_COHORT_SQL: Record<GsWvCohort, string> = {
   gardssalg: `${GS_WV_GARDSSALG_PRODUCER_TYPE_SQL} AND ${GS_WV_TEST_GARDSSALG_EXCLUSION_SQL}`,
   all: GS_WV_TEST_GARDSSALG_EXCLUSION_SQL,
+  // non_gardssalg needs no separate test-gardssalg exclusion term: that
+  // synthetic row's producer_type is 'test-gardssalg' (NOT NULL), so the
+  // predicate above already excludes it on its own — same end state as the
+  // other two cohorts, reached structurally rather than by an extra AND leg.
+  non_gardssalg: GS_WV_NON_GARDSSALG_PRODUCER_TYPE_SQL,
 };
 
 const GS_WV_SCOPE_ONLY_SQL: Record<GsWvScope, string> = {

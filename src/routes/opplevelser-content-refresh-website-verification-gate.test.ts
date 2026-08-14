@@ -319,6 +319,135 @@ export function runOpplevelserContentRefreshWebsiteVerificationGateTests(
       );
       const fallbackRow = db.prepare("SELECT description FROM experiences WHERE id = ?").get(fallbackExperienceId) as { description: string | null };
       assertEq(fallbackRow.description, null, "gate-e8: the COALESCE-fallback experience's description is completely unchanged (still blank) — never fetched, never written");
+
+      // ══════════════════════════════════════════════════════════════════
+      // (f) END-TO-END — dev-request 2026-08-14-exp-website-verification-
+      // stamp. Sections (a)-(e) above all prove the GATE behaves correctly
+      // given a pre-baked field_provenance stamp, but never prove anything
+      // actually PRODUCES that stamp for a GENERIC (non-gårdssalg) provider
+      // — before this dev-request, nothing did: the fleet's routine sweep
+      // only ever ran the default cohort=gardssalg, so every generic
+      // provider's field_provenance.hjemmeside_verification stayed
+      // permanently absent and this exact gate failed closed on all of them
+      // (the "generic content-refresh selector measures scanned=0" root
+      // cause). This section seeds a plain generic provider (no
+      // producer_type, no rfb_seed_source), confirms the gate fails closed
+      // BEFORE any sweep, runs the NEW POST .../gardssalg-website-
+      // verification-remediation cohort=non_gardssalg sweep against it with
+      // REAL evidence-match (no pre-baked stamp), and only then re-drives
+      // POST /admin/content-refresh — proving the sweep's own write is what
+      // opens the gate, not a test fixture standing in for it.
+      // ══════════════════════════════════════════════════════════════════
+      dbFactory.__resetDbFactoryForTesting();
+      db = dbFactory.getDb("experiences");
+      const genProviderId = store.createProvider({
+        navn: "Fjellro Opplevelser AS",
+        org_nr: "934567890",
+        fylke: "Troms", kommune: "Tromsø",
+        hjemmeside: "https://fjellro-opplevelser.example",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+        // producer_type / rfb_seed_source both omitted -> both NULL in the
+        // row, exactly the "generic, non-gårdssalg" shape this dev-request's
+        // new cohort=non_gardssalg targets (and the shape a naive `NOT(...)`
+        // negation of the gårdssalg predicate would have silently dropped —
+        // see GS_WV_NON_GARDSSALG_PRODUCER_TYPE_SQL's own doc comment).
+      });
+      const genExperienceId = store.createExperience({
+        title: "Fjellro Opplevelser AS opplevelse", provider_id: genProviderId, provider_match_status: "matched",
+        fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
+      });
+      const genProducerTypeRow = db
+        .prepare("SELECT producer_type, rfb_seed_source FROM experience_providers WHERE id = ?")
+        .get(genProviderId) as { producer_type: string | null; rfb_seed_source: string | null };
+      assertEq(
+        genProducerTypeRow,
+        { producer_type: null, rfb_seed_source: null },
+        "gate-f0: sanity — the seeded provider is genuinely outside the gårdssalg cohort (both legs null)",
+      );
+
+      const GEN_ABOUT_TEXT =
+        "Vi driver ein liten opplevingsbedrift med lokalmat og guida turar for heile familien, sommar som vinter.";
+      // org_nr in visible BODY text (gardssalgPageText strips all tags, so a
+      // value living only inside a meta `content="..."` attribute would
+      // never be seen by the evidence matcher) + an og:description meta tag
+      // for content-refresh's own summarizeAbout() to pick up — same page,
+      // two different readers, exactly as a real homepage would be.
+      const genHtml =
+        `<html><head><meta property="og:description" content="${GEN_ABOUT_TEXT}"></head>` +
+        `<body><p>Fjellro Opplevelser AS, org.nr 934 567 890, held til i Tromsø kommune.</p></body></html>`;
+
+      const prevGenFetch = globalThis.fetch;
+      let genFetchCallCount = 0;
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const host = new URL(String(url)).hostname;
+        if (host !== "fjellro-opplevelser.example") {
+          throw new Error(`gate-f test: unexpected fetch host "${host}" — only the generic provider's own homepage should ever be reached`);
+        }
+        genFetchCallCount++;
+        return {
+          ok: true, status: 200,
+          text: async () => genHtml,
+          arrayBuffer: async () => new TextEncoder().encode(genHtml).buffer,
+          headers: { get: () => null }, url: String(url),
+        } as unknown as Response;
+      }) as typeof fetch;
+
+      try {
+        // Step 1: BEFORE any sweep, content-refresh must still fail closed on
+        // this brand-new row (field_provenance is freshly null) — pins the
+        // exact starting state this dev-request's fix eliminates.
+        const beforeSweep = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: [genProviderId], apply: true },
+        });
+        assertEq(beforeSweep.status, 200, "gate-f1a: pre-sweep content-refresh call -> 200");
+        assertEq(genFetchCallCount, 0, "gate-f1: pre-sweep — content-refresh does NOT fetch the generic provider's homepage (unverified, as before this dev-request)");
+        assertTrue(
+          beforeSweep.body.excluded_unverified_website.some((e: any) => e.provider_id === genProviderId),
+          "gate-f2: pre-sweep — generic provider is excluded_unverified_website, the exact scanned=0-producing state this dev-request fixes",
+        );
+
+        // Step 2: run the NEW cohort=non_gardssalg sweep — real evidence
+        // match against the mocked homepage, no pre-baked stamp.
+        const sweepRes = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          url: "/admin/gardssalg-website-verification-remediation",
+          body: { apply: true, cohort: "non_gardssalg", limit: 12, providerIds: [genProviderId], batch_id: "gate-f-sweep" },
+        });
+        assertEq(sweepRes.status, 200, "gate-f3: cohort=non_gardssalg sweep -> 200");
+        assertEq(
+          sweepRes.body.provenance_written, 1,
+          "gate-f4: the sweep found and stamped exactly the one generic provider — proves it IS in the non_gardssalg cohort, not silently dropped",
+        );
+        const stampedRow = db.prepare("SELECT field_provenance FROM experience_providers WHERE id = ?").get(genProviderId) as { field_provenance: string };
+        const stampedProvenance = JSON.parse(stampedRow.field_provenance);
+        assertEq(stampedProvenance.hjemmeside_verification.classification, "verified", "gate-f5: real evidence match (org_nr on the mocked page) classifies verified");
+        assertEq(stampedProvenance.hjemmeside_verification.verified, true, "gate-f6: strict boolean true");
+
+        // Step 3: THE FIX, end to end — content-refresh now reaches, fetches,
+        // and enriches this same generic provider, using the SAME
+        // field_provenance.hjemmeside_verification key the sweep just wrote
+        // (isHjemmesideVerified() — the identical gate every section above
+        // exercises against a hand-written fixture).
+        const afterSweep = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: [genProviderId], apply: true },
+        });
+        assertEq(afterSweep.status, 200, "gate-f7: post-sweep content-refresh call -> 200");
+        assertTrue(genFetchCallCount > 0, "gate-f8: post-sweep — content-refresh's homepage fetch is now attempted (the gate opened)");
+        assertTrue(
+          afterSweep.body.changed.some((c: any) => c.provider_id === genProviderId),
+          "gate-f9: the generic provider now appears in changed[] — genuinely enriched, not just gate-passed",
+        );
+        assertTrue(
+          !afterSweep.body.excluded_unverified_website.some((e: any) => e.provider_id === genProviderId),
+          "gate-f10: no longer reported in excluded_unverified_website",
+        );
+        const genRow = db.prepare("SELECT description FROM experiences WHERE id = ?").get(genExperienceId) as { description: string | null };
+        assertEq(genRow.description, GEN_ABOUT_TEXT, "gate-f11: the experience row's description was actually written — real content, not a vacuous pass");
+      } finally {
+        globalThis.fetch = prevGenFetch;
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-content-refresh-website-verification-gate: unexpected error: " + String(err?.stack || err?.message || err));
