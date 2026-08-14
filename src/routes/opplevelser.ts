@@ -13401,7 +13401,7 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
     return;
   }
-  // cohort=gardssalg (default) | all — Steg 2 of dev-request 2026-08-02-
+  // cohort=gardssalg (default) | all | non_gardssalg — Steg 2 of dev-request 2026-08-02-
   // opplevagent-hjemmesideverifisering-og-enrichment-gate. A SEPARATE axis
   // from `scope` above (visibility) — this one decides WHICH producer types
   // are in the cohort at all (see loadGardssalgWebsiteVerificationCohort's
@@ -13461,9 +13461,15 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
   // callers who never paginate; at cohort=all scale it reproduces exactly
   // the timeout/event-loop-stall risk (PR #432) `limit`/MAX_GARDSSALG_AUDIT_
   // LIMIT were added to prevent. Checked BEFORE any DB load or fetch.
-  if (cohortParam === "all" && limit === undefined) {
+  // cohort=non_gardssalg (dev-request 2026-08-14-exp-website-verification-
+  // stamp) is the exact complement of cohort=gardssalg — plausibly just as
+  // large platform-wide as cohort=all — so it carries the SAME mandatory-
+  // pagination requirement, checked the same way (before any DB load/fetch).
+  // The message interpolates the actual cohort value; for cohort=all this is
+  // byte-for-byte the same string as before this cohort existed.
+  if (cohortParam !== "gardssalg" && limit === undefined) {
     res.status(400).json({
-      error: "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+      error: `Ugyldig — limit er påkrevd når cohort=${cohortParam} (kohorten er for stor for et enkelt kall uten paginering).`,
     });
     return;
   }
@@ -13562,7 +13568,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
     res.status(400).json({ error: `Ugyldig scope — må være en av: ${GS_WV_SCOPES.join(", ")}` });
     return;
   }
-  // cohort=gardssalg (default) | all — same axis/discipline as the GET audit
+  // cohort=gardssalg (default) | all | non_gardssalg — same axis/discipline as the GET audit
   // route above (dev-request 2026-08-02-opplevagent-hjemmesideverifisering-
   // og-enrichment-gate, Steg 2b): a SEPARATE axis from `scope` (visibility),
   // decides WHICH producer types are eligible at all. Read from the BODY
@@ -13609,9 +13615,15 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
   // absent) synchronous-scan path stays reachable ONLY for the default
   // cohort=gardssalg, preserving today's byte-for-byte behavior for callers
   // who never pass a body at all. Checked before any DB load or fetch.
-  if (cohortParam === "all" && limit === undefined) {
+  // cohort=non_gardssalg (dev-request 2026-08-14-exp-website-verification-
+  // stamp) is the exact complement of cohort=gardssalg — plausibly just as
+  // large platform-wide as cohort=all — so it carries the SAME mandatory-
+  // pagination requirement, checked the same way (before any DB load/fetch).
+  // The message interpolates the actual cohort value; for cohort=all this is
+  // byte-for-byte the same string as before this cohort existed.
+  if (cohortParam !== "gardssalg" && limit === undefined) {
     res.status(400).json({
-      error: "Ugyldig — limit er påkrevd når cohort=all (kohorten er for stor for et enkelt kall uten paginering).",
+      error: `Ugyldig — limit er påkrevd når cohort=${cohortParam} (kohorten er for stor for et enkelt kall uten paginering).`,
     });
     return;
   }
