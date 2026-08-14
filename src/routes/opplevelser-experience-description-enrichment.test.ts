@@ -38,6 +38,7 @@ import {
   expDescHasUngroundedNumbers,
   experienceDescriptionNeedsEnrichment,
   generateExperienceDescriptionNo,
+  generateExperienceDescriptionNoDetailed,
   judgeExperienceDescriptionCandidate,
   EXP_DESC_GENERATED_PROVENANCE_SENTINEL,
   type ExperienceDescriptionCandidate,
@@ -421,6 +422,96 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // Section B2 — generateExperienceDescriptionNoDetailed(): diagnostic
+    // reason granularity behind the single `null` above (dev-request
+    // 2026-07-12-opplevagent-serp-innholdsberikelse, item 1b — added after
+    // item 1(a)'s post-deploy probe found 17/17 candidates collapsing into
+    // one skip_reason with no way to tell which gate fired). Every case
+    // mirrors a Section B case 1:1; this only asserts `.reason` is the
+    // correct DISTINCT tag and that `.text` is byte-identical to what
+    // generateExperienceDescriptionNo() already returns for the same input
+    // (i.e. this is purely additive bookkeeping, not a behavior change).
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+      {
+        const thinRow = richCandidate({
+          subcategory: null, season: null, indoor_outdoor: null,
+          duration_min: null, duration_max: null, group_min: null, group_max: null,
+          price_band: null, price_from: null, languages: null, accessibility: null,
+          meeting_point: null, booking_url: null, provider_navn: null,
+        });
+        const stub = (async () => { throw new Error("gen-r1: fetch must NOT be called for a thin row"); }) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionNoDetailed(thinRow, stub);
+        assertEq(r.text, null, "gen-r1a: thin row -> null text");
+        assertEq(r.reason, "thin_data", "gen-r1b: thin row -> reason thin_data");
+      }
+
+      delete process.env.ANTHROPIC_API_KEY;
+      {
+        const r = await generateExperienceDescriptionNoDetailed(richCandidate(), (async () => { throw new Error("no"); }) as unknown as typeof fetch);
+        assertEq(r.reason, "no_api_key", "gen-r2: missing key -> reason no_api_key");
+      }
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: FIXTURE_DESCRIPTION }] }) })) as unknown as typeof fetch;
+        const r = await generateExperienceDescriptionNoDetailed(richCandidate(), stub);
+        assertEq(r.text, FIXTURE_DESCRIPTION, "gen-r3a: success -> text set");
+        assertEq(r.reason, null, "gen-r3b: success -> no fail reason");
+      }
+
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "UTILSTREKKELIG_GRUNNLAG" }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "sentinel", "gen-r4: exact sentinel -> reason sentinel");
+      }
+      {
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "Fint. UTILSTREKKELIG_GRUNNLAG likevel." }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "sentinel_smuggled", "gen-r4b: sentinel smuggled into prose -> reason sentinel_smuggled");
+      }
+
+      {
+        const short = "Dette er en altfor kort beskrivelse som aldri skal skrives til databasen.";
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: short }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "below_word_floor", "gen-r5: <400 words -> reason below_word_floor");
+      }
+      {
+        const huge = Array.from({ length: 1300 }, () => "ord").join(" ");
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: huge }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "above_word_ceiling", "gen-r6: >1200 words -> reason above_word_ceiling");
+      }
+      {
+        const fabricated = FIXTURE_DESCRIPTION + " Gården ble grunnlagt i 1847 og ligger 12 kilometer fra sentrum.";
+        const stub = (async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: fabricated }] }) })) as unknown as typeof fetch;
+        assertEq((await generateExperienceDescriptionNoDetailed(richCandidate(), stub)).reason, "ungrounded_numbers", "gen-r7: ungrounded number -> reason ungrounded_numbers");
+      }
+
+      {
+        const cases: Array<[string, any, string]> = [
+          ["gen-r8: non-200 response", async () => ({ ok: false, status: 500, json: async () => ({ error: "boom" }) }), "http_error"],
+          ["gen-r9: unparseable JSON body", async () => ({ ok: true, status: 200, json: async () => { throw new Error("not json"); } }), "unparseable_json"],
+          ["gen-r10: non-array content shape", async () => ({ ok: true, status: 200, json: async () => ({ content: { unexpected: "shape" } }) }), "unexpected_response_shape"],
+          ["gen-r11: network throw", async () => { throw new Error("simulated network failure"); }, "network_error"],
+          ["gen-r12: empty text", async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "   " }] }) }), "empty_response"],
+          ["gen-r13: no text block", async () => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "tool_use" }] }) }), "unexpected_response_shape"],
+        ];
+        for (const [label, impl, expectedReason] of cases) {
+          const r = await generateExperienceDescriptionNoDetailed(richCandidate(), impl as unknown as typeof fetch);
+          assertEq(r.text, null, `${label} -> null text`);
+          assertEq(r.reason, expectedReason, `${label} -> reason ${expectedReason}`);
+        }
+        // gen-r10/gen-r13 correctly share "unexpected_response_shape" (both are the same
+        // `typeof text !== "string"` gate on two different malformed shapes) — every OTHER
+        // pair here is a genuinely different code path and must report a distinct reason.
+        const seen = new Set(cases.map(([, , reason]) => reason));
+        assertEq(seen.size, cases.length - 1, "gen-r14: all API-deviation reasons are distinct except the two same-gate shape cases");
+      }
+    } catch (err: any) {
+      failed++;
+      failures.push("experience-description-enrichment (section B2): unexpected error: " + String(err?.stack || err?.message || err));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // Section C — judgeExperienceDescriptionCandidate()
     // ═══════════════════════════════════════════════════════════════════
     try {
@@ -648,6 +739,22 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(dumpAll(), before, "ed-r4h: NOT ONE row changed (fetch stub would have thrown on any call)");
       }
 
+      // ── ed-r4b: a real generation-gate failure surfaces WHICH gate fired,
+      //    end-to-end through the dry-run route response (item 1b diagnostic). ─
+      {
+        setStub(makeStub({
+          generate: async () => ({
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "Dette er en altfor kort beskrivelse som aldri skal skrives." }] }),
+          }),
+        }));
+        const r = await post({ ids: [idRich1] });
+        assertEq(r.body.sample.length, 1, "ed-r4b1: one sampled candidate");
+        assertEq(r.body.sample[0].skip_reason, "generation_failed", "ed-r4b2: skip_reason is generation_failed");
+        assertEq(r.body.sample[0].generation_fail_reason, "below_word_floor",
+          "ed-r4b3: generation_fail_reason names the exact gate (word floor), not just the collapsed skip_reason");
+      }
+
       // ── ed-r5: dry_run (default + non-literal-false) writes NOTHING. ───
       setStub(makeStub({}));
       for (const [label, body] of [
@@ -670,6 +777,7 @@ export function runOpplevelserExperienceDescriptionEnrichmentTests(
         assertEq(r.body.sample[0].proposed_description, FIXTURE_DESCRIPTION, "ed-r5h: proposal is the generated text");
         assertEq(r.body.sample[0].judge_approved, true, "ed-r5i: judge verdict is surfaced in the preview");
         assertEq(r.body.sample[0].skip_reason, null, "ed-r5j: no skip reason on an approved proposal");
+        assertEq(r.body.sample[0].generation_fail_reason, null, "ed-r5j2: no generation_fail_reason on an approved proposal");
         assertTrue(r.body.sample[0].word_count >= 400, "ed-r5k: word_count surfaced and ≥400");
       }
 
