@@ -293,6 +293,33 @@ function getRfbWebsiteDiscoveryTarget(db: ReturnType<typeof getDb>, agentId: str
   return row ?? null;
 }
 
+// rfbWdSelectSql INNER JOINs agent_knowledge, so a producer with no knowledge
+// row at all is invisible to this whole route — it 404s out of the external-
+// candidate intake as `not_found` even though the agents row is a fully valid
+// target. Measured 2026-08-13 (Bondens marked cross-match): 8 of 24 webless
+// producers had no agent_knowledge row, i.e. a third of that cohort could
+// never receive a website through the governed lever. Every agent_knowledge
+// column except the PK is nullable or defaulted (database/init.ts), so the
+// missing row is created EMPTY for an eligible producer and the evidence gate
+// then decides on the merits. Only the external-candidate path calls this —
+// auto-select SELECTs from knowledge state and has no candidate URL that
+// would justify manufacturing rows.
+function ensureKnowledgeRowForExternalCandidate(db: ReturnType<typeof getDb>, agentId: string): boolean {
+  const eligible = db
+    .prepare(
+      `SELECT a.id AS id
+         FROM agents a
+        WHERE a.id = ?
+          AND a.role = 'producer'
+          AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+          AND NOT EXISTS (SELECT 1 FROM agent_knowledge k WHERE k.agent_id = a.id)`,
+    )
+    .get(agentId) as { id: string } | undefined;
+  if (!eligible) return false;
+  db.prepare(`INSERT OR IGNORE INTO agent_knowledge (agent_id) VALUES (?)`).run(agentId);
+  return true;
+}
+
 // All hosts already carried by some OTHER agent's live agent_knowledge.website
 // — a candidate landing on one of these is never this row's own site (mirrors
 // gardssalgSharedHostCounts' role, re-implemented locally per the file
@@ -544,7 +571,10 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       }
       seenAgentIds.add(c.agentId);
 
-      const t = getRfbWebsiteDiscoveryTarget(db, c.agentId);
+      let t = getRfbWebsiteDiscoveryTarget(db, c.agentId);
+      if (!t && ensureKnowledgeRowForExternalCandidate(db, c.agentId)) {
+        t = getRfbWebsiteDiscoveryTarget(db, c.agentId);
+      }
       if (!t) {
         notFound.push(c.agentId);
         continue;

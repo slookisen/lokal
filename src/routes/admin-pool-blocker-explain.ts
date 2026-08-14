@@ -267,9 +267,15 @@ router.get("/", (req: Request, res: Response) => {
         `domain_incoherent (${domainCoherence?.reason ?? "agents.url vs knowledge.website/email host mismatch"})`,
       );
     }
-    if (emailOwnershipUnproven) {
-      poolBlockers.push("email_ownership_unproven (free-mail/ISP address with no corroborating evidence)");
-    }
+    // NB: `email_ownership_unproven` is deliberately NOT a pool blocker.
+    // Daniel, 2026-08-10: «gmail domener og forsåvidt hotmail og andre er ok
+    // å bruke» — the verifier's guard was changed to report-only in the same
+    // decision (lokal#568), so a free-mail address no longer costs an agent
+    // its pool place. This route listed it as a blocker for one deploy cycle
+    // and was, in that window, reporting a non-blocker as the reason an agent
+    // was held back (observed live on Eimealt). The signal stays available as
+    // `signals.email_ownership_unproven` for anyone watching wrong contacts —
+    // it is just no longer an answer to "what is blocking this agent".
 
     // ── Funnel B: homepage-provenance-batch default auto-select legs
     //    (routes/marketplace.ts selector, same order) ─────────────────────

@@ -328,11 +328,14 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
         "i2: the blocker carries the verifier's own reason text",
       );
       assertEq(dc.signals.domain_coherence.coherent, false, "i3: raw domain_coherence signal surfaced");
+      // Policy 2026-08-10 (Daniel, lokal#568): free-mail no longer blocks, so
+      // this must NOT appear as a pool blocker — the signal stays observable
+      // but is not an answer to "what is holding this agent back".
       assertTrue(
-        eo.pool_blockers.some((b: string) => b.startsWith("email_ownership_unproven")),
-        "i4: free-mail row names the email_ownership_unproven blocker",
+        !eo.pool_blockers.some((b: string) => b.startsWith("email_ownership_unproven")),
+        "i4: free-mail is NOT reported as a pool blocker (report-only since 2026-08-10)",
       );
-      assertEq(eo.signals.email_ownership_unproven, true, "i5: raw email-ownership signal surfaced");
+      assertEq(eo.signals.email_ownership_unproven, true, "i5: raw email-ownership signal still surfaced for observability");
       // A row with a clean stored verdict must NOT gain phantom blockers.
       const clean = await callExplain({ agentId: "pbe-pool" });
       assertEq(clean.body.agents[0].pool_blockers, [], "i6: a clean row still reports no blockers");

@@ -212,6 +212,8 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       insertProvider.run({ id: "wd-agg", navn: "Hanen", org_nr: "911111111", kommune: "Oslo", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
       // Row whose candidate host is ALREADY carried by another catalog row.
       insertProvider.run({ id: "wd-taken", navn: "Solbakken Gard", org_nr: "922222222", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+      // Blank row for the scheme-optional fill-path fixture (2026-08-13 fix).
+      insertProvider.run({ id: "wd-schemeless", navn: "Skjemalos Bryggeri", org_nr: "911223222", kommune: "Bergen", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
       insertProvider.run({ id: "wd-owner", navn: "Annen Produsent", org_nr: "933333333", kommune: "Voss", poststed: null, hjemmeside: "https://solbakkengard.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
       // Claim-locked row — never processed. Stamped with
       // field_provenance.owner_locks.hjemmeside (dev-request 2026-08-03-
@@ -426,6 +428,20 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertEq(wTaken.length, 0, "wd-6b: host already carried by another provider → write refused (shared-host guard)");
         const wBad = expStore.applyGardssalgProviderWebsite("wd-agg", "ikke-en-url", "https://x");
         assertEq(wBad.length, 0, "wd-6c: non-URL rejected by sanity gate");
+
+        // wd-6g/h (2026-08-13 fix, dev-request 2026-08-07-kontaktjakt-
+        // drikkeprodusenter): a scheme-less but genuinely domain-shaped
+        // candidate (Brreg-style, e.g. "hardangersider.no") on a BLANK row
+        // must now be accepted on the fill path — it used to be silently
+        // refused (write_skipped_by_guards) purely for lacking "https://",
+        // even though this same column already stores scheme-less values
+        // elsewhere. "ikke-en-url" above (no dot) must still be refused —
+        // the sanity gate is relaxed on scheme, not removed.
+        const wSchemeless = expStore.applyGardssalgProviderWebsite("wd-schemeless", "hardangersider.no", "https://evidence-schemeless.example");
+        assertEq(JSON.stringify(wSchemeless), JSON.stringify(["hjemmeside"]), "wd-6g: scheme-less domain-shaped candidate on a blank row now succeeds");
+        const rowSchemeless = expDb.prepare(`SELECT hjemmeside, field_provenance FROM experience_providers WHERE id='wd-schemeless'`).get() as any;
+        assertEq(rowSchemeless.hjemmeside, "hardangersider.no", "wd-6h: stored verbatim, scheme NOT added");
+        assertTrue(!!JSON.parse(rowSchemeless.field_provenance || "{}").hjemmeside, "wd-6i: field_provenance.hjemmeside stamped for the scheme-less fill write");
 
         // wd-6d/e: positive unlock case — the owner touched about_text, NOT
         // hjemmeside, via the claim portal, so hjemmeside is fair game.

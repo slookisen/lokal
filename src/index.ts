@@ -47,7 +47,7 @@ import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
-import adminRunVerifierRoutes from "./routes/admin-run-verifier";
+import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { runDispatchTick } from "./routes/admin-loop-dispatch";
 import { resolveTickIntervalMin } from "./services/loop-dispatch";
@@ -64,8 +64,10 @@ import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
+import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
+import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
@@ -613,6 +615,10 @@ app.use("/admin/agents/contact-email-dns-check", adminLimiter, adminAgentsContac
 // POST /admin/agents/url-write (dev-request 2026-08-01-rfb-agents-url-skrivespak).
 // Same ordering rule as the sibling above — mount BEFORE /admin/agents.
 app.use("/admin/agents/url-write", adminLimiter, adminAgentsUrlWriteRoutes);
+// POST /admin/agents/duplicate-merge — explicit-pair duplicate merge lever
+// (dev-request duplicate-merge lever). Same ordering rule as the siblings
+// above — mount BEFORE /admin/agents.
+app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMergeRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
@@ -703,6 +709,12 @@ app.use("/admin", adminLimiter, adminRfbWebsiteDiscoveryRoutes);
 // homepage-provenance-batch auto-select leg blocks a given agent, with the
 // same predicates production uses. GET /admin/pool-blocker-explain.
 app.use("/admin/pool-blocker-explain", adminLimiter, adminPoolBlockerExplainRoutes);
+// dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 3 follow-up:
+// READ-ONLY, paginated listing of the agent IDs POST /admin/homepage-
+// provenance-batch's default auto-select would pick next (identical
+// predicate) — the enumeration primitive Skive 3's "batches of 25 until the
+// cohort is exhausted" plan needed but never had. GET /admin/homepage-provenance-cohort.
+app.use("/admin/homepage-provenance-cohort", adminLimiter, adminHomepageProvenanceCohortRoutes);
 // dev-requests/2026-08-07-rfb-contact-extraction.md: corroborated contact-
 // email extraction from a producer's own website for RFB `agents` rows whose
 // contact_email is blank or DNS-flagged-dead — writes agents.contact_email
@@ -1131,6 +1143,43 @@ if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
       console.error("[salgskanal-sync] failed:", err);
     }
   }, 60 * 60_000); // hourly check
+}
+
+// ─── dev-request 2026-08-13-verifier-rutine-stub-og-kadens: internal ─────
+// hourly lokal-agent-verifier scheduler ───────────────────────────────
+//
+// The real verifier (src/agents/lokal-agent-verifier.ts) is supposed to run
+// 9x/night (22:00-06:00 UTC, hourly) via POST /admin/run-verifier, but
+// nothing drove it on that cadence — it only fired ~4x/night from incidental
+// calls by other routines (declared_daily_rate=9, observed_daily_rate=4.0).
+// This closes that gap the same way the debio-sync / salgskanal-sync blocks
+// above do: hourly wakeup, self-gated on the window, calling the SAME code
+// path admin-run-verifier.ts's POST / handler uses (runVerifierTick) rather
+// than re-implementing it or doing an HTTP self-call.
+//
+// Gated OFF by default — only runs when VERIFIER_SCHEDULER_ENABLED=1 (see
+// fly.toml). Any other value, or omitting the var, is a no-op.
+let verifierTickRunning = false;
+if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
+  setInterval(async () => {
+    if (!isVerifierWindowHour(new Date().getUTCHours())) return;
+    if (verifierTickRunning) {
+      console.warn("[verifier-scheduler] tick skipped — a previous tick is still running");
+      return;
+    }
+    verifierTickRunning = true;
+    try {
+      const r = await runVerifierTick({ batchSize: 30 });
+      console.log(
+        `[verifier-scheduler] run_id=${r.run_id} processed=${r.processed} passed=${r.passed} ` +
+        `pending_verify=${r.pending_verify} review_required=${r.review_required} pool_added=${r.pool_added}`
+      );
+    } catch (err) {
+      console.error("[verifier-scheduler] tick failed:", err);
+    } finally {
+      verifierTickRunning = false;
+    }
+  }, 60 * 60_000); // hourly check, self-gated on the 22-06 UTC window
 }
 
 // ─── PR-103 (2026-06-03): Backend dental geocoding worker ───────────

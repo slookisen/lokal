@@ -8403,6 +8403,8 @@ function computeGardssalgReadinessRows(
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
+  /** The stored homepage URL. See the construction site below for why. */
+  hjemmeside: string | null;
   // Skive 1 (dev-request 2026-08-09-daglig-outreach-klargjoering-og-
   // stoerrelsesgate) — additive, informational regardless of readiness_tier
   // or the size-gate's own enabled/disabled switch: Daniel sees the size
@@ -8566,6 +8568,15 @@ function computeGardssalgReadinessRows(
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
+      // Daniel, live session 2026-08-13: the stored homepage, surfaced.
+      // `has_website` (a boolean) was already here, but NO read-only route in
+      // this file returned the URL itself — so an operator holding a list of
+      // needs_enrichment rows had no way to learn WHICH sites to look at
+      // without a write-path call. That gap is what blocked running the
+      // headless-render pass (services/render-page.ts) over the 41 stuck rows.
+      // Purely additive: the column is already SELECTed above, this only stops
+      // discarding it. Same admin gate, same cohort, no new query.
+      hjemmeside: p.hjemmeside,
       antall_ansatte: p.antall_ansatte,
       size_flag,
     };
@@ -11835,7 +11846,10 @@ async function runGardssalgFieldConcordanceScan(
 
   const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
     const fetched = await crFetchGardssalgContent(homepageUrl);
-    if (!fetched.ok) return { ok: false, reason: fetched.reason };
+    // Pass `persistence` through. Dropping it (as this adapter used to) is
+    // what let a transient 5xx be recorded as a durable verified:false — see
+    // GsWvClassification's doc comment for the measured 2026-08-13 incident.
+    if (!fetched.ok) return { ok: false, reason: fetched.reason, persistence: fetched.persistence };
     return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
   };
 
@@ -16687,6 +16701,94 @@ export interface GardssalgProductsExtractionDiagnostic {
   outcome?: "products_found" | "sentinel_no_products" | "invalid_unparseable" | "infra_failure";
 }
 
+// dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 4
+// (retry-once on invalid_unparseable): a single API-call-and-parse attempt,
+// factored out of generateGardssalgProductList so the outer function can
+// invoke the EXACT SAME call/parse/filter/dedup/cap logic a second time on
+// an "unparseable" first attempt, without duplicating (and risking
+// diverging) that logic. Returns a discriminated result instead of stamping
+// diagnosticOut directly — the outer function is the only place that knows
+// whether a given attempt is the first or the (possible) retry, so it owns
+// translating the final attempt's kind into diagnosticOut.outcome.
+type GardssalgProductAttemptResult =
+  | { kind: "products"; items: string[] }
+  | { kind: "sentinel" }
+  | { kind: "unparseable" }
+  | { kind: "infra_failure" };
+
+async function attemptGardssalgProductExtraction(
+  apiKey: string,
+  prompt: string
+): Promise<GardssalgProductAttemptResult> {
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { kind: "infra_failure" }; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) {
+    return { kind: "infra_failure" };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { kind: "infra_failure" }; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { kind: "unparseable" };
+  }
+  const cleaned = text.trim();
+  if (cleaned === GARDSSALG_PRODUCTS_SENTINEL) {
+    return { kind: "sentinel" }; // explicit "no products" escape
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return { kind: "unparseable" }; // not valid JSON — never fabricate/guess a list from prose
+  }
+  if (!Array.isArray(parsed)) {
+    return { kind: "unparseable" };
+  }
+
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const raw of parsed) {
+    if (typeof raw !== "string") continue;
+    const item = raw.trim();
+    if (!item || item.length > GARDSSALG_PRODUCTS_MAX_ITEM_LEN) continue;
+    const key = item.toLocaleLowerCase("nb-NO");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push(item);
+    if (items.length >= GARDSSALG_PRODUCTS_MAX_ITEMS) break;
+  }
+
+  if (items.length === 0) {
+    return { kind: "unparseable" };
+  }
+  return { kind: "products", items };
+}
+
 export async function generateGardssalgProductList(
   sourceText: string,
   diagnosticOut?: GardssalgProductsExtractionDiagnostic
@@ -16705,82 +16807,34 @@ ${cappedSource}
 
 Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der. Ikke finn på produkter som ikke er nevnt. Svar med EKSAKT et JSON-array av strenger, f.eks. ["Eplesider","Eplemost"], og ingenting annet. Hvis kildeteksten ikke nevner noen konkrete produkter, svar med nøyaktig ${GARDSSALG_PRODUCTS_SENTINEL} og ingenting annet.`;
 
-  let response: Awaited<ReturnType<typeof fetch>>;
-  try {
-    response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5",
-        max_tokens: 400,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-  } catch {
-    if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
-    return null; // network/fetch failure — never fabricate
+  // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 4:
+  // ONE automatic retry (one additional API call, same cappedSource/prompt),
+  // triggered ONLY when the first attempt is "unparseable" — mirrors the
+  // manual retry that already, live, resolved the observed Rabalder Sideri
+  // response-sampling flip-flop (2026-08-12). Hard cap of 1 retry: the loop
+  // runs at most twice, never a third attempt regardless of outcome.
+  // sentinel/infra_failure attempts fall straight through — exactly 1 API
+  // call, unchanged from pre-Skive-4 behavior.
+  let attempt = await attemptGardssalgProductExtraction(apiKey, prompt);
+  if (attempt.kind === "unparseable") {
+    attempt = await attemptGardssalgProductExtraction(apiKey, prompt);
   }
 
-  if (!response.ok) {
-    if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
-    return null;
+  switch (attempt.kind) {
+    case "products":
+      if (diagnosticOut) diagnosticOut.outcome = "products_found";
+      return attempt.items;
+    case "sentinel":
+      if (diagnosticOut) diagnosticOut.outcome = "sentinel_no_products";
+      return null;
+    case "infra_failure":
+      if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
+      return null;
+    case "unparseable":
+    default:
+      if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
+      return null;
   }
-
-  let result: any;
-  try {
-    result = await response.json();
-  } catch {
-    if (diagnosticOut) diagnosticOut.outcome = "infra_failure";
-    return null; // unparseable JSON body — never fabricate
-  }
-
-  const contentArr = Array.isArray(result?.content) ? result.content : [];
-  const text = contentArr.find((c: any) => c?.type === "text")?.text;
-  if (typeof text !== "string") {
-    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
-    return null;
-  }
-  const cleaned = text.trim();
-  if (cleaned === GARDSSALG_PRODUCTS_SENTINEL) {
-    if (diagnosticOut) diagnosticOut.outcome = "sentinel_no_products";
-    return null; // explicit "no products" escape
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch {
-    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
-    return null; // not valid JSON — never fabricate/guess a list from prose
-  }
-  if (!Array.isArray(parsed)) {
-    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
-    return null;
-  }
-
-  const seen = new Set<string>();
-  const items: string[] = [];
-  for (const raw of parsed) {
-    if (typeof raw !== "string") continue;
-    const item = raw.trim();
-    if (!item || item.length > GARDSSALG_PRODUCTS_MAX_ITEM_LEN) continue;
-    const key = item.toLocaleLowerCase("nb-NO");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    items.push(item);
-    if (items.length >= GARDSSALG_PRODUCTS_MAX_ITEMS) break;
-  }
-
-  if (items.length === 0) {
-    if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
-    return null;
-  }
-  if (diagnosticOut) diagnosticOut.outcome = "products_found";
-  return items;
 }
 
 // Calls the Anthropic API the same way ClaudeVisionProvider.analyze() does

@@ -560,6 +560,57 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(!readQueueRow("wd-ext-has"), "s3: nothing queued");
     }
 
+    // ── (s2) external candidate for a producer with NO agent_knowledge row:
+    //     the missing row is created empty and the candidate is evaluated on
+    //     the merits (2026-08-13 INNER JOIN gap — 8/24 BM-matched webless
+    //     producers 404'd out of the intake as not_found) --
+    {
+      testDb.prepare(
+        `INSERT INTO agents (
+           id, name, description, provider, contact_email, url, role, api_key,
+           org_nr, city, vertical_id, created_at
+         ) VALUES ('wd-ext-nok', 'Vangen Gardsmat', 't', 't', 'x@example.com',
+                   'https://example.com', 'producer', 'key-wd-ext-nok',
+                   '966666666', 'Skjåk', 'rfb', '2026-01-01 00:00:00')`,
+      ).run();
+      assertTrue(
+        !testDb.prepare("SELECT 1 FROM agent_knowledge WHERE agent_id = 'wd-ext-nok'").get(),
+        "s2-pre: no agent_knowledge row exists",
+      );
+      fixtures.set(
+        "https://vangengardsmat.no",
+        htmlResponse("<html><body>Vangen Gardsmat i Skjåk — org.nr 966 666 666</body></html>", { finalUrl: "https://vangengardsmat.no" }),
+      );
+      const r = await callDiscovery({ candidates: [{ agentId: "wd-ext-nok", url: "https://vangengardsmat.no" }] });
+      assertEq(r.body.not_found.length, 0, "s2-1: NOT reported not_found anymore");
+      assertEq(r.body.proposed.length, 1, "s2-2: evaluated and proposed on evidence");
+      assertEq(r.body.proposed[0].agent_id, "wd-ext-nok", "s2-3: for the right agent");
+      const kRow = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-ext-nok'").get() as { website: string | null } | undefined;
+      assertTrue(!!kRow, "s2-4: the missing agent_knowledge row was created");
+      assertEq(kRow!.website ?? null, null, "s2-5: created row is blank — apply stays fill-only");
+      assertTrue(!!readQueueRow("wd-ext-nok"), "s2-6: queued as pending");
+    }
+
+    // ── (s3) the knowledge-row backfill is scoped: a non-producer without a
+    //     knowledge row stays not_found and no row is manufactured --
+    {
+      testDb.prepare(
+        `INSERT INTO agents (
+           id, name, description, provider, contact_email, url, role, api_key, vertical_id, created_at
+         ) VALUES ('wd-ext-cons', 'Ikke Produsent', 't', 't', 'x@example.com',
+                   'https://example.com', 'consumer', 'key-wd-ext-cons', 'rfb', '2026-01-01 00:00:00')`,
+      ).run();
+      const r = await callDiscovery({ candidates: [
+        { agentId: "wd-ext-cons", url: "https://noe.no" },
+        { agentId: "finnes-ikke", url: "https://annet.no" },
+      ] });
+      assertEq(r.body.not_found.length, 2, "s3-1: non-producer and unknown id both not_found");
+      assertTrue(
+        !testDb.prepare("SELECT 1 FROM agent_knowledge WHERE agent_id IN ('wd-ext-cons','finnes-ikke')").get(),
+        "s3-2: no knowledge row manufactured for either",
+      );
+    }
+
     // ═══ punkt 4b: the approve/apply lever ═══
 
     const postApprove = getHandler("post", "/rfb-website-review-approve");

@@ -399,6 +399,121 @@ export function runOpplevelserGardssalgProductsTests(
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // Section A2 — dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-
+    // rader, Skive 4: retry-once on invalid_unparseable. The observed,
+    // reproduced-live defect (Rabalder Sideri, 2026-08-12): the SAME row and
+    // SAME cappedSource got products_found on one call and invalid_unparseable
+    // on another moments later — pure LLM response-sampling non-determinism.
+    // A manual immediate retry against the exact same row succeeded, which is
+    // the evidence base for this fix.
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      const SOURCE_TEXT = "Vi selger Eplesider, Eplemost og Pæremost rett fra gården. Åpent hver lørdag.";
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key-retry";
+
+      // ── pg-14 (AK8): first mocked call returns unparseable/non-JSON text,
+      //    second mocked call (the retry) returns valid JSON → the function
+      //    returns the RETRY's products, and diagnosticOut.outcome reflects
+      //    the retry's success, not the first attempt's failure. ───────────
+      {
+        let callCount = 0;
+        globalThis.fetch = (async () => {
+          callCount++;
+          if (callCount === 1) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "Vi selger Eplesider og Eplemost." }] }),
+            } as unknown as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ content: [{ type: "text", text: JSON.stringify(["Eplesider", "Eplemost"]) }] }),
+          } as unknown as Response;
+        }) as unknown as typeof fetch;
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, ["Eplesider", "Eplemost"], "pg-14a (AK8): unparseable first attempt, valid-JSON retry → returns the retry's products");
+        assertEq(diag.outcome, "products_found", "pg-14b (AK8): diagnosticOut.outcome = products_found after a successful retry");
+        assertEq(callCount, 2, "pg-14c (AK8): exactly 2 API calls made (first attempt + the one retry)");
+      }
+
+      // ── pg-15 (AK9): BOTH mocked calls return unparseable text → the
+      //    function returns null, outcome stays invalid_unparseable (exactly
+      //    like today's single-attempt behavior — no new outcome value), and
+      //    the mock was called EXACTLY 2 times, never a 3rd (hard cap of 1
+      //    retry). ─────────────────────────────────────────────────────────
+      {
+        let callCount = 0;
+        globalThis.fetch = (async () => {
+          callCount++;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ content: [{ type: "text", text: "Vi selger Eplesider og Eplemost." }] }),
+          } as unknown as Response;
+        }) as unknown as typeof fetch;
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, null, "pg-15a (AK9): both attempts unparseable → null");
+        assertEq(diag.outcome, "invalid_unparseable", "pg-15b (AK9): diagnosticOut.outcome stays invalid_unparseable when both attempts fail");
+        assertEq(callCount, 2, "pg-15c (AK9): EXACTLY 2 API calls total — proves the hard cap, never a 3rd attempt");
+      }
+
+      // ── pg-16 (AK10): sentinel_no_products and infra_failure paths make
+      //    exactly ONE API call each — no retry triggered — regression-
+      //    securing that the retry ONLY applies to invalid_unparseable. ─────
+      {
+        let callCount = 0;
+        globalThis.fetch = (async () => {
+          callCount++;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ content: [{ type: "text", text: "INGEN_PRODUKTER_FUNNET" }] }),
+          } as unknown as Response;
+        }) as unknown as typeof fetch;
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, null, "pg-16a (AK10): sentinel response → null");
+        assertEq(diag.outcome, "sentinel_no_products", "pg-16b (AK10): diagnosticOut.outcome = sentinel_no_products");
+        assertEq(callCount, 1, "pg-16c (AK10): exactly 1 API call for the sentinel path — no retry");
+      }
+      {
+        let callCount = 0;
+        globalThis.fetch = (async () => {
+          callCount++;
+          throw new Error("simulated network failure");
+        }) as unknown as typeof fetch;
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, null, "pg-16d (AK10): thrown fetch (infra failure) → null");
+        assertEq(diag.outcome, "infra_failure", "pg-16e (AK10): diagnosticOut.outcome = infra_failure");
+        assertEq(callCount, 1, "pg-16f (AK10): exactly 1 API call for the infra-failure path — no retry");
+      }
+      {
+        let callCount = 0;
+        globalThis.fetch = (async () => {
+          callCount++;
+          return { ok: false, status: 500, json: async () => ({ error: "boom" }) } as unknown as Response;
+        }) as unknown as typeof fetch;
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, null, "pg-16g (AK10): non-2xx response (infra failure) → null");
+        assertEq(diag.outcome, "infra_failure", "pg-16h (AK10): diagnosticOut.outcome = infra_failure");
+        assertEq(callCount, 1, "pg-16i (AK10): exactly 1 API call for the non-2xx path — no retry");
+      }
+    } catch (err: any) {
+      failed++;
+      failures.push("opplevelser-gardssalg-products (section A2 — Skive 4 retry): unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      globalThis.fetch = prevFetch;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // Section B — POST /admin/gardssalg-content-refresh route-level wiring
     // ═══════════════════════════════════════════════════════════════════
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;

@@ -47,6 +47,7 @@
 
 import type Database from "better-sqlite3";
 import { v4 as uuid } from "uuid";
+import type { FetchPersistence } from "./fetch-page";
 import { hostFromUrlLike, isDirectoryOrAggregatorHost } from "./cross-source-validator";
 import {
   gardssalgWebsiteEvidenceMatch,
@@ -70,7 +71,31 @@ export interface GsWvProducerRow {
   catalog_hidden: number | null;
 }
 
-export type GsWvClassification = "verified" | "unverified" | "aggregator" | "missing_source";
+/**
+ * `unreachable_transient` (Daniel, live session 2026-08-13) is NOT a verdict
+ * about the producer — it means we could not reach the site THIS RUN.
+ *
+ * Before it existed, every fetch failure collapsed into `unverified`, which
+ * applyGardssalgWebsiteVerification then wrote durably as
+ * `hjemmeside_verification = {verified:false}`. Measured on the 2026-08-13
+ * remediation run over the 15 `nettsted_uverifisert` rows: Tromsø
+ * Mikrobryggeri's `bryggeri13.no` answered HTTP 5xx — a transient blip — and
+ * was permanently recorded as an unverified website, indistinguishable
+ * afterwards from a producer whose page genuinely carries no ownership
+ * evidence. That is the exact failure the doc comment in routes/opplevelser.ts
+ * (~line 10240) already described as live.
+ *
+ * `permanent`/`blocked` failures (dns_not_found, 404, 401 …) keep collapsing
+ * into `unverified` deliberately: a dead domain IS a statement about the
+ * stored URL, and queuing it for review is the correct remedy. Only
+ * `transient` is exempt.
+ */
+export type GsWvClassification =
+  | "verified"
+  | "unverified"
+  | "aggregator"
+  | "missing_source"
+  | "unreachable_transient";
 
 export type GsWvEvidence = ReturnType<typeof gardssalgWebsiteEvidenceMatch>;
 
@@ -87,6 +112,8 @@ export interface GsWvSummary {
   unverified: number;
   aggregator: number;
   missing_source: number;
+  /** Could not be reached this run. Nothing was recorded about these rows. */
+  unreachable_transient: number;
   total: number;
 }
 
@@ -102,7 +129,20 @@ export interface GsWvSummary {
 // it just means gardssalgWebsiteEvidenceMatch never sees a title source for
 // that call (see its own doc comment for exactly what that does and doesn't
 // change).
-export type GsWvFetchResult = { ok: true; pageText: string; title?: string } | { ok: false; reason: string };
+export type GsWvFetchResult =
+  | { ok: true; pageText: string; title?: string }
+  | {
+      ok: false;
+      reason: string;
+      /**
+       * fetch-page.ts's persistence class, passed straight through. Optional
+       * so an existing/simpler fetchFn still type-checks — an adapter that
+       * omits it keeps the old fail-closed behaviour (treated as a real
+       * negative), which is the safe default for a caller that cannot tell
+       * the difference. Only an explicit "transient" earns the exemption.
+       */
+      persistence?: FetchPersistence;
+    };
 export type GsWvFetchFn = (homepageUrl: string) => Promise<GsWvFetchResult>;
 
 // ─── Cohort (Part A load) ───────────────────────────────────────────────────
@@ -238,7 +278,11 @@ export async function classifyGardssalgProducerWebsite(
     fetched = { ok: false, reason: "fetch_threw" };
   }
   if (!fetched.ok) {
-    return { provider_id: producer.id, name: producer.navn, hjemmeside, classification: "unverified", evidence: null };
+    // A site we could not reach this run is not a producer we have judged.
+    // See GsWvClassification's doc comment for the measured incident.
+    const classification: GsWvClassification =
+      fetched.persistence === "transient" ? "unreachable_transient" : "unverified";
+    return { provider_id: producer.id, name: producer.navn, hjemmeside, classification, evidence: null };
   }
 
   const evidence = gardssalgWebsiteEvidenceMatch(
@@ -290,7 +334,14 @@ export async function scanGardssalgWebsiteVerificationRows(
 }
 
 export function summarizeGardssalgWebsiteVerification(rows: GsWvScanRow[]): GsWvSummary {
-  const summary: GsWvSummary = { verified: 0, unverified: 0, aggregator: 0, missing_source: 0, total: rows.length };
+  const summary: GsWvSummary = {
+    verified: 0,
+    unverified: 0,
+    aggregator: 0,
+    missing_source: 0,
+    unreachable_transient: 0,
+    total: rows.length,
+  };
   for (const r of rows) summary[r.classification]++;
   return summary;
 }
@@ -370,6 +421,17 @@ export function applyGardssalgWebsiteVerification(
       .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
       .get(row.provider_id) as { field_provenance: string | null } | undefined;
     if (!providerRow) return; // provider vanished mid-run (deleted) -> nothing to stamp
+
+    // A transient unreachability is not a finding about the producer, so it
+    // must leave NO durable trace that any downstream gate could read as one:
+    // no provenance stamp (isHjemmesideVerified gates the content step on it),
+    // no review-queue entry, no audit row claiming verified=0. The row is left
+    // exactly as it was for the next run to judge properly. Recorded in
+    // `applied` so the caller can still see it was attempted and skipped.
+    if (row.classification === "unreachable_transient") {
+      applied.push({ provider_id: row.provider_id, classification: row.classification, enqueued: false });
+      return;
+    }
 
     let provenance: Record<string, unknown> = {};
     if (providerRow.field_provenance) {

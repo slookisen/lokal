@@ -724,6 +724,32 @@ runSerial(async () => {
   }
 });
 
+// ── Daniel, live session 2026-08-13: headless-render fallback for JS-built
+// producer sites (services/render-page.ts). 67northdistillery.no serves 180 KB
+// of HTML that yields 19 visible characters, so `about_text`/`products` can
+// never be extracted from the raw source and the row is stuck in
+// needs_enrichment forever.
+//
+// Browser-free BY CONSTRUCTION: renderPage() takes an injected renderImpl, so
+// this block never launches Chromium. That is load-bearing, not incidental —
+// production runs on node:20-alpine with no browser at all, and a gate that
+// needed one could not run there.
+runSerial(async () => {
+  console.log("\n── render-page: headless-render fallback (escalation + classified failure) ──");
+  try {
+    const { runRenderPageTests } = require("../src/services/render-page.test") as
+      typeof import("../src/services/render-page.test");
+    const r = await runRenderPageTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("render-page: " + f);
+    console.log(`  render-page: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("render-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-27-harvest-hjemmeside-feltnavn-tapes: the harvest
 // SKILL sends `hjemmeside`, BulkRowSchema only accepted `website`, and
 // z.object() strips unknown keys silently — so every harvested homepage was
@@ -5238,6 +5264,66 @@ async function runIntegrationTests(): Promise<void> {
       ar?.new_verification_status,
       "verified",
       "intg-g16A: gmail + homepage/google_places agreeing → verified (NOT downgraded for free-mail)",
+    );
+  }
+
+  // ── Fixture A2 (Daniel 2026-08-10): free-mail WITHOUT homepage evidence is
+  // report-only, never a quarantine ──────────────────────────────────────────
+  // Daniel: «gmail domener og forsåvidt hotmail og andre er ok å bruke. Vi
+  // sender ikke sensitiv data, men du skal ikke lage fiktive eposter.»
+  // (daniel-responses/2026-08-10-frimeil-policy-og-ingen-fiktive-eposter.md)
+  //
+  // Same shape as Fixture A above but with NO field_provenance.email record and
+  // agents.is_verified = 0 — i.e. exactly the cohort the guard used to hold at
+  // review_required (18 live rows, measured 2026-08-10). The flag must still be
+  // RAISED (we keep watching wrong contacts) while the OUTCOME is untouched.
+  {
+    const sqlite = require("better-sqlite3");
+    const db = new sqlite(":memory:");
+    const { __setDbForTesting, __initSchemaForTesting } = require("../src/database/init");
+    __initSchemaForTesting(db);
+    const { getDb } = require("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-gmail-noevidence", "Solhaug Gard", {
+      email: "solhaug.gard@gmail.com",
+      website: "https://solhaug.no",
+      about: "Familiedrevet gard i Trøndelag som sel egg, honning og grønsaker direkte frå garden.",
+      products: JSON.stringify([{ name: "Egg" }, { name: "Honning" }, { name: "Grønsaker" }, { name: "Poteter" }]),
+      field_provenance: {
+        address: [
+          { value: "Solhaugvegen 8, 7288 Soknedal", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Solhaugvegen 8, 7288 Soknedal", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "95011044", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "95011044", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        // NB: deliberately NO email record — this is the whole point of the fixture.
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-gmail-noevidence");
+    assertTrue(!!ar, "intg-g16A2: unevidenced free-mail agent found");
+    assertTrue(
+      ar!.email_ownership_unproven,
+      "intg-g16A2: the signal is STILL raised — we keep watching wrong contacts",
+    );
+    assertTrue(
+      ar!.email_ownership_report_only,
+      "intg-g16A2: report-only for every agent now, not just already-verified ones",
+    );
+    assertTrue(
+      !ar!.flags.includes("email_ownership_unproven"),
+      "intg-g16A2: no gate flag is pushed — the flag drove the quarantine",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "verified",
+      "intg-g16A2: free-mail WITHOUT homepage evidence now reaches verified (Daniel 2026-08-10)",
     );
   }
 
@@ -30109,6 +30195,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of essc.failures) failures.push("experiences-seo-site-chrome: " + f);
     console.log(`  experiences-seo-site-chrome: ${essc.passed} passed, ${essc.failed} failed`);
 
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 7
+    // (fylkesblokk-kompaktering): max-width:560px media query compacting the
+    // homepage "Utforsk etter fylke" grid to 2 columns on mobile (same
+    // markup/data, denser only below the mobile breakpoint).
+    console.log("\n── experiences-seo-fylke-mobile-compact: fylkesblokk 2-col mobile (arbeidspunkt 7) ──");
+    const { runExperiencesSeoFylkeMobileCompactTests } = require("../src/routes/experiences-seo-fylke-mobile-compact.test") as
+      typeof import("../src/routes/experiences-seo-fylke-mobile-compact.test");
+    const esfmc = await runExperiencesSeoFylkeMobileCompactTests({ log: false });
+    passed += esfmc.passed;
+    failed += esfmc.failed;
+    for (const f of esfmc.failures) failures.push("experiences-seo-fylke-mobile-compact: " + f);
+    console.log(`  experiences-seo-fylke-mobile-compact: ${esfmc.passed} passed, ${esfmc.failed} failed`);
+
     // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2:
     // illustrated SVG hero scene (forside/drikke motifs) + the homepage
     // drikkested feature section + countGardssalgProvidersByType(). Covers
@@ -30235,6 +30334,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += esgbna.failed;
     for (const f of esgbna.failures) failures.push("experiences-seo-gardssalg-booking-ikke-aktivert: " + f);
     console.log(`  experiences-seo-gardssalg-booking-ikke-aktivert: ${esgbna.passed} passed, ${esgbna.failed} failed`);
+
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
+    // arbeidspunkt 5: gårdssalg produsent-profil template render-guards —
+    // drivingSted() adjacent-duplicate collapse, the new
+    // looksTruncatedMidWord() guard on opening_hours_text/about_text/
+    // visit_text (alongside the existing isJunkDescription()), and the
+    // reserve-CTA's muted "Meld interesse" state when booking is paused.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── experiences-seo-produsent-render-guards: sted-dedup + truncation-guard + paused-CTA ──");
+    const { runExperiencesSeoProdusentRenderGuardsTests } = require("../src/routes/experiences-seo-produsent-render-guards.test") as
+      typeof import("../src/routes/experiences-seo-produsent-render-guards.test");
+    const esprg = await runExperiencesSeoProdusentRenderGuardsTests({ log: false });
+    passed += esprg.passed;
+    failed += esprg.failed;
+    for (const f of esprg.failures) failures.push("experiences-seo-produsent-render-guards: " + f);
+    console.log(`  experiences-seo-produsent-render-guards: ${esprg.passed} passed, ${esprg.failed} failed`);
 
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
@@ -33134,6 +33250,151 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
   } catch (err) {
     failed++;
     failures.push(`descjunk: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ── looksTruncatedMidWord: cut-mid-word render-guard ─────────────────────────
+// dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 5
+// (gårdssalg produsent-profil render-guards). A DIFFERENT failure mode than
+// isJunkDescription() above — a raw byte/char-range scrape slice that begins
+// and/or ends inside a word, not nav boilerplate. See
+// src/services/description-quality.ts's doc comment for the full rationale;
+// route-level wiring of this guard onto opening_hours_text/about_text/
+// visit_text is covered end-to-end by
+// experiences-seo-produsent-render-guards.test.ts below.
+console.log("\n── looksTruncatedMidWord: cut-mid-word render-guard ──");
+(() => {
+  try {
+    const dq = require("../src/services/description-quality");
+    assertTrue(typeof dq.looksTruncatedMidWord === "function", "trunc: description-quality.ts exports looksTruncatedMidWord");
+
+    // ── Acceptance test (dev-request-mandated): the real live corrupt
+    // opening_hours_text fixture (paraphrased faithfully) must flag true. ──
+    const corruptFixture =
+      "g håndverk. Bli med på en smaksreise! åPNINGSTIDER … åpent H";
+    assertTrue(dq.looksTruncatedMidWord(corruptFixture) === true,
+      "trunc: real corrupt opening_hours_text fixture -> true (starts AND ends mid-word)");
+
+    // ── Empty / absent input: never flagged ──
+    assertTrue(dq.looksTruncatedMidWord("") === false, "trunc: empty string -> false");
+    assertTrue(dq.looksTruncatedMidWord(null) === false, "trunc: null -> false");
+    assertTrue(dq.looksTruncatedMidWord(undefined) === false, "trunc: undefined -> false");
+
+    // ── Normal Norwegian prose — must NOT flag ──
+    assertTrue(
+      dq.looksTruncatedMidWord("Vi er en liten familiedrevet sideri på Vestlandet og har laget sider av egne epler siden 2015.") === false,
+      "trunc: normal about-text prose -> false"
+    );
+    assertTrue(
+      dq.looksTruncatedMidWord("Åpent lørdager kl. 11-16 i sesong, ellers etter avtale.") === false,
+      "trunc: normal opening-hours prose -> false"
+    );
+    assertTrue(
+      dq.looksTruncatedMidWord("Et besøk hos oss starter med en kort omvisning i frukthagen, etterfulgt av en smaking av våre sider.") === false,
+      "trunc: normal visit-text prose -> false"
+    );
+    // Explicitly the false-positive risk called out in the dev-request: a
+    // normal LONGER first word starting with a lowercase Norwegian letter
+    // ("åpent") must not be mistaken for a 1-2 char cut-word remnant.
+    assertTrue(
+      dq.looksTruncatedMidWord("åpent hele uken, kontakt oss for avtale.") === false,
+      "trunc: 'åpent hele uken…' -> false (first word is 5 chars, not a 1-2 char truncation-shaped token)"
+    );
+    // Allowlisted short openers must not flag on their own.
+    assertTrue(dq.looksTruncatedMidWord("på gården selger vi egg og honning hver lørdag.") === false, "trunc: allowlisted opener 'på' -> false");
+    assertTrue(dq.looksTruncatedMidWord("og vi holder åpent alle dager i sommersesongen.") === false, "trunc: allowlisted opener 'og' -> false");
+    assertTrue(dq.looksTruncatedMidWord("i sesongen holder vi åpent hver helg.") === false, "trunc: allowlisted opener 'i' -> false");
+
+    // ── START signal in isolation ──
+    assertTrue(dq.looksTruncatedMidWord("g håndverk og tradisjon siden 1990, velkommen innom butikken vår.") === true,
+      "trunc: START signal alone — non-allowlisted 1-char lowercase opener 'g' -> true");
+    assertTrue(dq.looksTruncatedMidWord("xy håndverk og tradisjon siden 1990, velkommen innom butikken vår.") === true,
+      "trunc: START signal alone — non-allowlisted 2-char lowercase opener 'xy' -> true");
+
+    // ── END signal in isolation ──
+    assertTrue(dq.looksTruncatedMidWord("Vi holder åpent hver dag fra klokken ti til atten og selger H") === true,
+      "trunc: END signal alone — trailing lone uppercase letter with no sentence break before it -> true");
+    // A real finished sentence right before a standalone capital letter
+    // reads as a plausible abbreviation/initial, not a cut — must NOT flag.
+    assertTrue(dq.looksTruncatedMidWord("Vi selger produkter rett fra gården vår. A") === false,
+      "trunc: a lone trailing capital AFTER a real finished sentence (period right before it) -> false");
+
+    // ── Both signals firing together (the acceptance fixture already
+    // covers this, this is a second, more minimal example) ──
+    assertTrue(dq.looksTruncatedMidWord("m gården vår siden generasjoner tilbake, velkommen innom hele A") === true,
+      "trunc: both START and END signals fire on the same fragment -> true");
+
+    // ── 2026-08-12 negative-control regression coverage: the exact 5
+    // false positives reproduced by the CHANGES-REQUESTED review of the
+    // original SHORT_WORD_ALLOWLIST (which was missing common bokmål
+    // words like "kl"/"så"/"da"/"er"). Each must now return false. ──
+    assertTrue(dq.looksTruncatedMidWord("kl 10-18 alle dager unntatt søndag") === false,
+      "trunc: FP-regression — 'kl 10-18 alle dager unntatt søndag' -> false (normal hours-string opener)");
+    assertTrue(dq.looksTruncatedMidWord("øl smakes her hver lørdag fra kl 12") === false,
+      "trunc: FP-regression — 'øl smakes her hver lørdag fra kl 12' -> false");
+    assertTrue(dq.looksTruncatedMidWord("så lenge lageret rekker, selger vi direkte fra gården") === false,
+      "trunc: FP-regression — 'så lenge lageret rekker…' -> false ('så' is very common)");
+    assertTrue(dq.looksTruncatedMidWord("da vi startet i 1990 var det bare epler, nå har vi mye") === false,
+      "trunc: FP-regression — 'da vi startet i 1990…' -> false ('da' is very common)");
+    assertTrue(dq.looksTruncatedMidWord("er dette stedet du leter etter...") === false,
+      "trunc: FP-regression — 'er dette stedet du leter etter...' -> false ('er' is very common)");
+
+    // ── A few more negative controls using additional expanded-allowlist
+    // entries, so the broadened list itself has direct test coverage. ──
+    assertTrue(dq.looksTruncatedMidWord("jo, vi har fortsatt varer igjen fra årets innhøsting.") === false,
+      "trunc: allowlisted opener 'jo' -> false");
+    assertTrue(dq.looksTruncatedMidWord("må prøve sideren vår, den er laget av egne epler.") === false,
+      "trunc: allowlisted opener 'må' -> false");
+    assertTrue(dq.looksTruncatedMidWord("ta turen innom oss en lørdag i høstsesongen.") === false,
+      "trunc: allowlisted opener 'ta' -> false");
+    assertTrue(dq.looksTruncatedMidWord("gi bort en opplevelse hos oss til noen du er glad i.") === false,
+      "trunc: allowlisted opener 'gi' -> false");
+    assertTrue(dq.looksTruncatedMidWord("ny åpningstid fra 1. juni: alle dager 10-18.") === false,
+      "trunc: allowlisted opener 'ny' -> false");
+
+    // ── 2026-08-12 negative-control regression coverage, round 2: the exact
+    // 5 false positives reproduced by the SECOND CHANGES-REQUESTED review
+    // (round 1's fix was bokmål-only and still missed nynorsk pronouns/
+    // adverbs plus commerce abbreviations — this route's own fixtures are
+    // Vestland/Voss, nynorsk-dominant territory). Each must now return
+    // false. ──
+    assertTrue(dq.looksTruncatedMidWord("eg driv gard saman med familien min i tredje generasjon.") === false,
+      "trunc: FP-regression r2 — 'eg driv gard saman med familien min…' -> false (nynorsk 'jeg'/I)");
+    assertTrue(dq.looksTruncatedMidWord("no sel vi eple og pære frå garden kvar haust.") === false,
+      "trunc: FP-regression r2 — 'no sel vi eple og pære frå garden…' -> false (nynorsk 'nå'/now)");
+    assertTrue(dq.looksTruncatedMidWord("ca 200 meter frå hovudvegen finn du garden vår.") === false,
+      "trunc: FP-regression r2 — 'ca 200 meter frå hovudvegen…' -> false (ca = circa)");
+    assertTrue(dq.looksTruncatedMidWord("kr 50 per kilo, betaling på staden eller vipps.") === false,
+      "trunc: FP-regression r2 — 'kr 50 per kilo…' -> false (currency)");
+    assertTrue(dq.looksTruncatedMidWord("pr stykk koster eggene 5 kroner, henting i utsalget.") === false,
+      "trunc: FP-regression r2 — 'pr stykk koster eggene…' -> false (per)");
+
+    // ── 2026-08-12 round-3 adversarial coverage: NEW plausible bokmål/
+    // nynorsk producer-copy strings (not lifted from either bug report)
+    // constructed specifically to probe the broadened allowlist — mix of
+    // price/quantity/hours openers and plain nynorsk prose. All must be
+    // false; this is direct test coverage for the round-2-added entries
+    // "ho"/"me"/"so"/"då"/"kg"/"nr" that the two FP-regression blocks above
+    // don't otherwise exercise. ──
+    assertTrue(dq.looksTruncatedMidWord("ho driv garden saman med mannen sin og tre born.") === false,
+      "trunc: adversarial — 'ho driv garden saman med mannen sin…' -> false (nynorsk 'hun'/she)");
+    assertTrue(dq.looksTruncatedMidWord("me sel egg og grønsaker rett frå garden kvar laurdag.") === false,
+      "trunc: adversarial — 'me sel egg og grønsaker…' -> false (nynorsk 'vi'/we)");
+    assertTrue(dq.looksTruncatedMidWord("so kjem hausten og me haustar eplene frå den gamle hagen.") === false,
+      "trunc: adversarial — 'so kjem hausten…' -> false (nynorsk 'så'/so-then)");
+    assertTrue(dq.looksTruncatedMidWord("då bestefar starta garden i 1952, var det berre sau her.") === false,
+      "trunc: adversarial — 'då bestefar starta garden i 1952…' -> false (nynorsk-spelled 'da'/when)");
+    assertTrue(dq.looksTruncatedMidWord("kg-prisen på eplene er 20 kr i haustsesongen.") === false,
+      "trunc: adversarial — 'kg-prisen på eplene…' -> false (kg = kilogram, price opener)");
+    assertTrue(dq.looksTruncatedMidWord("nr 12 i bygdevegen, rett bak det gamle fjøset.") === false,
+      "trunc: adversarial — 'nr 12 i bygdevegen…' -> false (nr = nummer, address opener)");
+    assertTrue(dq.looksTruncatedMidWord("so og grisar går fritt på beite heile sommaren.") === false,
+      "trunc: adversarial — 'so og grisar går fritt på beite…' -> false ('so' = sow, on-domain farm noun)");
+    assertTrue(dq.looksTruncatedMidWord("eg og familien min driv sideriet saman, tredje generasjon på garden.") === false,
+      "trunc: adversarial — 'eg og familien min driv sideriet…' -> false (nynorsk 'jeg'/I, second construction)");
+  } catch (err) {
+    failed++;
+    failures.push(`trunc: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
 
@@ -36639,6 +36900,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("contact-email-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// POST /admin/agents/duplicate-merge — explicit-pair duplicate merge lever.
+// Fill-only survivor writes, append-only field_provenance merge, mandatory
+// duplicate deactivation (is_active=0 + merged_into), claimed-row and
+// curated-field locks, reversible via agent_knowledge_audit. Never detects
+// duplicates itself — only executes a caller-supplied decision. Own
+// in-memory DB via its own seam (same discipline as contact-email-write
+// above: never pins the shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── admin-agents-duplicate-merge: duplicate-pair merge lever ──");
+  try {
+    const { runAdminAgentsDuplicateMergeTests } = require("../src/routes/admin-agents-duplicate-merge.test") as
+      typeof import("../src/routes/admin-agents-duplicate-merge.test");
+    const dm = await runAdminAgentsDuplicateMergeTests({ log: false });
+    passed += dm.passed;
+    failed += dm.failed;
+    for (const f of dm.failures) failures.push("duplicate-merge: " + f);
+    console.log(`  duplicate-merge: ${dm.passed} passed, ${dm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("duplicate-merge: unexpected error: " + String(err?.message || err));
   }
 });
 

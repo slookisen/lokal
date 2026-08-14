@@ -225,7 +225,16 @@ export function runExperiencesSeoEierCtaSwapTests(opts: { log?: boolean } = {}):
       // fetch() resolves, which this router.handle() harness never runs. ──
       for (const [label, resp] of [["no-cookie", noCookie] as const, ["owner-cookie", ownerCookie] as const]) {
         assertTrue(resp.body.includes('id="reserve-cta"'), `c1 (${label}): server-rendered CTA still has the stable id="reserve-cta" for the client script to target`);
-        assertTrue(resp.body.includes(">Reserver besøk<"), `c2 (${label}): server-rendered CTA text is still exactly "Reserver besøk" — unchanged for cache-safety, swap happens client-side only`);
+        // 2026-08-12 (arbeidspunkt 5 of dev-request 2026-07-19-opplevagent-
+        // forside-seksjoner-design): this fixture's booking_live is null, so
+        // isBookingPaused() is true — the reserve-CTA now honestly renders
+        // "Meld interesse" (muted .reserve-cta-paused) instead of "Reserver
+        // besøk" for a paused provider. The cache-safety invariant this
+        // block exists to prove (identical output regardless of cookie) is
+        // unaffected — and already proven directly by b3's byte-identical
+        // check above — only the specific label this paused fixture renders
+        // changed, not whether it varies by viewer.
+        assertTrue(resp.body.includes(">Meld interesse<"), `c2 (${label}): server-rendered CTA text is still exactly "Meld interesse" (this fixture is paused) — unchanged for cache-safety, swap happens client-side only`);
         assertTrue(resp.body.includes("decideOwnerCtaSwap"), `c3 (${label}): the inline <script> embeds decideOwnerCtaSwap.toString() — tested code IS shipped code`);
         assertTrue(resp.body.includes("/session-status"), `c4 (${label}): the inline <script> calls the separate no-store session-status endpoint`);
         assertTrue(resp.body.includes("ecta-prov-owner"), `c5 (${label}): the inline <script> is parameterized with THIS page's own provider id`);
