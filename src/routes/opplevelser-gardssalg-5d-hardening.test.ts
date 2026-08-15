@@ -463,19 +463,36 @@ export function runOpplevelserGardssalg5dHardeningTests(
           process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
           let renderCalls = 0;
           let renderedUrl = "";
+          // `text` mirrors what the real renderPage returns (renderedTextOf of
+          // its own html), not a placeholder — chars_after is read from it.
+          const renderedText = renderedHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
           opplevelserMod.__setGardssalgRenderPageImplForTesting(async (url: string) => {
             renderCalls++;
             renderedUrl = url;
-            return { ok: true, html: renderedHtml, text: "x", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
+            return { ok: true, html: renderedHtml, text: renderedText, finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
           });
           const seen: string[] = [];
           globalThis.fetch = mkFetch(seen);
-          await callRoute(opplevelserRouter, {
+          const rOk = await callRoute(opplevelserRouter, {
             headers: adminHeaders,
             url: "/admin/gardssalg-content-refresh",
             body: { providerIds: ["p5-alone"], apply: false },
           });
           assertEq(renderCalls, 1, "5h-e2: with the flag ON the JS shell escalates to the renderer exactly once");
+          // The pair that makes a successful render self-evidencing: "it ran
+          // and helped" must be readable off the response without re-deriving
+          // anything, or it is indistinguishable from "it ran and the page
+          // really is empty" — the 67 North question in one line.
+          {
+            const diagOk = (rOk.body.render_diagnostic as any[] | undefined)?.find((d) => d.provider_id === "p5-alone");
+            assertEq(diagOk?.ok, true, "5h-e2b: a successful render is reported as ok");
+            assertTrue(
+              typeof diagOk?.chars_before === "number" &&
+                typeof diagOk?.chars_after === "number" &&
+                diagOk.chars_after > diagOk.chars_before,
+              "5h-e2c: chars_before/chars_after bracket the render, so 'it helped' is measurable from the response alone",
+            );
+          }
           assertEq(
             renderedUrl,
             "https://aleine.example.no/side/gard",
@@ -541,13 +558,24 @@ export function runOpplevelserGardssalg5dHardeningTests(
           assertEq(diag?.ok, false, "5h-e10: a failed render is not reported as ok");
         }
 
-        // The other half of the distinction: escalation that never fired at
-        // all reports NOTHING, so an absent `render` is itself information.
+        // ── the DECISION, not just the outcome ─────────────────────────────
+        //
+        // The first version of this report (PR #604) was emitted only when a
+        // render was attempted, and the test below used to assert exactly
+        // that: "an escalation that never fired reports null". Measured
+        // against the live system the same day, that contract was the problem
+        // rather than the fix — an absent entry still collapsed two states
+        // with different remedies (flag off -> set the env var; not eligible
+        // -> nothing to do, or the thresholds are wrong), which is the same
+        // mistake one level up. So the two decision bits are now always
+        // reported, and these are the assertions that hold that line.
         {
           delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
-          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => ({
-            ok: true, html: renderedHtml, text: "x", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1,
-          }));
+          let renderCalls = 0;
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => {
+            renderCalls++;
+            return { ok: true, html: renderedHtml, text: "x", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
+          });
           globalThis.fetch = mkFetch([]);
           const r = await callRoute(opplevelserRouter, {
             headers: adminHeaders,
@@ -555,10 +583,63 @@ export function runOpplevelserGardssalg5dHardeningTests(
             body: { providerIds: ["p5-alone"], apply: false },
           });
           const diag = (r.body.render_diagnostic as any[] | undefined)?.find((d) => d.provider_id === "p5-alone");
+          assertTrue(!!diag, "5h-e11: the escalation is reported even when it never fired — the flag being off IS the answer");
+          assertEq(diag?.flag_enabled, false, "5h-e12: flag_enabled says the kill switch is what stopped it");
           assertEq(
-            diag ?? null,
-            null,
-            "5h-e11: an escalation that never fired reports null — distinguishable from one that fired and failed",
+            diag?.eligible,
+            true,
+            "5h-e13: eligible stays true — the page WOULD have been escalated, which is what makes the flag the remedy",
+          );
+          assertEq(diag?.attempted, false, "5h-e14: attempted is false, and no render was actually performed");
+          assertEq(renderCalls, 0, "5h-e15: reporting the decision never triggers the render it is reporting on");
+          assertTrue(
+            typeof diag?.chars_before === "number" && diag.chars_before < 200,
+            "5h-e16: chars_before is reported regardless — it is the number that explains the eligible verdict",
+          );
+          assertEq(diag?.ok, undefined, "5h-e17: no ok/reason is invented for a render that never ran");
+        }
+
+        // The other side of the decision: flag ON, but the page is a real
+        // server-rendered one. Same shape, opposite bits — an operator reading
+        // `eligible:false` alongside a large chars_before knows there is
+        // nothing to fix, which an absent entry could never have told them.
+        {
+          process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+          let renderCalls = 0;
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => {
+            renderCalls++;
+            return { ok: true, html: renderedHtml, text: "x", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
+          });
+          const realPage =
+            `<html><head><title>Aleine Gard</title><script src="/analytics.js"></script></head><body><p>` +
+            "Aleine Gard held til i Hardanger og lagar sider av eigne eple. ".repeat(20) +
+            `</p></body></html>`;
+          globalThis.fetch = (async (url: string | URL | Request) => {
+            const urlStr = String(url);
+            if (urlStr.includes("data.brreg.no") || urlStr.includes("api.anthropic.com")) {
+              throw new Error(`unexpected non-page fetch in 5h-e: ${urlStr}`);
+            }
+            return {
+              ok: true, status: 200,
+              text: async () => realPage,
+              arrayBuffer: async () => new TextEncoder().encode(realPage).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
+          }) as unknown as typeof fetch;
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          const diag = (r.body.render_diagnostic as any[] | undefined)?.find((d) => d.provider_id === "p5-alone");
+          assertTrue(!!diag, "5h-e18: a page that did not need rendering is reported too");
+          assertEq(diag?.flag_enabled, true, "5h-e19: flag_enabled reflects the live env var, not a cached value");
+          assertEq(diag?.eligible, false, "5h-e20: a server-rendered page is not eligible — the page is the reason, not the flag");
+          assertEq(diag?.attempted, false, "5h-e21: not eligible means not attempted");
+          assertEq(renderCalls, 0, "5h-e22: an ineligible page never reaches the renderer, flag or no flag");
+          assertTrue(
+            typeof diag?.chars_before === "number" && diag.chars_before >= 200,
+            "5h-e23: chars_before shows WHY it was ineligible — this is the number the threshold is compared against",
           );
         }
 
