@@ -60,7 +60,13 @@ export function testSendRedirectAddress(): string | null {
 export interface TestSendEnvelope {
   to: string;
   subject: string;
-  htmlContent: string;
+  /**
+   * Optional since dev-request 2026-08-15-outreach-ab-standard-vs-personlig-
+   * drikke: absent = a genuinely text-only mail. The redirect preserves that
+   * (the banner goes on the text part only) — a test send must not change
+   * the wire format of the mail it stands in for.
+   */
+  htmlContent?: string;
   textContent: string;
 }
 
@@ -111,7 +117,8 @@ export function applyTestSendRedirect(envelope: TestSendEnvelope): TestSendEnvel
   return {
     to: redirect,
     subject,
-    htmlContent: bannerHtml + envelope.htmlContent,
+    // See TestSendEnvelope.htmlContent — a text-only mail stays text-only.
+    ...(envelope.htmlContent !== undefined ? { htmlContent: bannerHtml + envelope.htmlContent } : {}),
     textContent: bannerText + envelope.textContent,
   };
 }

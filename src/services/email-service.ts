@@ -23,7 +23,14 @@ export interface EmailAttachment {
 export interface EmailOptions {
   to: string;
   subject: string;
-  htmlContent: string;
+  /**
+   * Optional since dev-request 2026-08-15-outreach-ab-standard-vs-personlig-
+   * drikke: omitted means a genuinely text-only mail (no empty text/html part
+   * is ever attached) — the RFB master template's own spam-checklist calls
+   * for plain text, and the "personal" outreach variant mirrors it. Every
+   * pre-existing caller passes it, unchanged.
+   */
+  htmlContent?: string;
   textContent: string;
   replyTo?: string;
   listUnsubscribe?: string;
@@ -272,7 +279,8 @@ export class EmailService {
         from: options.from || this.fromAddress,
         to: options.to,
         subject: options.subject,
-        html: options.htmlContent,
+        // See EmailOptions.htmlContent — absent means text-only on the wire.
+        ...(options.htmlContent !== undefined ? { html: options.htmlContent } : {}),
         text: options.textContent,
         replyTo: options.replyTo,
         headers,
@@ -391,13 +399,19 @@ export class EmailService {
     to: string,
     providerName: string,
     profileUrl: string,
-    opts: { isTestSend?: boolean } = {},
+    opts: { isTestSend?: boolean; template?: GardssalgOutreachTemplate } = {},
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
-    const rendered = renderGardssalgOutreach(providerName, profileUrl);
+    // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke:
+    // opts.template selects the rendered draft ("standard" HTML template vs
+    // the RFB-style plain-text "personal" variant). Omitted = "standard",
+    // byte-identical to the pre-existing behaviour. Sender identity is the
+    // SAME for both variants — the draft text is the experiment's only
+    // variable.
+    const rendered = renderGardssalgOutreachVariant(opts.template ?? "standard", providerName, profileUrl);
     return await this.sendEmail({
       to,
       subject: rendered.subject,
-      htmlContent: rendered.html,
+      ...(rendered.html !== undefined ? { htmlContent: rendered.html } : {}),
       textContent: rendered.text,
       replyTo: GARDSSALG_OUTREACH_REPLY_TO,
       from: crmFromHeader("experiences"),
@@ -1238,6 +1252,74 @@ Daniel Fredriksen
 Opplevagent
 kontakt@opplevagent.no
 `;
+}
+
+// ─── Gårdssalg outreach: template variants (dev-request 2026-08-15-outreach-
+// ab-standard-vs-personlig-drikke) ───────────────────────────────────────────
+//
+// Daniel's A/B for the 2026-08-16 batch: 8 sends on the existing "standard"
+// draft above vs. 8 on a "personal" draft that mirrors the RFB master
+// template (A2A verticals/rfb/email-templates/outreach-v2.md) adapted for
+// drink producers on Opplevagent. The two arms are attributable in every log
+// by SUBJECT alone: standard asks «Stemmer det vi har om …?», personal asks
+// «Har vi info riktig om …?» (the RFB formula).
+//
+// The personal variant is deliberately TEXT-ONLY (html: undefined) — the RFB
+// template's spam-checklist specifies plain text, and matching its wire
+// format is part of matching the draft. Signature is the PLATFORM address
+// (kontakt@opplevagent.no), never the personal gmail the RFB template used
+// to carry (removed 2026-08-15, Daniel live) — and never the RFB identity:
+// the draft STYLE is borrowed, the platform separation is not.
+export type GardssalgOutreachTemplate = "standard" | "personal";
+
+export function renderGardssalgOutreachPersonal(
+  providerName: string,
+  profileUrl: string,
+): { subject: string; text: string; html?: string } {
+  return {
+    subject: `Har vi info riktig om ${providerName}?`,
+    text: `Hei,
+
+Jeg har laget en profil for ${providerName} som del av en åpen katalog
+over norske drikkeprodusenter og gårdsopplevelser. Du finner den her:
+
+${profileUrl}
+
+Bakgrunnen: AI-assistenter (typ ChatGPT, Claude) svarer i økende grad
+direkte på spørsmål som «hvilke bryggerier kan jeg besøke i Telemark».
+Norske produsenter forsvinner ofte i svarene fordi info-en deres ligger
+spredt. Vi samler det på ett sted, og holder profilene oppdaterte.
+
+Det koster ingenting og dere er ikke bundet til noe. Jeg ville bare
+sjekke at info stemmer, og at dere er OK med å være synlige der.
+
+Si fra om noe må endres — eller om dere helst fjernes. Begge deler
+ordnes innen 24 timer.
+
+Mvh,
+Daniel Fredriksen
+Opplevagent
+kontakt@opplevagent.no
+
+(Svar «fjern», så fjerner jeg profilen med en gang.)
+`,
+  };
+}
+
+/**
+ * The one variant dispatcher both the send path and the CRM-filing path go
+ * through (same single-source rule as renderGardssalgOutreach itself, per
+ * dev-request 2026-08-09-outreach-send-uten-crm-spor): what left the wire is
+ * what gets filed, for either arm.
+ */
+export function renderGardssalgOutreachVariant(
+  template: GardssalgOutreachTemplate,
+  providerName: string,
+  profileUrl: string,
+): { subject: string; text: string; html?: string } {
+  return template === "personal"
+    ? renderGardssalgOutreachPersonal(providerName, profileUrl)
+    : renderGardssalgOutreach(providerName, profileUrl);
 }
 
 export const emailService = new EmailService();
