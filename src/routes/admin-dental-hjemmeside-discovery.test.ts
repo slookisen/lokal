@@ -691,12 +691,29 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
           { title: "Vestfjord Tannlege", url: "https://vestfjordtannlege-ekte.no", description: "Narvik" },
         ];
       });
+      // Tier 2 constructs each candidate's fetch URL from the HOST ONLY
+      // (`https://${host}`, admin-dental-hjemmeside-discovery.ts ~line 526),
+      // never the search result's full path — so the URL it would attempt
+      // for the excluded host is "https://legelisten.no", not
+      // ".../vestfjord-tannlege". fetchCalls is a single array shared across
+      // this whole test file's run, so snapshot its length before this row's
+      // call and only inspect the slice made during it.
+      const fetchCallsBeforeQ3 = fetchCalls.length;
       try {
         const r = await postDiscovery({ agentIds: ["wd-nav-multihost"] });
         const entry = (r.body.results as any[]).find((e) => e.agent_id === "wd-nav-multihost");
         assertEq(entry?.status, "queued", "q3a: second candidate host (after the first is excluded) verifies -> queued");
         assertEq(entry?.candidate_url, "https://vestfjordtannlege-ekte.no", "q3b: queued candidate is the SECOND (verified) host, not the excluded first one");
-        assertTrue(!fetchCalls.includes("https://legelisten.no/vestfjord-tannlege"), "q3c: the excluded aggregator host was NEVER fetched");
+        // fetchCallsDuringQ3 also picks up this row's tier-1 Brreg org-detail
+        // lookup (no brregFixtures entry for 363636363, so it's a real
+        // stubFetch call) — filter down to just the two candidate HOST page
+        // URLs tier 2 could have fetched before counting, so that unrelated
+        // fetch traffic can't hide (or fake) the exclusion proof.
+        const fetchCallsDuringQ3 = fetchCalls.slice(fetchCallsBeforeQ3);
+        const q3CandidateHostUrls = ["https://legelisten.no", "https://vestfjordtannlege-ekte.no"];
+        const q3PageFetchesAttempted = fetchCallsDuringQ3.filter((u) => q3CandidateHostUrls.includes(u));
+        assertTrue(!q3PageFetchesAttempted.includes("https://legelisten.no"), "q3c: the excluded aggregator host was NEVER fetched (host-only URL, matching tier 2's actual candidateUrlGuess construction)");
+        assertEq(q3PageFetchesAttempted.length, 1, "q3c2: exactly ONE of the two candidate host URLs was ever fetched — only the verified second host, proving the isBad exclusion actually prevented a fetch of the first");
         const row = readQueueRow("wd-nav-multihost");
         assertEq(row.reason, "navnesok_fallback", "q3d: queue row tagged reason='navnesok_fallback'");
         assertEq(searchCallsQ3.length, 1, "q4: exactly ONE braveSearch-seam call per candidate row, even though TWO host attempts were made against its one result set — cost control");
