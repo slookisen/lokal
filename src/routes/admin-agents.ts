@@ -2779,6 +2779,8 @@ Godkjenn KUN hvis teksten er:
 - fri for åpenbart oppstykket, avkuttet eller ødelagt tekst,
 - faktisk informativ om produsenten, ikke bare en generisk floskel.
 
+Vurder ikke lengde, ikke volum — vurder KUN om teksten fremhever DENNE produsentens særegne egenskaper (produkter, sted, driftsform, historie, utmerkelser): en kort tekst som konkret navngir slikt skal godkjennes selv om den er kort, mens en lang men trekk-løs/generisk tekst skal avvises selv om den er lang. Kort-men-spesifikk = godkjenn; trekk-løs/generisk = avvis, uansett lengde.
+
 Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
 ${RFB_JUDGE_APPROVE_TOKEN}
 <kort begrunnelse>

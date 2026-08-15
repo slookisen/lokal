@@ -30,6 +30,24 @@
  *       cheap-bar outcome and the final cascade result (LLM mocked to return
  *       the fixture's own expected label — this proves the plumbing, not
  *       live model accuracy).
+ *   (e) kriterium 8 (dev-request rfb-kvalitetsgate-og-retroskann, "Daniels
+ *       beslutning 2026-08-15" section): the recalibrated judge's
+ *       short-but-specific principle ("ikke lengde, ikke volum. Kort-men-
+ *       spesifikk = godkjenn; trekk-løs/generisk = avvis"), proven against
+ *       13 REAL verbatim `agents.description` catalog texts (as of
+ *       2026-08-15T02:1xZ) that Daniel reviewed live and confirmed should
+ *       pass. Calls judgeRfbAboutCandidate() DIRECTLY (same direct-call
+ *       pattern as section (a) above) rather than going through
+ *       meetsRfbAboutQualityBar() — several of these 13 real texts are
+ *       under 80 chars, and meetsRfbAboutQualityBar()'s meetsAboutCheapBar()
+ *       prefilter has an 80-char floor that the real retro-scan code path
+ *       (rfbRetroScanShouldNull, admin-agents.ts) never applies (it calls
+ *       judgeRfbAboutCandidate directly, bypassing that floor entirely — see
+ *       that function's own code), so routing these fixtures through the
+ *       cheap-bar prefilter would wrongly fail known-good short-but-real
+ *       text before it ever reached the judge. fetch is mocked to return
+ *       GODKJENN for each (same mocking convention as the rest of this file
+ *       — this proves plumbing, not live model accuracy).
  *
  * Mocks globalThis.fetch (repo convention, no live network access in the
  * sandbox) — never calls the real Anthropic API.
@@ -457,6 +475,136 @@ export function runAdminAgentsRfbQualityJudgeTests(
         const result = await meetsRfbAboutQualityBar(fx.text, fx.producerName, "about");
         assertEq(result, fx.expectFinal, `${fx.label}: final cascade result`);
         assertEq(calLlmCalled, fx.expectCheapBarPass, `${fx.label}: LLM invoked iff the cheap prefilter passed`);
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (e) Kriterium 8 — recalibrated-judge known-good set: 13 REAL verbatim
+      //     agents.description catalog texts (2026-08-15T02:1xZ), Daniel-
+      //     reviewed, "short-but-specific = approve" (dev-request
+      //     rfb-kvalitetsgate-og-retroskann, "Implementer-spec for
+      //     kriterium 8"). Calls judgeRfbAboutCandidate() DIRECTLY — NOT
+      //     meetsRfbAboutQualityBar() — because several of these real texts
+      //     are under meetsAboutCheapBar()'s 80-char floor, which the real
+      //     retro-scan decision path (rfbRetroScanShouldNull) never applies
+      //     (it calls judgeRfbAboutCandidate directly too). fetch is mocked
+      //     to GODKJENN for every fixture — this proves the judge's plumbing
+      //     accepts short-but-specific text end to end, not live model
+      //     accuracy (matches this file's own documented caveat above).
+      // ═══════════════════════════════════════════════════════════════════
+      interface Kriterium8Fixture {
+        label: string;
+        agentId: string;
+        producerName: string;
+        description: string;
+      }
+
+      // Agent id column per the dev-request's verbatim table. "Opedalstunet"
+      // has a name collision in the catalog: `09c66e41-…` (plain name
+      // "Opedalstunet", description "Oppdaget via Brreg NACE-søk" — a
+      // discovery-source placeholder, NOT known-good) vs. `789ab32b-…` (name
+      // "Opedalstunet — Lofthus, Hardanger", description below, matches the
+      // "kort men med sted/vareprofil/særtrekk" pattern) — the dev-request
+      // explicitly directs using `789ab32b-…`; flagged here as the judgment
+      // call it is, not a silent assumption.
+      const KRITERIUM_8_KNOWN_GOOD: Kriterium8Fixture[] = [
+        {
+          label: "k8-1 Vika Frukt og Grønt",
+          agentId: "760e0e49-1039-4dc3-a904-6ff4bf0411a1",
+          producerName: "Vika Frukt og Grønt",
+          description: "Frukt- og grøntbutikk i Vika, Oslo sentrum. Ferske varer daglig.",
+        },
+        {
+          label: "k8-2 Vulkan Frukt og Grønt",
+          agentId: "50651bd2-0541-4773-8efe-0b94035995eb",
+          producerName: "Vulkan Frukt og Grønt",
+          description: "Frukt- og grøntbutikk i Mathallen på Vulkan. Kvalitetsvarer og sesongprodukter.",
+        },
+        {
+          label: "k8-3 Grønland Grønt Agent",
+          agentId: "16797909-f7ed-431f-bc2f-b3ccf9f9bc06",
+          producerName: "Grønland Grønt Agent",
+          description: "Dagligvarebutikk på Grønland med ferskt, rimelig grønt fra lokale leverandører.",
+        },
+        {
+          label: "k8-4 Løren Frukt og Grønt",
+          agentId: "a30c5ebc-b4b9-4bf0-b3c6-5a6729da2dd9",
+          producerName: "Løren Frukt og Grønt",
+          description: "Frukt- og grøntbutikk på Løren, Oslo. Ferskt utvalg med lokalt fokus.",
+        },
+        {
+          label: "k8-5 Biri Landhandel",
+          agentId: "08111fbf-864b-4c49-83c6-cef378c61130",
+          producerName: "Biri Landhandel",
+          description: "Delikatessebutikk og landhandel med sjølvbetjening via Vipps.",
+        },
+        {
+          label: "k8-6 Naukeset — Telemark",
+          agentId: "86b29c12-b1b3-474d-97ca-cc52de473e9d",
+          producerName: "Naukeset — Telemark",
+          description: "Grønnsaksprodusent i Bø, Telemark — sesongbaserte grønnsaker.",
+        },
+        {
+          label: "k8-7 Opedalstunet — Lofthus, Hardanger (disambiguated: 789ab32b-…, NOT the 09c66e41-… placeholder row)",
+          agentId: "789ab32b-8f49-4e0a-8457-600ab34d1cf9",
+          producerName: "Opedalstunet — Lofthus, Hardanger",
+          description: "Fruktgård i Lofthus med sider, juice, syltetøy og kaker på bestilling",
+        },
+        {
+          label: "k8-8 Bergen Mathall",
+          agentId: "fb674aa8-f3ec-4441-a7a2-baf2db061a68",
+          producerName: "Bergen Mathall",
+          description: "Vestlandets framtidige mathall i Bergen — mat, kultur og kunst",
+        },
+        {
+          label: "k8-9 Lyse Insecta",
+          agentId: "888e4668-8ec3-4767-8553-a94d00ab5096",
+          producerName: "Lyse Insecta",
+          description: "Birøkteri i Sandnes med honning, dronninger og birøktprodukter.",
+        },
+        {
+          label: "k8-10 Jenseg Bakeri og Konditori",
+          agentId: "8d5cf2a7-7a4b-41ad-b288-a608ac7eb329",
+          producerName: "Jenseg Bakeri og Konditori",
+          description: "Jenseg Bakeri og Konditori i Sarpsborg bakar tradisjonelle bakevarer og brød.",
+        },
+        {
+          label: "k8-11 Brandstorp Gårdsbutikk",
+          agentId: "23c8ae52-72ff-4a4b-9d4e-f99c4ee6d0c1",
+          producerName: "Brandstorp Gårdsbutikk",
+          description: "Brandstorp Gårdsbutikk — gårdsutsalg med lokale produkt i Sarpsborg.",
+        },
+        {
+          label: "k8-12 Skakadalskurv",
+          agentId: "e4695cdd-27a2-4c08-9081-0d145792ded9",
+          producerName: "Skakadalskurv",
+          description: "Gullvinnar kurv-NM 2024 — tradisjonell sauekurv frå Øygarden gard i Vang",
+        },
+        {
+          label: "k8-13 rotfesta da",
+          agentId: "b95e0f68-e6ff-47c3-b7f5-d69646882b09",
+          producerName: "rotfesta da",
+          description:
+            "Tre ungdommar frå Vindafjord dyrkar Astrix og Fakse potet på hobbybasert vis. Henting på gård i postnummer 5585, betaling via Vipps.",
+        },
+      ];
+
+      assertEq(
+        KRITERIUM_8_KNOWN_GOOD.length,
+        13,
+        "k8-sanity: all 13 kriterium-8 known-good catalog fixtures are present",
+      );
+
+      for (const fx of KRITERIUM_8_KNOWN_GOOD) {
+        globalThis.fetch = (async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            content: [{ type: "text", text: "GODKJENN\nKort, men spesifikk om denne produsentens sted/vareprofil/særtrekk." }],
+          }),
+        })) as unknown as typeof fetch;
+
+        const r = await judgeRfbAboutCandidate(fx.description, fx.producerName, "description");
+        assertEq(r.approved, true, `${fx.label} (${fx.agentId}): recalibrated judge approves the real verbatim description`);
       }
     } catch (err: any) {
       failed++;
