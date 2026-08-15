@@ -42,6 +42,11 @@
  *       "no usable source" (cause:'source_fetch_failed'), never fabricated.
  *   (i) generation returning the escape sentinel (not enough material) is
  *       treated as generation_failed — no write, no fabrication.
+ *   (i2/i3) deterministic cheap-bar prefilter (classifyAboutCheapBar) runs
+ *       BEFORE the judge: a foreign-language candidate (i2) or a candidate
+ *       containing the Unicode replacement character (i3) is rejected as
+ *       generation_failed_cheap_bar — no write, and the judge mock is
+ *       proven NOT called for that field at all.
  */
 
 import Database from "better-sqlite3";
@@ -197,6 +202,26 @@ export function runAdminAgentsTynneProfilerImproveTests(
           }
           const nameMatch = prompt.match(/for produsenten "([^"]+)"/);
           const name = nameMatch ? nameMatch[1] : "Ukjent Gard";
+          if (name === "Cheap Bar Foreign Gard") {
+            // Deliberately English, no Norwegian function word and no æøå —
+            // simulates the generation model not obeying "skriv på norsk",
+            // exercising the cheap-bar prefilter's "foreign" rejection
+            // (test block after (i) below). No Norwegian-marker substrings
+            // (see NORWEGIAN_WORD_MARKERS, search-enrich.ts) appear.
+            return anthropicResponse(
+              "This family-run farm in a valley region produces goat cheese using milk from their own herd, " +
+              "following methods passed down through generations. The cheese has won national quality awards " +
+              "and is loved by customers nationwide.",
+            );
+          }
+          if (name === "Cheap Bar Mangled Gard") {
+            // Contains the Unicode replacement character (U+FFFD) — simulates
+            // a byte-level mid-character truncation upstream, exercising the
+            // cheap-bar prefilter's "mangled" rejection.
+            return anthropicResponse(
+              `${name} ligger i Valdres og lager geitost av melk fra egne geiter, men datastrømmen ble skadet: opplevelser p�.`,
+            );
+          }
           const isAboutKind = prompt.includes("utfyllende «Om produsenten»-tekst");
           let candidate = `${name} lager geitost i Valdres av melk fra egne geiter og har mottatt Spesialitetsmerket fra Matmerk.`;
           if (isAboutKind && name === "Partial Reject Gard") {
@@ -541,6 +566,66 @@ export function runAdminAgentsTynneProfilerImproveTests(
         assertEq(rowResult.fields.description.outcome, "generation_failed", "i2: response reports generation_failed");
         const queueRow = readQueueRow("tp-genfail");
         assertEq(queueRow.cause, "generation_failed", "i3: queue cause updated to generation_failed");
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (i2) deterministic cheap-bar prefilter, foreign-language candidate:
+      //      a generated candidate that isn't Norwegian (no æøå, no common
+      //      Norwegian function word) must be rejected BEFORE the judge ever
+      //      sees it — classifyAboutCheapBar's "foreign" class — never
+      //      written, and the judge must NOT be called for this field at all
+      //      (proves the prefilter short-circuits, it doesn't just add a
+      //      second opinion).
+      // ═══════════════════════════════════════════════════════════════════
+      clearAll();
+      {
+        insertAgent({ id: "tp-cb-foreign", name: "Cheap Bar Foreign Gard", description: "kort tekst" });
+        insertKnowledge("tp-cb-foreign", { website: "https://cheapbarforeigngard.example" });
+        insertQueueRow({ agentId: "tp-cb-foreign", agentName: "Cheap Bar Foreign Gard", flaggedFields: ["description"], priorityTier: "description_only" });
+        fixtures.set("https://cheapbarforeigngard.example", htmlResponse(SOURCE_HTML("Cheap Bar Foreign Gard")));
+
+        const before = readAgent("tp-cb-foreign");
+        const judgeCallsBefore = judgeCallCount;
+        const genCallsBefore = genCallCount;
+        const r = await callImprove({ agentIds: ["tp-cb-foreign"], apply: true });
+        const after = readAgent("tp-cb-foreign");
+
+        assertTrue(genCallCount > genCallsBefore, "i2-1: generation call was made (a candidate WAS produced)");
+        assertEq(judgeCallCount, judgeCallsBefore, "i2-2: judge was NOT called — the foreign candidate never reached it");
+        assertEq(after.description, before.description, "i2-3: no write — no fabrication reaches a producer's public profile");
+        const rowResult = r.body.results.find((x: any) => x.agent_id === "tp-cb-foreign");
+        assertEq(rowResult.fields.description.outcome, "generation_failed_cheap_bar", "i2-4: response reports generation_failed_cheap_bar");
+        const queueRow = readQueueRow("tp-cb-foreign");
+        assertEq(queueRow.cause, "generation_failed_cheap_bar", "i2-5: queue cause updated to generation_failed_cheap_bar");
+        assertEq(queueRow.status, "pending", "i2-6: row stays pending — not resolved");
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (i3) deterministic cheap-bar prefilter, mangled-Unicode candidate:
+      //      a generated candidate containing the Unicode replacement
+      //      character (U+FFFD, "�") must be rejected BEFORE the judge, same
+      //      as (i2) — classifyAboutCheapBar's "mangled" class.
+      // ═══════════════════════════════════════════════════════════════════
+      clearAll();
+      {
+        insertAgent({ id: "tp-cb-mangled", name: "Cheap Bar Mangled Gard", description: "kort tekst" });
+        insertKnowledge("tp-cb-mangled", { website: "https://cheapbarmangledgard.example" });
+        insertQueueRow({ agentId: "tp-cb-mangled", agentName: "Cheap Bar Mangled Gard", flaggedFields: ["description"], priorityTier: "description_only" });
+        fixtures.set("https://cheapbarmangledgard.example", htmlResponse(SOURCE_HTML("Cheap Bar Mangled Gard")));
+
+        const before = readAgent("tp-cb-mangled");
+        const judgeCallsBefore = judgeCallCount;
+        const genCallsBefore = genCallCount;
+        const r = await callImprove({ agentIds: ["tp-cb-mangled"], apply: true });
+        const after = readAgent("tp-cb-mangled");
+
+        assertTrue(genCallCount > genCallsBefore, "i3-1: generation call was made (a candidate WAS produced)");
+        assertEq(judgeCallCount, judgeCallsBefore, "i3-2: judge was NOT called — the mangled candidate never reached it");
+        assertEq(after.description, before.description, "i3-3: no write — mangled Unicode never reaches a producer's public profile");
+        const rowResult = r.body.results.find((x: any) => x.agent_id === "tp-cb-mangled");
+        assertEq(rowResult.fields.description.outcome, "generation_failed_cheap_bar", "i3-4: response reports generation_failed_cheap_bar");
+        const queueRow = readQueueRow("tp-cb-mangled");
+        assertEq(queueRow.cause, "generation_failed_cheap_bar", "i3-5: queue cause updated to generation_failed_cheap_bar");
       }
 
       // ═══════════════════════════════════════════════════════════════════

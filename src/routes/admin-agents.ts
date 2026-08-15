@@ -3754,8 +3754,23 @@ router.get("/tynne-profiler-queue", (req: Request, res: Response) => {
 // closed null on ANY doubt (missing key / network / non-200 / bad JSON /
 // unexpected shape / the sentinel). The candidate's actual FITNESS to
 // publish is never trusted to the generator or to this route's own code —
-// it is decided ENTIRELY by the existing judgeRfbAboutCandidate cascade
-// (Step 3), exactly like every other write path in this file.
+// it must first clear classifyAboutCheapBar's deterministic prefilter
+// (mangled Unicode / boilerplate / non-Norwegian — see the cheap-bar call in
+// processTynneProfilerRow, Step 3, mirroring rfbRetroScanShouldNull's own
+// ordering), and only then the existing judgeRfbAboutCandidate cascade,
+// exactly like every other write path in this file. IMPORTANT CAVEAT this
+// comment previously overstated: the judge is never passed the source text,
+// so it cannot and does not verify factual grounding against it — it only
+// judges the candidate in isolation for coherence, genericness, and
+// nav/boilerplate leakage (plus, as a soft instruction rather than a
+// deterministic check, "ekte norsk prosa"). The actual "no fabrication"
+// guarantee rests entirely on the GENERATION prompt's own instruction-
+// following (see generateTynneProfilerCandidate below), not on any
+// downstream re-check against the source — nothing in this route's
+// pipeline re-verifies a candidate's claims against the fetched page text.
+// This is inherited unchanged from the gårdssalg precedent's identical
+// architecture (generateGardssalgAboutFromSource + meetsGardssalgAbout-
+// QualityBar, routes/opplevelser.ts), not a new gap introduced here.
 //
 // Fields NOT re-verified here (deliberately, matching the write path this
 // mirrors): a non-blank agent_knowledge.website is treated as already
@@ -3773,6 +3788,7 @@ type TynneProfilerFieldOutcome =
   | "source_aggregator_host"
   | "source_fetch_failed"
   | "generation_failed"
+  | "generation_failed_cheap_bar" // candidate generated, but classifyAboutCheapBar rejected it (mangled/boilerplate/foreign) BEFORE the judge ever saw it — see the cheap-bar prefilter call in processTynneProfilerRow below
   | "judge_rejected"
   | "judge_infra_failure"
   | "write_lock_race"; // approved, but the immediate-before-write re-check found the row/field newly locked
@@ -3801,6 +3817,7 @@ const TYNNE_PROFILER_ROW_CAUSE_PRIORITY: readonly TynneProfilerFieldOutcome[] = 
   "write_lock_race",
   "judge_infra_failure",
   "generation_failed",
+  "generation_failed_cheap_bar",
   "judge_rejected",
 ];
 
@@ -4239,6 +4256,28 @@ async function processTynneProfilerRow(
             });
             if (!candidate) {
               fieldResults[f] = { field: f, outcome: "generation_failed" };
+              continue;
+            }
+            // Deterministic cheap-bar prefilter BEFORE the judge — same
+            // ordering as rfbRetroScanShouldNull above (classifyAboutCheapBar
+            // first, only escalate to the judge when the candidate isn't
+            // mangled/boilerplate/foreign). The judge's "ekte norsk prosa"
+            // instruction is a soft LLM judgment call, not a deterministic
+            // gate, so a source page that isn't Norwegian (or that produced
+            // Unicode-mangled/boilerplate-dominated text) must never reach a
+            // producer's public profile on the judge's leniency alone.
+            // "too_short" is deliberately NOT rejected here (same as
+            // rfbRetroScanShouldNull): short is not evidence of WRONG, only
+            // of incomplete, and generateTynneProfilerCandidate's own prompt
+            // already targets a length range — a too-short candidate still
+            // goes on to the judge, exactly like the retro-scan path.
+            const cheapBarClass = classifyAboutCheapBar(candidate);
+            if (cheapBarClass === "mangled" || cheapBarClass === "boilerplate" || cheapBarClass === "foreign") {
+              fieldResults[f] = {
+                field: f,
+                outcome: "generation_failed_cheap_bar",
+                reasoning: `fails the cheap bar (${cheapBarClass})`,
+              };
               continue;
             }
             const verdict = await judgeRfbAboutCandidate(candidate, snapshot.name, f);
