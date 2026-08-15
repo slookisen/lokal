@@ -375,7 +375,7 @@ import {
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
 import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
-import { renderPage, shouldEscalateToRender } from "../services/render-page";
+import { renderPage, shouldEscalateToRender, selectRenderBackend } from "../services/render-page";
 // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
 // hygiene, item 5 ("wrong_content_rate holdout") — the fail-closed LLM judge
 // + candidate sampler for POST /admin/experiences-wrong-content-rate below.
@@ -1442,6 +1442,36 @@ type CrFetchOutcome =
       // optional — no existing caller/test that destructures a CrFetchOutcome
       // is affected by an unset optional field.
       pagesFetchedPaths?: string[];
+      /**
+       * What the headless escalation did on this call. ADDITIVE and optional —
+       * only crFetchGardssalgContent sets it.
+       *
+       * Daniel, live session 2026-08-15. 67 North came back with 19 visible
+       * characters AFTER the escalation shipped, and nothing in any response
+       * could say whether the render had run and failed, or never fired at
+       * all. Those have completely different remedies — a missing
+       * RENDER_WORKER_KEY versus a site the browser also cannot read — and
+       * collapsing them is exactly the failure fetch-page.ts's whole module
+       * doc exists to prevent. The escalation reintroduced it: a render
+       * failure is deliberately non-fatal, and non-fatal was implemented as
+       * SILENT.
+       *
+       * `chars_before`/`chars_after` are the visible-text lengths on either
+       * side of the render, so "it ran and helped" is distinguishable from
+       * "it ran and the page really is empty" without re-deriving anything.
+       */
+      render?: {
+        attempted: boolean;
+        /** Which backend renderPage would use — "worker" needs RENDER_WORKER_KEY. */
+        backend: "worker" | "local";
+        ok?: boolean;
+        /** Named failure reason from render-page.ts. Absent on success. */
+        reason?: string;
+        detail?: string;
+        chars_before: number;
+        chars_after?: number;
+        elapsed_ms?: number;
+      };
     }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
@@ -1961,8 +1991,10 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   // into a regression.
   let primaryHtml = primary.html;
   let primaryUrl = primary.finalUrl || fetchUrl;
+  let renderReport: NonNullable<Extract<CrFetchOutcome, { ok: true }>["render"]> | undefined;
   if (gardssalgHeadlessFallbackEnabled() && shouldEscalateToRender(primaryHtml, { bytes: primary.bytes })) {
     const renderFn = gsRenderPageImplForTesting ?? renderPage;
+    const charsBefore = visibleTextOf(primaryHtml).length;
     const rendered = await renderFn(primaryUrl, {
       userAgent: CR_UA,
       timeoutMs: GARDSSALG_RENDER_TIMEOUT_MS,
@@ -1970,6 +2002,27 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
     if (rendered.ok) {
       primaryHtml = rendered.html;
       primaryUrl = rendered.finalUrl;
+      renderReport = {
+        attempted: true,
+        backend: selectRenderBackend(),
+        ok: true,
+        chars_before: charsBefore,
+        chars_after: rendered.text.length,
+        elapsed_ms: rendered.elapsedMs,
+      };
+    } else {
+      // Still non-fatal — we keep the raw HTML — but no longer silent. The
+      // reason is what tells an operator whether the remedy is configuration
+      // (renderer_unavailable → RENDER_WORKER_KEY missing) or the site itself.
+      renderReport = {
+        attempted: true,
+        backend: selectRenderBackend(),
+        ok: false,
+        reason: rendered.reason,
+        detail: rendered.detail,
+        chars_before: charsBefore,
+        elapsed_ms: rendered.elapsedMs,
+      };
     }
   }
 
@@ -2059,7 +2112,7 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths, render: renderReport };
 }
 
 const GS_CR_DEFAULT_LIMIT = 25;
@@ -2217,6 +2270,21 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     outcome: GardssalgProductsOutcome;
   }> = [];
 
+  /**
+   * Per-row outcome of the headless escalation. A row appears here ONLY when
+   * the escalation actually fired, so an absent entry means the rule never
+   * triggered — which is itself the answer to a different question than
+   * "it fired and failed".
+   *
+   * Daniel, 2026-08-15: 67 North came back with 19 visible characters after
+   * the escalation shipped, and no response could say which of those two had
+   * happened. They have opposite remedies (a missing RENDER_WORKER_KEY versus
+   * a site the browser also cannot read).
+   */
+  const renderDiagnostic: Array<
+    { provider_id: string } & NonNullable<Extract<CrFetchOutcome, { ok: true }>["render"]>
+  > = [];
+
   async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
     const providerId = t.id;
 
@@ -2301,6 +2369,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       try { recordProviderHomepageFetchResult(providerId, true); } catch { /* best-effort */ }
     }
     scanned++;
+    // Reported UNCONDITIONALLY, before any eligibility branch. The products
+    // diagnostic below only fires when the products column is blank, so
+    // hanging render telemetry off it would hide the escalation's outcome for
+    // exactly the rows that already have some content — which is not the
+    // question being asked. A row that renders badly matters whether or not
+    // its products happen to be filled.
+    if (fetched.render) {
+      renderDiagnostic.push({ provider_id: providerId, ...fetched.render });
+    }
     const { primaryHtml, combinedHtml } = fetched;
 
     // ── Extract content ─────────────────────────────────────────────
@@ -2667,6 +2744,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // branch this run (see productsDiagnostic's doc comment above) — additive
     // bucket, reporting-only, changes no write behavior.
     products_diagnostic: productsDiagnostic,
+    render_diagnostic: renderDiagnostic,
   });
 });
 

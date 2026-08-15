@@ -510,6 +510,58 @@ export function runOpplevelserGardssalg5dHardeningTests(
           );
         }
 
+        // ── the render report: "never fired" vs "fired and failed" ──────────
+        //
+        // Daniel, 2026-08-15. 67 North came back with 19 visible characters
+        // AFTER the escalation shipped, and nothing in any response could say
+        // whether the render had run and failed or never fired at all. Those
+        // have opposite remedies — a missing RENDER_WORKER_KEY versus a site
+        // the browser also cannot read — and the non-fatal failure path had
+        // been implemented as SILENT, reintroducing the exact collapse
+        // fetch-page.ts's module doc exists to prevent.
+        {
+          process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => ({
+            ok: false, reason: "renderer_unavailable", detail: "no worker key and no playwright-core", elapsedMs: 3,
+          }));
+          globalThis.fetch = mkFetch([]);
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          const diag = (r.body.render_diagnostic as any[] | undefined)?.find((d) => d.provider_id === "p5-alone");
+          assertTrue(!!diag, "5h-e7: a failed render is REPORTED, not swallowed");
+          assertEq(diag?.attempted, true, "5h-e8: the report says the escalation was attempted");
+          assertEq(
+            diag?.reason,
+            "renderer_unavailable",
+            "5h-e9: the named reason survives to the response — this is what says the remedy is configuration, not the site",
+          );
+          assertEq(diag?.ok, false, "5h-e10: a failed render is not reported as ok");
+        }
+
+        // The other half of the distinction: escalation that never fired at
+        // all reports NOTHING, so an absent `render` is itself information.
+        {
+          delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => ({
+            ok: true, html: renderedHtml, text: "x", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1,
+          }));
+          globalThis.fetch = mkFetch([]);
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          const diag = (r.body.render_diagnostic as any[] | undefined)?.find((d) => d.provider_id === "p5-alone");
+          assertEq(
+            diag ?? null,
+            null,
+            "5h-e11: an escalation that never fired reports null — distinguishable from one that fired and failed",
+          );
+        }
+
         opplevelserMod.__setGardssalgRenderPageImplForTesting(null);
         if (prevFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
         else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevFlag;
