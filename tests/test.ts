@@ -38879,6 +38879,8 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-gardssalg-review-queues-staleness: unexpected error: " + String(err?.message || err));
+  }
+});
 
 // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke: the A/B
 // template variant for gårdssalg outreach (renderer guards + static source
