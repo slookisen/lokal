@@ -980,8 +980,13 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       assertEq(noBodyFieldsRegression.status, 200, "l19: providerIds-only body (no cohort/limit/offset) still -> 200");
       assertEq(
         Object.keys(noBodyFieldsRegression.body).sort(),
-        ["cohort", "dry_run", "scope", "success", "summary", "would_enqueue"].sort(),
-        "l19b: unpaginated response carries today's keys plus the new `cohort` field — no `pagination` key sneaking in"
+        ["cohort", "diagnostics", "dry_run", "scope", "success", "summary", "would_enqueue"].sort(),
+        // `diagnostics` added 2026-08-15 (see section (k)): additive and
+        // unconditional, so it belongs in this pinned set. The assertion's
+        // real job is unchanged — `pagination` must still never appear on an
+        // unpaginated call, and it catches that the same way it just caught
+        // this key.
+        "l19b: unpaginated response carries today's keys plus `cohort`/`diagnostics` — no `pagination` key sneaking in"
       );
       assertEq(noBodyFieldsRegression.body.cohort, "gardssalg", "l19c: cohort defaults to 'gardssalg' when omitted, same as the GET route");
 
@@ -1119,6 +1124,180 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         "prov-missing-source",
         "i6: homepage listing carries the pending row only — status filter is load-bearing (i3 fails if it is dropped, since approved would join)"
       );
+
+      // ── (k) what the routes were DROPPING on the way in ──────────────────
+      //
+      // Both endpoints above wire the verification service to the real
+      // crawler through a small adapter. That adapter existed in three
+      // hand-written copies, and each copy silently dropped a field the
+      // crawler had gone out of its way to report. Every assertion in this
+      // section fails if the routes go back to dropping one.
+      //
+      // Deliberately LAST in the file, and every row it needs is inserted
+      // here: sections (b)/(c)/(h)/(j) assert exact cohort counts and exact
+      // fetch counts, so a fixture added earlier would break them for reasons
+      // that have nothing to do with what it is testing. (Same shared-state
+      // hazard as the nace-discovery file's own header warns about.)
+      const opplevelserMod = require("./opplevelser") as typeof import("./opplevelser");
+      const prevRenderFlag = process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+
+      insertProvider.run({
+        id: "prov-transient-503", navn: "Tromsø Mikrobryggeri", hjemmeside: "https://bryggeri13.example.no",
+        org_nr: "998877665", kommune: "Tromsø", poststed: "Tromsø", telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "bryggeri", rfb_seed_source: null, content_source: "provider_site",
+      });
+      insertProvider.run({
+        id: "prov-js-shell", navn: "67 North Distillery", hjemmeside: "https://sekstisju-nord.example.no",
+        org_nr: "911223344", kommune: "Tromsø", poststed: "Tromsø", telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "destilleri", rfb_seed_source: null, content_source: "provider_site",
+      });
+
+      // The 67 North shape, measured 2026-08-15: a large scripted document
+      // whose visible text is the <title> and nothing else.
+      const jsShellHtml =
+        `<html><head><title>67 North Distillery</title><script src="/app.js"></script></head>` +
+        `<body><div id="root"></div><div data-payload="${"a".repeat(9_000)}"></div></body></html>`;
+
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const urlStr = String(url);
+        const host = new URL(urlStr).hostname;
+        if (host === "bryggeri13.example.no") {
+          // A transient 5xx — the exact 2026-08-13 incident shape.
+          return {
+            ok: false, status: 503, statusText: "Service Unavailable", text: async () => "",
+            arrayBuffer: async () => new ArrayBuffer(0),
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        if (host === "sekstisju-nord.example.no") {
+          return {
+            ok: true, status: 200, text: async () => jsShellHtml,
+            arrayBuffer: async () => new TextEncoder().encode(jsShellHtml).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
+        return {
+          ok: false, status: 404, statusText: "Not Found", text: async () => "",
+          arrayBuffer: async () => new ArrayBuffer(0),
+          headers: { get: () => null }, url: urlStr,
+        } as unknown as Response;
+      }) as typeof fetch;
+
+      // ── (k1-k4) persistence: a blip is not a verdict ──────────────────────
+      //
+      // `unreachable_transient` was added 2026-08-13 because one 5xx on
+      // bryggeri13.no was durably written as hjemmeside_verification=
+      // {verified:false} — indistinguishable afterwards from a producer whose
+      // page really carries no ownership evidence. It was only ever covered by
+      // service-level tests with a stub fetchFn, and THESE routes — the ones
+      // that actually perform the write — kept dropping `persistence` from
+      // their adapter, so the incident stayed live on the write path for two
+      // days after it was "fixed". This is that missing coverage.
+      delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+      const transientRes = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-transient-503"], apply: true },
+      });
+      assertEq(transientRes.status, 200, "k1: remediation on a 5xx host -> 200");
+      const transientRow = (transientRes.body.diagnostics as any[] | undefined)?.find(
+        (r) => r.provider_id === "prov-transient-503",
+      );
+      assertEq(
+        transientRow?.classification,
+        "unreachable_transient",
+        "k2: a transient 5xx classifies as unreachable_transient THROUGH THE ROUTE — fails the moment the adapter drops persistence",
+      );
+      const transientProvenance = expDb
+        .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+        .get("prov-transient-503") as { field_provenance: string | null } | undefined;
+      assertEq(
+        transientProvenance?.field_provenance ?? null,
+        null,
+        "k3: apply:true wrote NOTHING for it — a site we could not reach is not a producer we have judged",
+      );
+      assertEq(
+        (transientRes.body.summary as any)?.unverified,
+        0,
+        "k4: and it is not counted as unverified, which is what would have queued it for URL review",
+      );
+
+      // ── (k5-k9) the escalation record, on the only route that can see it ──
+      //
+      // content-refresh excludes rows that are not ownership-verified
+      // (isHjemmesideVerified), so a JS-built producer site is reachable ONLY
+      // through this route — which means this is the only place the render
+      // escalation can be observed for exactly the rows it was built for.
+      // Flag deliberately OFF here: the point is that the DECISION is
+      // reported, so "nothing rendered" is answerable without a second deploy.
+      const shellRes = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-js-shell"], apply: false },
+      });
+      assertEq(shellRes.status, 200, "k5: remediation dry-run on a JS shell -> 200");
+      const shellRow = (shellRes.body.diagnostics as any[] | undefined)?.find((r) => r.provider_id === "prov-js-shell");
+      assertEq(shellRow?.classification, "unverified", "k6: the shell cannot be verified — there is no text to match against");
+      assertTrue(
+        typeof shellRow?.page_chars === "number" && shellRow.page_chars < 200,
+        "k7: page_chars says the verdict was reached on a near-empty page, not on a site we read in full",
+      );
+      assertEq(
+        shellRow?.render?.flag_enabled,
+        false,
+        "k8: the escalation record survives the adapter into the row — and names the flag as the reason nothing rendered",
+      );
+      assertEq(
+        shellRow?.render?.eligible,
+        true,
+        "k9: eligible:true is what makes k8 actionable — this page WOULD render, so the flag is the remedy",
+      );
+
+      // ── (k10-k12) flag ON: the render reaches these rows and is measured ──
+      process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+      const renderedShellHtml =
+        `<html><head><title>67 North Distillery</title></head><body><p>` +
+        "67 North Distillery, Tromsø. Org.nr 911 223 344. Vi destillerer akevitt og gin på Kvaløya. ".repeat(4) +
+        `</p></body></html>`;
+      const renderedShellText = renderedShellHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => ({
+        ok: true,
+        html: renderedShellHtml,
+        text: renderedShellText,
+        finalUrl: "https://sekstisju-nord.example.no",
+        elapsedMs: 42,
+      }));
+      const renderedRes = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-js-shell"], apply: false },
+      });
+      const renderedRow = (renderedRes.body.diagnostics as any[] | undefined)?.find((r) => r.provider_id === "prov-js-shell");
+      assertEq(
+        renderedRow?.render?.attempted,
+        true,
+        "k10: with the flag on, the escalation fires on a row content-refresh would never have reached",
+      );
+      assertTrue(
+        (renderedRow?.page_chars ?? 0) > (shellRow?.page_chars ?? 0),
+        "k11: the rendered DOM is what the evidence match now reads — page_chars grew for the same producer",
+      );
+      // The payoff, and the whole reason the escalation exists: a producer
+      // that could not be verified from its source HTML verifies from its
+      // rendered DOM, and therefore stops being invisible to every gate
+      // downstream that keys on isHjemmesideVerified.
+      assertEq(
+        renderedRow?.classification,
+        "verified",
+        "k12: rendering turns an unverifiable JS shell into a verified producer — the enrichment chain unblocks from here",
+      );
+
+      opplevelserMod.__setGardssalgRenderPageImplForTesting(null);
+      if (prevRenderFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+      else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevRenderFlag;
     } catch (err: any) {
       failed++;
       failures.push(

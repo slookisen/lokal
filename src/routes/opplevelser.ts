@@ -302,6 +302,7 @@ import {
   GS_WV_SCOPES,
   GS_WV_COHORTS,
   type GsWvFetchFn,
+  type GsWvFetchResult,
   type GsWvScope,
   type GsWvCohort,
   type GsWvProducerRow,
@@ -375,7 +376,12 @@ import {
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
 import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
-import { renderPage, shouldEscalateToRender, selectRenderBackend } from "../services/render-page";
+import {
+  renderPage,
+  shouldEscalateToRender,
+  selectRenderBackend,
+  type RenderEscalationDiagnostic,
+} from "../services/render-page";
 // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
 // hygiene, item 5 ("wrong_content_rate holdout") — the fail-closed LLM judge
 // + candidate sampler for POST /admin/experiences-wrong-content-rate below.
@@ -1444,7 +1450,9 @@ type CrFetchOutcome =
       pagesFetchedPaths?: string[];
       /**
        * What the headless escalation did on this call. ADDITIVE and optional —
-       * only crFetchGardssalgContent sets it.
+       * only crFetchGardssalgContent sets it (crFetchHomepageContent, the other
+       * producer of this union, never escalates), so `undefined` means "this
+       * fetcher has no escalation", never "the escalation declined".
        *
        * Daniel, live session 2026-08-15. 67 North came back with 19 visible
        * characters AFTER the escalation shipped, and nothing in any response
@@ -1456,22 +1464,13 @@ type CrFetchOutcome =
        * failure is deliberately non-fatal, and non-fatal was implemented as
        * SILENT.
        *
-       * `chars_before`/`chars_after` are the visible-text lengths on either
-       * side of the render, so "it ran and helped" is distinguishable from
-       * "it ran and the page really is empty" without re-deriving anything.
+       * The first fix (PR #604) emitted this only when a render was ATTEMPTED,
+       * which left the SAME collapse one step earlier — flag-off and
+       * not-eligible were both just an absent field. RenderEscalationDiagnostic
+       * carries `flag_enabled`/`eligible` for exactly that reason; see its own
+       * doc comment.
        */
-      render?: {
-        attempted: boolean;
-        /** Which backend renderPage would use — "worker" needs RENDER_WORKER_KEY. */
-        backend: "worker" | "local";
-        ok?: boolean;
-        /** Named failure reason from render-page.ts. Absent on success. */
-        reason?: string;
-        detail?: string;
-        chars_before: number;
-        chars_after?: number;
-        elapsed_ms?: number;
-      };
+      render?: RenderEscalationDiagnostic;
     }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
@@ -1991,38 +1990,44 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   // into a regression.
   let primaryHtml = primary.html;
   let primaryUrl = primary.finalUrl || fetchUrl;
-  let renderReport: NonNullable<Extract<CrFetchOutcome, { ok: true }>["render"]> | undefined;
-  if (gardssalgHeadlessFallbackEnabled() && shouldEscalateToRender(primaryHtml, { bytes: primary.bytes })) {
+  // BOTH decision bits are recorded, whatever they come out to, and the report
+  // is emitted on every successful fetch — see RenderEscalationDiagnostic's
+  // doc comment for why "the field is absent" was not a good enough answer.
+  //
+  // visibleTextOf runs here as well as inside shouldEscalateToRender, and the
+  // duplicate pass is deliberate: the pure rule stays the single authority on
+  // eligibility rather than being re-derived from a length this function
+  // happens to be holding. It is also cheaper than it looks — the rule
+  // short-circuits on bytes and on the absence of <script> BEFORE extracting
+  // any text, so a small or script-free page never pays for it twice.
+  const renderFlagEnabled = gardssalgHeadlessFallbackEnabled();
+  const renderEligible = shouldEscalateToRender(primaryHtml, { bytes: primary.bytes });
+  const renderReport: RenderEscalationDiagnostic = {
+    flag_enabled: renderFlagEnabled,
+    eligible: renderEligible,
+    attempted: renderFlagEnabled && renderEligible,
+    backend: selectRenderBackend(),
+    chars_before: visibleTextOf(primaryHtml).length,
+  };
+  if (renderReport.attempted) {
     const renderFn = gsRenderPageImplForTesting ?? renderPage;
-    const charsBefore = visibleTextOf(primaryHtml).length;
     const rendered = await renderFn(primaryUrl, {
       userAgent: CR_UA,
       timeoutMs: GARDSSALG_RENDER_TIMEOUT_MS,
     });
+    renderReport.elapsed_ms = rendered.elapsedMs;
     if (rendered.ok) {
       primaryHtml = rendered.html;
       primaryUrl = rendered.finalUrl;
-      renderReport = {
-        attempted: true,
-        backend: selectRenderBackend(),
-        ok: true,
-        chars_before: charsBefore,
-        chars_after: rendered.text.length,
-        elapsed_ms: rendered.elapsedMs,
-      };
+      renderReport.ok = true;
+      renderReport.chars_after = rendered.text.length;
     } else {
       // Still non-fatal — we keep the raw HTML — but no longer silent. The
       // reason is what tells an operator whether the remedy is configuration
       // (renderer_unavailable → RENDER_WORKER_KEY missing) or the site itself.
-      renderReport = {
-        attempted: true,
-        backend: selectRenderBackend(),
-        ok: false,
-        reason: rendered.reason,
-        detail: rendered.detail,
-        chars_before: charsBefore,
-        elapsed_ms: rendered.elapsedMs,
-      };
+      renderReport.ok = false;
+      renderReport.reason = rendered.reason;
+      renderReport.detail = rendered.detail;
     }
   }
 
@@ -2113,6 +2118,44 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
     /* malformed URL — primary homepage content still stands */
   }
   return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths, render: renderReport };
+}
+
+/**
+ * The ONE adapter from crFetchGardssalgContent to GsWvFetchFn, shared by every
+ * route that hands the website-verification service a live fetcher (the audit
+ * GET, the remediation POST, and the field-concordance scan).
+ *
+ * It exists because three byte-identical copies of it drifted, twice, in the
+ * same way — each copy silently DROPPING a field crFetchGardssalgContent had
+ * gone out of its way to report:
+ *
+ *   - `persistence`: added 2026-08-13 so a transient 5xx would classify as
+ *     `unreachable_transient` and write nothing (bryggeri13.no was durably
+ *     stamped verified:false by one blip — see GsWvClassification's doc
+ *     comment). The field-concordance copy was fixed; the audit and
+ *     remediation copies were not, so the incident stayed open on the very
+ *     routes that WRITE the stamp. Only the service-level tests covered it,
+ *     which is why nothing failed.
+ *   - `render`: the headless escalation's record, which is only observable
+ *     through these routes at all (they are the only gårdssalg fetchers that
+ *     reach rows that are not yet ownership-verified).
+ *
+ * A shared adapter is not a style preference here: every field this contract
+ * grows is, by construction, one a caller needed and could not see.
+ */
+function gsWvFetchFnFromGardssalgCrawler(): GsWvFetchFn {
+  return async (homepageUrl: string) => {
+    const fetched = await crFetchGardssalgContent(homepageUrl);
+    if (!fetched.ok) {
+      return { ok: false, reason: fetched.reason, persistence: fetched.persistence };
+    }
+    return {
+      ok: true,
+      pageText: gardssalgPageText(fetched.combinedHtml),
+      title: gardssalgPageTitle(fetched.primaryHtml),
+      render: fetched.render,
+    };
+  };
 }
 
 const GS_CR_DEFAULT_LIMIT = 25;
@@ -2271,15 +2314,21 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   }> = [];
 
   /**
-   * Per-row outcome of the headless escalation. A row appears here ONLY when
-   * the escalation actually fired, so an absent entry means the rule never
-   * triggered — which is itself the answer to a different question than
-   * "it fired and failed".
+   * Per-row record of the headless escalation — the DECISION as well as the
+   * outcome, one entry for every row whose homepage was fetched successfully.
    *
    * Daniel, 2026-08-15: 67 North came back with 19 visible characters after
-   * the escalation shipped, and no response could say which of those two had
-   * happened. They have opposite remedies (a missing RENDER_WORKER_KEY versus
-   * a site the browser also cannot read).
+   * the escalation shipped, and no response could say whether the render had
+   * run and failed or never fired at all — remedies that have nothing to do
+   * with each other (a missing RENDER_WORKER_KEY versus a site the browser
+   * also cannot read).
+   *
+   * The first version of this array (PR #604) was populated only when the
+   * escalation actually fired, which just moved the same ambiguity one step
+   * earlier: an absent row meant flag-off OR not-eligible, and those have
+   * different remedies too. `flag_enabled`/`eligible`/`chars_before` are now
+   * always present, so every branch is readable off the response — see
+   * RenderEscalationDiagnostic's own doc comment.
    */
   const renderDiagnostic: Array<
     { provider_id: string } & NonNullable<Extract<CrFetchOutcome, { ok: true }>["render"]>
@@ -10550,7 +10599,7 @@ async function gsVtpProcessProvider(
       const gsVtpHost = hostFromUrlLike(row0.hjemmeside);
       const gsVtpIsAggregator = !!gsVtpHost && isDirectoryOrAggregatorHost(gsVtpHost);
 
-      let gsVtpFetchResult: { ok: true; pageText: string; title?: string } | undefined;
+      let gsVtpFetchResult: Extract<GsWvFetchResult, { ok: true }> | undefined;
       if (!gsVtpIsAggregator) {
         const gsVtpFetch = await crFetchGardssalgContent(row0.hjemmeside);
         if (!gsVtpFetch.ok) {
@@ -10560,6 +10609,11 @@ async function gsVtpProcessProvider(
             ok: true,
             pageText: gardssalgPageText(gsVtpFetch.combinedHtml),
             title: gardssalgPageTitle(gsVtpFetch.primaryHtml),
+            // Same passthrough as the shared adapter — this step builds its
+            // replay result by hand (it must NOT fetch twice, see above), so
+            // it has to carry the escalation record itself or this route,
+            // the one an operator actually drives, stays blind to it.
+            render: gsVtpFetch.render,
           };
         }
       }
@@ -10585,14 +10639,23 @@ async function gsVtpProcessProvider(
           if (apply) {
             applyGardssalgWebsiteVerification(expDb, rows, null);
           }
+          // Attached to whatever verdict comes out below, including the
+          // successful ones: a `queued_verification_failed` on a page we only
+          // ever saw 19 characters of is a different problem from the same
+          // verdict on a page we read in full, and this route reported them
+          // identically.
+          const gsVtpDiag = {
+            ...(rows[0]?.page_chars !== undefined ? { page_chars: rows[0].page_chars } : {}),
+            ...(rows[0]?.render_diagnostic ? { render: rows[0].render_diagnostic } : {}),
+          };
           if (summary.verified) {
-            steps.website = { status: apply ? "verified" : "would_verify" };
+            steps.website = { status: apply ? "verified" : "would_verify", ...gsVtpDiag };
           } else if (summary.unverified) {
-            steps.website = { status: "queued_verification_failed" };
+            steps.website = { status: "queued_verification_failed", ...gsVtpDiag };
           } else if (summary.aggregator) {
             steps.website = { status: "aggregator_host" };
           } else {
-            steps.website = { status: "no_website_no_candidate" };
+            steps.website = { status: "no_website_no_candidate", ...gsVtpDiag };
           }
         }
       }
@@ -12105,14 +12168,10 @@ async function runGardssalgFieldConcordanceScan(
   const pageOffset = offset ?? 0;
   const scanTargets = limit === undefined ? cohort : cohort.slice(pageOffset, pageOffset + limit);
 
-  const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
-    const fetched = await crFetchGardssalgContent(homepageUrl);
-    // Pass `persistence` through. Dropping it (as this adapter used to) is
-    // what let a transient 5xx be recorded as a durable verified:false — see
-    // GsWvClassification's doc comment for the measured 2026-08-13 incident.
-    if (!fetched.ok) return { ok: false, reason: fetched.reason, persistence: fetched.persistence };
-    return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
-  };
+  // Shared adapter — see gsWvFetchFnFromGardssalgCrawler's doc comment for why
+  // this is no longer written out per route. `persistence` passthrough (the
+  // 2026-08-13 transient fix) lives there now, unchanged in behaviour.
+  const fetchFn: GsWvFetchFn = gsWvFetchFnFromGardssalgCrawler();
 
   const providers: GfcProviderResult[] = [];
   for (let i = 0; i < scanTargets.length; i += CR_CONCURRENCY) {
@@ -13701,11 +13760,13 @@ router.get("/admin/gardssalg-website-verification-audit", requireAdmin, async (r
     return;
   }
   try {
-    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
-      const fetched = await crFetchGardssalgContent(homepageUrl);
-      if (!fetched.ok) return { ok: false, reason: fetched.reason };
-      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
-    };
+    // Shared adapter. Written out per route until now, and BOTH copies here
+    // dropped `persistence` — so a transient 5xx on the two routes that
+    // actually WRITE the verification stamp still classified as a durable
+    // verified:false, the exact 2026-08-13 incident the transient class was
+    // added to close (it was only ever fixed in the field-concordance copy).
+    // See gsWvFetchFnFromGardssalgCrawler's doc comment.
+    const fetchFn: GsWvFetchFn = gsWvFetchFnFromGardssalgCrawler();
     const cohortRows = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
 
     if (limit === undefined) {
@@ -13857,11 +13918,13 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
 
   const expDb = getExpDb("experiences");
   try {
-    const fetchFn: GsWvFetchFn = async (homepageUrl: string) => {
-      const fetched = await crFetchGardssalgContent(homepageUrl);
-      if (!fetched.ok) return { ok: false, reason: fetched.reason };
-      return { ok: true, pageText: gardssalgPageText(fetched.combinedHtml), title: gardssalgPageTitle(fetched.primaryHtml) };
-    };
+    // Shared adapter. Written out per route until now, and BOTH copies here
+    // dropped `persistence` — so a transient 5xx on the two routes that
+    // actually WRITE the verification stamp still classified as a durable
+    // verified:false, the exact 2026-08-13 incident the transient class was
+    // added to close (it was only ever fixed in the field-concordance copy).
+    // See gsWvFetchFnFromGardssalgCrawler's doc comment.
+    const fetchFn: GsWvFetchFn = gsWvFetchFnFromGardssalgCrawler();
 
     let cohort = loadGardssalgWebsiteVerificationCohort(expDb, scope, cohortParam);
     if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
@@ -13897,6 +13960,25 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
             next_offset: (pageOffset as number) + rows.length < total ? (pageOffset as number) + rows.length : null,
           };
 
+    // Per-row diagnostics. This route reported COUNTS only — an operator who
+    // ran it and got `unverified: 1` had no way to tell "we read the whole
+    // site and it names no owner" from "we judged it on 19 characters because
+    // the content only exists after JavaScript runs". Those are the two
+    // halves of the 67 North case (Daniel, 2026-08-15) and this route is the
+    // ONE place either can be seen: content-refresh excludes rows that are not
+    // yet ownership-verified, so an unverified JS-built site is unreachable
+    // everywhere else.
+    //
+    // Deliberately NOT the full `rows` array — that carries an evidence object
+    // per row and would change this response's size class. Just the identity,
+    // the verdict, and the two measurements that explain it.
+    const diagnostics = rows.map((r) => ({
+      provider_id: r.provider_id,
+      classification: r.classification,
+      ...(r.page_chars !== undefined ? { page_chars: r.page_chars } : {}),
+      ...(r.render_diagnostic ? { render: r.render_diagnostic } : {}),
+    }));
+
     if (!apply) {
       const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation(rows);
       res.json({
@@ -13906,6 +13988,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
         cohort: cohortParam,
         would_enqueue: wouldEnqueue,
         summary,
+        diagnostics,
         ...(pagination ? { pagination } : {}),
       });
       return;
@@ -13920,6 +14003,7 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
       enqueued: applied.filter((a) => a.enqueued).length,
       provenance_written: applied.length,
       summary,
+      diagnostics,
       ...(pagination ? { pagination } : {}),
     });
   } catch (err) {

@@ -184,6 +184,51 @@ export function selectRenderBackend(): "worker" | "local" {
   return process.env.RENDER_WORKER_KEY ? "worker" : "local";
 }
 
+/**
+ * What a caller's headless escalation did on ONE fetch — the reportable
+ * record of a decision that is otherwise invisible.
+ *
+ * Daniel, live session 2026-08-15. The first version of this diagnostic was
+ * emitted only when a render was actually ATTEMPTED, so an absent record
+ * collapsed three states with three different remedies:
+ *
+ *   flag off               -> set GARDSSALG_HEADLESS_FALLBACK_ENABLED
+ *   flag on, not eligible  -> nothing to do (or the thresholds are wrong)
+ *   attempted, failed      -> read `reason`
+ *
+ * Distinguishing them cost a deploy and a live probe per round, on exactly
+ * the rows that are hardest to reach. So the two decision bits are now part
+ * of the record and it is emitted unconditionally: `flag_enabled` is the
+ * caller's kill switch, `eligible` is shouldEscalateToRender()'s verdict, and
+ * `attempted` is their conjunction. This is the same rule fetch-page.ts's
+ * module doc states for failures — never collapse states whose remedies
+ * differ — applied to the decision instead of the outcome.
+ *
+ * `chars_before` is always meaningful (it is why `eligible` came out the way
+ * it did); `chars_after`, `ok`, `reason`, `detail` and `elapsed_ms` exist
+ * only once `attempted` is true.
+ */
+export type RenderEscalationDiagnostic = {
+  /** The caller's env kill switch, as read on this call. */
+  flag_enabled: boolean;
+  /** shouldEscalateToRender()'s verdict on the fetched page. */
+  eligible: boolean;
+  /** flag_enabled && eligible — whether renderPage() was actually called. */
+  attempted: boolean;
+  /** Which backend renderPage would use — "worker" needs RENDER_WORKER_KEY. */
+  backend: "worker" | "local";
+  /** Visible-text length of the RAW fetch, always present. */
+  chars_before: number;
+  /** Present only when `attempted`. */
+  ok?: boolean;
+  /** Named failure reason from classifyRenderError. Absent on success. */
+  reason?: RenderFailureReason | string;
+  detail?: string;
+  /** Visible-text length AFTER rendering. Present only on a successful render. */
+  chars_after?: number;
+  elapsed_ms?: number;
+};
+
 // ── The renderer ────────────────────────────────────────────────────────────
 
 export type RenderPageOptions = {

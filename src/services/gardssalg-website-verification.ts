@@ -48,6 +48,9 @@
 import type Database from "better-sqlite3";
 import { v4 as uuid } from "uuid";
 import type { FetchPersistence } from "./fetch-page";
+// Type-only: this module still performs no fetching and no rendering of its
+// own — it only carries the caller's escalation record through to its rows.
+import type { RenderEscalationDiagnostic } from "./render-page";
 import { hostFromUrlLike, isDirectoryOrAggregatorHost } from "./cross-source-validator";
 import {
   gardssalgWebsiteEvidenceMatch,
@@ -105,6 +108,33 @@ export interface GsWvScanRow {
   hjemmeside: string | null;
   classification: GsWvClassification;
   evidence: GsWvEvidence | null;
+  /**
+   * How many characters of visible text gardssalgWebsiteEvidenceMatch was
+   * actually given. Diagnostic only — nothing downstream branches on it, and
+   * applyGardssalgWebsiteVerification never writes it to provenance (a
+   * measurement is not a verdict).
+   *
+   * Present only when a page was really fetched: `aggregator` and
+   * `missing_source` never fetch, `unreachable_transient` never got a page.
+   *
+   * Why it earns a field: an `unverified` row is otherwise indistinguishable
+   * between "we read the whole site and it names no owner" and "we judged it
+   * on 19 characters because the content only exists after JavaScript runs".
+   * That is the 67 North case (Daniel, 2026-08-15), and it was invisible from
+   * this route's output — the exact place an operator looks first.
+   */
+  page_chars?: number;
+  /**
+   * What the caller's headless escalation did on the fetch behind this row —
+   * passed straight through from GsWvFetchResult, never interpreted here.
+   *
+   * This module is the ONLY gårdssalg path that fetches rows which are not
+   * yet ownership-verified (content-refresh excludes them by design, see
+   * isHjemmesideVerified), so a JS-built producer site can only ever be
+   * rendered HERE. Reporting it anywhere else would report it for every row
+   * except the ones it exists for.
+   */
+  render_diagnostic?: RenderEscalationDiagnostic;
 }
 
 export interface GsWvSummary {
@@ -130,7 +160,17 @@ export interface GsWvSummary {
 // that call (see its own doc comment for exactly what that does and doesn't
 // change).
 export type GsWvFetchResult =
-  | { ok: true; pageText: string; title?: string }
+  | {
+      ok: true;
+      pageText: string;
+      title?: string;
+      /**
+       * Optional escalation record from the adapter's own fetcher. Carried to
+       * GsWvScanRow.render_diagnostic untouched — this module never reads a
+       * field of it and nothing here branches on it.
+       */
+      render?: RenderEscalationDiagnostic;
+    }
   | {
       ok: false;
       reason: string;
@@ -351,6 +391,10 @@ export async function classifyGardssalgProducerWebsite(
     hjemmeside,
     classification: evidence.verified === true ? "verified" : "unverified",
     evidence,
+    // Diagnostics, attached on the one path that actually read a page. Both
+    // are pass-through/measurement — see their doc comments on GsWvScanRow.
+    page_chars: fetched.pageText.length,
+    ...(fetched.render ? { render_diagnostic: fetched.render } : {}),
   };
 }
 
