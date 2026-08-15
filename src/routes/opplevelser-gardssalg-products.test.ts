@@ -995,7 +995,13 @@ export function runOpplevelserGardssalgProductsTests(
       assertTrue(!secondEntry, "pg-r3c: prov-pg-blank no longer appears in changed[] — nothing left to do");
       const rowAfterSecond = getProviderRow("prov-pg-blank");
       assertEq(JSON.parse(rowAfterSecond.products), CANDIDATE, "pg-r3d: products unchanged by the idempotent second run");
-      assertTrue(!secondRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-blank"), "pg-r3e (Skive 1): no products_diagnostic entry once products is non-blank — the row never enters the branch");
+      // dev-request 2026-08-15-products-parser-kodegjerde, AC3: the row still
+      // ENTERS the branch (gardssalgProductsEligible is checked every run) —
+      // it's the eligibility check itself that now declines and reports why,
+      // rather than the row vanishing from the diagnostic entirely.
+      const secondDiag = secondRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-blank");
+      assertTrue(!!secondDiag, "pg-r3e (AC3): prov-pg-blank STILL gets a products_diagnostic row once products is non-blank — every processed provider gets one");
+      assertEq(secondDiag.outcome, "generator_not_invoked:products_already_present", "pg-r3f (AC3): outcome explains the generator was never invoked because products already has content");
 
       // ── pg-r4: manual/claim-locked provider → unaffected; the lock guard
       //    short-circuits BEFORE any fetch, so the LLM is never invoked. ────
@@ -1011,7 +1017,16 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(anthropicCallCount, callsBeforeLocked, "pg-r4d: the LLM is never called for a locked provider");
       const rowLocked = getProviderRow("prov-pg-locked");
       assertEq(rowLocked.products, null, "pg-r4e: locked provider's products is completely unchanged");
-      assertTrue(!lockedRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-locked"), "pg-r4f (Skive 1): no products_diagnostic entry for a locked row — the lock guard short-circuits before the products branch");
+      // dev-request 2026-08-15-products-parser-kodegjerde, AC3: the lock
+      // guard short-circuits before ANY fetch, so this row now gets an
+      // explicit generator_not_invoked:locked diagnostic row instead of
+      // being silently absent — a locked provider is exactly the shape of
+      // row a human running a drain/backfill needs explained, not hidden.
+      const lockedDiag = lockedRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-locked");
+      assertTrue(!!lockedDiag, "pg-r4f (AC3): a locked row now gets a products_diagnostic entry — every processed provider gets one, even one the lock guard never let past");
+      assertEq(lockedDiag.outcome, "generator_not_invoked:locked", "pg-r4g (AC3): outcome explains the generator was never invoked because the row is locked");
+      assertEq(lockedDiag.content_chars_full, 0, "pg-r4h (AC3): no fetch happened before the lock guard, so content_chars_full is zeroed, not fabricated");
+      assertEq(lockedDiag.pages_fetched_paths, [], "pg-r4i (AC3): no sub-pages were fetched before the lock guard");
 
       // ── pg-r5: a provider with an EXISTING non-empty products list is
       //    fill-only-protected — never overwritten, LLM never called for it,
@@ -1028,7 +1043,17 @@ export function runOpplevelserGardssalgProductsTests(
       assertTrue(!existingRes.body.changed.find((c: any) => c.provider_id === "prov-pg-existing"), "pg-r5c: prov-pg-existing does not appear in changed[] at all — nothing eligible on this provider");
       const rowExisting = getProviderRow("prov-pg-existing");
       assertEq(JSON.parse(rowExisting.products), ["Eplesider"], "pg-r5d: existing products value is completely untouched");
-      assertTrue(!existingRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-existing"), "pg-r5e (Skive 1): no products_diagnostic entry when products already has content — gardssalgProductsEligible is false, so the branch (and the diagnostic capture inside it) never runs");
+      // dev-request 2026-08-15-products-parser-kodegjerde, AC3: a fetched-
+      // but-not-eligible row now gets a diagnostic entry too — with the real
+      // content_chars_full/pages_fetched_paths from the fetch that DID
+      // happen (unlike the pre-fetch gates, this one runs after a
+      // successful fetch), proving knownStats is wired through correctly.
+      const existingDiag = existingRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-existing");
+      assertTrue(!!existingDiag, "pg-r5e (AC3): a row with pre-existing products still gets a products_diagnostic entry — gardssalgProductsEligible being false no longer means the row vanishes from the report");
+      assertEq(existingDiag.outcome, "generator_not_invoked:products_already_present", "pg-r5f (AC3): outcome explains the generator was never invoked because products already has content");
+      assertTrue(typeof existingDiag.content_chars_full === "number" && existingDiag.content_chars_full > 0, "pg-r5g (AC3): content_chars_full IS populated (real fetch happened) even though the generator was never invoked");
+      assertEq(existingDiag.products_source_chars, 0, "pg-r5h (AC3): products_source_chars stays zeroed — gardssalgProductSourceText was never computed for this row");
+      assertEq(existingDiag.product_pages, [], "pg-r5i (AC3): product_pages stays empty — no product-page ranking was ever done");
 
       // ── pg-r6: a provider whose products column is the literal "[]"
       //    (empty array, not NULL) is STILL eligible — the LLM IS called
@@ -1142,6 +1167,110 @@ export function runOpplevelserGardssalgProductsTests(
         '["Pils", "Session IPA", "Nordic Sais',
         "pg-r11g: the report carries what actually came back, on one readable line",
       );
+
+      // ═══════════════════════════════════════════════════════════════════
+      // Section B2 — AC3 (dev-request 2026-08-15-products-parser-kodegjerde):
+      // products_diagnostic must carry a row for EVERY processed provider,
+      // including the early-return/gate paths in processOne() that run
+      // BEFORE the generator is ever invoked. Measured live: 3 of 4
+      // processed providers in a targeted run had no diagnostic row at all
+      // once the generator wasn't invoked — silently indistinguishable from
+      // a row nobody looked at. pg-r3/pg-r4/pg-r5 above already cover the
+      // idempotent-refill and manual-lock and pre-existing-products gates;
+      // this section covers the three remaining gates.
+      // ═══════════════════════════════════════════════════════════════════
+
+      // ── pg-r12: the shared-/directory-domain guard is a PRE-FETCH gate —
+      //    neither the homepage fetch nor the LLM may ever run for a row it
+      //    excludes, and it still gets an explicit diagnostic row instead of
+      //    vanishing. "visit*.no" is a real DMO domain pattern
+      //    (gardssalgSharedDomainReason), so a single row is enough to
+      //    trigger it — no second provider sharing a host needed. ──────────
+      insertProvider.run({
+        id: "prov-pg-shareddomain", navn: "Prov PG SharedDomain Gard", hjemmeside: "https://visitpgshared.no",
+        content_source: null, about_text: SILENT_LONG_TEXT, visit_text: SILENT_LONG_TEXT, opening_hours_text: null, products: null,
+      });
+      {
+        globalThis.fetch = (async () => {
+          throw new Error("pg-r12: neither the homepage fetch nor the LLM should ever be called — the shared-/directory-domain guard short-circuits before both");
+        }) as unknown as typeof fetch;
+        const sharedRes = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-pg-shareddomain"], apply: true },
+        });
+        assertEq(sharedRes.status, 200, "pg-r12a: shared-domain-excluded provider call -> 200");
+        assertTrue(
+          sharedRes.body.excluded_shared_domain.some((e: any) => e.provider_id === "prov-pg-shareddomain"),
+          "pg-r12b: reported in excluded_shared_domain, as before this change",
+        );
+        const sharedDiag = sharedRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-shareddomain");
+        assertTrue(!!sharedDiag, "pg-r12c (AC3): a shared-/directory-domain-excluded row now gets a products_diagnostic entry — it never touched the network, but it was still a processed provider");
+        assertEq(sharedDiag.outcome, "generator_not_invoked:excluded_shared_domain", "pg-r12d (AC3): outcome names the exact gate that short-circuited the row");
+        assertEq(sharedDiag.content_chars_full, 0, "pg-r12e (AC3): no fetch ever happened, so content_chars_full is zeroed rather than fabricated");
+        assertEq(sharedDiag.pages_fetched_paths, [], "pg-r12f (AC3): no sub-pages were fetched before this pre-fetch gate");
+        assertEq(sharedDiag.product_pages, [], "pg-r12g (AC3): no product-page ranking was ever done");
+      }
+
+      // ── pg-r13: the website-verification gate is also a PRE-FETCH gate —
+      //    a hjemmeside the verification sweep never stamped verified=true
+      //    must never be fetched at all. ─────────────────────────────────
+      insertProvider.run({
+        id: "prov-pg-unverified", navn: "Prov PG Unverified Gard", hjemmeside: "https://prov-pg-unverified.example.no",
+        content_source: null, about_text: SILENT_LONG_TEXT, visit_text: SILENT_LONG_TEXT, opening_hours_text: null, products: null,
+        field_provenance: JSON.stringify({}),
+      });
+      {
+        globalThis.fetch = (async () => {
+          throw new Error("pg-r13: neither the homepage fetch nor the LLM should ever be called — the unverified-website gate short-circuits before both");
+        }) as unknown as typeof fetch;
+        const unverifiedRes = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-pg-unverified"], apply: true },
+        });
+        assertEq(unverifiedRes.status, 200, "pg-r13a: unverified-website provider call -> 200");
+        assertTrue(
+          unverifiedRes.body.excluded_unverified_website.some((e: any) => e.provider_id === "prov-pg-unverified"),
+          "pg-r13b: reported in excluded_unverified_website, as before this change",
+        );
+        const unverifiedDiag = unverifiedRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-unverified");
+        assertTrue(!!unverifiedDiag, "pg-r13c (AC3): an unverified-website row now gets a products_diagnostic entry");
+        assertEq(unverifiedDiag.outcome, "generator_not_invoked:unverified_website", "pg-r13d (AC3): outcome names the exact gate that short-circuited the row");
+        assertEq(unverifiedDiag.content_chars_full, 0, "pg-r13e (AC3): no fetch ever happened, so content_chars_full is zeroed rather than fabricated");
+      }
+
+      // ── pg-r14: a homepage that fails to fetch entirely (every request
+      //    404s) never reaches the products branch either — the row still
+      //    gets a diagnostic row explaining that the generator was never
+      //    invoked, distinct from every other gate above. ─────────────────
+      insertProvider.run({
+        id: "prov-pg-fetchfail", navn: "Prov PG FetchFail Gard", hjemmeside: "https://prov-pg-fetchfail.example.no",
+        content_source: null, about_text: SILENT_LONG_TEXT, visit_text: SILENT_LONG_TEXT, opening_hours_text: null, products: null,
+      });
+      {
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            throw new Error("pg-r14: the LLM must never be called when the homepage fetch itself failed");
+          }
+          return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+        }) as typeof fetch;
+        const failRes = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-pg-fetchfail"], apply: true },
+        });
+        assertEq(failRes.status, 200, "pg-r14a: fetch-failed provider call -> 200");
+        assertTrue(
+          failRes.body.errors.some((e: any) => e.provider_id === "prov-pg-fetchfail"),
+          "pg-r14b: reported in errors[], as before this change",
+        );
+        const failDiag = failRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-fetchfail");
+        assertTrue(!!failDiag, "pg-r14c (AC3): a row whose homepage fetch failed now gets a products_diagnostic entry");
+        assertEq(failDiag.outcome, "generator_not_invoked:fetch_failed", "pg-r14d (AC3): outcome names the exact gate that short-circuited the row — distinct from every pre-fetch gate above");
+        assertEq(failDiag.content_chars_full, 0, "pg-r14e (AC3): the fetch never succeeded, so there is no content to report — zeroed, not fabricated");
+      }
 
       // ── pg-r9 (Skive 1): truncation flag is correct AT and JUST OVER the
       //    6000-char GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP boundary.
