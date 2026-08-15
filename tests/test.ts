@@ -38879,5 +38879,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-gardssalg-review-queues-staleness: unexpected error: " + String(err?.message || err));
+
+// dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke: the A/B
+// template variant for gårdssalg outreach (renderer guards + static source
+// guards on the pilot-send route). Imports email-service (no DB touch — the
+// module's constructor only reads SMTP env vars) and reads opplevelser.ts as
+// TEXT, never requiring it — so no module-cache interaction with the
+// experience-store hazard documented above; tail position is convention,
+// not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke: template variant guards ──");
+  try {
+    const { runOpplevelserGardssalgOutreachTemplateVariantTests } = require("../src/routes/opplevelser-gardssalg-outreach-template-variant.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-template-variant.test");
+    const otv = await runOpplevelserGardssalgOutreachTemplateVariantTests({ log: false });
+    passed += otv.passed;
+    failed += otv.failed;
+    for (const f of otv.failures) failures.push("gardssalg-outreach-template-variant: " + f);
+    console.log(`  gardssalg-outreach-template-variant: ${otv.passed} passed, ${otv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-template-variant: unexpected error: " + String(err?.message || err));
   }
 });

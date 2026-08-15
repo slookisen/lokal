@@ -439,7 +439,10 @@ import {
   // dev-request 2026-08-09-outreach-send-uten-crm-spor: the pilot-send route
   // files each send in the CRM, and it records the SAME rendered copy the
   // mail carried — never a second hand-written version that could drift.
-  renderGardssalgOutreach,
+  // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke: filing
+  // goes through the variant dispatcher so BOTH A/B arms keep that rule.
+  renderGardssalgOutreachVariant,
+  GardssalgOutreachTemplate,
   GARDSSALG_OUTREACH_REPLY_TO,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
@@ -9550,7 +9553,7 @@ export function computeGardssalgOutreachSendEligibility(
 const MAX_GARDSSALG_OUTREACH_PILOT_BATCH = 4;
 
 router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { provider_ids?: unknown; is_test?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { provider_ids?: unknown; is_test?: unknown; apply?: unknown; template?: unknown };
   const rawIds = body.provider_ids;
 
   if (
@@ -9569,6 +9572,18 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
   const isTest = body.is_test === true;
   const apply = body.apply === true;
   const providerIds = rawIds as string[];
+
+  // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke: which
+  // rendered draft this batch uses. Absent = "standard" (the pre-existing
+  // HTML template) so every existing caller is byte-identical; "personal" is
+  // the RFB-style plain-text draft. Anything else is a 400 — a silent
+  // fallback would mislabel an A/B arm and corrupt the experiment's data.
+  const templateRaw = body.template;
+  if (templateRaw !== undefined && templateRaw !== "standard" && templateRaw !== "personal") {
+    res.status(400).json({ error: 'template must be "standard" or "personal"' });
+    return;
+  }
+  const template: GardssalgOutreachTemplate = (templateRaw as GardssalgOutreachTemplate | undefined) ?? "standard";
 
   type PilotResultRow = {
     provider_id: string;
@@ -9641,6 +9656,7 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
       try {
         const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
           isTestSend: isTest,
+          template,
         });
         if (!sendResult.success) {
           results.push({ provider_id: providerId, status: "error", reason: sendResult.error || "send_failed" });
@@ -9683,7 +9699,7 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
         let crmRecorded: boolean | undefined;
         if (!isTest) {
           try {
-            const rendered = renderGardssalgOutreach(providerName, profileUrl);
+            const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl);
             crmService.ingestThread(
               {
                 threadId: `opplevagent-outreach-${providerId}`,
@@ -9706,6 +9722,9 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
                       source: "gardssalg-outreach-pilot-send",
                       provider_id: providerId,
                       reply_to: GARDSSALG_OUTREACH_REPLY_TO,
+                      // A/B arm, directly queryable — the subject formula
+                      // carries the same signal for human eyes.
+                      template,
                     },
                   },
                 ],
