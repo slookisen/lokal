@@ -30,6 +30,7 @@
 import {
   generateGardssalgProductList,
   GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP,
+  GARDSSALG_PRODUCTS_INVALID_SAMPLE_CHARS,
   gardssalgProductSourceText,
   gardssalgLabelLooksLikeProducts,
 } from "./opplevelser";
@@ -172,6 +173,25 @@ export function runOpplevelserGardssalgProductsTests(
         assertTrue(body.messages[0].content.includes("INGEN_PRODUKTER_FUNNET"), "pg-2e: prompt includes the escape sentinel instruction");
         assertTrue(body.messages[0].content.includes("Bruk KUN produktnavn som faktisk står i kildeteksten"), "pg-2f: prompt includes the exact grounding instruction");
         assertEq(capturedInit.headers["x-api-key"], "test-anthropic-key", "pg-2g: x-api-key header carries ANTHROPIC_API_KEY");
+        // Dropping "meny" from GARDSSALG_PRODUCT_PATH_SUBSTRINGS only changes
+        // page ORDER — a small site's menu page still lands inside the
+        // 20 000-character window, so the prompt is the part that actually
+        // keeps Svensefjøset's "Røkelaks med pepperrotkrem" out of `products`.
+        // Both halves are asserted because either alone leaves the hole open.
+        assertTrue(
+          body.messages[0].content.includes("Retter som serveres er IKKE produkter"),
+          "pg-2j: prompt excludes served dishes from the product list",
+        );
+        assertTrue(
+          ["selskapsmeny", "cateringmeny", "dagens rett", "buffet"].every((w) =>
+            body.messages[0].content.includes(w),
+          ),
+          "pg-2k: prompt names the serving shapes it excludes, rather than relying on one word",
+        );
+        assertTrue(
+          body.messages[0].content.includes("varer i utsalget"),
+          "pg-2l: prompt still defines a product as goods sold — a gårdsbutikk's food is not excluded, only served dishes are",
+        );
       }
       // ── pg-2h (Skive 1): diagnosticOut.outcome = "products_found" when a
       //    valid non-empty array comes back. ────────────────────────────────
@@ -251,6 +271,9 @@ export function runOpplevelserGardssalgProductsTests(
         const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
         assertEq(r, null, "pg-5c: non-JSON prose → null (with diagnosticOut passed)");
         assertEq(diag.outcome, "invalid_unparseable", "pg-5d: diagnosticOut.outcome = invalid_unparseable for non-JSON prose");
+        assertEq(diag.invalid_reason, "not_json", "pg-5e: prose is classified not_json, not lumped with the other three shapes");
+        assertEq(diag.invalid_sample, "Vi selger Eplesider og Eplemost.", "pg-5f: the sample IS what came back — the whole point of Skive 5");
+        assertEq(diag.stop_reason, null, "pg-5g: stop_reason is null when the API response carries none");
       }
 
       // ── pg-6: valid JSON but not an array (an object) → null. ────────────
@@ -269,6 +292,8 @@ export function runOpplevelserGardssalgProductsTests(
         const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
         assertEq(r, null, "pg-6c: JSON object (not array) → null (with diagnosticOut passed)");
         assertEq(diag.outcome, "invalid_unparseable", "pg-6d: diagnosticOut.outcome = invalid_unparseable for a non-array JSON value");
+        assertEq(diag.invalid_reason, "not_array", "pg-6e: valid JSON, wrong shape → not_array (a prompt problem, not a truncation problem)");
+        assertEq(diag.invalid_sample, '{"products":["Eplesider"]}', "pg-6f: the sample shows the shape that came back");
       }
 
       // ── pg-7: an empty JSON array → null (never an empty-but-truthy
@@ -290,6 +315,141 @@ export function runOpplevelserGardssalgProductsTests(
         const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
         assertEq(r, null, "pg-7c: empty JSON array → null (with diagnosticOut passed)");
         assertEq(diag.outcome, "invalid_unparseable", "pg-7d: diagnosticOut.outcome = invalid_unparseable for an empty array");
+        assertEq(diag.invalid_reason, "empty_after_filter", "pg-7e: a well-formed array that yields no items is its own reason");
+        assertEq(diag.invalid_sample, "[]", "pg-7f: a literal [] is visible as such, distinct from an array the filter emptied");
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // Section A3 — Skive 5 (2026-08-15): what an unparseable response WAS.
+      //
+      // The PR #608 measurement produced four invalid_unparseable rows
+      // (Hurum Bryggeri and Nordfjord Distillery among them, both of which had
+      // returned products before) and not one of them could be explained,
+      // because the outcome was recorded and the response was thrown away. The
+      // leading hypothesis — max_tokens: 400 truncating a long list — was
+      // arithmetic, not evidence. These fields are the evidence: after this
+      // ships, `stop_reason: "max_tokens"` confirms it outright and
+      // `stop_reason: "end_turn"` kills it, with no further deploy needed.
+      // ═══════════════════════════════════════════════════════════════════
+
+      // ── pg-11: the truncation shape itself. A 400-token ceiling cuts a long
+      //    array mid-string, so what arrives is unterminated JSON — reason
+      //    not_json, with stop_reason naming the cause outright. ─────────────
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          content: [{ type: "text", text: '["Pils","Session IPA","Nordic Saison","Juleø' }],
+          stop_reason: "max_tokens",
+        }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, null, "pg-11a: a truncated array is still null — never a partial list written as if complete");
+        assertEq(diag.invalid_reason, "not_json", "pg-11b: truncation surfaces as not_json");
+        assertEq(diag.stop_reason, "max_tokens", "pg-11c: stop_reason carries the API's own verdict on truncation");
+        assertTrue(
+          typeof diag.invalid_sample === "string" && diag.invalid_sample.endsWith("Juleø"),
+          "pg-11d: the sample shows the cut-off point, so 'was it truncated' is readable even without stop_reason",
+        );
+      }
+
+      // ── pg-12: no text block at all — the fourth path to
+      //    invalid_unparseable, and the one with no model text to sample.
+      //    Records the response shape instead of going blank. ────────────────
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "tool_use", id: "x" }], stop_reason: "tool_use" }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, null, "pg-12a: a response with no text block → null");
+        assertEq(diag.invalid_reason, "no_text_block", "pg-12b: no text block is its own reason, not a parse failure");
+        assertTrue(
+          typeof diag.invalid_sample === "string" && diag.invalid_sample.includes("tool_use"),
+          "pg-12c: with no model text to sample, the response's own shape is recorded instead",
+        );
+        assertEq(diag.stop_reason, "tool_use", "pg-12d: stop_reason is captured on this path too");
+      }
+
+      // ── pg-13: the sample is bounded and readable — ~200 chars, whitespace
+      //    collapsed. A diagnostic must never carry a page of model output
+      //    into a report, and a wall of newlines is not readable in one. ─────
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: "Beklager,\n\n   jeg kan ikke.\t" + "z".repeat(500) }] }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(
+          diag.invalid_sample?.length,
+          GARDSSALG_PRODUCTS_INVALID_SAMPLE_CHARS,
+          "pg-13a: the sample is capped at the exported constant, not an inline literal",
+        );
+        assertTrue(
+          diag.invalid_sample?.startsWith("Beklager, jeg kan ikke. zzz") === true,
+          "pg-13b: whitespace is collapsed to single spaces so the sample stays one readable line",
+        );
+      }
+
+      // ── pg-14: the fields are ABSENT, not null/empty, on every outcome that
+      //    is not a parse failure. A reader must never have to tell "no sample
+      //    was taken" apart from "the sample was empty". ─────────────────────
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: JSON.stringify(["Eplesider"]) }], stop_reason: "end_turn" }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(diag.outcome, "products_found", "pg-14a: a good response is still products_found");
+        assertTrue(
+          !("invalid_reason" in diag) && !("invalid_sample" in diag) && !("stop_reason" in diag),
+          "pg-14b: no invalid_* / stop_reason keys are stamped on products_found",
+        );
+      }
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: "INGEN_PRODUKTER_FUNNET" }] }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(diag.outcome, "sentinel_no_products", "pg-14c: the sentinel is still sentinel_no_products");
+        assertTrue(
+          !("invalid_reason" in diag) && !("invalid_sample" in diag),
+          "pg-14d: an honest 'no products' answer carries no failure sample",
+        );
+      }
+
+      // ── pg-15: with the retry in play (Skive 4), the recorded evidence is
+      //    the FINAL attempt's — the response whose failure actually produced
+      //    the outcome, not the one that was already retried past. ───────────
+      {
+        let call = 0;
+        globalThis.fetch = (async () => {
+          call += 1;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              content: [{ type: "text", text: call === 1 ? "FØRSTE FORSØK" : "ANDRE FORSØK" }],
+              stop_reason: call === 1 ? "end_turn" : "max_tokens",
+            }),
+          };
+        }) as unknown as typeof fetch;
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(call, 2, "pg-15a: an unparseable first attempt still triggers exactly one retry");
+        assertEq(diag.invalid_sample, "ANDRE FORSØK", "pg-15b: the sample comes from the final attempt");
+        assertEq(diag.stop_reason, "max_tokens", "pg-15c: stop_reason comes from the same attempt as the sample");
       }
 
       // ── pg-8: filtering + dedup + cap — non-string entries, an
@@ -607,6 +767,12 @@ export function runOpplevelserGardssalgProductsTests(
         id: "prov-pg-none", navn: "Prov PG None Gard", hjemmeside: "https://prov-pg-none.example.no",
         content_source: null, about_text: SILENT_LONG_TEXT, visit_text: SILENT_LONG_TEXT, opening_hours_text: null, products: null,
       });
+      // Skive 5: the row that comes back unparseable — the shape the PR #608
+      // measurement produced four of and could not explain.
+      insertProvider.run({
+        id: "prov-pg-invalid", navn: "Prov PG Invalid Gard", hjemmeside: "https://prov-pg-invalid.example.no",
+        content_source: null, about_text: SILENT_LONG_TEXT, visit_text: SILENT_LONG_TEXT, opening_hours_text: null, products: null,
+      });
 
       function getProviderRow(id: string): any {
         return expDb.prepare(
@@ -831,6 +997,57 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(noneDiag.outcome, "sentinel_no_products", "pg-r7e: sentinel response classified as sentinel_no_products, not invalid_unparseable");
       assertEq(noneDiag.truncated, false, "pg-r7f: plainPage-derived content is far under the 6000-char cap");
       assertTrue(Array.isArray(noneDiag.pages_fetched_paths), "pg-r7g: pages_fetched_paths is present and an array");
+      assertTrue(
+        !("invalid_reason" in noneDiag) && !("invalid_sample" in noneDiag),
+        "pg-r7h (Skive 5): an honest sentinel row carries no failure sample in the report either",
+      );
+
+      // ── pg-r11 (Skive 5): the whole point, end to end. An unparseable
+      //    response must reach the REPORT with its reason, its first ~200
+      //    characters and the API's stop_reason — the three things the PR #608
+      //    measurement needed and did not have. Nothing is written, exactly as
+      //    before. ──────────────────────────────────────────────────────────
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const urlStr = String(url);
+        if (urlStr.includes("api.anthropic.com")) {
+          anthropicCallCount++;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              // A list cut off mid-string — what max_tokens: 400 produces.
+              content: [{ type: "text", text: '["Pils",\n  "Session IPA",\n  "Nordic Sais' }],
+              stop_reason: "max_tokens",
+            }),
+          } as unknown as Response;
+        }
+        const host = new URL(urlStr).hostname;
+        if (host === "prov-pg-invalid.example.no") {
+          return {
+            ok: true, status: 200, text: async () => plainPage,
+            arrayBuffer: async () => new TextEncoder().encode(plainPage).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
+        }
+        return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+      }) as typeof fetch;
+      const invalidRes = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-content-refresh",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-pg-invalid"], apply: true },
+      });
+      assertEq(invalidRes.status, 200, "pg-r11a: unparseable-response provider call -> 200");
+      assertEq(getProviderRow("prov-pg-invalid").products, null, "pg-r11b: nothing is written from an unparseable response — never a partial list");
+      const invalidDiag = invalidRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-invalid");
+      assertTrue(!!invalidDiag, "pg-r11c: the row appears in products_diagnostic");
+      assertEq(invalidDiag.outcome, "invalid_unparseable", "pg-r11d: outcome is invalid_unparseable");
+      assertEq(invalidDiag.invalid_reason, "not_json", "pg-r11e: the report says WHICH parse path failed");
+      assertEq(invalidDiag.stop_reason, "max_tokens", "pg-r11f: the report carries the API's own stop_reason — this is what settles the truncation question");
+      assertEq(
+        invalidDiag.invalid_sample,
+        '["Pils", "Session IPA", "Nordic Sais',
+        "pg-r11g: the report carries what actually came back, on one readable line",
+      );
 
       // ── pg-r9 (Skive 1): truncation flag is correct AT and JUST OVER the
       //    6000-char GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP boundary.
@@ -986,7 +1203,7 @@ export function runOpplevelserGardssalgProductsTests(
         // Every label here was observed live on 2026-08-15.
         for (const label of [
           "/produkter", "/nettbutikk", "/sortiment", "/vare-ol", "/ourbeer/",
-          "/products-2/", "/butikken.php?lang=en", "/v-re-viner", "/menyer",
+          "/products-2/", "/butikken.php?lang=en", "/v-re-viner",
           "/produkter.php?lang=en",
         ]) {
           assertTrue(gardssalgLabelLooksLikeProducts(label), `pg-src1: ${label} reads as a product page`);
@@ -995,12 +1212,42 @@ export function runOpplevelserGardssalgProductsTests(
         // unusable as a keyword — it is an about page on nearly every brewery
         // site, and promoting it would push the real product page back out of
         // the window this exists to protect.
+        //
+        // `/menyer` and `/meny` moved here from the list above on 2026-08-15,
+        // and this assertion is the regression guard for the one row PR #608's
+        // measurement changed for the worse: Svensefjøset's `/menyer` is a
+        // selskapsmeny (party catering), and promoting it turned a correct
+        // "no products" into four dish names written into `products`. A menu
+        // page is a different KIND of page, not a product page that happens to
+        // rank low — see GARDSSALG_PRODUCT_PATH_SUBSTRINGS' comment.
         for (const label of [
           "/kontakt", "/kontakt-oss", "/om-oss", "/om-bryggeriet", "/historien",
           "/about", "/contact", "/history", "/", "/minnesamvaer",
+          // `/vare-menyer` ("våre menyer") is the one that needed a veto rather
+          // than a removal: `vare` is a product SEGMENT keyword (it exists for
+          // `/vare-ol`), so this label matched through the possessive even
+          // after "meny" left the substring list. `/produkt-meny` is the same
+          // trap from the other direction — the veto wins over a product word.
+          "/menyer", "/meny", "/selskapsmeny", "/vare-menyer", "/produkt-meny",
+          "/catering", "/servering",
         ]) {
           assertTrue(!gardssalgLabelLooksLikeProducts(label), `pg-src2: ${label} is not mistaken for a product page`);
         }
+        // A site that has BOTH: the menu page must not outrank the real
+        // product page, and must not outrank the homepage either.
+        const bothPages = gardssalgProductSourceText(
+          [
+            { label: "/menyer", text: "MENY Roastbiff Brie" },
+            { label: "/", text: "HJEM" },
+            { label: "/produkter", text: "PRODUKTER Pils" },
+          ],
+          100_000,
+        );
+        assertTrue(
+          bothPages.text.indexOf("PRODUKTER") < bothPages.text.indexOf("HJEM") &&
+            bothPages.text.indexOf("HJEM") < bothPages.text.indexOf("MENY"),
+          "pg-src10: a menu page ranks with the rest — behind the product page AND behind the homepage",
+        );
 
         // The Oslo Brewing shape, to scale: a front page that fills the whole
         // budget on its own, with the product page crawled AFTER it.

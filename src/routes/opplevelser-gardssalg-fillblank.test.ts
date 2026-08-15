@@ -174,6 +174,20 @@ export function runOpplevelserGardssalgFillblankTests(
         assertTrue(body.messages[0].content.includes("INGEN_UTVIDELSE_MULIG"), "fb-2f: prompt includes the escape sentinel instruction");
         assertTrue(body.messages[0].content.includes("Bruk KUN fakta som faktisk står i kildeteksten"), "fb-2g: prompt includes the exact grounding instruction");
         assertEq(capturedInit.headers["x-api-key"], "test-anthropic-key", "fb-2h: x-api-key header carries ANTHROPIC_API_KEY");
+        // Daniel, 2026-08-15: a producer's served food "kan være med, men ikke
+        // under produkter" — the description carries it instead. The products
+        // prompt refuses dishes (opplevelser-gardssalg-products.test.ts,
+        // pg-2j); this is the other half of that decision, and without it the
+        // fact would simply be lost rather than relocated.
+        assertTrue(
+          body.messages[0].content.includes("serverer mat eller har et mattilbud"),
+          "fb-2i: prompt invites a short mention of a food/serving offer",
+        );
+        assertTrue(
+          body.messages[0].content.includes("bare det kildeteksten faktisk sier") &&
+            body.messages[0].content.includes("uten å ramse opp enkeltretter"),
+          "fb-2j: the food mention stays source-bound and stays a mention — not a dish list moved into prose",
+        );
       }
 
       // ── fb-3: source text capped to ~6000 chars in the prompt. ──────────
