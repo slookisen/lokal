@@ -33,30 +33,51 @@
  *
  * ── Deployment note, load-bearing ──────────────────────────────────────────
  *
- * This module does NOT add a runtime dependency. `playwright-core` is imported
- * lazily inside a try/catch, so:
+ * This module does NOT add a runtime dependency, and production DOES render —
+ * via a backend, not via a bundled browser. `defaultRenderImpl` picks that
+ * backend with `selectRenderBackend()`, keyed on whether `RENDER_WORKER_KEY`
+ * is configured:
  *
- *   - In production (Dockerfile: node:20-alpine, 1024 MB) there is no browser
- *     and no playwright-core. renderPage() returns `renderer_unavailable` and
- *     nothing else changes. Shipping this file is inert there BY DESIGN.
- *   - In an environment that HAS a browser (the Claude Code session container
- *     ships Chromium at $PLAYWRIGHT_BROWSERS_PATH), it renders.
+ *   - "worker" (production, and any environment with the key set): the
+ *     render is delegated to `render-worker/`, the standalone, already-live
+ *     `lokal-render-worker` Fly app (own image, built on
+ *     `mcr.microsoft.com/playwright`, own autoscale-to-zero, own internal
+ *     concurrency cap) via `services/render-client.ts`. Nothing is launched
+ *     in-process; this app's own memory/image footprint (Dockerfile:
+ *     node:20-alpine, 1024 MB, shared-cpu-1x, serving both
+ *     rettfrabonden.com and opplevagent.no) is untouched by rendering at all.
+ *     A failed call to the worker (bad response, timeout, network error) is
+ *     a real render failure for that page/attempt, classified by
+ *     `classifyRenderError()` same as the local path below — it is NOT
+ *     `renderer_unavailable`, because the worker being reachable in
+ *     principle is exactly what "configured" means here.
+ *   - "local" (RENDER_WORKER_KEY unset — dev/sandbox only): the original
+ *     `playwright-core` path, imported lazily inside a try/catch so merely
+ *     loading this module never requires the package to exist. This is what
+ *     makes `renderPage()` work in a session container that happens to ship
+ *     Chromium at $PLAYWRIGHT_BROWSERS_PATH, and it is kept as a harmless
+ *     fallback branch, not the production path. Playwright's own Chromium
+ *     builds are glibc-only and do not run on Alpine/musl, so this branch
+ *     was never going to be production's answer — apk-installing a system
+ *     Chromium into the main image remains out of scope (roughly +400 MB of
+ *     image and 150-300 MB more RSS while a page is open, on a machine that
+ *     already sits around 286 MB, with no staging environment to catch a
+ *     boot failure before real traffic) and is not needed now that the
+ *     worker covers production.
  *
- * That split is intentional and should not be "fixed" by adding playwright to
- * dependencies without a separate, explicit decision. Playwright's own
- * Chromium builds are glibc-only and do not run on Alpine/musl; making
- * production render would mean either leaving Alpine or apk-installing
- * chromium, roughly +400 MB of image, on a shared-cpu-1x machine with 1024 MB
- * of RAM that already sits around 286 MB RSS. Chromium wants 150-300 MB more
- * while a page is open. That is a real risk to a live site serving both
- * rettfrabonden.com and opplevagent.no, and it is Daniel's call to take, not a
- * side effect of landing this file.
+ * `renderer_unavailable` is reserved for the genuine case: no worker key AND
+ * the local `playwright-core` import fails — this environment has no
+ * rendering capability at all.
  *
- * The escalation decision is PURE and unit-tested; the render itself is the
- * only function here that touches a browser.
+ * The escalation decision and the backend selection are both PURE and
+ * unit-tested; the render itself is the only part here that does I/O.
  */
 
 import { visibleTextOf } from "./fetch-page";
+// Distinct local name: render-client.ts independently exports its own
+// `renderPage`, unrelated in shape to this module's export of the same name
+// — a pre-existing naming collision between two independently-written files.
+import { renderPage as callRenderWorker } from "./render-client";
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
@@ -148,6 +169,21 @@ export function renderedTextOf(html: string): string {
   return visibleTextOf(html);
 }
 
+/**
+ * Which render backend `defaultRenderImpl` should use. PURE — reads only
+ * whether `RENDER_WORKER_KEY` is configured, no I/O of its own.
+ *
+ * "worker" wins whenever the key is present: `render-worker/` (a standalone,
+ * already-live Fly app — see the deployment note above) is the ONLY backend
+ * available in production, since production's Alpine image has no browser
+ * and this repo is not adding one. "local" — the original `playwright-core`
+ * path — is the fallback for a dev/sandbox environment that has no worker
+ * key configured but may happen to have a local Chromium.
+ */
+export function selectRenderBackend(): "worker" | "local" {
+  return process.env.RENDER_WORKER_KEY ? "worker" : "local";
+}
+
 // ── The renderer ────────────────────────────────────────────────────────────
 
 export type RenderPageOptions = {
@@ -206,28 +242,98 @@ export async function renderPage(url: string, opts: RenderPageOptions): Promise<
  * `renderer_unavailable` is separated from every site-side failure on purpose:
  * it means THIS MACHINE cannot render, so a caller must not record anything
  * about the producer — not a strike, not a verification stamp, nothing. Every
- * other reason is a statement about the site.
+ * other reason is a statement about the site (or the attempt).
+ *
+ * Covers two shapes now: the local `playwright-core` errors this always
+ * handled, and `render-client.ts`'s thrown messages for the worker path
+ * (`render-worker <status>: <body>`, `RENDER_WORKER_KEY env var not set`,
+ * plain `fetch failed`, or an `AbortError` from the client-side timeout).
+ * Once `RENDER_WORKER_KEY` is configured, a worker-side failure is a REAL
+ * render failure about that page/attempt — it must land in one of the
+ * timeout/navigation/unknown buckets below, never `renderer_unavailable`.
+ * The one exception is `RENDER_WORKER_KEY env var not set`: only reachable by
+ * racing the env var away between `selectRenderBackend()` picking "worker"
+ * and `render-client.ts`'s own guard running, which genuinely does mean this
+ * attempt had no backend at all — `renderer_unavailable` is the sane bucket
+ * for that message specifically, not for any other worker failure.
  */
 export function classifyRenderError(err: unknown): { reason: RenderFailureReason; detail: string } {
   const e = err as { name?: string; message?: string; code?: string };
   const probe = `${e?.name ?? ""} ${e?.code ?? ""} ${e?.message ?? ""}`;
   const detail = String(e?.message ?? e?.name ?? "error").slice(0, 120);
 
-  if (/PLAYWRIGHT_UNAVAILABLE|Cannot find module|ERR_MODULE_NOT_FOUND|browserType\.launch/i.test(probe)) {
+  if (
+    /PLAYWRIGHT_UNAVAILABLE|Cannot find module|ERR_MODULE_NOT_FOUND|browserType\.launch|RENDER_WORKER_KEY env var not set/i.test(
+      probe,
+    )
+  ) {
     return { reason: "renderer_unavailable", detail };
   }
-  if (/Timeout|timed out|TimeoutError/i.test(probe)) return { reason: "render_timeout", detail };
-  if (/net::|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|ERR_CERT|navigation/i.test(probe)) {
+  // render-worker 504 = the worker's own navigation-timeout response
+  // (render-worker/src/index.ts classifies its page.goto timeout as 504).
+  if (/render-worker 504|Timeout|timed out|TimeoutError|AbortError/i.test(probe)) {
+    return { reason: "render_timeout", detail };
+  }
+  // render-worker 502 = the worker's own navigation-failed response (DNS,
+  // TLS, refused — everything page.goto threw that wasn't a timeout).
+  if (/render-worker 502|net::|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|ERR_CERT|navigation/i.test(probe)) {
     return { reason: "render_navigation_failed", detail };
   }
   return { reason: "unknown", detail };
 }
 
 /**
- * The real browser path. Imported lazily so that merely loading this module —
- * which the server does — never requires playwright-core to exist.
+ * The real render path. Branches on `selectRenderBackend()`:
+ *   - "worker": delegate to the already-live render-worker via
+ *     render-client.ts. No browser touches this process.
+ *   - "local": the original playwright-core path, unchanged.
  */
 async function defaultRenderImpl(
+  url: string,
+  timeoutMs: number,
+  userAgent: string,
+): Promise<{ html: string; finalUrl: string }> {
+  if (selectRenderBackend() === "worker") {
+    // Same `domcontentloaded` preference as the local branch below, and for
+    // the identical reason: producer sites routinely hold a socket open
+    // (chat widgets, analytics beacons) and never reach networkidle.
+    //
+    // `user_agent: userAgent` matters: every caller of this module's
+    // renderPage() (marketplace.ts, admin-rfb-website-discovery.ts) passes a
+    // specific UA precisely so the render looks like the SAME client as
+    // that caller's own plain fetch, not a different crawler, to the target
+    // site — see marketplace.ts's comment directly above its UA constant.
+    // Dropping it here would silently defeat that for every worker-backed
+    // render.
+    //
+    // Deploy caveat, load-bearing: render-worker/ is a SEPARATE Fly app
+    // (`lokal-render-worker`), deployed only by a manual
+    // `fly deploy --config render-worker/fly.toml --dockerfile
+    // render-worker/Dockerfile` — it is NOT auto-deployed by this repo's
+    // `git push origin main` → GitHub Actions pipeline (only the main
+    // `lokal` app is). So this UA plumbing is real, correct, and forward-
+    // compatible today, but the override will not actually take effect in
+    // production until someone with Fly credentials manually redeploys
+    // render-worker/. Until then, the worker keeps using its own default
+    // USER_AGENT constant (render-worker/src/index.ts) — identical to
+    // today's behaviour, not a regression, but also not yet the fix.
+    const result = await callRenderWorker(url, {
+      timeout_ms: timeoutMs,
+      wait_for: "domcontentloaded",
+      user_agent: userAgent,
+    });
+    return { html: result.html, finalUrl: result.final_url };
+  }
+  return defaultLocalRenderImpl(url, timeoutMs, userAgent);
+}
+
+/**
+ * The local browser path. Imported lazily so that merely loading this
+ * module — which the server does — never requires playwright-core to exist.
+ * Unchanged by the worker-backend addition above; still the dev/sandbox
+ * fallback for an environment with no RENDER_WORKER_KEY configured.
+ */
+async function defaultLocalRenderImpl(
   url: string,
   timeoutMs: number,
   userAgent: string,

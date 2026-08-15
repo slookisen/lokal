@@ -84,6 +84,12 @@ const renderRequestSchema = z.object({
     .default("networkidle"),
   timeout_ms: z.number().int().positive().max(60000).optional().default(30000),
   wait_selector: z.string().optional(),
+  // Optional per-request UA override. Omitting it keeps today's exact
+  // behaviour (context uses the hardcoded USER_AGENT below) — additive,
+  // backward-compatible. A caller needs this to make the render look like
+  // the SAME client as its own plain fetch, not a different crawler, to the
+  // target site (see render-page.ts's defaultRenderImpl worker branch).
+  user_agent: z.string().max(500).optional(),
 });
 
 // App setup
@@ -129,7 +135,7 @@ app.post("/render", requireKey, async (req: Request, res: Response) => {
     });
     return;
   }
-  const { url, wait_for, timeout_ms, wait_selector } = parsed.data;
+  const { url, wait_for, timeout_ms, wait_selector, user_agent } = parsed.data;
 
   if (!browser || !browserReady) {
     res.status(500).json({ status: "error", error: "browser not ready" });
@@ -140,7 +146,7 @@ app.post("/render", requireKey, async (req: Request, res: Response) => {
   let context: import("playwright").BrowserContext | null = null;
   try {
     context = await browser.newContext({
-      userAgent: USER_AGENT,
+      userAgent: user_agent ?? USER_AGENT,
       viewport: { width: 1280, height: 800 },
     });
 

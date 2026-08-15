@@ -30,6 +30,7 @@ import {
   classifyRenderError,
   renderPage,
   renderedTextOf,
+  selectRenderBackend,
   shouldEscalateToRender,
 } from "./render-page";
 
@@ -219,6 +220,57 @@ export async function runRenderPageTests(opts: { log?: boolean } = {}): Promise<
     classifyRenderError(new Error("something else entirely")).reason === "unknown",
     "cre-2: an unrecognised error is named unknown rather than guessed at",
   );
+
+  // ── classifyRenderError: render-client.ts's worker-path error shapes ──────
+  // These must NOT collapse into renderer_unavailable — once RENDER_WORKER_KEY
+  // is configured, a worker failure is a real render failure about that page.
+  check(
+    classifyRenderError(new Error("render-worker 504: navigation timeout")).reason === "render_timeout",
+    "cre-3: a render-worker 504 (the worker's own navigation-timeout status) is render_timeout",
+  );
+  check(
+    classifyRenderError(new Error("render-worker 502: navigation failed")).reason === "render_navigation_failed",
+    "cre-4: a render-worker 502 (the worker's own navigation-failed status) is render_navigation_failed",
+  );
+  {
+    const abortErr = new Error("This operation was aborted");
+    abortErr.name = "AbortError";
+    check(
+      classifyRenderError(abortErr).reason === "render_timeout",
+      "cre-5: an AbortError (render-client.ts's client-side fetch timeout) is render_timeout",
+    );
+  }
+  check(
+    classifyRenderError(new Error("render-worker 500: browser not ready")).reason === "unknown",
+    "cre-6: a render-worker 500 is a real attempt failure (unknown), never renderer_unavailable",
+  );
+  check(
+    classifyRenderError(new TypeError("fetch failed")).reason === "unknown",
+    "cre-7: a generic fetch failure reaching the worker is unknown, not renderer_unavailable",
+  );
+  check(
+    classifyRenderError(new Error("RENDER_WORKER_KEY env var not set; cannot call render-worker")).reason ===
+      "renderer_unavailable",
+    "cre-8: RENDER_WORKER_KEY vanishing mid-process (the one race case) still reports renderer_unavailable",
+  );
+
+  // ── selectRenderBackend: pure, env-only ────────────────────────────────────
+  {
+    const prevKey = process.env.RENDER_WORKER_KEY;
+    try {
+      process.env.RENDER_WORKER_KEY = "wk_live_test_key";
+      check(selectRenderBackend() === "worker", "srb-1: worker wins whenever RENDER_WORKER_KEY is set (the prod case)");
+
+      delete process.env.RENDER_WORKER_KEY;
+      check(selectRenderBackend() === "local", "srb-2: local is the fallback when RENDER_WORKER_KEY is unset (dev/sandbox)");
+
+      process.env.RENDER_WORKER_KEY = "";
+      check(selectRenderBackend() === "local", "srb-3: an empty-string key is treated the same as unset — falsy, not configured");
+    } finally {
+      if (prevKey === undefined) delete process.env.RENDER_WORKER_KEY;
+      else process.env.RENDER_WORKER_KEY = prevKey;
+    }
+  }
 
   return { passed, failed, failures };
 }
