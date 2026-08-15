@@ -2374,6 +2374,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     product_pages: string[];
     pages_fetched_paths: string[];
     outcome: GardssalgProductsOutcome;
+    // Only present when outcome === "invalid_unparseable" — see
+    // GardssalgProductsExtractionDiagnostic. Absent (not null) on every other
+    // outcome, so a reader never has to tell "no sample taken" apart from
+    // "sample was empty".
+    invalid_reason?: GardssalgProductsInvalidReason;
+    invalid_sample?: string;
+    stop_reason?: string | null;
   }> = [];
 
   /**
@@ -2753,6 +2760,17 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
         product_pages: productPageLabels,
         pages_fetched_paths: fetched.pagesFetchedPaths ?? [],
         outcome: diagnosticOut.outcome ?? "infra_failure",
+        // Spread-conditional rather than three unconditional fields: on a
+        // products_found row these keys are absent from the JSON entirely.
+        ...(diagnosticOut.invalid_reason !== undefined
+          ? { invalid_reason: diagnosticOut.invalid_reason }
+          : {}),
+        ...(diagnosticOut.invalid_sample !== undefined
+          ? { invalid_sample: diagnosticOut.invalid_sample }
+          : {}),
+        ...(diagnosticOut.stop_reason !== undefined
+          ? { stop_reason: diagnosticOut.stop_reason }
+          : {}),
       });
       if (productsCandidate && productsCandidate.length > 0) {
         wouldWriteActions.products = "filled";
@@ -17170,6 +17188,32 @@ const GARDSSALG_REWRITE_SOURCE_CHAR_CAP = 6000;
 const GARDSSALG_REWRITE_MIN_LEN = 200;
 const GARDSSALG_REWRITE_MAX_LEN = 500;
 
+/**
+ * Where a producer's food offer belongs — the DESCRIPTION, not `products`.
+ *
+ * Daniel, 2026-08-15, on Svensefjøset (a farm with a party venue whose
+ * `/menyer` page had just been written into `products` as "Røkelaks med
+ * pepperrotkrem, Karbonade av okse, …"): served food "kan være med, men ikke
+ * under produkter. Da er det bedre at beskrivelsen inkluderer en kort info om
+ * mat tilbud også."
+ *
+ * So the two halves of that decision are enforced in two different prompts:
+ * the products prompt (generateGardssalgProductList) refuses served dishes
+ * outright, and this sentence puts the fact back where it belongs — one short
+ * clause in the about text, still bound by the same never-fabricate rule as
+ * every other claim in that paragraph ("hvis kildeteksten viser").
+ *
+ * Deliberately about SERVING, not about food. This route feeds the whole
+ * gårdssalg catalog, not just the drink-producer cohort
+ * (selectGardssalgProvidersForContentRefresh has no producer_type filter), so a
+ * bakeri's bread and a gårdsbutikk's jam are still products — they are goods
+ * the customer takes home. What this excludes is a dish served on the premises.
+ *
+ * about_text only, never visit_text: "beskrivelsen" is the description field.
+ */
+const GARDSSALG_ABOUT_FOOD_MENTION_INSTRUCTION =
+  "Hvis kildeteksten viser at produsenten også serverer mat eller har et mattilbud (meny, servering, catering, selskapslokale, kafé), ta med én kort setning om det — men bare det kildeteksten faktisk sier, og uten å ramse opp enkeltretter.";
+
 // The profile template renders about_text/visit_text as plain text, so any
 // markdown the model emits lands on the public page as literal syntax —
 // found live 2026-07-19 on the first real rewrite ("**Smaksprøver og
@@ -17242,6 +17286,10 @@ export async function generateGardssalgAboutRewrite(
 
   const cappedSource = (sourceText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
   const sectionLabel = kind === "about" ? "Om produsenten" : "Besøket hos produsenten";
+  // Food-offer sentence goes to the DESCRIPTION only ("about"), never to
+  // visit_text — same Daniel decision as the fill-blank path below; see
+  // GARDSSALG_ABOUT_FOOD_MENTION_INSTRUCTION.
+  const foodMention = kind === "about" ? ` ${GARDSSALG_ABOUT_FOOD_MENTION_INSTRUCTION}` : "";
   const prompt = `Du skal utvide en kort, men allerede godkjent, norsk tekst om en gårdsprodusent (seksjonen "${sectionLabel}") til en mer utfyllende tekst på 200–400 tegn.
 
 Nåværende tekst: ${currentValue}
@@ -17249,7 +17297,7 @@ Nåværende tekst: ${currentValue}
 Kildetekst (hentet fra produsentens egen nettside):
 ${cappedSource}
 
-Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt. Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en utvidet, faktabasert tekst på 200–400 tegn, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt.${foodMention} Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en utvidet, faktabasert tekst på 200–400 tegn, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -17362,7 +17410,7 @@ export async function generateGardssalgAboutFromSource(
 Kildetekst (hentet fra produsentens egen nettside):
 ${cappedSource}
 
-Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt der. Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en genuin, faktabasert tekst om produsenten, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt der. ${GARDSSALG_ABOUT_FOOD_MENTION_INSTRUCTION} Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en genuin, faktabasert tekst om produsenten, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -17486,7 +17534,7 @@ const GARDSSALG_PRODUCTS_MAX_ITEMS = 20;
 //
 // Every entry earns its place from a label observed live on 2026-08-15:
 // /produkter · /nettbutikk · /sortiment · /vare-ol · /ourbeer/ · /products-2/ ·
-// /butikken.php?lang=en · /v-re-viner · /menyer · /produkter.php?lang=en
+// /butikken.php?lang=en · /v-re-viner · /produkter.php?lang=en
 //
 // A false positive here is cheap and a false negative is not, which is what
 // justifies matching this loosely: putting a contact page first costs nothing
@@ -17496,18 +17544,47 @@ const GARDSSALG_PRODUCTS_MAX_ITEMS = 20;
 // and anything derived from the producer's Brreg NACE code — Daniel, same
 // session: the products must come from what the site actually says, never from
 // the industry code. A brewery sells named beers, not "øl".
+//
+// "meny" was here for exactly one measured run (PR #608) and is now removed.
+// It was added because Svensefjøset exposed `/menyer`, without checking what
+// that page WAS: a selskapsmeny (party-catering dish list). Promoting it turned
+// a correct `sentinel_no_products` into "Røkelaks med pepperrotkrem, Karbonade
+// av okse, Roastbiff, Brie" written into `products` — a false positive, and the
+// one row this list "gained" in that run. Cheap-false-positive reasoning holds
+// for ORDERING pages, not for pointing the extractor at a page whose content is
+// a different kind of thing; the ordering nudge is not worth wrong data. Daniel,
+// 2026-08-15: served food may be mentioned, but not under `products` — the
+// description carries it instead (see generateGardssalgAboutFromSource).
 const GARDSSALG_PRODUCT_PATH_SUBSTRINGS = [
   "produkt", "product", "sortiment", "butikk", "beer", "wine", "cider",
-  "whisky", "sprit", "akevitt", "drikke", "shop", "meny",
+  "whisky", "sprit", "akevitt", "drikke", "shop",
 ];
 const GARDSSALG_PRODUCT_PATH_SEGMENTS = new Set([
   "ol", "øl", "vin", "viner", "gin", "rom", "vare", "varer", "store", "sider",
 ]);
 
+/**
+ * Serving-menu markers that VETO a product-page match, checked before either
+ * list above.
+ *
+ * Dropping "meny" from the substrings was not enough on its own: `vare` is a
+ * segment keyword (it exists for `/vare-ol` — "våre øl"), so `/vare-menyer`
+ * still read as a product page through the possessive rather than through
+ * anything about products. Found by the test that was written to pin the
+ * Svensefjøset regression, not in review.
+ *
+ * The veto only declines to PROMOTE the page. It is still fetched and still
+ * part of the source text at normal rank, so nothing is hidden from the model —
+ * this decides ordering, and a serving menu is never the page that best answers
+ * "what does this producer sell".
+ */
+const GARDSSALG_MENU_PATH_VETO = ["meny", "catering", "servering"];
+
 /** Whether a crawled page's label looks like it lists what the producer sells.
  *  PURE — no network, no state. */
 export function gardssalgLabelLooksLikeProducts(label: string): boolean {
   const lower = label.toLocaleLowerCase("nb-NO");
+  if (GARDSSALG_MENU_PATH_VETO.some((w) => lower.includes(w))) return false;
   if (GARDSSALG_PRODUCT_PATH_SUBSTRINGS.some((w) => lower.includes(w))) return true;
   return lower
     .split(/[^\p{L}\p{N}]+/u)
@@ -17566,8 +17643,48 @@ const GARDSSALG_PRODUCTS_MAX_ITEM_LEN = 60;
 // (missing API key, network error, non-2xx, unparseable response body) —
 // keeping these apart from "sentinel_no_products" is the whole point of this
 // diagnostic pass (see the dev-request's three hypotheses).
+// Which SHAPE of unparseable this was. Four code paths reach
+// "invalid_unparseable" and they have four different remedies, so the bucket
+// name alone has never been actionable:
+//   no_text_block       — the response carried no text content block at all
+//   not_json            — text came back, but JSON.parse rejected it (prose,
+//                         markdown fence, or a list cut off mid-array)
+//   not_array           — valid JSON, wrong shape (an object, a bare string)
+//   empty_after_filter  — a real array, but every entry was dropped by the
+//                         type/blank/length filter (e.g. all items longer than
+//                         GARDSSALG_PRODUCTS_MAX_ITEM_LEN)
+export type GardssalgProductsInvalidReason =
+  | "no_text_block"
+  | "not_json"
+  | "not_array"
+  | "empty_after_filter";
+
+/** ~200 chars, whitespace collapsed — enough to read what came back, bounded
+ *  so a diagnostic can never carry a whole page of model output. PURE. */
+export function gardssalgProductsInvalidSample(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim().slice(0, GARDSSALG_PRODUCTS_INVALID_SAMPLE_CHARS);
+}
+export const GARDSSALG_PRODUCTS_INVALID_SAMPLE_CHARS = 200;
+
+// dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 5
+// (2026-08-15): `outcome` alone could not explain a single one of the four
+// invalid_unparseable rows the PR #608 measurement produced — the failure had
+// a name and no description, so deciding whether max_tokens: 400 was cutting
+// the response off required another deploy just to look. These three fields
+// are what "look" needs, and they are recorded at the moment the response is
+// in hand rather than reconstructed later:
+//   invalid_reason — WHICH parse path failed (see the type above)
+//   invalid_sample — the first ~200 chars of what the model actually returned
+//   stop_reason    — the API's own stop_reason ("max_tokens" vs "end_turn"),
+//                    which settles the truncation question outright instead of
+//                    inferring it from a token estimate
+// All three are optional and only populated on the invalid_unparseable path;
+// every other outcome leaves them undefined, so no existing consumer changes.
 export interface GardssalgProductsExtractionDiagnostic {
   outcome?: "products_found" | "sentinel_no_products" | "invalid_unparseable" | "infra_failure";
+  invalid_reason?: GardssalgProductsInvalidReason;
+  invalid_sample?: string;
+  stop_reason?: string | null;
 }
 
 // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 4
@@ -17582,7 +17699,12 @@ export interface GardssalgProductsExtractionDiagnostic {
 type GardssalgProductAttemptResult =
   | { kind: "products"; items: string[] }
   | { kind: "sentinel" }
-  | { kind: "unparseable" }
+  | {
+      kind: "unparseable";
+      reason: GardssalgProductsInvalidReason;
+      sample: string;
+      stop_reason: string | null;
+    }
   | { kind: "infra_failure" };
 
 async function attemptGardssalgProductExtraction(
@@ -17619,10 +17741,22 @@ async function attemptGardssalgProductExtraction(
     return { kind: "infra_failure" }; // unparseable JSON body — never fabricate
   }
 
+  // Read straight off the API response, not inferred: "max_tokens" here IS the
+  // proof that the answer was cut off mid-emission, and "end_turn" IS the proof
+  // that it was not. Null when the field is absent or not a string.
+  const stopReason = typeof result?.stop_reason === "string" ? result.stop_reason : null;
+
   const contentArr = Array.isArray(result?.content) ? result.content : [];
   const text = contentArr.find((c: any) => c?.type === "text")?.text;
   if (typeof text !== "string") {
-    return { kind: "unparseable" };
+    // No text block to sample — record the response's own shape instead, so
+    // this branch is still distinguishable from an empty model answer.
+    return {
+      kind: "unparseable",
+      reason: "no_text_block",
+      sample: gardssalgProductsInvalidSample(JSON.stringify(result?.content ?? null) ?? "null"),
+      stop_reason: stopReason,
+    };
   }
   const cleaned = text.trim();
   if (cleaned === GARDSSALG_PRODUCTS_SENTINEL) {
@@ -17633,10 +17767,21 @@ async function attemptGardssalgProductExtraction(
   try {
     parsed = JSON.parse(cleaned);
   } catch {
-    return { kind: "unparseable" }; // not valid JSON — never fabricate/guess a list from prose
+    // not valid JSON — never fabricate/guess a list from prose
+    return {
+      kind: "unparseable",
+      reason: "not_json",
+      sample: gardssalgProductsInvalidSample(cleaned),
+      stop_reason: stopReason,
+    };
   }
   if (!Array.isArray(parsed)) {
-    return { kind: "unparseable" };
+    return {
+      kind: "unparseable",
+      reason: "not_array",
+      sample: gardssalgProductsInvalidSample(cleaned),
+      stop_reason: stopReason,
+    };
   }
 
   const seen = new Set<string>();
@@ -17653,7 +17798,16 @@ async function attemptGardssalgProductExtraction(
   }
 
   if (items.length === 0) {
-    return { kind: "unparseable" };
+    // A well-formed array that filtered down to nothing. Sampling `cleaned`
+    // rather than the array makes the cause readable: 25 entries all longer
+    // than GARDSSALG_PRODUCTS_MAX_ITEM_LEN look completely different here
+    // from a literal `[]`.
+    return {
+      kind: "unparseable",
+      reason: "empty_after_filter",
+      sample: gardssalgProductsInvalidSample(cleaned),
+      stop_reason: stopReason,
+    };
   }
   return { kind: "products", items };
 }
@@ -17674,7 +17828,7 @@ export async function generateGardssalgProductList(
 Kildetekst (hentet fra produsentens egen nettside):
 ${cappedSource}
 
-Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der. Ikke finn på produkter som ikke er nevnt. Svar med EKSAKT et JSON-array av strenger, f.eks. ["Eplesider","Eplemost"], og ingenting annet. Hvis kildeteksten ikke nevner noen konkrete produkter, svar med nøyaktig ${GARDSSALG_PRODUCTS_SENTINEL} og ingenting annet.`;
+Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der. Ikke finn på produkter som ikke er nevnt. Et produkt er en vare produsenten selger og som kunden får med seg — flasker, glass, pakker, varer i utsalget. Retter som serveres er IKKE produkter: selskapsmeny, cateringmeny, dagens rett, buffet og annen servering skal ALDRI med i listen, selv om rettene står navngitt i kildeteksten. Svar med EKSAKT et JSON-array av strenger, f.eks. ["Eplesider","Eplemost"], og ingenting annet. Hvis kildeteksten ikke nevner noen konkrete produkter, svar med nøyaktig ${GARDSSALG_PRODUCTS_SENTINEL} og ingenting annet.`;
 
   // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 4:
   // ONE automatic retry (one additional API call, same cappedSource/prompt),
@@ -17701,7 +17855,18 @@ Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der.
       return null;
     case "unparseable":
     default:
-      if (diagnosticOut) diagnosticOut.outcome = "invalid_unparseable";
+      if (diagnosticOut) {
+        diagnosticOut.outcome = "invalid_unparseable";
+        // The FINAL attempt's evidence. When the retry above fired, that is
+        // the second response — the one whose failure actually produced this
+        // outcome. (The `attempt.kind` guard is what makes this type-safe in
+        // the `default` branch, which no known result reaches.)
+        if (attempt.kind === "unparseable") {
+          diagnosticOut.invalid_reason = attempt.reason;
+          diagnosticOut.invalid_sample = attempt.sample;
+          diagnosticOut.stop_reason = attempt.stop_reason;
+        }
+      }
       return null;
   }
 }

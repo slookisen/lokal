@@ -167,6 +167,23 @@ export function runOpplevelserGardssalgRewriteTests(
         assertTrue(body.messages[0].content.includes(SOURCE_TEXT), "ru-2e: prompt includes the source text");
         assertTrue(body.messages[0].content.includes("INGEN_UTVIDELSE_MULIG"), "ru-2f: prompt includes the escape sentinel instruction");
         assertTrue(body.messages[0].content.includes("Bruk KUN fakta som faktisk står i kildeteksten"), "ru-2g: prompt includes the exact grounding instruction");
+        // Daniel, 2026-08-15: served food belongs in the description, not in
+        // `products`. This is the expand-existing path — the fill-blank path
+        // carries the same sentence (fillblank fb-2i). Asserted on BOTH kinds
+        // because they share one prompt builder: "beskrivelsen" is about_text,
+        // and visit_text must not start collecting menu prose as a side effect.
+        assertTrue(
+          body.messages[0].content.includes("serverer mat eller har et mattilbud"),
+          "ru-2h: about-kind prompt invites a short mention of a food/serving offer",
+        );
+      }
+      {
+        await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "visit");
+        const visitBody = JSON.parse(capturedInit.body);
+        assertTrue(
+          !visitBody.messages[0].content.includes("serverer mat eller har et mattilbud"),
+          "ru-2i: visit-kind prompt does NOT get the food sentence — the decision was about the description",
+        );
         assertEq(capturedInit.headers["x-api-key"], "test-anthropic-key", "ru-2h: x-api-key header carries ANTHROPIC_API_KEY");
       }
 
