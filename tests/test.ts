@@ -24878,6 +24878,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageProvenanceHeadlessFallbackPromise; } catch { /* errors already pushed to failures */ }
+  try { await _tynneProfilerImprovePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -33230,6 +33231,42 @@ const _homepageProvenanceHeadlessFallbackPromise: Promise<void> = new Promise<vo
   }
 })();
 
+// dev-request 2026-08-15-tynne-profiler-forbedringsloype, Slice 2: source-
+// fetch + LLM generation + judge-gate + audit-write improvement loop
+// (POST /admin/agents/tynne-profiler-improve, src/routes/admin-agents.ts) —
+// own in-memory prod-schema DB, swaps the shared getDb() singleton AND
+// globalThis.fetch (for both the website source-fetch and the Anthropic
+// generation+judge calls) — chained after
+// _homepageProvenanceHeadlessFallbackPromise, the current tail of this
+// serial chain, for the same reason every other DB-singleton-swapping/
+// fetch-swapping suite in this family is chained rather than run in
+// parallel.
+let _tynneProfilerImproveResolve: () => void = () => {};
+const _tynneProfilerImprovePromise: Promise<void> = new Promise<void>(r => {
+  _tynneProfilerImproveResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_homepageProvenanceHeadlessFallbackPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-08-15-tynne-profiler-forbedringsloype (Slice 2): agents/tynne-profiler-improve ──");
+  try {
+    const { runAdminAgentsTynneProfilerImproveTests } = require("../src/routes/admin-agents-tynne-profiler-improve.test") as
+      typeof import("../src/routes/admin-agents-tynne-profiler-improve.test");
+    const tpi = await runAdminAgentsTynneProfilerImproveTests({ log: false });
+    passed += tpi.passed;
+    failed += tpi.failed;
+    for (const f of tpi.failures) failures.push("admin-agents-tynne-profiler-improve: " + f);
+    console.log(`  admin-agents-tynne-profiler-improve: ${tpi.passed} passed, ${tpi.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-tynne-profiler-improve: unexpected error: " + String(err?.message || err));
+  } finally {
+    _tynneProfilerImproveResolve();
+  }
+})();
+
 // ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
@@ -33286,7 +33323,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _recentlyEnrichedSpotcheckPromise, _emailOwnershipProvenancePromise, _pilotOrdreLoopPromise,
   _expNoYieldBackoffPromise, _contentRefreshErrorsByPersistencePromise, _lowQualitySelectorPromise,
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
-  _homepageProvenanceHeadlessFallbackPromise,
+  _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);

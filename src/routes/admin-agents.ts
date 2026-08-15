@@ -63,7 +63,14 @@ import { canCorrectFactualField, mergeFieldProvenance } from "./admin-knowledge"
 // Unicode/boilerplate/Norwegian-language check — never the nav-menu-leakage/
 // umbrella-membership regex heuristic layer (meetsAboutQualityBar), which
 // stays exactly as-is for its existing caller (admin-knowledge.ts).
-import { meetsAboutCheapBar, classifyAboutCheapBar } from "../services/search-enrich";
+import { meetsAboutCheapBar, classifyAboutCheapBar, buildPageEvidence, type PageEvidence } from "../services/search-enrich";
+// dev-request 2026-08-15-tynne-profiler-forbedringsloype (Slice 2): the same
+// aggregator/directory-host denylist every other RFB write path that trusts
+// a "verified" website already reuses (admin-knowledge.ts, admin-rfb-
+// website-discovery.ts) — defensive re-check before crawling a website for
+// generation source text, never assumed safe just because it cleared the
+// (unrelated) website-discovery ownership gate.
+import { isDirectoryOrAggregatorHost, hostFromUrlLike } from "../services/cross-source-validator";
 // POST /org-nr-backfill below: RFB producer names carry the same "Navn —
 // Sted" display suffix convention gårdssalg does — reuse the existing,
 // already-tested stripper rather than re-implementing it.
@@ -3714,6 +3721,767 @@ router.get("/tynne-profiler-queue", (req: Request, res: Response) => {
   const db = getDb();
   const entries = listAgentTynneProfilerQueue(db);
   res.json({ count: entries.length, entries });
+});
+
+// ─── dev-request 2026-08-15-tynne-profiler-forbedringsloype (Slice 2) ──────
+// POST /admin/agents/tynne-profiler-improve
+//
+// Daniel's wish, the ACTIVE half: profiles the recalibrated judge still
+// flags should be actively IMPROVED, not just re-classified (Slice 1) or
+// nulled (POST /retro-scan). For each pending agents_tynne_profiler_queue
+// row: fetch the producer's own verified website (source), GENERATE new
+// Norwegian description/about text grounded ONLY in that source (a NEW LLM
+// call, separate from the judge), gate the candidate through the EXISTING
+// judgeRfbAboutCandidate cascade, and — apply mode only — write it through
+// the SAME row-lock / curated-field-lock / field_provenance-merge / audit
+// discipline every other RFB write path in this file already uses.
+//
+// CORRECTION vs this slice's own build brief: the verified website column is
+// `agent_knowledge.website` (written ONLY by POST /admin/rfb-website-review-
+// approve, gated on evaluateRfbWebsiteCandidate's evidence match — see that
+// route's own header comment), NOT `agents.website` (no such column exists —
+// verified directly against src/database/init.ts's CREATE TABLE agents
+// block). The rest of that provenance reasoning (a non-blank website is
+// already ownership-verified, so this route does not re-verify ownership,
+// only defensively excludes aggregator/directory hosts) is unchanged.
+//
+// Never-fabricate contract (the highest-fabrication-risk part of this whole
+// dev-request — see generateTynneProfilerCandidate below): the generator is
+// prompted to assert ONLY facts present in the fetched source text (plus a
+// small set of already-separately-verified structured facts — address/
+// postal_code from agent_knowledge, see that function's own doc comment),
+// with an explicit escape sentinel for "not enough material" and a fail-
+// closed null on ANY doubt (missing key / network / non-200 / bad JSON /
+// unexpected shape / the sentinel). The candidate's actual FITNESS to
+// publish is never trusted to the generator or to this route's own code —
+// it must first clear classifyAboutCheapBar's deterministic prefilter
+// (mangled Unicode / boilerplate / non-Norwegian — see the cheap-bar call in
+// processTynneProfilerRow, Step 3, mirroring rfbRetroScanShouldNull's own
+// ordering), and only then the existing judgeRfbAboutCandidate cascade,
+// exactly like every other write path in this file. IMPORTANT CAVEAT this
+// comment previously overstated: the judge is never passed the source text,
+// so it cannot and does not verify factual grounding against it — it only
+// judges the candidate in isolation for coherence, genericness, and
+// nav/boilerplate leakage (plus, as a soft instruction rather than a
+// deterministic check, "ekte norsk prosa"). The actual "no fabrication"
+// guarantee rests entirely on the GENERATION prompt's own instruction-
+// following (see generateTynneProfilerCandidate below), not on any
+// downstream re-check against the source — nothing in this route's
+// pipeline re-verifies a candidate's claims against the fetched page text.
+// This is inherited unchanged from the gårdssalg precedent's identical
+// architecture (generateGardssalgAboutFromSource + meetsGardssalgAbout-
+// QualityBar, routes/opplevelser.ts), not a new gap introduced here.
+//
+// Fields NOT re-verified here (deliberately, matching the write path this
+// mirrors): a non-blank agent_knowledge.website is treated as already
+// ownership-verified per the header comment above — this route does not
+// re-run evaluateRfbWebsiteCandidate.
+
+/** Per-field terminal/attempt state for ONE flagged field on ONE queue row.
+ * "approved" (dry-run) becomes "written" or "write_lock_race" once apply
+ * mode's write-time re-check has run — see processTynneProfilerRow below. */
+type TynneProfilerFieldOutcome =
+  | "written"
+  | "approved" // dry-run only: judge approved, would be written under apply
+  | "curated_locked"
+  | "no_source"
+  | "source_aggregator_host"
+  | "source_fetch_failed"
+  | "generation_failed"
+  | "generation_failed_cheap_bar" // candidate generated, but classifyAboutCheapBar rejected it (mangled/boilerplate/foreign) BEFORE the judge ever saw it — see the cheap-bar prefilter call in processTynneProfilerRow below
+  | "judge_rejected"
+  | "judge_infra_failure"
+  | "write_lock_race"; // approved, but the immediate-before-write re-check found the row/field newly locked
+
+interface TynneProfilerFieldAttempt {
+  field: "description" | "about";
+  outcome: TynneProfilerFieldOutcome;
+  text?: string; // present only for "approved"/"written"
+  reasoning?: string; // judge reasoning, when a judge call happened
+}
+
+/** Priority order (most-blocking first) used to pick ONE representative
+ * `cause` string for a queue row when more than one still-unresolved field
+ * failed for different reasons. Roughly "how far the pipeline got": no
+ * source at all outranks a locked field, which outranks a genuine judge
+ * rejection (the pipeline ran furthest for that one). Documented here per
+ * this slice's own build brief ("pick clear new cause strings and document
+ * them in a comment") — these are ADDITIVE new cause values, never
+ * colliding with Slice 1's 'no_source' or POST /retro-scan's
+ * RfbRetroScanCauseClass values (a different column's vocabulary entirely). */
+const TYNNE_PROFILER_ROW_CAUSE_PRIORITY: readonly TynneProfilerFieldOutcome[] = [
+  "no_source",
+  "source_aggregator_host",
+  "source_fetch_failed",
+  "curated_locked",
+  "write_lock_race",
+  "judge_infra_failure",
+  "generation_failed",
+  "generation_failed_cheap_bar",
+  "judge_rejected",
+];
+
+function pickTynneProfilerRowCause(outcomes: TynneProfilerFieldOutcome[]): string {
+  for (const c of TYNNE_PROFILER_ROW_CAUSE_PRIORITY) {
+    if (outcomes.includes(c)) return c;
+  }
+  return outcomes[0] ?? "no_source"; // defensive — every real outcome above is covered
+}
+
+interface TynneProfilerAgentSnapshot {
+  agent_id: string;
+  name: string;
+  claimed_at: string | null;
+  description: string;
+  about: string | null;
+  curated_fields: string | null;
+  field_provenance: string | null;
+  website: string | null;
+  address: string | null;
+  postal_code: string | null;
+}
+
+/** Fresh per-agent read — used both for the initial per-row attempt AND
+ * (separately, inside applyTynneProfilerFieldWrites' own transaction) for
+ * the immediate-before-write re-check. Never cached across the async
+ * generation/judge calls this route makes, so a row claimed or curated
+ * mid-flight is always caught. */
+function getTynneProfilerAgentSnapshot(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+): TynneProfilerAgentSnapshot | undefined {
+  return db
+    .prepare(
+      `SELECT a.id AS agent_id, a.name AS name, a.claimed_at AS claimed_at,
+              a.description AS description, k.about AS about,
+              k.curated_fields AS curated_fields, k.field_provenance AS field_provenance,
+              k.website AS website, k.address AS address, k.postal_code AS postal_code
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id = ?`,
+    )
+    .get(agentId) as TynneProfilerAgentSnapshot | undefined;
+}
+
+// ─── generateTynneProfilerCandidate — the generation LLM call ──────────────
+// Mirrors gårdssalg's own source-grounded generation precedent
+// (generateGardssalgAboutFromSource, routes/opplevelser.ts) EXACTLY: sync
+// fetch to https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from
+// env, model claude-haiku-4-5 (same model the judge above and gårdssalg's
+// own generator use). Returns null — NEVER throws, NEVER fabricates — on
+// missing key / network failure / non-200 / unparseable body / the escape
+// sentinel / residual markdown / an empty result.
+//
+// Grounding: the prompt passes ONLY (a) the already-fetched, already-
+// extracted visible page text (pageText — buildPageEvidence's contentText,
+// capped like gårdssalg's own generator) and (b) a SMALL set of already-
+// separately-verified structured facts (agent_knowledge.address/
+// postal_code — written by OTHER, already-gated RFB write paths, not fresh
+// unverified claims) as optional supplementary context, explicitly labelled
+// as facts the model may use "where relevant" but must not invent beyond.
+// This (b) half is this function's own deliberate design choice beyond the
+// gårdssalg precedent (which passes only pageText+navn) — worth a
+// reviewer's specific attention: it slightly widens what counts as
+// "grounded" beyond the crawled text, on the argument that these fields are
+// independently verified elsewhere in this codebase's own write paths, not
+// asserted fresh by this generator. If that argument doesn't hold up on
+// review, dropping the cachedFacts param entirely (source text only) is a
+// one-line-call-site change.
+//
+// Daniel's own wording, carried into the prompt near-verbatim: "de særegne
+// egenskapene" — produkter, sted, driftsform, historie, utmerkelser.
+// Målform: instructed to match whatever the SOURCE text itself uses
+// (bokmål vs nynorsk) — the "Avdem-presedensen" this dev-request cites
+// (Avdem Gardsysteri's 2026-07-25 manual fix matched the producer's own
+// nynorsk voice).
+const TYNNE_PROFILER_GEN_SENTINEL = "INGEN_FORBEDRING_MULIG";
+const TYNNE_PROFILER_SOURCE_CHAR_CAP = 6000;
+// Defensive outer ceiling on the WRITTEN value — generous relative to the
+// ~100–500 char prompt targets below (never expected to trip in practice),
+// mirrors marketplace.ts's own PATCH /agents/:id description length cap
+// (2000) so a runaway generation can never write something wildly outside
+// what every other write path on this column already tolerates.
+const TYNNE_PROFILER_GEN_MAX_LEN = 2000;
+
+// Same markdown-artifact strip + residual-check discipline as gårdssalg's
+// generateGardssalgAboutRewrite/generateGardssalgAboutFromSource (routes/
+// opplevelser.ts) — kept as a local copy rather than a cross-file import
+// (that helper isn't exported, and RFB's about/description template is its
+// own rendering surface, same "kept local" precedent this file's retro-scan
+// section already documents for its own cheap-bar split).
+const TYNNE_PROFILER_RESIDUAL_MARKDOWN = /[*#`_\\[\]>~|]/;
+function stripTynneProfilerMarkdownArtifacts(s: string): string {
+  return s
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^\s*[-*•]\s+/gm, "")
+    .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
+    .replace(/^\s*>\s+/gm, "")
+    .replace(/^[=\-_]{3,}\s*$/gm, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/\*(\S(?:[^*\n]*?\S)?)\*/g, "$1")
+    .replace(/`+/g, "")
+    .replace(/\s*\n+\s*/g, " ")
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
+export async function generateTynneProfilerCandidate(
+  pageText: string,
+  producerName: string,
+  kind: "description" | "about",
+  cachedFacts?: { address?: string | null; postalCode?: string | null },
+): Promise<string | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const cappedSource = (pageText || "").slice(0, TYNNE_PROFILER_SOURCE_CHAR_CAP);
+  const sectionLabel = kind === "description" ? "kort produsentbeskrivelse" : "utfyllende «Om produsenten»-tekst";
+  const lenHint = kind === "description" ? "100–300" : "200–500";
+
+  const factParts: string[] = [];
+  if (cachedFacts?.address && cachedFacts.address.trim()) factParts.push(`Adresse: ${cachedFacts.address.trim()}`);
+  if (cachedFacts?.postalCode && cachedFacts.postalCode.trim()) factParts.push(`Postnummer: ${cachedFacts.postalCode.trim()}`);
+  const factsBlock =
+    factParts.length > 0
+      ? `\nKjente, allerede bekreftede fakta om produsenten (kan brukes der relevant, men ikke finn på mer enn dette):\n${factParts.join(", ")}\n`
+      : "";
+
+  const prompt = `Skriv en ${sectionLabel} på norsk for produsenten "${producerName}", på ca. ${lenHint} tegn. Fremhev nettopp DENNE produsentens særegne egenskaper — produkter, sted, driftsform, historie, utmerkelser — der kilden faktisk nevner slikt.
+${factsBlock}
+Kildetekst (hentet fra produsentens egen nettside):
+${cappedSource}
+
+Bruk KUN fakta som faktisk fremgår av kildeteksten over${factParts.length > 0 ? " (og de kjente faktaene ovenfor, der relevant)" : ""}. Ikke finn på detaljer, produkter, tall, historie eller utmerkelser som ikke er nevnt. Skriv på samme målform (bokmål eller nynorsk) som kildeteksten selv bruker. Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en genuin, faktabasert tekst om nettopp denne produsentens særpreg, svar med nøyaktig ${TYNNE_PROFILER_GEN_SENTINEL} og ingenting annet.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+  const cleaned = text.trim();
+  if (cleaned === TYNNE_PROFILER_GEN_SENTINEL) return null; // explicit "not enough material" escape
+
+  const plain = stripTynneProfilerMarkdownArtifacts(cleaned);
+  if (!plain) return null;
+  if (plain.includes(TYNNE_PROFILER_GEN_SENTINEL)) return null; // sentinel embedded/wrapped rather than verbatim
+  if (TYNNE_PROFILER_RESIDUAL_MARKDOWN.test(plain)) return null; // unpaired markdown residue after stripping
+  if (plain.length > TYNNE_PROFILER_GEN_MAX_LEN) return null; // defensive outer ceiling, see constant's doc comment
+
+  return plain;
+}
+
+// ─── applyTynneProfilerFieldWrites — the actual write, apply mode only ────
+// Mirrors applyRfbRetroScanNull's exact discipline (this same file, above):
+// re-reads claimed_at + curated_fields from a FRESH row snapshot INSIDE the
+// transaction (never trusts the caller's earlier snapshot — a row could
+// have been claimed, or a field curated-locked, between the judge call and
+// this write), writes description/about + merges field_provenance (via the
+// SAME mergeFieldProvenance every other write path in this file uses,
+// preserving other fields' existing entries) + inserts one
+// agent_knowledge_audit row per field actually written
+// (changed_by:'system', notes carries the judge's approval reasoning + the
+// source URL).
+interface TynneProfilerFieldWriteRequest {
+  field: "description" | "about";
+  text: string;
+  sourceUrl: string;
+  reasoning: string;
+}
+
+interface TynneProfilerWriteResult {
+  writtenFields: Array<"description" | "about">;
+  raceLockedFields: Array<"description" | "about">;
+}
+
+function applyTynneProfilerFieldWrites(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  approved: TynneProfilerFieldWriteRequest[],
+): TynneProfilerWriteResult {
+  if (approved.length === 0) return { writtenFields: [], raceLockedFields: [] };
+
+  let result: TynneProfilerWriteResult = { writtenFields: [], raceLockedFields: [] };
+
+  const tx = db.transaction((): void => {
+    const fresh = db
+      .prepare(
+        `SELECT a.claimed_at AS claimed_at, a.description AS description,
+                k.about AS about, k.curated_fields AS curated_fields,
+                k.field_provenance AS field_provenance
+           FROM agents a
+           LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.id = ?`,
+      )
+      .get(agentId) as
+      | { claimed_at: string | null; description: string; about: string | null; curated_fields: string | null; field_provenance: string | null }
+      | undefined;
+
+    // Agent vanished or was claimed since selection — never write. Every
+    // requested field reports as a lock-race, same as the per-field curated
+    // case below (row-level lock is an absolute refusal for the WHOLE row).
+    if (!fresh || fresh.claimed_at) {
+      result = { writtenFields: [], raceLockedFields: approved.map((a) => a.field) };
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const written: Array<"description" | "about"> = [];
+    const raceLocked: Array<"description" | "about"> = [];
+    const auditRows: Array<{ field_name: string; old_value: string | null; new_value: string; notes: string }> = [];
+    const provenanceIncoming: Record<
+      string,
+      { sources: Array<{ source_type: string; value: string; source_url: string; fetched_at: string }> }
+    > = {};
+
+    for (const req of approved) {
+      if (isRfbFieldCurated(fresh.curated_fields, req.field)) {
+        raceLocked.push(req.field); // locked between judge call and this write
+        continue;
+      }
+      const oldValue = req.field === "description" ? fresh.description : fresh.about;
+      if (req.field === "description") {
+        db.prepare(`UPDATE agents SET description = ? WHERE id = ?`).run(req.text, agentId);
+      } else {
+        const exists = db.prepare("SELECT 1 AS one FROM agent_knowledge WHERE agent_id = ?").get(agentId);
+        if (!exists) {
+          db.prepare("INSERT INTO agent_knowledge (agent_id, about, updated_at) VALUES (?, ?, ?)").run(
+            agentId,
+            req.text,
+            nowIso,
+          );
+        } else {
+          db.prepare("UPDATE agent_knowledge SET about = ?, updated_at = ? WHERE agent_id = ?").run(
+            req.text,
+            nowIso,
+            agentId,
+          );
+        }
+      }
+      written.push(req.field);
+      auditRows.push({
+        field_name: req.field,
+        old_value: oldValue,
+        new_value: req.text,
+        notes: `tynne_profiler_slice2: godkjent av dommer ("${req.reasoning}") — kilde: ${req.sourceUrl}`,
+      });
+      provenanceIncoming[req.field] = {
+        sources: [{ source_type: "homepage", value: req.text, source_url: req.sourceUrl, fetched_at: nowIso }],
+      };
+    }
+
+    if (written.length > 0) {
+      // field_provenance merge — read-modify-write via the SAME shared
+      // helper every other write path uses; preserves entries for fields
+      // NOT touched by this write (e.g. website, phone, address).
+      let existingProv: Record<string, unknown> = {};
+      if (fresh.field_provenance) {
+        try {
+          const parsed = JSON.parse(fresh.field_provenance);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existingProv = parsed;
+        } catch {
+          /* malformed existing JSON -> treat as empty rather than clobber the write */
+        }
+      }
+      const merged = mergeFieldProvenance(existingProv, provenanceIncoming);
+
+      const existsRow = db.prepare("SELECT 1 AS one FROM agent_knowledge WHERE agent_id = ?").get(agentId);
+      if (!existsRow) {
+        db.prepare("INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, ?, ?)").run(
+          agentId,
+          JSON.stringify(merged),
+          nowIso,
+        );
+      } else {
+        db.prepare("UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?").run(
+          JSON.stringify(merged),
+          nowIso,
+          agentId,
+        );
+      }
+
+      const insertAudit = db.prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, ?, ?, ?, 'system', NULL, ?, ?)`,
+      );
+      for (const ar of auditRows) {
+        insertAudit.run(uuid(), agentId, ar.field_name, ar.old_value, ar.new_value, nowIso, ar.notes);
+      }
+    }
+
+    result = { writtenFields: written, raceLockedFields: raceLocked };
+  });
+  tx();
+
+  return result;
+}
+
+// ─── queue-row update helper (apply mode only) ─────────────────────────────
+// Plain UPDATE (not upsertAgentTynneProfilerQueue's upsert-on-agent_id — the
+// row here is ALWAYS already-existing, sourced from the queue itself, so an
+// upsert's INSERT branch would never fire and would just be dead code).
+// Only ever called when the computed next state actually differs from the
+// row's current state (tynneProfilerQueueStateEquals below) — keeps a
+// no-op call (e.g. a still-no_source row where nothing changed) a genuine
+// no-op, not a spurious last_seen_at bump.
+function updateTynneProfilerQueueRow(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  next: { status: "pending" | "resolved"; cause: string; flagged_fields: string[]; priority_tier: TynneProfilerPriorityTier },
+): void {
+  db.prepare(
+    `UPDATE agents_tynne_profiler_queue
+        SET status = ?, cause = ?, flagged_fields = ?, priority_tier = ?, last_seen_at = datetime('now')
+      WHERE agent_id = ?`,
+  ).run(next.status, next.cause, JSON.stringify(next.flagged_fields), next.priority_tier, agentId);
+}
+
+function tynneProfilerQueueStateEquals(
+  row: AgentTynneProfilerQueueRow,
+  next: { status: string; cause: string; flagged_fields: string[]; priority_tier: string },
+): boolean {
+  return (
+    row.status === next.status &&
+    row.cause === next.cause &&
+    row.priority_tier === next.priority_tier &&
+    JSON.stringify(row.flagged_fields) === JSON.stringify(next.flagged_fields)
+  );
+}
+
+interface TynneProfilerImproveRowResult {
+  agent_id: string;
+  name: string;
+  outcome: "resolved" | "partial" | "unresolved" | "skipped_locked" | "error";
+  website: string | null;
+  cause: string | null;
+  fields: Record<string, { outcome: TynneProfilerFieldOutcome; reasoning?: string; preview?: string }>;
+}
+
+// ─── processTynneProfilerRow — the per-row source-fetch/generate/judge/
+//     (maybe-)write pipeline ───────────────────────────────────────────────
+// Shared by BOTH dry-run and apply mode: fetch/generate/judge always run for
+// real (a genuine preview, same "real judge calls, zero writes" contract as
+// POST /retro-scan's own dry-run) — only the final write step (and the
+// queue-row bookkeeping update) is apply-mode-only.
+async function processTynneProfilerRow(
+  db: ReturnType<typeof getDb>,
+  queueRow: AgentTynneProfilerQueueRow,
+  apply: boolean,
+): Promise<TynneProfilerImproveRowResult> {
+  const snapshot = getTynneProfilerAgentSnapshot(db, queueRow.agent_id);
+  if (!snapshot) {
+    // Agent vanished since the queue row was written (deleted, merged) —
+    // the FK's ON DELETE CASCADE should have removed the queue row too, so
+    // this is defensive-only; nothing to do, queue untouched.
+    return { agent_id: queueRow.agent_id, name: queueRow.agent_name ?? "", outcome: "error", website: null, cause: null, fields: {} };
+  }
+  if (snapshot.claimed_at) {
+    // Row-level lock — checked FIRST, before any fetch/generate/judge call,
+    // same discipline as runRfbRetroScanCore's own processOne above. Queue
+    // row is left completely untouched (an owner-claimed row is no longer
+    // this route's business at all).
+    return { agent_id: queueRow.agent_id, name: snapshot.name, outcome: "skipped_locked", website: snapshot.website, cause: null, fields: {} };
+  }
+
+  const flaggedFields = queueRow.flagged_fields as Array<"description" | "about">;
+  const fieldResults: Record<string, TynneProfilerFieldAttempt> = {};
+
+  // Per-field curated lock — excluded from generation entirely (never even
+  // attempted), same "absolute refusal" every other RFB write path in this
+  // file applies.
+  const curatedFields = flaggedFields.filter((f) => isRfbFieldCurated(snapshot.curated_fields, f));
+  for (const f of curatedFields) fieldResults[f] = { field: f, outcome: "curated_locked" };
+  const remainingFields = flaggedFields.filter((f) => !curatedFields.includes(f));
+
+  const website = (snapshot.website || "").trim();
+
+  if (remainingFields.length > 0) {
+    if (!website) {
+      // No verified website on file at all -> no source. Leave the current
+      // (already-flagged) content exactly as it is; AC4's residual-queue
+      // bookkeeping (Slice 1's own default) already covers this cause.
+      for (const f of remainingFields) fieldResults[f] = { field: f, outcome: "no_source" };
+    } else {
+      const host = hostFromUrlLike(website);
+      if (host && isDirectoryOrAggregatorHost(host)) {
+        // Defensive re-check (see this section's header comment): a
+        // non-blank agent_knowledge.website is treated as already
+        // ownership-verified, but an aggregator/directory host is never a
+        // usable GENERATION source regardless — never fetched.
+        for (const f of remainingFields) fieldResults[f] = { field: f, outcome: "source_aggregator_host" };
+      } else {
+        let evidence: PageEvidence | null = null;
+        try {
+          evidence = await buildPageEvidence(website);
+        } catch {
+          evidence = null; // never let a crawl exception escape this route — treat as no usable source
+        }
+        const contentText = (evidence?.contentText || "").trim();
+        if (!evidence || contentText.length < TYNNE_PROFILER_MIN_SOURCE_TEXT_LEN) {
+          // Fetch failed OR the page came back essentially empty — "no
+          // usable source", never fabricated from nothing.
+          for (const f of remainingFields) fieldResults[f] = { field: f, outcome: "source_fetch_failed" };
+        } else {
+          for (const f of remainingFields) {
+            const candidate = await generateTynneProfilerCandidate(contentText, snapshot.name, f, {
+              address: snapshot.address,
+              postalCode: snapshot.postal_code,
+            });
+            if (!candidate) {
+              fieldResults[f] = { field: f, outcome: "generation_failed" };
+              continue;
+            }
+            // Deterministic cheap-bar prefilter BEFORE the judge — same
+            // ordering as rfbRetroScanShouldNull above (classifyAboutCheapBar
+            // first, only escalate to the judge when the candidate isn't
+            // mangled/boilerplate/foreign). The judge's "ekte norsk prosa"
+            // instruction is a soft LLM judgment call, not a deterministic
+            // gate, so a source page that isn't Norwegian (or that produced
+            // Unicode-mangled/boilerplate-dominated text) must never reach a
+            // producer's public profile on the judge's leniency alone.
+            // "too_short" is deliberately NOT rejected here (same as
+            // rfbRetroScanShouldNull): short is not evidence of WRONG, only
+            // of incomplete, and generateTynneProfilerCandidate's own prompt
+            // already targets a length range — a too-short candidate still
+            // goes on to the judge, exactly like the retro-scan path.
+            const cheapBarClass = classifyAboutCheapBar(candidate);
+            if (cheapBarClass === "mangled" || cheapBarClass === "boilerplate" || cheapBarClass === "foreign") {
+              fieldResults[f] = {
+                field: f,
+                outcome: "generation_failed_cheap_bar",
+                reasoning: `fails the cheap bar (${cheapBarClass})`,
+              };
+              continue;
+            }
+            const verdict = await judgeRfbAboutCandidate(candidate, snapshot.name, f);
+            if (isRfbJudgeInfraFailure(verdict)) {
+              // Fail-closed, same direction as a fresh-candidate call site
+              // (unlike retro-scan's null-vs-leave direction): infra doubt
+              // never writes. Retryable — cause surfaces this distinctly
+              // from a genuine reject so a future run knows to retry soon.
+              fieldResults[f] = { field: f, outcome: "judge_infra_failure", reasoning: verdict.reasoning };
+              continue;
+            }
+            if (!verdict.approved) {
+              fieldResults[f] = { field: f, outcome: "judge_rejected", reasoning: verdict.reasoning };
+              continue;
+            }
+            fieldResults[f] = { field: f, outcome: "approved", text: candidate, reasoning: verdict.reasoning };
+          }
+        }
+      }
+    }
+  }
+
+  if (apply) {
+    const approvedReqs: TynneProfilerFieldWriteRequest[] = remainingFields
+      .filter((f) => fieldResults[f]?.outcome === "approved")
+      .map((f) => ({
+        field: f,
+        text: fieldResults[f].text as string,
+        sourceUrl: website,
+        reasoning: fieldResults[f].reasoning || "",
+      }));
+    if (approvedReqs.length > 0) {
+      const writeResult = applyTynneProfilerFieldWrites(db, snapshot.agent_id, approvedReqs);
+      for (const f of writeResult.writtenFields) fieldResults[f]!.outcome = "written";
+      for (const f of writeResult.raceLockedFields) fieldResults[f]!.outcome = "write_lock_race";
+    }
+  }
+
+  const stillFlagged = flaggedFields.filter((f) => fieldResults[f]?.outcome !== "written");
+  let outcome: TynneProfilerImproveRowResult["outcome"];
+  let cause: string | null;
+  if (stillFlagged.length === 0) {
+    outcome = "resolved";
+    cause = "resolved";
+  } else {
+    outcome = stillFlagged.length < flaggedFields.length ? "partial" : "unresolved";
+    cause = pickTynneProfilerRowCause(stillFlagged.map((f) => fieldResults[f]!.outcome));
+  }
+
+  if (apply) {
+    const next =
+      outcome === "resolved"
+        ? { status: "resolved" as const, cause: "resolved", flagged_fields: [] as string[], priority_tier: queueRow.priority_tier }
+        : {
+            status: "pending" as const,
+            cause: cause as string,
+            flagged_fields: stillFlagged,
+            priority_tier: tynneProfilerPriorityTier(stillFlagged),
+          };
+    if (!tynneProfilerQueueStateEquals(queueRow, next)) {
+      updateTynneProfilerQueueRow(db, queueRow.agent_id, next);
+    }
+  }
+
+  const fieldsOut: Record<string, { outcome: TynneProfilerFieldOutcome; reasoning?: string; preview?: string }> = {};
+  for (const f of flaggedFields) {
+    const fr = fieldResults[f];
+    if (!fr) continue;
+    fieldsOut[f] = { outcome: fr.outcome, reasoning: fr.reasoning, preview: fr.text ? fr.text.slice(0, 300) : undefined };
+  }
+
+  return { agent_id: snapshot.agent_id, name: snapshot.name, outcome, website: website || null, cause, fields: fieldsOut };
+}
+
+const TYNNE_PROFILER_MIN_SOURCE_TEXT_LEN = 40;
+const TYNNE_PROFILER_IMPROVE_DEFAULT_LIMIT = 20;
+const TYNNE_PROFILER_IMPROVE_MAX_LIMIT = 100;
+// AC5's structural cap: apply mode may not touch more than this many rows in
+// a single call without the caller explicitly opting in via
+// confirm_large_batch:true. dry_run is never capped this way — see this
+// section's header comment and the route handler below.
+const TYNNE_PROFILER_IMPROVE_APPLY_MAX_BATCH = 20;
+const TYNNE_PROFILER_IMPROVE_CONCURRENCY = 3;
+
+function countPendingTynneProfilerQueue(db: ReturnType<typeof getDb>): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM agents_tynne_profiler_queue WHERE status = 'pending'`).get() as
+    | { n: number }
+    | undefined;
+  return row?.n ?? 0;
+}
+
+/** Select the page of pending queue rows this call will process — either an
+ * explicit agentIds override (sliced to `limit`, same "explicit target list
+ * still bounded by limit" convention runRfbRetroScanCore's own agentIds
+ * override uses) or plain limit/offset pagination over the pending queue,
+ * ordered by the SAME priority-tier-then-oldest ordering
+ * listAgentTynneProfilerQueue already establishes. */
+function selectTynneProfilerQueueRows(
+  db: ReturnType<typeof getDb>,
+  params: { limit: number; offset: number; agentIds?: string[] },
+): AgentTynneProfilerQueueRow[] {
+  const all = listAgentTynneProfilerQueue(db);
+  if (params.agentIds && params.agentIds.length > 0) {
+    const idSet = new Set(params.agentIds);
+    return all.filter((r) => idSet.has(r.agent_id)).slice(0, params.limit);
+  }
+  return all.slice(params.offset, params.offset + params.limit);
+}
+
+router.post("/tynne-profiler-improve", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+  const body = (req.body ?? {}) as {
+    agentIds?: unknown;
+    limit?: unknown;
+    offset?: unknown;
+    apply?: unknown;
+    confirm_large_batch?: unknown;
+  };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
+  const confirmLargeBatch =
+    body.confirm_large_batch === true ||
+    body.confirm_large_batch === 1 ||
+    body.confirm_large_batch === "1" ||
+    body.confirm_large_batch === "true";
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : TYNNE_PROFILER_IMPROVE_DEFAULT_LIMIT,
+    TYNNE_PROFILER_IMPROVE_MAX_LIMIT,
+  );
+
+  // AC5 — structural refusal, checked BEFORE any selection/fetch/generation/
+  // judge/write work happens (same "pure param validation, zero side
+  // effects" idiom as POST /retro-scan's apply+offset>0 refusal above).
+  // dry_run (apply omitted/false) is NEVER capped this way — safe to run
+  // over the whole cohort, per this slice's own build brief.
+  if (apply && limit > TYNNE_PROFILER_IMPROVE_APPLY_MAX_BATCH && !confirmLargeBatch) {
+    res.status(400).json({
+      error: "batch too large",
+      detail: `apply mode is capped at ${TYNNE_PROFILER_IMPROVE_APPLY_MAX_BATCH} rows per call — pass confirm_large_batch:true to process more, or lower limit`,
+    });
+    return;
+  }
+
+  const parsedOffset = parseRfbRetroScanOffset(body.offset !== undefined ? body.offset : req.query?.offset);
+  if ("error" in parsedOffset) {
+    res.status(400).json(parsedOffset);
+    return;
+  }
+  const offset = parsedOffset.offset;
+
+  let agentIds: string[] | undefined;
+  if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
+    agentIds = (body.agentIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim());
+  }
+
+  const rows = selectTynneProfilerQueueRows(db, { limit, offset, agentIds });
+
+  const results: TynneProfilerImproveRowResult[] = [];
+  const byOutcome: Record<string, number> = { resolved: 0, partial: 0, unresolved: 0, skipped_locked: 0, error: 0 };
+
+  async function processOne(row: AgentTynneProfilerQueueRow): Promise<void> {
+    try {
+      const r = await processTynneProfilerRow(db, row, apply);
+      byOutcome[r.outcome] = (byOutcome[r.outcome] ?? 0) + 1;
+      results.push(r);
+    } catch (e: any) {
+      byOutcome.error += 1;
+      results.push({
+        agent_id: row.agent_id,
+        name: row.agent_name ?? "",
+        outcome: "error",
+        website: null,
+        cause: e?.message ?? String(e),
+        fields: {},
+      });
+    }
+  }
+
+  for (let i = 0; i < rows.length; i += TYNNE_PROFILER_IMPROVE_CONCURRENCY) {
+    const slice = rows.slice(i, i + TYNNE_PROFILER_IMPROVE_CONCURRENCY);
+    await Promise.all(slice.map((r) => processOne(r)));
+  }
+
+  res.json({
+    dry_run: !apply,
+    processed: results.length,
+    limit,
+    offset,
+    total_pending: countPendingTynneProfilerQueue(db),
+    by_outcome: byOutcome,
+    results,
+  });
 });
 
 export default router;
