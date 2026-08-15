@@ -1,7 +1,8 @@
 /**
  * admin-dental-hjemmeside-discovery.test.ts — tests for
- * dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3 (Brreg-
- * field leg): POST /admin/dental/hjemmeside-discovery-batch + POST
+ * dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3: the
+ * Brreg-field leg (tier 1) AND the navnesøk/name-search fallback leg
+ * (tier 2): POST /admin/dental/hjemmeside-discovery-batch + POST
  * /admin/dental/hjemmeside-discovery-approve (src/routes/admin-dental-
  * hjemmeside-discovery.ts).
  *
@@ -26,6 +27,18 @@
  * this route's own fetch_failed handling is exercised deliberately (the
  * clinic-fetch-failed case below) and never masks a routing bug as a quiet
  * false negative.
+ *
+ * The tier-2 navnesøk leg (section (q) below) is stubbed the same way, via
+ * this route's own injectable search seam (__setDentalWdSearchForTesting) —
+ * never a real braveSearch/network call. BRAVE_API_KEY/BRAVE_SEARCH_API_KEY
+ * are saved/cleared/restored around the whole suite (like ADMIN_KEY) so a
+ * key that happens to be configured in the ambient environment can never
+ * make this suite's "no search seam wired" case (q5) accidentally reach the
+ * real production search path instead of exercising the null-seam branch.
+ * Every (q)-block installs its own stub and resets it to null (mirrors "no
+ * Brave key" in production) in a `finally`, so a block that throws never
+ * leaks a search seam into a later block or into the pre-existing (a)-(p)
+ * assertions, which must stay byte-identical to their tier-1-only behaviour.
  *
  * Covers:
  *   (a) 403 without X-Admin-Key on both routes.
@@ -66,6 +79,21 @@
  *       and the outcome is the same insufficient_evidence a plain-fetch-only
  *       world would produce. Mirrors admin-rfb-website-discovery.test.ts's
  *       own flag-off coverage (hf-a) for the identical fallback pattern.
+ *   (q) navnesøk (name-search) fallback leg (tier 2): a search hit with
+ *       org_nr_found evidence gets queued with reason='navnesok_fallback'
+ *       when tier 1 found nothing this row (q1); a search hit with only
+ *       weak/no evidence does NOT get queued and the ORIGINAL tier-1 skip
+ *       status is preserved untouched (q2); an aggregator-host search
+ *       result is excluded via classifyHjemmeside before any fetch, and a
+ *       LATER candidate host from the SAME search response can still verify
+ *       (q3) using only ONE braveSearch-seam call for the whole row — cost
+ *       control (q4, mirrors RFB's own wd-10a test); with NO search seam
+ *       wired, a Brreg-leg failure returns its original skip status
+ *       untouched and search_attempted stays false — tier 2 never attempted
+ *       (q5); approve stamps field_provenance.hjemmeside.source_type
+ *       correctly from the queue row's own `reason`:
+ *       'search_verified_website' for 'navnesok_fallback', unchanged
+ *       'brreg_registered_website' for 'brreg_field' (q6).
  *
  * Two ways to run:
  *   1. Standalone: npx tsx src/routes/admin-dental-hjemmeside-discovery.test.ts
@@ -165,6 +193,8 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   const prevHeadlessFallbackEnabled = process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
+  const prevBraveApiKey = process.env.BRAVE_API_KEY;
+  const prevBraveSearchApiKey = process.env.BRAVE_SEARCH_API_KEY;
   const testKey = process.env.ADMIN_KEY || "dental-wd-test-key";
   process.env.DENTAL_DB_PATH = ":memory:";
   process.env.ADMIN_KEY = testKey;
@@ -172,6 +202,14 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
   // Explicit default-OFF for the whole suite unless a block below opts in —
   // matches production's "absent from fly.toml" state.
   delete process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
+  // Cleared for the whole suite (never set by any block below) so an
+  // ambient Brave key in the environment can never make the (q5) "no search
+  // seam wired" case accidentally resolve to the REAL production search
+  // path — every (q) block installs its own seam via
+  // __setDentalWdSearchForTesting instead, which always takes priority over
+  // any env key regardless.
+  delete process.env.BRAVE_API_KEY;
+  delete process.env.BRAVE_SEARCH_API_KEY;
 
   const dbFactoryPath = require.resolve("../database/db-factory");
   const routePath = require.resolve("./admin-dental-hjemmeside-discovery");
@@ -549,6 +587,158 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
     const tooManyApprovals = Array.from({ length: approveCap + 1 }, (_, i) => ({ agent_id: `bulk-${i}`, url: "https://x.no" }));
     const overApproveCap = await postApprove({ approvals: tooManyApprovals });
     assertEq(overApproveCap.status, 400, "o1: more than DENTAL_WD_APPROVE_MAX approvals -> 400");
+
+    // ── (q) navnesøk (name-search) fallback leg — dev-request 2026-08-15-
+    // dental-hjemmeside-brreg-navnesoek, item 3 navnesøk leg. Uses the
+    // route's own injectable search seam (__setDentalWdSearchForTesting) —
+    // no real network. Each block installs its own stub and clears it (back
+    // to null, mirroring "no Brave key" in production) in a finally, so a
+    // block that throws never leaks a search seam into a later block.
+    assertEq(routeMod.DENTAL_WD_SEARCH_MAX_CANDIDATES, 5, "q0: DENTAL_WD_SEARCH_MAX_CANDIDATES is 5");
+
+    // (q1) Brreg leg finds nothing (no_brreg_website) + a search stub wired
+    // -> a search hit with org_nr_found evidence gets queued with
+    // reason: 'navnesok_fallback', and search_attempted: true.
+    {
+      seedClinic({ id: "wd-nav-orgnr", navn: "Nordlys Tannklinikk", org_nr: "343434343", poststed: "Harstad" });
+      // No brregFixtures entry for 343434343 -> tier 1 = no_brreg_website.
+      pageFixtures.set(
+        "https://nordlystannklinikk.no",
+        htmlResponse("<html><body>Nordlys Tannklinikk — org.nr 343 434 343 — Harstad</body></html>", {
+          finalUrl: "https://nordlystannklinikk.no",
+        }),
+      );
+      let searchCalls: string[] = [];
+      routeMod.__setDentalWdSearchForTesting(async (query: string) => {
+        searchCalls.push(query);
+        return [{ title: "Nordlys Tannklinikk", url: "https://nordlystannklinikk.no", description: "Harstad" }];
+      });
+      try {
+        const r = await postDiscovery({ agentIds: ["wd-nav-orgnr"] });
+        const entry = (r.body.results as any[]).find((e) => e.agent_id === "wd-nav-orgnr");
+        assertEq(entry?.status, "queued", "q1a: search hit with org_nr_found evidence -> queued");
+        assertEq(entry?.search_attempted, true, "q1b: search_attempted true — tier 2 actually ran");
+        assertEq(entry?.evidence?.org_nr_found, true, "q1c: verified via org_nr, same evidence contract as tier 1");
+        const row = readQueueRow("wd-nav-orgnr");
+        assertTrue(!!row, "q1d: a queue row was inserted");
+        assertEq(row.reason, "navnesok_fallback", "q1e: queue row tagged reason='navnesok_fallback'");
+        assertEq(row.candidate_url, "https://nordlystannklinikk.no", "q1f: queue row candidate_url is the search-discovered host");
+        assertEq(searchCalls.length, 1, "q1g: exactly one braveSearch-seam call for this row");
+      } finally {
+        routeMod.__setDentalWdSearchForTesting(null);
+      }
+    }
+
+    // (q2) Brreg leg finds an aggregator host (aggregator_host) + a search
+    // stub wired, but the search hit's page carries only weak/no evidence
+    // -> NOT queued; the ORIGINAL Brreg-leg skip status ('aggregator_host')
+    // is preserved untouched, search_attempted: true (tier 2 ran and found
+    // nothing).
+    {
+      seedClinic({ id: "wd-nav-weak", navn: "Solskinn Tannlege AS", org_nr: "353535353", poststed: "Bodø" });
+      brregFixtures.set("353535353", { hjemmeside: "https://legelisten.no/solskinn-tannlege" });
+      // No pageFixtures entry for legelisten.no — tier 1 excludes it before
+      // any fetch (aggregator_host), same as case (d).
+      pageFixtures.set(
+        "https://solskinn-info.no",
+        htmlResponse("<html><body>Ingen relevant informasjon her, bare en parkert side.</body></html>", {
+          finalUrl: "https://solskinn-info.no",
+        }),
+      );
+      routeMod.__setDentalWdSearchForTesting(async () => [
+        { title: "Solskinn", url: "https://solskinn-info.no", description: "" },
+      ]);
+      try {
+        const r = await postDiscovery({ agentIds: ["wd-nav-weak"] });
+        const entry = (r.body.results as any[]).find((e) => e.agent_id === "wd-nav-weak");
+        assertEq(entry?.status, "aggregator_host", "q2a: weak/no search-hit evidence -> ORIGINAL tier-1 skip status ('aggregator_host') preserved, not insufficient_evidence");
+        assertEq(entry?.search_attempted, true, "q2b: search_attempted true — tier 2 ran but found nothing");
+        assertTrue(!readQueueRow("wd-nav-weak"), "q2c: nothing queued");
+      } finally {
+        routeMod.__setDentalWdSearchForTesting(null);
+      }
+    }
+
+    // (q3) + (q4, cost control): a search response's FIRST candidate host is
+    // a known aggregator/directory domain (excluded via classifyHjemmeside,
+    // never fetched) and its SECOND candidate host verifies -> queued via
+    // the second host, and — despite trying two different HOST attempts —
+    // only ONE braveSearch-seam call was made for the row (cost control:
+    // mirrors RFB's own wd-10a test, opplevelser-gardssalg-website-
+    // discovery.test.ts).
+    {
+      seedClinic({ id: "wd-nav-multihost", navn: "Vestfjord Tannlege AS", org_nr: "363636363", poststed: "Narvik" });
+      // No brregFixtures entry for 363636363 -> tier 1 = no_brreg_website.
+      pageFixtures.set(
+        "https://vestfjordtannlege-ekte.no",
+        htmlResponse("<html><body>Vestfjord Tannlege — org.nr 363 636 363 — Narvik</body></html>", {
+          finalUrl: "https://vestfjordtannlege-ekte.no",
+        }),
+      );
+      // Deliberately NO pageFixtures entry for legelisten.no — if the route
+      // ever fetched the excluded first host, stubFetch would throw.
+      const searchCallsQ3: string[] = [];
+      routeMod.__setDentalWdSearchForTesting(async (query: string) => {
+        searchCallsQ3.push(query);
+        return [
+          { title: "Vestfjord — Legelisten", url: "https://legelisten.no/vestfjord-tannlege", description: "" },
+          { title: "Vestfjord Tannlege", url: "https://vestfjordtannlege-ekte.no", description: "Narvik" },
+        ];
+      });
+      try {
+        const r = await postDiscovery({ agentIds: ["wd-nav-multihost"] });
+        const entry = (r.body.results as any[]).find((e) => e.agent_id === "wd-nav-multihost");
+        assertEq(entry?.status, "queued", "q3a: second candidate host (after the first is excluded) verifies -> queued");
+        assertEq(entry?.candidate_url, "https://vestfjordtannlege-ekte.no", "q3b: queued candidate is the SECOND (verified) host, not the excluded first one");
+        assertTrue(!fetchCalls.includes("https://legelisten.no/vestfjord-tannlege"), "q3c: the excluded aggregator host was NEVER fetched");
+        const row = readQueueRow("wd-nav-multihost");
+        assertEq(row.reason, "navnesok_fallback", "q3d: queue row tagged reason='navnesok_fallback'");
+        assertEq(searchCallsQ3.length, 1, "q4: exactly ONE braveSearch-seam call per candidate row, even though TWO host attempts were made against its one result set — cost control");
+      } finally {
+        routeMod.__setDentalWdSearchForTesting(null);
+      }
+    }
+
+    // (q5) NO search seam wired (routeMod's default — the seam is reset to
+    // null after every block above) -> a Brreg-leg failure returns its
+    // ORIGINAL skip status untouched, tier 2 is NEVER attempted (no
+    // search-seam call at all), search_attempted: false. Reuses (e)'s own
+    // no_brreg_website result from batch1, computed earlier in this run
+    // while no search seam was ever installed.
+    {
+      assertEq(byId.get("wd-no-brreg")?.status, "no_brreg_website", "q5a: no search seam wired -> ORIGINAL Brreg-leg skip status untouched");
+      assertEq(byId.get("wd-no-brreg")?.search_attempted, false, "q5b: search_attempted false — tier 2 never attempted without a wired search seam");
+      assertTrue(!readQueueRow("wd-no-brreg"), "q5c: still nothing queued");
+    }
+
+    // (q6) approve route's provenance stamp, keyed by the queue row's own
+    // `reason`: a 'navnesok_fallback'-tagged row writes source_type
+    // 'search_verified_website'; a 'brreg_field'-tagged row still writes
+    // 'brreg_registered_website' — regression check on the Brreg leg's own
+    // EXISTING provenance value (unchanged), now using the leg's own actual
+    // reason literal ('brreg_field') rather than (l10)'s pre-existing
+    // manually-inserted legacy literal.
+    {
+      seedClinic({ id: "wd-nav-approve-search", navn: "Fallback Approve Tannlege AS", org_nr: "373737373" });
+      dentalDb.prepare(
+        `INSERT INTO dental_website_review_queue (id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, updated_at)
+         VALUES ('q-nav-search', 'wd-nav-approve-search', 'Fallback Approve Tannlege AS', 'https://fallbackapprove.no', 'https://fallbackapprove.no', '{"org_nr_found":true}', 1.0, 'navnesok_fallback', 'batch-q', 'pending', datetime('now'), datetime('now'))`,
+      ).run();
+      const applySearch = await postApprove({ approvals: [{ agent_id: "wd-nav-approve-search", url: "https://fallbackapprove.no" }], apply: true });
+      assertEq(applySearch.body.applied_count, 1, "q6a: navnesok_fallback-tagged row applies successfully");
+      const provSearch = JSON.parse(readClinic("wd-nav-approve-search").field_provenance).hjemmeside;
+      assertEq(provSearch.source_type, "search_verified_website", "q6b: navnesok_fallback-tagged row writes source_type='search_verified_website'");
+
+      seedClinic({ id: "wd-nav-approve-brreg", navn: "Brreg Approve Tannlege AS", org_nr: "383838383" });
+      dentalDb.prepare(
+        `INSERT INTO dental_website_review_queue (id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, updated_at)
+         VALUES ('q-nav-brreg', 'wd-nav-approve-brreg', 'Brreg Approve Tannlege AS', 'https://brregapprove.no', 'https://brregapprove.no', '{"org_nr_found":true}', 1.0, 'brreg_field', 'batch-q', 'pending', datetime('now'), datetime('now'))`,
+      ).run();
+      const applyBrreg = await postApprove({ approvals: [{ agent_id: "wd-nav-approve-brreg", url: "https://brregapprove.no" }], apply: true });
+      assertEq(applyBrreg.body.applied_count, 1, "q6c: brreg_field-tagged row applies successfully");
+      const provBrreg = JSON.parse(readClinic("wd-nav-approve-brreg").field_provenance).hjemmeside;
+      assertEq(provBrreg.source_type, "brreg_registered_website", "q6d: brreg_field-tagged row still writes source_type='brreg_registered_website' (unchanged from the existing leg's own regression coverage in (l10))");
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-dental-hjemmeside-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -558,6 +748,9 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
     if (prevHeadlessFallbackEnabled === undefined) delete process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
     else process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED = prevHeadlessFallbackEnabled;
+    if (prevBraveApiKey === undefined) delete process.env.BRAVE_API_KEY; else process.env.BRAVE_API_KEY = prevBraveApiKey;
+    if (prevBraveSearchApiKey === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
+    else process.env.BRAVE_SEARCH_API_KEY = prevBraveSearchApiKey;
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();

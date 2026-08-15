@@ -59,18 +59,52 @@
 // admin route file in this codebase).
 //
 // Non-goals (do not extend this route to cover these — separate future
-// slices per the dev-request): no navnesøk/name-search fallback leg, no
-// changes to items 1/2/4's own endpoints, no new audit table, no auto-apply
-// (apply is always a separate, explicit, dry-run-default call).
+// slices per the dev-request): no changes to items 1/2/4's own endpoints, no
+// new audit table, no auto-apply (apply is always a separate, explicit,
+// dry-run-default call).
+//
+// ─── Tier 2: navnesøk (name-search) fallback (dev-request
+//     2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3 navnesøk leg) ───
+// For a row where the Brreg-field leg above did NOT queue a candidate this
+// call (no_brreg_website / aggregator_host / insufficient_evidence /
+// fetch_failed), try ONE braveSearch call (services/search-enrich.ts) for
+// `"<navn>" <poststed>` (gardssalgWebsiteSearchQuery — dental has no kommune
+// column, poststed alone), take up to DENTAL_WD_SEARCH_MAX_CANDIDATES
+// candidate hosts (gardssalgWebsiteSearchCandidateHosts, both
+// services/experience-store.ts), and try each host in order: the SAME
+// classifyHjemmeside exclusion, the SAME fetchPage timeout/UA, the SAME
+// gardssalgWebsiteEvidenceMatch queue-gate as the Brreg leg — first verified
+// hit wins. Mirrors RFB's own tier-2 (routes/opplevelser.ts, dev-request
+// 2026-07-21-gardssalg-soekebasert-nettsidefunn) in its NARROWEST form: no
+// subpages, no embedded-layer second chance, no shared-host-in-catalog guard
+// (every tier-2 candidate here already came from a live search result, not a
+// guessed host list, so there is nothing to guard against). Queued via the
+// SAME dental_website_review_queue table, tagged reason: 'navnesok_fallback'
+// (vs the Brreg leg's 'brreg_field') so the approve route can stamp the
+// correct field_provenance.hjemmeside.source_type.
+//
+// Cost control: at most ONE braveSearch call per row per batch call, and
+// only attempted when the Brreg leg found nothing this row AND a search seam
+// is wired (dentalWdSearchImpl / __setDentalWdSearchForTesting, mirroring
+// the fetch/render seams above) — production wires it to the real
+// braveSearch only when BRAVE_API_KEY/BRAVE_SEARCH_API_KEY is configured; no
+// key configured -> tier 2 silently skipped, tier 1 still runs (mirrors
+// RFB's own "free tier still works without a key" behaviour).
 
 import { Router, Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
 import { fetchBrregWebsite } from "../services/brreg-client";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
-import { gardssalgWebsiteEvidenceMatch, gardssalgPageText } from "../services/experience-store";
+import {
+  gardssalgWebsiteEvidenceMatch,
+  gardssalgPageText,
+  gardssalgWebsiteSearchQuery,
+  gardssalgWebsiteSearchCandidateHosts,
+} from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+import { braveSearch, type BraveResult } from "../services/search-enrich";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -127,6 +161,12 @@ export const DENTAL_WD_BATCH_CAP = 25;
 // approvals/call) and the dev-request's explicit instruction.
 export const DENTAL_WD_APPROVE_MAX = 200;
 
+// Tier-2 candidate-host cap — deliberately narrower than RFB's own current
+// live value (10, raised there only after a live-measured cohort showed 5
+// was too thin for gårdssalg). This is dental's first cut; raise later on
+// measured dental evidence, not guessed up front.
+export const DENTAL_WD_SEARCH_MAX_CANDIDATES = 5;
+
 const DENTAL_WD_USER_AGENT = "Lokal-Dental-WebsiteDiscovery/1.0";
 
 // Deliberately below render-page.ts's DEFAULT_RENDER_TIMEOUT_MS (20s), same
@@ -177,6 +217,33 @@ export function __setDentalWdFetchForTesting(impl?: typeof fetch): void {
 let dentalWdRenderPageImplForTesting: typeof renderPage | null = null;
 export function __setDentalWdRenderPageImplForTesting(impl: typeof renderPage | null): void {
   dentalWdRenderPageImplForTesting = impl;
+}
+
+// Test-only injection point for the tier-2 search seam — mirrors
+// dentalWdFetchImpl/dentalWdRenderPageImplForTesting exactly. `null` by
+// default (production computes the real search function per-request from
+// whichever Brave env key is configured — see dentalWdActiveSearchImpl
+// below — so leaving this null in production is not itself "tier 2
+// disabled", only "no test override installed"). Tests inject a stub that
+// hands back BraveResult[] directly and never touches the network, same
+// seam-not-global-monkeypatch convention as the fetch/render seams' own
+// header note explains.
+let dentalWdSearchImpl: ((query: string) => Promise<BraveResult[]>) | null = null;
+export function __setDentalWdSearchForTesting(impl: ((query: string) => Promise<BraveResult[]>) | null): void {
+  dentalWdSearchImpl = impl;
+}
+
+// The search function this route actually uses for one batch call: a test
+// override always wins (never touches the network); otherwise the real
+// braveSearch, wired with whichever Brave env key is configured; otherwise
+// null (tier 2 silently skipped for the whole batch call, tier 1 still
+// runs). Computed once per batch call (not per row) so every row in one
+// call shares the identical resolved function — mirrors RFB's own
+// gardssalg-website-discovery route (routes/opplevelser.ts).
+function dentalWdActiveSearchImpl(): ((query: string) => Promise<BraveResult[]>) | null {
+  if (dentalWdSearchImpl) return dentalWdSearchImpl;
+  const braveKey = process.env.BRAVE_API_KEY || process.env.BRAVE_SEARCH_API_KEY || "";
+  return braveKey ? (query: string) => braveSearch(query, braveKey, DENTAL_WD_SEARCH_MAX_CANDIDATES) : null;
 }
 
 interface DentalWdTargetRow {
@@ -264,12 +331,13 @@ function upsertDentalWebsiteReviewQueue(
     confidence: number;
     batch_id: string;
   },
+  reason: "brreg_field" | "navnesok_fallback",
 ): void {
   db.prepare(
     `INSERT INTO dental_website_review_queue
        (id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, updated_at)
      VALUES (@id, @agent_id, @agent_name, @candidate_url, @final_url, @evidence, @confidence,
-             'website_discovery_candidate', @batch_id, 'pending', datetime('now'), datetime('now'))
+             @reason, @batch_id, 'pending', datetime('now'), datetime('now'))
      ON CONFLICT(agent_id) DO UPDATE SET
        agent_name = excluded.agent_name,
        candidate_url = excluded.candidate_url,
@@ -288,6 +356,7 @@ function upsertDentalWebsiteReviewQueue(
     final_url: entry.final_url,
     evidence: JSON.stringify(entry.evidence),
     confidence: entry.confidence,
+    reason,
     batch_id: entry.batch_id,
   });
 }
@@ -307,15 +376,24 @@ interface DentalWdResultEntry {
   evidence?: DentalWdEvidence;
   confidence?: number;
   reason?: string;
+  // Informational-only (dev-request 2026-08-15-dental-hjemmeside-brreg-
+  // navnesoek, item 3 navnesøk leg): true only when a search seam was wired
+  // AND the tier-2 leg actually ran for this row (the Brreg leg did not
+  // queue this row this call). Distinguishes "tier 2 ran and found nothing"
+  // from "tier 2 never ran (no key/seam)" — NOT a new top-level `skipped`
+  // bucket; the existing 4 skip reasons stay the response shape's skip
+  // taxonomy. Absent (undefined) on `not_eligible` results, which never
+  // reach either leg.
+  search_attempted?: boolean;
 }
 
-// Processes ONE candidate clinic end-to-end: Brreg lookup -> aggregator/
-// directory-host exclusion (item 1's classifier, no fetch if it fires) ->
-// bounded-timeout page fetch -> optional headless-render escalation for a
-// JS-shell page -> ownership-evidence match -> queue (or a named skip
-// reason). Never throws on a network/render failure — every outcome is a
-// named status.
-async function processDentalWdCandidate(
+// Tier 1 — processes ONE candidate clinic end-to-end via the Brreg-field
+// leg: Brreg lookup -> aggregator/directory-host exclusion (item 1's
+// classifier, no fetch if it fires) -> bounded-timeout page fetch ->
+// optional headless-render escalation for a JS-shell page -> ownership-
+// evidence match -> queue (or a named skip reason). Never throws on a
+// network/render failure — every outcome is a named status.
+async function processDentalWdBrregLeg(
   db: ReturnType<typeof getDb>,
   t: DentalWdTargetRow,
   batchId: string,
@@ -392,17 +470,141 @@ async function processDentalWdCandidate(
     candidateUrl = brregWebsite;
   }
 
-  upsertDentalWebsiteReviewQueue(db, {
-    agent_id: t.id,
-    agent_name: t.navn,
-    candidate_url: candidateUrl,
-    final_url: finalUrl,
-    evidence,
-    confidence,
-    batch_id: batchId,
-  });
+  upsertDentalWebsiteReviewQueue(
+    db,
+    {
+      agent_id: t.id,
+      agent_name: t.navn,
+      candidate_url: candidateUrl,
+      final_url: finalUrl,
+      evidence,
+      confidence,
+      batch_id: batchId,
+    },
+    "brreg_field",
+  );
 
   return { ...base, status: "queued", candidate_url: candidateUrl, final_url: finalUrl, evidence, confidence };
+}
+
+// Tier 2 — navnesøk (name-search) fallback, tried ONLY when tier 1 (above)
+// did not queue this row this call. ONE searchFn call for the whole row
+// (cost control), whose top candidate hosts (up to
+// DENTAL_WD_SEARCH_MAX_CANDIDATES) are tried in order against the SAME
+// exclusion/fetch/evidence pipeline tier 1 uses: classifyHjemmeside
+// exclusion (no fetch if it fires) -> bounded-timeout page fetch (SAME
+// timeout/UA as tier 1, no headless-render escalation — narrowest-shippable-
+// leg scope) -> the SAME ownership-evidence gate as tier 1. First verified
+// host wins and is queued with reason 'navnesok_fallback'. Returns null
+// (never a skip-reason of its own) when the search call itself fails, when
+// it returns zero usable candidates, or when every candidate host is
+// excluded/unfetchable/unverified — callers fall back to the ORIGINAL tier-1
+// result in every one of those cases, per the dev-request's "preserve the
+// Brreg leg's original skip status when tier 2 also finds nothing" rule.
+async function processDentalWdSearchLeg(
+  db: ReturnType<typeof getDb>,
+  t: DentalWdTargetRow,
+  batchId: string,
+  searchFn: (query: string) => Promise<BraveResult[]>,
+): Promise<DentalWdResultEntry | null> {
+  const base = { agent_id: t.id, agent_name: t.navn };
+
+  let results: BraveResult[];
+  try {
+    const query = gardssalgWebsiteSearchQuery({ navn: t.navn, poststed: t.poststed });
+    results = await searchFn(query);
+  } catch {
+    // A search failure (network/HTTP error) must not abort the row — it
+    // simply falls through to the original tier-1 result, exactly like a
+    // search that returned zero hits would.
+    return null;
+  }
+
+  const hosts = gardssalgWebsiteSearchCandidateHosts(results, DENTAL_WD_SEARCH_MAX_CANDIDATES);
+
+  for (const host of hosts) {
+    const candidateUrlGuess = `https://${host}`;
+
+    const classification = classifyHjemmeside(candidateUrlGuess);
+    if (classification.isBad) continue;
+
+    const fetchResult = await fetchPage(candidateUrlGuess, {
+      userAgent: DENTAL_WD_USER_AGENT,
+      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+      fetchImpl: dentalWdFetchImpl,
+    });
+    if (!fetchResult.ok) continue;
+
+    const pageText = gardssalgPageText(fetchResult.html);
+    const evidence = gardssalgWebsiteEvidenceMatch(pageText, {
+      orgNr: t.org_nr,
+      navn: t.navn,
+      poststed: t.poststed,
+      telefon: t.telefon,
+      mobil: t.mobil,
+      adresse: t.adresse,
+      postnummer: t.postnummer,
+    });
+
+    // SAME gate as tier 1 — see processDentalWdBrregLeg's own comment.
+    if (!(evidence.org_nr_found || (evidence.name_found && evidence.place_found))) continue;
+
+    const finalUrl = fetchResult.finalUrl;
+    const confidence = dentalWdConfidence(evidence);
+    let candidateUrl: string;
+    try {
+      const u = new URL(finalUrl);
+      candidateUrl = `${u.protocol}//${u.host.toLowerCase()}`;
+    } catch {
+      candidateUrl = candidateUrlGuess;
+    }
+
+    upsertDentalWebsiteReviewQueue(
+      db,
+      {
+        agent_id: t.id,
+        agent_name: t.navn,
+        candidate_url: candidateUrl,
+        final_url: finalUrl,
+        evidence,
+        confidence,
+        batch_id: batchId,
+      },
+      "navnesok_fallback",
+    );
+
+    return { ...base, status: "queued", candidate_url: candidateUrl, final_url: finalUrl, evidence, confidence };
+  }
+
+  return null;
+}
+
+// Processes ONE candidate clinic end-to-end across BOTH tiers: tier 1
+// (Brreg-field leg) always runs first; tier 2 (navnesøk fallback) runs ONLY
+// when tier 1 did not queue this row AND a search seam is wired (test
+// override or a configured Brave key), and is attempted at most once. When
+// tier 2 also finds nothing (or isn't attempted at all), the ORIGINAL tier-1
+// result is returned UNCHANGED — existing skip-reason semantics for a
+// Brreg-only failure are fully preserved.
+async function processDentalWdCandidate(
+  db: ReturnType<typeof getDb>,
+  t: DentalWdTargetRow,
+  batchId: string,
+  searchFn: ((query: string) => Promise<BraveResult[]>) | null,
+): Promise<DentalWdResultEntry> {
+  const tier1 = await processDentalWdBrregLeg(db, t, batchId);
+  if (tier1.status === "queued") {
+    return { ...tier1, search_attempted: false };
+  }
+  if (!searchFn) {
+    return { ...tier1, search_attempted: false };
+  }
+
+  const tier2 = await processDentalWdSearchLeg(db, t, batchId, searchFn);
+  if (tier2) {
+    return { ...tier2, search_attempted: true };
+  }
+  return { ...tier1, search_attempted: true };
 }
 
 const router = Router();
@@ -453,8 +655,13 @@ router.post("/hjemmeside-discovery-batch", async (req: Request, res: Response) =
   const results: DentalWdResultEntry[] = [];
   let queued = 0;
 
+  // Resolved ONCE per batch call — see dentalWdActiveSearchImpl's own doc
+  // comment. null (tier 2 skipped for every row this call) whenever no test
+  // override is installed and no Brave key is configured.
+  const searchFn = dentalWdActiveSearchImpl();
+
   for (const t of targets) {
-    const entry = await processDentalWdCandidate(db, t, batchId);
+    const entry = await processDentalWdCandidate(db, t, batchId, searchFn);
     results.push(entry);
     if (entry.status === "queued") queued++;
     else if (Object.prototype.hasOwnProperty.call(skipped, entry.status)) {
@@ -480,6 +687,7 @@ interface DentalWdQueueRow {
   final_url: string | null;
   batch_id: string | null;
   status: string;
+  reason: string | null;
 }
 
 type DentalWdApplyResult = { written: true } | { written: false; reason: string };
@@ -500,10 +708,23 @@ function parseFieldProvenance(raw: string | null | undefined): Record<string, un
 }
 
 export interface HjemmesideDiscoveryProvenanceEntry {
-  source_type: "brreg_registered_website";
+  source_type: "brreg_registered_website" | "search_verified_website";
   value: string;
   source_url: string;
   fetched_at: string;
+}
+
+// Maps a dental_website_review_queue row's `reason` to the field_provenance
+// source_type it should stamp. 'navnesok_fallback' -> the tier-2, search-
+// discovered source_type; ANYTHING ELSE (including the existing tier-1
+// literal 'brreg_field' and any legacy/unrecognized value) -> the tier-1
+// source_type — so a row from before this slice, or any value this route
+// doesn't recognize, safely defaults to the ORIGINAL, unchanged behaviour
+// rather than silently mis-stamping it as search-sourced.
+function dentalWdSourceTypeForReason(
+  reason: string | null | undefined,
+): HjemmesideDiscoveryProvenanceEntry["source_type"] {
+  return reason === "navnesok_fallback" ? "search_verified_website" : "brreg_registered_website";
 }
 
 /**
@@ -535,6 +756,7 @@ export function applyDentalWebsiteDiscovery(
   url: string,
   finalUrl: string,
   batchId: string | null,
+  queueReason: string | null,
 ): DentalWdApplyResult {
   let result: DentalWdApplyResult = { written: false, reason: "write_skipped_by_guards" };
   const tx = db.transaction(() => {
@@ -561,7 +783,7 @@ export function applyDentalWebsiteDiscovery(
     }
 
     const mergedProvenance = mergeHjemmesideDiscoveryProvenance(current.field_provenance, {
-      source_type: "brreg_registered_website",
+      source_type: dentalWdSourceTypeForReason(queueReason),
       value: url,
       source_url: finalUrl,
       fetched_at: new Date().toISOString(),
@@ -603,7 +825,7 @@ router.post("/hjemmeside-discovery-approve", (req: Request, res: Response) => {
   ensureDentalWebsiteReviewQueueTable(db);
 
   const pending = db
-    .prepare(`SELECT agent_id, candidate_url, final_url, batch_id, status FROM dental_website_review_queue WHERE status = 'pending'`)
+    .prepare(`SELECT agent_id, candidate_url, final_url, batch_id, status, reason FROM dental_website_review_queue WHERE status = 'pending'`)
     .all() as DentalWdQueueRow[];
   const byAgent = new Map(pending.map((q) => [q.agent_id, q]));
 
@@ -656,7 +878,7 @@ router.post("/hjemmeside-discovery-approve", (req: Request, res: Response) => {
       continue;
     }
 
-    const applied = applyDentalWebsiteDiscovery(db, agentId, url, q.final_url || url, q.batch_id);
+    const applied = applyDentalWebsiteDiscovery(db, agentId, url, q.final_url || url, q.batch_id, q.reason);
     if (applied.written) {
       results.push({ agent_id: agentId, url, status: "applied" });
     } else {
