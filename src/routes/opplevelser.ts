@@ -1449,6 +1449,19 @@ type CrFetchOutcome =
       // is affected by an unset optional field.
       pagesFetchedPaths?: string[];
       /**
+       * Every page this call actually read, in fetch order, primary first
+       * (label "/"). Set by BOTH producers of this union — deliberately
+       * required rather than optional, unlike the two fields around it: a
+       * consumer that composes its own source text from these pages must never
+       * silently receive an empty list and conclude the site was empty.
+       *
+       * combinedHtml stays exactly what it always was (primary + sub-pages, in
+       * fetch order, joined by newlines) and every existing consumer keeps
+       * reading that. This is the same content, unjoined, for the one consumer
+       * that needs to CHOOSE an order — see gardssalgProductSourceText.
+       */
+      pages: Array<{ label: string; html: string }>;
+      /**
        * What the headless escalation did on this call. ADDITIVE and optional —
        * only crFetchGardssalgContent sets it (crFetchHomepageContent, the other
        * producer of this union, never escalates), so `undefined` means "this
@@ -1510,6 +1523,7 @@ async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutco
   }
   const primaryHtml = primary.html;
   let combinedHtml = primaryHtml;
+  const pages: Array<{ label: string; html: string }> = [{ label: "/", html: primaryHtml }];
   // Link-driven sub-page crawl with CR_CONTENT_PATHS as fallback — see
   // buildPageEvidence in services/search-enrich.ts for the measurement.
   //
@@ -1527,12 +1541,15 @@ async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutco
     const targets = discovered.length > 0 ? discovered : CR_CONTENT_PATHS.map((p) => `${base}${p}`);
     for (const target of targets) {
       const sub = await crFetchHtml(target);
-      if (sub) combinedHtml += "\n" + sub;
+      if (sub) {
+        combinedHtml += "\n" + sub;
+        pages.push({ label: target, html: sub });
+      }
     }
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pages };
 }
 
 router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Response) => {
@@ -2032,6 +2049,7 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   }
 
   let combinedHtml = primaryHtml;
+  const pages: Array<{ label: string; html: string }> = [{ label: "/", html: primaryHtml }];
   let pagesFetched = 1;
   // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1:
   // which GARDSSALG_CONTENT_PATHS sub-pages actually made it into combinedHtml
@@ -2107,9 +2125,51 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
 
     for (const t of targets) {
       if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
-      const sub = await crFetchHtml(t.url);
+      let sub = await crFetchHtml(t.url);
+      // ── Sub-page escalation (Daniel, live session 2026-08-15) ───────────
+      //
+      // Rendering used to run on the PRIMARY page only, and on a JS-built site
+      // that leaves the crawl reading empty documents for every page that
+      // matters. Measured the same day on the 18 rows with a verified website
+      // and no products:
+      //
+      //   Agnes Brygghus   primary 47 -> 4910 rendered; /produkter,
+      //                    /nettbutikk, /sortiment and /kontakt contributed
+      //                    194 characters BETWEEN THEM
+      //   Bryggeriet Frøya primary 44 ->  454 rendered; four sub-pages, ~180
+      //
+      // Both were reported as `sentinel_no_products` — the model answered
+      // honestly about text that was never fetched. We were requesting exactly
+      // the right pages and reading nothing.
+      //
+      // Gated on the PRIMARY render having succeeded, which is what keeps this
+      // narrow: the site is then known to be JS-built AND the renderer is known
+      // to work for it, so this can never turn into a blanket second pass over
+      // every producer. shouldEscalateToRender still decides per page — a
+      // mixed site whose sub-pages are server-rendered pays nothing, and the
+      // pure rule stays the single authority on eligibility.
+      //
+      // Bounded by GARDSSALG_MAX_PAGES (5: homepage + 4), so the worst case is
+      // 4 extra renders on a site we have already proven needs them.
+      if (sub && renderReport.ok === true && shouldEscalateToRender(sub)) {
+        const renderFn = gsRenderPageImplForTesting ?? renderPage;
+        const renderedSub = await renderFn(t.url, {
+          userAgent: CR_UA,
+          timeoutMs: GARDSSALG_RENDER_TIMEOUT_MS,
+        });
+        if (renderedSub.ok) {
+          sub = renderedSub.html;
+          renderReport.subpages_rendered = (renderReport.subpages_rendered ?? 0) + 1;
+        } else {
+          // Non-fatal, same as the primary: keep the raw HTML and carry on.
+          // Counted, not silent — a site whose sub-pages all fail to render is
+          // a different problem from one that never tried.
+          renderReport.subpages_render_failed = (renderReport.subpages_render_failed ?? 0) + 1;
+        }
+      }
       if (sub) {
         combinedHtml += "\n" + sub;
+        pages.push({ label: t.label, html: sub });
         pagesFetched++;
         fetchedPaths.push(t.label);
       }
@@ -2117,7 +2177,7 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths, render: renderReport };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, pagesFetchedPaths: fetchedPaths, pages, render: renderReport };
 }
 
 /**
@@ -2309,6 +2369,9 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     provider_id: string;
     content_chars_full: number;
     truncated: boolean;
+    products_source_chars: number;
+    products_source_full_chars: number;
+    product_pages: string[];
     pages_fetched_paths: string[];
     outcome: GardssalgProductsOutcome;
   }> = [];
@@ -2656,11 +2719,38 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       // returns, so productsCandidate's value and every write decision
       // downstream of it are byte-for-byte unchanged from before this diff.
       const diagnosticOut: GardssalgProductsExtractionDiagnostic = {};
-      productsCandidate = await generateGardssalgProductList(contentText, diagnosticOut);
+      // NOT contentText. That is the combined text in CRAWL order, and the
+      // extractor's cap slices from the front — which is how Oslo Brewing's
+      // two fetched product pages ended up entirely outside the window. This
+      // composes the same pages in PURPOSE order instead; see
+      // gardssalgProductSourceText.
+      const productsSource = gardssalgProductSourceText(
+        fetched.pages.map((pg) => ({ label: pg.label, text: gardssalgPageText(pg.html) }))
+      );
+      const productPageLabels = fetched.pages
+        .map((pg) => pg.label)
+        .filter((label) => gardssalgLabelLooksLikeProducts(label));
+      productsCandidate = await generateGardssalgProductList(productsSource.text, diagnosticOut);
       productsDiagnostic.push({
         provider_id: providerId,
         content_chars_full: contentText.length,
-        truncated: contentText.length > GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP,
+        // `truncated` now measures the PRODUCTS SOURCE, not contentText, and
+        // that is a correction rather than a rename. contentText comes from
+        // extractVisibleText, which caps at 20 000 of its own accord — with
+        // the products cap raised to that same figure, the old comparison
+        // (contentText.length > cap) could never be true again, so the field
+        // would have quietly reported "nothing was cut" forever. What a
+        // reader wants from it is unchanged: did the model see everything?
+        truncated: productsSource.fullChars > GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP,
+        // What the model actually received, how much there was, and which
+        // pages were promoted to the front of it. A `sentinel_no_products`
+        // with an empty product_pages list is a crawl problem; the same
+        // outcome WITH a product page in the window is a page that genuinely
+        // names nothing. Those were indistinguishable before, and they are
+        // the two halves of this dev-request's remaining unknown.
+        products_source_chars: productsSource.text.length,
+        products_source_full_chars: productsSource.fullChars,
+        product_pages: productPageLabels,
         pages_fetched_paths: fetched.pagesFetchedPaths ?? [],
         outcome: diagnosticOut.outcome ?? "infra_failure",
       });
@@ -17357,8 +17447,109 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
 // GARDSSALG_PRODUCTS_MAX_ITEMS. An empty list after all of that (including
 // the explicit sentinel) is null, never an empty-but-truthy array.
 const GARDSSALG_PRODUCTS_SENTINEL = "INGEN_PRODUKTER_FUNNET";
-const GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP = 6000;
+/**
+ * How much page text the product extractor is allowed to see.
+ *
+ * Raised from 6 000 to 20 000 (Daniel, live session 2026-08-15) on a measured
+ * failure, not a hunch. Of the 18 rows with a verified website and no products,
+ * 12 came back `sentinel_no_products` — the model saying, honestly, that the
+ * text it was given named no products. Fetching Oslo Brewing's pages directly
+ * showed why:
+ *
+ *   www.oslobrewing.no              7 406 chars   <- the FRONT PAGE alone
+ *                                                    already exceeds the old cap
+ *   www.oslobrewing.no/ourbeer/     7 621 chars   <- begins at char 7 406
+ *   www.oslobrewing.no/products-2/  9 406 chars   <- begins at char ~15 000
+ *
+ * We fetched both product pages. The model never saw one character of either:
+ * the cap slices from the front, and the front page's nav/concept text used the
+ * whole budget. Same shape on Bryggeriet 1899, Jåttå, Svensefjøset.
+ *
+ * 20 000 covers every measured row's full combined text. The cost is ~4x the
+ * input tokens on a Haiku call — fractions of an øre per producer — against
+ * rows that are otherwise permanently stuck.
+ *
+ * The cap is not the only guard: gardssalgProductSourceText below puts the
+ * product pages FIRST, so a site that does exceed even this still spends the
+ * budget on the right pages.
+ */
+export const GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP = 20000;
 const GARDSSALG_PRODUCTS_MAX_ITEMS = 20;
+
+// ─── Which crawled page is a product page ──────────────────────────────────
+//
+// Two lists, because two different matching rules are safe. Long, unambiguous
+// words are matched anywhere in the path — "beer" has to catch `/ourbeer/`,
+// "product" has to catch `/products-2/`. Short words are matched only as whole
+// path segments: `ol` as a substring hits "kontroll", "folkefest" and half the
+// Norwegian web, but `/vare-ol` splits into ["vare","ol"] and matches exactly.
+//
+// Every entry earns its place from a label observed live on 2026-08-15:
+// /produkter · /nettbutikk · /sortiment · /vare-ol · /ourbeer/ · /products-2/ ·
+// /butikken.php?lang=en · /v-re-viner · /menyer · /produkter.php?lang=en
+//
+// A false positive here is cheap and a false negative is not, which is what
+// justifies matching this loosely: putting a contact page first costs nothing
+// now that GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP fits the whole text anyway, while
+// missing the one page that names the products is the bug being fixed.
+// Deliberately NOT included: "brygg" (matches `/om-bryggeriet`, an about page)
+// and anything derived from the producer's Brreg NACE code — Daniel, same
+// session: the products must come from what the site actually says, never from
+// the industry code. A brewery sells named beers, not "øl".
+const GARDSSALG_PRODUCT_PATH_SUBSTRINGS = [
+  "produkt", "product", "sortiment", "butikk", "beer", "wine", "cider",
+  "whisky", "sprit", "akevitt", "drikke", "shop", "meny",
+];
+const GARDSSALG_PRODUCT_PATH_SEGMENTS = new Set([
+  "ol", "øl", "vin", "viner", "gin", "rom", "vare", "varer", "store", "sider",
+]);
+
+/** Whether a crawled page's label looks like it lists what the producer sells.
+ *  PURE — no network, no state. */
+export function gardssalgLabelLooksLikeProducts(label: string): boolean {
+  const lower = label.toLocaleLowerCase("nb-NO");
+  if (GARDSSALG_PRODUCT_PATH_SUBSTRINGS.some((w) => lower.includes(w))) return true;
+  return lower
+    .split(/[^\p{L}\p{N}]+/u)
+    .some((seg) => GARDSSALG_PRODUCT_PATH_SEGMENTS.has(seg));
+}
+
+/**
+ * Compose the text handed to the product extractor: product pages first, then
+ * the homepage, then everything else, truncated to `cap`. PURE.
+ *
+ * The ordering is the whole point. combinedHtml is built in FETCH order and the
+ * cap slices from the front, so a producer whose homepage is wordy pushes its
+ * own product page out of the window — measured on Oslo Brewing, whose front
+ * page alone exceeded the old cap while `/ourbeer/` and `/products-2/` sat
+ * beyond it, fetched and unread. Sorting by what a page is FOR, rather than by
+ * when it happened to be crawled, is what puts the answer inside the budget.
+ *
+ * The homepage keeps second place rather than first: it is where a producer
+ * says who they are, which is useful context for reading a product list, but it
+ * is rarely where the list itself lives.
+ *
+ * Stable within each group — pages keep their crawl order — so the same site
+ * produces the same source text on every run.
+ */
+export function gardssalgProductSourceText(
+  pages: Array<{ label: string; text: string }>,
+  cap: number = GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP
+): { text: string; fullChars: number } {
+  const rank = (p: { label: string }): number =>
+    gardssalgLabelLooksLikeProducts(p.label) ? 0 : p.label === "/" ? 1 : 2;
+  const full = pages
+    .map((p, i) => ({ p, i, r: rank(p) }))
+    .sort((a, b) => a.r - b.r || a.i - b.i)
+    .map((x) => x.p.text.trim())
+    .filter((t) => t !== "")
+    .join("\n\n");
+  // fullChars is returned rather than recomputed by the caller so "the model
+  // did not see everything" stays measurable AFTER the slice — the caller
+  // holds only the truncated string, and a `truncated` flag derived from that
+  // would be permanently false.
+  return { text: full.slice(0, cap), fullChars: full.length };
+}
 const GARDSSALG_PRODUCTS_MAX_ITEM_LEN = 60;
 
 // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1

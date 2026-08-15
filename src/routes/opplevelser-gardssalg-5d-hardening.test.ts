@@ -466,8 +466,10 @@ export function runOpplevelserGardssalg5dHardeningTests(
           // `text` mirrors what the real renderPage returns (renderedTextOf of
           // its own html), not a placeholder — chars_after is read from it.
           const renderedText = renderedHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+          let firstRenderedUrl = "";
           opplevelserMod.__setGardssalgRenderPageImplForTesting(async (url: string) => {
             renderCalls++;
+            if (renderCalls === 1) firstRenderedUrl = url;
             renderedUrl = url;
             return { ok: true, html: renderedHtml, text: renderedText, finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
           });
@@ -478,7 +480,14 @@ export function runOpplevelserGardssalg5dHardeningTests(
             url: "/admin/gardssalg-content-refresh",
             body: { providerIds: ["p5-alone"], apply: false },
           });
-          assertEq(renderCalls, 1, "5h-e2: with the flag ON the JS shell escalates to the renderer exactly once");
+          // TWO renders, not one, and that is the point of the sub-page
+          // escalation: this fixture serves the same JS shell for every URL,
+          // so the discovered sub-page is a shell too. Before that escalation
+          // existed this read `1`, and a JS-built producer's /produkter page
+          // was fetched and then read as an empty document — measured live on
+          // Agnes Brygghus, whose four sub-pages contributed 194 characters
+          // between them.
+          assertEq(renderCalls, 2, "5h-e2: the JS shell escalates, and so does the shell sub-page it links to");
           // The pair that makes a successful render self-evidencing: "it ran
           // and helped" must be readable off the response without re-deriving
           // anything, or it is indistinguishable from "it ran and the page
@@ -492,11 +501,21 @@ export function runOpplevelserGardssalg5dHardeningTests(
                 diagOk.chars_after > diagOk.chars_before,
               "5h-e2c: chars_before/chars_after bracket the render, so 'it helped' is measurable from the response alone",
             );
+            assertEq(
+              diagOk?.subpages_rendered,
+              1,
+              "5h-e2d: the sub-page render is reported — this is what says the crawl read the site rather than four empty shells",
+            );
           }
           assertEq(
-            renderedUrl,
+            firstRenderedUrl,
             "https://aleine.example.no/side/gard",
             "5h-e3: the renderer is handed the page's own final url, not the host root",
+          );
+          assertEq(
+            renderedUrl,
+            "https://aleine.example.no/side/gard/kontakt-oss",
+            "5h-e3b: the sub-page render is handed the sub-page's own url — the crawl reads the rendered DOM, not an empty shell",
           );
           // THE ordering assertion: the link only exists in the RENDERED html.
           // If escalation ran after link discovery (or only fed text extraction)
@@ -641,6 +660,97 @@ export function runOpplevelserGardssalg5dHardeningTests(
             typeof diag?.chars_before === "number" && diag.chars_before >= 200,
             "5h-e23: chars_before shows WHY it was ineligible — this is the number the threshold is compared against",
           );
+        }
+
+        // ── (f) the sub-page escalation, and the gate that keeps it narrow ──
+        //
+        // Rendering used to touch the primary page only. On a JS-built site
+        // that means every sub-page — including the /produkter page the crawl
+        // deliberately went and found — is read as an empty document.
+        // Measured 2026-08-15: Agnes Brygghus rendered 47 -> 4910 on its front
+        // page while /produkter, /nettbutikk, /sortiment and /kontakt
+        // contributed 194 characters BETWEEN THEM, and the row was reported as
+        // `sentinel_no_products`. The model was answering honestly about text
+        // nobody had fetched.
+        //
+        // The gate is what stops this becoming a second render pass over the
+        // whole cohort: sub-pages escalate only when the PRIMARY render
+        // succeeded, so the site is known to be JS-built and the renderer is
+        // known to work for it.
+        {
+          process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+          // A server-rendered primary that links to a JS-shell sub-page. The
+          // primary is NOT eligible, so nothing escalates — the sub-page is a
+          // shell and still must not be rendered.
+          const realPrimary =
+            `<html><head><title>Aleine Gard</title><script src="/a.js"></script></head><body><p>` +
+            "Aleine Gard held til i Hardanger og lagar sider av eigne eple. ".repeat(20) +
+            `</p><a href="/side/gard/produkter">Produkt</a></body></html>`;
+          const shellSub =
+            `<html><head><title>Produkt</title><script src="/app.js"></script></head>` +
+            `<body><div id="root"></div><div data-x="${"a".repeat(9_000)}"></div></body></html>`;
+          let renderCalls = 0;
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => {
+            renderCalls++;
+            return { ok: true, html: "<html><body><p>rendret</p></body></html>", text: "rendret", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
+          });
+          globalThis.fetch = (async (url: string | URL | Request) => {
+            const urlStr = String(url);
+            if (urlStr.includes("data.brreg.no") || urlStr.includes("api.anthropic.com")) {
+              throw new Error(`unexpected non-page fetch in 5h-f: ${urlStr}`);
+            }
+            const body = urlStr.includes("/produkter") ? shellSub : realPrimary;
+            return {
+              ok: true, status: 200,
+              text: async () => body,
+              arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
+          }) as unknown as typeof fetch;
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          assertEq(
+            renderCalls,
+            0,
+            "5h-f1: a shell SUB-page is not rendered when the primary never needed rendering — the gate holds",
+          );
+          const diag = (r.body.render_diagnostic as any[] | undefined)?.find((d) => d.provider_id === "p5-alone");
+          assertEq(diag?.subpages_rendered, undefined, "5h-f2: and nothing is reported as rendered");
+        }
+
+        // Primary renders, sub-page render FAILS: non-fatal, and counted
+        // rather than silent — a site whose sub-pages all fail to render is a
+        // different problem from one that never tried.
+        {
+          process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+          let renderCalls = 0;
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => {
+            renderCalls++;
+            if (renderCalls === 1) {
+              return {
+                ok: true,
+                html: `<html><body><p>${"Aleine Gard lagar sider av eigne eple. ".repeat(8)}</p><a href="/side/gard/kontakt-oss">Kontakt</a></body></html>`,
+                text: "Aleine Gard lagar sider av eigne eple. ".repeat(8),
+                finalUrl: "https://aleine.example.no/side/gard",
+                elapsedMs: 1,
+              };
+            }
+            return { ok: false, reason: "render_timeout", detail: "Timeout 25000ms exceeded.", elapsedMs: 25_000 };
+          });
+          globalThis.fetch = mkFetch([]);
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          assertEq(r.status, 200, "5h-f3: a failed SUB-page render is non-fatal — the route still 200s");
+          const diag = (r.body.render_diagnostic as any[] | undefined)?.find((d) => d.provider_id === "p5-alone");
+          assertEq(diag?.ok, true, "5h-f4: the primary render is still reported as the success it was");
+          assertEq(diag?.subpages_render_failed, 1, "5h-f5: the failed sub-page render is counted, not swallowed");
+          assertEq(diag?.subpages_rendered, undefined, "5h-f6: and it is not counted as a success");
         }
 
         opplevelserMod.__setGardssalgRenderPageImplForTesting(null);
