@@ -38854,3 +38854,30 @@ runSerial(async () => {
     failures.push("admin-crm-compose-vertical: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-15-orgnr-review-koe-stale-varsling: GET
+// /admin/gardssalg-review-queues-staleness — reporting-only wiring of the
+// already-tested computeGardssalgQueueAgeReport() (AK9) over BOTH gårdssalg
+// review queues, for the daily brief's stale-entry surfacing. Registered
+// here, at the tail of the runSerial() chain, for the same reason as the
+// neighbouring blocks above: it reloads src/routes/opplevelser.ts (and
+// db-factory/experience-store alongside it), so running it after every
+// earlier block that already depends on those modules' require.cache state
+// avoids the shared-module-instance timing hazard this file's header
+// documents (see the 2026-08-15 hjemmeside-discovery block's comment just
+// above for the fuller account of that hazard class).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-15-orgnr-review-koe-stale-varsling: GET /admin/gardssalg-review-queues-staleness ──");
+  try {
+    const { runAdminGardssalgReviewQueuesStalenessTests } = require("../src/routes/admin-gardssalg-review-queues-staleness.test") as
+      typeof import("../src/routes/admin-gardssalg-review-queues-staleness.test");
+    const agrqs = await runAdminGardssalgReviewQueuesStalenessTests({ log: false });
+    passed += agrqs.passed;
+    failed += agrqs.failed;
+    for (const f of agrqs.failures) failures.push("admin-gardssalg-review-queues-staleness: " + f);
+    console.log(`  admin-gardssalg-review-queues-staleness: ${agrqs.passed} passed, ${agrqs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-gardssalg-review-queues-staleness: unexpected error: " + String(err?.message || err));
+  }
+});

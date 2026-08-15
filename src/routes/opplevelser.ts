@@ -7154,6 +7154,31 @@ router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, 
   res.json({ count: entries.length, entries });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-review-queues-staleness (admin) ───
+//
+// dev-request 2026-08-15-orgnr-review-koe-stale-varsling. Daniel (live
+// session, 2026-08-15): gårdssalg's two human-review queues
+// (gardssalg_orgnr_review_queue / gardssalg_website_review_queue, both
+// above) have no notification path — entries can sit unseen for weeks. The
+// approved fix is reporting-only: surface stale entries in the daily brief
+// (sibling change, SKILL-side). This route is the read half — it invents
+// NO new computation, it just calls the already-proven
+// computeGardssalgQueueAgeReport() (AK9, used identically by POST
+// /admin/gardssalg-veien-til-pool above) over each queue's own lister, so
+// the staleness math the daily brief reads is byte-identical to what that
+// route already reports per-run. Zero writes, zero change to either
+// queue's existing behaviour/thresholds/schema — a pure additional read.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.get("/admin/gardssalg-review-queues-staleness", requireAdmin, (_req: Request, res: Response) => {
+  const orgnrQueueReport = computeGardssalgQueueAgeReport(listGardssalgOrgnrReviewQueue());
+  const websiteQueueReport = computeGardssalgQueueAgeReport(listGardssalgWebsiteReviewQueue());
+  res.json({
+    orgnr_review_queue: orgnrQueueReport,
+    website_review_queue: websiteQueueReport,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-orgnr-review-approve (admin) ──────
 //
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
