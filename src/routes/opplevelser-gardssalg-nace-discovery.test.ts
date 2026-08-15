@@ -2,7 +2,9 @@
  * opplevelser-gardssalg-nace-discovery.test.ts — tests for dev-request
  * 2026-07-19-brreg-nace-drikkeprodusenter (the 67 North Distillery gap):
  * POST /admin/gardssalg-nace-discovery sweeps Brreg by the fixed drink NACE
- * family (11.010/11.030/11.040/11.050 → destilleri/sideri/mjøderi/bryggeri),
+ * family (11.010/11.020/11.030/11.040/11.050 + 01.210 → destilleri/vingård/
+ * sideri/mjøderi/bryggeri/vingård — the two wine codes added 2026-08-15, see
+ * nd-11 for the measurement and the 01.210 judgement),
  * dedups against ALL existing org_nrs + exact pruned-name matches against
  * existing gårdssalg rows (incl. catalog_hidden), skips dead orgs, and — in
  * apply mode — creates providers org_nr-KEYED with Brreg address/hjemmeside
@@ -175,6 +177,24 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
           _embedded: { enheter: [
             { organisasjonsnummer: "933333331", navn: "AMBIG SIDERI AS",
               forretningsadresse: { adresse: ["Sideriveien 1"], postnummer: "5000", poststed: "BERGEN", kommune: "BERGEN" } },
+          ] },
+        },
+        // nd-11: the wine codes, added 2026-08-15. 11.020 is a beverage-
+        // production code like the rest; 01.210 is an AGRICULTURE code
+        // included deliberately because Hebnes Vingård — a textbook gårdssalg
+        // row — registers under it. Both must map to `vingård`.
+        "11.020|0": {
+          page: { totalPages: 1 },
+          _embedded: { enheter: [
+            { organisasjonsnummer: "922020001", navn: "FJORDBOBLER VINERI AS",
+              forretningsadresse: { adresse: ["Vinvegen 3"], postnummer: "6200", poststed: "STRANDA", kommune: "STRANDA" } },
+          ] },
+        },
+        "01.210|0": {
+          page: { totalPages: 1 },
+          _embedded: { enheter: [
+            { organisasjonsnummer: "901210001", navn: "SOLBAKKEN DRUEGARD AS",
+              forretningsadresse: { adresse: ["Druevegen 7"], postnummer: "4230", poststed: "SAND", kommune: "SULDAL" } },
           ] },
         },
         "11.040|0": {
@@ -413,6 +433,52 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
           .get() as any;
         assertEq(dashRow?.candidate_orgnr, "944444444", "nd-10i: unrelated 1:1 match from nd-3 is unaffected — real candidate_orgnr");
         assertEq(dashRow?.reason, "nace_discovery_name_match", "nd-10j: unrelated 1:1 match keeps the non-ambiguous reason");
+      }
+
+      // ── nd-11: the wine codes (added 2026-08-15). ───────────────────────
+      //
+      // Before this, GARDSSALG_NACE_PRODUCER_TYPE named only 11.010/030/040/
+      // 050, so wine was invisible to every sweep — the identical hole the
+      // 2026-07-19 dev-request was written to close for 11.010. Measured
+      // against Brreg 2026-08-14: 20 of 21 wine producers and 23 of 24 grape
+      // growers were missing, against 2 of 235 for beer.
+      //
+      // Asserted through the ROUTE, not against the map: the map is module-
+      // private, and what actually matters is that a caller can sweep these
+      // codes and that the rows land as a recognised drink type.
+      {
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { codes: ["11.020", "01.210"], apply: true },
+        });
+        assertEq(r.status, 200, "nd-11a: the wine codes are accepted, not rejected as non-drink");
+
+        const wine = expDb
+          .prepare(`SELECT navn, producer_type FROM experience_providers WHERE org_nr = '922020001'`)
+          .get() as { navn: string; producer_type: string } | undefined;
+        assertEq(wine?.producer_type, "vingård", "nd-11b: NACE 11.020 lands as producer_type vingård");
+
+        // The judgement call: 01.210 is an agriculture code, included because
+        // Hebnes Vingård registers under it. If it were dropped from the map
+        // this row would never be created at all.
+        const grape = expDb
+          .prepare(`SELECT navn, producer_type FROM experience_providers WHERE org_nr = '901210001'`)
+          .get() as { navn: string; producer_type: string } | undefined;
+        assertEq(grape?.producer_type, "vingård", "nd-11c: NACE 01.210 (grape growing) also lands as vingård — the Hebnes shape");
+
+        // Both must be recognised as drink producers downstream, or they are
+        // created and then silently ignored by every gårdssalg gate.
+        const { DRINK_PRODUCER_TYPES } = require("../services/route-corridor-service") as
+          typeof import("../services/route-corridor-service");
+        assertTrue(
+          DRINK_PRODUCER_TYPES.has(String(wine?.producer_type)) && DRINK_PRODUCER_TYPES.has(String(grape?.producer_type)),
+          "nd-11d: the type both codes map to is a member of DRINK_PRODUCER_TYPES — no new taxonomy needed",
+        );
+
+        // Regression guard: widening the map must not have widened it to
+        // everything. 62.010 is still not a drink code.
+        const bad = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { codes: ["62.010"] } });
+        assertEq(bad.status, 400, "nd-11e: a genuinely non-drink code is STILL rejected after the widening");
       }
     } catch (err: any) {
       failed++;

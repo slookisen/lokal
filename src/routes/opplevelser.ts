@@ -2980,7 +2980,10 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
 //
 // Fixed, validated code→producer_type map — arbitrary codes are rejected
 // (400), this endpoint scans the drink family only:
-//   11.010 destilleri · 11.030 sideri · 11.040 mjøderi · 11.050 bryggeri
+//   11.010 destilleri · 11.020 vingård · 11.030 sideri · 11.040 mjøderi
+//   11.050 bryggeri · 01.210 vingård
+// (wine codes added 2026-08-15 — see the map's own comment for the 01.210
+// judgement and the measurement behind it)
 //
 // Per candidate enhet:
 //   dead        — konkurs / underAvvikling / underTvangsavviklingEller-
@@ -3018,11 +3021,42 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
 // landed the same day roll back independently.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+// Wine added 2026-08-15 (Daniel). Same failure this route was built for, one
+// family over: the 2026-07-19 dev-request exists because "NACE 11.010 var
+// usynlig for all discovery" and 67 North was therefore invisible. Measured
+// against Brreg on 2026-08-14, wine had the identical hole — the map simply
+// did not name it:
+//
+//   NACE 11.020 «Produksjon av vin»      21 active in Brreg, we had  1
+//   NACE 01.210 «Dyrking av druer»       24 active in Brreg, we had  1
+//
+// 43 producers no sweep could ever reach, against 2 of 235 missing for beer
+// and 2 of 50 for cider — the beer/cider families are saturated precisely
+// BECAUSE they are in this map.
+//
+// 01.210 is an AGRICULTURE code, not an 11.0xx beverage-production one, and
+// including it is a deliberate judgement rather than an oversight corrected:
+//   - Hebnes Vingård — the only wine producer we hold, and a textbook
+//     gårdssalg row — is itself 01.210. A grape grower pressing and selling
+//     its own wine from the farm is the archetype this vertical exists for,
+//     and it is the code they register under.
+//   - The cost is precision: 01.210 also carries land/road/river
+//     associations (measured: 3 of the 43, e.g. «HATLESTRAND SKOGVEGLAG SA»).
+//     Those land with no website and no email, so they stop at `unreachable`
+//     and can never reach outreach — they cost cohort noise, not a bad send.
+//   - The route's own batch rollback ({rollbackBatch: "<tag>"}) makes a whole
+//     discovery batch a single undo, so this is reversible if the noise rate
+//     turns out worse than measured.
+//
+// Both map to `vingård`, already a member of DRINK_PRODUCER_TYPES
+// (route-corridor-service.ts) — no new taxonomy.
 const GARDSSALG_NACE_PRODUCER_TYPE: Record<string, string> = {
   "11.010": "destilleri",
+  "11.020": "vingård",
   "11.030": "sideri",
   "11.040": "mjøderi",
   "11.050": "bryggeri",
+  "01.210": "vingård",
 };
 const GS_ND_PAGE_SIZE = 100;
 const GS_ND_MAX_PAGES_PER_CODE = 10; // 1000/code — far above the real ~240 ceiling
