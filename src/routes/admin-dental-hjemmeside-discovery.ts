@@ -137,6 +137,24 @@ const DENTAL_WD_USER_AGENT = "Lokal-Dental-WebsiteDiscovery/1.0";
 // own tested default for other, non-batched callers.
 export const DENTAL_WD_RENDER_TIMEOUT_MS = 12_000;
 
+// Flag-gated, default OFF — mirrors this codebase's existing boolean-env-flag
+// idiom exactly (grep `process.env.\w+ === "true"`, e.g. RFB's
+// RFB_WD_HEADLESS_FALLBACK_ENABLED in admin-rfb-website-discovery.ts,
+// marketplace.ts's HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED). Deliberately
+// NOT added to fly.toml's [env] block — an env var absent there and not set
+// as a Fly secret is `undefined`, which is exactly what this function
+// requires to gate to "do not attempt render" below. This route's own
+// headless-render escalation was never part of dev-request 2026-08-14-fetch-
+// vegg-headless-fallback's stated scope (that dev-request names only
+// admin-rfb-website-discovery.ts and marketplace.ts as consumers) — this
+// flag exists so THIS route's escalation behaviour stays byte-identical to
+// before that dev-request's worker-wiring change (renderPage() always
+// resolved renderer_unavailable in production until now) until a separate,
+// deliberately-scoped dev-request reviews and turns it on.
+function dentalWdHeadlessFallbackEnabled(): boolean {
+  return process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED === "true";
+}
+
 // ─── injectable fetch seam for this route's own Brreg + page-fetch calls ──
 // See file header. Threaded into BOTH fetchBrregWebsite's own fetchImpl
 // parameter and fetchPage's `fetchImpl` option, so a single test stub can
@@ -327,12 +345,14 @@ async function processDentalWdCandidate(
   let finalUrl = fetchResult.finalUrl;
 
   // Headless-render escalation for a page that looks like a JS shell
-  // (shouldEscalateToRender is pure — no network). A render failure
-  // (including `renderer_unavailable`, e.g. every production deploy, which
-  // ships no playwright-core — see render-page.ts's file header) simply
-  // falls through to evidence-matching the plain-fetched html: never a
-  // throw, never treated as fetch_failed.
-  if (shouldEscalateToRender(html)) {
+  // (shouldEscalateToRender is pure — no network). Flag-gated (see
+  // dentalWdHeadlessFallbackEnabled above) — unset/anything-other-than-
+  // "true" = disabled = this route never attempts a render, exactly as
+  // before this whole PR wired render-page.ts to a real production backend.
+  // A render failure (including `renderer_unavailable`) simply falls
+  // through to evidence-matching the plain-fetched html: never a throw,
+  // never treated as fetch_failed.
+  if (dentalWdHeadlessFallbackEnabled() && shouldEscalateToRender(html)) {
     const renderFn = dentalWdRenderPageImplForTesting ?? renderPage;
     const rendered = await renderFn(finalUrl, {
       userAgent: DENTAL_WD_USER_AGENT,

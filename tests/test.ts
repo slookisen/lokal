@@ -754,6 +754,28 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-08-14-fetch-vegg-headless-fallback, Slice 4:
+// render-client.ts's `final_url` field (render-page.ts's worker-backed
+// defaultRenderImpl reads it). Stubs globalThis.fetch and busts
+// render-client.ts's require-cache entry around a fake RENDER_WORKER_KEY —
+// runSerial so no concurrently-running block can observe either mutation.
+// No real network call, no real render-worker.
+runSerial(async () => {
+  console.log("\n── render-client: final_url threading (Slice 4) ──");
+  try {
+    const { runRenderClientTests } = require("../src/services/render-client.test") as
+      typeof import("../src/services/render-client.test");
+    const r = await runRenderClientTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("render-client: " + f);
+    console.log(`  render-client: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("render-client: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-27-harvest-hjemmeside-feltnavn-tapes: the harvest
 // SKILL sends `hjemmeside`, BulkRowSchema only accepted `website`, and
 // z.object() strips unknown keys silently — so every harvested homepage was

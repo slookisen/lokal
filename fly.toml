@@ -28,6 +28,17 @@ primary_region = 'arn'
   # 'true') or removing the line entirely turns it back off, with no
   # redeploy-side-effects beyond that.
   VERIFIER_SCHEDULER_ENABLED = '1'
+  # dev-request 2026-08-14-fetch-vegg-headless-fallback.md Slice 4: turns on
+  # admin-rfb-website-discovery.ts's headless-render fallback for JS-built
+  # producer sites. The route already exists and is already tested — it was
+  # shipped flag-OFF because render-page.ts's renderer had no real backend
+  # in production; this is what actually gives it one (render-page.ts now
+  # calls the already-live render-worker via render-client.ts).
+  RFB_WD_HEADLESS_FALLBACK_ENABLED = 'true'
+  # dev-request 2026-08-14-fetch-vegg-headless-fallback.md Slice 4: same
+  # switch as above, for marketplace.ts's processAgent() homepage-provenance
+  # batch. Already shipped flag-OFF for the same reason.
+  HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED = 'true'
 
 [[mounts]]
   source = 'lokal_data'

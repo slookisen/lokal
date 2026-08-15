@@ -28,7 +28,9 @@ curl -X POST localhost:8080/render \
 
 - `GET /health` — `{status, uptime, browser_ready}`. Used by Fly healthcheck.
 - `POST /render` — requires `X-Render-Key` header. Body:
-  `{ url, wait_for?, timeout_ms?, wait_selector? }`. Returns
+  `{ url, wait_for?, timeout_ms?, wait_selector?, user_agent? }`. `user_agent`
+  is optional — omit it to get the worker's own default `USER_AGENT`
+  constant, unchanged from before this field existed. Returns
   `{ status, url, status_code, content_type, html, html_bytes, duration_ms, timestamp }`.
 
 Status codes: `400` invalid body, `401` bad key, `502` navigation failed,

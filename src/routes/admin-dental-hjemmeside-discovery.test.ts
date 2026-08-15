@@ -59,6 +59,13 @@
  *       mismatch_with_queued_candidate; an agent_id never queued ->
  *       not_in_review_queue.
  *   (o) approve: more than DENTAL_WD_APPROVE_MAX approvals -> 400.
+ *   (p) DENTAL_WD_HEADLESS_FALLBACK_ENABLED unset/false (default) -> the
+ *       headless-render escalation is never attempted, even for a fetched
+ *       page that otherwise looks exactly like the JS-shell shape
+ *       shouldEscalateToRender() looks for — renderPage is never invoked,
+ *       and the outcome is the same insufficient_evidence a plain-fetch-only
+ *       world would produce. Mirrors admin-rfb-website-discovery.test.ts's
+ *       own flag-off coverage (hf-a) for the identical fallback pattern.
  *
  * Two ways to run:
  *   1. Standalone: npx tsx src/routes/admin-dental-hjemmeside-discovery.test.ts
@@ -157,10 +164,14 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
   const prevDentalPath = process.env.DENTAL_DB_PATH;
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+  const prevHeadlessFallbackEnabled = process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
   const testKey = process.env.ADMIN_KEY || "dental-wd-test-key";
   process.env.DENTAL_DB_PATH = ":memory:";
   process.env.ADMIN_KEY = testKey;
   delete process.env.ANALYTICS_ADMIN_KEY;
+  // Explicit default-OFF for the whole suite unless a block below opts in —
+  // matches production's "absent from fly.toml" state.
+  delete process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
 
   const dbFactoryPath = require.resolve("../database/db-factory");
   const routePath = require.resolve("./admin-dental-hjemmeside-discovery");
@@ -491,6 +502,47 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
     const neverQueued = await postApprove({ approvals: [{ agent_id: "does-not-exist-in-queue", url: "https://x.no" }], apply: true });
     assertEq(neverQueued.body.skipped[0]?.reason, "not_in_review_queue", "n2: agent never queued -> not_in_review_queue");
 
+    // ── (p) DENTAL_WD_HEADLESS_FALLBACK_ENABLED unset/false (default) ────────
+    // Fix-up, Finding 2: this route's headless-render escalation was never
+    // part of dev-request 2026-08-14-fetch-vegg-headless-fallback's stated
+    // scope, so it must stay off by default even though render-page.ts's
+    // renderer now has a real production backend. A "JS shell" fixture —
+    // big enough (>= RENDER_ESCALATION_MIN_BYTES), carries a <script>, and
+    // its visible text is a handful of characters — is the exact shape
+    // shouldEscalateToRender() (services/render-page.ts) looks for; if the
+    // flag were on, this fixture WOULD escalate. With the flag unset, it
+    // must not: renderPage is never invoked, and the outcome is the same
+    // insufficient_evidence a plain-fetch-only world produces (no evidence
+    // anywhere in the tiny visible text).
+    {
+      delete process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
+      let renderCalls = 0;
+      routeMod.__setDentalWdRenderPageImplForTesting(async () => {
+        renderCalls++;
+        throw new Error("renderPage must never be called while DENTAL_WD_HEADLESS_FALLBACK_ENABLED is off");
+      });
+
+      const jsShellPadding = "x".repeat(2500);
+      seedClinic({ id: "wd-hf-off", navn: "Fallback Off Tannlege AS", org_nr: "232323232", poststed: "Ålesund" });
+      brregFixtures.set("232323232", { hjemmeside: "https://hfofftannlege.no" });
+      pageFixtures.set(
+        "https://hfofftannlege.no",
+        htmlResponse(`<html><body><script>var pad = "${jsShellPadding}";</script><div id="root">App</div></body></html>`, {
+          finalUrl: "https://hfofftannlege.no",
+        }),
+      );
+
+      const batchP = await postDiscovery({ agentIds: ["wd-hf-off"] });
+      assertEq(batchP.status, 200, "p1: 200");
+      const resultP = (batchP.body.results as any[]).find((r) => r.agent_id === "wd-hf-off");
+      assertEq(resultP?.status, "insufficient_evidence", "p2: nothing changes with the flag off — same outcome as plain-fetch-only");
+      assertTrue(!readQueueRow("wd-hf-off"), "p3: nothing queued");
+      assertEq(renderCalls, 0, "p4: renderPage was never invoked while the flag is unset");
+
+      routeMod.__setDentalWdRenderPageImplForTesting(null);
+      delete process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
+    }
+
     // ── (o) approve cap ─────────────────────────────────────────────────────
     const approveCap = routeMod.DENTAL_WD_APPROVE_MAX;
     assertEq(approveCap, 200, "o0: DENTAL_WD_APPROVE_MAX is 200");
@@ -504,6 +556,8 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
     if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevDentalPath;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
+    if (prevHeadlessFallbackEnabled === undefined) delete process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED;
+    else process.env.DENTAL_WD_HEADLESS_FALLBACK_ENABLED = prevHeadlessFallbackEnabled;
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
