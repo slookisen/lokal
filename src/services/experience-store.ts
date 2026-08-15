@@ -6387,6 +6387,25 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // approval, not a fill-only extraction, but the audit row shape is
   // identical), so the standard rollback lever must cover it too.
   "mobil",
+  // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+  // merge lever (POST /admin/gardssalg-provider-dedup-merge,
+  // routes/opplevelser.ts, backed by services/gardssalg-provider-merge.ts):
+  // every write that route makes — the fill-only field copies onto the
+  // survivor (all fields already listed above, plus org_nr, already in this
+  // set), the org_nr NULL-out on the removed row, and the removed row's own
+  // merged_into stamp — goes through gardssalg_content_audit the SAME way as
+  // every other write in this file (both remove_id and keep_id are ordinary
+  // experience_providers ids, so this table's existing provider_id FK fits
+  // directly; no second audit table was needed — see that route's own doc
+  // comment on why this differs from the experiences-table conflict-
+  // remediation case, which DID need a second table). Adding "merged_into"
+  // here is therefore the ENTIRE rollback-wiring this merge lever needs: the
+  // existing POST /admin/gardssalg-content-rollback (default/"provider"
+  // entity_type, unchanged) already restores any (provider_id, field_name)
+  // pair with gardssalg_content_audit history, and a merge's batch_id spans
+  // BOTH the keep_id and remove_id rows it touched, so a single batch_id
+  // rollback call undoes an entire merge.
+  "merged_into",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
@@ -6503,16 +6522,78 @@ export function isGardssalgFieldOwnerLocked(
 // provider_id (+ optional field_name) -> that provider's field(s) with any
 // audit history. Pure lookup — no writes, no idempotency checks (those
 // happen in planGardssalgContentRollback).
+//
+// batch_id ordering (dev-request 2026-07-31-gardssalg-provider-dubletter-på-
+// tvers-av-seeds, merge lever): `ORDER BY MAX(rowid) DESC` — the
+// MOST-recently-written (provider_id, field_name) pair in the batch is
+// restored FIRST — rather than the previous plain `SELECT DISTINCT` (whose
+// row order was unspecified/implementation-defined). This matters for
+// exactly one existing rollbackable field: org_nr carries a UNIQUE
+// constraint, and the provider-merge lever's org_nr MOVE writes two audit
+// rows in the SAME batch — clear the removed row's org_nr (earlier rowid),
+// then set the survivor's org_nr to that value (later rowid). Restoring in
+// insertion order would try to write the survivor's PRE-restore org_nr back
+// onto the removed row WHILE the survivor still holds it — a live UNIQUE
+// collision (reproduced by opplevelser-gardssalg-provider-dedup-merge.test.ts's
+// own rollback coverage). Restoring in REVERSE-chronological (LIFO) order
+// undoes the LATER write (survivor -> NULL) before the EARLIER one (removed
+// row -> the value), which never collides. Every other rollbackable field on
+// experience_providers has no UNIQUE constraint, so this ordering change is
+// a no-op for every batch that doesn't contain this exact shape (each
+// UPDATE's own correctness never depended on sibling-item order before).
+//
+// batch_id per target, and the chain-merge history-loss fix (2026-08-15,
+// fix-up to the provider-merge lever above): the GROUP BY above collapses
+// EVERY audit row a (provider_id, field_name) pair accumulated within the
+// batch down to a single target — that's correct for the "which pairs does
+// this batch touch" question, but a CHAIN merge within one batch (pair 1:
+// remove=A,keep=B; pair 2, same batch_id: remove=B,keep=C — see this
+// module's own doc comment on why chains across pairs in one batch are
+// intentionally allowed) writes org_nr on B TWICE: once as a fill target
+// (NULL -> X, when A->B happens) and once cleared back out (X -> NULL, when
+// B->C happens). Both survive as separate gardssalg_content_audit rows —
+// the GROUP BY here only ever discarded which ROW to key the target on, it
+// never discarded the rows themselves. planGardssalgContentRollback (below)
+// now uses that: for a batch-resolved target it looks up the EARLIEST row
+// for that (provider_id, field_name) WITHIN THIS batch_id (not the global
+// latest) to compute restore_to, which is the row whose old_value is the
+// TRUE pre-batch value — for B above, that's the first (fill) row's
+// old_value = NULL, correctly ignoring the intermediate X it only held
+// transiently mid-batch. For every (provider_id, field_name) touched only
+// ONCE in the batch (every existing case before this fix), the earliest
+// row and the latest row are the SAME row, so this is a no-op — old
+// single-write batches restore identically to before. Returning `batch_id`
+// on each target here (rather than only accepting it as a resolveGardssalg-
+// RollbackTargets input) is what lets planGardssalgContentRollback tell a
+// batch-resolved target apart from a provider_id-resolved one and scope its
+// lookup query accordingly — provider_id-resolved targets are UNCHANGED
+// (still the global-latest-row lookup, since there's no batch to scope to).
+//
+// This was evaluated against the "reject chain-merges in one batch instead"
+// fallback and rejected in favor of this resolver-side fix: chain merges are
+// a real, intentional feature here (this module's own doc comment, and 4 of
+// 6 pairs in the dev-request's own verified-pairs table move org_nr across a
+// chain), so refusing them would be a feature regression, not just a bug
+// fix — and the fix above is narrow (two functions, additive `batch_id` on
+// the resolver's return shape, a single extra WHERE clause + ASC-vs-DESC
+// flip in the lookup query) and provably reconstructs the true pre-batch
+// state for arbitrarily long chains within a batch, not just the two-hop
+// case: see opplevelser-gardssalg-provider-dedup-merge.test.ts's chain-merge
+// rollback coverage.
 function resolveGardssalgRollbackTargets(
   opts: GardssalgRollbackTarget
-): Array<{ provider_id: string; field_name: string }> {
+): Array<{ provider_id: string; field_name: string; batch_id?: string }> {
   const db = getDb(VERTICAL);
   if (opts.batch_id) {
-    return db
+    const rows = db
       .prepare(
-        `SELECT DISTINCT provider_id, field_name FROM gardssalg_content_audit WHERE batch_id = ?`
+        `SELECT provider_id, field_name FROM gardssalg_content_audit
+          WHERE batch_id = ?
+          GROUP BY provider_id, field_name
+          ORDER BY MAX(rowid) DESC`
       )
       .all(opts.batch_id) as Array<{ provider_id: string; field_name: string }>;
+    return rows.map((r) => ({ ...r, batch_id: opts.batch_id }));
   }
   if (opts.provider_id) {
     if (opts.field_name) {
@@ -6556,15 +6637,38 @@ export function planGardssalgContentRollback(
     // by a rollback within the same second would tie), and id is a random
     // UUID with no relationship to insertion order — rowid is the only
     // column that reliably reflects "most recently inserted".
-    const latest = db
-      .prepare(
-        `SELECT old_value, new_value, source_url, changed_at FROM gardssalg_content_audit
-          WHERE provider_id = ? AND field_name = ?
-          ORDER BY rowid DESC LIMIT 1`
-      )
-      .get(t.provider_id, t.field_name) as
-      | { old_value: string | null; new_value: string | null; source_url: string | null; changed_at: string }
-      | undefined;
+    //
+    // Batch-scoped targets (t.batch_id set — see resolveGardssalgRollback-
+    // Targets's doc comment on the 2026-08-15 chain-merge fix) look up the
+    // EARLIEST row for this (provider_id, field_name) WITHIN THAT batch
+    // (ORDER BY rowid ASC, WHERE batch_id = ...) instead of the global
+    // latest: that row's old_value is the true pre-batch value, correctly
+    // skipping past any intermediate value this same field held only
+    // transiently mid-batch (e.g. org_nr passing through a middle row on its
+    // way A->B->C in a chain merge). A provider_id-resolved target (no
+    // batch_id — the plain, non-batch rollback path) is UNCHANGED: it keeps
+    // the original global-latest lookup, since there is no batch to scope
+    // to and this is the path the "already rolled back" idempotency check
+    // (case (2) below) actually depends on.
+    const latest = t.batch_id
+      ? (db
+          .prepare(
+            `SELECT old_value, new_value, source_url, changed_at FROM gardssalg_content_audit
+              WHERE provider_id = ? AND field_name = ? AND batch_id = ?
+              ORDER BY rowid ASC LIMIT 1`
+          )
+          .get(t.provider_id, t.field_name, t.batch_id) as
+          | { old_value: string | null; new_value: string | null; source_url: string | null; changed_at: string }
+          | undefined)
+      : (db
+          .prepare(
+            `SELECT old_value, new_value, source_url, changed_at FROM gardssalg_content_audit
+              WHERE provider_id = ? AND field_name = ?
+              ORDER BY rowid DESC LIMIT 1`
+          )
+          .get(t.provider_id, t.field_name) as
+          | { old_value: string | null; new_value: string | null; source_url: string | null; changed_at: string }
+          | undefined);
     if (!latest) {
       skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "no_audit_row" });
       continue;
@@ -6628,6 +6732,26 @@ export function planGardssalgContentRollback(
 }
 
 /**
+ * Thrown by applyGardssalgContentRollback when ANY item in the batch fails
+ * to apply (2026-08-15 chain-merge-rollback fix-up — the whole-batch
+ * transaction safety net described on that function's own doc comment).
+ * Distinguishing this from a generic thrown error lets the route layer
+ * (POST /admin/gardssalg-content-rollback, opplevelser.ts) tell the caller
+ * plainly that the rollback did NOT happen at all — better-sqlite3 has
+ * already rolled back every write this call attempted — rather than
+ * returning a bare, uninformative 500 that leaves an operator unsure
+ * whether the batch is half-applied. `cause` carries the original thrown
+ * error (e.g. the SqliteError for a UNIQUE constraint violation) for
+ * logging/diagnosis.
+ */
+export class GardssalgRollbackApplyError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause !== undefined ? { cause } : undefined);
+    this.name = "GardssalgRollbackApplyError";
+  }
+}
+
+/**
  * Apply a previously-planned gårdssalg content rollback (see
  * planGardssalgContentRollback): restores experience_providers.<field_name>
  * to `restore_to` for every item, and — critically — inserts a NEW
@@ -6635,16 +6759,32 @@ export function planGardssalgContentRollback(
  * immediately before the rollback, new_value = the restored value,
  * changed_by='system', source_url carries an `internal://rollback` marker)
  * so the rollback itself is auditable and the audit trail is never
- * silently mutated or deleted. Each restore + its audit row is applied in
- * one transaction. field_name is re-validated against the same allow-list
- * as planGardssalgContentRollback (defense in depth — items should already
- * be plan() output, but this function never trusts field_name blindly).
- * content_source is likewise re-verified right before each write (same
- * defense in depth — items should already have been filtered by plan()'s
- * manual/claim check, but this function never trusts that blindly either):
- * if a provider's content_source is 'manual' or 'claim', the item is
- * skipped entirely (no write, no audit row, omitted from the returned
- * `restored` array) rather than restored.
+ * silently mutated or deleted. field_name is re-validated against the same
+ * allow-list as planGardssalgContentRollback (defense in depth — items
+ * should already be plan() output, but this function never trusts
+ * field_name blindly). content_source is likewise re-verified right before
+ * each write (same defense in depth — items should already have been
+ * filtered by plan()'s manual/claim check, but this function never trusts
+ * that blindly either): if a provider's content_source is 'manual' or
+ * 'claim', the item is skipped entirely (no write, no audit row, omitted
+ * from the returned `restored` array) rather than restored.
+ *
+ * Whole-batch atomicity (2026-08-15, chain-merge-rollback fix-up): the ENTIRE
+ * loop below runs inside ONE outer db.transaction — previously each item ran
+ * in its OWN separate transaction, with nothing wrapping the loop itself, so
+ * a failure partway through a multi-item batch (e.g. a UNIQUE constraint
+ * violation restoring a chain-merged field — see resolveGardssalgRollback-
+ * Targets's doc comment) left every item BEFORE the failure already
+ * committed and every item AFTER it never attempted: a silently
+ * half-applied, corrupted rollback. Wrapping the whole loop makes it
+ * all-or-nothing — if ANY item throws (this bug or any future one),
+ * better-sqlite3 rolls back every write this call made, and the DB is left
+ * byte-for-byte as it was before the call. The exception is re-thrown as
+ * GardssalgRollbackApplyError so the caller can tell "atomically failed,
+ * nothing applied" apart from other failure modes. This is a general
+ * robustness fix to shared rollback machinery, independent of the
+ * chain-merge case that surfaced it — it protects every caller of this
+ * function, not just the provider-merge lever's batches.
  */
 export function applyGardssalgContentRollback(
   items: GardssalgRollbackPlanItem[]
@@ -6652,46 +6792,57 @@ export function applyGardssalgContentRollback(
   const db = getDb(VERTICAL);
   const restored: Array<{ provider_id: string; field_name: string; restored_to: string | null }> = [];
 
-  const runOne = db.transaction((item: GardssalgRollbackPlanItem) => {
-    db.prepare(`UPDATE experience_providers SET ${item.field_name} = @val WHERE id = @id`).run({
-      val: item.restore_to,
-      id: item.provider_id,
-    });
-    db.prepare(
-      `INSERT INTO gardssalg_content_audit
-         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
-       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, NULL, 'system', datetime('now'))`
-    ).run({
-      id: uuid(),
-      provider_id: item.provider_id,
-      field_name: item.field_name,
-      old_value: item.current_value,
-      new_value: item.restore_to,
-      source_url: GARDSSALG_ROLLBACK_MARKER,
-    });
+  const runAll = db.transaction((batchItems: GardssalgRollbackPlanItem[]) => {
+    for (const item of batchItems) {
+      if (!GARDSSALG_ROLLBACKABLE_FIELDS.has(item.field_name)) continue;
+      // Same write guard as applyGardssalgProviderContent() (~line 2031) and
+      // planGardssalgContentRollback's manual/claim check above — re-verified
+      // here, right before the UPDATE, rather than trusting that this item
+      // already passed that check in plan()'s `restorable` list. If a manual
+      // or claim edit reaches this function anyway, skip it silently: no
+      // write, no audit row, and it's simply omitted from `restored`. Narrowed
+      // to per-field for content_source='claim' rows via
+      // isGardssalgFieldOwnerLocked (dev-request 2026-08-03-gardssalg-owner-
+      // lock-rollback) — see its doc comment.
+      const providerRow = db
+        .prepare(`SELECT content_source, field_provenance FROM experience_providers WHERE id = ?`)
+        .get(item.provider_id) as
+        | { content_source: string | null; field_provenance: string | null }
+        | undefined;
+      if (providerRow && isGardssalgFieldOwnerLocked(providerRow, item.field_name)) {
+        continue;
+      }
+      db.prepare(`UPDATE experience_providers SET ${item.field_name} = @val WHERE id = @id`).run({
+        val: item.restore_to,
+        id: item.provider_id,
+      });
+      db.prepare(
+        `INSERT INTO gardssalg_content_audit
+           (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+         VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, NULL, 'system', datetime('now'))`
+      ).run({
+        id: uuid(),
+        provider_id: item.provider_id,
+        field_name: item.field_name,
+        old_value: item.current_value,
+        new_value: item.restore_to,
+        source_url: GARDSSALG_ROLLBACK_MARKER,
+      });
+      restored.push({ provider_id: item.provider_id, field_name: item.field_name, restored_to: item.restore_to });
+    }
   });
 
-  for (const item of items) {
-    if (!GARDSSALG_ROLLBACKABLE_FIELDS.has(item.field_name)) continue;
-    // Same write guard as applyGardssalgProviderContent() (~line 2031) and
-    // planGardssalgContentRollback's manual/claim check above — re-verified
-    // here, right before the UPDATE, rather than trusting that this item
-    // already passed that check in plan()'s `restorable` list. If a manual
-    // or claim edit reaches this function anyway, skip it silently: no
-    // write, no audit row, and it's simply omitted from `restored`. Narrowed
-    // to per-field for content_source='claim' rows via
-    // isGardssalgFieldOwnerLocked (dev-request 2026-08-03-gardssalg-owner-
-    // lock-rollback) — see its doc comment.
-    const providerRow = db
-      .prepare(`SELECT content_source, field_provenance FROM experience_providers WHERE id = ?`)
-      .get(item.provider_id) as
-      | { content_source: string | null; field_provenance: string | null }
-      | undefined;
-    if (providerRow && isGardssalgFieldOwnerLocked(providerRow, item.field_name)) {
-      continue;
-    }
-    runOne(item);
-    restored.push({ provider_id: item.provider_id, field_name: item.field_name, restored_to: item.restore_to });
+  try {
+    runAll(items);
+  } catch (e: any) {
+    // better-sqlite3 has already rolled the whole transaction back by the
+    // time this catch runs — `restored` (built up inside the transaction
+    // closure above) is discarded rather than returned, since none of it
+    // actually persisted.
+    throw new GardssalgRollbackApplyError(
+      `gardssalg content rollback failed atomically — no changes were applied: ${e?.message ?? String(e)}`,
+      e
+    );
   }
 
   return restored;

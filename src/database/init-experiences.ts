@@ -941,6 +941,35 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.log(`[experiences] claimed_at backfill skipped: ${(e as Error).message}`);
   }
 
+  // ─── merged_into (dev-request 2026-07-31-gardssalg-provider-dubletter-på-
+  // tvers-av-seeds, merge lever) ──────────────────────────────────────────────
+  // Additive, nullable pointer: NULL means "this row is not a merged-away
+  // duplicate" (the default for every existing row, unchanged behavior).
+  // Non-NULL means this row was identified as a same-producer duplicate of
+  // the row whose id it holds, and its content/contact/org_nr were fill-only
+  // migrated to that survivor by POST /admin/gardssalg-provider-dedup-merge
+  // (routes/opplevelser.ts) — see that route's own doc comment for the
+  // survivorship rule. Same SURVIVOR-POINTER semantic as `experiences.
+  // canonical_id` (this file, above — "opplevelses-raden-maskineriet"'s own
+  // same-table dedup marker: NULL = live/canonical, non-NULL = merged away,
+  // walk hops until a NULL terminal row) and as `agents.merged_into`
+  // (database/init.ts) — this column is deliberately named to match the
+  // latter (the dev-request's own spec text proposed "merged_into-peker") but
+  // carries the FORMER's semantic (row stays in the table, never deleted; a
+  // future consumer is responsible for filtering `merged_into IS NULL`,
+  // exactly as `experiences` call sites already filter `canonical_id IS
+  // NULL` — deliberately NOT retrofitted into any existing
+  // experience_providers query by this slice, since widening which queries
+  // exclude merged-away rows is outside this slice's scope, see the route's
+  // own non-goals). The row is NEVER hard-deleted and NEVER auto-hidden via
+  // catalog_hidden by this column alone (a separate, independently-audited
+  // lever already owns that toggle — see GET/POST .../gardssalg-provider-
+  // visibility below).
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN merged_into TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_experience_providers_merged_into ON experience_providers(merged_into)");
+  } catch { /* already present */ }
+
   // ─── experience_provider_conflict_audit (dev-request 2026-08-01-gardssalg-
   // profilkomplett-og-soekbar-foer-outreach, Steg 2) ─────────────────────────
   // Insert-only, field-level changelog for `experiences.booking_url`

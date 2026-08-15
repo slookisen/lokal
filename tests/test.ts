@@ -29525,6 +29525,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gpdar.failures) failures.push("opplevelser-gardssalg-provider-dedup-audit: " + f);
     console.log(`  opplevelser-gardssalg-provider-dedup-audit: ${gpdar.passed} passed, ${gpdar.failed} failed`);
 
+    // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+    // spec-punkt 2 (merge lever, 2026-08-15): POST /admin/gardssalg-provider-
+    // dedup-merge — executes an explicit, already human-verified
+    // {remove_id, keep_id} pair list (fill-only migration, org_nr move,
+    // merged_into soft-mark, owner-claim hard guard), plus its wiring into
+    // the EXISTING POST /admin/gardssalg-content-rollback lever. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-provider-dedup-merge: admin merge lever ──");
+    const { runOpplevelserGardssalgProviderDedupMergeTests } = require("../src/routes/opplevelser-gardssalg-provider-dedup-merge.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-provider-dedup-merge.test");
+    const gpdmr = await runOpplevelserGardssalgProviderDedupMergeTests({ log: false });
+    passed += gpdmr.passed;
+    failed += gpdmr.failed;
+    for (const f of gpdmr.failures) failures.push("opplevelser-gardssalg-provider-dedup-merge: " + f);
+    console.log(`  opplevelser-gardssalg-provider-dedup-merge: ${gpdmr.passed} passed, ${gpdmr.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1:
     // gardssalg_content_audit table + experience_providers.field_provenance
     // column, applyGardssalgProviderContent()'s additive audit/provenance

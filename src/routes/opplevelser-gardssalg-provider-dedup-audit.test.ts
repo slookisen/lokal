@@ -404,10 +404,15 @@ export function runOpplevelserGardssalgProviderDedupAuditTests(
         .all();
       assertEq(snapshotAfter, snapshotBefore, "k4: every fixture row's raw columns are byte-identical before vs after two calls");
 
-      // No merge/deletion-marker column exists on the table at all (this
-      // endpoint's slice never adds one) — a PRAGMA table_info sanity check.
+      // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+      // merge lever (2026-08-15): `merged_into` now DOES exist (added for
+      // POST /admin/gardssalg-provider-dedup-merge — this audit route itself
+      // never writes it, and every fixture row above still has it NULL, so
+      // this endpoint's own zero-writes/byte-identical checks above are
+      // unaffected). `deleted_at` is still absent — this lever soft-marks via
+      // merged_into, never a deletion timestamp.
       const columns = (expDb.prepare(`PRAGMA table_info(experience_providers)`).all() as Array<{ name: string }>).map((c) => c.name);
-      assertTrue(!columns.includes("merged_into"), "k5: no merged_into column exists on experience_providers");
+      assertTrue(columns.includes("merged_into"), "k5: merged_into column exists on experience_providers (merge lever)");
       assertTrue(!columns.includes("deleted_at"), "k6: no deleted_at column exists on experience_providers");
     } catch (err: any) {
       failed++;

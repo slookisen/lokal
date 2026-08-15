@@ -74,6 +74,7 @@ import {
   // rollback/provenance substrate backing POST /admin/gardssalg-content-rollback
   planGardssalgContentRollback,
   applyGardssalgContentRollback,
+  GardssalgRollbackApplyError,
   type GardssalgRollbackPlanItem,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
   // Brreg street-address backfill (fills adresse/postnummer/poststed only;
@@ -282,6 +283,20 @@ import {
   type GsExpTriageSide,
   type GsExpTriageEvidence,
 } from "../services/gardssalg-experience-conflict-triage";
+// dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+// spec-punkt 2 (the merge lever, still open as of 2026-08-15) — backs POST
+// /admin/gardssalg-provider-dedup-merge below. NOT the auto-detection scan
+// (that's the untouched GET /admin/gardssalg-provider-dedup-audit route
+// above); this executes an explicit, already human-verified {remove_id,
+// keep_id} pair. See services/gardssalg-provider-merge.ts's own doc comment
+// for the fill-only/org_nr-move/merged_into design and why it deliberately
+// reuses gardssalg_content_audit rather than a second audit table.
+import {
+  previewGardssalgProviderMergePair,
+  applyGardssalgProviderMergePair,
+  GARDSSALG_PROVIDER_MERGE_MAX_PAIRS,
+  type GardssalgProviderMergeResultItem,
+} from "../services/gardssalg-provider-merge";
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
 // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice — a new,
 // independent sweep that checks each gårdssalg producer's stored hjemmeside
@@ -7513,6 +7528,21 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
 // experience_id in place of provider_id. ONE HTTP surface for both audit
 // trails rather than a second rollback endpoint — per the dev-request's own
 // rollback section ("reverserbart... via gardssalg-content-rollback").
+//
+// entity_type "provider_merge" (dev-request 2026-07-31-gardssalg-provider-
+// dubletter-på-tvers-av-seeds, merge lever — POST /admin/gardssalg-provider-
+// dedup-merge, services/gardssalg-provider-merge.ts) is a RECOGNIZED value
+// for this param, but deliberately does NOT get its own branch below —
+// unlike "experience" above, a provider-merge's ids (both remove_id and
+// keep_id) are ordinary experience_providers ids, so its writes already land
+// in gardssalg_content_audit (provider_id-keyed) exactly like every other
+// provider content write, and the ternary's fallthrough already routes it
+// (and any other non-"experience" value) into the SAME "provider" path below
+// with zero extra code — that path's provider_id/batch_id targeting already
+// fully covers restoring a merge (its own doc comment on
+// GARDSSALG_ROLLBACKABLE_FIELDS's "merged_into" entry explains why). Verify
+// with a batch_id rollback call using the batch_id the merge endpoint
+// returned, or a provider_id call against either side of the pair.
 router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as {
     provider_id?: unknown;
@@ -7622,6 +7652,23 @@ router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, re
       skipped,
     });
   } catch (err: any) {
+    // GardssalgRollbackApplyError (2026-08-15 chain-merge-rollback fix-up):
+    // applyGardssalgContentRollback's whole-batch transaction already rolled
+    // every write in this call back before this catch runs — surface that
+    // plainly (distinct error code + applied:false + the batch_id in play)
+    // rather than the generic "Internal error" 500 below, so an operator can
+    // tell at a glance that the rollback did NOT happen at all and nothing
+    // needs undoing, rather than wondering whether the batch is half-applied.
+    if (err instanceof GardssalgRollbackApplyError) {
+      console.error("[opplevelser] gardssalg-content-rollback apply failed atomically (no changes applied)", err);
+      res.status(500).json({
+        error: "gardssalg_rollback_failed_atomically",
+        message: err.message,
+        applied: false,
+        batch_id: batchId ?? null,
+      });
+      return;
+    }
     console.error("[opplevelser] gardssalg-content-rollback failed", err);
     res.status(500).json({ error: "Internal error" });
   }
@@ -13133,6 +13180,118 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
     groups_found: groups.length,
     groups,
   });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-provider-dedup-merge ─────────────
+//
+// dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
+// spec-punkt 2 — the merge lever. Executes an EXPLICIT, already human-
+// verified list of {remove_id, keep_id} decisions supplied by the caller —
+// this route NEVER detects duplicates itself (that's the untouched GET
+// /admin/gardssalg-provider-dedup-audit above; widening its scope-WHERE is a
+// separate, still-open Daniel decision, out of scope here). See
+// services/gardssalg-provider-merge.ts's module doc comment for the full
+// fill-only/org_nr-move/merged_into design and Daniel's 2026-08-15 live-
+// session survivorship rule this route mechanically enforces.
+//
+// apply: dry-run by DEFAULT (same convention as every other admin write
+// route in this file, e.g. POST /admin/gardssalg-experience-conflict-
+// remediation above). Dry-run and apply share the SAME per-pair response
+// shape (outcome "would_merge" vs "merged", everything else identical) —
+// deliberately NOT the planned/applied-shape-split convention that route
+// above uses, since this endpoint's own test contract requires a dry-run to
+// report "the same response shape/counts as a real run would report".
+//
+// Body: { pairs: [{ remove_id, keep_id, note? }], apply?, batch_id? }.
+// batch_id is an optional caller-supplied tag (same optional-tag convention
+// as POST /admin/gardssalg-experience-conflict-remediation's own batch_id) —
+// stamped on every gardssalg_content_audit row this call's applies insert,
+// so a single POST /admin/gardssalg-content-rollback { batch_id } call
+// (default/"provider" entity_type — unchanged, no new entity_type branch was
+// needed; see that route's own doc comment) restores every field this call
+// touched, on both sides of every pair. If omitted, one is generated so the
+// response always carries a usable rollback key even when the caller didn't
+// supply one.
+//
+// Per pair, BEFORE any write: both ids must exist and be distinct rows (else
+// a per-pair "error"/"ikke_funnet" — never blocks the rest of the batch,
+// same discipline as the outreach-preflight endpoint's own ikke_funnet
+// handling), and `remove_id`'s row must NOT be owner-claimed
+// (content_source 'manual'/'claim' — else "rejected"/
+// "eier_overtatt_kan_ikke_fjernes", a hard mechanical guard regardless of
+// what the caller asked).
+//
+// Response: { success, dry_run, batch_id, scanned, counts, results }.
+// `counts` is a per-outcome tally (same "counted outcome buckets"
+// convention as the outreach-preflight endpoint's go/no_go/ikke_funnet
+// summary). `results` carries one item per submitted pair, in submitted
+// order, each { remove_id, keep_id, outcome, reason, fields_filled,
+// org_nr_migrated }.
+router.post("/admin/gardssalg-provider-dedup-merge", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { pairs?: unknown; apply?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.pairs) || body.pairs.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'pairs' array of {remove_id, keep_id}" });
+    return;
+  }
+  if (body.pairs.length > GARDSSALG_PROVIDER_MERGE_MAX_PAIRS) {
+    res.status(400).json({ error: `Too many pairs (max ${GARDSSALG_PROVIDER_MERGE_MAX_PAIRS} per call)` });
+    return;
+  }
+
+  const batchId =
+    typeof body.batch_id === "string" && body.batch_id.trim()
+      ? body.batch_id.trim()
+      : `provider-merge-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const results: GardssalgProviderMergeResultItem[] = [];
+
+    for (const raw of body.pairs as unknown[]) {
+      const it = (raw ?? {}) as { remove_id?: unknown; keep_id?: unknown; note?: unknown };
+      const removeId = typeof it.remove_id === "string" ? it.remove_id.trim() : "";
+      const keepId = typeof it.keep_id === "string" ? it.keep_id.trim() : "";
+      const note = typeof it.note === "string" && it.note.trim() ? it.note.trim() : null;
+
+      if (!removeId || !keepId) {
+        results.push({
+          remove_id: removeId || "(mangler)",
+          keep_id: keepId || "(mangler)",
+          outcome: "rejected",
+          reason: "ugyldig_par",
+          fields_filled: [],
+          org_nr_migrated: false,
+        });
+        continue;
+      }
+
+      if (dryRun) {
+        results.push(previewGardssalgProviderMergePair(expDb, removeId, keepId));
+      } else {
+        results.push(applyGardssalgProviderMergePair(expDb, removeId, keepId, note, batchId));
+      }
+    }
+
+    const counts = results.reduce<Record<string, number>>((acc, r) => {
+      acc[r.outcome] = (acc[r.outcome] ?? 0) + 1;
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      batch_id: batchId,
+      scanned: (body.pairs as unknown[]).length,
+      counts,
+      results,
+    });
+  } catch (err) {
+    console.error("[gardssalg-provider-dedup-merge] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET /api/opplevelser/admin/gardssalg-experience-conflict-audit ─────────
