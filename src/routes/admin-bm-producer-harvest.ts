@@ -33,9 +33,26 @@
 //   `isContactPhoneCurated` helper (mirrors `isContactEmailCurated`'s shape,
 //   checking `curated_fields`'s "phone" key) for the field-lock. A row can
 //   write email, phone, both, or neither — the two write types are
-//   independent outcomes on the same result row. Two write levers total now:
-//   agents.contact_email and agent_knowledge.phone. No other column, no
-//   other table, is ever written by this file.
+//   independent outcomes on the same result row.
+//
+//   Slice 5 (dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 5) extends
+//   the SAME apply-mode loop a THIRD time to attempt a URL candidate for the
+//   same matched row — but url-write is QUEUE ONLY, never a direct write
+//   (stronger discipline than email/phone, per the fleet's binding "review-kø,
+//   aldri auto-skriv" website-candidate norm). For a matched row whose
+//   `record.website` is non-null AND whose agent_knowledge.website is
+//   currently blank, this file calls the SAME evidence-gated evaluation
+//   admin-rfb-website-discovery.ts's own external-candidate intake uses
+//   (`evaluateRfbWebsiteCandidate`, exported there — imported here, never
+//   duplicated) with one shared existingHosts/hostsProposedThisBatch/
+//   fallbackCounters accumulator threaded across the WHOLE apply-mode call
+//   (not per-row), same shared-host-dedup guarantee that route's own
+//   multi-candidate call gives itself. The ONLY side effect a url candidate
+//   can ever cause is a row in `agents_website_review_queue` (via that same
+//   module's `upsertRfbWebsiteReviewQueue`) — this file NEVER writes
+//   `agent_knowledge.website` for a url candidate, and never calls
+//   `applyRfbAgentWebsite` / the review-approve route (explicitly out of
+//   scope — a human reviewer's lever, not this harvest route's).
 //
 // Auth: X-Admin-Key (same pattern as admin-bm-reconcile.ts — own local
 // requireAdmin, no shared middleware, per this codebase's convention).
@@ -45,7 +62,11 @@
 // branch is the only place in this file that writes, and only to
 // agents.contact_email, agent_knowledge.phone (+ an `INSERT OR IGNORE INTO
 // agent_knowledge` row-creation step when no row exists yet for a matched
-// agent) + one agent_knowledge_audit row per change.
+// agent), `agents_website_review_queue` (via evaluateRfbWebsiteCandidate,
+// slice 5 — queue only, never agent_knowledge.website itself), + one
+// agent_knowledge_audit row per email/phone change (url candidates write no
+// audit row — the queue insert/upsert IS their only, fully reversible,
+// effect, same guarantee admin-rfb-website-discovery.ts's own callers get).
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -61,6 +82,20 @@ import {
   isContactEmailCurated,
 } from "./admin-agents-contact-email-write";
 import { validatePhoneForWrite, normalizePhone } from "../services/contact-normalizer";
+// Slice 5: url-write via the SAME evidence-gated evaluation
+// admin-rfb-website-discovery.ts's own external-candidate intake uses —
+// imported, never duplicated (ground rule "export, don't duplicate").
+// `ensureRfbWebsiteReviewQueueTable`/`rfbWdExistingWebsiteHosts` are the
+// small pieces of that route's own per-call setup this file needs to
+// reproduce (table-exists guarantee + the shared existingHosts snapshot);
+// `evaluateRfbWebsiteCandidate` and its RfbWdFallbackCounters param type are
+// the reused evidence-gating logic itself.
+import {
+  evaluateRfbWebsiteCandidate,
+  ensureRfbWebsiteReviewQueueTable,
+  rfbWdExistingWebsiteHosts,
+  RfbWdFallbackCounters,
+} from "./admin-rfb-website-discovery";
 
 const router = Router();
 
@@ -137,6 +172,24 @@ type PhoneOutcome =
   | "phone_skipped_unchanged"
   | "phone_rejected_invalid";
 
+// ─── URL outcomes (slice 5, QUEUE ONLY — see file header) ──────────────────
+// Additive, own vocabulary, same independent-per-field-outcome convention
+// slice 4 established for phone. Deliberately NO "url_written" value exists
+// (per the file header's safety framing) — the only "success" outcome is
+// `url_proposed`, meaning a row landed in agents_website_review_queue, never
+// agent_knowledge.website. `url_rejected_${reason}` reuses
+// evaluateRfbWebsiteCandidate's own `rejected.reason` vocabulary verbatim
+// (e.g. "host_already_proposed_this_batch", "no_candidate_verified") so a
+// caller never has to translate between this route's outcome names and that
+// function's — `url_already_has_website` is the (rare, race-only) path where
+// evaluateRfbWebsiteCandidate's OWN fresh read disagrees with this route's
+// own pre-check; `url_skip_no_candidate` is this route's own pre-check
+// short-circuit, covering BOTH "record.website is null" (AC5: zero calls
+// into evaluateRfbWebsiteCandidate) AND "agent_knowledge.website is already
+// non-blank" — the row is simply not eligible, distinct from an
+// evaluated-and-rejected candidate.
+type UrlOutcome = "url_proposed" | `url_rejected_${string}` | "url_already_has_website" | "url_skip_no_candidate";
+
 interface ApplyResultItem {
   slug: string;
   agent_id?: string;
@@ -148,6 +201,10 @@ interface ApplyResultItem {
   phone_old_value?: string | null;
   phone_new_value?: string | null;
   phone_detail?: string;
+  url_outcome?: UrlOutcome;
+  url_new_value?: string;
+  url_final_url?: string;
+  url_detail?: string;
 }
 
 /**
@@ -323,6 +380,20 @@ router.get("/", async (req: Request, res: Response) => {
         .replace("T", "-")
         .slice(0, 15)}`;
 
+      // ── URL (slice 5) shared, whole-call accumulators ────────────────────
+      // Built ONCE before the slug loop (not per row) — same
+      // "existingHosts/hostsProposedThisBatch/fallbackCounters threaded
+      // across the WHOLE call" contract admin-rfb-website-discovery.ts's own
+      // multi-candidate branch gives itself, so a shared host proposed for
+      // one row in THIS call is correctly excluded for a later row in the
+      // SAME call (AC6). ensureRfbWebsiteReviewQueueTable is idempotent
+      // (CREATE TABLE IF NOT EXISTS) — safe to call even if the RFB
+      // discovery route has never run in this process yet.
+      ensureRfbWebsiteReviewQueueTable(db);
+      const urlExistingHosts = rfbWdExistingWebsiteHosts(db);
+      const urlHostsProposedThisBatch = new Set<string>();
+      const urlFallbackCounters: RfbWdFallbackCounters = { attempted: 0, verified: 0 };
+
       const results: ApplyResultItem[] = [];
 
       for (const slug of slugsToProcess) {
@@ -464,6 +535,68 @@ router.get("/", async (req: Request, res: Response) => {
           }
         }
 
+        // ── URL (slice 5, QUEUE ONLY) ───────────────────────────────────────
+        // Independent third write-attempt on the SAME matched row, same
+        // call/batch, same shared `limit` (spec AC1) — never a second
+        // budget. Unlike email/phone, this NEVER writes agent_knowledge
+        // directly — the only possible effect is a row in
+        // agents_website_review_queue via evaluateRfbWebsiteCandidate's own
+        // upsert. Pre-check (record.website present AND agent_knowledge.
+        // website currently blank) happens HERE, before ever calling into
+        // evaluateRfbWebsiteCandidate, so a row with no BM-sourced url — or
+        // an agent that already has one — costs zero fetches (AC5's
+        // "don't fetch when there's nothing to evaluate" cheapness).
+        let urlOutcome: UrlOutcome | undefined;
+        let urlNewValue: string | undefined;
+        let urlFinalUrl: string | undefined;
+        let urlDetail: string | undefined;
+
+        if (!record.website) {
+          urlOutcome = "url_skip_no_candidate";
+        } else {
+          const curW = db
+            .prepare(`SELECT website FROM agent_knowledge WHERE agent_id = ?`)
+            .get(agentId) as { website: string | null } | undefined;
+          const currentWebsite = curW?.website ?? null;
+          if (currentWebsite && currentWebsite.trim() !== "") {
+            urlOutcome = "url_skip_no_candidate";
+          } else {
+            const urlResult = await evaluateRfbWebsiteCandidate(
+              db,
+              { agentId, url: record.website },
+              urlExistingHosts,
+              urlHostsProposedThisBatch,
+              urlFallbackCounters,
+              batchTag,
+            );
+            switch (urlResult.outcome) {
+              case "proposed":
+                urlOutcome = "url_proposed";
+                urlNewValue = urlResult.candidate_url;
+                urlFinalUrl = urlResult.final_url;
+                break;
+              case "rejected":
+                urlOutcome = `url_rejected_${urlResult.reason}`;
+                break;
+              case "already_has_website":
+                // Rare race only — this route's own pre-check above already
+                // read agent_knowledge.website as blank; a distinct outcome
+                // (never url_skip_no_candidate) so it's never confused with
+                // this route's own pre-check short-circuit.
+                urlOutcome = "url_already_has_website";
+                break;
+              case "not_found":
+                // Should not happen: agentId is a real, just-matched agents
+                // row. Surfaced as a rejected-shaped outcome rather than
+                // silently dropped, same "never a throw, never a silent
+                // gap" discipline the rest of this file follows.
+                urlOutcome = "url_rejected_agent_not_found";
+                urlDetail = "evaluateRfbWebsiteCandidate reported not_found for a matched agent";
+                break;
+            }
+          }
+        }
+
         results.push({
           slug,
           agent_id: agentId,
@@ -475,15 +608,21 @@ router.get("/", async (req: Request, res: Response) => {
           ...(phoneOldValue !== undefined ? { phone_old_value: phoneOldValue } : {}),
           ...(phoneNewValue !== undefined ? { phone_new_value: phoneNewValue } : {}),
           ...(phoneDetail ? { phone_detail: phoneDetail } : {}),
+          ...(urlOutcome ? { url_outcome: urlOutcome } : {}),
+          ...(urlNewValue !== undefined ? { url_new_value: urlNewValue } : {}),
+          ...(urlFinalUrl !== undefined ? { url_final_url: urlFinalUrl } : {}),
+          ...(urlDetail ? { url_detail: urlDetail } : {}),
         });
       }
 
       const counts = results.reduce<Record<string, number>>((acc, r) => {
         acc[r.outcome] = (acc[r.outcome] ?? 0) + 1;
-        // Additive: phone outcome counts land in the SAME counts object
-        // (e.g. `phone_written` alongside `written`) — no separate nested
-        // object, per slice 4 AC7.
+        // Additive: phone/url outcome counts land in the SAME counts object
+        // (e.g. `phone_written` / `url_proposed` alongside `written`) — no
+        // separate nested object, per slice 4 AC7 (extended unmodified to
+        // url outcomes by slice 5).
         if (r.phone_outcome) acc[r.phone_outcome] = (acc[r.phone_outcome] ?? 0) + 1;
+        if (r.url_outcome) acc[r.url_outcome] = (acc[r.url_outcome] ?? 0) + 1;
         return acc;
       }, {});
 

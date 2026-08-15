@@ -176,7 +176,12 @@ export const RFB_WD_RENDER_TIMEOUT_MS = 12_000;
 // mutable reference so both response shapes that call it (the external-
 // candidates path and the auto-select/agentIds path) can report the same
 // two numbers without a second code path to keep in sync.
-interface RfbWdFallbackCounters {
+// Exported (dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 5) so
+// admin-bm-producer-harvest.ts's apply-mode loop can thread its OWN
+// fallback-counter accumulator through evaluateRfbWebsiteCandidate (below),
+// same shared-across-the-whole-call convention this route's own external-
+// candidates branch already uses — no behavior here is altered.
+export interface RfbWdFallbackCounters {
   attempted: number;
   verified: number;
 }
@@ -423,8 +428,12 @@ function ensureKnowledgeRowForExternalCandidate(db: ReturnType<typeof getDb>, ag
 // All hosts already carried by some OTHER agent's live agent_knowledge.website
 // — a candidate landing on one of these is never this row's own site (mirrors
 // gardssalgSharedHostCounts' role, re-implemented locally per the file
-// header's scoping instruction).
-function rfbWdExistingWebsiteHosts(db: ReturnType<typeof getDb>): Set<string> {
+// header's scoping instruction). Exported (slice 5) so
+// admin-bm-producer-harvest.ts's apply-mode loop can build the SAME
+// existingHosts snapshot evaluateRfbWebsiteCandidate expects, once per call,
+// rather than re-implementing this query — ground-rule "export, don't
+// duplicate".
+export function rfbWdExistingWebsiteHosts(db: ReturnType<typeof getDb>): Set<string> {
   const rows = db
     .prepare(`SELECT website FROM agent_knowledge WHERE website IS NOT NULL AND TRIM(website) != ''`)
     .all() as Array<{ website: string }>;
@@ -436,7 +445,9 @@ function rfbWdExistingWebsiteHosts(db: ReturnType<typeof getDb>): Set<string> {
   return hosts;
 }
 
-interface RfbWdEvidence {
+// Exported (slice 5, see RfbWdFallbackCounters note above) — needed for
+// evaluateRfbWebsiteCandidate's/RfbWdCandidateOutcome's own signatures.
+export interface RfbWdEvidence {
   org_nr_found: boolean;
   name_found: boolean;
   place_found: boolean;
@@ -446,7 +457,7 @@ interface RfbWdEvidence {
   verified: boolean;
 }
 
-interface RfbWdHit {
+export interface RfbWdHit {
   host: string;
   finalUrl: string;
   evidence: RfbWdEvidence;
@@ -627,6 +638,132 @@ function upsertRfbWebsiteReviewQueue(
   });
 }
 
+// ─── evaluateRfbWebsiteCandidate (dev-request 2026-08-14-bm-fullhoest-
+// katalogbred, slice 5) ─────────────────────────────────────────────────────
+//
+// Pure extraction of the external-candidate intake's per-item body below
+// (originally inline in POST /rfb-website-discovery's `candidates` branch,
+// ~L720-795 before this slice) — mechanical, zero behavior change: target
+// lookup/knowledge-row-creation, already-has-website check, host resolution,
+// tryRfbWebsiteCandidateHost's evidence-gating, and (on a verified hit)
+// upsertRfbWebsiteReviewQueue — the SAME "review-kø, aldri auto-skriv"
+// discipline every call into this route already followed. NEVER writes
+// agent_knowledge.website or any other pre-existing column; the queue upsert
+// is the only side effect, exactly as before. Exported so
+// admin-bm-producer-harvest.ts's apply-mode loop can reuse this EXACT
+// evidence-gating logic for its own `record.website` candidates via
+// import — never a copy/paste, never a self-HTTP round-trip (ground rules).
+//
+// `existingHosts`/`hostsProposedThisBatch`/`fallbackCounters` are threaded
+// by the CALLER across its whole batch (this route's own candidates branch
+// builds them once per request, same as before this slice; the BM harvest
+// route builds its own equivalents once per apply-mode call) — this function
+// never constructs or resets them itself, so the shared-host-dedup guarantee
+// is identical regardless of which caller drives it.
+export type RfbWdCandidateOutcome =
+  | {
+      outcome: "proposed";
+      agent_id: string;
+      agent_name: string;
+      candidate_url: string;
+      final_url: string;
+      evidence: RfbWdEvidence;
+      confidence: number;
+    }
+  | {
+      outcome: "rejected";
+      agent_id: string;
+      agent_name: string;
+      reason: string;
+      tried: string[];
+      excluded: Array<{ host: string; reason: string }>;
+    }
+  | { outcome: "already_has_website"; agent_id: string; agent_name: string }
+  | { outcome: "not_found"; agent_id: string };
+
+export async function evaluateRfbWebsiteCandidate(
+  db: ReturnType<typeof getDb>,
+  candidate: { agentId: string; url: string },
+  existingHosts: Set<string>,
+  hostsProposedThisBatch: Set<string>,
+  fallbackCounters: RfbWdFallbackCounters,
+  batchId: string,
+): Promise<RfbWdCandidateOutcome> {
+  let t = getRfbWebsiteDiscoveryTarget(db, candidate.agentId);
+  if (!t && ensureKnowledgeRowForExternalCandidate(db, candidate.agentId)) {
+    t = getRfbWebsiteDiscoveryTarget(db, candidate.agentId);
+  }
+  if (!t) {
+    return { outcome: "not_found", agent_id: candidate.agentId };
+  }
+  if (t.website && t.website.trim() !== "") {
+    return { outcome: "already_has_website", agent_id: t.id, agent_name: t.name };
+  }
+
+  const host = rfbWdHostFromUrl(candidate.url);
+  if (!host) {
+    return { outcome: "rejected", agent_id: t.id, agent_name: t.name, reason: "invalid_candidate_url", tried: [], excluded: [] };
+  }
+
+  const evidenceTarget = {
+    orgNr: t.org_nr,
+    navn: t.name,
+    kommune: t.city,
+    poststed: null as string | null,
+    telefon: t.phone,
+    mobil: null as string | null,
+    adresse: t.address,
+    postnummer: t.postal_code,
+  };
+  const tried: string[] = [];
+  const excludedHere: Array<{ host: string; reason: string }> = [];
+  const hit = await tryRfbWebsiteCandidateHost(
+    host,
+    evidenceTarget,
+    existingHosts,
+    hostsProposedThisBatch,
+    tried,
+    excludedHere,
+    fallbackCounters,
+  );
+
+  if (hit) {
+    hostsProposedThisBatch.add(hit.host);
+    let candidateUrl: string;
+    try {
+      const u = new URL(hit.finalUrl);
+      candidateUrl = `${u.protocol}//${u.host.toLowerCase()}`;
+    } catch {
+      candidateUrl = `https://${hit.host}`;
+    }
+    const confidence = rfbWdConfidence(hit.evidence);
+    upsertRfbWebsiteReviewQueue(db, {
+      agent_id: t.id,
+      agent_name: t.name,
+      candidate_url: candidateUrl,
+      final_url: hit.finalUrl,
+      evidence: hit.evidence,
+      confidence,
+      batch_id: batchId,
+      reason: "website_discovery_candidate_external",
+    });
+    return {
+      outcome: "proposed",
+      agent_id: t.id,
+      agent_name: t.name,
+      candidate_url: candidateUrl,
+      final_url: hit.finalUrl,
+      evidence: hit.evidence,
+      confidence,
+    };
+  }
+
+  let reason: string;
+  if (excludedHere.length > 0) reason = excludedHere[0].reason;
+  else reason = "no_candidate_verified";
+  return { outcome: "rejected", agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere };
+}
+
 const router = Router();
 
 // External-candidate intake item shape (dev-request 2026-08-10-rfb-
@@ -724,73 +861,46 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       }
       seenAgentIds.add(c.agentId);
 
-      let t = getRfbWebsiteDiscoveryTarget(db, c.agentId);
-      if (!t && ensureKnowledgeRowForExternalCandidate(db, c.agentId)) {
-        t = getRfbWebsiteDiscoveryTarget(db, c.agentId);
-      }
-      if (!t) {
-        notFound.push(c.agentId);
-        continue;
-      }
-      if (t.website && t.website.trim() !== "") {
-        alreadyHasWebsite.push({ agent_id: t.id, agent_name: t.name });
-        continue;
-      }
-
-      const host = rfbWdHostFromUrl(c.url);
-      if (!host) {
-        rejectedExt.push({ agent_id: t.id, agent_name: t.name, reason: "invalid_candidate_url", tried: [], excluded: [] });
-        continue;
-      }
-
-      const evidenceTarget = {
-        orgNr: t.org_nr,
-        navn: t.name,
-        kommune: t.city,
-        poststed: null as string | null,
-        telefon: t.phone,
-        mobil: null as string | null,
-        adresse: t.address,
-        postnummer: t.postal_code,
-      };
-      const tried: string[] = [];
-      const excludedHere: Array<{ host: string; reason: string }> = [];
-      const hit = await tryRfbWebsiteCandidateHost(
-        host,
-        evidenceTarget,
+      // Per-candidate evaluation is now the shared, exported
+      // evaluateRfbWebsiteCandidate (slice 5) — this loop only translates its
+      // discriminated-union return into the SAME proposedExt/rejectedExt/
+      // alreadyHasWebsite/notFound buckets it always pushed into, so the
+      // response shape below is byte-identical to before the extraction.
+      const outcome = await evaluateRfbWebsiteCandidate(
+        db,
+        { agentId: c.agentId, url: c.url },
         existingHostsExt,
         hostsProposedExt,
-        tried,
-        excludedHere,
         fallbackCountersExt,
+        batchId,
       );
 
-      if (hit) {
-        hostsProposedExt.add(hit.host);
-        let candidateUrl: string;
-        try {
-          const u = new URL(hit.finalUrl);
-          candidateUrl = `${u.protocol}//${u.host.toLowerCase()}`;
-        } catch {
-          candidateUrl = `https://${hit.host}`;
-        }
-        const confidence = rfbWdConfidence(hit.evidence);
-        upsertRfbWebsiteReviewQueue(db, {
-          agent_id: t.id,
-          agent_name: t.name,
-          candidate_url: candidateUrl,
-          final_url: hit.finalUrl,
-          evidence: hit.evidence,
-          confidence,
-          batch_id: batchId,
-          reason: "website_discovery_candidate_external",
-        });
-        proposedExt.push({ agent_id: t.id, agent_name: t.name, candidate_url: candidateUrl, final_url: hit.finalUrl, evidence: hit.evidence, confidence });
-      } else {
-        let reason: string;
-        if (excludedHere.length > 0) reason = excludedHere[0].reason;
-        else reason = "no_candidate_verified";
-        rejectedExt.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere });
+      switch (outcome.outcome) {
+        case "not_found":
+          notFound.push(outcome.agent_id);
+          break;
+        case "already_has_website":
+          alreadyHasWebsite.push({ agent_id: outcome.agent_id, agent_name: outcome.agent_name });
+          break;
+        case "proposed":
+          proposedExt.push({
+            agent_id: outcome.agent_id,
+            agent_name: outcome.agent_name,
+            candidate_url: outcome.candidate_url,
+            final_url: outcome.final_url,
+            evidence: outcome.evidence,
+            confidence: outcome.confidence,
+          });
+          break;
+        case "rejected":
+          rejectedExt.push({
+            agent_id: outcome.agent_id,
+            agent_name: outcome.agent_name,
+            reason: outcome.reason,
+            tried: outcome.tried,
+            excluded: outcome.excluded,
+          });
+          break;
       }
     }
 

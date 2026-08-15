@@ -91,6 +91,22 @@
  *   (hf-e) flag ON, plain fetch unverified but shouldEscalateToRender is
  *       false (a genuinely small static page, no <script>) — fallback
  *       never attempted.
+ *
+ * dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 5 (evaluateRfb
+ * WebsiteCandidate extraction, AC1-AC3):
+ *   AC1 — this ENTIRE suite (a)-(hf-e) above still passes UNMODIFIED after
+ *       the per-item body of the `candidates` branch was extracted into the
+ *       new exported evaluateRfbWebsiteCandidate() function — proves the
+ *       extraction is behavior-preserving, not just believed to be (see
+ *       "170 passed, 0 failed" before AND after in the build log).
+ *   ac2 — evaluateRfbWebsiteCandidate() called DIRECTLY (no router in the
+ *       call path at all) returns `proposed` for a fixture candidate whose
+ *       fetched page carries matching evidence, and queues a row in
+ *       agents_website_review_queue (DB read-back) with reason
+ *       'website_discovery_candidate_external'.
+ *   ac3 — same function called directly returns `already_has_website`
+ *       WITHOUT any fetch/queue-write when the target agent's
+ *       agent_knowledge.website is already non-blank.
  * renderPage() itself is injected via the module-level
  * __setRfbWdRenderPageImplForTesting() test hook (mirrors
  * __setRfbCxRowDelayForTesting, admin-rfb-contact-extraction.ts) rather than
@@ -225,7 +241,13 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     const routeModule = require("../routes/admin-rfb-website-discovery") as
       typeof import("../routes/admin-rfb-website-discovery");
     const routerModule = routeModule.default;
-    const { RFB_WD_HARD_CAP, rfbWebsiteHostExclusionReason, __setRfbWdRenderPageImplForTesting } = routeModule;
+    const {
+      RFB_WD_HARD_CAP,
+      rfbWebsiteHostExclusionReason,
+      __setRfbWdRenderPageImplForTesting,
+      evaluateRfbWebsiteCandidate,
+      rfbWdExistingWebsiteHosts,
+    } = routeModule;
     setRfbWdRenderPageImplForTesting = __setRfbWdRenderPageImplForTesting;
 
     function getHandler(method: "get" | "post", path: string) {
@@ -1050,6 +1072,80 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
 
       setRfbWdRenderPageImplForTesting!(null);
       delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // dev-request 2026-08-14-bm-fullhoest-katalogbred, slice 5 — direct
+    // evaluateRfbWebsiteCandidate() coverage (AC2/AC3), called WITHOUT going
+    // through the router at all — proves the extracted function is usable
+    // standalone by a second caller (admin-bm-producer-harvest.ts), not just
+    // reachable through this route's own handler.
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── AC2: proposed for a fixture candidate whose fetched page carries
+    //     matching evidence, and a row lands in agents_website_review_queue
+    //     (DB read-back, not just the return value) with the expected
+    //     reason. ─────────────────────────────────────────────────────────
+    {
+      insertAgent({ id: "eval-ac2", name: "Direktekalt Gard", orgNr: "955555555", city: "Rana" });
+      fixtures.set(
+        "https://direktekaltgard.no",
+        htmlResponse("<html><body>Direktekalt Gard — org.nr 955 555 555</body></html>", {
+          finalUrl: "https://direktekaltgard.no",
+        }),
+      );
+
+      const outcome = await evaluateRfbWebsiteCandidate(
+        testDb as any,
+        { agentId: "eval-ac2", url: "https://direktekaltgard.no" },
+        rfbWdExistingWebsiteHosts(testDb as any),
+        new Set<string>(),
+        { attempted: 0, verified: 0 },
+        "eval-ac2-batch",
+      );
+      assertEq(outcome.outcome, "proposed", "ac2: direct call returns proposed for a matching-evidence fixture");
+      assertTrue(
+        outcome.outcome === "proposed" && outcome.candidate_url === "https://direktekaltgard.no",
+        "ac2: proposed candidate_url is the fetched origin",
+      );
+
+      const row = readQueueRow("eval-ac2");
+      assertTrue(!!row, "ac2: a queue row was inserted (DB read-back)");
+      assertEq(row?.status, "pending", "ac2: queue row status is 'pending'");
+      assertEq(
+        row?.reason,
+        "website_discovery_candidate_external",
+        "ac2: queue row reason is 'website_discovery_candidate_external'",
+      );
+    }
+
+    // ── AC3: already_has_website, WITHOUT any fetch/queue-write, when the
+    //     target agent's agent_knowledge.website is already non-blank. ────
+    {
+      insertAgent({
+        id: "eval-ac3",
+        name: "Har Alt Nettside Gard",
+        orgNr: "955555556",
+        city: "Rana",
+        website: "https://haralt.no",
+      });
+      const fetchCallsBefore = fetchCalls.length;
+
+      const outcome = await evaluateRfbWebsiteCandidate(
+        testDb as any,
+        { agentId: "eval-ac3", url: "https://some-candidate.no" },
+        rfbWdExistingWebsiteHosts(testDb as any),
+        new Set<string>(),
+        { attempted: 0, verified: 0 },
+        "eval-ac3-batch",
+      );
+      assertEq(
+        outcome.outcome,
+        "already_has_website",
+        "ac3: direct call returns already_has_website when agent_knowledge.website is already non-blank",
+      );
+      assertEq(fetchCalls.length, fetchCallsBefore, "ac3: zero fetch calls when the agent already has a website");
+      assertTrue(!readQueueRow("eval-ac3"), "ac3: nothing queued for an agent that already has a website");
     }
   } catch (err: any) {
     failed++;
