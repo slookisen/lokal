@@ -301,6 +301,32 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
       }),
     );
 
+    // ── (c2) phone+name evidence WITHOUT org_nr/place -> still
+    // insufficient_evidence, because this route's gate is deliberately
+    // NARROWER than gardssalgWebsiteEvidenceMatch's own `verified` (which
+    // treats phone_found && (name_found || place_found) as sufficient).
+    // Page mentions the clinic's phone + name but never "Kristiansand"
+    // (target's own poststed) or the org_nr digits, so evidence.verified
+    // would be TRUE here while this route's own strict
+    // (org_nr_found || (name_found && place_found)) gate is FALSE — this is
+    // the one fixture that actually distinguishes the two gates (PR #600
+    // review: swapping the strict gate for evidence.verified passed all
+    // other tests unnoticed; this case fails loudly if that swap happens).
+    seedClinic({
+      id: "wd-phone-only",
+      navn: "Bjørknes Tannhelse",
+      org_nr: "141414141",
+      poststed: "Kristiansand",
+      telefon: "91234567",
+    });
+    brregFixtures.set("141414141", { hjemmeside: "https://bjorknes-tannhelse-info.no" });
+    pageFixtures.set(
+      "https://bjorknes-tannhelse-info.no",
+      htmlResponse("<html><body>Bjørknes Tannhelse — ring oss på 912 34 567 for time.</body></html>", {
+        finalUrl: "https://bjorknes-tannhelse-info.no",
+      }),
+    );
+
     // ── (d) aggregator/directory host -> aggregator_host, never fetched ──
     seedClinic({ id: "wd-aggregator", navn: "Sentrum Tannlege", org_nr: "333333333", poststed: "Oslo" });
     brregFixtures.set("333333333", { hjemmeside: "https://legelisten.no/sentrum-tannlege" });
@@ -343,6 +369,17 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
     assertEq(byId.get("wd-weak")?.status, "insufficient_evidence", "c1: weak evidence -> insufficient_evidence");
     assertTrue(!readQueueRow("wd-weak"), "c2: nothing queued for weak-evidence clinic");
 
+    {
+      const ev = byId.get("wd-phone-only")?.evidence;
+      assertEq(byId.get("wd-phone-only")?.status, "insufficient_evidence", "c2a: phone+name-only evidence -> insufficient_evidence (narrower than evidence.verified)");
+      assertTrue(!readQueueRow("wd-phone-only"), "c2b: nothing queued for phone+name-only clinic");
+      assertEq(ev?.phone_found, true, "c2c: phone_found is true on this fixture");
+      assertEq(ev?.name_found, true, "c2d: name_found is true on this fixture");
+      assertEq(ev?.place_found, false, "c2e: place_found is false (poststed never mentioned on the page)");
+      assertEq(ev?.org_nr_found, false, "c2f: org_nr_found is false (org.nr never mentioned on the page)");
+      assertEq(ev?.verified, true, "c2g: gardssalgWebsiteEvidenceMatch's own looser `verified` IS true here — proves this route's gate is a deliberately narrower, separate check, not a passthrough of `verified`");
+    }
+
     assertEq(byId.get("wd-aggregator")?.status, "aggregator_host", "d1: aggregator/directory Brreg website -> aggregator_host");
     assertTrue(!readQueueRow("wd-aggregator"), "d2: nothing queued for aggregator-host clinic");
     assertTrue(!fetchCalls.includes("https://legelisten.no/sentrum-tannlege"), "d3: aggregator host was NEVER fetched");
@@ -357,7 +394,7 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
     assertTrue(!byId.has("wd-inactive"), "h1: is_inactive=1 clinic never appears in results");
     assertEq(batch1.body.skipped.no_brreg_website, 1, "skip-counts: no_brreg_website counted once");
     assertEq(batch1.body.skipped.aggregator_host, 1, "skip-counts: aggregator_host counted once");
-    assertEq(batch1.body.skipped.insufficient_evidence, 1, "skip-counts: insufficient_evidence counted once");
+    assertEq(batch1.body.skipped.insufficient_evidence, 2, "skip-counts: insufficient_evidence counted twice (wd-weak + wd-phone-only)");
     assertEq(batch1.body.skipped.fetch_failed, 1, "skip-counts: fetch_failed counted once");
     assertEq(batch1.body.queued, 1, "skip-counts: queued=1 for this batch");
 

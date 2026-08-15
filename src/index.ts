@@ -689,6 +689,12 @@ app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemm
 // research). dry-run by default, dry_run:false writes.
 // POST /admin/dental/mark-inactive
 app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRoutes);
+// dev-request 2026-07-21-dental-schema-probe-writepath-fix, follow-up: finds
+// + repairs dental_agents rows already contaminated by the test/probe
+// fingerprint PR #323's write-path guard now blocks going forward — clears
+// only the contaminated field(s) and flags needs_review for re-enrichment.
+// dry-run by default, apply:true writes. POST /admin/dental/schema-probe-sweep
+app.use("/admin/dental/schema-probe-sweep", adminLimiter, adminDentalSchemaProbeSweepRoutes);
 // dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3 (Brreg-
 // field leg): discovers + verifies a candidate homepage from Brreg's own
 // registered hjemmeside field for org_nr-known, hjemmeside-blank clinics,
@@ -696,13 +702,15 @@ app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRout
 // dental_agents.hjemmeside directly. Approve is a separate, explicit,
 // dry-run-default call. POST /admin/dental/hjemmeside-discovery-batch,
 // POST /admin/dental/hjemmeside-discovery-approve.
+// Mounted at the bare "/admin/dental" prefix (this router only defines the
+// two specific sub-paths above) — MUST stay registered LAST among every
+// "/admin/dental/*" mount: Express falls through an unmatched prefix mount
+// to the next app.use, but adminLimiter still increments on the way through,
+// so registering this any earlier double-charges every later sibling's rate
+// limit on every request (caught in PR #600 review — reproduced: one POST to
+// schema-probe-sweep left only 498/500 remaining when this was mounted
+// before it).
 app.use("/admin/dental", adminLimiter, adminDentalHjemmesideDiscoveryRoutes);
-// dev-request 2026-07-21-dental-schema-probe-writepath-fix, follow-up: finds
-// + repairs dental_agents rows already contaminated by the test/probe
-// fingerprint PR #323's write-path guard now blocks going forward — clears
-// only the contaminated field(s) and flags needs_review for re-enrichment.
-// dry-run by default, apply:true writes. POST /admin/dental/schema-probe-sweep
-app.use("/admin/dental/schema-probe-sweep", adminLimiter, adminDentalSchemaProbeSweepRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls
