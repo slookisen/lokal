@@ -265,6 +265,69 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
 
         // slug=badpage-gard   -> no LocalBusiness ld+json at all -> parse_failed
 
+        // ═══════════════════════════════════════════════════════════════
+        // Slice 4 (phone-write-through) fixtures. `written-gard` above gets
+        // a tel: added to its page below to also exercise phone_written +
+        // (on the second call) phone idempotency IN THE SAME repeated-call
+        // test the email idempotency assertions already use (AC6 asks for
+        // one combined test, not two separate re-implementations). The rest
+        // are dedicated agents/slugs, one per phone-specific outcome.
+        // ═══════════════════════════════════════════════════════════════
+
+        // slug=phone-written-gard -> matched, unclaimed/uncurated, no mailto
+        // on the page (isolates the phone assertion from any email outcome)
+        // -> phone_written. Also reused for the phone-side idempotency
+        // check in the SAME repeated-call test as the email idempotency
+        // assertions below (AC6: "one repeated-call test, not two separate
+        // re-implementations").
+        insertAgent.run("agent-phone-written", "Phonewritten Gård", "", "key-phone-written", "Bostad", null);
+        insertKnowledge.run("agent-phone-written", "{}");
+
+        // slug=phone-claimed-gard -> row-lock also blocks phone (no mailto
+        // on this page at all, so email independently reports skipped_no_email
+        // — isolates the phone_skipped_claimed assertion).
+        insertAgent.run("agent-phone-claimed", "Phoneclaimed Gård", "", "key-phone-claimed", "Bostad", "2026-01-01T00:00:00.000Z");
+        insertKnowledge.run("agent-phone-claimed", "{}");
+
+        // slug=phone-curated-gard -> curated_fields locks "phone" specifically
+        // (NOT "contact_email"/"email") — demonstrates the two field-locks
+        // are independent of one another, same row.
+        insertAgent.run("agent-phone-curated", "Phonecurated Gård", "", "key-phone-curated", "Bostad", null);
+        insertKnowledge.run("agent-phone-curated", JSON.stringify({ phone: { by: "owner" } }));
+
+        // slug=phone-unchanged-gard -> agent_knowledge.phone pre-set to the
+        // SAME number as the harvested tel:, but formatted differently
+        // ("+47 90 00 00 03" vs the page's bare "90000003") — exercises the
+        // normalizePhone-based equality check, not a literal string match.
+        insertAgent.run("agent-phone-unchanged", "Phoneunchanged Gård", "", "key-phone-unchanged", "Bostad", null);
+        insertKnowledge.run("agent-phone-unchanged", "{}");
+        db.prepare(`UPDATE agent_knowledge SET phone = ? WHERE agent_id = ?`).run(
+          "+47 90 00 00 03",
+          "agent-phone-unchanged",
+        );
+
+        // slug=phone-invalid-gard -> tel: is the agent's own org-nr (same
+        // real-breach shape contact-normalizer-write-guard.test.ts's own
+        // suite already proves rejected) -> phone_rejected_invalid, never
+        // reaches UPDATE.
+        insertAgent.run("agent-phone-invalid", "Phoneinvalid Gård", "", "key-phone-invalid", "Bostad", null);
+        insertKnowledge.run("agent-phone-invalid", "{}");
+        db.prepare(`UPDATE agents SET org_nr = ? WHERE id = ?`).run("927011840", "agent-phone-invalid");
+
+        // slug=phone-newrow-gard -> deliberately NO agent_knowledge row
+        // inserted at all (AC2's "row doesn't exist yet" path).
+        insertAgent.run("agent-phone-newrow", "Phonenewrow Gård", "", "key-phone-newrow", "Bostad", null);
+
+        // slug=phone-existingrow-gard -> agent_knowledge row EXISTS with an
+        // UNRELATED field already set — must survive the write untouched
+        // (AC2's "existing rows are never touched by this step").
+        insertAgent.run("agent-phone-existingrow", "Phoneexistingrow Gård", "", "key-phone-existingrow", "Bostad", null);
+        insertKnowledge.run("agent-phone-existingrow", "{}");
+        db.prepare(`UPDATE agent_knowledge SET about = ? WHERE agent_id = ?`).run(
+          "Eksisterande innhald som ikkje skal røras",
+          "agent-phone-existingrow",
+        );
+
         function auditRows(agentId: string) {
           return db
             .prepare(
@@ -284,6 +347,21 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
             | { contact_email: string }
             | undefined;
           return row?.contact_email ?? "";
+        }
+        function phoneOf(agentId: string): string | null {
+          const row = db.prepare(`SELECT phone FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
+            | { phone: string | null }
+            | undefined;
+          return row?.phone ?? null;
+        }
+        function aboutOf(agentId: string): string | null {
+          const row = db.prepare(`SELECT about FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
+            | { about: string | null }
+            | undefined;
+          return row?.about ?? null;
+        }
+        function knowledgeRowExists(agentId: string): boolean {
+          return !!db.prepare(`SELECT 1 FROM agent_knowledge WHERE agent_id = ?`).get(agentId);
         }
 
         const ld = (name: string, city: string) =>
@@ -305,6 +383,14 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
           "noemail-gard": `<script type="application/ld+json">${ld("Noemail Gård", "Bostad")}</script>`,
           "unmatched-gard": `<script type="application/ld+json">${ld("No Such Catalog Entry AS", "Bostad")}</script><a href="mailto:x@nomatch.no">x@nomatch.no</a>`,
           "badpage-gard": `<html><body>no ld+json here at all</body></html>`,
+          // ── Slice 4 (phone) fixtures ──────────────────────────────────
+          "phone-written-gard": `<script type="application/ld+json">${ld("Phonewritten Gård", "Bostad")}</script><a href="tel:+4797711184">+4797711184</a>`,
+          "phone-claimed-gard": `<script type="application/ld+json">${ld("Phoneclaimed Gård", "Bostad")}</script><a href="tel:+4790000001">+4790000001</a>`,
+          "phone-curated-gard": `<script type="application/ld+json">${ld("Phonecurated Gård", "Bostad")}</script><a href="tel:+4790000002">+4790000002</a>`,
+          "phone-unchanged-gard": `<script type="application/ld+json">${ld("Phoneunchanged Gård", "Bostad")}</script><a href="tel:90000003">90000003</a>`,
+          "phone-invalid-gard": `<script type="application/ld+json">${ld("Phoneinvalid Gård", "Bostad")}</script><a href="tel:927 011 840">927 011 840</a>`,
+          "phone-newrow-gard": `<script type="application/ld+json">${ld("Phonenewrow Gård", "Bostad")}</script><a href="tel:91000006">91000006</a>`,
+          "phone-existingrow-gard": `<script type="application/ld+json">${ld("Phoneexistingrow Gård", "Bostad")}</script><a href="tel:91000007">91000007</a>`,
         };
         const slugOrder = Object.keys(pages);
 
@@ -381,6 +467,55 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
         assertEq(r.body?.counts?.written, 1, "ac9: counts.written tallies correctly");
         assertEq(r.body?.counts?.skipped_bm_domain, 1, "ac9: counts.skipped_bm_domain tallies correctly");
 
+        // ── Slice 4 AC8: every phone outcome, one fixture each ────────────
+        assertEq(resultFor(r.body, "phone-written-gard")?.phone_outcome, "phone_written", "ac-phone: phone-written-gard -> phone_written");
+        assertEq(phoneOf("agent-phone-written"), "+4797711184", "ac-phone: phone-written-gard actually wrote agent_knowledge.phone");
+        const phoneAuditWritten = auditRows("agent-phone-written").filter((a) => a.field_name === "phone");
+        assertEq(phoneAuditWritten.length, 1, "ac-phone: exactly one phone audit row for the write");
+        assertEq(phoneAuditWritten[0]?.old_value, null, "ac-phone: audit's old_value is the true prior value (NULL — row pre-existed with phone unset)");
+        assertEq(phoneAuditWritten[0]?.new_value, "+4797711184", "ac-phone: audit records the written phone value");
+        assertEq(phoneAuditWritten[0]?.changed_by, "system", "ac-phone: phone audit changed_by=system");
+        assertTrue((phoneAuditWritten[0]?.notes ?? "").includes("slug=phone-written-gard"), "ac-phone: phone audit notes carry the source slug");
+
+        assertEq(resultFor(r.body, "phone-claimed-gard")?.phone_outcome, "phone_skipped_claimed", "ac-phone: row-lock (claimed_at) blocks phone too");
+        assertEq(phoneOf("agent-phone-claimed"), null, "ac-phone: claimed row's phone column untouched");
+
+        assertEq(resultFor(r.body, "phone-curated-gard")?.phone_outcome, "phone_skipped_curated", "ac-phone: curated_fields \"phone\" key locks phone specifically");
+        assertEq(phoneOf("agent-phone-curated"), null, "ac-phone: phone-curated row's phone column untouched");
+
+        assertEq(resultFor(r.body, "phone-unchanged-gard")?.phone_outcome, "phone_skipped_unchanged", "ac-phone: unchanged value (via normalizePhone, formatting-only difference) skipped");
+        assertEq(phoneOf("agent-phone-unchanged"), "+47 90 00 00 03", "ac-phone: unchanged row's phone column untouched (original formatting preserved)");
+        assertEq(auditRows("agent-phone-unchanged").filter((a) => a.field_name === "phone").length, 0, "ac-phone: unchanged row wrote no phone audit");
+
+        assertEq(resultFor(r.body, "phone-invalid-gard")?.phone_outcome, "phone_rejected_invalid", "ac-phone: validatePhoneForWrite rejection (org-nr collision) never reaches UPDATE");
+        assertEq(phoneOf("agent-phone-invalid"), null, "ac-phone: rejected-phone row's phone column untouched");
+
+        // AC2: missing agent_knowledge row is created (INSERT OR IGNORE) only
+        // when needed, and the write proceeds against the freshly-created row.
+        assertEq(resultFor(r.body, "phone-newrow-gard")?.phone_outcome, "phone_written", "ac-phone AC2: phone written even though agent_knowledge had no row yet");
+        assertTrue(knowledgeRowExists("agent-phone-newrow"), "ac-phone AC2: agent_knowledge row now exists after the write");
+        assertEq(phoneOf("agent-phone-newrow"), "91000006", "ac-phone AC2: phone landed in the newly-created row");
+        const newrowAudit = auditRows("agent-phone-newrow").filter((a) => a.field_name === "phone");
+        assertEq(newrowAudit.length, 1, "ac-phone AC2: one phone audit row for the newly-created-row write");
+        assertEq(newrowAudit[0]?.old_value, null, "ac-phone AC2: audit's old_value is NULL — the row was just created, no prior phone");
+
+        // AC2: an EXISTING agent_knowledge row's unrelated fields survive the
+        // INSERT OR IGNORE + phone write untouched.
+        assertEq(resultFor(r.body, "phone-existingrow-gard")?.phone_outcome, "phone_written", "ac-phone AC2: phone written against a pre-existing agent_knowledge row");
+        assertEq(phoneOf("agent-phone-existingrow"), "91000007", "ac-phone AC2: phone landed in the existing row");
+        assertEq(
+          aboutOf("agent-phone-existingrow"),
+          "Eksisterande innhald som ikkje skal røras",
+          "ac-phone AC2: an existing row's UNRELATED field (about) survives the write untouched",
+        );
+
+        // Shared-limit-cap (AC1): the SAME `limit`/`scanned` window governs
+        // both write types together — not two independent budgets. `scanned`
+        // already equals the full requested/capped slug window regardless of
+        // how many of those slugs carry email vs. phone data.
+        let rShared = await get({ dry_run: "false", limit: "3" });
+        assertEq(rShared.body?.scanned, 3, "ac-phone: apply-mode limit caps the combined email+phone batch as ONE shared budget, not per-write-type");
+
         // ── AC9b: direct email-domain-suffix check (independent of the
         // bmDomainEmailExcluded flag) — the parser always nulls `email` for a
         // BM-domain mailto, so this exercises the route's OWN second check by
@@ -446,6 +581,20 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
         assertEq(rSecond.body?.counts?.written ?? 0, 0, "ac10: second apply's written count is 0");
         assertEq(contactEmailOf("agent-written"), "post@writtengard.no", "ac10: value unchanged by the second apply");
         assertEq(auditRows("agent-written").length, 1, "ac11: idempotent re-apply added no second audit row");
+
+        // ── Slice 4 AC6: phone idempotency, IN THE SAME repeated-call test
+        // as the email idempotency assertions above (not a separate re-
+        // implementation) — the second call's `phone-written-gard` result
+        // now reports phone_skipped_unchanged and writes no further audit
+        // row, and the value on disk is untouched.
+        assertEq(resultFor(rSecond.body, "phone-written-gard")?.phone_outcome, "phone_skipped_unchanged", "ac-phone AC6: second apply reports phone_skipped_unchanged");
+        assertEq(rSecond.body?.counts?.phone_written ?? 0, 0, "ac-phone AC6: second apply's phone_written count is 0");
+        assertEq(phoneOf("agent-phone-written"), "+4797711184", "ac-phone AC6: phone value unchanged by the second apply");
+        assertEq(
+          auditRows("agent-phone-written").filter((a) => a.field_name === "phone").length,
+          1,
+          "ac-phone AC6: idempotent re-apply added no second phone audit row",
+        );
       } finally {
         if (prevAdminKey2 === undefined) delete process.env.ADMIN_KEY;
         else process.env.ADMIN_KEY = prevAdminKey2;
