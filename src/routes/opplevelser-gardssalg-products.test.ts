@@ -27,7 +27,12 @@
  * Anthropic API call (keyed by URL containing "api.anthropic.com").
  */
 
-import { generateGardssalgProductList } from "./opplevelser";
+import {
+  generateGardssalgProductList,
+  GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP,
+  gardssalgProductSourceText,
+  gardssalgLabelLooksLikeProducts,
+} from "./opplevelser";
 
 export interface TestSummary {
   passed: number;
@@ -177,13 +182,25 @@ export function runOpplevelserGardssalgProductsTests(
         assertEq(diag.outcome, "products_found", "pg-2i: diagnosticOut.outcome = products_found for a valid array response");
       }
 
-      // ── pg-3: source text capped to ~6000 chars in the prompt. ───────────
+      // ── pg-3: source text capped in the prompt. Bound to the exported
+      //    constant, not a literal: the cap moved once already (6 000 ->
+      //    20 000, 2026-08-15) and a hardcoded number here just fails the
+      //    build for the wrong reason next time. ─────────────────────────────
       {
-        const hugeSource = "x".repeat(20000);
+        const hugeSource = "x".repeat(GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP * 2);
         await generateGardssalgProductList(hugeSource);
         const body = JSON.parse(capturedInit.body);
         const xRunLength = (body.messages[0].content.match(/x+/g) || [""]).sort((a: string, b: string) => b.length - a.length)[0]?.length ?? 0;
-        assertTrue(xRunLength <= 6000, "pg-3: source text is capped to ~6000 chars in the prompt");
+        assertTrue(xRunLength <= GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP, "pg-3: source text is capped to the configured cap in the prompt");
+        // Pins WHY the cap is the size it is, which a bare `<= CAP` cannot.
+        // Oslo Brewing's crawled text measured 15 640 characters on
+        // 2026-08-15, with its two product pages beyond the old 6 000 cap and
+        // therefore invisible to the model. A cap below that reproduces the
+        // exact bug this was raised to fix.
+        assertTrue(
+          GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP >= 15_640,
+          "pg-3b: the cap still fits a whole measured producer site (Oslo Brewing, 15 640 chars)",
+        );
       }
 
       // ── pg-4: the literal sentinel (with/without whitespace) → null. ─────
@@ -832,8 +849,10 @@ export function runOpplevelserGardssalgProductsTests(
         id: "prov-pg-overcap", navn: "Prov PG OverCap Gard", hjemmeside: "https://prov-pg-overcap.example.no",
         content_source: null, about_text: SILENT_LONG_TEXT, visit_text: SILENT_LONG_TEXT, opening_hours_text: null, products: null,
       });
-      const AT_CAP_PAGE = `<html><body><p>${"x".repeat(6000)}</p></body></html>`;
-      const OVER_CAP_PAGE = `<html><body><p>${"x".repeat(6001)}</p></body></html>`;
+      // Built FROM the cap, so this boundary pair keeps testing the boundary
+      // wherever the cap is set — see pg-3.
+      const AT_CAP_PAGE = `<html><body><p>${"x".repeat(GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP)}</p></body></html>`;
+      const OVER_CAP_PAGE = `<html><body><p>${"x".repeat(GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP + 1)}</p></body></html>`;
       globalThis.fetch = (async (url: string | URL | Request) => {
         const urlStr = String(url);
         if (urlStr.includes("api.anthropic.com")) {
@@ -873,8 +892,9 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(atCapRes.status, 200, "pg-r9a: at-cap provider call -> 200");
       const atCapDiag = atCapRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-atcap");
       assertTrue(!!atCapDiag, "pg-r9b: prov-pg-atcap appears in products_diagnostic");
-      assertEq(atCapDiag.content_chars_full, 6000, "pg-r9c: content_chars_full is exactly 6000 for a homepage body of exactly 6000 characters");
-      assertEq(atCapDiag.truncated, false, "pg-r9d: truncated=false AT exactly the cap (6000 is not > 6000)");
+      assertEq(atCapDiag.products_source_full_chars, GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP, "pg-r9c: products_source_full_chars is exactly the cap for a homepage body of exactly cap characters");
+      assertEq(atCapDiag.truncated, false, "pg-r9d: truncated=false AT exactly the cap (cap is not > cap)");
+      assertEq(atCapDiag.products_source_chars, GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP, "pg-r9d2: nothing was sliced off — the model received the whole source");
       assertEq(atCapDiag.pages_fetched_paths, [], "pg-r9e: no sub-pages fetched (every candidate path 404s in this mock)");
 
       const overCapRes = await callRoute(opplevelserRouter, {
@@ -885,7 +905,8 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(overCapRes.status, 200, "pg-r9f: over-cap provider call -> 200");
       const overCapDiag = overCapRes.body.products_diagnostic.find((d: any) => d.provider_id === "prov-pg-overcap");
       assertTrue(!!overCapDiag, "pg-r9g: prov-pg-overcap appears in products_diagnostic");
-      assertEq(overCapDiag.content_chars_full, 6001, "pg-r9h: content_chars_full is exactly 6001 for a homepage body of exactly 6001 characters");
+      assertEq(overCapDiag.products_source_full_chars, GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP + 1, "pg-r9h: products_source_full_chars is exactly cap+1 for a homepage body of exactly cap+1 characters");
+      assertEq(overCapDiag.products_source_chars, GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP, "pg-r9h2: exactly the cap reached the model — one character was cut");
       assertEq(overCapDiag.truncated, true, "pg-r9i: truncated=true one character OVER the cap");
 
       // ── pg-r10 (Skive 1; path list updated for Skive 2): pages_fetched_paths
@@ -948,6 +969,103 @@ export function runOpplevelserGardssalgProductsTests(
       assertEq(restoredEntry.restored_to, null, "pg-r8d: rollback restores products to its pre-write value (null)");
       const rowAfterRollback = getProviderRow("prov-pg-blank");
       assertEq(rowAfterRollback.products, null, "pg-r8e: products actually restored to null in the DB");
+
+      // ── pg-src: which page the extractor reads FIRST ────────────────────
+      //
+      // Daniel, live session 2026-08-15. Of the 18 rows with a verified
+      // website and no products, 12 came back `sentinel_no_products` — the
+      // model answering honestly about text that never contained a product.
+      // Fetching Oslo Brewing's own pages showed why: the front page is 7 406
+      // characters on its own, `/ourbeer/` begins at 7 406 and `/products-2/`
+      // at ~15 000. Both were crawled. Under a 6 000-character cap that slices
+      // from the front, neither was ever read.
+      //
+      // Pure functions, no network, no DB — the ordering rule is the fix and
+      // it is testable on its own.
+      {
+        // Every label here was observed live on 2026-08-15.
+        for (const label of [
+          "/produkter", "/nettbutikk", "/sortiment", "/vare-ol", "/ourbeer/",
+          "/products-2/", "/butikken.php?lang=en", "/v-re-viner", "/menyer",
+          "/produkter.php?lang=en",
+        ]) {
+          assertTrue(gardssalgLabelLooksLikeProducts(label), `pg-src1: ${label} reads as a product page`);
+        }
+        // The other side. `/om-bryggeriet` is the one that makes "brygg"
+        // unusable as a keyword — it is an about page on nearly every brewery
+        // site, and promoting it would push the real product page back out of
+        // the window this exists to protect.
+        for (const label of [
+          "/kontakt", "/kontakt-oss", "/om-oss", "/om-bryggeriet", "/historien",
+          "/about", "/contact", "/history", "/", "/minnesamvaer",
+        ]) {
+          assertTrue(!gardssalgLabelLooksLikeProducts(label), `pg-src2: ${label} is not mistaken for a product page`);
+        }
+
+        // The Oslo Brewing shape, to scale: a front page that fills the whole
+        // budget on its own, with the product page crawled AFTER it.
+        const front = "F".repeat(7_406);
+        const beer = "Pils Session IPA Nordic Saison " + "B".repeat(2_000);
+        const contact = "C".repeat(1_000);
+        const ordered = gardssalgProductSourceText(
+          [
+            { label: "/", text: front },
+            { label: "/kontakt", text: contact },
+            { label: "/ourbeer/", text: beer },
+          ],
+          6_000, // the OLD cap — the fix must hold even at the size that broke
+        );
+        assertTrue(
+          ordered.text.startsWith("Pils Session IPA Nordic Saison"),
+          "pg-src3: the product page leads the source text, so the product names survive the cap",
+        );
+        // Checked with a generous cap, deliberately: at the 6 000 above the
+        // front page alone fills the budget, so "contact is absent" would pass
+        // whether or not anything was reordered. This pins the ORDER itself —
+        // product page, then homepage, then the rest.
+        const wholeOrdering = gardssalgProductSourceText(
+          [
+            { label: "/", text: front },
+            { label: "/kontakt", text: contact },
+            { label: "/ourbeer/", text: beer },
+          ],
+          100_000,
+        );
+        assertTrue(
+          wholeOrdering.text.indexOf("Pils") <
+            wholeOrdering.text.indexOf("F".repeat(100)) &&
+            wholeOrdering.text.indexOf("F".repeat(100)) <
+              wholeOrdering.text.indexOf("C".repeat(100)),
+          "pg-src4: product page, then homepage, then the rest — the contact page is what gets cut when the budget runs out",
+        );
+        assertEq(
+          ordered.fullChars,
+          [front, beer, contact].map((s) => s.length).reduce((a, b) => a + b, 0) + 4,
+          "pg-src5: fullChars measures the whole ordered source (plus its two \n\n joins), not the truncated slice",
+        );
+        assertEq(ordered.text.length, 6_000, "pg-src6: the returned text respects the cap it was given");
+
+        // Homepage second, not first: it is where a producer says who they
+        // are, which helps read a product list, but it is rarely the list.
+        const withoutProductPage = gardssalgProductSourceText([
+          { label: "/kontakt", text: "KONTAKT" },
+          { label: "/", text: "HJEM" },
+          { label: "/om-oss", text: "OM" },
+        ]);
+        assertTrue(
+          withoutProductPage.text.startsWith("HJEM"),
+          "pg-src7: with no product page, the homepage leads",
+        );
+        assertTrue(
+          withoutProductPage.text.indexOf("KONTAKT") < withoutProductPage.text.indexOf("OM"),
+          "pg-src8: the remaining pages keep their crawl order — same site, same source text, every run",
+        );
+        assertEq(
+          gardssalgProductSourceText([{ label: "/", text: "   " }, { label: "/produkter", text: "Gin" }]).text,
+          "Gin",
+          "pg-src9: a blank page contributes nothing — no leading separator burning the budget",
+        );
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-products (section B): unexpected error: " + String(err?.stack || err?.message || err));

@@ -227,6 +227,17 @@ export type RenderEscalationDiagnostic = {
   /** Visible-text length AFTER rendering. Present only on a successful render. */
   chars_after?: number;
   elapsed_ms?: number;
+  /**
+   * Sub-pages this caller additionally rendered, and how many of those renders
+   * failed. Only a caller that crawls beyond the primary page sets these; both
+   * are absent when no sub-page was escalated.
+   *
+   * They are counters rather than per-page records on purpose: what an operator
+   * needs from a sweep is "did the crawl read this site or not", and a per-page
+   * breakdown at GARDSSALG_MAX_PAGES × cohort size is a report nobody reads.
+   */
+  subpages_rendered?: number;
+  subpages_render_failed?: number;
 };
 
 // ── The renderer ────────────────────────────────────────────────────────────
