@@ -1,8 +1,11 @@
 // ─── POST /admin/dental/hjemmeside-discovery-batch + POST /admin/dental/
 //     hjemmeside-discovery-approve ────────────────────────────────────────
 //
-// dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3 (the
-// Brreg-field leg only — no navnesøk/name-search fallback in this slice).
+// dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3: the
+// Brreg-field leg (tier 1) PLUS the navnesøk/name-search fallback leg
+// (tier 2), added in the same file per the dev-request's own narrowest-
+// independently-shippable framing — see runDentalWdSearchLeg below for tier
+// 2's own doc comment.
 //
 // WHY: item 1 (admin-dental-hjemmeside-cleanup.ts) moves directory/booking-
 // portal URLs OUT of dental_agents.hjemmeside; item 2 (admin-dental-mark-
@@ -59,18 +62,24 @@
 // admin route file in this codebase).
 //
 // Non-goals (do not extend this route to cover these — separate future
-// slices per the dev-request): no navnesøk/name-search fallback leg, no
-// changes to items 1/2/4's own endpoints, no new audit table, no auto-apply
-// (apply is always a separate, explicit, dry-run-default call).
+// slices per the dev-request): no subpages/embedded-layer evidence for tier
+// 2, no changes to items 1/2/4's own endpoints, no new audit table, no
+// auto-apply (apply is always a separate, explicit, dry-run-default call).
 
 import { Router, Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
 import { fetchBrregWebsite } from "../services/brreg-client";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
-import { gardssalgWebsiteEvidenceMatch, gardssalgPageText } from "../services/experience-store";
+import {
+  gardssalgWebsiteEvidenceMatch,
+  gardssalgPageText,
+  gardssalgWebsiteSearchQuery,
+  gardssalgWebsiteSearchCandidateHosts,
+} from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+import { braveSearch, type BraveResult } from "../services/search-enrich";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -179,6 +188,35 @@ export function __setDentalWdRenderPageImplForTesting(impl: typeof renderPage | 
   dentalWdRenderPageImplForTesting = impl;
 }
 
+// ─── injectable search seam for this route's own tier-2 (navnesøk) leg ────
+// dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3. Mirrors
+// dentalWdFetchImpl/__setDentalWdFetchForTesting's seam-not-global-monkeypatch
+// convention (see file header) with one deliberate difference: tier 2 is
+// genuinely OPTIONAL in production (unlike tier 1's fetch, which always
+// exists), so the test-override slot below starts at null rather than at a
+// real implementation. Production code never calls the setter; the real
+// wiring lives in effectiveDentalWdSearchImpl() below, which is evaluated
+// FRESH on every call (never cached at module-load time) — when a test
+// override is set it always wins (mirrors experience-store.ts's own
+// __setGardssalgWebsiteSearchForTesting override-wins convention), otherwise
+// production wires the real braveSearch(query, key, 5) when a Brave key is
+// configured (BRAVE_API_KEY / BRAVE_SEARCH_API_KEY) or stays null — tier 2
+// silently skipped, tier 1 still runs — when neither is set.
+let dentalWdSearchImpl: ((query: string) => Promise<BraveResult[]>) | null = null;
+export function __setDentalWdSearchForTesting(
+  impl: ((query: string) => Promise<BraveResult[]>) | null,
+): void {
+  dentalWdSearchImpl = impl;
+}
+
+const DENTAL_WD_SEARCH_MAX_CANDIDATES = 5;
+
+function effectiveDentalWdSearchImpl(): ((query: string) => Promise<BraveResult[]>) | null {
+  if (dentalWdSearchImpl) return dentalWdSearchImpl;
+  const braveKey = process.env.BRAVE_API_KEY || process.env.BRAVE_SEARCH_API_KEY || "";
+  return braveKey ? (query: string) => braveSearch(query, braveKey, DENTAL_WD_SEARCH_MAX_CANDIDATES) : null;
+}
+
 interface DentalWdTargetRow {
   id: string;
   navn: string;
@@ -263,13 +301,14 @@ function upsertDentalWebsiteReviewQueue(
     evidence: DentalWdEvidence;
     confidence: number;
     batch_id: string;
+    reason: "brreg_field" | "navnesok_fallback";
   },
 ): void {
   db.prepare(
     `INSERT INTO dental_website_review_queue
        (id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, updated_at)
      VALUES (@id, @agent_id, @agent_name, @candidate_url, @final_url, @evidence, @confidence,
-             'website_discovery_candidate', @batch_id, 'pending', datetime('now'), datetime('now'))
+             @reason, @batch_id, 'pending', datetime('now'), datetime('now'))
      ON CONFLICT(agent_id) DO UPDATE SET
        agent_name = excluded.agent_name,
        candidate_url = excluded.candidate_url,
@@ -289,6 +328,7 @@ function upsertDentalWebsiteReviewQueue(
     evidence: JSON.stringify(entry.evidence),
     confidence: entry.confidence,
     batch_id: entry.batch_id,
+    reason: entry.reason,
   });
 }
 
@@ -307,21 +347,29 @@ interface DentalWdResultEntry {
   evidence?: DentalWdEvidence;
   confidence?: number;
   reason?: string;
+  // Informational-only (NOT part of the response's skip-reason taxonomy):
+  // set true when tier 2's own navnesøk leg actually ran for this row
+  // (a search impl was wired AND the Brreg leg did not itself queue a
+  // candidate) — lets the batch caller distinguish "tier 2 ran and found
+  // nothing" from "tier 2 never ran (no key configured)". Absent entirely
+  // when tier 2 never attempted, so a response with the search seam left
+  // unwired stays byte-identical to before this leg existed.
+  search_attempted?: true;
 }
 
-// Processes ONE candidate clinic end-to-end: Brreg lookup -> aggregator/
-// directory-host exclusion (item 1's classifier, no fetch if it fires) ->
-// bounded-timeout page fetch -> optional headless-render escalation for a
-// JS-shell page -> ownership-evidence match -> queue (or a named skip
-// reason). Never throws on a network/render failure — every outcome is a
-// named status.
-async function processDentalWdCandidate(
+// Tier 1 (Brreg-field leg): Brreg lookup -> aggregator/directory-host
+// exclusion (item 1's classifier, no fetch if it fires) -> bounded-timeout
+// page fetch -> optional headless-render escalation for a JS-shell page ->
+// ownership-evidence match -> queue (or a named skip reason). Never throws
+// on a network/render failure — every outcome is a named status. Split out
+// of processDentalWdCandidate (below) so that function can run tier 2 (the
+// navnesøk fallback leg) afterward without duplicating this logic.
+async function runDentalWdBrregLeg(
   db: ReturnType<typeof getDb>,
   t: DentalWdTargetRow,
   batchId: string,
+  base: { agent_id: string; agent_name: string },
 ): Promise<DentalWdResultEntry> {
-  const base = { agent_id: t.id, agent_name: t.navn };
-
   const brregWebsite = await fetchBrregWebsite(t.org_nr, dentalWdFetchImpl);
   if (!brregWebsite) {
     return { ...base, status: "no_brreg_website" };
@@ -400,9 +448,130 @@ async function processDentalWdCandidate(
     evidence,
     confidence,
     batch_id: batchId,
+    reason: "brreg_field",
   });
 
   return { ...base, status: "queued", candidate_url: candidateUrl, final_url: finalUrl, evidence, confidence };
+}
+
+// Tier 2 (navnesøk / name-search fallback leg): ONE braveSearch call for
+// `"<navn>" <poststed>` (dental has no kommune column), evidence-matching
+// the top candidate hosts (gardssalgWebsiteSearchCandidateHosts, capped at
+// DENTAL_WD_SEARCH_MAX_CANDIDATES), first VERIFIED hit wins. Reuses item 1's
+// classifier (classifyHjemmeside) for pre-fetch host exclusion — the SAME
+// exclusion the Brreg leg above already uses — and the SAME evidence gate
+// (org_nr_found || (name_found && place_found)), so this tier can never
+// queue a candidate the Brreg leg itself would have rejected on weaker
+// grounds. No subpages, no embedded-layer second chance, no shared-host-in-
+// catalog guard (narrowest independently-shippable slice; see the dev-
+// request's own non-goals). Returns null when nothing verifies (including
+// when the search call itself throws) — the caller then falls back to the
+// Brreg leg's own original result, unchanged.
+async function runDentalWdSearchLeg(
+  db: ReturnType<typeof getDb>,
+  t: DentalWdTargetRow,
+  batchId: string,
+  base: { agent_id: string; agent_name: string },
+  searchImpl: (query: string) => Promise<BraveResult[]>,
+): Promise<DentalWdResultEntry | null> {
+  const query = gardssalgWebsiteSearchQuery({ navn: t.navn, poststed: t.poststed });
+
+  let results: BraveResult[];
+  try {
+    results = await searchImpl(query);
+  } catch {
+    // A search failure (network/HTTP error) must not abort the row — it
+    // simply falls through to the Brreg leg's own original result, exactly
+    // as if tier 2 had found nothing.
+    return null;
+  }
+
+  const hosts = gardssalgWebsiteSearchCandidateHosts(results, DENTAL_WD_SEARCH_MAX_CANDIDATES);
+
+  for (const host of hosts) {
+    const classification = classifyHjemmeside(host);
+    if (classification.isBad) continue;
+
+    const candidateUrl = `https://${host}`;
+    const fetchResult = await fetchPage(candidateUrl, {
+      userAgent: DENTAL_WD_USER_AGENT,
+      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+      fetchImpl: dentalWdFetchImpl,
+    });
+    if (!fetchResult.ok) continue;
+
+    const pageText = gardssalgPageText(fetchResult.html);
+    const evidence = gardssalgWebsiteEvidenceMatch(pageText, {
+      orgNr: t.org_nr,
+      navn: t.navn,
+      poststed: t.poststed,
+      telefon: t.telefon,
+      mobil: t.mobil,
+      adresse: t.adresse,
+      postnummer: t.postnummer,
+    });
+
+    // Same strict gate as the Brreg leg — deliberately NOT evidence.verified.
+    if (!(evidence.org_nr_found || (evidence.name_found && evidence.place_found))) continue;
+
+    const confidence = dentalWdConfidence(evidence);
+    let finalCandidateUrl: string;
+    try {
+      const u = new URL(fetchResult.finalUrl);
+      finalCandidateUrl = `${u.protocol}//${u.host.toLowerCase()}`;
+    } catch {
+      finalCandidateUrl = candidateUrl;
+    }
+
+    upsertDentalWebsiteReviewQueue(db, {
+      agent_id: t.id,
+      agent_name: t.navn,
+      candidate_url: finalCandidateUrl,
+      final_url: fetchResult.finalUrl,
+      evidence,
+      confidence,
+      batch_id: batchId,
+      reason: "navnesok_fallback",
+    });
+
+    return {
+      ...base,
+      status: "queued",
+      candidate_url: finalCandidateUrl,
+      final_url: fetchResult.finalUrl,
+      evidence,
+      confidence,
+      search_attempted: true,
+    };
+  }
+
+  return null;
+}
+
+// Processes ONE candidate clinic end-to-end: tier 1 (Brreg-field leg) first;
+// only when tier 1 did NOT itself queue a candidate AND a search impl is
+// wired (a Brave key configured, or a test stub) does tier 2 (navnesøk
+// fallback) run. Tier 2's own queued result wins when it finds one;
+// otherwise tier 1's original result is returned UNCHANGED (existing
+// skip-reason semantics preserved) with `search_attempted: true` added only
+// when tier 2 actually ran.
+async function processDentalWdCandidate(
+  db: ReturnType<typeof getDb>,
+  t: DentalWdTargetRow,
+  batchId: string,
+): Promise<DentalWdResultEntry> {
+  const base = { agent_id: t.id, agent_name: t.navn };
+
+  const brregResult = await runDentalWdBrregLeg(db, t, batchId, base);
+  if (brregResult.status === "queued") return brregResult;
+
+  const searchImpl = effectiveDentalWdSearchImpl();
+  if (!searchImpl) return brregResult;
+
+  const searchResult = await runDentalWdSearchLeg(db, t, batchId, base, searchImpl);
+  if (searchResult) return searchResult;
+
+  return { ...brregResult, search_attempted: true };
 }
 
 const router = Router();
@@ -480,6 +649,7 @@ interface DentalWdQueueRow {
   final_url: string | null;
   batch_id: string | null;
   status: string;
+  reason: string | null;
 }
 
 type DentalWdApplyResult = { written: true } | { written: false; reason: string };
@@ -500,7 +670,7 @@ function parseFieldProvenance(raw: string | null | undefined): Record<string, un
 }
 
 export interface HjemmesideDiscoveryProvenanceEntry {
-  source_type: "brreg_registered_website";
+  source_type: "brreg_registered_website" | "search_verified_website";
   value: string;
   source_url: string;
   fetched_at: string;
@@ -535,6 +705,7 @@ export function applyDentalWebsiteDiscovery(
   url: string,
   finalUrl: string,
   batchId: string | null,
+  queueReason: string | null,
 ): DentalWdApplyResult {
   let result: DentalWdApplyResult = { written: false, reason: "write_skipped_by_guards" };
   const tx = db.transaction(() => {
@@ -560,8 +731,15 @@ export function applyDentalWebsiteDiscovery(
       return;
     }
 
+    // source_type driven by the queue row's own `reason` — invisible to the
+    // approve caller, whose request/response shape (still {agent_id, url})
+    // is unchanged. Any reason other than "navnesok_fallback" (including the
+    // existing "brreg_field" leg, and any legacy/unknown value) keeps the
+    // original brreg_registered_website provenance.
+    const sourceType: HjemmesideDiscoveryProvenanceEntry["source_type"] =
+      queueReason === "navnesok_fallback" ? "search_verified_website" : "brreg_registered_website";
     const mergedProvenance = mergeHjemmesideDiscoveryProvenance(current.field_provenance, {
-      source_type: "brreg_registered_website",
+      source_type: sourceType,
       value: url,
       source_url: finalUrl,
       fetched_at: new Date().toISOString(),
@@ -603,7 +781,7 @@ router.post("/hjemmeside-discovery-approve", (req: Request, res: Response) => {
   ensureDentalWebsiteReviewQueueTable(db);
 
   const pending = db
-    .prepare(`SELECT agent_id, candidate_url, final_url, batch_id, status FROM dental_website_review_queue WHERE status = 'pending'`)
+    .prepare(`SELECT agent_id, candidate_url, final_url, batch_id, status, reason FROM dental_website_review_queue WHERE status = 'pending'`)
     .all() as DentalWdQueueRow[];
   const byAgent = new Map(pending.map((q) => [q.agent_id, q]));
 
@@ -656,7 +834,7 @@ router.post("/hjemmeside-discovery-approve", (req: Request, res: Response) => {
       continue;
     }
 
-    const applied = applyDentalWebsiteDiscovery(db, agentId, url, q.final_url || url, q.batch_id);
+    const applied = applyDentalWebsiteDiscovery(db, agentId, url, q.final_url || url, q.batch_id, q.reason);
     if (applied.written) {
       results.push({ agent_id: agentId, url, status: "applied" });
     } else {
