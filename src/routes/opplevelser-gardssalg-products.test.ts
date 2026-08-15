@@ -192,6 +192,13 @@ export function runOpplevelserGardssalgProductsTests(
           body.messages[0].content.includes("varer i utsalget"),
           "pg-2l: prompt still defines a product as goods sold — a gårdsbutikk's food is not excluded, only served dishes are",
         );
+        // Belt half of the fence fix (Skive 6). The braces half —
+        // gardssalgStripCodeFence — is asserted at pg-16/pg-17; neither is
+        // trusted alone, same discipline as the prose path's markdown rule.
+        assertTrue(
+          body.messages[0].content.includes("ingen kodeblokk, ingen backticks"),
+          "pg-2m: prompt asks for a bare JSON array — no markdown fence",
+        );
       }
       // ── pg-2h (Skive 1): diagnosticOut.outcome = "products_found" when a
       //    valid non-empty array comes back. ────────────────────────────────
@@ -352,6 +359,93 @@ export function runOpplevelserGardssalgProductsTests(
         assertTrue(
           typeof diag.invalid_sample === "string" && diag.invalid_sample.endsWith("Juleø"),
           "pg-11d: the sample shows the cut-off point, so 'was it truncated' is readable even without stop_reason",
+        );
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // Section A4 — Skive 6 (2026-08-15): the markdown code fence.
+      //
+      // This is not a hypothetical. It is what the Skive 5 diagnostic
+      // reported on its first live run, on BOTH rows that had regressed:
+      //   Hurum      end_turn  ```json [ "Hurums Pale Ale", …11 øl… ] ```
+      //   Nordfjord  end_turn  ```json [ "Frisider eple", … ] ```
+      // Complete, correct answers — thrown away because JSON.parse will not
+      // accept three backticks. max_tokens was never involved (`end_turn` on
+      // both), and is deliberately left alone.
+      // ═══════════════════════════════════════════════════════════════════
+
+      // ── pg-16: the exact Hurum response shape → parsed, not discarded. ───
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          content: [{ type: "text", text: '```json\n["Hurums Pale Ale","Meksikansk Lager","Stout","Weiss"]\n```' }],
+          stop_reason: "end_turn",
+        }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(
+          r,
+          ["Hurums Pale Ale", "Meksikansk Lager", "Stout", "Weiss"],
+          "pg-16a: a fenced JSON array is read, not thrown away — the live Hurum regression",
+        );
+        assertEq(diag.outcome, "products_found", "pg-16b: outcome is products_found, not invalid_unparseable");
+      }
+
+      // ── pg-17: the fence variants, and the two that must NOT be stripped. ─
+      {
+        const cases: Array<[string, string[] | null, string]> = [
+          ['```\n["Gin"]\n```', ["Gin"], "bare fence, no language tag"],
+          ['```JSON\n["Gin"]\n```', ["Gin"], "upper-case language tag"],
+          ['```json ["Gin"] ```', ["Gin"], "single-line fence, space-separated tag"],
+          ['  ```json\n["Gin"]\n```  ', ["Gin"], "fence with surrounding whitespace"],
+          ['["Gin"]', ["Gin"], "no fence at all — unchanged"],
+          // Only a HALF fence: the answer is genuinely damaged (this is what a
+          // real max_tokens cut would look like), so it must stay unparseable
+          // rather than be coerced into half a list.
+          ['```json\n["Gin","Vod', null, "unterminated fence stays unparseable"],
+        ];
+        for (const [text, expected, label] of cases) {
+          globalThis.fetch = (async () => ({
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text }], stop_reason: "end_turn" }),
+          })) as unknown as typeof fetch;
+          const r = await generateGardssalgProductList(SOURCE_TEXT);
+          assertEq(r, expected, `pg-17: ${label}`);
+        }
+      }
+
+      // ── pg-18: a FENCED sentinel is still an honest "no products", not a
+      //    parse failure. Misfiling it would recreate exactly the confusion
+      //    the Skive 1 buckets exist to prevent. ─────────────────────────────
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: "```\nINGEN_PRODUKTER_FUNNET\n```" }] }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        const r = await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(r, null, "pg-18a: a fenced sentinel is still null");
+        assertEq(diag.outcome, "sentinel_no_products", "pg-18b: and is classified as an honest answer, not a defect");
+      }
+
+      // ── pg-19: when a fenced answer DOES fail, the sample still shows the
+      //    fence. "What came back" must keep showing what came back. ────────
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: '```json\n{"produkter":["Gin"]}\n```' }], stop_reason: "end_turn" }),
+      })) as unknown as typeof fetch;
+      {
+        const diag: import("./opplevelser").GardssalgProductsExtractionDiagnostic = {};
+        await generateGardssalgProductList(SOURCE_TEXT, diag);
+        assertEq(diag.invalid_reason, "not_array", "pg-19a: unfenced, then judged on its actual shape");
+        assertTrue(
+          diag.invalid_sample?.startsWith("```json") === true,
+          "pg-19b: the sample reports the RAW answer, fence included — never the post-processed version",
         );
       }
 
