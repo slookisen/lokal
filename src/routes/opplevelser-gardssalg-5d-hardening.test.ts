@@ -397,6 +397,123 @@ export function runOpplevelserGardssalg5dHardeningTests(
           "5h-d4: fixed-path guessing is skipped entirely when real links were found",
         );
       }
+
+      // ── (e) headless escalation for JS-built producer sites ──────────────
+      //
+      // Daniel, live session 2026-08-15. 67northdistillery.no serves 180 KB of
+      // HTML that yields 19 visible characters, so about_text/products can
+      // never be extracted from the source and the row is stuck forever.
+      //
+      // The load-bearing property these tests protect is WHERE the escalation
+      // happens: on the primary page, BEFORE link discovery. A shell has no
+      // links either, so rendering only for text extraction would leave the
+      // sub-page crawl blind. 5h-e4 is the assertion that proves the ordering.
+      //
+      // Browser-free by construction — the render impl is injected, so the
+      // `npm test` gate never reaches a browser or the render worker.
+      {
+        const opplevelserMod = require("./opplevelser") as typeof import("./opplevelser");
+        const prevFlag = process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+
+        // A JS shell: big, scripted, no text, and — critically — no links.
+        const shell =
+          `<html><head><title>Aleine Gard</title><script src="/app.js"></script></head>` +
+          `<body><div id="root"></div><div data-x="${"a".repeat(9_000)}"></div></body></html>`;
+        // What the browser produces: real text AND a real link.
+        const renderedHtml =
+          `<html><head><title>Aleine Gard</title></head><body>` +
+          `<p>${"Aleine Gard held til i Hardanger og lagar sider av eigne eple. ".repeat(6)}</p>` +
+          `<a href="/side/gard/kontakt-oss">Kontakt oss</a></body></html>`;
+
+        const mkFetch = (seen: string[]) =>
+          (async (url: string | URL | Request) => {
+            const urlStr = String(url);
+            if (urlStr.includes("data.brreg.no") || urlStr.includes("api.anthropic.com")) {
+              throw new Error(`unexpected non-page fetch in 5h-e: ${urlStr}`);
+            }
+            seen.push(urlStr);
+            return {
+              ok: true, status: 200,
+              text: async () => shell,
+              arrayBuffer: async () => new TextEncoder().encode(shell).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
+          }) as unknown as typeof fetch;
+
+        // ── flag OFF: the shell is never escalated, whatever it looks like ──
+        {
+          delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+          let renderCalls = 0;
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => {
+            renderCalls++;
+            return { ok: true, html: renderedHtml, text: "x", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
+          });
+          const seen: string[] = [];
+          globalThis.fetch = mkFetch(seen);
+          await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          assertEq(renderCalls, 0, "5h-e1: with the flag OFF a JS shell is never escalated — the kill switch actually holds");
+        }
+
+        // ── flag ON: the shell IS escalated, and the render drives the crawl ──
+        {
+          process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+          let renderCalls = 0;
+          let renderedUrl = "";
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async (url: string) => {
+            renderCalls++;
+            renderedUrl = url;
+            return { ok: true, html: renderedHtml, text: "x", finalUrl: "https://aleine.example.no/side/gard", elapsedMs: 1 };
+          });
+          const seen: string[] = [];
+          globalThis.fetch = mkFetch(seen);
+          await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          assertEq(renderCalls, 1, "5h-e2: with the flag ON the JS shell escalates to the renderer exactly once");
+          assertEq(
+            renderedUrl,
+            "https://aleine.example.no/side/gard",
+            "5h-e3: the renderer is handed the page's own final url, not the host root",
+          );
+          // THE ordering assertion: the link only exists in the RENDERED html.
+          // If escalation ran after link discovery (or only fed text extraction)
+          // this sub-page could never be reached.
+          assertTrue(
+            seen.some((u) => u === "https://aleine.example.no/side/gard/kontakt-oss"),
+            "5h-e4: a link that exists ONLY in the rendered DOM is crawled — escalation happens before link discovery",
+          );
+        }
+
+        // ── a render failure must not fail the row ──────────────────────────
+        {
+          process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+          opplevelserMod.__setGardssalgRenderPageImplForTesting(async () => ({
+            ok: false, reason: "render_timeout", detail: "Timeout 25000ms exceeded.", elapsedMs: 25_000,
+          }));
+          const seen: string[] = [];
+          globalThis.fetch = mkFetch(seen);
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-content-refresh",
+            body: { providerIds: ["p5-alone"], apply: false },
+          });
+          assertEq(r.status, 200, "5h-e5: a render failure is non-fatal — the row keeps its raw HTML and the route still 200s");
+          assertTrue(
+            seen.some((u) => u === "https://aleine.example.no/side/gard"),
+            "5h-e6: the primary page was still fetched and used after the render failed",
+          );
+        }
+
+        opplevelserMod.__setGardssalgRenderPageImplForTesting(null);
+        if (prevFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+        else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevFlag;
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-5d-hardening: unexpected error: " + String(err?.stack || err?.message || err));

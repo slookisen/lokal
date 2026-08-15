@@ -375,6 +375,7 @@ import {
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
 // the one-shot transient retry and the empty-body check.
 import { fetchPage, discoverContentLinks, visibleTextOf, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
+import { renderPage, shouldEscalateToRender } from "../services/render-page";
 // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
 // hygiene, item 5 ("wrong_content_rate holdout") — the fail-closed LLM judge
 // + candidate sampler for POST /admin/experiences-wrong-content-rate below.
@@ -1896,13 +1897,82 @@ const GARDSSALG_MAX_PAGES = 5; // homepage + up to 4 sub-pages
  * be fetched. A 404/failure on any candidate sub-page costs nothing extra —
  * crFetchHtml already returns null on any failure, so it's just skipped.
  */
+/**
+ * Headless escalation for the gårdssalg content crawl. Default OFF — same
+ * shape and same reason as DENTAL_WD_HEADLESS_FALLBACK_ENABLED: a render is a
+ * round-trip to the lokal-render-worker Fly service, so turning it on for a
+ * whole sweep must be a deliberate act with a kill switch.
+ */
+function gardssalgHeadlessFallbackEnabled(): boolean {
+  return process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED === "true";
+}
+
+/**
+ * Longer than CR_FETCH_TIMEOUT_MS on purpose: a render is a browser navigation
+ * plus a settle wait, not a single HTTP round-trip, and the pages that need it
+ * are by definition the script-heavy ones.
+ */
+const GARDSSALG_RENDER_TIMEOUT_MS = 25_000;
+
+/**
+ * Test-only injection point for renderPage — mirrors
+ * dentalWdRenderPageImplForTesting (admin-dental-hjemmeside-discovery.ts).
+ * Production always leaves this null and gets the real renderPage, so the
+ * `npm test` gate never reaches the render worker or a browser.
+ */
+let gsRenderPageImplForTesting: typeof renderPage | null = null;
+export function __setGardssalgRenderPageImplForTesting(impl?: typeof renderPage | null): void {
+  gsRenderPageImplForTesting = impl ?? null;
+}
+
 async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
   const primary = await crFetchPage(fetchUrl);
   if (!primary.ok) {
     return { ok: false, reason: primary.reason, persistence: primary.persistence, status: primary.status };
   }
-  const primaryHtml = primary.html;
+  // ── Headless escalation for JS-built sites ────────────────────────────────
+  //
+  // Daniel, live session 2026-08-15. The case this exists for, measured:
+  //
+  //   67northdistillery.no   179 883 B HTML   ->   19 visible chars, 10 <script>
+  //
+  // Nineteen characters — the page title and nothing else. That row sits in
+  // `needs_enrichment` because about_text and products are empty, and they are
+  // empty because THERE IS NO TEXT IN THE SOURCE. Re-running the chain can
+  // never fix it; the content only exists after JavaScript runs.
+  //
+  // Escalating HERE, on the primary page before anything else happens, is what
+  // makes the whole rest of this function work on real content: link discovery
+  // below reads the rendered DOM (a shell has no links either), and every
+  // downstream text extraction sees the same rendered HTML. Rendering later,
+  // or only for text, would leave the sub-page crawl blind.
+  //
+  // Gated on GARDSSALG_HEADLESS_FALLBACK_ENABLED, default OFF — same shape and
+  // same reason as DENTAL_WD_HEADLESS_FALLBACK_ENABLED
+  // (admin-dental-hjemmeside-discovery.ts): a render costs a round-trip to the
+  // lokal-render-worker Fly service, so a sweep that suddenly renders every row
+  // must be a deliberate act with a kill switch, not a silent consequence of a
+  // deploy.
+  //
+  // A render FAILURE is deliberately non-fatal: we keep the raw HTML and carry
+  // on. The page was already fetched successfully — failing the whole row
+  // because the optional escalation did not work would turn an improvement
+  // into a regression.
+  let primaryHtml = primary.html;
+  let primaryUrl = primary.finalUrl || fetchUrl;
+  if (gardssalgHeadlessFallbackEnabled() && shouldEscalateToRender(primaryHtml, { bytes: primary.bytes })) {
+    const renderFn = gsRenderPageImplForTesting ?? renderPage;
+    const rendered = await renderFn(primaryUrl, {
+      userAgent: CR_UA,
+      timeoutMs: GARDSSALG_RENDER_TIMEOUT_MS,
+    });
+    if (rendered.ok) {
+      primaryHtml = rendered.html;
+      primaryUrl = rendered.finalUrl;
+    }
+  }
+
   let combinedHtml = primaryHtml;
   let pagesFetched = 1;
   // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1:
@@ -1915,7 +1985,10 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
   try {
     // Final url, not the requested one — a cross-host redirect otherwise leaves
     // the whole sub-page crawl pointed at a host that no longer serves the site.
-    const u = new URL(primary.finalUrl || fetchUrl);
+    // `primaryUrl`, not `primary.finalUrl`: when the headless escalation above
+    // ran, the browser may have followed a client-side redirect the raw fetch
+    // never saw, and the crawl base must follow the page we actually read.
+    const u = new URL(primaryUrl);
     // Slice 5d: sub-page candidates resolve relative to the STORED URL's
     // section, not the host root. For the normal case (hjemmeside is the
     // site root) this is identical to the old `${protocol}//${host}` base;
@@ -1964,7 +2037,7 @@ async function crFetchGardssalgContent(homepageUrl: string): Promise<CrFetchOutc
     // Fallback fires only when discovery yields nothing INSIDE the section,
     // which is the site shape fetch-page.ts documents as having no crawlable
     // internal links at all.
-    const discovered = discoverContentLinks(primaryHtml, primary.finalUrl || fetchUrl, GARDSSALG_MAX_PAGES)
+    const discovered = discoverContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES)
       .filter((href) => href.startsWith(base));
 
     const targets: Array<{ url: string; label: string }> =
@@ -2907,7 +2980,10 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
 //
 // Fixed, validated code→producer_type map — arbitrary codes are rejected
 // (400), this endpoint scans the drink family only:
-//   11.010 destilleri · 11.030 sideri · 11.040 mjøderi · 11.050 bryggeri
+//   11.010 destilleri · 11.020 vingård · 11.030 sideri · 11.040 mjøderi
+//   11.050 bryggeri · 01.210 vingård
+// (wine codes added 2026-08-15 — see the map's own comment for the 01.210
+// judgement and the measurement behind it)
 //
 // Per candidate enhet:
 //   dead        — konkurs / underAvvikling / underTvangsavviklingEller-
@@ -2945,11 +3021,42 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
 // landed the same day roll back independently.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+// Wine added 2026-08-15 (Daniel). Same failure this route was built for, one
+// family over: the 2026-07-19 dev-request exists because "NACE 11.010 var
+// usynlig for all discovery" and 67 North was therefore invisible. Measured
+// against Brreg on 2026-08-14, wine had the identical hole — the map simply
+// did not name it:
+//
+//   NACE 11.020 «Produksjon av vin»      21 active in Brreg, we had  1
+//   NACE 01.210 «Dyrking av druer»       24 active in Brreg, we had  1
+//
+// 43 producers no sweep could ever reach, against 2 of 235 missing for beer
+// and 2 of 50 for cider — the beer/cider families are saturated precisely
+// BECAUSE they are in this map.
+//
+// 01.210 is an AGRICULTURE code, not an 11.0xx beverage-production one, and
+// including it is a deliberate judgement rather than an oversight corrected:
+//   - Hebnes Vingård — the only wine producer we hold, and a textbook
+//     gårdssalg row — is itself 01.210. A grape grower pressing and selling
+//     its own wine from the farm is the archetype this vertical exists for,
+//     and it is the code they register under.
+//   - The cost is precision: 01.210 also carries land/road/river
+//     associations (measured: 3 of the 43, e.g. «HATLESTRAND SKOGVEGLAG SA»).
+//     Those land with no website and no email, so they stop at `unreachable`
+//     and can never reach outreach — they cost cohort noise, not a bad send.
+//   - The route's own batch rollback ({rollbackBatch: "<tag>"}) makes a whole
+//     discovery batch a single undo, so this is reversible if the noise rate
+//     turns out worse than measured.
+//
+// Both map to `vingård`, already a member of DRINK_PRODUCER_TYPES
+// (route-corridor-service.ts) — no new taxonomy.
 const GARDSSALG_NACE_PRODUCER_TYPE: Record<string, string> = {
   "11.010": "destilleri",
+  "11.020": "vingård",
   "11.030": "sideri",
   "11.040": "mjøderi",
   "11.050": "bryggeri",
+  "01.210": "vingård",
 };
 const GS_ND_PAGE_SIZE = 100;
 const GS_ND_MAX_PAGES_PER_CODE = 10; // 1000/code — far above the real ~240 ceiling
