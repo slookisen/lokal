@@ -73,6 +73,7 @@ import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extracti
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
+import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
@@ -688,6 +689,14 @@ app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemm
 // research). dry-run by default, dry_run:false writes.
 // POST /admin/dental/mark-inactive
 app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRoutes);
+// dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3 (Brreg-
+// field leg): discovers + verifies a candidate homepage from Brreg's own
+// registered hjemmeside field for org_nr-known, hjemmeside-blank clinics,
+// queues verified candidates (dental_website_review_queue) — never writes
+// dental_agents.hjemmeside directly. Approve is a separate, explicit,
+// dry-run-default call. POST /admin/dental/hjemmeside-discovery-batch,
+// POST /admin/dental/hjemmeside-discovery-approve.
+app.use("/admin/dental", adminLimiter, adminDentalHjemmesideDiscoveryRoutes);
 // dev-request 2026-07-21-dental-schema-probe-writepath-fix, follow-up: finds
 // + repairs dental_agents rows already contaminated by the test/probe
 // fingerprint PR #323's write-path guard now blocks going forward — clears
