@@ -2352,19 +2352,46 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // who plainly do sell products, per the dev-request's three hypotheses
   // (char-cap truncation eating the source before it reaches the product
   // page; sub-page discovery missing the product page entirely; or the model
-  // legitimately finding no products in what it was given). Populated for
-  // EVERY row that enters the products-extraction branch below
-  // (gardssalgProductsEligible(t.products) === true), independent of whether
-  // that row ends up in `changed` — a sentinel/null result or an
+  // legitimately finding no products in what it was given). Originally
+  // populated only for rows that entered the products-extraction branch
+  // below (gardssalgProductsEligible(t.products) === true) — independent of
+  // whether that row ends up in `changed`, since a sentinel/null result or an
   // already-satisfied about_text/visit_text means the row would otherwise
   // never appear anywhere in this report at all (see changed's early return
-  // once wouldWrite.length === 0), which would silently hide exactly the
-  // rows this diagnostic exists to explain.
+  // once wouldWrite.length === 0). Widened by AC3 of dev-request
+  // 2026-08-15-products-parser-kodegjerde: EVERY processed provider now gets
+  // exactly one row, including every early-return/gate path in processOne()
+  // that never even reaches the eligibility check — a locked/excluded/
+  // fetch-failed/already-has-products row used to be silently absent from
+  // this array too (measured live: 3 of 4 processed providers in one
+  // targeted run had none), which hid exactly the rows a human running a
+  // drain/backfill most needs explained. Those gates stamp an outcome of
+  // `generator_not_invoked:<gate>` via pushProductsNotInvokedDiagnostic()
+  // below rather than the four generator-side outcomes above.
+  // dev-request 2026-08-15-products-parser-kodegjerde, AC3: which gate
+  // short-circuited processOne() BEFORE the generator branch
+  // (gardssalgProductsEligible(t.products) === true) was even reached. Every
+  // member here corresponds to a return/early-exit point in processOne()
+  // below that used to leave the row with NO products_diagnostic entry at
+  // all — measured live: 3 of 4 processed providers in a targeted run had no
+  // row once the generator wasn't invoked, silently indistinguishable from a
+  // row nobody looked at. "products_already_present" is the one gate that
+  // runs AFTER a successful fetch (gardssalgProductsEligible(t.products) ===
+  // false — fill-only, an already non-blank products column is never
+  // overwritten); every other gate below it runs before any fetch.
+  type GardssalgGeneratorNotInvokedGate =
+    | "excluded_shared_domain"
+    | "locked"
+    | "unverified_website"
+    | "fetch_error"
+    | "fetch_failed"
+    | "products_already_present";
   type GardssalgProductsOutcome =
     | "products_found"
     | "sentinel_no_products"
     | "invalid_unparseable"
-    | "infra_failure";
+    | "infra_failure"
+    | `generator_not_invoked:${GardssalgGeneratorNotInvokedGate}`;
   const productsDiagnostic: Array<{
     provider_id: string;
     content_chars_full: number;
@@ -2382,6 +2409,32 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     invalid_sample?: string;
     stop_reason?: string | null;
   }> = [];
+
+  // dev-request 2026-08-15-products-parser-kodegjerde, AC3: stamps a row for
+  // a provider that never reached generateGardssalgProductList at all. The
+  // char/page-count fields are zeroed rather than omitted — the type stays
+  // one shape for every outcome, and 0/[] reads unambiguously as "nothing was
+  // gathered" (as opposed to a real 0-char fetch, which this pipeline cannot
+  // produce: a successful fetch always has SOME homepage HTML). Optional
+  // knownStats lets the one post-fetch gate (products_already_present) carry
+  // the real content_chars_full/pages_fetched_paths it already has in hand,
+  // rather than reporting zeroes for data that was actually gathered.
+  function pushProductsNotInvokedDiagnostic(
+    providerId: string,
+    gate: GardssalgGeneratorNotInvokedGate,
+    knownStats?: { content_chars_full: number; pages_fetched_paths: string[] }
+  ): void {
+    productsDiagnostic.push({
+      provider_id: providerId,
+      content_chars_full: knownStats?.content_chars_full ?? 0,
+      truncated: false,
+      products_source_chars: 0,
+      products_source_full_chars: 0,
+      product_pages: [],
+      pages_fetched_paths: knownStats?.pages_fetched_paths ?? [],
+      outcome: `generator_not_invoked:${gate}`,
+    });
+  }
 
   /**
    * Per-row record of the headless escalation — the DECISION as well as the
@@ -2425,6 +2478,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     const exclusionReason = gardssalgContentExclusionReason(t.hjemmeside, sharedHostCounts);
     if (exclusionReason) {
       excludedSharedDomain.push({ provider_id: providerId, reason: exclusionReason });
+      pushProductsNotInvokedDiagnostic(providerId, "excluded_shared_domain");
       return;
     }
 
@@ -2438,6 +2492,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // applyGardssalgProviderContent's own per-field gate).
     if (t.content_source === "manual") {
       skippedLocked.push(providerId);
+      pushProductsNotInvokedDiagnostic(providerId, "locked");
       return;
     }
 
@@ -2448,6 +2503,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // producer. See isHjemmesideVerified()'s doc comment above.
     if (!isHjemmesideVerified(t.field_provenance)) {
       excludedUnverifiedWebsite.push({ provider_id: providerId, reason: "unverified_website" });
+      pushProductsNotInvokedDiagnostic(providerId, "unverified_website");
       return;
     }
 
@@ -2462,6 +2518,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       // our side (a malformed stored URL, a bug), which is no evidence at all
       // that the producer's site is dead. Striking on it would park a provider
       // for 30 days for our own error.
+      pushProductsNotInvokedDiagnostic(providerId, "fetch_error");
       return;
     }
     if (!fetched.ok) {
@@ -2482,6 +2539,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
           if (p.parked_now) parkedNow.push(providerId);
         } catch { /* best-effort */ }
       }
+      pushProductsNotInvokedDiagnostic(providerId, "fetch_failed");
       return;
     }
     if (apply) {
@@ -2779,6 +2837,18 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
           snippet: productsCandidate.slice(0, 5).join(", ").slice(0, 120),
         };
       }
+    } else {
+      // dev-request 2026-08-15-products-parser-kodegjerde, AC3: the fill-only
+      // gate declined — `products` already has content, so the generator is
+      // never invoked (unchanged behavior) — but the row still fetched
+      // successfully and is still a processed provider, so it still gets a
+      // row. content_chars_full/pages_fetched_paths are real (already
+      // gathered above); the products_source_*/product_pages fields stay
+      // zeroed since gardssalgProductSourceText was never computed here.
+      pushProductsNotInvokedDiagnostic(providerId, "products_already_present", {
+        content_chars_full: contentText.length,
+        pages_fetched_paths: fetched.pagesFetchedPaths ?? [],
+      });
     }
 
     const wouldWrite = Object.keys(wouldWriteActions);
@@ -2896,10 +2966,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // is not stamped verified=true by the website-verification sweep —
     // additive bucket; every excluded provider is visible, never dropped.
     excluded_unverified_website: excludedUnverifiedWebsite,
-    // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1:
-    // per-row diagnostic for every row that entered the products-extraction
-    // branch this run (see productsDiagnostic's doc comment above) — additive
-    // bucket, reporting-only, changes no write behavior.
+    // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 1;
+    // widened to every processed provider by AC3 of dev-request
+    // 2026-08-15-products-parser-kodegjerde (see productsDiagnostic's doc
+    // comment above) — additive bucket, reporting-only, changes no write
+    // behavior.
     products_diagnostic: productsDiagnostic,
     render_diagnostic: renderDiagnostic,
   });
