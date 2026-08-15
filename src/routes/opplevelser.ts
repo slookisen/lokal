@@ -17687,6 +17687,38 @@ export interface GardssalgProductsExtractionDiagnostic {
   stop_reason?: string | null;
 }
 
+/**
+ * Strip a markdown code fence wrapping the model's answer. PURE.
+ *
+ * Skive 6 (2026-08-15) — this is what `invalid_unparseable` actually WAS, on
+ * every row that carried it. The Skive 5 diagnostic answered the question the
+ * first live run after it deployed:
+ *
+ *   Hurum Bryggeri   stop_reason: "end_turn"  ```json [ "Hurums Pale Ale", …11 øl… ] ```
+ *   Nordfjord Distillery  stop_reason: "end_turn"  ```json [ "Frisider eple", … ] ```
+ *
+ * Both answers were COMPLETE and CORRECT — `end_turn`, not `max_tokens`. The
+ * extraction had worked and eleven correct beer names were thrown away because
+ * `JSON.parse` will not accept three backticks. max_tokens was never the
+ * problem, so it is not touched; the estimate that said it might be is now
+ * moot.
+ *
+ * Requires BOTH fences before stripping anything: a response cut off mid-fence
+ * is genuinely damaged and must stay unparseable rather than be coerced into
+ * half a list. The language tag (```json) is dropped only when a newline or
+ * space separates it from the payload, so a fence-less answer that merely
+ * starts with a word is never mangled.
+ *
+ * Belt and braces, the same discipline generateGardssalgAboutRewrite already
+ * uses for prose: the prompt also asks for no markdown, and this strips it
+ * anyway. Neither half is trusted alone.
+ */
+export function gardssalgStripCodeFence(raw: string): string {
+  const t = raw.trim();
+  if (!t.startsWith("```") || !t.endsWith("```") || t.length < 6) return t;
+  return t.slice(3, -3).replace(/^[a-zA-Z0-9_-]*\s/, "").trim();
+}
+
 // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 4
 // (retry-once on invalid_unparseable): a single API-call-and-parse attempt,
 // factored out of generateGardssalgProductList so the outer function can
@@ -17758,14 +17790,22 @@ async function attemptGardssalgProductExtraction(
       stop_reason: stopReason,
     };
   }
+  // `cleaned` stays the RAW answer and is what every sample below reports —
+  // "what came back" must keep showing the fence, or the next reader of a
+  // failing row is back to guessing. `unfenced` is what gets interpreted.
   const cleaned = text.trim();
-  if (cleaned === GARDSSALG_PRODUCTS_SENTINEL) {
+  const unfenced = gardssalgStripCodeFence(cleaned);
+  // Sentinel check runs on the unfenced text too: a fenced
+  // ```INGEN_PRODUKTER_FUNNET``` is the model answering "no products"
+  // correctly, and reading it as a parse failure would misfile an honest
+  // answer as a defect — the exact confusion Skive 1 exists to prevent.
+  if (unfenced === GARDSSALG_PRODUCTS_SENTINEL) {
     return { kind: "sentinel" }; // explicit "no products" escape
   }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(cleaned);
+    parsed = JSON.parse(unfenced);
   } catch {
     // not valid JSON — never fabricate/guess a list from prose
     return {
@@ -17828,7 +17868,7 @@ export async function generateGardssalgProductList(
 Kildetekst (hentet fra produsentens egen nettside):
 ${cappedSource}
 
-Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der. Ikke finn på produkter som ikke er nevnt. Et produkt er en vare produsenten selger og som kunden får med seg — flasker, glass, pakker, varer i utsalget. Retter som serveres er IKKE produkter: selskapsmeny, cateringmeny, dagens rett, buffet og annen servering skal ALDRI med i listen, selv om rettene står navngitt i kildeteksten. Svar med EKSAKT et JSON-array av strenger, f.eks. ["Eplesider","Eplemost"], og ingenting annet. Hvis kildeteksten ikke nevner noen konkrete produkter, svar med nøyaktig ${GARDSSALG_PRODUCTS_SENTINEL} og ingenting annet.`;
+Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der. Ikke finn på produkter som ikke er nevnt. Et produkt er en vare produsenten selger og som kunden får med seg — flasker, glass, pakker, varer i utsalget. Retter som serveres er IKKE produkter: selskapsmeny, cateringmeny, dagens rett, buffet og annen servering skal ALDRI med i listen, selv om rettene står navngitt i kildeteksten. Svar med EKSAKT et JSON-array av strenger, f.eks. ["Eplesider","Eplemost"], og ingenting annet — ingen markdown, ingen kodeblokk, ingen backticks rundt svaret. Hvis kildeteksten ikke nevner noen konkrete produkter, svar med nøyaktig ${GARDSSALG_PRODUCTS_SENTINEL} og ingenting annet.`;
 
   // dev-request 2026-08-10-produktnavn-uttrekk-blokkerer-28-rader, Skive 4:
   // ONE automatic retry (one additional API call, same cappedSource/prompt),
