@@ -258,6 +258,14 @@ body[data-vertical="rfb"] .topbar{border-bottom:2px solid #4ade80}
             <option value="unknown">Ukjent</option>
           </select>
         </label>
+        <label>Plattform
+          <select id="composeNewVertical">
+            <option value="">Velg plattform…</option>
+            <option value="rfb">🌱 Rett fra Bonden</option>
+            <option value="dental">🦷 Finn Tannlege</option>
+            <option value="experiences">🧭 Opplevagent</option>
+          </select>
+        </label>
         <div class="modes">
           <label><input type="radio" name="composeNewMode" value="gmail_draft" checked> Lag draft i Gmail</label>
           <label><input type="radio" name="composeNewMode" value="resend_send"> Send nå (Resend)</label>
@@ -1030,6 +1038,11 @@ async function markDoneFromAwait(threadId) {
 
 // ─── Event delegation (CSP-safe — no inline handlers) ───
 function openCompose() {
+  // Forhåndsvelg plattform kun når det globale filteret ER én plattform.
+  // 'all' har ingen trygg default — avsender må velge selv (speiler
+  // composeSchema sitt påkrevde vertical-felt).
+  const vSel = document.getElementById('composeNewVertical');
+  if (vSel) vSel.value = (VERTICAL !== 'all') ? VERTICAL : '';
   document.getElementById('composeOverlay').style.display = 'flex';
   setTimeout(() => document.getElementById('composeNewTo')?.focus(), 50);
 }
@@ -1046,11 +1059,17 @@ async function sendCompose() {
   const subject = document.getElementById('composeNewSubject').value.trim();
   const body = document.getElementById('composeNewBody').value.trim();
   const category = document.getElementById('composeNewCategory').value;
+  const vertical = document.getElementById('composeNewVertical').value;
   const mode = document.querySelector('input[name=composeNewMode]:checked')?.value || 'gmail_draft';
 
   if (!to || !subject || !body) { toast('Til, emne og melding må fylles ut', true); return; }
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) { toast('Ugyldig e-postadresse', true); return; }
-  if (mode === 'resend_send' && !confirm(`Sende e-post nå til ${to}?\n\nFra: kontakt@rettfrabonden.com\nDenne kan ikke trekkes tilbake.`)) return;
+  // /compose krever eksplisitt vertical (fail-closed, ingen default — se
+  // composeSchema i routes/crm.ts). Stoppes her så feilen blir forståelig i
+  // stedet for rå 400 fra API-et.
+  if (!vertical) { toast('Velg plattform (Rett fra Bonden / Finn Tannlege / Opplevagent) før sending', true); return; }
+  const fromLabel = { rfb: 'Rett fra Bonden', dental: 'Finn Tannlege', experiences: 'Opplevagent' }[vertical] || vertical;
+  if (mode === 'resend_send' && !confirm(`Sende e-post nå til ${to}?\n\nFra: "${fromLabel}" <kontakt@rettfrabonden.com>\nDenne kan ikke trekkes tilbake.`)) return;
 
   const btn = document.getElementById('composeNewSendBtn');
   btn.disabled = true;
@@ -1065,6 +1084,7 @@ async function sendCompose() {
         bodyText: body,
         intent: mode,
         category,
+        vertical,
         createdBy: 'daniel',
       })
     });
