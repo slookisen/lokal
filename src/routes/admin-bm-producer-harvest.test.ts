@@ -32,6 +32,37 @@
  *          — this suite only ever calls dry_run=false against its own fresh
  *          fetch/db fixtures, never touching the dry-run path.
  *
+ * Slice 5 (url-write via evidence-gated queue — QUEUE ONLY), new in this
+ * file:
+ *   AC4 — a matched row with a real `record.website` (from the harvested
+ *         page's LocalBusiness `url`) AND a currently-blank agent website
+ *         produces `url_outcome: "url_proposed"` in the apply-mode response
+ *         AND a corresponding `agents_website_review_queue` row (DB
+ *         read-back) — proves the wiring end to end, not just that
+ *         evaluateRfbWebsiteCandidate works in isolation (that half is
+ *         covered directly in admin-rfb-website-discovery.test.ts's own
+ *         ac2/ac3 blocks).
+ *   AC5 — a matched row with `record.website: null` produces
+ *         `url_outcome: "url_skip_no_candidate"` and triggers ZERO network
+ *         fetches beyond the two bondensmarked.no calls (sitemap + its own
+ *         page) — proven by an request-host counter, since this codebase's
+ *         esbuild/tsx toolchain compiles the `evaluateRfbWebsiteCandidate`
+ *         import to a live binding that cannot be spied on from outside its
+ *         own module (same constraint documented in
+ *         admin-rfb-website-discovery.test.ts's file header) — an observable
+ *         "no candidate host was ever fetched" is the available proxy for
+ *         "the function was never called" here.
+ *   AC6 — two matched rows in the SAME apply-mode call whose harvested
+ *         `website` values resolve to the SAME host: the first is
+ *         `url_proposed`, the second is
+ *         `url_rejected_host_already_proposed_this_batch` — proves the
+ *         shared `hostsProposedThisBatch` accumulator this route builds
+ *         ONCE per call (not per row) is actually threaded through every
+ *         row of the batch.
+ *   Regression (AC7 of this slice): every slice-2/3/4 assertion above is
+ *         untouched — the url block only ADDS fields/branches to the same
+ *         per-slug loop and result item.
+ *
  * Wired into tests/test.ts.
  * Standalone: npx tsx src/routes/admin-bm-producer-harvest.test.ts
  */
@@ -328,6 +359,40 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
           "agent-phone-existingrow",
         );
 
+        // ═══════════════════════════════════════════════════════════════
+        // Slice 5 (url-write, QUEUE ONLY) fixtures.
+        // ═══════════════════════════════════════════════════════════════
+
+        // slug=url-proposed-gard -> matched, blank agent_knowledge.website,
+        // record.website resolves to a host whose fetched page carries
+        // matching org_nr evidence -> url_outcome: "url_proposed" AND a
+        // agents_website_review_queue row (AC4).
+        insertAgent.run("agent-url-proposed", "Urlproposed Gård", "", "key-url-proposed", "Bostad", null);
+        insertKnowledge.run("agent-url-proposed", "{}");
+        db.prepare(`UPDATE agents SET org_nr = ? WHERE id = ?`).run("977000001", "agent-url-proposed");
+
+        // slug=url-nocandidate-gard -> matched, but the harvested page has NO
+        // `url` on its LocalBusiness block at all (record.website: null) ->
+        // url_outcome: "url_skip_no_candidate", and (AC5) the candidate host
+        // it would have visited is never fetched at all.
+        insertAgent.run("agent-url-nocandidate", "Urlnocandidate Gård", "", "key-url-nocandidate", "Bostad", null);
+        insertKnowledge.run("agent-url-nocandidate", "{}");
+
+        // slug=url-batch1-gard / slug=url-batch2-gard -> two DIFFERENT
+        // matched agents whose harvested `website` values resolve to the
+        // SAME host (sharedhost-slice5.no). batch1's org_nr is on that
+        // page's text, so batch1 verifies and is proposed FIRST, adding the
+        // host to this apply-mode call's shared hostsProposedThisBatch;
+        // batch2's candidate resolves to the identical host and must be
+        // rejected purely on the shared-host guard, before any fetch of its
+        // own — proves the accumulator is built ONCE per call, not per row
+        // (AC6).
+        insertAgent.run("agent-url-batch1", "Urlbatch1 Gård", "", "key-url-batch1", "Bostad", null);
+        insertKnowledge.run("agent-url-batch1", "{}");
+        db.prepare(`UPDATE agents SET org_nr = ? WHERE id = ?`).run("977000002", "agent-url-batch1");
+        insertAgent.run("agent-url-batch2", "Urlbatch2 Gård", "", "key-url-batch2", "Bostad", null);
+        insertKnowledge.run("agent-url-batch2", "{}");
+
         function auditRows(agentId: string) {
           return db
             .prepare(
@@ -363,12 +428,32 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
         function knowledgeRowExists(agentId: string): boolean {
           return !!db.prepare(`SELECT 1 FROM agent_knowledge WHERE agent_id = ?`).get(agentId);
         }
+        function websiteReviewQueueRow(agentId: string): any {
+          return db.prepare(`SELECT * FROM agents_website_review_queue WHERE agent_id = ?`).get(agentId);
+        }
+        function knowledgeWebsiteOf(agentId: string): string | null {
+          const row = db.prepare(`SELECT website FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
+            | { website: string | null }
+            | undefined;
+          return row?.website ?? null;
+        }
 
         const ld = (name: string, city: string) =>
           JSON.stringify({
             "@context": "https://schema.org",
             "@type": "LocalBusiness",
             name,
+            address: { "@type": "PostalAddress", addressLocality: city, addressCountry: "NO" },
+          });
+        // Slice 5 (url-write) fixtures need a `url` on the LocalBusiness
+        // block too — parseBmProducerPage (services/bm-producer-harvest.ts)
+        // reads `record.website` from exactly that field.
+        const ldWithUrl = (name: string, city: string, url: string) =>
+          JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "LocalBusiness",
+            name,
+            url,
             address: { "@type": "PostalAddress", addressLocality: city, addressCountry: "NO" },
           });
 
@@ -391,12 +476,35 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
           "phone-invalid-gard": `<script type="application/ld+json">${ld("Phoneinvalid Gård", "Bostad")}</script><a href="tel:927 011 840">927 011 840</a>`,
           "phone-newrow-gard": `<script type="application/ld+json">${ld("Phonenewrow Gård", "Bostad")}</script><a href="tel:91000006">91000006</a>`,
           "phone-existingrow-gard": `<script type="application/ld+json">${ld("Phoneexistingrow Gård", "Bostad")}</script><a href="tel:91000007">91000007</a>`,
+          // ── Slice 5 (url-write, queue only) fixtures ────────────────────
+          "url-proposed-gard": `<script type="application/ld+json">${ldWithUrl("Urlproposed Gård", "Bostad", "https://urlproposedgard.no")}</script>`,
+          "url-nocandidate-gard": `<script type="application/ld+json">${ld("Urlnocandidate Gård", "Bostad")}</script>`,
+          "url-batch1-gard": `<script type="application/ld+json">${ldWithUrl("Urlbatch1 Gård", "Bostad", "https://sharedhost-slice5.no")}</script>`,
+          "url-batch2-gard": `<script type="application/ld+json">${ldWithUrl("Urlbatch2 Gård", "Bostad", "https://sharedhost-slice5.no")}</script>`,
         };
         const slugOrder = Object.keys(pages);
 
         const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${slugOrder
           .map((s) => `<url><loc>https://bondensmarked.no/produsenter/${s}</loc></url>`)
           .join("")}</urlset>`;
+
+        // ── Slice 5 candidate-host fixtures ─────────────────────────────────
+        // evaluateRfbWebsiteCandidate (admin-rfb-website-discovery.ts, via
+        // tryRfbWebsiteCandidateHost -> services/fetch-page.ts) fetches the
+        // CANDIDATE host itself (e.g. "https://urlproposedgard.no"), a
+        // separate request from the bondensmarked.no producer-page fetch
+        // above — both go through this SAME injected globalThis.fetch, keyed
+        // by the exact origin fetchPage requests.
+        const candidateHostPages: Record<string, string> = {
+          "https://urlproposedgard.no": `<html><body>Urlproposed Gård — org.nr 977 000 001</body></html>`,
+          "https://sharedhost-slice5.no": `<html><body>Urlbatch1 Gård — org.nr 977 000 002</body></html>`,
+        };
+        // Counts every fetch that is neither the bondensmarked.no sitemap nor
+        // a bondensmarked.no producer page — i.e. every candidate-host fetch
+        // a url-write attempt would trigger. Used by AC5 as the observable
+        // proxy for "evaluateRfbWebsiteCandidate was never called" (see file
+        // header note: the live-binding import can't be spied on directly).
+        let candidateHostFetchCount = 0;
 
         (globalThis as any).fetch = async (url: any) => {
           const u = String(url);
@@ -407,6 +515,10 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
           const slug = m ? m[1] : "";
           if (slug in pages) {
             return new Response(pages[slug], { status: 200, headers: { "content-type": "text/html" } });
+          }
+          candidateHostFetchCount++;
+          if (u in candidateHostPages) {
+            return new Response(candidateHostPages[u], { status: 200, headers: { "content-type": "text/html" } });
           }
           return new Response("not found", { status: 404 });
         };
@@ -508,6 +620,60 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
           "Eksisterande innhald som ikkje skal røras",
           "ac-phone AC2: an existing row's UNRELATED field (about) survives the write untouched",
         );
+
+        // ── Slice 5 AC4: real record.website + currently-blank agent
+        //     website -> url_proposed in the apply-mode response AND a
+        //     corresponding agents_website_review_queue row (DB read-back) ──
+        assertEq(resultFor(r.body, "url-proposed-gard")?.url_outcome, "url_proposed", "ac-url AC4: url-proposed-gard -> url_proposed");
+        assertEq(
+          resultFor(r.body, "url-proposed-gard")?.url_new_value,
+          "https://urlproposedgard.no",
+          "ac-url AC4: url_new_value is the verified candidate's origin",
+        );
+        const urlQueueRow = websiteReviewQueueRow("agent-url-proposed");
+        assertTrue(!!urlQueueRow, "ac-url AC4: a row landed in agents_website_review_queue (DB read-back)");
+        assertEq(urlQueueRow?.status, "pending", "ac-url AC4: queue row status is 'pending'");
+        assertEq(
+          urlQueueRow?.reason,
+          "website_discovery_candidate_external",
+          "ac-url AC4: queue row reason is the unmodified external-candidate default (no BM-specific reason invented)",
+        );
+        assertEq(
+          knowledgeWebsiteOf("agent-url-proposed"),
+          null,
+          "ac-url AC4: agent_knowledge.website is NEVER written for a url candidate — queue only",
+        );
+
+        // ── Slice 5 AC5: record.website: null -> url_skip_no_candidate, AND
+        //     zero candidate-host fetches (the "don't fetch when there's
+        //     nothing to evaluate" cheapness — see file header note on why
+        //     a fetch-host counter stands in for a direct call-spy here) ───
+        assertEq(
+          resultFor(r.body, "url-nocandidate-gard")?.url_outcome,
+          "url_skip_no_candidate",
+          "ac-url AC5: no record.website -> url_skip_no_candidate",
+        );
+        assertEq(
+          candidateHostFetchCount,
+          Object.keys(candidateHostPages).length,
+          "ac-url AC5: exactly the two REAL candidate hosts were ever fetched — url-nocandidate-gard triggered none of its own",
+        );
+
+        // ── Slice 5 AC6: two matched rows in the SAME call whose website
+        //     values resolve to the SAME host — first proposed, second
+        //     rejected purely on the shared hostsProposedThisBatch guard ───
+        assertEq(resultFor(r.body, "url-batch1-gard")?.url_outcome, "url_proposed", "ac-url AC6: url-batch1-gard (first) -> url_proposed");
+        assertEq(
+          resultFor(r.body, "url-batch2-gard")?.url_outcome,
+          "url_rejected_host_already_proposed_this_batch",
+          "ac-url AC6: url-batch2-gard (second, same host) -> url_rejected_host_already_proposed_this_batch",
+        );
+        assertTrue(
+          !websiteReviewQueueRow("agent-url-batch2"),
+          "ac-url AC6: the shared-host-rejected second row queued nothing",
+        );
+
+        assertEq(r.body?.counts?.url_proposed, 2, "ac-url: counts.url_proposed tallies both verified url candidates (proposed-gard + batch1-gard)");
 
         // Shared-limit-cap (AC1): the SAME `limit`/`scanned` window governs
         // both write types together — not two independent budgets. `scanned`
