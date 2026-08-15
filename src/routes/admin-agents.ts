@@ -2951,6 +2951,26 @@ const RFB_RETRO_SCAN_CONCURRENCY = 3;
 // legitimate would ever pass.
 const RFB_RETRO_SCAN_OFFSET_MAX = 100_000;
 
+/**
+ * Shared offset validation for both POST /retro-scan and GET
+ * /tynne-profiler-cohort below (dev-request 2026-08-15-tynne-profiler-
+ * forbedringsloype, Slice 1) — factored out so the cohort endpoint gets the
+ * EXACT same non-negative-integer / non-scalar / ceiling checks the
+ * retro-scan route already validated, rather than a second hand-rolled
+ * copy. `raw === undefined` -> offset 0, reproducing today's default.
+ */
+function parseRfbRetroScanOffset(raw: unknown): { offset: number } | { error: string; detail: string } {
+  if (raw === undefined) return { offset: 0 };
+  if (typeof raw !== "number" && typeof raw !== "string") {
+    return { error: "invalid offset", detail: "offset must be a non-negative integer" };
+  }
+  const n = typeof raw === "number" ? raw : parseInt(raw as string, 10);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > RFB_RETRO_SCAN_OFFSET_MAX) {
+    return { error: "invalid offset", detail: "offset must be a non-negative integer" };
+  }
+  return { offset: n };
+}
+
 interface RfbRetroScanTarget {
   agent_id: string;
   name: string;
@@ -3233,70 +3253,55 @@ function applyRfbRetroScanNull(
   return written;
 }
 
-router.post("/retro-scan", async (req: Request, res: Response) => {
-  if (!requireAdmin(req, res)) return;
+/** One flagged-and-in-scope row from runRfbRetroScanCore's `changed[]` —
+ * `name` and `cause_classes` are additive over the original POST
+ * /retro-scan response shape (dev-request 2026-08-15-tynne-profiler-
+ * forbedringsloype, Slice 1): GET /tynne-profiler-cohort below needs both
+ * (the producer name for its persisted queue row, the per-field cause class
+ * for its report) without re-querying the DB or re-running the judge, so
+ * they're carried through here instead of bolted on separately. Purely
+ * additive — existing POST /retro-scan callers/tests reading `agent_id`/
+ * `fields`/`reasons` are unaffected. */
+interface RfbRetroScanChangedEntry {
+  agent_id: string;
+  name: string;
+  fields: string[];
+  reasons: Record<string, string>;
+  cause_classes: Partial<Record<"description" | "about", RfbRetroScanCauseClass>>;
+}
 
-  const db = getDb();
-  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; offset?: unknown; apply?: unknown };
+interface RfbRetroScanCoreResult {
+  dry_run: boolean;
+  scanned: number;
+  offset: number;
+  total_eligible: number;
+  by_field: Record<"description" | "about", { flagged: number; nulled: number }>;
+  by_cause_class: Record<RfbRetroScanCauseClass, number>;
+  changed: RfbRetroScanChangedEntry[];
+  skipped_locked: string[];
+  skipped_curated: Array<{ agent_id: string; fields: string[] }>;
+  errors: Array<{ agent_id: string; error: string }>;
+}
 
-  const apply =
-    body.apply === true ||
-    body.apply === 1 ||
-    body.apply === "1" ||
-    body.apply === "true" ||
-    req.query?.apply === "1" ||
-    req.query?.apply === "true";
+/**
+ * The retro-scan's actual scan/judge/(maybe-)null loop, factored out of the
+ * POST /retro-scan handler below so GET /tynne-profiler-cohort (dev-request
+ * 2026-08-15-tynne-profiler-forbedringsloype, Slice 1) can call into the
+ * SAME cohort logic — same judge cascade, same claimed_at row-lock, same
+ * curated_fields field-lock — rather than duplicating it. Behavior is
+ * unchanged from before this extraction; POST /retro-scan below is now a
+ * thin request-parsing wrapper around this function.
+ */
+async function runRfbRetroScanCore(
+  db: ReturnType<typeof getDb>,
+  params: { limit: number; offset: number; agentIds?: unknown; apply: boolean },
+): Promise<RfbRetroScanCoreResult> {
+  const { limit, offset, agentIds, apply } = params;
   const dryRun = !apply;
 
-  const limit = Math.min(
-    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : RFB_RETRO_SCAN_DEFAULT_LIMIT,
-    RFB_RETRO_SCAN_MAX_LIMIT,
-  );
-
-  // offset: default 0 — reproduces today's exact behavior for any caller
-  // that doesn't pass it. Only meaningful for the auto-select path (the
-  // explicit agentIds override below ignores it entirely, same as today),
-  // but is parsed/validated up front, same shape as GET /admin/agents's own
-  // limit/offset validation above ({error, detail}, 400 on invalid).
-  let offset = 0;
-  const rawOffset = body.offset !== undefined ? body.offset : req.query?.offset;
-  if (rawOffset !== undefined) {
-    // Reject non-scalar values (arrays, objects, booleans, …) up front.
-    // Without this, e.g. body.offset === [5] is not typeof "number", falls
-    // through to parseInt(rawOffset as string, 10), which implicitly
-    // stringifies ([5].toString() === "5") and silently parses to 5.
-    if (typeof rawOffset !== "number" && typeof rawOffset !== "string") {
-      res.status(400).json({ error: "invalid offset", detail: "offset must be a non-negative integer" });
-      return;
-    }
-    const n = typeof rawOffset === "number" ? rawOffset : parseInt(rawOffset as string, 10);
-    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > RFB_RETRO_SCAN_OFFSET_MAX) {
-      res.status(400).json({ error: "invalid offset", detail: "offset must be a non-negative integer" });
-      return;
-    }
-    offset = n;
-  }
-
-  // apply=true + offset>0 is unsound: rfbRetroScanAutoSelectSql()'s WHERE
-  // clause depends on the LIVE value of description/about, and apply mode
-  // nulls exactly those columns. A row nulled on an earlier page drops out
-  // of the eligible set and shifts every later row's position, so a caller
-  // paging with fixed offsets across sequential apply:true calls would
-  // silently skip rows at page boundaries. Offset pagination is only safe
-  // for dry-run scans (the actual discovery use case); apply:true with
-  // offset omitted/0 — a normal small-batch write — is unaffected.
-  if (apply && offset > 0) {
-    res.status(400).json({
-      error: "invalid offset",
-      detail:
-        "offset pagination is only safe for dry-run scans — apply mode may not be combined with a nonzero offset, since applying nulls shifts row positions and can silently skip rows on later pages",
-    });
-    return;
-  }
-
   let targets: RfbRetroScanTarget[];
-  if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
-    const ids = (body.agentIds as unknown[])
+  if (Array.isArray(agentIds) && agentIds.length > 0) {
+    const ids = (agentIds as unknown[])
       .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
       .map((id) => id.trim())
       .slice(0, limit);
@@ -3324,7 +3329,7 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
     deterministic_foreign: 0,
     llm_rejected: 0,
   };
-  const changed: Array<{ agent_id: string; fields: string[]; reasons: Record<string, string> }> = [];
+  const changed: RfbRetroScanChangedEntry[] = [];
   const skippedLocked: string[] = [];
   const skippedCurated: Array<{ agent_id: string; fields: string[] }> = [];
   const errors: Array<{ agent_id: string; error: string }> = [];
@@ -3377,14 +3382,14 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
       }
 
       if (dryRun) {
-        changed.push({ agent_id: t.agent_id, fields: nonCuratedFields, reasons });
+        changed.push({ agent_id: t.agent_id, name: t.name, fields: nonCuratedFields, reasons, cause_classes: causeClasses });
         return;
       }
 
       const written = applyRfbRetroScanNull(db, t.agent_id, nonCuratedFields, reasons);
       if (written.length > 0) {
         for (const f of written) byField[f as "description" | "about"].nulled += 1;
-        changed.push({ agent_id: t.agent_id, fields: written, reasons });
+        changed.push({ agent_id: t.agent_id, name: t.name, fields: written, reasons, cause_classes: causeClasses });
       }
     } catch (e: any) {
       errors.push({ agent_id: t.agent_id, error: e?.message ?? String(e) });
@@ -3396,7 +3401,7 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
     await Promise.all(slice.map((t) => processOne(t)));
   }
 
-  res.json({
+  return {
     dry_run: dryRun,
     scanned,
     offset,
@@ -3407,7 +3412,308 @@ router.post("/retro-scan", async (req: Request, res: Response) => {
     skipped_locked: skippedLocked,
     skipped_curated: skippedCurated,
     errors,
+  };
+}
+
+router.post("/retro-scan", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; offset?: unknown; apply?: unknown };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : RFB_RETRO_SCAN_DEFAULT_LIMIT,
+    RFB_RETRO_SCAN_MAX_LIMIT,
+  );
+
+  // offset: default 0 — reproduces today's exact behavior for any caller
+  // that doesn't pass it. Only meaningful for the auto-select path (the
+  // explicit agentIds override below ignores it entirely, same as today),
+  // but is parsed/validated up front, same shape as GET /admin/agents's own
+  // limit/offset validation above ({error, detail}, 400 on invalid).
+  const rawOffset = body.offset !== undefined ? body.offset : req.query?.offset;
+  const parsedOffset = parseRfbRetroScanOffset(rawOffset);
+  if ("error" in parsedOffset) {
+    res.status(400).json(parsedOffset);
+    return;
+  }
+  const offset = parsedOffset.offset;
+
+  // apply=true + offset>0 is unsound: rfbRetroScanAutoSelectSql()'s WHERE
+  // clause depends on the LIVE value of description/about, and apply mode
+  // nulls exactly those columns. A row nulled on an earlier page drops out
+  // of the eligible set and shifts every later row's position, so a caller
+  // paging with fixed offsets across sequential apply:true calls would
+  // silently skip rows at page boundaries. Offset pagination is only safe
+  // for dry-run scans (the actual discovery use case); apply:true with
+  // offset omitted/0 — a normal small-batch write — is unaffected.
+  if (apply && offset > 0) {
+    res.status(400).json({
+      error: "invalid offset",
+      detail:
+        "offset pagination is only safe for dry-run scans — apply mode may not be combined with a nonzero offset, since applying nulls shifts row positions and can silently skip rows on later pages",
+    });
+    return;
+  }
+
+  const result = await runRfbRetroScanCore(db, { limit, offset, agentIds: body.agentIds, apply });
+  res.json(result);
+});
+
+// ─── dev-request 2026-08-15-tynne-profiler-forbedringsloype (Slice 1) ──────
+// GET /admin/agents/tynne-profiler-cohort + GET /admin/agents/tynne-profiler-
+// queue + the agents_tynne_profiler_queue bookkeeping table (see
+// src/database/init.ts for the CREATE TABLE).
+//
+// Daniel's wish (dev-requests/2026-08-15-tynne-profiler-forbedringsloype.md):
+// profiles the RECALIBRATED judge still flags should be actively IMPROVED,
+// not just re-classified or nulled. Slice 1 is the read-only half only:
+// cohort-read (AC1) + the SAME lock/curated-skip filters retro-scan already
+// applies (AC1's "samme lås-regler som retroskannet") + `no_source`
+// residual-queue bookkeeping (half of AC4). Slice 2 (source-fetch + LLM
+// generation + judge-gate + audit-write) and Slice 3 (quality-sample report)
+// are explicitly NOT built here — see that dev-request's "Implementer-spec"
+// section for the full 3-slice split.
+//
+// NO writes to `agents`/`agent_knowledge` content columns happen anywhere in
+// this section, and no LLM generation call is made — the only LLM call
+// reachable from here is the SAME existing judge call runRfbRetroScanCore
+// already makes (via rfbRetroScanShouldNull -> judgeRfbAboutCandidate) to
+// determine which rows are still flagged; that is reused, not duplicated,
+// and is always invoked here with apply:false (dry-run only — this route
+// does not accept an apply param at all).
+
+/** AC1's own ordering: "prioritert: flagget-begge-felt først, deretter
+ * description-only". Both-fields-flagged outranks description-only, which
+ * outranks about-only. `about_only` is this slice's own addition for
+ * completeness — the dev-request text names only the first two tiers
+ * explicitly, so this ordering choice is worth the reviewer's eyes if a
+ * different tie-break for about-only rows was actually intended. */
+type TynneProfilerPriorityTier = "both_fields" | "description_only" | "about_only";
+
+const TYNNE_PROFILER_PRIORITY_RANK: Record<TynneProfilerPriorityTier, number> = {
+  both_fields: 0,
+  description_only: 1,
+  about_only: 2,
+};
+
+function tynneProfilerPriorityTier(fields: string[]): TynneProfilerPriorityTier {
+  const hasDescription = fields.includes("description");
+  const hasAbout = fields.includes("about");
+  if (hasDescription && hasAbout) return "both_fields";
+  if (hasDescription) return "description_only";
+  return "about_only";
+}
+
+interface AgentTynneProfilerQueueEntry {
+  agent_id: string;
+  agent_name?: string | null;
+  flagged_fields: string[];
+  priority_tier: TynneProfilerPriorityTier;
+  cause: string;
+  cause_classes?: Partial<Record<"description" | "about", RfbRetroScanCauseClass>> | null;
+  reasons?: Record<string, string> | null;
+}
+
+/**
+ * Upsert-on-agent_id ("refresh, don't pile up") — mirrors
+ * upsertAgentOrgNrReviewQueue's exact idiom above. A re-run of the cohort
+ * read updates an already-queued row's snapshot in place (new reasons/cause
+ * classes/priority, `status` reset to 'pending', `last_seen_at` bumped)
+ * rather than accumulating a duplicate row for the same agent.
+ */
+function upsertAgentTynneProfilerQueue(db: ReturnType<typeof getDb>, entry: AgentTynneProfilerQueueEntry): void {
+  db.prepare(
+    `INSERT INTO agents_tynne_profiler_queue
+       (id, agent_id, agent_name, flagged_fields, priority_tier, cause, cause_classes, reasons,
+        status, first_seen_at, last_seen_at)
+     VALUES (@id, @agent_id, @agent_name, @flagged_fields, @priority_tier, @cause, @cause_classes, @reasons,
+             'pending', datetime('now'), datetime('now'))
+     ON CONFLICT(agent_id) DO UPDATE SET
+       agent_name = excluded.agent_name,
+       flagged_fields = excluded.flagged_fields,
+       priority_tier = excluded.priority_tier,
+       cause = excluded.cause,
+       cause_classes = excluded.cause_classes,
+       reasons = excluded.reasons,
+       status = 'pending',
+       last_seen_at = datetime('now')`,
+  ).run({
+    id: uuid(),
+    agent_id: entry.agent_id,
+    agent_name: entry.agent_name ?? null,
+    flagged_fields: JSON.stringify(entry.flagged_fields),
+    priority_tier: entry.priority_tier,
+    cause: entry.cause,
+    cause_classes: entry.cause_classes ? JSON.stringify(entry.cause_classes) : null,
+    reasons: entry.reasons ? JSON.stringify(entry.reasons) : null,
   });
+}
+
+interface AgentTynneProfilerQueueRow {
+  id: string;
+  agent_id: string;
+  agent_name: string | null;
+  flagged_fields: string[];
+  priority_tier: TynneProfilerPriorityTier;
+  cause: string;
+  cause_classes: Partial<Record<"description" | "about", RfbRetroScanCauseClass>> | null;
+  reasons: Record<string, string> | null;
+  status: "pending" | "resolved";
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+/** Defensive JSON parse — malformed/missing JSON becomes the given fallback
+ * rather than throwing, same convention as isRfbFieldCurated above. */
+function parseJsonColumn<T>(raw: string | null, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Read-only listing of the persisted queue, pending rows only, ordered by
+ * AC1's own priority (both_fields first) then oldest-flagged-first within a
+ * tier — mirrors listAgentOrgNrReviewQueue's read-only-listing shape above. */
+function listAgentTynneProfilerQueue(
+  db: ReturnType<typeof getDb>,
+): AgentTynneProfilerQueueRow[] {
+  const rows = db
+    .prepare(
+      `SELECT id, agent_id, agent_name, flagged_fields, priority_tier, cause, cause_classes, reasons,
+              status, first_seen_at, last_seen_at
+         FROM agents_tynne_profiler_queue
+        WHERE status = 'pending'
+        ORDER BY CASE priority_tier
+                   WHEN 'both_fields' THEN 0
+                   WHEN 'description_only' THEN 1
+                   ELSE 2
+                 END ASC,
+                 first_seen_at ASC`,
+    )
+    .all() as Array<{
+      id: string; agent_id: string; agent_name: string | null; flagged_fields: string;
+      priority_tier: TynneProfilerPriorityTier; cause: string; cause_classes: string | null;
+      reasons: string | null; status: "pending" | "resolved"; first_seen_at: string; last_seen_at: string;
+    }>;
+  return rows.map((r) => ({
+    ...r,
+    flagged_fields: parseJsonColumn<string[]>(r.flagged_fields, []),
+    cause_classes: parseJsonColumn<Partial<Record<"description" | "about", RfbRetroScanCauseClass>> | null>(r.cause_classes, null),
+    reasons: parseJsonColumn<Record<string, string> | null>(r.reasons, null),
+  }));
+}
+
+// ─── GET /admin/agents/tynne-profiler-cohort ────────────────────────────────
+// Read-only cohort report: calls runRfbRetroScanCore (the EXISTING
+// retro-scan cascade — same judge, same claimed_at/curated_fields skip
+// logic) forced to dry-run, classifies each flagged row into a priority
+// tier, and records every one of them into agents_tynne_profiler_queue with
+// cause:'no_source' (AC4's residual-queue bookkeeping — Slice 2 does not
+// exist yet, so no source-fetch has actually been attempted for any row;
+// this is bookkeeping structure only, not a claim that a source genuinely
+// doesn't exist). Locked rows (skipped_locked) and curated-locked fields
+// (skipped_curated) never reach the queue at all — the exact same "never
+// even reported as a candidate" discipline retro-scan itself uses.
+router.get("/tynne-profiler-cohort", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+
+  const rawLimit = req.query?.limit;
+  const parsedLimit =
+    typeof rawLimit === "string" && /^\d+$/.test(rawLimit) ? parseInt(rawLimit, 10) : undefined;
+  const limit = Math.min(
+    parsedLimit && parsedLimit > 0 ? parsedLimit : RFB_RETRO_SCAN_DEFAULT_LIMIT,
+    RFB_RETRO_SCAN_MAX_LIMIT,
+  );
+
+  const parsedOffset = parseRfbRetroScanOffset(req.query?.offset);
+  if ("error" in parsedOffset) {
+    res.status(400).json(parsedOffset);
+    return;
+  }
+
+  let agentIds: string[] | undefined;
+  const rawAgentIds = req.query?.agentIds;
+  if (typeof rawAgentIds === "string" && rawAgentIds.trim().length > 0) {
+    agentIds = rawAgentIds.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  }
+
+  const scan = await runRfbRetroScanCore(db, { limit, offset: parsedOffset.offset, agentIds, apply: false });
+
+  const byPriorityTier: Record<TynneProfilerPriorityTier, number> = {
+    both_fields: 0,
+    description_only: 0,
+    about_only: 0,
+  };
+
+  const cohort = scan.changed
+    .map((c) => {
+      const tier = tynneProfilerPriorityTier(c.fields);
+      byPriorityTier[tier] += 1;
+      return {
+        agent_id: c.agent_id,
+        name: c.name,
+        fields: c.fields,
+        priority_tier: tier,
+        reasons: c.reasons,
+        cause_classes: c.cause_classes,
+      };
+    })
+    .sort((a, b) => TYNNE_PROFILER_PRIORITY_RANK[a.priority_tier] - TYNNE_PROFILER_PRIORITY_RANK[b.priority_tier]);
+
+  // Bookkeeping write — the ONLY write this endpoint makes, and it is to
+  // agents_tynne_profiler_queue only, never to `agents`/`agent_knowledge`.
+  for (const row of cohort) {
+    upsertAgentTynneProfilerQueue(db, {
+      agent_id: row.agent_id,
+      agent_name: row.name,
+      flagged_fields: row.fields,
+      priority_tier: row.priority_tier,
+      cause: "no_source",
+      cause_classes: row.cause_classes,
+      reasons: row.reasons,
+    });
+  }
+
+  res.json({
+    dry_run: true,
+    scanned: scan.scanned,
+    offset: scan.offset,
+    total_eligible: scan.total_eligible,
+    cohort_count: cohort.length,
+    by_priority_tier: byPriorityTier,
+    by_cause_class: scan.by_cause_class,
+    cohort,
+    skipped_locked: scan.skipped_locked,
+    skipped_curated: scan.skipped_curated,
+    errors: scan.errors,
+    queue_recorded: cohort.length,
+  });
+});
+
+// ─── GET /admin/agents/tynne-profiler-queue ─────────────────────────────────
+// Read-only listing of the durable queue the cohort route above writes to —
+// the counterpart to GET /org-nr-review-queue above. Lets a caller (e.g. the
+// daily-brief routine, a future Slice 2/3) see the current pending backlog
+// without re-running the (LLM-calling) cohort scan.
+router.get("/tynne-profiler-queue", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  const entries = listAgentTynneProfilerQueue(db);
+  res.json({ count: entries.length, entries });
 });
 
 export default router;
