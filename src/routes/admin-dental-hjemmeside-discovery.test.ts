@@ -93,7 +93,13 @@
  *       (q5); approve stamps field_provenance.hjemmeside.source_type
  *       correctly from the queue row's own `reason`:
  *       'search_verified_website' for 'navnesok_fallback', unchanged
- *       'brreg_registered_website' for 'brreg_field' (q6).
+ *       'brreg_registered_website' for 'brreg_field' (q6); tier 2's own
+ *       evidence gate rejects phone+name-only search-hit evidence just like
+ *       tier 1's (c2) does, proving it is not a passthrough of
+ *       evidence.verified (q7); once tier 1 already queued a candidate,
+ *       tier 2 is NEVER attempted — even with a search seam wired that would
+ *       (if ever called) return a different, independently-verifiable
+ *       candidate (q8).
  *
  * Two ways to run:
  *   1. Standalone: npx tsx src/routes/admin-dental-hjemmeside-discovery.test.ts
@@ -738,6 +744,85 @@ export async function runAdminDentalHjemmesideDiscoveryTests(
       assertEq(applyBrreg.body.applied_count, 1, "q6c: brreg_field-tagged row applies successfully");
       const provBrreg = JSON.parse(readClinic("wd-nav-approve-brreg").field_provenance).hjemmeside;
       assertEq(provBrreg.source_type, "brreg_registered_website", "q6d: brreg_field-tagged row still writes source_type='brreg_registered_website' (unchanged from the existing leg's own regression coverage in (l10))");
+    }
+
+    // (q7) tier-2 evidence gate — the SAME phone+name-only-without-org_nr/
+    // place fixture pattern as tier 1's own (c2) above, mirrored onto the
+    // search leg: the search hit's page carries phone_found + name_found
+    // evidence (so gardssalgWebsiteEvidenceMatch's own looser `verified`
+    // would be TRUE, per its own `phoneFound && (nameFound || placeFound)`
+    // branch) but NOT org_nr_found and NOT (name_found && place_found) — so
+    // processDentalWdSearchLeg's own gate (mirrors processDentalWdBrregLeg's,
+    // deliberately narrower than `verified`) must reject it. Proves the SAME
+    // bug class (c2's own comment: "PR #600 review: swapping the strict gate
+    // for evidence.verified passed all other tests unnoticed") is now also
+    // caught on tier 2's own copy of the gate, not just tier 1's.
+    {
+      seedClinic({ id: "wd-nav-phone-only", navn: "Lyngen Tannlege", org_nr: "394949494", poststed: "Alta", telefon: "90112233" });
+      // No brregFixtures entry for 394949494 -> tier 1 = no_brreg_website.
+      pageFixtures.set(
+        "https://lyngen-info.no",
+        htmlResponse("<html><body>Lyngen Tannlege — ring oss på 901 12 233 for time.</body></html>", {
+          finalUrl: "https://lyngen-info.no",
+        }),
+      );
+      routeMod.__setDentalWdSearchForTesting(async () => [
+        { title: "Lyngen Tannlege", url: "https://lyngen-info.no", description: "" },
+      ]);
+      try {
+        const r = await postDiscovery({ agentIds: ["wd-nav-phone-only"] });
+        const entry = (r.body.results as any[]).find((e) => e.agent_id === "wd-nav-phone-only");
+        assertEq(entry?.status, "no_brreg_website", "q7a: phone+name-only search-hit evidence -> ORIGINAL tier-1 skip status ('no_brreg_website') preserved, NOT queued (narrower than evidence.verified, mirrors c2 for tier 2)");
+        assertEq(entry?.search_attempted, true, "q7b: search_attempted true — tier 2 actually ran and evaluated the candidate");
+        assertTrue(!readQueueRow("wd-nav-phone-only"), "q7c: nothing queued for the phone+name-only search hit");
+      } finally {
+        routeMod.__setDentalWdSearchForTesting(null);
+      }
+    }
+
+    // (q8) tier-1-already-queued short circuit: when tier 1 already queued a
+    // candidate for this row, tier 2 must NEVER run — even when a search
+    // seam IS wired. The wired stub here would (if ever invoked) return a
+    // DIFFERENT, independently-verifiable candidate host — proving this
+    // isn't merely "tier 2 also found nothing", but that tier 2 is never
+    // attempted at all once tier 1 has already succeeded.
+    {
+      seedClinic({ id: "wd-tier1-then-search", navn: "Bjerke Tannlege", org_nr: "404040404", poststed: "Kristiansund" });
+      brregFixtures.set("404040404", { hjemmeside: "https://bjerketannlege.no" });
+      pageFixtures.set(
+        "https://bjerketannlege.no",
+        htmlResponse("<html><body>Bjerke Tannlege — org.nr 404 040 404</body></html>", {
+          finalUrl: "https://bjerketannlege.no",
+        }),
+      );
+      // If tier 2 were ever reached, this alternate host would ALSO verify
+      // (org_nr_found) and get queued in tier 1's place — so a successful
+      // "nothing changed" assertion below genuinely proves the short circuit
+      // fired, not just that tier 2 happened to find nothing.
+      pageFixtures.set(
+        "https://different-verified-site.no",
+        htmlResponse("<html><body>Bjerke Tannlege — org.nr 404 040 404</body></html>", {
+          finalUrl: "https://different-verified-site.no",
+        }),
+      );
+      const searchCallsQ8: string[] = [];
+      routeMod.__setDentalWdSearchForTesting(async (query: string) => {
+        searchCallsQ8.push(query);
+        return [{ title: "Bjerke Tannlege (alternate)", url: "https://different-verified-site.no", description: "" }];
+      });
+      try {
+        const r = await postDiscovery({ agentIds: ["wd-tier1-then-search"] });
+        const entry = (r.body.results as any[]).find((e) => e.agent_id === "wd-tier1-then-search");
+        assertEq(entry?.status, "queued", "q8a: tier 1 already queued -> still queued");
+        assertEq(entry?.candidate_url, "https://bjerketannlege.no", "q8b: queued candidate is tier 1's OWN candidate, untouched — not tier 2's alternate host");
+        assertEq(entry?.search_attempted, false, "q8c: search_attempted false — tier 2 never attempted once tier 1 already queued");
+        assertEq(searchCallsQ8.length, 0, "q8d: the search seam's own call counter stays at 0 — braveSearch/searchFn is NEVER invoked when tier 1 already queued");
+        const row = readQueueRow("wd-tier1-then-search");
+        assertEq(row.reason, "brreg_field", "q8e: queue row still tagged reason='brreg_field' — never overwritten by a tier-2 upsert");
+        assertEq(row.candidate_url, "https://bjerketannlege.no", "q8f: queue row candidate_url is tier 1's own, unchanged");
+      } finally {
+        routeMod.__setDentalWdSearchForTesting(null);
+      }
     }
   } catch (err: any) {
     failed++;
