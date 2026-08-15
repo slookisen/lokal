@@ -73,6 +73,7 @@ import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extracti
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
+import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
@@ -694,6 +695,22 @@ app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRout
 // only the contaminated field(s) and flags needs_review for re-enrichment.
 // dry-run by default, apply:true writes. POST /admin/dental/schema-probe-sweep
 app.use("/admin/dental/schema-probe-sweep", adminLimiter, adminDentalSchemaProbeSweepRoutes);
+// dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3 (Brreg-
+// field leg): discovers + verifies a candidate homepage from Brreg's own
+// registered hjemmeside field for org_nr-known, hjemmeside-blank clinics,
+// queues verified candidates (dental_website_review_queue) — never writes
+// dental_agents.hjemmeside directly. Approve is a separate, explicit,
+// dry-run-default call. POST /admin/dental/hjemmeside-discovery-batch,
+// POST /admin/dental/hjemmeside-discovery-approve.
+// Mounted at the bare "/admin/dental" prefix (this router only defines the
+// two specific sub-paths above) — MUST stay registered LAST among every
+// "/admin/dental/*" mount: Express falls through an unmatched prefix mount
+// to the next app.use, but adminLimiter still increments on the way through,
+// so registering this any earlier double-charges every later sibling's rate
+// limit on every request (caught in PR #600 review — reproduced: one POST to
+// schema-probe-sweep left only 498/500 remaining when this was mounted
+// before it).
+app.use("/admin/dental", adminLimiter, adminDentalHjemmesideDiscoveryRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls

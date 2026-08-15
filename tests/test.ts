@@ -38694,3 +38694,45 @@ runSerial(async () => {
     failures.push("admin-bm-producer-harvest: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3 (Brreg-
+// field leg): POST /admin/dental/hjemmeside-discovery-batch + POST
+// /admin/dental/hjemmeside-discovery-approve. Registered here, at the TAIL
+// of the runSerial() chain (not sequentially inside the older, un-serialized
+// dental-* IIFE a few thousand lines up, alongside hjemmeside-cleanup/mark-
+// inactive), deliberately: this route imports services/experience-store.ts
+// (gardssalgWebsiteEvidenceMatch/gardssalgPageText), and that module's own
+// require.cache entry is repeatedly deleted+refreshed by dozens of
+// opplevelser-*.test.ts blocks earlier in this file (grep
+// `require.resolve(".*experience-store")` — none of those cachePaths
+// include it, so ITS eviction/reload timing is driven entirely by whichever
+// concurrent block happens to touch it). Empirically verified (2026-08-15):
+// inserting so much as a bare `require("../src/services/experience-store")`
+// into the older un-serialized IIFE — with NO route logic, no DB touch, no
+// await, nothing but the require() call itself — deterministically broke
+// opplevelser-providers-recently-enriched's later, unrelated homepage-
+// provenance assertions (w1-w6a) purely by shifting when THIS file's own
+// eviction of experience-store.ts's cache entry happens relative to that
+// suite's own fresh db-factory + opplevelser.ts reload. This is the same
+// class of "shifted timing exposes a pre-existing race" hazard this file's
+// own SHARED GLOBAL STATE header (~line 27) documents as NOT fully fixed for
+// the DB-singleton family — not a bug this route or its test introduces.
+// Registering here instead — after every block that already depends on
+// experience-store.ts's cache state — reproducibly avoids it (verified: full
+// suite green both immediately before and after this block in this
+// position, across repeated runs).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-15-dental-hjemmeside-brreg-navnesoek, item 3: POST /admin/dental/hjemmeside-discovery-batch + -approve ──");
+  try {
+    const { runAdminDentalHjemmesideDiscoveryTests } = require("../src/routes/admin-dental-hjemmeside-discovery.test") as
+      typeof import("../src/routes/admin-dental-hjemmeside-discovery.test");
+    const dhd = await runAdminDentalHjemmesideDiscoveryTests({ log: false });
+    passed += dhd.passed;
+    failed += dhd.failed;
+    for (const f of dhd.failures) failures.push("admin-dental-hjemmeside-discovery: " + f);
+    console.log(`  admin-dental-hjemmeside-discovery: ${dhd.passed} passed, ${dhd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-hjemmeside-discovery: unexpected error: " + String(err?.message || err));
+  }
+});
