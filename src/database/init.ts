@@ -4048,6 +4048,53 @@ function initSchema(db: Database.Database): void {
     console.error("Migration outreach_daily_send_cap failed:", err);
   }
 
+  // ─── dev-request 2026-08-15-tynne-profiler-forbedringsloype (Slice 1) ────
+  // agents_tynne_profiler_queue: the residual/tracking queue for the
+  // "tynne/flaggede profiler" improvement loop. Slice 1 is READ-ONLY against
+  // `agents`/`agent_knowledge` (no source-fetch, no LLM generation, no
+  // description/about writes yet — that's Slice 2) — this table is purely
+  // the bookkeeping structure GET /admin/agents/tynne-profiler-cohort writes
+  // to: one row per currently-flagged agent (per the recalibrated judge via
+  // the EXISTING POST /admin/agents/retro-scan dry-run cascade), recording
+  // WHY it's still pending (`cause` — this slice only ever writes
+  // 'no_source', since no source-fetch has been attempted yet; the column
+  // stays open for Slice 2's other cause classes, e.g. once a source is
+  // fetched but the generated candidate still fails the judge) and its
+  // outreach priority tier (both fields flagged > description-only >
+  // about-only, per the dev-request's own AC1 ordering).
+  //
+  // Mirrors agents_org_nr_review_queue's shape/idiom exactly (see that
+  // table above): UNIQUE(agent_id) + upsert-on-agent_id ("refresh, don't
+  // pile up" — a re-run of the cohort read updates an already-queued row in
+  // place rather than accumulating duplicates), FK ON DELETE CASCADE, a
+  // `status` column so a future slice can flip a row to 'resolved' once a
+  // source-backed rewrite actually clears the judge (AC4: "re-forsøkes når
+  // hjemmesidejakt-løypa finner nettsted" — retried later, not abandoned).
+  // `flagged_fields`/`cause_classes`/`reasons` are JSON, same
+  // defensive-parse-on-read convention used throughout this file.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agents_tynne_profiler_queue (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL UNIQUE,
+        agent_name TEXT,
+        flagged_fields TEXT NOT NULL,
+        priority_tier TEXT NOT NULL CHECK(priority_tier IN ('both_fields', 'description_only', 'about_only')),
+        cause TEXT NOT NULL DEFAULT 'no_source',
+        cause_classes TEXT,
+        reasons TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'resolved')),
+        first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_tynne_profiler_queue_status ON agents_tynne_profiler_queue(status)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_tynne_profiler_queue_priority ON agents_tynne_profiler_queue(priority_tier)`);
+  } catch (err) {
+    console.error("Migration agents_tynne_profiler_queue failed:", err);
+  }
+
 }
 
 export function closeDb(): void {

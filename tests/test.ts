@@ -33167,6 +33167,26 @@ const _rfbAgentsRetroScanPromise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("admin-agents-retro-scan: unexpected error: " + String(err?.message || err));
+  }
+
+  // dev-request 2026-08-15-tynne-profiler-forbedringsloype, Slice 1: the
+  // cohort-read + no_source residual-queue endpoints built on TOP of
+  // runRfbRetroScanCore (factored out of the retro-scan handler just
+  // above) — same in-memory-DB-singleton-swap discipline as retro-scan
+  // itself, so it runs SEQUENTIALLY right after it in this same chain link
+  // rather than as a separate barrier entry.
+  console.log("\n── dev-request 2026-08-15-tynne-profiler-forbedringsloype (Slice 1): agents/tynne-profiler-cohort ──");
+  try {
+    const { runAdminAgentsTynneProfilerCohortTests } = require("../src/routes/admin-agents-tynne-profiler-cohort.test") as
+      typeof import("../src/routes/admin-agents-tynne-profiler-cohort.test");
+    const tpc = await runAdminAgentsTynneProfilerCohortTests({ log: false });
+    passed += tpc.passed;
+    failed += tpc.failed;
+    for (const f of tpc.failures) failures.push("admin-agents-tynne-profiler-cohort: " + f);
+    console.log(`  admin-agents-tynne-profiler-cohort: ${tpc.passed} passed, ${tpc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-tynne-profiler-cohort: unexpected error: " + String(err?.message || err));
   } finally {
     _rfbAgentsRetroScanResolve();
   }
