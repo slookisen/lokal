@@ -38815,3 +38815,26 @@ runSerial(async () => {
     failures.push("admin-dental-hjemmeside-discovery: unexpected error: " + String(err?.message || err));
   }
 });
+
+// 2026-08-15 (session, Daniel-observed live bug): the "Ny e-post" compose
+// modal in admin-crm.html never sent `vertical`, so every manual dashboard
+// send 400'd against composeSchema's required-no-default vertical (the
+// fail-closed half of the 2026-07-27 platform split). Static source-level
+// guards on the HTML/inline-JS — no DB, no route import, no shared module
+// cache touched, so position in the chain is not load-bearing (tail chosen
+// only to match convention).
+runSerial(async () => {
+  console.log("\n── 2026-08-15 compose-modal vertical fix: admin-crm.html static guards ──");
+  try {
+    const { runAdminCrmComposeVerticalTests } = require("../src/routes/admin-crm-compose-vertical.test") as
+      typeof import("../src/routes/admin-crm-compose-vertical.test");
+    const accv = await runAdminCrmComposeVerticalTests({ log: false });
+    passed += accv.passed;
+    failed += accv.failed;
+    for (const f of accv.failures) failures.push("admin-crm-compose-vertical: " + f);
+    console.log(`  admin-crm-compose-vertical: ${accv.passed} passed, ${accv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-crm-compose-vertical: unexpected error: " + String(err?.message || err));
+  }
+});
