@@ -9076,19 +9076,39 @@ ${browseFooter()}
 </html>`);
 });
 
+// dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
+// (delt header/footer): the 404 catch-all adopts the shared S1 chrome
+// (oaSiteNav()/oaSiteFooter()/BROWSE_CSS/OA_CHROME_CSS — hamburger nav + full
+// footer), same "no matching OaNavActive item" precedent as the
+// /tilbyder/:providerSlugOrId page (PR #619): oaSiteNav() is called with no
+// `active` set. This is a real HTTP 404 — status code and Content-Type stay
+// exactly as before; only the body's markup is upgraded.
 router.use((_req: Request, res: Response) => {
   res.status(404);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  const main = `
+  <div class="head" style="text-align:center;padding:64px 0">
+    <h1>Siden finnes ikke</h1>
+    <p class="lede">Vi fant ikke siden du leter etter. Gå til forsiden eller prøv discovery-API-et.</p>
+    <p><a href="/">Til forsiden</a> &middot; <a href="/api/opplevelser/discover">Discovery-API</a></p>
+  </div>`;
   res.send(`<!doctype html>
-<html lang="no"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Side ikke funnet (404) — Opplevagent</title>
-<style>body{font-family:system-ui,sans-serif;background:#f7faf6;color:#1a2b1f;max-width:600px;margin:0 auto;padding:80px 20px;text-align:center}a{color:#1f6f43}</style>
-</head><body>
-<h1>Siden finnes ikke</h1>
-<p>Vi fant ikke siden du leter etter. Gå til forsiden eller prøv discovery-API-et.</p>
-<p><a href="/">Til forsiden</a> &middot; <a href="/api/opplevelser/discover">Discovery-API</a></p>
-</body></html>`);
+<meta name="robots" content="noindex, follow">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>${BROWSE_CSS}${OA_CHROME_CSS}</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+${oaSiteNav({})}
+<main id="main" class="container">${main}</main>
+${oaSiteFooter({})}
+</body>
+</html>`);
 });
 
 export default router;
