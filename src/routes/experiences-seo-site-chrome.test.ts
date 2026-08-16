@@ -40,6 +40,11 @@
  *       slices): each renders the hamburger toggle (id="oa-nav-toggle") AND
  *       the full shared footer (llms.txt + personvern links), i.e. none of
  *       them silently stayed on the old slim BROWSE_NAV/browseFooter() chrome.
+ *   (j) dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
+ *       arbeidspunkt 3, 404 sub-slice: the catch-all 404 handler also adopts
+ *       the shared chrome (hamburger toggle + full footer) while remaining a
+ *       REAL HTTP 404 (status 404, text/html Content-Type), and keeps its
+ *       original two links ("/" and the discovery API) intact.
  *
  * Same synthetic-req/res harness + in-memory-DB pattern as
  * experiences-seo-sok-gardssalg.test.ts.
@@ -327,6 +332,16 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
         assertTrue(res.body.includes('href="/llms.txt"'), `i4-${r.name}: footer links llms.txt`);
         assertTrue(res.body.includes('href="/personvern"'), `i5-${r.name}: footer links /personvern`);
       }
+      // ── (j) 404 catch-all: shared chrome + still a real 404 ───────────
+      const notFound = await callHtmlRoute(seoRouter, "/this-path-does-not-exist-xyz");
+      assertTrue(notFound.handled && notFound.status === 404, `j1: unknown path renders status 404 (got ${notFound.status})`);
+      assertTrue(notFound.body.includes('id="oa-nav-toggle"'), "j2: 404 page has the #oa-nav-toggle hamburger checkbox");
+      assertTrue(notFound.body.includes('class="site-footer"'), "j3: 404 page has the full .site-footer (not a hand-rolled minimal footer)");
+      assertTrue(notFound.body.includes('href="/llms.txt"'), "j4: 404 footer links llms.txt");
+      assertTrue(notFound.body.includes('href="/personvern"'), "j5: 404 footer links /personvern");
+      assertTrue(notFound.body.includes('href="/"'), "j6: 404 page keeps its original link back to the front page");
+      assertTrue(notFound.body.includes('href="/api/opplevelser/discover"'), "j7: 404 page keeps its original link to the discovery API");
+      assertTrue(notFound.body.includes("Siden finnes ikke"), "j8: 404 page keeps its original message");
     } catch (err: any) {
       failed++;
       failures.push("experiences-seo-site-chrome: unexpected error: " + String(err?.stack || err?.message || err));
