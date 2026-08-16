@@ -6788,7 +6788,28 @@ const GARDSSALG_AUTOSVAR_REDIRECT_PHRASES: string[] = [
   "kontakt i stedet",
 ];
 
-const GARDSSALG_AUTOSVAR_EMAIL_REGEX = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+// Bounded local-part/domain quantifiers (defense in depth alongside the
+// GARDSSALG_AUTOSVAR_SCAN_TEXT_MAX_CHARS truncation applied before matching,
+// below): the original unbounded `+` quantifiers let an attacker-controlled
+// inbound message body (untrusted external gårdsalg-contact email content,
+// with no length cap anywhere upstream of this regex) trigger catastrophic
+// backtracking on a long run of local-part-like characters with no nearby
+// `@` — measured quadratic (n=5000 -> 26ms, n=10000 -> 103ms, n=20000 ->
+// 405ms, n=40000 -> 1668ms), and pegged CPU on a realistic ~1MB message body
+// driven through the real route. Bounds below mirror real email length
+// limits (local part max 64 chars; this domain-part bound is intentionally
+// looser than the 253-char RFC total since it also has to admit multiple
+// dot-separated labels, not just one) — generous enough to never affect a
+// genuine address, tight enough to cap worst-case backtracking cost.
+const GARDSSALG_AUTOSVAR_EMAIL_REGEX = /[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}/g;
+
+// This is a review-queue detection heuristic, not a legal-completeness
+// requirement — a genuine autosvar redirect phrase+email always appears near
+// the top of a short auto-reply, never buried past 20-50KB into a message.
+// Truncating the text handed to findAutosvarCandidateInText() to this bound
+// caps the regex's worst-case input size regardless of how large the stored
+// body_text/body_html actually is, losing essentially no real signal.
+const GARDSSALG_AUTOSVAR_SCAN_TEXT_MAX_CHARS = 20000;
 
 // Diagnostic-only HTML->text fallback for when body_text is blank. Not a
 // security-sensitive render path (nothing here is ever rendered as HTML,
@@ -6952,7 +6973,14 @@ router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: R
             : "";
       if (!rawText) continue;
 
-      const hit = findAutosvarCandidateInText(rawText);
+      // Truncate BEFORE phrase/email matching — see
+      // GARDSSALG_AUTOSVAR_SCAN_TEXT_MAX_CHARS doc comment above. rawText is
+      // untrusted inbound-email content with no length cap upstream of this
+      // route, so this bounds the worst-case input size handed to the regex
+      // regardless of how large the stored message body actually is.
+      const scanText = rawText.slice(0, GARDSSALG_AUTOSVAR_SCAN_TEXT_MAX_CHARS);
+
+      const hit = findAutosvarCandidateInText(scanText);
       if (!hit) continue;
 
       let classification: Classification;

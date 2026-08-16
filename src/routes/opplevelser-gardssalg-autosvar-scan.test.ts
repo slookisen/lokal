@@ -33,6 +33,13 @@
  *   (j) zero writes: re-read the experience_providers row and the
  *       crm_messages row count before/after the scan and confirm both are
  *       byte-identical — this route must never write anything anywhere
+ *   (k) ReDoS regression: a message body with a very long run of
+ *       email-local-part-like characters and no nearby "@" (adversarial
+ *       input modeled on untrusted inbound gårdsalg-contact email content)
+ *       must not make GARDSSALG_AUTOSVAR_EMAIL_REGEX catastrophically
+ *       backtrack — the scan must complete quickly, AND a genuine
+ *       phrase+email elsewhere in the same (truncated) body must still be
+ *       correctly detected as a candidate
  *
  * Exported runOpplevelserGardssalgAutosvarScanTests({log}) -> TestSummary;
  * wired into tests/test.ts. Standalone:
@@ -347,6 +354,44 @@ export function runOpplevelserGardssalgAutosvarScanTests(
       assertEq(okPaged.body.pagination.offset, 0, "i7: pagination.offset echoes the request");
       assertTrue(okPaged.body.pagination.total >= 6, "i8: pagination.total counts the full base pool, not just this page");
       assertEq(okPaged.body.scanned, 2, "i9: scanned equals the page size, not the full pool");
+
+      // ── (k) ReDoS regression ─────────────────────────────────────────────
+      // Adversarial body modeled on the reviewer's repro: a genuine
+      // phrase+email near the top (within the truncation window applied by
+      // the route before matching), followed by a long run of
+      // email-local-part-like characters with no "@" nearby (15,000 chars,
+      // still inside the truncation window — so this specifically exercises
+      // the bounded-quantifier regex fix, not just the truncation), followed
+      // by a much larger run (200,000 more chars) that pushes the total body
+      // size well past the truncation bound, exercising that defense too.
+      // Against the OLD unbounded regex with NO truncation, a body shaped
+      // like this drives catastrophic backtracking (quadratic: n=20000 ->
+      // ~400ms, n=200000+ -> many seconds/minutes) and pegs the single
+      // Node process's CPU for the whole request. With both fixes in place
+      // this must complete in well under a second.
+      mkProvider({ id: "prov-redos", navn: "ReDoS Regresjon Gård", hjemmeside: "https://redostest.no", epost: "post@redostest.no" });
+      const redosJunkShort = "a".repeat(15000); // within the truncation window
+      const redosJunkLong = "c".repeat(200000); // pushes body well past the truncation window
+      mkInboundMessage({
+        providerId: "prov-redos",
+        contactEmail: "post@redostest.no",
+        bodyText:
+          "Ny kontaktperson er redos-test@redostest.no. " + redosJunkShort + " " + redosJunkLong,
+        sentAt: "2026-08-08 09:00:00",
+      });
+
+      const redosStart = Date.now();
+      const redosRes = await callRoute(opplevelserRouter, { headers: auth, query: {} });
+      const redosElapsedMs = Date.now() - redosStart;
+      assertTrue(
+        redosElapsedMs < 2000,
+        `k1: scan with adversarial long-run body completes quickly (took ${redosElapsedMs}ms, expected < 2000ms)`,
+      );
+      assertEq(redosRes.status, 200, "k2: scan with adversarial body still returns 200");
+      const redosCandidate = (redosRes.body.candidates as any[]).find((c) => c.provider_id === "prov-redos");
+      assertTrue(!!redosCandidate, "k3: genuine candidate in the adversarial body is still detected");
+      assertEq(redosCandidate?.candidate_email, "redos-test@redostest.no", "k4: genuine candidate_email extracted correctly despite the surrounding junk");
+      assertEq(redosCandidate?.classification, "domain_match", "k5: genuine candidate classified correctly (domain_match)");
 
       // ── (j) zero writes ──────────────────────────────────────────────────
       const providerBefore = getProviderRow("prov-match");
