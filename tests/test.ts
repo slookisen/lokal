@@ -38908,3 +38908,26 @@ runSerial(async () => {
     failures.push("gardssalg-outreach-template-variant: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1
+// (slice 6): the homepage .cat-grid no longer shows a gårdssalg entry from
+// ANY source (synthetic injection removed + a defensive filter on a genuine
+// DB-literal "gardssalg"/"gårdssalg" category row), and the #drikkested
+// section's CTA copy is state-driven (dark-launch vs live, both languages).
+// Reloads db-factory/experience-store/booking-store/experiences-seo, same
+// tail-position convention as the neighbouring blocks above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1: forside-seksjonering (gårdssalg-kort fjernet fra cat-grid + state-drevet drikkested-CTA) ──");
+  try {
+    const { runExperiencesSeoForsideSeksjoneringTests } = require("../src/routes/experiences-seo-forside-seksjonering.test") as
+      typeof import("../src/routes/experiences-seo-forside-seksjonering.test");
+    const esfs = await runExperiencesSeoForsideSeksjoneringTests({ log: false });
+    passed += esfs.passed;
+    failed += esfs.failed;
+    for (const f of esfs.failures) failures.push("experiences-seo-forside-seksjonering: " + f);
+    console.log(`  experiences-seo-forside-seksjonering: ${esfs.passed} passed, ${esfs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-forside-seksjonering: unexpected error: " + String(err?.message || err));
+  }
+});

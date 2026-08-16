@@ -2568,6 +2568,31 @@ export function countGardssalgProvidersByType(): Array<{ producer_type: string |
     .all() as Array<{ producer_type: string | null; count: number }>;
 }
 
+// Bookable subset of countGardssalgProviders()'s SAME provider set — same
+// WHERE clause (parens around the OR load-bearing, see that function's own
+// comment) plus a booking_live = 1 filter. dev-request 2026-07-19-
+// opplevagent-forside-seksjoner-design, arbeidspunkt 1 (slice 6): feeds the
+// homepage #drikkested feature section's dark-launch-vs-live CTA copy — the
+// section is "live" only when this count is > 0 AND bookingDispatchEnabled()
+// (src/services/booking-store.ts) is also true; the caller decides that
+// combination, this function only reports the real-provider booking_live=1
+// count. catalog_hidden=1 rows (the hidden booking-flyt-v1 test provider)
+// are excluded, same as every other gårdssalg count in this file — a hidden
+// test provider must never flip the section into "live" copy. Read-only; no
+// join, very fast.
+export function countGardssalgProvidersBookable(): number {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) AS c FROM experience_providers " +
+      "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) " +
+      "AND booking_live = 1"
+    )
+    .get() as { c: number };
+  return row.c;
+}
+
 export type GardssalgProviderRow = {
   id: string;
   navn: string;
