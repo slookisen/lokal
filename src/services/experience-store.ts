@@ -4320,6 +4320,112 @@ export function applyGardssalgProviderContact(
   return written;
 }
 
+export type GardssalgSetContactEmailResult =
+  | { ok: true; old_value: string | null; new_value: string }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "domain_mismatch"; website_domain: string; email_domain: string };
+
+/**
+ * Correct an already-filled (or blank) gårdssalg provider `epost`, unlike
+ * applyGardssalgProviderContact above which is strictly fill-only. Backs
+ * POST /admin/gardssalg-set-contact-email — the missing "correct a
+ * wrong-but-filled value" path (e.g. an autoresponder reports the old
+ * contact person left and gives a new address).
+ *
+ * Domain check: when the provider has an established hjemmeside on file, the
+ * new email's registrable domain must match the hjemmeside's registrable
+ * domain unless `force` is true — same eTLD+1 comparison
+ * (hostFromUrlLike + registrableDomain) used elsewhere in this file. A
+ * provider with no hjemmeside has no evidence to contradict, so the write
+ * proceeds regardless of `force`.
+ *
+ * NOTE: deliberately does NOT check content_source ('manual'/'claim') the
+ * way applyGardssalgProviderContact does — that lock-guard was considered
+ * for this slice and left out of scope on purpose (see PR description).
+ *
+ * Write discipline mirrors applyGardssalgProviderContact: pre-write
+ * old_value snapshot, read-merge-write field_provenance (malformed/missing
+ * JSON treated as {} rather than clobbered), one gardssalg_content_audit row,
+ * all inside a single transaction.
+ */
+export function applyGardssalgSetContactEmail(
+  providerId: string,
+  email: string,
+  source: string,
+  force: boolean
+): GardssalgSetContactEmailResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, epost, hjemmeside, content_source, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        epost: string | null;
+        hjemmeside: string | null;
+        content_source: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // ── domain check (only when the provider has an established hjemmeside) ──
+  if (row.hjemmeside && row.hjemmeside.trim() !== "") {
+    const websiteHost = hostFromUrlLike(row.hjemmeside);
+    const websiteDomain = websiteHost ? registrableDomain(websiteHost) : null;
+    if (websiteDomain) {
+      const emailHost = hostFromUrlLike(email.split("@").pop() || "");
+      const emailDomain = emailHost ? registrableDomain(emailHost) : "";
+      if (emailDomain !== websiteDomain && force !== true) {
+        return {
+          ok: false,
+          reason: "domain_mismatch",
+          website_domain: websiteDomain,
+          email_domain: emailDomain,
+        };
+      }
+    }
+  }
+
+  const oldValue = row.epost;
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.epost = { source_url: source, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET epost = @email, field_provenance = @field_provenance WHERE id = @id`
+    ).run({ id: providerId, email, field_provenance: JSON.stringify(provenance) });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'epost', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: email,
+      source_url: source,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: email };
+}
+
 // ─── Gårdssalg org_nr backfill (dev-request 2026-07-18-gardssalg-
 // profilkvalitet-foer-outreach, slice 5b) ────────────────────────────────────
 // Slice 4's batch report found 0/74 gårdssalg providers have org_nr set —
