@@ -63,10 +63,17 @@ function isProtected(filename) {
   return PROTECTED.some((re) => re.test(filename));
 }
 
+// github.rest.pulls.listFiles's per-file `patch` field is hunks-only (starts
+// at the first `@@ ... @@` marker) — it never carries +++/--- headers, so
+// there is no doubled-prefix header line to filter out here. Do not
+// reintroduce a `!l.startsWith(prefix + prefix)` guard: it silently drops
+// any added/removed line whose CONTENT itself starts with a literal +/- at
+// column 0 (caught in review, dev-request 2026-08-16-fleet-auto-approve-
+// protected-innholdsbasert-deteksjon — see test case below).
 function patchLines(patch, prefix) {
   return (patch || '')
     .split('\n')
-    .filter((l) => l.startsWith(prefix) && !l.startsWith(prefix + prefix))
+    .filter((l) => l.startsWith(prefix))
     .join('\n');
 }
 
@@ -205,6 +212,22 @@ checkContent(
   'a purely unrelated diff is not flagged',
   ['@@ -1,3 +1,3 @@', '-const x = 1;', '+const x = 2;'].join('\n'),
   false,
+);
+
+// Regression (caught in review before merge): patchLines() must NOT drop a
+// line whose CONTENT itself starts with the same character as the diff's
+// own +/- marker — e.g. content "-ADMIN_KEY;" on a removed line reads as
+// "--ADMIN_KEY;" (diff marker + content), and content "+ADMIN_KEY;" on an
+// added line reads as "++ADMIN_KEY;". There is no +++/--- header in
+// listFiles's per-file `patch` field to guard against (that only exists in
+// a raw `git diff`), so an earlier version's doubled-prefix filter was
+// solving a problem that cannot occur here while silently dropping exactly
+// these real content lines (unindented code, markdown-bullet-shaped
+// content) — a false negative in the very detection this file exists to test.
+checkContent(
+  'a removed/added line whose content itself starts with -/+ (doubles the diff marker) is still matched',
+  ['@@ -1,1 +1,1 @@', '--ADMIN_KEY;', '++ADMIN_KEY;'].join('\n'),
+  true,
 );
 
 // ── AC2/Slice B: needs_daniel is a hard stop wherever the fleet records it ──

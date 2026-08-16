@@ -182,13 +182,22 @@ jobs:
               /res\.setHeader\(\s*['"]Set-Cookie['"]/i,
               /process\.env\.[A-Z_]*(SECRET|KEY|TOKEN|PASS)\b/,
             ];
-            // patchLines(prefix) pulls only real +/- content lines from a unified
-            // diff hunk (excludes the +++/--- file-header lines, which always start
-            // with the same prefix doubled).
+            // patchLines(prefix) pulls the +/- content lines from a file's patch.
+            // github.rest.pulls.listFiles's per-file `patch` field is hunks-only
+            // (starts at the first `@@ ... @@` marker) — unlike a raw `git diff`,
+            // it never carries `+++ b/file` / `--- a/file` headers, so there is no
+            // doubled-prefix header line to filter out here. (An earlier version of
+            // this helper excluded lines starting with the prefix doubled on the
+            // false premise that such headers could appear — verified empirically
+            // against real listFiles responses that they don't — which silently
+            // dropped any added/removed line whose CONTENT itself started with a
+            // literal `+`/`-` at column 0, e.g. unindented code or a markdown
+            // bullet. Caught in review before merge, dev-request 2026-08-16-fleet-
+            // auto-approve-protected-innholdsbasert-deteksjon.)
             const patchLines = (patch, prefix) =>
               (patch || '')
                 .split('\n')
-                .filter(l => l.startsWith(prefix) && !l.startsWith(prefix + prefix))
+                .filter(l => l.startsWith(prefix))
                 .join('\n');
             const contentEditMatch = (f) => {
               if (!f.patch) return null;
