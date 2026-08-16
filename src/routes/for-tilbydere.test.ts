@@ -328,11 +328,18 @@ export function runForTilbydereTests(opts: { log?: boolean } = {}): Promise<Test
       assertTrue(!homeEn.body.includes(">For tilbydere<"), "f4: the Norwegian label doesn't leak into the EN render");
 
       // ── (g) negative control: old hardcoded nav variants untouched ─────
-      const opplevelser = invokeRoute(router, "/opplevelser", {}, "/opplevelser");
-      assertTrue(opplevelser.handled && opplevelser.status === 200, `g1: GET /opplevelser renders 200 (got ${opplevelser.status})`);
+      // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
+      // (delt header/footer): /opplevelser migrated to the shared S1 chrome in
+      // that slice, so it's no longer a valid negative control (see the "all
+      // migrated routes" positive-control block in
+      // experiences-seo-site-chrome.test.ts instead). /kontakt still renders
+      // its own standalone inline chrome (never called renderBrowsePage /
+      // BROWSE_NAV in the first place), so it remains a valid target here.
+      const kontakt = invokeRoute(router, "/kontakt", {}, "/kontakt");
+      assertTrue(kontakt.handled && kontakt.status === 200, `g1: GET /kontakt renders 200 (got ${kontakt.status})`);
       assertTrue(
-        !opplevelser.body.includes('href="/for-tilbydere"'),
-        "g2: the pre-chrome slim nav/mini-footer on /opplevelser does NOT pick up the new link (BROWSE_NAV untouched)"
+        !kontakt.body.includes('href="/for-tilbydere"'),
+        "g2: /kontakt's own standalone inline nav/footer does NOT pick up the new link"
       );
     } catch (err: any) {
       failed++;
