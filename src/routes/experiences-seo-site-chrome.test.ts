@@ -45,6 +45,13 @@
  *       the shared chrome (hamburger toggle + full footer) while remaining a
  *       REAL HTTP 404 (status 404, text/html Content-Type), and keeps its
  *       original two links ("/" and the discovery API) intact.
+ *   (k) dev-request orch-pr-20260816-produsent-shared-chrome: GET
+ *       /kategori/gardssalg/produsent/:providerSlug (the producer profile
+ *       detail page) is migrated to oaSiteNav()/oaSiteFooter() too — same
+ *       4-marker probe (hamburger toggle + full footer + llms.txt +
+ *       personvern) — while its own content (the "Om produsenten" section
+ *       and the "Reserver besøk" CTA, id="reserve-cta") stays untouched by
+ *       the chrome swap.
  *
  * Same synthetic-req/res harness + in-memory-DB pattern as
  * experiences-seo-sok-gardssalg.test.ts.
@@ -342,6 +349,18 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       assertTrue(notFound.body.includes('href="/"'), "j6: 404 page keeps its original link back to the front page");
       assertTrue(notFound.body.includes('href="/api/opplevelser/discover"'), "j7: 404 page keeps its original link to the discovery API");
       assertTrue(notFound.body.includes("Siden finnes ikke"), "j8: 404 page keeps its original message");
+
+      // ── (k) /kategori/gardssalg/produsent/:providerSlug — same 4-marker
+      //     probe as (i), plus a content-unaffected check (reserve CTA +
+      //     "Om produsenten" heading survive the chrome swap). ─────────────
+      const produsent = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/chromegard-sideri");
+      assertTrue(produsent.handled && produsent.status === 200, `k1: GET /kategori/gardssalg/produsent/chromegard-sideri renders 200 (got ${produsent.status})`);
+      assertTrue(produsent.body.includes('id="oa-nav-toggle"'), "k2: produsent page has the #oa-nav-toggle hamburger checkbox");
+      assertTrue(produsent.body.includes('class="site-footer"'), "k3: produsent page has the full .site-footer (not the old hand-rolled footer)");
+      assertTrue(produsent.body.includes('href="/llms.txt"'), "k4: produsent footer links llms.txt");
+      assertTrue(produsent.body.includes('href="/personvern"'), "k5: produsent footer links /personvern");
+      assertTrue(produsent.body.includes('id="reserve-cta"'), "k6: produsent page content unaffected — reserve CTA (id=\"reserve-cta\") still present");
+      assertTrue(produsent.body.includes("Om produsenten"), "k7: produsent page content unaffected — \"Om produsenten\" heading still present");
     } catch (err: any) {
       failed++;
       failures.push("experiences-seo-site-chrome: unexpected error: " + String(err?.stack || err?.message || err));

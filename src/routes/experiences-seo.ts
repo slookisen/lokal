@@ -5230,17 +5230,13 @@ ${BROWSE_CSS}
 .map-card strong{display:block;color:var(--ink);font-size:.95rem}
 .map-sub{font-size:.8rem;color:var(--mist)}
 .map-fallback:hover{border-color:var(--line)}
+${OA_CHROME_CSS}
 </style>
 ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
-<nav class="site-nav" aria-label="Navigasjon">
-  <div class="nav-inner">
-    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
-    <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/kategori/gardssalg">Gårdssalg</a></span>
-  </div>
-</nav>
+${oaSiteNav({ active: "gardssalg" })}
 <header class="produsent-hero">
   <div class="container">
     <div class="hero-kicker">Gårdssalg &amp; smaking</div>
@@ -5298,9 +5294,7 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
   </div>
   <p class="legal-note" style="font-size:.78rem;color:#7a7163;margin-top:24px;padding-top:16px;border-top:1px solid #e4ded0">Vi formidler besøket og smakingen hos produsenten. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
 </main>
-<footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
-  <span><a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a></span>
-</footer>
+${oaSiteFooter({})}
 <script>
 (function () {
   // dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: swap
