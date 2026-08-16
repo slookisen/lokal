@@ -580,6 +580,66 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
           assertEq(d?.flag_enabled, true, "cx-40c: …og flagget var påslått, så de to bitene er tydelig atskilt");
         }
 
+        // ═══ cx-41..cx-44: rå-fallback — rendering skal aldri TREKKE FRA ═══
+        //
+        // 67northdistillery.no, målt 2026-08-16: adressen ligger som en streng
+        // inne i sidebyggerens <script>-nyttelast, og den PURE uttrekkeren
+        // returnerer {"source":"embedded_same_domain"} mot rå-HTML-en. En
+        // vellykket render gir tilbake DOM-en etter JS — nyttelasten er borte
+        // fra den. Uten fallbacken ville altså det å koble inn rendering vært
+        // en netto REGRESJON for nettopp den klassen nettsted den ble bygget
+        // for.
+        //
+        // EMBEDDED_SHELL er den formen: et JS-skall der adressen finnes KUN i
+        // script-strengene, og en rendret DOM uten adressen i det hele tatt.
+        {
+          const EMBEDDED_SHELL =
+            "<html><head><title>Rå Gard</title></head><body><div id=root></div>" +
+            '<script>{"A":"post@raagard.no\\n","B":"' + "x".repeat(3000) + '"}</script></body></html>';
+          const RENDERED_NO_EMAIL =
+            "<html><body><h1>Rå Gard Destilleri</h1><p>Vi lager akevitt.</p></body></html>";
+
+          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+            const u = String(url);
+            if (u.startsWith("https://raagard.no")) return mkHtmlResponse(u, EMBEDDED_SHELL);
+            return (cxMockFetch3 as typeof fetch)(url as any, init);
+          }) as unknown as typeof fetch;
+          opplevelserModule.__setGardssalgRenderPageImplForTesting((async (u: string) => ({
+            ok: true as const,
+            html: RENDERED_NO_EMAIL,
+            finalUrl: u,
+            text: RENDERED_NO_EMAIL.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+            elapsedMs: 30,
+          })) as any);
+          ins.run({ id: "cx-raw", navn: "Rå Gard", pt: "destilleri", hj: "https://raagard.no", ep: null, tlf: null, cs: null, created: "2026-04-03" });
+
+          const r = await callRoute({ providerIds: ["cx-raw"] });
+          const c = (r.body.changed as any[]).find((x) => x.provider_id === "cx-raw");
+          assertEq(c?.epost, "post@raagard.no",
+            "cx-41: adressen overlever renderingen — hentet fra RÅ-dokumentet da den rendrede DOM-en ikke hadde den");
+          assertEq(c?.email_source, "embedded_same_domain",
+            "cx-42: …via embedded-nivået, klassifiseringen bevart");
+          assertEq(c?.email_from_raw, true,
+            "cx-43: og rapporten SIER at den kom fra rå-laget — et andrevalgs-nivå skal ikke se ut som et førstevalg");
+          const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "cx-raw");
+          assertEq(d?.ok, true, "cx-43b: renderingen lyktes — fallbacken er ikke en maskering av en render-feil");
+
+          // cx-44: den rendrede siden vinner når den HAR adressen. Rå brukes
+          // bare som andresjanse, aldri som erstatning — og da settes ikke
+          // email_from_raw, så flagget forblir et ekte signal.
+          opplevelserModule.__setGardssalgRenderPageImplForTesting((async (u: string) => {
+            const html = '<html><body>Kontakt: <a href="mailto:post@raagard.no">post@raagard.no</a></body></html>';
+            return { ok: true as const, html, finalUrl: u, text: "Kontakt: post@raagard.no", elapsedMs: 30 };
+          }) as any);
+          expDb.prepare("UPDATE experience_providers SET epost=NULL WHERE id='cx-raw'").run();
+          const r2 = await callRoute({ providerIds: ["cx-raw"] });
+          const c2 = (r2.body.changed as any[]).find((x) => x.provider_id === "cx-raw");
+          assertEq(c2?.email_source, "mailto",
+            "cx-44: rendret treff vinner og beholder sin egen (høyere-tillits) klassifisering");
+          assertEq(c2?.email_from_raw, undefined,
+            "cx-44b: …og rå-flagget settes ikke når rå aldri ble brukt");
+        }
+
         opplevelserModule.__setGardssalgRenderPageImplForTesting(null);
         if (prevFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
         else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevFlag;
