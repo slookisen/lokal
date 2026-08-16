@@ -63,6 +63,9 @@ import {
   // homepage drikkested feature section's per-type chips — same WHERE gate as
   // countGardssalgProviders(), plus GROUP BY producer_type.
   countGardssalgProvidersByType,
+  // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
+  // 1 (slice 6): the #drikkested section's dark-launch vs live CTA copy.
+  countGardssalgProvidersBookable,
   getPublishedProviderById,
   getPublishedProviderBySlug,
   getGardssalgProviderBySlug,
@@ -122,6 +125,9 @@ import {
   sendBookingConfirmation,
   // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0
   isBookingPaused,
+  // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
+  // 1 (slice 6): the #drikkested section's dark-launch vs live CTA copy.
+  bookingDispatchEnabled,
   sendProducerNotification,
   // booking-flyt-v1 "bekreft-løkka": producer confirm page (POST-mutating)
   getBookingByToken,
@@ -1098,6 +1104,26 @@ function gardssalgVisible(): boolean {
   }
 }
 
+// dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1
+// (slice 6): "opplevelser" and "gårdssalg & smaking" are two clearly
+// distinct homepage sections now — the dedicated #drikkested feature
+// section (renderDrikkestedFeatureSection() below) is the ONLY gårdssalg
+// surface on the homepage. The .cat-grid (experience-category grid) must
+// therefore NEVER show a gårdssalg entry, from ANY source:
+//   - the synthetic card Phase 1 used to inject into catSource when
+//     gardssalgVisible() was true (removed — see catSource below); and
+//   - a genuine DB row in the `experiences` table whose category happens to
+//     literally be "gardssalg"/"gårdssalg"/"gaardssalg" — listCategories()
+//     only reads the `experiences` table (never experience_providers), so
+//     this should never occur in practice, but it's cheap to guard
+//     defensively rather than assume.
+// Matches the SAME three spellings resolveCategoryIconKey() above already
+// recognizes as "this is the gårdssalg slug", so the guard and the icon
+// lookup stay in sync.
+function isGardssalgCategorySlug(category: string | null | undefined): boolean {
+  return !!category && /^(gårdssalg|gaardssalg|gardssalg)$/i.test(category.trim());
+}
+
 // ─────────────────────────────────────────────────────────────
 // Gårdssalg type subpages (dev-request 2026-08-06-opplevagent-ux-loft-
 // drikkested-lansering, S3): indexable per-drink-type catalog pages under
@@ -1233,7 +1259,16 @@ export function homeStrings(lang: Lang) {
     // Keep in sync with the `en` object below.
     drikkeKicker: "Nytt", drikkeTitle: "Besøk lokale drikkeprodusenter",
     drikkeIntro: "Bryggeri, sideri, mjøderi og destilleri åpner dørene for smaking og omvisning &mdash; book besøket direkte hos produsenten, verifisert mot Brønnøysundregistrene.",
+    // drikkeCta is superseded by the state-driven drikkeCtaDarkLaunch/
+    // drikkeCtaLive pair below (renderDrikkestedFeatureSection() no longer
+    // renders this static string) — kept defined rather than deleted in
+    // case another surface still reads it; grep before reusing.
     drikkeCta: "Utforsk drikkesteder", drikkeAria: "Drikkeprodusenter etter type", drikkeChipCountAria: "produsenter",
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
+    // 1 (slice 6): state-driven CTA variants for renderDrikkestedFeatureSection()
+    // — dark-launch copy never promises active booking; live copy is
+    // booking-forward. Keep in sync with the `en` object below.
+    drikkeCtaDarkLaunch: "Meld interesse — åpner snart", drikkeCtaLive: "Book besøk &amp; smaking",
     catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
     fylkeKicker: "Steder", fylkeTitle: "Utforsk etter fylke", fylkeIntro: "Se hvor opplevelsene finnes &mdash; velg et fylke for en fullstendig oversikt.", fylkeAria: "Fylker",
     kommuneTitle: "Populære kommuner", kommuneAria: "Populære kommuner",
@@ -1278,6 +1313,8 @@ export function homeStrings(lang: Lang) {
     drikkeKicker: "New", drikkeTitle: "Visit local drink producers",
     drikkeIntro: "Breweries, cideries, meaderies and distilleries open their doors for tastings and tours &mdash; book your visit directly with the producer, verified against the Norwegian business registry.",
     drikkeCta: "Explore drink stops", drikkeAria: "Drink producers by type", drikkeChipCountAria: "producers",
+    // Keep in sync with the `no` object above (arbeidspunkt 1, slice 6).
+    drikkeCtaDarkLaunch: "Register interest — opening soon", drikkeCtaLive: "Book a visit &amp; tasting",
     catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
     fylkeKicker: "Places", fylkeTitle: "Explore by county", fylkeIntro: "See where the experiences are &mdash; pick a county for a full overview.", fylkeAria: "Counties",
     kommuneTitle: "Popular municipalities", kommuneAria: "Popular municipalities",
@@ -1325,7 +1362,16 @@ const DRINK_TYPE_UNACCENTED_ALIASES: Record<string, string> = {
 
 export function renderDrikkestedFeatureSection(
   lang: Lang,
-  typeCounts: Array<{ producer_type: string | null; count: number }>
+  typeCounts: Array<{ producer_type: string | null; count: number }>,
+  // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
+  // 1 (slice 6): section-level "is booking meaningfully live for the
+  // vertical as a whole right now" — the caller computes this defensively
+  // (countGardssalgProvidersBookable() > 0 AND bookingDispatchEnabled()) and
+  // degrades to false (dark-launch copy) on any DB error, same pattern as
+  // `typeCounts` above. This is a COLLECTIVE flag, distinct from the
+  // per-provider isBookingPaused() check used on individual booking CTAs
+  // elsewhere on this route.
+  bookable = false
 ): string {
   const S = homeStrings(lang);
   // Aggregate raw producer_type rows by canonical label.
@@ -1370,7 +1416,7 @@ export function renderDrikkestedFeatureSection(
           <h2 id="drikkested-title">${S.drikkeTitle}</h2>
           <p>${S.drikkeIntro}</p>
           ${chips ? `<div class="drink-chips" role="list" aria-label="${S.drikkeAria}">${chips}</div>` : ""}
-          <a class="drikkested-cta" href="/kategori/gardssalg">${S.drikkeCta}</a>
+          <a class="drikkested-cta" href="/kategori/gardssalg">${bookable ? S.drikkeCtaLive : S.drikkeCtaDarkLaunch}</a>
         </div>
         <div class="drikkested-decor" aria-hidden="true">${decor}</div>
       </div>
@@ -1445,12 +1491,21 @@ router.get("/", (req: Request, res: Response) => {
   if (gardssalgVisible()) {
     let drinkTypeCounts: Array<{ producer_type: string | null; count: number }> = [];
     try { drinkTypeCounts = countGardssalgProvidersByType(); } catch { drinkTypeCounts = []; }
-    drikkestedSectionHtml = renderDrikkestedFeatureSection(lang, drinkTypeCounts);
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
+    // 1 (slice 6): section-level "live" = at least one REAL (non-hidden)
+    // gårdssalg provider has booking_live=1 AND the global dispatch master
+    // switch is on. Read defensively, same pattern as drinkTypeCounts above —
+    // degrade to dark-launch (false) on any DB error, never throw.
+    let drikkeBookable = false;
+    try { drikkeBookable = countGardssalgProvidersBookable() > 0 && bookingDispatchEnabled(); } catch { drikkeBookable = false; }
+    drikkestedSectionHtml = renderDrikkestedFeatureSection(lang, drinkTypeCounts, drikkeBookable);
   }
 
   // categories (DB not open / no data yet). When empty we show a tasteful set
   // of example categories so the grid never looks broken pre-data.
-  const cats = safeCategories();
+  // gårdssalg is filtered out here defensively (see isGardssalgCategorySlug()'s
+  // doc comment above) — the grid must show ONLY real experience categories.
+  const cats = safeCategories().filter((c) => !isGardssalgCategorySlug(c.category));
   const fallbackCats: Array<{ category: string; count: number }> = [
     { category: "Natur & friluft", count: 0 },
     { category: "Mat & drikke", count: 0 },
@@ -1460,18 +1515,14 @@ router.get("/", (req: Request, res: Response) => {
     { category: "Familievennlig", count: 0 },
   ];
   const usingFallbackCats = cats.length === 0;
-  // Phase 1 — Gårdssalg feature flag: inject the gardssalg card when the
-  // provider seed set crosses the visibility threshold and the category is not
-  // already present (e.g. because there are no published experiences yet).
-  let catSource = usingFallbackCats ? fallbackCats : cats.slice(0, 12);
-  if (!usingFallbackCats && gardssalgVisible() && !catSource.some((c) => c.category === "gardssalg")) {
-    // Live count, not hardcoded 0 — gardssalgVisible() already proved the
-    // count is >= GARDSSALG_VISIBILITY_THRESHOLD, so this card must never
-    // render the "Kommer snart" (coming soon) badge once visible.
-    let gardssalgCount = 0;
-    try { gardssalgCount = countGardssalgProviders(); } catch { /* DB not open — keep 0 */ }
-    catSource = [...catSource, { category: "gardssalg", count: gardssalgCount }].slice(0, 12);
-  }
+  // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1
+  // (slice 6): Phase 1 used to inject a synthetic { category: "gardssalg" }
+  // card into catSource here once gardssalgVisible() crossed the threshold —
+  // REMOVED. Gårdssalg now has its own dedicated #drikkested feature section
+  // (renderDrikkestedFeatureSection(), rendered separately below via
+  // drikkestedSectionHtml) instead of living inside the experience-category
+  // grid as one more card; the grid is real experience categories only.
+  const catSource = usingFallbackCats ? fallbackCats : cats.slice(0, 12);
 
   // Each category card carries its own unique inline glyph (see CATEGORY_ICON_INNER
   // / catIconSvg above). Keyed on the category slug, with a fuzzy + compass

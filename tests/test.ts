@@ -27095,14 +27095,21 @@ console.log("\n── site-quality: category card icons (sq-caticon) ──");
   console.log("  sq-caticon: OK (9 tests: 200/svg-present/aria-hidden/mountain-icon/snowflake-icon/no-compass-for-natur/no-rfb/no-dental)");
 })();
 
-// ─── gardssalg-homepage-count: live count, not hardcoded "Kommer snart" ─────
-// Regression guard for `dev-requests/2026-07-04-opplevagent-besokstall-og-forside-friskhet.md`
-// item 2: once gardssalgVisible() flips true (>= GARDSSALG_VISIBILITY_THRESHOLD
-// providers), the injected homepage card hardcoded `count: 0`, so it always
-// rendered the "Kommer snart" (coming soon) badge even though the live
-// /kategori/gardssalg page had real, bookable producers. Same isolated
-// :memory: experiences DB + sync mock req/res pattern as sq-caticon above.
-console.log("\n── gardssalg-homepage-count: live count replaces hardcoded 'Kommer snart' ──");
+// ─── gardssalg-homepage-count: no gårdssalg card on the .cat-grid ───────────
+// Originally a regression guard for `dev-requests/2026-07-04-opplevagent-
+// besokstall-og-forside-friskhet.md` item 2 (the injected homepage card
+// hardcoded `count: 0`, so it always rendered "Kommer snart" even with live
+// producers). dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
+// arbeidspunkt 1 (slice 6) REMOVED that card-injection entirely — gårdssalg
+// now has its own dedicated #drikkested feature section instead of living in
+// the experience-category grid, so there is no more card here to carry a
+// live count or a "Kommer snart" badge. This block is repurposed to pin the
+// new invariant (card absent) rather than deleted, so a future regression
+// that reintroduces the old injection is still caught by this test's own
+// history. Full dark-launch/live #drikkested CTA-copy coverage lives in
+// experiences-seo-forside-seksjonering.test.ts. Same isolated :memory:
+// experiences DB + sync mock req/res pattern as sq-caticon above.
+console.log("\n── gardssalg-homepage-count: no gårdssalg card on the .cat-grid ──");
 (() => {
   const prevPathGHC = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
@@ -27164,27 +27171,24 @@ console.log("\n── gardssalg-homepage-count: live count replaces hardcoded 'K
   assertEq(statusGHC, 200, "ghc-01: GET / → 200");
 
   // NB (S1 site chrome, dev-request 2026-08-06-opplevagent-ux-loft-
-  // drikkested-lansering): the shared nav/footer now ALWAYS link
+  // drikkested-lansering): the shared nav/footer ALWAYS links
   // /kategori/gardssalg, so a bare indexOf("/kategori/gardssalg") would land
-  // on the nav link, not the category card. Anchor on the cat-card markup
-  // instead — this block is about the CARD's live count.
+  // on the nav link, not a category card. Anchor on the cat-card markup
+  // specifically — this block is about the CARD (arbeidspunkt 1, slice 6:
+  // there must be none, in any state).
   const hrefIdxGHC = bodyGHC.indexOf('class="cat-card" href="/kategori/gardssalg"');
-  assertTrue(hrefIdxGHC >= 0, "ghc-02: gardssalg card is present on the homepage grid");
-  const cardBlockGHC = hrefIdxGHC >= 0 ? bodyGHC.substring(hrefIdxGHC, hrefIdxGHC + 900) : "";
+  assertTrue(hrefIdxGHC < 0, "ghc-02: NO gardssalg card on the homepage .cat-grid, even with ≥5 live providers");
 
-  assertTrue(
-    /cat-count">5 /.test(cardBlockGHC),
-    "ghc-03: gardssalg card shows the live count (5), not a hardcoded 0"
-  );
-  assertTrue(
-    !cardBlockGHC.includes("cat-count-soon"),
-    "ghc-04: gardssalg card does NOT render 'Kommer snart' once visible with live providers"
-  );
+  // #drikkested (the dedicated gårdssalg section) still renders — its own
+  // dark-launch/live CTA-copy coverage lives in
+  // experiences-seo-forside-seksjonering.test.ts; this block only pins that
+  // the .cat-grid card stays gone.
+  assertTrue(bodyGHC.includes('id="drikkested"'), "ghc-03: #drikkested section still renders separately (≥5 producers clears the gate)");
 
   if (prevPathGHC === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathGHC;
   dbFacGHC.__resetDbFactoryForTesting();
-  console.log("  gardssalg-homepage-count: OK (4 tests: 200/card-present/live-count/no-coming-soon)");
+  console.log("  gardssalg-homepage-count: OK (3 tests: 200/no-cat-grid-card/drikkested-still-renders)");
 })();
 
 // ─── content-refresh-attempt-tracking: failed attempts don't block forever ──
@@ -38902,5 +38906,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-outreach-template-variant: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1
+// (slice 6): the homepage .cat-grid no longer shows a gårdssalg entry from
+// ANY source (synthetic injection removed + a defensive filter on a genuine
+// DB-literal "gardssalg"/"gårdssalg" category row), and the #drikkested
+// section's CTA copy is state-driven (dark-launch vs live, both languages).
+// Reloads db-factory/experience-store/booking-store/experiences-seo, same
+// tail-position convention as the neighbouring blocks above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1: forside-seksjonering (gårdssalg-kort fjernet fra cat-grid + state-drevet drikkested-CTA) ──");
+  try {
+    const { runExperiencesSeoForsideSeksjoneringTests } = require("../src/routes/experiences-seo-forside-seksjonering.test") as
+      typeof import("../src/routes/experiences-seo-forside-seksjonering.test");
+    const esfs = await runExperiencesSeoForsideSeksjoneringTests({ log: false });
+    passed += esfs.passed;
+    failed += esfs.failed;
+    for (const f of esfs.failures) failures.push("experiences-seo-forside-seksjonering: " + f);
+    console.log(`  experiences-seo-forside-seksjonering: ${esfs.passed} passed, ${esfs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-forside-seksjonering: unexpected error: " + String(err?.message || err));
   }
 });

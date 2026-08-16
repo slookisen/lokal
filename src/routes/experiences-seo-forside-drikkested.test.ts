@@ -15,6 +15,13 @@
  *       focusable="false", the old .hero-range strip is gone, and EACH
  *       motif variant is < 50 000 chars.
  *   (d) the /en render shows the EN strings in the section (NO/EN parity).
+ *       NOTE (dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
+ *       arbeidspunkt 1, slice 6): the CTA label itself is now state-driven
+ *       (dark-launch vs live — see renderDrikkestedFeatureSection()'s
+ *       `bookable` param); this file's fixtures have no booking_live=1
+ *       provider, so d4 below asserts the dark-launch copy specifically.
+ *       Full dark-launch/live CTA-copy coverage lives in
+ *       experiences-seo-forside-seksjonering.test.ts.
  *   (e) the ONE steam @keyframes rule lives strictly INSIDE the
  *       @media (prefers-reduced-motion: no-preference) block — no motion
  *       definition is parsed by reduced-motion UAs.
@@ -294,7 +301,14 @@ export function runExperiencesSeoForsideDrikkestedTests(opts: { log?: boolean } 
       assertTrue(homeEn.handled && homeEn.status === 200, `d1: GET / with req.lang="en" renders 200 (got ${homeEn.status})`);
       assertTrue(homeEn.body.includes("Visit local drink producers"), "d2: EN section title rendered");
       assertTrue(homeEn.body.includes(">New</span>"), "d3: EN kicker («New») rendered");
-      assertTrue(homeEn.body.includes("Explore drink stops"), "d4: EN CTA label rendered");
+      // dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
+      // arbeidspunkt 1 (slice 6): the CTA is now state-driven
+      // (renderDrikkestedFeatureSection()'s `bookable` param) instead of the
+      // old static "Explore drink stops" string. Phase A's fixtures have no
+      // booking_live=1 provider, so the section renders in its dark-launch
+      // state here — see experiences-seo-forside-seksjonering.test.ts for
+      // full dark-launch/live CTA-copy coverage in both languages.
+      assertTrue(homeEn.body.includes("Register interest — opening soon"), "d4: EN CTA label rendered (dark-launch state)");
       assertTrue(!homeEn.body.includes("Besøk lokale drikkeprodusenter"), "d5: no NO title leaks into the EN render");
 
       // ── (f) /kategori/gardssalg renders the drikke motif ──────────────
