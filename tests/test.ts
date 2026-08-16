@@ -30203,6 +30203,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of goc.failures) failures.push("opplevelser-gardssalg-outreach-candidates: " + f);
     console.log(`  opplevelser-gardssalg-outreach-candidates: ${goc.passed} passed, ${goc.failed} failed`);
 
+    // dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A),
+    // autosvar-detection slice: GET /admin/gardssalg-autosvar-scan —
+    // read-only scan of inbound CRM messages on gårdssalg contacts for a
+    // Norwegian auto-reply/redirect phrase + a nearby email address (the
+    // Monkey Brew "Frank har sluttet, kontakt jorg@..." pattern), classified
+    // against the linked provider's hjemmeside. Detection only — no writes,
+    // no call to gardssalg-set-contact-email. Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-autosvar-scan: autosvar-redirect detection scan ──");
+    const { runOpplevelserGardssalgAutosvarScanTests } = require("../src/routes/opplevelser-gardssalg-autosvar-scan.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-autosvar-scan.test");
+    const gas = await runOpplevelserGardssalgAutosvarScanTests({ log: false });
+    passed += gas.passed;
+    failed += gas.failed;
+    for (const f of gas.failures) failures.push("opplevelser-gardssalg-autosvar-scan: " + f);
+    console.log(`  opplevelser-gardssalg-autosvar-scan: ${gas.passed} passed, ${gas.failed} failed`);
+
     // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
     // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
     // rfb_seed_source='rfb-seed' rows with no naeringskode have no signal that
