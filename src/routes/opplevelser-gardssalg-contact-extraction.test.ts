@@ -467,6 +467,124 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         assertTrue(!newHostCalls.includes("https://cooldownhost.no/tredje"),
           "cx-31b: …og cx-cool3s egen URL ble aldri fetchet i den friske kjøringen heller");
       }
+
+      // ═══ cx-32..cx-40: headless-eskalering (67 North-saken, 2026-08-16) ═══
+      //
+      // Denne ruta svarte `no_contact_found` for 67 North Distillery mens
+      // post@67northdistillery.no lå i sidens eget innhold hele tiden: rå-
+      // dokumentet er 19 synlige tegn, adressen finnes først etter at JS har
+      // kjørt, og ruta rendret aldri. Den svarte altså om en side den ikke
+      // hadde lest. Samme rad rendrer til 4 558 tegn gjennom workeren.
+      //
+      // JS_SHELL etterligner nettopp den formen: nok bytes til å passere
+      // shouldEscalateToRender sin byte-terskel, <script> til stede, og nesten
+      // ingen synlig tekst — så den PURE regelen (ikke testen) avgjør at raden
+      // er kvalifisert.
+      {
+        const prevFlag = process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+        const JS_SHELL =
+          "<html><head><title>67 Nord</title></head><body><div id=root></div>" +
+          "<script>" + "x".repeat(3000) + "</script></body></html>";
+        const RENDERED_FRONT =
+          '<html><body><h1>67 Nord Destilleri</h1><a href="/kontakt">Kontakt</a>' +
+          "<p>Vi lager akevitt i Saltdal.</p></body></html>";
+        const RENDERED_KONTAKT =
+          '<html><body>Kontakt oss: <a href="mailto:post@jsgard.no">post@jsgard.no</a></body></html>';
+
+        const cxMockFetch3 = globalThis.fetch;
+        let renderCalls: string[] = [];
+        const restoreFetch = () => { globalThis.fetch = cxMockFetch3; };
+        globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          const u = String(url);
+          // Både forsiden og /kontakt kommer tilbake som JS-skall over HTTP —
+          // det er nettopp poenget: uten rendering er de begge ulesbare.
+          if (u.startsWith("https://jsgard.no")) return mkHtmlResponse(u, JS_SHELL);
+          return (cxMockFetch3 as typeof fetch)(url as any, init);
+        }) as unknown as typeof fetch;
+
+        const mkRenderStub = (opts: { ok?: boolean; reason?: string } = {}) =>
+          (async (u: string) => {
+            renderCalls.push(u);
+            if (opts.ok === false) {
+              return { ok: false as const, reason: opts.reason ?? "renderer_unavailable", detail: "stub", elapsedMs: 5 };
+            }
+            const html = u.includes("/kontakt") ? RENDERED_KONTAKT : RENDERED_FRONT;
+            return { ok: true as const, html, finalUrl: u, text: html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(), elapsedMs: 42 };
+          }) as any;
+
+        ins.run({ id: "cx-js", navn: "JS Gard", pt: "bryggeri", hj: "https://jsgard.no", ep: null, tlf: null, cs: null, created: "2026-04-01" });
+
+        // ── cx-32/33: flagget AV — uendret oppførsel, men nå observerbart. ──
+        delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+        renderCalls = [];
+        opplevelserModule.__setGardssalgRenderPageImplForTesting(mkRenderStub());
+        {
+          const r = await callRoute({ providerIds: ["cx-js"] });
+          assertEq(renderCalls.length, 0, "cx-32: flagg AV → ingen render forsøkt");
+          const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "cx-js");
+          assertTrue(!!d, "cx-33: render_diagnostic har likevel en rad — «ingen eskalering» er ikke et fravær");
+          assertEq(d?.flag_enabled, false, "cx-33b: flag_enabled=false");
+          assertEq(d?.attempted, false, "cx-33c: attempted=false");
+          assertEq(d?.eligible, true, "cx-33d: eligible=true — siden ER et JS-skall; det er flagget som stopper, ikke regelen");
+          assertTrue(
+            !!(r.body.no_contact_found as any[]).find((x) => x.provider_id === "cx-js"),
+            "cx-33e: uten rendering finner ruta fortsatt ingenting — akkurat som 67 North",
+          );
+        }
+
+        // ── cx-34..37: flagget PÅ — saken dette ble bygget for. ──
+        process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+        renderCalls = [];
+        {
+          const r = await callRoute({ providerIds: ["cx-js"] });
+          const c = (r.body.changed as any[]).find((x) => x.provider_id === "cx-js");
+          assertEq(c?.epost, "post@jsgard.no", "cx-34: adressen hentes fra den RENDREDE kontaktsiden — hullet er tettet");
+          assertTrue(String(c?.source_url || "").includes("/kontakt"),
+            "cx-35: proveniens peker på kontaktsiden, ikke forsiden");
+          assertTrue(renderCalls.some((u) => u.includes("/kontakt")),
+            "cx-36: undersiden ble OGSÅ rendret — /kontakt er like ulesbar som forsiden på en JS-side");
+          const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "cx-js");
+          assertEq(d?.ok, true, "cx-37: forsidens render rapporteres ok");
+          assertEq(d?.subpages_rendered, 1, "cx-37b: og underside-telleren havner i rapporten, ikke i en kopi som forsvinner");
+          assertTrue((d?.chars_after ?? 0) > (d?.chars_before ?? 0),
+            "cx-37c: chars_before/after viser hva renderingen faktisk ga");
+        }
+
+        // ── cx-38/39: render-feil er IKKE fatal. Siden ble hentet; å felle
+        //    raden på en valgfri ekstra ville gjort en forbedring til en
+        //    regresjon. Grunnen rapporteres, så feilen aldri er taus. ──
+        renderCalls = [];
+        opplevelserModule.__setGardssalgRenderPageImplForTesting(mkRenderStub({ ok: false, reason: "renderer_unavailable" }));
+        {
+          const r = await callRoute({ providerIds: ["cx-js"] });
+          assertEq(r.status, 200, "cx-38: render-feil felle ikke kjøringen");
+          const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "cx-js");
+          assertEq(d?.ok, false, "cx-38b: rapporten sier at renderingen feilet");
+          assertEq(d?.reason, "renderer_unavailable",
+            "cx-39: …med grunn, så en operatør ser om botemiddelet er konfigurasjon eller nettstedet");
+          assertEq(d?.subpages_rendered, undefined,
+            "cx-39b: undersider rendres ALDRI når forsiden feilet — eskaleringen er portet på et bevist-JS-nettsted");
+        }
+
+        // ── cx-40: en server-rendret side betaler ingenting. Den PURE regelen
+        //    avgjør fortsatt per side, så flagget alene starter ikke en
+        //    blankett-runde med rendering over hver eneste produsent. ──
+        renderCalls = [];
+        opplevelserModule.__setGardssalgRenderPageImplForTesting(mkRenderStub());
+        ins.run({ id: "cx-ssr", navn: "SSR Gard", pt: "bryggeri", hj: "https://fjellbrygg.no", ep: null, tlf: null, cs: null, created: "2026-04-02" });
+        {
+          const r = await callRoute({ providerIds: ["cx-ssr"] });
+          assertEq(renderCalls.length, 0, "cx-40: server-rendret side → ingen render, selv med flagget på");
+          const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "cx-ssr");
+          assertEq(d?.eligible, false, "cx-40b: eligible=false er regelens svar, ikke testens");
+          assertEq(d?.flag_enabled, true, "cx-40c: …og flagget var påslått, så de to bitene er tydelig atskilt");
+        }
+
+        opplevelserModule.__setGardssalgRenderPageImplForTesting(null);
+        if (prevFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+        else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevFlag;
+        restoreFetch();
+      }
     } catch (err: any) {
       failed++;
       failures.push("gardssalg-contact-extraction: unexpected error: " + String(err?.stack || err?.message || err));

@@ -5976,7 +5976,7 @@ export function __resetGsCxCooldownForTesting(): void {
 }
 
 type GsCxFetchOutcome =
-  | { kind: "ok"; html: string; finalUrl: string }
+  | { kind: "ok"; html: string; finalUrl: string; bytes: number }
   | { kind: "cooldown_skipped"; host: string }
   | { kind: "failed" };
 
@@ -6003,12 +6003,84 @@ async function gsCxFetchPage(url: string): Promise<GsCxFetchOutcome> {
   }
   const result = await fetchPage(url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
   if (result.ok) {
-    return { kind: "ok", html: result.html, finalUrl: result.finalUrl };
+    // `bytes` is carried out so the caller can hand it to
+    // shouldEscalateToRender without re-measuring the body — the same
+    // arrangement crFetchGardssalgContent uses. See gsCxRenderFront below.
+    return { kind: "ok", html: result.html, finalUrl: result.finalUrl, bytes: result.bytes };
   }
   if (result.reason === "http_429" && host) {
     gsCxHostCooldownUntil.set(host, Date.now() + GS_CX_COOLDOWN_MS);
   }
   return { kind: "failed" };
+}
+
+/**
+ * Headless escalation for the contact-extraction crawl's FRONT page.
+ *
+ * Measured 2026-08-16, and the reason this exists: 67 North Distillery came
+ * back `no_contact_found` here while `post@67northdistillery.no` sat in the
+ * page's own content the whole time. The address is only in the DOM after
+ * JavaScript runs — the raw document is 19 visible characters — and this route
+ * never rendered, so it was answering about a page it had not read. The same
+ * row renders to 4 558 characters through the worker
+ * (gardssalg-content-refresh's render_diagnostic, same day).
+ *
+ * That made a "verify the stored address is published on the producer's site"
+ * check silently unreliable for every JS-built site, which is the exact class
+ * of site this catalogue keeps meeting. `no_contact_found` has to mean "the
+ * page does not say", not "we could not read the page".
+ *
+ * Deliberately identical in shape to crFetchGardssalgContent's escalation
+ * rather than a second dialect of the same idea:
+ *   - same GARDSSALG_HEADLESS_FALLBACK_ENABLED kill switch (default OFF), so a
+ *     sweep never starts rendering every row as a silent side effect of a deploy
+ *   - same shouldEscalateToRender rule as the single authority on eligibility
+ *   - same non-fatal failure handling: keep the raw HTML and carry on, because
+ *     the page WAS fetched and failing the row over an optional extra would
+ *     turn an improvement into a regression
+ *   - same gsRenderPageImplForTesting seam, so `npm test` never reaches a
+ *     browser or the render worker
+ *   - both decision bits recorded whatever they come out to, so "flag off" and
+ *     "not eligible" stay distinguishable in the report instead of both being
+ *     an absent field (the ambiguity RenderEscalationDiagnostic exists to kill)
+ *
+ * Escalating the FRONT page specifically is what makes the rest of the row
+ * work: gardssalgContactPageLinks reads the front page's DOM to find /kontakt,
+ * and a JS shell has no links either — so without this, the contact-ish
+ * sub-pages, where the address is most authoritative, are never even requested.
+ */
+async function gsCxRenderFront(
+  front: { html: string; finalUrl: string; bytes: number }
+): Promise<{ html: string; finalUrl: string; report: RenderEscalationDiagnostic }> {
+  const flagEnabled = gardssalgHeadlessFallbackEnabled();
+  const eligible = shouldEscalateToRender(front.html, { bytes: front.bytes });
+  const report: RenderEscalationDiagnostic = {
+    flag_enabled: flagEnabled,
+    eligible,
+    attempted: flagEnabled && eligible,
+    backend: selectRenderBackend(),
+    chars_before: visibleTextOf(front.html).length,
+  };
+  if (!report.attempted) return { html: front.html, finalUrl: front.finalUrl, report };
+
+  const renderFn = gsRenderPageImplForTesting ?? renderPage;
+  const rendered = await renderFn(front.finalUrl, {
+    userAgent: CR_UA,
+    timeoutMs: GARDSSALG_RENDER_TIMEOUT_MS,
+  });
+  report.elapsed_ms = rendered.elapsedMs;
+  if (!rendered.ok) {
+    // Non-fatal, but never silent: the reason is what tells an operator whether
+    // the remedy is configuration (renderer_unavailable → RENDER_WORKER_KEY
+    // missing) or the site itself.
+    report.ok = false;
+    report.reason = rendered.reason;
+    report.detail = rendered.detail;
+    return { html: front.html, finalUrl: front.finalUrl, report };
+  }
+  report.ok = true;
+  report.chars_after = rendered.text.length;
+  return { html: rendered.html, finalUrl: rendered.finalUrl, report };
 }
 
 router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Request, res: Response) => {
@@ -6060,6 +6132,13 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
   const cooldownSkipped: Array<{ provider_id: string; navn: string; host: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
+  // One entry per row whose homepage was fetched successfully — flag/eligible/
+  // attempted always present, so "the escalation declined" is never confusable
+  // with "this route has no escalation". Same contract and same shape as
+  // gardssalg-content-refresh's render_diagnostic, deliberately: an operator
+  // comparing the two routes on the same producer should not have to learn two
+  // report formats. See gsCxRenderFront.
+  const renderDiagnostic: Array<{ provider_id: string; navn: string } & RenderEscalationDiagnostic> = [];
 
   let clientDisconnected = false;
   for (const t of targets) {
@@ -6082,7 +6161,22 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
         fetchFailed.push({ provider_id: t.id, navn: t.navn });
         continue;
       }
-      const front = { html: frontOutcome.html, finalUrl: frontOutcome.finalUrl };
+      // Render BEFORE anything reads this page — link discovery below and every
+      // extraction after it must see the same document. See gsCxRenderFront.
+      const rendered = await gsCxRenderFront(frontOutcome);
+      const front = { html: rendered.html, finalUrl: rendered.finalUrl };
+      // Pushed HERE, before the sub-page loop, so every row with a successful
+      // homepage fetch has an entry even if a later step throws — the
+      // always-emitted guarantee RenderEscalationDiagnostic was built for. The
+      // sub-page counters below therefore mutate THIS entry, not
+      // `rendered.report`: the spread above is a copy, so writing to the report
+      // afterwards would update an object nothing reports from.
+      const renderEntry: { provider_id: string; navn: string } & RenderEscalationDiagnostic = {
+        provider_id: t.id,
+        navn: t.navn,
+        ...rendered.report,
+      };
+      renderDiagnostic.push(renderEntry);
       const host = hostFromUrlLike(front.finalUrl) || hostFromUrlLike(t.hjemmeside) || "";
       const homeDomain = homepageRegistrableDomain(t.hjemmeside);
       // Contact-ish subpages FIRST (that's where the info is authoritative),
@@ -6093,7 +6187,36 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
       const pages: Array<{ url: string; html: string; contactish: boolean }> = [];
       for (const sub of gardssalgContactPageLinks(front.html, host, 2)) {
         const subOutcome = await gsCxFetchPage(sub);
-        if (subOutcome.kind === "ok") pages.push({ url: subOutcome.finalUrl, html: subOutcome.html, contactish: true });
+        if (subOutcome.kind !== "ok") continue;
+        let subHtml = subOutcome.html;
+        // Sub-page escalation, gated on the PRIMARY render having succeeded —
+        // the same narrowing crFetchGardssalgContent uses. The site is then
+        // known to be JS-built AND the renderer known to work for it, so this
+        // can never become a blanket second pass over every producer.
+        // shouldEscalateToRender still decides per page, so a mixed site whose
+        // /kontakt is server-rendered pays nothing. Bounded by the existing
+        // 2-subpage cap, so the worst case is 2 extra renders on a site already
+        // proven to need them.
+        //
+        // This half matters most of all here: /kontakt is where an address is
+        // authoritative, and on a JS site it is exactly as unreadable as the
+        // front page was.
+        if (renderEntry.ok === true && shouldEscalateToRender(subHtml, { bytes: subOutcome.bytes })) {
+          const renderFn = gsRenderPageImplForTesting ?? renderPage;
+          const renderedSub = await renderFn(subOutcome.finalUrl, {
+            userAgent: CR_UA,
+            timeoutMs: GARDSSALG_RENDER_TIMEOUT_MS,
+          });
+          if (renderedSub.ok) {
+            subHtml = renderedSub.html;
+            renderEntry.subpages_rendered = (renderEntry.subpages_rendered ?? 0) + 1;
+          } else {
+            // Counted, not silent — sub-pages that all fail to render are a
+            // different problem from sub-pages that never tried.
+            renderEntry.subpages_render_failed = (renderEntry.subpages_render_failed ?? 0) + 1;
+          }
+        }
+        pages.push({ url: subOutcome.finalUrl, html: subHtml, contactish: true });
       }
       pages.push({ url: front.finalUrl, html: front.html, contactish: false });
 
@@ -6173,6 +6296,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     umbrella_address_rejected: umbrellaRejected,
     fetch_failed: fetchFailed,
     cooldown_skipped: cooldownSkipped,
+    render_diagnostic: renderDiagnostic,
     errors,
   });
   } finally {
