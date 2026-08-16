@@ -4426,6 +4426,75 @@ export function applyGardssalgSetContactEmail(
   return { ok: true, old_value: oldValue, new_value: email };
 }
 
+export type GardssalgAutosvarReviewQueueEntry = {
+  provider_id: string;
+  provider_name?: string | null;
+  candidate_email: string;
+  contact_email?: string | null;
+  matched_phrase?: string | null;
+  classification: "domain_mismatch" | "no_website_on_file";
+  thread_id?: string | null;
+  message_id?: string | null;
+  reason?: string;
+  batch_id?: string | null;
+};
+
+/**
+ * Upsert one autosvar-review-queue row — same UNIQUE(provider_id)
+ * refresh-on-rerun idiom as the org_nr/website queues. Backs
+ * POST /admin/gardssalg-autosvar-apply's domain_mismatch/no_website_on_file
+ * branch (never a direct epost write — see that route's doc comment).
+ */
+export function upsertGardssalgAutosvarReviewQueue(entry: GardssalgAutosvarReviewQueueEntry): void {
+  const db = getDb(VERTICAL);
+  db.prepare(
+    `INSERT INTO gardssalg_autosvar_review_queue
+       (id, provider_id, provider_name, candidate_email, contact_email, matched_phrase, classification, thread_id, message_id, reason, batch_id, created_at, updated_at)
+     VALUES (@id, @provider_id, @provider_name, @candidate_email, @contact_email, @matched_phrase, @classification, @thread_id, @message_id, @reason, @batch_id, datetime('now'), datetime('now'))
+     ON CONFLICT(provider_id) DO UPDATE SET
+       provider_name = excluded.provider_name,
+       candidate_email = excluded.candidate_email,
+       contact_email = excluded.contact_email,
+       matched_phrase = excluded.matched_phrase,
+       classification = excluded.classification,
+       thread_id = excluded.thread_id,
+       message_id = excluded.message_id,
+       reason = excluded.reason,
+       batch_id = excluded.batch_id,
+       updated_at = datetime('now')`
+  ).run({
+    id: uuid(),
+    provider_id: entry.provider_id,
+    provider_name: entry.provider_name ?? null,
+    candidate_email: entry.candidate_email,
+    contact_email: entry.contact_email ?? null,
+    matched_phrase: entry.matched_phrase ?? null,
+    classification: entry.classification,
+    thread_id: entry.thread_id ?? null,
+    message_id: entry.message_id ?? null,
+    reason: entry.reason ?? "autosvar_redirect_candidate",
+    batch_id: entry.batch_id ?? null,
+  });
+}
+
+/** Removes a provider's autosvar-queue entry once the correction is resolved. */
+export function clearGardssalgAutosvarReviewQueueEntry(providerId: string): void {
+  const db = getDb(VERTICAL);
+  db.prepare(`DELETE FROM gardssalg_autosvar_review_queue WHERE provider_id = ?`).run(providerId);
+}
+
+/** Lists all current autosvar-queue entries, newest-updated first. */
+export function listGardssalgAutosvarReviewQueue(): (GardssalgAutosvarReviewQueueEntry & {
+  id: string;
+  created_at: string;
+  updated_at: string;
+})[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(`SELECT * FROM gardssalg_autosvar_review_queue ORDER BY updated_at DESC`)
+    .all() as (GardssalgAutosvarReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
+}
+
 // ─── Gårdssalg org_nr backfill (dev-request 2026-07-18-gardssalg-
 // profilkvalitet-foer-outreach, slice 5b) ────────────────────────────────────
 // Slice 4's batch report found 0/74 gårdssalg providers have org_nr set —

@@ -96,6 +96,15 @@ import {
   // "correct an already-filled stale contact" path (contact-backfill above
   // is fill-only; this is not).
   applyGardssalgSetContactEmail,
+  // dev-request 2026-08-16-opplevagent-outreach-rutine, spec point 6
+  // ("Autosvar-regelen") — the review queue for autosvar candidates whose
+  // candidate email's domain does NOT (or cannot be shown to) agree with the
+  // provider's hjemmeside; see POST /admin/gardssalg-autosvar-apply /
+  // POST /admin/gardssalg-autosvar-review-approve below.
+  upsertGardssalgAutosvarReviewQueue,
+  clearGardssalgAutosvarReviewQueueEntry,
+  listGardssalgAutosvarReviewQueue,
+  type GardssalgAutosvarReviewQueueEntry,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
   // org_nr backfill via Brreg name-search + exact-name/postal corroboration
   // (auto-write only when both agree; otherwise the review queue).
@@ -6987,35 +6996,83 @@ function findAutosvarCandidateInText(text: string): { matched_phrase: string; ca
   return best ? { matched_phrase: best.phrase, candidate_email: best.email } : null;
 }
 
-router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: Response) => {
-  try {
-    let limit: number | undefined;
-    let offset: number | undefined;
-    if (req.query.limit !== undefined) {
-      const parsedLimit = Number(String(req.query.limit));
-      if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
-        res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
-        return;
-      }
-      if (parsedLimit > GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT) {
-        res.status(400).json({ error: `Ugyldig limit — maks er ${GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT}.` });
-        return;
-      }
-      limit = parsedLimit;
-    }
-    if (req.query.offset !== undefined) {
-      const parsedOffset = Number(String(req.query.offset));
-      if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
-        res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
-        return;
-      }
-      offset = parsedOffset;
-    }
-    if (limit === undefined && offset !== undefined) {
-      res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
-      return;
-    }
+// Classification + candidate/result shapes are module-scoped (rather than
+// declared inline in the GET handler, as in the original detection-only cut
+// of this route) so runGardssalgAutosvarScan below — shared by BOTH
+// GET /admin/gardssalg-autosvar-scan and POST /admin/gardssalg-autosvar-apply
+// — can be typed without either route re-declaring them.
+type GardssalgAutosvarClassification = "no_website_on_file" | "domain_match" | "domain_mismatch" | "no_email_found";
 
+interface GardssalgAutosvarScanCandidate {
+  thread_id: string;
+  message_id: string;
+  provider_id: string;
+  contact_email: string;
+  candidate_email: string;
+  matched_phrase: string;
+  classification: GardssalgAutosvarClassification;
+  sent_at: string | null;
+}
+
+interface GardssalgAutosvarScanResult {
+  scanned: number;
+  candidates: GardssalgAutosvarScanCandidate[];
+  summary: Record<GardssalgAutosvarClassification, number>;
+  pagination: {
+    total: number;
+    offset: number;
+    limit: number | null;
+    returned: number;
+    next_offset: number | null;
+  };
+}
+
+/**
+ * Shared limit/offset validation for the autosvar-scan pool. Used by BOTH
+ * GET /admin/gardssalg-autosvar-scan and POST /admin/gardssalg-autosvar-apply
+ * below — the apply route acts on exactly the same paginated pool the scan
+ * route reports, so this validation (and its error strings) must never drift
+ * between the two. Same strict discipline as the scan route's own doc
+ * comment above: offset without limit is a 400; limit over the cap is a 400
+ * — NEVER silently clamped.
+ */
+function parseGardssalgAutosvarScanPaging(
+  query: Request["query"],
+): { ok: true; limit?: number; offset?: number } | { ok: false; error: string } {
+  let limit: number | undefined;
+  let offset: number | undefined;
+  if (query.limit !== undefined) {
+    const parsedLimit = Number(String(query.limit));
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+      return { ok: false, error: "Ugyldig limit — må være et positivt heltall." };
+    }
+    if (parsedLimit > GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT) {
+      return { ok: false, error: `Ugyldig limit — maks er ${GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT}.` };
+    }
+    limit = parsedLimit;
+  }
+  if (query.offset !== undefined) {
+    const parsedOffset = Number(String(query.offset));
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      return { ok: false, error: "Ugyldig offset — må være et ikke-negativt heltall." };
+    }
+    offset = parsedOffset;
+  }
+  if (limit === undefined && offset !== undefined) {
+    return { ok: false, error: "Ugyldig offset — må være et ikke-negativt heltall." };
+  }
+  return { ok: true, limit, offset };
+}
+
+/**
+ * Runs the autosvar detection scan (phrase+email match over inbound
+ * crm_messages, classified against each candidate's provider hjemmeside) and
+ * returns exactly the shape GET /admin/gardssalg-autosvar-scan reports.
+ * Extracted so POST /admin/gardssalg-autosvar-apply below can act on the
+ * IDENTICAL detection logic — it must never re-implement or drift from what
+ * counts as a candidate or how it's classified.
+ */
+function runGardssalgAutosvarScan(limit: number | undefined, offset: number | undefined): GardssalgAutosvarScanResult {
     const rfbDb = getRfbDb();
     const expDb = getExpDb("experiences");
 
@@ -7070,18 +7127,8 @@ router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: R
       for (const p of providerRows) hjemmesideByProviderId.set(p.id, p.hjemmeside);
     }
 
-    type Classification = "no_website_on_file" | "domain_match" | "domain_mismatch" | "no_email_found";
-    const candidates: Array<{
-      thread_id: string;
-      message_id: string;
-      provider_id: string;
-      contact_email: string;
-      candidate_email: string;
-      matched_phrase: string;
-      classification: Classification;
-      sent_at: string | null;
-    }> = [];
-    const summary: Record<Classification, number> = {
+    const candidates: GardssalgAutosvarScanCandidate[] = [];
+    const summary: Record<GardssalgAutosvarClassification, number> = {
       no_website_on_file: 0,
       domain_match: 0,
       domain_mismatch: 0,
@@ -7107,7 +7154,7 @@ router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: R
       const hit = findAutosvarCandidateInText(scanText);
       if (!hit) continue;
 
-      let classification: Classification;
+      let classification: GardssalgAutosvarClassification;
       if (!hit.candidate_email) {
         // Defensive fallback only — findAutosvarCandidateInText never returns
         // a hit without a candidate_email (see its own doc comment above).
@@ -7142,7 +7189,7 @@ router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: R
     const nextOffset =
       limit !== undefined && pageOffset + returned < total ? pageOffset + returned : null;
 
-    res.json({
+    return {
       scanned: returned,
       candidates,
       pagination: {
@@ -7153,11 +7200,294 @@ router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: R
         next_offset: nextOffset,
       },
       summary,
+    };
+}
+
+router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const parsed = parseGardssalgAutosvarScanPaging(req.query);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const result = runGardssalgAutosvarScan(parsed.limit, parsed.offset);
+    res.json({
+      scanned: result.scanned,
+      candidates: result.candidates,
+      pagination: result.pagination,
+      summary: result.summary,
     });
   } catch (err: any) {
     console.error("[gardssalg-autosvar-scan] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-autosvar-apply (admin) ───────────
+//
+// dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A), spec
+// point 6 ("Autosvar-regelen") — the missing write-side wiring for
+// GET /admin/gardssalg-autosvar-scan above. Runs the EXACT same detection
+// scan (runGardssalgAutosvarScan, shared with the GET route so the two can
+// never disagree on what a candidate is) and then, per candidate:
+//
+//   domain_match         — the auto-apply case: the candidate email's host
+//                           already agrees with the provider's own
+//                           hjemmeside. Skipped as `already_set` (no write)
+//                           when the provider's CURRENT epost — read fresh
+//                           from the DB, never trusted from the scan's
+//                           snapshot — already equals the candidate email
+//                           case-insensitively. Otherwise, on apply=true,
+//                           calls applyGardssalgSetContactEmail(..., force:
+//                           false) — force is deliberately NOT used here; if
+//                           the fresher read disagrees with the scan's own
+//                           domain_match classification (the hjemmeside
+//                           changed between scan and apply), the function's
+//                           own domain guard legitimately refuses the write
+//                           and that is reported as `domain_mismatch`, not
+//                           silently forced through.
+//   domain_mismatch,
+//   no_website_on_file    — NEVER written to epost directly — "Ved
+//                           domene-avvik: legg i review-kø, aldri auto-bytt"
+//                           per the dev-request. On apply=true, upserted into
+//                           gardssalg_autosvar_review_queue
+//                           (UNIQUE(provider_id) — a repeat scan/apply run
+//                           refreshes the row rather than duplicating it) for
+//                           a human to resolve via
+//                           POST /admin/gardssalg-autosvar-review-approve
+//                           below.
+//   no_email_found        — skipped; documented as an unreachable defensive
+//                           fallback by the scan route above (candidacy
+//                           already requires an email match).
+//
+// Dry-run by default (apply=true query param gates writes — same
+// `req.query?.apply === "1" || req.query?.apply === "true"` idiom as every
+// other apply-gated POST route in this file, e.g.
+// gardssalg-website-review-approve above): a dry run reports what WOULD
+// happen and writes nothing anywhere — no epost write, no queue row.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-autosvar-apply", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const parsed = parseGardssalgAutosvarScanPaging(req.query);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const apply = req.query?.apply === "1" || req.query?.apply === "true";
+    const dryRun = !apply;
+
+    const scan = runGardssalgAutosvarScan(parsed.limit, parsed.offset);
+    const expDb = getExpDb("experiences");
+
+    const batchId = `autosvar-apply-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+    type GardssalgAutosvarApplyOutcome =
+      | "applied"
+      | "would_apply"
+      | "already_set"
+      | "queued"
+      | "would_queue"
+      | "domain_mismatch"
+      | "provider_not_found"
+      | "skipped_no_email_found";
+
+    const results: Array<GardssalgAutosvarScanCandidate & { outcome: GardssalgAutosvarApplyOutcome }> = [];
+    const counts: Record<GardssalgAutosvarApplyOutcome, number> = {
+      applied: 0,
+      would_apply: 0,
+      already_set: 0,
+      queued: 0,
+      would_queue: 0,
+      domain_mismatch: 0,
+      provider_not_found: 0,
+      skipped_no_email_found: 0,
+    };
+
+    for (const c of scan.candidates) {
+      if (c.classification === "no_email_found") {
+        // Unreachable defensive fallback (see scan route's own doc comment
+        // above) — skip, nothing to act on.
+        results.push({ ...c, outcome: "skipped_no_email_found" });
+        counts.skipped_no_email_found++;
+        continue;
+      }
+
+      if (c.classification === "domain_match") {
+        const providerRow = expDb
+          .prepare(`SELECT epost FROM experience_providers WHERE id = ?`)
+          .get(c.provider_id) as { epost: string | null } | undefined;
+        if (!providerRow) {
+          results.push({ ...c, outcome: "provider_not_found" });
+          counts.provider_not_found++;
+          continue;
+        }
+        const currentEmail = (providerRow.epost || "").trim().toLowerCase();
+        if (currentEmail && currentEmail === c.candidate_email.trim().toLowerCase()) {
+          // Idempotent no-op — a repeat scan/apply run must not re-write or
+          // re-audit an already-applied candidate.
+          results.push({ ...c, outcome: "already_set" });
+          counts.already_set++;
+          continue;
+        }
+        if (dryRun) {
+          results.push({ ...c, outcome: "would_apply" });
+          counts.would_apply++;
+          continue;
+        }
+        const source = `autosvar_redirect: thread=${c.thread_id} message=${c.message_id} sent_at=${c.sent_at ?? "ukjent"} phrase="${c.matched_phrase}"`;
+        const applyResult = applyGardssalgSetContactEmail(c.provider_id, c.candidate_email, source, false);
+        if (!applyResult.ok) {
+          if (applyResult.reason === "provider_not_found") {
+            results.push({ ...c, outcome: "provider_not_found" });
+            counts.provider_not_found++;
+          } else {
+            // Fresher DB read disagreed with the scan snapshot's domain_match
+            // classification — reported honestly, never forced through.
+            results.push({ ...c, outcome: "domain_mismatch" });
+            counts.domain_mismatch++;
+          }
+          continue;
+        }
+        results.push({ ...c, outcome: "applied" });
+        counts.applied++;
+        continue;
+      }
+
+      // domain_mismatch / no_website_on_file — never write epost directly;
+      // route to the review queue instead ("aldri auto-bytt").
+      if (dryRun) {
+        results.push({ ...c, outcome: "would_queue" });
+        counts.would_queue++;
+        continue;
+      }
+      const providerRow = expDb
+        .prepare(`SELECT epost, navn FROM experience_providers WHERE id = ?`)
+        .get(c.provider_id) as { epost: string | null; navn: string | null } | undefined;
+      if (!providerRow) {
+        results.push({ ...c, outcome: "provider_not_found" });
+        counts.provider_not_found++;
+        continue;
+      }
+      upsertGardssalgAutosvarReviewQueue({
+        provider_id: c.provider_id,
+        provider_name: providerRow.navn ?? null,
+        candidate_email: c.candidate_email,
+        contact_email: providerRow.epost ?? null,
+        matched_phrase: c.matched_phrase,
+        classification: c.classification,
+        thread_id: c.thread_id,
+        message_id: c.message_id,
+        reason: "autosvar_redirect_candidate",
+        batch_id: batchId,
+      });
+      results.push({ ...c, outcome: "queued" });
+      counts.queued++;
+    }
+
+    res.json({
+      dry_run: dryRun,
+      batch_id: batchId,
+      scanned: scan.scanned,
+      scan_summary: scan.summary,
+      pagination: scan.pagination,
+      counts,
+      results,
+      queue_size: listGardssalgAutosvarReviewQueue().length,
+    });
+  } catch (err: any) {
+    console.error("[gardssalg-autosvar-apply] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-autosvar-review-approve (admin) ──
+//
+// Drains gardssalg_autosvar_review_queue — the human confirmation lever for
+// a domain_mismatch/no_website_on_file autosvar candidate that
+// POST /admin/gardssalg-autosvar-apply above deliberately refused to write
+// directly ("aldri auto-bytt" per the dev-request). Mirrors
+// POST /admin/gardssalg-website-review-approve's confirmation-surface
+// contract above: only a currently-queued provider_id can be approved — a
+// provider_id not in the queue is rejected (not_in_review_queue). Unlike
+// that route, the queued CANDIDATE VALUE itself does not need to be repeated
+// in the body — the queue already carries exactly one pending candidate_email
+// per provider_id (UNIQUE(provider_id)), so provider_id alone is an
+// unambiguous confirmation target; the response echoes back the email that
+// was (or would be) applied for each one so a caller can verify it.
+//
+// force:true is deliberately correct here — UNLIKE the auto-apply path in
+// gardssalg-autosvar-apply above, which always calls with force:false — a
+// human has just explicitly approved a KNOWN domain-mismatch write, exactly
+// the case `force` exists for on applyGardssalgSetContactEmail.
+router.post("/admin/gardssalg-autosvar-review-approve", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { provider_ids?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.provider_ids) || body.provider_ids.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'provider_ids' array" });
+    return;
+  }
+  if (body.provider_ids.length > 200) {
+    res.status(400).json({ error: "Too many provider_ids (max 200 per call)" });
+    return;
+  }
+
+  const queue = listGardssalgAutosvarReviewQueue();
+  const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
+  const seen = new Set<string>();
+  const approved: Array<{ provider_id: string; email: string }> = [];
+  const written: Array<{ provider_id: string; email: string }> = [];
+  const rejected: Array<{ provider_id: string; reason: string }> = [];
+
+  for (const raw of body.provider_ids as unknown[]) {
+    const pid = typeof raw === "string" ? raw.trim() : "";
+    if (!pid) {
+      rejected.push({ provider_id: "(missing)", reason: "invalid_item" });
+      continue;
+    }
+    if (seen.has(pid)) {
+      rejected.push({ provider_id: pid, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(pid);
+    const q = byProvider.get(pid);
+    if (!q) {
+      rejected.push({ provider_id: pid, reason: "not_in_review_queue" });
+      continue;
+    }
+    approved.push({ provider_id: pid, email: q.candidate_email });
+    if (!dryRun) {
+      try {
+        const source = `autosvar_review_approved: thread=${q.thread_id ?? "ukjent"} message=${q.message_id ?? "ukjent"} phrase="${q.matched_phrase ?? ""}"`;
+        const result = applyGardssalgSetContactEmail(pid, q.candidate_email, source, true);
+        if (result.ok) {
+          written.push({ provider_id: pid, email: q.candidate_email });
+          clearGardssalgAutosvarReviewQueueEntry(pid);
+        } else {
+          rejected.push({ provider_id: pid, reason: result.reason });
+        }
+      } catch (err: any) {
+        rejected.push({ provider_id: pid, reason: `write_failed: ${err?.message ?? String(err)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    approved_count: approved.length,
+    approved,
+    written_count: written.length,
+    written,
+    rejected,
+  });
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-producer-type-classify (admin) ───
