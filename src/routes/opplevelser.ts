@@ -6707,6 +6707,307 @@ router.post("/admin/gardssalg-set-contact-email", requireAdmin, (req: Request, r
   });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-autosvar-scan (admin, read-only) ──
+//
+// dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A), detection
+// slice. The Monkey Brew case ("For henvendelser til Monkey Brew ber jeg deg ta
+// kontakt med jorg@monkeybrew.no — Frank har sluttet") was found and applied
+// via POST /admin/gardssalg-set-contact-email above by hand. This route only
+// FINDS other cases like it — it never calls that endpoint and never writes
+// anything. A later slice wires domain_match results here into that endpoint;
+// out of scope for this one.
+//
+// Pool: inbound (direction='in') crm_messages joined to crm_threads joined to
+// crm_contacts, WHERE crm_contacts.provider_id IS NOT NULL. provider_id is
+// only ever non-NULL on an experiences-vertical contact (enforced by the
+// crm_contact_provider_id_wrong_vertical trigger in database/init.ts), so this
+// condition alone — with no separate vertical_id check needed — already scopes
+// the scan to gårdssalg/experiences contacts and never touches an RFB contact.
+//
+// Detection (per scanned message): a Norwegian auto-reply/redirect phrase
+// (GARDSSALG_AUTOSVAR_REDIRECT_PHRASES, case-insensitive) AND at least one
+// email address, both present in the message body. body_text is used when
+// present/non-blank; otherwise body_html is run through a simple tag-strip
+// regex (stripHtmlToPlainTextForAutosvarScan below) — diagnostic-only, not a
+// security-sensitive render path, so a naive regex is intentionally
+// sufficient here (see that function's own comment). If BOTH a phrase and an
+// email are found, the email NEAREST the matched phrase by character distance
+// is taken as the candidate replacement email — computed as the globally
+// closest (phrase-occurrence, email-occurrence) pair by index distance over
+// ALL phrase and email occurrences in the body, not just the first of each
+// (findAutosvarCandidateInText below). A message with an email but no phrase,
+// or a phrase but no email, is NOT a candidate.
+//
+// Classification, per candidate, via the linked experience_providers row
+// (crm_contacts.provider_id -> experience_providers.id):
+//   no_website_on_file — provider has no hjemmeside on file.
+//   domain_match        — hostFromUrlLike(hjemmeside) equals hostFromUrlLike of
+//                          the candidate email's domain part (case-insensitive
+//                          host equality, deliberately NOT the eTLD+1-collapsing
+//                          registrableDomain() that applyGardssalgSetContactEmail
+//                          above uses for its own domain guard — the spec for
+//                          this route asks for hostFromUrlLike equality
+//                          specifically, and a plain host-vs-host comparison is
+//                          the more conservative, harder-to-false-positive
+//                          reading for a detection-only report).
+//   domain_mismatch     — provider has a hjemmeside but the hosts differ.
+//   no_email_found      — defensive fallback; unreachable in practice, since
+//                          email presence is already required for candidacy.
+//
+// Pagination (`limit`/`offset`): same strict-validation discipline as GET
+// .../gardssalg-website-verification-audit above (offset without limit is a
+// 400; limit over the cap is a 400 — NEVER silently clamped) — but, unlike
+// that route, `limit` is NOT mandatory here even for a large pool. That
+// route's ceiling exists because each paginated row triggers an outbound
+// network fetch (PR #432's timeout risk); this route does zero network I/O —
+// it is one indexed SQL query plus in-process regex over already-stored text,
+// cheap even over the full pool at today's and any plausible near-future
+// volume. So limit/offset exist here purely for caller convenience/paging,
+// not as a required safety valve. `limit`/`offset` paginate the BASE inbound-
+// message pool (before phrase/email scanning) — same "bound the pool before
+// doing the per-row work" discipline as the audit route, even though the
+// per-row work itself is cheap. `pagination` is always present in the
+// response (with `limit: null` when the caller didn't pass one) rather than
+// conditionally omitted the way the audit route's unbounded branch does —
+// this route's fields (total/offset/returned/next_offset) are always
+// well-defined even with no cap applied, so a caller never has to branch on
+// whether the key exists.
+const GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT = 200;
+
+// Short, specific, case-insensitive Norwegian auto-reply/redirect phrases.
+// Deliberately kept short — per the dev-request, false POSITIVES (flagging an
+// unrelated inbound reply as an autosvar redirect) are the risk to avoid here,
+// not false negatives, since this route's output is a human/next-slice review
+// queue, not an auto-apply.
+const GARDSSALG_AUTOSVAR_REDIRECT_PHRASES: string[] = [
+  "ta kontakt med",
+  "henvend deg til",
+  "kontakt oss på",
+  "ny kontaktperson er",
+  "kontakt istedet",
+  "kontakt i stedet",
+];
+
+const GARDSSALG_AUTOSVAR_EMAIL_REGEX = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+// Diagnostic-only HTML->text fallback for when body_text is blank. Not a
+// security-sensitive render path (nothing here is ever rendered as HTML,
+// only pattern-matched as text) — a naive tag-strip is exactly what the
+// dev-request calls for.
+function stripHtmlToPlainTextForAutosvarScan(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function findAutosvarCandidateInText(text: string): { matched_phrase: string; candidate_email: string } | null {
+  const lower = text.toLowerCase();
+
+  const phraseMatches: Array<{ index: number; phrase: string }> = [];
+  for (const phrase of GARDSSALG_AUTOSVAR_REDIRECT_PHRASES) {
+    const needle = phrase.toLowerCase();
+    let searchFrom = 0;
+    while (true) {
+      const idx = lower.indexOf(needle, searchFrom);
+      if (idx === -1) break;
+      // Original-case substring, so matched_phrase reflects the text as
+      // written rather than the lowercase needle.
+      phraseMatches.push({ index: idx, phrase: text.slice(idx, idx + phrase.length) });
+      searchFrom = idx + needle.length;
+    }
+  }
+  if (phraseMatches.length === 0) return null;
+
+  const emailMatches: Array<{ index: number; email: string }> = [];
+  const emailRe = new RegExp(GARDSSALG_AUTOSVAR_EMAIL_REGEX);
+  let m: RegExpExecArray | null;
+  while ((m = emailRe.exec(text)) !== null) {
+    emailMatches.push({ index: m.index, email: m[0] });
+  }
+  if (emailMatches.length === 0) return null;
+
+  // Nearest (phrase, email) pair by character distance, over ALL occurrences
+  // of each — not just the first of either (see module doc comment above).
+  let best: { phrase: string; email: string; dist: number } | null = null;
+  for (const pm of phraseMatches) {
+    for (const em of emailMatches) {
+      const dist = Math.abs(pm.index - em.index);
+      if (best === null || dist < best.dist) {
+        best = { phrase: pm.phrase, email: em.email, dist };
+      }
+    }
+  }
+  return best ? { matched_phrase: best.phrase, candidate_email: best.email } : null;
+}
+
+router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: Response) => {
+  try {
+    let limit: number | undefined;
+    let offset: number | undefined;
+    if (req.query.limit !== undefined) {
+      const parsedLimit = Number(String(req.query.limit));
+      if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+        res.status(400).json({ error: "Ugyldig limit — må være et positivt heltall." });
+        return;
+      }
+      if (parsedLimit > GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT) {
+        res.status(400).json({ error: `Ugyldig limit — maks er ${GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT}.` });
+        return;
+      }
+      limit = parsedLimit;
+    }
+    if (req.query.offset !== undefined) {
+      const parsedOffset = Number(String(req.query.offset));
+      if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+        res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+        return;
+      }
+      offset = parsedOffset;
+    }
+    if (limit === undefined && offset !== undefined) {
+      res.status(400).json({ error: "Ugyldig offset — må være et ikke-negativt heltall." });
+      return;
+    }
+
+    const rfbDb = getRfbDb();
+    const expDb = getExpDb("experiences");
+
+    const totalRow = rfbDb
+      .prepare(
+        `SELECT COUNT(*) AS n
+           FROM crm_messages cm
+           JOIN crm_threads ct ON ct.id = cm.thread_id
+           JOIN crm_contacts cc ON cc.id = ct.contact_id
+          WHERE cm.direction = 'in' AND cc.provider_id IS NOT NULL`,
+      )
+      .get() as { n: number };
+    const total = totalRow.n;
+
+    const pageOffset = offset ?? 0;
+    let sql = `
+      SELECT cm.id AS message_id, cm.thread_id AS thread_id, cm.body_text AS body_text,
+             cm.body_html AS body_html, cm.sent_at AS sent_at,
+             cc.provider_id AS provider_id, cc.email AS contact_email
+        FROM crm_messages cm
+        JOIN crm_threads ct ON ct.id = cm.thread_id
+        JOIN crm_contacts cc ON cc.id = ct.contact_id
+       WHERE cm.direction = 'in' AND cc.provider_id IS NOT NULL
+       ORDER BY COALESCE(cm.sent_at, cm.received_at) ASC, cm.id ASC`;
+    const params: unknown[] = [];
+    if (limit !== undefined) {
+      sql += ` LIMIT ? OFFSET ?`;
+      params.push(limit, pageOffset);
+    }
+
+    const rows = rfbDb.prepare(sql).all(...params) as Array<{
+      message_id: string;
+      thread_id: string;
+      body_text: string | null;
+      body_html: string | null;
+      sent_at: string | null;
+      provider_id: string;
+      contact_email: string;
+    }>;
+
+    // Batch-fetch hjemmeside for every distinct provider_id touched by this
+    // page, in ONE query against the experiences db (a separate connection
+    // from rfbDb above — crm_* tables and experience_providers live in two
+    // different SQLite databases, so this cannot be a single SQL JOIN).
+    const providerIds = Array.from(new Set(rows.map((r) => r.provider_id)));
+    const hjemmesideByProviderId = new Map<string, string | null>();
+    if (providerIds.length > 0) {
+      const placeholders = providerIds.map(() => "?").join(", ");
+      const providerRows = expDb
+        .prepare(`SELECT id, hjemmeside FROM experience_providers WHERE id IN (${placeholders})`)
+        .all(...providerIds) as Array<{ id: string; hjemmeside: string | null }>;
+      for (const p of providerRows) hjemmesideByProviderId.set(p.id, p.hjemmeside);
+    }
+
+    type Classification = "no_website_on_file" | "domain_match" | "domain_mismatch" | "no_email_found";
+    const candidates: Array<{
+      thread_id: string;
+      message_id: string;
+      provider_id: string;
+      contact_email: string;
+      candidate_email: string;
+      matched_phrase: string;
+      classification: Classification;
+      sent_at: string | null;
+    }> = [];
+    const summary: Record<Classification, number> = {
+      no_website_on_file: 0,
+      domain_match: 0,
+      domain_mismatch: 0,
+      no_email_found: 0,
+    };
+
+    for (const row of rows) {
+      const rawText =
+        row.body_text && row.body_text.trim() !== ""
+          ? row.body_text
+          : row.body_html
+            ? stripHtmlToPlainTextForAutosvarScan(row.body_html)
+            : "";
+      if (!rawText) continue;
+
+      const hit = findAutosvarCandidateInText(rawText);
+      if (!hit) continue;
+
+      let classification: Classification;
+      if (!hit.candidate_email) {
+        // Defensive fallback only — findAutosvarCandidateInText never returns
+        // a hit without a candidate_email (see its own doc comment above).
+        classification = "no_email_found";
+      } else {
+        const hjemmeside = hjemmesideByProviderId.get(row.provider_id) ?? null;
+        if (!hjemmeside || hjemmeside.trim() === "") {
+          classification = "no_website_on_file";
+        } else {
+          const websiteHost = hostFromUrlLike(hjemmeside);
+          const emailDomainPart = hit.candidate_email.split("@").pop() || "";
+          const emailHost = hostFromUrlLike(emailDomainPart);
+          classification =
+            websiteHost && emailHost && websiteHost === emailHost ? "domain_match" : "domain_mismatch";
+        }
+      }
+      summary[classification]++;
+
+      candidates.push({
+        thread_id: row.thread_id,
+        message_id: row.message_id,
+        provider_id: row.provider_id,
+        contact_email: row.contact_email,
+        candidate_email: hit.candidate_email,
+        matched_phrase: hit.matched_phrase,
+        classification,
+        sent_at: row.sent_at,
+      });
+    }
+
+    const returned = rows.length;
+    const nextOffset =
+      limit !== undefined && pageOffset + returned < total ? pageOffset + returned : null;
+
+    res.json({
+      scanned: returned,
+      candidates,
+      pagination: {
+        total,
+        offset: pageOffset,
+        limit: limit ?? null,
+        returned,
+        next_offset: nextOffset,
+      },
+      summary,
+    });
+  } catch (err: any) {
+    console.error("[gardssalg-autosvar-scan] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-producer-type-classify (admin) ───
 //
 // Steg C — producer_type is currently set ONLY manually or via the 4-entry
