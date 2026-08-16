@@ -96,6 +96,30 @@ jobs:
               return;
             }
 
+            // 1.5. needs_daniel is a HARD STOP, independent of everything below —
+            //      dev-request 2026-08-16-fleet-auto-approve-protected-innholdsbasert-
+            //      deteksjon, Slice B. Root cause of 3 documented gate-integrity misses
+            //      (lokal#455, #499, #583 — all supervisor-flags/-reports incidents):
+            //      an independent reviewer had ALREADY judged a PR needs Daniel (in the
+            //      review-verdict doc, or the PR body/label) and this gate approved it
+            //      anyway, because that judgment was never actually read here. No
+            //      content-regex below can be complete enough to substitute for an
+            //      explicit human call a reviewer already made — so this check runs
+            //      FIRST and is checked from every place the fleet actually records the
+            //      flag: PR body/labels now, the review-verdict doc once fetched in
+            //      step 4 below (search for needsDanielRe again there).
+            const needsDanielRe = /needs[_-]?daniel/i;
+            if (needsDanielRe.test(pr.body || '')) {
+              await note('PR body carries a needs_daniel flag. Needs Daniel, no auto-approve.');
+              core.info('needs_daniel in PR body — no-op');
+              return;
+            }
+            if ((pr.labels || []).some(l => needsDanielRe.test(typeof l === 'string' ? l : (l && l.name) || ''))) {
+              await note('PR carries a needs_daniel label. Needs Daniel, no auto-approve.');
+              core.info('needs_daniel label — no-op');
+              return;
+            }
+
             // 2. Protected paths — never auto-approve if the diff touches these,
             //    regardless of any verdict comment. Self-protecting: this workflow
             //    file itself can never approve a PR that edits workflows.
@@ -120,12 +144,83 @@ jobs:
               /(^|\/)\.env/i,
               /secret/i,
             ];
+            // Content-based detection (dev-request 2026-08-16-fleet-auto-approve-
+            // protected-innholdsbasert-deteksjon, Slice A). PROTECTED above only ever
+            // matched f.filename — lokal#455/#499/#583 all touched real auth-mechanism
+            // code in NEUTRALLY-NAMED files (crm.ts, analytics.ts, gardssalg-claim.ts)
+            // and sailed straight through. Patterns are the actual identifiers this
+            // repo uses for admin/session auth today (grepped, not guessed, 2026-08-16):
+            // every admin route's own local `function requireAdmin[Auth](...)` gate,
+            // the `ADMIN_KEY`/`ANALYTICS_ADMIN_KEY` env-var precedence it reads,
+            // owner-session helpers (`sessionFromRequest`, `verifyOwnerSession`,
+            // `readSessionCookie` — src/routes/gardssalg-claim.ts, owner-portal.ts),
+            // `issueClaimMagicLink`, cookie-setting call sites, and any other
+            // SECRET/KEY/TOKEN/PASS env var.
+            //
+            // Deliberately scoped to CHANGED (not merely touched) occurrences: a
+            // pattern must match on an ADDED line **and** a REMOVED line of the same
+            // file's patch to count — i.e. the diff EDITS existing matching code,
+            // not just adds a brand-new admin route that follows the repo's own
+            // standard `requireAdmin`/`ADMIN_KEY` boilerplate (every admin route
+            // does that; flagging every one of them is exactly the "too broad, all
+            // signal drowned in noise" failure AC4 exists to catch). Verified
+            // empirically against the last 30 auto-merged lokal PRs before this
+            // shipped: name-only gave 1 hit, unscoped content gave 12 (40% — too
+            // broad), this add+remove-scoped version gives 2 (6.7%) while still
+            // catching all three real incidents (#455/#499/#583 — each is a genuine
+            // edit of a pre-existing ADMIN_KEY/ANALYTICS_ADMIN_KEY/sessionFromRequest
+            // line, never a new file).
+            const PROTECTED_CONTENT = [
+              /\bADMIN_KEY\b/,
+              /\bANALYTICS_ADMIN_KEY\b/,
+              /\brequireAdmin\w*\b/,
+              /\bsessionFromRequest\b/,
+              /\bverifyOwnerSession\b/,
+              /\breadSessionCookie\b/,
+              /\bissueClaimMagicLink\b/,
+              /res\.cookie\(/,
+              /res\.setHeader\(\s*['"]Set-Cookie['"]/i,
+              /process\.env\.[A-Z_]*(SECRET|KEY|TOKEN|PASS)\b/,
+            ];
+            // patchLines(prefix) pulls the +/- content lines from a file's patch.
+            // github.rest.pulls.listFiles's per-file `patch` field is hunks-only
+            // (starts at the first `@@ ... @@` marker) — unlike a raw `git diff`,
+            // it never carries `+++ b/file` / `--- a/file` headers, so there is no
+            // doubled-prefix header line to filter out here. (An earlier version of
+            // this helper excluded lines starting with the prefix doubled on the
+            // false premise that such headers could appear — verified empirically
+            // against real listFiles responses that they don't — which silently
+            // dropped any added/removed line whose CONTENT itself started with a
+            // literal `+`/`-` at column 0, e.g. unindented code or a markdown
+            // bullet. Caught in review before merge, dev-request 2026-08-16-fleet-
+            // auto-approve-protected-innholdsbasert-deteksjon.)
+            const patchLines = (patch, prefix) =>
+              (patch || '')
+                .split('\n')
+                .filter(l => l.startsWith(prefix))
+                .join('\n');
+            const contentEditMatch = (f) => {
+              if (!f.patch) return null;
+              const added = patchLines(f.patch, '+');
+              const removed = patchLines(f.patch, '-');
+              return PROTECTED_CONTENT.find(re => re.test(added) && re.test(removed)) || null;
+            };
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner, repo, pull_number: prNumber, per_page: 100,
             });
-            const touchedProtected = files.filter(f => PROTECTED.some(re => re.test(f.filename)));
-            if (touchedProtected.length > 0) {
-              await note(`diff touches protected path(s) — ${touchedProtected.map(f => f.filename).join(', ')}. Needs Daniel, no auto-approve.`);
+            const touchedByName = files.filter(f => PROTECTED.some(re => re.test(f.filename)));
+            const contentHits = files
+              .map(f => ({ f, hit: contentEditMatch(f) }))
+              .filter(x => x.hit);
+            if (touchedByName.length > 0 || contentHits.length > 0) {
+              const parts = [];
+              if (touchedByName.length > 0) {
+                parts.push(`filename: ${touchedByName.map(f => f.filename).join(', ')}`);
+              }
+              if (contentHits.length > 0) {
+                parts.push(`content: ${contentHits.map(x => `${x.f.filename} (matched ${x.hit})`).join(', ')}`);
+              }
+              await note(`diff touches protected path(s) — ${parts.join(' | ')}. Needs Daniel, no auto-approve.`);
               core.info('protected path touched — no-op');
               return;
             }
@@ -216,6 +311,16 @@ jobs:
             } catch (e) {
               await note(`could not fetch review doc "${rawRef}": ${e.message}. No auto-approve.`);
               core.info('review doc fetch failed — no-op');
+              return;
+            }
+
+            // needs_daniel, third and last place the fleet records it (Slice B,
+            // same hard stop as step 1.5 above): the review-verdict doc itself —
+            // this is exactly where #455's reviewer wrote "(needs_daniel,
+            // protected-path)" and the old gate never read it.
+            if (needsDanielRe.test(docText)) {
+              await note(`review doc "${rawRef}" carries a needs_daniel flag. Needs Daniel, no auto-approve.`);
+              core.info('needs_daniel in review doc — no-op');
               return;
             }
             // Verdict anchoring — only the doc's own FIRST "VERDICT:"-marked line (its
