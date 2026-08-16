@@ -92,6 +92,10 @@ import {
   applyGardssalgProviderContact,
   GS_CB_HARD_CAP,
   type GardssalgContactBackfillTarget,
+  // dev-request 2026-08-16-gardssalg-set-contact-email — the missing
+  // "correct an already-filled stale contact" path (contact-backfill above
+  // is fill-only; this is not).
+  applyGardssalgSetContactEmail,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
   // org_nr backfill via Brreg name-search + exact-name/postal corroboration
   // (auto-write only when both agree; otherwise the review queue).
@@ -6609,6 +6613,91 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
     skipped_locked: skippedLocked,
     unresolved,
     errors,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-contact-email (admin) ────────
+//
+// dev-request 2026-08-16-gardssalg-set-contact-email.
+//
+// gardssalg-contact-backfill above only ever WRITES epost when the field is
+// currently blank (fill-only) — there was no lever to CORRECT an
+// already-filled epost once it goes stale (e.g. an autoresponder says the
+// contact person left and gives a new address). This endpoint is that
+// missing "correct a wrong-but-filled value" path. It intentionally does NOT
+// have a fill-only guard — overwriting an already-filled epost is the entire
+// point.
+//
+// Body: { provider_id: string, email: string, source: string, force?: boolean }.
+// `source` is free-text provenance (e.g. an autosvar timestamp + kontaktside
+// note), not necessarily a URL — stored verbatim in field_provenance.epost.source_url.
+//
+// Domain guard: when the provider has an established hjemmeside on file, the
+// new email's registrable domain must match it unless `force: true`. No
+// hjemmeside on file -> nothing to check against, write proceeds regardless
+// of force. `force` bypasses ONLY this domain-mismatch block.
+//
+// Scope is epost + field_provenance.epost ONLY — hjemmeside/telefon/
+// catalog_hidden/content_source are never touched here. NOTE: this endpoint
+// deliberately does NOT check content_source ('manual'/'claim') the way
+// applyGardssalgProviderContact does — that lock-guard was considered for
+// this slice and left out of scope on purpose; flagging for reviewer
+// judgment rather than implementing it silently.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-contact-email", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    email?: unknown;
+    source?: unknown;
+    force?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const email = typeof body.email === "string" ? body.email.trim() : "";
+  if (!email) {
+    res.status(400).json({ error: "email_required" });
+    return;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: "invalid_email" });
+    return;
+  }
+
+  const source = typeof body.source === "string" ? body.source.trim() : "";
+  if (!source) {
+    res.status(400).json({ error: "source_required" });
+    return;
+  }
+
+  const force = body.force === true;
+
+  const result = applyGardssalgSetContactEmail(providerId, email, source, force);
+
+  if (!result.ok) {
+    if (result.reason === "provider_not_found") {
+      res.status(404).json({ error: "provider_not_found" });
+      return;
+    }
+    res.status(409).json({
+      error: "domain_mismatch",
+      website_domain: result.website_domain,
+      email_domain: result.email_domain,
+    });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "epost",
+    old_value: result.old_value,
+    new_value: result.new_value,
   });
 });
 

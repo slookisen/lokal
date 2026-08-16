@@ -30169,6 +30169,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcb.failures) failures.push("opplevelser-gardssalg-contact-backfill: " + f);
     console.log(`  opplevelser-gardssalg-contact-backfill: ${gcb.passed} passed, ${gcb.failed} failed`);
 
+    // dev-request 2026-08-16-gardssalg-set-contact-email: gardssalg-contact-
+    // backfill above is fill-only (writes epost only when currently blank) —
+    // there was no lever to CORRECT an already-filled epost once it goes
+    // stale (e.g. an autoresponder says the old contact person left and gives
+    // a new address). POST /admin/gardssalg-set-contact-email
+    // (src/routes/opplevelser.ts) is that missing path: overwrites epost
+    // unconditionally except for a hjemmeside-domain-mismatch guard
+    // (bypassable with force:true), audit + provenance discipline unchanged.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block.
+    console.log("\n── opplevelser-gardssalg-set-contact-email: correct an already-filled stale epost ──");
+    const { runOpplevelserGardssalgSetContactEmailTests } = require("../src/routes/opplevelser-gardssalg-set-contact-email.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-contact-email.test");
+    const gsce = await runOpplevelserGardssalgSetContactEmailTests({ log: false });
+    passed += gsce.passed;
+    failed += gsce.failed;
+    for (const f of gsce.failures) failures.push("opplevelser-gardssalg-set-contact-email: " + f);
+    console.log(`  opplevelser-gardssalg-set-contact-email: ${gsce.passed} passed, ${gsce.failed} failed`);
+
     // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
     // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
     // rfb_seed_source='rfb-seed' rows with no naeringskode have no signal that
