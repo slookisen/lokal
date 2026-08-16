@@ -458,6 +458,12 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
 import { normalizeDomain, normalizeEmail, isBlocked } from "../services/blocklist-service";
+// GET /admin/gardssalg-outreach-candidates (near computeGardssalgOutreach-
+// SendEligibility, below) reuses the SAME email-collision dedupe RFB's
+// admin-outreach-candidates.ts uses — not gardssalg-outreach-dedupe.ts's
+// domain-aware Slice-2 guard, a different, unrelated utility (see that
+// route's own doc comment for why both exist).
+import { dedupeByEmail } from "../services/marketing-dedupe";
 
 // Same derivation as gardssalg-claim.ts's own constant — the verify URL must
 // point at the host that serves the claim routes.
@@ -9602,6 +9608,472 @@ export function computeGardssalgOutreachSendEligibility(
 
   return out;
 }
+
+// ─── GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS ──────────────────────────────────
+//
+// dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A), Slice 1:
+// GET /admin/gardssalg-outreach-candidates below needs its OWN first/second-
+// touch cadence, deliberately SEPARATE from OUTREACH_COOLDOWN_DAYS (the
+// 60-day constant computeGardssalgOutreachSendEligibility already reads,
+// just above). The two constants answer two DIFFERENT questions and must
+// never be collapsed into one by a future reader:
+//
+//   - OUTREACH_COOLDOWN_DAYS (60d default) — "has ANY platform (RFB or
+//     Opplevagent) already cold-mailed this HUMAN recently enough that
+//     mailing them again risks looking like spam / double-mailing the same
+//     inbox from what reads as one sender?" This route still reads it below,
+//     but ONLY for the cross-platform (RFB outreach_sent_log) check — never
+//     repurposed as this vertical's own send cadence.
+//   - GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS (30d default, NEW here) — "how
+//     long does gårdssalg itself wait after its OWN first touch before
+//     trying a second touch on the SAME producer?" This is this vertical's
+//     own outreach cadence, deliberately shorter than, and independent of,
+//     the cross-platform anti-spam window above.
+//
+// Same env-parsing style as OUTREACH_COOLDOWN_DAYS (Math.max(1, parseInt(...)
+// || default)); read LIVE on every call (not cached at module load), same
+// convention as isOutreachPaused() (admin-outreach-candidates.ts) and the
+// inline OUTREACH_COOLDOWN_DAYS reads above, so a secret change takes effect
+// on the next request with no redeploy.
+//
+// Deliberately NOT plumbed into computeGardssalgOutreachSendEligibility
+// itself — that function's own-table cooldown check keeps its existing
+// 60-day OUTREACH_COOLDOWN_DAYS behavior UNCHANGED for its other callers
+// (GET /admin/gardssalg-outreach-daily-prep, POST /admin/gardssalg-outreach-
+// pilot-send), which depend on it as-is. This route below reuses that
+// function only for its preflight/no_email/blocklist/cross-platform parts
+// (mode=first) and writes its own direct experience_outreach_sent_log query
+// for the second-touch cadence itself (both modes) — see the route's own
+// doc comment.
+function getGardssalgSecondTouchCooldownDays(): number {
+  return Math.max(1, parseInt(String(process.env.GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS ?? "30"), 10) || 30);
+}
+
+// ─── GET /admin/gardssalg-outreach-candidates ──────────────────────────────
+//
+// dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A), Slice 1:
+// gårdssalg's own outreach candidate-selection endpoint — the gårdssalg
+// counterpart to RFB's GET /admin/outreach-candidates
+// (admin-outreach-candidates.ts), mirroring its mode=first/second split and
+// response SHAPE, hand-adapted to this vertical's own tables/constants (RFB
+// and gårdssalg run on genuinely different content-readiness machinery —
+// outreach_ready_pool VIEW vs. computeGardssalgReadinessRows's tiering — so
+// this is a parallel implementation, not a shared function).
+//
+// Query params:
+//   mode   'first' | 'second'   (required; 400 on missing/invalid, same
+//          error shape as admin-outreach-candidates.ts)
+//   limit  integer, default 20, clamped to [1, 100]
+//
+// Base pool, EITHER mode: readiness_tier === "outreach_ready" only
+// (computeGardssalgReadinessRows, above) — a row that is skjult/
+// ikke_soekbar/nettsted_uverifisert/dublettkonflikt/needs_enrichment/
+// no_website/unreachable is never a candidate here, regardless of send
+// history.
+//
+// mode=first  — providers whose email has ZERO rows EVER in
+//   experience_outreach_sent_log (is_test = 0). "Never contacted at all" —
+//   note this is a STRONGER condition than computeGardssalgOutreachSend-
+//   Eligibility's own eligible:true, which only means "outside the 60-day
+//   OUTREACH_COOLDOWN_DAYS window (or never contacted)" and would ALSO admit
+//   a producer last mailed 90 days ago. That producer is a SECOND touch, not
+//   a first one — this branch reuses computeGardssalgOutreachSendEligibility
+//   for the preflight/no_email/blocklist/60-day-own-cooldown/cross-platform
+//   machinery it already implements, then INDEPENDENTLY confirms zero-ever
+//   via the own-log history map built below, because eligible:true alone
+//   cannot tell "never contacted" and "contacted long ago" apart.
+//
+// mode=second — providers with >=1 own-log row (is_test = 0) whose MOST
+//   RECENT real send is >= GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS days ago
+//   (30d default) — this vertical's OWN touch cadence, computed directly
+//   against experience_outreach_sent_log rather than through
+//   computeGardssalgOutreachSendEligibility, whose own-table cooldown check
+//   is hard-wired to the UNRELATED 60-day OUTREACH_COOLDOWN_DAYS constant
+//   (correct for that function's other callers, which this route must not
+//   alter — see GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS's own comment above).
+//   Only the preflight (readiness-tier + size-gate GO/NO-GO) and the
+//   cross-platform 60-day RFB check are reused from that machinery here
+//   (both are genuinely mode-agnostic concerns); the touch cadence itself is
+//   this route's own logic, against its own constant.
+//
+// Both modes additionally exclude — NEITHER is checked by
+// computeGardssalgOutreachSendEligibility today, so both are added directly
+// in this route:
+//   - replied: an inbound crm_messages row, via crm_threads, on a
+//     crm_contacts row with provider_id = this provider AND
+//     vertical_id = 'experiences' (mirrors admin-outreach-candidates.ts's
+//     has_replied subquery ~L242-250, agent_id -> provider_id/vertical_id).
+//   - hard-bounced: email_bounces (RFB db, vertical-agnostic, keyed on email
+//     only — no agent/provider FK) bounce_type IN ('hard','complaint').
+// ...and, via computeGardssalgOutreachSendEligibility itself (mode=first) or
+// this route's own direct checks mirroring it (mode=second): blocklisted,
+// no_email, and the cross-platform 60-day RFB cooldown.
+//
+// Dedupe: one candidate per recipient email (defensive — two DISTINCT
+// provider rows could theoretically share one email), via the SAME
+// dedupeByEmail utility RFB's admin-outreach-candidates.ts uses
+// (services/marketing-dedupe.ts) — NOT the Slice-2 dedupeGardssalgOutreach-
+// Recipients guard already folded into computeGardssalgOutreachSendEligi-
+// bility's own preflight call. This route calls that machinery with
+// skipRecipientDedupe:true (same precedent GET /admin/gardssalg-outreach-
+// daily-prep already established for exactly this reason — see that
+// route's own comment, ~line 10106) so dedupeByEmail runs LAST, over the
+// fully-narrowed survivor set (after cooldown/reply/bounce), rather than
+// having the coarser domain-based Slice-2 guard pick an earlier "winner"
+// and report the suppression under preflight_no_go instead of the
+// dedupe_suppressed_count field this response promises it under.
+// Tiebreak fields (views_count/google_rating/google_review_count) don't
+// apply to gårdssalg providers — 0/null/0 passed for every candidate, so
+// ties break on name (dedupeByEmail's 3rd rule).
+//
+// Ordering:
+//   mode=first  — created_at ASC (oldest-registered provider first).
+//     Gårdssalg has no outreach_eligible_at-equivalent column the way RFB's
+//     pool VIEW does, so provider registration order is the simplest
+//     stable, documented choice here — not a deliberate business-priority
+//     ranking.
+//   mode=second — oldest-last-contacted-first: ASC by each candidate's most
+//     recent experience_outreach_sent_log.sent_at (mirrors admin-outreach-
+//     candidates.ts ~L642-658 exactly, including its " " -> "T" separator
+//     normalization for mixed SQLite-default vs. app-ISO timestamp formats —
+//     experience_outreach_sent_log.sent_at has the same datetime('now')
+//     SQLite fallback default as outreach_sent_log).
+//
+// `cooldown_days` in the response reports GARDSSALG_SECOND_TOUCH_COOLDOWN_
+// DAYS for BOTH modes (even mode=first, where it plays no direct role) —
+// chosen for response self-consistency (one constant, one field) over
+// reporting null/omitting it for mode=first. The cross-platform 60-day
+// OUTREACH_COOLDOWN_DAYS value used internally for the RFB check is a
+// SEPARATE concern and deliberately NOT this field.
+//
+// no_email / large_company_excluded (mode=first, surfaced by
+// computeGardssalgOutreachSendEligibility) and no_email / large_company_
+// excluded (mode=second, computed directly) are folded into the
+// `preflight_no_go` suppressed_counts bucket — this response contract has
+// no dedicated bucket for either, and both are preflight-adjacent
+// (content-readiness / size-policy) exclusions rather than contact-history,
+// reply, bounce, or blocklist ones.
+router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const mode = String(req.query.mode ?? "").toLowerCase();
+    if (mode !== "first" && mode !== "second") {
+      res.status(400).json({ error: "mode must be 'first' or 'second'" });
+      return;
+    }
+
+    const limitRaw = parseInt(String(req.query.limit ?? "20"), 10);
+    const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 20, 1), 100);
+
+    const expDb = getExpDb("experiences");
+    const rfbDb = getRfbDb();
+
+    const secondTouchCooldownDays = getGardssalgSecondTouchCooldownDays();
+    const secondTouchCutoff = new Date(Date.now() - secondTouchCooldownDays * 86400_000).toISOString();
+    // Same OUTREACH_COOLDOWN_DAYS-scoped derivation as computeGardssalgOutreach-
+    // SendEligibility (~L9506) — reused here ONLY for the cross-platform RFB
+    // check, never for this vertical's own touch cadence. See this route's
+    // module doc comment and GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS's own
+    // comment above for why the two constants must stay separate.
+    const crossPlatformCooldownDays = Math.max(
+      1,
+      parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60,
+    );
+    const crossPlatformCutoff = new Date(Date.now() - crossPlatformCooldownDays * 86400_000).toISOString();
+
+    // ── Base pool: readiness-tier outreach_ready only, in EITHER mode ──────
+    const readinessRows = computeGardssalgReadinessRows(expDb);
+    const outreachReadyIds = readinessRows
+      .filter((r) => r.readiness_tier === "outreach_ready")
+      .map((r) => r.id);
+
+    let contactedOrCooldownCount = 0;
+    let repliedCount = 0;
+    let hardBouncedCount = 0;
+    let blocklistedCount = 0;
+    let crossPlatformCooldownCount = 0;
+    let preflightNoGoCount = 0;
+
+    type Candidate = { agent_id: string; name: string; email: string; last_sent_at: string | null };
+    const survivors: Candidate[] = [];
+
+    const emptyResponse = () =>
+      res.json({
+        success: true,
+        mode,
+        cooldown_days: secondTouchCooldownDays,
+        count: 0,
+        candidates: [],
+        dedupe_by_email: true,
+        dedupe_suppressed_count: 0,
+        suppressed_counts: {
+          contacted_or_cooldown: contactedOrCooldownCount,
+          replied: repliedCount,
+          hard_bounced: hardBouncedCount,
+          blocklisted: blocklistedCount,
+          cross_platform_cooldown: crossPlatformCooldownCount,
+          preflight_no_go: preflightNoGoCount,
+        },
+      });
+
+    if (outreachReadyIds.length === 0) {
+      emptyResponse();
+      return;
+    }
+
+    // Provider base fields (navn/epost/created_at) for the outreach_ready
+    // cohort — fetched once, keyed by id. Reused by both modes; readiness
+    // rows above already carry name/epost but not created_at (mode=first's
+    // ordering key), so this is the one direct query this route needs
+    // beyond the shared readiness/preflight machinery.
+    const idPlaceholders = outreachReadyIds.map(() => "?").join(", ");
+    const baseRows = expDb
+      .prepare(`SELECT id, navn, epost, created_at FROM experience_providers WHERE id IN (${idPlaceholders})`)
+      .all(...outreachReadyIds) as Array<{
+      id: string;
+      navn: string;
+      epost: string | null;
+      created_at: string | null;
+    }>;
+    const baseById = new Map(baseRows.map((r) => [r.id, r]));
+
+    // Own-table send history for the outreach_ready cohort — fetched once,
+    // grouped by LOWER(email), most-recent REAL (is_test = 0) send only.
+    // is_test = 0 mirrors computeGardssalgOutreachSendEligibility's own-table
+    // cooldown query and pilot-send's AC10 fix (2026-08-07-outreach-pool-
+    // krav123-og-pilot): a test-send must never count as a real touch, in
+    // either direction — it must never manufacture a false "second touch"
+    // eligibility, and it must never suppress a true first touch.
+    const sentByEmail = new Map<string, string>();
+    for (const r of expDb
+      .prepare(
+        `SELECT LOWER(recipient_email) AS email, MAX(sent_at) AS last_sent_at
+           FROM experience_outreach_sent_log
+          WHERE is_test = 0
+          GROUP BY LOWER(recipient_email)`,
+      )
+      .all() as Array<{ email: string; last_sent_at: string }>) {
+      sentByEmail.set(r.email, r.last_sent_at);
+    }
+
+    // Cross-platform (RFB) 60-day cooldown — read-only, same query pattern as
+    // computeGardssalgOutreachSendEligibility (~L9568-9591) above. Scoped to
+    // OUTREACH_COOLDOWN_DAYS, NOT GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS.
+    const crossPlatformByEmail = new Map<string, { sent_at: string; vertical_id: string }>();
+    for (const r of rfbDb
+      .prepare(
+        `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
+           FROM outreach_sent_log
+          WHERE recipient_email IS NOT NULL AND recipient_email != ''
+            AND sent_at >= ?
+          GROUP BY LOWER(recipient_email)`,
+      )
+      .all(crossPlatformCutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
+      crossPlatformByEmail.set(r.email, { sent_at: r.last_sent_at, vertical_id: r.vertical_id });
+    }
+
+    // ── replied: mirrors admin-outreach-candidates.ts's has_replied subquery
+    // (~L242-250), agent_id -> provider_id + vertical_id = 'experiences'
+    // (crm-service.ts resolveContact()'s experiences-vertical scoping).
+    const hasCrmReply = (providerId: string): boolean => {
+      const row = rfbDb
+        .prepare(
+          `SELECT 1
+             FROM crm_contacts cc
+             JOIN crm_threads ct ON ct.contact_id = cc.id
+             JOIN crm_messages cm ON cm.thread_id = ct.id
+            WHERE cc.provider_id = ?
+              AND cc.vertical_id = 'experiences'
+              AND cm.direction = 'in'
+            LIMIT 1`,
+        )
+        .get(providerId);
+      return row !== undefined;
+    };
+
+    // ── hard-bounced: email_bounces lives in the RFB db and is
+    // vertical-agnostic (keyed on email only, no agent/provider FK) — reused
+    // directly, same predicate as admin-outreach-candidates.ts's
+    // is_hard_bounced CASE (~L265-269).
+    const isHardBounced = (email: string): boolean => {
+      const row = rfbDb
+        .prepare(
+          `SELECT 1 FROM email_bounces
+            WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint')
+            LIMIT 1`,
+        )
+        .get(email);
+      return row !== undefined;
+    };
+
+    if (mode === "first") {
+      // Reuse the shared preflight/eligibility machinery for the readiness-
+      // tier + size-gate GO/NO-GO computation and its no_email/blocklisted/
+      // own-60-day-cooldown/cross-platform checks — skipRecipientDedupe:true
+      // so its internal Slice-2 recipient-dedupe guard is bypassed (see the
+      // module doc comment above) and this route's own dedupeByEmail pass
+      // runs last, over the fully-narrowed candidate set.
+      const eligibility = computeGardssalgOutreachSendEligibility(expDb, outreachReadyIds, {
+        skipRecipientDedupe: true,
+      });
+
+      for (const e of eligibility) {
+        if (e.eligible) {
+          // eligible:true here means "outside the 60-day OUTREACH_COOLDOWN_
+          // DAYS window (or never contacted)" — NOT "never contacted", which
+          // is what mode=first actually requires. Independently confirm
+          // zero-ever via the own-log history map built above (this is the
+          // check that actually encodes "first touch" — see module doc
+          // comment).
+          const email = e.epost.trim().toLowerCase();
+          if (sentByEmail.has(email)) {
+            // A real prior send exists outside the 60-day window — a
+            // genuine second-touch candidate, not a first-touch one.
+            contactedOrCooldownCount++;
+            continue;
+          }
+          if (hasCrmReply(e.provider_id)) {
+            repliedCount++;
+            continue;
+          }
+          if (isHardBounced(e.epost)) {
+            hardBouncedCount++;
+            continue;
+          }
+          survivors.push({ agent_id: e.provider_id, name: e.navn ?? "", email: e.epost, last_sent_at: null });
+          continue;
+        }
+
+        // eligible:false — bucket its reason into this response's contract.
+        if (e.reason === "blocklisted") {
+          blocklistedCount++;
+        } else if (e.reason === "cooldown_suppressed") {
+          if (e.cross_platform) crossPlatformCooldownCount++;
+          else contactedOrCooldownCount++;
+        } else {
+          // preflight_no_go / large_company_excluded / no_email — folded
+          // into preflight_no_go; none of the three has a dedicated bucket
+          // in this route's response contract (see module doc comment).
+          preflightNoGoCount++;
+        }
+      }
+    } else {
+      // mode=second: this route's OWN logic against
+      // experience_outreach_sent_log and GARDSSALG_SECOND_TOUCH_COOLDOWN_
+      // DAYS — deliberately NOT computeGardssalgOutreachSendEligibility,
+      // whose own-table cooldown check is hard-wired to the UNRELATED
+      // 60-day OUTREACH_COOLDOWN_DAYS constant (see module doc comment and
+      // the constant's own comment above). Only the preflight tier/size-gate
+      // GO computation is reused; skipRecipientDedupe:true for the same
+      // reason as mode=first above.
+      const { results: preflightResults } = computeGardssalgOutreachPreflight(expDb, outreachReadyIds, {
+        skipRecipientDedupe: true,
+      });
+
+      for (const pf of preflightResults) {
+        if (!pf.go) {
+          // readiness tier already filtered to outreach_ready above, so the
+          // only reasons possible here are large_company_excluded (size
+          // gate) — folded into preflight_no_go, same as mode=first.
+          preflightNoGoCount++;
+          continue;
+        }
+        const base = baseById.get(pf.provider_id);
+        const email = (base?.epost ?? "").trim();
+        if (!email) {
+          preflightNoGoCount++; // no_email — folded into preflight_no_go, see above
+          continue;
+        }
+        const lastSent = sentByEmail.get(email.toLowerCase());
+        if (!lastSent) {
+          // Never contacted at all — not eligible for a SECOND touch (it may
+          // be a mode=first candidate instead).
+          contactedOrCooldownCount++;
+          continue;
+        }
+        if (lastSent >= secondTouchCutoff) {
+          // Most recent real send is still inside the 30-day (default)
+          // second-touch window.
+          contactedOrCooldownCount++;
+          continue;
+        }
+        const blockCheck = isBlocked({ email });
+        if (blockCheck.blocked) {
+          blocklistedCount++;
+          continue;
+        }
+        const crossHit = crossPlatformByEmail.get(email.toLowerCase());
+        if (crossHit) {
+          crossPlatformCooldownCount++;
+          continue;
+        }
+        if (hasCrmReply(pf.provider_id)) {
+          repliedCount++;
+          continue;
+        }
+        if (isHardBounced(email)) {
+          hardBouncedCount++;
+          continue;
+        }
+        survivors.push({ agent_id: pf.provider_id, name: pf.name ?? "", email, last_sent_at: lastSent });
+      }
+    }
+
+    // ── Email-level dedupe (defensive) — see module doc comment above.
+    const dedupeCandidates = survivors.map((s) => ({
+      agent_id: s.agent_id,
+      name: s.name,
+      email: s.email,
+      views_count: 0,
+      google_rating: null,
+      google_review_count: 0,
+      last_sent_at: s.last_sent_at,
+    }));
+    const deduped = dedupeByEmail(dedupeCandidates);
+
+    let ordered = deduped.selected;
+    if (mode === "first") {
+      ordered = [...ordered].sort((a, b) => {
+        const ca = baseById.get(a.agent_id)?.created_at ?? "";
+        const cb = baseById.get(b.agent_id)?.created_at ?? "";
+        return ca < cb ? -1 : ca > cb ? 1 : 0;
+      });
+    } else {
+      ordered = [...ordered].sort((a, b) => {
+        const la = a.last_sent_at as string | null;
+        const lb = b.last_sent_at as string | null;
+        if (la === lb) return 0;
+        if (la === null) return 1; // defensive — every mode=second survivor has a last_sent_at
+        if (lb === null) return -1;
+        // Mixed SQLite/ISO timestamp formats — see module doc comment above.
+        const na = la.replace(" ", "T");
+        const nb = lb.replace(" ", "T");
+        return na < nb ? -1 : na > nb ? 1 : 0; // ascending -> oldest contact first
+      });
+    }
+
+    const capped = ordered.slice(0, limit);
+
+    res.json({
+      success: true,
+      mode,
+      cooldown_days: secondTouchCooldownDays,
+      count: capped.length,
+      candidates: capped.map((c) => ({ provider_id: c.agent_id, navn: c.name, epost: c.email })),
+      dedupe_by_email: true,
+      dedupe_suppressed_count: deduped.suppressed.length,
+      suppressed_counts: {
+        contacted_or_cooldown: contactedOrCooldownCount,
+        replied: repliedCount,
+        hard_bounced: hardBouncedCount,
+        blocklisted: blocklistedCount,
+        cross_platform_cooldown: crossPlatformCooldownCount,
+        preflight_no_go: preflightNoGoCount,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: String(err?.message || err) });
+  }
+});
 
 // ─── POST /api/opplevelser/admin/gardssalg-outreach-pilot-send ─────────────
 //

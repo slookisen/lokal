@@ -30188,6 +30188,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gsce.failures) failures.push("opplevelser-gardssalg-set-contact-email: " + f);
     console.log(`  opplevelser-gardssalg-set-contact-email: ${gsce.passed} passed, ${gsce.failed} failed`);
 
+    // dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A),
+    // Slice 1: GET /admin/gardssalg-outreach-candidates — gårdssalg's own
+    // outreach candidate-selection endpoint, the counterpart to RFB's
+    // GET /admin/outreach-candidates (admin-outreach-candidates.ts)
+    // mode=first/second split. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-outreach-candidates: mode=first/second candidate selection ──");
+    const { runOpplevelserGardssalgOutreachCandidatesTests } = require("../src/routes/opplevelser-gardssalg-outreach-candidates.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-candidates.test");
+    const goc = await runOpplevelserGardssalgOutreachCandidatesTests({ log: false });
+    passed += goc.passed;
+    failed += goc.failed;
+    for (const f of goc.failures) failures.push("opplevelser-gardssalg-outreach-candidates: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-candidates: ${goc.passed} passed, ${goc.failed} failed`);
+
     // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
     // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
     // rfb_seed_source='rfb-seed' rows with no naeringskode have no signal that
