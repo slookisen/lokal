@@ -631,6 +631,46 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_website_review_queue failed:", err);
   }
 
+  // ─── gardssalg_autosvar_review_queue (dev-request 2026-08-16-opplevagent-
+  // outreach-rutine, "Autosvar-regelen") ─────────────────────────────────────
+  // GET /admin/gardssalg-autosvar-scan (above, in the routes file) detects an
+  // inbound autoreply that redirects to an alternative contact email; POST
+  // /admin/gardssalg-autosvar-apply auto-applies ONLY the domain_match case
+  // (the candidate email's host agrees with the provider's own hjemmeside).
+  // A domain_mismatch or no_website_on_file candidate is NEVER written to
+  // epost directly ("Ved domene-avvik: legg i review-kø, aldri auto-bytt") —
+  // it lands here instead, for a human to resolve via
+  // POST /admin/gardssalg-autosvar-review-approve. One row per provider
+  // (UNIQUE(provider_id)): a rerun of the apply route upserts in place rather
+  // than accumulating duplicate rows, same refresh-on-rerun idiom as
+  // gardssalg_orgnr_review_queue/gardssalg_website_review_queue above.
+  // `contact_email` holds the provider's OLD epost (as of the run that queued
+  // the row) purely for diffing/display — it is never itself written or read
+  // back by the approve route, which always re-reads the live row.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_autosvar_review_queue (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL UNIQUE,
+        provider_name TEXT,
+        candidate_email TEXT NOT NULL,
+        contact_email TEXT,
+        matched_phrase TEXT,
+        classification TEXT NOT NULL,
+        thread_id TEXT,
+        message_id TEXT,
+        reason TEXT NOT NULL DEFAULT 'autosvar_redirect_candidate',
+        batch_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_autosvar_review_queue_reason ON gardssalg_autosvar_review_queue(reason)`);
+  } catch (err) {
+    console.error("Migration gardssalg_autosvar_review_queue failed:", err);
+  }
+
   // Per-provider attempt stamp for website discovery (skive B) — its own
   // column, NOT last_content_attempt_at (that one orders the content-refresh
   // selector; overloading it would let a website-discovery sweep push

@@ -30220,6 +30220,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gas.failures) failures.push("opplevelser-gardssalg-autosvar-scan: " + f);
     console.log(`  opplevelser-gardssalg-autosvar-scan: ${gas.passed} passed, ${gas.failed} failed`);
 
+    // dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A), spec
+    // point 6 ("Autosvar-regelen") — the write-side wiring the detection scan
+    // above was missing: POST /admin/gardssalg-autosvar-apply (domain_match
+    // auto-applies idempotently; domain_mismatch/no_website_on_file NEVER
+    // write epost directly, only queue) and POST /admin/gardssalg-autosvar-
+    // review-approve (force-applies a queued candidate on human approval).
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block for the same reason.
+    console.log("\n── opplevelser-gardssalg-autosvar-apply: autosvar auto-apply + review-approve ──");
+    const { runOpplevelserGardssalgAutosvarApplyTests } = require("../src/routes/opplevelser-gardssalg-autosvar-apply.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-autosvar-apply.test");
+    const gaa = await runOpplevelserGardssalgAutosvarApplyTests({ log: false });
+    passed += gaa.passed;
+    failed += gaa.failed;
+    for (const f of gaa.failures) failures.push("opplevelser-gardssalg-autosvar-apply: " + f);
+    console.log(`  opplevelser-gardssalg-autosvar-apply: ${gaa.passed} passed, ${gaa.failed} failed`);
+
     // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
     // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
     // rfb_seed_source='rfb-seed' rows with no naeringskode have no signal that
