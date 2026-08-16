@@ -4071,6 +4071,12 @@ router.get("/opplevelser", (req: Request, res: Response) => {
     extraTopHtml: searchBox("") + facetChips(),
     emptyTitle: "Ingen publiserte opplevelser ennå",
     emptyBody: "Vi verifiserer og publiserer nye opplevelser fortløpende. Kom gjerne tilbake snart.",
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
+    // (delt header/footer): /opplevelser adopts the shared S1 chrome (hamburger
+    // nav + full footer incl. "For tilbydere"). "opplevelser" is the exact
+    // oaSiteNav() item for this page.
+    useSharedChrome: true,
+    navActive: "opplevelser",
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -6892,6 +6898,13 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     extraTopHtml: searchBox("", { fylke }) + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
     map: { fylke, points: mapPoints },
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
+    // (delt header/footer): /fylke/:fylke adopts the shared S1 chrome (hamburger
+    // nav + full footer incl. "For tilbydere"). "kategorier" is the closest
+    // oaSiteNav() item (same "closest item" precedent as /kategori/:category —
+    // there's no per-fylke active state in that nav).
+    useSharedChrome: true,
+    navActive: "kategorier",
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -7010,6 +7023,13 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     extraTopHtml: searchBox("") + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
+    // (delt header/footer): /kommune/:kommune adopts the shared S1 chrome
+    // (hamburger nav + full footer incl. "For tilbydere"). "kategorier" is the
+    // closest oaSiteNav() item (same "closest item" precedent as
+    // /kategori/:category — there's no per-kommune active state in that nav).
+    useSharedChrome: true,
+    navActive: "kategorier",
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -7127,6 +7147,14 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox(""),
     extraJsonLd: produktByFaqJsonLd ? [produktByFaqJsonLd] : undefined,
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
+    // (delt header/footer): /kategori/:category/:kommune adopts the shared S1
+    // chrome (hamburger nav + full footer incl. "For tilbydere"). "kategorier"
+    // is the closest oaSiteNav() item (same "closest item" precedent as
+    // /kategori/:category — there's no per-category/kommune active state in
+    // that nav).
+    useSharedChrome: true,
+    navActive: "kategorier",
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -7187,6 +7215,14 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     page,
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: verifiedNote,
+    // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
+    // (delt header/footer): /tilbyder/:providerSlugOrId adopts the shared S1
+    // chrome (hamburger nav + full footer incl. "For tilbydere"). navActive is
+    // deliberately left unset (no aria-current on any nav item): the
+    // "tilbydere" nav item is the informational "For tilbydere" marketing page
+    // (/for-tilbydere), not this browse-by-provider list, and highlighting it
+    // here would misleadingly imply the visitor is on that marketing page.
+    useSharedChrome: true,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");

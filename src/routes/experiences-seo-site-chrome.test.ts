@@ -31,6 +31,15 @@
  *   (h) EN render (/en → req.lang="en"): lang-toggle back to Norwegian
  *       ("NO") present, and the chrome's anchor links are lang-aware
  *       (/en#kategorier — never the Norwegian-front /#kategorier).
+ *   (i) dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
+ *       arbeidspunkt 3 (delt header/footer): regression guard that the
+ *       remaining 5 renderBrowsePage() callers — /opplevelser, /fylke/:fylke,
+ *       /kommune/:kommune, /kategori/:category/:kommune,
+ *       /tilbyder/:providerSlugOrId — were flipped to useSharedChrome too
+ *       (not just /kategori/:category from the original S1/kategorimotiver
+ *       slices): each renders the hamburger toggle (id="oa-nav-toggle") AND
+ *       the full shared footer (llms.txt + personvern links), i.e. none of
+ *       them silently stayed on the old slim BROWSE_NAV/browseFooter() chrome.
  *
  * Same synthetic-req/res harness + in-memory-DB pattern as
  * experiences-seo-sok-gardssalg.test.ts.
@@ -98,6 +107,25 @@ function navLinkHrefs(body: string): string[] {
   return hrefs.sort();
 }
 
+// One published experience (+ its verified provider) in the given
+// fylke/kommune/category — same createProvider/createExperience shape
+// experiences-seo-kategorimotiver.test.ts's seedPublishedExperience() already
+// proved renders live /fylke, /kommune and /kategori/:category/:kommune
+// pages. Returns the provider's row id (caller backfills + reads its slug
+// for the /tilbyder/<slug> URL).
+function seedPublishedExperience(store: any, opts: { fylke: string; kommune: string; category: string; title: string }): string {
+  const providerId = store.createProvider({
+    navn: `${opts.title} AS`, fylke: opts.fylke, kommune: opts.kommune,
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  store.createExperience({
+    title: opts.title, provider_id: providerId, provider_match_status: "matched",
+    kommune: opts.kommune, fylke: opts.fylke,
+    category: opts.category, verification_status: "verified", confidence: "high",
+  });
+  return providerId;
+}
+
 export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
@@ -129,7 +157,7 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const db = dbFactory.getDb("experiences");
-      require("../services/experience-store");
+      const store = require("../services/experience-store") as typeof import("../services/experience-store");
 
       // One visible gårdssalg producer so /kategori/gardssalg renders a
       // non-empty grid (the chrome must be present either way — kg-zero in
@@ -142,6 +170,17 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
            ('gs-chrome', 'Chromegard Sideri', 'experiences', 'Telemark', 'Skien', 'Skien', 'sideri', NULL, NULL, 59.21, 9.61,
             'high', 'chromegard-sideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
       ).run();
+
+      // Fixture for (i): one published experience in Vestland/Bergen/
+      // natur_friluft so /fylke/Vestland, /kommune/Bergen and
+      // /kategori/natur_friluft/Bergen all render live (non-404) pages, plus
+      // its provider's slug for /tilbyder/<slug>.
+      const iProviderId = seedPublishedExperience(store, {
+        fylke: "Vestland", kommune: "Bergen", category: "natur_friluft",
+        title: "Fjellvandring i Bergen (chrome-regresjon)",
+      });
+      store.backfillProviderSlugs();
+      const iProviderSlug = (db.prepare("SELECT slug FROM experience_providers WHERE id = ?").get(iProviderId) as { slug: string }).slug;
 
       const seoRouter = (require("./experiences-seo") as typeof import("./experiences-seo")).default as any;
 
@@ -262,6 +301,32 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       assertTrue(homeEn.body.includes('href="/en#slik-funker-det"'), "h4: EN footer how-it-works anchor is lang-aware (/en#slik-funker-det)");
       assertTrue(!homeEn.body.includes('href="/#kategorier"'), "h5: no Norwegian-front /#kategorier anchor leaks into the EN render");
       assertTrue(home.body.includes('href="/#kategorier"'), "h6: the Norwegian render keeps its /#kategorier anchor");
+
+      // ── (i) regression guard: the 5 later-migrated renderBrowsePage()
+      //     callers all render the shared chrome too, not just / and
+      //     /kategori/gardssalg above (see the fixture seeded above this
+      //     block for the fylke/kommune/category/tilbyder pages' data). ────
+      const iRoutes: Array<{ name: string; url: string }> = [
+        { name: "/opplevelser", url: "/opplevelser" },
+        { name: "/fylke/:fylke", url: "/fylke/Vestland" },
+        { name: "/kommune/:kommune", url: "/kommune/Bergen" },
+        { name: "/kategori/:category/:kommune", url: "/kategori/natur_friluft/Bergen" },
+        { name: "/tilbyder/:providerSlugOrId", url: `/tilbyder/${iProviderSlug}` },
+      ];
+      for (const r of iRoutes) {
+        const res = await callHtmlRoute(seoRouter, r.url);
+        assertTrue(res.handled && res.status === 200, `i1-${r.name}: GET ${r.url} renders 200 (got ${res.status})`);
+        assertTrue(
+          res.body.includes('id="oa-nav-toggle"') && res.body.includes('class="nav-burger"'),
+          `i2-${r.name}: renders the hamburger toggle + burger label (not the old BROWSE_NAV)`
+        );
+        assertTrue(
+          res.body.includes('class="site-footer"'),
+          `i3-${r.name}: renders the full .site-footer (not the old mini browseFooter())`
+        );
+        assertTrue(res.body.includes('href="/llms.txt"'), `i4-${r.name}: footer links llms.txt`);
+        assertTrue(res.body.includes('href="/personvern"'), `i5-${r.name}: footer links /personvern`);
+      }
     } catch (err: any) {
       failed++;
       failures.push("experiences-seo-site-chrome: unexpected error: " + String(err?.stack || err?.message || err));
