@@ -85,11 +85,27 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("../services/experience-store");
     const brregClientPath = require.resolve("../services/brreg-client");
+    const blocklistPath = require.resolve("../services/blocklist-service");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, experienceStorePath, brregClientPath, opplevelserPath];
+    const cachePaths = [dbFactoryPath, experienceStorePath, brregClientPath, blocklistPath, opplevelserPath];
     for (const p of cachePaths) delete require.cache[p];
 
+    let prevRfbDb: any = null;
+
     try {
+      // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+      // utfoerelse): the blocklist gate reads agent_blocklist, which lives on
+      // the RFB db (database/init.ts), NOT the experiences db — inject a
+      // fresh :memory: instance (same pattern as the other gårdssalg route
+      // test files that exercise the blocklist gate).
+      const initMod = require("../database/init") as typeof import("../database/init");
+      const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+      prevRfbDb = initMod.__peekDbForTesting();
+      const rfbDb = new Database(":memory:");
+      initMod.__setDbForTesting(rfbDb as any);
+      initMod.__initSchemaForTesting(rfbDb as any);
+      const blocklistSvc = require("../services/blocklist-service") as typeof import("../services/blocklist-service");
+
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
@@ -1001,6 +1017,43 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         }
       }
 
+      // ── wd-21 (Skive D, dev-request 2026-08-17-cs-plattformparitet-og-
+      //    verifisert-utfoerelse): a target whose org_nr was explicitly
+      //    blocklisted (producer removed via "fjern oss") gets NO discovery
+      //    effort at all — no fetch, no proposal, no queue entry — and the
+      //    rejection is counted/reported instead of silently falling into
+      //    no_candidate_verified. ───────────────────────────────────────────
+      {
+        insertProvider.run({ id: "wd-blocked", navn: "Blokkert Sideri", org_nr: "999000001", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        blocklistSvc.addManualEntry({ identifierType: "org_nr", identifierValue: "999000001" });
+
+        const wd21FetchCalls: string[] = [];
+        const prevFetch6 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          wd21FetchCalls.push(String(url));
+          return { ok: false, status: 404, url: String(url), text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-blocked"], apply: true },
+          });
+          assertEq(wd21FetchCalls.length, 0, "wd-21a: a blocklisted target triggers ZERO candidate fetches — no discovery effort spent on it");
+          assertEq(r.body.rejected_blocklisted_count, 1, "wd-21b: top-level rejected_blocklisted_count reflects it");
+          const rej = (r.body.rejected_blocklisted as any[]).find((x) => x.provider_id === "wd-blocked");
+          assertTrue(!!rej, "wd-21c: it is reported, not silently dropped");
+          assertEq(rej?.matched_by, "org_nr", "wd-21d: matched_by=org_nr");
+          assertEq(rej?.matched_value, "999000001", "wd-21e: matched_value is the blocklisted org_nr");
+          assertTrue(!(r.body.proposed as any[]).some((p: any) => p.provider_id === "wd-blocked"), "wd-21f: never proposed");
+          assertTrue(!(r.body.no_candidate_verified as any[]).some((e: any) => e.provider_id === "wd-blocked"), "wd-21g: NOT reported as an ordinary no-candidate row either — it has its own distinct outcome");
+          const qCnt = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-blocked'`).get() as any).c;
+          assertEq(qCnt, 0, "wd-21h: nothing queued for the blocklisted target");
+        } finally {
+          globalThis.fetch = prevFetch6;
+        }
+      }
+
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -1010,6 +1063,10 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
+      try {
+        const initMod = require("../database/init") as typeof import("../database/init");
+        if (prevRfbDb) initMod.__setDbForTesting(prevRfbDb);
+      } catch { /* best-effort */ }
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

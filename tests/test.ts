@@ -17045,6 +17045,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
 
   const prevPathExp18 = process.env.EXPERIENCES_DB_PATH;
   let server18: import("http").Server | null = null;
+  let prevRfbDb18: unknown = null;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
 
@@ -17068,6 +17069,24 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
 
     // Pin the in-memory experiences DB (so assertions can query it directly).
     const dbExp18 = dbFactory18.getDb("experiences");
+
+    // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+    // utfoerelse): the bulk-load blocklist gate reads agent_blocklist, which
+    // lives on the RFB db (database/init.ts), NOT the experiences db — pin a
+    // fresh :memory: instance for this IIFE's whole duration (save/restore in
+    // finally, per this file's own kriterium-3 guidance at its top). Adding
+    // this here rather than as a separate runSerial()-registered block avoids
+    // the documented "runSerial() chain vs ad-hoc family never wait on each
+    // other" race (see the shared-globals comment at the top of this file) —
+    // this block is already part of the ad-hoc family via
+    // _orchPr18BulkLoadPromise.
+    const initMod18 = require("../src/database/init") as typeof import("../src/database/init");
+    const RfbDatabase18 = require("better-sqlite3") as typeof import("better-sqlite3");
+    prevRfbDb18 = initMod18.__peekDbForTesting();
+    const rfbDb18 = new RfbDatabase18(":memory:");
+    initMod18.__setDbForTesting(rfbDb18 as any);
+    initMod18.__initSchemaForTesting(rfbDb18 as any);
+    const blocklistSvc18 = require("../src/services/blocklist-service") as typeof import("../src/services/blocklist-service");
 
     // ── Stub Brreg by interpreting the `navn=` query param. ────────────
     // verified-active → Tromsø Opplevelser AS (NACE 93.291, not deleted)
@@ -17100,6 +17119,31 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
           underAvvikling: true,         // under avvikling ⇒ inactive
           underTvangsavviklingEllerTvangsopplosning: false,
           slettedato: "2025-02-01",     // and deleted
+        }];
+      } else if (lc.includes("blokkert orgnr bryggeri")) {
+        // bl-block-1 (Skive D): resolves to an org_nr that gets blocklisted
+        // BEFORE the request — must never be created.
+        enheter = [{
+          organisasjonsnummer: "955000001",
+          navn: "BLOKKERT ORGNR BRYGGERI AS",
+          naeringskode1: { kode: "93.291" },
+          forretningsadresse: { kommune: "Oslo" },
+          konkurs: false,
+          underAvvikling: false,
+          underTvangsavviklingEllerTvangsopplosning: false,
+          slettedato: null,
+        }];
+      } else if (lc.includes("ren bryggeri")) {
+        // bl-block-1's clean regression control — same call, unrelated org_nr.
+        enheter = [{
+          organisasjonsnummer: "955000099",
+          navn: "REN BRYGGERI AS",
+          naeringskode1: { kode: "93.291" },
+          forretningsadresse: { kommune: "Oslo" },
+          konkurs: false,
+          underAvvikling: false,
+          underTvangsavviklingEllerTvangsopplosning: false,
+          slettedato: null,
         }];
       }
       return {
@@ -17492,6 +17536,164 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       );
     }
 
+    // ── bl-block (Skive D, dev-request 2026-08-17-cs-plattformparitet-og-
+    //    verifisert-utfoerelse): a producer previously removed via "fjern
+    //    oss" (agent_blocklist, by org_nr or website domain) must not be
+    //    (re-)created by a later bulk-load harvest — rejected, counted,
+    //    reported (never silently dropped). A non-blocklisted candidate in
+    //    the SAME call still goes through normally (regression). ──────────
+    {
+      // Re-pin immediately before these writes too, not just before the
+      // bulkReqBl() dispatches below: addManualEntry() (blocklist-service.ts)
+      // also calls the bare getDb() with no injection param, and by this
+      // point in the IIFE many awaited HTTP round trips (bl-1..bl-7,
+      // bl-agg-1..4) have already run, each a chance for a sibling ad-hoc-
+      // family block to have left the singleton pointing elsewhere.
+      // Verified empirically (diagnostic run, reverted): under an
+      // artificially widened race window this exact gap made addManualEntry
+      // write to a foreign db lacking agent_blocklist entirely — a WORSE
+      // failure than a misrouted read, since rfbDb18 would then never
+      // receive these rows at all, no matter how well the reads below are
+      // guarded.
+      initMod18.__setDbForTesting(rfbDb18 as any);
+      blocklistSvc18.addManualEntry({ identifierType: "org_nr", identifierValue: "955000001" });
+      blocklistSvc18.addManualEntry({ identifierType: "website_domain", identifierValue: "blokkert-domene-bl.no" });
+
+      // The blocklist gate this block exercises (isBlocked(), called from
+      // the bulk-load handler at src/routes/opplevelser.ts's `blockCheck`
+      // site) reads agent_blocklist via getDb() (src/database/init.ts) —
+      // the SAME process-wide singleton this file's own "SHARED GLOBAL
+      // STATE" header (kriterium 3, "NOT yet fixed") documents as raced by
+      // ~69 OTHER __setDbForTesting() call sites in this suite. Before
+      // Skive D this IIFE never touched that singleton (only dbFactory18's
+      // own separate "experiences" cache, which is NOT part of that
+      // hazard), so it was never exposed to it; pinning rfbDb18 above (for
+      // agent_blocklist) newly exposes it — and this IIFE's own intended
+      // prerequisite gate (the two `await _orchPr...Promise` lines at the
+      // very top of this IIFE) turns out to be a no-op here: both promises
+      // are declared with `const` FURTHER DOWN this file (after this IIFE),
+      // so referencing them this early is a TDZ ReferenceError that gets
+      // silently swallowed by their own `catch { /* upstream */ }` — this
+      // IIFE actually starts unordered relative to virtually everything
+      // else (confirmed empirically; pre-existing, not introduced by this
+      // PR, and out of scope to fix broadly here — the file's own header
+      // documents a prior attempt at a full ad-hoc-family barrier tripping
+      // a DIFFERENT unrelated race elsewhere in the suite).
+      //
+      // bulkReq()'s own HTTP round trip has multiple await points between
+      // "addManualEntry() wrote to rfbDb18" and "the route handler's
+      // isBlocked() call reads getDb()" (the Brreg-stub fetch, the
+      // inter-provider BRREG_PACE_MS sleep) during which a concurrently-
+      // running sibling ad-hoc-family block can legitimately re-pin the
+      // singleton to ITS OWN db mid-flight — isBlocked() then silently
+      // reads that foreign (blocklist-empty) db and lets a blocklisted
+      // candidate through, creating a row that must never exist.
+      //
+      // Unlike PR-74's read-only GET (~line 14294 — this file's established
+      // detect-and-retry pattern for a block that can't feasibly enumerate
+      // every other singleton-toucher it might race), a bare retry is NOT
+      // safe here: bulk-load WRITES, so a corrupted first attempt can
+      // already have created the very row a retry is meant to prevent, and
+      // simply re-issuing the request would not undo that. bulkReqBl()
+      // below re-pins rfbDb18 synchronously right before every dispatch
+      // (closes the common gap) and, if the singleton no longer points at
+      // rfbDb18 once the response lands, deletes any provider row THIS
+      // request's own payload could have created under that contamination
+      // (scoped to its own provider_name values — never touches any other
+      // request's or block's rows) before retrying from a clean, re-pinned
+      // state — so a retry always starts from the same state as the very
+      // first attempt would have. dbExp18/dbFactory18 (the experiences
+      // vertical) is a SEPARATE cache from the RFB singleton and is not
+      // part of this hazard, so it's safe to query/mutate directly here.
+      async function bulkReqBl(
+        body: Record<string, unknown> | undefined,
+        key: string | undefined,
+        retriesLeft = 5
+      ): Promise<{ status: number; body: any }> {
+        initMod18.__setDbForTesting(rfbDb18 as any);
+        const result = await bulkReq(body, key);
+        if (initMod18.__peekDbForTesting() !== rfbDb18) {
+          const names = (
+            (body?.experiences as Array<{ provider_name: string }> | undefined) ?? []
+          ).map((e) => e.provider_name);
+          for (const n of new Set(names)) {
+            dbExp18
+              .prepare(
+                "DELETE FROM experiences WHERE provider_id IN (SELECT id FROM experience_providers WHERE navn = ?)"
+              )
+              .run(n);
+            dbExp18.prepare("DELETE FROM experience_providers WHERE navn = ?").run(n);
+          }
+          if (retriesLeft > 0) {
+            return bulkReqBl(body, key, retriesLeft - 1);
+          }
+        }
+        return result;
+      }
+
+      // bl-block-1: blocked by org_nr (resolved via the Brreg stub above),
+      // alongside a clean candidate in the SAME call.
+      const rBlk1 = await bulkReqBl(
+        {
+          experiences: [
+            { title: "Blokkert Opplevelse", provider_name: "Blokkert Orgnr Bryggeri AS", category: "annet",
+              kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" },
+            { title: "Ren Opplevelse", provider_name: "Ren Bryggeri AS", category: "annet",
+              kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" },
+          ],
+          apply: true,
+        },
+        ADMIN_KEY_18
+      );
+      assertEq(rBlk1.status, 200, "bl-block-1a: apply → 200");
+      assertEq(rBlk1.body.rejected_blocklisted, 1, "bl-block-1b: exactly one provider rejected by the blocklist gate");
+      assertEq((rBlk1.body.rejected_blocklisted_providers as any[])?.length, 1, "bl-block-1c: rejection reported, not silently dropped");
+      assertEq((rBlk1.body.rejected_blocklisted_providers as any[])?.[0]?.provider_name, "Blokkert Orgnr Bryggeri AS", "bl-block-1d: it is the blocklisted provider");
+      assertEq((rBlk1.body.rejected_blocklisted_providers as any[])?.[0]?.matched_by, "org_nr", "bl-block-1e: rejection reason names org_nr as the match");
+      const blockedRow = dbExp18
+        .prepare("SELECT id FROM experience_providers WHERE org_nr = '955000001'")
+        .get();
+      assertTrue(!blockedRow, "bl-block-1f: the blocklisted org_nr was NEVER created");
+      const cleanRow = dbExp18
+        .prepare("SELECT id FROM experience_providers WHERE org_nr = '955000099'")
+        .get();
+      assertTrue(!!cleanRow, "bl-block-1g: the non-blocklisted candidate in the SAME call still gets created normally");
+
+      // bl-block-2: blocked by `website` domain — an UNRECOGNIZED name (so
+      // the Brreg stub returns no match, classification=unverified), but
+      // evidence-backed (so it clears the evidenceBacked gate) and would
+      // otherwise be created were it not for the blocklisted domain.
+      const rBlk2 = await bulkReqBl(
+        {
+          experiences: [
+            { title: "Domeneblokkert Opplevelse", provider_name: "Domeneblokkert Provider AS", category: "annet",
+              kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both",
+              evidence_url: "https://kilde.example/domeneblokkert", website: "https://blokkert-domene-bl.no", confidence: "low" },
+          ],
+          apply: true,
+        },
+        ADMIN_KEY_18
+      );
+      assertEq(rBlk2.body.rejected_blocklisted, 1, "bl-block-2a: rejected via the website domain match");
+      assertEq((rBlk2.body.rejected_blocklisted_providers as any[])?.[0]?.matched_by, "website_domain", "bl-block-2b: rejection reason names website_domain");
+      const domCnt = (dbExp18
+        .prepare("SELECT COUNT(*) AS n FROM experience_providers WHERE navn = 'Domeneblokkert Provider AS'")
+        .get() as { n: number }).n;
+      assertEq(domCnt, 0, "bl-block-2c: never created under any name/org_nr");
+
+      // bl-block-3: dry-run also reports the rejection (useful for the daily
+      // brief preview), writes nothing.
+      const beforeCnt = (dbExp18.prepare("SELECT COUNT(*) AS n FROM experience_providers").get() as { n: number }).n;
+      const rBlk3 = await bulkReqBl(
+        { experiences: [{ title: "Blokkert Opplevelse 2", provider_name: "Blokkert Orgnr Bryggeri AS", category: "annet", kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" }] },
+        ADMIN_KEY_18
+      );
+      assertEq(rBlk3.body.dry_run, true, "bl-block-3a: dry-run");
+      assertEq(rBlk3.body.rejected_blocklisted, 1, "bl-block-3b: dry-run still reports the rejection");
+      const afterCnt = (dbExp18.prepare("SELECT COUNT(*) AS n FROM experience_providers").get() as { n: number }).n;
+      assertEq(afterCnt, beforeCnt, "bl-block-3c: dry-run wrote nothing");
+    }
+
     // ── Cleanup ───────────────────────────────────────────────────────
     expBrreg18.__setBrregFetchForTesting(null);
     dbFactory18.__resetDbFactoryForTesting();
@@ -17504,6 +17706,13 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     }
     if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
+    try {
+      if (prevRfbDb18) {
+        (require("../src/database/init") as typeof import("../src/database/init")).__setDbForTesting(prevRfbDb18 as any);
+      }
+    } catch {
+      // best-effort cleanup
+    }
     _orchPr18BulkLoadResolve();
   }
 })();

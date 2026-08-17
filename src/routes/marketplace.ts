@@ -3384,7 +3384,7 @@ router.post("/admin/blocklist", (req: Request, res: Response) => {
     // takes precedence whenever identifier_type and/or identifier_value is present,
     // so it never falls through to the legacy named-field logic below.
     if (body.identifier_type !== undefined || body.identifier_value !== undefined) {
-      const validTypes = ["email", "agent_id", "name_normalized", "website_domain"];
+      const validTypes = ["email", "agent_id", "name_normalized", "website_domain", "org_nr"];
       if (typeof body.identifier_type !== "string" || !validTypes.includes(body.identifier_type)) {
         res.status(400).json({ error: `Body må inneholde 'identifier_type' (en av: ${validTypes.join(", ")})` });
         return;
@@ -3416,16 +3416,19 @@ router.post("/admin/blocklist", (req: Request, res: Response) => {
       return;
     }
 
-    const { name, website, email, agentId, reason, sourceEmail } = body;
+    // orgNr (Skive D, dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+    // utfoerelse): additive optional field on the legacy named-field shape,
+    // same fan-out add() already gives name/website/email/agentId.
+    const { name, website, email, agentId, orgNr, reason, sourceEmail } = body;
     if (!reason || typeof reason !== "string") {
       res.status(400).json({ error: "Body må inneholde 'reason' (string)" });
       return;
     }
-    if (!name && !website && !email && !agentId) {
-      res.status(400).json({ error: "Minst én av name/website/email/agentId må oppgis" });
+    if (!name && !website && !email && !agentId && !orgNr) {
+      res.status(400).json({ error: "Minst én av name/website/email/agentId/orgNr må oppgis" });
       return;
     }
-    const result = blocklistAdd({ name, website, email, agentId, reason, sourceEmail });
+    const result = blocklistAdd({ name, website, email, agentId, orgNr, reason, sourceEmail });
     res.status(201).json({ success: true, ...result });
   } catch (err: any) {
     res.status(500).json({ error: "Add failed", detail: err.message });

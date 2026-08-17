@@ -91,11 +91,27 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("../services/experience-store");
     const brregClientPath = require.resolve("../services/brreg-client");
+    const blocklistPath = require.resolve("../services/blocklist-service");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, experienceStorePath, brregClientPath, opplevelserPath];
+    const cachePaths = [dbFactoryPath, experienceStorePath, brregClientPath, blocklistPath, opplevelserPath];
     for (const p of cachePaths) delete require.cache[p];
 
+    let prevRfbDb: any = null;
+
     try {
+      // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+      // utfoerelse): the blocklist gate reads agent_blocklist, which lives on
+      // the RFB db (database/init.ts), NOT the experiences db — inject a
+      // fresh :memory: instance the same way opplevelser-gardssalg-outreach-
+      // candidates.test.ts does, so blocklist fixtures never touch a real DB.
+      const initMod = require("../database/init") as typeof import("../database/init");
+      const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+      prevRfbDb = initMod.__peekDbForTesting();
+      const rfbDb = new Database(":memory:");
+      initMod.__setDbForTesting(rfbDb as any);
+      initMod.__initSchemaForTesting(rfbDb as any);
+      const blocklistSvc = require("../services/blocklist-service") as typeof import("../services/blocklist-service");
+
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
@@ -480,6 +496,57 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         const bad = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { codes: ["62.010"] } });
         assertEq(bad.status, 400, "nd-11e: a genuinely non-drink code is STILL rejected after the widening");
       }
+
+      // ── nd-12 (Skive D, dev-request 2026-08-17-cs-plattformparitet-og-
+      //    verifisert-utfoerelse): a Brreg candidate whose org_nr or
+      //    hjemmeside was explicitly blocklisted (producer removed via
+      //    "fjern oss") must not be (re-)created, and the rejection must be
+      //    counted/reported per-code and top-level — never silently
+      //    dropped. Own local fetch stub, fully isolated from the shared
+      //    brregPages fixture above (this is the LAST block in the file, so
+      //    no later block needs the shared mock restored). ────────────────
+      {
+        blocklistSvc.addManualEntry({ identifierType: "org_nr", identifierValue: "955000001" });
+        blocklistSvc.addManualEntry({ identifierType: "website_domain", identifierValue: "blokkert-nace-domene.no" });
+
+        const nd12Pages: Record<string, any> = {
+          "11.010|0": {
+            page: { totalPages: 1 },
+            _embedded: { enheter: [
+              { organisasjonsnummer: "955000001", navn: "BLOKKERT ORGNR BRYGGERI AS",
+                forretningsadresse: { kommune: "OSLO" } },
+              { organisasjonsnummer: "955000002", navn: "BLOKKERT DOMENE BRYGGERI AS",
+                hjemmeside: "https://blokkert-nace-domene.no",
+                forretningsadresse: { kommune: "OSLO" } },
+              { organisasjonsnummer: "955000003", navn: "REN BRYGGERI AS",
+                forretningsadresse: { kommune: "OSLO" } },
+            ] },
+          },
+        };
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const urlStr = String(url);
+          if (!urlStr.includes("data.brreg.no")) throw new Error(`unexpected fetch: ${urlStr}`);
+          const code = decodeURIComponent((urlStr.match(/naeringskode=([^&]*)/) || [])[1] || "");
+          const page = (urlStr.match(/[?&]page=(\d+)/) || [])[1] || "0";
+          const body = nd12Pages[`${code}|${page}`] ?? { page: { totalPages: 1 }, _embedded: { enheter: [] } };
+          return { ok: true, status: 200, json: async () => body } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { codes: ["11.010"], apply: true } });
+        assertEq(r.body.per_code["11.010"].rejected_blocklisted, 2, "nd-12a: both blocked candidates counted per-code");
+        assertEq(r.body.rejected_blocklisted_count, 2, "nd-12b: top-level count matches");
+        const orgnrs = (r.body.rejected_blocklisted as any[]).map((x) => x.org_nr).sort();
+        assertEq(JSON.stringify(orgnrs), JSON.stringify(["955000001", "955000002"]), "nd-12c: both rejected candidates reported by org_nr");
+        const byOrgnr = Object.fromEntries((r.body.rejected_blocklisted as any[]).map((x) => [x.org_nr, x]));
+        assertEq(byOrgnr["955000001"]?.matched_by, "org_nr", "nd-12d: matched_by=org_nr for the org_nr-blocked candidate");
+        assertEq(byOrgnr["955000002"]?.matched_by, "website_domain", "nd-12e: matched_by=website_domain for the domain-blocked candidate");
+        assertEq(r.body.created_count, 1, "nd-12f: only the clean candidate is created");
+        assertEq(r.body.created[0]?.org_nr, "955000003", "nd-12g: it is the clean one");
+        const blocked1 = expDb.prepare(`SELECT id FROM experience_providers WHERE org_nr = '955000001'`).get();
+        assertTrue(!blocked1, "nd-12h: org_nr-blocked candidate never created");
+        const blocked2 = expDb.prepare(`SELECT id FROM experience_providers WHERE org_nr = '955000002'`).get();
+        assertTrue(!blocked2, "nd-12i: domain-blocked candidate never created");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-nace-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -489,6 +556,10 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
+      try {
+        const initMod = require("../database/init") as typeof import("../database/init");
+        if (prevRfbDb) initMod.__setDbForTesting(prevRfbDb);
+      } catch { /* best-effort */ }
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

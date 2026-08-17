@@ -19,7 +19,11 @@ export type BlocklistEntry = {
   // hotmail.com, etc.). New entries use 'email' (literal address). Existing
   // 'email_domain' rows are migrated out by init.ts on next boot. Read paths
   // ignore them.
-  identifier_type: "website_domain" | "email" | "email_domain" | "name_normalized" | "agent_id";
+  // 'org_nr' (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+  // utfoerelse, Skive D): Norwegian organisation number, digits-only after
+  // normalizeOrgNr. Added so a removed producer's org_nr — not just its
+  // domain — keeps discovery/harvest from re-creating it.
+  identifier_type: "website_domain" | "email" | "email_domain" | "name_normalized" | "agent_id" | "org_nr";
   identifier_value: string;
   reason: string | null;
   source_email: string | null;
@@ -92,6 +96,21 @@ export function normalizeEmail(input: string | null | undefined): string {
   return String(input).trim().toLowerCase();
 }
 
+// ─── normalizeOrgNr (Skive D) ───────────────────────────────────
+// Norwegian org numbers are digits only; the only real-world variance seen
+// in this codebase is incidental whitespace (copy-pasted "977 777 777" —
+// see applyGardssalgProviderOrgnr's own 9-digit format gate elsewhere,
+// which this function deliberately does NOT duplicate: matching is
+// whatever was actually written to the blocklist, not a re-validation of
+// shape). Strip all whitespace, nothing else — no digit-extraction from
+// free text, so a non-digit value round-trips unchanged rather than being
+// silently mangled.
+
+export function normalizeOrgNr(input: string | null | undefined): string {
+  if (!input) return "";
+  return String(input).replace(/\s+/g, "").trim();
+}
+
 export function normalizeName(input: string | null | undefined): string {
   if (!input) return "";
   // Match the slugify rules so a blocked "Øvre-Eide Gård" catches
@@ -119,6 +138,7 @@ export function isBlocked(opts: {
   name?: string;
   website?: string;
   email?: string;
+  orgNr?: string;
 }): { blocked: boolean; matchedBy?: BlocklistEntry["identifier_type"]; matchedValue?: string } {
   try {
     const db = getDb();
@@ -132,6 +152,10 @@ export function isBlocked(opts: {
       // PR-14: literal email address only (do NOT block whole domain)
       const norm = normalizeEmail(opts.email);
       if (norm) checks.push(["email", norm]);
+    }
+    if (opts.orgNr) {
+      const norm = normalizeOrgNr(opts.orgNr);
+      if (norm) checks.push(["org_nr", norm]);
     }
     if (opts.name) {
       const norm = normalizeName(opts.name);
@@ -168,6 +192,7 @@ export function add(input: {
   name?: string;
   website?: string;
   email?: string;
+  orgNr?: string;
   reason: string;
   sourceEmail?: string;
   agentNameForAudit?: string;
@@ -187,6 +212,10 @@ export function add(input: {
     // PR-14: store literal email address (not domain) — see normalizeEmail comment.
     const norm = normalizeEmail(input.email);
     if (norm) rowsToInsert.push({ type: "email", value: norm });
+  }
+  if (input.orgNr) {
+    const norm = normalizeOrgNr(input.orgNr);
+    if (norm) rowsToInsert.push({ type: "org_nr", value: norm });
   }
   if (input.name) {
     const norm = normalizeName(input.name);
@@ -235,7 +264,7 @@ export function add(input: {
 // two domains.
 
 export function addManualEntry(input: {
-  identifierType: "email" | "agent_id" | "name_normalized" | "website_domain";
+  identifierType: "email" | "agent_id" | "name_normalized" | "website_domain" | "org_nr";
   identifierValue: string;
   reason?: string;
 }): { created: boolean; row: BlocklistEntry } {
@@ -256,6 +285,9 @@ export function addManualEntry(input: {
       break;
     case "agent_id":
       value = String(input.identifierValue || "").trim().toLowerCase();
+      break;
+    case "org_nr":
+      value = normalizeOrgNr(input.identifierValue);
       break;
     default:
       throw new BlocklistValidationError(`Ukjent identifier_type: ${input.identifierType}`);
