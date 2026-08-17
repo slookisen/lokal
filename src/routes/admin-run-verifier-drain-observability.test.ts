@@ -36,6 +36,18 @@
  *     by resulting status — so a bulk-sweep caller never again mistakes a
  *     high `passed` count (basic-gate re-passes) for real promotions.
  *
+ * dev-request 2026-08-17-verifier-tick-lock: runVerifierTick() now acquires
+ * a DB-backed once-per-hour lock (orchestrator_locks, agent
+ * "lokal-agent-verifier-tick") as the very first thing it does, so rounds
+ * 2 and 3 below now DELETE that lock row before calling the route again —
+ * standing in for "the next hour's tick, after the previous lock's natural
+ * staleMinutes=50 expiry" — otherwise every round after the first would
+ * immediately get skipped:true and none of the observability assertions
+ * below (which depend on a REAL batch running each round) would exercise
+ * anything. The lock's own behavior (skip-when-fresh, response shape,
+ * no-second-batch) is proven separately at the end of this suite (round 4),
+ * where the lock is deliberately left in place.
+ *
  * Exported runAdminRunVerifierDrainObservabilityTests({log}) -> TestSummary;
  * wired into tests/test.ts.
  * Standalone: npx tsx src/routes/admin-run-verifier-drain-observability.test.ts
@@ -181,6 +193,16 @@ export function runAdminRunVerifierDrainObservabilityTests(
 
       const { default: router } = require("./admin-run-verifier") as { default: any };
 
+      // dev-request 2026-08-17-verifier-tick-lock: runVerifierTick() now
+      // acquires an orchestrator_locks row (agent
+      // "lokal-agent-verifier-tick") as the first thing it does and never
+      // releases it explicitly — it just expires after staleMinutes=50.
+      // Deleting the row directly stands in for "that natural expiry
+      // already happened", i.e. simulates moving to the next hour's tick
+      // between rounds in this suite.
+      const clearTickLock = () =>
+        db.prepare(`DELETE FROM orchestrator_locks WHERE agent = 'lokal-agent-verifier-tick'`).run();
+
       // ── Round 1: reprocess the review queue ─────────────────────────
       const round1 = await callRoute(router, {
         method: "POST",
@@ -210,6 +232,26 @@ export function runAdminRunVerifierDrainObservabilityTests(
       assertEq(round1.body.transitioned, 1, "obs-6b: transitioned mirrors status_transitions (Skive B)");
       assertEq(round1.body.by_new_status?.pending_verify, 1, "obs-6c: by_new_status names the resulting status of the one real transition");
 
+      // dev-request 2026-08-17-verifier-tick-lock, requirement (c): the
+      // non-skipped response shape must be byte-identical to what this
+      // route returned before the lock was added — no field silently
+      // dropped/renamed while widening runVerifierTick's return type to a
+      // discriminated union. Pin the exact key set (order-independent).
+      const expectedNonSkippedKeys = [
+        "success", "run_id", "processed", "passed", "review_required",
+        "pending_verify", "data_insufficient", "http_unreachable",
+        "brreg_inactive", "domain_incoherent", "email_domain_mismatch",
+        "thin_content", "pool_added", "status_transitions", "transitioned",
+        "by_new_status", "persisted", "envelope_recorded", "hour_utc",
+        "forced", "reprocess_review_queue", "bias_growth",
+      ].sort();
+      assertEq(
+        Object.keys(round1.body).sort(),
+        expectedNonSkippedKeys,
+        "lock-1: round 1 (non-skipped) response has EXACTLY the pre-existing field set — nothing dropped, nothing added",
+      );
+      assertEq(round1.body.skipped, undefined, "lock-2: non-skipped response has no `skipped` key at all (matches pre-lock shape exactly)");
+
       const firstStamp = row1.last_verified_at;
 
       // ── Round 2: reprocess again, same unchanged evidence. The agent is
@@ -220,6 +262,7 @@ export function runAdminRunVerifierDrainObservabilityTests(
       // (which includes pending_verify) to keep re-selecting the SAME
       // agent against the SAME unchanged evidence — the actual scenario
       // the live drain-burst finding was about.
+      clearTickLock();
       const round2 = await callRoute(router, {
         method: "POST",
         url: "/",
@@ -257,6 +300,7 @@ export function runAdminRunVerifierDrainObservabilityTests(
         "unverified",
       );
 
+      clearTickLock();
       const round3 = await callRoute(router, {
         method: "POST",
         url: "/",
@@ -285,6 +329,47 @@ export function runAdminRunVerifierDrainObservabilityTests(
         0,
       );
       assertEq(byNewStatusSum, round3.body.transitioned, "obs-14c: by_new_status counts sum to transitioned exactly (no double counting, no dropped rows)");
+
+      // ── dev-request 2026-08-17-verifier-tick-lock: lock-contention ─────
+      // behavior. Round 3's call above acquired the tick lock and did NOT
+      // clear it afterwards (no releaseLock() in this design — see
+      // runVerifierTick's own comment). Round 4 fires immediately after,
+      // with the lock still fresh (well within staleMinutes=50), and must
+      // be skipped WITHOUT running a second batch — this is the exact
+      // production bug (2-6 near-simultaneous runs/night) this dev-request
+      // fixes.
+      const runsCountBefore = (
+        db.prepare(`SELECT COUNT(*) AS c FROM runs`).get() as { c: number }
+      ).c;
+      const lockRowBefore = db
+        .prepare(`SELECT run_id, started_at FROM orchestrator_locks WHERE agent = 'lokal-agent-verifier-tick'`)
+        .get() as { run_id: string; started_at: string } | undefined;
+      assertTrue(!!lockRowBefore, "lock-3: round 3 left a fresh orchestrator_locks row behind (agent=lokal-agent-verifier-tick)");
+
+      const round4 = await callRoute(router, {
+        method: "POST",
+        url: "/",
+        headers: { "x-admin-key": ADMIN_KEY },
+        query: { force: "1", reprocess_review_queue: "0", batchSize: "5" },
+        body: {},
+      });
+
+      assertEq(round4.status, 200, "lock-4: round 4 (lock still fresh) responds 200");
+      assertEq(
+        round4.body,
+        { success: true, skipped: true, reason: `already ran this hour (locked by ${lockRowBefore?.run_id} at ${lockRowBefore?.started_at})` },
+        "lock-5: round 4 response is EXACTLY {success:true, skipped:true, reason} naming the current holder — no run_id/processed/etc fields leak through",
+      );
+
+      const runsCountAfter = (
+        db.prepare(`SELECT COUNT(*) AS c FROM runs`).get() as { c: number }
+      ).c;
+      assertEq(runsCountAfter, runsCountBefore, "lock-6: round 4 wrote NO new run-ledger envelope (batch-processing function was not invoked a second time)");
+
+      const lockRowAfter = db
+        .prepare(`SELECT run_id, started_at FROM orchestrator_locks WHERE agent = 'lokal-agent-verifier-tick'`)
+        .get() as { run_id: string; started_at: string } | undefined;
+      assertEq(lockRowAfter, lockRowBefore, "lock-7: the lock row itself is untouched by the skipped call (still held by round 3's run_id)");
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
