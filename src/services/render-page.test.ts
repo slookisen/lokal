@@ -141,6 +141,104 @@ export async function runRenderPageTests(opts: { log?: boolean } = {}): Promise<
     );
   }
 
+  // ── mainContentTextOf: Finding 2 (independent-reviewer fix-up) ────────────
+  // Substring keyword matching risked stripping REAL farm-shop content that
+  // merely happens to contain a chrome keyword as a fragment of an unrelated
+  // word. Each fixture below is a realistic gårdssalg/producer element that
+  // must now SURVIVE mainContentTextOf() — the tightened rule requires a
+  // whole class/id token equal to a small safe bare-word set, or a genuine
+  // hyphenated compound (e.g. "cookie-consent"), not a bare substring.
+  {
+    const hamburgerProductFixture =
+      "<nav>Hjem Om Kontakt</nav>" +
+      '<div id="hamburger-info">Vi selger hjemmelaget hamburgerkjøtt fra eget storfe, 100% norsk kjøttdeig rett fra garden.</div>' +
+      "<footer>© 2026 Gard AS</footer>";
+    check(
+      mainContentTextOf(hamburgerProductFixture).includes("hamburgerkjøtt fra eget storfe"),
+      'mct-fp-1: id="hamburger-info" (a real meat product) survives — bare "hamburger" substring is no longer enough to strip real content',
+    );
+  }
+  {
+    const cookieJarProductFixture =
+      "<nav>Hjem Om Kontakt</nav>" +
+      '<div class="cookie-jar-produkter">Våre hjemmelagde cookies selges i syltetøyglass rett fra gardsbutikken, med smaker som havre og sjokolade.</div>' +
+      "<footer>© 2026 Gard AS</footer>";
+    check(
+      mainContentTextOf(cookieJarProductFixture).includes("hjemmelagde cookies selges"),
+      'mct-fp-2: class="cookie-jar-produkter" (real baked-goods content) survives — bare "cookie" substring is no longer enough to strip real content',
+    );
+  }
+  {
+    const sidebarHoursFixture =
+      "<nav>Hjem Om Kontakt</nav>" +
+      '<div class="sidebar">Åpningstider: Mandag-fredag 10-17, lørdag 10-14. Gardsutsalget ligger ved låven.</div>' +
+      "<footer>© 2026 Gard AS</footer>";
+    check(
+      mainContentTextOf(sidebarHoursFixture).includes("Åpningstider"),
+      'mct-fp-3: class="sidebar" (a real opening-hours widget — very common on small producer sites) survives — bare "sidebar" is no longer enough to strip real content',
+    );
+  }
+  {
+    // The tightened rule must not have gone too far the other way: genuine
+    // compound/whole-token chrome signals are still stripped as before.
+    const compoundChromeFixture =
+      '<div class="navbar">NAVBAR LINKS</div>' +
+      '<div class="hamburger-menu">MENU TOGGLE ICON</div>' +
+      '<div class="nav-sidebar">SIDEBAR NAV LINKS</div>' +
+      '<div class="gdpr-consent-notice">ACCEPT COOKIES</div>' +
+      "<main>REAL CONTENT</main>";
+    check(
+      mainContentTextOf(compoundChromeFixture) === "REAL CONTENT",
+      "mct-fp-4: genuine compound/whole-token chrome (navbar, hamburger-menu, nav-sidebar, gdpr-consent-notice) is still stripped — Finding 2's tightening does not weaken true-positive detection",
+    );
+  }
+
+  // ── mainContentTextOf / shouldEscalateToRender: Finding 1 (independent-
+  // reviewer fix-up) — quadratic-time DoS regression guard ──────────────────
+  //
+  // Reproduces the reviewer's concrete PoC shape: real prose + one <script>
+  // tag + tens of thousands of an OPENING tag that matches the class/id
+  // keyword clause with NO closing tag anywhere in the document (realistic
+  // malformed/buggy producer-CMS HTML, not even adversarial). Pre-fix, the
+  // reviewer measured 15.8s for a 1.29 MB payload of this shape through the
+  // real shouldEscalateToRender() call path; this asserts a strict wall-
+  // clock budget so a future regression to the old backreference-scan
+  // approach is caught by CI, not just eyeballed.
+  {
+    const unclosedCount = 60_000;
+    const prose = "Velkommen til garden vår, ekte norske gardsprodukter siden 1970. ".repeat(5);
+    let chromeBomb = "";
+    for (let i = 0; i < unclosedCount; i++) {
+      chromeBomb += '<div class="cookie-x">';
+    }
+    const pathological =
+      `<!doctype html><html><head><title>Gard</title><script src="/app.js"></script></head><body>` +
+      prose +
+      chromeBomb +
+      `</body></html>`;
+    const pathologicalBytes = Buffer.byteLength(pathological);
+
+    const mctStart = Date.now();
+    const mctResult = mainContentTextOf(pathological);
+    const mctElapsedMs = Date.now() - mctStart;
+    check(
+      typeof mctResult === "string",
+      "perf-1-sanity: mainContentTextOf still returns a string for the pathological (60k unclosed chrome divs) input",
+    );
+    check(
+      mctElapsedMs < 500,
+      `perf-1: mainContentTextOf() on a ${(pathologicalBytes / 1_000_000).toFixed(2)} MB payload of ${unclosedCount} unclosed <div class="cookie-x"> tags completes in ${mctElapsedMs}ms, well under the 500ms budget (reviewer measured 15.8s pre-fix on a same-shaped 1.29 MB payload) — Finding 1 regression guard`,
+    );
+
+    const escStart = Date.now();
+    shouldEscalateToRender(pathological);
+    const escElapsedMs = Date.now() - escStart;
+    check(
+      escElapsedMs < 500,
+      `perf-2: shouldEscalateToRender() on the same pathological payload — the real call path every fetched hjemmeside page goes through — completes in ${escElapsedMs}ms, under the 500ms budget`,
+    );
+  }
+
   // ── shouldEscalateToRender: Skive 2a — boilerplate-aware eligibility ──────
   // dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render.
   //
