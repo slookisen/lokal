@@ -6143,7 +6143,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
 
   const { targets, cohortTotal } = selectGardssalgProvidersForContactExtraction(limit, offset, providerIds);
 
-  const changed: Array<{ provider_id: string; navn: string; fields: string[]; epost: string | null; telefon: string | null; source_url: string; email_source?: string; phone_cued?: boolean }> = [];
+  const changed: Array<{ provider_id: string; navn: string; fields: string[]; epost: string | null; telefon: string | null; source_url: string; email_source?: string; phone_cued?: boolean; email_from_raw?: boolean }> = [];
   const noContactFound: Array<{ provider_id: string; navn: string; pages_tried: number }> = [];
   // Addresses refused because they belong to a trade body / members'
   // association rather than the producer (AK2). Reported, never written.
@@ -6203,11 +6203,15 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
       // simply not added to `pages` — same as the old wdFetchPage() null
       // handling — the front page (already fetched above) still stands as a
       // fallback source.
-      const pages: Array<{ url: string; html: string; contactish: boolean }> = [];
+      // `rawHtml` is the PRE-render document, carried alongside and set only
+      // when a render actually replaced it. See the raw-fallback block below
+      // the loop for why keeping it is not redundant.
+      const pages: Array<{ url: string; html: string; rawHtml?: string; contactish: boolean }> = [];
       for (const sub of gardssalgContactPageLinks(front.html, host, 2)) {
         const subOutcome = await gsCxFetchPage(sub);
         if (subOutcome.kind !== "ok") continue;
         let subHtml = subOutcome.html;
+        let subRaw: string | undefined;
         // Sub-page escalation, gated on the PRIMARY render having succeeded —
         // the same narrowing crFetchGardssalgContent uses. The site is then
         // known to be JS-built AND the renderer known to work for it, so this
@@ -6227,6 +6231,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
             timeoutMs: GARDSSALG_RENDER_TIMEOUT_MS,
           });
           if (renderedSub.ok) {
+            subRaw = subHtml;
             subHtml = renderedSub.html;
             renderEntry.subpages_rendered = (renderEntry.subpages_rendered ?? 0) + 1;
           } else {
@@ -6235,19 +6240,61 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
             renderEntry.subpages_render_failed = (renderEntry.subpages_render_failed ?? 0) + 1;
           }
         }
-        pages.push({ url: subOutcome.finalUrl, html: subHtml, contactish: true });
+        pages.push({ url: subOutcome.finalUrl, html: subHtml, rawHtml: subRaw, contactish: true });
       }
-      pages.push({ url: front.finalUrl, html: front.html, contactish: false });
+      pages.push({
+        url: front.finalUrl,
+        html: front.html,
+        rawHtml: rendered.report.ok === true ? frontOutcome.html : undefined,
+        contactish: false,
+      });
 
       const needEmail = !t.epost || t.epost.trim() === "";
       const needPhone = !t.telefon || t.telefon.trim() === "";
       let email: ReturnType<typeof extractGardssalgContactEmail> = null;
       let emailUrl = "";
+      // True when the address came from the PRE-render document. Reported, not
+      // just used: the embedded tier is a second-chance source by its own
+      // contract, and "the rendered page did not show this, the raw document
+      // did" is exactly the kind of thing a reviewer of an outreach candidate
+      // needs to see rather than infer.
+      let emailFromRaw = false;
       let phone: ReturnType<typeof extractGardssalgContactPhone> = null;
       let phoneUrl = "";
       for (const pg of pages) {
         if (needEmail && !email) {
           email = extractGardssalgContactEmail(pg.html, homeDomain, pg.contactish);
+          // ── Raw fallback: rendering must never SUBTRACT ──────────────────
+          //
+          // extractGardssalgContactEmail's fourth tier (embedded_same_domain)
+          // reads string literals out of <script> blocks, which is where
+          // site-builder platforms keep page copy. A successful render hands
+          // back the post-JS DOM and that payload is gone from it — so on a
+          // site whose only published address lives there, escalating would
+          // LOSE an address the un-rendered document would have yielded.
+          //
+          // Measured on 67northdistillery.no, 2026-08-16: the pure extractor
+          // run against that site's raw HTML returns
+          // {"email":"post@67northdistillery.no","source":"embedded_same_domain"}.
+          // The render (19 -> 4 558 chars, confirmed live) does not carry it.
+          // Without this fallback, wiring the render in would have been a net
+          // regression for exactly the class of site it was built to help.
+          //
+          // Rendered FIRST, raw only as second chance: the rendered DOM is what
+          // a visitor actually sees, so an address found there is the
+          // higher-trust answer and keeps its own classification. This only
+          // runs when the render replaced the document (rawHtml is otherwise
+          // undefined) and only when the rendered pass found nothing, so a
+          // server-rendered site pays nothing at all.
+          //
+          // Email only, deliberately: extractGardssalgContactPhone has no
+          // embedded tier — it reads visible text, which rendering can only
+          // add to — so there is no equivalent way for a render to lose a
+          // phone number.
+          if (!email && pg.rawHtml) {
+            email = extractGardssalgContactEmail(pg.rawHtml, homeDomain, pg.contactish);
+            if (email) emailFromRaw = true;
+          }
           if (email) emailUrl = pg.url;
         }
         if (needPhone && !phone) {
@@ -6266,6 +6313,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
         umbrellaRejected.push({ provider_id: t.id, navn: t.navn, epost: email.email, source_url: emailUrl });
         email = null;
         emailUrl = "";
+        emailFromRaw = false; // the rejected address is gone; its provenance goes with it
       }
 
       if (!email && !phone) {
@@ -6280,6 +6328,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
           provider_id: t.id, navn: t.navn, fields,
           epost: email?.email ?? null, telefon: phone?.phone ?? null,
           source_url: evidenceUrl, email_source: email?.source, phone_cued: phone?.cued,
+          ...(emailFromRaw ? { email_from_raw: true } : {}),
         });
       } else {
         const written = applyGardssalgProviderContact(
@@ -6293,6 +6342,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
             provider_id: t.id, navn: t.navn, fields: written,
             epost: email?.email ?? null, telefon: phone?.phone ?? null,
             source_url: evidenceUrl, email_source: email?.source, phone_cued: phone?.cued,
+            ...(emailFromRaw ? { email_from_raw: true } : {}),
           });
         }
       }
