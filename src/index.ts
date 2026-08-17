@@ -1194,10 +1194,14 @@ if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
     verifierTickRunning = true;
     try {
       const r = await runVerifierTick({ batchSize: 30 });
-      console.log(
-        `[verifier-scheduler] run_id=${r.run_id} processed=${r.processed} passed=${r.passed} ` +
-        `pending_verify=${r.pending_verify} review_required=${r.review_required} pool_added=${r.pool_added}`
-      );
+      if (r.skipped) {
+        console.warn(`[verifier-scheduler] tick skipped — ${r.reason}`);
+      } else {
+        console.log(
+          `[verifier-scheduler] run_id=${r.run_id} processed=${r.processed} passed=${r.passed} ` +
+          `pending_verify=${r.pending_verify} review_required=${r.review_required} pool_added=${r.pool_added}`
+        );
+      }
     } catch (err) {
       console.error("[verifier-scheduler] tick failed:", err);
     } finally {

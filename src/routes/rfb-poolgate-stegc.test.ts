@@ -207,6 +207,17 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
         insertKnowledge.run(id, "Testveien 1, 1400 Ski", "91234567", "info@gmail.com", "Kort tekst.", "[]", JSON.stringify({}));
       }
 
+      // dev-request 2026-08-17-verifier-tick-lock: runVerifierTick() now
+      // acquires an orchestrator_locks row (agent
+      // "lokal-agent-verifier-tick") as the first thing it does and never
+      // releases it explicitly (natural staleMinutes=50 expiry only) — so
+      // the back-to-back rounds below (r1..r6, all hitting POST / in the
+      // same test tick) must clear that row between calls, standing in for
+      // "the previous lock already expired", or every round after r1 would
+      // get skipped:true instead of actually running a batch.
+      const clearTickLock = () =>
+        db.prepare(`DELETE FROM orchestrator_locks WHERE agent = 'lokal-agent-verifier-tick'`).run();
+
       // (a) No batchSize, no VERIFY_BATCH_SIZE -> default 30 (unchanged).
       delete process.env.VERIFY_BATCH_SIZE;
       const r1 = await callRoute(runVerifierRouter, {
@@ -221,6 +232,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
 
       // (b) VERIFY_BATCH_SIZE=15 set, no explicit batchSize -> 15.
       process.env.VERIFY_BATCH_SIZE = "15";
+      clearTickLock();
       const r2 = await callRoute(runVerifierRouter, {
         method: "POST",
         url: "/",
@@ -231,6 +243,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
       assertEq(r2.body.processed, 15, "c1-3: VERIFY_BATCH_SIZE=15, batchSize omitted -> used as default (15)");
 
       // (c) VERIFY_BATCH_SIZE=15 still set, explicit batchSize=7 -> explicit wins.
+      clearTickLock();
       const r3 = await callRoute(runVerifierRouter, {
         method: "POST",
         url: "/",
@@ -244,6 +257,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
       // -> still clamped to 100. Proves the clamp is unchanged/still enforced
       // against the ENV-sourced value, not just the literal/explicit ones.
       process.env.VERIFY_BATCH_SIZE = "500";
+      clearTickLock();
       const r4 = await callRoute(runVerifierRouter, {
         method: "POST",
         url: "/",
@@ -256,6 +270,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
       // (e) VERIFY_BATCH_SIZE unset again -> default stays 30 (re-read fresh
       // per request, not cached/sticky from an earlier round).
       delete process.env.VERIFY_BATCH_SIZE;
+      clearTickLock();
       const r5 = await callRoute(runVerifierRouter, {
         method: "POST",
         url: "/",
@@ -266,6 +281,7 @@ export function runRfbPoolgateStegCTests(opts: { log?: boolean } = {}): Promise<
       assertEq(r5.body.processed, 30, "c1-6: VERIFY_BATCH_SIZE unset again -> default 30 (env re-read per request, no stickiness)");
 
       // (f) Explicit batchSize alone (no env) still clamps to [1,100] as before.
+      clearTickLock();
       const r6 = await callRoute(runVerifierRouter, {
         method: "POST",
         url: "/",

@@ -14,7 +14,7 @@
 
 import { Router, Request, Response } from "express";
 import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch, pickBatchBiased } from "../agents/lokal-agent-verifier";
-import { recordRun } from "../services/run-ledger";
+import { recordRun, acquireLock } from "../services/run-ledger";
 
 const router = Router();
 
@@ -47,6 +47,38 @@ export function isVerifierWindowHour(hourUTC: number): boolean {
   return ALLOWED_UTC_HOURS.includes(hourUTC);
 }
 
+// VerifierTickResult — discriminated union added for dev-request
+// 2026-08-17-verifier-tick-lock: a real batch run (`skipped: false`) keeps
+// every field runVerifierTick has always returned, unchanged; a
+// lock-contended call (`skipped: true`) returns only success/skipped/reason
+// and does NOT run a batch. See the acquireLock() call at the top of
+// runVerifierTick below for why this exists.
+export type VerifierTickResult =
+  | { success: true; skipped: true; reason: string }
+  | {
+      success: true;
+      skipped: false;
+      run_id: string;
+      processed: number;
+      passed: number;
+      review_required: number;
+      pending_verify: number;
+      data_insufficient: number;
+      http_unreachable: number;
+      brreg_inactive: number;
+      domain_incoherent: number;
+      email_domain_mismatch: number;
+      thin_content: number;
+      pool_added: number;
+      status_transitions: number;
+      transitioned: number;
+      by_new_status: Record<string, number>;
+      persisted: true;
+      envelope_recorded: boolean;
+      reprocess_review_queue: boolean;
+      bias_growth: boolean;
+    };
+
 // runVerifierTick — the actual verifier-batch-run + stat-computation +
 // envelope-record logic, extracted out of the POST / handler below so it
 // can be called directly from in-process schedulers (dev-request
@@ -55,32 +87,49 @@ export function isVerifierWindowHour(hourUTC: number): boolean {
 // a refactor, not a behavior change: the route handler (below) still
 // produces byte-identical JSON responses by calling this and shaping the
 // result the same way it always did.
+//
+// dev-request 2026-08-17-verifier-tick-lock: the FIRST thing this function
+// does is acquire a DB-backed lock (orchestrator_locks, via the SAME atomic
+// acquireLock() primitive the platform-orchestrator's build-lane mutex
+// uses — see run-ledger.ts). Root cause: the two independent callers of
+// this function (the HTTP route below, and index.ts's internal setInterval
+// scheduler) had NOTHING coordinating them — the scheduler's own
+// `verifierTickRunning` guard is an in-memory, per-process boolean that
+// resets on every restart and is invisible to the separate HTTP route
+// process/request — so live prod's run-ledger showed 2-6 near-simultaneous
+// runs clustering every night instead of one-per-hour. A DB row survives
+// restarts and is atomic across both callers (whichever caller's INSERT
+// wins the `agent` unique-key race is the only one that proceeds), closing
+// both gaps at once. Uses its own lock key
+// ("lokal-agent-verifier-tick") — separate from the orchestrator's own
+// build-lane lock key so the two systems can never contend with each
+// other. staleMinutes=50 is deliberately just under the 60-minute cadence
+// so the lock always expires on its own before the next legitimate hourly
+// tick; there is intentionally no matching releaseLock() call — natural
+// staleness expiry IS the release mechanism (an explicit release would add
+// a "crashed mid-batch, now permanently wedged" failure mode this design
+// avoids).
 export async function runVerifierTick(opts: {
   batchSize?: number;
   reprocessReviewQueue?: boolean;
   biasGrowth?: boolean;
-} = {}): Promise<{
-  success: true;
-  run_id: string;
-  processed: number;
-  passed: number;
-  review_required: number;
-  pending_verify: number;
-  data_insufficient: number;
-  http_unreachable: number;
-  brreg_inactive: number;
-  domain_incoherent: number;
-  email_domain_mismatch: number;
-  thin_content: number;
-  pool_added: number;
-  status_transitions: number;
-  transitioned: number;
-  by_new_status: Record<string, number>;
-  persisted: true;
-  envelope_recorded: boolean;
-  reprocess_review_queue: boolean;
-  bias_growth: boolean;
-}> {
+} = {}): Promise<VerifierTickResult> {
+  const tickStartedAt = new Date().toISOString();
+  const tickRunId = `run-${tickStartedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-tick`;
+  const lock = acquireLock({
+    agent: "lokal-agent-verifier-tick",
+    run_id: tickRunId,
+    started_at: tickStartedAt,
+    staleMinutes: 50,
+  });
+  if (!lock.acquired) {
+    return {
+      success: true,
+      skipped: true,
+      reason: `already ran this hour (locked by ${lock.holder.run_id} at ${lock.holder.started_at})`,
+    };
+  }
+
   const batchSize = Math.min(
     Math.max(parseInt(String(opts.batchSize ?? (process.env.VERIFY_BATCH_SIZE ?? "30")), 10) || 30, 1),
     100
@@ -169,6 +218,7 @@ export async function runVerifierTick(opts: {
 
   return {
     success: true,
+    skipped: false,
     run_id: batchResult.run_id,
     processed: results.length,
     passed,
@@ -239,6 +289,19 @@ router.post("/", async (req: Request, res: Response) => {
 
   try {
     const tick = await runVerifierTick({ batchSize, reprocessReviewQueue, biasGrowth });
+
+    if (tick.skipped) {
+      // dev-request 2026-08-17-verifier-tick-lock: same response shape as
+      // the window-hour skip case above ({success, skipped, reason}) — this
+      // is a SEPARATE, additional gate (the DB-backed once-per-hour lock),
+      // not a replacement for the window-hour check.
+      res.json({
+        success: true,
+        skipped: true,
+        reason: tick.reason,
+      });
+      return;
+    }
 
     res.json({
       success: true,
