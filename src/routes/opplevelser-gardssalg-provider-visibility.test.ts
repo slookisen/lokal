@@ -79,11 +79,28 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("../services/experience-store");
+    const blocklistPath = require.resolve("../services/blocklist-service");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, experienceStorePath, opplevelserPath];
+    const cachePaths = [dbFactoryPath, experienceStorePath, blocklistPath, opplevelserPath];
     for (const p of cachePaths) delete require.cache[p];
 
+    let prevRfbDb: any = null;
+
     try {
+      // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+      // utfoerelse): hiding a real gårdssalg producer now also auto-writes
+      // to agent_blocklist, which lives on the RFB db (database/init.ts),
+      // NOT the experiences db — inject a fresh :memory: instance (same
+      // pattern as the other gårdssalg route test files that exercise the
+      // blocklist gate/write).
+      const initMod = require("../database/init") as typeof import("../database/init");
+      const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+      prevRfbDb = initMod.__peekDbForTesting();
+      const rfbDb = new Database(":memory:");
+      initMod.__setDbForTesting(rfbDb as any);
+      initMod.__initSchemaForTesting(rfbDb as any);
+      const blocklistSvc = require("../services/blocklist-service") as typeof import("../services/blocklist-service");
+
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
@@ -226,6 +243,87 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
         assertEq((r.body.not_found as any[]).length, 2, "pv-8b: both references reported as not_found");
         assertEq(hiddenFlag("pv-x"), null, "pv-8c: catalog_hidden untouched outside the vertical");
       }
+
+      // ── pv-9 (Skive D, dev-request 2026-08-17-cs-plattformparitet-og-
+      //    verifisert-utfoerelse): hiding a real gårdssalg producer auto-
+      //    writes ALL its known identifiers (org_nr + website + email) to
+      //    agent_blocklist, not just the catalog_hidden flag — this is what
+      //    stops it coming back via a later discovery/harvest pass. ────────
+      {
+        expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, org_nr, hjemmeside, epost, catalog_hidden, content_source, products,
+              producer_type, enrichment_state, verification_status, source, confidence)
+           VALUES
+             ('pv-full', 'Full Identitet Gard', 'experiences', '966000099', 'https://full-identitet-gard.no', 'post@full-identitet-gard.no',
+              NULL, NULL, '["x"]', 'sideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+        ).run();
+
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { hidden: true, providerIds: ["pv-full"], apply: true },
+        });
+        assertEq(r.body.changed_count, 1, "pv-9a: hidden");
+        const row = (r.body.changed as any[]).find((c) => c.id === "pv-full");
+        assertEq(row?.blocklist_inserted, 3, "pv-9b: all 3 identifiers written (org_nr + website_domain + email)");
+        assertEq(r.body.blocklist_inserted_total, 3, "pv-9c: top-level total matches");
+        assertTrue(blocklistSvc.isBlocked({ orgNr: "966000099" }).blocked, "pv-9d: org_nr now blocked");
+        assertTrue(blocklistSvc.isBlocked({ website: "https://full-identitet-gard.no" }).blocked, "pv-9e: website domain now blocked");
+        assertTrue(blocklistSvc.isBlocked({ email: "post@full-identitet-gard.no" }).blocked, "pv-9f: email now blocked");
+      }
+
+      // ── pv-10: un-hiding (hidden=false) never writes to the blocklist —
+      //    only an actual removal does; the 24h angrefrist reversal must
+      //    not itself add a NEW block entry. ────────────────────────────────
+      {
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { hidden: false, providerIds: ["pv-full"], apply: true },
+        });
+        assertEq(r.body.changed_count, 1, "pv-10a: un-hidden");
+        const row = (r.body.changed as any[]).find((c) => c.id === "pv-full");
+        assertEq(row?.blocklist_inserted, undefined, "pv-10b: un-hide never attempts a blocklist write");
+        assertEq(r.body.blocklist_inserted_total, undefined, "pv-10c: top-level field absent for hidden:false");
+      }
+
+      // ── pv-11: dry-run never writes to the blocklist either. ─────────────
+      {
+        expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, org_nr, hjemmeside, epost, catalog_hidden, content_source, products,
+              producer_type, enrichment_state, verification_status, source, confidence)
+           VALUES
+             ('pv-dry', 'Toerrkjoert Gard', 'experiences', '966000098', 'https://toerrkjoert-gard.no', NULL,
+              NULL, NULL, '["x"]', 'sideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+        ).run();
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { hidden: true, providerIds: ["pv-dry"] },
+        });
+        assertEq(r.body.dry_run, true, "pv-11a: dry-run");
+        assertTrue(!blocklistSvc.isBlocked({ orgNr: "966000098" }).blocked, "pv-11b: dry-run wrote nothing to the blocklist");
+      }
+
+      // ── pv-12: a producer with NO known identifiers at all (no org_nr/
+      //    hjemmeside/epost) still hides cleanly — blocklist_inserted: 0,
+      //    never throws (mirrors add()'s own "nothing to write" no-op). ────
+      {
+        expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, org_nr, hjemmeside, epost, catalog_hidden, content_source, products,
+              producer_type, enrichment_state, verification_status, source, confidence)
+           VALUES
+             ('pv-bare', 'Bar Gard', 'experiences', NULL, NULL, NULL,
+              NULL, NULL, '["x"]', 'sideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+        ).run();
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { hidden: true, providerIds: ["pv-bare"], apply: true },
+        });
+        assertEq(r.body.changed_count, 1, "pv-12a: hidden despite no known identifiers");
+        const row = (r.body.changed as any[]).find((c) => c.id === "pv-bare");
+        assertEq(row?.blocklist_inserted, 0, "pv-12b: blocklist_inserted is 0, not undefined/absent — the write was attempted, just had nothing to insert");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-provider-visibility: unexpected error: " + String(err?.stack || err?.message || err));
@@ -234,6 +332,10 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
+      try {
+        const initMod = require("../database/init") as typeof import("../database/init");
+        if (prevRfbDb) initMod.__setDbForTesting(prevRfbDb);
+      } catch { /* best-effort */ }
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

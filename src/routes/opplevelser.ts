@@ -466,7 +466,7 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // was removed; a merge with main's independently-built AC6 slice (#508)
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
-import { normalizeDomain, normalizeEmail, isBlocked } from "../services/blocklist-service";
+import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd } from "../services/blocklist-service";
 // GET /admin/gardssalg-outreach-candidates (near computeGardssalgOutreach-
 // SendEligibility, below) reuses the SAME email-collision dedupe RFB's
 // admin-outreach-candidates.ts uses — not gardssalg-outreach-dedupe.ts's
@@ -1257,6 +1257,18 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   let providersInserted = 0;
   let experiencesInserted = 0;
   let skipped = 0; // providers/experiences skipped as already-present or non-evidence unverified
+  // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+  // utfoerelse): a producer whose org_nr, hjemmeside, or name matches a
+  // removed producer (agent_blocklist) must not be (re-)created here — and,
+  // since a resolve-or-create match on an already-existing (possibly
+  // catalog_hidden) row would otherwise still attach fresh experiences to
+  // it, the whole provider (row + its rows-batch of experiences) is skipped
+  // rather than just the create step. Checked in BOTH dry-run and apply —
+  // dry-run's own existing "no DB dedup" simplification (see the comment on
+  // its branch below) already treats every provider uniformly, so this gate
+  // follows the same convention.
+  let rejectedBlocklisted = 0;
+  const rejectedBlocklistedProviders: Array<{ provider_name: string; matched_by?: string; matched_value?: string }> = [];
 
   // ── 2–3. Classify + (conditionally) insert, one provider at a time. ─
   for (let i = 0; i < providerNames.length; i++) {
@@ -1285,6 +1297,14 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
         continue;
       }
 
+      const candidateWebsite = firstNonAggregatorWebsite(rows);
+      const blockCheck = isBlocked({ orgNr: verdict.org_nr ?? undefined, website: candidateWebsite ?? undefined, name });
+      if (blockCheck.blocked) {
+        rejectedBlocklisted++;
+        rejectedBlocklistedProviders.push({ provider_name: name, matched_by: blockCheck.matchedBy, matched_value: blockCheck.matchedValue });
+        continue;
+      }
+
       if (dryRun) {
         // Dry-run: count what WOULD be inserted, write nothing.
         // (every row whose (provider,title) we'd create — all rows here,
@@ -1310,7 +1330,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           org_nr: verdict.org_nr,
           kommune,
           fylke: rows.find((r) => r.fylke)?.fylke ?? null,
-          hjemmeside: firstNonAggregatorWebsite(rows),
+          hjemmeside: candidateWebsite,
           naeringskode: verdict.naeringskode ?? null,
           brreg_verified: verdict.brreg_verified,
           brreg_active: verdict.brreg_active,
@@ -1415,6 +1435,8 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     providers_inserted: providersInserted,
     skipped,
     excluded_inactive: excludedInactive,
+    rejected_blocklisted: rejectedBlocklisted,
+    rejected_blocklisted_providers: rejectedBlocklistedProviders,
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
 });
@@ -3722,10 +3744,17 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
   // Date+time stamped: a date-only tag collides when two runs land the same
   // day, and rollbackBatch would then undo BOTH batches as one.
   const batchTag = `brreg-nace-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
-  const perCode: Record<string, { total: number; dead: number; duplicates: number; created: number; capped: number }> = {};
+  const perCode: Record<string, { total: number; dead: number; duplicates: number; rejected_blocklisted: number; created: number; capped: number }> = {};
   const created: Array<{ provider_id?: string; org_nr: string; navn: string; producer_type: string; kommune: string | null; hjemmeside: string | null }> = [];
   const duplicates: Array<{ org_nr: string; brreg_navn: string; reason: string; existing_provider_id?: string; suggested_orgnr_for_existing?: string }> = [];
   const dead: Array<{ org_nr: string; navn: string }> = [];
+  // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+  // utfoerelse): a Brreg candidate whose org_nr or hjemmeside matches a
+  // producer that was explicitly removed (agent_blocklist). Checked BEFORE
+  // the create-vs-capped decision, same priority as the existing-orgnr
+  // duplicate check above it — a blocklisted candidate never consumes the
+  // per-code create cap.
+  const rejectedBlocklisted: Array<{ org_nr: string; navn: string; matched_by?: string; matched_value?: string }> = [];
   const errors: Array<{ code: string; error: string }> = [];
   const seenThisBatch = new Set<string>();
   // Tracks how many times each existing gårdssalg provider_id has already
@@ -3739,7 +3768,7 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
   let cappedTotal = 0;
 
   for (const code of codes) {
-    perCode[code] = { total: 0, dead: 0, duplicates: 0, created: 0, capped: 0 };
+    perCode[code] = { total: 0, dead: 0, duplicates: 0, rejected_blocklisted: 0, created: 0, capped: 0 };
     try {
       for (let page = 0; page < GS_ND_MAX_PAGES_PER_CODE; page++) {
         const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}?naeringskode=${encodeURIComponent(code)}&size=${GS_ND_PAGE_SIZE}&page=${page}`;
@@ -3768,6 +3797,27 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
             perCode[code].duplicates++;
             duplicates.push({ org_nr: orgnr, brreg_navn: e.navn, reason: "orgnr_exists" });
             continue;
+          }
+          // Skive D: a candidate whose org_nr or Brreg-reported hjemmeside
+          // was explicitly blocklisted (producer removed via "fjern oss")
+          // must never be (re-)created. Checked before the name-match dup
+          // screen, since it is a stronger, more deliberate signal than an
+          // incidental name collision.
+          {
+            const blockCheck = isBlocked({
+              orgNr: orgnr,
+              website: typeof e.hjemmeside === "string" ? e.hjemmeside : undefined,
+            });
+            if (blockCheck.blocked) {
+              perCode[code].rejected_blocklisted++;
+              rejectedBlocklisted.push({
+                org_nr: orgnr,
+                navn: e.navn,
+                matched_by: blockCheck.matchedBy,
+                matched_value: blockCheck.matchedValue,
+              });
+              continue;
+            }
           }
           // Match the raw catalog name AND the «— Sted»-pruned one: legacy
           // dash-suffixed rows («Ægir Bryggeri — Flåm») score only 0.8 raw,
@@ -3889,9 +3939,11 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
     per_code: perCode,
     created_count: created.length,
     capped_count: cappedTotal,
+    rejected_blocklisted_count: rejectedBlocklisted.length,
     created,
     duplicates,
     dead,
+    rejected_blocklisted: rejectedBlocklisted,
     errors,
   });
 });
@@ -4168,11 +4220,27 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
   }> = [];
   const noCandidateVerified: Array<{ provider_id: string; navn: string; tried: string[] }> = [];
   const excluded: Array<{ provider_id: string; navn: string; hosts: Array<{ host: string; reason: string }> }> = [];
+  // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+  // utfoerelse): a target whose org_nr or name was explicitly blocklisted
+  // (producer removed via "fjern oss") gets no discovery effort spent on
+  // it — finding it a new candidate website would only make a removed
+  // producer's row more complete, one step closer to looking live again.
+  const rejectedBlocklisted: Array<{ provider_id: string; navn: string; matched_by?: string; matched_value?: string }> = [];
   const processedIds: string[] = [];
   let searchCallCount = 0;
 
   for (const t of targets) {
     processedIds.push(t.id);
+    const blockCheck = isBlocked({ orgNr: t.org_nr ?? undefined, name: t.navn });
+    if (blockCheck.blocked) {
+      rejectedBlocklisted.push({
+        provider_id: t.id,
+        navn: t.navn,
+        matched_by: blockCheck.matchedBy,
+        matched_value: blockCheck.matchedValue,
+      });
+      continue;
+    }
     const tried: string[] = [];
     const excludedHere: Array<{ host: string; reason: string }> = [];
 
@@ -4263,6 +4331,8 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
     // per scanned row, and 0 whenever no Brave key/override is configured.
     search_calls: searchCallCount,
     search_configured: searchFn !== null,
+    rejected_blocklisted_count: rejectedBlocklisted.length,
+    rejected_blocklisted: rejectedBlocklisted,
   });
 });
 
@@ -18394,14 +18464,22 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
   try {
     const expDb = getExpDb("experiences");
     const byId = expDb.prepare(
-      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source FROM experience_providers
         WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     const byOrgNr = expDb.prepare(
-      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source FROM experience_providers
         WHERE org_nr = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
-    type PvRow = { id: string; navn: string; org_nr: string | null; catalog_hidden: number | null; content_source: string | null };
+    type PvRow = {
+      id: string;
+      navn: string;
+      org_nr: string | null;
+      hjemmeside: string | null;
+      epost: string | null;
+      catalog_hidden: number | null;
+      content_source: string | null;
+    };
 
     const matched = new Map<string, PvRow>();
     const notFound: Array<{ ref: string; via: string }> = [];
@@ -18418,12 +18496,32 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
 
     const skippedLocked: Array<{ id: string; navn: string; org_nr: string | null }> = [];
     const unchanged: Array<{ id: string; navn: string; org_nr: string | null }> = [];
-    const changed: Array<{ id: string; navn: string; org_nr: string | null; previous_hidden: boolean }> = [];
+    const changed: Array<{
+      id: string;
+      navn: string;
+      org_nr: string | null;
+      previous_hidden: boolean;
+      blocklist_inserted?: number;
+    }> = [];
     const targetValue = hidden ? 1 : null;
 
     const upd = expDb.prepare(
       `UPDATE experience_providers SET catalog_hidden = ?, updated_at = datetime('now') WHERE id = ?`
     );
+    // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+    // utfoerelse): this lever is the CS "fjern oss" delist mechanism for real
+    // gårdssalg producers (see the catalog_hidden doc comment on
+    // GardssalgProviderRow in experience-store.ts). Previously ONLY the
+    // catalog_hidden flag was set here — the CS routine's own playbook
+    // (scheduled-agents/rfb-customer-service.md, A2A repo) separately called
+    // POST /admin/blocklist with `website` alone as its own step. Writing
+    // org_nr + email here too, atomically with the hide itself, means a
+    // removed producer's full identifier set lands on the blocklist the
+    // moment it is actually removed — not only whichever subset a manual
+    // follow-up step happens to pass. Best-effort: a blocklist failure must
+    // never block the hide itself (the row is already the source of truth;
+    // the blocklist write is a defense-in-depth belt, not the buckle).
+    let blocklistInsertedTotal = 0;
     for (const row of matched.values()) {
       if (row.content_source === "manual" || row.content_source === "claim") {
         skippedLocked.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
@@ -18434,8 +18532,31 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
         unchanged.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
         continue;
       }
-      if (!dryRun) upd.run(targetValue, row.id);
-      changed.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, previous_hidden: currentlyHidden });
+      let blocklistInserted: number | undefined;
+      if (!dryRun) {
+        upd.run(targetValue, row.id);
+        if (hidden) {
+          try {
+            const bl = blocklistAdd({
+              orgNr: row.org_nr ?? undefined,
+              website: row.hjemmeside ?? undefined,
+              email: row.epost ?? undefined,
+              reason: "gardssalg-provider-visibility hide (fjern oss)",
+            });
+            blocklistInserted = bl.inserted;
+            blocklistInsertedTotal += bl.inserted;
+          } catch (blockErr) {
+            console.error("[opplevelser] gardssalg-provider-visibility blocklist auto-add failed (non-critical):", blockErr);
+          }
+        }
+      }
+      changed.push({
+        id: row.id,
+        navn: row.navn,
+        org_nr: row.org_nr,
+        previous_hidden: currentlyHidden,
+        ...(blocklistInserted !== undefined ? { blocklist_inserted: blocklistInserted } : {}),
+      });
     }
 
     res.json({
@@ -18448,6 +18569,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       unchanged,
       skipped_locked: skippedLocked,
       not_found: notFound,
+      ...(!dryRun && hidden ? { blocklist_inserted_total: blocklistInsertedTotal } : {}),
     });
   } catch (err) {
     console.error("[opplevelser] admin/gardssalg-provider-visibility POST failed", err);

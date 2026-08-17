@@ -252,6 +252,38 @@ export function runAdminBlocklistManualEntryTests(opts: { log?: boolean } = {}):
     const blockCheck = isBlocked({ email: "norskott@online.no" });
     assertEq(blockCheck.blocked, true, "isBlocked(): sees the manually-inserted email row (outreach-candidates suppression mechanism)");
     assertEq(blockCheck.matchedBy, "email", "isBlocked(): reports matchedBy='email' for the manual entry");
+
+    // ── 9. org_nr (Skive D, dev-request 2026-08-17-cs-plattformparitet-og-
+    //    verifisert-utfoerelse) — generic shape, whitespace normalized. ─────
+    const resOrgNr = callRouteSync(router, {
+      method: "POST",
+      url: "/admin/blocklist",
+      headers: { "x-admin-key": testKey },
+      body: { identifier_type: "org_nr", identifier_value: " 977 777 777 ", reason: "test" },
+    });
+    assertEq(resOrgNr.status, 201, "generic shape: org_nr entry -> 201");
+    assertEq(resOrgNr.body?.identifier_type, "org_nr", "generic shape: response echoes identifier_type=org_nr");
+    assertEq(resOrgNr.body?.identifier_value, "977777777", "generic shape: org_nr normalized (whitespace stripped)");
+    assertEq(countRows("org_nr", "977777777"), 1, "generic shape: org_nr row retrievable");
+    const blockCheckOrgNr = isBlocked({ orgNr: "977 777 777" });
+    assertEq(blockCheckOrgNr.blocked, true, "isBlocked(): sees the manually-inserted org_nr row regardless of whitespace");
+    assertEq(blockCheckOrgNr.matchedBy, "org_nr", "isBlocked(): reports matchedBy='org_nr'");
+
+    // ── 10. orgNr on the legacy named-field shape (the write side of the
+    //    "fjern oss" removal path — Skive D). ────────────────────────────
+    const resLegacyOrgNr = callRouteSync(router, {
+      method: "POST",
+      url: "/admin/blocklist",
+      headers: { "x-admin-key": testKey },
+      body: {
+        website: "https://legacy-orgnr-gard.no",
+        orgNr: "988111222",
+        reason: "customer-opt-out (opplevagent)",
+      },
+    });
+    assertEq(resLegacyOrgNr.status, 201, "legacy shape: orgNr field accepted -> 201");
+    assertEq(resLegacyOrgNr.body?.inserted, 2, "legacy shape: inserts both website_domain and org_nr");
+    assertEq(countRows("org_nr", "988111222"), 1, "legacy shape: org_nr row written via the named-field shape");
   } catch (err) {
     failed++;
     failures.push(`admin-blocklist-manual-entry: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
