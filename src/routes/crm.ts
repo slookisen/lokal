@@ -606,6 +606,13 @@ router.post("/compose", async (req, res) => {
       const lookback7d = new Date(Date.now() - 7 * 24 * 3600_000).toISOString();
 
       // Has the contact sent us anything inbound in the last 7 days?
+      //
+      // datetime(...) wrap: same fix as crm-service.ts's listSentMessages
+      // since_hours filter (root cause: crm_messages.received_at is ALWAYS
+      // written in SQLite's own "YYYY-MM-DD HH:MM:SS" format, but
+      // `lookback7d` is a JS ISO-8601 string — a raw `>=` between the two
+      // formats silently misjudges rows whose date falls on the same
+      // calendar day as the cutoff).
       const hasRecentInbound = getDb().prepare(`
         SELECT 1 AS hit
         FROM crm_messages m
@@ -613,7 +620,7 @@ router.post("/compose", async (req, res) => {
         JOIN crm_contacts c ON c.id = t.contact_id
         WHERE m.direction = 'in'
           AND LOWER(c.email) = LOWER(?)
-          AND m.received_at >= ?
+          AND datetime(m.received_at) >= datetime(?)
         LIMIT 1
       `).get(to, lookback7d) as { hit: number } | undefined;
 
@@ -675,6 +682,13 @@ router.post("/compose", async (req, res) => {
 
         // Legacy 24h duplicate guard (kept as a fast secondary check on raw
         // crm_messages, e.g. sends not yet mirrored into outreach_sent_log).
+        //
+        // datetime(...) wrap: same fix as above / crm-service.ts's
+        // listSentMessages since_hours filter — crm_messages.sent_at is
+        // written in BOTH SQLite's own format (updateMessageDeliveryStatus's
+        // `datetime('now')`) and JS ISO format (recordOutboundReply's
+        // `new Date().toISOString()`), and a raw `>=` against `lookback24h`
+        // (JS ISO) silently misjudges the SQLite-format rows.
         const recent = getDb().prepare(`
           SELECT m.id, m.thread_id, m.subject, m.sent_at
           FROM crm_messages m
@@ -683,7 +697,7 @@ router.post("/compose", async (req, res) => {
           WHERE m.direction = 'out'
             AND m.delivery_status = 'sent'
             AND LOWER(c.email) = LOWER(?)
-            AND m.sent_at >= ?
+            AND datetime(m.sent_at) >= datetime(?)
           ORDER BY m.sent_at DESC
           LIMIT 5
         `).all(to, lookback24h) as Array<{ id: string; thread_id: string; subject: string; sent_at: string }>;

@@ -173,6 +173,156 @@ export function runCrmServiceTests(opts: { log?: boolean } = {}): TestSummary {
     assertEq(expDetail.thread.agent_id, null, "experiences thread detail's agent_id is null");
   }
 
+  // ─── recomputeThreadStats() rollup bugs (Skive G) ───────────────────────
+  // Three confirmed bugs in the CRM "have we replied?" rollup:
+  //   1. last_inbound_at always NULL (inbound rows never carry a real
+  //      sent_at; recomputeThreadStats didn't fall back to received_at).
+  //   2. last_outbound_at froze at a stale value because
+  //      updateMessageDeliveryStatus() never re-ran recomputeThreadStats()
+  //      after confirming a 'queued' reservation as 'sent'.
+  //   3. listSentMessages()'s since_hours filter silently dropped rows whose
+  //      sent_at/received_at was written in SQLite's own
+  //      "YYYY-MM-DD HH:MM:SS" format (raw string >= against a JS ISO
+  //      cutoff misorders on the 'T'/' ' separator).
+
+  // (1) ingestThread() with a real inbound message (sentAt omitted) sets
+  // last_inbound_at — regression guard for bug 1.
+  {
+    insertContact("contact-bug1", "inbound1@example.no", "Inbound Sender 1");
+    const { threadId } = crmService.ingestThread(
+      {
+        threadId: "thread-bug1-inbound",
+        subject: "Spørsmål om levering",
+        messages: [
+          {
+            messageId: "gmail-msg-bug1-in",
+            direction: "in",
+            fromEmail: "inbound1@example.no",
+            bodyText: "Når kommer bestillingen min?",
+            sentAt: null,
+          },
+        ],
+      },
+      "inbound1@example.no",
+      "rfb",
+    );
+    const row = db.prepare("SELECT last_inbound_at, last_message_at, message_count FROM crm_threads WHERE id = ?")
+      .get(threadId) as { last_inbound_at: string | null; last_message_at: string | null; message_count: number };
+    assertTrue(row.last_inbound_at !== null, "ingestThread(inbound, no sentAt) sets last_inbound_at — regression guard for bug 1");
+    assertTrue(row.last_message_at !== null, "ingestThread(inbound, no sentAt) also sets last_message_at via the same COALESCE fallback");
+    assertEq(row.message_count, 1, "ingestThread(inbound) counts the message");
+  }
+
+  // (2) recordOutboundReply({deliveryStatus:'queued'}) followed by
+  // updateMessageDeliveryStatus(id,'sent') moves last_outbound_at to the
+  // real confirmed sent_at — regression guard for bug 2. A 'failed'
+  // transition must NOT move it.
+  {
+    insertContact("contact-bug2", "outbound2@example.no", "Outbound Contact 2");
+    insertThread("thread-bug2-outbound", "contact-bug2", "in_progress", "Reply thread");
+
+    // Seed a PRIOR confirmed outbound reply with an old, explicit sentAt —
+    // this is the "stale value" last_outbound_at must move away from.
+    crmService.recordOutboundReply({
+      threadId: "thread-bug2-outbound",
+      vertical: "rfb",
+      toEmails: ["outbound2@example.no"],
+      subject: "Første svar",
+      bodyText: "Her er svaret ditt.",
+      deliveryStatus: "sent",
+      sentAt: "2020-01-01T00:00:00.000Z",
+    });
+    const beforeReserve = db.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?")
+      .get("thread-bug2-outbound") as { last_outbound_at: string | null };
+    assertEq(beforeReserve.last_outbound_at, "2020-01-01T00:00:00.000Z", "seeded prior reply sets last_outbound_at to the old sentAt");
+
+    // resend_send reservation shape: inserted 'queued', sent_at stays null.
+    const { messageId: reservedId } = crmService.recordOutboundReply({
+      threadId: "thread-bug2-outbound",
+      vertical: "rfb",
+      toEmails: ["outbound2@example.no"],
+      subject: "Nytt svar",
+      bodyText: "Her er et nytt svar.",
+      deliveryStatus: "queued",
+    });
+    const afterReserve = db.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?")
+      .get("thread-bug2-outbound") as { last_outbound_at: string | null };
+    assertEq(afterReserve.last_outbound_at, "2020-01-01T00:00:00.000Z", "a 'queued' reservation (sent_at still null) does NOT move last_outbound_at");
+
+    // Confirm the send — this is the fix under test.
+    crmService.updateMessageDeliveryStatus(reservedId, "sent");
+    const afterSent = db.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?")
+      .get("thread-bug2-outbound") as { last_outbound_at: string | null };
+    assertTrue(
+      afterSent.last_outbound_at !== null && afterSent.last_outbound_at !== "2020-01-01T00:00:00.000Z",
+      "updateMessageDeliveryStatus(id,'sent') moves last_outbound_at off the stale prior value — regression guard for bug 2",
+    );
+    const confirmedSentAt = db.prepare("SELECT sent_at FROM crm_messages WHERE id = ?").get(reservedId) as { sent_at: string };
+    assertEq(afterSent.last_outbound_at, confirmedSentAt.sent_at, "last_outbound_at exactly matches the just-confirmed message's sent_at");
+
+    // A second reservation that ends in 'failed' must NOT move last_outbound_at.
+    const { messageId: failedId } = crmService.recordOutboundReply({
+      threadId: "thread-bug2-outbound",
+      vertical: "rfb",
+      toEmails: ["outbound2@example.no"],
+      subject: "Mislykket svar",
+      bodyText: "Dette skal feile.",
+      deliveryStatus: "queued",
+    });
+    crmService.updateMessageDeliveryStatus(failedId, "failed");
+    const afterFailed = db.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?")
+      .get("thread-bug2-outbound") as { last_outbound_at: string | null };
+    assertEq(afterFailed.last_outbound_at, afterSent.last_outbound_at, "a 'failed' transition does NOT move last_outbound_at");
+  }
+
+  // (3) listSentMessages({sinceHours}) must not drop a row whose
+  // sent_at/received_at is written in SQLite's own datetime('now') format
+  // — regression guard for bug 3.
+  {
+    insertContact("contact-bug3", "outbound3@example.no", "Outbound Contact 3");
+    insertThread("thread-bug3-sincehours", "contact-bug3", "in_progress", "Sent-log thread");
+
+    // Recent row, SQLite datetime('now') format: reserve 'queued' (sent_at
+    // null) then confirm 'sent' via updateMessageDeliveryStatus, which
+    // writes sent_at = datetime('now') — no 'T'/'Z', exactly the legacy
+    // format class that was previously silently dropped.
+    const { messageId: recentId } = crmService.recordOutboundReply({
+      threadId: "thread-bug3-sincehours",
+      vertical: "rfb",
+      toEmails: ["outbound3@example.no"],
+      subject: "Nylig svar",
+      bodyText: "Dette er nylig.",
+      deliveryStatus: "queued",
+    });
+    crmService.updateMessageDeliveryStatus(recentId, "sent");
+    const recentRow = db.prepare("SELECT sent_at FROM crm_messages WHERE id = ?").get(recentId) as { sent_at: string };
+    assertTrue(
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(recentRow.sent_at),
+      `recent message's sent_at is written in SQLite datetime('now') format, no 'T'/'Z' (got ${JSON.stringify(recentRow.sent_at)})`,
+    );
+
+    // Control: an old row, JS-ISO format, well outside the window. Inserted
+    // directly (not via recordOutboundReply) so received_at can ALSO be
+    // backdated — recordOutboundReply always leaves received_at at its
+    // schema default of datetime('now'), which would make this row look
+    // "just recorded" via the OR received_at branch regardless of sent_at.
+    db.prepare(`
+      INSERT INTO crm_messages
+        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, snippet, sent_at, received_at, delivery_status, vertical_id)
+      VALUES ('msg-bug3-old', 'thread-bug3-sincehours', 'out', 'kontakt@rettfrabonden.com', '["outbound3@example.no"]', '[]', 'Gammelt svar', 'Dette er gammelt.', 'Dette er gammelt.', '2020-01-01T00:00:00.000Z', '2020-01-01 00:00:00', 'sent', 'rfb')
+    `).run();
+
+    const sinceHours = crmService.listSentMessages({ sinceHours: 1 });
+    assertTrue(
+      sinceHours.some((r) => r.message_id === recentId),
+      "listSentMessages({sinceHours:1}) includes the recent SQLite-format-timestamp row — regression guard for bug 3",
+    );
+    assertTrue(
+      !sinceHours.some((r) => r.subject === "Gammelt svar"),
+      "listSentMessages({sinceHours:1}) correctly excludes a row well outside the window (control case)",
+    );
+  }
+
   return { passed, failed, failures };
 }
 
