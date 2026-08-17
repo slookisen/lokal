@@ -9529,6 +9529,24 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // is: test-provider{claimableEditable:true} -> gardssalg-claim-grant{apply:
 // true} -> click the emailed link (verifyClaimToken) -> portal is editable
 // -> gardssalg-claim-revoke{apply:true} to reset -> grant again.
+// HONESTY NOTE (2026-08-17, P0 consent-bug fix — getGardssalgProviderBySlug()
+// in services/experience-store.ts): this route creates/upserts its test row
+// with catalog_hidden=1 (see the raw UPDATE below), specifically so a caller
+// could exercise the REAL public booking flow end-to-end via this row's
+// public slug URL while it stayed out of the public grid. That "hidden but
+// still slug-reachable" behavior is exactly the hole the above fix closes —
+// getGardssalgProviderBySlug() now excludes catalog_hidden=1 unconditionally,
+// with no bypass/flag, because a real producer's catalog_hidden=1 delist
+// (POST /admin/gardssalg-provider-visibility) must ALSO be unconditional. As
+// a direct, accepted consequence, this test provider's own
+// /kategori/gardssalg/produsent/<slug> and /kategori/gardssalg/book/<slug>
+// pages now 404 too — this route's booking-E2E purpose is no longer
+// reachable through its public slug. Not redesigned here (out of scope for
+// that fix); if the test harness needs restoring, a future dev-request
+// should give it a way to exercise the flow that doesn't require a
+// catalog_hidden=1 row to stay publicly slug-reachable (e.g. a
+// admin-authenticated preview path, or a distinct non-catalog_hidden test
+// marker the public routes explicitly special-case).
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
@@ -18319,8 +18337,11 @@ router.post("/admin/hjemmeside-cleanup-sweep", requireAdmin, (req: Request, res:
 // holdingselskaper). Denne spaken setter/nuller catalog_hidden for
 // EKSPLISITT opplistede rader — samme kolonne og semantikk som den skjulte
 // booking-flyt-testprovideren: listGardssalgProviders filtrerer
-// catalog_hidden=1 ut av det offentlige grid'et, mens slug-oppslag fortsatt
-// virker, så en skjult rad er reversibel og lenkbar, aldri slettet.
+// catalog_hidden=1 ut av det offentlige grid'et. Fikset 2026-08-17 (P0
+// samtykke-bug): slug-oppslag (getGardssalgProviderBySlug, brukt av
+// produsent-profilsiden, JSON-LD-en og bookingflyten) filtrerer nå OGSÅ bort
+// catalog_hidden=1 — en skjult rad er fortsatt reversibel og aldri slettet,
+// men er ikke lenger offentlig nåbar via slug mens den er skjult.
 //
 // Body: { providerIds?: string[], orgNrs?: string[], hidden: boolean,
 // apply? } — dry-run default som alle andre admin-ruter i denne fila.

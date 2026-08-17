@@ -21,6 +21,10 @@
  *       .reserve-cta-paused class + "Meld interesse" label when it IS
  *       paused — id="reserve-cta" present in both cases (the owner-swap
  *       script's hook must survive either state).
+ *   (i) 2026-08-17 P0 consent-bug fix: catalog_hidden=1 makes the profile
+ *       page 404 by slug (falls through to next()), not just disappear from
+ *       the grid — see getGardssalgProviderBySlug()'s doc comment in
+ *       services/experience-store.ts.
  *
  * Same synthetic router.handle() harness + in-memory-DB pattern as
  * experiences-seo-gardssalg-claimed-badge.test.ts /
@@ -282,6 +286,33 @@ export function runExperiencesSeoProdusentRenderGuardsTests(opts: { log?: boolea
         assertTrue(r.body.includes(">Meld interesse<"), "h3: paused state uses the 'Meld interesse' label, not 'Reserver besøk'");
         assertTrue(!r.body.includes(">Reserver besøk<"), "h4: the active label does not also appear");
         assertTrue(r.body.includes('id="reserve-cta"'), "h5: id=\"reserve-cta\" is still present (owner-swap script hook)");
+      }
+
+      // ── (i) catalog_hidden=1 → 404 by slug (2026-08-17 P0 consent-bug fix)
+      // — a delisted producer's profile page must be gone, not just absent
+      // from the grid. Own raw insert (not the shared insertProvider() above,
+      // which hardcodes catalog_hidden NULL) so this doesn't touch the other
+      // fixtures' shape. ─────────────────────────────────────────────────────
+      {
+        db.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, fylke, kommune, poststed, producer_type, booking_live, catalog_hidden, lat, lon,
+              geocode_confidence, slug, enrichment_state, verification_status, source, confidence)
+           VALUES
+             ('gs-rg-hidden', 'Skjultgård Bryggeri', 'experiences', 'Agder', 'Kristiansand', 'Kristiansand', 'bryggeri', 1, 1, 60.63, 6.42,
+              'high', 'skjultgard-bryggeri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
+        ).run();
+        const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/skjultgard-bryggeri");
+        // The route itself next()'s (see the source), but this router has its
+        // own catch-all that renders a real 404 page for it — same observable
+        // shape as experiences-seo-site-chrome.test.ts's j1 (unknown path).
+        assertTrue(r.handled && r.status === 404, `i1: catalog_hidden=1 provider's profile page 404s (status ${r.status})`);
+        // Sanity check: the SAME slug, visible (catalog_hidden reset to NULL),
+        // renders normally — proves i1 is about catalog_hidden, not a fixture
+        // typo/column-name mistake.
+        db.prepare(`UPDATE experience_providers SET catalog_hidden = NULL WHERE id = 'gs-rg-hidden'`).run();
+        const r2 = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/skjultgard-bryggeri");
+        assertTrue(r2.handled && r2.status === 200, `i2: sanity check — the same slug renders 200 once catalog_hidden is cleared (status ${r2.status})`);
       }
 
       return { passed, failed, failures };

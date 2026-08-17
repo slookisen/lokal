@@ -598,6 +598,69 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     }
   }
 
+  // ── getGardssalgProviderBySlug (2026-08-17 P0 consent-bug fix) — a
+  //    catalog_hidden=1 row must be UNREACHABLE by slug, same as it's
+  //    already unreachable from the grid/count/search (see
+  //    searchGardssalgProviders' sgp-4/sgp-5 above). Own isolated in-memory
+  //    DB block, same convention as the searchGardssalgProviders block
+  //    above. ───────────────────────────────────────────────────────────────
+  {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("./experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const db = dbFactory.getDb("experiences");
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+
+      const insertProvider = db.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, producer_type, catalog_hidden, slug,
+            enrichment_state, verification_status, source, confidence)
+         VALUES
+           (@id, @navn, 'experiences', @producer_type, @catalog_hidden, @slug,
+            'raw', 'pending_verify', 'test-fixture', 'medium')`
+      );
+
+      // gbs-visible: catalog_hidden NULL — the ordinary case, unaffected.
+      insertProvider.run({ id: "gbs-visible", navn: "Synlig Gard", producer_type: "cideri", catalog_hidden: null, slug: "synlig-gard" });
+      // gbs-zero: catalog_hidden=0 explicitly (not just NULL) — also unaffected.
+      insertProvider.run({ id: "gbs-zero", navn: "Null Gard", producer_type: "cideri", catalog_hidden: 0, slug: "null-gard" });
+      // gbs-hidden: catalog_hidden=1 — the real "Fjording" scenario this fix
+      // closes: a producer who asked to be delisted must 404 by slug.
+      insertProvider.run({ id: "gbs-hidden", navn: "Skjult Gard", producer_type: "cideri", catalog_hidden: 1, slug: "skjult-gard" });
+
+      const visible = expStore.getGardssalgProviderBySlug("synlig-gard");
+      assertTrue(!!visible && visible.id === "gbs-visible", "gbs-1: catalog_hidden=NULL row IS returned by slug");
+
+      const zeroHidden = expStore.getGardssalgProviderBySlug("null-gard");
+      assertTrue(!!zeroHidden && zeroHidden.id === "gbs-zero", "gbs-2: catalog_hidden=0 (explicit) row IS returned by slug");
+
+      const hidden = expStore.getGardssalgProviderBySlug("skjult-gard");
+      assertEq(hidden, null, "gbs-3: catalog_hidden=1 row returns null by slug (the P0 fix — was previously returned)");
+
+      assertEq(expStore.getGardssalgProviderBySlug("does-not-exist"), null, "gbs-4: unknown slug still returns null (unrelated to this fix, sanity check)");
+      assertEq(expStore.getGardssalgProviderBySlug(""), null, "gbs-5: empty slug still short-circuits to null without hitting the DB");
+    } catch (err: any) {
+      failed++;
+      failures.push("getGardssalgProviderBySlug: unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch { /* best-effort */ }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+  }
+
   // ── selectGardssalgMojibakeCandidates + applyGardssalgProviderContent's
   //    `forceFields` bypass (dev-request 2026-07-21-opplevagent-norske-tegn-
   //    encoding, criterion 3) — own isolated in-memory DB block, same

@@ -701,11 +701,17 @@ export function initExperiencesSchema(db: Database.Database): void {
   // flyt-v1, slice 0) ─────────────────────────────────────────────────────────
   // catalog_hidden gates a provider OUT of the public gårdssalg catalog + count
   // (listGardssalgProviders()/countGardssalgProviders() filter rows carrying it)
-  // while keeping it fully bookable by slug (getGardssalgProviderBySlug() does
-  // NOT filter) — the mechanism behind a controlled end-to-end booking test
-  // whose producer notification is routed only to Daniel's inbox. Defaults 0
-  // (visible) so every existing row keeps today's behavior the instant this
-  // column exists; nothing but the admin test-provider endpoint ever sets it 1.
+  // AND, as of the 2026-08-17 P0 consent-bug fix, out of slug lookup too
+  // (getGardssalgProviderBySlug() now filters it — see that function's doc
+  // comment in services/experience-store.ts). Originally this column also
+  // kept a catalog_hidden=1 row fully bookable by slug, as the mechanism
+  // behind a controlled end-to-end booking test whose producer notification
+  // is routed only to Daniel's inbox — that is no longer true; a hidden row
+  // is unreachable via its public slug on every surface now, no exceptions.
+  // Defaults 0 (visible) so every existing row keeps today's behavior the
+  // instant this column exists; set by the admin test-provider endpoint AND
+  // by POST /admin/gardssalg-provider-visibility (the real-producer delist
+  // lever added later — see that route's own comment).
   try {
     db.exec("ALTER TABLE experience_providers ADD COLUMN catalog_hidden INTEGER DEFAULT 0");
   } catch { /* already present */ }

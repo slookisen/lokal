@@ -27945,7 +27945,13 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   const testSlugTP = String(createTP.json.slug);
   const testIdTP = String(createTP.json.provider_id);
 
-  // Hidden from the catalog + count, but resolvable (bookable) by slug.
+  // Hidden from the catalog + count. As of the 2026-08-17 P0 consent-bug fix
+  // (getGardssalgProviderBySlug() in services/experience-store.ts), the
+  // hidden test provider is ALSO no longer resolvable by its public slug —
+  // "hidden" now means hidden on every public surface, no exceptions,
+  // including this admin test row. It stays reachable by provider_id (the
+  // booking write paths below, invokeBookTP, use provider_id directly and
+  // are unaffected — see tp-06/tp-08 further down).
   const listAfterTP = expStTP.listGardssalgProviders(100, 0);
   assertTrue(!listAfterTP.some((p: any) => p.id === testIdTP),
     "tp-02a: hidden test provider does NOT appear in listGardssalgProviders()");
@@ -27954,10 +27960,18 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   assertEq(expStTP.countGardssalgProviders(), countBeforeTP,
     "tp-02c: countGardssalgProviders() unchanged — the hidden row never bumps the visibility gate");
   const bySlugTP = expStTP.getGardssalgProviderBySlug(testSlugTP);
-  assertTrue(!!bySlugTP, "tp-03a: getGardssalgProviderBySlug() STILL returns the hidden test provider (bookable by slug)");
-  assertEq(bySlugTP?.booking_live, 1, "tp-03b: test provider booking_live===1");
-  assertEq(bySlugTP?.catalog_hidden, 1, "tp-03c: test provider catalog_hidden===1");
-  assertEq(bySlugTP?.epost, danielEmailTP, "tp-03d: test provider epost === the routed email");
+  assertEq(bySlugTP, null,
+    "tp-03a: getGardssalgProviderBySlug() no longer returns the hidden test provider (P0 fix — was previously returned/bookable by slug)");
+  // The row itself is untouched (still exists, still booking_live=1,
+  // catalog_hidden=1, epost=the routed address) — only the PUBLIC slug
+  // lookup is gated now. Verified directly against the raw row so tp-03a
+  // isn't hiding a fixture-setup mistake.
+  const rawTestRowTP = dbTP.prepare(
+    "SELECT booking_live, catalog_hidden, epost FROM experience_providers WHERE id = ?"
+  ).get(testIdTP) as { booking_live: number | null; catalog_hidden: number | null; epost: string | null };
+  assertEq(rawTestRowTP.booking_live, 1, "tp-03b: test provider row itself still has booking_live===1");
+  assertEq(rawTestRowTP.catalog_hidden, 1, "tp-03c: test provider row itself still has catalog_hidden===1");
+  assertEq(rawTestRowTP.epost, danielEmailTP, "tp-03d: test provider row itself still has epost === the routed email");
 
   // ═══ (d) regression — the ordinary provider is entirely unaffected ═══
   assertTrue(listAfterTP.some((p: any) => p.id === normalIdTP),
@@ -28044,7 +28058,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   if (prevDispatchTP === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
   else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchTP;
   dbFacTP.__resetDbFactoryForTesting();
-  console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count / bookable by slug, producer dispatch to Daniel, carve-out dispatches with global flag OFF while real providers stay gated, double-gate regression, admin idempotency, ordinary-provider no-regression)");
+  console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count+slug lookup, still bookable by provider_id, producer dispatch to Daniel, carve-out dispatches with global flag OFF while real providers stay gated, double-gate regression, admin idempotency, ordinary-provider no-regression)");
 })();
 
 // ─── gardssalg booking: kundekommentar + produsentens bekreft-løkke
