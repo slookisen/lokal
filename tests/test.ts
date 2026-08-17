@@ -1045,6 +1045,23 @@ console.log("\n── homepage-provenance-contact-extraction-fix (address/phone)
   console.log(`  homepage-provenance-contact-extraction-fix: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── css-favicon-extraction-guards (2026-08-17, W34 breach): the two
+// extractPhone/extractEmail false-positive bugs (Tailwind CSS hex-alpha
+// class inside a <style> block matching the phone regex; favicon@2x.png
+// href matching the bare email regex) that paused the `rfb` vertical's
+// enrichment write path a second time. Pure functions of an html string —
+// no DB/fetch involved, so no serial chaining needed. ──
+console.log("\n── css-favicon-extraction-guards (phone/email) ──");
+{
+  const { runCssFaviconExtractionGuardsTests } = require("../src/routes/css-favicon-extraction-guards.test") as
+    typeof import("../src/routes/css-favicon-extraction-guards.test");
+  const r = runCssFaviconExtractionGuardsTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("css-favicon-extraction-guards: " + f);
+  console.log(`  css-favicon-extraction-guards: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── PR-131: dental-claim-service buildWhereClause (completion-mode fix) ──
 // Pins the completion-mode already-complete exclusion (and pre-existing
 // PR-108/PR-120 exclusions + base filter behaviour) so `npm test` catches
