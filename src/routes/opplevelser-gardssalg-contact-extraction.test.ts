@@ -146,6 +146,63 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         assertEq(r6, null, "cx-6: webdesigner-kreditering på forsiden skrives ikke (feil domene + ikke kontaktside)");
       }
 
+      // ═══ cx-50..cx-55: domeneblind mailto/tekst — dev-request
+      // kontaktadresse-domeneblind-mailto-og-tekst (lofotpils.no-saken:
+      // tg@dng-norge.no, en distributørs mailto, slo den ekte produsent-
+      // adressen lenger ned på siden). Samme-domene rangeres nå FØR
+      // fremmed-domene i alle kanaler; en gjenværende fremmed-domene-
+      // adresse returneres fortsatt (aldri stille droppet) men flagget
+      // needsReview. ═══
+      {
+        const ex = expStore.extractGardssalgContactEmail;
+        // cx-50: akseptansekriteriet fra dev-requesten selv — fremmed-domene
+        // mailto OG produsentens egen samme-domene-adresse i tekst samtidig
+        // -> den egne adressen vinner.
+        const r50 = ex(
+          '<a href="mailto:tg@bryggdistribusjon.no">Distributør</a> Kontakt oss: post@fjellbrygg2.no',
+          "fjellbrygg2.no",
+          false,
+        );
+        assertEq(r50?.email, "post@fjellbrygg2.no",
+          "cx-50: egen samme-domene-adresse vinner over distributørens fremmed-domene mailto");
+        assertEq(r50?.source, "text_same_domain", "cx-50b: …med samme-domene-proveniens");
+        assertEq((r50 as any)?.needsReview, undefined, "cx-50c: …og uten needsReview (den vant på ekte grunnlag)");
+
+        // cx-51: KUN fremmed-domene mailto (ingen samme-domene-kandidat) ->
+        // adressen returneres likevel (aldri droppet), flagget needsReview.
+        const r51 = ex('<a href="mailto:tg@bryggdistribusjon.no">Distributør</a>', "fjellbrygg2.no", false);
+        assertEq(r51?.email, "tg@bryggdistribusjon.no",
+          "cx-51: fremmed-domene mailto uten alternativ -> returnert, ikke droppet");
+        assertEq(r51?.source, "mailto_other_domain", "cx-51b: …med proveniens mailto_other_domain");
+        assertEq(r51?.needsReview, true, "cx-51c: …og flagget needsReview");
+
+        // cx-52: KUN fremmed-domene tekstadresse PÅ kontaktside (ingen
+        // mailto, ingen samme-domene) -> flagget needsReview.
+        const r52 = ex("Kontakt: post@annenfirma.no", "fjellbrygg2.no", true);
+        assertEq(r52?.email, "post@annenfirma.no", "cx-52: fremmed-domene tekstadresse på kontaktside -> returnert");
+        assertEq(r52?.source, "text_other_domain", "cx-52b: …med proveniens text_other_domain");
+        assertEq(r52?.needsReview, true, "cx-52c: …og flagget needsReview");
+
+        // cx-53: samme som cx-52, men IKKE kontaktside -> null (speiler den
+        // eksisterende cx-6-porten: fremmed-domene tekst uten kontaktside-
+        // signal skrives aldri).
+        const r53 = ex("Kontakt: post@annenfirma.no", "fjellbrygg2.no", false);
+        assertEq(r53, null, "cx-53: samme fremmed-domene-adresse på IKKE-kontaktside -> null");
+
+        // cx-54: freemail via mailto på en IKKE-kontaktside -> fortsatt
+        // akseptert uten needsReview (mailto er ubetinget på sidetype,
+        // uendret fra før).
+        const r54 = ex('<a href="mailto:fjellbrygg2@gmail.com">Skriv</a>', "fjellbrygg2.no", false);
+        assertEq(r54?.email, "fjellbrygg2@gmail.com",
+          "cx-54: freemail via mailto er fortsatt ubetinget akseptert på sidetype");
+        assertEq(r54?.source, "mailto", "cx-54b: …med proveniens mailto — ingen needsReview");
+        assertEq((r54 as any)?.needsReview, undefined, "cx-54c: …og needsReview-feltet er fraværende, ikke false");
+
+        // cx-55: den eksisterende embedded-same-domain-regresjonen bekreftes
+        // i src/services/gardssalg-embedded-evidence.test.ts (67northdistillery.no-
+        // fixturen) — ikke duplisert her.
+      }
+
       // ═══ cx-7..cx-11: telefon-ekstraksjon (PURE) ═══
       {
         const px = expStore.extractGardssalgContactPhone;

@@ -234,7 +234,17 @@ interface ResultItem {
   // "embedded_same_domain" added by dev-request 2026-08-08-gardssalg-brreg-
   // verify-og-embedded-evidens: the shared extractor gained a lowest-priority
   // same-domain tier read from script-embedded JSON (sitebuilder SPAs).
-  email_source?: "mailto" | "text_same_domain" | "text_contact_page" | "embedded_same_domain";
+  // "mailto_other_domain" / "text_other_domain" added by dev-request
+  // kontaktadresse-domeneblind-mailto-og-tekst: a foreign-domain address is
+  // still returned (never silently dropped) but flagged for review instead
+  // of trusted outright.
+  email_source?:
+    | "mailto"
+    | "text_same_domain"
+    | "text_contact_page"
+    | "embedded_same_domain"
+    | "mailto_other_domain"
+    | "text_other_domain";
   source_url?: string;
   old_value?: string | null;
   detail?: string;
