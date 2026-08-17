@@ -621,14 +621,34 @@ class CrmService {
    * computed another. Pure recompute from source data: calling it twice in a
    * row is a no-op, so every caller can call it unconditionally after any
    * crm_messages write.
+   *
+   * Per-direction timestamp derivation is deliberately ASYMMETRIC:
+   *   - INBOUND rows fall back to `COALESCE(sent_at, received_at)`. Inbound
+   *     mail (ingested via ingestThread()) almost never carries a real
+   *     `sent_at` — the Gmail ingest path inserts `m.sentAt ?? null`, and
+   *     `received_at TEXT DEFAULT (datetime('now'))` is the only timestamp
+   *     that's reliably set on an inbound row. Without the fallback,
+   *     `last_inbound_at` is NULL on every thread regardless of real inbound
+   *     activity (root cause of a bug where "have we replied?" rollups never
+   *     saw inbound mail at all).
+   *   - OUTBOUND rows stay STRICTLY `sent_at`-only, with no fallback to
+   *     `received_at`. A reserved-but-not-yet-sent row (delivery_status
+   *     'queued', see recordOutboundReply's resend_send reservation) or a
+   *     'failed' send has a `received_at` (it was inserted) but no `sent_at`
+   *     — and must NOT count as an outbound reply. Falling back to
+   *     `received_at` here would make `last_outbound_at` move the instant a
+   *     send is merely reserved/attempted, before it's confirmed, which is
+   *     exactly the kind of premature "we replied" signal this rollup exists
+   *     to prevent. Do not "fix" this back to symmetric with the inbound
+   *     case — the asymmetry is intentional and load-bearing.
    */
   private recomputeThreadStats(threadId: string): number {
     const db = getDb();
     const stats = db.prepare(`
       SELECT
         COUNT(*) AS cnt,
-        MAX(sent_at) AS last_msg,
-        MAX(CASE WHEN direction = 'in' THEN sent_at END) AS last_in,
+        MAX(CASE WHEN direction = 'in' THEN COALESCE(sent_at, received_at) ELSE sent_at END) AS last_msg,
+        MAX(CASE WHEN direction = 'in' THEN COALESCE(sent_at, received_at) END) AS last_in,
         MAX(CASE WHEN direction = 'out' THEN sent_at END) AS last_out
       FROM crm_messages WHERE thread_id = ?
     `).get(threadId) as any;
@@ -858,11 +878,28 @@ class CrmService {
    * Update an outbound message's delivery_status after the actual send
    * outcome is known.  Sets sent_at to NOW only when transitioning to
    * 'sent' and sent_at was previously NULL — preserves audit accuracy.
+   *
+   * On a 'sent' transition this also re-runs recomputeThreadStats() for the
+   * message's thread. Without this, a row reserved by recordOutboundReply()
+   * with deliveryStatus 'queued' (sent_at still NULL, by design — see the
+   * resend_send reservation in POST /threads/:id/send) never moves
+   * last_outbound_at once the send actually completes: recordOutboundReply()
+   * only recomputed at INSERT time, while sent_at was still null, so the
+   * thread's rollup stayed frozen at whatever the PREVIOUS reply's sent_at
+   * was. The 'queued'/'draft_in_gmail'/'failed' branches deliberately do NOT
+   * recompute — none of them confirm a real send, and recomputeThreadStats's
+   * outbound derivation is strictly sent_at-only, so a non-'sent' row could
+   * never move last_outbound_at anyway; recomputing there would just be a
+   * wasted query.
    */
   updateMessageDeliveryStatus(messageId: string, status: "sent" | "queued" | "draft_in_gmail" | "failed"): void {
     const db = getDb();
     if (status === "sent") {
       db.prepare(`UPDATE crm_messages SET delivery_status = ?, sent_at = COALESCE(sent_at, datetime('now')) WHERE id = ?`).run(status, messageId);
+      const row = db.prepare(`SELECT thread_id FROM crm_messages WHERE id = ?`).get(messageId) as { thread_id: string } | undefined;
+      if (row) {
+        this.recomputeThreadStats(row.thread_id);
+      }
     } else {
       db.prepare(`UPDATE crm_messages SET delivery_status = ? WHERE id = ?`).run(status, messageId);
     }
@@ -1284,7 +1321,15 @@ class CrmService {
 
     if (opts.sinceHours) {
       const cutoff = new Date(Date.now() - opts.sinceHours * 3600_000).toISOString();
-      where.push("(m.sent_at >= ? OR m.received_at >= ?)");
+      // datetime(...) normalizes both SQLite's own "YYYY-MM-DD HH:MM:SS"
+      // write format (e.g. updateMessageDeliveryStatus's `datetime('now')`)
+      // and JS's ISO-8601-with-'Z'-and-milliseconds format (e.g.
+      // recordOutboundReply's `new Date().toISOString()`) to the same
+      // canonical form before comparing. A raw string `>=` between the two
+      // formats is wrong — the 'T'/' ' separator at character 10 sorts
+      // differently even for the identical instant — and silently dropped
+      // every SQLite-formatted row from this filter regardless of recency.
+      where.push("(datetime(m.sent_at) >= datetime(?) OR datetime(m.received_at) >= datetime(?))");
       params.push(cutoff, cutoff);
     }
     if (opts.deliveryStatus) {
