@@ -628,6 +628,154 @@ export function runCrmPlatformIdentityTests(opts: { log?: boolean } = {}): Promi
           }
         }
       }
+
+      // ═══════════════════════════════════════════════════════════════
+      // pi28-pi37 — Skive E: outbound BODY lint, fail-closed (AC7).
+      //
+      // Steg 3 / pi9-pi16 above fixed the ENVELOPE (From display-name +
+      // reply-to). Funn 2's mirror image was still open: nothing stopped the
+      // BODY TEXT itself from saying "Rett fra Bonden" on an Opplevagent
+      // thread. pi28-pi32 drive lintOutboundBodyForForeignBranding directly,
+      // both ways per AC7 (foreign brand flagged, own brand NOT flagged).
+      // pi33-pi37 then drive it through the REAL route — pi9-pi16's own
+      // header above names the exact failure mode this guards against too: a
+      // perfect helper that nothing calls.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        assertTrue(
+          ident.lintOutboundBodyForForeignBranding("experiences", "Emne", "Hei, dette er fra Rett fra Bonden").violation,
+          "pi28: an experiences body naming 'Rett fra Bonden' is flagged",
+        );
+        assertTrue(
+          ident.lintOutboundBodyForForeignBranding("experiences", "Emne", "Se rettfrabonden.com for mer info").violation,
+          "pi29: …and so is a bare rettfrabonden.com link, with no brand name present at all",
+        );
+        assertTrue(
+          !ident.lintOutboundBodyForForeignBranding("experiences", "Emne", "Hei fra Opplevagent, se opplevagent.no").violation,
+          "pi30: a CORRECT Opplevagent body — mentioning its OWN brand/domain — goes through clean; this is the " +
+            "'goes through' half of AC7, and a lint that flags everything would trivially pass pi28/pi29 while failing this",
+        );
+        assertTrue(
+          ident.lintOutboundBodyForForeignBranding("rfb", "Emne", "Dette kommer fra Opplevagent").violation,
+          "pi31: mirror case — an rfb body naming 'Opplevagent' is flagged",
+        );
+        assertTrue(
+          ident.lintOutboundBodyForForeignBranding("rfb", "Emne", "Se opplevagent.no for mer").violation,
+          "pi32: …and so is an opplevagent.no link on an rfb thread",
+        );
+        const clean = ident.lintOutboundBodyForForeignBranding("experiences", "Emne", "Hei fra Opplevagent");
+        assertEq(clean.matches.length, 0, "pi32b: a clean body's matches[] is empty, not just violation===false");
+        const dirty = ident.lintOutboundBodyForForeignBranding("experiences", "Emne", "Hilsen, Rett fra Bonden");
+        assertTrue(
+          dirty.matches.some((m) => m.includes("Rett fra Bonden")),
+          "pi32c: matches[] names WHAT matched, for logging/diagnostics — not just a bare boolean",
+        );
+        assertTrue(
+          !ident.lintOutboundBodyForForeignBranding("dental", "Emne", "Hilsen, Finn Tannlege — finn-tannlege.com").violation,
+          "pi32d: dental's own brand/domain in a dental body is not a violation either",
+        );
+        assertTrue(
+          ident.lintOutboundBodyForForeignBranding("dental", "Emne", "Hilsen, Rett fra Bonden").violation,
+          "pi32e: …but rfb's brand IS flagged on a dental thread — the third vertical is covered too, not just the two named in AC7",
+        );
+
+        // pi33-pi37: THE ROUTE. Same class of bug pi9-pi16 names: a helper
+        // can be perfect while POST /threads/:id/send never calls it.
+        const prevAdminKey2 = process.env.ADMIN_KEY;
+        const prevAnalyticsAdminKey2 = process.env.ANALYTICS_ADMIN_KEY;
+        const lintKey = process.env.ADMIN_KEY || "crm-lint-test-key";
+        process.env.ADMIN_KEY = lintKey;
+        process.env.ANALYTICS_ADMIN_KEY = process.env.ANALYTICS_ADMIN_KEY || lintKey;
+
+        const emailMod3 = require("./email-service") as typeof import("./email-service");
+        const svc3 = emailMod3.emailService as any;
+        const realSendRaw3 = svc3.sendRaw.bind(svc3);
+        const sent3: any[] = [];
+        svc3.sendRaw = async (o: any) => { sent3.push(o); return { success: true, messageId: "stub-lint" }; };
+
+        try {
+          const crmRoutes3 = require("../routes/crm") as any;
+          const router3 = crmRoutes3.default ?? crmRoutes3.router ?? crmRoutes3;
+
+          const post3 = async (url: string, body: any): Promise<{ status: number; body: any }> => {
+            const req: any = {
+              method: "POST", url, query: {}, body,
+              headers: { "x-admin-key": lintKey },
+              get(n: string) { return this.headers[n.toLowerCase()]; },
+            };
+            let settle: () => void;
+            const done = new Promise<void>((r) => { settle = r; });
+            let jsonBody: any;
+            const res: any = {
+              statusCode: 200,
+              status(c: number) { this.statusCode = c; return this; },
+              json(b: any) { jsonBody = b; settle(); return this; },
+            };
+            router3.handle(req, res, () => settle());
+            await done;
+            return { status: res.statusCode, body: jsonBody };
+          };
+
+          const contact3 = require("./crm-service").crmService.resolveContact("lint@example.no", null, "experiences");
+          db.prepare(`INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id)
+                      VALUES ('pi-lint-thread','${contact3.id}','Emne','innkommende','normal','experiences')`).run();
+
+          const outboxCount = () =>
+            (db.prepare(`SELECT COUNT(*) n FROM crm_outbox WHERE thread_id = 'pi-lint-thread'`).get() as any).n;
+
+          sent3.length = 0;
+          const beforeCount = outboxCount();
+          const violatingResp = await post3("/threads/pi-lint-thread/send", {
+            intent: "resend_send",
+            toEmails: ["gjest@example.no"],
+            subject: "Bekreftelse fra Rett fra Bonden",
+            bodyText: "Hilsen, Rett fra Bonden",
+            createdBy: "daniel",
+          });
+          assertTrue(
+            violatingResp.status >= 400 && violatingResp.status < 500,
+            `pi33: a body naming 'Rett fra Bonden' on an experiences thread is REJECTED by the route (got status ${violatingResp.status})`,
+          );
+          assertEq(sent3.length, 0, "pi34: …and nothing reached the transport — a wrongly-branded email must not go out");
+          assertEq(
+            outboxCount(), beforeCount,
+            "pi35: …and nothing was enqueued either — a wrongly-branded Gmail DRAFT is still a wrongly-branded draft a human could send",
+          );
+
+          sent3.length = 0;
+          const domainResp = await post3("/threads/pi-lint-thread/send", {
+            intent: "gmail_draft",
+            toEmails: ["gjest@example.no"],
+            subject: "Se lenken",
+            bodyText: "Se rettfrabonden.com for mer",
+            createdBy: "daniel",
+          });
+          assertTrue(
+            domainResp.status >= 400 && domainResp.status < 500,
+            `pi35b: …and a bare rettfrabonden.com LINK (no brand name) is rejected too, on the gmail_draft path — not just resend_send (got status ${domainResp.status})`,
+          );
+          assertEq(outboxCount(), beforeCount, "pi35c: …still nothing enqueued");
+
+          sent3.length = 0;
+          const cleanResp = await post3("/threads/pi-lint-thread/send", {
+            intent: "resend_send",
+            toEmails: ["gjest@example.no"],
+            subject: "Bekreftelse fra Opplevagent",
+            bodyText: "Hilsen, Opplevagent (opplevagent.no)",
+            createdBy: "daniel",
+          });
+          assertEq(
+            cleanResp.status, 200,
+            `pi36: a correctly-branded Opplevagent reply on the SAME thread goes through (got status ${cleanResp.status}, body ${JSON.stringify(cleanResp.body)})`,
+          );
+          assertEq(sent3.length, 1, "pi37: …and DOES reach the transport — the lint blocks foreign branding, not everything");
+        } finally {
+          svc3.sendRaw = realSendRaw3;
+          if (prevAdminKey2 === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey2;
+          if (prevAnalyticsAdminKey2 === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
+          else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey2;
+        }
+      }
     } finally {
       try { db.close(); } catch { /* already closed */ }
       initMod.__setDbForTesting(prevDb as any);

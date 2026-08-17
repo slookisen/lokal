@@ -40,7 +40,7 @@
 // the mechanism behind funn 2: an email went out branded as the wrong platform
 // and nothing anywhere reported a problem.
 
-import { CrmVertical, assertVertical } from "./crm-service";
+import { CrmVertical, CRM_VERTICALS, assertVertical } from "./crm-service";
 
 export interface CrmPlatformIdentity {
   /** Shown in the recipient's inbox list — the part that reads as the brand. */
@@ -109,6 +109,86 @@ export function resolveCrmIdentity(vertical: unknown): CrmPlatformIdentity {
     );
   }
   return identity;
+}
+
+// ─── Skive E — outbound BODY lint (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-utfoerelse) ──
+//
+// Steg 3 above (resolveCrmIdentity / crmFromHeader) fixed the ENVELOPE — From
+// display-name + reply-to. Funn 2's mirror image is still open: nothing stops
+// a CS agent from writing "Rett fra Bonden" or a rettfrabonden.com link into
+// the BODY of a reply on an Opplevagent thread. The envelope would say
+// Opplevagent; the words on the page would say something else. This table is
+// the per-vertical "these markers belong to someone ELSE" list that
+// lintOutboundBodyForForeignBranding scans with, below.
+//
+// Domains confirmed via the actual routing/config in the codebase (not
+// invented): rfb -> rettfrabonden.com (this file's CRM_SENDER_ADDRESS + the
+// reply-to above), experiences -> opplevagent.no (the replyTo above),
+// dental -> finn-tannlege.com (src/index.ts's DENTAL_HOSTS routing block).
+// Brand names likewise only include strings actually used elsewhere in this
+// codebase as the platform's name — see admin-crm.html / admin-dashboard.html
+// for "Finn Tannlege" alongside "Rett fra Bonden" / "Opplevagent".
+const CRM_PLATFORM_MARKERS: Readonly<
+  Record<CrmVertical, { brandNames: readonly string[]; domains: readonly string[] }>
+> = {
+  rfb: {
+    brandNames: ["Rett fra Bonden"],
+    domains: ["rettfrabonden.com"],
+  },
+  experiences: {
+    brandNames: ["Opplevagent"],
+    domains: ["opplevagent.no"],
+  },
+  dental: {
+    brandNames: ["Finn Tannlege"],
+    domains: ["finn-tannlege.com"],
+  },
+};
+
+export interface ForeignBrandingLintResult {
+  /** True when the body carries at least one marker belonging to another vertical. */
+  violation: boolean;
+  /** Which marker(s) matched — e.g. `"rfb brand: Rett fra Bonden"` — for logging/diagnostics. */
+  matches: string[];
+}
+
+/**
+ * Scan an outbound reply's subject + body for brand names / domains that
+ * belong to a vertical OTHER than the thread's own — the class of bug that
+ * put "Rett fra Bonden" content behind an Opplevagent envelope (funn 2), just
+ * in the body instead of the headers.
+ *
+ * FAIL-CLOSED note: `vertical` must already be a validated CrmVertical (see
+ * assertVertical / isCrmVertical at the call site) — this function does not
+ * add a fallback for an unknown vertical, on purpose. A silent "treat unknown
+ * as rfb" here would recreate the exact bug CRM_PLATFORM_IDENTITIES above
+ * exists to prevent, just one function over.
+ */
+export function lintOutboundBodyForForeignBranding(
+  vertical: CrmVertical,
+  subject: string,
+  bodyText: string,
+  bodyHtml?: string | null,
+): ForeignBrandingLintResult {
+  const haystack = [subject ?? "", bodyText ?? "", bodyHtml ?? ""].join("\n").toLowerCase();
+  const matches: string[] = [];
+
+  for (const v of CRM_VERTICALS) {
+    if (v === vertical) continue; // own platform's brand/domain is correct, not a violation
+    const markers = CRM_PLATFORM_MARKERS[v];
+    for (const name of markers.brandNames) {
+      if (haystack.includes(name.toLowerCase())) {
+        matches.push(`${v} brand: ${name}`);
+      }
+    }
+    for (const domain of markers.domains) {
+      if (haystack.includes(domain.toLowerCase())) {
+        matches.push(`${v} domain: ${domain}`);
+      }
+    }
+  }
+
+  return { violation: matches.length > 0, matches };
 }
 
 /**

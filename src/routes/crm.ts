@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { z } from "zod";
 import { crmService, CrmVertical, isCrmVertical, CRM_VERTICALS } from "../services/crm-service";
-import { crmFromHeader, resolveCrmIdentity } from "../services/crm-platform-identity";
+import { crmFromHeader, resolveCrmIdentity, lintOutboundBodyForForeignBranding } from "../services/crm-platform-identity";
 import {
   planRetroTagging,
   applyRetroTagging,
@@ -314,6 +314,26 @@ router.post("/threads/:id/send", async (req, res) => {
     return res.status(409).json({
       error: "thread has no valid vertical",
       detail: `crm_threads.vertical_id = ${JSON.stringify(thread.vertical_id)} — refusing to guess a platform for an outbound reply`,
+    });
+  }
+
+  // ─── Skive E — outbound BODY lint, fail-closed ─────────────────
+  // The envelope (From display-name + reply-to) is already pinned to the
+  // THREAD's platform above via resolveCrmIdentity — that closed funn 2 for
+  // the headers. Nothing stopped the body text itself from still saying "Rett
+  // fra Bonden" or linking rettfrabonden.com on an experiences thread; that's
+  // the mirror-image leak this guard closes. A hit here means neither
+  // resend_send NOR gmail_draft may proceed — a wrongly-branded Gmail draft
+  // is still a wrongly-branded draft a human could send.
+  const brandingLint = lintOutboundBodyForForeignBranding(thread.vertical_id, subject, bodyText, bodyHtml);
+  if (brandingLint.violation) {
+    return res.status(409).json({
+      error: "foreign_platform_branding",
+      detail:
+        `outbound body for a ${JSON.stringify(thread.vertical_id)} thread contains branding belonging to ` +
+        `another platform (${brandingLint.matches.join(", ")}) — refusing to send or draft a reply that ` +
+        `names the wrong platform in its own words`,
+      matches: brandingLint.matches,
     });
   }
 
