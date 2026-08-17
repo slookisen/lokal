@@ -5365,8 +5365,18 @@ function hasPhoneContext(text: string, matchStart: number, groupEnd: number): bo
  * field blank is always safer than writing a confidently-wrong number.
  */
 export function extractPhone(html: string): string | null {
+  // Bug fix 5 (2026-08-17, W34 breach, Austrått Kaffebrenneri live repro):
+  // drop <script>/<style> block CONTENT before the generic tag-strip below —
+  // the tag-strip alone removes tags but not the CSS/JS text between them,
+  // so a Tailwind arbitrary-value hex-alpha class living inside a <style>
+  // block (e.g. `.bg-\[\#79656569\]{background-color:#79656569}`) survives
+  // as 8 bare digits and can pass every check below. Same two lines, same
+  // order, as the already-established fix in the sibling extractPageText().
+  const stripped = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ");
   // Strip HTML tags for cleaner matching.
-  const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
+  const text = stripped.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
   // Match: optional +47 / 0047 / 47, then 8 digits possibly grouped.
   const re = /(?:\+47|0047|47[\s\-])?(\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})\b/g;
   let m: RegExpExecArray | null;
@@ -5429,6 +5439,62 @@ const ADDRESS_CONTACT_LABELS = new Set([
  * length sanity check / return, same reused single-implementation posture
  * as the phone checks above.
  */
+/** Bug fix (2026-08-17, W34 breach, LOKAL Matkvartalet Hamar live repro):
+ *  known image/icon file extensions that show up as the final segment of an
+ *  `<link rel="icon" href="favicon@2x.png">`-style filename. The bare-email
+ *  regex fallback in extractEmail() is TLD-shape-only ("2+ letters"), so
+ *  "png"/"ico"/etc. satisfy it; this guard rejects those specifically
+ *  because they are icon filenames, not real domains. */
+const EMAIL_ICON_EXTENSIONS = new Set([
+  "png", "ico", "jpg", "jpeg", "svg", "gif", "webp", "bmp",
+]);
+
+/** Extract the best email address from HTML. Prefers non-generic domains.
+ *
+ * Bug fix (2026-08-17, W34 breach): the bare-regex fallback below runs
+ * directly against the RAW, untagged `html` — so a `<link rel="icon"
+ * href="favicon@2x.png">` attribute string matches directly ("png" is
+ * 3 letters, satisfies the TLD-shaped tail). The mailto: path is collected
+ * first, separately, and is unaffected (a real mailto: href never carries an
+ * image-extension domain) — the icon-extension guard below therefore applies
+ * ONLY to candidates collected from the bare-regex fallback.
+ */
+export function extractEmail(html: string): string | null {
+  // Collect mailto: links first (most reliable).
+  const mailtoRe = /mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/gi;
+  const candidates: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = mailtoRe.exec(html)) !== null) {
+    candidates.push(m[1].toLowerCase());
+  }
+  // Fallback: bare email pattern in text.
+  if (candidates.length === 0) {
+    const bareRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
+    while ((m = bareRe.exec(html)) !== null) {
+      const candidate = m[1].toLowerCase();
+      // Reject a bare-fallback candidate whose domain's final segment (the
+      // TLD position) is a known image/icon file extension — e.g.
+      // "favicon@2x.png" from an <link rel="icon" href="..."> attribute.
+      const domain = candidate.split("@")[1] ?? "";
+      const tld = domain.split(".").pop() ?? "";
+      if (EMAIL_ICON_EXTENSIONS.has(tld)) continue;
+      candidates.push(candidate);
+    }
+  }
+  if (candidates.length === 0) return null;
+  // Prefer non-generic (not gmail/outlook/etc.).
+  const genericDomains = new Set([
+    "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com",
+    "icloud.com", "me.com", "msn.com", "proton.me", "protonmail.com",
+    "online.no", "live.no", "hotmail.no",
+  ]);
+  const branded = candidates.find((e) => {
+    const domain = e.split("@")[1] ?? "";
+    return !genericDomains.has(domain);
+  });
+  return branded ?? candidates[0] ?? null;
+}
+
 export function extractAddress(html: string): string | null {
   const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
   // Pattern: <words> <number> <optional comma/space> <4 digits> <CAPS/title word>
@@ -5751,36 +5817,11 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   const isLowQualityMode = selectRaw === "low_quality";
 
   // ── Norwegian contact-field extractors ───────────────────────────────────
-
-  /** Extract the best email address from HTML. Prefers non-generic domains. */
-  function extractEmail(html: string): string | null {
-    // Collect mailto: links first (most reliable).
-    const mailtoRe = /mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/gi;
-    const candidates: string[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = mailtoRe.exec(html)) !== null) {
-      candidates.push(m[1].toLowerCase());
-    }
-    // Fallback: bare email pattern in text.
-    if (candidates.length === 0) {
-      const bareRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
-      while ((m = bareRe.exec(html)) !== null) {
-        candidates.push(m[1].toLowerCase());
-      }
-    }
-    if (candidates.length === 0) return null;
-    // Prefer non-generic (not gmail/outlook/etc.).
-    const genericDomains = new Set([
-      "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com",
-      "icloud.com", "me.com", "msn.com", "proton.me", "protonmail.com",
-      "online.no", "live.no", "hotmail.no",
-    ]);
-    const branded = candidates.find((e) => {
-      const domain = e.split("@")[1] ?? "";
-      return !genericDomains.has(domain);
-    });
-    return branded ?? candidates[0] ?? null;
-  }
+  // extractEmail() moved to module scope (2026-08-17, W34 breach fix) so it
+  // can be unit-tested the same way as extractPhone/extractAddress — it took
+  // no closure state from this handler (only its `html` parameter), so this
+  // is a pure relocation, not a behavior change. See its definition above,
+  // near extractPhone/extractAddress.
 
   /**
    * Extract visible page text (title + headings + de-tagged body) for the
