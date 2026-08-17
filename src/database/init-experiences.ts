@@ -1097,6 +1097,17 @@ export function initExperiencesSchema(db: Database.Database): void {
   } catch (err) {
     console.error("Migration gardssalg_website_verification_audit failed:", err);
   }
+  // promoted_from_evidence_url (Skive 1, dev-request 2026-08-17-berikelse-
+  // uttrekk-evidence-url-og-render): NULL on every ordinary row; holds the
+  // candidate URL itself (not just a 0/1 flag) on the one row shape this
+  // sweep ever promotes — a producer whose own hjemmeside was blank, verified
+  // via its experiences.evidence_url fallback instead. TEXT rather than a
+  // boolean so the audit row is self-explanatory without joining back to the
+  // evidence JSON column. ALTER TABLE ADD COLUMN is idempotent here — error
+  // just means already-present.
+  try {
+    db.exec("ALTER TABLE gardssalg_website_verification_audit ADD COLUMN promoted_from_evidence_url TEXT");
+  } catch { /* already present */ }
 
   // ─── gardssalg_field_concordance_review_queue (orchestrator dev-request
   // 2026-08-03-gardssalg-field-concordance, write-side slice) ────────────────

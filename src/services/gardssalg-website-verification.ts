@@ -9,7 +9,13 @@
 // For every gårdssalg producer in the outreach cohort, classifies its stored
 // `hjemmeside` into exactly one bucket:
 //
-//   missing_source — blank/null hjemmeside. Never fetched.
+//   missing_source — blank/null hjemmeside AND no evidence_url candidate
+//                     promoted (Skive 1, dev-request 2026-08-17-berikelse-
+//                     uttrekk-evidence-url-og-render): when hjemmeside is
+//                     blank, a candidate evidence_url may still be tried —
+//                     see classifyGardssalgProducerWebsiteViaEvidenceUrl
+//                     Candidate — but anything short of a full ownership-
+//                     evidence pass on that candidate still lands here.
 //   aggregator     — isDirectoryOrAggregatorHost(hostFromUrlLike(hjemmeside))
 //                     is true. Never fetched (Funn 4: a directory/DMO host is
 //                     never evidence of ownership, fetching it would just
@@ -72,6 +78,18 @@ export interface GsWvProducerRow {
   adresse: string | null;
   postnummer: string | null;
   catalog_hidden: number | null;
+  /**
+   * Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render):
+   * the SAME candidate `selectProvidersForContentRefresh` (experience-store.ts)
+   * would fall back to — the first non-empty `experiences.evidence_url` for
+   * this provider, via the identical predicate/ordering (TRIM'd, non-empty,
+   * `LIMIT 1`, no explicit ORDER BY — whatever row SQLite returns first).
+   * Only ever populated when the producer's OWN `hjemmeside` is blank (see
+   * the SELECT below); classifyGardssalgProducerWebsite only ever looks at
+   * this when `hjemmeside` is null, so the two systems agree on "the
+   * candidate" by construction, not by convention.
+   */
+  evidence_url_candidate?: string | null;
 }
 
 /**
@@ -135,6 +153,19 @@ export interface GsWvScanRow {
    * except the ones it exists for.
    */
   render_diagnostic?: RenderEscalationDiagnostic;
+  /**
+   * Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render):
+   * set ONLY when this row is a promotion — the producer's own `hjemmeside`
+   * was blank, a candidate evidence_url was fetched instead, and it passed
+   * gardssalgWebsiteEvidenceMatch (classification === "verified" in this
+   * case). Carries the candidate URL through to applyGardssalgWebsiteVerification,
+   * which is the one place in this file that ever WRITES
+   * experience_providers.hjemmeside — every other row here only ever touches
+   * field_provenance/audit tables. Absent (not merely false) on every other
+   * row, including a normal own-hjemmeside "verified" row, which must NOT
+   * re-write hjemmeside (a no-op today, and must stay one).
+   */
+  promoted_from_evidence_url?: string;
 }
 
 export interface GsWvSummary {
@@ -313,7 +344,19 @@ export function loadGardssalgWebsiteVerificationCohort(
   const whereSql = `${GS_WV_COHORT_SQL[cohort]} AND ${GS_WV_SCOPE_ONLY_SQL[scope]}`;
   return db
     .prepare(
-      `SELECT id, navn, hjemmeside, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer, catalog_hidden
+      `SELECT id, navn, hjemmeside, org_nr, kommune, poststed, telefon, mobil, adresse, postnummer, catalog_hidden,
+              -- Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-
+              -- og-render): the IDENTICAL correlated-subquery fragment
+              -- selectProvidersForContentRefresh (experience-store.ts) already
+              -- uses for its own COALESCE fallback — copied verbatim rather
+              -- than shared, so the two systems agree on "the candidate" by
+              -- construction. Computed for every row (cheap, indexed on
+              -- provider_id); classifyGardssalgProducerWebsite only ever
+              -- consults it when hjemmeside is itself blank.
+              (SELECT TRIM(e2.evidence_url) FROM experiences e2
+                WHERE e2.provider_id = experience_providers.id
+                  AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
+                LIMIT 1) AS evidence_url_candidate
          FROM experience_providers
         WHERE ${whereSql}
         ORDER BY id`
@@ -337,7 +380,13 @@ export async function classifyGardssalgProducerWebsite(
   const hjemmeside = producer.hjemmeside && producer.hjemmeside.trim() !== "" ? producer.hjemmeside.trim() : null;
 
   if (!hjemmeside) {
-    return { provider_id: producer.id, name: producer.navn, hjemmeside: null, classification: "missing_source", evidence: null };
+    // Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-
+    // render, Funn 1): before giving up as missing_source, try the SAME
+    // evidence_url candidate selectProvidersForContentRefresh would fall
+    // back to. This is the ONLY extension to the "blank hjemmeside" path —
+    // everything below runs the exact same ownership-evidence machinery as
+    // a producer's own hjemmeside, just against a different candidate URL.
+    return classifyGardssalgProducerWebsiteViaEvidenceUrlCandidate(producer, fetchFn);
   }
 
   const host = hostFromUrlLike(hjemmeside);
@@ -393,6 +442,99 @@ export async function classifyGardssalgProducerWebsite(
     evidence,
     // Diagnostics, attached on the one path that actually read a page. Both
     // are pass-through/measurement — see their doc comments on GsWvScanRow.
+    page_chars: fetched.pageText.length,
+    ...(fetched.render ? { render_diagnostic: fetched.render } : {}),
+  };
+}
+
+/**
+ * Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render,
+ * Funn 1): the "own hjemmeside is blank" path. Attempts the SAME evidence_url
+ * candidate selectProvidersForContentRefresh (experience-store.ts) would fall
+ * back to (see GsWvProducerRow.evidence_url_candidate — loaded by the
+ * identical SQL fragment), running it through the identical ownership-
+ * evidence check used for a producer's own site. Fail-closed in every
+ * direction, same as classifyGardssalgProducerWebsite's own contract: a
+ * throw from fetchFn on the candidate must not propagate.
+ *
+ * Rules (dev-request spec, Skive 1):
+ *   1. No candidate at all -> missing_source, unchanged from before this
+ *      slice existed.
+ *   2. Candidate resolves to a directory/aggregator host -> never fetched,
+ *      missing_source (a directory host is never ownership evidence, same
+ *      principle as the own-hjemmeside "aggregator" bucket — but this stays
+ *      missing_source rather than "aggregator" since the producer's OWN
+ *      hjemmeside really is still blank).
+ *   3. Candidate fetched (fetch fails OR evidence doesn't match) -> NOTHING
+ *      happens: missing_source, deliberately NOT unverified — an
+ *      `unverified` classification enqueues a review-queue entry in
+ *      applyGardssalgWebsiteVerification, and a random evidence_url that
+ *      doesn't match this producer does not deserve one (only a producer's
+ *      OWN declared, non-matching hjemmeside does). No page_chars/evidence
+ *      recorded either — missing_source stays uniformly "never fetched
+ *      anything worth reporting" regardless of which leg produced it.
+ *   4. Candidate fetched AND verified -> "verified", with
+ *      `promoted_from_evidence_url` set so applyGardssalgWebsiteVerification
+ *      can promote the candidate to hjemmeside.
+ */
+async function classifyGardssalgProducerWebsiteViaEvidenceUrlCandidate(
+  producer: GsWvProducerRow,
+  fetchFn: GsWvFetchFn
+): Promise<GsWvScanRow> {
+  const missingSource: GsWvScanRow = {
+    provider_id: producer.id,
+    name: producer.navn,
+    hjemmeside: null,
+    classification: "missing_source",
+    evidence: null,
+  };
+
+  const candidate =
+    producer.evidence_url_candidate && producer.evidence_url_candidate.trim() !== ""
+      ? producer.evidence_url_candidate.trim()
+      : null;
+  if (!candidate) return missingSource; // Rule 1
+
+  const host = hostFromUrlLike(candidate);
+  if (host && isDirectoryOrAggregatorHost(host)) return missingSource; // Rule 2 — never fetched
+
+  let fetched: GsWvFetchResult;
+  try {
+    fetched = await fetchFn(candidate);
+  } catch {
+    // Same fail-closed treatment as classifyGardssalgProducerWebsite's own
+    // catch block: a throwing fetchFn is indistinguishable from {ok:false}.
+    fetched = { ok: false, reason: "fetch_threw" };
+  }
+  if (!fetched.ok) return missingSource; // Rule 3 — fetch failure leg
+
+  const evidence = gardssalgWebsiteEvidenceMatch(
+    fetched.pageText,
+    {
+      orgNr: producer.org_nr,
+      navn: producer.navn,
+      kommune: producer.kommune,
+      poststed: producer.poststed,
+      telefon: producer.telefon,
+      mobil: producer.mobil,
+      adresse: producer.adresse,
+      postnummer: producer.postnummer,
+    },
+    fetched.title
+  );
+
+  // Strict boolean comparison — same discipline classifyGardssalgProducer
+  // Website's own comment calls out on its equivalent line.
+  if (evidence.verified !== true) return missingSource; // Rule 3 — evidence-mismatch leg
+
+  // Rule 4 — promotion.
+  return {
+    provider_id: producer.id,
+    name: producer.navn,
+    hjemmeside: candidate,
+    classification: "verified",
+    evidence,
+    promoted_from_evidence_url: candidate,
     page_chars: fetched.pageText.length,
     ...(fetched.render ? { render_diagnostic: fetched.render } : {}),
   };
@@ -466,6 +608,15 @@ export interface GsWvApplyResult {
   provider_id: string;
   classification: GsWvClassification;
   enqueued: boolean;
+  /**
+   * Skive 1: true when this row's `hjemmeside` was actually written this run
+   * (the promotion happened AND the defensive re-check found it still blank
+   * at apply time). Observability only — a promotion row whose write raced
+   * and was skipped still gets its field_provenance/audit stamp (see
+   * applyGardssalgWebsiteVerification's own doc comment), so this flag is
+   * the one place to see whether the hjemmeside column itself changed.
+   */
+  promoted?: boolean;
 }
 
 /**
@@ -490,6 +641,17 @@ export interface GsWvApplyResult {
  * upsert — that is the existing table's own established refresh-on-rerun
  * contract (see upsertGardssalgWebsiteReviewQueue's doc comment), unchanged
  * by this slice.
+ *
+ * Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render):
+ * a row carrying `promoted_from_evidence_url` is the ONE case in this whole
+ * function that ever writes `experience_providers.hjemmeside` itself —
+ * everywhere else this function only ever touches field_provenance/audit.
+ * Guarded by a defensive re-read of hjemmeside at apply time: if it is no
+ * longer blank (a race between scan and apply — e.g. a concurrent write, or
+ * the same producer scanned twice in one batch), the hjemmeside write is
+ * skipped, but field_provenance/audit are still stamped exactly as if the
+ * write had happened (the candidate DID pass ownership verification; that
+ * fact doesn't depend on which value ended up winning the race).
  */
 export function applyGardssalgWebsiteVerification(
   db: Database.Database,
@@ -502,8 +664,8 @@ export function applyGardssalgWebsiteVerification(
 
   const runOne = db.transaction((row: GsWvScanRow) => {
     const providerRow = db
-      .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
-      .get(row.provider_id) as { field_provenance: string | null } | undefined;
+      .prepare(`SELECT field_provenance, hjemmeside FROM experience_providers WHERE id = ?`)
+      .get(row.provider_id) as { field_provenance: string | null; hjemmeside: string | null } | undefined;
     if (!providerRow) return; // provider vanished mid-run (deleted) -> nothing to stamp
 
     // A transient unreachability is not a finding about the producer, so it
@@ -541,16 +703,40 @@ export function applyGardssalgWebsiteVerification(
     if ((row.classification === "verified" || row.classification === "unverified") && row.evidence) {
       entry.evidence = row.evidence;
     }
+
+    // Skive 1: this row's hjemmeside was promoted from an evidence_url
+    // candidate rather than being the producer's own already-stored value.
+    // The marker is stamped regardless of whether the hjemmeside write below
+    // actually happens (see the defensive re-check) — it records what the
+    // candidate proved, not which value won a scan/apply race.
+    const isPromotion = row.classification === "verified" && !!row.promoted_from_evidence_url;
+    if (isPromotion) {
+      entry.source = "promoted_from_evidence_url";
+    }
     provenance.hjemmeside_verification = entry;
 
-    db.prepare(
-      `UPDATE experience_providers SET field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`
-    ).run({ id: row.provider_id, field_provenance: JSON.stringify(provenance) });
+    // Defensive re-check (spec): only write hjemmeside if it is STILL blank
+    // at apply time — a scan can be minutes old by the time apply runs, and
+    // this is the only path in this file that ever writes hjemmeside itself.
+    const stillBlank = isPromotion && (!providerRow.hjemmeside || providerRow.hjemmeside.trim() === "");
+    if (stillBlank) {
+      db.prepare(
+        `UPDATE experience_providers SET field_provenance = @field_provenance, hjemmeside = @hjemmeside, updated_at = datetime('now') WHERE id = @id`
+      ).run({
+        id: row.provider_id,
+        field_provenance: JSON.stringify(provenance),
+        hjemmeside: row.promoted_from_evidence_url,
+      });
+    } else {
+      db.prepare(
+        `UPDATE experience_providers SET field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`
+      ).run({ id: row.provider_id, field_provenance: JSON.stringify(provenance) });
+    }
 
     db.prepare(
       `INSERT INTO gardssalg_website_verification_audit
-         (id, provider_id, classification, verified, evidence, batch_id, checked_at)
-       VALUES (@id, @provider_id, @classification, @verified, @evidence, @batch_id, @checked_at)`
+         (id, provider_id, classification, verified, evidence, batch_id, checked_at, promoted_from_evidence_url)
+       VALUES (@id, @provider_id, @classification, @verified, @evidence, @batch_id, @checked_at, @promoted_from_evidence_url)`
     ).run({
       id: uuid(),
       provider_id: row.provider_id,
@@ -559,6 +745,9 @@ export function applyGardssalgWebsiteVerification(
       evidence: row.evidence ? JSON.stringify(row.evidence) : null,
       batch_id: batchId,
       checked_at: checkedAt,
+      // Independently auditable regardless of the defensive-recheck outcome
+      // above — see this function's own doc comment.
+      promoted_from_evidence_url: isPromotion ? row.promoted_from_evidence_url : null,
     });
 
     let enqueued = false;
@@ -579,7 +768,12 @@ export function applyGardssalgWebsiteVerification(
       }
     }
 
-    applied.push({ provider_id: row.provider_id, classification: row.classification, enqueued });
+    applied.push({
+      provider_id: row.provider_id,
+      classification: row.classification,
+      enqueued,
+      ...(isPromotion ? { promoted: stillBlank } : {}),
+    });
   });
 
   for (const row of rows) runOne(row);
