@@ -1062,6 +1062,26 @@ console.log("\n── css-favicon-extraction-guards (phone/email) ──");
   console.log(`  css-favicon-extraction-guards: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── search-enrich-extraction-guards (2026-08-17, dev-request search-enrich-
+// css-favicon-extraction-guards-parallel-gap): PR #629 fixed the CSS
+// hex-alpha / favicon-href extraction false-positives in
+// marketplace.ts's extractPhone/extractEmail, but src/services/search-
+// enrich.ts's own, independent extractPhones/extractEmails (plural,
+// array-returning — feeding pickProducerEmail()/confirmProducerPage())
+// carried the same two bugs and were never touched by that fix. Pure
+// functions of an html string — no DB/fetch involved, so no serial
+// chaining needed. ──
+console.log("\n── search-enrich-extraction-guards (phones/emails) ──");
+{
+  const { runSearchEnrichExtractionGuardsTests } = require("../src/services/search-enrich-extraction-guards.test") as
+    typeof import("../src/services/search-enrich-extraction-guards.test");
+  const r = runSearchEnrichExtractionGuardsTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("search-enrich-extraction-guards: " + f);
+  console.log(`  search-enrich-extraction-guards: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── PR-131: dental-claim-service buildWhereClause (completion-mode fix) ──
 // Pins the completion-mode already-complete exclusion (and pre-existing
 // PR-108/PR-120 exclusions + base filter behaviour) so `npm test` catches

@@ -506,6 +506,17 @@ export function rankCandidates(
 const FETCH_TIMEOUT_MS = 8_000;
 const UA = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
 
+// Bug fix (2026-08-17, dev-request search-enrich-css-favicon-extraction-
+// guards-parallel-gap): known image/icon file extensions that show up as the
+// final segment of a `<link rel="icon" href="favicon@2x.png">`-style
+// filename. The bare-email regex fallback below is TLD-shape-only ("2+
+// letters"), so "png"/"ico"/etc. satisfy it; this guard rejects those
+// specifically because they are icon filenames, not real domains. Same set
+// as marketplace.extractEmail's PR #629 fix.
+const EMAIL_ICON_EXTENSIONS = new Set([
+  "png", "ico", "jpg", "jpeg", "svg", "gif", "webp", "bmp",
+]);
+
 /** Collect ALL candidate emails from HTML (mailto: links first, then bare). */
 export function extractEmails(html: string): string[] {
   const out: string[] = [];
@@ -521,7 +532,18 @@ export function extractEmails(html: string): string[] {
   let m: RegExpExecArray | null;
   while ((m = mailtoRe.exec(html)) !== null) push(m[1]!);
   const bareRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
-  while ((m = bareRe.exec(html)) !== null) push(m[1]!);
+  while ((m = bareRe.exec(html)) !== null) {
+    const candidate = m[1]!.toLowerCase();
+    // Reject a bare-fallback candidate whose domain's final segment (the
+    // TLD position) is a known image/icon file extension — e.g.
+    // "favicon@2x.png" from an <link rel="icon" href="..."> attribute. This
+    // guard applies ONLY to the bare-regex fallback path (mailto: candidates
+    // are already pushed above, unaffected).
+    const domain = candidate.split("@")[1] ?? "";
+    const tld = domain.split(".").pop() ?? "";
+    if (EMAIL_ICON_EXTENSIONS.has(tld)) continue;
+    push(candidate);
+  }
   return out;
 }
 
@@ -537,7 +559,19 @@ function normalisePhoneHtml(raw: string): string {
 
 /** Collect ALL candidate phone numbers from HTML (mirrors marketplace.extractPhone). */
 export function extractPhones(html: string): string[] {
-  const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
+  // Bug fix (2026-08-17, dev-request search-enrich-css-favicon-extraction-
+  // guards-parallel-gap): drop <script>/<style> block CONTENT before the
+  // generic tag-strip below — the tag-strip alone removes tags but not the
+  // CSS/JS text between them, so a Tailwind arbitrary-value hex-alpha class
+  // living inside a <style> block (e.g.
+  // `.bg-\[\#79656569\]{background-color:#79656569}`) survives as 8 bare
+  // digits and can pass the phone regex below. Same guard, same order, as
+  // marketplace.extractPhone's PR #629 fix (this function was the second,
+  // independent implementation PR #629 did not touch).
+  const stripped = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ");
+  const text = stripped.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
   const re = /(?:\+47|0047|47[\s\-])?(\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})\b/g;
   const out: string[] = [];
   const seen = new Set<string>();
