@@ -17543,12 +17543,97 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     //    reported (never silently dropped). A non-blocklisted candidate in
     //    the SAME call still goes through normally (regression). ──────────
     {
+      // Re-pin immediately before these writes too, not just before the
+      // bulkReqBl() dispatches below: addManualEntry() (blocklist-service.ts)
+      // also calls the bare getDb() with no injection param, and by this
+      // point in the IIFE many awaited HTTP round trips (bl-1..bl-7,
+      // bl-agg-1..4) have already run, each a chance for a sibling ad-hoc-
+      // family block to have left the singleton pointing elsewhere.
+      // Verified empirically (diagnostic run, reverted): under an
+      // artificially widened race window this exact gap made addManualEntry
+      // write to a foreign db lacking agent_blocklist entirely — a WORSE
+      // failure than a misrouted read, since rfbDb18 would then never
+      // receive these rows at all, no matter how well the reads below are
+      // guarded.
+      initMod18.__setDbForTesting(rfbDb18 as any);
       blocklistSvc18.addManualEntry({ identifierType: "org_nr", identifierValue: "955000001" });
       blocklistSvc18.addManualEntry({ identifierType: "website_domain", identifierValue: "blokkert-domene-bl.no" });
 
+      // The blocklist gate this block exercises (isBlocked(), called from
+      // the bulk-load handler at src/routes/opplevelser.ts's `blockCheck`
+      // site) reads agent_blocklist via getDb() (src/database/init.ts) —
+      // the SAME process-wide singleton this file's own "SHARED GLOBAL
+      // STATE" header (kriterium 3, "NOT yet fixed") documents as raced by
+      // ~69 OTHER __setDbForTesting() call sites in this suite. Before
+      // Skive D this IIFE never touched that singleton (only dbFactory18's
+      // own separate "experiences" cache, which is NOT part of that
+      // hazard), so it was never exposed to it; pinning rfbDb18 above (for
+      // agent_blocklist) newly exposes it — and this IIFE's own intended
+      // prerequisite gate (the two `await _orchPr...Promise` lines at the
+      // very top of this IIFE) turns out to be a no-op here: both promises
+      // are declared with `const` FURTHER DOWN this file (after this IIFE),
+      // so referencing them this early is a TDZ ReferenceError that gets
+      // silently swallowed by their own `catch { /* upstream */ }` — this
+      // IIFE actually starts unordered relative to virtually everything
+      // else (confirmed empirically; pre-existing, not introduced by this
+      // PR, and out of scope to fix broadly here — the file's own header
+      // documents a prior attempt at a full ad-hoc-family barrier tripping
+      // a DIFFERENT unrelated race elsewhere in the suite).
+      //
+      // bulkReq()'s own HTTP round trip has multiple await points between
+      // "addManualEntry() wrote to rfbDb18" and "the route handler's
+      // isBlocked() call reads getDb()" (the Brreg-stub fetch, the
+      // inter-provider BRREG_PACE_MS sleep) during which a concurrently-
+      // running sibling ad-hoc-family block can legitimately re-pin the
+      // singleton to ITS OWN db mid-flight — isBlocked() then silently
+      // reads that foreign (blocklist-empty) db and lets a blocklisted
+      // candidate through, creating a row that must never exist.
+      //
+      // Unlike PR-74's read-only GET (~line 14294 — this file's established
+      // detect-and-retry pattern for a block that can't feasibly enumerate
+      // every other singleton-toucher it might race), a bare retry is NOT
+      // safe here: bulk-load WRITES, so a corrupted first attempt can
+      // already have created the very row a retry is meant to prevent, and
+      // simply re-issuing the request would not undo that. bulkReqBl()
+      // below re-pins rfbDb18 synchronously right before every dispatch
+      // (closes the common gap) and, if the singleton no longer points at
+      // rfbDb18 once the response lands, deletes any provider row THIS
+      // request's own payload could have created under that contamination
+      // (scoped to its own provider_name values — never touches any other
+      // request's or block's rows) before retrying from a clean, re-pinned
+      // state — so a retry always starts from the same state as the very
+      // first attempt would have. dbExp18/dbFactory18 (the experiences
+      // vertical) is a SEPARATE cache from the RFB singleton and is not
+      // part of this hazard, so it's safe to query/mutate directly here.
+      async function bulkReqBl(
+        body: Record<string, unknown> | undefined,
+        key: string | undefined,
+        retriesLeft = 5
+      ): Promise<{ status: number; body: any }> {
+        initMod18.__setDbForTesting(rfbDb18 as any);
+        const result = await bulkReq(body, key);
+        if (initMod18.__peekDbForTesting() !== rfbDb18) {
+          const names = (
+            (body?.experiences as Array<{ provider_name: string }> | undefined) ?? []
+          ).map((e) => e.provider_name);
+          for (const n of new Set(names)) {
+            dbExp18
+              .prepare(
+                "DELETE FROM experiences WHERE provider_id IN (SELECT id FROM experience_providers WHERE navn = ?)"
+              )
+              .run(n);
+            dbExp18.prepare("DELETE FROM experience_providers WHERE navn = ?").run(n);
+          }
+          if (retriesLeft > 0) {
+            return bulkReqBl(body, key, retriesLeft - 1);
+          }
+        }
+        return result;
+      }
+
       // bl-block-1: blocked by org_nr (resolved via the Brreg stub above),
       // alongside a clean candidate in the SAME call.
-      const rBlk1 = await bulkReq(
+      const rBlk1 = await bulkReqBl(
         {
           experiences: [
             { title: "Blokkert Opplevelse", provider_name: "Blokkert Orgnr Bryggeri AS", category: "annet",
@@ -17578,7 +17663,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       // the Brreg stub returns no match, classification=unverified), but
       // evidence-backed (so it clears the evidenceBacked gate) and would
       // otherwise be created were it not for the blocklisted domain.
-      const rBlk2 = await bulkReq(
+      const rBlk2 = await bulkReqBl(
         {
           experiences: [
             { title: "Domeneblokkert Opplevelse", provider_name: "Domeneblokkert Provider AS", category: "annet",
@@ -17599,7 +17684,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       // bl-block-3: dry-run also reports the rejection (useful for the daily
       // brief preview), writes nothing.
       const beforeCnt = (dbExp18.prepare("SELECT COUNT(*) AS n FROM experience_providers").get() as { n: number }).n;
-      const rBlk3 = await bulkReq(
+      const rBlk3 = await bulkReqBl(
         { experiences: [{ title: "Blokkert Opplevelse 2", provider_name: "Blokkert Orgnr Bryggeri AS", category: "annet", kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" }] },
         ADMIN_KEY_18
       );
