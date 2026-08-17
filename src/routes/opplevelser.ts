@@ -2342,6 +2342,45 @@ export function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean
   }
 }
 
+// dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A. Same
+// local-shape-per-stamp convention as HjemmesideVerificationEntry just above
+// (no shared typed FieldProvenance interface anywhere in this codebase — see
+// isHjemmesideVerified's own doc comment). Mirrors
+// GardssalgContactEmailOverrideStamp (services/experience-store.ts, the
+// WRITE side of this same stamp) but kept as its own loose/`unknown`-typed
+// shape here since this is a READ of persisted JSON that could in principle
+// be malformed — never trust it to already match the writer's type.
+interface ContactEmailDomainOverrideEntry {
+  approved_email?: unknown;
+}
+
+/**
+ * Fail-closed check: true only when field_provenance.contact_email_domain_
+ * override exists AND its approved_email exactly matches the row's CURRENT
+ * epost (case-sensitive, trimmed) — this is what makes the override lapse
+ * automatically the moment the address changes again (AC2): a stamp
+ * approving an OLD address never silently covers a new, never-reviewed one.
+ * Missing field_provenance, missing/malformed stamp, malformed JSON, or a
+ * non-matching approved_email -> false (not active). Never throws.
+ */
+export function isGardssalgContactEmailOverrideActive(
+  fieldProvenanceRaw: string | null,
+  currentEmail: string | null,
+): boolean {
+  if (!fieldProvenanceRaw || !currentEmail) return false;
+  try {
+    const parsed = JSON.parse(fieldProvenanceRaw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const entry = (parsed as Record<string, unknown>).contact_email_domain_override as
+      | ContactEmailDomainOverrideEntry
+      | undefined;
+    if (!entry || typeof entry !== "object") return false;
+    return typeof entry.approved_email === "string" && entry.approved_email === currentEmail;
+  } catch {
+    return false; // malformed existing JSON -> fail closed, never treat as active
+  }
+}
+
 router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
 
@@ -11488,6 +11527,36 @@ function gardssalgDailyPrepWrongIndustry(
 
 const DAILY_PREP_MAX_CANDIDATES = 4;
 
+/**
+ * Skive A (dev-request 2026-08-17-kontaktadresse-feilkilde-og-override):
+ * catalog-wide count of currently-active contact-email domain-mismatch
+ * overrides — every provider whose field_provenance.contact_email_domain_
+ * override stamp's approved_email still matches its current epost (see
+ * isGardssalgContactEmailOverrideActive's own doc comment for the exact
+ * "still matches" / lapse rule). Deliberately independent of this route's
+ * own outreach_ready/eligible cohort filtering above: an override is a
+ * catalog-wide exception, worth surfacing even for a provider that isn't
+ * outreach_ready today, so Daniel sees the true count of active exceptions
+ * rather than only the ones this run happened to touch (krav 3 — "synlige,
+ * ikke usynlige unntak"). A cheap LIKE prefilter narrows the query to rows
+ * that could possibly carry the stamp before the per-row JSON parse/compare
+ * — the gårdssalg pool is small (tens of rows), but there is no reason to
+ * parse JSON for rows that plainly don't have the key.
+ */
+export function countActiveGardssalgContactEmailOverrides(expDb: ReturnType<typeof getExpDb>): number {
+  const rows = expDb
+    .prepare(
+      `SELECT epost, field_provenance FROM experience_providers
+         WHERE field_provenance LIKE '%contact_email_domain_override%'`,
+    )
+    .all() as Array<{ epost: string | null; field_provenance: string | null }>;
+  let count = 0;
+  for (const r of rows) {
+    if (isGardssalgContactEmailOverrideActive(r.field_provenance, r.epost)) count++;
+  }
+  return count;
+}
+
 // Address-basis classification (krav 7: "adressegrunnlag — samme domene /
 // publisert på nettstedet / freemail som peker på produsenten"). A PURE,
 // INFORMATIONAL label surfaced on each returned candidate — it derives from
@@ -11582,6 +11651,12 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
   // Cheap, already-computed count — no new machinery, krav 12's refill hint.
   const needsEnrichmentCount = rows.filter((r) => r.readiness_tier === "needs_enrichment").length;
 
+  // Skive A (dev-request 2026-08-17-kontaktadresse-feilkilde-og-override,
+  // krav 3): catalog-wide, additive — computed once, reported on every
+  // response branch below (including the two early-return branches), never
+  // replacing an existing field.
+  const activeContactEmailOverrides = countActiveGardssalgContactEmailOverrides(expDb);
+
   // Deterministic order (see module doc comment above) — plain id ascending.
   const readyRows = rows
     .filter((r) => r.readiness_tier === "outreach_ready")
@@ -11601,6 +11676,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       missing: { count: DAILY_PREP_MAX_CANDIDATES, reason: "pool_exhausted" },
       note: "No outreach_ready candidates exist right now — the pool is exhausted.",
       refill_hints: { needs_enrichment_count: needsEnrichmentCount },
+      active_contact_email_overrides: activeContactEmailOverrides,
     });
     return;
   }
@@ -11694,8 +11770,19 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       extra?.field_provenance ?? null,
     );
     if (addressBasis === "unverified") {
-      skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "address_domain_mismatch" });
-      continue;
+      // Skive A override (dev-request 2026-08-17-kontaktadresse-feilkilde-
+      // og-override): a human/session force-approved THIS EXACT address via
+      // POST /admin/gardssalg-set-contact-email (force:true) — respect it
+      // and let the row continue through the remaining Skive 3 checks below,
+      // instead of re-flagging address_domain_mismatch every run. Scoped to
+      // the exact approved address (isGardssalgContactEmailOverrideActive
+      // compares against e.epost, the row's CURRENT value) — if the address
+      // has since changed, the override no longer matches and this row is
+      // excluded again like any other unverified address (AC2).
+      if (!isGardssalgContactEmailOverrideActive(extra?.field_provenance ?? null, e.epost)) {
+        skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "address_domain_mismatch" });
+        continue;
+      }
     }
     if (!meetsAboutCheapBar(extra?.about_text ?? null)) {
       skive3Excluded.push({ provider_id: e.provider_id, name: e.navn, reason: "profile_text_low_quality" });
@@ -11875,6 +11962,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     missing: { count: missingCount, reason: missingReason },
     note,
     ...(refillHints ? { refill_hints: refillHints } : {}),
+    active_contact_email_overrides: activeContactEmailOverrides,
   });
 });
 

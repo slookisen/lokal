@@ -30239,6 +30239,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gsce.failures) failures.push("opplevelser-gardssalg-set-contact-email: " + f);
     console.log(`  opplevelser-gardssalg-set-contact-email: ${gsce.passed} passed, ${gsce.failed} failed`);
 
+    // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A:
+    // persist the force-approval from gardssalg-set-contact-email above (a
+    // field_provenance.contact_email_domain_override stamp, scoped to the
+    // exact approved address) and make daily-prep's own
+    // address_domain_mismatch check (Skive 3 check 1, above) respect it —
+    // plus the new catalog-wide `active_contact_email_overrides` count on
+    // the daily-prep response. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-contact-email-override: persisted force-approval override (Skive A) ──");
+    const { runOpplevelserGardssalgContactEmailOverrideTests } = require("../src/routes/opplevelser-gardssalg-contact-email-override.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-contact-email-override.test");
+    const gceo = await runOpplevelserGardssalgContactEmailOverrideTests({ log: false });
+    passed += gceo.passed;
+    failed += gceo.failed;
+    for (const f of gceo.failures) failures.push("opplevelser-gardssalg-contact-email-override: " + f);
+    console.log(`  opplevelser-gardssalg-contact-email-override: ${gceo.passed} passed, ${gceo.failed} failed`);
+
     // dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A),
     // Slice 1: GET /admin/gardssalg-outreach-candidates — gårdssalg's own
     // outreach candidate-selection endpoint, the counterpart to RFB's
