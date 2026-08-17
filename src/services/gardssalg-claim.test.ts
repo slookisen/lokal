@@ -1850,6 +1850,36 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         claimSvc.__resetClaimHarvestCacheForTesting();
       }
 
+      // ── getClaimProviderBySlug (2026-08-17 P0 consent-bug fix) — a
+      //    catalog_hidden=1 row must be UNREACHABLE by slug, same as
+      //    getGardssalgProviderBySlug() (lokal#637, experience-store.test.ts's
+      //    gbs-1..gbs-5). Own raw insert (not the shared insertProvider()
+      //    above, which doesn't carry catalog_hidden) so this doesn't touch
+      //    the other fixtures' shape. ─────────────────────────────────────
+      {
+        const insertHidden = expDb.prepare(`
+          INSERT INTO experience_providers
+            (id, navn, slug, vertical, catalog_hidden, enrichment_state, verification_status, source, confidence)
+          VALUES
+            (@id, @navn, @slug, 'experiences', @catalog_hidden, 'raw', 'pending_verify', 'test-fixture', 'medium')
+        `);
+        insertHidden.run({ id: "ch-visible", navn: "Synlig Claim Gård", slug: "synlig-claim-gard", catalog_hidden: null });
+        insertHidden.run({ id: "ch-zero", navn: "Null Claim Gård", slug: "null-claim-gard", catalog_hidden: 0 });
+        insertHidden.run({ id: "ch-hidden", navn: "Skjult Claim Gård", slug: "skjult-claim-gard", catalog_hidden: 1 });
+
+        const visible = claimSvc.getClaimProviderBySlug("synlig-claim-gard");
+        assertTrue(!!visible && visible.id === "ch-visible", "ch-1: catalog_hidden=NULL row IS returned by slug");
+
+        const zeroHidden = claimSvc.getClaimProviderBySlug("null-claim-gard");
+        assertTrue(!!zeroHidden && zeroHidden.id === "ch-zero", "ch-2: catalog_hidden=0 (explicit) row IS returned by slug");
+
+        const hidden = claimSvc.getClaimProviderBySlug("skjult-claim-gard");
+        assertEq(hidden, null, "ch-3: catalog_hidden=1 row returns null by slug (the P0 fix -- was previously returned)");
+
+        assertEq(claimSvc.getClaimProviderBySlug("does-not-exist-claim"), null, "ch-4: unknown slug still returns null (unrelated to this fix, sanity check)");
+        assertEq(claimSvc.getClaimProviderBySlug(""), null, "ch-5: empty slug still short-circuits to null without hitting the DB");
+      }
+
       // ── (z) Suite-wide outbound-fetch ledger ─────────────────────────────
       // emptyPageFetchImpl has been counting into suiteFetchCalls since the
       // top of this suite but nothing ever read it — dead tracking, and out of

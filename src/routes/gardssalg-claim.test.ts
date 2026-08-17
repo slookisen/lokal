@@ -248,6 +248,36 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       });
       expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("eier2@gmail.com", "prov-route-two");
 
+      // ── catalog_hidden=1 fixtures (2026-08-17 P0 consent-bug fix, dev-
+      // request 2026-08-17-gardssalg-claim-eier-side-catalog-hidden-
+      // lekkasje) — mirrors lokal#637's getGardssalgProviderBySlug fixture
+      // pattern. Own raw insert (not the shared insertProvider() above,
+      // which doesn't carry catalog_hidden) so this doesn't touch the other
+      // fixtures' shape. Two rows: one that WOULD otherwise be claim-
+      // eligible (has a stored epost), one with zero candidates at all --
+      // AC4 requires 404 for both, since the pre-fix code only ever
+      // distinguished those two shapes AFTER already confirming the row
+      // exists (i.e. both leaked "this slug is a real, delisted producer").
+      const insertHiddenProvider = expDb.prepare(`
+        INSERT INTO experience_providers
+          (id, navn, slug, vertical, org_nr, brreg_verified, hjemmeside, content_source, field_provenance, catalog_hidden,
+           enrichment_state, verification_status, source, confidence)
+        VALUES
+          (@id, @navn, @slug, 'experiences', @org_nr, @brreg_verified, @hjemmeside, @content_source, @field_provenance, 1,
+           'raw', 'pending_verify', 'test-fixture', 'medium')
+      `);
+      insertHiddenProvider.run({
+        id: "prov-route-hidden", navn: "Skjult Route Gård", slug: "skjult-route-gard",
+        org_nr: "977777777", brreg_verified: 1, hjemmeside: null,
+        content_source: "manual", field_provenance: null,
+      });
+      expDb.prepare("UPDATE experience_providers SET epost = ? WHERE id = ?").run("post@skjultroutegard.no", "prov-route-hidden");
+      insertHiddenProvider.run({
+        id: "prov-route-hidden-noemail", navn: "Skjult Uten Epost Gård", slug: "skjult-uten-epost-gard",
+        org_nr: "988888888", brreg_verified: 1, hjemmeside: null,
+        content_source: null, field_provenance: null,
+      });
+
       const routerMod = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
 
       // ── describeSaveOutcome (pure, dev-request 2026-08-03-eierportal-
@@ -324,6 +354,13 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertEq(noEmailPage.status, 200, "a2: GET entry page for a non-eligible provider still returns 200 (manual fallback shown, not an error)");
       assertTrue(noEmailPage.body.includes("kontakt@opplevagent.no"), "a3: non-eligible provider's entry page shows the manual-fallback contact");
       assertTrue(!noEmailPage.body.includes("Send meg tilgangslenke"), "a4: non-eligible provider's entry page has NO self-service request button");
+
+      // ── catalog_hidden=1 -> 404 (2026-08-17 P0 consent-bug fix) ─────────
+      const hiddenPage = await req("GET", "/kategori/gardssalg/eier/skjult-route-gard");
+      assertEq(hiddenPage.status, 404, "a4b: GET entry page for a catalog_hidden=1 provider -> 404 (was previously 200, rendering the provider's name -- the P0 leak this fix closes)");
+      assertTrue(!hiddenPage.body.includes("Skjult Route Gård"), "a4c: hidden provider's name never appears anywhere in the 404 response body");
+      const hiddenNoEmailPage = await req("GET", "/kategori/gardssalg/eier/skjult-uten-epost-gard");
+      assertEq(hiddenNoEmailPage.status, 404, "a4d: catalog_hidden=1 provider with zero email candidates ALSO 404s -- not the 200 manual-fallback page a4 has for a non-hidden 0-candidate provider, which would otherwise still confirm the slug exists");
 
       const eligiblePage = await req("GET", "/kategori/gardssalg/eier/route-test-gard");
       assertEq(eligiblePage.status, 200, "a5: GET entry page for an eligible provider -> 200");
