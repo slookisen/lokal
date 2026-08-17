@@ -322,6 +322,14 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
           producer_type TEXT,
           rfb_seed_source TEXT
         );
+        -- Minimal: only what the evidence_url_candidate correlated subquery
+        -- (Skive 1) touches. Empty is fine — this section exercises the
+        -- cohort/scope axes only, not the candidate itself.
+        CREATE TABLE experiences (
+          id TEXT PRIMARY KEY,
+          provider_id TEXT,
+          evidence_url TEXT
+        );
       `);
       const insert = db.prepare(
         `INSERT INTO experience_providers (id, navn, catalog_hidden, producer_type, rfb_seed_source)
@@ -406,6 +414,92 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
         GS_WV_COHORTS,
         ["gardssalg", "all", "non_gardssalg"],
         "j6: GS_WV_COHORTS lists exactly the three valid values, gardssalg first (the default)"
+      );
+
+      db.close();
+    }
+
+    // ── (j2) Skive 1 — loadGardssalgWebsiteVerificationCohort's
+    //     evidence_url_candidate SQL fragment itself (the copy of
+    //     selectProvidersForContentRefresh's own COALESCE fragment). A
+    //     separate minimal in-memory DB (this one needs real `experiences`
+    //     rows, section (j)'s fixture deliberately left that table empty). ──
+    {
+      const db = new Database(":memory:");
+      db.exec(`
+        CREATE TABLE experience_providers (
+          id TEXT PRIMARY KEY,
+          navn TEXT,
+          hjemmeside TEXT,
+          org_nr TEXT,
+          kommune TEXT,
+          poststed TEXT,
+          telefon TEXT,
+          mobil TEXT,
+          adresse TEXT,
+          postnummer TEXT,
+          catalog_hidden INTEGER,
+          producer_type TEXT,
+          rfb_seed_source TEXT
+        );
+        CREATE TABLE experiences (
+          id TEXT PRIMARY KEY,
+          provider_id TEXT,
+          evidence_url TEXT
+        );
+      `);
+      const insertProvider = db.prepare(
+        `INSERT INTO experience_providers (id, navn, hjemmeside, catalog_hidden, producer_type)
+         VALUES (@id, @navn, @hjemmeside, 0, 'bryggeri')`
+      );
+      const insertExperience = db.prepare(
+        `INSERT INTO experiences (id, provider_id, evidence_url) VALUES (@id, @provider_id, @evidence_url)`
+      );
+
+      // p1: blank hjemmeside, ONE experience with a non-empty evidence_url
+      // -> candidate surfaced.
+      insertProvider.run({ id: "p1-blank-with-evidence", navn: "P1", hjemmeside: null });
+      insertExperience.run({ id: "e1", provider_id: "p1-blank-with-evidence", evidence_url: "  https://p1-listing.example.no  " });
+
+      // p2: blank hjemmeside, but the only experience's evidence_url is
+      // blank/whitespace-only -> COALESCE finds nothing, candidate stays null
+      // (same TRIM/non-empty guard as the own-column check).
+      insertProvider.run({ id: "p2-blank-no-usable-evidence", navn: "P2", hjemmeside: null });
+      insertExperience.run({ id: "e2", provider_id: "p2-blank-no-usable-evidence", evidence_url: "   " });
+
+      // p3: blank hjemmeside, no experiences rows at all.
+      insertProvider.run({ id: "p3-blank-no-experiences", navn: "P3", hjemmeside: null });
+
+      // p4: own hjemmeside IS set — evidence_url_candidate is still computed
+      // (the SQL doesn't gate on hjemmeside being blank, classify() does),
+      // but must be exactly the same value the fragment would produce
+      // regardless — just proving the column always reflects the real data,
+      // not a null forced by the presence of hjemmeside.
+      insertProvider.run({ id: "p4-ownsite-still-has-evidence", navn: "P4", hjemmeside: "https://p4-ownsite.example.no" });
+      insertExperience.run({ id: "e4", provider_id: "p4-ownsite-still-has-evidence", evidence_url: "https://p4-listing.example.no" });
+
+      const rows = loadGardssalgWebsiteVerificationCohort(db, "visible", "gardssalg");
+      const byId = new Map(rows.map((r) => [r.id, r]));
+
+      assertEq(
+        byId.get("p1-blank-with-evidence")?.evidence_url_candidate,
+        "https://p1-listing.example.no",
+        "j2-1: TRIM'd, non-empty evidence_url surfaces as the candidate"
+      );
+      assertEq(
+        byId.get("p2-blank-no-usable-evidence")?.evidence_url_candidate,
+        null,
+        "j2-2: a whitespace-only evidence_url is treated as absent, same TRIM/non-empty guard as the own-column check"
+      );
+      assertEq(
+        byId.get("p3-blank-no-experiences")?.evidence_url_candidate,
+        null,
+        "j2-3: no experiences rows at all -> candidate is null, not an error"
+      );
+      assertEq(
+        byId.get("p4-ownsite-still-has-evidence")?.evidence_url_candidate,
+        "https://p4-listing.example.no",
+        "j2-4: the column is populated even when hjemmeside is already set — classify() is what decides whether to use it, not this query"
       );
 
       db.close();
@@ -578,6 +672,160 @@ export function runGardssalgWebsiteVerificationTests(opts: { log?: boolean } = {
       // has no URL to fix, so it must not be queued.
       const planned = planGardssalgWebsiteVerificationRemediation(scanned.rows);
       assertEq(planned.wouldEnqueue.length, 0, "t8: an unreachable_transient row is never queued for URL review");
+    }
+
+    // ═══ Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-
+    //     render, Funn 1) — evidence_url-promotion, classification level.
+    //     GsWvProducerRow.evidence_url_candidate is set directly here rather
+    //     than via a real DB query — loadGardssalgWebsiteVerificationCohort's
+    //     own SQL fragment is exercised separately (it is copied verbatim
+    //     from selectProvidersForContentRefresh's own COALESCE fragment, and
+    //     that fragment already has its own coverage in experience-store's
+    //     tests); this section covers ONLY what classifyGardssalgProducer
+    //     Website does once a candidate is handed to it. ══════════════════
+
+    // ── (u) Rule 1 — blank hjemmeside AND no candidate at all: unchanged
+    //     behavior, identical to (a) above but pinned again here so this
+    //     whole Skive-1 block reads standalone. ──────────────────────────
+    {
+      let fetchCalls = 0;
+      const neverFetch: GsWvFetchFn = async () => {
+        fetchCalls++;
+        return { ok: true, pageText: "should never be reached" };
+      };
+      const producer = blankProducer({
+        id: "prov-evurl-nocandidate",
+        navn: "Steinbekk Bryggeri",
+        hjemmeside: null,
+        evidence_url_candidate: null,
+      });
+      const row = await classifyGardssalgProducerWebsite(producer, neverFetch);
+      assertEq(row.classification, "missing_source", "u1: blank hjemmeside + no candidate -> missing_source, unchanged");
+      assertEq(row.evidence, null, "u2: no evidence object");
+      assertEq(row.promoted_from_evidence_url, undefined, "u3: no promotion marker");
+      assertEq(fetchCalls, 0, "u4: fetchFn never touched");
+    }
+
+    // ── (v) Rule 2 — candidate resolves to a directory/aggregator host:
+    //     never fetched, stays missing_source (NOT "aggregator" — the
+    //     producer's OWN hjemmeside really is still blank). ──────────────
+    {
+      let fetchCalls = 0;
+      const neverFetch: GsWvFetchFn = async () => {
+        fetchCalls++;
+        return { ok: true, pageText: "should never be reached" };
+      };
+      const producer = blankProducer({
+        id: "prov-evurl-aggregator",
+        navn: "Lyngheim Gård",
+        hjemmeside: null,
+        evidence_url_candidate: "https://hanen.no/gardsutsalg/lyngheim",
+      });
+      const row = await classifyGardssalgProducerWebsite(producer, neverFetch);
+      assertEq(row.classification, "missing_source", "v1: aggregator-hosted candidate -> missing_source, never 'aggregator'");
+      assertEq(row.evidence, null, "v2: no evidence object");
+      assertEq(row.promoted_from_evidence_url, undefined, "v3: no promotion marker");
+      assertEq(fetchCalls, 0, "v4: aggregator/directory candidate host is NEVER fetched (Funn 4, same principle as own-hjemmeside)");
+    }
+
+    // ── (w) Rule 3, fetch-failure leg — candidate exists, fetch fails ->
+    //     NOTHING happens: missing_source, deliberately NOT unverified. ──
+    {
+      const producer = blankProducer({
+        id: "prov-evurl-fetchfail",
+        navn: "Kalvtjern Sideri",
+        hjemmeside: null,
+        evidence_url_candidate: "https://kalvtjernsideri-experience-listing.example.no",
+      });
+      const fetchFn: GsWvFetchFn = async () => ({ ok: false, reason: "timeout" });
+      const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+      assertEq(row.classification, "missing_source", "w1: candidate fetch failure -> missing_source, NOT unverified");
+      assertEq(row.evidence, null, "w2: no evidence object");
+      assertEq(row.promoted_from_evidence_url, undefined, "w3: no promotion marker");
+      assertEq(row.hjemmeside, null, "w4: hjemmeside stays null on the row itself");
+
+      // Deliberately NOT enqueued — an unverified own-hjemmeside row queues
+      // for review, but a random fallback candidate that couldn't even be
+      // fetched does not deserve one (only a producer's own declared,
+      // non-matching hjemmeside does).
+      const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation([row]);
+      assertEq(wouldEnqueue.length, 0, "w5: a failed-candidate missing_source row is never queued for review");
+    }
+
+    // ── (x) Rule 3, evidence-mismatch leg — candidate fetched fine but
+    //     names nobody related to this producer -> still missing_source,
+    //     still not enqueued. ─────────────────────────────────────────────
+    {
+      const producer = blankProducer({
+        id: "prov-evurl-nomatch",
+        navn: "Kalvtjern Sideri",
+        hjemmeside: null,
+        kommune: "Nes",
+        evidence_url_candidate: "https://en-helt-annen-side.example.no",
+      });
+      const fetchFn: GsWvFetchFn = async () => ({
+        ok: true,
+        pageText: "Velkommen til vår nettbutikk. Vi selger håndverksprodukter fra hele landet.",
+      });
+      const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+      assertEq(row.classification, "missing_source", "x1: candidate fetched, no evidence match -> missing_source, NOT unverified");
+      assertEq(row.promoted_from_evidence_url, undefined, "x2: no promotion marker");
+      assertEq(row.hjemmeside, null, "x3: hjemmeside stays null on the row itself");
+
+      const { wouldEnqueue } = planGardssalgWebsiteVerificationRemediation([row]);
+      assertEq(wouldEnqueue.length, 0, "x4: a non-matching candidate is never queued for review either");
+    }
+
+    // ── (y) Rule 4 — candidate fetched AND verified: promotion. ─────────
+    {
+      const producer = blankProducer({
+        id: "prov-evurl-promoted",
+        navn: "Kalvtjern Sideri",
+        hjemmeside: null,
+        org_nr: "934567123",
+        kommune: "Nes",
+        evidence_url_candidate: "https://kalvtjernsideri.example.no/om-oss",
+      });
+      const fetchFn: GsWvFetchFn = async (url) => {
+        assertEq(url, "https://kalvtjernsideri.example.no/om-oss", "y1: fetchFn is called with the CANDIDATE url, not any own-hjemmeside");
+        return {
+          ok: true,
+          pageText: "Kalvtjern Sideri holder til i Nes. Org.nr: 934 567 123. Velkommen til gårdsbutikken vår.",
+        };
+      };
+      const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+      assertEq(row.classification, "verified", "y2: matching evidence on the candidate -> verified");
+      assertEq(row.hjemmeside, "https://kalvtjernsideri.example.no/om-oss", "y3: row.hjemmeside carries the candidate through");
+      assertEq(
+        row.promoted_from_evidence_url,
+        "https://kalvtjernsideri.example.no/om-oss",
+        "y4: promoted_from_evidence_url carries the exact candidate URL for applyGardssalgWebsiteVerification"
+      );
+      assertTrue(!!row.evidence, "y5: verified row carries the evidence object");
+      assertEq(row.evidence?.org_nr_found, true, "y6: evidence.org_nr_found is true");
+    }
+
+    // ── (z) sanity — a producer whose OWN hjemmeside is set (non-blank)
+    //     must NEVER be promoted even if evidence_url_candidate happens to
+    //     be populated on the row: classifyGardssalgProducerWebsite only
+    //     ever consults the candidate on the blank-hjemmeside branch. ────
+    {
+      const producer = blankProducer({
+        id: "prov-evurl-ownsite-wins",
+        navn: "Kalvtjern Sideri",
+        hjemmeside: "https://kalvtjernsideri.no",
+        org_nr: "934567123",
+        evidence_url_candidate: "https://some-other-experience-listing.example.no",
+      });
+      let fetchedUrl: string | null = null;
+      const fetchFn: GsWvFetchFn = async (url) => {
+        fetchedUrl = url;
+        return { ok: true, pageText: "Kalvtjern Sideri. Org.nr 934 567 123." };
+      };
+      const row = await classifyGardssalgProducerWebsite(producer, fetchFn);
+      assertEq(fetchedUrl, "https://kalvtjernsideri.no", "z1: the OWN hjemmeside is fetched, never the candidate, when hjemmeside is set");
+      assertEq(row.classification, "verified", "z2: own-hjemmeside verification unaffected by an unrelated candidate field");
+      assertEq(row.promoted_from_evidence_url, undefined, "z3: no promotion marker on an own-hjemmeside verification");
     }
   })().then(() => ({ passed, failed, failures }));
 }

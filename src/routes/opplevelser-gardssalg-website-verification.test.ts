@@ -269,6 +269,18 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
             headers: { get: () => null }, url: urlStr,
           } as unknown as Response;
         }
+        if (host === "kalvtjernsideri-listing.example.no") {
+          // Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-
+          // og-render) — the evidence_url candidate for prov-evurl-promoted-
+          // route, which has no own hjemmeside. Carries the producer's own
+          // org_nr, so it must verify.
+          const html = "<html><body><p>Kalvtjern Sideri, Nes. Org.nr 934 567 199. Velkommen til gårdsbutikken.</p></body></html>";
+          return {
+            ok: true, status: 200, text: async () => html,
+            arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+            headers: { get: () => null }, url: urlStr,
+          } as unknown as Response;
+        }
         // fossmoenfrukt.example.no (hidden — never fetched by a
         // DEFAULT-scope call, which is what assertion c3 pins at its point
         // in the sequence; section (h) later fetches it deliberately via
@@ -488,7 +500,13 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
       assertEq(wayOverMax.status, 400, "j23: a much larger limit (the exact PR #432 unbounded-scan shape) is also rejected, not clamped");
 
       function getProviderRow(id: string): any {
-        return expDb.prepare(`SELECT id, field_provenance FROM experience_providers WHERE id = ?`).get(id);
+        // `hjemmeside` added alongside field_provenance for Skive 1 (dev-
+        // request 2026-08-17-berikelse-uttrekk-evidence-url-og-render) — the
+        // one write this whole file's `applyGardssalgWebsiteVerification`
+        // call ever makes to a column other than field_provenance. Every
+        // existing caller above only ever reads `.field_provenance` off the
+        // result, so this is additive.
+        return expDb.prepare(`SELECT id, hjemmeside, field_provenance FROM experience_providers WHERE id = ?`).get(id);
       }
       function getVerificationAuditRows(providerId: string): any[] {
         return expDb
@@ -1124,6 +1142,175 @@ export function runOpplevelserGardssalgWebsiteVerificationTests(
         "prov-missing-source",
         "i6: homepage listing carries the pending row only — status filter is load-bearing (i3 fails if it is dropped, since approved would join)"
       );
+
+      // ── (n) Skive 1 (dev-request 2026-08-17-berikelse-uttrekk-evidence-
+      //     url-og-render, Funn 1) — evidence_url promotion through the real
+      //     apply write path. Three NEW providers, all with blank hjemmeside,
+      //     each carrying an `experiences.evidence_url` candidate; scoped via
+      //     `providerIds` (same technique sections (g)/(l) already use) so
+      //     none of the cohort-total/pagination assertions above or the
+      //     persistence/render section below are disturbed. ─────────────────
+      insertProvider.run({
+        id: "prov-evurl-promoted-route", navn: "Kalvtjern Sideri Route", hjemmeside: null,
+        org_nr: "934567199", kommune: "Nes", poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "sideri", rfb_seed_source: null, content_source: null,
+      });
+      expDb
+        .prepare(`INSERT INTO experiences (id, provider_id, title, evidence_url) VALUES (?, ?, ?, ?)`)
+        .run("exp-evurl-promoted", "prov-evurl-promoted-route", "Gårdsbesøk", "https://kalvtjernsideri-listing.example.no/om");
+
+      insertProvider.run({
+        id: "prov-evurl-nomatch-route", navn: "Nomatch Sideri Route", hjemmeside: null,
+        org_nr: null, kommune: "Nes", poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "sideri", rfb_seed_source: null, content_source: null,
+      });
+      expDb
+        .prepare(`INSERT INTO experiences (id, provider_id, title, evidence_url) VALUES (?, ?, ?, ?)`)
+        .run("exp-evurl-nomatch", "prov-evurl-nomatch-route", "Gårdsbesøk", "https://urelatert-oppslag.example.no/listing");
+
+      insertProvider.run({
+        id: "prov-evurl-aggregator-route", navn: "Aggregator Sideri Route", hjemmeside: null,
+        org_nr: null, kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+        catalog_hidden: 0, producer_type: "sideri", rfb_seed_source: null, content_source: null,
+      });
+      expDb
+        .prepare(`INSERT INTO experiences (id, provider_id, title, evidence_url) VALUES (?, ?, ?, ?)`)
+        .run("exp-evurl-aggregator", "prov-evurl-aggregator-route", "Gårdsbesøk", "https://hanen.no/gardsutsalg/aggregator-sideri-route");
+
+      const fetchCountBeforeEvurlSection = fetchCallCount;
+      const evurlApply = await callRoute(opplevelserRouter, {
+        method: "POST",
+        url: "/admin/gardssalg-website-verification-remediation",
+        headers: { "x-admin-key": testKey },
+        body: {
+          providerIds: ["prov-evurl-promoted-route", "prov-evurl-nomatch-route", "prov-evurl-aggregator-route"],
+          apply: true,
+          batch_id: "test-batch-wv-evurl-promo",
+        },
+      });
+      assertEq(evurlApply.status, 200, "n1: providerIds-scoped apply over the 3 evidence_url fixtures -> 200");
+      assertEq(
+        evurlApply.body.summary,
+        { verified: 1, unverified: 0, aggregator: 0, missing_source: 2, unreachable_transient: 0, total: 3 },
+        "n2: exactly one promotion (verified), two missing_source (nomatch + aggregator-candidate) — NEITHER of the latter classifies as 'aggregator', since the producer's OWN hjemmeside really is still blank"
+      );
+      assertTrue(
+        fetchedHosts.includes("kalvtjernsideri-listing.example.no"),
+        "n3: the promoted candidate's host was actually fetched"
+      );
+      assertTrue(
+        !fetchedHosts.includes("hanen.no"),
+        "n4: the aggregator-hosted candidate was NEVER fetched (Funn 4, same principle as an own-hjemmeside aggregator)"
+      );
+
+      // ── promoted row: hjemmeside WRITTEN, provenance carries the marker,
+      //     audit row independently carries the candidate URL ─────────────
+      const promotedRow = getProviderRow("prov-evurl-promoted-route");
+      assertEq(
+        promotedRow.hjemmeside,
+        "https://kalvtjernsideri-listing.example.no/om",
+        "n5: experience_providers.hjemmeside was WRITTEN to the candidate — the one write this whole file makes outside field_provenance/audit"
+      );
+      const promotedProvenance = JSON.parse(promotedRow.field_provenance);
+      assertEq(promotedProvenance.hjemmeside_verification.classification, "verified", "n6: promoted row's provenance classification is 'verified'");
+      assertEq(promotedProvenance.hjemmeside_verification.verified, true, "n7: provenance.verified is the strict boolean true");
+      assertEq(
+        promotedProvenance.hjemmeside_verification.source,
+        "promoted_from_evidence_url",
+        "n8: provenance carries the marker distinguishing this from a normal own-hjemmeside verification"
+      );
+      assertTrue(!!promotedProvenance.hjemmeside_verification.evidence, "n9: promoted row's provenance still carries the evidence object, same as any other verified row");
+
+      const promotedAudit = getVerificationAuditRows("prov-evurl-promoted-route");
+      assertEq(promotedAudit.length, 1, "n10: exactly one audit row for the promoted producer");
+      assertEq(
+        promotedAudit[0].promoted_from_evidence_url,
+        "https://kalvtjernsideri-listing.example.no/om",
+        "n11: the audit row independently carries the promoted URL — auditable without cross-referencing the provenance JSON"
+      );
+      assertEq(promotedAudit[0].batch_id, "test-batch-wv-evurl-promo", "n12: audit row stamped with this call's batch_id");
+
+      // ── nomatch/aggregator rows: NOTHING happens beyond the normal
+      //     missing_source stamp — no hjemmeside write, no promotion marker,
+      //     no queue entry (a random fallback candidate that doesn't match
+      //     this producer does not deserve a review-queue entry — only a
+      //     producer's OWN declared, non-matching hjemmeside does) ─────────
+      for (const id of ["prov-evurl-nomatch-route", "prov-evurl-aggregator-route"]) {
+        const row = getProviderRow(id);
+        assertEq(row.hjemmeside, null, `n13.${id}: hjemmeside stays null — no promotion happened`);
+        const prov = JSON.parse(row.field_provenance);
+        assertEq(prov.hjemmeside_verification.classification, "missing_source", `n14.${id}: provenance classification is missing_source`);
+        assertEq(prov.hjemmeside_verification.source, undefined, `n15.${id}: no promotion marker on a non-promoted row`);
+        const audit = getVerificationAuditRows(id);
+        assertEq(audit.length, 1, `n16.${id}: still exactly one audit row (every scanned row gets one, promoted or not)`);
+        assertEq(audit[0].promoted_from_evidence_url, null, `n17.${id}: audit column is null — this row was never a promotion`);
+        assertEq(getQueueRow(id), undefined, `n18.${id}: never enqueued to the review queue`);
+      }
+      assertTrue(fetchCallCount > fetchCountBeforeEvurlSection, "n19: this section performed real fetch work, not a vacuous scan");
+
+      // ── (o) apply-time defensive re-check — a race between scan and apply.
+      //     Exercised directly against the service functions (not through
+      //     the HTTP route, which scans+applies in one request and so cannot
+      //     itself model a scan/apply gap) — same expDb, same real schema,
+      //     so this still proves the write path, just with the race
+      //     deliberately injected between the two calls. ───────────────────
+      {
+        const wvService = require("../services/gardssalg-website-verification") as typeof import("../services/gardssalg-website-verification");
+
+        insertProvider.run({
+          id: "prov-evurl-race", navn: "Raceflaten Sideri", hjemmeside: null,
+          org_nr: "945112233", kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+          catalog_hidden: 0, producer_type: "sideri", rfb_seed_source: null, content_source: null,
+        });
+
+        const candidateUrl = "https://raceflaten-listing.example.no/om";
+        const producerRow: import("../services/gardssalg-website-verification").GsWvProducerRow = {
+          id: "prov-evurl-race", navn: "Raceflaten Sideri", hjemmeside: null,
+          org_nr: "945112233", kommune: null, poststed: null, telefon: null, mobil: null, adresse: null, postnummer: null,
+          catalog_hidden: 0, evidence_url_candidate: candidateUrl,
+        };
+        const raceFetchFn: import("../services/gardssalg-website-verification").GsWvFetchFn = async () => ({
+          ok: true,
+          pageText: "Raceflaten Sideri. Org.nr 945 112 233. Velkommen til gården.",
+        });
+        const scannedRow = await wvService.classifyGardssalgProducerWebsite(producerRow, raceFetchFn);
+        assertEq(scannedRow.classification, "verified", "o1: sanity — the race fixture itself promotes when scanned in isolation");
+        assertEq(scannedRow.promoted_from_evidence_url, candidateUrl, "o2: sanity — carries the promotion marker");
+
+        // The race: something else writes hjemmeside for this provider
+        // BETWEEN the scan above and the apply below (e.g. a concurrent
+        // manual write, or the operator resolving it another way first).
+        expDb
+          .prepare(`UPDATE experience_providers SET hjemmeside = ? WHERE id = ?`)
+          .run("https://raced-in-elsewhere.example.no", "prov-evurl-race");
+
+        const { applied } = wvService.applyGardssalgWebsiteVerification(expDb, [scannedRow], "test-batch-wv-evurl-race");
+        assertEq(applied.length, 1, "o3: apply still processes the row (never throws, never silently drops it)");
+        assertEq(applied[0].promoted, false, "o4: applied[].promoted is false — the write was skipped, not performed");
+
+        const racedRow = getProviderRow("prov-evurl-race");
+        assertEq(
+          racedRow.hjemmeside,
+          "https://raced-in-elsewhere.example.no",
+          "o5: hjemmeside keeps whatever won the race — the candidate write was skipped, not force-overwritten"
+        );
+
+        const racedProvenance = JSON.parse(racedRow.field_provenance);
+        assertEq(racedProvenance.hjemmeside_verification.classification, "verified", "o6: field_provenance is STILL stamped as normal despite the skipped write");
+        assertEq(
+          racedProvenance.hjemmeside_verification.source,
+          "promoted_from_evidence_url",
+          "o7: the promotion marker is stamped regardless — the candidate DID pass verification, independent of which value won the race"
+        );
+
+        const racedAudit = getVerificationAuditRows("prov-evurl-race");
+        assertEq(racedAudit.length, 1, "o8: exactly one audit row");
+        assertEq(
+          racedAudit[0].promoted_from_evidence_url,
+          candidateUrl,
+          "o9: the audit row still independently records the promotion — 'stamp field_provenance/audit as normal' per spec, even though the hjemmeside write itself was skipped"
+        );
+      }
 
       // ── (k) what the routes were DROPPING on the way in ──────────────────
       //
