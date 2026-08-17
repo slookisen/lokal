@@ -59,7 +59,7 @@ import { normaliseName } from "./brreg-client";
 // (isContentFieldHomepageSourced below) needs the SAME eTLD+1 comparison
 // GET /admin/providers/recently-enriched already uses, not a second
 // reimplementation.
-import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
+import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, FREE_MAIL_DOMAINS } from "./cross-source-validator";
 // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — search-based
 // website-discovery candidate source. BraveResult is the shape braveSearch()
 // already returns; only the TYPE is needed here (the pure host-extraction
@@ -5931,26 +5931,46 @@ const CX_PLACEHOLDER_DOMAINS = new Set([
 /**
  * Extract the producer's contact EMAIL from a page.
  *
- * Trust order:
- *   1. mailto: links (explicit, author-intended contact affordance)
- *   2. addresses in visible text whose registrable domain MATCHES the
- *      provider's own homepage domain
- *   3. other text addresses (incl. freemail — common for small farms) ONLY
- *      when `pageIsContactish` (found on a kontakt/om-oss page, where a
- *      listed address is overwhelmingly the site's own)
- *   4. addresses in EMBEDDED content (script-JSON string literals /
- *      meta tags — gardssalgEmbeddedPageText) whose registrable domain
- *      MATCHES the homepage domain. Dev-request 2026-08-08-gardssalg-
- *      brreg-verify-og-embedded-evidens: sitebuilder SPAs (Wix et al.)
- *      render their contact paragraph client-side, so the address the
- *      visitor SEES on the page exists in the raw HTML only as an escaped
- *      JSON string ("post@67northdistillery.no" on 67northdistillery.no —
- *      the live case that motivated this tier). Same-domain ONLY: an
- *      embedded freemail/other-domain address is never used from this
- *      layer (script blobs carry third-party config; a same-domain address
- *      by construction belongs to the site's own mailbox). This is still
- *      strictly "found on the producer's own page" — never a guess — and
- *      it ranks BELOW every existing tier, so no current behavior changes.
+ * Trust order (rewritten by dev-request kontaktadresse-domeneblind-mailto-
+ * og-tekst: tier 1 and (old) tier 3 used to accept the FIRST mailto/visible
+ * candidate regardless of whose domain it was on, so a distributor's or web
+ * agency's address up top could beat the producer's own same-domain address
+ * lower on the page — confirmed live on lofotpils.no, tg@dng-norge.no):
+ *
+ *   1. SAME-DOMAIN (registrable domain matches homepageDomain), in this
+ *      sub-order — mailto -> visible text -> embedded:
+ *        a. mailto: links (explicit, author-intended contact affordance)
+ *        b. addresses in visible text
+ *        c. addresses in EMBEDDED content (script-JSON string literals /
+ *           meta tags — gardssalgEmbeddedPageText). Dev-request 2026-08-08-
+ *           gardssalg-brreg-verify-og-embedded-evidens: sitebuilder SPAs
+ *           (Wix et al.) render their contact paragraph client-side, so the
+ *           address the visitor SEES exists in the raw HTML only as an
+ *           escaped JSON string ("post@67northdistillery.no" on
+ *           67northdistillery.no). Same-domain-only contract UNCHANGED —
+ *           just moved earlier in the flow (it always ranked below every
+ *           visible-text tier; now it ranks below every SAME-DOMAIN tier).
+ *   2. FREEMAIL (gmail.com, outlook.com, … — FREE_MAIL_DOMAINS, common for
+ *      small Norwegian farms with no company mailbox), same eligibility as
+ *      before:
+ *        a. via mailto — unconditional on page type — source stays "mailto"
+ *        b. via visible text — ONLY when `pageIsContactish` (a kontakt/
+ *           om-oss page, where a listed address is overwhelmingly the
+ *           site's own) — source stays "text_contact_page"
+ *        c. NEVER from embedded content (script blobs carry third-party
+ *           config; only a same-domain embedded address is trustworthy —
+ *           see tier 1c)
+ *   3. FOREIGN/OTHER domain — flagged, not silently dropped. Reached only
+ *      when nothing above matched. The address is still returned (an
+ *      outreach candidate is never worth losing) but marked `needsReview`
+ *      instead of trusted outright:
+ *        a. via mailto — unconditional on page type, mirroring 1a/2a —
+ *           source "mailto_other_domain"
+ *        b. via visible text — ONLY when `pageIsContactish`, mirroring 2b —
+ *           source "text_other_domain"
+ *        c. embedded foreign-domain addresses stay unmatched -> null
+ *           (no embedded-foreign tier; embedded is same-domain-only, full
+ *           stop)
  *
  * Junk localparts (noreply/postmaster/…) never match. Pure — exported for
  * tests.
@@ -5959,7 +5979,17 @@ export function extractGardssalgContactEmail(
   html: string,
   homepageDomain: string | null,
   pageIsContactish: boolean,
-): { email: string; source: "mailto" | "text_same_domain" | "text_contact_page" | "embedded_same_domain" } | null {
+): {
+  email: string;
+  source:
+    | "mailto"
+    | "text_same_domain"
+    | "text_contact_page"
+    | "embedded_same_domain"
+    | "mailto_other_domain"
+    | "text_other_domain";
+  needsReview?: true;
+} | null {
   const candidates: Array<{ email: string; viaMailto: boolean; embedded: boolean }> = [];
   const seen = new Set<string>();
   const push = (raw: string, viaMailto: boolean, embedded = false): void => {
@@ -5985,20 +6015,41 @@ export function extractGardssalgContactEmail(
   const embeddedText = gardssalgEmbeddedPageText(html || "");
   while ((m = textRe.exec(embeddedText)) !== null) push(m[0]!, false, true);
 
-  const mailto = candidates.find((c) => c.viaMailto);
-  if (mailto) return { email: mailto.email, source: "mailto" };
-  if (homepageDomain) {
-    const same = candidates.find((c) => !c.embedded && registrableDomain(c.email.split("@")[1]!) === homepageDomain);
-    if (same) return { email: same.email, source: "text_same_domain" };
+  const domainOf = (c: { email: string }): string | null => registrableDomain(c.email.split("@")[1]!);
+  const isSameDomain = (c: { email: string }): boolean => homepageDomain != null && domainOf(c) === homepageDomain;
+  const isFreeMail = (c: { email: string }): boolean => {
+    const dom = c.email.split("@")[1]!;
+    return FREE_MAIL_DOMAINS.includes(dom) || FREE_MAIL_DOMAINS.includes(domainOf(c) ?? dom);
+  };
+
+  // ── Tier 1: same-domain — mailto -> visible text -> embedded ──────────
+  const mailtoSame = candidates.find((c) => c.viaMailto && !c.embedded && isSameDomain(c));
+  if (mailtoSame) return { email: mailtoSame.email, source: "mailto" };
+  const textSame = candidates.find((c) => !c.viaMailto && !c.embedded && isSameDomain(c));
+  if (textSame) return { email: textSame.email, source: "text_same_domain" };
+  const embeddedSame = candidates.find((c) => c.embedded && isSameDomain(c));
+  if (embeddedSame) return { email: embeddedSame.email, source: "embedded_same_domain" };
+
+  // ── Tier 2: freemail — mailto unconditional, visible text only on a
+  // contact-ish page, never from embedded content ────────────────────────
+  const mailtoFree = candidates.find((c) => c.viaMailto && !c.embedded && isFreeMail(c));
+  if (mailtoFree) return { email: mailtoFree.email, source: "mailto" };
+  if (pageIsContactish) {
+    const textFree = candidates.find((c) => !c.viaMailto && !c.embedded && isFreeMail(c));
+    if (textFree) return { email: textFree.email, source: "text_contact_page" };
   }
-  const visibleFirst = candidates.find((c) => !c.embedded);
-  if (pageIsContactish && visibleFirst) {
-    return { email: visibleFirst.email, source: "text_contact_page" };
+
+  // ── Tier 3: foreign/other domain — flagged for review, never silently
+  // dropped. mailto unconditional, visible text only on a contact-ish
+  // page; embedded foreign addresses are never reached (same-domain-only
+  // contract on tier 1c). ────────────────────────────────────────────────
+  const mailtoOther = candidates.find((c) => c.viaMailto && !c.embedded);
+  if (mailtoOther) return { email: mailtoOther.email, source: "mailto_other_domain", needsReview: true };
+  if (pageIsContactish) {
+    const textOther = candidates.find((c) => !c.viaMailto && !c.embedded);
+    if (textOther) return { email: textOther.email, source: "text_other_domain", needsReview: true };
   }
-  if (homepageDomain) {
-    const emb = candidates.find((c) => c.embedded && registrableDomain(c.email.split("@")[1]!) === homepageDomain);
-    if (emb) return { email: emb.email, source: "embedded_same_domain" };
-  }
+
   return null;
 }
 
