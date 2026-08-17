@@ -5826,14 +5826,38 @@ export function gardssalgWebsiteEvidenceMatch(
  * Pure — exported for tests.
  */
 export function gardssalgContactPageLinks(html: string, baseHost: string, max = 3): string[] {
-  const out: string[] = [];
   const seen = new Set<string>();
+  const found: Array<{ url: string; tier: number; order: number }> = [];
   const re = /<a\b[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-  const looksContact = (hrefLower: string, textLower: string): boolean =>
-    /kontakt|contact|om-oss|om_oss|omoss|about|besok|bes%c3%b8k/.test(hrefLower) ||
-    /\bkontakt\b|\bcontact\b|\bom oss\b|\babout\b|\bbesøk\b/.test(textLower);
+
+  // Tier 0 — an explicit contact page. A general inbox (post@, kontakt@) lives
+  // here, and that is the address outreach should use.
+  const isContact = (h: string, t: string): boolean =>
+    /kontakt|contact/.test(h) || /\bkontakt\b|\bcontact\b/.test(t);
+  // Tier 1 — about/visit pages. Often carry the same general address.
+  const isAbout = (h: string, t: string): boolean =>
+    /om-oss|om_oss|omoss|about|besok|bes%c3%b8k/.test(h) ||
+    /\bom oss\b|\babout\b|\bbesøk\b/.test(t);
+  // Tier 2 — team/staff pages. Added 2026-08-17 after Eik & Tid: eiktid.no has
+  // NO contact page at all, and its four links are /, /the-brewery/, /the-beer/
+  // and /the-team/. All three addresses (bjorn@, amund@, linda@eiktid.no) and
+  // the phone number sit on /the-team/, which this rule did not recognise — so
+  // the route fetched /the-brewery/, found nothing, and reported the producer
+  // as having no contact information at all. Fetching /the-team/ by hand and
+  // running this file's own extractor on it returns
+  // {"email":"bjorn@eiktid.no","source":"text_same_domain"} plus a cued phone.
+  // The page was always readable; it was never requested.
+  //
+  // Ranked LAST deliberately: a team page yields a named person's address, and
+  // a general inbox on a contact page is the better outreach target when both
+  // exist. This makes team pages a fallback, not a competitor.
+  const isTeam = (h: string, t: string): boolean =>
+    /team|ansatte|staff|people|folka?\b|om-?bryggeriet|crew/.test(h) ||
+    /\bteam\b|\bansatte\b|\bstaff\b|\bvårt team\b|\bfolka\b/.test(t);
+
+  let order = 0;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(html || "")) !== null && out.length < max) {
+  while ((m = re.exec(html || "")) !== null) {
     const href = (m[1] || "").trim();
     const anchorText = gardssalgPageText(m[2] || "").toLowerCase();
     if (!href || /^(mailto:|tel:|javascript:)/i.test(href)) continue;
@@ -5846,13 +5870,20 @@ export function gardssalgContactPageLinks(html: string, baseHost: string, max = 
     if (url.protocol !== "https:" && url.protocol !== "http:") continue;
     const host = url.hostname.toLowerCase().replace(/^www\./, "");
     if (host !== baseHost.toLowerCase().replace(/^www\./, "")) continue;
-    if (!looksContact(url.pathname.toLowerCase(), anchorText)) continue;
+    const path = url.pathname.toLowerCase();
+    const tier = isContact(path, anchorText) ? 0 : isAbout(path, anchorText) ? 1 : isTeam(path, anchorText) ? 2 : -1;
+    if (tier < 0) continue;
     const key = url.origin + url.pathname;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push(url.toString());
+    found.push({ url: url.toString(), tier, order: order++ });
   }
-  return out;
+  // Stable within a tier — document order is still the tie-break, so the same
+  // page produces the same list on every run.
+  return found
+    .sort((a, b) => a.tier - b.tier || a.order - b.order)
+    .slice(0, max)
+    .map((f) => f.url);
 }
 
 // ─── Gårdssalg kontakt-utvinning fra hjemmeside (Daniels GO 2026-07-30:
