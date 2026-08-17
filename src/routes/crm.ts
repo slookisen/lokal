@@ -113,16 +113,39 @@ const ingestSchema = z.object({
 // being long enough to ever catch a human re-reading and re-sending later.
 const DUPLICATE_SEND_WINDOW_SECONDS = 30;
 
-const sendSchema = z.object({
-  intent: z.enum(["gmail_draft", "resend_send"]),
-  toEmails: z.array(z.string().email()).min(1),
-  ccEmails: z.array(z.string().email()).optional(),
-  subject: z.string().min(1),
-  bodyText: z.string().min(1),
-  bodyHtml: z.string().optional(),
-  replyToMessageId: z.string().nullable().optional(),
-  createdBy: z.enum(["claude", "daniel"]),
-});
+// A subject that's empty (after trimming) or that trims to NOTHING but a
+// reply/svar prefix ("Re:" / "Sv:", case-insensitive) is contentless — see
+// the LIVE incident this guards against: an outreach thread got two
+// auto-replies four seconds apart, both subject "Re:" and both missing the
+// claim link the producer needed. The empty subject was the symptom of a
+// reply the agent never actually composed. "Re: faktisk oppfølging" has real
+// content beyond the prefix and is NOT rejected — only an exact,
+// nothing-else match is.
+const REPLY_PREFIX_ONLY_SUBJECT = /^(re|sv):$/i;
+
+const sendSchema = z
+  .object({
+    intent: z.enum(["gmail_draft", "resend_send"]),
+    toEmails: z.array(z.string().email()).min(1),
+    ccEmails: z.array(z.string().email()).optional(),
+    subject: z.string().min(1),
+    bodyText: z.string().min(1),
+    bodyHtml: z.string().optional(),
+    replyToMessageId: z.string().nullable().optional(),
+    createdBy: z.enum(["claude", "daniel"]),
+  })
+  .superRefine((data, ctx) => {
+    const trimmed = data.subject.trim();
+    if (trimmed.length === 0 || REPLY_PREFIX_ONLY_SUBJECT.test(trimmed)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["subject"],
+        message:
+          "subject is empty or contains only a reply prefix ('Re:'/'Sv:') with no actual content — " +
+          "this is the signature of a reply the agent never composed a real subject for, not a real message.",
+      });
+    }
+  });
 
 // ─── GET /admin/crm/summary ──────────────────────────────────
 router.get("/summary", (req, res) => {

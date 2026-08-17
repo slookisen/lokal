@@ -44,6 +44,14 @@
  *           the fix, /compose's outbox row was never linked, so this fell
  *           through to the "most recent for thread" fallback and wrongly
  *           flipped B instead.
+ *   m31-m35 dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+ *           utfoerelse (Skive F), akseptansekriterium 9 — a subject that's
+ *           empty after trim, or trims to exactly a reply/svar prefix
+ *           ("Re:"/"Sv:", any case, with or without surrounding
+ *           whitespace), is rejected 400 before any send is attempted, with
+ *           no crm_messages/outbox side effects; a real subject (including
+ *           "Re: faktisk oppfølging", which has content beyond the prefix)
+ *           still succeeds.
  *
  * Standalone: npx tsx src/routes/crm-send-message-history.test.ts
  * Wired into tests/test.ts via runCrmSendMessageHistoryTests().
@@ -496,6 +504,63 @@ export async function runCrmSendMessageHistoryTests(opts: { log?: boolean } = {}
         "m29: message A (the one outbox O actually produced) is updated to 'draft_in_gmail'");
       assertEq(msgBAfter?.delivery_status, "queued",
         "m30: message B is UNTOUCHED, still 'queued' — this is the reported bug: before the fix, the 'most recent for thread' fallback would have wrongly flipped B here instead of A");
+    }
+    // ═══════════════════════════════════════════════════════════════
+    // m31-m40 — dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
+    // utfoerelse (Skive F), akseptansekriterium 9: a subject that's empty
+    // (after trim) or that trims to NOTHING but a reply/svar prefix
+    // ("Re:"/"Sv:", case-insensitive) is rejected before any send is
+    // attempted. Concrete background: an outreach thread got two
+    // auto-replies four seconds apart, both subject "Re:" — the empty
+    // subject was the symptom of a reply the agent never actually composed.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const subjectThreadId = "send-history-subject-guard-thread-1";
+      db.prepare(`
+        INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id, message_count)
+        VALUES (?, ?, 'Subjektvakt-sak', 'innkommende', 'normal', 'rfb', 1)
+      `).run(subjectThreadId, contact.id);
+      db.prepare(`
+        INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, sent_at, delivery_status, vertical_id)
+        VALUES ('inbound-subject-guard-1', ?, 'in', 'kunde@example.no', '[]', '[]', 'Subjektvakt-sak', 'Har et spørsmål.', datetime('now','-1 hour'), 'sent', 'rfb')
+      `).run(subjectThreadId);
+
+      async function sendWithSubject(subject: string) {
+        return call("POST", `/threads/${subjectThreadId}/send`, {
+          intent: "gmail_draft",
+          toEmails: ["kunde@example.no"],
+          subject,
+          bodyText: "Et faktisk svar.",
+          createdBy: "daniel",
+        });
+      }
+
+      const rejectedSubjects = ["", "Re:", "Sv:", "re:", "RE:", "  Re:  "];
+      for (const subject of rejectedSubjects) {
+        const res = await sendWithSubject(subject);
+        assertEq(res.status, 400, `m31: subject ${JSON.stringify(subject)} is rejected with 400`);
+        assertEq(res.body?.error, "invalid body", `m31b: …with the same 'invalid body' shape sendSchema failures already use, for subject ${JSON.stringify(subject)}`);
+        const issues = (res.body?.details as any[]) || [];
+        assertTrue(
+          issues.some((i) => Array.isArray(i.path) && i.path[0] === "subject"),
+          `m31c: …and the schema issue is attributed to the 'subject' field, for subject ${JSON.stringify(subject)}`
+        );
+      }
+
+      const afterRejections = crmService.getThreadDetail(subjectThreadId) as any;
+      assertEq(afterRejections.messages.length, 1, "m32: none of the rejected sends created a crm_messages row");
+      assertEq(afterRejections.thread.message_count, 1, "m32b: …and message_count is untouched");
+
+      // Regression guards — real subjects (including a real "Re: ..." reply)
+      // must NOT be rejected.
+      const okPlain = await sendWithSubject("Spørsmål om levering (svar)");
+      assertEq(okPlain.status, 200, "m33: a normal, non-empty, non-prefix-only subject still succeeds");
+
+      const okReply = await sendWithSubject("Re: faktisk oppfølging");
+      assertEq(okReply.status, 200, "m34: 'Re: faktisk oppfølging' (real content beyond the prefix) still succeeds — only an exact prefix-only match is rejected");
+
+      const afterOk = crmService.getThreadDetail(subjectThreadId) as any;
+      assertEq(afterOk.messages.length, 3, "m35: the two legitimate sends both landed (1 seeded inbound + 2 outbound replies)");
     }
   } catch (err) {
     failed++;
