@@ -4325,6 +4325,33 @@ export type GardssalgSetContactEmailResult =
   | { ok: false; reason: "provider_not_found" }
   | { ok: false; reason: "domain_mismatch"; website_domain: string; email_domain: string };
 
+// field_provenance stamp key for a force-approved domain-mismatch override
+// (dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A).
+// Same "verification STAMP living inside field_provenance" idiom this file
+// already uses for hjemmeside_verification (see isHjemmesideVerified in
+// routes/opplevelser.ts) — a human/session confirmed this EXACT address is
+// correct despite the domain mismatch, so the daily-prep
+// address_domain_mismatch gate (routes/opplevelser.ts,
+// GET /admin/gardssalg-outreach-daily-prep) can stop re-flagging it. Scoped
+// to the exact approved_email value on purpose (AC2): if epost is later
+// changed by ANY path (this endpoint again, contact-backfill, field-
+// concordance, ...) without a fresh force-approval, the stamp's
+// approved_email no longer equals the row's current epost, so the reader
+// (getGardssalgContactEmailOverride, routes/opplevelser.ts) reports it as
+// lapsed rather than silently carrying the old approval over to a new,
+// never-reviewed address. No shared typed FieldProvenance interface exists
+// in this codebase (every field_provenance read/write inlines its own shape
+// — see isHjemmesideVerified's own doc comment), so this is a local, minimal
+// shape scoped to just this one stamp, matching that convention.
+export interface GardssalgContactEmailOverrideStamp {
+  approved_email: string;
+  approved_by: string;
+  approved_at: string;
+  source: string;
+  website_domain: string;
+  email_domain: string;
+}
+
 /**
  * Correct an already-filled (or blank) gårdssalg provider `epost`, unlike
  * applyGardssalgProviderContact above which is strictly fill-only. Backs
@@ -4338,6 +4365,16 @@ export type GardssalgSetContactEmailResult =
  * (hostFromUrlLike + registrableDomain) used elsewhere in this file. A
  * provider with no hjemmeside has no evidence to contradict, so the write
  * proceeds regardless of `force`.
+ *
+ * force-approval persistence (Skive A, dev-request 2026-08-17-kontaktadresse-
+ * feilkilde-og-override): when `force: true` is the reason a genuine domain
+ * mismatch was bypassed (website has an established domain AND it disagrees
+ * with the new email's domain), a GardssalgContactEmailOverrideStamp is
+ * written to field_provenance.contact_email_domain_override so the daily-
+ * prep address_domain_mismatch gate can respect it later — see that type's
+ * own doc comment. `force: true` on a write that never actually hit a
+ * mismatch (no hjemmeside on file, or the domains already agreed) writes NO
+ * stamp — there was nothing to override.
  *
  * NOTE: deliberately does NOT check content_source ('manual'/'claim') the
  * way applyGardssalgProviderContact does — that lock-guard was considered
@@ -4372,19 +4409,25 @@ export function applyGardssalgSetContactEmail(
   if (!row) return { ok: false, reason: "provider_not_found" };
 
   // ── domain check (only when the provider has an established hjemmeside) ──
+  // domainOverride is set only when `force` actually bypassed a REAL
+  // mismatch — never on a force:true call that never hit one.
+  let domainOverride: { website_domain: string; email_domain: string } | null = null;
   if (row.hjemmeside && row.hjemmeside.trim() !== "") {
     const websiteHost = hostFromUrlLike(row.hjemmeside);
     const websiteDomain = websiteHost ? registrableDomain(websiteHost) : null;
     if (websiteDomain) {
       const emailHost = hostFromUrlLike(email.split("@").pop() || "");
       const emailDomain = emailHost ? registrableDomain(emailHost) : "";
-      if (emailDomain !== websiteDomain && force !== true) {
-        return {
-          ok: false,
-          reason: "domain_mismatch",
-          website_domain: websiteDomain,
-          email_domain: emailDomain,
-        };
+      if (emailDomain !== websiteDomain) {
+        if (force !== true) {
+          return {
+            ok: false,
+            reason: "domain_mismatch",
+            website_domain: websiteDomain,
+            email_domain: emailDomain,
+          };
+        }
+        domainOverride = { website_domain: websiteDomain, email_domain: emailDomain };
       }
     }
   }
@@ -4392,18 +4435,29 @@ export function applyGardssalgSetContactEmail(
   const oldValue = row.epost;
 
   // ── field_provenance merge (read-modify-write, preserves other fields) ──
-  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  let provenance: Record<string, unknown> = {};
   if (row.field_provenance) {
     try {
       const parsed = JSON.parse(row.field_provenance);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+        provenance = parsed as Record<string, unknown>;
       }
     } catch {
       /* malformed existing JSON -> treat as empty rather than clobber the write */
     }
   }
   provenance.epost = { source_url: source, fetched_at: new Date().toISOString() };
+  if (domainOverride) {
+    const stamp: GardssalgContactEmailOverrideStamp = {
+      approved_email: email,
+      approved_by: "admin",
+      approved_at: new Date().toISOString(),
+      source,
+      website_domain: domainOverride.website_domain,
+      email_domain: domainOverride.email_domain,
+    };
+    provenance.contact_email_domain_override = stamp;
+  }
 
   const applyWithAudit = db.transaction(() => {
     db.prepare(

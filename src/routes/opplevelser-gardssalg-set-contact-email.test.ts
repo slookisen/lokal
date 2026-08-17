@@ -266,6 +266,41 @@ export function runOpplevelserGardssalgSetContactEmailTests(
       assertEq(forcedRes.body.new_value, "ny@annendomene.no", "d2: write succeeds despite mismatch");
       assertEq(getProviderRow("sce-mismatch").epost, "ny@annendomene.no", "d3: DB row now updated");
 
+      // ── (d-override) Skive A: force:true over a genuine mismatch persists
+      // a contact_email_domain_override stamp in field_provenance ──────────
+      const forcedProv = JSON.parse(getProviderRow("sce-mismatch").field_provenance || "{}");
+      assertTrue(!!forcedProv.contact_email_domain_override, "d4: force write over a genuine mismatch persists a contact_email_domain_override stamp");
+      assertEq(forcedProv.contact_email_domain_override?.approved_email, "ny@annendomene.no", "d5: stamp approved_email matches the written address exactly");
+      assertEq(forcedProv.contact_email_domain_override?.website_domain, "mismatchgard.no", "d6: stamp records the website_domain that was in conflict");
+      assertEq(forcedProv.contact_email_domain_override?.email_domain, "annendomene.no", "d7: stamp records the email_domain that was in conflict");
+      assertEq(forcedProv.contact_email_domain_override?.source, "autosvar, bekreftet manuelt", "d8: stamp source matches the request's source verbatim");
+      assertTrue(!!forcedProv.contact_email_domain_override?.approved_at, "d9: stamp carries an approved_at timestamp");
+      assertEq(forcedProv.contact_email_domain_override?.approved_by, "admin", "d10: stamp approved_by is 'admin' (same convention as the audit row's changed_by)");
+      // epost's own provenance entry is untouched by the new stamp.
+      assertEq(forcedProv.epost?.source_url, "autosvar, bekreftet manuelt", "d11: epost's own field_provenance entry is unaffected by the new stamp");
+
+      // ── (d-override-2) force:true on a write that never actually hit a
+      // mismatch (domains already agree) -> NO stamp is written ────────────
+      mkProvider({
+        id: "sce-force-no-mismatch",
+        navn: "Force No Mismatch Gard",
+        hjemmeside: "https://forcenomismatch.no",
+        epost: null,
+        created_at: "2026-01-01 00:00:00",
+      });
+      const forceNoMismatchRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: {
+          provider_id: "sce-force-no-mismatch",
+          email: "post@forcenomismatch.no",
+          source: "manual",
+          force: true,
+        },
+      });
+      assertEq(forceNoMismatchRes.status, 200, "d12: force:true on a matching-domain write -> 200");
+      const forceNoMismatchProv = JSON.parse(getProviderRow("sce-force-no-mismatch").field_provenance || "{}");
+      assertTrue(!forceNoMismatchProv.contact_email_domain_override, "d13: no override stamp written when force:true never actually bypassed a mismatch");
+
       // ── (e) no hjemmeside on file -> write succeeds without force ─────────
       mkProvider({
         id: "sce-no-website",
