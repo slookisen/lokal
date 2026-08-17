@@ -640,6 +640,89 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
             "cx-44b: …og rå-flagget settes ikke når rå aldri ble brukt");
         }
 
+        // ═══ cx-45..cx-49: team-sider + pages_read (Eik & Tid / Frøya) ═══
+        //
+        // Daniel, 2026-08-17, med skjermbilde: adressene står rett på siden.
+        // eiktid.no har INGEN kontaktside — de fire lenkene er /, /the-brewery/,
+        // /the-beer/ og /the-team/, og alle tre adressene står på den siste.
+        // Ruta hentet /the-brewery/, fant ingenting, og rapporterte produsenten
+        // som helt uten kontaktinfo. Siden var alltid lesbar; den ble aldri
+        // etterspurt.
+        {
+          opplevelserModule.__setGardssalgRenderPageImplForTesting(null);
+          delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+          const FRONT_EIKTID =
+            '<html><body><nav><a href="/">Home</a><a href="/the-brewery/">The Brewery</a>' +
+            '<a href="/the-beer/">The Beer</a><a href="/the-team/">The Team</a></nav>' +
+            "<p>Eik &amp; Tid brygger kveik.</p></body></html>";
+          const TEAM_EIKTID =
+            "<html><body><h1>OUR TEAM</h1><p>Bjørn Harald Færøvik — GM / BREWER / OWNER<br>" +
+            "Phone: +47 24 02 22 12<br>Email: bjorn@eiktid.no</p></body></html>";
+          const BREWERY_EIKTID = "<html><body><h1>The Brewery</h1><p>Vi startet i 2015.</p></body></html>";
+
+          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+            const u = String(url);
+            if (u.includes("eiktidtest.no/the-team")) return mkHtmlResponse(u, TEAM_EIKTID);
+            if (u.includes("eiktidtest.no/the-brewery")) return mkHtmlResponse(u, BREWERY_EIKTID);
+            if (u.startsWith("https://eiktidtest.no")) return mkHtmlResponse(u, FRONT_EIKTID);
+            return (cxMockFetch3 as typeof fetch)(url as any, init);
+          }) as unknown as typeof fetch;
+          ins.run({ id: "cx-team", navn: "Eik Test", pt: "bryggeri", hj: "https://eiktidtest.no", ep: null, tlf: null, cs: null, created: "2026-04-04" });
+
+          const r = await callRoute({ providerIds: ["cx-team"] });
+          const c = (r.body.changed as any[]).find((x) => x.provider_id === "cx-team");
+          assertEq(c?.epost, "bjorn@eiktid.no",
+            "cx-45: adressen på TEAM-siden blir funnet — siden var alltid lesbar, den ble bare aldri hentet");
+          assertEq(c?.telefon, "24022212", "cx-45b: …og telefonen fra samme side");
+          assertTrue(String(c?.source_url || "").includes("/the-team"),
+            "cx-45c: proveniens peker på team-siden");
+        }
+
+        // ── cx-46: en ekte kontaktside slår team-siden. En generell postkasse
+        //    er et bedre outreach-mål enn en navngitt persons adresse, så
+        //    team er en RESERVE, ikke en konkurrent. ─────────────────────────
+        {
+          const FRONT_BOTH =
+            '<html><body><a href="/the-team/">Team</a><a href="/kontakt">Kontakt</a></body></html>';
+          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+            const u = String(url);
+            if (u.includes("beggeto.no/the-team")) return mkHtmlResponse(u, "<html><body>Email: person@beggeto.no</body></html>");
+            if (u.includes("beggeto.no/kontakt")) return mkHtmlResponse(u, "<html><body>Kontakt: post@beggeto.no</body></html>");
+            if (u.startsWith("https://beggeto.no")) return mkHtmlResponse(u, FRONT_BOTH);
+            return (cxMockFetch3 as typeof fetch)(url as any, init);
+          }) as unknown as typeof fetch;
+          ins.run({ id: "cx-both", navn: "Begge To", pt: "bryggeri", hj: "https://beggeto.no", ep: null, tlf: null, cs: null, created: "2026-04-05" });
+          const r = await callRoute({ providerIds: ["cx-both"] });
+          const c = (r.body.changed as any[]).find((x) => x.provider_id === "cx-both");
+          assertEq(c?.epost, "post@beggeto.no",
+            "cx-46: kontaktsidens generelle postkasse vinner over team-sidens personadresse — selv om team-lenken står FØRST i dokumentet");
+        }
+
+        // ── cx-47..49: pages_read — «pages_tried: 3» var et tall uten noe bak.
+        //    Uten dette kunne ikke Frøya avgjøres: rendret, fant ingenting, og
+        //    ingen respons kunne si HVILKE sider som ble lest eller hvor mye
+        //    tekst hver ga. ──────────────────────────────────────────────────
+        {
+          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+            const u = String(url);
+            if (u.includes("tomgard.no/kontakt")) return mkHtmlResponse(u, "<html><body>Skjema uten adresse. Fyll ut under.</body></html>");
+            if (u.startsWith("https://tomgard.no")) return mkHtmlResponse(u, '<html><body><a href="/kontakt">Kontakt</a>Tom Gard</body></html>');
+            return (cxMockFetch3 as typeof fetch)(url as any, init);
+          }) as unknown as typeof fetch;
+          ins.run({ id: "cx-tom", navn: "Tom Gard", pt: "bryggeri", hj: "https://tomgard.no", ep: null, tlf: null, cs: null, created: "2026-04-06" });
+          const r = await callRoute({ providerIds: ["cx-tom"] });
+          const n = (r.body.no_contact_found as any[]).find((x) => x.provider_id === "cx-tom");
+          assertTrue(!!n, "cx-47: raden havner i no_contact_found (kontaktskjema uten adresse — ekte negativ, som Druehagen)");
+          assertTrue(Array.isArray(n?.pages_read) && n.pages_read.length === n.pages_tried,
+            "cx-48: pages_read har én rad per side som faktisk ble lest, og stemmer med pages_tried");
+          const kontakt = (n?.pages_read as any[]).find((p) => String(p.url).includes("/kontakt"));
+          assertTrue(!!kontakt, "cx-48b: kontaktsiden er navngitt — ikke bare talt");
+          assertTrue((kontakt?.visible_chars ?? 0) > 20,
+            "cx-49: …med hvor mye tekst den faktisk ga, som er det som skiller en render-svikt fra en side uten adresse");
+          assertEq(kontakt?.contactish, true, "cx-49b: og om siden ble regnet som kontaktside");
+          assertEq(kontakt?.rendered, false, "cx-49c: og om den ble rendret (her: nei, server-rendret side)");
+        }
+
         opplevelserModule.__setGardssalgRenderPageImplForTesting(null);
         if (prevFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
         else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevFlag;

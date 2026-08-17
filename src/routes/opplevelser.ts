@@ -5989,6 +5989,15 @@ export function __setGsCxRowDelayForTesting(ms: number | null): void {
 // for a persistent (DB/file) rate-limit store, and the process restarting
 // (or a fresh run past the window) simply clears it.
 const GS_CX_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
+
+/**
+ * How many contact-ish sub-pages one row may fetch. Raised 2 -> 4 on
+ * 2026-08-17 together with gardssalgContactPageLinks' team tier: a site can
+ * expose kontakt + om-oss + team, and the page carrying the only address is
+ * sometimes the last of them. Bounded because every entry is a fetch and,
+ * on a JS site, possibly a render.
+ */
+const GS_CX_MAX_CONTACT_PAGES = 4;
 const gsCxHostCooldownUntil = new Map<string, number>();
 export function __resetGsCxCooldownForTesting(): void {
   gsCxHostCooldownUntil.clear();
@@ -6144,7 +6153,12 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   const { targets, cohortTotal } = selectGardssalgProvidersForContactExtraction(limit, offset, providerIds);
 
   const changed: Array<{ provider_id: string; navn: string; fields: string[]; epost: string | null; telefon: string | null; source_url: string; email_source?: string; phone_cued?: boolean; email_from_raw?: boolean }> = [];
-  const noContactFound: Array<{ provider_id: string; navn: string; pages_tried: number }> = [];
+  const noContactFound: Array<{
+    provider_id: string;
+    navn: string;
+    pages_tried: number;
+    pages_read: Array<{ url: string; visible_chars: number; rendered: boolean; contactish: boolean }>;
+  }> = [];
   // Addresses refused because they belong to a trade body / members'
   // association rather than the producer (AK2). Reported, never written.
   const umbrellaRejected: Array<{ provider_id: string; navn: string; epost: string; source_url: string }> = [];
@@ -6206,8 +6220,14 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
       // `rawHtml` is the PRE-render document, carried alongside and set only
       // when a render actually replaced it. See the raw-fallback block below
       // the loop for why keeping it is not redundant.
-      const pages: Array<{ url: string; html: string; rawHtml?: string; contactish: boolean }> = [];
-      for (const sub of gardssalgContactPageLinks(front.html, host, 2)) {
+      const pages: Array<{ url: string; html: string; rawHtml?: string; contactish: boolean; rendered: boolean }> = [];
+      // Raised from 2 to GS_CX_MAX_CONTACT_PAGES (2026-08-17): with team pages
+      // now recognised, a site can legitimately expose kontakt + om-oss + team,
+      // and a cap of 2 would drop the tier-2 page that is sometimes the ONLY
+      // one carrying an address (eiktid.no). Ordering is by tier, so the extra
+      // budget is spent on the least-authoritative pages, never at the expense
+      // of a real contact page.
+      for (const sub of gardssalgContactPageLinks(front.html, host, GS_CX_MAX_CONTACT_PAGES)) {
         const subOutcome = await gsCxFetchPage(sub);
         if (subOutcome.kind !== "ok") continue;
         let subHtml = subOutcome.html;
@@ -6240,13 +6260,14 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
             renderEntry.subpages_render_failed = (renderEntry.subpages_render_failed ?? 0) + 1;
           }
         }
-        pages.push({ url: subOutcome.finalUrl, html: subHtml, rawHtml: subRaw, contactish: true });
+        pages.push({ url: subOutcome.finalUrl, html: subHtml, rawHtml: subRaw, contactish: true, rendered: subRaw !== undefined });
       }
       pages.push({
         url: front.finalUrl,
         html: front.html,
         rawHtml: rendered.report.ok === true ? frontOutcome.html : undefined,
         contactish: false,
+        rendered: rendered.report.ok === true,
       });
 
       const needEmail = !t.epost || t.epost.trim() === "";
@@ -6317,7 +6338,32 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
       }
 
       if (!email && !phone) {
-        noContactFound.push({ provider_id: t.id, navn: t.navn, pages_tried: pages.length });
+        // `pages_tried: 3` was a number with nothing behind it. Diagnosing
+        // Bryggeriet Frøya on 2026-08-17 needed exactly this and did not have
+        // it: the row rendered (44 -> 454 chars) and still found nothing, and
+        // no response could say WHICH pages were read or how much text each
+        // one yielded — so "the crawl missed the contact page" and "the render
+        // under-captured the page it did read" were indistinguishable. They
+        // have completely different remedies. Same lesson as
+        // invalid_unparseable: a failure needs a description, not just a name.
+        //
+        // Bounded by construction — at most GS_CX_MAX_CONTACT_PAGES + 1
+        // entries, each a URL and two numbers.
+        noContactFound.push({
+          provider_id: t.id,
+          navn: t.navn,
+          pages_tried: pages.length,
+          pages_read: pages.map((pg) => ({
+            url: pg.url,
+            // What the extractor actually had to work with, per page. A
+            // contact page that renders to 40 characters is a render problem;
+            // one that renders to 4 000 and still yields nothing is a page
+            // that genuinely does not publish an address.
+            visible_chars: gardssalgPageText(pg.html).length,
+            rendered: pg.rendered,
+            contactish: pg.contactish,
+          })),
+        });
         continue;
       }
 
