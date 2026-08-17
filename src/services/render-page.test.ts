@@ -25,9 +25,11 @@
  */
 
 import {
+  RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR,
   RENDER_ESCALATION_MIN_BYTES,
   RENDER_ESCALATION_TEXT_FLOOR,
   classifyRenderError,
+  mainContentTextOf,
   renderPage,
   renderedTextOf,
   selectRenderBackend,
@@ -121,6 +123,99 @@ export async function runRenderPageTests(opts: { log?: boolean } = {}): Promise<
   check(
     !shouldEscalateToRender(atByteFloor, { bytes: RENDER_ESCALATION_MIN_BYTES - 1 }),
     "esc-8: one byte under the floor does not escalate — the caller's byte count wins over the string length",
+  );
+
+  // ── mainContentTextOf: boilerplate stripping, direct unit tests ───────────
+
+  {
+    const boilerChrome =
+      "<nav>NAVLINK1 NAVLINK2</nav>" +
+      "<header>SITE HEADER TEXT</header>" +
+      '<div role="banner">ROLE BANNER TEXT</div>' +
+      '<div class="cookie-consent-banner">COOKIE TEXT</div>' +
+      "<footer>FOOTER TEXT</footer>" +
+      "<main>REAL CONTENT HERE</main>";
+    check(
+      mainContentTextOf(boilerChrome) === "REAL CONTENT HERE",
+      "mct-1: nav/header/role-banner/cookie-banner/footer are all stripped; the real <main> text survives untouched",
+    );
+  }
+
+  // ── shouldEscalateToRender: Skive 2a — boilerplate-aware eligibility ──────
+  // dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render.
+  //
+  // Fixture shaped like the real measured case: nav + footer + a
+  // cookie-consent banner alone add up to ~1.8K characters of raw "visible
+  // text" (well above RENDER_ESCALATION_TEXT_FLOOR), but strip that chrome
+  // out and what's left is just the page title — a handful of characters.
+  // Zero real content, same as the live row that inspired this fix.
+  const navChrome =
+    "<nav>" +
+    '<a href="/">Hjem</a> <a href="/om">Om oss</a> <a href="/produkter">Produkter</a> <a href="/kontakt">Kontakt</a> '.repeat(
+      15,
+    ) +
+    "</nav>";
+  const footerChrome =
+    "<footer>" +
+    "© 2026 Gard AS. Følg oss i sosiale medier. Meld deg på nyhetsbrevet vårt for oppdateringer. ".repeat(8) +
+    "</footer>";
+  const cookieBanner =
+    '<div class="cookie-consent-banner">' +
+    "Vi bruker informasjonskapsler for å forbedre opplevelsen din på nettsiden. Godta eller avvis. ".repeat(6) +
+    "</div>";
+  const jsShellBoilerplate =
+    `<!doctype html><html><head><title>Gard</title><script src="/app.js"></script></head><body>` +
+    navChrome +
+    `<div id="root"></div>` +
+    footerChrome +
+    cookieBanner +
+    `<script>window.__STATE__={};</script></body></html>`;
+
+  check(
+    Buffer.byteLength(jsShellBoilerplate) >= RENDER_ESCALATION_MIN_BYTES,
+    "esc-9-sanity-a: the boilerplate-heavy fixture clears the byte floor on its own (no artificial padding needed)",
+  );
+  check(
+    renderedTextOf(jsShellBoilerplate).length >= RENDER_ESCALATION_TEXT_FLOOR,
+    "esc-9-sanity-b: fixture sanity — the RAW visible-text length alone is already >= the raw floor (200), so only the boilerplate-aware branch can catch this case",
+  );
+  check(
+    mainContentTextOf(jsShellBoilerplate).length < RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR,
+    "esc-9-sanity-c: fixture sanity — after stripping nav/footer/cookie-banner chrome, real content is under the main-content floor (400)",
+  );
+  check(
+    shouldEscalateToRender(jsShellBoilerplate),
+    "esc-9: a JS shell whose nav/footer/cookie-banner chrome alone pushes raw visible text past the 200-char floor is now judged eligible — the measured 2043-char/zero-fields-extracted case this fix exists for",
+  );
+
+  // Regression guard: a genuinely content-rich static page — real prose well
+  // past both floors, with only a small, normal amount of nav/footer — must
+  // still NOT become eligible. Without the "stripping removed a meaningful
+  // chunk" gap requirement, this fixture's ~650 real chars would still sit
+  // under some blunt combined floor; the gap check is what keeps it safe.
+  const realProseHeavy =
+    `<!doctype html><html><head><title>Ekte Gard</title><script src="/analytics.js"></script></head><body>` +
+    `<nav><a href="/">Hjem</a> <a href="/kontakt">Kontakt</a></nav>` +
+    `<p>${"Velkommen til garden vår, der vi dyrker grønnsaker og bær på tradisjonelt vis. ".repeat(8)}</p>` +
+    `<footer>© 2026 Ekte Gard</footer></body></html>`;
+  check(
+    mainContentTextOf(realProseHeavy).length >= RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR,
+    "esc-10-sanity: fixture sanity — the real-prose fixture's content clears the main-content floor even after stripping its (small, normal) nav/footer",
+  );
+  check(
+    !shouldEscalateToRender(realProseHeavy),
+    "esc-10: a real content-rich page with ordinary nav/footer does NOT falsely escalate — no regression from the boilerplate-aware branch",
+  );
+
+  // Second regression guard, restated explicitly for Skive 2a: the SAME
+  // hamre-hagen-shaped real-page fixture from esc-2/esc-3 above (305 real
+  // visible chars, effectively no nav/footer to strip) must still not
+  // escalate under the new logic — its stripped length is ~= its raw length,
+  // so the mandatory "boilerplate actually removed something" gap never
+  // opens, and the boilerplate-aware branch never fires for it.
+  check(
+    !shouldEscalateToRender(realPage),
+    "esc-11: the hamre-hagen-shaped short-but-real fixture (no nav/footer to strip) is unaffected by the boilerplate-aware branch — still does not escalate",
   );
 
   // ── renderPage: success path ──────────────────────────────────────────────

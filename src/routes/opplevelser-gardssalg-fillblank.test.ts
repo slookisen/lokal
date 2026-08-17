@@ -773,6 +773,205 @@ export function runOpplevelserGardssalgFillblankTests(
         const row = getProviderRow("prov-gate-malformed");
         assertEq(row.about_text, null, "gate-d5: malformed-provenance provider's about_text is completely unchanged");
       }
+      // ═══════════════════════════════════════════════════════════════════
+      // Section D — render_attempted / render_yield per-run reporting
+      // (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render,
+      // Skive 2b). crFetchGardssalgContent() already escalates an eligible
+      // page to a headless render and stamps one render_diagnostic row per
+      // fetched provider (attempted/eligible/flag_enabled always present —
+      // see RenderEscalationDiagnostic's own doc comment); this section
+      // proves the per-RUN summary fields built on top of that array are
+      // correct. The escalation mechanism itself (sub-page rendering, raw
+      // fallback, error classification) is already covered end-to-end in
+      // opplevelser-gardssalg-contact-extraction.test.ts's cx-32..44 —
+      // deliberately not re-proven here.
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        const prevRenderFlag = process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+        try {
+          const opplevelserModuleFull = require("./opplevelser") as typeof import("./opplevelser");
+
+          // A JS-shell page: big enough (>2000B), carries a <script>, and its
+          // visible text is just the hostname used as the page title — the
+          // shape shouldEscalateToRender exists for (render-page.ts's module
+          // doc). Eligible under the pre-existing raw-length rule alone, so
+          // this section stays independent of Skive 2a's boilerplate-aware
+          // measurement (covered separately in render-page.test.ts).
+          const jsShellHtml = (title: string) =>
+            `<html><head><title>${title}</title></head><body><div id="root"></div>` +
+            `<script>${"x".repeat(3000)}</script></body></html>`;
+          // A real, server-rendered page, well over the escalation floor —
+          // never eligible, whatever the flag says.
+          const realPageHtml =
+            `<html><head><title>Ekte Gard</title></head><body><p>${"Velkommen til garden vår. ".repeat(20)}</p></body></html>`;
+          const renderedHtml =
+            `<html><body><h1>JS Gard</h1><p>${"Vi selger egg, ost og syltetøy rett fra garden. ".repeat(6)}</p></body></html>`;
+          const renderedHtmlText = renderedHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+          for (const id of ["prov-rend-off", "prov-rend-real", "prov-rend-yield", "prov-rend-noyield", "prov-rend-fail"]) {
+            insertProvider.run({
+              id,
+              navn: `Prov Render ${id} Gard`,
+              hjemmeside: `https://${id}.example.no`,
+              content_source: null,
+              about_text: "Eksisterende tekst om garden som allerede dekker feltet fint uansett.",
+              visit_text: null,
+              opening_hours_text: null,
+            });
+          }
+
+          globalThis.fetch = (async (url: string | URL | Request) => {
+            const urlStr = String(url);
+            // Any candidate about/visit text this section's fixtures produce
+            // goes through meetsGardssalgAboutQualityBar's LLM judge
+            // regardless of whether about_text is already filled (see the
+            // route's own comment on that above) — reject unconditionally so
+            // it never writes anything this section doesn't already assert
+            // on, and never trips over a response shape this stub doesn't
+            // model (no `.json()` on the plain HTML responses below).
+            if (urlStr.includes("api.anthropic.com")) {
+              return {
+                ok: true, status: 200,
+                json: async () => ({ content: [{ type: "text", text: "AVVIS\nikke relevant for denne testen" }] }),
+              } as unknown as Response;
+            }
+            const host = new URL(urlStr).hostname;
+            const html = host === "prov-rend-real.example.no" ? realPageHtml : jsShellHtml(host);
+            return {
+              ok: true, status: 200, text: async () => html,
+              arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
+          }) as typeof fetch;
+
+          // ── gs-rend-1: flag OFF → render_attempted=0/render_yield=0 for the
+          //    whole run, even though prov-rend-off's page IS eligible. ──────
+          delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+          opplevelserModuleFull.__setGardssalgRenderPageImplForTesting((async (u: string) => {
+            throw new Error(`gs-rend-1: renderPage must NOT be called while the flag is off (got ${u})`);
+          }) as any);
+          {
+            const r = await callRoute(opplevelserRouter, {
+              url: "/admin/gardssalg-content-refresh",
+              headers: { "x-admin-key": testKey },
+              body: { providerIds: ["prov-rend-off"], apply: false },
+            });
+            assertEq(r.status, 200, "gs-rend-1a: flag-off call -> 200");
+            assertEq(r.body.render_attempted, 0, "gs-rend-1b: render_attempted=0 with the flag off");
+            assertEq(r.body.render_yield, 0, "gs-rend-1c: render_yield=0 with the flag off");
+            const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "prov-rend-off");
+            assertEq(d?.eligible, true, "gs-rend-1d: the page IS eligible — it's the flag, not the rule, holding attempted at 0");
+            assertEq(d?.attempted, false, "gs-rend-1e: …and attempted is correspondingly false");
+          }
+
+          process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = "true";
+
+          // ── gs-rend-2: flag ON, a genuinely real page → not eligible, so
+          //    render_attempted stays 0. ─────────────────────────────────────
+          opplevelserModuleFull.__setGardssalgRenderPageImplForTesting((async (u: string) => {
+            throw new Error(`gs-rend-2: renderPage must NOT be called for a page that is not eligible (got ${u})`);
+          }) as any);
+          {
+            const r = await callRoute(opplevelserRouter, {
+              url: "/admin/gardssalg-content-refresh",
+              headers: { "x-admin-key": testKey },
+              body: { providerIds: ["prov-rend-real"], apply: false },
+            });
+            assertEq(r.body.render_attempted, 0, "gs-rend-2a: a real, content-rich page never escalates — render_attempted stays 0 even with the flag on");
+            assertEq(r.body.render_yield, 0, "gs-rend-2b: …and render_yield with it");
+          }
+
+          // ── gs-rend-3: flag ON, JS-shell page, render SUCCEEDS and adds
+          //    real text → render_attempted=1 AND render_yield=1. ────────────
+          opplevelserModuleFull.__setGardssalgRenderPageImplForTesting((async (u: string) => ({
+            ok: true as const,
+            html: renderedHtml,
+            finalUrl: u,
+            text: renderedHtmlText,
+            elapsedMs: 12,
+          })) as any);
+          {
+            const r = await callRoute(opplevelserRouter, {
+              url: "/admin/gardssalg-content-refresh",
+              headers: { "x-admin-key": testKey },
+              body: { providerIds: ["prov-rend-yield"], apply: false },
+            });
+            assertEq(r.body.render_attempted, 1, "gs-rend-3a: render was attempted on the eligible JS-shell page");
+            assertEq(r.body.render_yield, 1, "gs-rend-3b: …and it yielded — the rendered DOM carries more visible text than the raw fetch");
+            const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "prov-rend-yield");
+            assertTrue((d?.chars_after ?? 0) > (d?.chars_before ?? 0), "gs-rend-3c: chars_after > chars_before backs the yield count");
+          }
+
+          // ── gs-rend-4: flag ON, JS-shell page, render reports ok:true but
+          //    adds NOTHING beyond the raw fetch → attempted, but no yield.
+          //    A render that ran and produced no more text than the page
+          //    already had must not be counted as progress. ──────────────────
+          opplevelserModuleFull.__setGardssalgRenderPageImplForTesting((async (u: string) => ({
+            ok: true as const,
+            html: "<html><body><div id=root></div></body></html>",
+            finalUrl: u,
+            text: "x",
+            elapsedMs: 12,
+          })) as any);
+          {
+            const r = await callRoute(opplevelserRouter, {
+              url: "/admin/gardssalg-content-refresh",
+              headers: { "x-admin-key": testKey },
+              body: { providerIds: ["prov-rend-noyield"], apply: false },
+            });
+            assertEq(r.body.render_attempted, 1, "gs-rend-4a: still attempted — the render actually ran");
+            assertEq(r.body.render_yield, 0, "gs-rend-4b: but no yield — a 1-char render result is not more content than the raw fetch already had");
+          }
+
+          // ── gs-rend-5: flag ON, JS-shell page, render FAILS outright →
+          //    attempted, and never counted as yield. ───────────────────────
+          opplevelserModuleFull.__setGardssalgRenderPageImplForTesting((async () => ({
+            ok: false as const,
+            reason: "renderer_unavailable" as const,
+            detail: "stub failure",
+            elapsedMs: 3,
+          })) as any);
+          {
+            const r = await callRoute(opplevelserRouter, {
+              url: "/admin/gardssalg-content-refresh",
+              headers: { "x-admin-key": testKey },
+              body: { providerIds: ["prov-rend-fail"], apply: false },
+            });
+            assertEq(r.body.render_attempted, 1, "gs-rend-5a: a render that fails outright still counts as attempted");
+            assertEq(r.body.render_yield, 0, "gs-rend-5b: …but never as yield");
+            const d = (r.body.render_diagnostic as any[]).find((x) => x.provider_id === "prov-rend-fail");
+            assertEq(d?.ok, false, "gs-rend-5c: the row itself reports the render failure, same as before this change");
+          }
+
+          // ── gs-rend-6: a single run mixing an eligible and a non-eligible
+          //    provider tallies correctly across the whole run, not just per
+          //    provider — proving these are genuine sums, not a stray 0/1. ──
+          opplevelserModuleFull.__setGardssalgRenderPageImplForTesting((async (u: string) => {
+            if (u.includes("prov-rend-yield")) {
+              return { ok: true as const, html: renderedHtml, finalUrl: u, text: renderedHtmlText, elapsedMs: 12 };
+            }
+            throw new Error(`gs-rend-6: unexpected renderPage call for ${u} — the real page must never escalate`);
+          }) as any);
+          {
+            const r = await callRoute(opplevelserRouter, {
+              url: "/admin/gardssalg-content-refresh",
+              headers: { "x-admin-key": testKey },
+              body: { providerIds: ["prov-rend-yield", "prov-rend-real"], apply: false },
+            });
+            assertEq(r.body.render_attempted, 1, "gs-rend-6a: exactly one of the two providers in this run was eligible");
+            assertEq(r.body.render_yield, 1, "gs-rend-6b: …and it yielded — the sum is over the whole run, not a single row");
+          }
+        } finally {
+          try {
+            const opplevelserModuleFull = require("./opplevelser") as typeof import("./opplevelser");
+            opplevelserModuleFull.__setGardssalgRenderPageImplForTesting(null);
+          } catch {
+            /* best-effort cleanup */
+          }
+          if (prevRenderFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
+          else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevRenderFlag;
+        }
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-fillblank (section B): unexpected error: " + String(err?.stack || err?.message || err));

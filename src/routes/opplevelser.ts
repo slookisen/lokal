@@ -1552,6 +1552,46 @@ function tallyErrorsByPersistence(
   return tally;
 }
 
+/**
+ * Per-run summary of a route's render_diagnostic[] rows (dev-request
+ * 2026-08-17-berikelse-uttrekk-evidence-url-og-render, Skive 2b).
+ *
+ * Every successfully-fetched row already gets a RenderEscalationDiagnostic
+ * entry (flag_enabled/eligible/attempted always present — see that type's
+ * own doc comment), but reading "did rendering help this run" out of a
+ * per-row array meant counting by hand. This is the aggregate:
+ *
+ *   render_attempted  rows where `attempted` is true — flag on AND the pure
+ *                      rule judged the page eligible, regardless of outcome.
+ *   render_yield      the subset of those where the render both SUCCEEDED
+ *                      (`ok === true`) and produced MORE visible text than
+ *                      the pre-render fetch (`chars_after > chars_before`) —
+ *                      a render that ran but added nothing (or failed) is
+ *                      attempted, not yielded.
+ *
+ * Pure, called once after each route's processing loop completes — same
+ * shape as tallyErrorsByPersistence above.
+ */
+function tallyGardssalgRenderStats(
+  entries: ReadonlyArray<{
+    attempted: boolean;
+    ok?: boolean;
+    chars_before: number;
+    chars_after?: number;
+  }>
+): { render_attempted: number; render_yield: number } {
+  let render_attempted = 0;
+  let render_yield = 0;
+  for (const e of entries) {
+    if (!e.attempted) continue;
+    render_attempted++;
+    if (e.ok === true && typeof e.chars_after === "number" && e.chars_after > e.chars_before) {
+      render_yield++;
+    }
+  }
+  return { render_attempted, render_yield };
+}
+
 async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
   const primary = await crFetchPage(fetchUrl);
@@ -3010,6 +3050,12 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // behavior.
     products_diagnostic: productsDiagnostic,
     render_diagnostic: renderDiagnostic,
+    // Skive 2b (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-
+    // render): the per-run summary of renderDiagnostic above — see
+    // tallyGardssalgRenderStats()'s own doc comment for the exact
+    // attempted/yield contract. 0/0 whenever GARDSSALG_HEADLESS_FALLBACK_
+    // ENABLED is off or no processed row was eligible; never absent.
+    ...tallyGardssalgRenderStats(renderDiagnostic),
   });
 });
 

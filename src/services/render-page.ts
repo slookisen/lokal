@@ -105,6 +105,33 @@ export const RENDER_ESCALATION_TEXT_FLOOR = 200;
  */
 export const RENDER_ESCALATION_MIN_BYTES = 2_000;
 
+/**
+ * Boilerplate-aware companion to RENDER_ESCALATION_TEXT_FLOOR (dev-request
+ * 2026-08-17-berikelse-uttrekk-evidence-url-og-render, Skive 2a).
+ *
+ * Measured live, 2026-08-17: a gårdssalg homepage came back with
+ * `chars_before: 2043` — comfortably over the 200-char raw floor above, so
+ * shouldEscalateToRender said "has enough text" — yet the enrichment run on
+ * that exact fetch extracted ZERO of the four content fields (about_text,
+ * visit_text, opening_hours_text, products) from it. The 2043 characters
+ * were real, but they were nav/footer/cookie-banner chrome from a JS shell,
+ * not producer content — visibleTextOf() (fetch-page.ts) only strips
+ * script/style/comments/tags, it has no notion of structural boilerplate.
+ *
+ * 400 is the dev-request's own worked example ("< 400 tegn ekstrahert tekst
+ * etter boilerplate-fjerning"), applied to mainContentTextOf()'s output, NOT
+ * to raw visibleTextOf() output — see shouldEscalateToRender()'s gap
+ * requirement below for why reusing RENDER_ESCALATION_TEXT_FLOOR's value of
+ * 200 as a blanket replacement would have been wrong: hamre-hagen.no (the
+ * fixture RENDER_ESCALATION_TEXT_FLOOR is itself calibrated against) is a
+ * real, content-bearing page whose ENTIRE body is only 305 characters — well
+ * under 400 — and must never be judged eligible just because it is short.
+ * This floor only ever applies to pages where boilerplate stripping removed
+ * a meaningful chunk of the raw text (the gap check), so a genuinely short
+ * real page with little to no nav/footer/cookie chrome never reaches it.
+ */
+export const RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR = 400;
+
 // ── Result types ────────────────────────────────────────────────────────────
 
 export type RenderFailureReason =
@@ -139,11 +166,52 @@ export type RenderPageResult =
 // ── Pure decision ───────────────────────────────────────────────────────────
 
 /**
+ * Strip structural chrome — `<nav>`, `<header>`, `<footer>`, ARIA landmark
+ * equivalents (`role="navigation"/"banner"/"contentinfo"`), and cookie-
+ * consent/menu widgets identified by class/id — before reducing to visible
+ * text via visibleTextOf(). PURE.
+ *
+ * This exists ONLY to make shouldEscalateToRender's floor comparison
+ * content-based rather than raw-length-based (Skive 2a, see
+ * RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR's doc comment for the measured
+ * case). It is deliberately NOT used anywhere in the actual extraction
+ * pipeline — fetch-page.ts's visibleTextOf() stays the single source of
+ * truth there, unchanged, per that module's own doc comment on why no
+ * "too thin" heuristic belongs in the fetcher. Stripping real content by
+ * mistake here only costs one wrong render-eligibility guess; doing the same
+ * in the extractor would silently hide real pages from every downstream
+ * field.
+ *
+ * Regex-based, same discipline as discoverContentLinks (fetch-page.ts) and
+ * visibleTextOf itself — a full HTML parser is not worth pulling in for a
+ * PURE heuristic that only ever feeds a boolean decision, never a value that
+ * gets stored or shown to anyone.
+ */
+export function mainContentTextOf(html: string): string {
+  const stripped = html
+    .replace(/<nav\b[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<header\b[\s\S]*?<\/header>/gi, " ")
+    .replace(/<footer\b[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<(\w+)\b[^>]*\brole\s*=\s*["'](?:navigation|banner|contentinfo)["'][^>]*>[\s\S]*?<\/\1>/gi, " ")
+    // Cookie-consent banners and menu/nav widgets built as plain <div>s with
+    // no semantic tag or ARIA role at all — the common JS-framework shape.
+    // Matched by class/id name, the same identifying signal used across
+    // essentially every consent-management platform and hamburger menu.
+    .replace(
+      /<(\w+)\b[^>]*\b(?:class|id)\s*=\s*["'][^"']*(?:cookie|consent|gdpr|navbar|nav-menu|site-nav|menu-toggle|hamburger|sidebar)[^"']*["'][^>]*>[\s\S]*?<\/\1>/gi,
+      " ",
+    );
+  return visibleTextOf(stripped);
+}
+
+/**
  * Whether a successfully-fetched page looks like a JS shell worth rendering.
  * PURE — no network, no browser.
  *
  * All three conditions must hold:
- *   1. the visible text is under the escalation floor,
+ *   1. the visible text is under the escalation floor (raw) OR the page
+ *      reads as content-thin once boilerplate chrome is stripped out (see
+ *      below),
  *   2. the response is big enough to be an application rather than a stub, and
  *   3. the markup actually contains a script — without one, running a browser
  *      cannot produce text that raw HTML did not already have.
@@ -151,12 +219,36 @@ export type RenderPageResult =
  * Condition 3 is what keeps this from firing on a small-but-complete static
  * page (the `og:description`-only producer site fetch-page.ts documents, whose
  * body text is 20 characters): no script, no escalation, no wasted launch.
+ *
+ * The boilerplate-aware branch (Skive 2a, dev-request 2026-08-17-berikelse-
+ * uttrekk-evidence-url-og-render) only fires once BOTH of these hold:
+ *   - mainContentTextOf(html) is under RENDER_ESCALATION_MAIN_CONTENT_TEXT_
+ *     FLOOR, AND
+ *   - stripping boilerplate removed at least RENDER_ESCALATION_TEXT_FLOOR
+ *     characters' worth of text (rawLen - mainLen >= the same 200-char
+ *     floor the raw check uses).
+ *
+ * That second condition is load-bearing, not decorative: without it, a
+ * genuinely short real page with little or no nav/footer (hamre-hagen.no,
+ * 305 total visible chars — see RENDER_ESCALATION_TEXT_FLOOR's own doc
+ * comment) would have mainLen ≈ rawLen ≈ 305, which is under the 400-char
+ * main-content floor too, and would wrongly become eligible purely for
+ * being short. Requiring a real gap means the branch only fires when
+ * boilerplate chrome is what pushed the raw count over 200 in the first
+ * place — exactly the 2043-chars-of-chrome-zero-fields-extracted shape this
+ * was built for, not an ordinary short producer page.
  */
 export function shouldEscalateToRender(html: string, opts: { bytes?: number } = {}): boolean {
   const bytes = opts.bytes ?? Buffer.byteLength(html);
   if (bytes < RENDER_ESCALATION_MIN_BYTES) return false;
   if (!/<script\b/i.test(html)) return false;
-  return visibleTextOf(html).length < RENDER_ESCALATION_TEXT_FLOOR;
+  const rawLen = visibleTextOf(html).length;
+  if (rawLen < RENDER_ESCALATION_TEXT_FLOOR) return true;
+  const mainLen = mainContentTextOf(html).length;
+  return (
+    mainLen < RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR &&
+    rawLen - mainLen >= RENDER_ESCALATION_TEXT_FLOOR
+  );
 }
 
 /**
