@@ -25,9 +25,11 @@
  */
 
 import {
+  RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR,
   RENDER_ESCALATION_MIN_BYTES,
   RENDER_ESCALATION_TEXT_FLOOR,
   classifyRenderError,
+  mainContentTextOf,
   renderPage,
   renderedTextOf,
   selectRenderBackend,
@@ -121,6 +123,206 @@ export async function runRenderPageTests(opts: { log?: boolean } = {}): Promise<
   check(
     !shouldEscalateToRender(atByteFloor, { bytes: RENDER_ESCALATION_MIN_BYTES - 1 }),
     "esc-8: one byte under the floor does not escalate — the caller's byte count wins over the string length",
+  );
+
+  // ── mainContentTextOf: boilerplate stripping, direct unit tests ───────────
+
+  {
+    const boilerChrome =
+      "<nav>NAVLINK1 NAVLINK2</nav>" +
+      "<header>SITE HEADER TEXT</header>" +
+      '<div role="banner">ROLE BANNER TEXT</div>' +
+      '<div class="cookie-consent-banner">COOKIE TEXT</div>' +
+      "<footer>FOOTER TEXT</footer>" +
+      "<main>REAL CONTENT HERE</main>";
+    check(
+      mainContentTextOf(boilerChrome) === "REAL CONTENT HERE",
+      "mct-1: nav/header/role-banner/cookie-banner/footer are all stripped; the real <main> text survives untouched",
+    );
+  }
+
+  // ── mainContentTextOf: Finding 2 (independent-reviewer fix-up) ────────────
+  // Substring keyword matching risked stripping REAL farm-shop content that
+  // merely happens to contain a chrome keyword as a fragment of an unrelated
+  // word. Each fixture below is a realistic gårdssalg/producer element that
+  // must now SURVIVE mainContentTextOf() — the tightened rule requires a
+  // whole class/id token equal to a small safe bare-word set, or a genuine
+  // hyphenated compound (e.g. "cookie-consent"), not a bare substring.
+  {
+    const hamburgerProductFixture =
+      "<nav>Hjem Om Kontakt</nav>" +
+      '<div id="hamburger-info">Vi selger hjemmelaget hamburgerkjøtt fra eget storfe, 100% norsk kjøttdeig rett fra garden.</div>' +
+      "<footer>© 2026 Gard AS</footer>";
+    check(
+      mainContentTextOf(hamburgerProductFixture).includes("hamburgerkjøtt fra eget storfe"),
+      'mct-fp-1: id="hamburger-info" (a real meat product) survives — bare "hamburger" substring is no longer enough to strip real content',
+    );
+  }
+  {
+    const cookieJarProductFixture =
+      "<nav>Hjem Om Kontakt</nav>" +
+      '<div class="cookie-jar-produkter">Våre hjemmelagde cookies selges i syltetøyglass rett fra gardsbutikken, med smaker som havre og sjokolade.</div>' +
+      "<footer>© 2026 Gard AS</footer>";
+    check(
+      mainContentTextOf(cookieJarProductFixture).includes("hjemmelagde cookies selges"),
+      'mct-fp-2: class="cookie-jar-produkter" (real baked-goods content) survives — bare "cookie" substring is no longer enough to strip real content',
+    );
+  }
+  {
+    const sidebarHoursFixture =
+      "<nav>Hjem Om Kontakt</nav>" +
+      '<div class="sidebar">Åpningstider: Mandag-fredag 10-17, lørdag 10-14. Gardsutsalget ligger ved låven.</div>' +
+      "<footer>© 2026 Gard AS</footer>";
+    check(
+      mainContentTextOf(sidebarHoursFixture).includes("Åpningstider"),
+      'mct-fp-3: class="sidebar" (a real opening-hours widget — very common on small producer sites) survives — bare "sidebar" is no longer enough to strip real content',
+    );
+  }
+  {
+    // The tightened rule must not have gone too far the other way: genuine
+    // compound/whole-token chrome signals are still stripped as before.
+    const compoundChromeFixture =
+      '<div class="navbar">NAVBAR LINKS</div>' +
+      '<div class="hamburger-menu">MENU TOGGLE ICON</div>' +
+      '<div class="nav-sidebar">SIDEBAR NAV LINKS</div>' +
+      '<div class="gdpr-consent-notice">ACCEPT COOKIES</div>' +
+      "<main>REAL CONTENT</main>";
+    check(
+      mainContentTextOf(compoundChromeFixture) === "REAL CONTENT",
+      "mct-fp-4: genuine compound/whole-token chrome (navbar, hamburger-menu, nav-sidebar, gdpr-consent-notice) is still stripped — Finding 2's tightening does not weaken true-positive detection",
+    );
+  }
+
+  // ── mainContentTextOf / shouldEscalateToRender: Finding 1 (independent-
+  // reviewer fix-up) — quadratic-time DoS regression guard ──────────────────
+  //
+  // Reproduces the reviewer's concrete PoC shape: real prose + one <script>
+  // tag + tens of thousands of an OPENING tag that IS a chrome candidate
+  // (here: bare `<nav>` — matched via CHROME_STRUCTURAL_TAGS by tag name
+  // alone, no class/id keyword involved, so this fixture can't silently
+  // drift out of sync with the CHROME_COMPOUND_BIGRAMS keyword list) with NO
+  // closing tag anywhere in the document (realistic malformed/buggy
+  // producer-CMS HTML, not even adversarial). Using a genuine chrome
+  // candidate here matters: it's what forces mainContentTextOf() past its
+  // `candidates.length === 0` fast path and into the actual steps 2-4
+  // (closing-tag collection, per-tag-name cursor matching, range merging)
+  // this test exists to regression-guard — a non-matching tag would make
+  // this test pass for the wrong reason, staying green even if steps 2-4
+  // regressed back to quadratic. Pre-fix, the reviewer measured 15.8s for a
+  // 1.29 MB payload of this shape through the real shouldEscalateToRender()
+  // call path; this asserts a strict wall-clock budget so a future
+  // regression to the old backreference-scan approach is caught by CI, not
+  // just eyeballed.
+  {
+    const unclosedCount = 60_000;
+    const prose = "Velkommen til garden vår, ekte norske gardsprodukter siden 1970. ".repeat(5);
+    let chromeBomb = "";
+    for (let i = 0; i < unclosedCount; i++) {
+      chromeBomb += "<nav>";
+    }
+    const pathological =
+      `<!doctype html><html><head><title>Gard</title><script src="/app.js"></script></head><body>` +
+      prose +
+      chromeBomb +
+      `</body></html>`;
+    const pathologicalBytes = Buffer.byteLength(pathological);
+
+    const mctStart = Date.now();
+    const mctResult = mainContentTextOf(pathological);
+    const mctElapsedMs = Date.now() - mctStart;
+    check(
+      typeof mctResult === "string",
+      "perf-1-sanity: mainContentTextOf still returns a string for the pathological (60k unclosed <nav> tags) input",
+    );
+    check(
+      mctElapsedMs < 500,
+      `perf-1: mainContentTextOf() on a ${(pathologicalBytes / 1_000_000).toFixed(2)} MB payload of ${unclosedCount} unclosed <nav> tags (each a genuine chrome candidate, forcing the real closing-tag-matching algorithm to run rather than hitting the candidates.length===0 fast path) completes in ${mctElapsedMs}ms, well under the 500ms budget (reviewer measured 15.8s pre-fix on a same-shaped 1.29 MB payload) — Finding 1 regression guard`,
+    );
+
+    const escStart = Date.now();
+    shouldEscalateToRender(pathological);
+    const escElapsedMs = Date.now() - escStart;
+    check(
+      escElapsedMs < 500,
+      `perf-2: shouldEscalateToRender() on the same pathological payload — the real call path every fetched hjemmeside page goes through — completes in ${escElapsedMs}ms, under the 500ms budget`,
+    );
+  }
+
+  // ── shouldEscalateToRender: Skive 2a — boilerplate-aware eligibility ──────
+  // dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render.
+  //
+  // Fixture shaped like the real measured case: nav + footer + a
+  // cookie-consent banner alone add up to ~1.8K characters of raw "visible
+  // text" (well above RENDER_ESCALATION_TEXT_FLOOR), but strip that chrome
+  // out and what's left is just the page title — a handful of characters.
+  // Zero real content, same as the live row that inspired this fix.
+  const navChrome =
+    "<nav>" +
+    '<a href="/">Hjem</a> <a href="/om">Om oss</a> <a href="/produkter">Produkter</a> <a href="/kontakt">Kontakt</a> '.repeat(
+      15,
+    ) +
+    "</nav>";
+  const footerChrome =
+    "<footer>" +
+    "© 2026 Gard AS. Følg oss i sosiale medier. Meld deg på nyhetsbrevet vårt for oppdateringer. ".repeat(8) +
+    "</footer>";
+  const cookieBanner =
+    '<div class="cookie-consent-banner">' +
+    "Vi bruker informasjonskapsler for å forbedre opplevelsen din på nettsiden. Godta eller avvis. ".repeat(6) +
+    "</div>";
+  const jsShellBoilerplate =
+    `<!doctype html><html><head><title>Gard</title><script src="/app.js"></script></head><body>` +
+    navChrome +
+    `<div id="root"></div>` +
+    footerChrome +
+    cookieBanner +
+    `<script>window.__STATE__={};</script></body></html>`;
+
+  check(
+    Buffer.byteLength(jsShellBoilerplate) >= RENDER_ESCALATION_MIN_BYTES,
+    "esc-9-sanity-a: the boilerplate-heavy fixture clears the byte floor on its own (no artificial padding needed)",
+  );
+  check(
+    renderedTextOf(jsShellBoilerplate).length >= RENDER_ESCALATION_TEXT_FLOOR,
+    "esc-9-sanity-b: fixture sanity — the RAW visible-text length alone is already >= the raw floor (200), so only the boilerplate-aware branch can catch this case",
+  );
+  check(
+    mainContentTextOf(jsShellBoilerplate).length < RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR,
+    "esc-9-sanity-c: fixture sanity — after stripping nav/footer/cookie-banner chrome, real content is under the main-content floor (400)",
+  );
+  check(
+    shouldEscalateToRender(jsShellBoilerplate),
+    "esc-9: a JS shell whose nav/footer/cookie-banner chrome alone pushes raw visible text past the 200-char floor is now judged eligible — the measured 2043-char/zero-fields-extracted case this fix exists for",
+  );
+
+  // Regression guard: a genuinely content-rich static page — real prose well
+  // past both floors, with only a small, normal amount of nav/footer — must
+  // still NOT become eligible. Without the "stripping removed a meaningful
+  // chunk" gap requirement, this fixture's ~650 real chars would still sit
+  // under some blunt combined floor; the gap check is what keeps it safe.
+  const realProseHeavy =
+    `<!doctype html><html><head><title>Ekte Gard</title><script src="/analytics.js"></script></head><body>` +
+    `<nav><a href="/">Hjem</a> <a href="/kontakt">Kontakt</a></nav>` +
+    `<p>${"Velkommen til garden vår, der vi dyrker grønnsaker og bær på tradisjonelt vis. ".repeat(8)}</p>` +
+    `<footer>© 2026 Ekte Gard</footer></body></html>`;
+  check(
+    mainContentTextOf(realProseHeavy).length >= RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR,
+    "esc-10-sanity: fixture sanity — the real-prose fixture's content clears the main-content floor even after stripping its (small, normal) nav/footer",
+  );
+  check(
+    !shouldEscalateToRender(realProseHeavy),
+    "esc-10: a real content-rich page with ordinary nav/footer does NOT falsely escalate — no regression from the boilerplate-aware branch",
+  );
+
+  // Second regression guard, restated explicitly for Skive 2a: the SAME
+  // hamre-hagen-shaped real-page fixture from esc-2/esc-3 above (305 real
+  // visible chars, effectively no nav/footer to strip) must still not
+  // escalate under the new logic — its stripped length is ~= its raw length,
+  // so the mandatory "boilerplate actually removed something" gap never
+  // opens, and the boilerplate-aware branch never fires for it.
+  check(
+    !shouldEscalateToRender(realPage),
+    "esc-11: the hamre-hagen-shaped short-but-real fixture (no nav/footer to strip) is unaffected by the boilerplate-aware branch — still does not escalate",
   );
 
   // ── renderPage: success path ──────────────────────────────────────────────

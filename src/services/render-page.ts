@@ -105,6 +105,33 @@ export const RENDER_ESCALATION_TEXT_FLOOR = 200;
  */
 export const RENDER_ESCALATION_MIN_BYTES = 2_000;
 
+/**
+ * Boilerplate-aware companion to RENDER_ESCALATION_TEXT_FLOOR (dev-request
+ * 2026-08-17-berikelse-uttrekk-evidence-url-og-render, Skive 2a).
+ *
+ * Measured live, 2026-08-17: a gårdssalg homepage came back with
+ * `chars_before: 2043` — comfortably over the 200-char raw floor above, so
+ * shouldEscalateToRender said "has enough text" — yet the enrichment run on
+ * that exact fetch extracted ZERO of the four content fields (about_text,
+ * visit_text, opening_hours_text, products) from it. The 2043 characters
+ * were real, but they were nav/footer/cookie-banner chrome from a JS shell,
+ * not producer content — visibleTextOf() (fetch-page.ts) only strips
+ * script/style/comments/tags, it has no notion of structural boilerplate.
+ *
+ * 400 is the dev-request's own worked example ("< 400 tegn ekstrahert tekst
+ * etter boilerplate-fjerning"), applied to mainContentTextOf()'s output, NOT
+ * to raw visibleTextOf() output — see shouldEscalateToRender()'s gap
+ * requirement below for why reusing RENDER_ESCALATION_TEXT_FLOOR's value of
+ * 200 as a blanket replacement would have been wrong: hamre-hagen.no (the
+ * fixture RENDER_ESCALATION_TEXT_FLOOR is itself calibrated against) is a
+ * real, content-bearing page whose ENTIRE body is only 305 characters — well
+ * under 400 — and must never be judged eligible just because it is short.
+ * This floor only ever applies to pages where boilerplate stripping removed
+ * a meaningful chunk of the raw text (the gap check), so a genuinely short
+ * real page with little to no nav/footer/cookie chrome never reaches it.
+ */
+export const RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR = 400;
+
 // ── Result types ────────────────────────────────────────────────────────────
 
 export type RenderFailureReason =
@@ -138,12 +165,244 @@ export type RenderPageResult =
 
 // ── Pure decision ───────────────────────────────────────────────────────────
 
+// ── mainContentTextOf internals ─────────────────────────────────────────────
+//
+// Finding 1 (independent-reviewer fix-up, 2026-08-17): the original
+// implementation stripped each chrome category with its own
+// `<tag\b[\s\S]*?<\/tag>` / `<(\w+)...>[\s\S]*?<\/\1>` regex. That "lazy
+// scan to the matching closing tag" shape is quadratic on malformed HTML:
+// for EVERY candidate opening tag that has no closing tag anywhere after it
+// (a buggy producer CMS emitting unclosed `<div class="cookie-x">` chrome,
+// not even an adversarial input), the regex engine scans all the way to
+// end-of-string before giving up on that one candidate, then repeats for
+// the next candidate. N unclosed candidates over a document of length L is
+// O(N·L) — reviewer-measured at 15.8s for a 1.29 MB payload of 60 000
+// unclosed `<div class="cookie-x">` tags, 44s at 2.2 MB, blocking the whole
+// single-threaded event loop (every route on both sites) for the duration.
+//
+// The fix below replaces ALL FOUR chrome categories (nav/header/footer,
+// ARIA-role landmarks, and the class/id keyword clause) with a single
+// linear-time pass, so the same failure mode can't resurface via an
+// unclosed <nav>/<header>/<footer>/role tag either:
+//
+//   1. One single forward regex pass collects every opening tag's name,
+//      attributes, and position — O(n) (regex.exec advances strictly past
+//      each match; nothing here re-scans from an interior position).
+//   2. A second single forward regex pass collects every closing tag's
+//      name and position — also O(n) — grouped by lower-cased tag name.
+//   3. For each opening-tag candidate that is chrome (tag name is
+//      nav/header/footer, OR it carries a matching ARIA role, OR its
+//      class/id carries a chrome token — see classAttrIsChrome below), we
+//      need "the next closing tag of the same name after this candidate".
+//      Candidates of the same tag name are visited in the SAME left-to-
+//      right order they were collected in step 1, and step 2's per-name
+//      closing-tag lists are already sorted left-to-right too — so a single
+//      monotonically-advancing cursor per tag name finds each candidate's
+//      closing tag (or proves none exists) WITHOUT re-scanning: the cursor
+//      only ever moves forward, and its total forward movement across all
+//      candidates of one tag name is bounded by that tag name's closing-tag
+//      count. Summed over all tag names, total cursor movement is O(n).
+//      Critically: when no closing tag exists for a candidate, the cursor
+//      simply reaches the end of that tag name's list and stops — an O(1)
+//      "give up", never an O(n) rescan. That is the specific property that
+//      kills the quadratic blowup: an unclosed candidate now costs O(1),
+//      not O(remaining document length).
+//   4. The resulting strip ranges are sorted (already emitted in start
+//      order) and merged, then the output is built with one linear copy
+//      pass over the original string.
+//
+// Worst case overall: steps 1+2 are O(n) each, step 3 is O(n) total across
+// all cursors, step 4 is O(n). No step ever re-scans a suffix of the input
+// per-candidate, so the whole function is O(n) regardless of how many
+// candidates are unclosed. This is the same reasoning fetch-page.ts's
+// visibleTextOf() relies on for its own script/style stripping (a single
+// forward lazy scan per tag TYPE, not per candidate instance) — the bug
+// here was doing that scan per INSTANCE instead of per type.
+
+type ChromeTagCandidate = { tagLower: string; start: number; afterOpenTag: number };
+type StripRange = { start: number; end: number };
+
+const CHROME_STRUCTURAL_TAGS = new Set(["nav", "header", "footer"]);
+const CHROME_ROLE_RE = /\brole\s*=\s*["'](navigation|banner|contentinfo)["']/i;
+const CLASS_OR_ID_ATTR_RE = /\b(?:class|id)\s*=\s*["']([^"']*)["']/gi;
+
+/**
+ * Compound two-word signals that reliably identify a consent/menu widget.
+ * Checked against ADJACENT hyphen-separated words *within* a single class/id
+ * token (e.g. token "cookie-consent-banner" contains the adjacent pair
+ * "cookie-consent" -> chrome). Finding 2 (independent-reviewer fix-up): the
+ * bare single words "cookie", "hamburger", "sidebar", "consent", "gdpr" are
+ * DELIBERATELY not matched on their own below — this is a farm-shop/
+ * producer-goods platform where `id="hamburger-info"` (a meat product),
+ * `class="cookie-jar-produkter"` (baked goods), and `class="sidebar"` (an
+ * opening-hours widget — very common producer-site layout) are all
+ * plausible REAL content, not chrome. Requiring the fuller compound is the
+ * tightened signal; see mct-fp-* tests in render-page.test.ts.
+ */
+const CHROME_COMPOUND_BIGRAMS = new Set([
+  "cookie-consent",
+  "cookie-banner",
+  "cookie-notice",
+  "cookie-popup",
+  "cookie-bar",
+  "gdpr-banner",
+  "gdpr-consent",
+  "gdpr-notice",
+  "consent-banner",
+  "consent-manager",
+  "consent-popup",
+  "nav-menu",
+  "site-nav",
+  "menu-toggle",
+  "nav-toggle",
+  "nav-sidebar",
+  "sidebar-nav",
+  "mobile-menu",
+  "mobile-nav",
+  "hamburger-menu",
+  "nav-hamburger",
+]);
+
+/**
+ * Single bare words that are unambiguous boilerplate signals even alone —
+ * unlike cookie/hamburger/sidebar/consent/gdpr (see CHROME_COMPOUND_BIGRAMS
+ * doc comment), none of these plausibly names real farm-shop content.
+ */
+const CHROME_BARE_WORDS = new Set(["navbar"]);
+
+/** Whether a single class/id ATTRIBUTE VALUE carries a chrome signal. PURE. */
+function classOrIdValueIsChrome(attrValue: string): boolean {
+  for (const rawToken of attrValue.split(/\s+/)) {
+    if (!rawToken) continue;
+    const token = rawToken.toLowerCase();
+    if (CHROME_BARE_WORDS.has(token)) return true;
+    const words = token.split("-");
+    if (words.length < 2) continue;
+    for (let i = 0; i + 1 < words.length; i++) {
+      if (CHROME_COMPOUND_BIGRAMS.has(`${words[i]}-${words[i + 1]}`)) return true;
+    }
+  }
+  return false;
+}
+
+/** Whether an opening tag's raw attribute text carries a chrome class/id. PURE. */
+function attrsHaveChromeClassOrId(attrs: string): boolean {
+  CLASS_OR_ID_ATTR_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = CLASS_OR_ID_ATTR_RE.exec(attrs))) {
+    if (classOrIdValueIsChrome(m[1])) return true;
+  }
+  return false;
+}
+
+/**
+ * Strip structural chrome — `<nav>`, `<header>`, `<footer>`, ARIA landmark
+ * equivalents (`role="navigation"/"banner"/"contentinfo"`), and cookie-
+ * consent/menu widgets identified by class/id — before reducing to visible
+ * text via visibleTextOf(). PURE. Linear in html.length — see the internals
+ * comment above for the worst-case proof.
+ *
+ * This exists ONLY to make shouldEscalateToRender's floor comparison
+ * content-based rather than raw-length-based (Skive 2a, see
+ * RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR's doc comment for the measured
+ * case). It is deliberately NOT used anywhere in the actual extraction
+ * pipeline — fetch-page.ts's visibleTextOf() stays the single source of
+ * truth there, unchanged, per that module's own doc comment on why no
+ * "too thin" heuristic belongs in the fetcher. Stripping real content by
+ * mistake here only costs one wrong render-eligibility guess; doing the same
+ * in the extractor would silently hide real pages from every downstream
+ * field.
+ */
+export function mainContentTextOf(html: string): string {
+  // Step 1: one forward pass collecting every chrome-eligible opening tag.
+  const candidates: ChromeTagCandidate[] = [];
+  const openTagRe = /<(\w+)\b([^>]*)>/g;
+  let openMatch: RegExpExecArray | null;
+  while ((openMatch = openTagRe.exec(html))) {
+    const tagLower = openMatch[1].toLowerCase();
+    const attrs = openMatch[2];
+    const isChrome =
+      CHROME_STRUCTURAL_TAGS.has(tagLower) || CHROME_ROLE_RE.test(attrs) || attrsHaveChromeClassOrId(attrs);
+    if (isChrome) {
+      candidates.push({
+        tagLower,
+        start: openMatch.index,
+        afterOpenTag: openMatch.index + openMatch[0].length,
+      });
+    }
+  }
+  if (candidates.length === 0) return visibleTextOf(html);
+
+  // Step 2: one forward pass collecting every closing tag, grouped by name.
+  const closingsByTag = new Map<string, number[]>();
+  const closeTagRe = /<\/(\w+)\s*>/g;
+  let closeMatch: RegExpExecArray | null;
+  while ((closeMatch = closeTagRe.exec(html))) {
+    const tagLower = closeMatch[1].toLowerCase();
+    let list = closingsByTag.get(tagLower);
+    if (!list) {
+      list = [];
+      closingsByTag.set(tagLower, list);
+    }
+    list.push(closeMatch.index);
+  }
+
+  // Step 3: monotonic per-tag-name cursor — never rescans, never rewinds.
+  const cursorByTag = new Map<string, number>();
+  const ranges: StripRange[] = [];
+  for (const candidate of candidates) {
+    const closings = closingsByTag.get(candidate.tagLower);
+    if (!closings) continue; // no closing tag anywhere in the document: O(1) give-up.
+    let cursor = cursorByTag.get(candidate.tagLower) ?? 0;
+    while (cursor < closings.length && closings[cursor] < candidate.afterOpenTag) {
+      cursor++;
+    }
+    cursorByTag.set(candidate.tagLower, cursor);
+    if (cursor >= closings.length) continue; // no closing AFTER this candidate: O(1) give-up.
+    const closeStart = closings[cursor];
+    ranges.push({ start: candidate.start, end: closeStart });
+  }
+
+  // Step 4: merge overlapping/nested ranges, then one linear copy pass.
+  ranges.sort((a, b) => a.start - b.start);
+  const merged: StripRange[] = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end) {
+      if (r.end > last.end) last.end = r.end;
+    } else {
+      merged.push({ start: r.start, end: r.end });
+    }
+  }
+  // Each merged range's `end` currently points at the START of its closing
+  // tag; extend it to cover the closing tag itself (bounded, single regex
+  // exec per merged range — not per candidate, so still O(n) total since
+  // merged ranges cannot overlap and their closing-tag scans stay within
+  // each range's own small closing-tag text).
+  for (const r of merged) {
+    const closeTagMatch = /^<\/\w+\s*>/.exec(html.slice(r.end));
+    if (closeTagMatch) r.end += closeTagMatch[0].length;
+  }
+
+  let out = "";
+  let cursor = 0;
+  for (const r of merged) {
+    out += html.slice(cursor, r.start) + " ";
+    cursor = r.end;
+  }
+  out += html.slice(cursor);
+
+  return visibleTextOf(out);
+}
+
 /**
  * Whether a successfully-fetched page looks like a JS shell worth rendering.
  * PURE — no network, no browser.
  *
  * All three conditions must hold:
- *   1. the visible text is under the escalation floor,
+ *   1. the visible text is under the escalation floor (raw) OR the page
+ *      reads as content-thin once boilerplate chrome is stripped out (see
+ *      below),
  *   2. the response is big enough to be an application rather than a stub, and
  *   3. the markup actually contains a script — without one, running a browser
  *      cannot produce text that raw HTML did not already have.
@@ -151,12 +410,36 @@ export type RenderPageResult =
  * Condition 3 is what keeps this from firing on a small-but-complete static
  * page (the `og:description`-only producer site fetch-page.ts documents, whose
  * body text is 20 characters): no script, no escalation, no wasted launch.
+ *
+ * The boilerplate-aware branch (Skive 2a, dev-request 2026-08-17-berikelse-
+ * uttrekk-evidence-url-og-render) only fires once BOTH of these hold:
+ *   - mainContentTextOf(html) is under RENDER_ESCALATION_MAIN_CONTENT_TEXT_
+ *     FLOOR, AND
+ *   - stripping boilerplate removed at least RENDER_ESCALATION_TEXT_FLOOR
+ *     characters' worth of text (rawLen - mainLen >= the same 200-char
+ *     floor the raw check uses).
+ *
+ * That second condition is load-bearing, not decorative: without it, a
+ * genuinely short real page with little or no nav/footer (hamre-hagen.no,
+ * 305 total visible chars — see RENDER_ESCALATION_TEXT_FLOOR's own doc
+ * comment) would have mainLen ≈ rawLen ≈ 305, which is under the 400-char
+ * main-content floor too, and would wrongly become eligible purely for
+ * being short. Requiring a real gap means the branch only fires when
+ * boilerplate chrome is what pushed the raw count over 200 in the first
+ * place — exactly the 2043-chars-of-chrome-zero-fields-extracted shape this
+ * was built for, not an ordinary short producer page.
  */
 export function shouldEscalateToRender(html: string, opts: { bytes?: number } = {}): boolean {
   const bytes = opts.bytes ?? Buffer.byteLength(html);
   if (bytes < RENDER_ESCALATION_MIN_BYTES) return false;
   if (!/<script\b/i.test(html)) return false;
-  return visibleTextOf(html).length < RENDER_ESCALATION_TEXT_FLOOR;
+  const rawLen = visibleTextOf(html).length;
+  if (rawLen < RENDER_ESCALATION_TEXT_FLOOR) return true;
+  const mainLen = mainContentTextOf(html).length;
+  return (
+    mainLen < RENDER_ESCALATION_MAIN_CONTENT_TEXT_FLOOR &&
+    rawLen - mainLen >= RENDER_ESCALATION_TEXT_FLOOR
+  );
 }
 
 /**
