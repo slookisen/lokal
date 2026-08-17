@@ -220,18 +220,62 @@ export function runOpplevelserGardssalgFieldDiagnosticTests(
       // at all once tags are stripped.
       const pageFetchEmpty = `<html><head></head><body></body></html>`;
 
+      // Row G ("prov-fd-alreadygood-navonly"): fix-up regression case
+      // (independent review of 97596a7) — reproduces the reviewer's exact
+      // repro shape. Current DB values for about_text/visit_text/
+      // opening_hours_text are ALL already good/non-blank (same GOOD_ABOUT/
+      // GOOD_VISIT/hours string as rows A/D), but THIS crawl's homepage is
+      // nav-only chrome (byte-identical fixture to row B's pageNoCandidate)
+      // — no prose paragraph, no weekday/time pattern, so raw extraction
+      // (aboutSummary/visitSummary/hoursSnippet) comes back blank for all
+      // three fields. Before the fix, that blank-raw-extraction check ran
+      // BEFORE the current-value check, so all three wrongly resolved to
+      // no_candidate_section (reading as "no such section exists for this
+      // provider at all") even though the fields are fine and there was
+      // nothing to improve on. The fix checks the current DB value first —
+      // all three must resolve to already_present, and nothing should be
+      // written (changed[] must stay empty for this row), confirming the
+      // write path itself was never the bug.
+      insertProvider.run({
+        id: "prov-fd-alreadygood-navonly", navn: "Prov Fd Alreadygood Navonly Gard",
+        hjemmeside: "https://prov-fd-alreadygood-navonly.example.no",
+        content_source: null, about_text: GOOD_ABOUT, visit_text: GOOD_VISIT, opening_hours_text: "Man-fre 10-17",
+        products: JSON.stringify(["Eksisterende produkt"]),
+      });
+
       insertProvider.run({
         id: "prov-fd-filled", navn: "Prov Fd Filled Gard", hjemmeside: "https://prov-fd-filled.example.no",
         content_source: null, about_text: GOOD_ABOUT, visit_text: GOOD_VISIT, opening_hours_text: null,
         products: JSON.stringify(["Eksisterende produkt"]),
       });
       insertProvider.run({
+        // about_text was "x" (a non-blank, single-char placeholder) before
+        // the fix-up (independent review of 97596a7): the pre-fix diagnostic
+        // never looked at the current DB value at all, so it made no
+        // difference whether about_text was "x" or null here — only the raw
+        // extraction mattered. Post-fix, the current value IS checked first,
+        // and "x" is technically non-blank, so it would now wrongly resolve
+        // to already_present instead of exercising the no_candidate_section
+        // branch this row exists to test. null restores this row's actual
+        // intent: a genuinely blank current field with a blank raw
+        // extraction. Doesn't change wouldWriteActions either way (no
+        // candidate -> gardssalgReplaceableFieldAction returns null
+        // regardless of currentValue), so fd-B8 (changed[] empty) is
+        // unaffected.
         id: "prov-fd-nocandidate", navn: "Prov Fd Nocandidate Gard", hjemmeside: "https://prov-fd-nocandidate.example.no",
-        content_source: null, about_text: "x", visit_text: null, opening_hours_text: null, products: null,
+        content_source: null, about_text: null, visit_text: null, opening_hours_text: null, products: null,
       });
       insertProvider.run({
+        // Same fix-up as prov-fd-nocandidate above: about_text/visit_text
+        // were "x" before the fix, which now (correctly, per the current-
+        // value check) resolves to already_present rather than exercising
+        // the below_quality_bar branch this row exists to test. null
+        // restores the original intent (blank current, non-blank raw
+        // extraction that fails the judge). No effect on the write path
+        // (fd-C3) — the judge-rejected candidate still writes nothing
+        // regardless of currentValue.
         id: "prov-fd-belowbar", navn: "Prov Fd Belowbar Gard", hjemmeside: "https://prov-fd-belowbar.example.no",
-        content_source: null, about_text: "x", visit_text: "x", opening_hours_text: null,
+        content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
         products: JSON.stringify(["Eksisterende produkt"]),
       });
       insertProvider.run({
@@ -330,6 +374,14 @@ export function runOpplevelserGardssalgFieldDiagnosticTests(
           return {
             ok: true, status: 200, text: async () => pageFetchEmpty,
             arrayBuffer: async () => new TextEncoder().encode(pageFetchEmpty).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
+        }
+        if (host === "prov-fd-alreadygood-navonly.example.no") {
+          if (!isRoot) return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => pageNoCandidate,
+            arrayBuffer: async () => new TextEncoder().encode(pageNoCandidate).buffer,
             headers: { get: () => null },
           } as unknown as Response;
         }
@@ -432,6 +484,26 @@ export function runOpplevelserGardssalgFieldDiagnosticTests(
       assertEq(diagE.about_text, "fetch_empty", "fd-E2: about_text -> fetch_empty (empty page)");
       assertEq(diagE.visit_text, "fetch_empty", "fd-E3: visit_text -> fetch_empty");
       assertEq(diagE.opening_hours_text, "fetch_empty", "fd-E4: opening_hours_text -> fetch_empty");
+
+      // ── Row G: fix-up regression test (independent review of 97596a7) —
+      //    current DB values for about_text/visit_text/opening_hours_text
+      //    are ALL already good/non-blank, but this crawl's homepage is
+      //    nav-only (blank raw extraction for all three fields). Must
+      //    resolve to "already_present" for all three, NOT
+      //    "no_candidate_section" — and nothing gets written, confirming the
+      //    write path was untouched by this fix. ─────────────────────────
+      const resG = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-content-refresh",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-fd-alreadygood-navonly"], apply: false },
+      });
+      assertEq(resG.status, 200, "fd-G0: row G call -> 200");
+      const diagG = getFieldDiag(resG.body, "prov-fd-alreadygood-navonly");
+      assertTrue(!!diagG, "fd-G1: prov-fd-alreadygood-navonly appears in field_diagnostic");
+      assertEq(diagG.about_text, "already_present", "fd-G2: about_text -> already_present (current already good, blank raw extraction this crawl — NOT no_candidate_section)");
+      assertEq(diagG.visit_text, "already_present", "fd-G3: visit_text -> already_present (current already good, blank raw extraction this crawl — NOT no_candidate_section)");
+      assertEq(diagG.opening_hours_text, "already_present", "fd-G4: opening_hours_text -> already_present (current already good, no hours snippet this crawl — NOT no_candidate_section)");
+      assertTrue(!resG.body.changed.find((c: any) => c.provider_id === "prov-fd-alreadygood-navonly"), "fd-G5: prov-fd-alreadygood-navonly does NOT appear in changed[] — write path untouched, nothing written");
 
       // ── fd-F: rows that never reach `scanned++` (row-locked, in this
       //    case) must NOT appear in field_diagnostic at all — same scope

@@ -3011,13 +3011,21 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     //      don't re-derive it.
     //   2. the whole page's extracted text is empty/near-empty -> fetch_empty
     //      (a page problem, not a per-section one — reported once for the row).
-    //   3. the field's own raw pre-judge extraction is blank -> no section to
+    //   3. the row's CURRENT DB value for the field is already non-blank ->
+    //      already_present. Checked BEFORE the raw-extraction-blank check
+    //      below (fix-up from independent review of 97596a7): THIS crawl's
+    //      fresh extraction coming back blank (nav-only page, extractor-shape
+    //      miss, etc) says nothing about whether the field itself has content
+    //      — an already-enriched row must not be misreported as
+    //      no_candidate_section just because this particular re-scan didn't
+    //      find a fresh candidate to improve on.
+    //   4. the field's own raw pre-judge extraction is blank -> no section to
     //      find at all -> no_candidate_section.
-    //   4. (about_text/visit_text only) a non-blank raw extraction that still
+    //   5. (about_text/visit_text only) a non-blank raw extraction that still
     //      never became a judge-approved candidate -> below_quality_bar.
     //      opening_hours_text has no quality-judge step, so it never reaches
     //      this branch.
-    //   5. anything left found something usable, but nothing was written ->
+    //   6. anything left found something usable, but nothing was written ->
     //      already_present (the current DB value was already adequate).
     // Placed BEFORE the `wouldWrite.length === 0 return` below (not after) —
     // that early return exists for the pre-existing changed[]/owner-lock
@@ -3025,14 +3033,29 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // array's whole point is to explain no-op rows, so it must fire whether
     // or not this row ends up writing anything.
     const contentIsNearEmpty = contentText.trim().length < GARDSSALG_FIELD_DIAG_EMPTY_CHARS;
+    // Fix-up from independent review of 97596a7: `no_candidate_section` must
+    // only mean "the fetched page has no matching section this crawl" — it
+    // must NOT fire on an already-enriched row just because THIS crawl's
+    // fresh extraction happened to miss (nav-only page, extractor-shape
+    // mismatch, etc). The row's CURRENT DB value is checked BEFORE falling
+    // through to the raw-extraction-blank check, so an already-good field is
+    // reported as already_present regardless of what this run's extraction
+    // found. NOTE (known imprecision, out of scope here): if the current
+    // value is non-blank but actually low-quality/contaminated and this run's
+    // extraction also came back blank/rejected, this still reports
+    // already_present rather than surfacing the contamination — distinguishing
+    // that would require re-running the quality judge outside the paths that
+    // already do it conditionally elsewhere in this function.
     function extractiveFieldDiagOutcome(
       field: "about_text" | "visit_text",
       rawSummary: string,
-      candidate: string | null
+      candidate: string | null,
+      currentValue: string | null | undefined
     ): GardssalgFieldDiagnosticOutcome {
       const written = wouldWriteActions[field];
       if (written) return written as GardssalgFieldDiagnosticOutcome;
       if (contentIsNearEmpty) return "fetch_empty";
+      if (!isBlank(currentValue)) return "already_present";
       if (isBlank(rawSummary)) return "no_candidate_section";
       if (!candidate) return "below_quality_bar";
       return "already_present";
@@ -3041,13 +3064,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       ? (wouldWriteActions.opening_hours_text as GardssalgFieldDiagnosticOutcome)
       : contentIsNearEmpty
         ? "fetch_empty"
-        : isBlank(hoursSnippet)
-          ? "no_candidate_section"
-          : "already_present";
+        : !isBlank(t.opening_hours_text)
+          ? "already_present"
+          : isBlank(hoursSnippet)
+            ? "no_candidate_section"
+            : "already_present";
     fieldDiagnostic.push({
       provider_id: providerId,
-      about_text: extractiveFieldDiagOutcome("about_text", aboutSummary, candidateAbout),
-      visit_text: extractiveFieldDiagOutcome("visit_text", visitSummary, candidateVisit),
+      about_text: extractiveFieldDiagOutcome("about_text", aboutSummary, candidateAbout, t.about_text),
+      visit_text: extractiveFieldDiagOutcome("visit_text", visitSummary, candidateVisit, t.visit_text),
       opening_hours_text: hoursFieldDiagOutcome,
       products: mapProductsOutcomeToFieldDiagnostic(productsOutcomeForFieldDiag),
     });
