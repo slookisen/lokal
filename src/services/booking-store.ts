@@ -43,12 +43,28 @@ export function bookingDispatchEnabled(): boolean {
 // (0/1/NULL/undefined) — anything but the literal 1 counts as "not live".
 //
 // providerCatalogHidden (optional) is experience_providers.catalog_hidden.
-// A catalog_hidden=1 provider is the controlled slice-0 TEST provider: it can
-// ONLY be created by POST /admin/gardssalg/test-provider (admin-key gated) with
-// the notification email pinned by the admin caller, and it is filtered out of
-// the public catalog/count/sitemap. Such a provider dispatches even when the
-// global master switch is off — this is the intended test harness, and its
-// blast radius is bounded to the admin-specified address. REAL providers
+// Originally this flag was set ONLY by the admin-key-gated
+// POST /admin/gardssalg/test-provider (the controlled slice-0 TEST provider,
+// notification email pinned by the admin caller) — a catalog_hidden=1
+// provider dispatching even when the global master switch is off was the
+// intended test harness, blast radius bounded to that admin-specified
+// address. As of the 2026-08-17 P0 consent-bug fix, catalog_hidden=1 is ALSO
+// set by POST /admin/gardssalg-provider-visibility for REAL producers who
+// asked to be delisted (the CS "fjern oss" flow) — this function's own
+// bypass logic below was NOT changed as part of that fix (out of scope; see
+// getGardssalgProviderBySlug()'s doc comment in experience-store.ts for what
+// WAS changed: the public produsent-profil/booking-panel slug lookup now
+// 404s for any catalog_hidden=1 row, real or test). That means this
+// function's bypass no longer distinguishes "the test provider" from "a real
+// delisted producer whose booking_live happened to still be 1" — a caller
+// that already holds such a provider's raw provider_id (POST
+// /api/opplevelser/book, the book_gardssalg MCP tool — neither goes through
+// getGardssalgProviderBySlug()/slug at all) can still dispatch a booking and
+// notify them, bypassing the master switch, even while they're delisted.
+// Flagged, not fixed here — see this fix's PR/report for the explicit
+// call-out; a real fix needs either flipping booking_live off whenever
+// catalog_hidden is set, or giving the test provider its own identity
+// instead of overloading catalog_hidden for it. REAL providers
 // (catalog_hidden 0/NULL) are unchanged: they still require BOTH the global
 // BOOKING_DISPATCH_ENABLED master switch AND their own booking_live=1.
 export function isBookingPaused(

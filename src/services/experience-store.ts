@@ -2643,10 +2643,15 @@ export type GardssalgProviderRow = {
   booking_live: number | null;
   // Additive (2026-07-14, dev-request 2026-07-14-booking-flyt-v1, slice 0):
   // hidden-from-catalog flag. 1 = kept out of the public gårdssalg grid + count
-  // (listGardssalgProviders()/countGardssalgProviders() filter it) but STILL
-  // bookable by slug (getGardssalgProviderBySlug() deliberately does not filter)
-  // — the mechanism behind the controlled end-to-end booking test. 0/NULL =
-  // today's behavior (visible). Only the admin test-provider endpoint sets it 1.
+  // (listGardssalgProviders()/countGardssalgProviders() filter it) AND, as of
+  // the 2026-08-17 P0 consent-bug fix, also out of slug lookup
+  // (getGardssalgProviderBySlug() now filters it too — see that function's own
+  // doc comment for why: a hidden row must be unreachable via its public
+  // produsent-profil page, JSON-LD, and booking flow, not just the grid). 0/NULL
+  // = today's behavior (visible). Set by the admin test-provider endpoint (its
+  // own row) AND by POST /admin/gardssalg-provider-visibility (the CS
+  // "fjern oss" delist lever for real producers) — both flows share this one
+  // column/semantics.
   catalog_hidden: number | null;
   // Additive (2026-07-25, GSC opplevagent indekseringsfiks, sitemap lastmod
   // honesty item): the provider row's own updated_at — a real per-row
@@ -2762,7 +2767,30 @@ export function listGardssalgProviderMapPoints(filter?: GardssalgProviderTypeFil
  *  getPublishedProviderBySlug() — gårdssalg producers have zero rows in the
  *  experiences table (their product is a gårdsbesøk booking, not a listed
  *  "experience"), so the join-based gate always 404'd them. That mismatch was
- *  the root cause of the live "Book besøk" 404 bug (2026-07-02). */
+ *  the root cause of the live "Book besøk" 404 bug (2026-07-02).
+ *
+ *  catalog_hidden=1 rows are excluded here too (fixed 2026-08-17, P0 consent
+ *  bug: a real producer asked to be delisted via
+ *  POST /admin/gardssalg-provider-visibility, was flagged catalog_hidden=1,
+ *  and was told "done" — but this function used to deliberately NOT filter
+ *  on catalog_hidden, so their public produsent-profil page, its JSON-LD
+ *  LocalBusiness structured data, and the booking flow all stayed fully live
+ *  at their old URL. "Hidden" must mean actually hidden on EVERY public
+ *  surface, no exceptions — this is now that surface's single enforcement
+ *  point, shared by all 4 call sites in routes/experiences-seo.ts (profile
+ *  page, its JSON-LD, the booking panel, and the booking POST/confirm
+ *  redirects), so they 404 in lockstep, same discipline as
+ *  listGardssalgProviders()/countGardssalgProviders()/
+ *  searchGardssalgProviders(). Same load-bearing parens as those functions'
+ *  WHERE clauses (see their comments): without them the trailing AND binds
+ *  tighter than the OR and changes the set.
+ *
+ *  Known, accepted side effect: this also removes the admin-key-gated
+ *  POST /admin/gardssalg/test-provider mechanism's ability to exercise the
+ *  real public booking flow end-to-end via its public slug URL (that test
+ *  row is itself catalog_hidden=1 — see that route's own comment for where
+ *  this is called out). No bypass/flag was added to preserve that — a
+ *  reachable-while-hidden exception is exactly the hole this fix closes. */
 export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow | null {
   if (!slug) return null;
   const db = getDb(VERTICAL);
@@ -2771,7 +2799,8 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE slug = @slug
-          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
     )
     .get({ slug }) as GardssalgProviderRow | undefined;
   return row ?? null;
