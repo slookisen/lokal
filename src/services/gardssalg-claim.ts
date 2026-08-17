@@ -424,11 +424,27 @@ export function getClaimProviderById(providerId: string): ClaimProviderRow | nul
   return row ?? null;
 }
 
+/** catalog_hidden=1 rows are excluded here (fixed 2026-08-17, same P0 consent-bug
+ *  class as getGardssalgProviderBySlug() in experience-store.ts, fixed there in
+ *  lokal#637): a producer who asked to be delisted via
+ *  POST /admin/gardssalg-provider-visibility was flagged catalog_hidden=1 and told
+ *  "done" — but this function used to NOT filter on it, so the unauthenticated
+ *  "Er dette din bedrift?" claim entry page (GET /kategori/gardssalg/eier/:slug)
+ *  kept rendering their name to any visitor, and the /portal and /save routes
+ *  (session-gated further down, but both look the provider up by this same
+ *  function first) stayed slug-reachable too. Same load-bearing parens as the
+ *  sibling functions' WHERE clauses — without them the trailing AND binds
+ *  tighter than a bare OR would read and changes the set. */
 export function getClaimProviderBySlug(slug: string): ClaimProviderRow | null {
   if (!slug) return null;
   const db = getDb(VERTICAL);
   const row = db
-    .prepare(`SELECT ${CLAIM_PROVIDER_COLUMNS} FROM experience_providers WHERE slug = ?`)
+    .prepare(
+      `SELECT ${CLAIM_PROVIDER_COLUMNS}
+         FROM experience_providers
+        WHERE slug = ?
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,
+    )
     .get(slug) as ClaimProviderRow | undefined;
   return row ?? null;
 }
