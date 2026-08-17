@@ -2513,6 +2513,75 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     });
   }
 
+  // dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render, Skive 3,
+  // AC4: productsDiagnostic above gives one row per processed provider
+  // explaining exactly why the `products` outcome was what it was, but
+  // about_text/visit_text/opening_hours_text have no equivalent — a 0-
+  // written run for those three fields could not be explained from the
+  // route's own JSON response without reading code. fieldDiagnostic closes
+  // that gap: ONE row per row that reached `scanned++` (same scope as
+  // productsDiagnostic post-fix — a row excluded/locked/fetch-failed before
+  // the fetch succeeds never had any of these fields computed at all, so
+  // there is nothing honest to report for it here), carrying an outcome for
+  // EACH of the 4 fields using the SAME vocabulary. Purely additive,
+  // reporting-only — never read by the write path, never changes what gets
+  // written (see wouldWriteActions, computed entirely above this array).
+  type GardssalgFieldDiagnosticOutcome =
+    | "filled"
+    | "replaced"
+    | "rewritten"
+    | "no_candidate_section"
+    | "below_quality_bar"
+    | "already_present"
+    | "fetch_empty";
+  const fieldDiagnostic: Array<{
+    provider_id: string;
+    about_text: GardssalgFieldDiagnosticOutcome;
+    visit_text: GardssalgFieldDiagnosticOutcome;
+    opening_hours_text: GardssalgFieldDiagnosticOutcome;
+    products: GardssalgFieldDiagnosticOutcome;
+  }> = [];
+
+  // "at/near zero" for the whole page's extracted text — reported ONCE per
+  // row (fetch_empty), not once per field, since a page that yielded
+  // essentially nothing is a crawl/render problem, not a per-section one.
+  // 20 is not a magic quality threshold — it is just comfortably below any
+  // real section snippet (opening-hours snippets alone run 20-200 chars, see
+  // extractOpeningHours) and comfortably above the handful of stray
+  // characters (a lone template artifact, decoded whitespace) a truly-empty
+  // page can leave behind after extractVisibleText's own trim.
+  const GARDSSALG_FIELD_DIAG_EMPTY_CHARS = 20;
+
+  // Maps productsDiagnostic's own outcome vocabulary (GardssalgProductsOutcome,
+  // above) onto GardssalgFieldDiagnosticOutcome — reused, not re-derived: the
+  // products branch below already computes the real outcome once; this only
+  // translates it into the shared 4-field vocabulary so a reader compares
+  // fields like-for-like. sentinel_no_products (model found nothing) reads as
+  // "no_candidate_section" (nothing to write, structurally); invalid_
+  // unparseable (model answered but not usably) reads as "below_quality_bar"
+  // (something came back, it just didn't clear the bar); infra_failure
+  // (missing key/network/unparseable-body) reads as "fetch_empty" (no signal
+  // was actually obtained, same shape as an empty page for the other 3
+  // fields). Every generator_not_invoked:<gate> OTHER than
+  // products_already_present is a pre-fetch gate (excluded_shared_domain/
+  // locked/unverified_website/fetch_error/fetch_failed — see the gates above,
+  // all of which `return` before `scanned++`), so it can never actually reach
+  // this function; the default branch exists only so the switch stays total
+  // under GardssalgProductsOutcome's template-literal type, not because that
+  // path is expected to run.
+  function mapProductsOutcomeToFieldDiagnostic(
+    outcome: GardssalgProductsOutcome
+  ): GardssalgFieldDiagnosticOutcome {
+    switch (outcome) {
+      case "products_found": return "filled";
+      case "sentinel_no_products": return "no_candidate_section";
+      case "invalid_unparseable": return "below_quality_bar";
+      case "infra_failure": return "fetch_empty";
+      case "generator_not_invoked:products_already_present": return "already_present";
+      default: return "fetch_empty";
+    }
+  }
+
   /**
    * Per-row record of the headless escalation — the DECISION as well as the
    * outcome, one entry for every row whose homepage was fetched successfully.
@@ -2847,6 +2916,10 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // mode (dry-run still calls the LLM so the preview is real), same
     // convention as the slice 5a rewrite path above.
     let productsCandidate: string[] | null = null;
+    // Captured in BOTH branches below so the fieldDiagnostic push after this
+    // block can reuse the real outcome instead of re-deriving it — see
+    // mapProductsOutcomeToFieldDiagnostic's doc comment above.
+    let productsOutcomeForFieldDiag: GardssalgProductsOutcome;
     if (gardssalgProductsEligible(t.products)) {
       // Skive 1 diagnostic capture — see productsDiagnostic's doc comment
       // above. contentText here is the FULL, pre-cap combined page text (the
@@ -2873,6 +2946,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
         .map((pg) => pg.label)
         .filter((label) => gardssalgLabelLooksLikeProducts(label));
       productsCandidate = await generateGardssalgProductList(productsSource.text, diagnosticOut);
+      productsOutcomeForFieldDiag = diagnosticOut.outcome ?? "infra_failure";
       productsDiagnostic.push({
         provider_id: providerId,
         content_chars_full: contentText.length,
@@ -2926,7 +3000,82 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
         content_chars_full: contentText.length,
         pages_fetched_paths: fetched.pagesFetchedPaths ?? [],
       });
+      productsOutcomeForFieldDiag = "generator_not_invoked:products_already_present";
     }
+
+    // ── Skive 3, AC4 — per-field diagnostic (dev-request 2026-08-17-
+    // berikelse-uttrekk-evidence-url-og-render): fieldDiagnostic's doc
+    // comment above explains the array; this is the precedence per field,
+    // first match wins:
+    //   1. wouldWriteActions[field] set -> that's the real outcome this run,
+    //      don't re-derive it.
+    //   2. the whole page's extracted text is empty/near-empty -> fetch_empty
+    //      (a page problem, not a per-section one — reported once for the row).
+    //   3. the row's CURRENT DB value for the field is already non-blank ->
+    //      already_present. Checked BEFORE the raw-extraction-blank check
+    //      below (fix-up from independent review of 97596a7): THIS crawl's
+    //      fresh extraction coming back blank (nav-only page, extractor-shape
+    //      miss, etc) says nothing about whether the field itself has content
+    //      — an already-enriched row must not be misreported as
+    //      no_candidate_section just because this particular re-scan didn't
+    //      find a fresh candidate to improve on.
+    //   4. the field's own raw pre-judge extraction is blank -> no section to
+    //      find at all -> no_candidate_section.
+    //   5. (about_text/visit_text only) a non-blank raw extraction that still
+    //      never became a judge-approved candidate -> below_quality_bar.
+    //      opening_hours_text has no quality-judge step, so it never reaches
+    //      this branch.
+    //   6. anything left found something usable, but nothing was written ->
+    //      already_present (the current DB value was already adequate).
+    // Placed BEFORE the `wouldWrite.length === 0 return` below (not after) —
+    // that early return exists for the pre-existing changed[]/owner-lock
+    // bookkeeping, which has nothing to report on a no-op row, but THIS
+    // array's whole point is to explain no-op rows, so it must fire whether
+    // or not this row ends up writing anything.
+    const contentIsNearEmpty = contentText.trim().length < GARDSSALG_FIELD_DIAG_EMPTY_CHARS;
+    // Fix-up from independent review of 97596a7: `no_candidate_section` must
+    // only mean "the fetched page has no matching section this crawl" — it
+    // must NOT fire on an already-enriched row just because THIS crawl's
+    // fresh extraction happened to miss (nav-only page, extractor-shape
+    // mismatch, etc). The row's CURRENT DB value is checked BEFORE falling
+    // through to the raw-extraction-blank check, so an already-good field is
+    // reported as already_present regardless of what this run's extraction
+    // found. NOTE (known imprecision, out of scope here): if the current
+    // value is non-blank but actually low-quality/contaminated and this run's
+    // extraction also came back blank/rejected, this still reports
+    // already_present rather than surfacing the contamination — distinguishing
+    // that would require re-running the quality judge outside the paths that
+    // already do it conditionally elsewhere in this function.
+    function extractiveFieldDiagOutcome(
+      field: "about_text" | "visit_text",
+      rawSummary: string,
+      candidate: string | null,
+      currentValue: string | null | undefined
+    ): GardssalgFieldDiagnosticOutcome {
+      const written = wouldWriteActions[field];
+      if (written) return written as GardssalgFieldDiagnosticOutcome;
+      if (contentIsNearEmpty) return "fetch_empty";
+      if (!isBlank(currentValue)) return "already_present";
+      if (isBlank(rawSummary)) return "no_candidate_section";
+      if (!candidate) return "below_quality_bar";
+      return "already_present";
+    }
+    const hoursFieldDiagOutcome: GardssalgFieldDiagnosticOutcome = wouldWriteActions.opening_hours_text
+      ? (wouldWriteActions.opening_hours_text as GardssalgFieldDiagnosticOutcome)
+      : contentIsNearEmpty
+        ? "fetch_empty"
+        : !isBlank(t.opening_hours_text)
+          ? "already_present"
+          : isBlank(hoursSnippet)
+            ? "no_candidate_section"
+            : "already_present";
+    fieldDiagnostic.push({
+      provider_id: providerId,
+      about_text: extractiveFieldDiagOutcome("about_text", aboutSummary, candidateAbout, t.about_text),
+      visit_text: extractiveFieldDiagOutcome("visit_text", visitSummary, candidateVisit, t.visit_text),
+      opening_hours_text: hoursFieldDiagOutcome,
+      products: mapProductsOutcomeToFieldDiagnostic(productsOutcomeForFieldDiag),
+    });
 
     const wouldWrite = Object.keys(wouldWriteActions);
     if (wouldWrite.length === 0) return;
@@ -3049,6 +3198,13 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // comment above) — additive bucket, reporting-only, changes no write
     // behavior.
     products_diagnostic: productsDiagnostic,
+    // dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render, Skive
+    // 3, AC4: per-row, per-field WHY for about_text/visit_text/opening_hours_
+    // text/products — see fieldDiagnostic's doc comment above. Additive,
+    // reporting-only; scoped to rows that reached `scanned++` (same scope
+    // rationale as productsDiagnostic pre-AC3-widen — see that array's own
+    // doc comment for why the pre-fetch gates are excluded here).
+    field_diagnostic: fieldDiagnostic,
     render_diagnostic: renderDiagnostic,
     // Skive 2b (dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-
     // render): the per-run summary of renderDiagnostic above — see

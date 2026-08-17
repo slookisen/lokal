@@ -29889,6 +29889,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gpr.failures) failures.push("opplevelser-gardssalg-products: " + f);
     console.log(`  opplevelser-gardssalg-products: ${gpr.passed} passed, ${gpr.failed} failed`);
 
+    // dev-request 2026-08-17-berikelse-uttrekk-evidence-url-og-render, Skive
+    // 3, AC4: POST /admin/gardssalg-content-refresh's `field_diagnostic`
+    // array — a per-row, per-field WHY for about_text/visit_text/opening_
+    // hours_text/products, mirroring products_diagnostic. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-field-diagnostic: per-field write-outcome diagnostic ──");
+    const { runOpplevelserGardssalgFieldDiagnosticTests } = require("../src/routes/opplevelser-gardssalg-field-diagnostic.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-field-diagnostic.test");
+    const gfdr = await runOpplevelserGardssalgFieldDiagnosticTests({ log: false });
+    passed += gfdr.passed;
+    failed += gfdr.failed;
+    for (const f of gfdr.failures) failures.push("opplevelser-gardssalg-field-diagnostic: " + f);
+    console.log(`  opplevelser-gardssalg-field-diagnostic: ${gfdr.passed} passed, ${gfdr.failed} failed`);
+
     // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3:
     // POST /admin/gardssalg-mojibake-backfill — the audited, reversible
     // databackfill for gårdssalg producer text corrupted (æ/ø/å mojibake)
