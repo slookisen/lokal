@@ -197,19 +197,28 @@ export async function runRenderPageTests(opts: { log?: boolean } = {}): Promise<
   // reviewer fix-up) — quadratic-time DoS regression guard ──────────────────
   //
   // Reproduces the reviewer's concrete PoC shape: real prose + one <script>
-  // tag + tens of thousands of an OPENING tag that matches the class/id
-  // keyword clause with NO closing tag anywhere in the document (realistic
-  // malformed/buggy producer-CMS HTML, not even adversarial). Pre-fix, the
-  // reviewer measured 15.8s for a 1.29 MB payload of this shape through the
-  // real shouldEscalateToRender() call path; this asserts a strict wall-
-  // clock budget so a future regression to the old backreference-scan
-  // approach is caught by CI, not just eyeballed.
+  // tag + tens of thousands of an OPENING tag that IS a chrome candidate
+  // (here: bare `<nav>` — matched via CHROME_STRUCTURAL_TAGS by tag name
+  // alone, no class/id keyword involved, so this fixture can't silently
+  // drift out of sync with the CHROME_COMPOUND_BIGRAMS keyword list) with NO
+  // closing tag anywhere in the document (realistic malformed/buggy
+  // producer-CMS HTML, not even adversarial). Using a genuine chrome
+  // candidate here matters: it's what forces mainContentTextOf() past its
+  // `candidates.length === 0` fast path and into the actual steps 2-4
+  // (closing-tag collection, per-tag-name cursor matching, range merging)
+  // this test exists to regression-guard — a non-matching tag would make
+  // this test pass for the wrong reason, staying green even if steps 2-4
+  // regressed back to quadratic. Pre-fix, the reviewer measured 15.8s for a
+  // 1.29 MB payload of this shape through the real shouldEscalateToRender()
+  // call path; this asserts a strict wall-clock budget so a future
+  // regression to the old backreference-scan approach is caught by CI, not
+  // just eyeballed.
   {
     const unclosedCount = 60_000;
     const prose = "Velkommen til garden vår, ekte norske gardsprodukter siden 1970. ".repeat(5);
     let chromeBomb = "";
     for (let i = 0; i < unclosedCount; i++) {
-      chromeBomb += '<div class="cookie-x">';
+      chromeBomb += "<nav>";
     }
     const pathological =
       `<!doctype html><html><head><title>Gard</title><script src="/app.js"></script></head><body>` +
@@ -223,11 +232,11 @@ export async function runRenderPageTests(opts: { log?: boolean } = {}): Promise<
     const mctElapsedMs = Date.now() - mctStart;
     check(
       typeof mctResult === "string",
-      "perf-1-sanity: mainContentTextOf still returns a string for the pathological (60k unclosed chrome divs) input",
+      "perf-1-sanity: mainContentTextOf still returns a string for the pathological (60k unclosed <nav> tags) input",
     );
     check(
       mctElapsedMs < 500,
-      `perf-1: mainContentTextOf() on a ${(pathologicalBytes / 1_000_000).toFixed(2)} MB payload of ${unclosedCount} unclosed <div class="cookie-x"> tags completes in ${mctElapsedMs}ms, well under the 500ms budget (reviewer measured 15.8s pre-fix on a same-shaped 1.29 MB payload) — Finding 1 regression guard`,
+      `perf-1: mainContentTextOf() on a ${(pathologicalBytes / 1_000_000).toFixed(2)} MB payload of ${unclosedCount} unclosed <nav> tags (each a genuine chrome candidate, forcing the real closing-tag-matching algorithm to run rather than hitting the candidates.length===0 fast path) completes in ${mctElapsedMs}ms, well under the 500ms budget (reviewer measured 15.8s pre-fix on a same-shaped 1.29 MB payload) — Finding 1 regression guard`,
     );
 
     const escStart = Date.now();
