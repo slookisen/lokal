@@ -51,6 +51,14 @@
  *       failure (unrelated two-provider UNIQUE collision) leaves the
  *       database completely UNCHANGED — proves applyGardssalgContentRollback
  *       is now all-or-nothing rather than partially applying
+ *   (n) dev-request 2026-08-18-gardssalg-dedup-org-nr-override, point 5 —
+ *       fail-closed org_nr guard AT THIS ROUTE ITSELF (not just at the audit
+ *       route): a pair where BOTH rows carry a non-blank org_nr and the
+ *       values DIFFER is rejected outright, "org_nr_konflikt_ulike_org_nr",
+ *       on both dry-run and apply, regardless of what the audit route would
+ *       have graded that pair as — proves the write side can't be talked
+ *       into merging two distinct legal entities even if some upstream
+ *       caller trusted a bad "high" grade. Zero writes result either way.
  */
 
 export interface TestSummary {
@@ -603,6 +611,62 @@ export function runOpplevelserGardssalgProviderDedupMergeTests(
         ],
         "l10: chain rollback restores A/B/C to their TRUE pre-batch values — A keeps its org_nr back, B and C both end up blank, nothing orphaned",
       );
+
+      // ── (n) org_nr conflict — fail-closed at the merge route itself ─────────
+      seed({ id: "prov-orgconflict-remove", navn: "Konflikt Produsent A", org_nr: "700111222" });
+      seed({ id: "prov-orgconflict-keep", navn: "Konflikt Produsent B", org_nr: "700999888" });
+
+      const orgConflictDry = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { pairs: [{ remove_id: "prov-orgconflict-remove", keep_id: "prov-orgconflict-keep" }] },
+      });
+      assertEq(orgConflictDry.body.results[0].outcome, "rejected", "n1: dry-run, different populated org_nr on both sides -> rejected");
+      assertEq(
+        orgConflictDry.body.results[0].reason,
+        "org_nr_konflikt_ulike_org_nr",
+        "n2: reason is org_nr_konflikt_ulike_org_nr",
+      );
+
+      const orgConflictApply = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { pairs: [{ remove_id: "prov-orgconflict-remove", keep_id: "prov-orgconflict-keep" }], apply: true },
+      });
+      assertEq(
+        orgConflictApply.body.results[0].outcome,
+        "rejected",
+        "n3: apply=true, different populated org_nr on both sides -> STILL rejected (fail-closed, not just a dry-run warning)",
+      );
+      assertEq(
+        orgConflictApply.body.results[0].reason,
+        "org_nr_konflikt_ulike_org_nr",
+        "n4: apply=true reason is org_nr_konflikt_ulike_org_nr",
+      );
+
+      const orgConflictAfter = expDb
+        .prepare(`SELECT id, org_nr, merged_into FROM experience_providers WHERE id IN ('prov-orgconflict-remove','prov-orgconflict-keep') ORDER BY id`)
+        .all() as Array<{ id: string; org_nr: string | null; merged_into: string | null }>;
+      assertEq(
+        orgConflictAfter,
+        [
+          { id: "prov-orgconflict-keep", org_nr: "700999888", merged_into: null },
+          { id: "prov-orgconflict-remove", org_nr: "700111222", merged_into: null },
+        ],
+        "n5: both rows completely unchanged — apply=true performed ZERO writes on the rejected pair",
+      );
+
+      // Sanity: the SAME guard fires independent of which id is remove vs
+      // keep (the conflict is symmetric in the two org_nr values, not tied
+      // to a particular role).
+      const orgConflictSwapped = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { pairs: [{ remove_id: "prov-orgconflict-keep", keep_id: "prov-orgconflict-remove" }], apply: true },
+      });
+      assertEq(
+        orgConflictSwapped.body.results[0].outcome,
+        "rejected",
+        "n6: guard fires regardless of which row is remove_id vs keep_id",
+      );
+      assertEq(orgConflictSwapped.body.results[0].reason, "org_nr_konflikt_ulike_org_nr", "n7: same reason when roles are swapped");
 
       // ── (m) transaction-atomicity safety net — force some OTHER rollback
       // failure mid-batch (a plain two-provider UNIQUE-constraint collision,
