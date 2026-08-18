@@ -29856,6 +29856,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gqur.failures) failures.push("opplevelser-gardssalg-quality-update: " + f);
     console.log(`  opplevelser-gardssalg-quality-update: ${gqur.passed} passed, ${gqur.failed} failed`);
 
+    // dev-request 2026-08-18-apningstider-ekstraktor-vindusgrenser (AC7):
+    // GET /admin/gardssalg-content-quality-count — a read-only, single-pass
+    // full-catalog defect count (about_text/visit_text/opening_hours_text),
+    // reusing the same classifyGardssalgFieldDefect + listGardssalgFieldValues-
+    // ForQualityUpdate the POST route above already uses. Same in-memory-DB
+    // pattern, runs sequentially in this same gated block.
+    console.log("\n── opplevelser-gardssalg-content-quality-count: AC7 full-catalog count ──");
+    const { runOpplevelserGardssalgContentQualityCountTests } = require("../src/routes/opplevelser-gardssalg-content-quality-count.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-content-quality-count.test");
+    const gqcr = await runOpplevelserGardssalgContentQualityCountTests({ log: false });
+    passed += gqcr.passed;
+    failed += gqcr.failed;
+    for (const f of gqcr.failures) failures.push("opplevelser-gardssalg-content-quality-count: " + f);
+    console.log(`  opplevelser-gardssalg-content-quality-count: ${gqcr.passed} passed, ${gqcr.failed} failed`);
+
     // 2026-08-09 (rollback-veto-override, criterion 4): the deliberate-
     // override lever for a gardssalgContactFieldWasRolledBack veto —
     // planGardssalgRollbackVetoOverride/applyGardssalgRollbackVetoOverride
