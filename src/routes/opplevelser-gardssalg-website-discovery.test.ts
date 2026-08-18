@@ -87,7 +87,8 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
     const brregClientPath = require.resolve("../services/brreg-client");
     const blocklistPath = require.resolve("../services/blocklist-service");
     const opplevelserPath = require.resolve("./opplevelser");
-    const cachePaths = [dbFactoryPath, experienceStorePath, brregClientPath, blocklistPath, opplevelserPath];
+    const providerWorkQueuePath = require.resolve("../services/provider-work-queue");
+    const cachePaths = [dbFactoryPath, experienceStorePath, brregClientPath, blocklistPath, opplevelserPath, providerWorkQueuePath];
     for (const p of cachePaths) delete require.cache[p];
 
     let prevRfbDb: any = null;
@@ -111,6 +112,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       const expDb = dbFactory.getDb("experiences");
       const expStore = require("../services/experience-store") as typeof import("../services/experience-store");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+      const providerWorkQueue = require("../services/provider-work-queue") as typeof import("../services/provider-work-queue");
       const adminHeaders = { "x-admin-key": testKey };
 
       // ═══ Section A — pure candidate-host generation ═════════════════════
@@ -1051,6 +1053,150 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
           assertEq(qCnt, 0, "wd-21h: nothing queued for the blocklisted target");
         } finally {
           globalThis.fetch = prevFetch6;
+        }
+      }
+
+      // ── wd-22 (Skive 1, dev-request 2026-08-17-forsyningskjede-samarbeid-
+      //    og-kvalitetsoppdatering): selectGardssalgProvidersForWebsiteDiscovery
+      //    pulls provider_work_queue items targeted at "discovery" FIRST,
+      //    ahead of the normal oldest-first rotation — and still respects the
+      //    existing eligibility filters for queue-sourced candidates (a
+      //    queued provider that already has a hjemmeside is simply skipped,
+      //    its queue row left untouched for a later cycle). ─────────────────
+      {
+        insertProvider.run({ id: "wd-queue-a", navn: "Køprioritert Gard", org_nr: "999100001", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-queue-a",
+          provider_name: "Køprioritert Gard",
+          from_system: "sweep",
+          to_system: "discovery",
+          reason: "missing_source",
+        });
+        // wd-owner already has a stored hjemmeside (see fixtures above) — a
+        // work-queue item targeting it must never surface it as a discovery
+        // target, and must NOT be resolved/touched by the selector itself.
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-owner",
+          from_system: "berikelse",
+          to_system: "discovery",
+          reason: "parked_needs_replacement",
+        });
+
+        const sel = expStore.selectGardssalgProvidersForWebsiteDiscovery(48);
+        const ids = sel.map((s: any) => s.id);
+        assertEq(ids[0], "wd-queue-a", "wd-22a: queue-pending eligible provider sorts FIRST, ahead of every never-attempted rotation row");
+        assertTrue(!ids.includes("wd-owner"), "wd-22b: a queued provider that no longer meets the eligibility filters (has hjemmeside) is not returned");
+        const stillPending = providerWorkQueue.listPendingProviderWorkQueue("discovery").map((p) => p.provider_id);
+        assertTrue(stillPending.includes("wd-owner"), "wd-22c: the ineligible queue row is left alone (not resolved) for a later cycle to re-evaluate");
+      }
+
+      // ── wd-22d (Skive 1 fix-up, CHANGES-REQUESTED finding): a provider can
+      //    legitimately have TWO unresolved provider_work_queue rows both
+      //    targeting "discovery" — the idempotency key is provider_id +
+      //    to_system + reason, so a later sweep run can add a second reason
+      //    (e.g. evidence_url_rejected) for a provider still pending from an
+      //    earlier one (missing_source) before either resolves. The selector
+      //    must dedupe by provider_id and return that provider exactly ONCE,
+      //    not once per queue row. ──────────────────────────────────────────
+      {
+        insertProvider.run({ id: "wd-queue-dup", navn: "Dobbelkoet Gard", org_nr: "999100003", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-queue-dup",
+          provider_name: "Dobbelkoet Gard",
+          from_system: "sweep",
+          to_system: "discovery",
+          reason: "missing_source",
+        });
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-queue-dup",
+          provider_name: "Dobbelkoet Gard",
+          from_system: "berikelse",
+          to_system: "discovery",
+          reason: "evidence_url_rejected",
+        });
+        const pendingDup = providerWorkQueue
+          .listPendingProviderWorkQueue("discovery")
+          .filter((p) => p.provider_id === "wd-queue-dup");
+        assertEq(pendingDup.length, 2, "wd-22d-setup: two distinct-reason queue rows exist for the same provider");
+
+        const selDup = expStore.selectGardssalgProvidersForWebsiteDiscovery(48);
+        const idsDup = selDup.map((s: any) => s.id);
+        const dupCount = idsDup.filter((id: string) => id === "wd-queue-dup").length;
+        assertEq(dupCount, 1, "wd-22d: a provider with two unresolved discovery-queue rows (different reasons) appears exactly ONCE in the selection, not twice");
+      }
+
+      // ── wd-23 (Skive 1, dev-request 2026-08-17-forsyningskjede-samarbeid-
+      //    og-kvalitetsoppdatering): approving a discovery candidate resolves
+      //    the pending discovery-targeted provider_work_queue row(s) for that
+      //    provider AND triggers the ownership-verification sweep for that
+      //    ONE provider in the SAME request. ──────────────────────────────
+      {
+        insertProvider.run({ id: "wd-sweep-trigger", navn: "Samkjoert Gard", org_nr: "999100002", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        expStore.upsertGardssalgWebsiteReviewQueue({
+          provider_id: "wd-sweep-trigger",
+          provider_name: "Samkjoert Gard",
+          candidate_url: "https://samkjoertgard.no",
+        });
+        // The pending item this approval is expected to resolve: some
+        // earlier pipeline (sweep, here) asked discovery for a homepage.
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-sweep-trigger",
+          from_system: "sweep",
+          to_system: "discovery",
+          reason: "missing_source",
+        });
+
+        const prevFetch7 = globalThis.fetch;
+        const sweepTriggerHtml = "<html><body>Samkjoert Gard, Voss — org.nr 999 100 002</body></html>";
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const urlStr = String(url);
+          if (urlStr.startsWith("https://samkjoertgard.no")) {
+            return {
+              ok: true, status: 200, url: urlStr,
+              arrayBuffer: async () => new TextEncoder().encode(sweepTriggerHtml).buffer,
+              headers: { get: () => null },
+            } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: urlStr, headers: { get: () => null } } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            url: "/admin/gardssalg-website-review-approve",
+            body: { approvals: [{ provider_id: "wd-sweep-trigger", url: "https://samkjoertgard.no" }], apply: true },
+          });
+          assertEq(r.body.written_count, 1, "wd-23a: approval writes hjemmeside as before");
+          const hj = (expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-sweep-trigger'`).get() as any).hjemmeside;
+          assertEq(hj, "https://samkjoertgard.no", "wd-23b: hjemmeside persisted");
+
+          const resolvedRow = expDb.prepare(
+            `SELECT resolved_at, outcome FROM provider_work_queue WHERE provider_id='wd-sweep-trigger' AND to_system='discovery'`
+          ).get() as any;
+          assertTrue(!!resolvedRow?.resolved_at, "wd-23c: the pending discovery-targeted work-queue row for this provider is resolved by the approval");
+          assertEq(resolvedRow?.outcome, "hjemmeside_written", "wd-23d: resolved with outcome hjemmeside_written");
+          const stillPendingAfterResolve = providerWorkQueue.listPendingProviderWorkQueue("discovery").some((p) => p.provider_id === "wd-sweep-trigger");
+          assertTrue(!stillPendingAfterResolve, "wd-23e: no longer reported as pending by listPendingProviderWorkQueue");
+
+          // The SAME-cycle sweep trigger: field_provenance.hjemmeside_
+          // verification is stamped by applyGardssalgWebsiteVerification,
+          // which ONLY the internal .../gardssalg-website-verification-
+          // remediation call (never applyGardssalgProviderWebsite itself)
+          // ever writes — its presence proves the sweep really ran inside
+          // the SAME request as the approval above, not merely that
+          // hjemmeside was written.
+          const prov = JSON.parse(
+            (expDb.prepare(`SELECT field_provenance FROM experience_providers WHERE id='wd-sweep-trigger'`).get() as any).field_provenance || "{}"
+          );
+          assertTrue(!!prov.hjemmeside_verification, "wd-23f: the ownership-verification sweep ran in the SAME request as the approval (field_provenance.hjemmeside_verification stamped)");
+          assertEq(prov.hjemmeside_verification.classification, "verified", "wd-23g: the mocked candidate page carries matching ownership evidence, so the same-cycle sweep verifies it");
+
+          // wd-22a's queue item for a DIFFERENT provider (wd-queue-a) must be
+          // completely unaffected by approving wd-sweep-trigger.
+          const wdQueueAStillPending = providerWorkQueue.listPendingProviderWorkQueue("discovery").some((p) => p.provider_id === "wd-queue-a");
+          assertTrue(wdQueueAStillPending, "wd-23h: an unrelated provider's pending discovery-targeted queue item is untouched by this approval");
+        } finally {
+          globalThis.fetch = prevFetch7;
         }
       }
 

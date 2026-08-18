@@ -367,6 +367,13 @@ import {
   type GsWvCohort,
   type GsWvProducerRow,
 } from "../services/gardssalg-website-verification";
+// dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
+// Skive 1: the shared provider_work_queue hand-off table between the
+// sweep/berikelse/discovery gårdssalg pipelines.
+import {
+  enqueueProviderWorkQueueItem,
+  resolveProviderWorkQueueItems,
+} from "../services/provider-work-queue";
 // orchestrator dev-request 2026-08-03-gardssalg-field-concordance:
 // GET /admin/gardssalg-field-concordance-audit — read-only per-field
 // concordance check (DB-stored value vs. what's actually findable on the
@@ -1814,7 +1821,23 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       if (apply && fetched.persistence !== "transient") {
         try {
           const p = recordProviderHomepageFetchResult(providerId, false);
-          if (p.parked_now) parkedNow.push(providerId);
+          if (p.parked_now) {
+            parkedNow.push(providerId);
+            // Skive 1 (dev-request 2026-08-17-forsyningskjede-samarbeid-og-
+            // kvalitetsoppdatering): hand off to website-discovery — this
+            // provider's homepage just crossed the 3-consecutive-failure
+            // parking threshold. Best-effort, must never abort the run.
+            try {
+              enqueueProviderWorkQueueItem({
+                provider_id: providerId,
+                provider_name: t.navn ?? null,
+                from_system: "berikelse",
+                to_system: "discovery",
+                reason: "parked_needs_replacement",
+                batch_id: null,
+              });
+            } catch { /* best-effort */ }
+          }
         } catch { /* best-effort */ }
       }
       return;
@@ -2850,7 +2873,23 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       if (apply && fetched.persistence !== "transient") {
         try {
           const p = recordProviderHomepageFetchResult(providerId, false);
-          if (p.parked_now) parkedNow.push(providerId);
+          if (p.parked_now) {
+            parkedNow.push(providerId);
+            // Skive 1 (dev-request 2026-08-17-forsyningskjede-samarbeid-og-
+            // kvalitetsoppdatering): hand off to website-discovery — this
+            // provider's homepage just crossed the 3-consecutive-failure
+            // parking threshold. Best-effort, must never abort the run.
+            try {
+              enqueueProviderWorkQueueItem({
+                provider_id: providerId,
+                provider_name: t.navn ?? null,
+                from_system: "berikelse",
+                to_system: "discovery",
+                reason: "parked_needs_replacement",
+                batch_id: null,
+              });
+            } catch { /* best-effort */ }
+          }
         } catch { /* best-effort */ }
       }
       pushProductsNotInvokedDiagnostic(providerId, "fetch_failed");
@@ -4725,7 +4764,7 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
 // rejected. Writes go through applyGardssalgProviderWebsite (fill-only, lock
 // guard, shared-host identity re-check, audit + provenance), and the queue
 // entry is cleared on a confirmed write. Never an arbitrary-write surface.
-router.post("/admin/gardssalg-website-review-approve", requireAdmin, (req: Request, res: Response) => {
+router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
   const apply =
     body.apply === true ||
@@ -4781,6 +4820,25 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, (req: Reque
         if (w.length > 0) {
           written.push({ provider_id: pid, url: q.candidate_url });
           clearGardssalgWebsiteReviewQueueEntry(pid);
+          // Skive 1 (dev-request 2026-08-17-forsyningskjede-samarbeid-og-
+          // kvalitetsoppdatering): resolve any pending discovery-targeted
+          // work-queue items for this provider, and trigger the ownership-
+          // verification sweep for this ONE provider in the SAME request
+          // (not waiting for the next scheduled sweep run) — both
+          // best-effort, must never fail the approve response.
+          try {
+            resolveProviderWorkQueueItems(pid, "discovery", "hjemmeside_written");
+          } catch {
+            /* best-effort */
+          }
+          try {
+            await callGardssalgAdminRouteInProcess("/admin/gardssalg-website-verification-remediation", {
+              providerIds: [pid],
+              apply: true,
+            });
+          } catch {
+            /* best-effort */
+          }
         } else {
           rejected.push({ provider_id: pid, reason: "write_skipped_by_guards" });
         }

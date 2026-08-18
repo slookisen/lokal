@@ -63,6 +63,7 @@ import {
   upsertGardssalgWebsiteReviewQueue,
   listGardssalgWebsiteReviewQueue,
 } from "./experience-store";
+import { enqueueProviderWorkQueueItem } from "./provider-work-queue";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -166,6 +167,14 @@ export interface GsWvScanRow {
    * re-write hjemmeside (a no-op today, and must stay one).
    */
   promoted_from_evidence_url?: string;
+  /**
+   * Skive 1 (dev-request 2026-08-17-forsyningskjede-samarbeid-og-
+   * kvalitetsoppdatering): set only when the evidence_url-candidate fallback
+   * path fetched and rejected a specific URL, so the caller can tell "no
+   * candidate existed" apart from "a candidate was tried and failed", and
+   * can pass the rejected URL to the work queue.
+   */
+  rejected_evidence_url_candidate?: string;
 }
 
 export interface GsWvSummary {
@@ -506,7 +515,7 @@ async function classifyGardssalgProducerWebsiteViaEvidenceUrlCandidate(
     // catch block: a throwing fetchFn is indistinguishable from {ok:false}.
     fetched = { ok: false, reason: "fetch_threw" };
   }
-  if (!fetched.ok) return missingSource; // Rule 3 — fetch failure leg
+  if (!fetched.ok) return { ...missingSource, rejected_evidence_url_candidate: candidate }; // Rule 3 — fetch failure leg
 
   const evidence = gardssalgWebsiteEvidenceMatch(
     fetched.pageText,
@@ -525,7 +534,7 @@ async function classifyGardssalgProducerWebsiteViaEvidenceUrlCandidate(
 
   // Strict boolean comparison — same discipline classifyGardssalgProducer
   // Website's own comment calls out on its equivalent line.
-  if (evidence.verified !== true) return missingSource; // Rule 3 — evidence-mismatch leg
+  if (evidence.verified !== true) return { ...missingSource, rejected_evidence_url_candidate: candidate }; // Rule 3 — evidence-mismatch leg
 
   // Rule 4 — promotion.
   return {
@@ -749,6 +758,28 @@ export function applyGardssalgWebsiteVerification(
       // above — see this function's own doc comment.
       promoted_from_evidence_url: isPromotion ? row.promoted_from_evidence_url : null,
     });
+
+    // Skive 1 (dev-request 2026-08-17-forsyningskjede-samarbeid-og-
+    // kvalitetsoppdatering): hand a missing_source verdict off to the
+    // website-discovery job via the shared provider_work_queue — best-effort,
+    // must never throw and abort this transaction.
+    if (row.classification === "missing_source") {
+      try {
+        enqueueProviderWorkQueueItem({
+          provider_id: row.provider_id,
+          provider_name: row.name,
+          from_system: "sweep",
+          to_system: "discovery",
+          reason: row.rejected_evidence_url_candidate ? "evidence_url_rejected" : "missing_source",
+          payload: row.rejected_evidence_url_candidate
+            ? JSON.stringify({ rejected_url: row.rejected_evidence_url_candidate })
+            : null,
+          batch_id: batchId,
+        });
+      } catch {
+        /* best-effort */
+      }
+    }
 
     let enqueued = false;
     if (row.classification === "unverified" && row.hjemmeside) {
