@@ -354,17 +354,23 @@ export interface GardssalgFieldReplacementDecision {
  * Order:
  *   1. current blank -> never (fill-only's job, out of scope for this
  *      lever).
- *   2. candidate blank, OR the candidate ITSELF is defective (never replace
+ *   2. current's defect status (B) is classified ONCE here, up front, and
+ *      reused by every branch below — this must happen even when the
+ *      candidate turns out to be blank or itself defective, so report-mode
+ *      can always surface a real current-side defect instead of masking it.
+ *   3. candidate blank, OR the candidate ITSELF is defective (never replace
  *      bad with bad — defense in depth beyond whatever gate produced the
- *      candidate) -> never.
- *   3. current is defective (B) -> replace, reason "defect:<type>".
- *   4. candidate is byte-identical to current -> never (nothing to gain).
- *   5. candidate strictly covers MORE info-point categories than current
+ *      candidate) -> never; reason is "current_defective_no_clean_candidate"
+ *      if current IS defective (there's a real defect, just no clean
+ *      candidate to fix it with), else null.
+ *   4. current is defective (B) -> replace, reason "defect:<type>".
+ *   5. candidate is byte-identical to current -> never (nothing to gain).
+ *   6. candidate strictly covers MORE info-point categories than current
  *      (C) -> replace, reason "margin". A candidate that covers the SAME or
  *      FEWER categories never replaces — "a shorter/less-specific candidate
  *      must never replace a richer current value" is enforced by this
  *      being a strict `>`, not `>=`.
- *   6. otherwise -> never.
+ *   7. otherwise -> never.
  */
 export function planGardssalgFieldReplacement(
   fieldName: GardssalgQualityFieldName,
@@ -375,12 +381,24 @@ export function planGardssalgFieldReplacement(
   const current = (currentValue ?? "").trim();
   const candidate = (candidateValue ?? "").trim();
   if (!current) return { shouldReplace: false, reason: null };
-  if (!candidate) return { shouldReplace: false, reason: null };
-
-  const candidateDefect = classifyGardssalgFieldDefect(fieldName, candidate);
-  if (candidateDefect.defective) return { shouldReplace: false, reason: null };
 
   const currentDefect = classifyGardssalgFieldDefect(fieldName, current, { othersForField });
+
+  if (!candidate) {
+    return {
+      shouldReplace: false,
+      reason: currentDefect.defective ? "current_defective_no_clean_candidate" : null,
+    };
+  }
+
+  const candidateDefect = classifyGardssalgFieldDefect(fieldName, candidate);
+  if (candidateDefect.defective) {
+    return {
+      shouldReplace: false,
+      reason: currentDefect.defective ? "current_defective_no_clean_candidate" : null,
+    };
+  }
+
   if (currentDefect.defective) {
     return { shouldReplace: true, reason: `defect:${currentDefect.type}` };
   }
