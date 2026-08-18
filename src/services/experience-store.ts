@@ -60,6 +60,12 @@ import { normaliseName } from "./brreg-client";
 // GET /admin/providers/recently-enriched already uses, not a second
 // reimplementation.
 import { isDirectoryOrAggregatorHost, hostFromUrlLike, registrableDomain, FREE_MAIL_DOMAINS } from "./cross-source-validator";
+// dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
+// Skive 1: the shared provider_work_queue hand-off table between the
+// sweep/berikelse/discovery gårdssalg pipelines — used here only to
+// prioritize discovery's own provider selection (see
+// selectGardssalgProvidersForWebsiteDiscovery below).
+import { listPendingProviderWorkQueue } from "./provider-work-queue";
 // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — search-based
 // website-discovery candidate source. BraveResult is the shape braveSearch()
 // already returns; only the TYPE is needed here (the pure host-extraction
@@ -5515,19 +5521,63 @@ export type GardssalgWebsiteDiscoveryTarget = {
 export function selectGardssalgProvidersForWebsiteDiscovery(limit = 16): GardssalgWebsiteDiscoveryTarget[] {
   const db = getDb(VERTICAL);
   const cap = Math.max(1, Math.min(48, limit));
-  return db
-    .prepare(
-      `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type,
-              telefon, mobil, adresse, postnummer
-         FROM experience_providers
-        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')
-          AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))
-          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
-        ORDER BY (website_discovery_attempted_at IS NOT NULL), website_discovery_attempted_at ASC, created_at ASC
-        LIMIT ?`
-    )
-    .all(cap) as GardssalgWebsiteDiscoveryTarget[];
+
+  // Skive 1 (dev-request 2026-08-17-forsyningskjede-samarbeid-og-
+  // kvalitetsoppdatering): providers explicitly handed to discovery by the
+  // sweep/berikelse pipelines (provider_work_queue, to_system='discovery')
+  // go FIRST, in the queue's own requested_at order — before falling back to
+  // the normal oldest-first rotation below. A queue-pending provider that no
+  // longer meets the eligibility filters (already has a hjemmeside, got
+  // locked, etc.) is simply not returned here; its queue row is left alone
+  // for a later cycle to re-evaluate, not resolved/touched by this selector.
+  const pending = listPendingProviderWorkQueue("discovery", cap);
+  const queueTargets: GardssalgWebsiteDiscoveryTarget[] = [];
+  if (pending.length > 0) {
+    const pendingIds = pending.map((p) => p.provider_id);
+    const placeholders = pendingIds.map(() => "?").join(", ");
+    const eligibleRows = db
+      .prepare(
+        `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type,
+                telefon, mobil, adresse, postnummer
+           FROM experience_providers
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+            AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')
+            AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))
+            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+            AND id IN (${placeholders})`
+      )
+      .all(...pendingIds) as GardssalgWebsiteDiscoveryTarget[];
+    const eligibleById = new Map(eligibleRows.map((r) => [r.id, r]));
+    // Preserve the queue's own requested_at order (SQL's IN(...) does not
+    // guarantee row order matches the placeholder list).
+    for (const providerId of pendingIds) {
+      const row = eligibleById.get(providerId);
+      if (row) queueTargets.push(row);
+    }
+  }
+
+  const remaining = cap - queueTargets.length;
+  let rotationTargets: GardssalgWebsiteDiscoveryTarget[] = [];
+  if (remaining > 0) {
+    const excludeIds = queueTargets.map((t) => t.id);
+    const excludeClause = excludeIds.length > 0 ? `AND id NOT IN (${excludeIds.map(() => "?").join(", ")})` : "";
+    rotationTargets = db
+      .prepare(
+        `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type,
+                telefon, mobil, adresse, postnummer
+           FROM experience_providers
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+            AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')
+            AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))
+            AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+            ${excludeClause}
+          ORDER BY (website_discovery_attempted_at IS NOT NULL), website_discovery_attempted_at ASC, created_at ASC
+          LIMIT ?`
+      )
+      .all(...excludeIds, remaining) as GardssalgWebsiteDiscoveryTarget[];
+  }
+
+  return [...queueTargets, ...rotationTargets].slice(0, cap);
 }
 
 /** Explicit-target resolver for the route's providerIds override — gårdssalg-

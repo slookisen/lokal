@@ -631,6 +631,37 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_website_review_queue failed:", err);
   }
 
+  // ─── provider_work_queue (dev-request 2026-08-17-forsyningskjede-
+  // samarbeid-og-kvalitetsoppdatering, Skive 1) ───────────────────────────────
+  // Shared hand-off queue between the three gårdssalg pipelines (ownership-
+  // verification sweep, content-enrichment "berikelse", and website-discovery
+  // "discovery") so they hand each other work instead of silently dropping
+  // cases: sweep → discovery (missing_source / evidence_url_rejected),
+  // berikelse → discovery (parked_needs_replacement), discovery → sweep
+  // (resolved when a discovered candidate is written to hjemmeside).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS provider_work_queue (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        provider_name TEXT,
+        from_system TEXT NOT NULL,      -- 'sweep' | 'berikelse' | 'discovery'
+        to_system TEXT NOT NULL,        -- 'sweep' | 'discovery'
+        reason TEXT NOT NULL,           -- 'missing_source' | 'evidence_url_rejected' | 'parked_needs_replacement'
+        payload TEXT,                   -- JSON, nullable (e.g. {"rejected_url": "..."})
+        batch_id TEXT,
+        requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+        resolved_at TEXT,
+        outcome TEXT,
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_provider_work_queue_to_system_resolved ON provider_work_queue(to_system, resolved_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_provider_work_queue_provider_id ON provider_work_queue(provider_id)`);
+  } catch (err) {
+    console.error("Migration provider_work_queue failed:", err);
+  }
+
   // ─── gardssalg_autosvar_review_queue (dev-request 2026-08-16-opplevagent-
   // outreach-rutine, "Autosvar-regelen") ─────────────────────────────────────
   // GET /admin/gardssalg-autosvar-scan (above, in the routes file) detects an

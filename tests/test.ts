@@ -29969,6 +29969,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of ogwvr.failures) failures.push("opplevelser-gardssalg-website-verification: " + f);
     console.log(`  opplevelser-gardssalg-website-verification: ${ogwvr.passed} passed, ${ogwvr.failed} failed`);
 
+    // dev-request 2026-08-17-forsyningskjede-samarbeid-og-
+    // kvalitetsoppdatering, Skive 1: the shared provider_work_queue hand-off
+    // table between the sweep/berikelse/discovery gårdssalg pipelines
+    // (enqueue idempotency, resolve, oldest-first/filtered/limited listing).
+    console.log("\n── provider-work-queue: shared sweep/berikelse/discovery hand-off queue ──");
+    const { runProviderWorkQueueTests } = require("../src/services/provider-work-queue.test") as
+      typeof import("../src/services/provider-work-queue.test");
+    const pwqr = await runProviderWorkQueueTests({ log: false });
+    passed += pwqr.passed;
+    failed += pwqr.failed;
+    for (const f of pwqr.failures) failures.push("provider-work-queue: " + f);
+    console.log(`  provider-work-queue: ${pwqr.passed} passed, ${pwqr.failed} failed`);
+
     // dev-request 2026-08-14-dublett-auto-triage (DRY-RUN / REPORT ONLY):
     // pure classification-logic tests for classifyGardssalgExperienceConflict
     // Pair (services/gardssalg-experience-conflict-triage.ts) — the two-page
