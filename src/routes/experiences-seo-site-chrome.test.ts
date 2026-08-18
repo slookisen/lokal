@@ -52,6 +52,14 @@
  *       personvern) — while its own content (the "Om produsenten" section
  *       and the "Reserver besøk" CTA, id="reserve-cta") stays untouched by
  *       the chrome swap.
+ *   (l) dev-request orch-pr-20260818-kontakt-shared-chrome: GET /kontakt
+ *       (hand-rolled contact-form page, no matching OaNavActive item — same
+ *       "call oaSiteNav({}) with no active" precedent as /tilbyder/:id) is
+ *       migrated to oaSiteNav()/oaSiteFooter() too — same 4-marker probe
+ *       (hamburger toggle + full footer + llms.txt + personvern) — while the
+ *       contact form itself (id="contact-form", the honeypot field, every
+ *       input, and the Turnstile widget) stays byte-identical to before the
+ *       chrome swap.
  *
  * Same synthetic-req/res harness + in-memory-DB pattern as
  * experiences-seo-sok-gardssalg.test.ts.
@@ -361,6 +369,31 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       assertTrue(produsent.body.includes('href="/personvern"'), "k5: produsent footer links /personvern");
       assertTrue(produsent.body.includes('id="reserve-cta"'), "k6: produsent page content unaffected — reserve CTA (id=\"reserve-cta\") still present");
       assertTrue(produsent.body.includes("Om produsenten"), "k7: produsent page content unaffected — \"Om produsenten\" heading still present");
+
+      // ── (l) /kontakt — same 4-marker probe as (i)/(k), plus the contact
+      //     form (honeypot, every field, Turnstile widget) unaffected by the
+      //     chrome swap. No matching OaNavActive item, so (unlike (e)) no
+      //     nav link is expected to carry aria-current="page" here. ────────
+      const kontakt = await callHtmlRoute(seoRouter, "/kontakt");
+      assertTrue(kontakt.handled && kontakt.status === 200, `l1: GET /kontakt renders 200 (got ${kontakt.status})`);
+      assertTrue(kontakt.body.includes('id="oa-nav-toggle"'), "l2: kontakt page has the #oa-nav-toggle hamburger checkbox");
+      assertTrue(kontakt.body.includes('class="nav-burger"'), "l3: kontakt page has the .nav-burger label");
+      assertTrue(kontakt.body.includes('class="site-footer"'), "l4: kontakt page has the full .site-footer (not the old hand-rolled footer)");
+      assertTrue(kontakt.body.includes('href="/llms.txt"'), "l5: kontakt footer links llms.txt");
+      assertTrue(kontakt.body.includes('href="/personvern"'), "l6: kontakt footer links /personvern");
+      assertTrue(kontakt.body.includes('href="/.well-known/agent-card.json"'), "l7: kontakt footer links agent-card.json");
+      assertTrue(kontakt.body.includes('class="brand-word"'), "l8: kontakt page renders the shared brand mark (brand-word)");
+      assertTrue(!/aria-current="page"/.test(kontakt.body), "l9: kontakt has no matching OaNavActive item — oaSiteNav({}) marks nothing aria-current");
+      assertTrue(kontakt.body.includes('--ink:#18130d'), "l9b: kontakt's :root defines --ink (OA_CHROME_CSS's .brand-word/.nav-burger span rely on var(--ink))");
+      // Contact form untouched: honeypot, every field, hidden platform input,
+      // Turnstile widget + its script tag, and the submit button all survive.
+      assertTrue(kontakt.body.includes('<form id="contact-form" novalidate>'), "l10: contact-form markup intact");
+      assertTrue(kontakt.body.includes('name="_honey"') && kontakt.body.includes('aria-hidden="true"'), "l11: honeypot field intact");
+      assertTrue(kontakt.body.includes('name="platform" value="experiences"'), "l12: hidden platform field intact");
+      assertTrue(kontakt.body.includes('id="cf-name"') && kontakt.body.includes('id="cf-email"') && kontakt.body.includes('id="cf-subject"') && kontakt.body.includes('id="cf-message"'), "l13: all contact-form fields intact");
+      assertTrue(kontakt.body.includes('class="cf-turnstile"') && kontakt.body.includes('data-sitekey="0x4AAAAAADr56qDaUM0XWoTF"'), "l14: Turnstile widget intact");
+      assertTrue(kontakt.body.includes('src="https://challenges.cloudflare.com/turnstile/v0/api.js"'), "l15: Turnstile script tag intact");
+      assertTrue(kontakt.body.includes("fetch('/api/contact'"), "l16: submit script's fetch('/api/contact') call intact");
     } catch (err: any) {
       failed++;
       failures.push("experiences-seo-site-chrome: unexpected error: " + String(err?.stack || err?.message || err));
