@@ -2930,7 +2930,16 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     const contentText = extractVisibleText(combinedHtml);
     const aboutSummary = summarizeAbout(primaryHtml);
     const visitSummary = summarizeVisit(combinedHtml);
-    const hoursSnippet = extractOpeningHours(contentText);
+    // dev-request 2026-08-18-apningstider-llm-dommer, spec C: extractOpeningHours()'s
+    // own return VALUE is never written to opening_hours_text anymore — it is
+    // used strictly as a free, deterministic yes/no TRIGGER for whether the
+    // page is worth an LLM call at all (weekday+time nearby). A null trigger
+    // means "not worth calling the model" (candidateHours stays null, zero
+    // LLM cost); a non-null trigger only means it's worth ASKING
+    // generateGardssalgOpeningHoursFromSource — that helper's own vetted
+    // output (never this raw snippet) is the only thing that can ever become
+    // candidateHours below.
+    const hoursTrigger = extractOpeningHours(contentText);
 
     // Kvalitetsgate-redesign (dev-request 2026-07-20-gardssalg-kvalitetsgate-
     // redesign, slice 2/3/4): about_text/visit_text candidates are judged by
@@ -2975,7 +2984,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // Do NOT fabricate a distinct visit_text from nothing.
     const candidateVisit =
       candidateVisitRaw && candidateVisitRaw !== candidateAbout ? candidateVisitRaw : null;
-    const candidateHours = hoursSnippet && hoursSnippet.trim() ? hoursSnippet : null;
+    // Spec A/B/C: only ask the model when the cheap regex trigger found
+    // something worth checking; the generator's own sentinel/residual-
+    // markdown/classifyGardssalgFieldDefect gates (see its doc comment) are
+    // the only thing that can produce a non-null candidateHours here.
+    const candidateHours =
+      hoursTrigger && hoursTrigger.trim()
+        ? await generateGardssalgOpeningHoursFromSource(contentText, t.navn)
+        : null;
 
     function isBlank(v: unknown): boolean {
       return v === null || v === undefined || String(v).trim() === "";
@@ -3289,9 +3305,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
         ? "fetch_empty"
         : !isBlank(t.opening_hours_text)
           ? "already_present"
-          : isBlank(hoursSnippet)
+          : isBlank(hoursTrigger)
             ? "no_candidate_section"
-            : "already_present";
+            // The regex trigger fired (raw section found this crawl) but the
+            // LLM generator + classifyGardssalgFieldDefect gate never produced
+            // a usable candidate — same "found a section, judge/gate declined
+            // it" bucket about_text/visit_text already report via
+            // extractiveFieldDiagOutcome above. Reachable now that the trigger
+            // firing no longer guarantees a written candidate (spec C).
+            : "below_quality_bar";
     fieldDiagnostic.push({
       provider_id: providerId,
       about_text: extractiveFieldDiagOutcome("about_text", aboutSummary, candidateAbout, t.about_text),
@@ -3917,13 +3939,19 @@ router.post("/admin/gardssalg-content-quality-update", requireAdmin, async (req:
     // Same extraction + LLM-judge cascade content-refresh already uses for
     // about_text/visit_text (meetsGardssalgAboutQualityBar) — a candidate
     // this route ever considers is one that pipeline would already trust.
-    // opening_hours_text keeps the same non-judged extractOpeningHours()
-    // extraction content-refresh uses (never judged there either) —
+    // opening_hours_text (dev-request 2026-08-18-apningstider-llm-dommer,
+    // spec C): extractOpeningHours() is now used ONLY as the free,
+    // deterministic yes/no TRIGGER for whether the page is worth an LLM
+    // call — its raw return value is never the candidate. When it fires,
+    // generateGardssalgOpeningHoursFromSource (spec A) produces the actual
+    // candidate, already gated by classifyGardssalgFieldDefect (spec B)
+    // inside that helper before it can return non-null.
     // classifyGardssalgFieldDefect/planGardssalgFieldReplacement below still
-    // independently re-check the CANDIDATE itself before ever proposing it.
+    // independently re-check the CANDIDATE itself before ever proposing it
+    // (defense in depth, same discipline as every other field here).
     const aboutSummary = summarizeAbout(primaryHtml);
     const visitSummary = summarizeVisit(combinedHtml);
-    const hoursSnippet = extractOpeningHours(contentText);
+    const hoursTrigger = extractOpeningHours(contentText);
     const candidateAboutRaw = (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")) ? aboutSummary : null;
     const candidateVisitRaw = (await meetsGardssalgAboutQualityBar(visitSummary, t.navn, "visit")) ? visitSummary : null;
     // Same duplicate-extraction guard content-refresh uses (the Draopar
@@ -3931,7 +3959,10 @@ router.post("/admin/gardssalg-content-quality-update", requireAdmin, async (req:
     // exact same block on a page with no distinct "visit us" section).
     const candidateVisit = candidateVisitRaw && candidateVisitRaw !== candidateAboutRaw ? candidateVisitRaw : null;
     const candidateAbout = candidateAboutRaw;
-    const candidateHours = hoursSnippet && hoursSnippet.trim() ? hoursSnippet : null;
+    const candidateHours =
+      hoursTrigger && hoursTrigger.trim()
+        ? await generateGardssalgOpeningHoursFromSource(contentText, t.navn)
+        : null;
     const candidateByField: Record<GardssalgQualityFieldName, string | null> = {
       about_text: candidateAbout,
       visit_text: candidateVisit,
@@ -9215,11 +9246,18 @@ router.post("/admin/gardssalg-content-clear", requireAdmin, (req: Request, res: 
     req.query?.apply === "true";
   const dryRun = !apply;
 
-  const CLEARABLE = new Set(["about_text", "visit_text"]);
+  // dev-request 2026-08-18-apningstider-llm-dommer, spec D: opening_hours_text
+  // is now content this lever can clear too, since it went from a raw regex
+  // slice to an LLM-generated candidate that can be contaminated the same
+  // way about_text/visit_text can — same minimal allow-list extension, same
+  // lock guards (applyGardssalgRetroScanNull's manual/claim owner-lock check
+  // below applies identically regardless of which of the three fields is
+  // named).
+  const CLEARABLE = new Set(["about_text", "visit_text", "opening_hours_text"]);
   const fieldName = typeof body.field_name === "string" ? body.field_name.trim() : "";
   if (!CLEARABLE.has(fieldName)) {
     res.status(400).json({
-      error: "field_name must be one of: about_text, visit_text",
+      error: "field_name must be one of: about_text, visit_text, opening_hours_text",
       detail: "only the free-text content fields are clearable through this lever",
     });
     return;
@@ -9252,13 +9290,24 @@ router.post("/admin/gardssalg-content-clear", requireAdmin, (req: Request, res: 
   try {
     for (const providerId of providerIds) {
       const row = getProviderById(providerId) as
-        | { id: string; navn?: string | null; about_text?: string | null; visit_text?: string | null }
+        | {
+            id: string;
+            navn?: string | null;
+            about_text?: string | null;
+            visit_text?: string | null;
+            opening_hours_text?: string | null;
+          }
         | null;
       if (!row) {
         skipped.push({ provider_id: providerId, reason: "not_found" });
         continue;
       }
-      const current = (fieldName === "about_text" ? row.about_text : row.visit_text) ?? "";
+      const current =
+        (fieldName === "about_text"
+          ? row.about_text
+          : fieldName === "visit_text"
+            ? row.visit_text
+            : row.opening_hours_text) ?? "";
       if (current.trim() === "") {
         skipped.push({ provider_id: providerId, reason: "already_blank" });
         continue;
@@ -9274,7 +9323,7 @@ router.post("/admin/gardssalg-content-clear", requireAdmin, (req: Request, res: 
       }
       const written = applyGardssalgRetroScanNull(
         providerId,
-        [fieldName as "about_text" | "visit_text"],
+        [fieldName as "about_text" | "visit_text" | "opening_hours_text"],
         `admin:gardssalg-content-clear:${batchId}`,
         batchId
       );
@@ -9949,9 +9998,18 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 
     const freshAbout = flaggedFields.has("about_text") ? summarizeAbout(page.html) : null;
     const freshVisit = flaggedFields.has("visit_text") ? summarizeVisit(page.html) : null;
-    const freshHours = flaggedFields.has("opening_hours_text")
-      ? extractOpeningHours(page.contentText ?? extractVisibleText(page.html))
-      : null;
+    // dev-request 2026-08-18-apningstider-llm-dommer, spec C: extractOpeningHours()'s
+    // raw return value is never written here either — only used as the
+    // deterministic yes/no trigger for whether re-running the LLM generator
+    // is worth it. generateGardssalgOpeningHoursFromSource's own output
+    // (already gated by classifyGardssalgFieldDefect, spec B, inside that
+    // helper) is the only thing that can become freshHours.
+    const freshPageText = page.contentText ?? extractVisibleText(page.html);
+    const hoursTrigger = flaggedFields.has("opening_hours_text") ? extractOpeningHours(freshPageText) : null;
+    const freshHours =
+      hoursTrigger && hoursTrigger.trim()
+        ? await generateGardssalgOpeningHoursFromSource(freshPageText, c.navn)
+        : null;
 
     const candidateWrite: { about_text?: string; visit_text?: string; opening_hours_text?: string } = {};
     const forceFields: Array<"about_text" | "visit_text" | "opening_hours_text"> = [];
@@ -20442,6 +20500,140 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
   // the SAME shared quality bar every other fill candidate in this route is
   // judged by, rather than inventing a separate arbitrary length range.
   if (!meetsAboutQualityBar(plain)) return null;
+  return plain;
+}
+
+// ─── generateGardssalgOpeningHoursFromSource (dev-request 2026-08-18-
+//     apningstider-llm-dommer) ─────────────────────────────────────────────
+// LLM-judge replacement for the old character-window/regex extraction of
+// opening_hours_text. A full catalog scan (dev-request's own header) found 0
+// clean opening-hours texts across all 173 published gårdssalg profiles that
+// had any at all — extractOpeningHours()'s ±80-char index-window slice
+// (search-enrich.ts) has no word-boundary snapping and no chrome filtering,
+// so it routinely glued nav-menu/search-box/slider chrome onto the real
+// hours, or picked up an unrelated "Lorem ipsum" block that merely happened
+// to sit near a weekday+time match. Three independent rounds of trying to
+// harden that SAME extraction mechanism (word-boundary snapping + chrome-
+// stripping) each found a genuinely new defect of the same shape and never
+// shipped — Daniel (platform owner) explicitly chose to abandon the
+// character-window/boundary-search approach entirely in favor of this
+// LLM-judge shape, mirroring generateGardssalgAboutFromSource immediately
+// above (no existing opening_hours_text value to expand, so the FromSource
+// fill-shape — pageText + producer name in, sentinel/null out — is the
+// closer structural match, not generateGardssalgAboutRewrite's expand-
+// existing-text shape).
+//
+// Mirrors generateGardssalgAboutFromSource's exact never-fabricate contract:
+// sync fetch to https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY
+// from env, model claude-haiku-4-5. Returns null — NEVER throws, NEVER
+// fabricates — on missing key / network failure / non-200 / unparseable
+// body / the sentinel / residual markdown / an oversized response /
+// classifyGardssalgFieldDefect flagging the result (see below).
+//
+// extractOpeningHours() itself is NEVER called from inside this helper —
+// per spec C, that regex extraction is strictly the CALLER's prefilter
+// (worth an LLM call at all), never any part of producing the output value.
+// This function only ever sees the already-fetched, already-extracted page
+// text (pageText — the SAME extractVisibleText(combinedHtml)/contentText the
+// calling route already computed, capped to the same
+// GARDSSALG_REWRITE_SOURCE_CHAR_CAP — no new fetch/host-binding surface) and
+// the producer's name.
+//
+// The gate: opening_hours_text does NOT go through meetsAboutQualityBar (a
+// Norwegian-prose cheap bar — "Man-fre 10-18" is legitimately not prose, see
+// classifyGardssalgFieldDefect's own doc comment on why that field is
+// exempt from it). Instead, EVERY candidate this helper is about to return
+// is run through classifyGardssalgFieldDefect("opening_hours_text", ...)
+// (gardssalg-quality-update.ts) — the SAME classifier the quality-update
+// lever already trusts for this exact field (chrome/UI-leakage, CSS/JS
+// leakage, placeholder/boilerplate, truncation, mangled encoding) — and a
+// defective verdict becomes null here, never reaching a caller. This is the
+// real fail-closed gate (spec B); the prompt's own instructions are
+// defense-in-depth, never trusted alone.
+const GARDSSALG_HOURS_CANDIDATE_MAX_LEN = 300;
+
+export async function generateGardssalgOpeningHoursFromSource(
+  pageText: string,
+  navn: string
+): Promise<string | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const cappedSource = (pageText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+  const prompt = `Finn åpningstidene til gårdsprodusenten "${navn}" i kildeteksten under, og skriv dem som en kort, faktabasert setning eller frase på norsk (f.eks. "Mandag – fredag: 09–15, lørdag og søndag stengt" eller "Åpent i sommersesongen, se nettsiden for detaljer").
+
+Kildetekst (hentet fra produsentens egen nettside):
+${cappedSource}
+
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på ukedager, klokkeslett, sesonger eller annet som ikke er nevnt der. Meny-, bunntekst-, søkefelt-, navigasjons-, stillingsannonse- og annen mal-/skjelett-tekst fra nettsiden ER IKKE åpningstider — ignorer slikt fullstendig selv om det står nær en dato eller et klokkeslett i kildeteksten (f.eks. "Søk", knappetekster, informasjonskapsel-/personvernvarsler, stillingsutlysninger, produktpriser). Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke inneholder faktiske åpningstider for produsenten, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+  const cleaned = text.trim();
+  if (cleaned === GARDSSALG_REWRITE_SENTINEL) return null; // explicit "no hours found" escape
+
+  // Strip markdown BEFORE any gate below — same reasoning as the sibling
+  // helpers: every gate must judge the exact string that would land on the
+  // public page, not a version padded/shortened by formatting syntax.
+  const plain = stripMarkdownArtifacts(cleaned);
+
+  // Sentinel embedded/wrapped rather than verbatim — same two-check
+  // discipline as the sibling helpers (checked BEFORE the residual gate
+  // since the sentinel itself contains "_").
+  if (plain.includes(GARDSSALG_REWRITE_SENTINEL)) return null;
+
+  // Residual markers after stripping (unpaired "**", "_x_", spaced "*", …)
+  // → reject outright; see GARDSSALG_REWRITE_RESIDUAL_MARKDOWN's comment.
+  if (GARDSSALG_REWRITE_RESIDUAL_MARKDOWN.test(plain)) return null;
+
+  // Safety valve only — NOT the quality gate (that's classifyGardssalgField
+  // Defect below). Guards against a rambling, non-conforming response; the
+  // LOWER bound is deliberately left to classifyGardssalgFieldDefect's own
+  // too_short floor for this field (8 chars — "Man-fre 10-18" is legitimately
+  // short and must not be rejected here on length alone).
+  if (!plain || plain.length > GARDSSALG_HOURS_CANDIDATE_MAX_LEN) return null;
+
+  // Fail-closed gate (spec B, the actual gate for this field): the SAME
+  // defect classifier the write-side quality-update lever already trusts,
+  // reused here so a candidate that would be judged defective the instant it
+  // landed in the DB is never even returned from this helper. opening_hours_
+  // text is deliberately exempt from classifyGardssalgFieldDefect's own
+  // Norwegian-prose cheap-bar backstop (see that function's doc comment) —
+  // it still catches chrome/UI-leakage, CSS/JS leakage, placeholder/
+  // boilerplate markers, truncation and mangled encoding, which is exactly
+  // the defect shape this whole helper exists to eliminate.
+  const defect = classifyGardssalgFieldDefect("opening_hours_text", plain);
+  if (defect.defective) return null;
+
   return plain;
 }
 

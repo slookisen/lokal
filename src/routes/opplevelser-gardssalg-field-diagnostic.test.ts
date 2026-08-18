@@ -322,6 +322,27 @@ export function runOpplevelserGardssalgFieldDiagnosticTests(
               json: async () => ({ content: [{ type: "text", text: "INGEN_PRODUKTER_FUNNET" }] }),
             } as unknown as Response;
           }
+          if (prompt.includes("Finn åpningstidene")) {
+            // dev-request 2026-08-18-apningstider-llm-dommer: opening_hours_text
+            // candidates now come from generateGardssalgOpeningHoursFromSource,
+            // not the raw extractOpeningHours() snippet — return a clean,
+            // classifyGardssalgFieldDefect-passing candidate whenever the
+            // source text actually names hours; sentinel otherwise (row D's
+            // pagePresent also has an hours section, but that row's current
+            // value is already non-blank so the candidate is never written —
+            // see fd-D4's already_present assertion, unaffected by what this
+            // returns).
+            if (prompt.includes("Åpningstider")) {
+              return {
+                ok: true, status: 200,
+                json: async () => ({ content: [{ type: "text", text: "Mandag – fredag: 10–18, lørdag 10–15" }] }),
+              } as unknown as Response;
+            }
+            return {
+              ok: true, status: 200,
+              json: async () => ({ content: [{ type: "text", text: "INGEN_UTVIDELSE_MULIG" }] }),
+            } as unknown as Response;
+          }
           // Fill-from-source / rewrite prompt — not exercised by any fixture
           // below (every row's about_text current value is either non-blank
           // or already good), but answered harmlessly rather than throwing,
