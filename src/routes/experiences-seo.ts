@@ -8523,12 +8523,17 @@ router.get("/kontakt", (_req: Request, res: Response) => {
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
+  --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --amber-500:#ff5d3b;--teal-400:#3cc3b4;
+  --ink-soft:#544a3e;--surface:#fff;--line:#e4ded0;
+  --r-pill:999px;--sh-md:0 6px 18px rgba(24,19,13,.10);--maxw:1120px;
+}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f7f4ee;color:#18130d;line-height:1.6;min-height:100vh;display:flex;flex-direction:column}
 a{color:#0c7264;text-decoration:none}
 a:hover{text-decoration:underline}
-.site-nav{background:rgba(244,248,244,.92);border-bottom:1px solid #dde8dd;padding:0 24px;height:60px;display:flex;align-items:center;gap:32px;position:sticky;top:0;z-index:100}
-.brand{font-weight:800;font-size:1.16rem;color:#0b2e29}
-.nav-links{display:flex;gap:22px;font-size:.88rem;font-weight:600;color:#4a6a4f}
+${OA_CHROME_CSS}
 .main-content{max-width:660px;margin:0 auto;padding:48px 24px 80px;flex:1}
 h1{font-size:1.9rem;font-weight:800;color:#0b2e29;margin-bottom:8px}
 .subtitle{color:#6a7a6a;margin-bottom:36px}
@@ -8540,22 +8545,10 @@ input:focus,textarea:focus{outline:none;border-color:#12a594;box-shadow:0 0 0 3p
 .btn{background:#0b2e29;color:#fff;padding:12px 28px;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:8px;font-family:inherit;transition:background .15s}
 .btn:hover{background:#0f5a50}
 .btn:disabled{opacity:.6;cursor:not-allowed}
-.site-footer{background:#0b2e29;color:rgba(255,255,255,.66);padding:40px 24px 28px;margin-top:auto}
-.footer-inner{max-width:1100px;margin:0 auto;display:flex;flex-wrap:wrap;gap:28px 48px;justify-content:space-between;font-size:.85rem}
-.footer-inner a{color:rgba(255,255,255,.62)}
-.footer-inner a:hover{color:#fff;text-decoration:none}
-.footer-bottom{max-width:1100px;margin:24px auto 0;padding-top:16px;border-top:1px solid rgba(255,255,255,.1);font-size:.78rem;color:rgba(255,255,255,.4)}
 </style>
 </head>
 <body>
-<nav class="site-nav">
-  <a class="brand" href="/">opplevagent.no</a>
-  <div class="nav-links">
-    <a href="/opplevelser">Opplevelser</a>
-    <a href="#kategorier">Kategorier</a>
-    <a href="/kontakt" aria-current="page">Kontakt</a>
-  </div>
-</nav>
+${oaSiteNav({})}
 
 <div class="main-content">
   <h1>Kontakt oss</h1>
@@ -8594,27 +8587,7 @@ input:focus,textarea:focus{outline:none;border-color:#12a594;box-shadow:0 0 0 3p
   </form>
 </div>
 
-<footer class="site-footer">
-  <div class="footer-inner">
-    <div>
-      <div style="font-weight:800;color:#fff;margin-bottom:8px">Opplevagent</div>
-      <div>Norske opplevelser for mennesker og AI-agenter.</div>
-    </div>
-    <div>
-      <div style="font-weight:700;color:#fff;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Utforsk</div>
-      <a href="/opplevelser">Alle opplevelser</a><br>
-      <a href="/#kategorier">Kategorier</a><br>
-      <a href="/kontakt">Kontakt oss</a>
-    </div>
-    <div>
-      <div style="font-weight:700;color:#fff;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">For agenter</div>
-      <a href="/llms.txt">llms.txt</a><br>
-      <a href="/.well-known/agent-card.json">agent-card.json</a><br>
-      <a href="/api/opplevelser/discover">/api/opplevelser</a>
-    </div>
-  </div>
-  <div class="footer-bottom">&copy; ${new Date().getFullYear()} Opplevagent</div>
-</footer>
+${oaSiteFooter({})}
 
 <script>
 (function(){

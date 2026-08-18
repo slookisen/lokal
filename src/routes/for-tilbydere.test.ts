@@ -26,8 +26,11 @@
  *   (f) NO + EN strings: the EN landing render shows "For providers"
  *       pointing at the same /for-tilbydere URL (the page is NO-canonical
  *       with no /en variant — same convention as /opplevelser).
- *   (g) negative control: the link does NOT leak into the old hardcoded
- *       slim-nav pages that don't use the S1 helpers (/opplevelser).
+ *   (g) dev-request orch-pr-20260818-kontakt-shared-chrome: /kontakt was
+ *       migrated onto the shared S1 chrome too, so it now DOES pick up the
+ *       «For tilbydere» link in oaSiteNav()/oaSiteFooter() (no more negative
+ *       control here — see experiences-seo-site-chrome.test.ts for its full
+ *       chrome-migration coverage).
  *
  * Same synthetic invokeRoute harness + in-memory-DB pattern as
  * experiences-seo-gardssalg-typesider.test.ts (S3).
@@ -327,19 +330,16 @@ export function runForTilbydereTests(opts: { log?: boolean } = {}): Promise<Test
       );
       assertTrue(!homeEn.body.includes(">For tilbydere<"), "f4: the Norwegian label doesn't leak into the EN render");
 
-      // ── (g) negative control: old hardcoded nav variants untouched ─────
-      // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
-      // (delt header/footer): /opplevelser migrated to the shared S1 chrome in
-      // that slice, so it's no longer a valid negative control (see the "all
-      // migrated routes" positive-control block in
-      // experiences-seo-site-chrome.test.ts instead). /kontakt still renders
-      // its own standalone inline chrome (never called renderBrowsePage /
-      // BROWSE_NAV in the first place), so it remains a valid target here.
+      // ── (g) /kontakt: migrated onto the shared S1 chrome (dev-request
+      // orch-pr-20260818-kontakt-shared-chrome) — it now renders oaSiteNav()/
+      // oaSiteFooter() same as every other adopter, so the «For tilbydere»
+      // link DOES appear (no longer a negative control; full chrome-migration
+      // coverage for /kontakt lives in experiences-seo-site-chrome.test.ts).
       const kontakt = invokeRoute(router, "/kontakt", {}, "/kontakt");
       assertTrue(kontakt.handled && kontakt.status === 200, `g1: GET /kontakt renders 200 (got ${kontakt.status})`);
       assertTrue(
-        !kontakt.body.includes('href="/for-tilbydere"'),
-        "g2: /kontakt's own standalone inline nav/footer does NOT pick up the new link"
+        kontakt.body.includes('href="/for-tilbydere"'),
+        "g2: /kontakt now renders the shared chrome, which includes the For-tilbydere link"
       );
     } catch (err: any) {
       failed++;
