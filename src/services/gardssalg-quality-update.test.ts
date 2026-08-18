@@ -275,6 +275,26 @@ export function runGardssalgQualityUpdateTests(opts: { log?: boolean } = {}): Te
     "32: hashing different text yields different hashes"
   );
 
+  // ── current_defective_no_clean_candidate: current IS defective but no ───
+  // ── clean candidate exists to replace it with (report-mode precision) ───
+  assertEq(
+    planGardssalgFieldReplacement("about_text", CSS_LEAK_CURRENT, null),
+    { shouldReplace: false, reason: "current_defective_no_clean_candidate" },
+    "33: defective current (CSS leakage) + no candidate -> reports the real current-side defect instead of a generic null reason"
+  );
+  assertEq(
+    planGardssalgFieldReplacement("about_text", CSS_LEAK_CURRENT, "Kort."),
+    { shouldReplace: false, reason: "current_defective_no_clean_candidate" },
+    "34: defective current (CSS leakage) + a candidate that is ITSELF defective (too_short) -> still reports the real current-side defect, not null"
+  );
+  assertEq(
+    planGardssalgFieldReplacement("opening_hours_text", BRINGEBAERLANDET_HOURS, BRINGEBAERLANDET_HOURS),
+    { shouldReplace: false, reason: "current_defective_no_clean_candidate" },
+    "35 (AC12/13 regression, Bringebærlandet ce85458a): a fresh candidate extracted from the same defective page " +
+      "region inherits the identical UI-chrome leakage ('Previous Next') as the current value -- the defect is " +
+      "still surfaced (current_defective_no_clean_candidate), never silently dropped to reason:null"
+  );
+
   return { passed, failed, failures };
 }
 

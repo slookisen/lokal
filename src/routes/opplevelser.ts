@@ -3810,7 +3810,7 @@ router.post("/admin/gardssalg-content-quality-update", requireAdmin, async (req:
         notReplaced.push({
           provider_id: providerId,
           field_name: field,
-          reason: !candidate ? "no_candidate" : "no_defect_no_margin",
+          reason: decision.reason ?? (!candidate ? "no_candidate" : "no_defect_no_margin"),
         });
         continue;
       }
