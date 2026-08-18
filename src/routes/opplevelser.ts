@@ -249,7 +249,34 @@ import {
   // preview can never claim a field the real apply path's own veto would
   // actually refuse (see applyGardssalgMedlemslisteEnrichment's doc comment).
   gardssalgContactFieldWasRolledBack,
+  // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
+  // Skive 3 — candidate selection for POST /admin/gardssalg-content-quality-
+  // update below (services/gardssalg-quality-update.ts owns the classifier/
+  // margin/anti-churn POLICY; selection stays here in experience-store.ts,
+  // same split every other gårdssalg admin route in this file already uses).
+  selectGardssalgProvidersForQualityUpdate,
+  getGardssalgProviderQualityUpdateTarget,
+  listGardssalgFieldValuesForQualityUpdate,
+  type GardssalgQualityUpdateTarget,
 } from "../services/experience-store";
+// dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
+// Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
+// fill-only"): the pure defect classifier (B) + info-point margin proxy (C)
+// + anti-churn check (D) + the audited writer (E). See that module's own
+// header doc comment for the full policy this backs. Owner-lock (A) is NOT
+// re-implemented here — isGardssalgFieldOwnerLocked (imported above from
+// experience-store) is reused exactly as every other gårdssalg writer in
+// this file already reuses it.
+import {
+  GARDSSALG_QUALITY_FIELDS,
+  classifyGardssalgFieldDefect,
+  planGardssalgFieldReplacement,
+  checkGardssalgAntiChurn,
+  applyGardssalgQualityReplacement,
+  hashGardssalgSourceContent,
+  type GardssalgQualityFieldName,
+  type GardssalgQualityPlanItem,
+} from "../services/gardssalg-quality-update";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
 // common-token rule merged some genuinely different experiences), consumed by
@@ -3571,6 +3598,279 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
     // owner-locked this run (0 nulled as a result) — additive bucket,
     // distinct from skipped_locked (manual, row-level, never-fetched) above.
     owner_field_locked: ownerFieldLocked,
+    errors,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-content-quality-update (admin) ───
+//
+// dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
+// Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
+// fill-only"). Daniel, live session 2026-08-17: "en dårlig beskrivelse skal
+// kunne endres med en mer komplett og bedre beskrivelse ... Riktig info skal
+// kunne byttes med feil info ... Det eneste unntaket er dersom profilen er
+// tatt over av en eier, og dem har gjort egne endringer, da skal feltene
+// sperres ... med mindre eier spesifikt ber oss om å gjøre det."
+//
+// Every OTHER gårdssalg content writer in this file is fill-only once a
+// field is non-blank (about_text/visit_text get a narrow replace-thin-or-
+// contaminated carve-out via gardssalgReplaceableFieldAction, but NEVER
+// opening_hours_text — see that function's own doc comment above,
+// experience-store.ts). This route is the missing REPLACE lever: it may
+// overwrite a NON-BLANK about_text/visit_text/opening_hours_text when a
+// fresh candidate is *measurably* better — an objective defect (Skive 3-B)
+// or a strict information-point margin (Skive 3-C) — never merely because
+// it is newer, and never when isGardssalgFieldOwnerLocked says the owner has
+// touched that exact field (Skive 3-A, absolute, checked first, own report
+// bucket — never folded into the generic skipped bucket).
+//
+// Candidate GENERATION reuses the EXACT SAME pipeline POST /admin/gardssalg-
+// content-refresh already uses above (crFetchGardssalgContent +
+// summarizeAbout/summarizeVisit/extractOpeningHours + the
+// meetsGardssalgAboutQualityBar LLM-judge cascade for about_text/
+// visit_text) — this route adds NO new content-extraction logic, only a new
+// REPLACE policy on top of the same kind of candidates. The policy itself
+// (classifier + margin + anti-churn + audited write) lives in
+// services/gardssalg-quality-update.ts — see that module's own header doc
+// comment for the full contract.
+//
+// Two-stage rollout (Skive 3-F): `apply` omitted/false is the default and is
+// a PURE READ (zero writes) — it plans every candidate replacement (defect
+// or margin reason) and returns a diff array for Daniel to review BEFORE
+// anyone ever calls apply=true. This route is a MANUALLY-INVOKED lever
+// only — it is deliberately NOT wired into experiences-enrichment.md or any
+// other charter/cron/scheduled-agent file by this slice.
+//
+// Scope: about_text/visit_text/opening_hours_text ONLY (GARDSSALG_QUALITY_
+// FIELDS) — the three free-text fields the dev-request's own examples
+// concern (incl. the Bringebærlandet/ce85458a "Previous Next" slider-chrome
+// defect in opening_hours_text, acceptance criterion 13). hjemmeside/
+// adresse/contact fields already have their own fill-only/verification
+// flows, deliberately untouched here.
+//
+// Rollback: every replacement writes exactly one gardssalg_content_audit row
+// via the SAME insert shape every other gårdssalg writer in this file uses
+// (see applyGardssalgQualityReplacement's own doc comment,
+// gardssalg-quality-update.ts) — the EXISTING POST /admin/gardssalg-content-
+// rollback restores it with NO changes to that endpoint whatsoever
+// (about_text/visit_text/opening_hours_text are already members of
+// GARDSSALG_ROLLBACKABLE_FIELDS there).
+const GS_CQU_DEFAULT_LIMIT = 25;
+const GS_CQU_HARD_CAP = 200;
+
+router.post("/admin/gardssalg-content-quality-update", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    apply?: unknown;
+    limit?: unknown;
+    cohort?: unknown;
+    batch_id?: unknown;
+    providerIds?: unknown;
+  };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_CQU_DEFAULT_LIMIT,
+    GS_CQU_HARD_CAP
+  );
+
+  // `cohort` (optional): restricts the scan to ONE producer_type (e.g.
+  // "bryggeri"). A coarse scoping knob for a manual review run — distinct
+  // from GS_WV_COHORTS' gårdssalg-vs-non-gårdssalg vocabulary
+  // (gardssalg-website-verification.ts); this route only ever scans
+  // gårdssalg rows to begin with. Omitted -> every gårdssalg producer_type.
+  const cohort = typeof body.cohort === "string" && body.cohort.trim() ? body.cohort.trim() : null;
+
+  const batchId =
+    typeof body.batch_id === "string" && body.batch_id.trim()
+      ? body.batch_id.trim()
+      : `gardssalg-cq-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  let targets: GardssalgQualityUpdateTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim())
+      .slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderQualityUpdateTarget(id))
+      .filter((t): t is GardssalgQualityUpdateTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForQualityUpdate(limit);
+  }
+  if (cohort) targets = targets.filter((t) => t.producer_type === cohort);
+
+  // One-time snapshot of every OTHER gårdssalg provider's current field
+  // values, for the "identical to a DIFFERENT provider's stored value"
+  // (template-leakage) defect check — same cost-bounded discipline as every
+  // other one-query-per-run lookup in this file (e.g. gardssalgRows/
+  // knownOrgnr above in gardssalg-nace-discovery), not one query per row.
+  const allFieldValues = listGardssalgFieldValuesForQualityUpdate();
+  function othersFor(providerId: string, field: GardssalgQualityFieldName): string[] {
+    return allFieldValues.filter((r) => r.id !== providerId).map((r) => r[field]).filter((v): v is string => !!v && v.trim() !== "");
+  }
+
+  let scanned = 0;
+  const diff: GardssalgQualityPlanItem[] = [];
+  const ownerLocked: Array<{ provider_id: string; field_name: GardssalgQualityFieldName }> = [];
+  const antiChurnBlocked: Array<{ provider_id: string; field_name: GardssalgQualityFieldName; last_changed_at?: string }> = [];
+  const notReplaced: Array<{ provider_id: string; field_name: GardssalgQualityFieldName; reason: string }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  async function planOne(t: GardssalgQualityUpdateTarget): Promise<void> {
+    const providerId = t.id;
+
+    // Row-level lock short-circuit — same "never touch the network for a
+    // fully-locked row" discipline every other gårdssalg fetcher in this
+    // file uses. 'claim' rows still proceed (their per-field lock is decided
+    // per-field below, via isGardssalgFieldOwnerLocked, same as everywhere
+    // else) — but if EVERY one of the 3 fields is already locked for a
+    // 'claim' row (owner has touched about_text, visit_text AND opening_
+    // hours_text), skip the fetch too — nothing this run could ever write.
+    const candidateFields = GARDSSALG_QUALITY_FIELDS.filter((f) => !isGardssalgFieldOwnerLocked(t, f));
+    for (const f of GARDSSALG_QUALITY_FIELDS) {
+      if (!candidateFields.includes(f)) ownerLocked.push({ provider_id: providerId, field_name: f });
+    }
+    if (candidateFields.length === 0) return;
+    // Also skip a field with a currently-blank value — out of scope for this
+    // lever (fill-only's job) — before ever fetching.
+    const blankFilter = candidateFields.filter((f) => t[f] != null && String(t[f]).trim() !== "");
+    if (blankFilter.length === 0) return;
+
+    if (apply) {
+      try { markProviderContentAttempted(providerId); } catch { /* best-effort */ }
+    }
+
+    let fetched: CrFetchOutcome;
+    try {
+      fetched = await crFetchGardssalgContent(t.hjemmeside);
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      return; // internal fault, not evidence the site is dead — no parking strike
+    }
+    if (!fetched.ok) {
+      errors.push({ provider_id: providerId, error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${t.hjemmeside}` });
+      if (apply && fetched.persistence !== "transient") {
+        try { recordProviderHomepageFetchResult(providerId, false); } catch { /* best-effort */ }
+      }
+      return;
+    }
+    if (apply) {
+      try { recordProviderHomepageFetchResult(providerId, true); } catch { /* best-effort */ }
+    }
+    scanned++;
+
+    const { primaryHtml, combinedHtml } = fetched;
+    const contentText = extractVisibleText(combinedHtml);
+    // Hashed from the RAW combinedHtml, not the post-extraction contentText:
+    // about_text's candidate is drawn from summarizeAbout(primaryHtml)'s
+    // og:description/meta lookup, which lives in an HTML ATTRIBUTE — invisible
+    // to extractVisibleText's body-text extraction. Hashing contentText alone
+    // would miss a producer changing only their meta description (source
+    // genuinely changed, candidate genuinely changes, but the anti-churn hash
+    // would not) — hashing the raw combined HTML instead covers every source
+    // this route ever derives a candidate from (meta attributes AND body text).
+    const contentHash = hashGardssalgSourceContent(combinedHtml);
+
+    // Same extraction + LLM-judge cascade content-refresh already uses for
+    // about_text/visit_text (meetsGardssalgAboutQualityBar) — a candidate
+    // this route ever considers is one that pipeline would already trust.
+    // opening_hours_text keeps the same non-judged extractOpeningHours()
+    // extraction content-refresh uses (never judged there either) —
+    // classifyGardssalgFieldDefect/planGardssalgFieldReplacement below still
+    // independently re-check the CANDIDATE itself before ever proposing it.
+    const aboutSummary = summarizeAbout(primaryHtml);
+    const visitSummary = summarizeVisit(combinedHtml);
+    const hoursSnippet = extractOpeningHours(contentText);
+    const candidateAboutRaw = (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about")) ? aboutSummary : null;
+    const candidateVisitRaw = (await meetsGardssalgAboutQualityBar(visitSummary, t.navn, "visit")) ? visitSummary : null;
+    // Same duplicate-extraction guard content-refresh uses (the Draopar
+    // incident — summarizeAbout/summarizeVisit can independently land on the
+    // exact same block on a page with no distinct "visit us" section).
+    const candidateVisit = candidateVisitRaw && candidateVisitRaw !== candidateAboutRaw ? candidateVisitRaw : null;
+    const candidateAbout = candidateAboutRaw;
+    const candidateHours = hoursSnippet && hoursSnippet.trim() ? hoursSnippet : null;
+    const candidateByField: Record<GardssalgQualityFieldName, string | null> = {
+      about_text: candidateAbout,
+      visit_text: candidateVisit,
+      opening_hours_text: candidateHours,
+    };
+
+    for (const field of blankFilter) {
+      const candidate = candidateByField[field];
+      const decision = planGardssalgFieldReplacement(field, t[field], candidate, othersFor(providerId, field));
+      if (!decision.shouldReplace) {
+        notReplaced.push({
+          provider_id: providerId,
+          field_name: field,
+          reason: !candidate ? "no_candidate" : "no_defect_no_margin",
+        });
+        continue;
+      }
+      const antiChurn = checkGardssalgAntiChurn(getExpDb("experiences"), providerId, field, contentHash);
+      if (!antiChurn.allowed) {
+        antiChurnBlocked.push({ provider_id: providerId, field_name: field, last_changed_at: antiChurn.last_changed_at });
+        continue;
+      }
+      diff.push({
+        provider_id: providerId,
+        field_name: field,
+        current_value: String(t[field]),
+        candidate_value: candidate as string,
+        reason: decision.reason as string,
+        source_url: fetched.fetchUrl,
+        content_hash: contentHash,
+      });
+    }
+  }
+
+  for (let i = 0; i < targets.length; i += CR_CONCURRENCY) {
+    const slice = targets.slice(i, i + CR_CONCURRENCY);
+    await Promise.all(slice.map((t) => planOne(t)));
+  }
+
+  if (dryRun) {
+    res.json({
+      dry_run: true,
+      scanned,
+      batch_id: batchId,
+      diff,
+      owner_locked: ownerLocked,
+      anti_churn_blocked: antiChurnBlocked,
+      not_replaced: notReplaced,
+      errors,
+    });
+    return;
+  }
+
+  const db = getExpDb("experiences");
+  const applied: Array<{ provider_id: string; field_name: GardssalgQualityFieldName; reason: string }> = [];
+  const skipped: Array<{ provider_id: string; field_name: GardssalgQualityFieldName; outcome: string; reason?: string }> = [];
+  for (const item of diff) {
+    const result = applyGardssalgQualityReplacement(db, item, batchId, othersFor(item.provider_id, item.field_name));
+    if (result.outcome === "applied") {
+      applied.push({ provider_id: item.provider_id, field_name: item.field_name, reason: item.reason });
+    } else {
+      skipped.push({ provider_id: item.provider_id, field_name: item.field_name, outcome: result.outcome, reason: result.reason });
+    }
+  }
+
+  res.json({
+    dry_run: false,
+    scanned,
+    batch_id: batchId,
+    applied,
+    skipped,
+    owner_locked: ownerLocked,
+    anti_churn_blocked: antiChurnBlocked,
+    not_replaced: notReplaced,
     errors,
   });
 });
