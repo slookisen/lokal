@@ -1200,6 +1200,85 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         }
       }
 
+      // ── wd-24 (dev-request 2026-08-17-discovery-hand-off-og-skedulering,
+      //    Skive 2 — the one gap Skive 1's provider_work_queue left open): a
+      //    pending sweep->discovery "evidence_url_rejected" queue row already
+      //    carries the exact URL the sweep just disproved for this provider
+      //    (payload.rejected_url) — discovery must never re-propose that SAME
+      //    host, via EITHER tier, and must never even fetch it. ─────────────
+      {
+        insertProvider.run({ id: "wd-rejhost", navn: "Kveldsro Sideri", org_nr: "999111266", kommune: "Ulvik", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        // The sweep already tried this exact host (via an evidence_url
+        // candidate) and it failed ownership-proof — recorded as a pending
+        // discovery-targeted work-queue row, same shape Skive 1 writes.
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-rejhost",
+          provider_name: "Kveldsro Sideri",
+          from_system: "sweep",
+          to_system: "discovery",
+          reason: "evidence_url_rejected",
+          payload: JSON.stringify({ rejected_url: "https://kveldsrosideri-ekte.no/om-oss" }),
+        });
+
+        // Tier-2 search is rigged to hand back EXACTLY that host as its only
+        // result — proving the exclusion applies to search-sourced
+        // candidates too, not just the tier-1 name-guess list.
+        expStore.__setGardssalgWebsiteSearchForTesting(async () => [
+          { title: "Kveldsro Sideri", url: "https://kveldsrosideri-ekte.no", description: "Kveldsro Sideri i Ulvik" },
+        ]);
+
+        const rejHostFetchCalls: string[] = [];
+        const prevFetch8 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const urlStr = String(url);
+          rejHostFetchCalls.push(urlStr);
+          // Would VERIFY if ever fetched — proves any exclusion observed
+          // below is the rejected-host guard, not a missing/failing page.
+          // Title tag included deliberately: the weakest verification branch
+          // (name+place, no org_nr/phone match) also requires the producer's
+          // name in <title> (2026-08-06 incident fix) — without it this page
+          // would never verify for EITHER provider below, making wd-24a's
+          // "would verify if fetched" premise false.
+          if (urlStr.startsWith("https://kveldsrosideri-ekte.no")) {
+            return { ok: true, status: 200, url: urlStr, text: async () => "<html><head><title>Kveldsro Sideri</title></head><body>Kveldsro Sideri, Ulvik</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-rejhost"], apply: true },
+          });
+
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-rejhost"),
+            "wd-24a: the just-rejected host is never proposed, even though it would verify if fetched");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-rejhost"),
+            "wd-24b: falls through to no_candidate_verified instead");
+          assertTrue(!rejHostFetchCalls.some((u) => u.includes("kveldsrosideri-ekte.no")),
+            "wd-24c: the rejected host is never even fetched (excluded pre-fetch, both tiers)");
+          const rejQ = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-rejhost'`).get() as any).c;
+          assertEq(rejQ, 0, "wd-24d: no review-queue write for the excluded row");
+
+          // A DIFFERENT provider's tier-2 result for the SAME host string
+          // must be unaffected — the exclusion is scoped per-provider (keyed
+          // off THAT provider's own pending queue row), not global.
+          insertProvider.run({ id: "wd-rejhost-other", navn: "Kveldsro Sideri", org_nr: "999111299", kommune: "Ulvik", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+          expStore.__setGardssalgWebsiteSearchForTesting(async () => [
+            { title: "Kveldsro Sideri", url: "https://kveldsrosideri-ekte.no", description: "Kveldsro Sideri i Ulvik" },
+          ]);
+          const r2 = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-rejhost-other"], apply: true },
+          });
+          assertTrue((r2.body.proposed as any[]).some((p) => p.provider_id === "wd-rejhost-other" && p.candidate_url === "https://kveldsrosideri-ekte.no"),
+            "wd-24e: the SAME host is proposed for an unrelated provider with no rejection recorded against it — exclusion is per-provider, not a global blocklist");
+        } finally {
+          globalThis.fetch = prevFetch8;
+          expStore.__setGardssalgWebsiteSearchForTesting(null);
+        }
+      }
+
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));

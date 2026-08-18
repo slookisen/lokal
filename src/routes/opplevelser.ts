@@ -370,9 +370,18 @@ import {
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 1: the shared provider_work_queue hand-off table between the
 // sweep/berikelse/discovery gårdssalg pipelines.
+//
+// listPendingProviderWorkQueue below is this same table's read side, used
+// here by dev-request 2026-08-17-discovery-hand-off-og-skedulering (Skive 2)
+// to close the one gap Skive 1 left open: an `evidence_url_rejected` queue
+// row already carries the specific URL the sweep just disproved
+// (`payload.rejected_url`), but nothing consumed it — discovery could still
+// blindly re-propose the exact host the sweep just rejected for that same
+// provider. See the rejected-host exclusion below.
 import {
   enqueueProviderWorkQueueItem,
   resolveProviderWorkQueueItems,
+  listPendingProviderWorkQueue,
 } from "../services/provider-work-queue";
 // orchestrator dev-request 2026-08-03-gardssalg-field-concordance:
 // GET /admin/gardssalg-field-concordance-audit — read-only per-field
@@ -4620,6 +4629,28 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
     targets = selectGardssalgProvidersForWebsiteDiscovery(limit);
   }
 
+  // Skive 2 (dev-request 2026-08-17-discovery-hand-off-og-skedulering):
+  // index pending sweep->discovery "evidence_url_rejected" queue rows by
+  // provider_id, so the per-target loop below can skip re-trying a host the
+  // sweep JUST rejected for that same provider (AC3). `missing_source` rows
+  // carry no rejected_url (no candidate was ever tried) and are irrelevant
+  // here — this route already picks those providers up via
+  // selectGardssalgProvidersForWebsiteDiscovery's priority pass (Skive 1),
+  // it just has nothing host-specific to exclude for them.
+  const rejectedHostByProvider = new Map<string, string>();
+  for (const row of listPendingProviderWorkQueue("discovery")) {
+    if (row.reason !== "evidence_url_rejected" || !row.payload) continue;
+    let rejectedUrl: unknown;
+    try {
+      rejectedUrl = JSON.parse(row.payload)?.rejected_url;
+    } catch {
+      continue; // malformed payload -> nothing to exclude, never throw
+    }
+    if (typeof rejectedUrl !== "string" || rejectedUrl.trim() === "") continue;
+    const host = hostFromUrlLike(rejectedUrl);
+    if (host) rejectedHostByProvider.set(row.provider_id, host.toLowerCase());
+  }
+
   const hostCounts = gardssalgSharedHostCounts();
   // Tier-2 search dependency: a test override always wins (never touches the
   // network); otherwise the real braveSearch, wired with whichever Brave env
@@ -4663,8 +4694,15 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
     const tried: string[] = [];
     const excludedHere: Array<{ host: string; reason: string }> = [];
 
+    // Skive 2 (AC3): never blindly retry the exact host the sweep just
+    // rejected for THIS provider — case-insensitive, a no-op when there is
+    // no pending evidence_url_rejected row for this provider.
+    const rejectedHost = rejectedHostByProvider.get(t.id);
+    const excludeRejectedHost = (hosts: string[]): string[] =>
+      rejectedHost ? hosts.filter((h) => h.toLowerCase() !== rejectedHost) : hosts;
+
     // Tier 1 — free name-guess candidates, tried first.
-    const nameGuessHosts = gardssalgWebsiteCandidateHosts(t.navn);
+    const nameGuessHosts = excludeRejectedHost(gardssalgWebsiteCandidateHosts(t.navn));
     let hit = await tryGardssalgCandidateHosts(nameGuessHosts, hostCounts, t, tried, excludedHere);
 
     // Tier 2 — search-based candidates, ONLY when tier 1 verified nothing,
@@ -4674,7 +4712,7 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
       try {
         const query = gardssalgWebsiteSearchQuery(t);
         const results: BraveResult[] = await searchFn(query);
-        const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, GS_WD_SEARCH_MAX_CANDIDATES);
+        const searchHosts = excludeRejectedHost(gardssalgWebsiteSearchCandidateHosts(results, GS_WD_SEARCH_MAX_CANDIDATES));
         hit = await tryGardssalgCandidateHosts(searchHosts, hostCounts, t, tried, excludedHere);
       } catch {
         // A search failure (network/HTTP error) must not abort the row — it
