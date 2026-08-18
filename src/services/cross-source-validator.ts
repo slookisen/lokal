@@ -987,7 +987,7 @@ function brandTokensSimilar(ta: string, tb: string): boolean {
   return false;
 }
 
-function domainsEquivalent(a: string, b: string): boolean {
+export function domainsEquivalent(a: string, b: string): boolean {
   if (a === b) return true;
   if (collapseDomain(a) === collapseDomain(b)) return true;
   // PR-129: cross-TLD same-brand equality. A producer using the same brand on a

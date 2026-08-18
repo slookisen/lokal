@@ -169,6 +169,7 @@ export const GENERIC_DOMAINS: ReadonlySet<string> = new Set([
   "google.com", "maps.google.com", "goo.gl", "linktr.ee",
   "wixsite.com", "wix.com", "squarespace.com", "wordpress.com", "blogspot.com",
   "weebly.com", "webnode.no", "one.com", "gmail.com", "hotmail.com", "outlook.com",
+  "myshopify.com",
 ]);
 
 /** A domain we can safely use as a unique producer identity for matching. */

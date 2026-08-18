@@ -537,7 +537,14 @@ import {
   PLACEHOLDER_EMAIL_DOMAINS,
   FREE_MAIL_DOMAINS,
   hasHomepageEvidence,
+  domainsEquivalent,
 } from "../services/cross-source-validator";
+// dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive D — the
+// catalog-wide contact-email audit (POST /admin/gardssalg-contact-email-audit,
+// below) reuses this SAME "shared hosting apex is not a producer identity"
+// classifier gardssalg-rfb-enrich.ts already relies on, instead of hand-rolling
+// a second generic-domain list.
+import { isMatchableDomain } from "../services/gardssalg-rfb-enrich";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
 // Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
 // verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
@@ -7835,6 +7842,8 @@ router.post("/admin/gardssalg-contact-email-audit", requireAdmin, (req: Request,
   let alreadyOverrideExempt = 0;
   let alreadyFlagged = 0;
   let newlyFlagged = 0;
+  let hostPlatformDomainExcluded = 0;
+  let brandAliasDomainExcluded = 0;
 
   for (const row of rows) {
     const epost = (row.epost ?? "").trim();
@@ -7850,6 +7859,29 @@ router.post("/admin/gardssalg-contact-email-audit", requireAdmin, (req: Request,
     const emailDomain = emailHost ? registrableDomain(emailHost) : "";
     if (!emailDomain || emailDomain === websiteDomain) continue;
     if (FREE_MAIL_DOMAINS.includes(emailHostRaw.toLowerCase()) || FREE_MAIL_DOMAINS.includes(emailDomain)) continue;
+
+    // Skive D: the domain pair itself may not be a real mismatch at all —
+    // check this BEFORE the override/already-flagged/locked checks below,
+    // since those are about THIS-address-specific history, not about whether
+    // the domain pair is a genuine company mismatch.
+    //   - hosting-platform apex (myshopify.com, squarespace.com, ...): the
+    //     producer never bought a custom domain, so websiteDomain is a shared
+    //     platform apex, not an identity — it can never "match" any email
+    //     domain regardless of correctness. Reuses isMatchableDomain(), the
+    //     same "shared apex, not an identity" classifier gardssalg-rfb-enrich
+    //     already applies to hjemmeside domains.
+    if (!isMatchableDomain(websiteDomain)) {
+      hostPlatformDomainExcluded++;
+      continue;
+    }
+    //   - cross-TLD/hyphenation brand-alias (nogne-o.com vs nogne-o.no): same
+    //     brand, different TLD/hyphenation, not a different company. Reuses
+    //     domainsEquivalent(), the same PR-129 same-brand-different-TLD logic
+    //     cross-source-validator.ts already applies elsewhere.
+    if (domainsEquivalent(emailDomain, websiteDomain)) {
+      brandAliasDomainExcluded++;
+      continue;
+    }
 
     if (isGardssalgContactEmailOverrideActive(row.field_provenance, epost)) {
       alreadyOverrideExempt++;
@@ -7899,6 +7931,8 @@ router.post("/admin/gardssalg-contact-email-audit", requireAdmin, (req: Request,
     already_override_exempt: alreadyOverrideExempt,
     already_flagged: alreadyFlagged,
     newly_flagged: newlyFlagged,
+    host_platform_domain_excluded: hostPlatformDomainExcluded,
+    brand_alias_domain_excluded: brandAliasDomainExcluded,
     locked_not_flagged: lockedNotFlagged,
     mismatches,
   });
