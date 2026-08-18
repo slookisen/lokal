@@ -31,6 +31,11 @@
  *       NEITHER surface — no visible "E-post" fact row and no JSON-LD
  *       `email` — while an unflagged provider still shows both, telefon is
  *       untouched, and a flag raised against a since-changed address lapses.
+ *   (k) fix-up round, independent reviewer findings B1 + B2: a row with an
+ *       ACTIVE force-approval override publishes its address on both surfaces
+ *       even when a flag stamp for that same address is still present, and a
+ *       whitespace-padded epost flagged with its trimmed form is still hidden
+ *       from both surfaces.
  *
  * Same synthetic router.handle() harness + in-memory-DB pattern as
  * experiences-seo-gardssalg-claimed-badge.test.ts /
@@ -387,6 +392,59 @@ export function runExperiencesSeoProdusentRenderGuardsTests(opts: { log?: boolea
         const rLapsed = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/endretgard-sideri");
         assertTrue(rLapsed.handled && rLapsed.status === 200, `j10: lapsed-flag fixture renders (status ${rLapsed.status})`);
         assertTrue(rLapsed.body.includes('"email":"ny@endretgard.no"'), "j11: a flag raised against an OLD address does not suppress the new one");
+
+        // ── (k) fix-up round, independent reviewer findings B1 + B2, at the
+        // render layer — the surface that actually matters to a producer and
+        // to the AI assistants reading the JSON-LD. ──────────────────────────
+        //
+        // (k1-k3 / B1) A row carrying BOTH an active Skive A force-approval
+        // override AND a flag stamp for that same address: the human already
+        // said yes, so the address must be published on both surfaces. That is
+        // exactly the state a Daniel-approved row was stuck in before the fix
+        // (the approval never cleared the flag), and the state legacy rows
+        // flagged by the catalog audit can still be in.
+        const approvedEmail = "post@godkjentannet.no";
+        insertContactProvider.run({
+          id: "gs-rg-approved", navn: "Godkjentgård Sideri", slug: "godkjentgard-sideri",
+          hjemmeside: "https://godkjentgard.no", epost: approvedEmail, telefon: "55667711",
+          field_provenance: JSON.stringify({
+            contact_email_domain_override: {
+              approved_email: approvedEmail,
+              approved_by: "admin",
+              approved_at: "2026-08-17T10:00:00.000Z",
+              source: "manuell verifisering",
+              website_domain: "godkjentgard.no",
+              email_domain: "godkjentannet.no",
+            },
+            contact_email_flagged_review: {
+              flagged_email: approvedEmail,
+              website_domain: "godkjentgard.no",
+              email_domain: "godkjentannet.no",
+              reason: "domain_mismatch",
+              source: "catalog_audit",
+              flagged_at: "2026-08-18T09:00:00.000Z",
+            },
+          }),
+        });
+        const rApproved = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/godkjentgard-sideri");
+        assertTrue(rApproved.handled && rApproved.status === 200, `k1: force-approved fixture renders (status ${rApproved.status})`);
+        assertTrue(rApproved.body.includes(`mailto:${approvedEmail}`), "k2 (B1): a human-approved address shows in the visible E-post fact row again");
+        assertTrue(rApproved.body.includes(`"email":"${approvedEmail}"`), "k3 (B1): …and in the JSON-LD `email` an AI assistant reads");
+
+        // (k4-k6 / B2) A row whose stored epost carries leading/trailing
+        // whitespace while the audit's stamp holds the TRIMMED address: the
+        // audit reported the row as protected, so the page must actually hide
+        // it. Constructed directly — the write paths trim on the way in.
+        const paddedEpost = "  kontakt@paddetbedrift.no  ";
+        insertContactProvider.run({
+          id: "gs-rg-padded", navn: "Paddetgård Sideri", slug: "paddetgard-sideri",
+          hjemmeside: "https://paddetgard.no", epost: paddedEpost, telefon: "55667722",
+          field_provenance: flagStamp(paddedEpost.trim()),
+        });
+        const rPadded = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/paddetgard-sideri");
+        assertTrue(rPadded.handled && rPadded.status === 200, `k4: padded-epost fixture renders (status ${rPadded.status})`);
+        assertTrue(!rPadded.body.includes("kontakt@paddetbedrift.no"), "k5 (B2): a padded, flagged address is published on NEITHER surface");
+        assertTrue(rPadded.body.includes("55667722"), "k6: telefon on that row is untouched — the gate stays email-only");
       }
 
       return { passed, failed, failures };

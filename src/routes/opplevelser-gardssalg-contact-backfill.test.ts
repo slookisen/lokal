@@ -75,6 +75,13 @@
  *       active-override rows are excluded and owner-locked rows are reported
  *       but never auto-flagged; a re-run is idempotent (already_flagged); a
  *       flag lapses when epost changes
+ *   (z) fix-up round, independent reviewer findings B1 + B2: a human's
+ *       force-approval through POST /admin/gardssalg-set-contact-email clears
+ *       the pending contact_email_flagged_review stamp so the approved
+ *       address is published again (and is never re-flagged); an active
+ *       override outranks a flag stamp that is somehow still on the row; and
+ *       a whitespace-padded epost column is both flagged by the audit AND
+ *       correctly hidden by the reader (trimmed stamp vs raw column)
  */
 
 export interface TestSummary {
@@ -687,6 +694,144 @@ export function runOpplevelserGardssalgContactBackfillTests(
         auditAfterChange.body.mismatches.some((m: any) => m.provider_id === "aud-mismatch"),
         "y25: a stale flag lapses when epost changes — the new address is re-detected",
       );
+
+      // ── (z) fix-up round — independent reviewer findings B1 + B2 ──────────
+      // B1: a human force-approving an address through POST /admin/gardssalg-
+      //     set-contact-email left any existing contact_email_flagged_review
+      //     stamp in place, so the approved address stayed hidden from the
+      //     profile + JSON-LD forever (the documented resolution path silently
+      //     did nothing). Two fixes: the write clears the stale flag, and the
+      //     reader treats an ACTIVE override as outranking any flag.
+      // B2: the audit stamps the TRIMMED epost while the reader compares the
+      //     RAW column value, so a padded epost was reported as protected but
+      //     kept being published.
+      {
+        const readerMod = require("./opplevelser") as typeof import("./opplevelser");
+        const isFlagged = readerMod.isGardssalgContactEmailFlaggedForReview;
+        const setEmailUrl = "/admin/gardssalg-set-contact-email";
+
+        // ── B1: audit flags → human force-approves the SAME address ────────
+        mkProvider({
+          id: "fix-b1-resolve", navn: "Fixup Resolve", org_nr: orgFor(SHAPE_EMPTY),
+          hjemmeside: "https://fixresolve.no", epost: "kontakt@annenbedrift.no",
+          created_at: "2026-07-01 00:00:00",
+        });
+        const auditB1 = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: { apply: true } });
+        assertTrue(
+          auditB1.body.mismatches.some((m: any) => m.provider_id === "fix-b1-resolve"),
+          "z1: the catalog audit flags the domain-deviating address",
+        );
+        const rowB1Before = getProviderRow("fix-b1-resolve");
+        assertEq(
+          JSON.parse(rowB1Before.field_provenance || "{}").contact_email_flagged_review?.flagged_email,
+          "kontakt@annenbedrift.no",
+          "z2: the review stamp landed on the row",
+        );
+        assertTrue(
+          isFlagged(rowB1Before.field_provenance, rowB1Before.epost),
+          "z3: pre-condition — the flagged address is hidden from the profile page + JSON-LD",
+        );
+
+        // The documented resolution path: Daniel approves that EXACT address.
+        const forceApprove = await callRoute(opplevelserRouter, {
+          url: setEmailUrl, headers: auth,
+          body: {
+            provider_id: "fix-b1-resolve",
+            email: "kontakt@annenbedrift.no",
+            source: "manuell verifisering 2026-08-18",
+            force: true,
+          },
+        });
+        assertEq(forceApprove.status, 200, "z4: the force-approval write succeeds");
+        const rowB1After = getProviderRow("fix-b1-resolve");
+        const provB1After = JSON.parse(rowB1After.field_provenance || "{}");
+        assertEq(
+          provB1After.contact_email_flagged_review,
+          undefined,
+          "z5 (B1): the confirmed write clears the stale review flag",
+        );
+        assertEq(
+          provB1After.contact_email_domain_override?.approved_email,
+          "kontakt@annenbedrift.no",
+          "z6: the human override stamp is recorded for the approved address",
+        );
+        assertTrue(
+          typeof provB1After.epost?.source_url === "string",
+          "z7: the epost provenance entry survives the same read-modify-write merge",
+        );
+        assertTrue(
+          !isFlagged(rowB1After.field_provenance, rowB1After.epost),
+          "z8 (B1): the approved address is published again — the resolution path actually resolves",
+        );
+        const reAudit = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: {} });
+        assertTrue(
+          !reAudit.body.mismatches.some((m: any) => m.provider_id === "fix-b1-resolve"),
+          "z9: a later audit run never re-flags the approved address",
+        );
+
+        // Belt-and-suspenders: a row that carries BOTH an active override and
+        // a matching flag stamp (legacy prod data flagged before the clearing
+        // shipped, or the write-time gate re-flagging an already-approved
+        // address after some other path blanked epost) must never render as
+        // hidden — the human's yes outranks the flag.
+        mkProvider({
+          id: "fix-b1-both", navn: "Fixup Both Stamps", org_nr: orgFor(SHAPE_EMPTY),
+          hjemmeside: "https://fixboth.no", epost: "post@godkjentmen.no",
+          created_at: "2026-07-02 00:00:00",
+        });
+        expDb.prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = 'fix-b1-both'`).run(
+          JSON.stringify({
+            contact_email_domain_override: {
+              approved_email: "post@godkjentmen.no",
+              approved_by: "admin",
+              approved_at: "2026-08-17T10:00:00.000Z",
+              source: "manuell verifisering",
+              website_domain: "fixboth.no",
+              email_domain: "godkjentmen.no",
+            },
+            contact_email_flagged_review: {
+              flagged_email: "post@godkjentmen.no",
+              website_domain: "fixboth.no",
+              email_domain: "godkjentmen.no",
+              reason: "domain_mismatch",
+              source: "catalog_audit",
+              flagged_at: "2026-08-18T09:00:00.000Z",
+            },
+          }),
+        );
+        const rowBoth = getProviderRow("fix-b1-both");
+        assertTrue(
+          !isFlagged(rowBoth.field_provenance, rowBoth.epost),
+          "z10 (B1): an ACTIVE human override outranks a flag stamp still sitting on the row",
+        );
+
+        // ── B2: a padded epost in the DB ───────────────────────────────────
+        // Constructed directly: the normal write paths trim on the way in, but
+        // the contact-extraction cohort query's own TRIM(epost) != '' guard
+        // proves such rows exist in the catalog.
+        const paddedEpost = "  kontakt@paddetbedrift.no  ";
+        mkProvider({
+          id: "fix-b2-padded", navn: "Fixup Padded", org_nr: orgFor(SHAPE_EMPTY),
+          hjemmeside: "https://fixpadded.no", epost: paddedEpost,
+          created_at: "2026-07-03 00:00:00",
+        });
+        const auditB2 = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: { apply: true } });
+        assertTrue(
+          auditB2.body.mismatches.some((m: any) => m.provider_id === "fix-b2-padded"),
+          "z11: the audit detects the mismatch on a whitespace-padded epost",
+        );
+        const rowB2 = getProviderRow("fix-b2-padded");
+        assertEq(rowB2.epost, paddedEpost, "z12: the audit never rewrites (or trims) the epost column itself");
+        assertEq(
+          JSON.parse(rowB2.field_provenance || "{}").contact_email_flagged_review?.flagged_email,
+          "kontakt@paddetbedrift.no",
+          "z13: the stamp carries the TRIMMED address, while the column stays padded",
+        );
+        assertTrue(
+          isFlagged(rowB2.field_provenance, rowB2.epost),
+          "z14 (B2): the reader still hides it — trimmed stamp vs raw padded column must not diverge",
+        );
+      }
     } finally {
       globalThis.fetch = prevFetch;
       if (prevExperiencesDbPath === undefined) {

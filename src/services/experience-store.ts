@@ -4776,6 +4776,16 @@ export function applyGardssalgSetContactEmail(
     }
   }
   provenance.epost = { source_url: source, fetched_at: new Date().toISOString() };
+  // Skive C fix-up (independent review, finding B1): a confirmed epost write
+  // through THIS endpoint is a human resolving the address, so it always ends
+  // any pending review on this row. Without it, an address flagged by the
+  // write-time gate or the catalog audit (field_provenance.contact_email_
+  // flagged_review) stayed flagged even after a human force-approved that
+  // EXACT address here — the documented resolution path silently did nothing
+  // and the produsent-profil page + its JSON-LD kept hiding the approved
+  // address forever. Done inside the same read-modify-write merge (no extra
+  // write, every other provenance key preserved); a no-op when no flag exists.
+  delete provenance.contact_email_flagged_review;
   if (domainOverride) {
     const stamp: GardssalgContactEmailOverrideStamp = {
       approved_email: email,

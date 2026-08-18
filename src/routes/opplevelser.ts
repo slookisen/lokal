@@ -2464,14 +2464,31 @@ interface ContactEmailFlaggedReviewEntry {
  * human to resolve later (POST /admin/gardssalg-set-contact-email with
  * force:true, the Skive A override path).
  *
+ * An ACTIVE contact_email_domain_override for the same address (Skive A's
+ * human force-approval) also returns false, unconditionally: a human who
+ * approved this exact address outranks any flag stamp still sitting on the
+ * row (fix-up round, reviewer finding B1).
+ *
  * Missing field_provenance, missing/malformed stamp, malformed JSON, or a
- * non-matching flagged_email -> false. Never throws.
+ * non-matching flagged_email -> false. Never throws. flagged_email and the
+ * row's current epost are compared TRIMMED on both sides (finding B2 — the
+ * catalog audit stamps a trimmed address while this reader gets the raw
+ * column value).
  */
 export function isGardssalgContactEmailFlaggedForReview(
   fieldProvenanceRaw: string | null,
   currentEmail: string | null,
 ): boolean {
   if (!fieldProvenanceRaw || !currentEmail) return false;
+  // Skive C fix-up (independent review, finding B1 — belt-and-suspenders next
+  // to the flag-clearing in applyGardssalgSetContactEmail): an ACTIVE human
+  // override for this exact address always wins over any flag stamp. A row can
+  // legitimately carry both — already-existing prod data flagged before the
+  // clearing shipped, or an address that was force-approved, later blanked by
+  // some other path and then reintroduced by the write-time gate (which
+  // re-flags without consulting the override). In every such case the human
+  // has already said yes to THIS address, so it must never render as hidden.
+  if (isGardssalgContactEmailOverrideActive(fieldProvenanceRaw, currentEmail)) return false;
   try {
     const parsed = JSON.parse(fieldProvenanceRaw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
@@ -2479,7 +2496,15 @@ export function isGardssalgContactEmailFlaggedForReview(
       | ContactEmailFlaggedReviewEntry
       | undefined;
     if (!entry || typeof entry !== "object") return false;
-    return typeof entry.flagged_email === "string" && entry.flagged_email === currentEmail;
+    // Skive C fix-up (independent review, finding B2): the catalog audit
+    // stamps the TRIMMED epost (it trims during its own row processing) while
+    // this reader is handed the RAW column value straight off
+    // GardssalgProviderRow. A row whose stored epost carries leading/trailing
+    // whitespace (the contact-extraction cohort query guards against exactly
+    // those with TRIM(epost) != '', so such rows exist) compared unequal here:
+    // the audit reported the row as newly_flagged/protected while the profile
+    // page and JSON-LD kept publishing the mismatched address. Trim both sides.
+    return typeof entry.flagged_email === "string" && entry.flagged_email.trim() === currentEmail.trim();
   } catch {
     return false; // malformed existing JSON -> fail closed, never treat as flagged
   }
