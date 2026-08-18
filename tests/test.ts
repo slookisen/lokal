@@ -860,6 +860,22 @@ console.log("\n── experience-store (formatDistanceLabel) ──");
   console.log(`  experience-store: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
+// Skive 3 ("erstatter fill-only"): the PURE obvious-defect classifier (B) +
+// info-point margin proxy (C) + their combination (planGardssalgFieldReplacement)
+// in services/gardssalg-quality-update.ts. No DB access — same "pure helpers"
+// pattern as experience-store.test.ts just above.
+console.log("\n── gardssalg-quality-update (defect classifier + margin proxy) ──");
+{
+  const { runGardssalgQualityUpdateTests } = require("../src/services/gardssalg-quality-update.test") as
+    typeof import("../src/services/gardssalg-quality-update.test");
+  const r = runGardssalgQualityUpdateTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("gardssalg-quality-update: " + f);
+  console.log(`  gardssalg-quality-update: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-04-app-strategi-pwa, slice 1 of 3: manifest.json +
 // icons (rfb host only). Pins the required PWA fields on
 // src/public/manifest.json (name/short_name/start_url/display/icons).
@@ -29821,6 +29837,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gcar.failed;
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
+
+    // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
+    // Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
+    // fill-only"): POST /admin/gardssalg-content-quality-update — owner-lock
+    // (AC5), defect/margin replace decisions (AC6), audit-row shape + the
+    // EXISTING gardssalg-content-rollback endpoint restoring it (AC7), the
+    // Bringebærlandet (ce85458a) fixture (AC12/13), and anti-churn. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block
+    // for the same reason (globalThis.fetch mocked — no network access in
+    // the sandbox).
+    console.log("\n── opplevelser-gardssalg-quality-update: Skive 3 quality-update lever ──");
+    const { runOpplevelserGardssalgQualityUpdateTests } = require("../src/routes/opplevelser-gardssalg-quality-update.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-quality-update.test");
+    const gqur = await runOpplevelserGardssalgQualityUpdateTests({ log: false });
+    passed += gqur.passed;
+    failed += gqur.failed;
+    for (const f of gqur.failures) failures.push("opplevelser-gardssalg-quality-update: " + f);
+    console.log(`  opplevelser-gardssalg-quality-update: ${gqur.passed} passed, ${gqur.failed} failed`);
 
     // 2026-08-09 (rollback-veto-override, criterion 4): the deliberate-
     // override lever for a gardssalgContactFieldWasRolledBack veto —

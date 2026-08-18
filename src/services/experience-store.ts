@@ -3118,6 +3118,122 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
   return row;
 }
 
+// ─── Gårdssalg content QUALITY-UPDATE selection (dev-request 2026-08-17-
+// forsyningskjede-samarbeid-og-kvalitetsoppdatering, Skive 3 — "erstatter
+// fill-only") ────────────────────────────────────────────────────────────
+//
+// selectGardssalgProvidersForContentRefresh above only ever selects rows
+// THIN on a field (fill-only's own scope). Skive 3 policy-changes the
+// pipeline to also be able to REPLACE a measurably-defective or measurably-
+// thinner NON-BLANK value — see services/gardssalg-quality-update.ts for the
+// classifier/margin/anti-churn policy this selection feeds. This is the
+// counterpart selection: candidates with a website, not row-locked, and with
+// AT LEAST ONE of about_text/visit_text/opening_hours_text already NON-blank
+// (a row where all three are blank has nothing for this lever to do — that's
+// entirely fill-only's job, unchanged).
+export type GardssalgQualityUpdateTarget = {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+  content_source: string | null;
+  producer_type: string | null;
+  about_text: string | null;
+  visit_text: string | null;
+  opening_hours_text: string | null;
+  field_provenance: string | null;
+};
+
+/**
+ * Auto-select candidates for POST /admin/gardssalg-content-quality-update.
+ * Same exclusions as selectGardssalgProvidersForContentRefresh (gårdssalg
+ * WITH a website, real producers only — 'test-gardssalg' excluded, same as
+ * every other admin sweep in this file — not catalog_hidden, not row-locked
+ * 'manual'; 'claim' rows ARE included here, since the per-field owner-lock
+ * decision happens downstream via isGardssalgFieldOwnerLocked, never by
+ * excluding the whole row at select time) and the SAME
+ * providerParkingExclusionSql() 3-strikes exclusion. Ordered oldest-attempted
+ * first via the SAME last_content_attempt_at/homepage_fetch_attempts cadence
+ * counters selectGardssalgProvidersForContentRefresh uses — this lever is a
+ * different admin route, but it fetches the SAME homepages and should not
+ * re-hammer a site another gårdssalg fetcher already tried recently.
+ */
+export function selectGardssalgProvidersForQualityUpdate(limit = 25): GardssalgQualityUpdateTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(200, limit));
+  return db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, producer_type,
+              about_text, visit_text, opening_hours_text, field_provenance
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+          AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (content_source IS NULL OR content_source != 'manual')
+          AND (
+                (about_text IS NOT NULL AND TRIM(about_text) != '')
+             OR (visit_text IS NOT NULL AND TRIM(visit_text) != '')
+             OR (opening_hours_text IS NOT NULL AND TRIM(opening_hours_text) != '')
+              )
+          ${providerParkingExclusionSql()}
+        ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC
+        LIMIT ?`
+    )
+    .all(cap) as GardssalgQualityUpdateTarget[];
+}
+
+/**
+ * Resolve an explicit providerId for the quality-update route's
+ * `providerIds` override — mirrors getGardssalgProviderContentTarget's own
+ * override semantics exactly (bypasses the thin/blank + lock filters above,
+ * so an admin can force-run a SPECIFIC provider — e.g. the Bringebærlandet
+ * (ce85458a) acceptance-criterion fixture — regardless of auto-select
+ * eligibility/cadence ordering). Returns null when the provider doesn't
+ * exist, isn't a gårdssalg provider, or has no usable website.
+ */
+export function getGardssalgProviderQualityUpdateTarget(providerId: string): GardssalgQualityUpdateTarget | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, producer_type,
+              about_text, visit_text, opening_hours_text, field_provenance
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get(providerId) as GardssalgQualityUpdateTarget | undefined;
+  if (!row || !row.hjemmeside || row.hjemmeside.trim().length === 0) return null;
+  return row;
+}
+
+/**
+ * Every gårdssalg provider's CURRENT stored value for the three quality-
+ * update fields, keyed by id — feeds the "identical to another provider's
+ * stored value" (template-leakage) defect check in
+ * services/gardssalg-quality-update.ts. One query per run (not per
+ * candidate row): cheap (dozens of gårdssalg rows total), and every
+ * candidate row's duplicate-check needs the SAME full set to compare
+ * against. Scoped the same as listGardssalgProviders (visible gårdssalg rows
+ * only — a value only stored on a catalog_hidden test row is not a
+ * meaningful template-leakage signal for a real producer).
+ */
+export function listGardssalgFieldValuesForQualityUpdate(): Array<{
+  id: string;
+  about_text: string | null;
+  visit_text: string | null;
+  opening_hours_text: string | null;
+}> {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT id, about_text, visit_text, opening_hours_text
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+    )
+    .all() as Array<{ id: string; about_text: string | null; visit_text: string | null; opening_hours_text: string | null }>;
+}
+
 // ─── Gårdssalg mojibake detection + candidate scan (dev-request 2026-07-21-
 // opplevagent-norske-tegn-encoding, criterion 3) ────────────────────────────
 //
