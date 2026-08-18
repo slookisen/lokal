@@ -637,6 +637,34 @@ export function runOpplevelserGardssalgContactBackfillTests(
           },
         }),
       );
+      // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive D —
+      // two known-benign classes the raw domain compare wrongly counted as
+      // mismatches (13/140 on the live prod dry-run, manual inspection):
+      //   1. hosting-platform apex — the producer never bought a custom
+      //      domain, so website_domain is a shared platform apex (myshopify,
+      //      squarespace, ...), not an identity; it can never "match" any
+      //      email domain regardless of correctness.
+      mkProvider({
+        id: "aud-hostplatform", navn: "Audit Host Platform", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://wettrebryggeri.myshopify.com", epost: "kontakt@heltannenbedrift.no",
+        created_at: "2026-06-06 00:00:00",
+      });
+      //   2. cross-TLD/hyphenation brand-alias — same brand, different
+      //      TLD/hyphenation (nogne-o.com vs nogne-o.no), not a different
+      //      company.
+      mkProvider({
+        id: "aud-brandalias", navn: "Audit Brand Alias", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://nogne-o.no", epost: "post@nogne-o.com",
+        created_at: "2026-06-07 00:00:00",
+      });
+      // Regression check: a genuine unrelated-company domain pair resembling
+      // the dev-request's own real-world case must still be a mismatch,
+      // completely unaffected by the two new exclusions.
+      mkProvider({
+        id: "aud-mismatch-real", navn: "Audit Mismatch Real", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://lofotpils.no", epost: "kontakt@dng-norge.no",
+        created_at: "2026-06-08 00:00:00",
+      });
 
       const auditDry = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: {} });
       assertEq(auditDry.status, 200, "y1: audit dry-run returns 200");
@@ -645,6 +673,20 @@ export function runOpplevelserGardssalgContactBackfillTests(
       assertTrue(dryIds.includes("aud-mismatch"), "y3: a genuine domain mismatch is counted");
       assertTrue(!dryIds.includes("aud-same"), "y4: a same-domain row is not a mismatch");
       assertTrue(!dryIds.includes("aud-freemail"), "y5: a freemail address is exempt");
+      assertTrue(
+        !dryIds.includes("aud-hostplatform"),
+        "y5b: a hosting-platform apex website domain (myshopify.com) is not a mismatch",
+      );
+      assertTrue(
+        !dryIds.includes("aud-brandalias"),
+        "y5c: a cross-TLD/hyphenation brand-alias pair (nogne-o.no / nogne-o.com) is not a mismatch",
+      );
+      assertTrue(
+        dryIds.includes("aud-mismatch-real"),
+        "y5d: a genuine unrelated-company domain pair (lofotpils.no / dng-norge.no) is still a mismatch",
+      );
+      assertEq(auditDry.body.host_platform_domain_excluded, 1, "y5e: the hosting-platform exclusion is counted");
+      assertEq(auditDry.body.brand_alias_domain_excluded, 1, "y5f: the brand-alias exclusion is counted");
       assertTrue(!dryIds.includes("aud-override"), "y6: an active force-approval override is exempt");
       assertTrue(!dryIds.includes("aud-locked"), "y7: an owner/manual-locked row is never auto-flagged");
       assertEq(
