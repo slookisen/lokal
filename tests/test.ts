@@ -30106,6 +30106,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gfbr.failures) failures.push("opplevelser-gardssalg-fillblank: " + f);
     console.log(`  opplevelser-gardssalg-fillblank: ${gfbr.passed} passed, ${gfbr.failed} failed`);
 
+    // dev-request 2026-08-18-apningstider-llm-dommer: LLM-judge replacement
+    // for the old character-window/regex extraction of opening_hours_text.
+    // generateGardssalgOpeningHoursFromSource() (routes/opplevelser.ts,
+    // mirrors generateGardssalgAboutFromSource's never-fabricate contract,
+    // gated by classifyGardssalgFieldDefect rather than meetsAboutQualityBar)
+    // wired into POST /admin/gardssalg-content-refresh's processOne() —
+    // extractOpeningHours() is now strictly a free yes/no trigger for
+    // whether the LLM call is worth making, never the written value. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block
+    // for the same reason.
+    console.log("\n── opplevelser-gardssalg-opening-hours-llm: LLM-judge opening_hours_text ──");
+    const { runOpplevelserGardssalgOpeningHoursLlmTests } = require("../src/routes/opplevelser-gardssalg-opening-hours-llm.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-opening-hours-llm.test");
+    const gohl = await runOpplevelserGardssalgOpeningHoursLlmTests({ log: false });
+    passed += gohl.passed;
+    failed += gohl.failed;
+    for (const f of gohl.failures) failures.push("opplevelser-gardssalg-opening-hours-llm: " + f);
+    console.log(`  opplevelser-gardssalg-opening-hours-llm: ${gohl.passed} passed, ${gohl.failed} failed`);
+
     // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, criterion 6:
     // the retroactive scan+null endpoint (POST /admin/gardssalg-retro-scan)
     // that re-judges the CURRENTLY STORED about_text/visit_text of every

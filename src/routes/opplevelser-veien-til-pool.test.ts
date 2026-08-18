@@ -120,6 +120,7 @@ export function runVeienTilPoolTests(opts: { log?: boolean } = {}): Promise<Test
       seed({ id: "vp-test", navn: "Testrad", pt: "test-gardssalg", hj: "https://t.example.no", created: "2026-01-05" });
       seed({ id: "vp-nosite", navn: "Uten Side", hj: null, created: "2026-01-06" });
       seed({ id: "vp-full", navn: "Har Alt", hj: "https://full.example.no", ep: "post@full.example.no", tlf: "99887766", created: "2026-01-07" });
+      seed({ id: "vp-manual", navn: "Manuell Gard", hj: "https://manuell.example.no", cs: "manual", created: "2026-01-08" });
 
       // ═══ vp-1..vp-5: providerIds snevrer inn, utvider aldri (AK1) ═══
       {
@@ -212,6 +213,57 @@ export function runVeienTilPoolTests(opts: { log?: boolean } = {}): Promise<Test
         });
         assertEq(again.body?.skipped?.[0]?.reason, "already_blank",
           "vp-24c: å kjøre den på nytt er trygt — allerede tom rapporteres, ikke skrives");
+
+        // ═══ vp-25..vp-29: opening_hours_text i CLEARABLE (dev-request
+        // 2026-08-18-apningstider-llm-dommer, spec D) — feltet gikk fra en
+        // rå regex-skiver til en LLM-generert kandidat, og kan derfor bli
+        // like kontaminert som about_text/visit_text kan. Samme sperrer.
+        expDb.prepare(`UPDATE experience_providers SET opening_hours_text = ? WHERE id = ?`)
+          .run("Previous Next Man-fre 10-18 Søk", "vp-c");
+        expDb.prepare(`UPDATE experience_providers SET opening_hours_text = ? WHERE id = ?`)
+          .run("Man-fre 10-18", "vp-manual");
+        expDb.prepare(`UPDATE experience_providers SET opening_hours_text = ?, field_provenance = ? WHERE id = ?`)
+          .run(
+            "Lør 10-14",
+            JSON.stringify({ owner_locks: { opening_hours_text: { locked_at: "2026-08-01T00:00:00.000Z" } } }),
+            "vp-locked",
+          );
+
+        const hoursDry = await call("/admin/gardssalg-content-clear", {
+          providerIds: ["vp-c"], field_name: "opening_hours_text",
+        });
+        assertEq(hoursDry.status, 200, "vp-25: opening_hours_text er nå et gyldig felt for denne leveren (ikke 400)");
+        assertEq(hoursDry.body?.cleared_count, 1, "vp-26: tørrkjøringen ser en tømbar rad for opening_hours_text");
+
+        const hoursApplied = await call("/admin/gardssalg-content-clear", {
+          providerIds: ["vp-c"], field_name: "opening_hours_text", apply: true,
+        });
+        assertEq(hoursApplied.body?.cleared_count, 1, "vp-27a: apply tømmer opening_hours_text på den navngitte raden");
+        const hoursCleared = expDb.prepare(`SELECT opening_hours_text FROM experience_providers WHERE id = 'vp-c'`).get() as any;
+        assertTrue((hoursCleared?.opening_hours_text ?? "") === "" || hoursCleared?.opening_hours_text === null,
+          "vp-27b: feltet er faktisk tomt etterpå");
+        const hoursAudit = expDb
+          .prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = 'vp-c' AND field_name = 'opening_hours_text'`)
+          .get() as any;
+        assertTrue((hoursAudit?.n ?? 0) > 0, "vp-27c: tømmingen av opening_hours_text er revisjonsført akkurat som de to andre feltene");
+
+        // Samme sperrer som about_text/visit_text allerede respekterer må
+        // gjelde IDENTISK for det nye feltet.
+        const manualBlocked = await call("/admin/gardssalg-content-clear", {
+          providerIds: ["vp-manual"], field_name: "opening_hours_text", apply: true,
+        });
+        assertEq(manualBlocked.body?.skipped?.[0]?.reason, "write_refused_locked_or_manual",
+          "vp-28: content_source='manual' sperrer opening_hours_text akkurat som about_text/visit_text");
+        const manualUntouched = expDb.prepare(`SELECT opening_hours_text FROM experience_providers WHERE id = 'vp-manual'`).get() as any;
+        assertEq(manualUntouched?.opening_hours_text, "Man-fre 10-18", "vp-28b: den manuelle radens verdi er urørt");
+
+        const claimOwnerLockedBlocked = await call("/admin/gardssalg-content-clear", {
+          providerIds: ["vp-locked"], field_name: "opening_hours_text", apply: true,
+        });
+        assertEq(claimOwnerLockedBlocked.body?.skipped?.[0]?.reason, "write_refused_locked_or_manual",
+          "vp-29: en eier-låst opening_hours_text (field_provenance.owner_locks) sperrer akkurat som for de to andre feltene");
+        const claimUntouched = expDb.prepare(`SELECT opening_hours_text FROM experience_providers WHERE id = 'vp-locked'`).get() as any;
+        assertEq(claimUntouched?.opening_hours_text, "Lør 10-14", "vp-29b: den eier-låste radens verdi er urørt");
       }
     } catch (err: any) {
       failed++;

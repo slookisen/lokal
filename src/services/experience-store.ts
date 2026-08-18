@@ -3924,10 +3924,18 @@ export function getGardssalgProviderRetroScanTarget(providerId: string): Gardssa
 }
 
 /**
- * Null a set of about_text/visit_text fields on ONE gårdssalg provider
- * because the retro-scan (POST /admin/gardssalg-retro-scan,
- * routes/opplevelser.ts) judged the CURRENTLY STORED value as no longer
- * clearing the gårdssalg quality gate. Mirrors applyGardssalgProviderContent's
+ * Null a set of about_text/visit_text/opening_hours_text fields on ONE
+ * gårdssalg provider — either because the retro-scan (POST /admin/gardssalg-
+ * retro-scan, routes/opplevelser.ts, about_text/visit_text only — see that
+ * route's own "Non-goals: no changes to opening_hours_text" note) judged the
+ * CURRENTLY STORED value as no longer clearing the gårdssalg quality gate, or
+ * because an admin explicitly asked POST /admin/gardssalg-content-clear
+ * (dev-request 2026-08-18-apningstider-llm-dommer, spec D — about_text/
+ * visit_text only until then) to blank a contaminated field so the fill
+ * machinery can re-populate it. `fields` accepts opening_hours_text purely so
+ * that second caller can reuse this exact same audited, reversible write
+ * path rather than duplicating it — the retro-scan route itself never passes
+ * it. Mirrors applyGardssalgProviderContent's
  * exact write discipline so the row stays reversible via the existing
  * /admin/gardssalg-content-rollback lever (no new rollback mechanism):
  *   - lock re-checked against a FRESH row snapshot (defense in depth — the
@@ -3963,26 +3971,33 @@ export function getGardssalgProviderRetroScanTarget(providerId: string): Gardssa
  */
 export function applyGardssalgRetroScanNull(
   providerId: string,
-  fields: Array<"about_text" | "visit_text">,
+  fields: Array<"about_text" | "visit_text" | "opening_hours_text">,
   evidenceUrl: string,
   batchId?: string
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
-    .prepare(`SELECT id, content_source, about_text, visit_text, field_provenance FROM experience_providers WHERE id = ?`)
+    .prepare(
+      `SELECT id, content_source, about_text, visit_text, opening_hours_text, field_provenance FROM experience_providers WHERE id = ?`
+    )
     .get(providerId) as
     | {
         id: string;
         content_source: string | null;
         about_text: string | null;
         visit_text: string | null;
+        opening_hours_text: string | null;
         field_provenance: string | null;
       }
     | undefined;
   if (!row) return [];
   if (row.content_source === "manual") return [];
 
-  const oldValues: Record<string, string | null> = { about_text: row.about_text, visit_text: row.visit_text };
+  const oldValues: Record<string, string | null> = {
+    about_text: row.about_text,
+    visit_text: row.visit_text,
+    opening_hours_text: row.opening_hours_text,
+  };
   const sets: string[] = [];
   const params: Record<string, unknown> = { id: providerId };
   const written: string[] = [];
