@@ -102,6 +102,15 @@ import {
   type GardssalgProviderMapPoint,
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
+// dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C(b) /
+// AC4: an epost whose registrable domain deviates from the producer's own
+// homepage domain is under review and must not be published — neither in the
+// produsent-profil page's visible "E-post" fact row nor in its JSON-LD
+// `email`. The reader lives next to its Skive A sibling
+// (isGardssalgContactEmailOverrideActive) in routes/opplevelser.ts and is
+// imported here rather than duplicated, so each stamp keeps exactly one
+// reader.
+import { isGardssalgContactEmailFlaggedForReview } from "./opplevelser";
 // dev-request 2026-08-07-orch-fylke-2024-migrasjon: the /fylke/:fylke 301
 // fallback below reuses norway-fylke.ts's own historical-alias map
 // (ALIAS_TO_CANONICAL), merged-legacy equivalence classes
@@ -5054,7 +5063,14 @@ router.get(
     ) facts.push(["Åpningstider", escapeHtml(provider.opening_hours_text)]);
     if (site) facts.push(["Nettside", `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
     if (isDisplayablePhone(provider.telefon)) facts.push(["Telefon", `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
-    if (provider.epost) facts.push(["E-post", `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    // epostUnderReview: Skive C(b)/AC4 — a flagged (domain-deviating) address
+    // is published NOWHERE on this page until a human resolves it: not in the
+    // visible fact row here, and not in the JSON-LD `email` further down (the
+    // structured-data copy is what AI assistants read, so hiding only one of
+    // the two would fix nothing). telefon is untouched — this gate is
+    // email-only.
+    const epostUnderReview = isGardssalgContactEmailFlaggedForReview(provider.field_provenance, provider.epost);
+    if (provider.epost && !epostUnderReview) facts.push(["E-post", `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
       ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
@@ -5146,7 +5162,9 @@ router.get(
     if (lat !== null && lon !== null) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
     if (site) ld.sameAs = [site];
     if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
-    if (provider.epost) ld.email = provider.epost;
+    // Same review gate as the visible "E-post" fact row above — see
+    // epostUnderReview's comment there (AC4).
+    if (provider.epost && !epostUnderReview) ld.email = provider.epost;
     ld.offers = {
       "@type": "Offer",
       name: `Gårdsbesøk og smaking hos ${provider.navn}`,

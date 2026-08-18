@@ -58,6 +58,30 @@
  *       gardssalg_website_review_queue instead
  *   (v) route: brreg_hits/cohort_total reporting is accurate (this is the
  *       number the dry-run exists to produce)
+ *
+ * dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C —
+ * the write-time contact-email domain gate now lives INSIDE
+ * applyGardssalgProviderContact (one choke point for both writer routes),
+ * and the one-time catalog-wide settlement lives behind a new endpoint:
+ *   (w) applyGardssalgProviderContact's gate: same-domain still writes
+ *       (no regression); foreign-domain non-freemail is withheld, reported
+ *       and stamped into field_provenance.contact_email_flagged_review while
+ *       telefon on the same call is unaffected; freemail stays exempt; a row
+ *       with no hjemmeside on file still writes
+ *   (x) route: the withheld candidate surfaces in
+ *       contact_email_flagged_for_review and never in changed[]
+ *   (y) POST /admin/gardssalg-contact-email-audit: admin-gated; dry-run
+ *       reports without writing; apply flags; same-domain/freemail/
+ *       active-override rows are excluded and owner-locked rows are reported
+ *       but never auto-flagged; a re-run is idempotent (already_flagged); a
+ *       flag lapses when epost changes
+ *   (z) fix-up round, independent reviewer findings B1 + B2: a human's
+ *       force-approval through POST /admin/gardssalg-set-contact-email clears
+ *       the pending contact_email_flagged_review stamp so the approved
+ *       address is published again (and is never re-flagged); an active
+ *       override outranks a flag stamp that is somehow still on the row; and
+ *       a whitespace-padded epost column is both flagged by the audit AND
+ *       correctly hidden by the reader (trimmed stamp vs raw column)
  */
 
 export interface TestSummary {
@@ -333,7 +357,8 @@ export function runOpplevelserGardssalgContactBackfillTests(
       const written1 = store.applyGardssalgProviderContact(
         "app-blank", { epost: " ny@post.no ", telefon: " 12345678 " }, "https://brreg.example/810000001", "batch-k"
       );
-      assertEq(written1.sort(), ["epost", "telefon"], "k1: both blank fields written");
+      assertEq(written1.written.sort(), ["epost", "telefon"], "k1: both blank fields written");
+      assertEq(written1.epostFlaggedForReview, undefined, "k1b: no hjemmeside on file -> the domain gate never fires");
       const rowK = getProviderRow("app-blank");
       assertEq(rowK.epost, "ny@post.no", "k2: epost written trimmed");
       assertEq(rowK.telefon, "12345678", "k3: telefon written trimmed");
@@ -349,23 +374,108 @@ export function runOpplevelserGardssalgContactBackfillTests(
       const written2 = store.applyGardssalgProviderContact(
         "app-existing", { epost: "brreg@post.no", telefon: "99999999" }, "https://brreg.example/810000001"
       );
-      assertEq(written2, ["telefon"], "l1: only the blank field is written");
+      assertEq(written2.written, ["telefon"], "l1: only the blank field is written");
       assertEq(getProviderRow("app-existing").epost, "gammel@post.no", "l2: an existing value is NEVER overwritten");
 
       mkProvider({ id: "app-locked", navn: "Apply Locked", org_nr: orgFor(SHAPE_FULL), content_source: "claim", created_at: "2026-02-03 00:00:00" });
       assertEq(
-        store.applyGardssalgProviderContact("app-locked", { epost: "x@y.no", telefon: "1" }, "https://brreg.example/1"),
+        store.applyGardssalgProviderContact("app-locked", { epost: "x@y.no", telefon: "1" }, "https://brreg.example/1").written,
         [],
         "m1: locked provider -> nothing written"
       );
       assertEq(getProviderRow("app-locked").epost, null, "m2: locked provider row untouched");
 
       assertEq(
-        store.applyGardssalgProviderContact("app-blank", { epost: "annen@post.no", telefon: "87654321" }, "https://brreg.example/1"),
+        store.applyGardssalgProviderContact("app-blank", { epost: "annen@post.no", telefon: "87654321" }, "https://brreg.example/1").written,
         [],
         "n1: second call on a filled row is a no-op"
       );
       assertEq(getAuditRows("app-blank").length, 2, "n2: no-op writes no extra audit rows");
+
+      // ── (w) write-time contact-email domain gate (dev-request 2026-08-17-
+      // kontaktadresse-feilkilde-og-override, Skive C(a)). The gate lives
+      // INSIDE applyGardssalgProviderContact, so both writer routes inherit
+      // it; these cases pin the four branches that decide whether an epost
+      // candidate is publishable or queued for review. ────────────────────
+      {
+        // (w1) same-domain candidate still writes normally — the load-bearing
+        // no-regression case.
+        mkProvider({
+          id: "gate-same", navn: "Gate Same Domain", org_nr: orgFor(SHAPE_FULL),
+          hjemmeside: "https://www.gatesame.no", created_at: "2026-02-10 00:00:00",
+        });
+        const r = store.applyGardssalgProviderContact(
+          "gate-same", { epost: "post@gatesame.no", telefon: "22222222", epostSource: "mailto" },
+          "https://gatesame.no/kontakt", "batch-w"
+        );
+        assertEq(r.written.sort(), ["epost", "telefon"], "w1a: same-domain candidate is written as before");
+        assertEq(r.epostFlaggedForReview, undefined, "w1b: same-domain candidate is not flagged");
+        assertEq(getProviderRow("gate-same").epost, "post@gatesame.no", "w1c: the row carries the address");
+        assertTrue(
+          !JSON.parse(getProviderRow("gate-same").field_provenance || "{}").contact_email_flagged_review,
+          "w1d: no review stamp written for a same-domain candidate",
+        );
+      }
+      {
+        // (w2) foreign-domain, non-freemail candidate: NOT written, reported
+        // back, stamped for review. telefon on the same call is unaffected.
+        mkProvider({
+          id: "gate-foreign", navn: "Gate Foreign Domain", org_nr: orgFor(SHAPE_FULL),
+          hjemmeside: "https://gateforeign.no", created_at: "2026-02-11 00:00:00",
+        });
+        const r = store.applyGardssalgProviderContact(
+          "gate-foreign", { epost: "tg@distributor-as.no", telefon: "33333333", epostSource: "mailto_other_domain" },
+          "https://gateforeign.no/kontakt", "batch-w"
+        );
+        assertEq(r.written, ["telefon"], "w2a: the foreign-domain epost is NOT written; telefon still is");
+        assertEq(getProviderRow("gate-foreign").epost, null, "w2b: the row's epost stays blank");
+        assertEq(getProviderRow("gate-foreign").telefon, "33333333", "w2c: telefon is untouched by the email-only gate");
+        assertEq(r.epostFlaggedForReview?.candidate, "tg@distributor-as.no", "w2d: the held-back candidate is reported back");
+        assertEq(r.epostFlaggedForReview?.website_domain, "gateforeign.no", "w2e: the website domain is reported");
+        assertEq(r.epostFlaggedForReview?.email_domain, "distributor-as.no", "w2f: the email domain is reported");
+        const stamp = JSON.parse(getProviderRow("gate-foreign").field_provenance || "{}").contact_email_flagged_review;
+        assertEq(stamp?.flagged_email, "tg@distributor-as.no", "w2g: field_provenance.contact_email_flagged_review stamped");
+        assertEq(stamp?.reason, "domain_mismatch", "w2h: stamp carries the reason");
+        assertEq(stamp?.source, "mailto_other_domain", "w2i: stamp carries the caller's source label");
+        assertTrue(typeof stamp?.flagged_at === "string" && stamp.flagged_at.length > 0, "w2j: stamp carries flagged_at");
+        // The stamp must survive the same call's OWN field_provenance merge
+        // for telefon — both are read-modify-write on one column.
+        assertTrue(
+          !!JSON.parse(getProviderRow("gate-foreign").field_provenance || "{}").telefon?.source_url,
+          "w2k: telefon provenance from the same call is preserved alongside the stamp",
+        );
+        // No audit row for the flag — it is not a content change.
+        assertEq(getAuditRows("gate-foreign").length, 1, "w2l: only the telefon write produced an audit row");
+      }
+      {
+        // (w3) freemail candidate stays exempt — a farm on gmail.com is the
+        // norm, not a wrong-company signal.
+        mkProvider({
+          id: "gate-freemail", navn: "Gate Freemail", org_nr: orgFor(SHAPE_FULL),
+          hjemmeside: "https://gatefreemail.no", created_at: "2026-02-12 00:00:00",
+        });
+        const r = store.applyGardssalgProviderContact(
+          "gate-freemail", { epost: "gaardsbruket@gmail.com", telefon: null, epostSource: "mailto" },
+          "https://gatefreemail.no/kontakt", "batch-w"
+        );
+        assertEq(r.written, ["epost"], "w3a: a freemail candidate is still written");
+        assertEq(r.epostFlaggedForReview, undefined, "w3b: a freemail candidate is not flagged");
+        assertEq(getProviderRow("gate-freemail").epost, "gaardsbruket@gmail.com", "w3c: the row carries the freemail address");
+      }
+      {
+        // (w4) no hjemmeside on file -> nothing to contradict, write proceeds
+        // (same precedent as applyGardssalgSetContactEmail's own domain check).
+        mkProvider({
+          id: "gate-nosite", navn: "Gate No Site", org_nr: orgFor(SHAPE_FULL),
+          hjemmeside: null, created_at: "2026-02-13 00:00:00",
+        });
+        const r = store.applyGardssalgProviderContact(
+          "gate-nosite", { epost: "post@heltannen.no", telefon: null, epostSource: "brreg" },
+          "https://brreg.example/1", "batch-w"
+        );
+        assertEq(r.written, ["epost"], "w4a: with no homepage on file the candidate is written");
+        assertEq(r.epostFlaggedForReview, undefined, "w4b: with no homepage on file nothing is flagged");
+      }
 
       // ── (o) auth ─────────────────────────────────────────────────────────
       const unauth = await callRoute(opplevelserRouter, { body: {} });
@@ -439,6 +549,289 @@ export function runOpplevelserGardssalgContactBackfillTests(
       assertEq(rate.body.cohort_total, store.countGardssalgProvidersForContactBackfill(), "v3: cohort_total reports the remaining walk");
       assertEq(rate.body.changed.length, 3, "v4: three of four rows would be enriched");
       assertEq(rate.body.unresolved.filter((u: any) => u.reason === "no_brreg_contact").length, 1, "v5: the contact-less row is bucketed");
+
+      // ── (x) route: the write-time gate surfaces in the response (Skive C(a))
+      // — a Brreg-registered address on a domain the producer's own homepage
+      // does not use is queued for review, not published. ────────────────────
+      mkProvider({
+        id: "rt-gate", navn: "Route Gate", org_nr: orgFor(SHAPE_FULL),
+        hjemmeside: "https://rutegaarden.no", created_at: "2026-05-01 00:00:00",
+      });
+      const gated = await callRoute(opplevelserRouter, { headers: auth, body: { providerIds: ["rt-gate"], apply: true } });
+      assertEq(gated.status, 200, "x1: the route still returns 200");
+      assertEq(
+        gated.body.contact_email_flagged_for_review.map((f: any) => f.provider_id),
+        ["rt-gate"],
+        "x2: the held-back candidate is reported in contact_email_flagged_for_review",
+      );
+      assertEq(
+        gated.body.contact_email_flagged_for_review[0]?.candidate_email,
+        "post@fullhouse.no",
+        "x3: the reported entry names the candidate address",
+      );
+      assertEq(
+        gated.body.contact_email_flagged_for_review[0]?.website_domain,
+        "rutegaarden.no",
+        "x4: the reported entry names the homepage domain it disagreed with",
+      );
+      assertTrue(
+        !gated.body.changed.some((c: any) => (c.fields ?? []).includes("epost")),
+        "x5: the flagged address never appears as a written epost in changed[]",
+      );
+      assertEq(getProviderRow("rt-gate").epost, null, "x6: the row's epost is still blank");
+      assertEq(
+        JSON.parse(getProviderRow("rt-gate").field_provenance || "{}").contact_email_flagged_review?.flagged_email,
+        "post@fullhouse.no",
+        "x7: the review stamp landed on the row",
+      );
+      assertEq(
+        gated.body.unresolved.filter((u: any) => u.provider_id === "rt-gate").length,
+        0,
+        "x8: a flagged row is NOT mislabelled 'already_filled_or_locked_at_write_time'",
+      );
+
+      // ── (y) POST /admin/gardssalg-contact-email-audit (Skive C(c), AC5) ────
+      const auditUrl = "/admin/gardssalg-contact-email-audit";
+      {
+        const unauthAudit = await callRoute(opplevelserRouter, { url: auditUrl, body: {} });
+        assertEq(unauthAudit.status, 403, "y0: audit endpoint is admin-gated");
+      }
+      // Already-published legacy mismatches — exactly the Hull-1 population
+      // the write-time gate cannot reach.
+      mkProvider({
+        id: "aud-mismatch", navn: "Audit Mismatch", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://audmismatch.no", epost: "kontakt@heltannenbedrift.no",
+        created_at: "2026-06-01 00:00:00",
+      });
+      mkProvider({
+        id: "aud-same", navn: "Audit Same", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://www.audsame.no", epost: "post@audsame.no",
+        created_at: "2026-06-02 00:00:00",
+      });
+      mkProvider({
+        id: "aud-freemail", navn: "Audit Freemail", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://audfreemail.no", epost: "audgarden@gmail.com",
+        created_at: "2026-06-03 00:00:00",
+      });
+      mkProvider({
+        id: "aud-locked", navn: "Audit Locked", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://audlocked.no", epost: "eier@annetfirma.no", content_source: "claim",
+        created_at: "2026-06-04 00:00:00",
+      });
+      // An active Skive A force-approval override for this exact address —
+      // Daniel already reviewed it; the audit must never re-flag it.
+      mkProvider({
+        id: "aud-override", navn: "Audit Override", org_nr: orgFor(SHAPE_EMPTY),
+        hjemmeside: "https://audoverride.no", epost: "post@godkjentannet.no",
+        created_at: "2026-06-05 00:00:00",
+      });
+      expDb.prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = 'aud-override'`).run(
+        JSON.stringify({
+          contact_email_domain_override: {
+            approved_email: "post@godkjentannet.no",
+            approved_by: "admin",
+            approved_at: "2026-08-17T10:00:00.000Z",
+            source: "manuell verifisering",
+            website_domain: "audoverride.no",
+            email_domain: "godkjentannet.no",
+          },
+        }),
+      );
+
+      const auditDry = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: {} });
+      assertEq(auditDry.status, 200, "y1: audit dry-run returns 200");
+      assertEq(auditDry.body.dry_run, true, "y2: dry_run defaults to true");
+      const dryIds = auditDry.body.mismatches.map((m: any) => m.provider_id);
+      assertTrue(dryIds.includes("aud-mismatch"), "y3: a genuine domain mismatch is counted");
+      assertTrue(!dryIds.includes("aud-same"), "y4: a same-domain row is not a mismatch");
+      assertTrue(!dryIds.includes("aud-freemail"), "y5: a freemail address is exempt");
+      assertTrue(!dryIds.includes("aud-override"), "y6: an active force-approval override is exempt");
+      assertTrue(!dryIds.includes("aud-locked"), "y7: an owner/manual-locked row is never auto-flagged");
+      assertEq(
+        auditDry.body.locked_not_flagged.map((l: any) => l.provider_id),
+        ["aud-locked"],
+        "y8: but the locked row IS reported, not silently unknown",
+      );
+      assertEq(auditDry.body.already_override_exempt, 1, "y9: the override exemption is counted, not hidden");
+      assertEq(auditDry.body.mismatch_count, auditDry.body.mismatches.length, "y10: mismatch_count matches the list length");
+      assertEq(auditDry.body.newly_flagged, 0, "y11: a dry run flags nothing");
+      assertTrue(auditDry.body.cohort_total >= 5, "y12: cohort_total counts every row with both a homepage and an epost");
+      assertEq(
+        JSON.parse(getProviderRow("aud-mismatch").field_provenance || "{}").contact_email_flagged_review,
+        undefined,
+        "y13: a dry run wrote NOTHING to the row",
+      );
+
+      const auditApply = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: { apply: true } });
+      assertEq(auditApply.body.dry_run, false, "y14: apply:true flips dry_run off");
+      assertEq(auditApply.body.newly_flagged, auditDry.body.mismatch_count, "y15: apply flags every reported mismatch");
+      const stampY = JSON.parse(getProviderRow("aud-mismatch").field_provenance || "{}").contact_email_flagged_review;
+      assertEq(stampY?.flagged_email, "kontakt@heltannenbedrift.no", "y16: the stamp names the flagged address");
+      assertEq(stampY?.source, "catalog_audit", "y17: the stamp records that the audit raised it");
+      assertEq(stampY?.email_domain, "heltannenbedrift.no", "y18: the stamp records the deviating domain");
+      assertEq(getProviderRow("aud-mismatch").epost, "kontakt@heltannenbedrift.no", "y19: the audit never changes the epost column itself");
+      assertEq(getAuditRows("aud-mismatch").length, 0, "y20: flagging writes no gardssalg_content_audit row (it is not a content change)");
+      assertEq(
+        JSON.parse(getProviderRow("aud-override").field_provenance || "{}").contact_email_flagged_review,
+        undefined,
+        "y21: an override-exempt row is never stamped",
+      );
+      assertEq(
+        JSON.parse(getProviderRow("aud-locked").field_provenance || "{}").contact_email_flagged_review,
+        undefined,
+        "y22: a locked row is never stamped",
+      );
+
+      const auditRerun = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: {} });
+      assertEq(auditRerun.body.mismatch_count, 0, "y23: idempotent — a second run finds no NEW mismatch");
+      assertEq(auditRerun.body.already_flagged, auditDry.body.mismatch_count, "y24: the flagged rows are now reported as already_flagged");
+
+      // A lapse check that mirrors the override stamp's: change the address
+      // and the old flag stops applying, so the row is re-detected.
+      expDb.prepare(`UPDATE experience_providers SET epost = 'ny@ennyannen.no' WHERE id = 'aud-mismatch'`).run();
+      const auditAfterChange = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: {} });
+      assertTrue(
+        auditAfterChange.body.mismatches.some((m: any) => m.provider_id === "aud-mismatch"),
+        "y25: a stale flag lapses when epost changes — the new address is re-detected",
+      );
+
+      // ── (z) fix-up round — independent reviewer findings B1 + B2 ──────────
+      // B1: a human force-approving an address through POST /admin/gardssalg-
+      //     set-contact-email left any existing contact_email_flagged_review
+      //     stamp in place, so the approved address stayed hidden from the
+      //     profile + JSON-LD forever (the documented resolution path silently
+      //     did nothing). Two fixes: the write clears the stale flag, and the
+      //     reader treats an ACTIVE override as outranking any flag.
+      // B2: the audit stamps the TRIMMED epost while the reader compares the
+      //     RAW column value, so a padded epost was reported as protected but
+      //     kept being published.
+      {
+        const readerMod = require("./opplevelser") as typeof import("./opplevelser");
+        const isFlagged = readerMod.isGardssalgContactEmailFlaggedForReview;
+        const setEmailUrl = "/admin/gardssalg-set-contact-email";
+
+        // ── B1: audit flags → human force-approves the SAME address ────────
+        mkProvider({
+          id: "fix-b1-resolve", navn: "Fixup Resolve", org_nr: orgFor(SHAPE_EMPTY),
+          hjemmeside: "https://fixresolve.no", epost: "kontakt@annenbedrift.no",
+          created_at: "2026-07-01 00:00:00",
+        });
+        const auditB1 = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: { apply: true } });
+        assertTrue(
+          auditB1.body.mismatches.some((m: any) => m.provider_id === "fix-b1-resolve"),
+          "z1: the catalog audit flags the domain-deviating address",
+        );
+        const rowB1Before = getProviderRow("fix-b1-resolve");
+        assertEq(
+          JSON.parse(rowB1Before.field_provenance || "{}").contact_email_flagged_review?.flagged_email,
+          "kontakt@annenbedrift.no",
+          "z2: the review stamp landed on the row",
+        );
+        assertTrue(
+          isFlagged(rowB1Before.field_provenance, rowB1Before.epost),
+          "z3: pre-condition — the flagged address is hidden from the profile page + JSON-LD",
+        );
+
+        // The documented resolution path: Daniel approves that EXACT address.
+        const forceApprove = await callRoute(opplevelserRouter, {
+          url: setEmailUrl, headers: auth,
+          body: {
+            provider_id: "fix-b1-resolve",
+            email: "kontakt@annenbedrift.no",
+            source: "manuell verifisering 2026-08-18",
+            force: true,
+          },
+        });
+        assertEq(forceApprove.status, 200, "z4: the force-approval write succeeds");
+        const rowB1After = getProviderRow("fix-b1-resolve");
+        const provB1After = JSON.parse(rowB1After.field_provenance || "{}");
+        assertEq(
+          provB1After.contact_email_flagged_review,
+          undefined,
+          "z5 (B1): the confirmed write clears the stale review flag",
+        );
+        assertEq(
+          provB1After.contact_email_domain_override?.approved_email,
+          "kontakt@annenbedrift.no",
+          "z6: the human override stamp is recorded for the approved address",
+        );
+        assertTrue(
+          typeof provB1After.epost?.source_url === "string",
+          "z7: the epost provenance entry survives the same read-modify-write merge",
+        );
+        assertTrue(
+          !isFlagged(rowB1After.field_provenance, rowB1After.epost),
+          "z8 (B1): the approved address is published again — the resolution path actually resolves",
+        );
+        const reAudit = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: {} });
+        assertTrue(
+          !reAudit.body.mismatches.some((m: any) => m.provider_id === "fix-b1-resolve"),
+          "z9: a later audit run never re-flags the approved address",
+        );
+
+        // Belt-and-suspenders: a row that carries BOTH an active override and
+        // a matching flag stamp (legacy prod data flagged before the clearing
+        // shipped, or the write-time gate re-flagging an already-approved
+        // address after some other path blanked epost) must never render as
+        // hidden — the human's yes outranks the flag.
+        mkProvider({
+          id: "fix-b1-both", navn: "Fixup Both Stamps", org_nr: orgFor(SHAPE_EMPTY),
+          hjemmeside: "https://fixboth.no", epost: "post@godkjentmen.no",
+          created_at: "2026-07-02 00:00:00",
+        });
+        expDb.prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = 'fix-b1-both'`).run(
+          JSON.stringify({
+            contact_email_domain_override: {
+              approved_email: "post@godkjentmen.no",
+              approved_by: "admin",
+              approved_at: "2026-08-17T10:00:00.000Z",
+              source: "manuell verifisering",
+              website_domain: "fixboth.no",
+              email_domain: "godkjentmen.no",
+            },
+            contact_email_flagged_review: {
+              flagged_email: "post@godkjentmen.no",
+              website_domain: "fixboth.no",
+              email_domain: "godkjentmen.no",
+              reason: "domain_mismatch",
+              source: "catalog_audit",
+              flagged_at: "2026-08-18T09:00:00.000Z",
+            },
+          }),
+        );
+        const rowBoth = getProviderRow("fix-b1-both");
+        assertTrue(
+          !isFlagged(rowBoth.field_provenance, rowBoth.epost),
+          "z10 (B1): an ACTIVE human override outranks a flag stamp still sitting on the row",
+        );
+
+        // ── B2: a padded epost in the DB ───────────────────────────────────
+        // Constructed directly: the normal write paths trim on the way in, but
+        // the contact-extraction cohort query's own TRIM(epost) != '' guard
+        // proves such rows exist in the catalog.
+        const paddedEpost = "  kontakt@paddetbedrift.no  ";
+        mkProvider({
+          id: "fix-b2-padded", navn: "Fixup Padded", org_nr: orgFor(SHAPE_EMPTY),
+          hjemmeside: "https://fixpadded.no", epost: paddedEpost,
+          created_at: "2026-07-03 00:00:00",
+        });
+        const auditB2 = await callRoute(opplevelserRouter, { url: auditUrl, headers: auth, body: { apply: true } });
+        assertTrue(
+          auditB2.body.mismatches.some((m: any) => m.provider_id === "fix-b2-padded"),
+          "z11: the audit detects the mismatch on a whitespace-padded epost",
+        );
+        const rowB2 = getProviderRow("fix-b2-padded");
+        assertEq(rowB2.epost, paddedEpost, "z12: the audit never rewrites (or trims) the epost column itself");
+        assertEq(
+          JSON.parse(rowB2.field_provenance || "{}").contact_email_flagged_review?.flagged_email,
+          "kontakt@paddetbedrift.no",
+          "z13: the stamp carries the TRIMMED address, while the column stays padded",
+        );
+        assertTrue(
+          isFlagged(rowB2.field_provenance, rowB2.epost),
+          "z14 (B2): the reader still hides it — trimmed stamp vs raw padded column must not diverge",
+        );
+      }
     } finally {
       globalThis.fetch = prevFetch;
       if (prevExperiencesDbPath === undefined) {

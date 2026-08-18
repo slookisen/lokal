@@ -96,6 +96,11 @@ import {
   // "correct an already-filled stale contact" path (contact-backfill above
   // is fill-only; this is not).
   applyGardssalgSetContactEmail,
+  // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C —
+  // the contact-email domain review queue (write-time gate + the one-time
+  // catalog-wide audit behind POST /admin/gardssalg-contact-email-audit).
+  flagGardssalgContactEmailForReview,
+  selectGardssalgProvidersForContactEmailAudit,
   // dev-request 2026-08-16-opplevagent-outreach-rutine, spec point 6
   // ("Autosvar-regelen") — the review queue for autosvar candidates whose
   // candidate email's domain does NOT (or cannot be shown to) agree with the
@@ -2427,6 +2432,81 @@ export function isGardssalgContactEmailOverrideActive(
     return typeof entry.approved_email === "string" && entry.approved_email === currentEmail;
   } catch {
     return false; // malformed existing JSON -> fail closed, never treat as active
+  }
+}
+
+// dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C.
+// READ side of field_provenance.contact_email_flagged_review — mirrors
+// ContactEmailDomainOverrideEntry just above, same loose/`unknown`-typed
+// shape (this is a read of persisted JSON that could in principle be
+// malformed; never trust it to match the writer's type). The WRITE side is
+// GardssalgContactEmailFlaggedReviewStamp / flagGardssalgContactEmailFor
+// Review in services/experience-store.ts.
+interface ContactEmailFlaggedReviewEntry {
+  flagged_email?: unknown;
+}
+
+/**
+ * Fail-closed check: true only when field_provenance.contact_email_flagged_
+ * review exists AND its flagged_email exactly matches the row's CURRENT
+ * epost — the exact lapse discipline isGardssalgContactEmailOverrideActive
+ * uses, for the same reason: a flag raised against an OLD address must never
+ * keep suppressing a NEW address nobody has objected to, and no explicit
+ * cleanup step is needed when epost changes.
+ *
+ * True means "this address is under review — do not publish it": the
+ * produsent-profil page (routes/experiences-seo.ts) omits both the visible
+ * "E-post" fact row and the JSON-LD `email` key for it (AC4).
+ *
+ * A row whose epost is blank returns false, deliberately: a write-time-
+ * blocked candidate was never written, so there is nothing published to
+ * hide — its stamp is purely a recorded pending-review candidate for a
+ * human to resolve later (POST /admin/gardssalg-set-contact-email with
+ * force:true, the Skive A override path).
+ *
+ * An ACTIVE contact_email_domain_override for the same address (Skive A's
+ * human force-approval) also returns false, unconditionally: a human who
+ * approved this exact address outranks any flag stamp still sitting on the
+ * row (fix-up round, reviewer finding B1).
+ *
+ * Missing field_provenance, missing/malformed stamp, malformed JSON, or a
+ * non-matching flagged_email -> false. Never throws. flagged_email and the
+ * row's current epost are compared TRIMMED on both sides (finding B2 — the
+ * catalog audit stamps a trimmed address while this reader gets the raw
+ * column value).
+ */
+export function isGardssalgContactEmailFlaggedForReview(
+  fieldProvenanceRaw: string | null,
+  currentEmail: string | null,
+): boolean {
+  if (!fieldProvenanceRaw || !currentEmail) return false;
+  // Skive C fix-up (independent review, finding B1 — belt-and-suspenders next
+  // to the flag-clearing in applyGardssalgSetContactEmail): an ACTIVE human
+  // override for this exact address always wins over any flag stamp. A row can
+  // legitimately carry both — already-existing prod data flagged before the
+  // clearing shipped, or an address that was force-approved, later blanked by
+  // some other path and then reintroduced by the write-time gate (which
+  // re-flags without consulting the override). In every such case the human
+  // has already said yes to THIS address, so it must never render as hidden.
+  if (isGardssalgContactEmailOverrideActive(fieldProvenanceRaw, currentEmail)) return false;
+  try {
+    const parsed = JSON.parse(fieldProvenanceRaw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const entry = (parsed as Record<string, unknown>).contact_email_flagged_review as
+      | ContactEmailFlaggedReviewEntry
+      | undefined;
+    if (!entry || typeof entry !== "object") return false;
+    // Skive C fix-up (independent review, finding B2): the catalog audit
+    // stamps the TRIMMED epost (it trims during its own row processing) while
+    // this reader is handed the RAW column value straight off
+    // GardssalgProviderRow. A row whose stored epost carries leading/trailing
+    // whitespace (the contact-extraction cohort query guards against exactly
+    // those with TRIM(epost) != '', so such rows exist) compared unequal here:
+    // the audit reported the row as newly_flagged/protected while the profile
+    // page and JSON-LD kept publishing the mismatched address. Trim both sides.
+    return typeof entry.flagged_email === "string" && entry.flagged_email.trim() === currentEmail.trim();
+  } catch {
+    return false; // malformed existing JSON -> fail closed, never treat as flagged
   }
 }
 
@@ -6773,6 +6853,19 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
   // Addresses refused because they belong to a trade body / members'
   // association rather than the producer (AK2). Reported, never written.
   const umbrellaRejected: Array<{ provider_id: string; navn: string; epost: string; source_url: string }> = [];
+  // Email candidates held back by applyGardssalgProviderContact's write-time
+  // domain gate (Skive C(a), dev-request 2026-08-17-kontaktadresse-feilkilde-
+  // og-override): the address disagreed with the row's own homepage domain,
+  // so it was stamped into field_provenance.contact_email_flagged_review for
+  // review instead of being written as a publishable address. Reported here
+  // for the same reason umbrella_address_rejected is — a withheld candidate
+  // must be visible, never silently dropped.
+  const contactEmailFlaggedForReview: Array<{
+    provider_id: string;
+    candidate_email: string;
+    website_domain: string;
+    email_domain: string;
+  }> = [];
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
   const cooldownSkipped: Array<{ provider_id: string; navn: string; host: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
@@ -6988,16 +7081,25 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
           ...(emailFromRaw ? { email_from_raw: true } : {}),
         });
       } else {
-        const written = applyGardssalgProviderContact(
+        const { written, epostFlaggedForReview } = applyGardssalgProviderContact(
           t.id,
-          { epost: email?.email ?? null, telefon: phone?.phone ?? null },
+          { epost: email?.email ?? null, telefon: phone?.phone ?? null, epostSource: email?.source ?? null },
           evidenceUrl,
           batchId,
         );
+        if (epostFlaggedForReview) {
+          contactEmailFlaggedForReview.push({
+            provider_id: t.id,
+            candidate_email: epostFlaggedForReview.candidate,
+            website_domain: epostFlaggedForReview.website_domain,
+            email_domain: epostFlaggedForReview.email_domain,
+          });
+        }
         if (written.length > 0) {
           changed.push({
             provider_id: t.id, navn: t.navn, fields: written,
-            epost: email?.email ?? null, telefon: phone?.phone ?? null,
+            epost: written.includes("epost") ? (email?.email ?? null) : null,
+            telefon: phone?.phone ?? null,
             source_url: evidenceUrl, email_source: email?.source, phone_cued: phone?.cued,
             ...(emailFromRaw ? { email_from_raw: true } : {}),
           });
@@ -7020,6 +7122,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     changed,
     no_contact_found: noContactFound,
     umbrella_address_rejected: umbrellaRejected,
+    contact_email_flagged_for_review: contactEmailFlaggedForReview,
     fetch_failed: fetchFailed,
     cooldown_skipped: cooldownSkipped,
     render_diagnostic: renderDiagnostic,
@@ -7338,6 +7441,16 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
     source_url: string;
   }> = [];
   const websiteCandidates: Array<{ provider_id: string; candidate_url: string }> = [];
+  // Same write-time domain gate as gardssalg-contact-extraction above — the
+  // gate lives inside applyGardssalgProviderContact, so a Brreg-registered
+  // address that disagrees with the producer's own homepage domain is held
+  // back and queued for review here too (Skive C(a)).
+  const contactEmailFlaggedForReview: Array<{
+    provider_id: string;
+    candidate_email: string;
+    website_domain: string;
+    email_domain: string;
+  }> = [];
   const skippedLocked: string[] = [];
   const unresolved: Array<{ provider_id: string; reason: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
@@ -7420,12 +7533,20 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
       });
     } else {
       try {
-        const written = applyGardssalgProviderContact(
+        const { written, epostFlaggedForReview } = applyGardssalgProviderContact(
           providerId,
-          { epost: contact.epost, telefon: contact.telefon },
+          { epost: contact.epost, telefon: contact.telefon, epostSource: "brreg" },
           evidenceUrl,
           batchId
         );
+        if (epostFlaggedForReview) {
+          contactEmailFlaggedForReview.push({
+            provider_id: providerId,
+            candidate_email: epostFlaggedForReview.candidate,
+            website_domain: epostFlaggedForReview.website_domain,
+            email_domain: epostFlaggedForReview.email_domain,
+          });
+        }
         if (written.length > 0) {
           changed.push({
             provider_id: providerId,
@@ -7434,7 +7555,7 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
             telefon: written.includes("telefon") ? contact.telefon : null,
             source_url: evidenceUrl,
           });
-        } else {
+        } else if (!epostFlaggedForReview) {
           // Fresh-read-at-write-time found the fields already non-blank or the
           // provider now locked — same race class the sibling routes document.
           unresolved.push({ provider_id: providerId, reason: "already_filled_or_locked_at_write_time" });
@@ -7456,6 +7577,7 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
     providers_enriched: changed.length,
     changed,
     website_candidates: websiteCandidates,
+    contact_email_flagged_for_review: contactEmailFlaggedForReview,
     skipped_locked: skippedLocked,
     unresolved,
     errors,
@@ -7544,6 +7666,145 @@ router.post("/admin/gardssalg-set-contact-email", requireAdmin, (req: Request, r
     field: "epost",
     old_value: result.old_value,
     new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-contact-email-audit (admin) ──────
+//
+// dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C(c),
+// AC5. The write-time gate (applyGardssalgProviderContact) only protects
+// addresses written from now on. This is the one-time catalog-wide
+// settlement for the addresses ALREADY stored: it walks every gårdssalg row
+// that has BOTH a hjemmeside and an epost, compares registrable domains, and
+// (with apply=true) stamps each genuine mismatch into
+// field_provenance.contact_email_flagged_review — which is what makes the
+// produsent-profil page + JSON-LD stop publishing it (Hull 1 / AC4).
+//
+// The count itself is the other half of the deliverable: before this route
+// existed nobody could say how many rows in the catalog publish an address on
+// a domain the producer's own website does not use. `mismatch_count` is that
+// number.
+//
+// dry-run by default (same apply=1/"1"/true body-or-query idiom as every
+// other admin route in this file) — a dry run writes NOTHING and is safe to
+// run repeatedly. Idempotent under apply too: a row already carrying an
+// active flag lands in `already_flagged`, not in `mismatches`, so a second
+// apply run flags nothing new.
+//
+// Exclusions, each deliberate:
+//   - same registrable domain -> not a mismatch (the normal case);
+//   - freemail (FREE_MAIL_DOMAINS) -> a producer on gmail.com is the norm,
+//     not a wrong-company signal; identical exemption to the write-time gate
+//     and to extractGardssalgContactEmail's own freemail tier;
+//   - an ACTIVE Skive A force-approval override for this exact address
+//     (isGardssalgContactEmailOverrideActive) -> a human already reviewed and
+//     approved precisely this address; re-flagging it would hide an address
+//     Daniel confirmed. Counted separately as `already_override_exempt`;
+//   - manual/claim-locked rows (content_source) -> the owner/an operator owns
+//     that value; a retroactive sweep must not silently hide an owner-set
+//     address. These are NOT auto-flagged but ARE listed in
+//     `locked_not_flagged` so nothing is silently unknown (AC5's "visible,
+//     not silently unknown" — a human resolves them via
+//     POST /admin/gardssalg-set-contact-email).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-contact-email-audit", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const rows = selectGardssalgProvidersForContactEmailAudit();
+
+  const mismatches: Array<{
+    provider_id: string;
+    navn: string;
+    epost: string;
+    website_domain: string;
+    email_domain: string;
+  }> = [];
+  const lockedNotFlagged: Array<{
+    provider_id: string;
+    navn: string;
+    epost: string;
+    website_domain: string;
+    email_domain: string;
+    content_source: string | null;
+  }> = [];
+  let alreadyOverrideExempt = 0;
+  let alreadyFlagged = 0;
+  let newlyFlagged = 0;
+
+  for (const row of rows) {
+    const epost = (row.epost ?? "").trim();
+    const hjemmeside = (row.hjemmeside ?? "").trim();
+    if (!epost || !hjemmeside) continue;
+
+    const websiteHost = hostFromUrlLike(hjemmeside);
+    const websiteDomain = websiteHost ? registrableDomain(websiteHost) : null;
+    if (!websiteDomain) continue; // no established homepage domain -> nothing to compare
+
+    const emailHostRaw = epost.split("@").pop() || "";
+    const emailHost = hostFromUrlLike(emailHostRaw);
+    const emailDomain = emailHost ? registrableDomain(emailHost) : "";
+    if (!emailDomain || emailDomain === websiteDomain) continue;
+    if (FREE_MAIL_DOMAINS.includes(emailHostRaw.toLowerCase()) || FREE_MAIL_DOMAINS.includes(emailDomain)) continue;
+
+    if (isGardssalgContactEmailOverrideActive(row.field_provenance, epost)) {
+      alreadyOverrideExempt++;
+      continue;
+    }
+    if (isGardssalgContactEmailFlaggedForReview(row.field_provenance, epost)) {
+      alreadyFlagged++;
+      continue;
+    }
+
+    if (row.content_source === "manual" || row.content_source === "claim") {
+      lockedNotFlagged.push({
+        provider_id: row.id,
+        navn: row.navn,
+        epost,
+        website_domain: websiteDomain,
+        email_domain: emailDomain,
+        content_source: row.content_source,
+      });
+      continue;
+    }
+
+    mismatches.push({
+      provider_id: row.id,
+      navn: row.navn,
+      epost,
+      website_domain: websiteDomain,
+      email_domain: emailDomain,
+    });
+
+    if (!dryRun) {
+      flagGardssalgContactEmailForReview(row.id, {
+        flagged_email: epost,
+        website_domain: websiteDomain,
+        email_domain: emailDomain,
+        reason: "domain_mismatch",
+        source: "catalog_audit",
+      });
+      newlyFlagged++;
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    cohort_total: rows.length,
+    mismatch_count: mismatches.length,
+    already_override_exempt: alreadyOverrideExempt,
+    already_flagged: alreadyFlagged,
+    newly_flagged: newlyFlagged,
+    locked_not_flagged: lockedNotFlagged,
+    mismatches,
   });
 });
 

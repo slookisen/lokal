@@ -41,6 +41,10 @@
  *       excluded/address_domain_mismatch exactly like an unoverridden row
  *       (AC2 — the override lapses, it does not silently cover the new
  *       address)
+ *   (e) isGardssalgContactEmailFlaggedForReview (Skive C, same dev-request):
+ *       the sibling review-flag stamp's reader — active match, lapsed after
+ *       an epost change, missing/malformed stamp, malformed JSON, blank
+ *       epost, and mutual non-confusion with the override stamp
  *   (d) daily-prep response carries `active_contact_email_overrides` — a
  *       catalog-wide count, present and correct on the full-batch response,
  *       and independently correct (counts a provider that isn't even
@@ -206,6 +210,59 @@ export function runOpplevelserGardssalgContactEmailOverrideTests(
       assertTrue(!isActive(JSON.stringify({ contact_email_domain_override: "not-an-object" }), "post@approved.example.org"), "a7: malformed stamp shape (string, not object) -> not active");
       assertTrue(!isActive(JSON.stringify([1, 2, 3]), "post@approved.example.org"), "a8: top-level array -> not active");
       assertTrue(!isActive(JSON.stringify({ contact_email_domain_override: { approved_by: "admin" } }), "post@approved.example.org"), "a9: stamp present but missing approved_email -> not active");
+
+      // ══ (e) isGardssalgContactEmailFlaggedForReview (Skive C): the SIBLING
+      // stamp's reader — same fail-closed / lapse-on-change discipline as
+      // (a) above, on field_provenance.contact_email_flagged_review. True
+      // means "under review, do not publish": routes/experiences-seo.ts drops
+      // both the visible E-post fact row and the JSON-LD `email` for it
+      // (AC4). ═══════════════════════════════════════════════════════════════
+      const isFlagged = opplevelserMod.isGardssalgContactEmailFlaggedForReview;
+      const flagStamp = (flaggedEmail: string) => ({
+        flagged_email: flaggedEmail,
+        website_domain: "site.no",
+        email_domain: "annenbedrift.no",
+        reason: "domain_mismatch",
+        source: "catalog_audit",
+        flagged_at: "2026-08-18T09:00:00.000Z",
+      });
+      assertTrue(
+        isFlagged(JSON.stringify({ contact_email_flagged_review: flagStamp("post@annenbedrift.no") }), "post@annenbedrift.no"),
+        "e1: flag matching the row's current epost -> flagged",
+      );
+      assertTrue(
+        !isFlagged(JSON.stringify({ contact_email_flagged_review: flagStamp("gammel@annenbedrift.no") }), "ny@annenbedrift.no"),
+        "e2: epost changed since the flag was raised -> lapsed, NOT flagged",
+      );
+      assertTrue(!isFlagged(JSON.stringify({}), "post@annenbedrift.no"), "e3: no stamp at all -> not flagged");
+      assertTrue(!isFlagged(null, "post@annenbedrift.no"), "e4: null field_provenance -> not flagged");
+      assertTrue(
+        !isFlagged(JSON.stringify({ contact_email_flagged_review: flagStamp("post@annenbedrift.no") }), null),
+        "e5: blank epost (write-time-blocked candidate, nothing published) -> not flagged",
+      );
+      assertTrue(!isFlagged("{not valid json", "post@annenbedrift.no"), "e6: malformed JSON -> fail closed, not flagged");
+      assertTrue(
+        !isFlagged(JSON.stringify({ contact_email_flagged_review: "not-an-object" }), "post@annenbedrift.no"),
+        "e7: malformed stamp shape -> not flagged",
+      );
+      assertTrue(!isFlagged(JSON.stringify([1, 2, 3]), "post@annenbedrift.no"), "e8: top-level array -> not flagged");
+      assertTrue(
+        !isFlagged(JSON.stringify({ contact_email_flagged_review: { reason: "domain_mismatch" } }), "post@annenbedrift.no"),
+        "e9: stamp present but missing flagged_email -> not flagged",
+      );
+      // The two stamps are independent: an ACTIVE override must never be read
+      // as a review flag, and a review flag must never be read as an override.
+      assertTrue(
+        !isFlagged(
+          JSON.stringify({ contact_email_domain_override: overrideStamp("post@annenbedrift.no", "site.no", "annenbedrift.no") }),
+          "post@annenbedrift.no",
+        ),
+        "e10: an override stamp is never mistaken for a review flag",
+      );
+      assertTrue(
+        !isActive(JSON.stringify({ contact_email_flagged_review: flagStamp("post@annenbedrift.no") }), "post@annenbedrift.no"),
+        "e11: a review flag is never mistaken for an active override",
+      );
 
       // ── DB fixtures for (b)/(c)/(d) ──────────────────────────────────────
       const insertProvider = expDb.prepare(

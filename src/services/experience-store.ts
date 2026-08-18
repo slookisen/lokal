@@ -2669,10 +2669,21 @@ export type GardssalgProviderRow = {
   // "Bekreftet av eier" badge vs. the "Er dette din bedrift?" claim CTA.
   // NULL = never claimed.
   claimed_at: string | null;
+  // Additive (2026-08-18, dev-request 2026-08-17-kontaktadresse-feilkilde-og-
+  // override, Skive C): the row's raw field_provenance JSON blob. Selected
+  // here so the RENDER surfaces (routes/experiences-seo.ts's produsent-profil
+  // page + its JSON-LD) can read the contact_email_flagged_review stamp and
+  // suppress an email whose domain deviates from the homepage domain until a
+  // human resolves it (AC4 — "Hull 1"). Kept as the raw string and never
+  // parsed here: every consumer parses defensively through its own
+  // fail-closed reader (isGardssalgContactEmailFlaggedForReview /
+  // isGardssalgContactEmailOverrideActive, routes/opplevelser.ts). NULL on
+  // most rows.
+  field_provenance: string | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at, claimed_at";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, updated_at, claimed_at, field_provenance";
 
 export function listGardssalgProviders(limit = 100, offset = 0, filter?: GardssalgProviderTypeFilter): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
@@ -4353,6 +4364,101 @@ export function getGardssalgProviderContactTarget(providerId: string): Gardssalg
   return row;
 }
 
+// ── Contact-email review queue (dev-request 2026-08-17-kontaktadresse-
+// feilkilde-og-override, Skive C) ──────────────────────────────────────────
+//
+// field_provenance stamp key for an email candidate/value whose registrable
+// domain deviates from the provider's established hjemmeside domain. Same
+// "verification STAMP living inside field_provenance" idiom as
+// GardssalgContactEmailOverrideStamp below (and hjemmeside_verification
+// before it) — no shared typed FieldProvenance interface exists in this
+// codebase, so this is a local minimal shape scoped to just this one stamp.
+//
+// Two producers write it:
+//   1. applyGardssalgProviderContact's write-time gate — a NEW candidate
+//      held back instead of written (the row's epost stays blank);
+//   2. POST /admin/gardssalg-contact-email-audit (apply=true) — an
+//      ALREADY-PUBLISHED legacy mismatch, retroactively flagged so the
+//      render surfaces hide it (AC4/AC5).
+//
+// One consumer today: isGardssalgContactEmailFlaggedForReview
+// (routes/opplevelser.ts), read by the produsent-profil page + its JSON-LD.
+// Scoped to `flagged_email` on purpose, exactly like the override stamp's
+// approved_email: if epost later changes by ANY path, the stamp no longer
+// matches the row's current value and the flag lapses on its own — no
+// explicit cleanup step, and a stale flag can never suppress a NEW,
+// never-flagged address.
+export interface GardssalgContactEmailFlaggedReviewStamp {
+  flagged_email: string;
+  website_domain: string | null;
+  email_domain: string;
+  reason: "domain_mismatch";
+  source: string;
+  flagged_at: string;
+}
+
+/** What applyGardssalgProviderContact reports back about a held-back epost. */
+export type GardssalgContactEmailFlaggedForReview = {
+  candidate: string;
+  website_domain: string;
+  email_domain: string;
+};
+
+export type GardssalgProviderContactWriteResult = {
+  /** Field names actually written (empty when nothing was written). */
+  written: string[];
+  /**
+   * Present only when the epost candidate was withheld by the write-time
+   * domain gate — lets a caller distinguish "wrote nothing because the field
+   * was already filled / the row is locked" from "wrote nothing because the
+   * address is under review".
+   */
+  epostFlaggedForReview?: GardssalgContactEmailFlaggedForReview;
+};
+
+/**
+ * Stamp field_provenance.contact_email_flagged_review for ONE provider.
+ * Read-modify-write merge that preserves every other key (malformed existing
+ * JSON is treated as {} rather than clobbering the write — same defensive
+ * parse as applyGardssalgProviderContact/applyGardssalgSetContactEmail).
+ *
+ * Deliberately does NOT touch the `epost` column, does NOT insert a
+ * gardssalg_content_audit row and does NOT bump updated_at: this is a
+ * provenance/queue stamp about a candidate, not a change to a published
+ * field. (gardssalg_content_audit is the visible-content change log; a
+ * write-time-blocked candidate never became visible content, and bumping
+ * updated_at would make the sitemap claim a freshness that no reader can
+ * observe.) Idempotent in effect — re-stamping the same address just
+ * refreshes flagged_at.
+ */
+export function flagGardssalgContactEmailForReview(
+  providerId: string,
+  stamp: Omit<GardssalgContactEmailFlaggedReviewStamp, "flagged_at">,
+): void {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { field_provenance: string | null } | undefined;
+  if (!row) return;
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  const full: GardssalgContactEmailFlaggedReviewStamp = { ...stamp, flagged_at: new Date().toISOString() };
+  provenance.contact_email_flagged_review = full;
+  db.prepare(`UPDATE experience_providers SET field_provenance = @fp WHERE id = @id`).run({
+    id: providerId,
+    fp: JSON.stringify(provenance),
+  });
+}
+
 /**
  * Apply a Brreg contact candidate to ONE gårdssalg provider. Same discipline
  * as applyGardssalgProviderAddress: NEVER writes if the provider is locked
@@ -4367,18 +4473,42 @@ export function getGardssalgProviderContactTarget(providerId: string): Gardssalg
  * established evidence-checked review-queue path
  * (gardssalg_website_review_queue) and this backfill routes candidates there
  * instead of bypassing it. Returns the field names actually written (empty
- * array when there was nothing to write). Idempotent.
+ * array when there was nothing to write) plus, when the epost candidate was
+ * held back by the write-time domain gate below, a description of what was
+ * flagged instead. Idempotent.
+ *
+ * WRITE-TIME DOMAIN GATE (2026-08-18, dev-request 2026-08-17-kontaktadresse-
+ * feilkilde-og-override, Skive C(a)): a candidate epost whose registrable
+ * domain disagrees with the provider's established hjemmeside domain is NOT
+ * written as a publishable address — it is stamped into
+ * field_provenance.contact_email_flagged_review (a review queue a human
+ * resolves later via POST /admin/gardssalg-set-contact-email with
+ * force:true, the Skive A override path) and reported back to the caller.
+ * The check lives HERE rather than in each route because both writers
+ * (POST /admin/gardssalg-contact-extraction, HTML-scrape source, and
+ * POST /admin/gardssalg-contact-backfill, Brreg-registry source) funnel
+ * their real write through this one function — one choke point, no
+ * duplicated logic, no way for a new caller to skip it.
+ *
+ * Exemptions, all deliberate and mirroring applyGardssalgSetContactEmail's
+ * own domain check:
+ *   - no established hjemmeside on file -> nothing to contradict, write
+ *     proceeds (same precedent as Skive A);
+ *   - freemail candidate (FREE_MAIL_DOMAINS) -> a farm on gmail.com is the
+ *     norm, not a wrong-company signal, and extractGardssalgContactEmail
+ *     already treats freemail as its own trusted tier;
+ *   - telefon is completely unaffected — this gate is epost-only.
  */
 export function applyGardssalgProviderContact(
   providerId: string,
-  candidate: { epost?: string | null; telefon?: string | null },
+  candidate: { epost?: string | null; telefon?: string | null; epostSource?: string | null },
   evidenceUrl: string,
   batchId?: string
-): string[] {
+): GardssalgProviderContactWriteResult {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, content_source, epost, telefon, field_provenance
+      `SELECT id, content_source, epost, telefon, hjemmeside, field_provenance
          FROM experience_providers WHERE id = ?`
     )
     .get(providerId) as
@@ -4387,11 +4517,12 @@ export function applyGardssalgProviderContact(
         content_source: string | null;
         epost: string | null;
         telefon: string | null;
+        hjemmeside: string | null;
         field_provenance: string | null;
       }
     | undefined;
-  if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
+  if (!row) return { written: [] };
+  if (row.content_source === "manual" || row.content_source === "claim") return { written: [] };
 
   function isBlank(v: unknown): boolean {
     return v === null || v === undefined || String(v).trim() === "";
@@ -4407,7 +4538,38 @@ export function applyGardssalgProviderContact(
     telefon: row.telefon,
   };
 
+  // Write-time domain gate (Skive C(a)) — see this function's doc comment.
+  // Computed BEFORE the epost branch decides anything, so a flagged
+  // candidate never reaches `sets`/`written`.
+  let epostFlaggedForReview: GardssalgContactEmailFlaggedForReview | null = null;
   if (isBlank(row.epost) && candidate.epost?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "epost")) {
+    const candidateEmail = candidate.epost.trim();
+    if (row.hjemmeside && row.hjemmeside.trim() !== "") {
+      const websiteHost = hostFromUrlLike(row.hjemmeside);
+      const websiteDomain = websiteHost ? registrableDomain(websiteHost) : null;
+      if (websiteDomain) {
+        const emailHostRaw = candidateEmail.split("@").pop() || "";
+        const emailHost = hostFromUrlLike(emailHostRaw);
+        const emailDomain = emailHost ? registrableDomain(emailHost) : "";
+        const isFreeMail =
+          FREE_MAIL_DOMAINS.includes(emailHostRaw.toLowerCase()) || FREE_MAIL_DOMAINS.includes(emailDomain);
+        if (emailDomain !== websiteDomain && !isFreeMail) {
+          epostFlaggedForReview = {
+            candidate: candidateEmail,
+            website_domain: websiteDomain,
+            email_domain: emailDomain,
+          };
+        }
+      }
+    }
+  }
+
+  if (
+    isBlank(row.epost)
+    && candidate.epost?.trim()
+    && !gardssalgContactFieldWasRolledBack(providerId, "epost")
+    && !epostFlaggedForReview
+  ) {
     sets.push("epost = @epost");
     params.epost = candidate.epost.trim();
     written.push("epost");
@@ -4418,7 +4580,28 @@ export function applyGardssalgProviderContact(
     written.push("telefon");
   }
 
-  if (sets.length === 0) return [];
+  // The flag stamp is written even when there is nothing else to write —
+  // that is the whole point: a held-back candidate must leave a visible,
+  // resolvable trace rather than vanishing. Always stamped AFTER this
+  // function's own field_provenance write below (when there is one), because
+  // both are read-modify-write merges over the same column: stamping first
+  // would be clobbered by the `provenance` object this function already read
+  // from the pre-write row.
+  const stampFlag = (): void => {
+    if (!epostFlaggedForReview) return;
+    flagGardssalgContactEmailForReview(providerId, {
+      flagged_email: epostFlaggedForReview.candidate,
+      website_domain: epostFlaggedForReview.website_domain,
+      email_domain: epostFlaggedForReview.email_domain,
+      reason: "domain_mismatch",
+      source: candidate.epostSource?.trim() || "unknown",
+    });
+  };
+
+  if (sets.length === 0) {
+    stampFlag();
+    return { written: [], ...(epostFlaggedForReview ? { epostFlaggedForReview } : {}) };
+  }
 
   sets.push("updated_at = datetime('now')");
 
@@ -4461,8 +4644,9 @@ export function applyGardssalgProviderContact(
     }
   });
   applyWithAudit();
+  stampFlag();
 
-  return written;
+  return { written, ...(epostFlaggedForReview ? { epostFlaggedForReview } : {}) };
 }
 
 export type GardssalgSetContactEmailResult =
@@ -4592,6 +4776,16 @@ export function applyGardssalgSetContactEmail(
     }
   }
   provenance.epost = { source_url: source, fetched_at: new Date().toISOString() };
+  // Skive C fix-up (independent review, finding B1): a confirmed epost write
+  // through THIS endpoint is a human resolving the address, so it always ends
+  // any pending review on this row. Without it, an address flagged by the
+  // write-time gate or the catalog audit (field_provenance.contact_email_
+  // flagged_review) stayed flagged even after a human force-approved that
+  // EXACT address here — the documented resolution path silently did nothing
+  // and the produsent-profil page + its JSON-LD kept hiding the approved
+  // address forever. Done inside the same read-modify-write merge (no extra
+  // write, every other provenance key preserved); a no-op when no flag exists.
+  delete provenance.contact_email_flagged_review;
   if (domainOverride) {
     const stamp: GardssalgContactEmailOverrideStamp = {
       approved_email: email,
@@ -6262,6 +6456,47 @@ export function selectGardssalgProvidersForContactExtraction(
     )
     .all(...ids, limit, offset) as GardssalgContactExtractionTarget[];
   return { targets, cohortTotal };
+}
+
+export type GardssalgContactEmailAuditRow = {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+  epost: string;
+  content_source: string | null;
+  field_provenance: string | null;
+};
+
+/**
+ * Cohort for the one-time catalog-wide contact-email domain audit
+ * (dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C(c),
+ * AC5): every gårdssalg row that has BOTH an established hjemmeside AND a
+ * stored epost — i.e. every row where a domain comparison is even possible.
+ *
+ * Same base population predicate as
+ * selectGardssalgProvidersForContactExtraction above (gårdssalg scope, test
+ * provider excluded); deliberately does NOT exclude locked or catalog_hidden
+ * rows — the audit must COUNT the whole catalog honestly. The caller decides
+ * what to do per row (POST /admin/gardssalg-contact-email-audit never
+ * auto-flags a manual/claim-locked row, but does report it).
+ *
+ * Unpaged on purpose: this is a one-time full-catalog pass over a few
+ * hundred rows, looped in JS exactly like
+ * countActiveGardssalgContactEmailOverrides (routes/opplevelser.ts).
+ */
+export function selectGardssalgProvidersForContactEmailAudit(): GardssalgContactEmailAuditRow[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT id, navn, hjemmeside, epost, content_source, field_provenance
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          AND epost IS NOT NULL AND TRIM(epost) != ''
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+        ORDER BY navn ASC, id ASC`
+    )
+    .all() as GardssalgContactEmailAuditRow[];
 }
 
 // ─── Paraply-/foreningsvern (dev-request 2026-08-10-veien-til-pool-…, AK2) ──
