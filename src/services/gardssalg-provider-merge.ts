@@ -68,6 +68,16 @@
 //   * either id not found -> error, "ikke_funnet" (never blocks the rest of
 //     the batch — same discipline as the outreach-preflight endpoint's own
 //     ikke_funnet handling).
+//   * both rows have a non-blank org_nr AND the values differ -> rejected,
+//     "org_nr_konflikt_ulike_org_nr". Fail-closed, dev-request 2026-08-18-
+//     gardssalg-dedup-org-nr-override point 5 — two distinct, populated org
+//     numbers is positive proof of two separate companies, independent of
+//     whatever GET /admin/gardssalg-provider-dedup-audit graded the pair as
+//     (that route's own point-3 override is a SEPARATE, best-effort read
+//     gate; this is the write-side enforcement so the decision can't be
+//     gotten wrong in one place while being right in the other). Checked
+//     BEFORE the survivorship/content_source guard below — a genuine org_nr
+//     conflict is a harder, more objective fact than ownership-claim status.
 //   * remove_id row content_source in ('manual','claim') -> rejected,
 //     "eier_overtatt_kan_ikke_fjernes". Hard, unconditional, checked before
 //     any write.
@@ -210,6 +220,17 @@ function evaluatePair(db: Database.Database, removeId: string, keepId: string): 
   const keep = readSnapshot(db, keepId);
   if (!remove || !keep) {
     return { ok: false, outcome: "error", reason: "ikke_funnet" };
+  }
+  // Fail-closed org_nr guard (dev-request 2026-08-18-gardssalg-dedup-org-nr-
+  // override, point 5) — enforced HERE at the write route itself, not only
+  // at the audit route, so this decision can't be gotten wrong in one place
+  // while being right in the other. Two distinct, non-blank org_nr values is
+  // positive proof of two separate companies; no caller-supplied pair can
+  // override it.
+  const removeOrgNr = remove.org_nr && remove.org_nr.trim() ? remove.org_nr.trim() : null;
+  const keepOrgNr = keep.org_nr && keep.org_nr.trim() ? keep.org_nr.trim() : null;
+  if (removeOrgNr && keepOrgNr && removeOrgNr !== keepOrgNr) {
+    return { ok: false, outcome: "rejected", reason: "org_nr_konflikt_ulike_org_nr" };
   }
   // Hard, mechanical, fail-closed guard (survivorship rule §2) — checked
   // before anything else about the pair's data, and never overridable by

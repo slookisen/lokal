@@ -15472,9 +15472,12 @@ router.post("/admin/gardssalg-field-concordance-clear", requireAdmin, async (req
 //                       on the raw navn and on the "— Sted"-suffix-stripped
 //                       gardssalgSearchName() variant (so "X — By" still
 //                       matches a bare "X"), keeping the higher score:
-//                         score 1.0  -> "name_exact"            (high conf.)
-//                         score 0.95 -> "name_first_token_postal" (high conf.
-//                                       — first word matches AND same postal)
+//                         score 1.0  -> "name_exact"            (identity-
+//                                       bearing — see confidence rule below)
+//                         score 0.95 -> "name_first_token_postal" (NEVER
+//                                       high on its own — see confidence
+//                                       rule below; dev-request 2026-08-18-
+//                                       gardssalg-dedup-org-nr-override)
 //                         score 0.80 -> "name_first_token"       (LOW conf.
 //                                       — first word matches alone; e.g.
 //                                       "Himkok" vs "Himkok Rtd" lands here:
@@ -15483,6 +15486,51 @@ router.post("/admin/gardssalg-field-concordance-clear", requireAdmin, async (req
 //                                       deliberately distinct product line —
 //                                       surfaced for human judgment, never
 //                                       silently merged or silently dropped)
+//
+// ── Confidence rule (dev-request 2026-08-18-gardssalg-dedup-org-nr-
+//    override) ──────────────────────────────────────────────────────────
+// A live grading pass on real gårdssalg rows found 17 false "high" groups
+// produced SOLELY by name_first_token_postal — "same first word in the name,
+// same postal place" is a weak signal in this domain (breweries/
+// distilleries in the same village routinely share a first name-word
+// without being the same company: "Geiranger Brenneri" vs "Geiranger
+// Bryggeri", different org numbers). It was ALSO simultaneously missing a
+// real blind spot: two rows differing only by a mandatory Norwegian
+// legal-form suffix ("Kinn Bryggeri" vs "Kinn Bryggeri AS") already score
+// 1.0/name_exact today (normaliseNamePruned in brreg-client.ts already
+// strips as/asa/da/ans/sa before that comparison) — what was actually
+// missing was a way to distinguish THAT (genuinely the same company, just
+// spelled with vs without its mandatory legal suffix) from "X" vs
+// "X Holding" / "X Gruppen" / "X Norge" / "X Supply Company" (a DIFFERENT,
+// related legal entity in the same corporate group — Ringnes / Ringnes
+// Brygghus / Ringnes Norge / Ringnes Supply is a real 4-way example, four
+// different org numbers).
+//
+// Fix (see gsDedupCorporateGroupSuffixMatch / GS_DEDUP_HIGH_CONF_NAME_TIERS
+// below), deliberately NOT touching brreg-client.ts's shared
+// normaliseNamePruned/ORG_SUFFIXES (also used by unrelated Brreg fuzzy
+// matching in services/local-orgnr-candidates.ts — this fix is scoped to
+// THIS audit's own dedup judgment):
+//   (a) "high" now requires an IDENTITY-bearing signal — org_nr match,
+//       domain match, or name_exact (score===1.0 — unchanged, EXISTING
+//       as/asa/da/ans/sa-stripped comparison). name_first_token_postal and
+//       name_first_token are demoted to hints for human review; neither can
+//       produce "high" alone.
+//   (b) a SEPARATE "corporate_group" label (never a confidence tier, never
+//       contributes to "high") fires when two names are equal after
+//       stripping ONE trailing corporate/legal-form word from EXACTLY one
+//       side — holding / gruppen / norge / "supply company" — words that
+//       denote a DIFFERENT (related) legal entity, unlike as/asa/da/ans/sa
+//       which brreg-client.ts already treats as pure spelling variants of
+//       the SAME entity.
+//   (c) org_nr override: two rows with DIFFERENT, BOTH-populated org_nr
+//       values is positive proof of two separate companies. This overrides
+//       ANY other matching signal (name_exact, domain — even a shared
+//       domain, e.g. one website listing two legally-separate producer
+//       brands) for THAT PAIR — it can never contribute to "high" for that
+//       pair no matter what else matches. Other pairs within the same group
+//       are evaluated independently, so this only suppresses the specific
+//       pair it applies to.
 //
 // A row-pair comparison is O(n²) in the worst case, so name-matching first
 // buckets rows by the normalised first token of gardssalgSearchName(navn)
@@ -15496,10 +15544,10 @@ router.post("/admin/gardssalg-field-concordance-clear", requireAdmin, async (req
 // gardssalg-outreach-readiness's existing precedent (a public Brreg registry
 // number, not a contact channel).
 type GsDedupNameTier = "name_exact" | "name_first_token_postal" | "name_first_token";
-const GS_DEDUP_HIGH_CONF_NAME_TIERS: ReadonlySet<GsDedupNameTier> = new Set([
-  "name_exact",
-  "name_first_token_postal",
-]);
+// ONLY name_exact is identity-bearing on its own — see confidence rule
+// above. name_first_token_postal used to also be in this set (the 17-false-
+// high bug); it is intentionally demoted to a hint-only tier.
+const GS_DEDUP_HIGH_CONF_NAME_TIERS: ReadonlySet<GsDedupNameTier> = new Set(["name_exact"]);
 
 function gsDedupNameTierForScore(score: number): GsDedupNameTier | null {
   if (score >= 1.0) return "name_exact";
@@ -15508,7 +15556,57 @@ function gsDedupNameTierForScore(score: number): GsDedupNameTier | null {
   return null;
 }
 
-interface GsDedupRow {
+// ── corporate/legal-form suffix words that denote a DIFFERENT (related)
+// entity, not a spelling variant of the same one — deliberately NOT in
+// brreg-client.ts's ORG_SUFFIXES (that set is as/asa/da/ans/sa/enk/ba/ks/
+// nuf/stif/stiftelse, pure legal-form spelling, already stripped by the
+// EXISTING name_exact tier above; these four are NOT pure legal-form — they
+// name an actual different corporate relationship). Longest phrase first so
+// "supply company" matches before any bare-word entry would (there is no
+// bare "company" entry — only the exact two-word phrase).
+const GS_DEDUP_CORPORATE_GROUP_SUFFIXES: readonly string[] = ["supply company", "holding", "gruppen", "norge"];
+
+/**
+ * Strips AT MOST ONE trailing corporate-group suffix word/phrase (see
+ * GS_DEDUP_CORPORATE_GROUP_SUFFIXES) from an already-normalised
+ * (normaliseName) name. Returns the input unchanged if no such suffix is
+ * present as the trailing token(s), or if the ENTIRE name is only the
+ * suffix itself (nothing left to compare). Pure, exported for tests.
+ */
+export function gsDedupStripCorporateGroupSuffix(normalisedNavn: string): string {
+  for (const suf of GS_DEDUP_CORPORATE_GROUP_SUFFIXES) {
+    if (normalisedNavn === suf) continue;
+    if (normalisedNavn.endsWith(" " + suf)) {
+      return normalisedNavn.slice(0, normalisedNavn.length - suf.length - 1).trim();
+    }
+  }
+  return normalisedNavn;
+}
+
+/**
+ * True when two rows' names are equal after stripping ONE corporate-group
+ * suffix word from EXACTLY one side (not both, not neither) — the "X" vs
+ * "X Holding" shape. Tried on both the raw navn and the "— Sted"-suffix-
+ * stripped gardssalgSearchName() variant, same convention as
+ * gsDedupBestNameTier. Pure, exported for tests.
+ */
+export function gsDedupIsCorporateGroupPair(a: GsDedupRow, b: GsDedupRow): boolean {
+  const check = (navnA: string, navnB: string): boolean => {
+    const rawA = normaliseName(navnA);
+    const rawB = normaliseName(navnB);
+    const baseA = gsDedupStripCorporateGroupSuffix(rawA);
+    const baseB = gsDedupStripCorporateGroupSuffix(rawB);
+    if (!baseA || !baseB || baseA !== baseB) return false;
+    const strippedA = rawA !== baseA;
+    const strippedB = rawB !== baseB;
+    return strippedA !== strippedB; // exactly one side had a suffix stripped
+  };
+  return check(a.navn, b.navn) || check(gardssalgSearchName(a.navn), gardssalgSearchName(b.navn));
+}
+
+// Exported (not just for the route below) so tests can construct minimal
+// fixture rows and call the pure helpers above directly.
+export interface GsDedupRow {
   id: string;
   navn: string;
   org_nr: string | null;
@@ -15653,6 +15751,25 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
   const groups: Array<{
     signals: string[];
     confidence: "high" | "low";
+    // Point 6 (dev-request 2026-08-18-gardssalg-dedup-org-nr-override): WHICH
+    // signal(s) actually justified `confidence: "high"` — a subset of
+    // `signals` (which lists ALL matched evidence, including tiers/matches
+    // that were considered but did NOT justify "high", e.g. a
+    // name_first_token_postal match, or a domain match suppressed by an
+    // org_nr conflict on that same pair). Always [] when confidence is "low"
+    // — a human reader can see exactly why a group was/wasn't trusted
+    // without re-deriving the scoring rules themselves.
+    confidence_signals: string[];
+    // True when some pair in this group differs ONLY by a trailing
+    // corporate/legal-form word (holding/gruppen/norge/"supply company") —
+    // e.g. "Fjording" vs "Fjording Holding". A DIFFERENT, related legal
+    // entity, never a duplicate-confidence signal — see
+    // gsDedupIsCorporateGroupPair.
+    corporate_group: boolean;
+    // True when some pair in this group has DIFFERENT, BOTH-populated
+    // org_nr values — positive proof of two separate companies for that
+    // pair, which overrides any other matching signal for it (point 3).
+    org_nr_conflict: boolean;
     rows: ReturnType<typeof toRowOut>[];
   }> = [];
 
@@ -15663,33 +15780,56 @@ router.get("/admin/gardssalg-provider-dedup-audit", requireAdmin, (_req: Request
     // pair here (rather than threading evidence through the union-find
     // above) is cheap and keeps the "why grouped" logic in one place.
     const signals = new Set<string>();
+    const confidenceSignals = new Set<string>();
     let highConfidence = false;
+    let corporateGroup = false;
+    let orgNrConflict = false;
     for (let x = 0; x < idxs.length; x++) {
       for (let y = x + 1; y < idxs.length; y++) {
         const a = rows[idxs[x]];
         const b = rows[idxs[y]];
         const orgA = a.org_nr && a.org_nr.trim();
         const orgB = b.org_nr && b.org_nr.trim();
-        if (orgA && orgB && orgA === orgB) {
-          signals.add("org_nr");
-          highConfidence = true;
-        }
+        const orgMatch = !!(orgA && orgB && orgA === orgB);
+        // Point 3: different, BOTH-populated org_nr is positive proof of two
+        // separate companies for THIS pair — overrides any other matching
+        // signal below for this pair, regardless of domain/name evidence.
+        const orgConflictThisPair = !!(orgA && orgB && orgA !== orgB);
+        if (orgConflictThisPair) orgNrConflict = true;
+
         const domA = homepageRegistrableDomain(a.hjemmeside);
         const domB = homepageRegistrableDomain(b.hjemmeside);
-        if (domA && domB && domA === domB) {
-          signals.add("domain");
-          highConfidence = true;
-        }
+        const domMatch = !!(domA && domB && domA === domB);
+        if (domMatch) signals.add("domain");
+
         const tier = gsDedupBestNameTier(a, b);
-        if (tier) {
-          signals.add(tier);
-          if (GS_DEDUP_HIGH_CONF_NAME_TIERS.has(tier)) highConfidence = true;
+        if (tier) signals.add(tier);
+
+        if (gsDedupIsCorporateGroupPair(a, b)) corporateGroup = true;
+
+        if (orgConflictThisPair) continue; // never contributes to high for this pair
+
+        if (orgMatch) {
+          signals.add("org_nr");
+          highConfidence = true;
+          confidenceSignals.add("org_nr");
+        }
+        if (domMatch) {
+          highConfidence = true;
+          confidenceSignals.add("domain");
+        }
+        if (tier && GS_DEDUP_HIGH_CONF_NAME_TIERS.has(tier)) {
+          highConfidence = true;
+          confidenceSignals.add(tier);
         }
       }
     }
     groups.push({
       signals: Array.from(signals),
       confidence: highConfidence ? "high" : "low",
+      confidence_signals: Array.from(confidenceSignals),
+      corporate_group: corporateGroup,
+      org_nr_conflict: orgNrConflict,
       rows: idxs.map((i) => toRowOut(rows[i])),
     });
   }
