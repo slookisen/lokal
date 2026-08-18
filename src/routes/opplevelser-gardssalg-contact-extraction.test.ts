@@ -42,6 +42,12 @@
  *                innenfor vinduet — hoppes over med den dedikerte
  *                cooldown_skipped-bøtta i stedet for å bli fetchet på nytt;
  *                en vert UTENFOR cooldown fetches som normalt.
+ *   cx-50..cx-53 Skrive-tids-domenegjerdet (dev-request 2026-08-17-
+ *                kontaktadresse-feilkilde-og-override, Skive C(a)): en
+ *                fremmed-domene-kandidat skrives ikke som publiserbar
+ *                adresse, men stemples i review-køen og rapporteres i
+ *                contact_email_flagged_for_review; telefonen fra samme side
+ *                er upåvirket.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/routes/opplevelser-gardssalg-contact-extraction.test.ts
@@ -778,6 +784,47 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
             "cx-49: …med hvor mye tekst den faktisk ga, som er det som skiller en render-svikt fra en side uten adresse");
           assertEq(kontakt?.contactish, true, "cx-49b: og om siden ble regnet som kontaktside");
           assertEq(kontakt?.rendered, false, "cx-49c: og om den ble rendret (her: nei, server-rendret side)");
+        }
+
+        // ── cx-50..53: skrive-tids-domenegjerdet (dev-request 2026-08-17-
+        //    kontaktadresse-feilkilde-og-override, Skive C(a)). En mailto på
+        //    et FREMMED domene (Skive B klassifiserer den som
+        //    `mailto_other_domain` + needsReview) skrives ikke lenger som en
+        //    publiserbar adresse: den havner i review-køen
+        //    (field_provenance.contact_email_flagged_review) og rapporteres i
+        //    responsen. Telefonen fra samme side er upåvirket — gjerdet
+        //    gjelder bare e-post. ────────────────────────────────────────────
+        {
+          const FOREIGN_MAILTO =
+            '<html><body><h1>Fremmedgård</h1><p>Tlf: 41 41 41 41</p>' +
+            '<a href="mailto:tg@distributoren-as.no">Kontakt oss</a></body></html>';
+          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+            const u = String(url);
+            if (u.startsWith("https://fremmedgard.no")) return mkHtmlResponse(u, FOREIGN_MAILTO);
+            return (cxMockFetch3 as typeof fetch)(url as any, init);
+          }) as unknown as typeof fetch;
+          ins.run({ id: "cx-foreign", navn: "Fremmed Gard", pt: "bryggeri", hj: "https://fremmedgard.no", ep: null, tlf: null, cs: null, created: "2026-04-07" });
+
+          const r = await callRoute({ providerIds: ["cx-foreign"], apply: true });
+          const flagged = (r.body.contact_email_flagged_for_review as any[]).find((x) => x.provider_id === "cx-foreign");
+          assertEq(flagged?.candidate_email, "tg@distributoren-as.no",
+            "cx-50: fremmed-domene-kandidaten rapporteres i contact_email_flagged_for_review");
+          assertEq(flagged?.website_domain, "fremmedgard.no", "cx-50b: …med hjemmesidedomenet den er uenig med");
+          assertEq(flagged?.email_domain, "distributoren-as.no", "cx-50c: …og e-postdomenet");
+          const rowForeign = expDb.prepare(
+            "SELECT epost, telefon, field_provenance FROM experience_providers WHERE id='cx-foreign'"
+          ).get() as any;
+          assertEq(rowForeign?.epost, null, "cx-51: adressen er IKKE skrevet til raden");
+          assertEq(rowForeign?.telefon, "41414141", "cx-51b: telefonen fra samme side skrives som før — gjerdet gjelder kun e-post");
+          assertEq(
+            JSON.parse(rowForeign?.field_provenance || "{}").contact_email_flagged_review?.flagged_email,
+            "tg@distributoren-as.no",
+            "cx-52: kandidaten er stemplet i review-køen, ikke stille droppet",
+          );
+          const changedForeign = (r.body.changed as any[]).find((x) => x.provider_id === "cx-foreign");
+          assertTrue(!(changedForeign?.fields ?? []).includes("epost"),
+            "cx-53: den flaggede adressen dukker aldri opp som skrevet epost i changed[]");
+          assertEq(changedForeign?.epost ?? null, null, "cx-53b: …og rapporteres ikke som skrevet verdi heller");
         }
 
         opplevelserModule.__setGardssalgRenderPageImplForTesting(null);
