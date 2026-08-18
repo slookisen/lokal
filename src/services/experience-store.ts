@@ -5533,7 +5533,14 @@ export function selectGardssalgProvidersForWebsiteDiscovery(limit = 16): Gardssa
   const pending = listPendingProviderWorkQueue("discovery", cap);
   const queueTargets: GardssalgWebsiteDiscoveryTarget[] = [];
   if (pending.length > 0) {
-    const pendingIds = pending.map((p) => p.provider_id);
+    // A provider can legitimately have more than one unresolved queue row
+    // targeting discovery (idempotency key is provider_id+to_system+reason,
+    // e.g. missing_source then evidence_url_rejected before either
+    // resolves) — dedupe here so the same provider isn't pushed into
+    // queueTargets twice, which would waste a discovery slot/tier-2 lookup
+    // on a repeat instead of a distinct provider. Set preserves first-seen
+    // (i.e. queue requested_at) order.
+    const pendingIds = [...new Set(pending.map((p) => p.provider_id))];
     const placeholders = pendingIds.map(() => "?").join(", ");
     const eligibleRows = db
       .prepare(

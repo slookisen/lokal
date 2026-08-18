@@ -1090,6 +1090,41 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertTrue(stillPending.includes("wd-owner"), "wd-22c: the ineligible queue row is left alone (not resolved) for a later cycle to re-evaluate");
       }
 
+      // ── wd-22d (Skive 1 fix-up, CHANGES-REQUESTED finding): a provider can
+      //    legitimately have TWO unresolved provider_work_queue rows both
+      //    targeting "discovery" — the idempotency key is provider_id +
+      //    to_system + reason, so a later sweep run can add a second reason
+      //    (e.g. evidence_url_rejected) for a provider still pending from an
+      //    earlier one (missing_source) before either resolves. The selector
+      //    must dedupe by provider_id and return that provider exactly ONCE,
+      //    not once per queue row. ──────────────────────────────────────────
+      {
+        insertProvider.run({ id: "wd-queue-dup", navn: "Dobbelkoet Gard", org_nr: "999100003", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-queue-dup",
+          provider_name: "Dobbelkoet Gard",
+          from_system: "sweep",
+          to_system: "discovery",
+          reason: "missing_source",
+        });
+        providerWorkQueue.enqueueProviderWorkQueueItem({
+          provider_id: "wd-queue-dup",
+          provider_name: "Dobbelkoet Gard",
+          from_system: "berikelse",
+          to_system: "discovery",
+          reason: "evidence_url_rejected",
+        });
+        const pendingDup = providerWorkQueue
+          .listPendingProviderWorkQueue("discovery")
+          .filter((p) => p.provider_id === "wd-queue-dup");
+        assertEq(pendingDup.length, 2, "wd-22d-setup: two distinct-reason queue rows exist for the same provider");
+
+        const selDup = expStore.selectGardssalgProvidersForWebsiteDiscovery(48);
+        const idsDup = selDup.map((s: any) => s.id);
+        const dupCount = idsDup.filter((id: string) => id === "wd-queue-dup").length;
+        assertEq(dupCount, 1, "wd-22d: a provider with two unresolved discovery-queue rows (different reasons) appears exactly ONCE in the selection, not twice");
+      }
+
       // ── wd-23 (Skive 1, dev-request 2026-08-17-forsyningskjede-samarbeid-
       //    og-kvalitetsoppdatering): approving a discovery candidate resolves
       //    the pending discovery-targeted provider_work_queue row(s) for that
