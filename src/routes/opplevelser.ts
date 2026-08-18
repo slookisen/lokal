@@ -4041,6 +4041,85 @@ router.post("/admin/gardssalg-content-quality-update", requireAdmin, async (req:
   });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-content-quality-count (admin) ──────
+//
+// dev-request 2026-08-18-apningstider-ekstraktor-vindusgrenser, AC7. Three
+// prior sessions tried to verify "0 defective / >0 clean opening_hours_text
+// across the whole catalog" by repeatedly calling POST /admin/gardssalg-
+// content-quality-update above in batches — but that route only rotates a
+// random/rolling subset per call (selectGardssalgProvidersForQualityUpdate),
+// does real network fetches + LLM calls per row, and has no providerIds
+// checklist, so there is no way to get a guaranteed single-pass full-catalog
+// count from it. This route is the small, additive, READ-ONLY diagnostic
+// the dev-request's own log concludes is the fix: one single-pass count over
+// the whole catalog, reusing existing data + logic only — no new
+// extraction/writing logic, no network calls, no LLM calls.
+//
+// Reuses exactly two existing building blocks:
+//   - listGardssalgFieldValuesForQualityUpdate() (experience-store.ts) — the
+//     SAME "every visible gårdssalg provider's id/about_text/visit_text/
+//     opening_hours_text" query the POST route above already uses for its
+//     template-leakage othersFor() comparison set (already excludes
+//     catalog_hidden rows, already scoped to gårdssalg providers).
+//   - classifyGardssalgFieldDefect() (gardssalg-quality-update.ts) — the
+//     SAME pure classifier the POST route uses, called with the SAME
+//     othersForField (every OTHER row's value for that field) so this
+//     route's counts are consistent with what that route would flag.
+//
+// Takes zero params: it always scans the whole catalog in one pass — that is
+// the entire point (a repeatable, deterministic count), unlike the POST
+// route's rotating batch. Read-only — a single SELECT, no writes.
+router.get("/admin/gardssalg-content-quality-count", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const allFieldValues = listGardssalgFieldValuesForQualityUpdate();
+
+    function othersFor(providerId: string, field: GardssalgQualityFieldName): string[] {
+      return allFieldValues
+        .filter((r) => r.id !== providerId)
+        .map((r) => r[field])
+        .filter((v): v is string => !!v && v.trim() !== "");
+    }
+
+    const fields: Record<
+      GardssalgQualityFieldName,
+      { total: number; blank: number; clean: number; defective: number; defect_types: Record<string, number> }
+    > = {
+      about_text: { total: 0, blank: 0, clean: 0, defective: 0, defect_types: {} },
+      visit_text: { total: 0, blank: 0, clean: 0, defective: 0, defect_types: {} },
+      opening_hours_text: { total: 0, blank: 0, clean: 0, defective: 0, defect_types: {} },
+    };
+
+    for (const field of GARDSSALG_QUALITY_FIELDS) {
+      const stats = fields[field];
+      for (const row of allFieldValues) {
+        stats.total++;
+        const rawValue = row[field];
+        if (!rawValue || rawValue.trim() === "") {
+          stats.blank++;
+          continue;
+        }
+        const verdict = classifyGardssalgFieldDefect(field, rawValue, { othersForField: othersFor(row.id, field) });
+        if (verdict.defective) {
+          stats.defective++;
+          const type = verdict.type ?? "unknown";
+          stats.defect_types[type] = (stats.defect_types[type] ?? 0) + 1;
+        } else {
+          stats.clean++;
+        }
+      }
+    }
+
+    res.json({
+      scanned_at: new Date().toISOString(),
+      providers_scanned: allFieldValues.length,
+      fields,
+    });
+  } catch (err) {
+    console.error("[gardssalg-content-quality-count] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-nace-discovery (admin) ────────────
 //
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter (motivert av 67 North
