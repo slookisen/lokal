@@ -8527,7 +8527,7 @@ router.get("/kontakt", (_req: Request, res: Response) => {
   --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
   --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
   --amber-500:#ff5d3b;--teal-400:#3cc3b4;
-  --ink-soft:#544a3e;--surface:#fff;--line:#e4ded0;
+  --ink:#18130d;--ink-soft:#544a3e;--surface:#fff;--line:#e4ded0;
   --r-pill:999px;--sh-md:0 6px 18px rgba(24,19,13,.10);--maxw:1120px;
 }
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f7f4ee;color:#18130d;line-height:1.6;min-height:100vh;display:flex;flex-direction:column}

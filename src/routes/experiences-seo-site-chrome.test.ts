@@ -384,6 +384,7 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       assertTrue(kontakt.body.includes('href="/.well-known/agent-card.json"'), "l7: kontakt footer links agent-card.json");
       assertTrue(kontakt.body.includes('class="brand-word"'), "l8: kontakt page renders the shared brand mark (brand-word)");
       assertTrue(!/aria-current="page"/.test(kontakt.body), "l9: kontakt has no matching OaNavActive item — oaSiteNav({}) marks nothing aria-current");
+      assertTrue(kontakt.body.includes('--ink:#18130d'), "l9b: kontakt's :root defines --ink (OA_CHROME_CSS's .brand-word/.nav-burger span rely on var(--ink))");
       // Contact form untouched: honeypot, every field, hidden platform input,
       // Turnstile widget + its script tag, and the submit button all survive.
       assertTrue(kontakt.body.includes('<form id="contact-form" novalidate>'), "l10: contact-form markup intact");
