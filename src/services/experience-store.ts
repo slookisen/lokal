@@ -18,6 +18,12 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents } from "./norway-fylke";
+// dev-request 2026-08-18-gardssalg-set-contact-phone: reuse the SAME write-time
+// phone guard the rfb `agent_knowledge` write path already uses (dev-request
+// 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon) instead of inventing a
+// second phone-shape check for this vertical — see applyGardssalgSetContactPhone
+// below for why.
+import { validatePhoneForWrite } from "./contact-normalizer";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
 // reuse the same quality-bar predicate the homepage-content extractor already
 // gates candidates with, so applyGardssalgProviderContent() can tell "thin"
@@ -4838,6 +4844,100 @@ export function applyGardssalgSetContactEmail(
   applyWithAudit();
 
   return { ok: true, old_value: oldValue, new_value: email };
+}
+
+export type GardssalgSetContactPhoneResult =
+  | { ok: true; old_value: string | null; new_value: string }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "invalid_phone" };
+
+/**
+ * Correct an already-filled (or blank) gårdssalg provider `telefon`, the
+ * phone-field counterpart to applyGardssalgSetContactEmail above (same
+ * "correct a wrong-but-filled value" gap, this time surfaced by the Monkey
+ * Brew case: a producer replied with a corrected phone number and no write
+ * path existed to apply it — dev-request 2026-08-18-gardssalg-set-contact-phone).
+ * Backs POST /admin/gardssalg-set-contact-phone.
+ *
+ * Unlike the email sibling, there is no domain-mismatch concept for a phone
+ * number, so this has no `force` parameter — the only gate is the SAME
+ * write-time phone guard `agent_knowledge` writes already use
+ * (validatePhoneForWrite/classifyPhoneForWrite, contact-normalizer.ts):
+ * reject values that don't reduce to a valid 8-digit Norwegian national
+ * number, that collide with the provider's own org_nr, or that look like a
+ * YYYYMMDD date. That guard was built specifically because unvalidated
+ * "phone" writes have previously persisted org-numbers and dates verbatim
+ * (2026-07-27 regressions, see contact-normalizer.ts's own doc comment) — an
+ * admin-typed correction is not exempt from that failure mode just because a
+ * human typed it, so this endpoint reuses the existing check rather than
+ * skipping it.
+ *
+ * `validatePhoneForWrite` returns the ORIGINAL string unchanged when it
+ * passes (see that function's own doc comment) — it validates SHAPE, it does
+ * not normalize for storage. So a formatted input ("+47 476 36 504") is
+ * accepted and persisted verbatim, not collapsed to bare digits. This
+ * matches applyGardssalgSetContactEmail's precedent of storing the
+ * admin-supplied value as typed, with no separate normalization step.
+ *
+ * Write discipline mirrors applyGardssalgSetContactEmail: pre-write
+ * old_value snapshot, read-merge-write field_provenance (malformed/missing
+ * JSON treated as {} rather than clobbered), one gardssalg_content_audit row,
+ * all inside a single transaction.
+ */
+export function applyGardssalgSetContactPhone(
+  providerId: string,
+  phone: string,
+  source: string
+): GardssalgSetContactPhoneResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, telefon, org_nr, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | { id: string; telefon: string | null; org_nr: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  const validated = validatePhoneForWrite(phone, row.org_nr);
+  if (validated === null) return { ok: false, reason: "invalid_phone" };
+
+  const oldValue = row.telefon;
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.telefon = { source_url: source, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET telefon = @phone, field_provenance = @field_provenance WHERE id = @id`
+    ).run({ id: providerId, phone: validated, field_provenance: JSON.stringify(provenance) });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'telefon', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: validated,
+      source_url: source,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: validated };
 }
 
 export type GardssalgAutosvarReviewQueueEntry = {

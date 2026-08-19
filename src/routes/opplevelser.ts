@@ -101,6 +101,10 @@ import {
   // catalog-wide audit behind POST /admin/gardssalg-contact-email-audit).
   flagGardssalgContactEmailForReview,
   selectGardssalgProvidersForContactEmailAudit,
+  // dev-request 2026-08-18-gardssalg-set-contact-phone — same gap, phone
+  // field (Monkey Brew case: producer replied with a corrected phone number,
+  // no write path existed).
+  applyGardssalgSetContactPhone,
   // dev-request 2026-08-16-opplevagent-outreach-rutine, spec point 6
   // ("Autosvar-regelen") — the review queue for autosvar candidates whose
   // candidate email's domain does NOT (or cannot be shown to) agree with the
@@ -8045,6 +8049,77 @@ router.post("/admin/gardssalg-contact-email-audit", requireAdmin, (req: Request,
     brand_alias_domain_excluded: brandAliasDomainExcluded,
     locked_not_flagged: lockedNotFlagged,
     mismatches,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-contact-phone (admin) ────────
+//
+// dev-request 2026-08-18-gardssalg-set-contact-phone. Phone-field counterpart
+// to gardssalg-set-contact-email above — same "correct an already-filled
+// stale value" gap, this time for `telefon` (Monkey Brew case: a producer
+// replied to outreach with a corrected phone number and no write path
+// existed to apply it).
+//
+// Body: { provider_id: string, phone: string, source: string }.
+// `source` is free-text provenance (e.g. a CRM thread reference), stored
+// verbatim in field_provenance.telefon.source_url.
+//
+// No domain concept applies to a phone number, so unlike the email sibling
+// this endpoint has no `force` parameter. The only gate is the shared
+// write-time phone guard (validatePhoneForWrite, contact-normalizer.ts) —
+// rejects values that don't reduce to a valid 8-digit Norwegian national
+// number, that collide with the provider's own org_nr, or that look like a
+// YYYYMMDD date. See applyGardssalgSetContactPhone's own doc comment.
+//
+// Scope is telefon + field_provenance.telefon ONLY — same scoping discipline
+// as the email endpoint (hjemmeside/epost/catalog_hidden/content_source are
+// never touched here). Also deliberately does NOT check content_source
+// ('manual'/'claim') — same choice as the email endpoint, left to reviewer
+// judgment rather than implemented silently.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-contact-phone", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    phone?: unknown;
+    source?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+  if (!phone) {
+    res.status(400).json({ error: "phone_required" });
+    return;
+  }
+
+  const source = typeof body.source === "string" ? body.source.trim() : "";
+  if (!source) {
+    res.status(400).json({ error: "source_required" });
+    return;
+  }
+
+  const result = applyGardssalgSetContactPhone(providerId, phone, source);
+
+  if (!result.ok) {
+    if (result.reason === "provider_not_found") {
+      res.status(404).json({ error: "provider_not_found" });
+      return;
+    }
+    res.status(400).json({ error: "invalid_phone" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "telefon",
+    old_value: result.old_value,
+    new_value: result.new_value,
   });
 });
 

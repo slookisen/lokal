@@ -30543,6 +30543,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gsce.failures) failures.push("opplevelser-gardssalg-set-contact-email: " + f);
     console.log(`  opplevelser-gardssalg-set-contact-email: ${gsce.passed} passed, ${gsce.failed} failed`);
 
+    // dev-request 2026-08-18-gardssalg-set-contact-phone: phone-field
+    // counterpart to gardssalg-set-contact-email above — same "correct an
+    // already-filled stale value" gap, this time for `telefon` (Monkey Brew
+    // case: a producer replied to outreach with a corrected phone number and
+    // no write path existed). No domain-mismatch concept for phone, so this
+    // endpoint is gated by the shared write-time phone guard
+    // (validatePhoneForWrite, contact-normalizer.ts) instead. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-set-contact-phone: correct an already-filled stale telefon ──");
+    const { runOpplevelserGardssalgSetContactPhoneTests } = require("../src/routes/opplevelser-gardssalg-set-contact-phone.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-contact-phone.test");
+    const gscp = await runOpplevelserGardssalgSetContactPhoneTests({ log: false });
+    passed += gscp.passed;
+    failed += gscp.failed;
+    for (const f of gscp.failures) failures.push("opplevelser-gardssalg-set-contact-phone: " + f);
+    console.log(`  opplevelser-gardssalg-set-contact-phone: ${gscp.passed} passed, ${gscp.failed} failed`);
+
     // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A:
     // persist the force-approval from gardssalg-set-contact-email above (a
     // field_provenance.contact_email_domain_override stamp, scoped to the
