@@ -1564,5 +1564,22 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_outreach_size_gate_config failed:", err);
   }
 
+  // ─── experience_providers.terminal_status (dev-request 2026-08-19-
+  // kursjustering-drikkefunnel-llm-og-supply, Grep 3a) ────────────────────────
+  // Explicit end-status for a gårdssalg row that has been deliberately taken
+  // OUT of the readiness/outreach rotation — 'krever_eier' (needs an owner to
+  // step forward) or 'dod_kilde' (source website verified dead) — rather than
+  // being counted as ordinary pipeline backlog. NULL (the default) means "no
+  // terminal status" — every existing row is unaffected the instant this
+  // column exists, and its derived readiness_tier is computed exactly as
+  // before. See computeGardssalgReadinessTier (routes/opplevelser.ts) for the
+  // precedence (terminal_status, when set, short-circuits every other tier
+  // check) and applyGardssalgSetTerminalStatus (services/experience-store.ts)
+  // for the write path. Setting it back to NULL via that same write path IS
+  // the rollback mechanism — no separate rollback route/migration needed.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN terminal_status TEXT DEFAULT NULL");
+  } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

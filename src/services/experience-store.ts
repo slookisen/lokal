@@ -4940,6 +4940,69 @@ export function applyGardssalgSetContactPhone(
   return { ok: true, old_value: oldValue, new_value: validated };
 }
 
+export type GardssalgSetTerminalStatusResult =
+  | { ok: true; old_value: string | null; new_value: string | null }
+  | { ok: false; reason: "provider_not_found" };
+
+/**
+ * Set (or, with `terminalStatus: null`, CLEAR) a gårdssalg provider's
+ * `terminal_status` — dev-request 2026-08-19-kursjustering-drikkefunnel-llm-
+ * og-supply, Grep 3a ("Ærlig kulling av de 296"). Backs POST
+ * /admin/gardssalg-set-terminal-status.
+ *
+ * Structurally mirrors applyGardssalgSetContactPhone above: pre-write
+ * old_value snapshot, one gardssalg_content_audit row, all inside a single
+ * transaction. No field_provenance merge here — that column is a
+ * telefon/epost/hjemmeside-only concept (per-contact-field source/fetched_at
+ * shape), not something terminal_status participates in.
+ *
+ * `terminalStatus: null` is the ROLLBACK path for this write (dev-request's
+ * own Rollback section) — clearing the column returns the row to its
+ * ordinary derived readiness_tier (computeGardssalgReadinessTier,
+ * routes/opplevelser.ts) on the very next read. No separate rollback route
+ * exists or is needed.
+ *
+ * Validation of `terminalStatus` against the three allowed values
+ * ("krever_eier" | "dod_kilde" | null) is the HTTP handler's job (same
+ * division of labor as validatePhoneForWrite's caller above) — this function
+ * trusts its typed parameter.
+ */
+export function applyGardssalgSetTerminalStatus(
+  providerId: string,
+  terminalStatus: "krever_eier" | "dod_kilde" | null,
+  reason: string,
+  sourceUrl?: string
+): GardssalgSetTerminalStatusResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, terminal_status FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; terminal_status: string | null } | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  const oldValue = row.terminal_status;
+  const provenance = sourceUrl && sourceUrl.trim() ? sourceUrl.trim() : reason;
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET terminal_status = @terminal_status WHERE id = @id`
+    ).run({ id: providerId, terminal_status: terminalStatus });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'terminal_status', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: terminalStatus,
+      source_url: provenance,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: terminalStatus };
+}
+
 export type GardssalgAutosvarReviewQueueEntry = {
   provider_id: string;
   provider_name?: string | null;

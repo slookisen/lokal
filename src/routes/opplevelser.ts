@@ -105,6 +105,9 @@ import {
   // field (Monkey Brew case: producer replied with a corrected phone number,
   // no write path existed).
   applyGardssalgSetContactPhone,
+  // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 3a
+  // — explicit terminal-status write (krever_eier / dod_kilde / null-clear).
+  applyGardssalgSetTerminalStatus,
   // dev-request 2026-08-16-opplevagent-outreach-rutine, spec point 6
   // ("Autosvar-regelen") — the review queue for autosvar candidates whose
   // candidate email's domain does NOT (or cannot be shown to) agree with the
@@ -8123,6 +8126,81 @@ router.post("/admin/gardssalg-set-contact-phone", requireAdmin, (req: Request, r
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-set-terminal-status (admin) ──────
+//
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 3a
+// ("Ærlig kulling av de 296"). Sets (or clears) the explicit end-status on a
+// gårdssalg row — `krever_eier` (needs an owner to step forward) or
+// `dod_kilde` (source website verified dead) — that takes it OUT of
+// ordinary readiness/outreach-rotation counting via
+// computeGardssalgReadinessTier's highest-precedence check (see that
+// function's own comment). The row is not deleted or hidden — it is
+// reported as its own bucket in GET /admin/gardssalg-outreach-readiness's
+// summary, per the dev-request's "rapporteres som sin egen bestand"
+// requirement.
+//
+// Body: { provider_id: string, terminal_status: "krever_eier" | "dod_kilde"
+// | null, reason: string, source_url?: string }.
+//
+// `terminal_status: null` CLEARS the column — this IS the rollback path for
+// this endpoint (dev-request's own Rollback section); no separate rollback
+// route exists or is needed, same precedent as this file's other
+// content-audit write paths.
+//
+// `reason` is required (free-text — WHY the row is being marked terminal,
+// e.g. "domene NXDOMAIN siden 2026-06, verifisert manuelt" or "eier bedt om
+// pause") and stored verbatim as the audit row's source_url when
+// `source_url` itself is not given — same "always capture a provenance
+// string" discipline as gardssalg-set-contact-phone/-email, just reusing
+// `reason` as the fallback provenance text since a terminal-status change
+// isn't always evidenced by a URL.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-terminal-status", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    terminal_status?: unknown;
+    reason?: unknown;
+    source_url?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const rawTerminalStatus = body.terminal_status;
+  if (rawTerminalStatus !== null && rawTerminalStatus !== "krever_eier" && rawTerminalStatus !== "dod_kilde") {
+    res.status(400).json({ error: "invalid_terminal_status" });
+    return;
+  }
+  const terminalStatus = rawTerminalStatus as "krever_eier" | "dod_kilde" | null;
+
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!reason) {
+    res.status(400).json({ error: "reason_required" });
+    return;
+  }
+
+  const sourceUrl = typeof body.source_url === "string" ? body.source_url.trim() : "";
+
+  const result = applyGardssalgSetTerminalStatus(providerId, terminalStatus, reason, sourceUrl || undefined);
+
+  if (!result.ok) {
+    res.status(404).json({ error: "provider_not_found" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "terminal_status",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
 // ─── GET /api/opplevelser/admin/gardssalg-autosvar-scan (admin, read-only) ──
 //
 // dev-request 2026-08-16-opplevagent-outreach-rutine (slookisen/A2A), detection
@@ -11081,7 +11159,9 @@ export type GardssalgReadinessTier =
   | "skjult"
   | "ikke_soekbar"
   | "nettsted_uverifisert"
-  | "dublettkonflikt";
+  | "dublettkonflikt"
+  | "krever_eier"
+  | "dod_kilde";
 
 export function computeGardssalgReadinessTier(input: {
   has_website: boolean;
@@ -11094,7 +11174,16 @@ export function computeGardssalgReadinessTier(input: {
   is_searchable: boolean;
   website_verified: boolean;
   has_duplicate_conflict: boolean;
+  // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 3a:
+  // an explicit end-status set via POST /admin/gardssalg-set-terminal-status.
+  // HIGHEST precedence — checked before every other tier below — because a
+  // terminal row is deliberately finished-with, not ordinary backlog; it
+  // must never be recounted as unreachable/no_website/etc. NULL/undefined
+  // means "no terminal status", falls through to the existing checks
+  // unchanged.
+  terminal_status?: "krever_eier" | "dod_kilde" | null;
 }): GardssalgReadinessTier {
+  if (input.terminal_status) return input.terminal_status;
   if (!input.has_email && !input.has_phone) return "unreachable";
   if (!input.has_website) return "no_website";
   // krav 2 (dev-request 2026-08-07-outreach-pool-krav123-og-pilot): content-
@@ -11154,6 +11243,11 @@ function computeGardssalgReadinessRows(
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
   readiness_tier: GardssalgReadinessTier;
+  // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 3a:
+  // surfaced so a caller can see WHY a row landed in krever_eier/dod_kilde
+  // without a separate lookup — same additive-surfacing precedent as
+  // hjemmeside/epost below.
+  terminal_status: "krever_eier" | "dod_kilde" | null;
   /** The stored homepage URL. See the construction site below for why. */
   hjemmeside: string | null;
   /** The stored outreach address. See the construction site below for why. */
@@ -11184,6 +11278,7 @@ function computeGardssalgReadinessRows(
     field_provenance: string | null;
     brreg_verified: number | null;
     antall_ansatte: number | null;
+    terminal_status: string | null;
   }> = [];
 
   // Same base gårdssalg scoping WHERE clause as listGardssalgProviders() et
@@ -11193,7 +11288,7 @@ function computeGardssalgReadinessRows(
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
                 content_source, booking_live, catalog_hidden, slug,
-                field_provenance, brreg_verified, antall_ansatte
+                field_provenance, brreg_verified, antall_ansatte, terminal_status
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`;
   const params: string[] = [];
@@ -11287,6 +11382,8 @@ function computeGardssalgReadinessRows(
     const name_token_conflict_candidate = nameTokenConflictCandidateIds.has(p.id);
     const brreg_verified = p.brreg_verified === 1;
     const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold);
+    const terminal_status =
+      p.terminal_status === "krever_eier" || p.terminal_status === "dod_kilde" ? p.terminal_status : null;
 
     const readiness_tier = computeGardssalgReadinessTier({
       has_website,
@@ -11299,6 +11396,7 @@ function computeGardssalgReadinessRows(
       is_searchable,
       website_verified,
       has_duplicate_conflict,
+      terminal_status,
     });
 
     return {
@@ -11321,6 +11419,7 @@ function computeGardssalgReadinessRows(
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
       readiness_tier,
+      terminal_status,
       // Daniel, live session 2026-08-13: the stored homepage, surfaced.
       // `has_website` (a boolean) was already here, but NO read-only route in
       // this file returned the URL itself — so an operator holding a list of
@@ -11374,6 +11473,14 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     ikke_soekbar: 0,
     nettsted_uverifisert: 0,
     dublettkonflikt: 0,
+    // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep
+    // 3a: explicit end-status buckets, reported as their OWN population per
+    // the dev-request's "rapporteres som sin egen bestand" requirement — not
+    // merged into unreachable/no_website. Pre-initialized to 0 (like every
+    // other tier key above) so a zero-count still shows the bucket rather
+    // than omitting the key.
+    krever_eier: 0,
+    dod_kilde: 0,
     // dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering,
     // slice 1: NOT a tier — the count of rows carrying the informational
     // name_token/host_name candidate flag (rows may sit in any tier).
