@@ -30561,6 +30561,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gscp.failures) failures.push("opplevelser-gardssalg-set-contact-phone: " + f);
     console.log(`  opplevelser-gardssalg-set-contact-phone: ${gscp.passed} passed, ${gscp.failed} failed`);
 
+    // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep
+    // 3a ("Ærlig kulling av de 296"): explicit end-status
+    // (krever_eier/dod_kilde) write path, highest-precedence short-circuit
+    // in computeGardssalgReadinessTier, and its own summary buckets on GET
+    // .../gardssalg-outreach-readiness. Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-set-terminal-status: explicit end-status (krever_eier/dod_kilde) ──");
+    const { runOpplevelserGardssalgSetTerminalStatusTests } = require("../src/routes/opplevelser-gardssalg-set-terminal-status.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-terminal-status.test");
+    const gsts = await runOpplevelserGardssalgSetTerminalStatusTests({ log: false });
+    passed += gsts.passed;
+    failed += gsts.failed;
+    for (const f of gsts.failures) failures.push("opplevelser-gardssalg-set-terminal-status: " + f);
+    console.log(`  opplevelser-gardssalg-set-terminal-status: ${gsts.passed} passed, ${gsts.failed} failed`);
+
     // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A:
     // persist the force-approval from gardssalg-set-contact-email above (a
     // field_provenance.contact_email_domain_override stamp, scoped to the
