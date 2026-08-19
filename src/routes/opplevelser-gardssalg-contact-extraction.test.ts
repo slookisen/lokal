@@ -78,6 +78,18 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
   return (async () => {
     const prevExpPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b):
+    // applyGardssalgProviderContact now gates every epost/telefon candidate
+    // through the shared contact-candidate LLM judge before writing it (see
+    // services/contact-candidate-judge.ts). This suite's fixtures are all
+    // genuine, non-defect candidates (the W34-defect-rejection behaviour
+    // itself is covered directly in opplevelser-gardssalg-contact-backfill.
+    // test.ts) — an ANTHROPIC_API_KEY plus a blanket-approve mock response
+    // (wired into every fetch stub below) keeps this suite's existing
+    // "candidate IS written" assertions accurate rather than having them all
+    // fail-closed on a missing key.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "cx-test-anthropic-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = process.env.ADMIN_KEY || "cx-test-key";
     const testKey = process.env.ADMIN_KEY;
@@ -275,6 +287,18 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
           headers: cxMockHeaders,
           arrayBuffer: async () => new TextEncoder().encode(html).buffer,
         }) as unknown as Response;
+      // Blanket-approve stub for the contact-candidate LLM judge's direct
+      // fetch to api.anthropic.com (services/contact-candidate-judge.ts) —
+      // wired into every one of this suite's fetch stubs below so a real
+      // ANTHROPIC_API_KEY + mocked GODKJENN keeps the existing "candidate IS
+      // written" assertions accurate (see the ANTHROPIC_API_KEY doc comment
+      // above).
+      const cxAnthropicApproveResponse = (): Response =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => ({ content: [{ type: "text", text: "GODKJENN\nPlausibel kontaktinfo for virksomheten." }] }),
+        }) as unknown as Response;
       const mk404Response = (u: string): Response =>
         ({
           ok: false,
@@ -286,6 +310,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         }) as unknown as Response;
       globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
         const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
         const host = (() => { try { return new URL(u).hostname; } catch { return ""; } })();
         if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
           return (prevFetch as typeof fetch)(url as any, init);
@@ -469,6 +494,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         const cxMockFetch2 = globalThis.fetch;
         globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
           const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
           if (u.startsWith("https://retryhost.no")) {
             newHostCalls.push(u);
             retryHostCalls++;
@@ -559,6 +585,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         const restoreFetch = () => { globalThis.fetch = cxMockFetch3; };
         globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
           const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
           // Både forsiden og /kontakt kommer tilbake som JS-skall over HTTP —
           // det er nettopp poenget: uten rendering er de begge ulesbare.
           if (u.startsWith("https://jsgard.no")) return mkHtmlResponse(u, JS_SHELL);
@@ -664,6 +691,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
 
           globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
             if (u.startsWith("https://raagard.no")) return mkHtmlResponse(u, EMBEDDED_SHELL);
             return (cxMockFetch3 as typeof fetch)(url as any, init);
           }) as unknown as typeof fetch;
@@ -725,6 +753,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
 
           globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
             if (u.includes("eiktidtest.no/the-team")) return mkHtmlResponse(u, TEAM_EIKTID);
             if (u.includes("eiktidtest.no/the-brewery")) return mkHtmlResponse(u, BREWERY_EIKTID);
             if (u.startsWith("https://eiktidtest.no")) return mkHtmlResponse(u, FRONT_EIKTID);
@@ -749,6 +778,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
             '<html><body><a href="/the-team/">Team</a><a href="/kontakt">Kontakt</a></body></html>';
           globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
             if (u.includes("beggeto.no/the-team")) return mkHtmlResponse(u, "<html><body>Email: person@beggeto.no</body></html>");
             if (u.includes("beggeto.no/kontakt")) return mkHtmlResponse(u, "<html><body>Kontakt: post@beggeto.no</body></html>");
             if (u.startsWith("https://beggeto.no")) return mkHtmlResponse(u, FRONT_BOTH);
@@ -768,6 +798,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         {
           globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
             if (u.includes("tomgard.no/kontakt")) return mkHtmlResponse(u, "<html><body>Skjema uten adresse. Fyll ut under.</body></html>");
             if (u.startsWith("https://tomgard.no")) return mkHtmlResponse(u, '<html><body><a href="/kontakt">Kontakt</a>Tom Gard</body></html>');
             return (cxMockFetch3 as typeof fetch)(url as any, init);
@@ -800,6 +831,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
             '<a href="mailto:tg@distributoren-as.no">Kontakt oss</a></body></html>';
           globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
+        if (u.includes("api.anthropic.com")) return cxAnthropicApproveResponse();
             if (u.startsWith("https://fremmedgard.no")) return mkHtmlResponse(u, FOREIGN_MAILTO);
             return (cxMockFetch3 as typeof fetch)(url as any, init);
           }) as unknown as typeof fetch;
@@ -841,6 +873,8 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
       else process.env.EXPERIENCES_DB_PATH = prevExpPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
       try {
         const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
         dbFactory.__resetDbFactoryForTesting();

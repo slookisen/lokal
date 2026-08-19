@@ -143,10 +143,35 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
 
   const fixtures: Map<string, Response> = new Map();
   const fetchCalls: string[] = [];
+  // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b):
+  // applyRfbCxWrite's call site now gates every extracted email candidate
+  // through the shared contact-candidate LLM judge (services/contact-
+  // candidate-judge.ts) — a direct fetch("https://api.anthropic.com/...")
+  // call. Candidate values placed in rfbCxGateRejectCandidates get AVVIS;
+  // every other candidate gets a blanket GODKJENN, so this suite's existing
+  // "candidate IS written" assertions stay accurate.
+  const rfbCxGateRejectCandidates: Set<string> = new Set();
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
 
   function stubFetch(): typeof fetch {
-    return (async (url: string | URL | Request) => {
+    return (async (url: string | URL | Request, init?: any) => {
       const urlStr = String(url);
+      if (urlStr.includes("api.anthropic.com")) {
+        const body = init?.body ? JSON.parse(init.body) : {};
+        const prompt: string = body?.messages?.[0]?.content ?? "";
+        const rejected = Array.from(rfbCxGateRejectCandidates).some((c) => prompt.includes("Kandidat (") && prompt.includes(c));
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            content: [{
+              type: "text",
+              text: rejected
+                ? "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne agenten."
+                : "GODKJENN\nPlausibel kontaktinfo for agenten.",
+            }],
+          }),
+        } as unknown as Response;
+      }
       fetchCalls.push(urlStr);
       const fx = fixtures.get(urlStr);
       return fx ?? notFoundResponse();
@@ -157,6 +182,7 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
     __setDbForTesting(testDb as any);
     __initSchemaForTesting(testDb as any);
     process.env.ADMIN_KEY = ADMIN_KEY;
+    process.env.ANTHROPIC_API_KEY = "rfb-cx-test-anthropic-key";
     delete process.env.ANALYTICS_ADMIN_KEY;
     globalThis.fetch = stubFetch();
 
@@ -453,11 +479,86 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       const auditDead = auditRowsFor("cx-dnsdead");
       assertTrue(auditDead.length > 0 && auditDead.every((row: any) => row.changed_by === "system"), "o3: same guarantee holds for the DNS-dead-replacement write");
     }
+
+    // ── (p) contact-candidate gate (dev-request 2026-08-19-rfb-kontakt-llm-
+    // dommer follow-on, Grep 5b): applyRfbCxWrite's call site now gates every
+    // extracted email candidate through services/contact-candidate-judge.ts
+    // (backstop classifier first, LLM judge second) before writing — mirrors
+    // marketplace.ts's judgeRfbContactCandidate gate on the sibling RFB
+    // homepage-provenance-batch write path (PR #655). (b)/(c) above already
+    // prove a genuine candidate is still written; these cases pin the actual
+    // rejection paths. ───────────────────────────────────────────────────
+    {
+      // (p1) backstop-rejected email (W34 favicon-filename shape) is never
+      // written — reported exactly like "no candidate found".
+      insertAgent({ id: "cx-defect-backstop", name: "Defect Backstop AS", website: "https://defectbackstop.no" });
+      // mailto: (unconditional on page type — extractGardssalgContactEmail's
+      // tier 3a) so the favicon-shaped candidate is actually EXTRACTED (not
+      // silently dropped for an unrelated reason, which would make this test
+      // vacuous) and reaches the contact-candidate gate below.
+      fixtures.set(
+        "https://defectbackstop.no",
+        htmlResponse('<html><body><a href="mailto:favicon@2x.png">Kontakt</a></body></html>', { finalUrl: "https://defectbackstop.no" }),
+      );
+      const rBackstop = await callExtraction({ agentIds: ["cx-defect-backstop"], apply: true });
+      const itemBackstop = (rBackstop.body.results as any[]).find((x) => x.agent_id === "cx-defect-backstop");
+      assertEq(itemBackstop?.outcome, "no_contact_found", "p1a: the favicon-shaped email candidate is rejected — reported exactly like no candidate found");
+      assertTrue(
+        typeof itemBackstop?.detail === "string" && itemBackstop.detail.startsWith("rejected_by_contact_gate:") && itemBackstop.detail.includes("backstop"),
+        "p1b: the rejection detail attributes this to the backstop classifier",
+      );
+      assertEq(contactEmailOf("cx-defect-backstop"), "", "p1c: contact_email column stays untouched");
+    }
+    {
+      // (p2) a candidate that clears the backstop (structurally fine) but the
+      // LLM judge rejects (mocked AVVIS via rfbCxGateRejectCandidates) is
+      // never written either.
+      insertAgent({ id: "cx-defect-llm", name: "Defect LLM AS", website: "https://defectllm.no" });
+      fixtures.set(
+        "https://defectllm.no",
+        htmlResponse('<html><body><a href="mailto:sidestoy@defectllm.no">sidestoy@defectllm.no</a></body></html>', { finalUrl: "https://defectllm.no" }),
+      );
+      rfbCxGateRejectCandidates.add("sidestoy@defectllm.no");
+      try {
+        const rLlm = await callExtraction({ agentIds: ["cx-defect-llm"], apply: true });
+        const itemLlm = (rLlm.body.results as any[]).find((x) => x.agent_id === "cx-defect-llm");
+        assertEq(itemLlm?.outcome, "no_contact_found", "p2a: the LLM-judge-rejected (but structurally clean) candidate is rejected — reported exactly like no candidate found");
+        assertTrue(
+          typeof itemLlm?.detail === "string" && itemLlm.detail.startsWith("rejected_by_contact_gate:") && itemLlm.detail.includes("LLM judge"),
+          "p2b: the rejection detail attributes this to the LLM judge",
+        );
+        assertEq(contactEmailOf("cx-defect-llm"), "", "p2c: contact_email column stays untouched");
+      } finally {
+        rfbCxGateRejectCandidates.delete("sidestoy@defectllm.no");
+      }
+    }
+    {
+      // (p3) missing ANTHROPIC_API_KEY fails the gate closed even for an
+      // otherwise-perfectly-good candidate.
+      insertAgent({ id: "cx-defect-nokey", name: "Defect No Key AS", website: "https://defectnokey.no" });
+      fixtures.set(
+        "https://defectnokey.no",
+        htmlResponse('<html><body><a href="mailto:post@defectnokey.no">post@defectnokey.no</a></body></html>', { finalUrl: "https://defectnokey.no" }),
+      );
+      const prevKeyP3 = process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+      try {
+        const rNoKey = await callExtraction({ agentIds: ["cx-defect-nokey"], apply: true });
+        const itemNoKey = (rNoKey.body.results as any[]).find((x) => x.agent_id === "cx-defect-nokey");
+        assertEq(itemNoKey?.outcome, "no_contact_found", "p3a: no ANTHROPIC_API_KEY fails the gate closed for an otherwise-plausible candidate");
+        assertEq(contactEmailOf("cx-defect-nokey"), "", "p3b: contact_email column stays untouched");
+      } finally {
+        if (prevKeyP3 === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevKeyP3;
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-contact-extraction: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     globalThis.fetch = prevFetch;
+    if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;

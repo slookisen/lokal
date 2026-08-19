@@ -143,6 +143,40 @@ export function runOpplevelserGardssalgAutosvarApplyTests(
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
 
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b): the
+    // "domain_match" apply branch of POST /admin/gardssalg-autosvar-apply now
+    // gates its candidate_email through the shared contact-candidate LLM
+    // judge (services/contact-candidate-judge.ts) — a direct
+    // fetch("https://api.anthropic.com/...") call — before calling
+    // applyGardssalgSetContactEmail. Candidate values placed in
+    // aaApplyGateRejectCandidates get AVVIS; every other candidate gets a
+    // blanket GODKJENN, so this suite's existing "domain_match candidate IS
+    // applied" assertions stay accurate.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "gardssalg-aa-test-anthropic-key";
+    const prevGlobalFetch = globalThis.fetch;
+    const aaApplyGateRejectCandidates = new Set<string>();
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const u = String(input);
+      if (!u.includes("api.anthropic.com")) {
+        throw new Error(`opplevelser-gardssalg-autosvar-apply test: unexpected globalThis.fetch call to ${u}`);
+      }
+      const body = init?.body ? JSON.parse(init.body) : {};
+      const prompt: string = body?.messages?.[0]?.content ?? "";
+      const rejected = Array.from(aaApplyGateRejectCandidates).some((c) => prompt.includes("Kandidat (") && prompt.includes(c));
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          content: [{
+            type: "text",
+            text: rejected
+              ? "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten."
+              : "GODKJENN\nPlausibel kontaktinfo for produsenten.",
+          }],
+        }),
+      } as any;
+    }) as any;
+
     // NOTE: unlike opplevelser-gardssalg-autosvar-scan.test.ts (which reads
     // gardssalg-autosvar-scan's data ONLY via opplevelser.ts's own direct
     // getExpDb/getRfbDb bindings, never through experience-store), this suite
@@ -353,6 +387,60 @@ export function runOpplevelserGardssalgAutosvarApplyTests(
       assertEq(countQueueRows("aa-mismatch"), 1, "d3: repeat apply upserts (not duplicates) the domain_mismatch queue row");
       assertEq(countQueueRows("aa-nowebsite"), 1, "d4: repeat apply upserts (not duplicates) the no_website_on_file queue row");
 
+      // ── (h) contact-candidate gate (dev-request 2026-08-19-rfb-kontakt-llm-
+      // dommer follow-on, Grep 5b): a SEPARATE choke point from
+      // applyGardssalgProviderContact — this candidate is sourced from an
+      // autosvar email thread. (c)/(d) above already prove a genuine
+      // domain_match candidate is still applied; these cases pin the
+      // rejection paths. ──────────────────────────────────────────────────
+      {
+        // (h1) backstop-rejected candidate_email (W34 favicon-filename
+        // shape) is never applied — reported as rejected_by_contact_gate,
+        // not "applied".
+        mkProvider({ id: "aa-defect-backstop", navn: "Defect Backstop Gård", hjemmeside: "https://defectbackstop.no", epost: "gammel@defectbackstop.no" });
+        mkInboundMessage({
+          providerId: "aa-defect-backstop",
+          contactEmail: "gammel@defectbackstop.no",
+          // Local part "favicon" (CONTACT_FAVICON_LOCAL_PARTS, contact-
+          // candidate-judge.ts) on the SAME domain as the provider's own
+          // hjemmeside — domain_match classification (so this reaches the
+          // gated branch), backstop-rejected local part (so this reaches the
+          // classifier, not just the LLM).
+          bodyText: "Ta kontakt med favicon@defectbackstop.no fremover.",
+          sentAt: "2026-08-04 09:00:00",
+        });
+        const rBackstop = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-autosvar-apply", query: { apply: "true" }, headers: auth, body: {},
+        });
+        const itemBackstop = (rBackstop.body.results as any[]).find((r) => r.provider_id === "aa-defect-backstop");
+        assertTrue(!!itemBackstop, "h1a: setup — aa-defect-backstop's candidate was detected by the scan");
+        assertEq(itemBackstop?.outcome, "rejected_by_contact_gate", "h1b: the favicon-shaped candidate is rejected by the contact gate, never applied");
+        assertEq(getProviderRow("aa-defect-backstop").epost, "gammel@defectbackstop.no", "h1c: epost stays unchanged");
+      }
+      {
+        // (h2) a candidate that clears the backstop (structurally fine) but
+        // the LLM judge rejects (mocked AVVIS) is never applied either.
+        mkProvider({ id: "aa-defect-llm", navn: "Defect LLM Gård", hjemmeside: "https://defectllm-aa.no", epost: "gammel@defectllm-aa.no" });
+        mkInboundMessage({
+          providerId: "aa-defect-llm",
+          contactEmail: "gammel@defectllm-aa.no",
+          bodyText: "Ta kontakt med sidestoy@defectllm-aa.no fremover.",
+          sentAt: "2026-08-05 09:00:00",
+        });
+        aaApplyGateRejectCandidates.add("sidestoy@defectllm-aa.no");
+        try {
+          const rLlm = await callRoute(opplevelserRouter, {
+            url: "/admin/gardssalg-autosvar-apply", query: { apply: "true" }, headers: auth, body: {},
+          });
+          const itemLlm = (rLlm.body.results as any[]).find((r) => r.provider_id === "aa-defect-llm");
+          assertTrue(!!itemLlm, "h2a: setup — aa-defect-llm's candidate was detected by the scan");
+          assertEq(itemLlm?.outcome, "rejected_by_contact_gate", "h2b: the LLM-judge-rejected (but structurally clean) candidate is rejected, never applied");
+          assertEq(getProviderRow("aa-defect-llm").epost, "gammel@defectllm-aa.no", "h2c: epost stays unchanged");
+        } finally {
+          aaApplyGateRejectCandidates.delete("sidestoy@defectllm-aa.no");
+        }
+      }
+
       // ── (e) review-approve: reject an unqueued provider_id ─────────────────
       const rejectRes = await callRoute(opplevelserRouter, {
         url: "/admin/gardssalg-autosvar-review-approve",
@@ -414,6 +502,8 @@ export function runOpplevelserGardssalgAutosvarApplyTests(
       };
       restore("EXPERIENCES_DB_PATH", prevExperiencesDbPath);
       restore("ADMIN_KEY", prevAdminKey);
+      restore("ANTHROPIC_API_KEY", prevAnthropicKey);
+      globalThis.fetch = prevGlobalFetch;
       try {
         const initMod = require("../database/init") as typeof import("../database/init");
         if (prevRfbDb) {

@@ -73,9 +73,14 @@ import {
   isSyntacticallyValidEmail,
   isContactEmailCurated,
 } from "./admin-agents-contact-email-write";
-import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain } from "../services/experience-store";
+import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain, gardssalgPageText } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { hostFromUrlLike } from "../services/cross-source-validator";
+// dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b): the same
+// backstop-classifier + LLM-judge gate PR #655 built for RFB's homepage-
+// provenance-batch write path (marketplace.ts), factored out into a shared
+// module — see services/contact-candidate-judge.ts's own file header.
+import { gateContactCandidate } from "../services/contact-candidate-judge";
 
 // Re-exported so this route's own test file (and any future caller) can
 // build a guaranteed-excluded fixture host without a second import path back
@@ -402,10 +407,14 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
 
       let email: ReturnType<typeof extractGardssalgContactEmail> = null;
       let emailUrl = "";
+      // Visible text of the page the candidate was actually found on — the
+      // contact-candidate LLM judge's sourceContext below (Grep 5b).
+      let emailPageText = "";
       for (const pg of pages) {
         email = extractGardssalgContactEmail(pg.html, homeDomain, pg.contactish);
         if (email) {
           emailUrl = pg.url;
+          emailPageText = gardssalgPageText(pg.html);
           break;
         }
       }
@@ -434,6 +443,30 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         results.push({
           agent_id: t.id, agent_name: t.name, outcome: "written",
           email: email.email, email_source: email.source, source_url: emailUrl, old_value: t.contact_email,
+        });
+        continue;
+      }
+
+      // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b):
+      // every candidate must ALSO clear the shared backstop-classifier + LLM-
+      // judge gate before it is eligible for applyRfbCxWrite below — mirrors
+      // marketplace.ts's judgeRfbContactCandidate gate on the sibling RFB
+      // homepage-provenance-batch write path (PR #655). Run only here (never
+      // in the dryRun branch above) — a preview report never writes anything
+      // regardless, so spending an LLM call on it would be pure cost with no
+      // safety benefit. A rejected candidate is treated EXACTLY like
+      // extractGardssalgContactEmail having found nothing.
+      const rfbCxContactGate = await gateContactCandidate({
+        fieldType: "email",
+        candidate: email.email,
+        sourceContext: emailPageText,
+        businessName: t.name,
+      });
+      if (!rfbCxContactGate.value) {
+        results.push({
+          agent_id: t.id, agent_name: t.name, outcome: "no_contact_found",
+          email: email.email, email_source: email.source, source_url: emailUrl,
+          detail: `rejected_by_contact_gate: ${rfbCxContactGate.rejectedReason ?? "unknown reason"}`,
         });
         continue;
       }

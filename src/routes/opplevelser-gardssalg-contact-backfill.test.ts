@@ -172,6 +172,17 @@ export function runOpplevelserGardssalgContactBackfillTests(
     const testKey = process.env.ADMIN_KEY || "gardssalg-contact-backfill-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b):
+    // applyGardssalgProviderContact now gates every epost/telefon candidate
+    // through the shared contact-candidate LLM judge (services/contact-
+    // candidate-judge.ts) before writing it. This suite's fixtures are all
+    // genuine, non-defect candidates (defect-rejection behaviour itself is
+    // covered in the dedicated "(ac) contact-candidate gate" block added
+    // below) — an ANTHROPIC_API_KEY plus a blanket-approve branch on the
+    // SAME globalThis.fetch stub this suite already uses for Brreg keeps the
+    // existing "candidate IS written" assertions accurate.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "gardssalg-cb-test-anthropic-key";
 
     const dbFactoryPath = require.resolve("../database/db-factory");
     const experienceStorePath = require.resolve("../services/experience-store");
@@ -223,8 +234,29 @@ export function runOpplevelserGardssalgContactBackfillTests(
         return orgNr;
       }
       let fetchCalls: string[] = [];
-      globalThis.fetch = (async (input: any) => {
+      // Contact-candidate LLM judge mock (Grep 5b) — candidate values placed
+      // in this set get AVVIS; every other candidate gets a blanket GODKJENN.
+      // Populated per-block by the "(ac) contact-candidate gate" tests below
+      // to exercise the judge-rejection path without a second fetch stub.
+      const gsCbAnthropicRejectCandidates = new Set<string>();
+      globalThis.fetch = (async (input: any, init?: any) => {
         const url = String(input);
+        if (url.includes("api.anthropic.com")) {
+          const body = init?.body ? JSON.parse(init.body) : {};
+          const prompt: string = body?.messages?.[0]?.content ?? "";
+          const rejected = Array.from(gsCbAnthropicRejectCandidates).some((c) => prompt.includes(`Kandidat (`) && prompt.includes(c));
+          return {
+            ok: true, status: 200,
+            json: async () => ({
+              content: [{
+                type: "text",
+                text: rejected
+                  ? "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten."
+                  : "GODKJENN\nPlausibel kontaktinfo for produsenten.",
+              }],
+            }),
+          } as any;
+        }
         fetchCalls.push(url);
         const m = url.match(/\/enheter\/(\d+)/);
         const orgNr = m ? m[1] : "";
@@ -354,14 +386,20 @@ export function runOpplevelserGardssalgContactBackfillTests(
 
       // ── (k)-(n) applyGardssalgProviderContact ────────────────────────────
       mkProvider({ id: "app-blank", navn: "Apply Blank", org_nr: orgFor(SHAPE_FULL), created_at: "2026-02-01 00:00:00" });
-      const written1 = store.applyGardssalgProviderContact(
-        "app-blank", { epost: " ny@post.no ", telefon: " 12345678 " }, "https://brreg.example/810000001", "batch-k"
+      // telefon deliberately NOT a sequential/repeated-digit shape (e.g. NOT
+      // "12345678") — Grep 5b's contact-candidate backstop classifier
+      // (services/contact-candidate-judge.ts) flags those as placeholder-
+      // shaped and rejects them; this fixture is meant to exercise the
+      // "genuine candidate is written" path, not the rejection path (that is
+      // covered separately in the "(ac) contact-candidate gate" block below).
+      const written1 = await store.applyGardssalgProviderContact(
+        "app-blank", { epost: " ny@post.no ", telefon: " 45123678 " }, "https://brreg.example/810000001", "batch-k"
       );
       assertEq(written1.written.sort(), ["epost", "telefon"], "k1: both blank fields written");
       assertEq(written1.epostFlaggedForReview, undefined, "k1b: no hjemmeside on file -> the domain gate never fires");
       const rowK = getProviderRow("app-blank");
       assertEq(rowK.epost, "ny@post.no", "k2: epost written trimmed");
-      assertEq(rowK.telefon, "12345678", "k3: telefon written trimmed");
+      assertEq(rowK.telefon, "45123678", "k3: telefon written trimmed");
       const auditK = getAuditRows("app-blank");
       assertEq(auditK.length, 2, "k4: one audit row per written field");
       assertEq(auditK.every((a: any) => a.old_value === null), true, "k5: audit old_value is the true pre-write null");
@@ -371,22 +409,22 @@ export function runOpplevelserGardssalgContactBackfillTests(
       assertTrue(!!provK.epost?.source_url && !!provK.telefon?.source_url, "k8: field_provenance recorded for both fields");
 
       mkProvider({ id: "app-existing", navn: "Apply Existing", org_nr: orgFor(SHAPE_FULL), epost: "gammel@post.no", created_at: "2026-02-02 00:00:00" });
-      const written2 = store.applyGardssalgProviderContact(
-        "app-existing", { epost: "brreg@post.no", telefon: "99999999" }, "https://brreg.example/810000001"
+      const written2 = await store.applyGardssalgProviderContact(
+        "app-existing", { epost: "brreg@post.no", telefon: "45789234" }, "https://brreg.example/810000001"
       );
       assertEq(written2.written, ["telefon"], "l1: only the blank field is written");
       assertEq(getProviderRow("app-existing").epost, "gammel@post.no", "l2: an existing value is NEVER overwritten");
 
       mkProvider({ id: "app-locked", navn: "Apply Locked", org_nr: orgFor(SHAPE_FULL), content_source: "claim", created_at: "2026-02-03 00:00:00" });
       assertEq(
-        store.applyGardssalgProviderContact("app-locked", { epost: "x@y.no", telefon: "1" }, "https://brreg.example/1").written,
+        (await store.applyGardssalgProviderContact("app-locked", { epost: "x@y.no", telefon: "1" }, "https://brreg.example/1")).written,
         [],
         "m1: locked provider -> nothing written"
       );
       assertEq(getProviderRow("app-locked").epost, null, "m2: locked provider row untouched");
 
       assertEq(
-        store.applyGardssalgProviderContact("app-blank", { epost: "annen@post.no", telefon: "87654321" }, "https://brreg.example/1").written,
+        (await store.applyGardssalgProviderContact("app-blank", { epost: "annen@post.no", telefon: "87654321" }, "https://brreg.example/1")).written,
         [],
         "n1: second call on a filled row is a no-op"
       );
@@ -404,8 +442,8 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-same", navn: "Gate Same Domain", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: "https://www.gatesame.no", created_at: "2026-02-10 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
-          "gate-same", { epost: "post@gatesame.no", telefon: "22222222", epostSource: "mailto" },
+        const r = await store.applyGardssalgProviderContact(
+          "gate-same", { epost: "post@gatesame.no", telefon: "45671234", epostSource: "mailto" },
           "https://gatesame.no/kontakt", "batch-w"
         );
         assertEq(r.written.sort(), ["epost", "telefon"], "w1a: same-domain candidate is written as before");
@@ -423,13 +461,13 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-foreign", navn: "Gate Foreign Domain", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: "https://gateforeign.no", created_at: "2026-02-11 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
-          "gate-foreign", { epost: "tg@distributor-as.no", telefon: "33333333", epostSource: "mailto_other_domain" },
+        const r = await store.applyGardssalgProviderContact(
+          "gate-foreign", { epost: "tg@distributor-as.no", telefon: "45672345", epostSource: "mailto_other_domain" },
           "https://gateforeign.no/kontakt", "batch-w"
         );
         assertEq(r.written, ["telefon"], "w2a: the foreign-domain epost is NOT written; telefon still is");
         assertEq(getProviderRow("gate-foreign").epost, null, "w2b: the row's epost stays blank");
-        assertEq(getProviderRow("gate-foreign").telefon, "33333333", "w2c: telefon is untouched by the email-only gate");
+        assertEq(getProviderRow("gate-foreign").telefon, "45672345", "w2c: telefon is untouched by the email-only gate");
         assertEq(r.epostFlaggedForReview?.candidate, "tg@distributor-as.no", "w2d: the held-back candidate is reported back");
         assertEq(r.epostFlaggedForReview?.website_domain, "gateforeign.no", "w2e: the website domain is reported");
         assertEq(r.epostFlaggedForReview?.email_domain, "distributor-as.no", "w2f: the email domain is reported");
@@ -454,7 +492,7 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-freemail", navn: "Gate Freemail", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: "https://gatefreemail.no", created_at: "2026-02-12 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
+        const r = await store.applyGardssalgProviderContact(
           "gate-freemail", { epost: "gaardsbruket@gmail.com", telefon: null, epostSource: "mailto" },
           "https://gatefreemail.no/kontakt", "batch-w"
         );
@@ -469,12 +507,95 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-nosite", navn: "Gate No Site", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: null, created_at: "2026-02-13 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
+        const r = await store.applyGardssalgProviderContact(
           "gate-nosite", { epost: "post@heltannen.no", telefon: null, epostSource: "brreg" },
           "https://brreg.example/1", "batch-w"
         );
         assertEq(r.written, ["epost"], "w4a: with no homepage on file the candidate is written");
         assertEq(r.epostFlaggedForReview, undefined, "w4b: with no homepage on file nothing is flagged");
+      }
+
+      // ── (ac) contact-candidate gate (dev-request 2026-08-19-rfb-kontakt-
+      // llm-dommer follow-on, Grep 5b): applyGardssalgProviderContact is the
+      // shared choke point both gårdssalg contact writers funnel through, so
+      // it gates every epost/telefon candidate through services/contact-
+      // candidate-judge.ts (backstop classifier first, LLM judge second)
+      // before writing. These cases pin the actual rejection paths — (w1)-
+      // (w4) above already prove genuine candidates still write. ───────────
+      {
+        // (ac1) backstop-rejected email (W34 favicon-filename shape) is
+        // never written; a genuine telefon candidate on the SAME call still
+        // is (per-field independence).
+        mkProvider({
+          id: "gate-defect-email", navn: "Gate Defect Email", org_nr: orgFor(SHAPE_FULL),
+          created_at: "2026-02-14 00:00:00",
+        });
+        const r = await store.applyGardssalgProviderContact(
+          "gate-defect-email", { epost: "favicon@2x.png", telefon: "45673456", epostSource: "embedded_same_domain" },
+          "https://gatedefectemail.no/kontakt", "batch-ac"
+        );
+        assertEq(r.written, ["telefon"], "ac1a: the favicon-shaped email candidate is NOT written; telefon still is");
+        assertEq(getProviderRow("gate-defect-email").epost, null, "ac1b: epost column stays blank — treated exactly like extractGardssalgContactEmail finding nothing");
+        assertEq(getProviderRow("gate-defect-email").telefon, "45673456", "ac1c: telefon written normally");
+        assertEq(r.epostFlaggedForReview, undefined, "ac1d: a backstop-rejected candidate is not real contact info at all, so it is never flagged for domain review either");
+      }
+      {
+        // (ac2) backstop-rejected telefon (sequential-digit-run W34 shape) is
+        // never written; a genuine epost candidate on the SAME call still is.
+        mkProvider({
+          id: "gate-defect-phone", navn: "Gate Defect Phone", org_nr: orgFor(SHAPE_FULL),
+          created_at: "2026-02-15 00:00:00",
+        });
+        const r = await store.applyGardssalgProviderContact(
+          "gate-defect-phone", { epost: "post@gatedefectphone.no", telefon: "23456789", epostSource: "mailto" },
+          "https://gatedefectphone.no/kontakt", "batch-ac"
+        );
+        assertEq(r.written, ["epost"], "ac2a: the sequential-digit-run telefon candidate is NOT written; epost still is");
+        assertEq(getProviderRow("gate-defect-phone").telefon, null, "ac2b: telefon column stays blank");
+        assertEq(getProviderRow("gate-defect-phone").epost, "post@gatedefectphone.no", "ac2c: epost written normally");
+      }
+      {
+        // (ac3) a candidate that clears the backstop (structurally fine) but
+        // the LLM judge rejects (mocked AVVIS via gsCbAnthropicRejectCandidates)
+        // is never written either.
+        mkProvider({
+          id: "gate-defect-llm", navn: "Gate Defect LLM", org_nr: orgFor(SHAPE_FULL),
+          created_at: "2026-02-16 00:00:00",
+        });
+        gsCbAnthropicRejectCandidates.add("sidestoy@gatedefectllm.no");
+        try {
+          const r = await store.applyGardssalgProviderContact(
+            "gate-defect-llm", { epost: "sidestoy@gatedefectllm.no", telefon: null, epostSource: "text_same_domain" },
+            "https://gatedefectllm.no/kontakt", "batch-ac"
+          );
+          assertEq(r.written, [], "ac3a: an LLM-judge-rejected (but structurally clean) candidate is NOT written");
+          assertEq(getProviderRow("gate-defect-llm").epost, null, "ac3b: epost column stays blank");
+        } finally {
+          gsCbAnthropicRejectCandidates.delete("sidestoy@gatedefectllm.no");
+        }
+      }
+      {
+        // (ac4) missing ANTHROPIC_API_KEY fails the gate closed even for an
+        // otherwise-perfectly-good candidate — the judge never fabricates an
+        // approval on doubt.
+        mkProvider({
+          id: "gate-no-key", navn: "Gate No Key", org_nr: orgFor(SHAPE_FULL),
+          created_at: "2026-02-17 00:00:00",
+        });
+        const prevKeyAc4 = process.env.ANTHROPIC_API_KEY;
+        delete process.env.ANTHROPIC_API_KEY;
+        try {
+          const r = await store.applyGardssalgProviderContact(
+            "gate-no-key", { epost: "post@gatenokey.no", telefon: "45674567", epostSource: "mailto" },
+            "https://gatenokey.no/kontakt", "batch-ac"
+          );
+          assertEq(r.written, [], "ac4a: both candidates fail closed with no ANTHROPIC_API_KEY, even though both are perfectly plausible");
+          assertEq(getProviderRow("gate-no-key").epost, null, "ac4b: epost stays blank");
+          assertEq(getProviderRow("gate-no-key").telefon, null, "ac4c: telefon stays blank");
+        } finally {
+          if (prevKeyAc4 === undefined) delete process.env.ANTHROPIC_API_KEY;
+          else process.env.ANTHROPIC_API_KEY = prevKeyAc4;
+        }
       }
 
       // ── (o) auth ─────────────────────────────────────────────────────────
@@ -876,6 +997,8 @@ export function runOpplevelserGardssalgContactBackfillTests(
       }
     } finally {
       globalThis.fetch = prevFetch;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;
       } else {

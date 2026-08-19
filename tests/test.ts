@@ -39442,3 +39442,31 @@ runSerial(async () => {
     failures.push("experiences-seo-forside-seksjonering: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on ("Grep 5b"): direct
+// unit coverage of the shared contact-candidate backstop-classifier + LLM-
+// judge gate (services/contact-candidate-judge.ts) that extends PR #655's
+// RFB-homepage-provenance-batch-only gate to gårdssalg's contact write paths
+// and RFB's remaining contact-extraction/Brreg-backfill write paths. Each of
+// those four write paths' own end-to-end rejection/regression coverage lives
+// in their own suites (opplevelser-gardssalg-contact-backfill.test.ts,
+// opplevelser-gardssalg-contact-extraction.test.ts, opplevelser-gardssalg-
+// autosvar-apply.test.ts, admin-rfb-contact-extraction.ts's own suite,
+// admin-agents-brreg-contact-backfill.test.ts) — this suite is pure/mocked-
+// fetch only (no DB fixtures), so it runs via runSerial() at the tail like
+// its neighbours above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b): contact-candidate-judge ──");
+  try {
+    const { runContactCandidateJudgeTests } = require("../src/services/contact-candidate-judge.test") as
+      typeof import("../src/services/contact-candidate-judge.test");
+    const ccj = await runContactCandidateJudgeTests({ log: false });
+    passed += ccj.passed;
+    failed += ccj.failed;
+    for (const f of ccj.failures) failures.push("contact-candidate-judge: " + f);
+    console.log(`  contact-candidate-judge: ${ccj.passed} passed, ${ccj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-candidate-judge: unexpected error: " + String(err?.message || err));
+  }
+});

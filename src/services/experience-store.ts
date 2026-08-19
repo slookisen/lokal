@@ -24,6 +24,7 @@ import { fylkeEquivalents } from "./norway-fylke";
 // second phone-shape check for this vertical — see applyGardssalgSetContactPhone
 // below for why.
 import { validatePhoneForWrite } from "./contact-normalizer";
+import { gateContactCandidate } from "./contact-candidate-judge";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
 // reuse the same quality-bar predicate the homepage-content extractor already
 // gates candidates with, so applyGardssalgProviderContent() can tell "thin"
@@ -4526,21 +4527,22 @@ export function flagGardssalgContactEmailForReview(
  *     already treats freemail as its own trusted tier;
  *   - telefon is completely unaffected — this gate is epost-only.
  */
-export function applyGardssalgProviderContact(
+export async function applyGardssalgProviderContact(
   providerId: string,
-  candidate: { epost?: string | null; telefon?: string | null; epostSource?: string | null },
+  candidate: { epost?: string | null; telefon?: string | null; epostSource?: string | null; sourceContext?: string | null },
   evidenceUrl: string,
   batchId?: string
-): GardssalgProviderContactWriteResult {
+): Promise<GardssalgProviderContactWriteResult> {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, content_source, epost, telefon, hjemmeside, field_provenance
+      `SELECT id, navn, content_source, epost, telefon, hjemmeside, field_provenance
          FROM experience_providers WHERE id = ?`
     )
     .get(providerId) as
     | {
         id: string;
+        navn: string | null;
         content_source: string | null;
         epost: string | null;
         telefon: string | null;
@@ -4565,12 +4567,58 @@ export function applyGardssalgProviderContact(
     telefon: row.telefon,
   };
 
+  // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b):
+  // this is the shared choke point BOTH gårdssalg contact writers funnel
+  // through (POST /admin/gardssalg-contact-extraction's HTML-scrape
+  // candidates AND POST /admin/gardssalg-contact-backfill's Brreg-registry
+  // candidates) — so gating ONCE here (services/contact-candidate-judge.ts:
+  // the backstop classifier + LLM judge PR #655 built for RFB's homepage-
+  // provenance-batch write path) covers both. Gated ONLY for a field that
+  // is otherwise fill-eligible (blank column, non-blank candidate, not
+  // rolled back) — cost control: never spend an LLM call on a candidate the
+  // pre-existing fill-only/rollback guards would have discarded anyway, and
+  // it keeps the gate's fail-closed rejection indistinguishable from "this
+  // field was never eligible to begin with" for every downstream check
+  // below (the domain-mismatch flag, the write itself). A rejected
+  // candidate is treated EXACTLY like the extractor/Brreg lookup having
+  // found nothing — never written, never flagged for review, never
+  // audited.
+  const businessName = row.navn?.trim() || providerId;
+  const sourceContext = candidate.sourceContext?.trim() || evidenceUrl;
+  const epostEligibleForGate =
+    isBlank(row.epost) && !!candidate.epost?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "epost");
+  const telefonEligibleForGate =
+    isBlank(row.telefon) && !!candidate.telefon?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "telefon");
+  const [epostGate, telefonGate] = await Promise.all([
+    epostEligibleForGate
+      ? gateContactCandidate({ fieldType: "email", candidate: candidate.epost!.trim(), sourceContext, businessName })
+      : Promise.resolve(null),
+    telefonEligibleForGate
+      ? gateContactCandidate({ fieldType: "phone", candidate: candidate.telefon!.trim(), sourceContext, businessName })
+      : Promise.resolve(null),
+  ]);
+  if (epostEligibleForGate && !epostGate!.value) {
+    console.log(
+      `[gardssalg-contact] ${providerId} (${businessName}) epost candidate "${candidate.epost}" REJECTED by contact gate for ${evidenceUrl} — ${epostGate!.rejectedReason ?? "unknown reason"}; not written`
+    );
+  }
+  if (telefonEligibleForGate && !telefonGate!.value) {
+    console.log(
+      `[gardssalg-contact] ${providerId} (${businessName}) telefon candidate "${candidate.telefon}" REJECTED by contact gate for ${evidenceUrl} — ${telefonGate!.rejectedReason ?? "unknown reason"}; not written`
+    );
+  }
+  const gatedEpost = epostGate?.value ?? null;
+  const gatedTelefon = telefonGate?.value ?? null;
+
   // Write-time domain gate (Skive C(a)) — see this function's doc comment.
   // Computed BEFORE the epost branch decides anything, so a flagged
-  // candidate never reaches `sets`/`written`.
+  // candidate never reaches `sets`/`written`. Operates on gatedEpost (not
+  // the raw candidate) — a candidate the LLM/backstop gate above already
+  // rejected is not real contact info at all, so there is nothing left to
+  // flag for domain review either.
   let epostFlaggedForReview: GardssalgContactEmailFlaggedForReview | null = null;
-  if (isBlank(row.epost) && candidate.epost?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "epost")) {
-    const candidateEmail = candidate.epost.trim();
+  if (gatedEpost) {
+    const candidateEmail = gatedEpost;
     if (row.hjemmeside && row.hjemmeside.trim() !== "") {
       const websiteHost = hostFromUrlLike(row.hjemmeside);
       const websiteDomain = websiteHost ? registrableDomain(websiteHost) : null;
@@ -4591,19 +4639,14 @@ export function applyGardssalgProviderContact(
     }
   }
 
-  if (
-    isBlank(row.epost)
-    && candidate.epost?.trim()
-    && !gardssalgContactFieldWasRolledBack(providerId, "epost")
-    && !epostFlaggedForReview
-  ) {
+  if (gatedEpost && !epostFlaggedForReview) {
     sets.push("epost = @epost");
-    params.epost = candidate.epost.trim();
+    params.epost = gatedEpost;
     written.push("epost");
   }
-  if (isBlank(row.telefon) && candidate.telefon?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "telefon")) {
+  if (gatedTelefon) {
     sets.push("telefon = @telefon");
-    params.telefon = candidate.telefon.trim();
+    params.telefon = gatedTelefon;
     written.push("telefon");
   }
 

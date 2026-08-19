@@ -207,10 +207,45 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     }) as typeof fetch;
   }
 
+  // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b):
+  // applyAgentBrregContact now gates every address/phone candidate through
+  // the shared contact-candidate LLM judge (services/contact-candidate-
+  // judge.ts) — a DIRECT fetch("https://api.anthropic.com/...") call, on
+  // globalThis.fetch, completely separate from this file's own injected
+  // Brreg-fetch seam (__setAgentsBrregContactBackfillFetchForTesting) above.
+  // An ANTHROPIC_API_KEY + a blanket-approve globalThis.fetch stub (candidate
+  // values in agentsBrregGateRejectCandidates get AVVIS instead, for the
+  // dedicated rejection-path tests below) keeps this suite's existing
+  // "candidate IS written" assertions accurate.
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  const prevGlobalFetch = globalThis.fetch;
+  const agentsBrregGateRejectCandidates = new Set<string>();
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const u = String(input);
+    if (!u.includes("api.anthropic.com")) {
+      throw new Error(`admin-agents-brreg-contact-backfill test: unexpected globalThis.fetch call to ${u} — Brreg calls must go through the injected fetch seam, not globalThis.fetch`);
+    }
+    const body = init?.body ? JSON.parse(init.body) : {};
+    const prompt: string = body?.messages?.[0]?.content ?? "";
+    const rejected = Array.from(agentsBrregGateRejectCandidates).some((c) => prompt.includes(`Kandidat (`) && prompt.includes(c));
+    return {
+      ok: true, status: 200,
+      json: async () => ({
+        content: [{
+          type: "text",
+          text: rejected
+            ? "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne agenten."
+            : "GODKJENN\nPlausibel kontaktinfo for agenten.",
+        }],
+      }),
+    } as any;
+  }) as any;
+
   try {
     __setDbForTesting(testDb as any);
     __initSchemaForTesting(testDb as any);
     process.env.ADMIN_KEY = ADMIN_KEY;
+    process.env.ANTHROPIC_API_KEY = "agents-brreg-cb-test-anthropic-key";
     delete process.env.ANALYTICS_ADMIN_KEY;
 
     // Fresh require of admin-agents.ts + its brreg-client dependency —
@@ -341,7 +376,7 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     insertAgent({ id: "u-blank", name: "Unit Blank AS", orgNr: "900000001" });
     insertKnowledge("u-blank");
     {
-      const written = applyAgentBrregContact(
+      const written = await applyAgentBrregContact(
         testDb as any,
         "u-blank",
         { address: "Gårdsveien 12", phone: PHONE_A },
@@ -365,7 +400,7 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     insertAgent({ id: "u-existing", name: "Unit Existing AS", orgNr: "900000002" });
     insertKnowledge("u-existing", { address: "Original Address 1" });
     {
-      const written = applyAgentBrregContact(
+      const written = await applyAgentBrregContact(
         testDb as any,
         "u-existing",
         { address: "Brreg Says Different 99", phone: null },
@@ -382,7 +417,7 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     // (g) idempotency: a second call with the SAME values touches nothing
     // and does not duplicate the provenance record.
     {
-      const written2 = applyAgentBrregContact(
+      const written2 = await applyAgentBrregContact(
         testDb as any,
         "u-existing",
         { address: "Brreg Says Different 99", phone: null },
@@ -397,7 +432,7 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     insertAgent({ id: "u-locked", name: "Unit Locked AS", orgNr: "900000003", claimedAt: "2026-01-01 00:00:00" });
     insertKnowledge("u-locked");
     {
-      const written = applyAgentBrregContact(
+      const written = await applyAgentBrregContact(
         testDb as any,
         "u-locked",
         { address: "Should Never Land 1", phone: PHONE_A },
@@ -415,7 +450,7 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     {
       const totalChangesBefore = testDb.prepare("SELECT total_changes() AS n").get() as { n: number };
       const kBefore = readKnowledge("u-dry");
-      const touched = applyAgentBrregContact(
+      const touched = await applyAgentBrregContact(
         testDb as any,
         "u-dry",
         { address: "Dry Preview Address 1", phone: PHONE_B },
@@ -434,7 +469,7 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     insertAgent({ id: "u-audit", name: "Unit Audit AS", orgNr: "900000005" });
     insertKnowledge("u-audit", { address: "Kept Value 1" });
     {
-      applyAgentBrregContact(
+      await applyAgentBrregContact(
         testDb as any,
         "u-audit",
         { address: "Different Brreg Value 1", phone: PHONE_A },
@@ -453,6 +488,92 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
       assertTrue(!!phoneRow, "j6: an audit row exists for 'phone' (column WAS filled this time)");
       assertEq(phoneRow.old_value, null, "j7: phone audit old_value is the true pre-write null");
       assertEq(phoneRow.new_value, PHONE_A, "j8: phone audit new_value is the written value");
+    }
+
+    // ── (v) contact-candidate gate (dev-request 2026-08-19-rfb-kontakt-llm-
+    // dommer follow-on, Grep 5b): applyAgentBrregContact now gates every
+    // address/phone candidate through services/contact-candidate-judge.ts
+    // (backstop classifier first, LLM judge second) before writing — a
+    // structured-registry source is lower-risk than the other three Grep 5b
+    // sites, but still gated per the "no exceptions" requirement. (e)-(j)
+    // above already prove a genuine candidate is still written; these cases
+    // pin the actual rejection paths. ──────────────────────────────────────
+    {
+      // (v1) backstop-rejected phone (sequential-digit-run W34 shape,
+      // reachable here since Brreg's own telefon passes validatePhoneForWrite
+      // — that gate has no sequential-run check) is never written; a genuine
+      // address candidate on the SAME call still is.
+      insertAgent({ id: "u-gate-phone", name: "Gate Phone AS", orgNr: "900000010" });
+      insertKnowledge("u-gate-phone");
+      const writtenV1 = await applyAgentBrregContact(
+        testDb as any,
+        "u-gate-phone",
+        { address: "Gategate 1", phone: "23456789" },
+        "https://brreg.example/900000010",
+      );
+      assertEq(writtenV1, ["address"], "v1a: the sequential-digit-run phone candidate is NOT written; address still is");
+      const kV1 = readKnowledge("u-gate-phone");
+      assertEq(kV1.phone, null, "v1b: phone column stays NULL");
+      assertEq(kV1.address, "Gategate 1", "v1c: address written normally");
+      assertEq(readProvenance("u-gate-phone").phone, undefined, "v1d: phone NEVER gets a provenance record when rejected by the gate");
+    }
+    {
+      // (v2) a candidate that clears the backstop (structurally fine) but
+      // the LLM judge rejects (mocked AVVIS via agentsBrregGateRejectCandidates)
+      // is never written either — exercised on `address`, which has NO
+      // structural backstop check at all (see contact-candidate-judge.ts's
+      // own "Honesty note"), so the LLM judge is the ONLY line of defense
+      // demonstrated here.
+      insertAgent({ id: "u-gate-llm", name: "Gate LLM AS", orgNr: "900000011" });
+      insertKnowledge("u-gate-llm");
+      agentsBrregGateRejectCandidates.add("Sidestøyveien 99");
+      try {
+        const writtenV2 = await applyAgentBrregContact(
+          testDb as any,
+          "u-gate-llm",
+          { address: "Sidestøyveien 99", phone: PHONE_A },
+          "https://brreg.example/900000011",
+        );
+        assertEq(writtenV2, ["phone"], "v2a: the LLM-judge-rejected address is NOT written; phone still is");
+        assertEq(readKnowledge("u-gate-llm").address, null, "v2b: address column stays NULL");
+      } finally {
+        agentsBrregGateRejectCandidates.delete("Sidestøyveien 99");
+      }
+    }
+    {
+      // (v3) missing ANTHROPIC_API_KEY fails the gate closed even for an
+      // otherwise-perfectly-good candidate.
+      insertAgent({ id: "u-gate-nokey", name: "Gate No Key AS", orgNr: "900000012" });
+      insertKnowledge("u-gate-nokey");
+      const prevKeyV3 = process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+      try {
+        const writtenV3 = await applyAgentBrregContact(
+          testDb as any,
+          "u-gate-nokey",
+          { address: "Nøkkelveien 1", phone: PHONE_B },
+          "https://brreg.example/900000012",
+        );
+        assertEq(writtenV3, [], "v3a: both candidates fail closed with no ANTHROPIC_API_KEY, even though both are perfectly plausible");
+      } finally {
+        if (prevKeyV3 === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevKeyV3;
+      }
+    }
+    {
+      // (v4) dry-run preview is NOT gated (cost control — a preview never
+      // writes anything regardless of the gate's verdict) — the sequential-
+      // digit-run phone from (v1) still previews as touchable here.
+      insertAgent({ id: "u-gate-dry", name: "Gate Dry AS", orgNr: "900000013" });
+      insertKnowledge("u-gate-dry");
+      const touchedV4 = await applyAgentBrregContact(
+        testDb as any,
+        "u-gate-dry",
+        { address: null, phone: "23456789" },
+        "https://brreg.example/900000013",
+        { dryRun: true },
+      );
+      assertEq(touchedV4, ["phone"], "v4: dry-run preview is not gated — the sequential-run phone still previews as touchable");
     }
 
     // ── Route tests ─────────────────────────────────────────────────────
@@ -679,6 +800,9 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     failures.push("admin-agents-brreg-contact-backfill: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     if (resetFetch) resetFetch();
+    globalThis.fetch = prevGlobalFetch;
+    if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;

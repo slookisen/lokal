@@ -51,6 +51,11 @@ import {
 // dev-request 2026-07-28) before it may be used anywhere — column write OR
 // provenance value.
 import { validatePhoneForWrite } from "../services/contact-normalizer";
+// dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b): the same
+// backstop-classifier + LLM-judge gate PR #655 built for RFB's homepage-
+// provenance-batch write path (marketplace.ts), factored out into a shared
+// module — see services/contact-candidate-judge.ts's own file header.
+import { gateContactCandidate } from "../services/contact-candidate-judge";
 // Reused, unchanged, from the admin-knowledge factual-field write gate (see
 // POST /brreg-description-fallback below): canCorrectFactualField's
 // curated-lock refusal is the SAME hard rule every other admin write path
@@ -2284,23 +2289,23 @@ function agentKnowledgeHasBrregValueAlready(
  * always returns [] and never opens a transaction that writes. Exported for
  * unit tests.
  */
-export function applyAgentBrregContact(
+export async function applyAgentBrregContact(
   db: ReturnType<typeof getDb>,
   agentId: string,
   values: { address?: string | null; phone?: string | null },
   evidenceUrl: string,
   opts: { dryRun?: boolean; batchId?: string } = {},
-): string[] {
+): Promise<string[]> {
   const dryRun = !!opts.dryRun;
 
-  const agentRow = db.prepare(`SELECT id, claimed_at FROM agents WHERE id = ?`).get(agentId) as
-    | { id: string; claimed_at: string | null }
+  const agentRow = db.prepare(`SELECT id, name, claimed_at FROM agents WHERE id = ?`).get(agentId) as
+    | { id: string; name: string | null; claimed_at: string | null }
     | undefined;
   if (!agentRow) return [];
   if (agentRow.claimed_at) return []; // owner-claimed -> locked, mirrors applyAgentOrgNr
 
-  const addressVal = values.address && values.address.trim() !== "" ? values.address.trim() : null;
-  const phoneVal = values.phone && values.phone.trim() !== "" ? values.phone.trim() : null;
+  let addressVal = values.address && values.address.trim() !== "" ? values.address.trim() : null;
+  let phoneVal = values.phone && values.phone.trim() !== "" ? values.phone.trim() : null;
   if (!addressVal && !phoneVal) return [];
 
   const kRow = db.prepare(`SELECT address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as
@@ -2328,7 +2333,43 @@ export function applyAgentBrregContact(
   if (addressVal && (addressProvNew || addressWouldFillColumn)) touched.push("address");
   if (phoneVal && (phoneProvNew || phoneWouldFillColumn)) touched.push("phone");
 
-  if (dryRun || touched.length === 0) return touched;
+  // dev-request 2026-08-19-rfb-kontakt-llm-dommer follow-on (Grep 5b): a
+  // structured-registry source (Brreg) is lower-risk than the page-scrape/
+  // LLM-extraction paths PR #655 and the other three Grep 5b sites gate, but
+  // still gated per the "no exceptions" requirement — the SAME shared
+  // backstop classifier + LLM judge (services/contact-candidate-judge.ts).
+  // Preview (dryRun) mode returns BEFORE this — a preview never writes
+  // anything, so spending an LLM call on it would be pure cost with no
+  // safety benefit (same "dry-run stays free" decision made at every other
+  // Grep 5b call site). Gated ONLY for a field actually in `touched` — cost
+  // control: no LLM call for a field that would be a no-op regardless of the
+  // gate's verdict (already fully corroborated, or genuinely blank).
+  if (dryRun) return touched;
+  if (touched.length === 0) return [];
+
+  const agentBrregGateBusinessName = agentRow.name?.trim() || agentId;
+  const agentBrregGateSourceContext = `Hentet fra Brreg (Enhetsregisteret). Kilde-URL: ${evidenceUrl}.`;
+  const [agentBrregAddressGate, agentBrregPhoneGate] = await Promise.all([
+    touched.includes("address")
+      ? gateContactCandidate({ fieldType: "address", candidate: addressVal!, sourceContext: agentBrregGateSourceContext, businessName: agentBrregGateBusinessName })
+      : Promise.resolve(null),
+    touched.includes("phone")
+      ? gateContactCandidate({ fieldType: "phone", candidate: phoneVal!, sourceContext: agentBrregGateSourceContext, businessName: agentBrregGateBusinessName })
+      : Promise.resolve(null),
+  ]);
+  if (touched.includes("address") && !agentBrregAddressGate!.value) {
+    console.log(
+      `[agents-brreg-contact] ${agentId} (${agentBrregGateBusinessName}) address candidate "${addressVal}" REJECTED by contact gate — ${agentBrregAddressGate!.rejectedReason ?? "unknown reason"}; not written`
+    );
+    addressVal = null;
+  }
+  if (touched.includes("phone") && !agentBrregPhoneGate!.value) {
+    console.log(
+      `[agents-brreg-contact] ${agentId} (${agentBrregGateBusinessName}) phone candidate "${phoneVal}" REJECTED by contact gate — ${agentBrregPhoneGate!.rejectedReason ?? "unknown reason"}; not written`
+    );
+    phoneVal = null;
+  }
+  if (!addressVal && !phoneVal) return [];
 
   const nowIso = new Date().toISOString();
   const written: string[] = [];
@@ -2529,7 +2570,7 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
       const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
 
       if (dryRun) {
-        const wouldTouch = applyAgentBrregContact(
+        const wouldTouch = await applyAgentBrregContact(
           db,
           agentId,
           { address: usableAddress, phone: usablePhone },
@@ -2549,7 +2590,7 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
         });
       } else {
         try {
-          const written = applyAgentBrregContact(
+          const written = await applyAgentBrregContact(
             db,
             agentId,
             { address: usableAddress, phone: usablePhone },
