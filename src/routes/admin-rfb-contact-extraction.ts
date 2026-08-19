@@ -73,9 +73,13 @@ import {
   isSyntacticallyValidEmail,
   isContactEmailCurated,
 } from "./admin-agents-contact-email-write";
-import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain } from "../services/experience-store";
+import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain, gardssalgPageText } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { hostFromUrlLike } from "../services/cross-source-validator";
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
+// shared LLM-judge + deterministic-backstop contact gate (mirrors lokal#655's
+// marketplace.ts pattern; see contact-candidate-judge.ts's own doc comment).
+import { gateContactCandidates } from "../services/contact-candidate-judge";
 
 // Re-exported so this route's own test file (and any future caller) can
 // build a guaranteed-excluded fixture host without a second import path back
@@ -402,10 +406,12 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
 
       let email: ReturnType<typeof extractGardssalgContactEmail> = null;
       let emailUrl = "";
+      let emailPageHtml = "";
       for (const pg of pages) {
         email = extractGardssalgContactEmail(pg.html, homeDomain, pg.contactish);
         if (email) {
           emailUrl = pg.url;
+          emailPageHtml = pg.html;
           break;
         }
       }
@@ -430,19 +436,40 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         continue;
       }
 
+      // Grep 5b LLM-judge contact gate (dev-request 2026-08-19-kursjustering-
+      // drikkefunnel-llm-og-supply): every candidate — dry-run preview
+      // included, so a preview never promises a write the gate would then
+      // refuse — must clear the shared backstop+LLM-judge gate before it is
+      // eligible to be reported/written as "found". A rejected candidate is
+      // treated EXACTLY like extractGardssalgContactEmail having found
+      // nothing: fail-closed, no write, no throw.
+      const gated = await gateContactCandidates({
+        businessName: t.name,
+        sourceContext: gardssalgPageText(emailPageHtml),
+        candidateEmail: email.email,
+      });
+      if (!gated.email) {
+        console.log(
+          `[rfb-contact-extraction] ${t.id} (${t.name}) email candidate "${email.email}" REJECTED by contact gate for ${emailUrl} — ${gated.emailRejectedReason ?? "unknown reason"}; not written`
+        );
+        results.push({ agent_id: t.id, agent_name: t.name, outcome: "no_contact_found" });
+        continue;
+      }
+      const gatedEmail = gated.email;
+
       if (dryRun) {
         results.push({
           agent_id: t.id, agent_name: t.name, outcome: "written",
-          email: email.email, email_source: email.source, source_url: emailUrl, old_value: t.contact_email,
+          email: gatedEmail, email_source: email.source, source_url: emailUrl, old_value: t.contact_email,
         });
         continue;
       }
 
-      const written = applyRfbCxWrite(db, t.id, email.email, emailUrl, batchId);
+      const written = applyRfbCxWrite(db, t.id, gatedEmail, emailUrl, batchId);
       if (written.outcome === "written") {
         results.push({
           agent_id: t.id, agent_name: t.name, outcome: "written",
-          email: email.email, email_source: email.source, source_url: emailUrl, old_value: written.oldValue,
+          email: gatedEmail, email_source: email.source, source_url: emailUrl, old_value: written.oldValue,
         });
       } else {
         results.push({ agent_id: t.id, agent_name: t.name, outcome: written.outcome, old_value: written.oldValue });

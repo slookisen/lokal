@@ -134,6 +134,14 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   const prevFetch = globalThis.fetch;
+  // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+  // supply): applyRfbCxWrite's call site now gates every email candidate
+  // through the shared LLM-judge contact gate before writing — see
+  // contact-candidate-judge.test.ts for the judge module's own unit tests.
+  // Every existing fixture below is a plausible, legitimate candidate, so
+  // the default mock always GODKJENNs; a dedicated W34 rejection case is
+  // added in section (p).
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -143,10 +151,27 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
 
   const fixtures: Map<string, Response> = new Map();
   const fetchCalls: string[] = [];
+  const anthropicRejectCandidates = new Set<string>();
 
   function stubFetch(): typeof fetch {
-    return (async (url: string | URL | Request) => {
+    return (async (url: string | URL | Request, init?: any) => {
       const urlStr = String(url);
+      if (urlStr.includes("api.anthropic.com")) {
+        const body = init?.body ? JSON.parse(init.body) : {};
+        const prompt: string = body?.messages?.[0]?.content ?? "";
+        const m = prompt.match(/^Kandidat \([^)]+\): (.+)$/m);
+        const candidate = m ? m[1].trim() : "";
+        if (anthropicRejectCandidates.has(candidate)) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten." }] }),
+          } as any;
+        }
+        return {
+          ok: true, status: 200,
+          json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+        } as any;
+      }
       fetchCalls.push(urlStr);
       const fx = fixtures.get(urlStr);
       return fx ?? notFoundResponse();
@@ -157,6 +182,7 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
     __setDbForTesting(testDb as any);
     __initSchemaForTesting(testDb as any);
     process.env.ADMIN_KEY = ADMIN_KEY;
+    process.env.ANTHROPIC_API_KEY = "rfb-cx-test-anthropic-key";
     delete process.env.ANALYTICS_ADMIN_KEY;
     globalThis.fetch = stubFetch();
 
@@ -453,6 +479,62 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       const auditDead = auditRowsFor("cx-dnsdead");
       assertTrue(auditDead.length > 0 && auditDead.every((row: any) => row.changed_by === "system"), "o3: same guarantee holds for the DNS-dead-replacement write");
     }
+
+    // ── (p) Grep 5b — LLM-judge contact gate (dev-request 2026-08-19-
+    // kursjustering-drikkefunnel-llm-og-supply): a candidate the shared
+    // judge rejects is NEVER written — reported exactly like
+    // 'no_contact_found' — while a genuine candidate in the SAME apply call
+    // still writes normally (regression guard). ────────────────────────────
+    {
+      insertAgent({ id: "cx-gate-reject", name: "Dommeravvist Gard", website: "https://dommeravvist.no" });
+      const rejectedCandidate = "post@dommeravvist.no";
+      fixtures.set(
+        "https://dommeravvist.no",
+        htmlResponse(`<a href="mailto:${rejectedCandidate}">Kontakt</a>`, { finalUrl: "https://dommeravvist.no" }),
+      );
+      anthropicRejectCandidates.add(rejectedCandidate);
+
+      insertAgent({ id: "cx-gate-ok", name: "Dommergodkjent Gard", website: "https://dommergodkjent.no" });
+      fixtures.set(
+        "https://dommergodkjent.no",
+        htmlResponse('<a href="mailto:post@dommergodkjent.no">Kontakt</a>', { finalUrl: "https://dommergodkjent.no" }),
+      );
+
+      try {
+        const r = await callExtraction({ agentIds: ["cx-gate-reject", "cx-gate-ok"], apply: true });
+        const rejectedItem = r.body.results.find((x: any) => x.agent_id === "cx-gate-reject");
+        assertEq(rejectedItem?.outcome, "no_contact_found", "p1: a judge-rejected candidate is reported exactly like no_contact_found");
+        assertEq(contactEmailOf("cx-gate-reject"), "", "p2: the rejected candidate was NEVER written to agents.contact_email");
+        assertEq(auditRowsFor("cx-gate-reject").length, 0, "p3: no audit row for a candidate the gate rejected");
+
+        const okItem = r.body.results.find((x: any) => x.agent_id === "cx-gate-ok");
+        assertEq(okItem?.outcome, "written", "p4: a genuine candidate on the SAME apply call still writes (regression guard)");
+        assertEq(contactEmailOf("cx-gate-ok"), "post@dommergodkjent.no", "p5: the genuine candidate WAS written");
+      } finally {
+        anthropicRejectCandidates.delete(rejectedCandidate);
+      }
+    }
+
+    // ── (q) Grep 5b — fail-closed on a missing ANTHROPIC_API_KEY: a
+    // candidate that would otherwise write (mailto, clean syntax, own
+    // domain) is still never written when the judge cannot even be called. ─
+    {
+      insertAgent({ id: "cx-gate-nokey", name: "Uten Nøkkel Gard", website: "https://utennokkel.no" });
+      fixtures.set(
+        "https://utennokkel.no",
+        htmlResponse('<a href="mailto:post@utennokkel.no">Kontakt</a>', { finalUrl: "https://utennokkel.no" }),
+      );
+      const savedKey = process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+      try {
+        const r = await callExtraction({ agentIds: ["cx-gate-nokey"], apply: true });
+        const item = r.body.results.find((x: any) => x.agent_id === "cx-gate-nokey");
+        assertEq(item?.outcome, "no_contact_found", "q1: missing ANTHROPIC_API_KEY -> fails closed, reported as no_contact_found");
+        assertEq(contactEmailOf("cx-gate-nokey"), "", "q2: nothing written with no ANTHROPIC_API_KEY, even though the page has a perfectly valid mailto");
+      } finally {
+        process.env.ANTHROPIC_API_KEY = savedKey;
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-contact-extraction: unexpected error: " + String(err?.stack || err?.message || err));
@@ -462,6 +544,8 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
     else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
+    if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     try {
       if (prevDb) __setDbForTesting(prevDb);
     } catch {

@@ -24,6 +24,11 @@ import { fylkeEquivalents } from "./norway-fylke";
 // second phone-shape check for this vertical — see applyGardssalgSetContactPhone
 // below for why.
 import { validatePhoneForWrite } from "./contact-normalizer";
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b:
+// the shared LLM-judge + deterministic-backstop gate (mirrors lokal#655's
+// marketplace.ts pattern) that now stands in front of every contact-field
+// write this file makes — see gateContactCandidates' own doc comment.
+import { gateContactCandidates } from "./contact-candidate-judge";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
 // reuse the same quality-bar predicate the homepage-content extractor already
 // gates candidates with, so applyGardssalgProviderContent() can tell "thin"
@@ -4525,13 +4530,31 @@ export function flagGardssalgContactEmailForReview(
  *     norm, not a wrong-company signal, and extractGardssalgContactEmail
  *     already treats freemail as its own trusted tier;
  *   - telefon is completely unaffected — this gate is epost-only.
+ *
+ * LLM-JUDGE CONTACT GATE (2026-08-19, dev-request 2026-08-19-kursjustering-
+ * drikkefunnel-llm-og-supply, Grep 5b): every incoming epost/telefon
+ * candidate is now ALSO run through gateContactCandidates (backstop
+ * classifier + LLM judge, src/services/contact-candidate-judge.ts) before
+ * anything below decides what to write — the exact same "one choke point,
+ * no duplicated logic, no way for a new caller to skip it" rationale as the
+ * domain gate above, and living in the same place for the same reason: both
+ * writer routes (contact-extraction, contact-backfill) funnel through this
+ * one function. A judge-rejected candidate is treated EXACTLY like the
+ * extractor having found nothing for that field — fail-closed, no write, no
+ * throw — and the existing fill-only/lock/domain-mismatch guards below run
+ * UNCHANGED on whatever survives the gate. `gateContext` carries the
+ * business name + page/source text the judge needs; callers that omit it
+ * (there should be none in production — both writer routes pass it) still
+ * get a safe fail-closed gate call with an empty context, which can only
+ * ever make the judge MORE likely to reject, never less.
  */
-export function applyGardssalgProviderContact(
+export async function applyGardssalgProviderContact(
   providerId: string,
   candidate: { epost?: string | null; telefon?: string | null; epostSource?: string | null },
   evidenceUrl: string,
-  batchId?: string
-): GardssalgProviderContactWriteResult {
+  batchId?: string,
+  gateContext?: { businessName: string; sourceContext: string }
+): Promise<GardssalgProviderContactWriteResult> {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
@@ -4550,6 +4573,15 @@ export function applyGardssalgProviderContact(
     | undefined;
   if (!row) return { written: [] };
   if (row.content_source === "manual" || row.content_source === "claim") return { written: [] };
+
+  // ── LLM-judge contact gate (Grep 5b) — see doc comment above ────────────
+  const gated = await gateContactCandidates({
+    businessName: gateContext?.businessName ?? "",
+    sourceContext: gateContext?.sourceContext ?? "",
+    candidateEmail: candidate.epost ?? null,
+    candidatePhone: candidate.telefon ?? null,
+  });
+  candidate = { epost: gated.email, telefon: gated.phone, epostSource: candidate.epostSource };
 
   function isBlank(v: unknown): boolean {
     return v === null || v === undefined || String(v).trim() === "";

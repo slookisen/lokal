@@ -586,6 +586,11 @@ import {
 // dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
 import { buildReiseApiRouter } from "./reise-api";
 import { getDb as getExperiencesDbHandle } from "../database/db-factory";
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
+// shared LLM-judge contact gate for the gardssalg-autosvar-apply call site
+// (applyGardssalgProviderContact's own gate call lives inside
+// experience-store.ts and needs no separate import here).
+import { gateContactCandidates } from "../services/contact-candidate-judge";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -7301,11 +7306,18 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
           ...(emailFromRaw ? { email_from_raw: true } : {}),
         });
       } else {
-        const { written, epostFlaggedForReview } = applyGardssalgProviderContact(
+        // Grep 5b gate context: the concatenated visible text of every page
+        // this row's crawl actually read, so the LLM judge (called INSIDE
+        // applyGardssalgProviderContact) sees the same source material the
+        // extractors themselves saw — same idea as marketplace.ts passing
+        // extractedPageText into gateRfbContactCandidates.
+        const gateSourceContext = pages.map((pg) => gardssalgPageText(pg.html)).join("\n\n");
+        const { written, epostFlaggedForReview } = await applyGardssalgProviderContact(
           t.id,
           { epost: email?.email ?? null, telefon: phone?.phone ?? null, epostSource: email?.source ?? null },
           evidenceUrl,
           batchId,
+          { businessName: t.navn, sourceContext: gateSourceContext },
         );
         if (epostFlaggedForReview) {
           contactEmailFlaggedForReview.push({
@@ -7753,11 +7765,20 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
       });
     } else {
       try {
-        const { written, epostFlaggedForReview } = applyGardssalgProviderContact(
+        // Grep 5b gate context: Brreg is a structured registry source (no
+        // page HTML to quote), so the "source context" the judge sees is a
+        // short description of where the candidate came from rather than a
+        // page excerpt — still enough for the judge to sanity-check the
+        // candidate shape against the business name.
+        const gateSourceContext =
+          `Data fra Brønnøysundregistrene (Brreg) for org.nr ${t.org_nr}: ` +
+          `epostadresse=${JSON.stringify(contact.epost ?? null)}, telefon/mobil=${JSON.stringify(contact.telefon ?? null)}.`;
+        const { written, epostFlaggedForReview } = await applyGardssalgProviderContact(
           providerId,
           { epost: contact.epost, telefon: contact.telefon, epostSource: "brreg" },
           evidenceUrl,
-          batchId
+          batchId,
+          { businessName: t.navn, sourceContext: gateSourceContext },
         );
         if (epostFlaggedForReview) {
           contactEmailFlaggedForReview.push({
@@ -8628,7 +8649,7 @@ router.get("/admin/gardssalg-autosvar-scan", requireAdmin, (req: Request, res: R
 // happen and writes nothing anywhere — no epost write, no queue row.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
-router.post("/admin/gardssalg-autosvar-apply", requireAdmin, (req: Request, res: Response) => {
+router.post("/admin/gardssalg-autosvar-apply", requireAdmin, async (req: Request, res: Response) => {
   try {
     const parsed = parseGardssalgAutosvarScanPaging(req.query);
     if (!parsed.ok) {
@@ -8651,7 +8672,14 @@ router.post("/admin/gardssalg-autosvar-apply", requireAdmin, (req: Request, res:
       | "would_queue"
       | "domain_mismatch"
       | "provider_not_found"
-      | "skipped_no_email_found";
+      | "skipped_no_email_found"
+      // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+      // supply): the candidate cleared the domain-match classification but
+      // was rejected by the shared LLM-judge contact gate (backstop
+      // classifier or the judge itself) — treated exactly like "nothing to
+      // apply" (no epost write, no queue row), but reported under its own
+      // label rather than folded into an unrelated bucket.
+      | "contact_gate_rejected";
 
     const results: Array<GardssalgAutosvarScanCandidate & { outcome: GardssalgAutosvarApplyOutcome }> = [];
     const counts: Record<GardssalgAutosvarApplyOutcome, number> = {
@@ -8663,6 +8691,7 @@ router.post("/admin/gardssalg-autosvar-apply", requireAdmin, (req: Request, res:
       domain_mismatch: 0,
       provider_not_found: 0,
       skipped_no_email_found: 0,
+      contact_gate_rejected: 0,
     };
 
     for (const c of scan.candidates) {
@@ -8676,8 +8705,8 @@ router.post("/admin/gardssalg-autosvar-apply", requireAdmin, (req: Request, res:
 
       if (c.classification === "domain_match") {
         const providerRow = expDb
-          .prepare(`SELECT epost FROM experience_providers WHERE id = ?`)
-          .get(c.provider_id) as { epost: string | null } | undefined;
+          .prepare(`SELECT navn, epost FROM experience_providers WHERE id = ?`)
+          .get(c.provider_id) as { navn: string; epost: string | null } | undefined;
         if (!providerRow) {
           results.push({ ...c, outcome: "provider_not_found" });
           counts.provider_not_found++;
@@ -8696,8 +8725,33 @@ router.post("/admin/gardssalg-autosvar-apply", requireAdmin, (req: Request, res:
           counts.would_apply++;
           continue;
         }
+
+        // Grep 5b LLM-judge contact gate — call-site gate (this is the
+        // spec's own choke point: applyGardssalgSetContactEmail is also
+        // called by human force-approval routes elsewhere, where gating a
+        // human's own explicit decision would be wrong, so the gate lives
+        // HERE, at this one automated-apply call site, not inside the
+        // shared function). sourceContext is the matched autosvar phrase —
+        // the actual evidence this candidate came from.
+        const gateSourceContext =
+          `Autosvar-e-post-tråd (innkommende e-post fra produsentens tidligere kontakt-epost ${c.contact_email}): ` +
+          `treffende frase="${c.matched_phrase}", kandidat-epost=${c.candidate_email}.`;
+        const gated = await gateContactCandidates({
+          businessName: providerRow.navn,
+          sourceContext: gateSourceContext,
+          candidateEmail: c.candidate_email,
+        });
+        if (!gated.email) {
+          console.log(
+            `[gardssalg-autosvar-apply] ${c.provider_id} (${providerRow.navn}) candidate epost "${c.candidate_email}" REJECTED by contact gate — ${gated.emailRejectedReason ?? "unknown reason"}; not applied`
+          );
+          results.push({ ...c, outcome: "contact_gate_rejected" });
+          counts.contact_gate_rejected++;
+          continue;
+        }
+
         const source = `autosvar_redirect: thread=${c.thread_id} message=${c.message_id} sent_at=${c.sent_at ?? "ukjent"} phrase="${c.matched_phrase}"`;
-        const applyResult = applyGardssalgSetContactEmail(c.provider_id, c.candidate_email, source, false);
+        const applyResult = applyGardssalgSetContactEmail(c.provider_id, gated.email, source, false);
         if (!applyResult.ok) {
           if (applyResult.reason === "provider_not_found") {
             results.push({ ...c, outcome: "provider_not_found" });

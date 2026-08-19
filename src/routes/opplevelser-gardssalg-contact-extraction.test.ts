@@ -93,6 +93,44 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
     for (const p of cachePaths) delete require.cache[p];
 
     const prevFetch = globalThis.fetch;
+    // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+    // supply): applyGardssalgProviderContact (the choke point this route's
+    // real writes go through) now gates every epost/telefon candidate
+    // through the shared LLM-judge contact gate before writing — see
+    // contact-candidate-judge.test.ts for the judge module's own unit
+    // tests. Every existing fixture below is a plausible, legitimate
+    // candidate, so the default mock always GODKJENNs; a dedicated W34
+    // rejection case is added in section (cx-60). Every one of this file's
+    // MANY page-fetch mocks below is renamed from a direct `globalThis.
+    // fetch = ...` assignment to `activePageFetch = ...` — a single
+    // dispatcher (installed once, right here) owns globalThis.fetch for
+    // the whole suite and routes an api.anthropic.com URL to the judge
+    // mock, anything else to whichever page-fetch mock the current test
+    // block last set.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "gardssalg-contact-extraction-test-anthropic-key";
+    let activePageFetch: typeof fetch = prevFetch as typeof fetch;
+    const anthropicRejectCandidates = new Set<string>();
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const urlStr = String(url);
+      if (urlStr.includes("api.anthropic.com")) {
+        const body = init?.body ? JSON.parse(init.body) : {};
+        const prompt: string = body?.messages?.[0]?.content ?? "";
+        const m = prompt.match(/^Kandidat \([^)]+\): (.+)$/m);
+        const candidate = m ? m[1].trim() : "";
+        if (anthropicRejectCandidates.has(candidate)) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten." }] }),
+          } as any;
+        }
+        return {
+          ok: true, status: 200,
+          json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+        } as any;
+      }
+      return activePageFetch(url as any, init);
+    }) as any;
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
@@ -284,7 +322,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
           headers: cxMockHeaders,
           arrayBuffer: async () => new ArrayBuffer(0),
         }) as unknown as Response;
-      globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
         const u = String(url);
         const host = (() => { try { return new URL(u).hostname; } catch { return ""; } })();
         if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
@@ -466,8 +504,11 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         // whether the cooldown logic actually skipped the call.
         let retryHostCalls = 0;
         const newHostCalls: string[] = [];
-        const cxMockFetch2 = globalThis.fetch;
-        globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+        // Grep 5b: captures the concrete page-fetch mock directly (see the
+        // matching cxMockFetch3 comment below for why globalThis.fetch
+        // itself must not be captured here).
+        const cxMockFetch2 = activePageFetch;
+        activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
           const u = String(url);
           if (u.startsWith("https://retryhost.no")) {
             newHostCalls.push(u);
@@ -554,10 +595,18 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         const RENDERED_KONTAKT =
           '<html><body>Kontakt oss: <a href="mailto:post@jsgard.no">post@jsgard.no</a></body></html>';
 
-        const cxMockFetch3 = globalThis.fetch;
+        // Grep 5b: captures the concrete page-fetch mock directly (NOT
+        // globalThis.fetch, which is now the shared Anthropic-aware
+        // dispatcher installed once at suite setup) — capturing the
+        // dispatcher here would create a circular fallback once a LATER
+        // block reassigns activePageFetch to a new mock that itself falls
+        // back to cxMockFetch3 for unmatched URLs.
+        const cxMockFetch3 = activePageFetch;
         let renderCalls: string[] = [];
-        const restoreFetch = () => { globalThis.fetch = cxMockFetch3; };
-        globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+        // Grep 5b: restores the PAGE mock (not globalThis.fetch itself,
+        // which stays the shared dispatcher for the rest of the suite).
+        const restoreFetch = () => { activePageFetch = cxMockFetch3; };
+        activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
           const u = String(url);
           // Både forsiden og /kontakt kommer tilbake som JS-skall over HTTP —
           // det er nettopp poenget: uten rendering er de begge ulesbare.
@@ -662,7 +711,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
           const RENDERED_NO_EMAIL =
             "<html><body><h1>Rå Gard Destilleri</h1><p>Vi lager akevitt.</p></body></html>";
 
-          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
             if (u.startsWith("https://raagard.no")) return mkHtmlResponse(u, EMBEDDED_SHELL);
             return (cxMockFetch3 as typeof fetch)(url as any, init);
@@ -723,7 +772,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
             "Phone: +47 24 02 22 12<br>Email: bjorn@eiktid.no</p></body></html>";
           const BREWERY_EIKTID = "<html><body><h1>The Brewery</h1><p>Vi startet i 2015.</p></body></html>";
 
-          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
             if (u.includes("eiktidtest.no/the-team")) return mkHtmlResponse(u, TEAM_EIKTID);
             if (u.includes("eiktidtest.no/the-brewery")) return mkHtmlResponse(u, BREWERY_EIKTID);
@@ -747,7 +796,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         {
           const FRONT_BOTH =
             '<html><body><a href="/the-team/">Team</a><a href="/kontakt">Kontakt</a></body></html>';
-          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
             if (u.includes("beggeto.no/the-team")) return mkHtmlResponse(u, "<html><body>Email: person@beggeto.no</body></html>");
             if (u.includes("beggeto.no/kontakt")) return mkHtmlResponse(u, "<html><body>Kontakt: post@beggeto.no</body></html>");
@@ -766,7 +815,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         //    ingen respons kunne si HVILKE sider som ble lest eller hvor mye
         //    tekst hver ga. ──────────────────────────────────────────────────
         {
-          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
             if (u.includes("tomgard.no/kontakt")) return mkHtmlResponse(u, "<html><body>Skjema uten adresse. Fyll ut under.</body></html>");
             if (u.startsWith("https://tomgard.no")) return mkHtmlResponse(u, '<html><body><a href="/kontakt">Kontakt</a>Tom Gard</body></html>');
@@ -798,7 +847,7 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
           const FOREIGN_MAILTO =
             '<html><body><h1>Fremmedgård</h1><p>Tlf: 41 41 41 41</p>' +
             '<a href="mailto:tg@distributoren-as.no">Kontakt oss</a></body></html>';
-          globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
             if (u.startsWith("https://fremmedgard.no")) return mkHtmlResponse(u, FOREIGN_MAILTO);
             return (cxMockFetch3 as typeof fetch)(url as any, init);
@@ -837,6 +886,8 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
       failures.push("gardssalg-contact-extraction: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
       globalThis.fetch = prevFetch;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
       if (prevExpPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExpPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

@@ -182,6 +182,44 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   let resetFetch: (() => void) | undefined;
+  // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+  // supply): POST /brreg-contact-backfill's call site now gates every
+  // address/phone candidate through the shared LLM-judge contact gate
+  // before applyAgentBrregContact — see contact-candidate-judge.test.ts for
+  // the judge module's own unit tests. That gate calls the REAL global
+  // fetch() (Brreg I/O in this file goes through the SEPARATE injectable
+  // __setAgentsBrregContactBackfillFetchForTesting seam, untouched here), so
+  // globalThis.fetch needs its own stub — every fixture below is a
+  // plausible, legitimate candidate, so the default mock always GODKJENNs;
+  // a dedicated W34 rejection case is added in section (v). The direct-call
+  // applyAgentBrregContact unit tests ((e)-(j) below) bypass the route
+  // entirely and therefore never reach this gate at all — exactly as
+  // designed (see admin-agents.ts's own doc comment on why the gate lives
+  // at the route call site, not inside applyAgentBrregContact).
+  const prevGlobalFetch = globalThis.fetch;
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  const anthropicRejectCandidates = new Set<string>();
+  process.env.ANTHROPIC_API_KEY = "agents-brreg-contact-backfill-test-anthropic-key";
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const urlStr = String(url);
+    if (urlStr.includes("api.anthropic.com")) {
+      const body = init?.body ? JSON.parse(init.body) : {};
+      const prompt: string = body?.messages?.[0]?.content ?? "";
+      const m = prompt.match(/^Kandidat \([^)]+\): (.+)$/m);
+      const candidate = m ? m[1].trim() : "";
+      if (anthropicRejectCandidates.has(candidate)) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ content: [{ type: "text", text: "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten." }] }),
+        } as any;
+      }
+      return {
+        ok: true, status: 200,
+        json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+      } as any;
+    }
+    return (prevGlobalFetch as any)(url, init);
+  }) as any;
 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -660,6 +698,66 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
       assertEq(res.body.changed.length, 3, "u3: three of four rows would be enriched");
     }
 
+    // ── (v) Grep 5b — LLM-judge contact gate (dev-request 2026-08-19-
+    // kursjustering-drikkefunnel-llm-og-supply): rejected candidates are
+    // NEVER written — reported exactly like a candidate Brreg never
+    // returned — while a genuine candidate on the SAME call still lands
+    // (regression guard). Two rejection shapes: (v1) a placeholder-shaped
+    // repeated-digit phone caught by the deterministic backstop BEFORE the
+    // LLM judge is even reachable (cost control — no Anthropic call needed
+    // to prove this branch); (v2) a structurally clean phone the mocked
+    // judge specifically rejects, proving the judge itself is wired in.
+    // Placed BEFORE (t) deliberately — (t) DROPs agent_knowledge_audit to
+    // test write-failure handling and never recreates it, which would make
+    // every write below fail closed for the WRONG reason (a missing table,
+    // not the gate) if run afterward. ───────────────────────────────────
+    {
+      // (v1) backstop-level rejection.
+      insertAgent({ id: "rt-gate-backstop", name: "Gate Backstop AS", orgNr: "940000001", createdAt: "2026-05-01 00:00:00" });
+      insertKnowledge("rt-gate-backstop");
+      detailFixtures.set("940000001", enhetDetail({ adresse: ["Backstopveien 1"], telefon: "55555555" }));
+      {
+        const res = await callBackfill({ agentIds: ["rt-gate-backstop"], apply: true });
+        const kV1 = readKnowledge("rt-gate-backstop");
+        assertEq(kV1.phone, null, "v1a: the repeated-digit placeholder-shaped phone was NEVER written — caught by the backstop");
+        assertEq(kV1.address, "Backstopveien 1", "v1b: the genuine address on the SAME row still lands — the gate is per-field, not all-or-nothing");
+        const provV1 = readProvenance("rt-gate-backstop");
+        assertEq(provV1.phone, undefined, "v1c: phone never gets a provenance record either");
+        assertTrue(!!res.body, "v1d: route call completed (200, not a crash)");
+      }
+
+      // (v2) LLM-judge-level rejection: structurally clean (passes the
+      // backstop) but the mocked judge specifically rejects it.
+      const judgeRejectedPhone = "93456782";
+      anthropicRejectCandidates.add(judgeRejectedPhone);
+      try {
+        insertAgent({ id: "rt-gate-judge", name: "Gate Judge AS", orgNr: "940000002", createdAt: "2026-05-02 00:00:00" });
+        insertKnowledge("rt-gate-judge");
+        detailFixtures.set("940000002", enhetDetail({ adresse: null, telefon: judgeRejectedPhone }));
+        const res = await callBackfill({ agentIds: ["rt-gate-judge"], apply: true });
+        assertTrue(
+          res.body.unresolved.some((u: any) => u.agent_id === "rt-gate-judge" && u.reason === "contact_gate_rejected"),
+          "v2a: a judge-rejected candidate (no other field to fall back on) -> unresolved contact_gate_rejected",
+        );
+        assertEq(readKnowledge("rt-gate-judge").phone, null, "v2b: the judge-rejected candidate was NEVER written");
+      } finally {
+        anthropicRejectCandidates.delete(judgeRejectedPhone);
+      }
+
+      // (v3) regression: a genuine candidate on a DIFFERENT agent in the
+      // SAME batch call still writes normally once both gates approve.
+      insertAgent({ id: "rt-gate-ok", name: "Gate OK AS", orgNr: "940000003", createdAt: "2026-05-03 00:00:00" });
+      insertKnowledge("rt-gate-ok");
+      detailFixtures.set("940000003", enhetDetail({ adresse: ["Gateokveien 1"], telefon: "93456783" }));
+      {
+        const res = await callBackfill({ agentIds: ["rt-gate-backstop", "rt-gate-judge", "rt-gate-ok"], apply: true });
+        assertTrue(!!res.body, "v3a: batched call with mixed rejected/genuine candidates completes");
+        const kV3 = readKnowledge("rt-gate-ok");
+        assertEq(kV3.address, "Gateokveien 1", "v3b: a genuine candidate in the SAME batch still writes (address)");
+        assertEq(kV3.phone, "93456783", "v3c: a genuine candidate in the SAME batch still writes (phone)");
+      }
+    }
+
     // (t) route: write failure surfaces in errors[] with write_failed: prefix,
     // never a 500.
     insertAgent({ id: "rt-write-fail", name: "Route Write Fail AS", orgNr: "930000005", createdAt: "2026-04-01 00:00:00" });
@@ -679,6 +777,9 @@ export async function runAdminAgentsBrregContactBackfillTests(opts: { log?: bool
     failures.push("admin-agents-brreg-contact-backfill: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     if (resetFetch) resetFetch();
+    globalThis.fetch = prevGlobalFetch;
+    if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
