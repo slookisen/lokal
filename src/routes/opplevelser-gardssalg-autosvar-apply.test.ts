@@ -139,6 +139,37 @@ export function runOpplevelserGardssalgAutosvarApplyTests(
   return (async () => {
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
+    const prevFetch = globalThis.fetch;
+    // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+    // supply): the "domain_match" auto-apply branch now runs its candidate
+    // epost through the shared LLM-judge contact gate before calling
+    // applyGardssalgSetContactEmail — see contact-candidate-judge.test.ts
+    // for the judge module's own unit tests. Every existing fixture below
+    // is a plausible, legitimate candidate, so the default mock always
+    // GODKJENNs; a dedicated W34 rejection case is added in section (h).
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "gardssalg-autosvar-apply-test-anthropic-key";
+    let anthropicRejectCandidates = new Set<string>();
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = String(input);
+      if (url.includes("api.anthropic.com")) {
+        const body = init?.body ? JSON.parse(init.body) : {};
+        const prompt: string = body?.messages?.[0]?.content ?? "";
+        const m = prompt.match(/^Kandidat \([^)]+\): (.+)$/m);
+        const candidate = m ? m[1].trim() : "";
+        if (anthropicRejectCandidates.has(candidate)) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten." }] }),
+          } as any;
+        }
+        return {
+          ok: true, status: 200,
+          json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+        } as any;
+      }
+      throw new Error(`opplevelser-gardssalg-autosvar-apply.test: unexpected fetch to ${url}`);
+    }) as any;
     const testKey = process.env.ADMIN_KEY || "gardssalg-autosvar-apply-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
@@ -402,18 +433,74 @@ export function runOpplevelserGardssalgAutosvarApplyTests(
         "g7: aa-nowebsite's epost applied to the queued candidate_email",
       );
       assertEq(getQueueRow("aa-nowebsite"), undefined, "g8: aa-nowebsite's queue row cleared after approval");
+
+      // ── (h) Grep 5b — LLM-judge contact gate wired into the domain_match
+      // auto-apply branch (dev-request 2026-08-19-kursjustering-
+      // drikkefunnel-llm-og-supply). A candidate that classifies as
+      // domain_match (redirect email's host DOES agree with the provider's
+      // own hjemmeside) but is judge-rejected (e.g. the redirect text
+      // actually pointed at page noise, not a real mailbox) must NEVER be
+      // applied — treated exactly like "nothing to apply": no epost write,
+      // no queue row either (domain_match candidates never queue). ────────
+      mkProvider({ id: "aa-gate-reject", navn: "Gate Reject Gård", hjemmeside: "https://gatereject.no", epost: "gammel@gatereject.no" });
+      const gateRejectCandidate = "ny@gatereject.no";
+      mkInboundMessage({
+        providerId: "aa-gate-reject",
+        contactEmail: "gammel@gatereject.no",
+        bodyText: `Vennligst ta kontakt med ${gateRejectCandidate} fremover, takk.`,
+        sentAt: "2026-08-04 09:00:00",
+      });
+      anthropicRejectCandidates.add(gateRejectCandidate);
+      try {
+        const gateRejectRes = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-autosvar-apply",
+          query: { apply: "true" },
+          headers: auth,
+          body: {},
+        });
+        assertEq(gateRejectRes.status, 200, "h1: apply=true still returns 200");
+        const gateRejectResult = (gateRejectRes.body.results as any[]).find((r) => r.provider_id === "aa-gate-reject");
+        assertEq(gateRejectResult?.outcome, "contact_gate_rejected", "h2: a domain_match candidate the LLM judge rejects -> contact_gate_rejected");
+        assertEq(getProviderRow("aa-gate-reject").epost, "gammel@gatereject.no", "h3: the rejected candidate was NEVER applied — epost unchanged");
+        assertEq(getQueueRow("aa-gate-reject"), undefined, "h4: a gate-rejected domain_match candidate does NOT land in the review queue either");
+        assertEq(getAuditRows("aa-gate-reject").length, 0, "h5: no audit row for a candidate that was never written");
+      } finally {
+        anthropicRejectCandidates.delete(gateRejectCandidate);
+      }
+
+      // ── (h6) regression: a genuine domain_match candidate on a DIFFERENT
+      // provider in the SAME run still auto-applies — the gate does not
+      // fail the whole batch closed. ─────────────────────────────────────
+      mkProvider({ id: "aa-gate-ok", navn: "Gate OK Gård", hjemmeside: "https://gateok.no", epost: "gammel@gateok.no" });
+      mkInboundMessage({
+        providerId: "aa-gate-ok",
+        contactEmail: "gammel@gateok.no",
+        bodyText: "Vennligst ta kontakt med ny@gateok.no fremover, takk.",
+        sentAt: "2026-08-05 09:00:00",
+      });
+      const gateOkRes = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-autosvar-apply",
+        query: { apply: "true" },
+        headers: auth,
+        body: {},
+      });
+      const gateOkResult = (gateOkRes.body.results as any[]).find((r) => r.provider_id === "aa-gate-ok");
+      assertEq(gateOkResult?.outcome, "applied", "h6a: a genuine domain_match candidate is still applied");
+      assertEq(getProviderRow("aa-gate-ok").epost, "ny@gateok.no", "h6b: the genuine candidate WAS written");
     } catch (err: any) {
       failed++;
       failures.push(
         "opplevelser-gardssalg-autosvar-apply: unexpected error: " + String(err?.stack || err?.message || err),
       );
     } finally {
+      globalThis.fetch = prevFetch;
       const restore = (k: string, v: string | undefined) => {
         if (v === undefined) delete process.env[k];
         else process.env[k] = v;
       };
       restore("EXPERIENCES_DB_PATH", prevExperiencesDbPath);
       restore("ADMIN_KEY", prevAdminKey);
+      restore("ANTHROPIC_API_KEY", prevAnthropicKey);
       try {
         const initMod = require("../database/init") as typeof import("../database/init");
         if (prevRfbDb) {

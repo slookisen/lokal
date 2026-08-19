@@ -83,6 +83,13 @@ import { findLocalOrgnrCandidate, type LocalOrgnrHit } from "../services/local-o
 // self-registered-review-approve route below is the ONLY caller in this
 // file — see that route for why the ping moved here from routes/marketplace.ts.
 import { pingIndexNow } from "../services/indexnow-service";
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b —
+// shared LLM-judge + deterministic-backstop contact gate for
+// POST /brreg-contact-backfill below (mirrors lokal#655's marketplace.ts
+// pattern; see contact-candidate-judge.ts's own doc comment). Distinct from
+// this file's own judgeRfbAboutCandidate below, which judges about-text
+// quality, not contact-field candidates.
+import { gateContactCandidates } from "../services/contact-candidate-judge";
 
 const router = Router();
 
@@ -2528,11 +2535,47 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
 
       const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
 
+      // Grep 5b LLM-judge contact gate (dev-request 2026-08-19-kursjustering-
+      // drikkefunnel-llm-og-supply): Brreg is a structured registry source
+      // (lower risk than the scraped-HTML lanes 1-3 — see the dev-request's
+      // own framing), but per its own "no exceptions" requirement this route
+      // was still ungated before this slice. Both candidates are gated
+      // together, independently, BEFORE either the dry-run preview or the
+      // real write — a rejected field is treated exactly like Brreg never
+      // having returned it. brreg_hits above already counted the RAW Brreg
+      // yield (a data-quality signal, unaffected by the gate); this replaces
+      // the values that actually reach applyAgentBrregContact.
+      const gateSourceContext =
+        `Data fra Brønnøysundregistrene (Brreg) for org.nr ${t.org_nr}: ` +
+        `adresse=${JSON.stringify(usableAddress)}, telefon=${JSON.stringify(usablePhone)}.`;
+      const gated = await gateContactCandidates({
+        businessName: t.name,
+        sourceContext: gateSourceContext,
+        candidateAddress: usableAddress,
+        candidatePhone: usablePhone,
+      });
+      if (usableAddress && !gated.address) {
+        console.log(
+          `[agents-brreg-contact-backfill] ${agentId} (${t.name}) address candidate "${usableAddress}" REJECTED by contact gate — ${gated.addressRejectedReason ?? "unknown reason"}; not applied`
+        );
+      }
+      if (usablePhone && !gated.phone) {
+        console.log(
+          `[agents-brreg-contact-backfill] ${agentId} (${t.name}) phone candidate "${usablePhone}" REJECTED by contact gate — ${gated.phoneRejectedReason ?? "unknown reason"}; not applied`
+        );
+      }
+      const gatedAddress = gated.address;
+      const gatedPhone = gated.phone;
+      if (!gatedAddress && !gatedPhone) {
+        unresolved.push({ agent_id: agentId, reason: "contact_gate_rejected" });
+        continue;
+      }
+
       if (dryRun) {
         const wouldTouch = applyAgentBrregContact(
           db,
           agentId,
-          { address: usableAddress, phone: usablePhone },
+          { address: gatedAddress, phone: gatedPhone },
           evidenceUrl,
           { dryRun: true },
         );
@@ -2543,8 +2586,8 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
         changed.push({
           agent_id: agentId,
           fields: wouldTouch,
-          address: wouldTouch.includes("address") ? usableAddress : null,
-          phone: wouldTouch.includes("phone") ? usablePhone : null,
+          address: wouldTouch.includes("address") ? gatedAddress : null,
+          phone: wouldTouch.includes("phone") ? gatedPhone : null,
           source_url: evidenceUrl,
         });
       } else {
@@ -2552,7 +2595,7 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
           const written = applyAgentBrregContact(
             db,
             agentId,
-            { address: usableAddress, phone: usablePhone },
+            { address: gatedAddress, phone: gatedPhone },
             evidenceUrl,
             { dryRun: false, batchId },
           );
@@ -2560,8 +2603,8 @@ router.post("/brreg-contact-backfill", async (req: Request, res: Response) => {
             changed.push({
               agent_id: agentId,
               fields: written,
-              address: written.includes("address") ? usableAddress : null,
-              phone: written.includes("phone") ? usablePhone : null,
+              address: written.includes("address") ? gatedAddress : null,
+              phone: written.includes("phone") ? gatedPhone : null,
               source_url: evidenceUrl,
             });
           } else {

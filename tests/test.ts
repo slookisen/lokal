@@ -25142,6 +25142,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _homepageProvenanceHeadlessFallbackPromise; } catch { /* errors already pushed to failures */ }
   try { await _tynneProfilerImprovePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbContactJudgePromise; } catch { /* errors already pushed to failures */ }
+  try { await _contactCandidateJudgePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -33797,6 +33798,48 @@ const _rfbContactJudgePromise: Promise<void> = new Promise<void>(r => {
   }
 })();
 
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, "Grep 5b":
+// unit tests for the SHARED LLM-judge + deterministic-backstop contact gate
+// (src/services/contact-candidate-judge.ts) that extends lokal#655's pattern
+// to the gårdssalg contact-write choke points, RFB contact-extraction and
+// RFB Brreg-backfill — see that module's own doc comment. Swaps globalThis.
+// fetch (for the Anthropic judge calls) and ANTHROPIC_API_KEY, saved/
+// restored within its own execution — chained after _rfbContactJudgePromise,
+// the current tail of this serial chain, for the same reason every other
+// fetch-swapping suite in this family is chained rather than run in
+// parallel. (The four call-site integration tests proving each write site
+// actually wires this gate in live in their own existing suites —
+// opplevelser-gardssalg-contact-backfill.test.ts, opplevelser-gardssalg-
+// autosvar-apply.test.ts, admin-agents-brreg-contact-backfill.test.ts, all
+// already wired above/below — and admin-rfb-contact-extraction.test.ts,
+// deliberately standalone-only per its own file header, unchanged by this
+// slice.)
+let _contactCandidateJudgeResolve: () => void = () => {};
+const _contactCandidateJudgePromise: Promise<void> = new Promise<void>(r => {
+  _contactCandidateJudgeResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_rfbContactJudgePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply (Grep 5b): contact-candidate-judge ──");
+  try {
+    const { runContactCandidateJudgeTests } = require("../src/services/contact-candidate-judge.test") as
+      typeof import("../src/services/contact-candidate-judge.test");
+    const ccj = await runContactCandidateJudgeTests({ log: false });
+    passed += ccj.passed;
+    failed += ccj.failed;
+    for (const f of ccj.failures) failures.push("contact-candidate-judge: " + f);
+    console.log(`  contact-candidate-judge: ${ccj.passed} passed, ${ccj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-candidate-judge: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contactCandidateJudgeResolve();
+  }
+})();
+
 // ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
@@ -33854,7 +33897,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _expNoYieldBackoffPromise, _contentRefreshErrorsByPersistencePromise, _lowQualitySelectorPromise,
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
   _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
-  _rfbContactJudgePromise,
+  _rfbContactJudgePromise, _contactCandidateJudgePromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);

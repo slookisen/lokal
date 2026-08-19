@@ -169,6 +169,15 @@ export function runOpplevelserGardssalgContactBackfillTests(
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
     const prevFetch = globalThis.fetch;
+    // Grep 5b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+    // supply): applyGardssalgProviderContact now gates every epost/telefon
+    // candidate through the shared LLM judge before writing — see
+    // contact-candidate-judge.test.ts for the judge module's own unit
+    // tests. Every fixture in THIS file is a plausible, legitimate
+    // candidate, so the default mock always GODKJENNs; a dedicated W34
+    // rejection case is added below (section (aa)).
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "gardssalg-contact-backfill-test-anthropic-key";
     const testKey = process.env.ADMIN_KEY || "gardssalg-contact-backfill-test-key";
     process.env.EXPERIENCES_DB_PATH = ":memory:";
     process.env.ADMIN_KEY = testKey;
@@ -223,8 +232,29 @@ export function runOpplevelserGardssalgContactBackfillTests(
         return orgNr;
       }
       let fetchCalls: string[] = [];
-      globalThis.fetch = (async (input: any) => {
+      // Anthropic (LLM-judge) mock state — a per-run override lets section
+      // (aa) below force a REJECT for one specific candidate string while
+      // every other candidate in this file (all legitimate-looking) is
+      // approved by default.
+      let anthropicRejectCandidates = new Set<string>();
+      globalThis.fetch = (async (input: any, init?: any) => {
         const url = String(input);
+        if (url.includes("api.anthropic.com")) {
+          const body = init?.body ? JSON.parse(init.body) : {};
+          const prompt: string = body?.messages?.[0]?.content ?? "";
+          const m = prompt.match(/^Kandidat \([^)]+\): (.+)$/m);
+          const candidate = m ? m[1].trim() : "";
+          if (anthropicRejectCandidates.has(candidate)) {
+            return {
+              ok: true, status: 200,
+              json: async () => ({ content: [{ type: "text", text: "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten." }] }),
+            } as any;
+          }
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+          } as any;
+        }
         fetchCalls.push(url);
         const m = url.match(/\/enheter\/(\d+)/);
         const orgNr = m ? m[1] : "";
@@ -354,14 +384,14 @@ export function runOpplevelserGardssalgContactBackfillTests(
 
       // ── (k)-(n) applyGardssalgProviderContact ────────────────────────────
       mkProvider({ id: "app-blank", navn: "Apply Blank", org_nr: orgFor(SHAPE_FULL), created_at: "2026-02-01 00:00:00" });
-      const written1 = store.applyGardssalgProviderContact(
-        "app-blank", { epost: " ny@post.no ", telefon: " 12345678 " }, "https://brreg.example/810000001", "batch-k"
+      const written1 = await store.applyGardssalgProviderContact(
+        "app-blank", { epost: " ny@post.no ", telefon: " 92345678 " }, "https://brreg.example/810000001", "batch-k"
       );
       assertEq(written1.written.sort(), ["epost", "telefon"], "k1: both blank fields written");
       assertEq(written1.epostFlaggedForReview, undefined, "k1b: no hjemmeside on file -> the domain gate never fires");
       const rowK = getProviderRow("app-blank");
       assertEq(rowK.epost, "ny@post.no", "k2: epost written trimmed");
-      assertEq(rowK.telefon, "12345678", "k3: telefon written trimmed");
+      assertEq(rowK.telefon, "92345678", "k3: telefon written trimmed");
       const auditK = getAuditRows("app-blank");
       assertEq(auditK.length, 2, "k4: one audit row per written field");
       assertEq(auditK.every((a: any) => a.old_value === null), true, "k5: audit old_value is the true pre-write null");
@@ -371,22 +401,22 @@ export function runOpplevelserGardssalgContactBackfillTests(
       assertTrue(!!provK.epost?.source_url && !!provK.telefon?.source_url, "k8: field_provenance recorded for both fields");
 
       mkProvider({ id: "app-existing", navn: "Apply Existing", org_nr: orgFor(SHAPE_FULL), epost: "gammel@post.no", created_at: "2026-02-02 00:00:00" });
-      const written2 = store.applyGardssalgProviderContact(
-        "app-existing", { epost: "brreg@post.no", telefon: "99999999" }, "https://brreg.example/810000001"
+      const written2 = await store.applyGardssalgProviderContact(
+        "app-existing", { epost: "brreg@post.no", telefon: "90123456" }, "https://brreg.example/810000001"
       );
       assertEq(written2.written, ["telefon"], "l1: only the blank field is written");
       assertEq(getProviderRow("app-existing").epost, "gammel@post.no", "l2: an existing value is NEVER overwritten");
 
       mkProvider({ id: "app-locked", navn: "Apply Locked", org_nr: orgFor(SHAPE_FULL), content_source: "claim", created_at: "2026-02-03 00:00:00" });
       assertEq(
-        store.applyGardssalgProviderContact("app-locked", { epost: "x@y.no", telefon: "1" }, "https://brreg.example/1").written,
+        (await store.applyGardssalgProviderContact("app-locked", { epost: "x@y.no", telefon: "1" }, "https://brreg.example/1")).written,
         [],
         "m1: locked provider -> nothing written"
       );
       assertEq(getProviderRow("app-locked").epost, null, "m2: locked provider row untouched");
 
       assertEq(
-        store.applyGardssalgProviderContact("app-blank", { epost: "annen@post.no", telefon: "87654321" }, "https://brreg.example/1").written,
+        (await store.applyGardssalgProviderContact("app-blank", { epost: "annen@post.no", telefon: "90123457" }, "https://brreg.example/1")).written,
         [],
         "n1: second call on a filled row is a no-op"
       );
@@ -404,8 +434,8 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-same", navn: "Gate Same Domain", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: "https://www.gatesame.no", created_at: "2026-02-10 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
-          "gate-same", { epost: "post@gatesame.no", telefon: "22222222", epostSource: "mailto" },
+        const r = await store.applyGardssalgProviderContact(
+          "gate-same", { epost: "post@gatesame.no", telefon: "92345671", epostSource: "mailto" },
           "https://gatesame.no/kontakt", "batch-w"
         );
         assertEq(r.written.sort(), ["epost", "telefon"], "w1a: same-domain candidate is written as before");
@@ -423,13 +453,13 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-foreign", navn: "Gate Foreign Domain", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: "https://gateforeign.no", created_at: "2026-02-11 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
-          "gate-foreign", { epost: "tg@distributor-as.no", telefon: "33333333", epostSource: "mailto_other_domain" },
+        const r = await store.applyGardssalgProviderContact(
+          "gate-foreign", { epost: "tg@distributor-as.no", telefon: "92345672", epostSource: "mailto_other_domain" },
           "https://gateforeign.no/kontakt", "batch-w"
         );
         assertEq(r.written, ["telefon"], "w2a: the foreign-domain epost is NOT written; telefon still is");
         assertEq(getProviderRow("gate-foreign").epost, null, "w2b: the row's epost stays blank");
-        assertEq(getProviderRow("gate-foreign").telefon, "33333333", "w2c: telefon is untouched by the email-only gate");
+        assertEq(getProviderRow("gate-foreign").telefon, "92345672", "w2c: telefon is untouched by the email-only gate");
         assertEq(r.epostFlaggedForReview?.candidate, "tg@distributor-as.no", "w2d: the held-back candidate is reported back");
         assertEq(r.epostFlaggedForReview?.website_domain, "gateforeign.no", "w2e: the website domain is reported");
         assertEq(r.epostFlaggedForReview?.email_domain, "distributor-as.no", "w2f: the email domain is reported");
@@ -454,7 +484,7 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-freemail", navn: "Gate Freemail", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: "https://gatefreemail.no", created_at: "2026-02-12 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
+        const r = await store.applyGardssalgProviderContact(
           "gate-freemail", { epost: "gaardsbruket@gmail.com", telefon: null, epostSource: "mailto" },
           "https://gatefreemail.no/kontakt", "batch-w"
         );
@@ -469,7 +499,7 @@ export function runOpplevelserGardssalgContactBackfillTests(
           id: "gate-nosite", navn: "Gate No Site", org_nr: orgFor(SHAPE_FULL),
           hjemmeside: null, created_at: "2026-02-13 00:00:00",
         });
-        const r = store.applyGardssalgProviderContact(
+        const r = await store.applyGardssalgProviderContact(
           "gate-nosite", { epost: "post@heltannen.no", telefon: null, epostSource: "brreg" },
           "https://brreg.example/1", "batch-w"
         );
@@ -874,8 +904,87 @@ export function runOpplevelserGardssalgContactBackfillTests(
           "z14 (B2): the reader still hides it — trimmed stamp vs raw padded column must not diverge",
         );
       }
+
+      // ── (aa) Grep 5b — LLM-judge contact gate wired into
+      // applyGardssalgProviderContact's choke point (dev-request 2026-08-19-
+      // kursjustering-drikkefunnel-llm-og-supply). Proves BOTH writer routes
+      // inherit the gate (it lives inside the shared function, not
+      // duplicated per-route) and that a W34-shaped candidate is blocked
+      // exactly like "not found" while a genuine candidate is unaffected. ──
+      {
+        // (aa1) backstop-level rejection via POST /admin/gardssalg-contact-
+        // backfill: a favicon-filename-shaped "epostadresse" from Brreg
+        // (simulating a contaminated upstream value) is rejected by
+        // classifyContactCandidateDefect BEFORE the LLM judge is even
+        // reachable — fetchCalls stays limited to the one Brreg round-trip,
+        // no Anthropic call needed to prove this branch.
+        mkProvider({
+          id: "aa-backstop", navn: "Gate Backstop Favicon",
+          org_nr: orgFor({ epostadresse: "favicon@2x.png" }),
+          created_at: "2026-08-01 00:00:00",
+        });
+        const aaBackstop = await callRoute(opplevelserRouter, {
+          headers: auth, body: { providerIds: ["aa-backstop"], apply: true },
+        });
+        assertEq(aaBackstop.status, 200, "aa1a: route still returns 200");
+        assertEq(getProviderRow("aa-backstop").epost, null, "aa1b: the favicon-shaped candidate was NEVER written to epost");
+        assertTrue(
+          !aaBackstop.body.changed.some((c: any) => c.provider_id === "aa-backstop"),
+          "aa1c: aa-backstop never appears in changed[] — reported exactly like no_brreg_contact would be",
+        );
+
+        // (aa2) LLM-judge-level rejection: a structurally clean 8-digit
+        // phone number (would pass classifyContactCandidateDefect cleanly)
+        // that the mocked judge specifically rejects — proves the judge is
+        // wired in, not just the backstop.
+        const judgeRejectedPhone = "93456781";
+        anthropicRejectCandidates.add(judgeRejectedPhone);
+        try {
+          mkProvider({
+            id: "aa-judge", navn: "Gate LLM Judge Reject",
+            org_nr: orgFor({ telefon: judgeRejectedPhone }),
+            created_at: "2026-08-02 00:00:00",
+          });
+          const aaJudge = await callRoute(opplevelserRouter, {
+            headers: auth, body: { providerIds: ["aa-judge"], apply: true },
+          });
+          assertEq(aaJudge.status, 200, "aa2a: route still returns 200");
+          assertEq(getProviderRow("aa-judge").telefon, null, "aa2b: the judge-rejected candidate was NEVER written to telefon");
+        } finally {
+          anthropicRejectCandidates.delete(judgeRejectedPhone);
+        }
+
+        // (aa3) regression: a genuine candidate on the SAME route, SAME
+        // batch shape, still writes normally once both gates approve —
+        // proves the gate does not fail the whole candidate closed by
+        // accident.
+        mkProvider({
+          id: "aa-genuine", navn: "Gate Genuine Candidate",
+          org_nr: orgFor({ epostadresse: "kontakt@aagenuine.no", telefon: "91234567" }),
+          created_at: "2026-08-03 00:00:00",
+        });
+        const aaGenuine = await callRoute(opplevelserRouter, {
+          headers: auth, body: { providerIds: ["aa-genuine"], apply: true },
+        });
+        assertEq(aaGenuine.status, 200, "aa3a: route still returns 200");
+        assertEq(getProviderRow("aa-genuine").epost, "kontakt@aagenuine.no", "aa3b: a genuine epost candidate is still written");
+        assertEq(getProviderRow("aa-genuine").telefon, "91234567", "aa3c: a genuine telefon candidate is still written");
+
+        // aa1-aa3 exercise the gate through POST /admin/gardssalg-contact-
+        // backfill; the direct-call tests above ((k)-(n), (w1)-(w4)) already
+        // exercise applyGardssalgProviderContact — the SAME choke point
+        // POST /admin/gardssalg-contact-extraction (the other writer route)
+        // calls — with the gate mocked to GODKJENN throughout, confirming
+        // both writer routes funnel through one shared, already-proven gate
+        // rather than each carrying its own copy.
+      }
     } finally {
       globalThis.fetch = prevFetch;
+      if (prevAnthropicKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+      }
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;
       } else {

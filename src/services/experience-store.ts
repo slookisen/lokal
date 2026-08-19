@@ -24,6 +24,11 @@ import { fylkeEquivalents } from "./norway-fylke";
 // second phone-shape check for this vertical — see applyGardssalgSetContactPhone
 // below for why.
 import { validatePhoneForWrite } from "./contact-normalizer";
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 5b:
+// the shared LLM-judge + deterministic-backstop gate (mirrors lokal#655's
+// marketplace.ts pattern) that now stands in front of every contact-field
+// write this file makes — see gateContactCandidates' own doc comment.
+import { gateContactCandidates } from "./contact-candidate-judge";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
 // reuse the same quality-bar predicate the homepage-content extractor already
 // gates candidates with, so applyGardssalgProviderContent() can tell "thin"
@@ -4441,6 +4446,17 @@ export type GardssalgProviderContactWriteResult = {
    * address is under review".
    */
   epostFlaggedForReview?: GardssalgContactEmailFlaggedForReview;
+  /**
+   * Present when the shared LLM-judge contact gate (gateContactCandidates)
+   * rejected the epost and/or telefon candidate passed in — keyed by field,
+   * valued by the gate's rejection reason. Without this, a judge-rejected
+   * candidate wrote nothing and looked identical to "the field was already
+   * filled / the row is locked" from the caller's side (both report
+   * written: [] with no other signal). Mirrors the observability the other
+   * 3 gated sites already have (RFB contact-extraction, RFB brreg-backfill,
+   * gårdssalg autosvar).
+   */
+  contactGateRejected?: { epost?: string; telefon?: string };
 };
 
 /**
@@ -4525,13 +4541,37 @@ export function flagGardssalgContactEmailForReview(
  *     norm, not a wrong-company signal, and extractGardssalgContactEmail
  *     already treats freemail as its own trusted tier;
  *   - telefon is completely unaffected — this gate is epost-only.
+ *
+ * LLM-JUDGE CONTACT GATE (2026-08-19, dev-request 2026-08-19-kursjustering-
+ * drikkefunnel-llm-og-supply, Grep 5b): every incoming epost/telefon
+ * candidate is now ALSO run through gateContactCandidates (backstop
+ * classifier + LLM judge, src/services/contact-candidate-judge.ts) before
+ * anything below decides what to write — the exact same "one choke point,
+ * no duplicated logic, no way for a new caller to skip it" rationale as the
+ * domain gate above, and living in the same place for the same reason: both
+ * writer routes (contact-extraction, contact-backfill) funnel through this
+ * one function. A judge-rejected candidate is treated EXACTLY like the
+ * extractor having found nothing for that field — fail-closed, no write, no
+ * throw — and the existing fill-only/lock/domain-mismatch guards below run
+ * UNCHANGED on whatever survives the gate. `gateContext` carries the
+ * business name + page/source text the judge needs; callers that omit it
+ * (there should be none in production — both writer routes pass it) still
+ * get a safe fail-closed gate call with an empty context, which can only
+ * ever make the judge MORE likely to reject, never less.
+ *
+ * A rejection is logged (`[gardssalg-contact-write] ... REJECTED by contact
+ * gate ...`, matching the format the other 3 gated sites already use) and
+ * reported back via the result's `contactGateRejected` field — without this,
+ * a judge-rejected candidate wrote nothing and was indistinguishable from
+ * "field already filled" / "row locked" to both callers of this function.
  */
-export function applyGardssalgProviderContact(
+export async function applyGardssalgProviderContact(
   providerId: string,
   candidate: { epost?: string | null; telefon?: string | null; epostSource?: string | null },
   evidenceUrl: string,
-  batchId?: string
-): GardssalgProviderContactWriteResult {
+  batchId?: string,
+  gateContext?: { businessName: string; sourceContext: string }
+): Promise<GardssalgProviderContactWriteResult> {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
@@ -4554,6 +4594,43 @@ export function applyGardssalgProviderContact(
   function isBlank(v: unknown): boolean {
     return v === null || v === undefined || String(v).trim() === "";
   }
+
+  // ── LLM-judge contact gate (Grep 5b) — see doc comment above ────────────
+  // Eligibility computed BEFORE the gate call, against the untouched
+  // candidate, using the exact same fill-only + not-rolled-back conditions
+  // the write decision below re-checks — so a rejection is only logged/
+  // reported for a field that would actually have been written had the
+  // gate approved it. Without this scoping, a redundant candidate for an
+  // already-filled or rolled-back field (routes pass the full candidate
+  // regardless of per-field eligibility) would misreport as "gate
+  // rejected" a value that was never going to be written anyway.
+  const epostGateEligible =
+    isBlank(row.epost) && !!candidate.epost?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "epost");
+  const telefonGateEligible =
+    isBlank(row.telefon) && !!candidate.telefon?.trim() && !gardssalgContactFieldWasRolledBack(providerId, "telefon");
+  const gated = await gateContactCandidates({
+    businessName: gateContext?.businessName ?? "",
+    sourceContext: gateContext?.sourceContext ?? "",
+    candidateEmail: candidate.epost ?? null,
+    candidatePhone: candidate.telefon ?? null,
+  });
+  let contactGateRejected: { epost?: string; telefon?: string } | undefined;
+  const gateLogName = gateContext?.businessName?.trim() || providerId;
+  if (epostGateEligible && !gated.email) {
+    const reason = gated.emailRejectedReason ?? "unknown reason";
+    contactGateRejected = { ...contactGateRejected, epost: reason };
+    console.log(
+      `[gardssalg-contact-write] ${providerId} (${gateLogName}) epost candidate "${(candidate.epost as string).trim()}" REJECTED by contact gate — ${reason}; not written`
+    );
+  }
+  if (telefonGateEligible && !gated.phone) {
+    const reason = gated.phoneRejectedReason ?? "unknown reason";
+    contactGateRejected = { ...contactGateRejected, telefon: reason };
+    console.log(
+      `[gardssalg-contact-write] ${providerId} (${gateLogName}) telefon candidate "${(candidate.telefon as string).trim()}" REJECTED by contact gate — ${reason}; not written`
+    );
+  }
+  candidate = { epost: gated.email, telefon: gated.phone, epostSource: candidate.epostSource };
 
   const sets: string[] = [];
   const params: Record<string, unknown> = { id: providerId };
@@ -4627,7 +4704,11 @@ export function applyGardssalgProviderContact(
 
   if (sets.length === 0) {
     stampFlag();
-    return { written: [], ...(epostFlaggedForReview ? { epostFlaggedForReview } : {}) };
+    return {
+      written: [],
+      ...(epostFlaggedForReview ? { epostFlaggedForReview } : {}),
+      ...(contactGateRejected ? { contactGateRejected } : {}),
+    };
   }
 
   sets.push("updated_at = datetime('now')");
@@ -4673,7 +4754,11 @@ export function applyGardssalgProviderContact(
   applyWithAudit();
   stampFlag();
 
-  return { written, ...(epostFlaggedForReview ? { epostFlaggedForReview } : {}) };
+  return {
+    written,
+    ...(epostFlaggedForReview ? { epostFlaggedForReview } : {}),
+    ...(contactGateRejected ? { contactGateRejected } : {}),
+  };
 }
 
 export type GardssalgSetContactEmailResult =
