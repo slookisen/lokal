@@ -172,6 +172,13 @@ export function runHomepageProvenanceHeadlessFallbackTests(
     const prevFetch = (globalThis as any).fetch;
     const prevFlag = process.env.HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED;
     delete process.env.HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED;
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer: every extracted phone/
+    // email candidate now also has to clear gateRfbContactCandidates (LLM
+    // judge + backstop classifier, marketplace.ts) — approve every
+    // candidate unconditionally so this suite's headless-fallback
+    // assertions are unaffected.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-anthropic-key-headless-fallback";
 
     const db = new Database(":memory:");
     try {
@@ -211,6 +218,12 @@ export function runHomepageProvenanceHeadlessFallbackTests(
       // (each test phase sets `plainHtml` before posting).
       let plainHtml = jsShellHtml();
       (globalThis as any).fetch = async (_url: string) => {
+        if (String(_url).includes("api.anthropic.com")) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+          } as any;
+        }
         return {
           ok: true,
           status: 200,
@@ -368,6 +381,8 @@ export function runHomepageProvenanceHeadlessFallbackTests(
       else process.env.ADMIN_KEY = prevAdminKey;
       if (prevFlag === undefined) delete process.env.HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED;
       else process.env.HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED = prevFlag;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     }
 
     return { passed, failed, failures };

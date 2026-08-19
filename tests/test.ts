@@ -25141,6 +25141,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _rfbAgentsRetroScanPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageProvenanceHeadlessFallbackPromise; } catch { /* errors already pushed to failures */ }
   try { await _tynneProfilerImprovePromise; } catch { /* errors already pushed to failures */ }
+  try { await _rfbContactJudgePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -33744,6 +33745,43 @@ const _tynneProfilerImprovePromise: Promise<void> = new Promise<void>(r => {
   }
 })();
 
+// dev-request 2026-08-19-rfb-kontakt-llm-dommer (W34 breach follow-up,
+// platform-alerts/2026-08-17-rfb-enrichment-spotcheck-breach.md): the
+// backstop classifier + LLM-judge gate now standing between
+// extractPhone()/extractEmail() and the write path in POST
+// /admin/homepage-provenance-batch (src/routes/marketplace.ts) — own
+// in-memory prod-schema DB, swaps the shared getDb() singleton AND
+// globalThis.fetch (for both the homepage-HTML fetch and the Anthropic
+// judge calls) — chained after _tynneProfilerImprovePromise, the current
+// tail of this serial chain, for the same reason every other DB-singleton-
+// swapping/fetch-swapping suite in this family is chained rather than run
+// in parallel.
+let _rfbContactJudgeResolve: () => void = () => {};
+const _rfbContactJudgePromise: Promise<void> = new Promise<void>(r => {
+  _rfbContactJudgeResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_tynneProfilerImprovePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-08-19-rfb-kontakt-llm-dommer: marketplace-rfb-contact-judge ──");
+  try {
+    const { runMarketplaceRfbContactJudgeTests } = require("../src/routes/marketplace-rfb-contact-judge.test") as
+      typeof import("../src/routes/marketplace-rfb-contact-judge.test");
+    const rcj = await runMarketplaceRfbContactJudgeTests({ log: false });
+    passed += rcj.passed;
+    failed += rcj.failed;
+    for (const f of rcj.failures) failures.push("marketplace-rfb-contact-judge: " + f);
+    console.log(`  marketplace-rfb-contact-judge: ${rcj.passed} passed, ${rcj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-rfb-contact-judge: unexpected error: " + String(err?.message || err));
+  } finally {
+    _rfbContactJudgeResolve();
+  }
+})();
+
 // ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
@@ -33801,6 +33839,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _expNoYieldBackoffPromise, _contentRefreshErrorsByPersistencePromise, _lowQualitySelectorPromise,
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
   _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
+  _rfbContactJudgePromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);

@@ -154,6 +154,13 @@ export function runHomepageProvenanceLowQualitySelectorTests(
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
     const prevFetch = (globalThis as any).fetch;
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer: every extracted phone/
+    // email candidate now also has to clear gateRfbContactCandidates (LLM
+    // judge + backstop classifier, marketplace.ts) — approve every
+    // candidate unconditionally so this suite's own ranking/isolation
+    // assertions are unaffected.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-anthropic-key-low-quality-selector";
     const prevParkingDisabled = process.env.HOMEPAGE_PARKING_DISABLED;
     delete process.env.HOMEPAGE_PARKING_DISABLED;
     const prevNoYieldBackoffDays = process.env.NO_YIELD_BACKOFF_DAYS;
@@ -350,6 +357,13 @@ export function runHomepageProvenanceLowQualitySelectorTests(
 
       const fetchedHosts: string[] = [];
       (globalThis as any).fetch = async (url: string) => {
+        const urlStr = String(url);
+        if (urlStr.includes("api.anthropic.com")) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+          } as any;
+        }
         const host = new URL(url).hostname;
         fetchedHosts.push(host);
         const name = nameByHost[host] ?? "Ukjent AS";
@@ -525,6 +539,8 @@ export function runHomepageProvenanceLowQualitySelectorTests(
       else process.env.HOMEPAGE_PARKING_DISABLED = prevParkingDisabled;
       if (prevNoYieldBackoffDays === undefined) delete process.env.NO_YIELD_BACKOFF_DAYS;
       else process.env.NO_YIELD_BACKOFF_DAYS = prevNoYieldBackoffDays;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     }
 
     return { passed, failed, failures };

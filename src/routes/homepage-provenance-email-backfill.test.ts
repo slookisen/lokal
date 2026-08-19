@@ -139,6 +139,13 @@ export function runHomepageProvenanceEmailBackfillTests(
     const prevAdminKey = process.env.ADMIN_KEY;
     process.env.ADMIN_KEY = testKey;
     const prevFetch = (globalThis as any).fetch;
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer: every extracted phone/
+    // email candidate now also has to clear gateRfbContactCandidates (LLM
+    // judge + backstop classifier, marketplace.ts) — approve every
+    // candidate unconditionally so this suite's own backfill assertions are
+    // unaffected.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-anthropic-key-email-backfill";
 
     const db = new Database(":memory:");
     try {
@@ -166,8 +173,16 @@ export function runHomepageProvenanceEmailBackfillTests(
       const marketplaceMod = require("./marketplace");
       const router = marketplaceMod.default;
 
-      // Stub global fetch: return HTML keyed by URL.
+      // Stub global fetch: return HTML keyed by URL (or a GODKJENN judge
+      // verdict for the Anthropic endpoint — see the ANTHROPIC_API_KEY
+      // comment above).
       (globalThis as any).fetch = async (url: string) => {
+        if (url.includes("api.anthropic.com")) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+          } as any;
+        }
         let html = "";
         if (url.includes("testgard.no")) {
           html = `<html><head><title>Testgard AS</title></head><body>
@@ -236,6 +251,8 @@ export function runHomepageProvenanceEmailBackfillTests(
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     }
 
     return { passed, failed, failures };

@@ -153,6 +153,14 @@ export function runHomepageProvenanceSelectorRotationTests(
     delete process.env.HOMEPAGE_PARKING_DISABLED;
     const prevNoYieldBackoffDays = process.env.NO_YIELD_BACKOFF_DAYS;
     delete process.env.NO_YIELD_BACKOFF_DAYS;
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer: every extracted phone/
+    // email candidate now also has to clear gateRfbContactCandidates (LLM
+    // judge + backstop classifier, marketplace.ts) before it is written —
+    // this suite isn't about that gate, so approve every candidate
+    // unconditionally (GODKJENN) so the pre-existing rotation/backoff
+    // behavior under test here is unaffected.
+    const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-anthropic-key-selector-rotation";
 
     const db = new Database(":memory:");
     try {
@@ -239,6 +247,13 @@ export function runHomepageProvenanceSelectorRotationTests(
 
       const fetchedHosts: string[] = [];
       (globalThis as any).fetch = async (url: string) => {
+        const urlStr = String(url);
+        if (urlStr.includes("api.anthropic.com")) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }] }),
+          } as any;
+        }
         const host = new URL(url).hostname;
         fetchedHosts.push(host);
         const name = hostNames[host] ?? "Ukjent AS";
@@ -511,6 +526,8 @@ export function runHomepageProvenanceSelectorRotationTests(
       else process.env.HOMEPAGE_PARKING_DISABLED = prevParkingDisabled;
       if (prevNoYieldBackoffDays === undefined) delete process.env.NO_YIELD_BACKOFF_DAYS;
       else process.env.NO_YIELD_BACKOFF_DAYS = prevNoYieldBackoffDays;
+      if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     }
 
     return { passed, failed, failures };
