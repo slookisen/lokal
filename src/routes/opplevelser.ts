@@ -7091,6 +7091,19 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     website_domain: string;
     email_domain: string;
   }> = [];
+  // Candidates rejected by applyGardssalgProviderContact's shared LLM-judge
+  // contact gate (Grep 5b). Reported here (not just logged inside the write
+  // function) so a caller can tell "the gate rejected this candidate" apart
+  // from "nothing to do" — before this, a rejected candidate simply never
+  // appeared in any bucket of this response. Mirrors contact_gate_rejected
+  // on the other 3 gated sites (RFB contact-extraction, RFB brreg-backfill,
+  // gårdssalg autosvar).
+  const contactGateRejected: Array<{
+    provider_id: string;
+    navn: string;
+    epost_rejected_reason?: string;
+    telefon_rejected_reason?: string;
+  }> = [];
   const fetchFailed: Array<{ provider_id: string; navn: string }> = [];
   const cooldownSkipped: Array<{ provider_id: string; navn: string; host: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
@@ -7312,7 +7325,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
         // extractors themselves saw — same idea as marketplace.ts passing
         // extractedPageText into gateRfbContactCandidates.
         const gateSourceContext = pages.map((pg) => gardssalgPageText(pg.html)).join("\n\n");
-        const { written, epostFlaggedForReview } = await applyGardssalgProviderContact(
+        const { written, epostFlaggedForReview, contactGateRejected: gateRejected } = await applyGardssalgProviderContact(
           t.id,
           { epost: email?.email ?? null, telefon: phone?.phone ?? null, epostSource: email?.source ?? null },
           evidenceUrl,
@@ -7325,6 +7338,14 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
             candidate_email: epostFlaggedForReview.candidate,
             website_domain: epostFlaggedForReview.website_domain,
             email_domain: epostFlaggedForReview.email_domain,
+          });
+        }
+        if (gateRejected) {
+          contactGateRejected.push({
+            provider_id: t.id,
+            navn: t.navn,
+            ...(gateRejected.epost ? { epost_rejected_reason: gateRejected.epost } : {}),
+            ...(gateRejected.telefon ? { telefon_rejected_reason: gateRejected.telefon } : {}),
           });
         }
         if (written.length > 0) {
@@ -7355,6 +7376,7 @@ router.post("/admin/gardssalg-contact-extraction", requireAdmin, async (req: Req
     no_contact_found: noContactFound,
     umbrella_address_rejected: umbrellaRejected,
     contact_email_flagged_for_review: contactEmailFlaggedForReview,
+    contact_gate_rejected: contactGateRejected,
     fetch_failed: fetchFailed,
     cooldown_skipped: cooldownSkipped,
     render_diagnostic: renderDiagnostic,
@@ -7683,6 +7705,18 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
     website_domain: string;
     email_domain: string;
   }> = [];
+  // Candidates rejected by applyGardssalgProviderContact's shared LLM-judge
+  // contact gate (Grep 5b). Reported here (not just logged inside the write
+  // function) so a caller can tell "the gate rejected this candidate" apart
+  // from "nothing to do" (also surfaced via unresolved's own
+  // contact_gate_rejected reason below). Mirrors contact_gate_rejected on
+  // the other 3 gated sites (RFB contact-extraction, RFB brreg-backfill,
+  // gårdssalg autosvar).
+  const contactGateRejected: Array<{
+    provider_id: string;
+    epost_rejected_reason?: string;
+    telefon_rejected_reason?: string;
+  }> = [];
   const skippedLocked: string[] = [];
   const unresolved: Array<{ provider_id: string; reason: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
@@ -7773,7 +7807,7 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
         const gateSourceContext =
           `Data fra Brønnøysundregistrene (Brreg) for org.nr ${t.org_nr}: ` +
           `epostadresse=${JSON.stringify(contact.epost ?? null)}, telefon/mobil=${JSON.stringify(contact.telefon ?? null)}.`;
-        const { written, epostFlaggedForReview } = await applyGardssalgProviderContact(
+        const { written, epostFlaggedForReview, contactGateRejected: gateRejected } = await applyGardssalgProviderContact(
           providerId,
           { epost: contact.epost, telefon: contact.telefon, epostSource: "brreg" },
           evidenceUrl,
@@ -7788,6 +7822,13 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
             email_domain: epostFlaggedForReview.email_domain,
           });
         }
+        if (gateRejected) {
+          contactGateRejected.push({
+            provider_id: providerId,
+            ...(gateRejected.epost ? { epost_rejected_reason: gateRejected.epost } : {}),
+            ...(gateRejected.telefon ? { telefon_rejected_reason: gateRejected.telefon } : {}),
+          });
+        }
         if (written.length > 0) {
           changed.push({
             provider_id: providerId,
@@ -7799,7 +7840,13 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
         } else if (!epostFlaggedForReview) {
           // Fresh-read-at-write-time found the fields already non-blank or the
           // provider now locked — same race class the sibling routes document.
-          unresolved.push({ provider_id: providerId, reason: "already_filled_or_locked_at_write_time" });
+          // A gate rejection gets its own reason (mirrors
+          // admin-agents-brreg-contact-backfill's "contact_gate_rejected")
+          // rather than being folded into the generic bucket.
+          unresolved.push({
+            provider_id: providerId,
+            reason: gateRejected ? "contact_gate_rejected" : "already_filled_or_locked_at_write_time",
+          });
         }
       } catch (e: any) {
         errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
@@ -7819,6 +7866,7 @@ router.post("/admin/gardssalg-contact-backfill", requireAdmin, async (req: Reque
     changed,
     website_candidates: websiteCandidates,
     contact_email_flagged_for_review: contactEmailFlaggedForReview,
+    contact_gate_rejected: contactGateRejected,
     skipped_locked: skippedLocked,
     unresolved,
     errors,

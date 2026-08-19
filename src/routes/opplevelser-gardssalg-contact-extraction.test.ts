@@ -48,6 +48,12 @@
  *                adresse, men stemples i review-køen og rapporteres i
  *                contact_email_flagged_for_review; telefonen fra samme side
  *                er upåvirket.
+ *   cx-60        LLM-judge-porten (Grep 5b, dev-request 2026-08-19-
+ *                kursjustering-drikkefunnel-llm-og-supply): en strukturelt
+ *                gyldig, W34-formet falsk-positiv-kandidat blir avvist av
+ *                den mockede dommeren — ruta rapporterer den som avvist
+ *                (ikke skrevet, ikke "changed"), og raden i databasen er
+ *                urørt.
  *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/routes/opplevelser-gardssalg-contact-extraction.test.ts
@@ -99,8 +105,11 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
     // through the shared LLM-judge contact gate before writing — see
     // contact-candidate-judge.test.ts for the judge module's own unit
     // tests. Every existing fixture below is a plausible, legitimate
-    // candidate, so the default mock always GODKJENNs; a dedicated W34
-    // rejection case is added in section (cx-60). Every one of this file's
+    // candidate, so the default mock always GODKJENNs; section (cx-60)
+    // below is the one exception — it adds `judgeRejectedPhone` to
+    // `anthropicRejectCandidates` for the duration of that block, proving
+    // the reject branch of this mock (and this route's gate-rejection
+    // path) is actually reachable, not dead code. Every one of this file's
     // MANY page-fetch mocks below is renamed from a direct `globalThis.
     // fetch = ...` assignment to `activePageFetch = ...` — a single
     // dispatcher (installed once, right here) owns globalThis.fetch for
@@ -880,6 +889,59 @@ export function runGardssalgContactExtractionTests(opts: { log?: boolean } = {})
         if (prevFlag === undefined) delete process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED;
         else process.env.GARDSSALG_HEADLESS_FALLBACK_ENABLED = prevFlag;
         restoreFetch();
+      }
+
+      // ═══ cx-60: LLM-judge-porten avviser en strukturelt gyldig
+      // falsk-positiv gjennom POST /admin/gardssalg-contact-extraction
+      // (Grep 5b, dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-
+      // supply). Speiler backfill-suitens (aa2): en strukturelt ren
+      // 8-sifret, cue-et telefonkandidat (ville passert
+      // classifyContactCandidateDefect uten videre — poenget er å bevise
+      // DOMMER-grenen, ikke backstoppen som favicon-formen i (aa1) treffer)
+      // som den mockede dommeren spesifikt avviser via
+      // anthropicRejectCandidates. Før denne testen var det ELLER at .add()
+      // aldri ble kalt noe sted i denne filen — dommer-avvisningsgrenen av
+      // mocken var altså udekket, og denne ruta spesifikt (til forskjell
+      // fra søsterruta gardssalg-contact-backfill, som (aa) i den andre
+      // filen dekker) hadde ingen test som beviste at et dommer-avvist funn
+      // faktisk rapporteres som avvist og ALDRI skrives. ═══
+      {
+        const judgeRejectedPhoneCx = "93456782";
+        const cxMockFetchPreJudge = activePageFetch;
+        activePageFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+          const u = String(url);
+          if (u.startsWith("https://dommeravvist.no")) {
+            return mkHtmlResponse(u,
+              "<html><body>Dommeravvist Gard — håndverksøl. Ring tlf 93 45 67 82 for bestilling.</body></html>");
+          }
+          return (cxMockFetchPreJudge as typeof fetch)(url as any, init);
+        }) as unknown as typeof fetch;
+        ins.run({
+          id: "cx-judgereject", navn: "Dommeravvist Gard", pt: "bryggeri",
+          hj: "https://dommeravvist.no", ep: null, tlf: null, cs: null, created: "2026-05-01",
+        });
+
+        anthropicRejectCandidates.add(judgeRejectedPhoneCx);
+        try {
+          const r = await callRoute({ providerIds: ["cx-judgereject"], apply: true });
+          assertEq(r.status, 200, "cx-60a: ruta svarer 200 selv når kandidaten avvises");
+          assertTrue(
+            !(r.body.changed as any[]).some((c: any) => c.provider_id === "cx-judgereject"),
+            "cx-60b: den dommer-avviste kandidaten dukker ALDRI opp i changed[]",
+          );
+          const rejected = (r.body.contact_gate_rejected as any[]).find((x: any) => x.provider_id === "cx-judgereject");
+          assertTrue(!!rejected, "cx-60c: raden rapporteres i contact_gate_rejected — avvisningen forsvinner ikke tyst");
+          assertTrue(!!rejected?.telefon_rejected_reason,
+            "cx-60d: …med en konkret avvisningsgrunn for telefon-feltet, ikke bare et flagg");
+          const row = expDb.prepare(
+            "SELECT epost, telefon FROM experience_providers WHERE id='cx-judgereject'"
+          ).get() as any;
+          assertEq(row.telefon, null, "cx-60e: telefonfeltet i databasen er urørt — dommer-avvist kandidat skrives aldri");
+          assertEq(row.epost, null, "cx-60f: …og epost (aldri funnet på denne siden uansett) er også urørt");
+        } finally {
+          anthropicRejectCandidates.delete(judgeRejectedPhoneCx);
+          activePageFetch = cxMockFetchPreJudge;
+        }
       }
     } catch (err: any) {
       failed++;
