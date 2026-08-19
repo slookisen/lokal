@@ -5498,6 +5498,350 @@ export function extractEmail(html: string): string | null {
   return branded ?? candidates[0] ?? null;
 }
 
+// ─── classifyRfbContactCandidateDefect + judgeRfbContactCandidate +
+//     gateRfbContactCandidates (dev-request 2026-08-19-rfb-kontakt-llm-
+//     dommer) ───────────────────────────────────────────────────────────────
+//
+// W34 breach (platform-alerts/2026-08-17-rfb-enrichment-spotcheck-breach.md):
+// deterministic extraction alone put a CSS hex color, a Facebook App ID
+// substring, and a favicon filename into agent_knowledge.phone/email as if
+// they were real contact info. extractPhone/extractEmail above already carry
+// several structural hardening passes for these exact shapes (script/style
+// content stripping, the icon-extension TLD guard, the digit-run-neighbour
+// check, etc.) — this section is Daniel's explicit follow-on decision (see
+// dev-requests/2026-08-19-kursjustering-drikkefunnel-llm-og-supply.md Grep 5):
+// stop trusting deterministic extraction for these two fields AT ALL. Every
+// phone/email candidate extractPhone/extractEmail produce must now ALSO clear
+// a two-part gate — a conservative deterministic backstop classifier AND an
+// LLM judge that reads the candidate together with its page source context —
+// before it is eligible for the write path in POST
+// /admin/homepage-provenance-batch below. Either half rejecting is treated
+// exactly like extractPhone/extractEmail having returned null in the first
+// place: nothing is written, and the rejection reason is logged in the same
+// console.log style already used elsewhere in that handler (e.g. the
+// website_ownership "UNVERIFIED" log a few hundred lines below).
+//
+// classifyRfbContactCandidateDefect mirrors classifyGardssalgFieldDefect's
+// shape (services/gardssalg-quality-update.ts: a pure, candidate-only
+// function returning { defective, reason? }) but is scoped to the structural
+// shapes the W34 breach actually reproduced, NOT general phone-number-format
+// validation — this is a BACKSTOP for when the LLM judge below is wrong, not
+// the primary judge, so it stays deliberately conservative and NEVER flags a
+// value that could plausibly be real.
+//
+// Code-review follow-up (2026-08-19, confirmed defect, pre-merge): the
+// ORIGINAL phone-side checks here (hex-letter/'#'-shaped, 15-16-digit
+// App-ID-shaped) were dead code. extractPhone() (above) can only ever return
+// `null` or a value that has already been through normalisePhone()'s
+// `.replace(/\D/g, "")` and an exact-length-8 filter — i.e. EXACTLY 8 `\d`
+// characters, nothing else, ever. A hex LETTER or a '#' or a 15/16-digit
+// length can never survive into that value, so those two checks could never
+// fire on any candidate the real extractPhone -> gateRfbContactCandidates
+// pipeline actually hands this function. (The email-side checks below are
+// unaffected — extractEmail()'s output legitimately retains the full
+// local-part/domain/TLD shape those checks inspect, and stay exactly as
+// written.)
+//
+// This was NOT fixed by threading extractPhone's raw pre-normalization page
+// context into this classifier (the seemingly obvious fix): extractPhone
+// itself already strips ALL <script>/<style> block CONTENT and ALL HTML tags
+// (attributes included, so inline `style="background-color:#..."` goes too)
+// BEFORE its digit regex ever runs (see extractPhone's "Bug fix 5,
+// 2026-08-17, W34 breach" comment above) — that fix landed specifically to
+// close the CSS-hex-color/style-block reproduction at the extraction layer.
+// By construction, neither extractPhone's own scanning text nor
+// gateRfbContactCandidates' sourceContext (extractPageText() — same
+// script/style/tag stripping) can ever contain a literal "#xxxxxx" / CSS
+// property / "fbAppId"-style JS token any more; threading that context in
+// here would just be checking a haystack that structurally cannot contain
+// the needle, i.e. more dead code of the same kind, and would require
+// loosening the exact hardening that fixed W34 to even attempt it.
+//
+// Rescoped instead to checks on properties that DO survive into the final
+// 8-digit string and are still genuinely useful placeholder/junk signals:
+// a long run of one repeated digit (hasLongRepeatedDigitRun) and a
+// sequential ascending/descending digit run (isSequentialDigitRun) — both
+// common placeholder/test-data shapes, both real weaknesses distinct from
+// what the LLM judge is doing (a pure shape check here vs. the judge's
+// semantic read of the candidate against page context).
+//
+// Honesty note (do not remove): for PHONE, the CSS-hex-color and
+// Facebook-App-ID/tracking-ID failure modes from the W34 breach are NOT
+// covered by this deterministic backstop — they cannot be, per the above —
+// and are caught ONLY by judgeRfbContactCandidate (the LLM judge), which
+// receives the full, un-stripped-of-meaning page sourceContext and is
+// explicitly taught both failure modes in its prompt (see the Norwegian
+// prompt text below: "En CSS-fargekode..." / "En Facebook App ID..."). If
+// ANTHROPIC_API_KEY is ever unset or the judge call fails, gateRfbContact-
+// Candidates fails the WHOLE candidate closed anyway (see judgeRfbContact-
+// Candidate's fail-closed contract), so this is not a silent gap — it is a
+// single-line-of-defense-by-design gap, not a two-lines-of-defense gap, and
+// must be described that way in review/documentation, not implied to be
+// double-covered when it structurally is not.
+export interface RfbContactCandidateDefectVerdict {
+  defective: boolean;
+  reason?: string;
+}
+
+/** True if `digits` contains a run of the same character repeated `minRun`
+ *  or more times in a row (e.g. "23222222" — six 2's). A conservative
+ *  placeholder-shaped signal that survives into extractPhone()'s final
+ *  8-digit output (unlike hex-letter/App-ID-length shapes, which do not —
+ *  see the block comment above). extractPhone() already rejects the
+ *  ALL-8-same-digit case itself (`/^(\d)\1{7}$/`); this is a genuinely
+ *  independent, additional check for a PARTIAL long repeat, and also guards
+ *  gateRfbContactCandidates callers other than extractPhone (candidatePhone
+ *  is a plain `string | null` parameter, not tied to extractPhone alone). */
+function hasLongRepeatedDigitRun(digits: string, minRun: number): boolean {
+  let run = 1;
+  for (let i = 1; i < digits.length; i++) {
+    run = digits[i] === digits[i - 1] ? run + 1 : 1;
+    if (run >= minRun) return true;
+  }
+  return false;
+}
+
+/** True if `digits` is a strictly sequential ascending run (e.g. "23456789")
+ *  or strictly sequential descending run (e.g. "98765432") — the shape of
+ *  placeholder/test/example phone numbers, and (like
+ *  hasLongRepeatedDigitRun) a signal that survives into extractPhone()'s
+ *  final 8-digit output. */
+function isSequentialDigitRun(digits: string): boolean {
+  if (digits.length < 2) return false;
+  let ascending = true;
+  let descending = true;
+  for (let i = 1; i < digits.length; i++) {
+    const prev = digits.charCodeAt(i - 1) - 48;
+    const curr = digits.charCodeAt(i) - 48;
+    if (curr !== prev + 1) ascending = false;
+    if (curr !== prev - 1) descending = false;
+  }
+  return ascending || descending;
+}
+
+const RFB_CONTACT_FAVICON_LOCAL_PARTS = new Set([
+  "favicon", "favicon@2x", "apple-touch-icon", "apple-touch-icon-precomposed",
+]);
+
+export function classifyRfbContactCandidateDefect(
+  fieldType: "phone" | "email",
+  candidate: string
+): RfbContactCandidateDefectVerdict {
+  const trimmed = (candidate ?? "").trim();
+  if (!trimmed) return { defective: false };
+
+  if (fieldType === "phone") {
+    // Only pure-digit candidates are in scope for these two checks — the
+    // reachable shape of extractPhone()'s real output (see block comment
+    // above). A formatted value like "+47 400 12 345" is left to the LLM
+    // judge, same as it always was for anything not unambiguously junk.
+    if (/^\d+$/.test(trimmed)) {
+      if (hasLongRepeatedDigitRun(trimmed, 6)) {
+        return { defective: true, reason: "candidate contains a long run of the same repeated digit (placeholder-shaped), not a plausible Norwegian phone number" };
+      }
+      if (isSequentialDigitRun(trimmed)) {
+        return { defective: true, reason: "candidate is a sequential ascending/descending digit run (placeholder-shaped), not a plausible Norwegian phone number" };
+      }
+    }
+    return { defective: false };
+  }
+
+  // fieldType === "email"
+  const atIdx = trimmed.lastIndexOf("@");
+  if (atIdx <= 0 || atIdx === trimmed.length - 1) {
+    return { defective: true, reason: "candidate does not parse as a real email address (missing/misplaced '@')" };
+  }
+  const localPart = trimmed.slice(0, atIdx).toLowerCase();
+  const domain = trimmed.slice(atIdx + 1).toLowerCase();
+  if (RFB_CONTACT_FAVICON_LOCAL_PARTS.has(localPart)) {
+    return { defective: true, reason: "candidate's local part is a favicon/icon filename, not a mailbox name" };
+  }
+  if (!domain.includes(".")) {
+    return { defective: true, reason: "candidate does not parse as a real email address (no domain TLD)" };
+  }
+  const tld = domain.split(".").pop() ?? "";
+  if (EMAIL_ICON_EXTENSIONS.has(tld)) {
+    return { defective: true, reason: "candidate's domain ends in an image/icon file extension (e.g. .png/.ico) — looks like a favicon filename, not an email" };
+  }
+  if (!/^[a-z0-9._%+-]+$/i.test(localPart) || !/^[a-z0-9.-]+$/i.test(domain)) {
+    return { defective: true, reason: "candidate does not parse as a real email address" };
+  }
+  return { defective: false };
+}
+
+// judgeRfbContactCandidate mirrors judgeRfbAboutCandidate's (admin-agents.ts)
+// EXACT sentinel/fail-closed contract: direct fetch to
+// https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+// claude-haiku-4-5. ANY doubt or failure — missing key, network failure,
+// non-200, unparseable JSON, a response that isn't the exact expected
+// verdict token — resolves to REJECT. Never throws, never silently approves.
+// Kept in THIS file (not admin-agents.ts) since the write path it gates
+// (POST /admin/homepage-provenance-batch) lives here too, and extractPhone/
+// extractEmail — the functions that produce the candidates it judges — are
+// already module-scope here.
+export interface RfbContactJudgeVerdict {
+  approved: boolean;
+  reason?: string;
+}
+
+const RFB_CONTACT_JUDGE_APPROVE_TOKEN = "GODKJENN";
+const RFB_CONTACT_JUDGE_REJECT_TOKEN = "AVVIS";
+// Comparable to RFB_JUDGE_CANDIDATE_CHAR_CAP (admin-agents.ts, 4000) and
+// GARDSSALG_REWRITE_SOURCE_CHAR_CAP (opplevelser.ts, 6000) — this caps the
+// surrounding PAGE source context (not the candidate itself, which is a
+// short phone/email string), so a value in that same range is used rather
+// than an unbounded prompt.
+const RFB_CONTACT_JUDGE_SOURCE_CONTEXT_CHAR_CAP = 4000;
+
+export async function judgeRfbContactCandidate(params: {
+  fieldType: "phone" | "email";
+  candidate: string;
+  sourceContext: string;
+  businessName: string;
+}): Promise<RfbContactJudgeVerdict> {
+  const { fieldType, candidate, sourceContext, businessName } = params;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { approved: false, reason: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+  }
+
+  const fieldLabel = fieldType === "phone" ? "telefonnummer" : "e-postadresse";
+  const cappedContext = (sourceContext || "").slice(0, RFB_CONTACT_JUDGE_SOURCE_CONTEXT_CHAR_CAP);
+  const prompt = `Du er en kvalitetsdommer for kontaktinformasjon på Rett fra Bonden, en norsk markedsplattform som kobler forbrukere direkte med lokale matprodusenter. En automatisk tekstuttrekker har funnet følgende KANDIDAT til ${fieldLabel} for produsenten "${businessName}", hentet fra produsentens egen nettside.
+
+Kandidat (${fieldLabel}): ${candidate}
+
+Kildekontekst (tekst hentet fra produsentens nettside, der kandidaten ble funnet):
+${cappedContext}
+
+Automatisk tekstuttrekk fra nettsider har GJENTATTE GANGER feilaktig plukket opp følgende som om de var ekte kontaktinformasjon — vær spesielt oppmerksom på disse kjente feilkildene:
+- En CSS-fargekode (hex-farge, f.eks. "#3a7d44" eller en Tailwind arbitrary-value-klasse som ".bg-[#79656569]") tolket som telefonnummer.
+- En Facebook App ID eller annen lang numerisk sporings-/konfigurasjons-ID fra JavaScript-kode (f.eks. et "facebookAppId"/"fbAppId"/"fb-app-id"-felt) tolket som telefonnummer.
+- Et favicon- eller ikon-filnavn (f.eks. "favicon@2x.png", "apple-touch-icon.png") tolket som e-postadresse fordi filnavnet inneholder "@".
+- Annen generisk sidestøy: versjonsnumre, produkt-SKUer, datoer, postnumre, org-numre, eller andre tall-/tekststrenger som tilfeldigvis matcher formatet til ${fieldLabel}, men ikke faktisk ER kontaktinformasjon for DENNE produsenten.
+
+Godkjenn KUN hvis kandidaten er en plausibel, ekte, SPESIFIKK ${fieldLabel} for akkurat DENNE produsenten, gitt kildekonteksten. Ved minste tvil om at dette faktisk er ekte kontaktinformasjon — eller om det heller ser ut som en av feilkildene over — svar ${RFB_CONTACT_JUDGE_REJECT_TOKEN}.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${RFB_CONTACT_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${RFB_CONTACT_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${RFB_CONTACT_JUDGE_REJECT_TOKEN}.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { approved: false, reason: "nettverksfeil under dommer-kall — avvist fail-closed" }; // never fabricate
+  }
+
+  if (!response.ok) {
+    return { approved: false, reason: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { approved: false, reason: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { approved: false, reason: "uventet svarformat fra dommer-API — avvist fail-closed" };
+  }
+
+  const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const verdictToken = (lines[0] || "").toUpperCase();
+  const reason = lines.slice(1).join(" ").trim();
+
+  // Only the EXACT approve token approves. Anything else — the reject
+  // token, an empty response, garbage, a token that merely CONTAINS the
+  // approve word inside a longer sentence — is a reject. Fail-closed on any
+  // ambiguity, never a silent approval.
+  if (verdictToken === RFB_CONTACT_JUDGE_APPROVE_TOKEN) {
+    return { approved: true, reason: reason || "godkjent av LLM-dommer" };
+  }
+  if (verdictToken === RFB_CONTACT_JUDGE_REJECT_TOKEN) {
+    return { approved: false, reason: reason || "avvist av LLM-dommer" };
+  }
+  return { approved: false, reason: "uventet/tvetydig dommersvar — avvist fail-closed" };
+}
+
+export interface RfbContactCandidateGateResult {
+  phone: string | null;
+  email: string | null;
+  phoneRejectedReason?: string;
+  emailRejectedReason?: string;
+}
+
+// gateRfbContactCandidates is the single entry point POST /admin/homepage-
+// provenance-batch (below) uses to turn extractPhone()/extractEmail()'s raw
+// output into write-eligible values: a candidate must pass BOTH
+// classifyRfbContactCandidateDefect (cheap, checked first — cost control,
+// same "cheap filter before LLM call" posture as every other cascade gate in
+// this codebase) AND judgeRfbContactCandidate (the LLM judge, given the
+// page's own source context) to survive. Either rejecting is reported back
+// exactly like "no candidate found" — the caller never sees a
+// partially-trusted value. Factored out from the route handler so it is
+// unit-testable directly, without needing the full HTTP route/DB fixture.
+export async function gateRfbContactCandidates(params: {
+  producerName: string;
+  sourceContext: string;
+  candidatePhone: string | null;
+  candidateEmail: string | null;
+}): Promise<RfbContactCandidateGateResult> {
+  const { producerName, sourceContext, candidatePhone, candidateEmail } = params;
+  const result: RfbContactCandidateGateResult = { phone: null, email: null };
+
+  async function gateOne(fieldType: "phone" | "email", candidate: string | null): Promise<{ value: string | null; rejectedReason?: string }> {
+    if (!candidate) return { value: null };
+    const defect = classifyRfbContactCandidateDefect(fieldType, candidate);
+    if (defect.defective) {
+      return { value: null, rejectedReason: `backstop classifier: ${defect.reason ?? "flagged defective"}` };
+    }
+    const verdict = await judgeRfbContactCandidate({
+      fieldType,
+      candidate,
+      sourceContext,
+      businessName: producerName,
+    });
+    if (!verdict.approved) {
+      return { value: null, rejectedReason: `LLM judge: ${verdict.reason ?? "avvist"}` };
+    }
+    return { value: candidate };
+  }
+
+  const [phoneOutcome, emailOutcome] = await Promise.all([
+    gateOne("phone", candidatePhone),
+    gateOne("email", candidateEmail),
+  ]);
+  result.phone = phoneOutcome.value;
+  if (phoneOutcome.rejectedReason) result.phoneRejectedReason = phoneOutcome.rejectedReason;
+  result.email = emailOutcome.value;
+  if (emailOutcome.rejectedReason) result.emailRejectedReason = emailOutcome.rejectedReason;
+
+  return result;
+}
+
 export function extractAddress(html: string): string | null {
   const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
   // Pattern: <words> <number> <optional comma/space> <4 digits> <CAPS/title word>
@@ -6044,7 +6388,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       // against the producer.
     }
 
-    const { email: extractedEmail, phone: extractedPhone, address: extractedAddress, verified: ownershipVerified } = extraction;
+    const { email: extractedEmail, phone: extractedPhone, address: extractedAddress, pageText: extractedPageText, verified: ownershipVerified } = extraction;
 
     if (!ownershipVerified) {
       // Record an advisory marker (no homepage provenance written). Merge into
@@ -6086,6 +6430,39 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       return { agentId, status: "ownership_unverified" };
     }
 
+    // dev-request 2026-08-19-rfb-kontakt-llm-dommer (W34 breach follow-up,
+    // platform-alerts/2026-08-17-rfb-enrichment-spotcheck-breach.md): every
+    // raw phone/email candidate extractPhone()/extractEmail() produced above
+    // must ALSO clear gateRfbContactCandidates (backstop classifier + LLM
+    // judge, both defined above near extractPhone/extractEmail) before it is
+    // eligible to be written below. Run only in this (ownership-verified)
+    // branch — a wrong-entity page's candidates are already discarded above
+    // and never reach this LLM call, so no cost is spent judging them. A
+    // rejected candidate is treated EXACTLY like extractPhone/extractEmail
+    // having found nothing: `gated.phone`/`gated.email` is null, so it never
+    // enters incomingProv below and the existing "no candidate found" shape
+    // (no field written, no fieldsFound entry) fires unchanged. The rejection
+    // reason is logged in the same console.log style as the website-ownership
+    // UNVERIFIED log just above.
+    const contactGate = await gateRfbContactCandidates({
+      producerName,
+      sourceContext: extractedPageText,
+      candidatePhone: extractedPhone,
+      candidateEmail: extractedEmail,
+    });
+    if (extractedPhone && !contactGate.phone) {
+      console.log(
+        `[homepage-provenance] ${agentId} (${producerName}) phone candidate "${extractedPhone}" REJECTED by contact gate for ${effectiveUrl} — ${contactGate.phoneRejectedReason ?? "unknown reason"}; not written`
+      );
+    }
+    if (extractedEmail && !contactGate.email) {
+      console.log(
+        `[homepage-provenance] ${agentId} (${producerName}) email candidate "${extractedEmail}" REJECTED by contact gate for ${effectiveUrl} — ${contactGate.emailRejectedReason ?? "unknown reason"}; not written`
+      );
+    }
+    const gatedEmail = contactGate.email;
+    const gatedPhone = contactGate.phone;
+
     const nowIso = new Date().toISOString();
 
     // Build the incoming provenance payload (wrapped shape accepted by mergeFieldProvenance).
@@ -6098,14 +6475,16 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // (which happen to share the producer's URL) would be written as the
     // producer's contact — and different-company emails from contaminated pages
     // (the Eidsmo distributor case) would silently overwrite correct data.
-    if (extractedEmail && isAcceptableHomepageEmail(extractedEmail, effectiveUrl)) {
+    // gatedEmail (not extractedEmail) — must already have cleared the
+    // contact gate above.
+    if (gatedEmail && isAcceptableHomepageEmail(gatedEmail, effectiveUrl)) {
       incomingProv.email = {
-        sources: [{ source_type: "homepage", value: extractedEmail, fetched_at: nowIso, source_url: effectiveUrl }],
+        sources: [{ source_type: "homepage", value: gatedEmail, fetched_at: nowIso, source_url: effectiveUrl }],
       };
     }
-    if (extractedPhone) {
+    if (gatedPhone) {
       incomingProv.phone = {
-        sources: [{ source_type: "homepage", value: extractedPhone, fetched_at: nowIso, source_url: effectiveUrl }],
+        sources: [{ source_type: "homepage", value: gatedPhone, fetched_at: nowIso, source_url: effectiveUrl }],
       };
     }
     if (extractedAddress) {
@@ -6160,9 +6539,9 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       const currAddr = (kRow.address ?? "").toString().trim();
       const currEmail = (kRow.email ?? "").toString().trim();
 
-      if (!currPhone && extractedPhone) {
+      if (!currPhone && gatedPhone) {
         sets.push("phone = ?");
-        params.push(extractedPhone);
+        params.push(gatedPhone);
       }
       if (!currAddr && extractedAddress) {
         sets.push("address = ?");
