@@ -367,7 +367,7 @@ function utf8FileNameSource(name: string): string {
     .trim()
     // Cap BEFORE the lone-surrogate strip, so a pair split by the cap is
     // cleaned up by it rather than left dangling for encodeURIComponent.
-    // (60 UTF-16 units, the same budget safeFileName() uses for the ASCII half.)
+    // (60 UTF-16 units, the same budget asciiSafeFileName() uses for the ASCII half.)
     .slice(0, 60)
     // Keep well-formed pairs (emoji), drop every unpaired surrogate.
     .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, (m) => (m.length === 2 ? m : ""))

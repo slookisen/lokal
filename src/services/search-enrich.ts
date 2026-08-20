@@ -679,6 +679,15 @@ export function decodeHtmlEntities(input: string): string {
       // EXPORTED, so two spellings of the same character must not give a future
       // caller two different results.
       if (cp === 0xa0) return HTML_NAMED_ENTITIES.nbsp;
+      // `&lt;`/`&gt;` are deliberately NOT in HTML_NAMED_ENTITIES; the numeric
+      // spellings must agree, or `&#60;/script&#62;` becomes a real `</script>`.
+      // Same inconsistency class as the NBSP guard above, but this one has a
+      // live public sink: about_text flows through admin-knowledge into the
+      // JSON-LD "description" that seo.ts emits inside a
+      // <script type="application/ld+json"> element, so a decoded `</script>`
+      // terminates that element early. Fixing it HERE, at the source, keeps the
+      // two spellings byte-identical for every caller of this exported helper.
+      if (cp === 0x3c || cp === 0x3e) return match;
       try {
         return String.fromCodePoint(cp);
       } catch {

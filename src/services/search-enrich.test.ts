@@ -1606,6 +1606,66 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       summarizeAbout(escapedHtml).includes("Gården &#8211; siden 1890"),
       "summarizeAbout: &amp;#8211; stays the literal text &#8211;",
     );
+
+    // ── `<` / `>`: all spellings must agree (round-2 review BLOCKING) ──────
+    // `&lt;`/`&gt;` are deliberately absent from HTML_NAMED_ENTITIES and stay
+    // verbatim. If the NUMERIC spellings decoded, `&#60;/script&#62;` in a
+    // producer's og:description would become a real `</script>` in about_text,
+    // which admin-knowledge writes automatically and seo.ts emits INSIDE a
+    // <script type="application/ld+json"> element — terminating it early.
+    // Both decimal AND hex (upper- and lowercase) must be covered: a guard that
+    // catches only `&#60;` is exactly the failure mode this test exists for.
+    for (const ref of ["&#60;", "&#62;", "&#x3C;", "&#x3E;", "&#x3c;", "&#x3e;"]) {
+      assertEq(
+        decodeHtmlEntities(`a${ref}b`),
+        `a${ref}b`,
+        `decodeHtmlEntities: ${ref} left verbatim (never becomes a real < or >)`,
+      );
+    }
+    assertTrue(
+      !/[<>]/.test(decodeHtmlEntities("&#60;&#62;&#x3C;&#x3E;&#x3c;&#x3e;")),
+      "decodeHtmlEntities: NO angle bracket is ever emitted from a numeric reference",
+    );
+    // Unchanged behaviour: the named twins still pass through verbatim.
+    assertEq(decodeHtmlEntities("a&lt;b&gt;c"), "a&lt;b&gt;c", "decodeHtmlEntities: &lt;/&gt; still verbatim (unchanged)");
+    assertEq(
+      [decodeHtmlEntities("&lt;"), decodeHtmlEntities("&#60;"), decodeHtmlEntities("&#x3C;")].join("|"),
+      "&lt;|&#60;|&#x3C;",
+      "decodeHtmlEntities: named/decimal/hex `<` spellings all stay un-decoded (they agree)",
+    );
+
+    // The reviewer's executed payload, through all THREE call sites.
+    const xssPayload = "&#60;/script&#62;&#60;img src=x onerror=alert(1)&#62;";
+    const xssHtml =
+      `<html><head><meta property='og:description' content='Vi driver gård i Gudbrandsdalen og selger egne produkter hele året rundt. ` +
+      `${xssPayload} Velkommen innom til oss i helgene.'></head>` +
+      `<body><p>Vi driver gård i Gudbrandsdalen og selger egne produkter hele året rundt. ${xssPayload} Velkommen innom til oss i helgene.</p></body></html>`;
+
+    for (const [label, out] of [
+      ["extractVisibleText", extractVisibleText(xssHtml)],
+      ["extractProseText", extractProseText(xssHtml)],
+      ["summarizeAbout", summarizeAbout(xssHtml)],
+    ] as const) {
+      assertTrue(
+        !out.includes("</script>"),
+        `${label}: the &#60;/script&#62; payload never yields a literal </script> (got: ${out.slice(0, 160)})`,
+      );
+      assertTrue(
+        !/<img[^>]*onerror/i.test(out),
+        `${label}: the &#60;img src=x onerror=…&#62; payload never yields a real <img> tag`,
+      );
+      assertTrue(
+        out.includes("&#60;/script&#62;"),
+        `${label}: the numeric references survive verbatim instead (got: ${out.slice(0, 160)})`,
+      );
+    }
+    // …and the equivalent named spelling behaves identically (it always did).
+    assertTrue(
+      !summarizeAbout(
+        `<html><head><meta property='og:description' content='Gården vår er fin hele året rundt og vi tar imot besøk. &lt;/script&gt; Velkommen.'></head><body></body></html>`,
+      ).includes("</script>"),
+      "summarizeAbout: the &lt;/script&gt; named spelling also stays verbatim (unchanged)",
+    );
   }
 
   return { passed, failed, failures };
