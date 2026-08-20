@@ -105,6 +105,12 @@ import {
   // field (Monkey Brew case: producer replied with a corrected phone number,
   // no write path existed).
   applyGardssalgSetContactPhone,
+  // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 2b
+  // — the CONTENT-field counterpart: a write path for about_text /
+  // visit_text / opening_hours_text with a caller-supplied (LLM-authored or
+  // human-corrected) value, since the fill-only gardssalg-content-refresh
+  // route cannot carry one (measured 0/12 enriched on the drinks cohort).
+  applyGardssalgSetContentField,
   // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 3a
   // — explicit terminal-status write (krever_eier / dod_kilde / null-clear).
   applyGardssalgSetTerminalStatus,
@@ -8194,6 +8200,113 @@ router.post("/admin/gardssalg-set-contact-phone", requireAdmin, (req: Request, r
     success: true,
     provider_id: providerId,
     field: "telefon",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-content-field (admin) ───────
+//
+// Grep 2b (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply).
+// CONTENT-field counterpart to gardssalg-set-contact-phone/-email above: a
+// write path for about_text / visit_text / opening_hours_text that carries a
+// CALLER-SUPPLIED value.
+//
+// The gap this closes: POST /admin/gardssalg-content-refresh generates its own
+// candidate by fetching the producer's homepage and is fill-only on top of
+// that — it has no way to accept text an LLM (or a human reading a producer's
+// reply) authored, and on the drinks cohort it enriched 0 of 12 rows. So a
+// KNOWN-CORRECT replacement value simply had nowhere to go.
+//
+// Body: { provider_id: string, field: "about_text" | "visit_text" |
+// "opening_hours_text", value: string, source: string }. `source` is
+// free-text provenance (a CRM thread ref, a prompt/run id, a URL) stored
+// verbatim in field_provenance.<field>.source_url and on the audit row.
+//
+// `products` is deliberately NOT an accepted field: the defect classifier has
+// no vocabulary for it (GardssalgQualityFieldName) and the only products-side
+// check that exists is an emptiness test, not a quality judge — so accepting
+// it here would mean an ungated write. It returns invalid_field like any
+// other unknown name.
+//
+// No `force` parameter, by design: the two gates (owner-lock, then the SAME
+// objective-defect classifier the quality-update lever uses) are the entire
+// point of routing corrections through this endpoint rather than raw SQL.
+// See applyGardssalgSetContentField's own doc comment for both gates and for
+// why content_source / content_updated_at / content_evidence_url are left
+// untouched.
+//
+// Rollback: no new lever — all three fields are already in
+// GARDSSALG_ROLLBACKABLE_FIELDS, and the audit row this writes is exactly
+// what POST /admin/gardssalg-content-rollback already reads.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-content-field", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    field?: unknown;
+    value?: unknown;
+    source?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  // Two distinct error codes on purpose: "you forgot the field" and "that
+  // field is not writable through this endpoint" are different operator
+  // mistakes, and the second one (e.g. field: "products") should read as a
+  // policy refusal, not as a malformed request.
+  const rawField = typeof body.field === "string" ? body.field.trim() : "";
+  if (!rawField) {
+    res.status(400).json({ error: "field_required" });
+    return;
+  }
+  if (!(GARDSSALG_QUALITY_FIELDS as readonly string[]).includes(rawField)) {
+    res.status(400).json({ error: "invalid_field" });
+    return;
+  }
+  const field = rawField as GardssalgQualityFieldName;
+
+  const value = typeof body.value === "string" ? body.value.trim() : "";
+  if (!value) {
+    res.status(400).json({ error: "value_required" });
+    return;
+  }
+
+  const source = typeof body.source === "string" ? body.source.trim() : "";
+  if (!source) {
+    res.status(400).json({ error: "source_required" });
+    return;
+  }
+
+  const result = applyGardssalgSetContentField(providerId, field, value, source);
+
+  if (!result.ok) {
+    if (result.reason === "provider_not_found") {
+      res.status(404).json({ error: "provider_not_found" });
+      return;
+    }
+    if (result.reason === "owner_locked") {
+      // 409, not 403: the request is authorized, it is the row's STATE (an
+      // owner edited this field, or the row is content_source='manual') that
+      // conflicts with the write.
+      res.status(409).json({ error: "owner_locked" });
+      return;
+    }
+    // defect_type is surfaced so the caller can act on it (regenerate a
+    // longer about_text vs. strip UI chrome are different fixes) rather than
+    // guessing why a value was refused.
+    res.status(400).json({ error: "defective_value", defect_type: result.defect_type });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field,
     old_value: result.old_value,
     new_value: result.new_value,
   });
