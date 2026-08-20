@@ -18,10 +18,17 @@
  *   (a) two active rows whose names slugify identically -> one group, 2 rows
  *   (b) rows that slugify differently -> no group (no false positives)
  *   (c) is_active = 0 rows (already-merged duplicates) are excluded
- *   (d) sitemap_affected: umbrella / unvetted rows are reported but do NOT
- *       count toward the sitemap cohort; two vetted producers do
+ *   (d) sitemap_affected, BOTH halves of the sitemap's filter:
+ *       getActiveAgents() (umbrella / unvetted rows are reported but do NOT
+ *       count toward the cohort) AND the WO-17 emit-site gate in seo.ts
+ *       (slug.length >= 2 AND (knowledge row OR claim)) — a vetted skeleton
+ *       with neither is reported as a collision but is NOT sitemap-affected
  *   (e) filled_fields / enrichment_depth counting, '' and NULL both blank
- *   (f) suggested_survivor_id ranking + tie -> null, tie: true
+ *   (f) suggested_survivor_id ranking + tie -> null, tie: true, with one
+ *       fixture per ranking rule that isolates that rule: claimed (f1),
+ *       has_knowledge_row at equal depth (f3), older created_at (f4), and
+ *       the NULL-created_at sentinel (f5)
+ *   (j) un-sluggable names never form a ""-keyed group (f6)
  *   (g) auth gate (missing key -> 403, wrong key -> 403, no ADMIN_KEY -> 503)
  *   (h) dupslug-write-freedom: agents + agent_knowledge + agent_knowledge_audit
  *       byte-identical before and after the call
@@ -139,8 +146,9 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
 
       const insertAgent = db.prepare(
         `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key,
-                             vertical_id, claimed_at, is_active, is_vetted, umbrella_type, created_at)
-         VALUES (?, ?, 'test agent', 'test', ?, 'https://example.no', 'producer', ?, 'rfb', ?, ?, ?, ?, ?)`,
+                             vertical_id, claimed_at, claimed_by_user_id, is_active, is_vetted,
+                             umbrella_type, created_at)
+         VALUES (?, ?, 'test agent', 'test', ?, 'https://example.no', 'producer', ?, 'rfb', ?, ?, ?, ?, ?, ?)`,
       );
       const insertKnowledge = db.prepare(
         `INSERT INTO agent_knowledge (agent_id, address, postal_code, website, phone, email, about,
@@ -153,10 +161,17 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
         name: string;
         contactEmail?: string;
         claimedAt?: string | null;
+        // agents.claimed_by_user_id — the column the sitemap's WO-17 gate
+        // reads (seo.ts ~5587), which is NOT the same signal as claimed_at
+        // (what DuplicateSlugRow.claimed reports). Kept separately settable
+        // so a fixture can isolate one from the other.
+        claimedByUserId?: string | null;
         isActive?: number;
         isVetted?: number;
         umbrellaType?: string | null;
-        createdAt?: string;
+        // `null` means an explicit NULL created_at (the ranking sentinel
+        // case); omitting the key falls back to the shared default.
+        createdAt?: string | null;
       };
       function agent(f: AgentFixture): void {
         insertAgent.run(
@@ -165,10 +180,11 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
           f.contactEmail ?? "",
           `key-${f.id}`,
           f.claimedAt ?? null,
+          f.claimedByUserId ?? null,
           f.isActive ?? 1,
           f.isVetted ?? 1,
           f.umbrellaType ?? null,
-          f.createdAt ?? "2024-01-01T00:00:00.000Z",
+          f.createdAt === undefined ? "2024-01-01T00:00:00.000Z" : f.createdAt,
         );
       }
       type KnowledgeFixture = {
@@ -219,15 +235,83 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
       agent({ id: "ds-c2", name: "fjell  meieri", isActive: 0 });
       db.prepare(`UPDATE agents SET merged_into = 'ds-c1' WHERE id = 'ds-c2'`).run();
 
-      // ── (d) umbrella + vetted producer -> group, but not sitemap-affected
+      // ── (d) sitemap cohort ──────────────────────────────────────────────
+      // Every row in d/e/f gets an agent_knowledge row so it CLEARS the
+      // WO-17 emit-site gate (knowledge row OR claim) — that way each of
+      // these three groups isolates exactly ONE getActiveAgents() filter
+      // (umbrella / vetted) instead of passing for the wrong reason.
+      //     umbrella + vetted producer -> group, but not sitemap-affected
       agent({ id: "ds-d1", name: "Dalen Lokallag", umbrellaType: "lokallag" });
+      knowledge({ id: "ds-d1", address: "Dalvegen 1" });
       agent({ id: "ds-d2", name: "dalen  lokallag" });
+      knowledge({ id: "ds-d2", address: "Dalvegen 2" });
       //     two vetted producers -> sitemap-affected
       agent({ id: "ds-e1", name: "Sogn Frukt" });
+      knowledge({ id: "ds-e1", address: "Sognvegen 1" });
       agent({ id: "ds-e2", name: "sogn  frukt" });
+      knowledge({ id: "ds-e2", address: "Sognvegen 2" });
       //     unvetted + vetted -> group, but not sitemap-affected
       agent({ id: "ds-f1", name: "Nord Bakeri", isVetted: 0 });
+      knowledge({ id: "ds-f1", address: "Nordvegen 1" });
       agent({ id: "ds-f2", name: "nord  bakeri" });
+      knowledge({ id: "ds-f2", address: "Nordvegen 2" });
+
+      // ── (d2) the WO-17 emit-site gate (seo.ts ~5580), the SECOND half of
+      //     the sitemap filter. All four pairs below are active, vetted and
+      //     non-umbrella, i.e. they clear getActiveAgents() outright — only
+      //     the emit-site gate decides.
+      //     j: two skeletons, no knowledge row and no claim -> neither is in
+      //        the cohort -> NOT sitemap-affected.
+      agent({ id: "ds-j1", name: "Skjelett Gard" });
+      agent({ id: "ds-j2", name: "skjelett  gard" });
+      //     k: same, but ONE of them is claimed -> exactly one row in the
+      //        cohort, and one duplicated <loc> needs two -> still false.
+      agent({ id: "ds-k1", name: "Halv Gard", claimedByUserId: "user-k1" });
+      agent({ id: "ds-k2", name: "halv  gard" });
+      //     l: both claimed, still no knowledge row -> the claim disjunct
+      //        alone puts both in the cohort -> sitemap-affected.
+      agent({ id: "ds-l1", name: "Eigd Gard", claimedByUserId: "user-l1" });
+      agent({ id: "ds-l2", name: "eigd  gard", claimedByUserId: "user-l2" });
+      //     m: slug of length 1 ("Å" -> "a"). Both rows have knowledge rows,
+      //        so ONLY the slug.length >= 2 half of the gate can exclude
+      //        them.
+      agent({ id: "ds-m1", name: "Å" });
+      knowledge({ id: "ds-m1", address: "Åvegen 1" });
+      agent({ id: "ds-m2", name: "å!" });
+      knowledge({ id: "ds-m2", address: "Åvegen 2" });
+
+      // ── (f3) ranking rule 2 in isolation: has_knowledge_row, with
+      //     enrichment_depth DELIBERATELY EQUAL on both sides.
+      //     ds-n1: blank contact_email + an all-blank knowledge row
+      //            -> filled 0, +1 for the knowledge row  = depth 1
+      //     ds-n2: contact_email set, NO knowledge row
+      //            -> filled 1, +0                        = depth 1
+      //     Identical created_at too, so rules 1/3/4 all tie and ONLY rule 2
+      //     can pick a winner — delete rule 2 and this group becomes a tie.
+      agent({ id: "ds-n1", name: "Regel To", contactEmail: "", createdAt: "2024-07-07T00:00:00.000Z" });
+      knowledge({ id: "ds-n1" });
+      agent({ id: "ds-n2", name: "regel  to", contactEmail: "post@regelto.no", createdAt: "2024-07-07T00:00:00.000Z" });
+
+      // ── (f4) ranking rule 4 in isolation: older created_at wins. Equal on
+      //     claimed, has_knowledge_row and enrichment_depth.
+      agent({ id: "ds-o1", name: "Gamal Gard", createdAt: "2023-01-01T00:00:00.000Z" });
+      knowledge({ id: "ds-o1", address: "Gamalvegen 1" });
+      agent({ id: "ds-o2", name: "gamal  gard", createdAt: "2025-01-01T00:00:00.000Z" });
+      knowledge({ id: "ds-o2", address: "Gamalvegen 1" });
+
+      // ── (f5) created_at NULL sentinel: NULL ranks LAST (treated as
+      //     newest), so the dated row wins. Equal on everything else.
+      agent({ id: "ds-p1", name: "Utan Dato", createdAt: "2024-05-05T00:00:00.000Z" });
+      knowledge({ id: "ds-p1", address: "Datovegen 1" });
+      agent({ id: "ds-p2", name: "utan  dato", createdAt: null });
+      knowledge({ id: "ds-p2", address: "Datovegen 1" });
+
+      // ── (f6) two un-sluggable names: slugify("!!!") === slugify("###")
+      //     === "". Without the `if (!slug) continue` guard these two would
+      //     form a bogus ""-keyed "collision group" for a URL that does not
+      //     exist.
+      agent({ id: "ds-q1", name: "!!!" });
+      agent({ id: "ds-q2", name: "###" });
 
       // ── (e) enrichment depth: all 7 fields vs 0 ('' and NULL both blank) ─
       agent({ id: "ds-g1", name: "Djup Gard", contactEmail: "post@djup.no" });
@@ -335,9 +419,9 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
       const bySlug = (s: string) => groups.find((g) => g.slug === s);
 
       assertEq(typeof r.body?.generated_at, "string", "dupslug-07: generated_at present");
-      // 18 agent fixtures, of which ds-c2 is is_active = 0 -> 17 active rows.
-      assertEq(db.prepare(`SELECT COUNT(*) AS c FROM agents`).get(), { c: 18 }, "dupslug-08a: 18 agent fixtures inserted");
-      assertEq(r.body?.total_active_rows, 17, "dupslug-08: total_active_rows counts only is_active = 1");
+      // 34 agent fixtures, of which ds-c2 is is_active = 0 -> 33 active rows.
+      assertEq(db.prepare(`SELECT COUNT(*) AS c FROM agents`).get(), { c: 34 }, "dupslug-08a: 34 agent fixtures inserted");
+      assertEq(r.body?.total_active_rows, 33, "dupslug-08: total_active_rows counts only is_active = 1");
       assertEq(r.body?.collision_groups, groups.length, "dupslug-09: collision_groups matches groups.length");
       assertTrue(
         groups.every((g, i) => i === 0 || groups[i - 1].slug <= g.slug),
@@ -358,9 +442,16 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
       assertEq((gA?.rows ?? []).map((x: any) => x.id).sort(), ["ds-a1", "ds-a2"], "dupslug-15: group carries both colliding rows");
       assertEq(gA?.served_selection, "scan_order_dependent", "dupslug-16: served_selection flags the scan-order dependency");
       assertEq(gA?.currently_served_id, "ds-a1", "dupslug-17: currently_served_id = first scan-order match (same find() as getAgentBySlugIncludingUmbrellas)");
-      assertEq(gA?.sitemap_affected, true, "dupslug-18: two vetted non-umbrella rows -> sitemap_affected");
+      // ds-a2 is the classic re-imported skeleton: vetted + non-umbrella, so
+      // it clears getActiveAgents(), but it has no agent_knowledge row and
+      // no claim, so the WO-17 emit-site gate skips it and the sitemap only
+      // ever emits ONE /produsent/boen-gard-as <loc>. Reporting this pair as
+      // sitemap_affected was the over-report the reviewer caught.
+      assertEq(gA?.sitemap_affected, false, "dupslug-18: vetted skeleton with no knowledge row and no claim is skipped by the WO-17 gate -> not sitemap_affected");
       const a1 = (gA?.rows ?? []).find((x: any) => x.id === "ds-a1");
       const a2 = (gA?.rows ?? []).find((x: any) => x.id === "ds-a2");
+      assertEq(a1?.in_sitemap_cohort, true, "dupslug-18a: ds-a1 (vetted, knowledge row) is in the sitemap cohort");
+      assertEq(a2?.in_sitemap_cohort, false, "dupslug-18b: ds-a2 (vetted, but no knowledge row and no claim) is NOT in the sitemap cohort");
       assertEq(a1?.has_knowledge_row, true, "dupslug-19: ds-a1 has_knowledge_row true");
       assertEq(a2?.has_knowledge_row, false, "dupslug-20: ds-a2 (no knowledge row) -> has_knowledge_row false");
       assertEq(a1?.curated_locked_fields, ["about", "phone"], "dupslug-21: curated_locked_fields lists curated_fields keys, sorted");
@@ -368,7 +459,11 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
       assertEq(a1?.enrichment_status, "enriched", "dupslug-23: enrichment_status carried through");
       assertEq(a1?.claimed, false, "dupslug-24: unclaimed row -> claimed false");
       assertEq(a1?.created_at, "2024-01-01T00:00:00.000Z", "dupslug-25: created_at carried through");
-      assertEq(gA?.suggested_survivor_id, "ds-a1", "dupslug-26: has_knowledge_row outranks the skeleton row");
+      // NB the honest label: this pair differs on has_knowledge_row AND on
+      // enrichment_depth (2 vs 0), so rules 2 and 3 agree here and neither
+      // is pinned by this assertion alone. Rule 2 in isolation is
+      // dupslug-72; rule 3 in isolation is dupslug-45.
+      assertEq(gA?.suggested_survivor_id, "ds-a1", "dupslug-26: the enriched row outranks the skeleton row (rules 2 and 3 agreeing)");
       assertEq(gA?.tie, false, "dupslug-27: no tie when the rows differ");
 
       // ── (b) no false positives ──────────────────────────────────────────
@@ -394,6 +489,35 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
         groups.filter((g) => g.sitemap_affected).length,
         "dupslug-38: sitemap_affected_groups matches the per-group flags",
       );
+
+      // ── (d2) the WO-17 emit-site gate — the second half of the filter ───
+      const gJ = bySlug("skjelett-gard");
+      assertEq(gJ?.row_count, 2, "dupslug-62: two skeleton rows still form a collision group");
+      assertEq(
+        (gJ?.rows ?? []).map((x: any) => x.in_sitemap_cohort),
+        [false, false],
+        "dupslug-63: vetted rows with no knowledge row and no claim are both outside the sitemap cohort",
+      );
+      assertEq(gJ?.sitemap_affected, false, "dupslug-64: two vetted skeletons (no knowledge row, no claim) -> sitemap_affected false");
+
+      const gK = bySlug("halv-gard");
+      const k1 = (gK?.rows ?? []).find((x: any) => x.id === "ds-k1");
+      const k2 = (gK?.rows ?? []).find((x: any) => x.id === "ds-k2");
+      assertEq(k1?.in_sitemap_cohort, true, "dupslug-65: a claimed skeleton IS in the cohort (claim disjunct of the WO-17 gate)");
+      assertEq(k2?.in_sitemap_cohort, false, "dupslug-66: its unclaimed twin is not");
+      assertEq(gK?.sitemap_affected, false, "dupslug-67: only ONE row in the cohort -> no duplicated <loc> -> sitemap_affected false");
+
+      const gL = bySlug("eigd-gard");
+      assertEq(
+        (gL?.rows ?? []).map((x: any) => x.in_sitemap_cohort),
+        [true, true],
+        "dupslug-68: both claimed, no knowledge rows -> both in the cohort on the claim disjunct alone",
+      );
+      assertEq(gL?.sitemap_affected, true, "dupslug-69: two claimed skeletons -> sitemap_affected true");
+
+      const gM = bySlug("a");
+      assertEq(gM?.row_count, 2, "dupslug-70: a one-character slug still forms a collision group");
+      assertEq(gM?.sitemap_affected, false, "dupslug-71: slug shorter than 2 chars is skipped by the WO-17 gate -> not in the cohort");
 
       // ── (e) enrichment depth ────────────────────────────────────────────
       const gG = bySlug("djup-gard");
@@ -421,6 +545,50 @@ export function runAdminAgentsDuplicateSlugsTests(opts: { log?: boolean } = {}):
       assertEq(gI?.row_count, 2, "dupslug-51: identical rows still form a group");
       assertEq(gI?.tie, true, "dupslug-52: rows equal on all four criteria -> tie true");
       assertEq(gI?.suggested_survivor_id, null, "dupslug-53: tie -> suggested_survivor_id null (no coin flip)");
+
+      // ── (f3) rule 2 — has_knowledge_row — with depth held equal ─────────
+      // suggested_survivor_id is what POST /admin/agents/duplicate-merge
+      // deactivates a producer row on, so every ranking rule needs a case
+      // that fails if the rule is deleted or inverted. Here depth is 1 on
+      // both sides by construction, claimed is false on both, and created_at
+      // is identical — so rule 2 is the ONLY thing separating them, and
+      // deleting it turns this group into a tie.
+      const gN = bySlug("regel-to");
+      const n1 = (gN?.rows ?? []).find((x: any) => x.id === "ds-n1");
+      const n2 = (gN?.rows ?? []).find((x: any) => x.id === "ds-n2");
+      assertEq(n1?.has_knowledge_row, true, "dupslug-72a: ds-n1 has a knowledge row");
+      assertEq(n2?.has_knowledge_row, false, "dupslug-72b: ds-n2 has none");
+      assertEq(n1?.enrichment_depth, 1, "dupslug-72c: ds-n1 depth 1 (0 filled + 1 for the knowledge row)");
+      assertEq(n2?.enrichment_depth, 1, "dupslug-72d: ds-n2 depth 1 (contact_email filled, no knowledge row) — depth is EQUAL, so rule 3 cannot decide");
+      assertEq(n1?.created_at, n2?.created_at, "dupslug-72e: identical created_at, so rule 4 cannot decide either");
+      assertEq(gN?.suggested_survivor_id, "ds-n1", "dupslug-72: rule 2 alone — has_knowledge_row wins when claimed, depth and created_at all tie");
+      assertEq(gN?.tie, false, "dupslug-73: rule 2 breaks the tie (delete it and this becomes tie: true)");
+
+      // ── (f4) rule 4 — older created_at wins ─────────────────────────────
+      const gO = bySlug("gamal-gard");
+      const o1 = (gO?.rows ?? []).find((x: any) => x.id === "ds-o1");
+      const o2 = (gO?.rows ?? []).find((x: any) => x.id === "ds-o2");
+      assertEq(o1?.enrichment_depth, o2?.enrichment_depth, "dupslug-74a: rules 1-3 tie (same claimed, knowledge row and depth)");
+      assertEq(gO?.suggested_survivor_id, "ds-o1", "dupslug-74: rule 4 alone — the OLDER created_at wins (2023 over 2025)");
+      assertEq(gO?.tie, false, "dupslug-75: differing created_at is not a tie");
+
+      // ── (f5) rule 4's NULL sentinel — NULL ranks LAST ───────────────────
+      const gP = bySlug("utan-dato");
+      const p1 = (gP?.rows ?? []).find((x: any) => x.id === "ds-p1");
+      const p2 = (gP?.rows ?? []).find((x: any) => x.id === "ds-p2");
+      assertEq(p2?.created_at, null, "dupslug-76a: ds-p2 really has created_at NULL");
+      assertEq(p1?.enrichment_depth, p2?.enrichment_depth, "dupslug-76b: rules 1-3 tie here too");
+      assertEq(gP?.suggested_survivor_id, "ds-p1", "dupslug-76: NULL created_at sorts LAST (counts as newest) -> the dated row wins");
+      assertEq(gP?.tie, false, "dupslug-77: dated vs NULL is not a tie");
+
+      // ── (f6) un-sluggable names never form a ""-keyed group ─────────────
+      assertEq(slugify("!!!"), "", "dupslug-78a: '!!!' slugifies to the empty string");
+      assertEq(slugify("###"), "", "dupslug-78b: '###' slugifies to the empty string");
+      assertEq(bySlug(""), undefined, "dupslug-78: two un-sluggable names produce NO group — there is no /produsent/ URL to collide on");
+      assertTrue(
+        groups.every((g) => g.slug !== ""),
+        "dupslug-79: no group is keyed by the empty slug",
+      );
 
       // ── pure helpers ────────────────────────────────────────────────────
       assertEq(routeMod.curatedLockedFields(null), [], "dupslug-54: curatedLockedFields(null) -> []");

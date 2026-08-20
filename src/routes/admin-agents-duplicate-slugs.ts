@@ -160,8 +160,13 @@ export interface DuplicateSlugRow {
   merged_into: string | null;
   knowledge_updated_at: string | null;
   // True iff this row is one the sitemap generator would emit a
-  // /produsent/<slug> entry for (getActiveAgents(): active + not umbrella +
-  // vetted). See sitemapAffected below.
+  // /produsent/<slug> entry for. That takes BOTH of the sitemap's filters,
+  // not just the first one — see inSitemapCohort() for the full derivation:
+  //   1. getActiveAgents() (src/services/marketplace-registry.ts:1327):
+  //      is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1
+  //   2. the WO-17 pre-flight gate at the emit site (src/routes/seo.ts,
+  //      ~line 5580): slug.length >= 2 AND (has an agent_knowledge row OR
+  //      is claimed)
   in_sitemap_cohort: boolean;
 }
 
@@ -224,7 +229,56 @@ export function countFilledFields(row: RawRow): number {
   return values.reduce<number>((n, v) => (isBlank(v) ? n : n + 1), 0);
 }
 
-function toRow(raw: RawRow): DuplicateSlugRow {
+/**
+ * Does the sitemap generator actually emit a <loc> for this row?
+ *
+ * The sitemap applies TWO filters, and reproducing only the first one
+ * over-reports precisely the rows that are the most common duplicates.
+ *
+ * FILTER 1 — the cohort query, marketplace-registry.getActiveAgents()
+ * (src/services/marketplace-registry.ts:1327):
+ *     is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1
+ * (`is_active = 1` is already the WHERE clause of readActiveRows.)
+ *
+ * FILTER 2 — the WO-17 pre-flight gate at the emit site itself
+ * (src/routes/seo.ts, the `for (const a of agents)` producer loop, ~5580):
+ *     const slug = slugify(a.name);
+ *     if (!slug || slug.length < 2) { skippedCount++; continue; }
+ *     const k = knowledgeByAgent.get(a.id);
+ *     const claimedBy = (a as any).claimed_by_user_id ?? (a as any).claimed_by;
+ *     if (!k && !claimedBy) { skippedCount++; continue; }
+ * i.e. slug.length >= 2 AND (has an `agent_knowledge` row OR is claimed).
+ * A skeleton row with neither never reaches the sitemap — and "re-imported
+ * skeleton row next to the enriched original" is the textbook duplicate
+ * shape, so leaving filter 2 out makes sitemap_affected wrong exactly where
+ * it matters most.
+ *
+ * On the claim half: `agents` has no `claimed_by` column in this schema —
+ * only `claimed_by_user_id` (src/database/init.ts:897; the `?? claimed_by`
+ * in seo.ts is defensive slack for a column that does not exist). So
+ * claimed_by_user_id is the only thing to read, and it is read with plain
+ * truthiness — not isBlank() — because that is exactly what the gate does.
+ *
+ * Known conservatism, stated rather than hidden: in production seo.ts feeds
+ * this gate `RegisteredAgent` objects built by rowToAgent()
+ * (marketplace-registry.ts:1578), which does not copy claimed_by_user_id
+ * onto the object — so today the claim disjunct never actually fires there
+ * and a claimed row with no knowledge row is skipped by the live sitemap.
+ * This function still mirrors the gate AS WRITTEN, so it stays correct the
+ * moment that mapping is fixed; the cost is that such a row can be reported
+ * as in-cohort one release early. Over-reporting a read-only advisory is the
+ * safe direction; silently under-reporting a real duplicate <loc> is not.
+ */
+function inSitemapCohort(raw: RawRow, slug: string, hasKnowledgeRow: boolean): boolean {
+  // Filter 1 (is_active already enforced by the query).
+  if (raw.a_umbrella_type !== null) return false;
+  if (raw.a_is_vetted === 0) return false;
+  // Filter 2.
+  if (slug.length < 2) return false;
+  return hasKnowledgeRow || !!raw.a_claimed_by_user_id;
+}
+
+function toRow(raw: RawRow, slug: string): DuplicateSlugRow {
   const hasKnowledgeRow = raw.k_agent_id !== null;
   const filled = countFilledFields(raw);
   return {
@@ -251,7 +305,7 @@ function toRow(raw: RawRow): DuplicateSlugRow {
     trust_score: raw.a_trust_score,
     merged_into: raw.a_merged_into,
     knowledge_updated_at: raw.k_updated_at,
-    in_sitemap_cohort: raw.a_umbrella_type === null && raw.a_is_vetted !== 0,
+    in_sitemap_cohort: inSitemapCohort(raw, slug, hasKnowledgeRow),
   };
 }
 
@@ -331,14 +385,18 @@ router.get("/", (req: Request, res: Response) => {
     const out: DuplicateSlugGroup[] = [];
     for (const [slug, bucket] of groups) {
       if (bucket.length < 2) continue;
-      const rows = bucket.map(toRow);
+      const rows = bucket.map((raw) => toRow(raw, slug));
       // A collision only breaks the sitemap when at least TWO of the
       // colliding rows are in the cohort the sitemap actually emits —
-      // getActiveAgents(): is_active = 1 AND umbrella_type IS NULL AND
-      // is_vetted = 1 (src/services/marketplace-registry.ts). An
-      // umbrella/unvetted row colliding with one producer is still a real
-      // /produsent/<slug> ambiguity (so the group IS reported), but it does
-      // not duplicate a <loc>.
+      // BOTH of its filters: getActiveAgents() (is_active = 1 AND
+      // umbrella_type IS NULL AND is_vetted = 1) AND the WO-17 emit-site
+      // gate (slug.length >= 2 AND (knowledge row OR claimed)). See
+      // inSitemapCohort() above for the full derivation.
+      //
+      // A row that fails either filter — umbrella, unvetted, one-character
+      // slug, or an unclaimed skeleton with no agent_knowledge row — is
+      // still a real /produsent/<slug> ambiguity for the public route (so
+      // the group IS reported), but it does not duplicate a <loc>.
       const sitemapAffected = rows.filter((r) => r.in_sitemap_cohort).length >= 2;
       const suggestion = suggestSurvivor(rows);
       out.push({
