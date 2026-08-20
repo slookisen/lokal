@@ -190,6 +190,22 @@ function homepageEmailProvenance(email: string, websiteUrl: string): string {
   });
 }
 
+// Grep 6 slice 1 (DAILY_PREP_MAX_CANDIDATES env knob): saves/restores
+// process.env.DAILY_PREP_MAX_CANDIDATES around a single case via try/finally
+// so a failing assertion inside `fn` can never leak the value into a later
+// case in this shared-suite file.
+async function withDailyCapEnv(value: string | undefined, fn: () => Promise<void>): Promise<void> {
+  const prev = process.env.DAILY_PREP_MAX_CANDIDATES;
+  try {
+    if (value === undefined) delete process.env.DAILY_PREP_MAX_CANDIDATES;
+    else process.env.DAILY_PREP_MAX_CANDIDATES = value;
+    await fn();
+  } finally {
+    if (prev === undefined) delete process.env.DAILY_PREP_MAX_CANDIDATES;
+    else process.env.DAILY_PREP_MAX_CANDIDATES = prev;
+  }
+}
+
 export function runOpplevelserGardssalgOutreachDailyPrepTests(
   opts: { log?: boolean } = {},
 ): Promise<TestSummary> {
@@ -480,7 +496,7 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       assertTrue(!excludedById.has("prov-needs-enrichment"), "c7: a needs_enrichment-tier row (never outreach_ready) is absent from excluded");
       assertTrue(!byId.has("prov-needs-enrichment"), "c8: a needs_enrichment-tier row is absent from candidates too");
       assertEq(full.body.excluded.length, 3, "c9: excluded has exactly 3 rows (macks, quarantine, prov-d-unverified)");
-      assertEq(full.body.pool, { outreach_ready_total: 7, eligible_total: 5, selected: 4, excluded_total: 3 }, "c10: pool counters (unchanged in shape from Skive 2 — d and e simply swapped buckets)");
+      assertEq(full.body.pool, { outreach_ready_total: 7, eligible_total: 5, selected: 4, excluded_total: 3, daily_cap: 4 }, "c10: pool counters (unchanged in shape from Skive 2 — d and e simply swapped buckets) + daily_cap (env unset -> default 4)");
       assertEq(full.body.missing, { count: 0, reason: null }, "c11: full batch -> missing.count 0, reason null");
       assertEq(full.body.dry, false, "c12: dry:false (eligible_total > 0)");
 
@@ -534,7 +550,7 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
       assertEq(dry.body.excluded.length, 0, "f3: zero excluded (nothing was ever outreach_ready)");
       assertEq(dry.body.dry, true, "f4: dry:true");
       assertEq(dry.body.missing, { count: 4, reason: "pool_exhausted" }, "f5: missing.count 4, reason pool_exhausted");
-      assertEq(dry.body.pool, { outreach_ready_total: 0, eligible_total: 0, selected: 0, excluded_total: 0 }, "f6: pool counters all zero");
+      assertEq(dry.body.pool, { outreach_ready_total: 0, eligible_total: 0, selected: 0, excluded_total: 0, daily_cap: 4 }, "f6: pool counters all zero + daily_cap (env unset -> default 4, pool-exhausted branch)");
       assertTrue(!!dry.body.refill_hints, "f7: refill_hints present");
       assertTrue(
         typeof dry.body.refill_hints.needs_enrichment_count === "number" && dry.body.refill_hints.needs_enrichment_count >= 1,
@@ -708,6 +724,95 @@ export function runOpplevelserGardssalgOutreachDailyPrepTests(
         "k6: the proposed candidate is not ALSO listed as excluded",
       );
       expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('prov-k-dup-1-thinabout', 'prov-k-dup-2-valid')`).run();
+
+      // ══ (l) configurable daily cap (Grep 6 slice 1: DAILY_PREP_MAX_CANDIDATES) ══
+      // Case (a) — env unset -> cap 4 — is already covered by the untouched
+      // b2/c10 assertions above (the regression guard proving the default is
+      // unchanged); no new fixtures needed for it here.
+      //
+      // 10 fixtures (cap-b01..cap-b10), each own-domain email + realistic
+      // about_text + a recognized producer_type ("sideri") — clears every
+      // Skive 3 check on its own merits, so exactly the daily cap (not Skive
+      // 3) governs how many of them get selected. IDs zero-padded/ascending
+      // so selection order stays deterministic like every other block above.
+      for (let i = 1; i <= 10; i++) {
+        const n = String(i).padStart(2, "0");
+        insertProvider.run({
+          id: `cap-b${n}`, navn: `Cap Batch ${n} Gård`, org_nr: String(300000000 + i), kommune: "Voss",
+          rfb_seed_source: "rfb-seed", producer_type: "sideri",
+          epost: `post@cap-batch-${n}-fixture.no`, telefon: null, hjemmeside: `https://cap-batch-${n}-fixture.no`,
+          about_text: REALISTIC_ABOUT_TEXT, visit_text: null, opening_hours_text: null,
+          products: "Sider", content_source: "provider_site",
+          booking_live: 0, catalog_hidden: 0, slug: `cap-batch-${n}-gard`, field_provenance: VERIFIED_PROVENANCE,
+          brreg_verified: 1, antall_ansatte: 5, naeringskode: null,
+        });
+      }
+
+      // ── (l-b) env "10" with exactly 10 eligible -> exactly 10 selected,
+      // no daily_cap_reached in excluded (nothing overflows the cap), and
+      // pool.daily_cap reflects the effective cap (normal-branch half of l-f).
+      await withDailyCapEnv("10", async () => {
+        const capTen = await callRoute(opplevelserRouter, { headers: auth });
+        assertEq(capTen.status, 200, "l-b1: env=10, 10 eligible -> 200");
+        assertEq(capTen.body.candidates.length, 10, "l-b2: exactly 10 selected");
+        assertTrue(
+          !(capTen.body.excluded as any[]).some((e) => e.reason === "daily_cap_reached"),
+          "l-b3: no daily_cap_reached entry in excluded (10 eligible == cap 10, nothing overflows)",
+        );
+        assertEq(capTen.body.pool.daily_cap, 10, "l-b4: pool.daily_cap is 10 (normal branch)");
+      });
+
+      // ── (l-e) env "100" -> clamps to the named ceiling (10), not 100 — a
+      // typo like "100" must not propose the whole pool as one day's batch.
+      // Still 10 eligible here, so this also proves the clamp actually caps
+      // selection at 10, not 100.
+      await withDailyCapEnv("100", async () => {
+        const capHundred = await callRoute(opplevelserRouter, { headers: auth });
+        assertEq(capHundred.status, 200, "l-e1: env=100, 10 eligible -> 200");
+        assertEq(capHundred.body.pool.daily_cap, 10, "l-e2: pool.daily_cap clamped to the ceiling (10), not 100");
+        assertEq(capHundred.body.candidates.length, 10, "l-e3: selection also clamped to 10, not the raw env value");
+      });
+
+      // Narrow the pool to 3 eligible (cap-b01..cap-b03) for the
+      // fewer-than-cap and lower-clamp cases below.
+      expDb.prepare(`DELETE FROM experience_providers WHERE id IN (${Array.from({ length: 7 }, (_, i) => `'cap-b${String(i + 4).padStart(2, "0")}'`).join(", ")})`).run();
+
+      // ── (l-c) env "10" with only 3 eligible -> 3 selected, NO padding,
+      // missing.count 7, missing.reason "fewer_than_cap".
+      await withDailyCapEnv("10", async () => {
+        const capFewer = await callRoute(opplevelserRouter, { headers: auth });
+        assertEq(capFewer.status, 200, "l-c1: env=10, 3 eligible -> 200");
+        assertEq(capFewer.body.candidates.length, 3, "l-c2: exactly 3 selected (never padded to 10)");
+        assertEq(capFewer.body.missing, { count: 7, reason: "fewer_than_cap" }, "l-c3: missing.count 7, reason fewer_than_cap");
+        assertEq(capFewer.body.pool.daily_cap, 10, "l-c4: pool.daily_cap still 10 (the effective cap, independent of how many are eligible)");
+      });
+
+      // ── (l-d) env "0", "-5", "", "abc" -> each clamps to the lower bound
+      // (1), never 0 — a 0/empty/garbage value must never resolve to 0 (that
+      // would silently propose nothing every day, reading like an empty pool
+      // rather than a misconfiguration). 3 eligible remain, so a selected
+      // count of 1 (not 3) proves the clamp actually took effect.
+      for (const garbageValue of ["0", "-5", "", "abc"]) {
+        await withDailyCapEnv(garbageValue, async () => {
+          const capGarbage = await callRoute(opplevelserRouter, { headers: auth });
+          assertEq(capGarbage.status, 200, `l-d1(${JSON.stringify(garbageValue)}): 200`);
+          assertEq(capGarbage.body.candidates.length, 1, `l-d2(${JSON.stringify(garbageValue)}): exactly 1 selected (clamped to 1, never 0)`);
+          assertEq(capGarbage.body.pool.daily_cap, 1, `l-d3(${JSON.stringify(garbageValue)}): pool.daily_cap is 1`);
+        });
+      }
+
+      expDb.prepare(`DELETE FROM experience_providers WHERE id IN ('cap-b01', 'cap-b02', 'cap-b03')`).run();
+
+      // ── (l-f, pool-exhausted-branch half) pool.daily_cap is also reported
+      // in the pool-exhausted early-return branch, and reflects whatever the
+      // effective cap resolved to for THIS request.
+      await withDailyCapEnv("7", async () => {
+        const capExhausted = await callRoute(opplevelserRouter, { headers: auth });
+        assertEq(capExhausted.status, 200, "l-f1: env=7, 0 outreach_ready -> 200");
+        assertEq(capExhausted.body.dry, true, "l-f2: dry:true (pool exhausted)");
+        assertEq(capExhausted.body.missing, { count: 7, reason: "pool_exhausted" }, "l-f3: missing.count 7, reason pool_exhausted");
+        assertEq(capExhausted.body.pool.daily_cap, 7, "l-f4: pool.daily_cap is 7 (pool-exhausted branch)");
+      });
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-outreach-daily-prep: unexpected error: " + String(err?.stack || err?.message || err));

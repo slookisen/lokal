@@ -12881,9 +12881,11 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
 //      outreach-pilot-send runs when `apply` is omitted — never a
 //      duplicated copy of that logic (both routes now call the one
 //      extracted function, see its own doc comment above).
-//   4. Cap the eligible ("would_send") rows at DAILY_PREP_MAX_CANDIDATES (4,
-//      hard default) — no filling to 4 if fewer are eligible ("Ingen
-//      fylling", krav 11).
+//   4. Cap the eligible ("would_send") rows at the configurable
+//      DAILY_PREP_MAX_CANDIDATES cap (resolveDailyPrepMaxCandidates() below —
+//      env DAILY_PREP_MAX_CANDIDATES, default 4, clamped to [1,
+//      DAILY_PREP_MAX_CANDIDATES_CEILING]) — no filling to the cap if fewer
+//      are eligible ("Ingen fylling", krav 11).
 //   5. Every outreach_ready row that did NOT make the final selection —
 //      whether skipped by step 3's dry-run or simply bumped past the step-4
 //      cap despite being eligible — is reported in `excluded`, each with a
@@ -12971,7 +12973,36 @@ function gardssalgDailyPrepWrongIndustry(
   return division === "03";
 }
 
-const DAILY_PREP_MAX_CANDIDATES = 4;
+const DAILY_PREP_MAX_CANDIDATES_DEFAULT = 4;
+const DAILY_PREP_MAX_CANDIDATES_CEILING = 10;
+
+/**
+ * DAILY_PREP_MAX_CANDIDATES env knob — same overall env-read-and-clamp shape
+ * as OUTREACH_COOLDOWN_DAYS / GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS above
+ * (Math.max(1, ...) floor, parseInt, a fallback for an unset var), plus an
+ * upper clamp to the named ceiling — but deliberately NOT the sibling knobs'
+ * literal `parseInt(...) || default` one-liner: for THIS knob, a `0`/empty/
+ * garbage value that was actually SET must clamp to the floor (1), never
+ * silently fall through to the default (4) the way it would for the
+ * siblings (their `|| default` only catches negative inputs via
+ * Math.max(1, ...); "0"/""/"abc" parse to a falsy 0/NaN and would resolve to
+ * their default instead) — a `0` cap would make the route silently propose
+ * nothing every day, reading like "the pool is empty" rather than a
+ * misconfiguration, so it must land on the same floor as an explicit
+ * negative value, not quietly on the default. The default only applies when
+ * the var is genuinely unset. A typo like "100" must not propose the whole
+ * pool as one day's batch, hence the ceiling clamp. Default stays 4 — this
+ * only delivers the lever, it does not pull it.
+ */
+function resolveDailyPrepMaxCandidates(): number {
+  const raw = process.env.DAILY_PREP_MAX_CANDIDATES;
+  if (raw === undefined) {
+    return DAILY_PREP_MAX_CANDIDATES_DEFAULT;
+  }
+  const parsed = parseInt(raw, 10);
+  const flooredAtOne = Math.max(1, Number.isFinite(parsed) ? parsed : 1);
+  return Math.min(flooredAtOne, DAILY_PREP_MAX_CANDIDATES_CEILING);
+}
 
 /**
  * Skive A (dev-request 2026-08-17-kontaktadresse-feilkilde-og-override):
@@ -13083,6 +13114,10 @@ export function computeGardssalgAddressBasis(
 
 router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
+  // Resolved exactly once per request, before the pool-exhausted early
+  // return below (which also reports it) so no two places in one response
+  // can disagree about which cap was in effect.
+  const dailyCap = resolveDailyPrepMaxCandidates();
 
   let rows: ReturnType<typeof computeGardssalgReadinessRows>;
   try {
@@ -13117,9 +13152,9 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       generated_at: generatedAt,
       candidates: [],
       excluded: [],
-      pool: { outreach_ready_total: 0, eligible_total: 0, selected: 0, excluded_total: 0 },
+      pool: { outreach_ready_total: 0, eligible_total: 0, selected: 0, excluded_total: 0, daily_cap: dailyCap },
       dry: true,
-      missing: { count: DAILY_PREP_MAX_CANDIDATES, reason: "pool_exhausted" },
+      missing: { count: dailyCap, reason: "pool_exhausted" },
       note: "No outreach_ready candidates exist right now — the pool is exhausted.",
       refill_hints: { needs_enrichment_count: needsEnrichmentCount },
       active_contact_email_overrides: activeContactEmailOverrides,
@@ -13279,8 +13314,8 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     afterDedup.push(e);
   }
 
-  const selected = afterDedup.slice(0, DAILY_PREP_MAX_CANDIDATES);
-  const overflow = afterDedup.slice(DAILY_PREP_MAX_CANDIDATES);
+  const selected = afterDedup.slice(0, dailyCap);
+  const overflow = afterDedup.slice(dailyCap);
 
   const candidates = selected.map((e) => {
     const readyRow = readyById.get(e.provider_id);
@@ -13355,12 +13390,12 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       name: o.navn ?? readyById.get(o.provider_id)?.name ?? null,
       // This route's OWN selection cap — not a preflight/pilot-send finding.
       // The row would_send just like the selected ones; it simply didn't
-      // fit in today's batch of DAILY_PREP_MAX_CANDIDATES.
+      // fit in today's batch of dailyCap (resolveDailyPrepMaxCandidates()).
       reason: "daily_cap_reached",
     });
   }
 
-  const missingCount = Math.max(0, DAILY_PREP_MAX_CANDIDATES - selected.length);
+  const missingCount = Math.max(0, dailyCap - selected.length);
   let missingReason: "all_excluded" | "fewer_than_cap" | null = null;
   let note: string | null = null;
   if (missingCount > 0) {
@@ -13369,7 +13404,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       note = `${readyRows.length} outreach_ready candidate(s) exist, but this route's checks (preflight/pilot-send dry-run, address/profile-text/industry) excluded all of them today.`;
     } else {
       missingReason = "fewer_than_cap";
-      note = `${missingCount} of ${DAILY_PREP_MAX_CANDIDATES} missing — only ${selected.length} eligible candidate(s) exist right now (never padded).`;
+      note = `${missingCount} of ${dailyCap} missing — only ${selected.length} eligible candidate(s) exist right now (never padded).`;
     }
   }
 
@@ -13403,6 +13438,7 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
       eligible_total: eligible.length,
       selected: selected.length,
       excluded_total: excluded.length,
+      daily_cap: dailyCap,
     },
     dry: afterDedup.length === 0,
     missing: { count: missingCount, reason: missingReason },
