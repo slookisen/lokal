@@ -38,6 +38,15 @@
  *   8. admin-knowledge.ts    POST /admin/prune-dead-urls?apply=1    (PHASE 4)
  *   9. admin-knowledge.ts    POST /admin/homepage-content-refresh?apply=1 (PH 5)
  *
+ * Section (D) covers PR review ROUND 2's two BLOCKING gaps — destructive or
+ * producer-content, both reachable by the offending routine:
+ *  10. marketplace.ts   DELETE /agents/:id  (SKILL dedup phase; cascades into
+ *                       agent_knowledge/agent_claims/listings/conversations —
+ *                       the worst damage class here, a delete is not undoable)
+ *  11. admin-agents.ts  DELETE /:id         (sibling bare `DELETE FROM agents`)
+ *  12. admin-agents.ts  POST /org-nr-backfill?apply=1 (agents.org_nr is
+ *                       producer content exactly like website/phone)
+ *
  * No outbound network: every "pause inactive" fixture is deliberately shaped so
  * the handler's own pre-fetch guards short-circuit before any fetch() — an
  * agent with neither agent_knowledge.website nor agents.url yields `no_data` /
@@ -115,7 +124,7 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
 
   // ── req/res harness — the real handler pulled off the router's own stack,
   // invoked directly (same convention as marketplace-quarantine-gates.test.ts).
-  function findRouteHandler(router: any, path: string, method: "get" | "post"): Function {
+  function findRouteHandler(router: any, path: string, method: "get" | "post" | "delete"): Function {
     const layer = (router.stack as any[]).find(
       (l: any) => l.route && l.route.path === path && l.route.methods?.[method],
     );
@@ -217,6 +226,7 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
       "./marketplace",
       "./admin-rfb-website-discovery",
       "./admin-knowledge",
+      "./admin-agents",
       "../services/marketplace-registry",
     ]) {
       try {
@@ -229,6 +239,7 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
     const rfbWdMod = require("./admin-rfb-website-discovery") as
       typeof import("./admin-rfb-website-discovery");
     const knowledgeMod = require("./admin-knowledge") as typeof import("./admin-knowledge");
+    const adminAgentsMod = require("./admin-agents") as typeof import("./admin-agents");
     const { marketplaceRegistry } = require("../services/marketplace-registry") as
       typeof import("../services/marketplace-registry");
     marketplaceRegistry._agentsCache = null;
@@ -277,6 +288,14 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
     assertTrue(!!prunePost, "shp-06: POST /admin/prune-dead-urls handler found");
     assertTrue(!!hcrPost, "shp-07: POST /admin/homepage-content-refresh handler found");
 
+    // ── Round-3 surfaces (PR review round 2's two BLOCKING gaps) ───────────
+    const marketplaceDelete = findRouteHandler(marketplaceRouter, "/agents/:id", "delete");
+    const adminAgentsDelete = findRouteHandler((adminAgentsMod as any).default, "/:id", "delete");
+    const orgNrBackfillPost = findRouteHandler((adminAgentsMod as any).default, "/org-nr-backfill", "post");
+    assertTrue(!!marketplaceDelete, "shp-08: DELETE /api/marketplace/agents/:id handler found");
+    assertTrue(!!adminAgentsDelete, "shp-08b: DELETE /admin/agents/:id handler found");
+    assertTrue(!!orgNrBackfillPost, "shp-09: POST /admin/agents/org-nr-backfill handler found");
+
     // ── Fixtures ───────────────────────────────────────────────────────────
     // RFB agent: junk website (prune bait), blank knowledge.website for the
     // website-approve lever, NO agents.url so nothing ever tries to fetch.
@@ -313,6 +332,14 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
            VALUES (?, NULL, '{}', '{}', datetime('now'))`,
       )
       .run("shp-dental");
+
+    // Round-3 fixtures: one agent per (delete surface × mode), since a
+    // successful delete consumes its own fixture. All four are history-free RFB
+    // producers — what admin-agents.ts's own history guard requires — so a 423
+    // there is unambiguously the pause gate and not that guard.
+    for (const id of ["shp-del-mkt-paused", "shp-del-mkt-open", "shp-del-adm-paused", "shp-del-adm-open"]) {
+      insertAgent.run(id, `Slett Meg ${id}`, `post@${id}.example`, `key-${id}`, "rfb");
+    }
 
     // Queue row the website-approve lever reads (the table is created lazily by
     // the route itself; create it here so we can seed before the first call).
@@ -363,14 +390,28 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
     }
     const PAUSE_REASON = "verifier: skrivepause under opprydding";
 
-    /** Every 423 body must be the SAME shape, built by the same code. */
-    function assertPausedBody(body: any, prefix: string): void {
+    /**
+     * Every 423 body must be the SAME shape, built by the same code. The one
+     * documented difference: on the PUBLIC route the operator free-text
+     * `reason` is nulled (round-2 LOW) — that endpoint is unauthenticated, and
+     * its own blocklist gate states the convention "quietly reject without
+     * leaking why". Everything else is identical, so the caller still learns
+     * it is paused and should retry.
+     */
+    function assertPausedBody(body: any, prefix: string, publicCaller = false): void {
       assertEq(body?.paused, true, `${prefix}: … paused:true`);
       assertEq(body?.vertical, "rfb", `${prefix}: … vertical resolved to rfb`);
-      assertEq(body?.reason, PAUSE_REASON, `${prefix}: … the stored reason is surfaced verbatim`);
+      assertEq(
+        body?.reason,
+        publicCaller ? null : PAUSE_REASON,
+        publicCaller
+          ? `${prefix}: … the operator reason is NOT leaked to an unauthenticated caller`
+          : `${prefix}: … the stored reason is surfaced verbatim`,
+      );
       assertTrue(typeof body?.triggered_at === "string", `${prefix}: … triggered_at surfaced`);
       assertEq(body?.fail_closed, false, `${prefix}: … flagged a real pause, not a lookup failure`);
     }
+    const assertPublicPausedBody = (body: any, prefix: string) => assertPausedBody(body, prefix, true);
 
     let seq = 0;
     function adminRegisterBody(): any {
@@ -405,7 +446,7 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
 
     r = await invokeHandler(publicRegisterPost, makeReq({ body: publicRegisterBody() }));
     assertEq(r.status, 423, "shp-12: paused PUBLIC POST /api/marketplace/register -> 423 (it creates a real rfb row too)");
-    assertPausedBody(r.body, "shp-13");
+    assertPublicPausedBody(r.body, "shp-13");
 
     r = await invokeHandler(
       provenanceBatchPost,
@@ -699,6 +740,137 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
     const g2 = svc.assertEnrichmentWriteAllowedForAgents(throwingThunk as any, ["shp-rfb"]);
     assertEq(g2.allowed, false, "shp-97: the batch guard fails closed on a throwing thunk too");
     assertEq((g2 as any).fail_closed, true, "shp-98: … also flagged fail_closed");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (D) ROUND-3 surfaces — the two BLOCKING gaps from PR review round 2
+    // ═══════════════════════════════════════════════════════════════════════
+    // D1 DELETE /api/marketplace/agents/:id, D2 DELETE /admin/agents/:id,
+    // D3 POST /admin/agents/org-nr-backfill?apply=1. No outbound network: the
+    // deletes make none, and the org-nr route's ONE network seam is stubbed to
+    // throw (its own per-agent try/catch buckets that as an `errors[]` entry,
+    // so the handler still completes normally) for the one call past a gate.
+    const orgNrFetchStub: any = async () => {
+      throw new Error("no network in this suite");
+    };
+    adminAgentsMod.__setAgentsOrgNrBackfillFetchForTesting(orgNrFetchStub);
+
+    function agentExists(id: string): boolean {
+      return !!testDb.prepare("SELECT 1 FROM agents WHERE id = ?").get(id);
+    }
+    function orgNrOf(id: string): string | null {
+      const row = testDb.prepare("SELECT org_nr FROM agents WHERE id = ?").get(id) as
+        | { org_nr: string | null }
+        | undefined;
+      return row ? row.org_nr : null;
+    }
+
+    setPause(true);
+    const d1Changes = totalChanges();
+    const d1Agents = agentCount();
+
+    r = await invokeHandler(marketplaceDelete, {
+      ...makeReq({ body: { skipBlocklist: true } }),
+      params: { id: "shp-del-mkt-paused" },
+    });
+    assertEq(
+      r.status,
+      423,
+      "shp-100: paused DELETE /api/marketplace/agents/:id -> 423 (the enrichment SKILL's own dedup call — a cascaded delete is the worst damage class here)",
+    );
+    assertPausedBody(r.body, "shp-101");
+    assertTrue(agentExists("shp-del-mkt-paused"), "shp-102: … and the agent row is still there");
+
+    r = await invokeHandler(adminAgentsDelete, {
+      ...makeReq({ body: {} }),
+      params: { id: "shp-del-adm-paused" },
+    });
+    assertEq(r.status, 423, "shp-103: paused DELETE /admin/agents/:id -> 423 (the sibling bare DELETE FROM agents)");
+    assertPausedBody(r.body, "shp-104");
+    assertTrue(agentExists("shp-del-adm-paused"), "shp-105: … and that agent row is still there too");
+
+    r = await invokeHandler(
+      orgNrBackfillPost,
+      makeReq({ query: { apply: "1" }, body: { agentIds: ["shp-rfb"] } }),
+    );
+    assertEq(r.status, 423, "shp-106: paused POST /admin/agents/org-nr-backfill?apply=1 -> 423 (org_nr is producer content)");
+    assertPausedBody(r.body, "shp-107");
+    assertEq(orgNrOf("shp-rfb"), null, "shp-108: … and no org_nr was written");
+
+    assertEq(
+      totalChanges() - d1Changes,
+      0,
+      "shp-109: the three round-3 rejections changed ZERO rows (SQLite total_changes()) — nothing deleted, nothing written",
+    );
+    assertEq(agentCount(), d1Agents, "shp-110: … and the agents table has exactly as many rows as before");
+
+    // The org-nr DRY RUN stays reachable during a pause — same documented
+    // policy as prune-dead-urls / homepage-content-refresh.
+    r = await invokeHandler(orgNrBackfillPost, makeReq({ body: { agentIds: ["shp-rfb"] } }));
+    assertEq(r.status, 200, "shp-111: an org-nr-backfill DRY RUN is still allowed during a pause");
+    assertEq(r.body?.dry_run, true, "shp-112: … and reports dry_run:true");
+    assertEq(orgNrOf("shp-rfb"), null, "shp-113: … having written no org_nr");
+
+    // The PUBLIC 423 redacts `reason`; the ADMIN ones deliberately do not.
+    r = await invokeHandler(publicRegisterPost, makeReq({ body: publicRegisterBody() }));
+    assertEq(r.status, 423, "shp-114: paused PUBLIC register still answers 423");
+    assertPublicPausedBody(r.body, "shp-115");
+    r = await invokeHandler(adminRegisterPost, makeReq({ body: adminRegisterBody() }));
+    assertEq(r.status, 423, "shp-116: paused ADMIN register still answers 423");
+    assertEq(
+      r.body?.reason,
+      PAUSE_REASON,
+      "shp-117: … and an ADMIN caller still gets the full reason — the redaction is public-only",
+    );
+
+    // ── Unpaused: byte-identical behaviour to before these three gates ─────
+    setPause(false);
+
+    r = await invokeHandler(marketplaceDelete, {
+      ...makeReq({ body: { skipBlocklist: true } }),
+      params: { id: "shp-del-mkt-open" },
+    });
+    assertEq(r.status, 200, "shp-120: unpaused DELETE /api/marketplace/agents/:id -> 200 as before");
+    assertEq(r.body?.success, true, "shp-121: … usual response shape");
+    assertTrue(!agentExists("shp-del-mkt-open"), "shp-122: … and the agent really was deleted");
+
+    r = await invokeHandler(adminAgentsDelete, {
+      ...makeReq({ body: {} }),
+      params: { id: "shp-del-adm-open" },
+    });
+    assertEq(r.status, 200, "shp-123: unpaused DELETE /admin/agents/:id -> 200 as before");
+    assertEq(r.body?.success, true, "shp-124: … usual response shape");
+    assertTrue(!agentExists("shp-del-adm-open"), "shp-125: … and that agent really was deleted");
+
+    // Dental-only apply run: the RFB-scoped target lookup yields no targets, so
+    // this is a real 200 through the handler with no network — proof the gate
+    // is not what answers when nothing is paused.
+    r = await invokeHandler(
+      orgNrBackfillPost,
+      makeReq({ query: { apply: "1" }, body: { agentIds: ["shp-dental"] } }),
+    );
+    assertEq(r.status, 200, "shp-126: unpaused POST /admin/agents/org-nr-backfill?apply=1 -> 200 as before");
+    assertEq(r.body?.dry_run, false, "shp-127: … dry_run:false");
+    assertTrue(r.body?.paused === undefined, "shp-128: … and carries no paused marker");
+
+    // A paused DELETE must also fail CLOSED when the lookup itself cannot
+    // answer — the destructive surfaces get the same treatment as the rest.
+    __setDbForTesting(throwingDb);
+    r = await invokeHandler(marketplaceDelete, {
+      ...makeReq({ body: { skipBlocklist: true } }),
+      params: { id: "shp-del-mkt-paused" },
+    });
+    assertEq(r.status, 423, "shp-130: DELETE /api/marketplace/agents/:id fails CLOSED on a throwing lookup");
+    assertEq(r.body?.fail_closed, true, "shp-131: … and says fail_closed:true rather than dying as a 500");
+    r = await invokeHandler(adminAgentsDelete, { ...makeReq({ body: {} }), params: { id: "shp-del-adm-paused" } });
+    assertEq(r.status, 423, "shp-132: DELETE /admin/agents/:id fails CLOSED too");
+    assertEq(r.body?.fail_closed, true, "shp-133: … also flagged fail_closed");
+    __setDbForTesting(testDb as any);
+    assertTrue(
+      agentExists("shp-del-mkt-paused") && agentExists("shp-del-adm-paused"),
+      "shp-134: … and neither agent was deleted while failing closed",
+    );
+
+    adminAgentsMod.__setAgentsOrgNrBackfillFetchForTesting();
   } catch (err: any) {
     failed++;
     failures.push(`✗ shp-fatal: unexpected error: ${String(err?.stack ?? err?.message ?? err)}`);
@@ -711,6 +883,14 @@ export async function runEnrichmentWritePauseSharedPrimitivesTests(
     else process.env.GOOGLE_PLACES_API_KEY = prevPlacesKey;
     if (prevBrregFlag === undefined) delete process.env.BRREG_VERIFY_ON_REGISTER;
     else process.env.BRREG_VERIFY_ON_REGISTER = prevBrregFlag;
+    // Restore the org-nr backfill's network seam even if section (D) threw
+    // first — a stubbed fetch leaking into a later suite is exactly the
+    // shared-mutable class tests/test.ts's own header warns about.
+    try {
+      (require("./admin-agents") as typeof import("./admin-agents")).__setAgentsOrgNrBackfillFetchForTesting();
+    } catch {
+      /* ignore */
+    }
     try {
       __setDbForTesting((prevDb ?? null) as any);
     } catch {

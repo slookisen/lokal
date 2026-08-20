@@ -40,7 +40,9 @@ import {
   enrichmentWritePauseBlock,
   enrichmentWritePauseBlockForAgents,
   normalizeEnrichmentVertical,
+  publicEnrichmentWritePausedBody,
   sendEnrichmentWritePausedIfPaused,
+  sendPublicEnrichmentWritePausedIfPaused,
 } from "../services/enrichment-write-pause";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
@@ -432,10 +434,16 @@ router.post("/register", (req: Request, res: Response) => {
     // is inside marketplaceRegistry.register(); this is the same check run
     // FIRST so a paused request costs no blocklist lookup and answers with the
     // shared 423 body instead of falling through the generic catch.
+    //
+    // PUBLIC route ⇒ publicEnrichmentWritePausedBody nulls the operator
+    // free-text `reason`: anyone on the internet can call this, and the very
+    // next gate below states the convention — "quietly reject without leaking
+    // why". Status, `paused` and `fail_closed` still say "retry later". The
+    // ADMIN routes keep the full reason (round-2 LOW finding).
     {
       const pauseBlock = enrichmentWritePauseBlock(getDb, DEFAULT_ENRICHMENT_VERTICAL);
       if (pauseBlock) {
-        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(publicEnrichmentWritePausedBody(pauseBlock));
         return;
       }
     }
@@ -489,8 +497,10 @@ router.post("/register", (req: Request, res: Response) => {
     });
   } catch (error: any) {
     // A pause that went live between the gate above and the INSERT still ends
-    // as a 423, never a 500 — the primitive's own gate is what caught it.
-    if (sendEnrichmentWritePausedIfPaused(error, res)) return;
+    // as a 423, never a 500 — the primitive's own gate is what caught it. The
+    // PUBLIC variant, so this late path redacts `reason` exactly like the gate
+    // above does; both exits of this route must leak the same amount.
+    if (sendPublicEnrichmentWritePausedIfPaused(error, res)) return;
     if (error.name === "ZodError") {
       res.status(400).json({
         success: false,
@@ -2758,6 +2768,27 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
     if (!adminKey || adminKey !== expectedKey) {
       res.status(403).json({ error: "Krever X-Admin-Key header" });
       return;
+    }
+
+    // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+    // pause-mekanisk-gjerde; PR review round 2, highest-severity remaining gap)
+    // ─────────────────────────────────────────────────────────────────────────
+    // `lokal-agent-enrichment`'s SKILL calls THIS endpoint directly in its dedup
+    // phase (`curl -X DELETE "$BASE/api/marketplace/agents/{DUPLICATE_ID}"`). A
+    // pause is set precisely when that routine is misbehaving — e.g.
+    // misidentifying agents — and a delete here cascades into agent_knowledge,
+    // agent_claims, listings and conversations: a strictly WORSE damage class
+    // than the incident this dev-request was filed over, since a wrong website
+    // or phone is overwritable and a cascaded delete is not. Same helper, same
+    // 423 body, same `agents.vertical_id` resolution as every other gated
+    // surface, placed before the row is even read so a rejection touches
+    // nothing. `getDb` as a thunk (finding 3) ⇒ fails CLOSED.
+    {
+      const pauseBlock = enrichmentWritePauseBlockForAgents(getDb, [agentId]);
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
     }
 
     const db = getDb();

@@ -86,8 +86,6 @@ class MarketplaceRegistry {
       isVetted?: boolean;
     },
   ): RegisteredAgent {
-    const db = getDb();
-
     // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
     // pause-mekanisk-gjerde; PR review finding 1) ───────────────────────────
     // The gate lives HERE, on the shared primitive, not only on the routes.
@@ -106,11 +104,18 @@ class MarketplaceRegistry {
     // than escaping a live pause) and its absence resolves to that default.
     // Throws rather than returning, so a caller cannot ignore it; every HTTP
     // caller catches it and re-emits the shared 423 body.
+    //
+    // `getDb` (the THUNK), not `getDb()`, and the gate runs BEFORE the handle
+    // is resolved at all: resolving first put a throwing getDb() outside the
+    // guard's try, so it escaped as a bare 500 and the fail_closed:true signal
+    // was lost. Last call site in the branch still doing that (round-2 LOW,
+    // same shape as PR review finding 3).
     assertEnrichmentWriteAllowedOrThrow(
-      db,
+      getDb,
       normalizeEnrichmentVertical((registration as { vertical_id?: unknown }).vertical_id),
     );
 
+    const db = getDb();
     const id = uuid();
     const apiKey = this.generateApiKey();
     const now = new Date().toISOString();

@@ -32,6 +32,7 @@ import { getDb } from "../database/init";
 import {
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
   enrichmentWritePauseBlock,
+  enrichmentWritePauseBlockForAgents,
   normalizeEnrichmentVertical,
 } from "../services/enrichment-write-pause";
 import { slugify } from "../utils/slug";
@@ -694,6 +695,24 @@ router.delete("/:id", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   const { id } = req.params;
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review round 2) ────────────────────────────────
+  // Sibling of DELETE /api/marketplace/agents/:id, gated for the same reason:
+  // it runs a bare `DELETE FROM agents` below rather than going through an
+  // already-gated primitive. Narrower than that sibling — the history guard
+  // refuses any agent with agent_knowledge/listings/agent_claims/conversations
+  // rows, so only a brand-new agent can be deleted here — but "narrower" is not
+  // "impossible", and a delete while the fleet is known to be misidentifying
+  // agents is exactly what this fence is for. Runs before the row is read, so a
+  // rejection touches nothing; `getDb` as a thunk ⇒ fails CLOSED.
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(getDb, [typeof id === "string" ? id : ""]);
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   try {
     const db = getDb();
@@ -1731,6 +1750,33 @@ router.post("/org-nr-backfill", async (req: Request, res: Response) => {
         .filter((t): t is AgentOrgNrBackfillTargetRow => t !== null);
     } else {
       targets = fetchAgentsOrgNrBackfillBatch(db, limit);
+    }
+
+    // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+    // pause-mekanisk-gjerde; PR review round 2) ─────────────────────────────
+    // The apply path writes `agents.org_nr` (applyAgentOrgNr above) plus its
+    // audit row and the org_nr field_provenance. org_nr is PRODUCER CONTENT in
+    // exactly the sense website and phone are: a wrong one written to an
+    // out-of-scope agent during a pause is the same damage class as the
+    // 2026-08-20 incident — and worse to unpick, since the write is fill-only,
+    // so the route will never correct itself on a later run.
+    //
+    // APPLY branch only, mirroring prune-dead-urls / homepage-content-refresh
+    // here: the dry run writes no agents row and stays reachable so an operator
+    // can still measure. Placed AFTER target selection (so the gate judges the
+    // verticals about to be written) and BEFORE the loop — everything above is
+    // pure SELECT and the review-queue upserts live inside the loop, so a
+    // rejected apply run changes ZERO rows and makes zero Brreg calls.
+    // Per-REQUEST; `getDb` as a thunk (finding 3) ⇒ fails CLOSED.
+    if (apply) {
+      const pauseBlock = enrichmentWritePauseBlockForAgents(
+        getDb,
+        targets.map((t) => t.id),
+      );
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
     }
 
     let scanned = 0;

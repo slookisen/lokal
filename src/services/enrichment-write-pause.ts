@@ -36,6 +36,24 @@
 // itself (setEnrichmentWritePause below), not merely by convention: enabling
 // demands a `reason`, and clearing demands an explicit `cleared_by`. A clear
 // with no `cleared_by` is REJECTED, never silently attributed to "system".
+//
+// ── Deliberate exemption: POST /admin/run-verifier ─────────────────────────
+// NOT gated, and the reason matters because a plausible-sounding WRONG one
+// exists. It is not a deadlock risk: the verifier never touches
+// `enrichment_write_pause` at all (the pause is set/cleared through the
+// separate POST /admin/enrichment-write-pause), so gating it could not lock a
+// lever it never reads. The real reason is WHAT it writes —
+// agent_knowledge.verification_status, ASSESSMENT data, not producer CONTENT
+// (website/phone/org_nr). This fence stops wrong producer content landing
+// during a pause; verifier output is how an operator SEES which rows are
+// wrong, so freezing it would blind them in exactly the window they need
+// visibility, for no gain to what this protects.
+//
+// ── Disclosed, out-of-scope gaps (PR review round 2) ───────────────────────
+// Still ungated, documented rather than proven unreachable: /admin/deduplicate,
+// /admin/recalculate-trust, /admin/geocode-batch, /admin/postal-backfill,
+// /admin/curated-fields, and knowledgeService.upsertKnowledge / bulkEnrich as
+// bare primitives (their HTTP callers ARE gated). Follow-up work.
 import type Database from "better-sqlite3";
 
 export type EnrichmentVertical = "rfb" | "dental" | "experiences";
@@ -516,5 +534,33 @@ export function sendEnrichmentWritePausedIfPaused(
 ): boolean {
   if (!isEnrichmentWritePausedError(err)) return false;
   res.status(err.status).json(err.body);
+  return true;
+}
+
+// ─── Public-caller variants (reason redacted) ──────────────────────────────
+//
+// PR review round 2, LOW finding. `reason` is operator free-text naming the
+// incident and often the routine or an agent — right for an admin-key caller,
+// wrong for an UNAUTHENTICATED one. routes/marketplace.ts's public POST
+// /register states the convention two lines under its own gate: "Blocklist gate
+// — quietly reject without leaking why". So the public route keeps the same
+// status, field set and `paused`/`fail_closed` signals with the free-text
+// nulled; `triggered_at` stays, a timestamp carries no incident detail. Admin
+// routes keep the full body — there the reason IS the useful part.
+
+/** The same 423 body with the operator free-text `reason` removed. */
+export function publicEnrichmentWritePausedBody(
+  body: EnrichmentWritePausedBody,
+): EnrichmentWritePausedBody {
+  return { ...body, reason: null };
+}
+
+/** `sendEnrichmentWritePausedIfPaused` for an UNAUTHENTICATED caller. */
+export function sendPublicEnrichmentWritePausedIfPaused(
+  err: unknown,
+  res: { status(code: number): { json(body: unknown): unknown } },
+): boolean {
+  if (!isEnrichmentWritePausedError(err)) return false;
+  res.status(err.status).json(publicEnrichmentWritePausedBody(err.body));
   return true;
 }
