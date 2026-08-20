@@ -7793,6 +7793,23 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   };
   const ldScript = `<script type="application/ld+json">${JSON.stringify(breadcrumbLd).replace(/<\//g, "<\\/")}</script>`;
 
+  // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
+  // 3 (delt header/footer), /sok sub-slice: this page adopts the shared S1
+  // chrome (oaSiteNav()/oaSiteFooter()/OA_CHROME_CSS — hamburger nav + full
+  // footer incl. «For tilbydere») instead of the legacy slim
+  // BROWSE_NAV/browseFooter(), exactly like the 404 catch-all below and the
+  // renderBrowsePage() callers. Same "no matching OaNavActive item" precedent
+  // as /tilbyder/:providerSlugOrId, the 404 page and /kontakt: /sok is not one
+  // of the five nav destinations, so oaSiteNav() is called with no `active`
+  // and nothing in the nav is marked aria-current (the breadcrumb's own
+  // `<span aria-current="page">Søk</span>` is unrelated and untouched).
+  // OA_CHROME_CSS is appended AFTER BROWSE_CSS (whose slimmer .nav-inner/
+  // .nav-links rules it deliberately overrides) — BROWSE_CSS itself is shared
+  // with /reise and every renderBrowsePage() caller and is NOT modified here;
+  // its :root{} block already defines all 14 custom properties OA_CHROME_CSS
+  // reads (--ink, --line, --maxw, --surface, …), so no extra token block is
+  // needed on this page. Pure chrome swap: the search form, «Nær meg» box and
+  // all geo/route-intent logic below are byte-identical.
   const html = `<!doctype html>
 <html lang="nb">
 <head>
@@ -7811,10 +7828,11 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
 <meta property="og:locale" content="nb_NO">
 <meta property="og:site_name" content="Opplevagent">
 ${ldScript}
-<style>${BROWSE_CSS}</style>
+<style>${BROWSE_CSS}${OA_CHROME_CSS}</style>
 </head>
 <body>
-${BROWSE_NAV}
+<a class="skip-link" href="#main">Hopp til innhold</a>
+${oaSiteNav({})}
 <main id="main" class="container">
   <nav class="breadcrumb" aria-label="Brødsmuler"><a href="/">Forsiden</a><span class="sep">/</span><span aria-current="page">Søk</span></nav>
   <header class="head">
@@ -7829,7 +7847,7 @@ ${BROWSE_NAV}
   ${producerSection}
   ${cards}
 </main>
-${browseFooter()}
+${oaSiteFooter({})}
 </body>
 </html>`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");

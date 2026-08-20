@@ -60,6 +60,18 @@
  *       contact form itself (id="contact-form", the honeypot field, every
  *       input, and the Turnstile widget) stays byte-identical to before the
  *       chrome swap.
+ *   (m) dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
+ *       arbeidspunkt 3, /sok sub-slice (the last page type still wearing the
+ *       legacy BROWSE_NAV/browseFooter() chrome apart from /reise): GET /sok
+ *       is migrated to oaSiteNav()/oaSiteFooter()/OA_CHROME_CSS too — same
+ *       4-marker probe (hamburger toggle + full footer + llms.txt +
+ *       personvern) — with no `active` passed to oaSiteNav() (/sok is not one
+ *       of the five OaNavActive destinations), so NOTHING inside the site nav
+ *       carries aria-current="page". Unlike (l) the page-wide variant of that
+ *       check does not apply here: /sok's breadcrumb legitimately carries its
+ *       own `<span aria-current="page">Søk</span>`, so the assertion is scoped
+ *       to the <header class="site-nav"> block. The search form, the «Nær meg»
+ *       geolocation box and their inline JS must survive the swap untouched.
  *
  * Same synthetic-req/res harness + in-memory-DB pattern as
  * experiences-seo-sok-gardssalg.test.ts.
@@ -125,6 +137,15 @@ function navLinkHrefs(body: string): string[] {
     if (href) hrefs.push(href[1]);
   }
   return hrefs.sort();
+}
+
+// The whole shared-chrome header (oaSiteNav()'s <header class="site-nav">…
+// </header>). Used by (m) to scope the "nothing is aria-current" check to the
+// site nav — /sok's breadcrumb legitimately marks its own current crumb, so
+// the page-wide check (l) uses for /kontakt would be a false positive here.
+function siteNavBlock(body: string): string {
+  const m = body.match(/<header class="site-nav">[\s\S]*?<\/header>/);
+  return m ? m[0] : "";
 }
 
 // One published experience (+ its verified provider) in the given
@@ -394,6 +415,72 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
       assertTrue(kontakt.body.includes('class="cf-turnstile"') && kontakt.body.includes('data-sitekey="0x4AAAAAADr56qDaUM0XWoTF"'), "l14: Turnstile widget intact");
       assertTrue(kontakt.body.includes('src="https://challenges.cloudflare.com/turnstile/v0/api.js"'), "l15: Turnstile script tag intact");
       assertTrue(kontakt.body.includes("fetch('/api/contact'"), "l16: submit script's fetch('/api/contact') call intact");
+
+      // ── (m) /sok — the last page type off the legacy BROWSE_NAV/
+      //     browseFooter() chrome (apart from /reise). Same 4-marker probe as
+      //     (i)/(k)/(l), plus: the legacy slim nav/footer MARKUP is gone, the
+      //     site nav carries no aria-current (no OaNavActive item for /sok —
+      //     but the breadcrumb keeps its own, hence the scoped check), and the
+      //     search form + «Nær meg» geolocation box + their inline JS survive
+      //     the swap untouched (a pure chrome swap must not eat the form). ──
+      const sok = await callHtmlRoute(seoRouter, "/sok");
+      assertTrue(sok.handled && sok.status === 200, `m1: GET /sok renders 200 (got ${sok.status})`);
+      assertTrue(sok.body.includes('id="oa-nav-toggle"'), "m2: sok page has the #oa-nav-toggle hamburger checkbox");
+      assertTrue(sok.body.includes('class="nav-burger"'), "m3: sok page has the .nav-burger label");
+      assertTrue(sok.body.includes('class="site-footer"'), "m4: sok page has the full .site-footer (not the old slim browseFooter())");
+      assertTrue(sok.body.includes('href="/llms.txt"'), "m5: sok footer links llms.txt");
+      assertTrue(sok.body.includes('href="/personvern"'), "m6: sok footer links /personvern");
+      assertTrue(sok.body.includes('href="/.well-known/agent-card.json"'), "m7: sok footer links agent-card.json");
+      assertTrue(sok.body.includes('class="brand-word"'), "m8: sok page renders the shared brand mark (brand-word)");
+      assertTrue(sok.body.includes('href="/for-tilbydere"'), "m9: sok chrome carries the «For tilbydere» link (proves the shared partials, not BROWSE_NAV)");
+      // The legacy chrome's MARKUP must be gone. (Its CSS rules still live in
+      // the shared BROWSE_CSS — /reise is still on the old chrome — so the
+      // assertions below pin the emitted tags, not the class names.)
+      assertTrue(!sok.body.includes('<nav class="site-nav">'), "m10: the legacy BROWSE_NAV <nav class=\"site-nav\"> markup is gone");
+      assertTrue(!sok.body.includes('<footer class="site-foot">'), "m11: the legacy browseFooter() <footer class=\"site-foot\"> markup is gone");
+      assertTrue(sok.body.includes('<a class="skip-link" href="#main">'), "m12: the skip-link BROWSE_NAV used to carry is preserved by the migration");
+      // No OaNavActive item for /sok → oaSiteNav({}) marks nothing current.
+      // Scoped to the nav: the breadcrumb's own current crumb stays valid.
+      const sokNav = siteNavBlock(sok.body);
+      assertTrue(sokNav.length > 0, "m13: sok page renders the shared <header class=\"site-nav\"> block");
+      assertTrue(!/aria-current="page"/.test(sokNav), "m14: sok has no matching OaNavActive item — oaSiteNav({}) marks nothing in the nav aria-current");
+      assertTrue(
+        sok.body.includes('<span aria-current="page">Søk</span>'),
+        "m15: the breadcrumb's own aria-current crumb is untouched by the chrome swap"
+      );
+      assertTrue(sok.body.includes("--ink:#18130d"), "m16: sok's :root (via BROWSE_CSS) defines --ink (OA_CHROME_CSS's .brand-word/.nav-burger span rely on var(--ink))");
+      assertTrue(sok.body.includes("#oa-nav-toggle:checked~.nav-links"), "m17: OA_CHROME_CSS is in the <style> block (the :checked reveal rule is present)");
+      // Search form intact — the whole point of the page.
+      assertTrue(
+        sok.body.includes('<form action="/sok" method="GET" role="search" aria-label="Søk i opplevelser">'),
+        "m18: the search form markup is intact"
+      );
+      assertTrue(sok.body.includes('class="searchbar"'), "m19: the .searchbar wrapper is intact");
+      assertTrue(
+        sok.body.includes('id="sok-q"') && sok.body.includes('name="q"') && sok.body.includes('<button type="submit">Søk</button>'),
+        "m20: the search input (id=\"sok-q\", name=\"q\") + submit button are intact"
+      );
+      // «Nær meg» geolocation box + its progressive-enhancement JS intact.
+      assertTrue(sok.body.includes('id="geoBtn"') && sok.body.includes('class="geo-btn"'), "m21: the «Nær meg» geo button is intact");
+      assertTrue(
+        sok.body.includes('class="place-fallback"') && sok.body.includes('id="sok-sted"') && sok.body.includes('name="sted"'),
+        "m22: the no-JS typed-place fallback form (?sted=) is intact"
+      );
+      assertTrue(sok.body.includes("navigator.geolocation.getCurrentPosition"), "m23: the geolocation JS is intact");
+      assertTrue(sok.body.includes("'geolocation' in navigator"), "m24: the geolocation feature-detect guard is intact");
+      assertTrue(
+        sok.body.includes("params.set('lat'") && sok.body.includes("params.set('lng'") && sok.body.includes("window.location.href = '/sok?' + params.toString();"),
+        "m25: the geo JS still re-submits lat/lng back to /sok"
+      );
+      // A real query still renders the same chrome (the handler has several
+      // render branches — hasQuery/empty-state — all share this one template).
+      const sokQ = await callHtmlRoute(seoRouter, "/sok?q=fjellvandring");
+      assertTrue(sokQ.handled && sokQ.status === 200, `m26: GET /sok?q=… renders 200 (got ${sokQ.status})`);
+      assertTrue(
+        sokQ.body.includes('id="oa-nav-toggle"') && sokQ.body.includes('class="site-footer"'),
+        "m27: a /sok query render wears the same shared chrome as the empty one"
+      );
+      assertTrue(!siteNavBlock(sokQ.body).includes('aria-current="page"'), "m28: the query render's nav is likewise never aria-current");
     } catch (err: any) {
       failed++;
       failures.push("experiences-seo-site-chrome: unexpected error: " + String(err?.stack || err?.message || err));
