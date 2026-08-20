@@ -37761,6 +37761,30 @@ runSerial(async () => {
   }
 });
 
+// GET /admin/agents/duplicate-slugs — READ-ONLY slug-collision detector that
+// feeds the duplicate-merge lever above (which by design never detects
+// duplicates itself). Groups active `agents` rows by slugify(name) in JS
+// (SQLite cannot reproduce the æ/ø/å transliteration), reports
+// sitemap_affected + the scan-order-dependent currently_served_id, and
+// suggests — never executes — a survivor. Own in-memory DB via its own seam
+// (same discipline as the two blocks above: never pins the shared getDb()
+// singleton); one of its tests asserts full write-freedom.
+runSerial(async () => {
+  console.log("\n── admin-agents-duplicate-slugs: read-only slug-collision detector ──");
+  try {
+    const { runAdminAgentsDuplicateSlugsTests } = require("../src/routes/admin-agents-duplicate-slugs.test") as
+      typeof import("../src/routes/admin-agents-duplicate-slugs.test");
+    const dsl = await runAdminAgentsDuplicateSlugsTests({ log: false });
+    passed += dsl.passed;
+    failed += dsl.failed;
+    for (const f of dsl.failures) failures.push("duplicate-slugs: " + f);
+    console.log(`  duplicate-slugs: ${dsl.passed} passed, ${dsl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("duplicate-slugs: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // POST /admin/agents/contact-email-dns-check — diagnostic-only DNS-liveness
 // stamp on agent_knowledge.field_provenance.contact_email_dns_check. Detects
 // (never gates on, never writes contact_email/email, never touches
