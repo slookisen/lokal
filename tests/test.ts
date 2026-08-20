@@ -30979,6 +30979,27 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     console.log(`  opplevelser-gardssalg-set-contact-phone: ${gscp.passed} passed, ${gscp.failed} failed`);
 
     // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep
+    // 2b: the CONTENT-field counterpart to the two contact endpoints above.
+    // Gap covered: the fill-only gardssalg-content-refresh route generates its
+    // own candidate from a homepage fetch and cannot carry LLM-authored or
+    // human-corrected text at all (measured 0/12 enriched on the drinks
+    // cohort), so a known-correct about_text/visit_text/opening_hours_text had
+    // no write path onto the row. Unlike the contact endpoints this one has
+    // TWO gates — the per-field owner lock and the shared objective-defect
+    // classifier — so this suite proves both fail CLOSED (no column change, no
+    // audit row), plus the rollback round-trip through the EXISTING rollback
+    // lever. Same in-memory-DB pattern, runs sequentially inside this same
+    // gated block.
+    console.log("\n── opplevelser-gardssalg-set-content-field: caller-supplied content write (Grep 2b) ──");
+    const { runOpplevelserGardssalgSetContentFieldTests } = require("../src/routes/opplevelser-gardssalg-set-content-field.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-content-field.test");
+    const gscf = await runOpplevelserGardssalgSetContentFieldTests({ log: false });
+    passed += gscf.passed;
+    failed += gscf.failed;
+    for (const f of gscf.failures) failures.push("opplevelser-gardssalg-set-content-field: " + f);
+    console.log(`  opplevelser-gardssalg-set-content-field: ${gscf.passed} passed, ${gscf.failed} failed`);
+
+    // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep
     // 3a ("Ærlig kulling av de 296"): explicit end-status
     // (krever_eier/dod_kilde) write path, highest-precedence short-circuit
     // in computeGardssalgReadinessTier, and its own summary buckets on GET

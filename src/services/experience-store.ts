@@ -29,6 +29,24 @@ import { validatePhoneForWrite } from "./contact-normalizer";
 // marketplace.ts pattern) that now stands in front of every contact-field
 // write this file makes — see gateContactCandidates' own doc comment.
 import { gateContactCandidates } from "./contact-candidate-judge";
+// dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 2b:
+// applyGardssalgSetContentField (below) reuses the SAME objective-defect
+// classifier the quality-update lever already gates candidates with, rather
+// than inventing a second, parallel quality bar for the admin write path.
+//
+// NB — this is a deliberate module CYCLE: gardssalg-quality-update.ts imports
+// isGardssalgFieldOwnerLocked from this file (owner-lock policy A lives here,
+// defect/margin policy B+C lives there). It is safe under CommonJS because
+// neither side touches the other at MODULE-INIT time — both only call across
+// the boundary from inside function bodies, by which point both modules are
+// fully evaluated. The alternative (duplicating the classifier here, or
+// moving the owner-lock helper) would either fork the policy or churn every
+// existing caller, so the cycle is the smaller cost.
+import {
+  classifyGardssalgFieldDefect,
+  type GardssalgDefectType,
+  type GardssalgQualityFieldName,
+} from "./gardssalg-quality-update";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
 // reuse the same quality-bar predicate the homepage-content extractor already
 // gates candidates with, so applyGardssalgProviderContent() can tell "thin"
@@ -5023,6 +5041,173 @@ export function applyGardssalgSetContactPhone(
   applyWithAudit();
 
   return { ok: true, old_value: oldValue, new_value: validated };
+}
+
+export type GardssalgSetContentFieldResult =
+  | { ok: true; old_value: string | null; new_value: string }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "owner_locked" }
+  | { ok: false; reason: "defective_value"; defect_type: GardssalgDefectType | null };
+
+/**
+ * Write ONE gårdssalg CONTENT field (about_text / visit_text /
+ * opening_hours_text) with a CALLER-SUPPLIED value — Grep 2b (dev-request
+ * 2026-08-19-kursjustering-drikkefunnel-llm-og-supply). Backs POST
+ * /admin/gardssalg-set-content-field.
+ *
+ * Why this exists at all: every existing content writer either generates its
+ * own candidate or is fill-only. applyGardssalgProviderContent is fill-only
+ * once a field is non-blank (bar the narrow replace-thin carve-out), and the
+ * gardssalg-content-refresh route cannot carry LLM-authored text at all —
+ * measured 0/12 rows enriched on the drinks cohort. So a CORRECTED value
+ * (LLM-authored, or typed by a human after a producer reply) had no write
+ * path onto the row. This is that path: the value comes from the caller, not
+ * from a fetch.
+ *
+ * Scope is deliberately the THREE quality-vocabulary fields only.
+ * `products` is NOT accepted: classifyGardssalgFieldDefect has no vocabulary
+ * for it (GardssalgQualityFieldName, gardssalg-quality-update.ts), and
+ * gardssalgProductsEligible is an emptiness check, not a value-quality
+ * judge — accepting products here would mean writing it through NO quality
+ * gate at all, which is exactly what this endpoint exists to avoid.
+ *
+ * Two gates, both mandatory, in this order:
+ *   1. Owner-lock (isGardssalgFieldOwnerLocked, below) — re-read fresh from
+ *      the row, never from a caller snapshot. Unlike the phone/email
+ *      siblings (which deliberately skip content_source, having no
+ *      owner-lock-eligible field to protect), these three fields are exactly
+ *      the claim-portal-editable ones an owner can lock, so the same guard
+ *      applyGardssalgProviderContent and applyGardssalgQualityReplacement
+ *      already enforce applies here too. An admin lever is not an exemption
+ *      from an owner's own edit.
+ *   2. Objective defect (classifyGardssalgFieldDefect) on the SUPPLIED
+ *      value. Called WITHOUT `othersForField`, exactly like the candidate-
+ *      side classification in planGardssalgFieldReplacement: the
+ *      duplicate-of-other-provider check compares against the whole live
+ *      cohort and is meaningful for a scraped candidate, not for a value a
+ *      caller deliberately typed for THIS provider. A defective value is
+ *      rejected with NO write and NO audit row — fail closed; "an admin
+ *      typed it" is not evidence that the text is not truncated,
+ *      placeholder, UI chrome or CSS leakage (the LLM-authored case has
+ *      exactly the same failure modes as the scraped one).
+ *
+ * There is deliberately no `force`/override parameter: an escape hatch past
+ * gate 2 would make the gate decorative, and a genuinely-good value that
+ * trips the classifier is a classifier bug to fix, not a value to smuggle in.
+ *
+ * What is NOT touched, on purpose: content_source, content_evidence_url,
+ * content_updated_at, updated_at. Re-stamping content_source would flip the
+ * row's ownership semantics (a 'manual'/'claim' stamp is what the owner-lock
+ * above reads); content_updated_at is read by the quality lever's anti-churn
+ * logic (checkGardssalgAntiChurn) and content_evidence_url asserts a fetched
+ * page backs the value — none of which is true of an admin-supplied string.
+ * Same minimalism as applyGardssalgSetContactPhone above.
+ *
+ * Rollback needs no new wiring: all three fields are already in
+ * GARDSSALG_ROLLBACKABLE_FIELDS and the single audit row written below is
+ * exactly the shape planGardssalgContentRollback reads.
+ */
+export function applyGardssalgSetContentField(
+  providerId: string,
+  field: GardssalgQualityFieldName,
+  value: string,
+  source: string
+): GardssalgSetContentFieldResult {
+  const db = getDb(VERTICAL);
+  // All three content columns listed EXPLICITLY — `field` never reaches SQL
+  // as text, here or in the UPDATE below (see the switch), even though it is
+  // already narrowed to the closed union by the route's own validation.
+  const row = db
+    .prepare(
+      `SELECT id, about_text, visit_text, opening_hours_text, content_source, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        about_text: string | null;
+        visit_text: string | null;
+        opening_hours_text: string | null;
+        content_source: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // Gate 1 — owner lock, on the FRESH row (see doc comment).
+  if (isGardssalgFieldOwnerLocked(row, field)) return { ok: false, reason: "owner_locked" };
+
+  const trimmed = value.trim();
+  // Gate 2 — objective defect on the supplied value. No othersForField: see
+  // doc comment. Returns before any write, so a rejected value leaves neither
+  // a column change nor an audit row behind.
+  const defect = classifyGardssalgFieldDefect(field, trimmed);
+  if (defect.defective) {
+    return { ok: false, reason: "defective_value", defect_type: defect.type };
+  }
+
+  const oldValue = row[field];
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  // Same parse-guard as applyGardssalgSetContactPhone above: malformed
+  // existing JSON is treated as {} rather than clobbering the write. NB this
+  // preserves any existing `owner_locks` object untouched — gate 1 already
+  // refused every row where the lock applies to THIS field, and a lock on a
+  // DIFFERENT field must survive this write.
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance[field] = { source_url: source, fetched_at: new Date().toISOString() };
+  const provenanceJson = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    // Three LITERAL statements chosen by a switch — no column name is ever
+    // built by interpolation, so this write path is structurally incapable of
+    // taking a column name from request data.
+    switch (field) {
+      case "about_text":
+        db.prepare(
+          `UPDATE experience_providers SET about_text = @value, field_provenance = @field_provenance WHERE id = @id`
+        ).run({ id: providerId, value: trimmed, field_provenance: provenanceJson });
+        break;
+      case "visit_text":
+        db.prepare(
+          `UPDATE experience_providers SET visit_text = @value, field_provenance = @field_provenance WHERE id = @id`
+        ).run({ id: providerId, value: trimmed, field_provenance: provenanceJson });
+        break;
+      case "opening_hours_text":
+        db.prepare(
+          `UPDATE experience_providers SET opening_hours_text = @value, field_provenance = @field_provenance WHERE id = @id`
+        ).run({ id: providerId, value: trimmed, field_provenance: provenanceJson });
+        break;
+    }
+    // Exactly ONE audit row, same shape every other gårdssalg writer uses —
+    // this is what makes the write reversible through the EXISTING POST
+    // /admin/gardssalg-content-rollback with zero changes there.
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      field_name: field,
+      old_value: oldValue,
+      new_value: trimmed,
+      source_url: source,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: trimmed };
 }
 
 export type GardssalgSetTerminalStatusResult =
