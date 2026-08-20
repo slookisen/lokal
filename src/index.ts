@@ -66,6 +66,7 @@ import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
@@ -626,6 +627,10 @@ app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMerge
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/deactivate", adminLimiter, adminAgentsDeactivateRoutes);
+// GET /admin/agents/duplicate-slugs — READ-ONLY slug-collision detector that
+// feeds the duplicate-merge lever above (which never detects by itself).
+// Same ordering rule as the siblings above — mount BEFORE /admin/agents.
+app.use("/admin/agents/duplicate-slugs", adminLimiter, adminAgentsDuplicateSlugsRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
