@@ -278,8 +278,10 @@ router.post("/", (req: Request, res: Response) => {
   // fails CLOSED — a lookup that cannot answer blocks the write. Gates the
   // whole request (not per item) so a paused batch performs ZERO writes.
   {
+    // `db_` (the thunk), not `db_()` — a resolver that throws must fail CLOSED
+    // as a 423 rather than escape as a 500 (PR review finding 3, 2026-08-20).
     const pauseBlock = enrichmentWritePauseBlockForAgents(
-      db_(),
+      db_,
       (Array.isArray((req.body as any)?.items) ? ((req.body as any).items as unknown[]) : []).map((raw) => {
         const id = (raw as { agent_id?: unknown } | null)?.agent_id;
         return typeof id === "string" ? id : "";

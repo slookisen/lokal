@@ -26642,12 +26642,30 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
         name TEXT,
         slug TEXT,
         role TEXT,
-        api_key TEXT
+        api_key TEXT,
+        -- dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde: the
+        -- apply path of this endpoint now sits behind the write-pause gate,
+        -- which resolves its vertical from agents.vertical_id. Same declaration
+        -- as database/init.ts (NOT NULL DEFAULT 'rfb'), so the seeds below need
+        -- no change and land on 'rfb' exactly as production rows do.
+        vertical_id TEXT NOT NULL DEFAULT 'rfb'
       );
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY,
         website TEXT,
         updated_at TEXT
+      );
+      -- Gate state. Absence of a ROW means "not paused"; absence of the TABLE
+      -- means the gate cannot answer and fails CLOSED (423) — which is exactly
+      -- what this fixture tripped before it was added. Created empty = no pause.
+      CREATE TABLE IF NOT EXISTS enrichment_write_pause (
+        vertical TEXT PRIMARY KEY CHECK(vertical IN ('rfb', 'dental', 'experiences')),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        reason TEXT,
+        triggered_at TEXT,
+        triggered_by TEXT,
+        cleared_at TEXT,
+        cleared_by TEXT
       );
     `);
 
@@ -40011,5 +40029,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("enrichment-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, PR review finding 1: the gate moved DOWN to the shared
+// write primitives (marketplaceRegistry.register, applyRfbAgentWebsite) and out
+// to the six write surfaces `lokal-agent-enrichment` actually calls — the first
+// cut had gated four handlers the routine mostly does not call. This block is
+// that fix's proof: pause active ⇒ 423 + total_changes() delta 0 on every new
+// surface, pause inactive ⇒ unchanged behaviour, plus fail-closed on the new
+// surfaces and on a THROWING getDb thunk (finding 3).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-20-enrichment-write-pause: gjerdet på de delte skrive-primitivene ──");
+  try {
+    const { runEnrichmentWritePauseSharedPrimitivesTests } =
+      require("../src/routes/enrichment-write-pause-shared-primitives.test") as
+        typeof import("../src/routes/enrichment-write-pause-shared-primitives.test");
+    const shp = await runEnrichmentWritePauseSharedPrimitivesTests({ log: false });
+    passed += shp.passed;
+    failed += shp.failed;
+    for (const f of shp.failures) failures.push("enrichment-write-pause-shared-primitives: " + f);
+    console.log(`  enrichment-write-pause-shared-primitives: ${shp.passed} passed, ${shp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("enrichment-write-pause-shared-primitives: unexpected error: " + String(err?.message || err));
   }
 });

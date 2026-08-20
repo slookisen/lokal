@@ -80,13 +80,31 @@ function resolveDb(): ReturnType<typeof getDb> {
  * the class of accident this whole dev-request is about.
  */
 function parseVertical(raw: unknown, fallback: EnrichmentVertical | null): EnrichmentVertical | null {
-  if (raw === undefined || raw === null || raw === "") return fallback;
-  if (typeof raw !== "string") return null;
-  const v = raw.trim();
+  // Trim BEFORE the emptiness test, so `vertical: "   "` cannot take a
+  // different path from `vertical: ""` — both are "absent".
+  const v = typeof raw === "string" ? raw.trim() : raw;
+  if (v === undefined || v === null || v === "") return fallback;
+  if (typeof v !== "string") return null;
   return isEnrichmentVertical(v) ? v : null;
 }
 
 const VERTICAL_ERROR = `vertical må være en av: ${ENRICHMENT_VERTICALS.join(", ")}`;
+
+/**
+ * POST is stricter than GET: `vertical` is REQUIRED there, and an absent or
+ * empty one is a 400 rather than a silent default to 'rfb'.
+ *
+ * This file's whole stance is that an unrecognised vertical must never resolve
+ * to a real one on a WRITE — a typo'd vertical is already rejected for exactly
+ * that reason. Defaulting an absent/empty one to 'rfb' contradicted that on
+ * the call where it matters most, a CLEAR: `{enabled:false, cleared_by:"…"}`
+ * with no vertical would have lifted the live RFB pause without the caller
+ * ever naming RFB. GET keeps its default — it is a read, and reading the wrong
+ * vertical costs nothing. PR review finding 4, 2026-08-20.
+ */
+const VERTICAL_REQUIRED_ERROR =
+  `vertical er påkrevd på POST og må være en av: ${ENRICHMENT_VERTICALS.join(", ")}` +
+  ` — den defaultes aldri på en skriving (verken PÅ eller AV)`;
 
 // ─── GET /admin/enrichment-write-pause?vertical=rfb ─────────────────────────
 // Read-only status. `vertical` defaults to 'rfb'. An unknown vertical is a 400,
@@ -113,7 +131,8 @@ router.get("/", (req: Request, res: Response) => {
 });
 
 // ─── POST /admin/enrichment-write-pause ─────────────────────────────────────
-// Body: { vertical?, enabled, reason?, triggered_by?, cleared_by? }
+// Body: { vertical, enabled, reason?, triggered_by?, cleared_by? }
+//   vertical: REQUIRED (unlike GET's default) — a write never defaults it.
 //   enabled: true  → reason required. triggered_by optional (defaults 'admin').
 //   enabled: false → cleared_by REQUIRED. No default, ever.
 router.post("/", (req: Request, res: Response) => {
@@ -127,9 +146,16 @@ router.post("/", (req: Request, res: Response) => {
     cleared_by?: unknown;
   };
 
-  const vertical = parseVertical(body.vertical, "rfb");
+  // No fallback on POST — see VERTICAL_REQUIRED_ERROR. An absent, empty or
+  // unrecognised vertical is a 400; it is never assumed to be 'rfb'.
+  const vertical = parseVertical(body.vertical, null);
   if (!vertical) {
-    res.status(400).json({ error: VERTICAL_ERROR });
+    res.status(400).json({
+      error:
+        body.vertical === undefined || body.vertical === null || (typeof body.vertical === "string" && body.vertical.trim() === "")
+          ? VERTICAL_REQUIRED_ERROR
+          : VERTICAL_ERROR,
+    });
     return;
   }
   if (typeof body.enabled !== "boolean") {

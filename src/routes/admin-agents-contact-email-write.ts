@@ -251,8 +251,10 @@ router.post("/", (req: Request, res: Response) => {
   // the sibling url-write route for the full rationale. Fails CLOSED; gates
   // the whole request so a paused batch performs ZERO writes.
   {
+    // `resolveDb` (the thunk), not `resolveDb()` — a resolver that throws must
+    // fail CLOSED as a 423, not escape as a 500 (PR review finding 3).
     const pauseBlock = enrichmentWritePauseBlockForAgents(
-      resolveDb(),
+      resolveDb,
       (Array.isArray((req.body as any)?.items) ? ((req.body as any).items as unknown[]) : []).map((raw) => {
         const id = (raw as { agent_id?: unknown } | null)?.agent_id;
         return typeof id === "string" ? id : "";

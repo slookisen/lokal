@@ -289,15 +289,38 @@ export async function runAdminEnrichmentWritePauseTests(
     r = await call(pauseGet, { query: { vertical: "finnesikke" } });
     assertEq(r.status, 400, "ewp-16: unknown vertical on GET is a 400, never a silent 'not paused'");
 
-    r = await call(pausePost, { body: { enabled: true } });
+    r = await call(pausePost, { body: { vertical: "rfb", enabled: true } });
     assertEq(r.status, 400, "ewp-17: enabling without a reason -> 400");
     assertEq(r.body?.code, "reason_required", "ewp-18: … with code reason_required");
 
-    r = await call(pausePost, { body: { enabled: "ja", reason: "x" } });
+    r = await call(pausePost, { body: { vertical: "rfb", enabled: "ja", reason: "x" } });
     assertEq(r.status, 400, "ewp-19: non-boolean `enabled` -> 400");
 
     r = await call(pausePost, { body: { vertical: "finnesikke", enabled: true, reason: "x" } });
     assertEq(r.status, 400, "ewp-20: unknown vertical on POST -> 400 (never pause the wrong vertical on a typo)");
+
+    // ── PR review finding 4: an ABSENT/EMPTY vertical on POST is a 400 too ──
+    // Same stance as ewp-20, applied to the case that used to slip through:
+    // the route defaulted a missing vertical to 'rfb', so a CLEAR that never
+    // named RFB could lift the live RFB pause. GET keeps its default (ewp-12) —
+    // it is a read. Nothing may be written on any of these.
+    r = await call(pausePost, { body: { enabled: true, reason: "x" } });
+    assertEq(r.status, 400, "ewp-20a: MISSING vertical on POST -> 400, never a silent default to rfb");
+    r = await call(pausePost, { body: { vertical: "", enabled: true, reason: "x" } });
+    assertEq(r.status, 400, "ewp-20b: EMPTY-string vertical on POST -> 400");
+    r = await call(pausePost, { body: { vertical: "   ", enabled: true, reason: "x" } });
+    assertEq(r.status, 400, "ewp-20c: whitespace-only vertical on POST -> 400 (same path as empty)");
+    // The dangerous one: a CLEAR with cleared_by but no vertical must NOT lift
+    // rfb. Nothing is paused yet here, so prove it by the absence of any row.
+    r = await call(pausePost, { body: { enabled: false, cleared_by: "daniel" } });
+    assertEq(r.status, 400, "ewp-20d: a CLEAR with no vertical -> 400 (it must never resolve to rfb)");
+    assertEq(
+      (testDb.prepare("SELECT COUNT(*) AS n FROM enrichment_write_pause").get() as { n: number }).n,
+      0,
+      "ewp-20e: … and none of the rejected POSTs wrote a single row",
+    );
+    r = await call(pauseGet, {});
+    assertEq(r.body?.status?.is_default, true, "ewp-20f: … rfb still has no row at all");
 
     const PAUSE_REASON = "verifier: feil website/telefon skrevet under pause";
     r = await call(pausePost, {
@@ -551,20 +574,41 @@ export async function runAdminEnrichmentWritePauseTests(
         if (!f.endsWith(".ts")) continue;
         const rel = `${dir}/${f}`;
         if (rel === "services/enrichment-write-pause.ts") continue;
-        if (readSrc(rel).includes("services/enrichment-write-pause")) importers.push(rel);
+        // Two spellings of the same import: routes/ reach it as
+        // "../services/enrichment-write-pause", a sibling in services/ as
+        // "./enrichment-write-pause". Matching only the first silently missed
+        // services/marketplace-registry.ts — i.e. the invariant would not have
+        // noticed the guard appearing on a shared primitive at all.
+        const src = readSrc(rel);
+        if (src.includes("services/enrichment-write-pause") || src.includes('"./enrichment-write-pause"')) {
+          importers.push(rel);
+        }
       }
     }
     assertEq(
       importers.slice().sort(),
       [
+        // The four original handler surfaces.
         "routes/admin-agents-contact-email-write.ts",
         "routes/admin-agents-url-write.ts",
         "routes/admin-agents.ts",
+        "routes/admin-knowledge.ts",
+        // Its own admin route + the two test files.
         "routes/admin-enrichment-write-pause.test.ts",
         "routes/admin-enrichment-write-pause.ts",
-        "routes/admin-knowledge.ts",
-      ],
-      "ewp-125: the guard is imported by exactly the four gated surfaces, its own admin route, and this test",
+        "routes/enrichment-write-pause-shared-primitives.test.ts",
+        // PR review finding 1 — the surfaces `lokal-agent-enrichment` ACTUALLY
+        // calls, and the shared write primitives behind them. marketplace.ts
+        // carries three (admin/register, homepage-provenance-batch,
+        // google-rating-batch) plus the public /register that inherits from
+        // the registry primitive; admin-rfb-website-discovery.ts carries the
+        // review-approve lever and applyRfbAgentWebsite itself;
+        // marketplace-registry.ts is register(), the one INSERT into `agents`.
+        "routes/admin-rfb-website-discovery.ts",
+        "routes/marketplace.ts",
+        "services/marketplace-registry.ts",
+      ].sort(),
+      "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the two test files",
     );
 
     // No YAML anywhere near this guard: controller/enrichment-write-pause.yaml

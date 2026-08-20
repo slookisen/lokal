@@ -406,8 +406,13 @@ router.post("/register", async (req: Request, res: Response) => {
   // unrecognised value also collapses to 'rfb' rather than escaping the gate
   // (the strict rejection of a bogus vertical_id still happens below, at 400).
   {
+    // `getDb` (the thunk), not `getDb()` — evaluating it as an ARGUMENT put a
+    // getDb() throw OUTSIDE the guard's try, so it surfaced as a bare 500 and
+    // the fail_closed:true signal was lost (the write still never happened).
+    // Passing the thunk moves that failure back inside the fence. PR review
+    // finding 3, 2026-08-20.
     const pauseBlock = enrichmentWritePauseBlock(
-      getDb(),
+      getDb,
       normalizeEnrichmentVertical((req.body as { vertical_id?: unknown } | undefined)?.vertical_id),
     );
     if (pauseBlock) {

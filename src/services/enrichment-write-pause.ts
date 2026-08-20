@@ -254,6 +254,24 @@ export function setEnrichmentWritePause(
 
 // ─── The guard ─────────────────────────────────────────────────────────────
 
+/**
+ * What every guard entry point accepts as its database.
+ *
+ * A THUNK is allowed (and preferred at route call sites) so that the
+ * `getDb()` call itself happens INSIDE the guard's own try/catch. Passing
+ * `getDb()` as an argument evaluates it before the guard is even entered, so a
+ * `getDb()` that throws produced a 500 instead of the guard's fail-closed 423:
+ * the write still never happened, but the `fail_closed:true` signal — the one
+ * thing that tells an operator "the fence answered, it just could not read" —
+ * was lost. Accepting the thunk moves that failure back inside the fence.
+ * (PR review finding 3, 2026-08-20.)
+ */
+export type EnrichmentWriteDb = Database.Database | (() => Database.Database);
+
+function resolveGuardDb(db: EnrichmentWriteDb): Database.Database {
+  return typeof db === "function" ? db() : db;
+}
+
 export type EnrichmentWriteGuardResult =
   | { allowed: true; vertical: EnrichmentVertical }
   | {
@@ -283,12 +301,15 @@ export const ENRICHMENT_WRITE_PAUSE_LOOKUP_FAILED_REASON =
  * costs one retry; a wrongly-allowed one costs a prod cleanup.
  */
 export function assertEnrichmentWriteAllowed(
-  db: Database.Database,
+  db: EnrichmentWriteDb,
   vertical: EnrichmentVertical,
 ): EnrichmentWriteGuardResult {
   let status: EnrichmentWritePauseStatus;
   try {
-    status = getEnrichmentWritePause(db, vertical);
+    // resolveGuardDb INSIDE the try: a getDb() that throws is a lookup
+    // failure like any other, and must fail closed rather than escaping as a
+    // 500. See EnrichmentWriteDb.
+    status = getEnrichmentWritePause(resolveGuardDb(db), vertical);
   } catch (err) {
     console.error(`[enrichment-write-pause] lookup failed for '${vertical}' — failing closed:`, err);
     return {
@@ -352,12 +373,17 @@ export function resolveVerticalsForAgents(
  * Fail-closed on any lookup failure, including the agents-table read.
  */
 export function assertEnrichmentWriteAllowedForAgents(
-  db: Database.Database,
+  db: EnrichmentWriteDb,
   agentIds: readonly string[],
 ): EnrichmentWriteGuardResult {
   let verticals: EnrichmentVertical[];
+  // Resolved ONCE, inside the try, and the resolved handle is reused for the
+  // per-vertical checks below — so a throwing getDb() fails closed here too,
+  // and a working one is not re-entered per vertical.
+  let resolved: Database.Database;
   try {
-    verticals = resolveVerticalsForAgents(db, agentIds);
+    resolved = resolveGuardDb(db);
+    verticals = resolveVerticalsForAgents(resolved, agentIds);
   } catch (err) {
     console.error("[enrichment-write-pause] vertical resolution failed — failing closed:", err);
     return {
@@ -369,7 +395,7 @@ export function assertEnrichmentWriteAllowedForAgents(
     };
   }
   for (const v of verticals) {
-    const r = assertEnrichmentWriteAllowed(db, v);
+    const r = assertEnrichmentWriteAllowed(resolved, v);
     if (!r.allowed) return r;
   }
   return { allowed: true, vertical: verticals[0] ?? DEFAULT_ENRICHMENT_VERTICAL };
@@ -411,7 +437,7 @@ export function enrichmentWritePausedBody(
  * own vertical) use this one.
  */
 export function enrichmentWritePauseBlock(
-  db: Database.Database,
+  db: EnrichmentWriteDb,
   vertical: EnrichmentVertical,
 ): EnrichmentWritePausedBody | null {
   const r = assertEnrichmentWriteAllowed(db, vertical);
@@ -420,9 +446,75 @@ export function enrichmentWritePauseBlock(
 
 /** `null` when the write may proceed; otherwise the exact 423 body to send. */
 export function enrichmentWritePauseBlockForAgents(
-  db: Database.Database,
+  db: EnrichmentWriteDb,
   agentIds: readonly string[],
 ): EnrichmentWritePausedBody | null {
   const r = assertEnrichmentWriteAllowedForAgents(db, agentIds);
   return r.allowed ? null : enrichmentWritePausedBody(r);
+}
+
+// ─── Primitive-facing adapters (throwing) ──────────────────────────────────
+//
+// PR review finding 1 (2026-08-20): gating only at HTTP handlers means every
+// NEW caller of a shared write primitive has to remember to add a gate call at
+// its own route. It did not scale even once — the first review found five
+// ungated write paths the offending routine actually calls, against four gated
+// ones it mostly does not. So the shared write PRIMITIVES gate themselves, and
+// the handlers keep their own gate as the surface that shapes the 423.
+//
+// A primitive cannot "return a response body", so it THROWS. The error carries
+// the finished 423 body, so a route that catches it re-emits the byte-identical
+// shape every other gated surface emits — the body is never rebuilt by hand.
+
+export class EnrichmentWritePausedError extends Error {
+  readonly body: EnrichmentWritePausedBody;
+  readonly status = ENRICHMENT_WRITE_PAUSE_HTTP_STATUS;
+  constructor(body: EnrichmentWritePausedBody) {
+    super(body.error);
+    this.name = "EnrichmentWritePausedError";
+    this.body = body;
+  }
+}
+
+export function isEnrichmentWritePausedError(err: unknown): err is EnrichmentWritePausedError {
+  return err instanceof EnrichmentWritePausedError;
+}
+
+/**
+ * Guard for a shared write primitive whose vertical is known up front (or is
+ * the column default, e.g. a brand-new `agents` row). Throws on a live pause
+ * AND on a lookup failure (fail-closed), never returns a "maybe".
+ */
+export function assertEnrichmentWriteAllowedOrThrow(
+  db: EnrichmentWriteDb,
+  vertical: EnrichmentVertical = DEFAULT_ENRICHMENT_VERTICAL,
+): void {
+  const block = enrichmentWritePauseBlock(db, vertical);
+  if (block) throw new EnrichmentWritePausedError(block);
+}
+
+/** Batch flavour of the above: blocked if ANY vertical the ids span is paused. */
+export function assertEnrichmentWriteAllowedForAgentsOrThrow(
+  db: EnrichmentWriteDb,
+  agentIds: readonly string[],
+): void {
+  const block = enrichmentWritePauseBlockForAgents(db, agentIds);
+  if (block) throw new EnrichmentWritePausedError(block);
+}
+
+/**
+ * Send the 423 for a caught EnrichmentWritePausedError. Returns true when it
+ * handled the error (so the caller can `return`), false when the error was
+ * something else and must keep propagating through the caller's own handling.
+ *
+ * `res` is structurally typed rather than imported as express.Response so this
+ * service keeps depending on nothing but better-sqlite3's types.
+ */
+export function sendEnrichmentWritePausedIfPaused(
+  err: unknown,
+  res: { status(code: number): { json(body: unknown): unknown } },
+): boolean {
+  if (!isEnrichmentWritePausedError(err)) return false;
+  res.status(err.status).json(err.body);
+  return true;
 }

@@ -30,6 +30,18 @@ import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+// dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
+// mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
+// getDb() that throws is caught by the guard and fails closed as a 423,
+// instead of escaping as a 500 that loses the fail_closed signal.
+import {
+  DEFAULT_ENRICHMENT_VERTICAL,
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  enrichmentWritePauseBlock,
+  enrichmentWritePauseBlockForAgents,
+  normalizeEnrichmentVertical,
+  sendEnrichmentWritePausedIfPaused,
+} from "../services/enrichment-write-pause";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -411,6 +423,23 @@ export function vcardContentDisposition(agentName: string): string {
 
 router.post("/register", (req: Request, res: Response) => {
   try {
+    // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+    // pause-mekanisk-gjerde; PR review finding 1) ──────────────────────────
+    // This route creates an `agents` row whose vertical_id takes the column
+    // default 'rfb' — a REAL vertical — so a live RFB pause must cover it too,
+    // or "no write lands against a paused vertical regardless of caller" is
+    // false for the one caller nobody authenticates. The authoritative check
+    // is inside marketplaceRegistry.register(); this is the same check run
+    // FIRST so a paused request costs no blocklist lookup and answers with the
+    // shared 423 body instead of falling through the generic catch.
+    {
+      const pauseBlock = enrichmentWritePauseBlock(getDb, DEFAULT_ENRICHMENT_VERTICAL);
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
+
     const registration = AgentRegistrationSchema.parse(req.body);
 
     // Blocklist gate — quietly reject without leaking why.
@@ -459,6 +488,9 @@ router.post("/register", (req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
+    // A pause that went live between the gate above and the INSERT still ends
+    // as a 423, never a 500 — the primitive's own gate is what caught it.
+    if (sendEnrichmentWritePausedIfPaused(error, res)) return;
     if (error.name === "ZodError") {
       res.status(400).json({
         success: false,
@@ -1701,6 +1733,27 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
     return;
   }
 
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review finding 1, scan result) ────────────────
+  // Not one of the six the review named, but found by walking the SKILL's own
+  // call list: `lokal-agent-enrichment` PHASE 2D does TWO PUTs per enriched
+  // agent, and THIS is the first of them (`PUT $BASE/api/marketplace/agents/
+  // {ID}/knowledge`) — by volume the most-used enrichment write there is.
+  // Leaving it open would have made "the fence covers the routine" false.
+  //
+  // Scoped to the ADMIN lane on purpose. The claim-token and API-key lanes
+  // below are a PRODUCER editing their own profile — self-service, not
+  // enrichment. An internal enrichment pause is not a reason to lock a
+  // producer out of their own page, and widening it to do so would be an
+  // unrequested behaviour change well outside this dev-request.
+  if (isAdmin) {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(getDb, [agentId]);
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   try {
     if (isAdmin) {
       // Admin enrichment — preserve dataSource as "auto" (or what's in body)
@@ -1924,6 +1977,29 @@ router.post("/admin/register", (req: Request, res: Response) => {
     return;
   }
 
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review finding 1) ────────────────────────────
+  // THIS is the endpoint `lokal-agent-enrichment` registers producers through
+  // (SKILL PHASE 1: `POST $BASE/api/marketplace/admin/register`) — the surface
+  // that put 5 producers into prod on 2026-08-20 while an RFB pause was live.
+  // The first cut of this branch gated admin-agents.ts's similarly-named
+  // /register instead, which the routine does not call. Runs FIRST — before
+  // Zod, before the blocklist lookup, before the INSERT — and fails CLOSED.
+  // A new agent has no row to read a vertical off; the INSERT never writes
+  // vertical_id, so the row lands on the column default 'rfb' and the gate
+  // resolves the vertical from the same place (unknown → 'rfb', never an
+  // escape hatch). marketplaceRegistry.register() re-checks this itself.
+  {
+    const pauseBlock = enrichmentWritePauseBlock(
+      getDb,
+      normalizeEnrichmentVertical((req.body as { vertical_id?: unknown } | undefined)?.vertical_id),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   try {
     const registration = AdminRegistrationSchema.parse(req.body);
 
@@ -1960,6 +2036,9 @@ router.post("/admin/register", (req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
+    // Same as the public route: a pause that went live between the gate and
+    // the INSERT is still a 423, never a 500.
+    if (sendEnrichmentWritePausedIfPaused(error, res)) return;
     if (error.name === "ZodError") {
       res.status(400).json({
         success: false,
@@ -1992,6 +2071,25 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
   if (!Array.isArray(agents) || agents.length === 0) {
     res.status(400).json({ success: false, error: "Forventer { agents: [{ agentId, data }] }" });
     return;
+  }
+
+  // ── Enrichment write-pause gate (scan result, same dev-request) ───────────
+  // The batch sibling of PUT /agents/:id/knowledge above: admin-only, writes
+  // agent_knowledge through the same knowledgeService, and would otherwise be
+  // a one-call way around every gate on this page. Per-REQUEST over the whole
+  // batch, same policy as every other gated surface.
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      getDb,
+      (agents as unknown[]).map((a) => {
+        const id = (a as { agentId?: unknown; id?: unknown } | null)?.agentId ?? (a as any)?.id;
+        return typeof id === "string" ? id : "";
+      }),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
   }
 
   try {
@@ -2036,6 +2134,19 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
   }
 
   const agentId = req.params.id as string;
+
+  // ── Enrichment write-pause gate (scan result, same dev-request) ───────────
+  // The SINGULAR sibling of /admin/google-rating-batch, writing the same
+  // agent_knowledge rating/address/phone columns one agent at a time. Gating
+  // the batch but not this would leave a loop-over-single-calls way around it.
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(getDb, [agentId]);
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const placesKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!placesKey) {
     res.status(503).json({ success: false, error: "GOOGLE_PLACES_API_KEY not configured" });
@@ -2181,6 +2292,30 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   const proFieldMask = "places.id,places.displayName,places.formattedAddress";
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review finding 1) ─────────────────────────────
+  // `lokal-agent-enrichment` calls this in PHASE 2F with
+  // include_address_phone:true, which writes address/phone (+ their
+  // field_provenance) onto agent_knowledge. The gate covers the WHOLE handler,
+  // not just that branch, because the flag-less path still writes
+  // google_rating/google_review_count through upsertKnowledge and stamps
+  // google_enterprise_fetched_at — all agent_knowledge mutations, all covered
+  // by the same pause. Gated per-REQUEST on the whole batch (any paused
+  // vertical among the ids blocks everything), identical policy and identical
+  // 423 body to every other gated surface — and placed before the first
+  // Google Places call, so a paused run also spends no API quota.
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      getDb,
+      (batch as unknown[]).map((id) => (typeof id === "string" ? id : "")),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const results: any[] = [];
   let enriched = 0;
   let enterpriseCalls = 0; // Text Search calls made with the Enterprise-tier mask
@@ -6246,6 +6381,26 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     targetIds = rows
       .filter((r) => r.homepage_url && r.homepage_url.trim())
       .map((r) => r.agent_id);
+  }
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review finding 1) ─────────────────────────────
+  // `lokal-agent-enrichment` calls this in PHASE 2B/2D (SKILL:
+  // `POST $BASE/api/marketplace/admin/homepage-provenance-batch`); it writes
+  // agent_knowledge email/phone/address + field_provenance. Placed HERE rather
+  // than at the top of the handler on purpose: the two auto-select modes learn
+  // WHICH agents they will touch only after the selection query above, and the
+  // gate must judge the verticals actually about to be written, not just the
+  // ones the caller happened to name. Everything above this line is pure
+  // SELECT — zero rows change on a rejection. Gated per-REQUEST (any paused
+  // vertical in the batch blocks the whole batch), and before the first
+  // outbound homepage fetch, so a paused run also does no crawling.
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(getDb, targetIds);
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
   }
 
   // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 3):
