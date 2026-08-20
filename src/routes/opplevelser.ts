@@ -108,6 +108,10 @@ import {
   // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 3a
   // — explicit terminal-status write (krever_eier / dod_kilde / null-clear).
   applyGardssalgSetTerminalStatus,
+  // Grep 3c — manual producer_type OVERRIDE (unlike the fill-only
+  // applyGardssalgProducerType below in this file, this one can correct an
+  // already-set, wrong classification).
+  applyGardssalgSetProducerType,
   // dev-request 2026-08-16-opplevagent-outreach-rutine, spec point 6
   // ("Autosvar-regelen") — the review queue for autosvar candidates whose
   // candidate email's domain does NOT (or cannot be shown to) agree with the
@@ -8265,6 +8269,80 @@ router.post("/admin/gardssalg-set-terminal-status", requireAdmin, (req: Request,
     success: true,
     provider_id: providerId,
     field: "terminal_status",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-producer-type (admin) ────────
+//
+// Grep 3c (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply
+// follow-on). Manually OVERRIDES a gårdssalg row's producer_type — the
+// existing POST /admin/gardssalg-producer-type-classify (fill-only, above)
+// refuses to touch a row that already has a value set, so there was no way
+// to correct a wrong classification (e.g. a "bryggeri" that turns out to
+// actually be an event venue, not a real drink producer).
+//
+// Body: { provider_id: string, producer_type: string | null, reason: string,
+// source_url?: string }.
+//
+// `producer_type: null` CLEARS the column — this IS the rollback path for
+// this endpoint, same "null clears" discipline as gardssalg-set-terminal-
+// status above. Otherwise `producer_type` must be a member of the closed
+// DRINK_PRODUCER_TYPES ∪ NON_DRINK_PRODUCER_TYPES vocabulary
+// (route-corridor-service.ts) — same vocabulary the classify route already
+// validates against (GARDSSALG_PRODUCER_TYPE_VOCAB, below); no new category
+// invented here.
+//
+// `reason` is required and stored verbatim as the audit row's source_url
+// when `source_url` itself is not given — same "always capture a provenance
+// string" discipline as gardssalg-set-terminal-status.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-producer-type", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    producer_type?: unknown;
+    reason?: unknown;
+    source_url?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!reason) {
+    res.status(400).json({ error: "reason_required" });
+    return;
+  }
+
+  const rawProducerType = body.producer_type;
+  const isValidProducerType =
+    rawProducerType === null ||
+    (typeof rawProducerType === "string" &&
+      (DRINK_PRODUCER_TYPES.has(rawProducerType) || NON_DRINK_PRODUCER_TYPES.has(rawProducerType)));
+  if (!isValidProducerType) {
+    res.status(400).json({ error: "invalid_producer_type" });
+    return;
+  }
+  const producerType = rawProducerType as string | null;
+
+  const sourceUrl = typeof body.source_url === "string" ? body.source_url.trim() : "";
+
+  const result = applyGardssalgSetProducerType(providerId, producerType, reason, sourceUrl || undefined);
+
+  if (!result.ok) {
+    res.status(404).json({ error: "provider_not_found" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "producer_type",
     old_value: result.old_value,
     new_value: result.new_value,
   });

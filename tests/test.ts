@@ -30577,6 +30577,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gsts.failures) failures.push("opplevelser-gardssalg-set-terminal-status: " + f);
     console.log(`  opplevelser-gardssalg-set-terminal-status: ${gsts.passed} passed, ${gsts.failed} failed`);
 
+    // Grep 3c (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply
+    // follow-on): manual producer_type OVERRIDE lever — the existing
+    // gardssalg-producer-type-classify route above is fill-only and refuses
+    // to touch an already-set row, so there was no way to correct a wrong
+    // classification. Same in-memory-DB pattern, runs sequentially inside
+    // this same gated block.
+    console.log("\n── opplevelser-gardssalg-set-producer-type: manual producer_type override ──");
+    const { runOpplevelserGardssalgSetProducerTypeTests } = require("../src/routes/opplevelser-gardssalg-set-producer-type.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-producer-type.test");
+    const gspt = await runOpplevelserGardssalgSetProducerTypeTests({ log: false });
+    passed += gspt.passed;
+    failed += gspt.failed;
+    for (const f of gspt.failures) failures.push("opplevelser-gardssalg-set-producer-type: " + f);
+    console.log(`  opplevelser-gardssalg-set-producer-type: ${gspt.passed} passed, ${gspt.failed} failed`);
+
     // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A:
     // persist the force-approval from gardssalg-set-contact-email above (a
     // field_provenance.contact_email_domain_override stamp, scoped to the
