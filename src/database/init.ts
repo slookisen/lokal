@@ -4095,6 +4095,43 @@ function initSchema(db: Database.Database): void {
     console.error("Migration agents_tynne_profiler_queue failed:", err);
   }
 
+  // ─── dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde ───────
+  // enrichment_write_pause: the MECHANICAL fence behind the per-vertical
+  // enrichment write-pause. One row per vertical ('rfb' | 'dental' |
+  // 'experiences'); ABSENCE of a row means "not paused", so a fresh DB needs
+  // no seed migration and every existing deployment is unaffected the instant
+  // this table exists.
+  //
+  // Deliberately a DB row and NOT a repo-tracked YAML. The control-plane
+  // spelling of this lever (controller/enrichment-write-pause.yaml) lives in
+  // slookisen/A2A — a DIFFERENT repo that is never part of this app's image
+  // (the Dockerfile COPYs only src/, tsconfig.json, openapi.yaml, verticals/,
+  // mcp-server*/). A guard reading that file from the running process would
+  // pass in dev and silently no-op in prod. Same reasoning, and the same
+  // DB-backed-admin-lever shape, as gardssalg_outreach_size_gate_config in
+  // database/init-experiences.ts — just on the MAIN db, because the surfaces
+  // being gated (agents / agent_knowledge writes) live here.
+  //
+  // The asymmetry (verifier SETS, only Daniel LIFTS) is carried by the two
+  // stamp pairs: triggered_at/triggered_by are written when the pause goes ON
+  // and survive the lift, cleared_at/cleared_by only ever by an explicit
+  // clear that names who cleared it. See services/enrichment-write-pause.ts.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS enrichment_write_pause (
+        vertical TEXT PRIMARY KEY CHECK(vertical IN ('rfb', 'dental', 'experiences')),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        reason TEXT,
+        triggered_at TEXT,
+        triggered_by TEXT,
+        cleared_at TEXT,
+        cleared_by TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration enrichment_write_pause failed:", err);
+  }
+
 }
 
 export function closeDb(): void {

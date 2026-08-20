@@ -20,6 +20,10 @@ import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision"
 // geocoding-service.ts (→ database/init) would have. Aliased to the old local
 // name so every call site below reads exactly as it did.
 import { haversineDistanceKm as haversine, toRadians as toRad } from "./geo-distance";
+import {
+  assertEnrichmentWriteAllowedOrThrow,
+  normalizeEnrichmentVertical,
+} from "./enrichment-write-pause";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -82,6 +86,35 @@ class MarketplaceRegistry {
       isVetted?: boolean;
     },
   ): RegisteredAgent {
+    // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+    // pause-mekanisk-gjerde; PR review finding 1) ───────────────────────────
+    // The gate lives HERE, on the shared primitive, not only on the routes.
+    // This one INSERT is the only way any caller creates an `agents` row —
+    // the public POST /api/marketplace/register, the admin POST
+    // /api/marketplace/admin/register that `lokal-agent-enrichment` actually
+    // uses, and every src/_seeds/*.ts script — so gating it means a future
+    // caller inherits the fence instead of having to remember to add one.
+    // (The first review of this branch found exactly that failure: four gated
+    // handlers the routine barely calls, five ungated ones it does.)
+    //
+    // Vertical: the INSERT below never sets `vertical_id`, so every row this
+    // creates takes the column's own `NOT NULL DEFAULT 'rfb'`. The vertical is
+    // therefore read from the same place — an explicitly-passed `vertical_id`
+    // is honoured (normalised, so an unknown value collapses to 'rfb' rather
+    // than escaping a live pause) and its absence resolves to that default.
+    // Throws rather than returning, so a caller cannot ignore it; every HTTP
+    // caller catches it and re-emits the shared 423 body.
+    //
+    // `getDb` (the THUNK), not `getDb()`, and the gate runs BEFORE the handle
+    // is resolved at all: resolving first put a throwing getDb() outside the
+    // guard's try, so it escaped as a bare 500 and the fail_closed:true signal
+    // was lost. Last call site in the branch still doing that (round-2 LOW,
+    // same shape as PR review finding 3).
+    assertEnrichmentWriteAllowedOrThrow(
+      getDb,
+      normalizeEnrichmentVertical((registration as { vertical_id?: unknown }).vertical_id),
+    );
+
     const db = getDb();
     const id = uuid();
     const apiKey = this.generateApiKey();

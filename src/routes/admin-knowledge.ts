@@ -88,6 +88,15 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+// dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
+// mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
+// getDb() that throws is caught by the guard and fails closed as a 423 with
+// fail_closed:true, instead of escaping as a bare 500 that loses that signal
+// (PR review finding 3).
+import {
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  enrichmentWritePauseBlockForAgents,
+} from "../services/enrichment-write-pause";
 import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
 // dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
 // render-time repair logic as the one-time DB backfill/cleanup function —
@@ -531,6 +540,26 @@ type IncomingBody = {
 
 router.put("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde) ───────────────────────────────────────────────────
+  // THIS is the endpoint `lokal-agent-enrichment` PUTs into, and the one that
+  // wrote ~8 agents in violation on 2026-08-20 while an RFB pause was live.
+  // The gate runs FIRST — before agent_id validation, before the 404 lookup,
+  // before any column or provenance work — and fails CLOSED, so a lookup that
+  // cannot answer blocks the write instead of waving it through. The vertical
+  // is read from the target agent's own `agents.vertical_id`; an unknown or
+  // missing agent_id resolves to that column's own default ('rfb').
+  {
+    // `getDb` (the thunk), not `getDb()`: see the import comment / finding 3.
+    const pauseBlock = enrichmentWritePauseBlockForAgents(getDb, [
+      typeof (req.body as any)?.agent_id === "string" ? ((req.body as any).agent_id as string) : "",
+    ]);
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const body = (req.body ?? {}) as IncomingBody;
   const agentId = typeof body.agent_id === "string" ? body.agent_id.trim() : "";
@@ -1045,6 +1074,28 @@ pruneUrlsRouter.post("/prune-dead-urls", (req: Request, res: Response) => {
     return;
   }
 
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review finding 1) ─────────────────────────────
+  // `lokal-agent-enrichment` calls this in PHASE 4 (SKILL:
+  // `POST $BASE/admin/prune-dead-urls?apply=1&limit=500`); the apply path
+  // NULLs agent_knowledge.website. Gated on the APPLY path only — the dry run
+  // is pure SELECT and stays usable during a pause so an operator can still
+  // measure. Placed AFTER classification and BEFORE the transaction, so the
+  // gate judges the verticals of the rows actually about to be nulled rather
+  // than the whole scanned set; everything above is read-only, so a rejection
+  // changes zero rows. Per-REQUEST: any paused vertical blocks the whole
+  // prune, never a partial one. `getDb` as a thunk (finding 3).
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      getDb,
+      toPrune.map((item) => item.agent_id),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   // Apply: null the website for each matched agent (parameterized, idempotent).
   // The WHERE website IS NOT NULL guard makes re-runs report pruned=0.
   let pruned = 0;
@@ -1308,6 +1359,30 @@ homepageContentRefreshRouter.post(
         )
         .all(limit) as HcrTargetRow[];
       targets = rows.filter((r) => r.homepage_url && r.homepage_url.trim().length > 0);
+    }
+
+    // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+    // pause-mekanisk-gjerde; PR review finding 1) ───────────────────────────
+    // `lokal-agent-enrichment` calls this in PHASE 5 (SKILL:
+    // `POST $BASE/admin/homepage-content-refresh?apply=1&limit=25`); the apply
+    // path writes agent_knowledge about/products/categories + field_provenance
+    // and agents.description, plus the fetch-strike/parking bookkeeping below.
+    // Gated on the APPLY path only — the dry run writes nothing (every write in
+    // this route is already `!dryRun`-gated), and the SKILL's own read-only
+    // mode during a pause depends on that preview staying reachable. Placed
+    // after target selection so the gate judges the verticals actually about
+    // to be written; everything above is pure SELECT, so a rejection changes
+    // zero rows. Per-REQUEST, before the first outbound fetch: a paused run
+    // does no crawling either. `getDb` as a thunk (finding 3).
+    if (apply) {
+      const pauseBlock = enrichmentWritePauseBlockForAgents(
+        getDb,
+        targets.map((t) => t.agent_id),
+      );
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
     }
 
     // ── Per-agent processing ──────────────────────────────────────────────────

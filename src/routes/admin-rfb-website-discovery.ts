@@ -59,6 +59,15 @@ import {
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { mergeFieldProvenance } from "./admin-knowledge";
+// dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
+// mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
+// getDb() that throws fails closed as a 423 instead of escaping as a 500.
+import {
+  assertEnrichmentWriteAllowedForAgentsOrThrow,
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  enrichmentWritePauseBlockForAgents,
+  sendEnrichmentWritePausedIfPaused,
+} from "../services/enrichment-write-pause";
 
 // ─── agents_website_review_queue (lazy, ensureXTable pattern) ──────────────
 //
@@ -1155,6 +1164,20 @@ export function applyRfbAgentWebsite(
   finalUrl: string,
   batchId: string | null,
 ): RfbWdApplyResult {
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review finding 1) ─────────────────────────────
+  // On the SHARED primitive, not only on the route below, so any future reuse
+  // (admin-bm-producer-harvest's harvest path is the one already named in this
+  // repo) inherits the fence instead of having to remember its own gate call.
+  // Vertical comes from this agent's own `agents.vertical_id`, same resolution
+  // as every other gated surface; a lookup that cannot answer fails CLOSED.
+  //
+  // THROWS rather than returning a {written:false, reason} — deliberately. A
+  // per-item reason would turn a live pause into a partial-batch outcome, and
+  // the promise this dev-request makes is ZERO writes while a pause is live,
+  // for the whole request. The route below catches it and answers 423.
+  assertEnrichmentWriteAllowedForAgentsOrThrow(db, [agentId]);
+
   const host = rfbWdHostFromUrl(candidateUrl);
   if (!host) return { written: false, reason: "invalid_candidate_url" };
   const exclusion = rfbWebsiteHostExclusionReason(host);
@@ -1284,6 +1307,30 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
     return;
   }
 
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; PR review finding 1) ─────────────────────────────
+  // `lokal-agent-enrichment` calls this with apply=1 (SKILL PHASE 3:
+  // `POST $BASE/admin/rfb-website-review-approve?apply=1`). Gated on the
+  // APPLY path only — a dry run performs no write at all, and leaving it
+  // reachable during a pause is what lets an operator still MEASURE the queue
+  // while writes are frozen. Gated per-REQUEST over every agent_id named in
+  // the body, so a batch spanning a paused vertical is blocked whole: zero
+  // writes, not a partially-applied batch. `getDb` passed as a thunk so a
+  // getDb() throw also fails closed here.
+  if (apply) {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      getDb,
+      (body.approvals as unknown[]).map((raw) => {
+        const id = (raw as { agent_id?: unknown } | null)?.agent_id;
+        return typeof id === "string" ? id : "";
+      }),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const db = getDb();
   ensureRfbWebsiteReviewQueueTable(db);
   const pending = db
@@ -1328,6 +1375,13 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
           rejected.push({ agent_id: aid, reason: w.reason });
         }
       } catch (err: any) {
+        // A pause that went live between this request's gate and this item's
+        // write: applyRfbAgentWebsite's own gate caught it. Abort the WHOLE
+        // remaining batch with the shared 423 rather than degrading it into a
+        // per-item `write_failed:` reason — a live pause is never a per-item
+        // outcome. Items already written before the pause landed stand; that
+        // is a genuine race, and stopping here is the narrowest response to it.
+        if (sendEnrichmentWritePausedIfPaused(err, res)) return;
         rejected.push({ agent_id: aid, reason: `write_failed: ${err?.message ?? String(err)}` });
       }
     }

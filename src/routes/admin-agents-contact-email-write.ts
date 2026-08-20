@@ -63,6 +63,10 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
+import {
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  enrichmentWritePauseBlockForAgents,
+} from "../services/enrichment-write-pause";
 
 const router = Router();
 
@@ -240,6 +244,27 @@ function applyContactEmail(
 
 router.post("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde) ───────────────────────────────────────────────────
+  // FIRST thing after auth, before ANY validation and before any write — see
+  // the sibling url-write route for the full rationale. Fails CLOSED; gates
+  // the whole request so a paused batch performs ZERO writes.
+  {
+    // `resolveDb` (the thunk), not `resolveDb()` — a resolver that throws must
+    // fail CLOSED as a 423, not escape as a 500 (PR review finding 3).
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      resolveDb,
+      (Array.isArray((req.body as any)?.items) ? ((req.body as any).items as unknown[]) : []).map((raw) => {
+        const id = (raw as { agent_id?: unknown } | null)?.agent_id;
+        return typeof id === "string" ? id : "";
+      }),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const body = (req.body ?? {}) as { items?: unknown; apply?: unknown };
   const apply =

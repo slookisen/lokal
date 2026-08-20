@@ -6582,7 +6582,30 @@ const _pr24Promise = (async function runPr24Tests() {
         url TEXT,
         version TEXT,
         role TEXT,
-        api_key TEXT
+        api_key TEXT,
+        -- dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde: this
+        -- block hand-rolls a SUBSET of the production schema instead of
+        -- calling __initSchemaForTesting, so every column a gated handler
+        -- reads has to be listed here explicitly. PUT /admin/knowledge now
+        -- resolves the target agent's vertical off \`agents.vertical_id\`
+        -- (same NOT NULL DEFAULT 'rfb' as database/init.ts's Phase-4.6a
+        -- ALTER) before it does anything else, and that guard fails CLOSED —
+        -- without this column the lookup throws and every pr24 PUT correctly
+        -- answers 423 instead of ever reaching the route body.
+        vertical_id TEXT NOT NULL DEFAULT 'rfb'
+      );
+      -- Same reason: the write-pause guard SELECTs this table on every gated
+      -- write. Absence of a ROW means "not paused" (the designed default —
+      -- no seed needed, and none is inserted here); absence of the TABLE is a
+      -- lookup failure, which fails closed. Mirrors database/init.ts exactly.
+      CREATE TABLE enrichment_write_pause (
+        vertical TEXT PRIMARY KEY CHECK(vertical IN ('rfb', 'dental', 'experiences')),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        reason TEXT,
+        triggered_at TEXT,
+        triggered_by TEXT,
+        cleared_at TEXT,
+        cleared_by TEXT
       );
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY,
@@ -26619,12 +26642,30 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
         name TEXT,
         slug TEXT,
         role TEXT,
-        api_key TEXT
+        api_key TEXT,
+        -- dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde: the
+        -- apply path of this endpoint now sits behind the write-pause gate,
+        -- which resolves its vertical from agents.vertical_id. Same declaration
+        -- as database/init.ts (NOT NULL DEFAULT 'rfb'), so the seeds below need
+        -- no change and land on 'rfb' exactly as production rows do.
+        vertical_id TEXT NOT NULL DEFAULT 'rfb'
       );
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY,
         website TEXT,
         updated_at TEXT
+      );
+      -- Gate state. Absence of a ROW means "not paused"; absence of the TABLE
+      -- means the gate cannot answer and fails CLOSED (423) — which is exactly
+      -- what this fixture tripped before it was added. Created empty = no pause.
+      CREATE TABLE IF NOT EXISTS enrichment_write_pause (
+        vertical TEXT PRIMARY KEY CHECK(vertical IN ('rfb', 'dental', 'experiences')),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        reason TEXT,
+        triggered_at TEXT,
+        triggered_by TEXT,
+        cleared_at TEXT,
+        cleared_by TEXT
       );
     `);
 
@@ -39959,5 +40000,58 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-forside-seksjonering: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde (L3, P1): the
+// per-vertical enrichment write-pause is now a MECHANICAL gate on all four RFB
+// enrichment write surfaces (url-write, contact-email-write, PUT
+// /admin/knowledge, POST /admin/agents/register) instead of prose in a SKILL
+// file. This block proves the load-bearing claim — a paused vertical changes
+// ZERO rows, measured with SQLite's own total_changes() — plus the fail-closed
+// posture and the enabled:false-without-cleared_by rejection.
+//
+// Own harness: in-memory DB + __initSchemaForTesting, the two per-route DB
+// seams (__setUrlWriteDbForTesting / __setContactEmailWriteDbForTesting), and a
+// getDb()-singleton swap restored in `finally` for the two handlers that expose
+// no seam — same isolation contract as admin-agents-register-contact.test.ts.
+// Tail position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde: berikelses-skrivepause som mekanisk gjerde ──");
+  try {
+    const { runAdminEnrichmentWritePauseTests } = require("../src/routes/admin-enrichment-write-pause.test") as
+      typeof import("../src/routes/admin-enrichment-write-pause.test");
+    const ewp = await runAdminEnrichmentWritePauseTests({ log: false });
+    passed += ewp.passed;
+    failed += ewp.failed;
+    for (const f of ewp.failures) failures.push("enrichment-write-pause: " + f);
+    console.log(`  enrichment-write-pause: ${ewp.passed} passed, ${ewp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("enrichment-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, PR review finding 1: the gate moved DOWN to the shared
+// write primitives (marketplaceRegistry.register, applyRfbAgentWebsite) and out
+// to the six write surfaces `lokal-agent-enrichment` actually calls — the first
+// cut had gated four handlers the routine mostly does not call. This block is
+// that fix's proof: pause active ⇒ 423 + total_changes() delta 0 on every new
+// surface, pause inactive ⇒ unchanged behaviour, plus fail-closed on the new
+// surfaces and on a THROWING getDb thunk (finding 3).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-20-enrichment-write-pause: gjerdet på de delte skrive-primitivene ──");
+  try {
+    const { runEnrichmentWritePauseSharedPrimitivesTests } =
+      require("../src/routes/enrichment-write-pause-shared-primitives.test") as
+        typeof import("../src/routes/enrichment-write-pause-shared-primitives.test");
+    const shp = await runEnrichmentWritePauseSharedPrimitivesTests({ log: false });
+    passed += shp.passed;
+    failed += shp.failed;
+    for (const f of shp.failures) failures.push("enrichment-write-pause-shared-primitives: " + f);
+    console.log(`  enrichment-write-pause-shared-primitives: ${shp.passed} passed, ${shp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("enrichment-write-pause-shared-primitives: unexpected error: " + String(err?.message || err));
   }
 });
