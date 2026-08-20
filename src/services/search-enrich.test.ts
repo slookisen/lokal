@@ -27,6 +27,10 @@ import {
   // dev-request 2026-07-20 gårdssalg-kvalitetsgate-redesign, criterion 1:
   // structure-aware prose extraction (PURE).
   extractProseText,
+  // dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 3:
+  // the ONE shared HTML-entity decoder behind extractVisibleText /
+  // extractProseText / summarizeAbout (PURE).
+  decodeHtmlEntities,
   // PR-24a: homepage CONTENT → platform write helpers (PURE).
   mapToPlatformCategories,
   meetsAboutQualityBar,
@@ -1431,6 +1435,119 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
         "mojibakeSnippet: snippet is bounded/windowed, not the entire (potentially huge) field value"
       );
     }
+  }
+
+  // ── dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 3 ──
+  // decodeHtmlEntities() + the three call sites that used to carry their own
+  // divergent, partial entity lists. The production symptom: CMS copy written
+  // with an en dash (`&#8211;` / `&ndash;` / `&#x2013;`) landed the RAW entity
+  // text in about_text/description, so profiles showed "Gården &#8211; siden
+  // 1890".
+  {
+    // The decoder itself.
+    assertEq(decodeHtmlEntities("a &#8211; b"), "a – b", "decodeHtmlEntities: decimal &#8211; → en dash");
+    assertEq(decodeHtmlEntities("a &ndash; b"), "a – b", "decodeHtmlEntities: named &ndash; → en dash");
+    assertEq(decodeHtmlEntities("a &#x2013; b"), "a – b", "decodeHtmlEntities: hex &#x2013; → en dash");
+    assertEq(decodeHtmlEntities("a &#X2013; b"), "a – b", "decodeHtmlEntities: uppercase-X hex form also decodes");
+    assertEq(decodeHtmlEntities("a &mdash; b"), "a — b", "decodeHtmlEntities: &mdash; → em dash");
+    assertEq(decodeHtmlEntities("vent&hellip;"), "vent…", "decodeHtmlEntities: &hellip; → ellipsis");
+    assertEq(
+      decodeHtmlEntities("&lsquo;a&rsquo; &ldquo;b&rdquo;"),
+      "‘a’ “b”",
+      "decodeHtmlEntities: curly quote entities (&lsquo;/&rsquo;/&ldquo;/&rdquo;)",
+    );
+
+    // Everything the old chains handled must still work.
+    assertEq(decodeHtmlEntities("a&nbsp;b"), "a b", "decodeHtmlEntities: &nbsp; → plain space (unchanged semantics)");
+    assertEq(decodeHtmlEntities("Salt &amp; Pepper"), "Salt & Pepper", "decodeHtmlEntities: &amp; → &");
+    assertEq(
+      decodeHtmlEntities("&aelig;&oslash;&aring;"),
+      "æøå",
+      "decodeHtmlEntities: lowercase Norwegian entities",
+    );
+    assertEq(
+      decodeHtmlEntities("&AElig;&Oslash;&Aring;"),
+      "ÆØÅ",
+      "decodeHtmlEntities: UPPERCASE Norwegian entities decode to uppercase letters",
+    );
+    assertEq(decodeHtmlEntities("&quot;sitat&quot;"), '"sitat"', "decodeHtmlEntities: &quot; → \"");
+    assertEq(decodeHtmlEntities("det&#39;s"), "det's", "decodeHtmlEntities: &#39; → apostrophe (numeric branch)");
+
+    // THE ordering invariant: `&amp;` must be decoded in the same single pass,
+    // never before the numeric branch, or `&amp;#8211;` double-decodes into a
+    // dash instead of staying the literal text `&#8211;`.
+    assertEq(
+      decodeHtmlEntities("Gården &amp;#8211; siden 1890"),
+      "Gården &#8211; siden 1890",
+      "decodeHtmlEntities: &amp;#8211; stays LITERAL &#8211; (no double-decode)",
+    );
+    assertEq(
+      decodeHtmlEntities("&amp;ndash;"),
+      "&ndash;",
+      "decodeHtmlEntities: &amp;ndash; stays literal &ndash; (no double-decode)",
+    );
+    assertEq(
+      decodeHtmlEntities("&#38;amp;"),
+      "&amp;",
+      "decodeHtmlEntities: &#38;amp; single-decodes to the literal text &amp;",
+    );
+
+    // Invalid / out-of-range numeric references are left verbatim, not thrown on.
+    assertEq(decodeHtmlEntities("&#1114112;"), "&#1114112;", "decodeHtmlEntities: code point > 0x10FFFF left as-is");
+    assertEq(decodeHtmlEntities("&#xD800;"), "&#xD800;", "decodeHtmlEntities: lone surrogate left as-is");
+    assertEq(decodeHtmlEntities("&#0;"), "&#0;", "decodeHtmlEntities: NUL reference left as-is");
+    assertEq(decodeHtmlEntities("&copy; 2026"), "&copy; 2026", "decodeHtmlEntities: unknown named entity left verbatim");
+    assertEq(decodeHtmlEntities("100% &agree"), "100% &agree", "decodeHtmlEntities: bare '&' / unterminated ref untouched");
+    assertEq(decodeHtmlEntities(""), "", "decodeHtmlEntities: empty in → empty out");
+    assertEq(decodeHtmlEntities(null as unknown as string), "", "decodeHtmlEntities: null-ish in → empty out");
+
+    // All THREE call sites must decode the same way — that's the whole point of
+    // the shared helper (three divergent lists was the bug).
+    const dashHtml =
+      "<html><head><meta property='og:description' content='Gården &#8211; drevet &ndash; siden &#x2013; 1890'></head>" +
+      "<body><p>Gården &#8211; drevet &ndash; siden &#x2013; 1890 og vi selger økologiske grønnsaker hele året.</p></body></html>";
+
+    const visible = extractVisibleText(dashHtml);
+    assertTrue(!visible.includes("&#8211;"), "extractVisibleText: no raw &#8211; survives");
+    assertTrue(!visible.includes("&ndash;"), "extractVisibleText: no raw &ndash; survives");
+    assertTrue(!visible.includes("&#x2013;"), "extractVisibleText: no raw &#x2013; survives");
+    assertTrue(
+      visible.includes("Gården – drevet – siden – 1890"),
+      `extractVisibleText: all three dash forms decode to a real en dash (got: ${visible.slice(0, 80)})`,
+    );
+
+    const prose = extractProseText(dashHtml);
+    assertTrue(!prose.includes("&#8211;") && !prose.includes("&ndash;") && !prose.includes("&#x2013;"),
+      "extractProseText: no raw dash entity survives");
+    assertTrue(
+      prose.includes("Gården – drevet – siden – 1890"),
+      `extractProseText: all three dash forms decode to a real en dash (got: ${prose.slice(0, 80)})`,
+    );
+
+    const about = summarizeAbout(dashHtml);
+    assertTrue(!about.includes("&#8211;") && !about.includes("&ndash;") && !about.includes("&#x2013;"),
+      "summarizeAbout: no raw dash entity survives");
+    assertTrue(
+      about.includes("Gården – drevet – siden – 1890"),
+      `summarizeAbout: all three dash forms decode to a real en dash (got: ${about.slice(0, 80)})`,
+    );
+
+    // …and the double-escape case stays literal through all three too.
+    const escapedHtml =
+      "<html><head><meta property='og:description' content='Gården &amp;#8211; siden 1890'></head>" +
+      "<body><p>Gården &amp;#8211; siden 1890 og vi selger økologiske grønnsaker hele året.</p></body></html>";
+    assertTrue(
+      extractVisibleText(escapedHtml).includes("Gården &#8211; siden 1890"),
+      "extractVisibleText: &amp;#8211; stays the literal text &#8211;",
+    );
+    assertTrue(
+      extractProseText(escapedHtml).includes("Gården &#8211; siden 1890"),
+      "extractProseText: &amp;#8211; stays the literal text &#8211;",
+    );
+    assertTrue(
+      summarizeAbout(escapedHtml).includes("Gården &#8211; siden 1890"),
+      "summarizeAbout: &amp;#8211; stays the literal text &#8211;",
+    );
   }
 
   return { passed, failed, failures };

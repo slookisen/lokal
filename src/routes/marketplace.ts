@@ -238,6 +238,17 @@ function escapeVCard(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
 }
 
+// dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 1:
+// vCard 3.0 has no document-level charset declaration, so a strict 3.0 parser
+// (Outlook and several Android address books in particular) is entitled to read
+// property values as ASCII/latin-1 and render "Bjørnstad Gård" as mojibake. The
+// 3.0 way to say otherwise is a per-property CHARSET parameter —
+// `FN;CHARSET=UTF-8:<value>`. Applied to exactly the properties that carry
+// free-form Norwegian text (FN/ORG/NOTE/ADR); the machine-ish fields
+// (TEL/EMAIL/URL/GEO/X-LOKAL-*) are ASCII by construction and are left alone.
+const VCARD_CHARSET = "CHARSET=UTF-8";
+const VCARD_NOTE_PREFIX = `NOTE;${VCARD_CHARSET}:`;
+
 function buildVCard(agentId: string): string | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
@@ -246,9 +257,9 @@ function buildVCard(agentId: string): string | null {
   const lines: string[] = [];
   lines.push("BEGIN:VCARD");
   lines.push("VERSION:3.0");
-  lines.push(`FN:${escapeVCard(agent.name)}`);
-  lines.push(`ORG:${escapeVCard(agent.name)}`);
-  if (k.about) lines.push(`NOTE:${escapeVCard(k.about)}`);
+  lines.push(`FN;${VCARD_CHARSET}:${escapeVCard(agent.name)}`);
+  lines.push(`ORG;${VCARD_CHARSET}:${escapeVCard(agent.name)}`);
+  if (k.about) lines.push(`${VCARD_NOTE_PREFIX}${escapeVCard(k.about)}`);
   if (isDisplayablePhone(k.phone)) lines.push(`TEL;TYPE=WORK,VOICE:${escapeVCard(k.phone)}`);
   if (k.email) lines.push(`EMAIL;TYPE=WORK:${escapeVCard(k.email)}`);
   if (k.website) lines.push(`URL:${escapeVCard(k.website)}`);
@@ -257,7 +268,7 @@ function buildVCard(agentId: string): string | null {
     const street = k.address ? escapeVCard(k.address) : "";
     const city = agent.city ? escapeVCard(agent.city) : "";
     const postal = k.postalCode ? escapeVCard(k.postalCode) : "";
-    lines.push(`ADR;TYPE=WORK:;;${street};${city};;${postal};Norway`);
+    lines.push(`ADR;TYPE=WORK;${VCARD_CHARSET}:;;${street};${city};;${postal};Norway`);
   }
   // Products as NOTE appendix (visible in most contact apps)
   if (k.products && Array.isArray(k.products) && k.products.length > 0) {
@@ -275,9 +286,12 @@ function buildVCard(agentId: string): string | null {
       .join(", ");
     if (productList) {
       const notePrefix = k.about ? escapeVCard(k.about) + "\\n\\nProdukter: " : "Produkter: ";
-      const noteIdx = lines.findIndex(l => l.startsWith("NOTE:"));
-      if (noteIdx >= 0) lines[noteIdx] = `NOTE:${notePrefix}${escapeVCard(productList)}`;
-      else lines.push(`NOTE:Produkter: ${escapeVCard(productList)}`);
+      // NB: match on the parameterised prefix, not "NOTE:" — the NOTE line now
+      // carries CHARSET=UTF-8, so a bare "NOTE:" startsWith would never hit and
+      // the about text would be duplicated into a second NOTE property.
+      const noteIdx = lines.findIndex(l => l.startsWith(VCARD_NOTE_PREFIX));
+      if (noteIdx >= 0) lines[noteIdx] = `${VCARD_NOTE_PREFIX}${notePrefix}${escapeVCard(productList)}`;
+      else lines.push(`${VCARD_NOTE_PREFIX}Produkter: ${escapeVCard(productList)}`);
     }
   }
   // GEO field — helps contact apps show location
@@ -307,6 +321,49 @@ function buildVCard(agentId: string): string | null {
 
 function safeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9æøåÆØÅ_-]+/g, "_").slice(0, 60) || "agent";
+}
+
+// dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 1:
+// safeFileName() deliberately PRESERVES æøåÆØÅ, which is right for the UTF-8
+// half of the header but wrong for the plain `filename=` parameter — RFC 6266
+// says that one is bytes-as-ASCII, so shipping "Bjørnstad.vcf" there hands the
+// client raw non-ASCII with no declared encoding and the download lands as
+// "BjÃ¸rnstad.vcf" (or gets rejected). Hence a transliterated ASCII fallback
+// for old clients PLUS an RFC 5987 `filename*` carrying the real name for
+// everything modern.
+function asciiSafeFileName(name: string): string {
+  const translit = name
+    .replace(/æ/g, "ae").replace(/ø/g, "oe").replace(/å/g, "aa")
+    .replace(/Æ/g, "AE").replace(/Ø/g, "OE").replace(/Å/g, "AA");
+  return translit
+    // Strip every remaining non-ASCII code point (é, ü, Cyrillic, emoji …) so
+    // the result is guaranteed 7-bit …
+    .replace(/[^\x00-\x7F]+/g, "")
+    // … then apply safeFileName's own substitution to what's left.
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .slice(0, 60) || "agent";
+}
+
+// RFC 5987 ext-value: percent-encode everything outside attr-char.
+// encodeURIComponent already leaves attr-char's alphanumerics, `-._~` alone but
+// also passes `!*'()` through, which are NOT attr-char — encode those too.
+function encodeRfc5987(value: string): string {
+  return encodeURIComponent(value).replace(
+    /['()!*]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase(),
+  );
+}
+
+/**
+ * Build an RFC 6266-compliant Content-Disposition attachment header:
+ * `attachment; filename="<ascii>"; filename*=UTF-8''<pct>`. Clients that
+ * understand `filename*` (all current browsers) use the exact original name;
+ * older ones fall back to the transliterated ASCII form. PURE.
+ */
+export function vcardContentDisposition(agentName: string): string {
+  const ascii = asciiSafeFileName(agentName) + ".vcf";
+  const utf8 = safeFileName(agentName) + ".vcf";
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeRfc5987(utf8)}`;
 }
 
 // ─── POST /register — Register a new agent ──────────────────
@@ -772,7 +829,7 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
     return;
   }
   const info = knowledgeService.getAgentInfo(agentId);
-  const filename = safeFileName(info?.agent.name || "agent") + ".vcf";
+  const contentDisposition = vcardContentDisposition(info?.agent.name || "agent");
 
   interactionLogger.log("view", {
     agentId: agentId,
@@ -781,7 +838,7 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
   });
 
   res.setHeader("Content-Type", "text/vcard; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Content-Disposition", contentDisposition);
   res.send(vcard);
 });
 

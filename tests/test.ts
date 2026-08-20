@@ -8396,6 +8396,127 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+// ── dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 2 ──
+// The AI-agent stat tile's tooltip. Producers read "Sidevisninger fra
+// AI-agenter (ChatGPT, Claude, Perplexity m.fl.)" as a crawler-traffic metric
+// and asked why THEIR profile had one; the Daniel-confirmed wording says
+// instead that every profile has the stat and that it counts real people
+// searching via AI services. Text only — the tile markup, data-fill="ai" and
+// the stats JS are untouched.
+console.log("\n── pf-stat ai: tooltip wording (Daniel-confirmed) ──");
+{
+  const seoSrcTip = require("fs").readFileSync("src/routes/seo.ts", "utf8");
+
+  assertTrue(
+    seoSrcTip.includes(
+      "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste 90 dager."
+    ),
+    "ai-tooltip: Norwegian branch uses the exact Daniel-confirmed wording"
+  );
+  assertTrue(
+    seoSrcTip.includes("Every profile has this statistic.") &&
+      /It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last 90 days\./.test(seoSrcTip),
+    "ai-tooltip: English branch carries the equivalent wording"
+  );
+  assertTrue(
+    !seoSrcTip.includes("Sidevisninger fra AI-agenter (ChatGPT, Claude, Perplexity m.fl.), siste 90 dager"),
+    "ai-tooltip: the old crawler-flavoured Norwegian tooltip is gone"
+  );
+  assertTrue(
+    !seoSrcTip.includes("Page views from AI agents (ChatGPT, Claude, Perplexity etc.), last 90 days"),
+    "ai-tooltip: the old crawler-flavoured English tooltip is gone"
+  );
+  // The tile itself must be untouched: same wrapper, same data-fill hook the
+  // stats JS writes into, same meta line.
+  assertTrue(
+    /<div class="pf-stat" data-stat="ai" title="\$\{lang === "en" \? "[^"]+" : "[^"]+"\}">/.test(seoSrcTip),
+    "ai-tooltip: tile markup unchanged and the title attribute stays valid (no raw quote inside)"
+  );
+  assertTrue(
+    seoSrcTip.includes('<strong data-fill="ai">0</strong>'),
+    "ai-tooltip: data-fill=\"ai\" hook untouched"
+  );
+}
+
+
+// ── dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 1 ──
+// vCard encoding hardening: per-property CHARSET=UTF-8 parameters in
+// buildVCard(), and an RFC 6266 Content-Disposition with BOTH an ASCII
+// transliterated `filename=` fallback and an RFC 5987 `filename*=UTF-8''…`.
+// buildVCard() itself needs a live registry/knowledge row, so its parameter
+// syntax is pinned source-presence style (same convention as the pr42 block
+// below); the header builder is a pure export and is tested for real.
+console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ──");
+{
+  const fs = require("fs");
+  const src = fs.readFileSync("src/routes/marketplace.ts", "utf8");
+
+  assertTrue(
+    src.includes("`FN;${VCARD_CHARSET}:${escapeVCard(agent.name)}`"),
+    "vcard: FN carries a CHARSET=UTF-8 property parameter"
+  );
+  assertTrue(
+    src.includes("`ORG;${VCARD_CHARSET}:${escapeVCard(agent.name)}`"),
+    "vcard: ORG carries a CHARSET=UTF-8 property parameter"
+  );
+  assertTrue(
+    src.includes("const VCARD_NOTE_PREFIX = `NOTE;${VCARD_CHARSET}:`"),
+    "vcard: NOTE carries a CHARSET=UTF-8 property parameter"
+  );
+  assertTrue(
+    src.includes("`ADR;TYPE=WORK;${VCARD_CHARSET}:;;"),
+    "vcard: ADR carries a CHARSET=UTF-8 property parameter (after TYPE=WORK)"
+  );
+  assertTrue(
+    src.includes('const VCARD_CHARSET = "CHARSET=UTF-8"'),
+    "vcard: CHARSET parameter value is exactly CHARSET=UTF-8 (vCard 3.0 syntax)"
+  );
+  // Regression guard: the products appendix rewrites the NOTE line in place by
+  // prefix. If that lookup still used the un-parameterised "NOTE:" it would
+  // silently miss and emit a SECOND NOTE property.
+  assertTrue(
+    src.includes("lines.findIndex(l => l.startsWith(VCARD_NOTE_PREFIX))"),
+    "vcard: products appendix finds the NOTE line by its parameterised prefix, not bare 'NOTE:'"
+  );
+  assertTrue(
+    !/lines\.findIndex\(l => l\.startsWith\("NOTE:"\)\)/.test(src),
+    "vcard: no leftover bare 'NOTE:' prefix lookup"
+  );
+
+  const { vcardContentDisposition } =
+    require("../src/routes/marketplace") as typeof import("../src/routes/marketplace");
+
+  const cd = vcardContentDisposition("Bjørnstad Gård");
+  assertEq(
+    cd,
+    "attachment; filename=\"Bjoernstad_Gaard.vcf\"; filename*=UTF-8''Bj%C3%B8rnstad_G%C3%A5rd.vcf",
+    "vcard: Content-Disposition has ASCII fallback + RFC 5987 filename*"
+  );
+  assertTrue(
+    !/[^\x00-\x7F]/.test(cd),
+    "vcard: the whole Content-Disposition header value is 7-bit ASCII"
+  );
+  assertTrue(
+    cd.startsWith('attachment; filename="') && cd.includes("; filename*=UTF-8''"),
+    "vcard: header order is attachment; filename=\"…\"; filename*=UTF-8''…"
+  );
+  assertEq(
+    vcardContentDisposition("Ærfuglen Øst Ås"),
+    "attachment; filename=\"AErfuglen_OEst_AAs.vcf\"; filename*=UTF-8''%C3%86rfuglen_%C3%98st_%C3%85s.vcf",
+    "vcard: uppercase ÆØÅ transliterate to AE/OE/AA in the ASCII fallback"
+  );
+  assertTrue(
+    vcardContentDisposition("Café Ünïcode 北京").startsWith('attachment; filename="Caf_ncode_.vcf"'),
+    "vcard: non-Norwegian non-ASCII is stripped from the ASCII fallback"
+  );
+  assertEq(
+    vcardContentDisposition(""),
+    "attachment; filename=\"agent.vcf\"; filename*=UTF-8''agent.vcf",
+    "vcard: empty name falls back to agent.vcf on both parameters"
+  );
+}
+
+
 // ── PR-42: PUT /api/marketplace/agents/:id/description (source-presence) ──
 // The runtime handler is exercised by manual probes against prod (see
 // supervisor-rejections/2026-05-15-pr-42-success.md). These tests lock in
