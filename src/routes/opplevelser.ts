@@ -177,6 +177,9 @@ import {
   upsertGardssalgWebsiteReviewQueue,
   clearGardssalgWebsiteReviewQueueEntry,
   listGardssalgWebsiteReviewQueue,
+  // Grep 8 slice 1 — third human-review queue reported by
+  // GET /admin/gardssalg-review-queues-staleness (pending rows only).
+  listExperienceHomepageReviewQueuePending,
   stampGardssalgWebsiteDiscoveryAttempt,
   applyGardssalgProviderWebsite,
   // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, sub-slice
@@ -9713,13 +9716,30 @@ router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, 
 // route already reports per-run. Zero writes, zero change to either
 // queue's existing behaviour/thresholds/schema — a pure additional read.
 //
+// Grep 8 slice 1: the report now covers all THREE human-review queues — the
+// two gårdssalg ones above plus experience_homepage_review_queue (the M0c /
+// generic listing-homepage queue), which had the same silent-staleness gap.
+// The homepage queue alone is read through a `status='pending'` filter
+// (listExperienceHomepageReviewQueuePending) because of a delete-vs-mark
+// asymmetry: the two gårdssalg queues DELETE a row when it is resolved, so
+// their table IS the open queue, whereas the homepage queue's approve lever
+// only MARKS the row (`status='approved'` + `resolved_at`) and keeps it.
+// Reading it unfiltered would count every historically-resolved candidate as
+// still queued and — since `created_at` never moves — report long-closed rows
+// as permanently stale. Still zero new math: same
+// computeGardssalgQueueAgeReport, same GS_VTP_QUEUE_STALE_DAYS threshold, and
+// the two pre-existing response keys are untouched (the daily-brief SKILL
+// already consumes them).
+//
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 router.get("/admin/gardssalg-review-queues-staleness", requireAdmin, (_req: Request, res: Response) => {
   const orgnrQueueReport = computeGardssalgQueueAgeReport(listGardssalgOrgnrReviewQueue());
   const websiteQueueReport = computeGardssalgQueueAgeReport(listGardssalgWebsiteReviewQueue());
+  const homepageQueueReport = computeGardssalgQueueAgeReport(listExperienceHomepageReviewQueuePending());
   res.json({
     orgnr_review_queue: orgnrQueueReport,
     website_review_queue: websiteQueueReport,
+    experience_homepage_review_queue: homepageQueueReport,
   });
 });
 

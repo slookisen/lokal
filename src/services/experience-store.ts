@@ -7506,6 +7506,48 @@ export function listGardssalgWebsiteReviewQueue(): (GardssalgWebsiteReviewQueueE
     .all() as (GardssalgWebsiteReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
 }
 
+/**
+ * Lists the CURRENTLY-PENDING rows of experience_homepage_review_queue (the
+ * M0c / generic listing-homepage queue), oldest first — read-only, backs the
+ * third queue reported by GET /admin/gardssalg-review-queues-staleness.
+ *
+ * The `status = 'pending'` filter is load-bearing and is the reason this
+ * lister exists at all instead of a plain `SELECT *` like its two gårdssalg
+ * neighbours above. Those two queues DELETE the row when a human resolves it
+ * (clearGardssalgOrgnrReviewQueueEntry / clearGardssalgWebsiteReviewQueueEntry),
+ * so their whole table IS the open queue. This one instead MARKS the row
+ * (`status='approved'` + `resolved_at`, see POST
+ * /admin/listing-homepage-review-approve) and RETAINS it — so an unfiltered
+ * read would count every historically-resolved candidate as still queued and,
+ * because `created_at` never moves, would report long-closed rows as
+ * permanently "stale". Only `pending` is an open review item.
+ *
+ * Selects exactly the four columns the age report reads — the table has no
+ * `updated_at` (deliberately; see its DDL in init-experiences.ts), hence the
+ * `created_at ASC` ordering rather than the neighbours' updated-desc.
+ */
+export function listExperienceHomepageReviewQueuePending(): Array<{
+  provider_id: string;
+  provider_name: string | null;
+  reason: string | null;
+  created_at: string;
+}> {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT provider_id, provider_name, reason, created_at
+         FROM experience_homepage_review_queue
+        WHERE status = 'pending'
+        ORDER BY created_at ASC`
+    )
+    .all() as Array<{
+    provider_id: string;
+    provider_name: string | null;
+    reason: string | null;
+    created_at: string;
+  }>;
+}
+
 /** Anti-starvation stamp for website discovery (mirrors the content-refresh
  * attempt stamp's role, on its own column). */
 export function stampGardssalgWebsiteDiscoveryAttempt(providerIds: string[]): void {

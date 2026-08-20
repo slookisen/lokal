@@ -34,6 +34,27 @@
  *   s5  no X-Admin-Key header -> 403 (same status the neighbouring
  *       /admin/gardssalg-orgnr-review-queue GET route's own tests assert)
  *
+ * Grep 8 slice 1 — the report gained a THIRD queue,
+ * experience_homepage_review_queue (the M0c / generic listing-homepage
+ * queue). It is the only one of the three whose approve lever MARKS the row
+ * (`status='approved'` + `resolved_at`) instead of DELETING it, so it is read
+ * through listExperienceHomepageReviewQueuePending()'s `status='pending'`
+ * filter — without which every historically-resolved candidate would be
+ * counted as still-queued and, since `created_at` never moves, reported as
+ * permanently stale. s9 is the guard on exactly that.
+ *
+ *   s6  empty homepage queue -> experience_homepage_review_queue present with
+ *       count:0, stale_count:0, oldest_first:[]
+ *   s7  a pending homepage row older than GS_VTP_QUEUE_STALE_DAYS ->
+ *       stale:true, counted in stale_count
+ *   s8  a fresh (today) pending homepage row -> stale:false, NOT counted
+ *   s9  resolved rows (status 'approved' / 'rejected') are EXCLUDED entirely:
+ *       1 pending + 2 resolved -> count:1, and the returned row is the
+ *       pending one
+ *   s10 all THREE queues reported independently in ONE response, with the two
+ *       pre-existing keys keeping their exact prior shape/values (regression
+ *       guard for the daily-brief SKILL that already consumes them)
+ *
  * Standalone:
  *   node node_modules/tsx/dist/cli.mjs src/routes/admin-gardssalg-review-queues-staleness.test.ts
  */
@@ -136,6 +157,14 @@ export function runAdminGardssalgReviewQueuesStalenessTests(opts: { log?: boolea
            (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, created_at, updated_at)
          VALUES (@id, @provider_id, @provider_name, @candidate_url, NULL, NULL, NULL, @reason, NULL, @created_at, @created_at)`
       );
+      // Grep 8 slice 1 — the third queue. Note it has NO updated_at (by
+      // design) but DOES carry status/resolved_at, which is exactly what s9
+      // exercises.
+      const insertHomepageQueueRow = expDb.prepare(
+        `INSERT INTO experience_homepage_review_queue
+           (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, resolved_at)
+         VALUES (@id, @provider_id, @provider_name, @candidate_url, NULL, NULL, NULL, @reason, NULL, @status, @created_at, @resolved_at)`
+      );
 
       // SQLite-formatted UTC timestamp (space separator, no zone) — the
       // exact shape gsVtpParseSqliteUtcMs expects, matching datetime('now')
@@ -228,6 +257,133 @@ export function runAdminGardssalgReviewQueuesStalenessTests(opts: { log?: boolea
         const r = await call({}, { headers: {} });
         assertEq(r.status, 403, "s5a: no X-Admin-Key -> 403");
         assertTrue(r.body?.orgnr_review_queue === undefined, "s5b: no-key response carries no queue payload");
+      }
+
+      // ── s6: homepage queue present and zeroed out while still empty ──────
+      {
+        const r = await call();
+        assertEq(r.status, 200, "s6a: with the third queue wired in -> still 200");
+        assertTrue(r.body?.experience_homepage_review_queue !== undefined, "s6b: experience_homepage_review_queue key present");
+        assertEq(r.body.experience_homepage_review_queue?.count, 0, "s6c: experience_homepage_review_queue.count 0");
+        assertEq(r.body.experience_homepage_review_queue?.stale_count, 0, "s6d: experience_homepage_review_queue.stale_count 0");
+        assertEq(JSON.stringify(r.body.experience_homepage_review_queue?.oldest_first), "[]", "s6e: experience_homepage_review_queue.oldest_first []");
+        assertEq(
+          r.body.experience_homepage_review_queue?.stale_threshold_days,
+          staleThresholdDays,
+          "s6f: same threshold reported (no new threshold introduced)"
+        );
+      }
+
+      // ── s7: a stale PENDING homepage row ─────────────────────────────────
+      {
+        seedProvider("s7-homepage-old", "Gammel Hjemmeside Gard");
+        insertHomepageQueueRow.run({
+          id: "q-s7-old", provider_id: "s7-homepage-old", provider_name: "Gammel Hjemmeside Gard",
+          candidate_url: "https://gammel-hjemmeside-gard.example.no",
+          reason: "listing_page_link_candidate", status: "pending",
+          created_at: sqliteUtcDaysAgo(staleThresholdDays + 4), resolved_at: null,
+        });
+
+        const r = await call();
+        assertEq(r.body.experience_homepage_review_queue?.count, 1, "s7a: homepage count reflects the 1 pending row");
+        assertEq(r.body.experience_homepage_review_queue?.stale_count, 1, "s7b: the old pending row is counted stale");
+        const row = (r.body.experience_homepage_review_queue?.oldest_first as any[])?.find((x) => x.provider_id === "s7-homepage-old");
+        assertTrue(!!row, "s7c: the old pending row is present in oldest_first");
+        assertEq(row?.stale, true, "s7d: row carries stale:true");
+        assertEq(row?.name, "Gammel Hjemmeside Gard", "s7e: row carries the provider name");
+        assertEq(row?.reason, "listing_page_link_candidate", "s7f: row carries the queue reason");
+        assertTrue(typeof row?.age_days === "number" && row.age_days >= staleThresholdDays + 3, "s7g: age_days reflects the backdated created_at");
+      }
+
+      // ── s8: a fresh (today) PENDING homepage row alongside the old one ───
+      {
+        seedProvider("s8-homepage-fresh", "Fersk Hjemmeside Gard");
+        insertHomepageQueueRow.run({
+          id: "q-s8-fresh", provider_id: "s8-homepage-fresh", provider_name: "Fersk Hjemmeside Gard",
+          candidate_url: "https://fersk-hjemmeside-gard.example.no",
+          reason: "listing_page_link_candidate", status: "pending",
+          created_at: sqliteUtcDaysAgo(0), resolved_at: null,
+        });
+
+        const r = await call();
+        assertEq(r.body.experience_homepage_review_queue?.count, 2, "s8a: homepage count now 2 (old + fresh)");
+        assertEq(r.body.experience_homepage_review_queue?.stale_count, 1, "s8b: stale_count STILL 1 — the fresh row is not counted");
+        const freshRow = (r.body.experience_homepage_review_queue?.oldest_first as any[])?.find((x) => x.provider_id === "s8-homepage-fresh");
+        assertTrue(!!freshRow, "s8c: the fresh row is present in oldest_first");
+        assertEq(freshRow?.stale, false, "s8d: fresh row carries stale:false");
+        assertEq(freshRow?.age_days, 0, "s8e: fresh row's age_days is 0");
+      }
+
+      // ── s9: RESOLVED rows are excluded entirely ──────────────────────────
+      //
+      // The load-bearing case. Unlike the two gårdssalg queues (which DELETE
+      // a row on approval), this queue's approve lever sets status='approved'
+      // + resolved_at and KEEPS the row. Reading the table unfiltered would
+      // therefore count every historically-resolved candidate as still queued
+      // — and since created_at never moves, every one of them would report as
+      // permanently stale. Rebuild the table to the exact spec shape (1
+      // pending + 2 resolved) so the count assertion is unambiguous.
+      {
+        expDb.prepare(`DELETE FROM experience_homepage_review_queue`).run();
+        seedProvider("s9-homepage-pending", "Ventende Hjemmeside Gard");
+        seedProvider("s9-homepage-approved", "Godkjent Hjemmeside Gard");
+        seedProvider("s9-homepage-rejected", "Avvist Hjemmeside Gard");
+        insertHomepageQueueRow.run({
+          id: "q-s9-pending", provider_id: "s9-homepage-pending", provider_name: "Ventende Hjemmeside Gard",
+          candidate_url: "https://ventende.example.no",
+          reason: "listing_page_link_candidate", status: "pending",
+          created_at: sqliteUtcDaysAgo(staleThresholdDays + 2), resolved_at: null,
+        });
+        insertHomepageQueueRow.run({
+          id: "q-s9-approved", provider_id: "s9-homepage-approved", provider_name: "Godkjent Hjemmeside Gard",
+          candidate_url: "https://godkjent.example.no",
+          reason: "listing_page_link_candidate", status: "approved",
+          created_at: sqliteUtcDaysAgo(staleThresholdDays + 90), resolved_at: sqliteUtcDaysAgo(1),
+        });
+        insertHomepageQueueRow.run({
+          id: "q-s9-rejected", provider_id: "s9-homepage-rejected", provider_name: "Avvist Hjemmeside Gard",
+          candidate_url: "https://avvist.example.no",
+          reason: "listing_page_link_candidate", status: "rejected",
+          created_at: sqliteUtcDaysAgo(staleThresholdDays + 60), resolved_at: sqliteUtcDaysAgo(2),
+        });
+
+        const r = await call();
+        assertEq(r.body.experience_homepage_review_queue?.count, 1, "s9a: 1 pending + 2 resolved -> count 1, not 3");
+        assertEq(r.body.experience_homepage_review_queue?.stale_count, 1, "s9b: only the pending row can be stale");
+        const rows = (r.body.experience_homepage_review_queue?.oldest_first as any[]) ?? [];
+        assertEq(rows.length, 1, "s9c: oldest_first holds exactly the 1 pending row");
+        assertEq(rows[0]?.provider_id, "s9-homepage-pending", "s9d: the returned row IS the pending one");
+        assertTrue(
+          !rows.some((x) => x.provider_id === "s9-homepage-approved" || x.provider_id === "s9-homepage-rejected"),
+          "s9e: neither resolved row leaks into the report"
+        );
+      }
+
+      // ── s10: all THREE queues, independently, in ONE response ────────────
+      //
+      // Regression guard for the daily-brief SKILL: adding the third key must
+      // not perturb the two pre-existing ones. Their values here are exactly
+      // what s3/s4 already asserted (orgnr 2/1, website 1/1) — nothing seeded
+      // since then touched either queue.
+      {
+        const r = await call();
+        assertEq(r.status, 200, "s10a: 200");
+        assertEq(r.body.orgnr_review_queue?.count, 2, "s10b: orgnr_review_queue.count unchanged at 2");
+        assertEq(r.body.orgnr_review_queue?.stale_count, 1, "s10c: orgnr_review_queue.stale_count unchanged at 1");
+        assertEq(r.body.orgnr_review_queue?.stale_threshold_days, staleThresholdDays, "s10d: orgnr threshold unchanged");
+        assertEq((r.body.orgnr_review_queue?.oldest_first as any[])?.length, 2, "s10e: orgnr oldest_first still holds both rows");
+        assertEq(r.body.website_review_queue?.count, 1, "s10f: website_review_queue.count unchanged at 1");
+        assertEq(r.body.website_review_queue?.stale_count, 1, "s10g: website_review_queue.stale_count unchanged at 1");
+        assertEq(r.body.website_review_queue?.stale_threshold_days, staleThresholdDays, "s10h: website threshold unchanged");
+        assertEq((r.body.website_review_queue?.oldest_first as any[])?.length, 1, "s10i: website oldest_first still holds its row");
+        assertEq(r.body.experience_homepage_review_queue?.count, 1, "s10j: homepage queue reported independently (count 1)");
+        assertEq(r.body.experience_homepage_review_queue?.stale_count, 1, "s10k: homepage stale_count computed independently");
+        // Exactly three keys — no accidental extra/renamed key in the payload.
+        assertEq(
+          JSON.stringify(Object.keys(r.body).sort()),
+          JSON.stringify(["experience_homepage_review_queue", "orgnr_review_queue", "website_review_queue"]),
+          "s10l: response carries exactly the three queue keys"
+        );
       }
     } catch (err: any) {
       failed++;
