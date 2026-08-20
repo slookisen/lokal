@@ -29,6 +29,11 @@
 import { Router, Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/init";
+import {
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  enrichmentWritePauseBlock,
+  normalizeEnrichmentVertical,
+} from "../services/enrichment-write-pause";
 import { slugify } from "../utils/slug";
 import {
   verifyOrgNumber,
@@ -389,6 +394,27 @@ router.get("/", (req: Request, res: Response) => {
 // "kontakt@rettfrabonden.com" placeholder that column otherwise gets.
 router.post("/register", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde) ───────────────────────────────────────────────────
+  // This is the surface that registered 5 producers in violation on
+  // 2026-08-20 while an RFB pause was live. The gate runs FIRST — before the
+  // required-field validation below, before dedup, before the INSERT — and
+  // fails CLOSED. A net-new agent has no row to read a vertical off, so the
+  // vertical is taken from the one the request is registering under,
+  // defaulting to 'rfb' exactly as `agents.vertical_id` itself does; an
+  // unrecognised value also collapses to 'rfb' rather than escaping the gate
+  // (the strict rejection of a bogus vertical_id still happens below, at 400).
+  {
+    const pauseBlock = enrichmentWritePauseBlock(
+      getDb(),
+      normalizeEnrichmentVertical((req.body as { vertical_id?: unknown } | undefined)?.vertical_id),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   // ── Validate required fields ───────────────────────────────
   const {

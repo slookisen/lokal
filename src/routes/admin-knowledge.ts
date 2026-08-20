@@ -88,6 +88,10 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import {
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  enrichmentWritePauseBlockForAgents,
+} from "../services/enrichment-write-pause";
 import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
 // dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
 // render-time repair logic as the one-time DB backfill/cleanup function —
@@ -531,6 +535,25 @@ type IncomingBody = {
 
 router.put("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde) ───────────────────────────────────────────────────
+  // THIS is the endpoint `lokal-agent-enrichment` PUTs into, and the one that
+  // wrote ~8 agents in violation on 2026-08-20 while an RFB pause was live.
+  // The gate runs FIRST — before agent_id validation, before the 404 lookup,
+  // before any column or provenance work — and fails CLOSED, so a lookup that
+  // cannot answer blocks the write instead of waving it through. The vertical
+  // is read from the target agent's own `agents.vertical_id`; an unknown or
+  // missing agent_id resolves to that column's own default ('rfb').
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(getDb(), [
+      typeof (req.body as any)?.agent_id === "string" ? ((req.body as any).agent_id as string) : "",
+    ]);
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const body = (req.body ?? {}) as IncomingBody;
   const agentId = typeof body.agent_id === "string" ? body.agent_id.trim() : "";

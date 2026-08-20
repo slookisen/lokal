@@ -64,6 +64,7 @@ import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
+import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
@@ -619,6 +620,13 @@ app.use("/admin/agents/contact-email-dns-check", adminLimiter, adminAgentsContac
 // POST /admin/agents/url-write (dev-request 2026-08-01-rfb-agents-url-skrivespak).
 // Same ordering rule as the sibling above — mount BEFORE /admin/agents.
 app.use("/admin/agents/url-write", adminLimiter, adminAgentsUrlWriteRoutes);
+// GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
+// write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
+// state that services/enrichment-write-pause.ts enforces on every enrichment
+// write surface (url-write, knowledge PUT, agents/register, contact-email-
+// write). Its own top-level path, NOT under /admin/agents: the pause is a
+// vertical-wide lever, not an agent-scoped one.
+app.use("/admin/enrichment-write-pause", adminLimiter, adminEnrichmentWritePauseRoutes);
 // POST /admin/agents/duplicate-merge — explicit-pair duplicate merge lever
 // (dev-request duplicate-merge lever). Same ordering rule as the siblings
 // above — mount BEFORE /admin/agents.

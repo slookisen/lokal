@@ -62,6 +62,10 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
+import {
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  enrichmentWritePauseBlockForAgents,
+} from "../services/enrichment-write-pause";
 
 const router = Router();
 
@@ -264,6 +268,28 @@ function applyUrl(
 
 router.post("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde) ───────────────────────────────────────────────────
+  // FIRST thing after auth, before ANY validation and before any write. The
+  // 2026-08-20 incident happened because the pause lived only as prose in a
+  // SKILL file; this call is what makes it impossible to write here while a
+  // pause is live, regardless of which caller or which SKILL revision. It
+  // fails CLOSED — a lookup that cannot answer blocks the write. Gates the
+  // whole request (not per item) so a paused batch performs ZERO writes.
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      db_(),
+      (Array.isArray((req.body as any)?.items) ? ((req.body as any).items as unknown[]) : []).map((raw) => {
+        const id = (raw as { agent_id?: unknown } | null)?.agent_id;
+        return typeof id === "string" ? id : "";
+      }),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
 
   const body = (req.body ?? {}) as { items?: unknown; apply?: unknown; allow_directory_host?: unknown };
   const apply =
