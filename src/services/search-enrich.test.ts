@@ -27,6 +27,10 @@ import {
   // dev-request 2026-07-20 gårdssalg-kvalitetsgate-redesign, criterion 1:
   // structure-aware prose extraction (PURE).
   extractProseText,
+  // dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 3:
+  // the ONE shared HTML-entity decoder behind extractVisibleText /
+  // extractProseText / summarizeAbout (PURE).
+  decodeHtmlEntities,
   // PR-24a: homepage CONTENT → platform write helpers (PURE).
   mapToPlatformCategories,
   meetsAboutQualityBar,
@@ -1431,6 +1435,237 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
         "mojibakeSnippet: snippet is bounded/windowed, not the entire (potentially huge) field value"
       );
     }
+  }
+
+  // ── dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 3 ──
+  // decodeHtmlEntities() + the three call sites that used to carry their own
+  // divergent, partial entity lists. The production symptom: CMS copy written
+  // with an en dash (`&#8211;` / `&ndash;` / `&#x2013;`) landed the RAW entity
+  // text in about_text/description, so profiles showed "Gården &#8211; siden
+  // 1890".
+  {
+    // The decoder itself.
+    assertEq(decodeHtmlEntities("a &#8211; b"), "a – b", "decodeHtmlEntities: decimal &#8211; → en dash");
+    assertEq(decodeHtmlEntities("a &ndash; b"), "a – b", "decodeHtmlEntities: named &ndash; → en dash");
+    assertEq(decodeHtmlEntities("a &#x2013; b"), "a – b", "decodeHtmlEntities: hex &#x2013; → en dash");
+    assertEq(decodeHtmlEntities("a &#X2013; b"), "a – b", "decodeHtmlEntities: uppercase-X hex form also decodes");
+    assertEq(decodeHtmlEntities("a &mdash; b"), "a — b", "decodeHtmlEntities: &mdash; → em dash");
+    assertEq(decodeHtmlEntities("vent&hellip;"), "vent…", "decodeHtmlEntities: &hellip; → ellipsis");
+    assertEq(
+      decodeHtmlEntities("&lsquo;a&rsquo; &ldquo;b&rdquo;"),
+      "‘a’ “b”",
+      "decodeHtmlEntities: curly quote entities (&lsquo;/&rsquo;/&ldquo;/&rdquo;)",
+    );
+
+    // Everything the old chains handled must still work.
+    assertEq(decodeHtmlEntities("a&nbsp;b"), "a b", "decodeHtmlEntities: &nbsp; → plain space (unchanged semantics)");
+    assertEq(decodeHtmlEntities("Salt &amp; Pepper"), "Salt & Pepper", "decodeHtmlEntities: &amp; → &");
+    assertEq(
+      decodeHtmlEntities("&aelig;&oslash;&aring;"),
+      "æøå",
+      "decodeHtmlEntities: lowercase Norwegian entities",
+    );
+    assertEq(
+      decodeHtmlEntities("&AElig;&Oslash;&Aring;"),
+      "ÆØÅ",
+      "decodeHtmlEntities: UPPERCASE Norwegian entities decode to uppercase letters",
+    );
+    assertEq(decodeHtmlEntities("&quot;sitat&quot;"), '"sitat"', "decodeHtmlEntities: &quot; → \"");
+    assertEq(decodeHtmlEntities("det&#39;s"), "det's", "decodeHtmlEntities: &#39; → apostrophe (numeric branch)");
+
+    // THE ordering invariant: `&amp;` must be decoded in the same single pass,
+    // never before the numeric branch, or `&amp;#8211;` double-decodes into a
+    // dash instead of staying the literal text `&#8211;`.
+    assertEq(
+      decodeHtmlEntities("Gården &amp;#8211; siden 1890"),
+      "Gården &#8211; siden 1890",
+      "decodeHtmlEntities: &amp;#8211; stays LITERAL &#8211; (no double-decode)",
+    );
+    assertEq(
+      decodeHtmlEntities("&amp;ndash;"),
+      "&ndash;",
+      "decodeHtmlEntities: &amp;ndash; stays literal &ndash; (no double-decode)",
+    );
+    assertEq(
+      decodeHtmlEntities("&#38;amp;"),
+      "&amp;",
+      "decodeHtmlEntities: &#38;amp; single-decodes to the literal text &amp;",
+    );
+
+    // Invalid / out-of-range numeric references are left verbatim, not thrown on.
+    assertEq(decodeHtmlEntities("&#1114112;"), "&#1114112;", "decodeHtmlEntities: code point > 0x10FFFF left as-is");
+    assertEq(decodeHtmlEntities("&#xD800;"), "&#xD800;", "decodeHtmlEntities: lone surrogate left as-is");
+    assertEq(decodeHtmlEntities("&#0;"), "&#0;", "decodeHtmlEntities: NUL reference left as-is");
+
+    // ── Control characters (round-2 review finding) ────────────────────────
+    // `\b` and DEL are NOT matched by `\s`, so the whitespace collapse every
+    // call site runs does not remove them — before the guard in
+    // decodeHtmlEntities they survived all the way into about_text/description
+    // and the DB.
+    assertEq(decodeHtmlEntities("a&#8;b"), "a&#8;b", "decodeHtmlEntities: &#8; (BACKSPACE) left as-is, never emitted");
+    assertEq(decodeHtmlEntities("a&#1;b"), "a&#1;b", "decodeHtmlEntities: &#1; (C0) left as-is");
+    assertEq(decodeHtmlEntities("a&#127;b"), "a&#127;b", "decodeHtmlEntities: &#127; (DEL) left as-is");
+    assertEq(decodeHtmlEntities("a&#x7F;b"), "a&#x7F;b", "decodeHtmlEntities: hex DEL spelling left as-is too");
+    assertEq(decodeHtmlEntities("a&#155;b"), "a&#155;b", "decodeHtmlEntities: &#155; (C1) left as-is");
+    assertEq(decodeHtmlEntities("a&#x9F;b"), "a&#x9F;b", "decodeHtmlEntities: &#x9F; (top of C1) left as-is");
+    assertEq(decodeHtmlEntities("a&#31;b"), "a&#31;b", "decodeHtmlEntities: &#31; (last C0 above CR) left as-is");
+    assertTrue(
+      !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(
+        decodeHtmlEntities("&#1;&#8;&#11;&#14;&#31;&#127;&#128;&#159;"),
+      ),
+      "decodeHtmlEntities: NO C0/C1/DEL code point is ever emitted from a numeric reference",
+    );
+    // The whitespace controls that ARE legitimate text still decode — the call
+    // sites' \s+ collapse then folds them into a single space.
+    assertEq(decodeHtmlEntities("a&#9;b"), "a\tb", "decodeHtmlEntities: &#9; (TAB) still decodes");
+    assertEq(decodeHtmlEntities("a&#10;b"), "a\nb", "decodeHtmlEntities: &#10; (LF) still decodes");
+    assertEq(decodeHtmlEntities("a&#13;b"), "a\rb", "decodeHtmlEntities: &#13; (CR) still decodes");
+    assertEq(decodeHtmlEntities("a&#32;b"), "a b", "decodeHtmlEntities: &#32; (SPACE) still decodes");
+    assertEq(
+      extractVisibleText("<p>Gården&#8;drevet&#127;siden 1890</p>"),
+      "Gården&#8;drevet&#127;siden 1890",
+      "extractVisibleText: control-char references stay literal — no raw \\b/DEL reaches about_text",
+    );
+
+    // ── NBSP: all three spellings must agree (round-2 review finding) ──────
+    // decodeHtmlEntities is EXPORTED now, so `&nbsp;` → U+0020 while
+    // `&#160;`/`&#xA0;` → U+00A0 would hand a future caller two different
+    // answers for one and the same character.
+    assertEq(decodeHtmlEntities("a&#160;b"), "a b", "decodeHtmlEntities: &#160; → plain space, same as &nbsp;");
+    assertEq(decodeHtmlEntities("a&#xA0;b"), "a b", "decodeHtmlEntities: &#xA0; → plain space, same as &nbsp;");
+    assertEq(
+      [decodeHtmlEntities("a&nbsp;b"), decodeHtmlEntities("a&#160;b"), decodeHtmlEntities("a&#xA0;b")].join("|"),
+      "a b|a b|a b",
+      "decodeHtmlEntities: named/decimal/hex NBSP spellings are byte-identical",
+    );
+    assertTrue(
+      !decodeHtmlEntities("a&#160;b&#xA0;c&nbsp;d").includes("\u00A0"),
+      "decodeHtmlEntities: no U+00A0 is emitted for ANY NBSP spelling",
+    );
+    // The call-site semantics the existing three sites rely on are unchanged.
+    assertEq(
+      Array.from(extractVisibleText("<p>a&nbsp;b</p>")).map((c) => c.codePointAt(0)!.toString(16)).join(","),
+      "61,20,62",
+      "extractVisibleText: <p>a&nbsp;b</p> still yields exactly [a, U+0020, b]",
+    );
+    assertEq(
+      Array.from(extractVisibleText("<p>a&#160;b</p>")).map((c) => c.codePointAt(0)!.toString(16)).join(","),
+      "61,20,62",
+      "extractVisibleText: the numeric NBSP spelling now yields the same [a, U+0020, b]",
+    );
+
+    assertEq(decodeHtmlEntities("&copy; 2026"), "&copy; 2026", "decodeHtmlEntities: unknown named entity left verbatim");
+    assertEq(decodeHtmlEntities("100% &agree"), "100% &agree", "decodeHtmlEntities: bare '&' / unterminated ref untouched");
+    assertEq(decodeHtmlEntities(""), "", "decodeHtmlEntities: empty in → empty out");
+    assertEq(decodeHtmlEntities(null as unknown as string), "", "decodeHtmlEntities: null-ish in → empty out");
+
+    // All THREE call sites must decode the same way — that's the whole point of
+    // the shared helper (three divergent lists was the bug).
+    const dashHtml =
+      "<html><head><meta property='og:description' content='Gården &#8211; drevet &ndash; siden &#x2013; 1890'></head>" +
+      "<body><p>Gården &#8211; drevet &ndash; siden &#x2013; 1890 og vi selger økologiske grønnsaker hele året.</p></body></html>";
+
+    const visible = extractVisibleText(dashHtml);
+    assertTrue(!visible.includes("&#8211;"), "extractVisibleText: no raw &#8211; survives");
+    assertTrue(!visible.includes("&ndash;"), "extractVisibleText: no raw &ndash; survives");
+    assertTrue(!visible.includes("&#x2013;"), "extractVisibleText: no raw &#x2013; survives");
+    assertTrue(
+      visible.includes("Gården – drevet – siden – 1890"),
+      `extractVisibleText: all three dash forms decode to a real en dash (got: ${visible.slice(0, 80)})`,
+    );
+
+    const prose = extractProseText(dashHtml);
+    assertTrue(!prose.includes("&#8211;") && !prose.includes("&ndash;") && !prose.includes("&#x2013;"),
+      "extractProseText: no raw dash entity survives");
+    assertTrue(
+      prose.includes("Gården – drevet – siden – 1890"),
+      `extractProseText: all three dash forms decode to a real en dash (got: ${prose.slice(0, 80)})`,
+    );
+
+    const about = summarizeAbout(dashHtml);
+    assertTrue(!about.includes("&#8211;") && !about.includes("&ndash;") && !about.includes("&#x2013;"),
+      "summarizeAbout: no raw dash entity survives");
+    assertTrue(
+      about.includes("Gården – drevet – siden – 1890"),
+      `summarizeAbout: all three dash forms decode to a real en dash (got: ${about.slice(0, 80)})`,
+    );
+
+    // …and the double-escape case stays literal through all three too.
+    const escapedHtml =
+      "<html><head><meta property='og:description' content='Gården &amp;#8211; siden 1890'></head>" +
+      "<body><p>Gården &amp;#8211; siden 1890 og vi selger økologiske grønnsaker hele året.</p></body></html>";
+    assertTrue(
+      extractVisibleText(escapedHtml).includes("Gården &#8211; siden 1890"),
+      "extractVisibleText: &amp;#8211; stays the literal text &#8211;",
+    );
+    assertTrue(
+      extractProseText(escapedHtml).includes("Gården &#8211; siden 1890"),
+      "extractProseText: &amp;#8211; stays the literal text &#8211;",
+    );
+    assertTrue(
+      summarizeAbout(escapedHtml).includes("Gården &#8211; siden 1890"),
+      "summarizeAbout: &amp;#8211; stays the literal text &#8211;",
+    );
+
+    // ── `<` / `>`: all spellings must agree (round-2 review BLOCKING) ──────
+    // `&lt;`/`&gt;` are deliberately absent from HTML_NAMED_ENTITIES and stay
+    // verbatim. If the NUMERIC spellings decoded, `&#60;/script&#62;` in a
+    // producer's og:description would become a real `</script>` in about_text,
+    // which admin-knowledge writes automatically and seo.ts emits INSIDE a
+    // <script type="application/ld+json"> element — terminating it early.
+    // Both decimal AND hex (upper- and lowercase) must be covered: a guard that
+    // catches only `&#60;` is exactly the failure mode this test exists for.
+    for (const ref of ["&#60;", "&#62;", "&#x3C;", "&#x3E;", "&#x3c;", "&#x3e;"]) {
+      assertEq(
+        decodeHtmlEntities(`a${ref}b`),
+        `a${ref}b`,
+        `decodeHtmlEntities: ${ref} left verbatim (never becomes a real < or >)`,
+      );
+    }
+    assertTrue(
+      !/[<>]/.test(decodeHtmlEntities("&#60;&#62;&#x3C;&#x3E;&#x3c;&#x3e;")),
+      "decodeHtmlEntities: NO angle bracket is ever emitted from a numeric reference",
+    );
+    // Unchanged behaviour: the named twins still pass through verbatim.
+    assertEq(decodeHtmlEntities("a&lt;b&gt;c"), "a&lt;b&gt;c", "decodeHtmlEntities: &lt;/&gt; still verbatim (unchanged)");
+    assertEq(
+      [decodeHtmlEntities("&lt;"), decodeHtmlEntities("&#60;"), decodeHtmlEntities("&#x3C;")].join("|"),
+      "&lt;|&#60;|&#x3C;",
+      "decodeHtmlEntities: named/decimal/hex `<` spellings all stay un-decoded (they agree)",
+    );
+
+    // The reviewer's executed payload, through all THREE call sites.
+    const xssPayload = "&#60;/script&#62;&#60;img src=x onerror=alert(1)&#62;";
+    const xssHtml =
+      `<html><head><meta property='og:description' content='Vi driver gård i Gudbrandsdalen og selger egne produkter hele året rundt. ` +
+      `${xssPayload} Velkommen innom til oss i helgene.'></head>` +
+      `<body><p>Vi driver gård i Gudbrandsdalen og selger egne produkter hele året rundt. ${xssPayload} Velkommen innom til oss i helgene.</p></body></html>`;
+
+    for (const [label, out] of [
+      ["extractVisibleText", extractVisibleText(xssHtml)],
+      ["extractProseText", extractProseText(xssHtml)],
+      ["summarizeAbout", summarizeAbout(xssHtml)],
+    ] as const) {
+      assertTrue(
+        !out.includes("</script>"),
+        `${label}: the &#60;/script&#62; payload never yields a literal </script> (got: ${out.slice(0, 160)})`,
+      );
+      assertTrue(
+        !/<img[^>]*onerror/i.test(out),
+        `${label}: the &#60;img src=x onerror=…&#62; payload never yields a real <img> tag`,
+      );
+      assertTrue(
+        out.includes("&#60;/script&#62;"),
+        `${label}: the numeric references survive verbatim instead (got: ${out.slice(0, 160)})`,
+      );
+    }
+    // …and the equivalent named spelling behaves identically (it always did).
+    assertTrue(
+      !summarizeAbout(
+        `<html><head><meta property='og:description' content='Gården vår er fin hele året rundt og vi tar imot besøk. &lt;/script&gt; Velkommen.'></head><body></body></html>`,
+      ).includes("</script>"),
+      "summarizeAbout: the &lt;/script&gt; named spelling also stays verbatim (unchanged)",
+    );
   }
 
   return { passed, failed, failures };

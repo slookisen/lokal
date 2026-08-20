@@ -610,11 +610,106 @@ export function extractTitle(html: string): string {
 // network — they read the same `html`/`contentText` the crawler already has, and
 // only run on a CONFIRMED producer page (provenance guaranteed by the caller).
 
+// ── HTML entity decoding (shared) ────────────────────────────────────────────
+// dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 3:
+// extractVisibleText(), extractProseText() and summarizeAbout() each carried
+// their OWN hand-rolled `.replace()` chain over a partial, and slowly
+// DIVERGING, entity list — so a producer page written with `&#8211;` or
+// `&ndash;` (both extremely common in CMS copy) landed the raw entity text in
+// about_text/description. One decoder, three call sites, so the list can never
+// drift again.
+const HTML_NAMED_ENTITIES: Readonly<Record<string, string>> = Object.freeze({
+  amp: "&",
+  // NB: a plain SPACE, not U+00A0 — every call site collapses whitespace right
+  // after decoding, and the pre-existing chains all mapped &nbsp; to " ".
+  nbsp: " ",
+  quot: '"',
+  apos: "'",
+  aelig: "æ", oslash: "ø", aring: "å",
+  AElig: "Æ", Oslash: "Ø", Aring: "Å",
+  ndash: "–", mdash: "—", hellip: "…",
+  rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“",
+});
+
+// One alternation covering hex-numeric, decimal-numeric and named references.
+// The length bounds are anti-pathology guards, not correctness limits: a valid
+// code point never needs more than 6 hex / 7 decimal digits, and no named
+// entity is 32+ chars.
+const HTML_ENTITY_RE = /&(?:#[xX]([0-9a-fA-F]{1,6})|#([0-9]{1,7})|([a-zA-Z][a-zA-Z0-9]{0,31}));/g;
+
+/**
+ * Decode the HTML character references that show up in real producer-homepage
+ * copy: decimal (`&#8211;`), hex (`&#x2013;`), and the named set above. PURE.
+ *
+ * SINGLE PASS, deliberately. `String.replace` never rescans what a replacement
+ * produced, which is what makes `&amp;` safe here: `&amp;#8211;` matches the
+ * `&amp;` at index 0, emits `&`, and resumes AFTER the `;` — so the trailing
+ * `#8211;` is never re-examined and the result is the literal text `&#8211;`,
+ * exactly as an HTML parser would render it. A chained-replace decoder that
+ * expands `&amp;` first (as all three call sites used to) double-decodes that
+ * input into a dash. The mirror case `&#38;amp;` → `&amp;` works for the same
+ * reason.
+ *
+ * Unknown named entities (`&copy;`, `&lt;`, …) are left verbatim rather than
+ * dropped — same as the chains this replaced.
+ */
+export function decodeHtmlEntities(input: string): string {
+  if (!input) return "";
+  if (!input.includes("&")) return input;
+  return input.replace(HTML_ENTITY_RE, (match, hex?: string, dec?: string, name?: string): string => {
+    if (hex !== undefined || dec !== undefined) {
+      const cp = hex !== undefined ? parseInt(hex, 16) : parseInt(dec as string, 10);
+      // Out-of-range / NUL / lone-surrogate references are left as-is instead
+      // of throwing (String.fromCodePoint would) or emitting an unpaired
+      // surrogate that later JSON/DB writes would mangle.
+      if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff) return match;
+      if (cp >= 0xd800 && cp <= 0xdfff) return match;
+      // Control characters get the SAME treatment (left verbatim, never
+      // emitted). `&#8;` (BACKSPACE), `&#1;` and `&#127;` (DEL) are not
+      // whitespace, so every call site's `\s+`-collapse steps straight over
+      // them and they land in about_text/description and the DB. C0 minus
+      // TAB/LF/CR, plus DEL and the C1 block — none of those are page copy
+      // under any encoding.
+      if (cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) return match;
+      if (cp >= 0x7f && cp <= 0x9f) return match;
+      // NBSP: the numeric spellings (`&#160;` / `&#xA0;`) must decode
+      // byte-identically to the named one (`&nbsp;`), which
+      // HTML_NAMED_ENTITIES deliberately maps to a PLAIN space — every in-repo
+      // call site collapses whitespace right after decoding, and this helper is
+      // EXPORTED, so two spellings of the same character must not give a future
+      // caller two different results.
+      if (cp === 0xa0) return HTML_NAMED_ENTITIES.nbsp;
+      // `&lt;`/`&gt;` are deliberately NOT in HTML_NAMED_ENTITIES; the numeric
+      // spellings must agree, or `&#60;/script&#62;` becomes a real `</script>`.
+      // Same inconsistency class as the NBSP guard above, but this one has a
+      // live public sink: about_text flows through admin-knowledge into the
+      // JSON-LD "description" that seo.ts emits inside a
+      // <script type="application/ld+json"> element, so a decoded `</script>`
+      // terminates that element early. Fixing it HERE, at the source, keeps the
+      // two spellings byte-identical for every caller of this exported helper.
+      if (cp === 0x3c || cp === 0x3e) return match;
+      try {
+        return String.fromCodePoint(cp);
+      } catch {
+        return match;
+      }
+    }
+    const n = name as string;
+    // Exact match first so the case-DISTINGUISHING Norwegian entities resolve
+    // correctly (&AElig; → Æ, &aelig; → æ); lowercase fallback preserves the
+    // case-insensitive tolerance the old /gi chains had for &NBSP; / &AMP;.
+    if (Object.prototype.hasOwnProperty.call(HTML_NAMED_ENTITIES, n)) return HTML_NAMED_ENTITIES[n];
+    const lower = n.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(HTML_NAMED_ENTITIES, lower)) return HTML_NAMED_ENTITIES[lower];
+    return match;
+  });
+}
+
 /**
  * Strip a page to its visible text: drop <script>/<style>/<noscript>/<template>
- * blocks, remove all remaining tags, decode the handful of entities the contact
- * extractors already special-case, collapse whitespace, and cap at ~20k chars so
- * a huge page can't blow up downstream token scans. PURE.
+ * blocks, remove all remaining tags, decode HTML entities (decodeHtmlEntities),
+ * collapse whitespace, and cap at ~20k chars so a huge page can't blow up
+ * downstream token scans. PURE.
  */
 export function extractVisibleText(html: string): string {
   if (!html) return "";
@@ -625,13 +720,8 @@ export function extractVisibleText(html: string): string {
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
     .replace(/<template[\s\S]*?<\/template>/gi, " ");
-  // Strip remaining tags, decode common entities, collapse whitespace.
-  const text = h
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
-    .replace(/&AElig;/g, "Æ").replace(/&Oslash;/g, "Ø").replace(/&Aring;/g, "Å")
+  // Strip remaining tags, decode entities, collapse whitespace.
+  const text = decodeHtmlEntities(h.replace(/<[^>]+>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
   return text.slice(0, 20_000);
@@ -803,12 +893,7 @@ export function extractProseText(html: string): string {
     .replace(/<template[\s\S]*?<\/template>/gi, " ");
   h = stripBlocksByTagNames(h, ["nav", "header", "footer", "aside"]);
   h = stripBlocksByTagNames(h, ["ul", "ol"], isHighLinkDensityBlock);
-  const text = h
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
-    .replace(/&AElig;/g, "Æ").replace(/&Oslash;/g, "Ø").replace(/&Aring;/g, "Å")
+  const text = decodeHtmlEntities(h.replace(/<[^>]+>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
   return text.slice(0, 20_000);
@@ -933,13 +1018,10 @@ export function summarizeAbout(html: string): string {
     const lastSpace = slice.lastIndexOf(" ");
     return (lastSpace > 200 ? slice.slice(0, lastSpace) : slice).trim();
   };
-  const decode = (s: string): string =>
-    s
-      .replace(/&nbsp;/gi, " ")
-      .replace(/&amp;/gi, "&")
-      .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
-      .replace(/&AElig;/g, "Æ").replace(/&Oslash;/g, "Ø").replace(/&Aring;/g, "Å")
-      .replace(/&quot;/gi, '"').replace(/&#39;/g, "'");
+  // Shared decoder (see decodeHtmlEntities): covers everything this local
+  // chain used to — &quot; and &#39; included, the latter now via the generic
+  // numeric-reference branch.
+  const decode = decodeHtmlEntities;
 
   // (1) og:description (property OR name, attribute order tolerant).
   const ogContentFirst = html.match(
