@@ -5029,6 +5029,69 @@ export type GardssalgSetTerminalStatusResult =
   | { ok: true; old_value: string | null; new_value: string | null }
   | { ok: false; reason: "provider_not_found" };
 
+export type GardssalgSetProducerTypeResult =
+  | { ok: true; old_value: string | null; new_value: string | null }
+  | { ok: false; reason: "provider_not_found" };
+
+/**
+ * Manually OVERRIDE a gårdssalg provider's `producer_type` — Grep 3c
+ * (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply follow-on).
+ * Backs POST /admin/gardssalg-set-producer-type.
+ *
+ * Structurally mirrors applyGardssalgSetTerminalStatus above EXACTLY:
+ * pre-write old_value snapshot, one gardssalg_content_audit row, all inside a
+ * single transaction. Deliberately UNCONDITIONAL — no
+ * `AND producer_type IS NULL` guard — unlike the existing
+ * applyGardssalgProducerType() (routes/opplevelser.ts), which is fill-only
+ * and therefore cannot correct an already-set, wrong classification (e.g. a
+ * "bryggeri" that turns out to actually be an event venue, not a real drink
+ * producer). This function is the missing override lever for that gap. No
+ * field_provenance merge here either, same as the terminal_status precedent.
+ *
+ * `producerType: null` clears the column — this IS the rollback path for
+ * this endpoint, same "null clears" discipline as terminal_status.
+ *
+ * Validation of `producerType` against the closed
+ * DRINK_PRODUCER_TYPES/NON_DRINK_PRODUCER_TYPES vocabulary is the HTTP
+ * handler's job (same division of labor as applyGardssalgSetTerminalStatus's
+ * caller) — this function trusts its typed parameter.
+ */
+export function applyGardssalgSetProducerType(
+  providerId: string,
+  producerType: string | null,
+  reason: string,
+  sourceUrl?: string
+): GardssalgSetProducerTypeResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, producer_type FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; producer_type: string | null } | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  const oldValue = row.producer_type;
+  const provenance = sourceUrl && sourceUrl.trim() ? sourceUrl.trim() : reason;
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET producer_type = @producer_type WHERE id = @id`
+    ).run({ id: providerId, producer_type: producerType });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'producer_type', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: producerType,
+      source_url: provenance,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: producerType };
+}
+
 /**
  * Set (or, with `terminalStatus: null`, CLEAR) a gårdssalg provider's
  * `terminal_status` — dev-request 2026-08-19-kursjustering-drikkefunnel-llm-
