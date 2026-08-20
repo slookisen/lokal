@@ -664,6 +664,21 @@ export function decodeHtmlEntities(input: string): string {
       // surrogate that later JSON/DB writes would mangle.
       if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff) return match;
       if (cp >= 0xd800 && cp <= 0xdfff) return match;
+      // Control characters get the SAME treatment (left verbatim, never
+      // emitted). `&#8;` (BACKSPACE), `&#1;` and `&#127;` (DEL) are not
+      // whitespace, so every call site's `\s+`-collapse steps straight over
+      // them and they land in about_text/description and the DB. C0 minus
+      // TAB/LF/CR, plus DEL and the C1 block — none of those are page copy
+      // under any encoding.
+      if (cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) return match;
+      if (cp >= 0x7f && cp <= 0x9f) return match;
+      // NBSP: the numeric spellings (`&#160;` / `&#xA0;`) must decode
+      // byte-identically to the named one (`&nbsp;`), which
+      // HTML_NAMED_ENTITIES deliberately maps to a PLAIN space — every in-repo
+      // call site collapses whitespace right after decoding, and this helper is
+      // EXPORTED, so two spellings of the same character must not give a future
+      // caller two different results.
+      if (cp === 0xa0) return HTML_NAMED_ENTITIES.nbsp;
       try {
         return String.fromCodePoint(cp);
       } catch {

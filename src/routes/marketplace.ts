@@ -239,11 +239,17 @@ function escapeVCard(value: string): string {
 }
 
 // dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 1:
-// vCard 3.0 has no document-level charset declaration, so a strict 3.0 parser
-// (Outlook and several Android address books in particular) is entitled to read
-// property values as ASCII/latin-1 and render "Bjørnstad Gård" as mojibake. The
-// 3.0 way to say otherwise is a per-property CHARSET parameter —
-// `FN;CHARSET=UTF-8:<value>`. Applied to exactly the properties that carry
+// vCard 3.0 has no document-level charset declaration of its own. Strictly,
+// RFC 2426 (vCard 3.0) DROPPED the per-property `CHARSET` parameter that vCard
+// 2.1 (§2.1.2) defined, and defers the character set entirely to the MIME
+// `Content-Type` parameter — which this route already sets correctly
+// (`text/vcard; charset=utf-8`, see the /agents/:id/vcard handler). So
+// `CHARSET=UTF-8` below is NOT "the 3.0 way"; it is a vCard 2.1 carry-over.
+// It is kept because it is widely TOLERATED (3.0 parsers ignore unknown
+// property parameters) and because Outlook in particular still HONOURS it —
+// Outlook and several Android address books otherwise read property values as
+// ASCII/latin-1 and render "Bjørnstad Gård" as mojibake. Belt-and-suspenders
+// on top of the MIME charset, applied to exactly the properties that carry
 // free-form Norwegian text (FN/ORG/NOTE/ADR); the machine-ish fields
 // (TEL/EMAIL/URL/GEO/X-LOKAL-*) are ASCII by construction and are left alone.
 const VCARD_CHARSET = "CHARSET=UTF-8";
@@ -319,17 +325,12 @@ function buildVCard(agentId: string): string | null {
   return lines.join("\r\n") + "\r\n";
 }
 
-function safeFileName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9æøåÆØÅ_-]+/g, "_").slice(0, 60) || "agent";
-}
-
 // dev-request 2026-08-19-vcard-tooltip-entity-decode-oppfolging, goal 1:
-// safeFileName() deliberately PRESERVES æøåÆØÅ, which is right for the UTF-8
-// half of the header but wrong for the plain `filename=` parameter — RFC 6266
-// says that one is bytes-as-ASCII, so shipping "Bjørnstad.vcf" there hands the
-// client raw non-ASCII with no declared encoding and the download lands as
-// "BjÃ¸rnstad.vcf" (or gets rejected). Hence a transliterated ASCII fallback
-// for old clients PLUS an RFC 5987 `filename*` carrying the real name for
+// The plain `filename=` parameter is bytes-as-ASCII per RFC 6266, so shipping
+// "Bjørnstad.vcf" there hands the client raw non-ASCII with no declared
+// encoding and the download lands as "BjÃ¸rnstad.vcf" (or gets rejected).
+// Hence a transliterated ASCII fallback for old clients PLUS an RFC 5987
+// `filename*` (see utf8FileNameSource below) carrying the real name for
 // everything modern.
 function asciiSafeFileName(name: string): string {
   const translit = name
@@ -339,14 +340,47 @@ function asciiSafeFileName(name: string): string {
     // Strip every remaining non-ASCII code point (é, ü, Cyrillic, emoji …) so
     // the result is guaranteed 7-bit …
     .replace(/[^\x00-\x7F]+/g, "")
-    // … then apply safeFileName's own substitution to what's left.
+    // … then collapse everything outside [a-zA-Z0-9_-] to "_", so no quote,
+    // semicolon or CR/LF can escape the quoted-string parameter.
     .replace(/[^a-zA-Z0-9_-]+/g, "_")
     .slice(0, 60) || "agent";
 }
 
+// The source string for the RFC 5987 `filename*` half. This used to reuse a
+// `safeFileName()` helper whose allowlist was `[a-zA-Z0-9æøåÆØÅ_-]`, which
+// collapsed CJK, Cyrillic and accented Latin to "_" BEFORE percent-encoding —
+// `vcardContentDisposition("北京")` produced `filename*=UTF-8''_.vcf`, i.e. the
+// UTF-8 half destroyed exactly the names it exists to carry. So sanitise the
+// ORIGINAL name only as much as safety requires, and let encodeRfc5987() do the
+// rest (its output is ASCII by construction, so the header stays 7-bit):
+//   - C0/C1 controls + DEL: non-printing; CR/LF here would be header injection.
+//   - `/` and `\`: path separators have no business in a filename.
+//   - lone (unpaired) surrogates: encodeURIComponent() THROWS on those.
+// Everything else — spaces, `æøå`, `é`, `北京`, emoji — is preserved verbatim
+// and percent-encoded. Note `"` and `;` need no special casing: they are not
+// unreserved, so encodeURIComponent turns them into %22/%3B and they cannot
+// escape the header parameter.
+function utf8FileNameSource(name: string): string {
+  const cleaned = name
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
+    .replace(/[/\\]/g, "")
+    .trim()
+    // Cap BEFORE the lone-surrogate strip, so a pair split by the cap is
+    // cleaned up by it rather than left dangling for encodeURIComponent.
+    // (60 UTF-16 units, the same budget safeFileName() uses for the ASCII half.)
+    .slice(0, 60)
+    // Keep well-formed pairs (emoji), drop every unpaired surrogate.
+    .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, (m) => (m.length === 2 ? m : ""))
+    .trim();
+  return cleaned || "agent";
+}
+
 // RFC 5987 ext-value: percent-encode everything outside attr-char.
 // encodeURIComponent already leaves attr-char's alphanumerics, `-._~` alone but
-// also passes `!*'()` through, which are NOT attr-char — encode those too.
+// also passes `!*'()` through, which are NOT attr-char — encode those too. That
+// second pass is genuinely reachable: utf8FileNameSource() above preserves the
+// original name's punctuation, so a producer called "Kari's (Gård)" really does
+// reach here with `'` and `()` in it.
 function encodeRfc5987(value: string): string {
   return encodeURIComponent(value).replace(
     /['()!*]/g,
@@ -362,7 +396,7 @@ function encodeRfc5987(value: string): string {
  */
 export function vcardContentDisposition(agentName: string): string {
   const ascii = asciiSafeFileName(agentName) + ".vcf";
-  const utf8 = safeFileName(agentName) + ".vcf";
+  const utf8 = utf8FileNameSource(agentName) + ".vcf";
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeRfc5987(utf8)}`;
 }
 

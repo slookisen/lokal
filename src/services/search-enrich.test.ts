@@ -1496,6 +1496,64 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertEq(decodeHtmlEntities("&#1114112;"), "&#1114112;", "decodeHtmlEntities: code point > 0x10FFFF left as-is");
     assertEq(decodeHtmlEntities("&#xD800;"), "&#xD800;", "decodeHtmlEntities: lone surrogate left as-is");
     assertEq(decodeHtmlEntities("&#0;"), "&#0;", "decodeHtmlEntities: NUL reference left as-is");
+
+    // ── Control characters (round-2 review finding) ────────────────────────
+    // `\b` and DEL are NOT matched by `\s`, so the whitespace collapse every
+    // call site runs does not remove them — before the guard in
+    // decodeHtmlEntities they survived all the way into about_text/description
+    // and the DB.
+    assertEq(decodeHtmlEntities("a&#8;b"), "a&#8;b", "decodeHtmlEntities: &#8; (BACKSPACE) left as-is, never emitted");
+    assertEq(decodeHtmlEntities("a&#1;b"), "a&#1;b", "decodeHtmlEntities: &#1; (C0) left as-is");
+    assertEq(decodeHtmlEntities("a&#127;b"), "a&#127;b", "decodeHtmlEntities: &#127; (DEL) left as-is");
+    assertEq(decodeHtmlEntities("a&#x7F;b"), "a&#x7F;b", "decodeHtmlEntities: hex DEL spelling left as-is too");
+    assertEq(decodeHtmlEntities("a&#155;b"), "a&#155;b", "decodeHtmlEntities: &#155; (C1) left as-is");
+    assertEq(decodeHtmlEntities("a&#x9F;b"), "a&#x9F;b", "decodeHtmlEntities: &#x9F; (top of C1) left as-is");
+    assertEq(decodeHtmlEntities("a&#31;b"), "a&#31;b", "decodeHtmlEntities: &#31; (last C0 above CR) left as-is");
+    assertTrue(
+      !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(
+        decodeHtmlEntities("&#1;&#8;&#11;&#14;&#31;&#127;&#128;&#159;"),
+      ),
+      "decodeHtmlEntities: NO C0/C1/DEL code point is ever emitted from a numeric reference",
+    );
+    // The whitespace controls that ARE legitimate text still decode — the call
+    // sites' \s+ collapse then folds them into a single space.
+    assertEq(decodeHtmlEntities("a&#9;b"), "a\tb", "decodeHtmlEntities: &#9; (TAB) still decodes");
+    assertEq(decodeHtmlEntities("a&#10;b"), "a\nb", "decodeHtmlEntities: &#10; (LF) still decodes");
+    assertEq(decodeHtmlEntities("a&#13;b"), "a\rb", "decodeHtmlEntities: &#13; (CR) still decodes");
+    assertEq(decodeHtmlEntities("a&#32;b"), "a b", "decodeHtmlEntities: &#32; (SPACE) still decodes");
+    assertEq(
+      extractVisibleText("<p>Gården&#8;drevet&#127;siden 1890</p>"),
+      "Gården&#8;drevet&#127;siden 1890",
+      "extractVisibleText: control-char references stay literal — no raw \\b/DEL reaches about_text",
+    );
+
+    // ── NBSP: all three spellings must agree (round-2 review finding) ──────
+    // decodeHtmlEntities is EXPORTED now, so `&nbsp;` → U+0020 while
+    // `&#160;`/`&#xA0;` → U+00A0 would hand a future caller two different
+    // answers for one and the same character.
+    assertEq(decodeHtmlEntities("a&#160;b"), "a b", "decodeHtmlEntities: &#160; → plain space, same as &nbsp;");
+    assertEq(decodeHtmlEntities("a&#xA0;b"), "a b", "decodeHtmlEntities: &#xA0; → plain space, same as &nbsp;");
+    assertEq(
+      [decodeHtmlEntities("a&nbsp;b"), decodeHtmlEntities("a&#160;b"), decodeHtmlEntities("a&#xA0;b")].join("|"),
+      "a b|a b|a b",
+      "decodeHtmlEntities: named/decimal/hex NBSP spellings are byte-identical",
+    );
+    assertTrue(
+      !decodeHtmlEntities("a&#160;b&#xA0;c&nbsp;d").includes("\u00A0"),
+      "decodeHtmlEntities: no U+00A0 is emitted for ANY NBSP spelling",
+    );
+    // The call-site semantics the existing three sites rely on are unchanged.
+    assertEq(
+      Array.from(extractVisibleText("<p>a&nbsp;b</p>")).map((c) => c.codePointAt(0)!.toString(16)).join(","),
+      "61,20,62",
+      "extractVisibleText: <p>a&nbsp;b</p> still yields exactly [a, U+0020, b]",
+    );
+    assertEq(
+      Array.from(extractVisibleText("<p>a&#160;b</p>")).map((c) => c.codePointAt(0)!.toString(16)).join(","),
+      "61,20,62",
+      "extractVisibleText: the numeric NBSP spelling now yields the same [a, U+0020, b]",
+    );
+
     assertEq(decodeHtmlEntities("&copy; 2026"), "&copy; 2026", "decodeHtmlEntities: unknown named entity left verbatim");
     assertEq(decodeHtmlEntities("100% &agree"), "100% &agree", "decodeHtmlEntities: bare '&' / unterminated ref untouched");
     assertEq(decodeHtmlEntities(""), "", "decodeHtmlEntities: empty in → empty out");

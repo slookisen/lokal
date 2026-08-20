@@ -8443,53 +8443,264 @@ console.log("\n── pf-stat ai: tooltip wording (Daniel-confirmed) ──");
 // vCard encoding hardening: per-property CHARSET=UTF-8 parameters in
 // buildVCard(), and an RFC 6266 Content-Disposition with BOTH an ASCII
 // transliterated `filename=` fallback and an RFC 5987 `filename*=UTF-8''…`.
-// buildVCard() itself needs a live registry/knowledge row, so its parameter
-// syntax is pinned source-presence style (same convention as the pr42 block
-// below); the header builder is a pure export and is tested for real.
+//
+// FUNCTIONAL, not source-presence (round-2 review finding). The first version
+// of this block grepped src/routes/marketplace.ts for the template literals it
+// expected. That proved nothing: reverting buildVCard's `about` push from
+// `${VCARD_NOTE_PREFIX}` back to a bare `NOTE:` still left the whole suite
+// green while the emitted vCard grew a SECOND NOTE property and the about text
+// lost its CHARSET — exactly the regression the block claimed to guard. So the
+// vCard body is now produced by driving the REAL GET /agents/:id/vcard handler
+// (pulled off the router's own stack, same convention as
+// src/routes/marketplace-quarantine-gates.test.ts) against a fresh in-memory
+// DB, and every assertion below is on the actual emitted body.
 console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ──");
 {
-  const fs = require("fs");
-  const src = fs.readFileSync("src/routes/marketplace.ts", "utf8");
+  // Fully SYNCHRONOUS block: pin → assert → restore-in-finally, with no await
+  // anywhere in between, so no concurrently-awaiting block in this file can
+  // observe the swapped singleton (see the isolation contract at the top).
+  const DatabaseVc = require("better-sqlite3");
+  const initModVc = require("../src/database/init");
+  const prevVcDb = initModVc.__peekDbForTesting();
+  const vcDb = new DatabaseVc(":memory:");
+  vcDb.pragma("journal_mode = DELETE");
+  vcDb.pragma("foreign_keys = ON");
 
-  assertTrue(
-    src.includes("`FN;${VCARD_CHARSET}:${escapeVCard(agent.name)}`"),
-    "vcard: FN carries a CHARSET=UTF-8 property parameter"
-  );
-  assertTrue(
-    src.includes("`ORG;${VCARD_CHARSET}:${escapeVCard(agent.name)}`"),
-    "vcard: ORG carries a CHARSET=UTF-8 property parameter"
-  );
-  assertTrue(
-    src.includes("const VCARD_NOTE_PREFIX = `NOTE;${VCARD_CHARSET}:`"),
-    "vcard: NOTE carries a CHARSET=UTF-8 property parameter"
-  );
-  assertTrue(
-    src.includes("`ADR;TYPE=WORK;${VCARD_CHARSET}:;;"),
-    "vcard: ADR carries a CHARSET=UTF-8 property parameter (after TYPE=WORK)"
-  );
-  assertTrue(
-    src.includes('const VCARD_CHARSET = "CHARSET=UTF-8"'),
-    "vcard: CHARSET parameter value is exactly CHARSET=UTF-8 (vCard 3.0 syntax)"
-  );
-  // Regression guard: the products appendix rewrites the NOTE line in place by
-  // prefix. If that lookup still used the un-parameterised "NOTE:" it would
-  // silently miss and emit a SECOND NOTE property.
-  assertTrue(
-    src.includes("lines.findIndex(l => l.startsWith(VCARD_NOTE_PREFIX))"),
-    "vcard: products appendix finds the NOTE line by its parameterised prefix, not bare 'NOTE:'"
-  );
-  assertTrue(
-    !/lines\.findIndex\(l => l\.startsWith\("NOTE:"\)\)/.test(src),
-    "vcard: no leftover bare 'NOTE:' prefix lookup"
-  );
+  const { marketplaceRegistry: vcRegistry } = require("../src/services/marketplace-registry");
+  const { knowledgeService: vcKnowledge } = require("../src/services/knowledge-service");
 
+  try {
+    initModVc.__setDbForTesting(vcDb);
+    initModVc.__initSchemaForTesting(vcDb);
+    // buildVCard()'s CATEGORIES line reads getConfig().display_name. Only
+    // cold-load if the ambient config is missing — the vertical-config blocks
+    // near the top of this file leave their own fixture loaded and we must not
+    // clobber it.
+    try { getConfig(); } catch { try { loadConfigsAtBoot(); } catch { /* CI without verticals/ */ } }
+
+    (vcRegistry as any)._agentsCache = null;
+    (vcRegistry as any)._statsCache = null;
+
+    const vcRouter = require("../src/routes/marketplace").default as any;
+    const vcLayer = (vcRouter.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/agents/:id/vcard" && l.route.methods?.get,
+    );
+    assertTrue(!!vcLayer, "vcard: GET /agents/:id/vcard route found on the marketplace router");
+    const vcHandler = vcLayer.route.stack[vcLayer.route.stack.length - 1].handle;
+
+    function vcInvoke(id: string): { status: number; body: any; headers: Record<string, string> } {
+      let status = 200;
+      let body: any;
+      const headers: Record<string, string> = {};
+      const res: any = {
+        status(c: number) { status = c; return res; },
+        json(p: any) { body = p; return res; },
+        send(p: any) { body = p; return res; },
+        setHeader(k: string, v: string) { headers[k] = v; return res; },
+        header(k: string, v: string) { headers[k] = v; return res; },
+        set(k: string, v: string) { headers[k] = v; return res; },
+        type() { return res; },
+        end() { return res; },
+      };
+      vcHandler(
+        { params: { id }, query: {}, body: undefined, headers: {}, ip: "127.0.0.1", get: () => undefined },
+        res,
+        () => { /* no next() path on this route */ },
+      );
+      return { status, body, headers };
+    }
+
+    function vcRegister(name: string, city: string): string {
+      const reg = vcRegistry.register({
+        name,
+        description: "Test-produsent for vcard-blokken.",
+        provider: "vcard-test",
+        contactEmail: "vcard@test.invalid",
+        url: "https://vcard.test.invalid",
+        role: "producer",
+        skills: [{ id: "sell", name: "Selger", description: "Selger lokalmat", tags: ["ost"] }],
+        location: { lat: 59.66, lng: 10.79, city },
+        categories: ["dairy"],
+      });
+      (vcRegistry as any)._agentsCache = null;
+      (vcRegistry as any)._statsCache = null;
+      return reg.id;
+    }
+
+    const NOTE_LINE_RE = /^NOTE[;:]/;
+    function noteLines(bodyText: string): string[] {
+      return bodyText.split("\r\n").filter((l) => NOTE_LINE_RE.test(l));
+    }
+
+    // ── (A) about + products: the exact shape the mutation broke ─────────
+    // buildVCard pushes `about` as a NOTE, then the products appendix REWRITES
+    // that same line in place (found by VCARD_NOTE_PREFIX). If the push or the
+    // lookup ever disagree on the prefix, the appendix misses and a SECOND
+    // NOTE property is emitted — which is what these assertions catch.
+    const vcIdBoth = vcRegister("Bjørnstad Gård", "Ås");
+    vcKnowledge.upsertKnowledge(vcIdBoth, {
+      about: "Vi driver økologisk gård på Ås siden 1890.",
+      email: "post@bjornstad.test.invalid",
+      website: "https://bjornstad.test.invalid",
+      address: "Gårdsveien 1",
+      postalCode: "1430",
+      products: [{ name: "Brunost", price: "89 kr" }, { name: "Rømme" }],
+    });
+
+    const vcResBoth = vcInvoke(vcIdBoth);
+    assertEq(vcResBoth.status, 200, "vcard: GET /agents/:id/vcard 200s for a vetted agent");
+    const bodyBoth = String(vcResBoth.body);
+    assertTrue(bodyBoth.startsWith("BEGIN:VCARD\r\n"), "vcard: body is a real CRLF-delimited vCard");
+
+    assertEq(
+      noteLines(bodyBoth).length,
+      1,
+      `vcard: EXACTLY ONE NOTE property with about+products (got ${noteLines(bodyBoth).length}: ${JSON.stringify(noteLines(bodyBoth))})`,
+    );
+    assertTrue(
+      noteLines(bodyBoth).every((l) => l.startsWith("NOTE;CHARSET=UTF-8:")),
+      `vcard: the NOTE property carries CHARSET=UTF-8 (got ${JSON.stringify(noteLines(bodyBoth))})`,
+    );
+    assertTrue(
+      noteLines(bodyBoth)[0].includes("Vi driver økologisk gård på Ås siden 1890.") &&
+        noteLines(bodyBoth)[0].includes("Produkter: Brunost (89 kr)"),
+      `vcard: the single NOTE carries BOTH the about text and the products appendix (got ${JSON.stringify(noteLines(bodyBoth)[0])})`,
+    );
+
+    const linesBoth = bodyBoth.split("\r\n");
+    // (b) CHARSET=UTF-8 on every free-form-text property.
+    assertTrue(
+      linesBoth.some((l) => l.startsWith("FN;CHARSET=UTF-8:Bjørnstad Gård")),
+      `vcard: FN carries CHARSET=UTF-8 and the raw UTF-8 name (got ${JSON.stringify(linesBoth[2])})`,
+    );
+    assertTrue(
+      linesBoth.some((l) => l.startsWith("ORG;CHARSET=UTF-8:Bjørnstad Gård")),
+      "vcard: ORG carries CHARSET=UTF-8 and the raw UTF-8 name",
+    );
+    assertTrue(
+      linesBoth.some((l) => l.startsWith("ADR;TYPE=WORK;CHARSET=UTF-8:;;Gårdsveien 1;Ås;")),
+      `vcard: ADR carries CHARSET=UTF-8 after TYPE=WORK (got ${JSON.stringify(linesBoth.filter((l) => l.startsWith("ADR")))})`,
+    );
+    for (const prop of ["FN", "ORG", "NOTE", "ADR"]) {
+      const propLines = linesBoth.filter((l) => new RegExp(`^${prop}[;:]`).test(l));
+      assertTrue(
+        propLines.length > 0 && propLines.every((l) => l.includes("CHARSET=UTF-8")),
+        `vcard: every ${prop} line carries CHARSET=UTF-8 (got ${JSON.stringify(propLines)})`,
+      );
+    }
+    // The machine-ish fields are deliberately left alone.
+    assertTrue(
+      linesBoth.filter((l) => /^(EMAIL|URL|GEO|X-LOKAL-)/.test(l)).every((l) => !l.includes("CHARSET=")),
+      "vcard: EMAIL/URL/GEO/X-LOKAL-* get NO CHARSET parameter (ASCII by construction)",
+    );
+
+    // (c) NOTE must come before EMAIL — buildVCard's property order.
+    const noteIdxBoth = linesBoth.findIndex((l) => NOTE_LINE_RE.test(l));
+    const emailIdxBoth = linesBoth.findIndex((l) => /^EMAIL[;:]/.test(l));
+    assertTrue(emailIdxBoth > 0, "vcard: EMAIL property present (so the ordering assertion is meaningful)");
+    assertTrue(
+      noteIdxBoth >= 0 && noteIdxBoth < emailIdxBoth,
+      `vcard: the NOTE line is positioned BEFORE EMAIL (NOTE@${noteIdxBoth}, EMAIL@${emailIdxBoth})`,
+    );
+
+    // ── (B) products but NO about — the appendix's "else push" branch ────
+    const vcIdProductsOnly = vcRegister("Sæterdal Ysteri", "Vinstra");
+    vcKnowledge.upsertKnowledge(vcIdProductsOnly, {
+      email: "post@saeterdal.test.invalid",
+      address: "Setervegen 7",
+      postalCode: "2640",
+      products: [{ name: "Geitost" }, { name: "Kvitost", price: "120 kr" }],
+    });
+
+    const vcResProducts = vcInvoke(vcIdProductsOnly);
+    assertEq(vcResProducts.status, 200, "vcard: products-only agent also 200s");
+    const bodyProducts = String(vcResProducts.body);
+    assertEq(
+      noteLines(bodyProducts).length,
+      1,
+      `vcard: EXACTLY ONE NOTE property with products and NO about (got ${noteLines(bodyProducts).length}: ${JSON.stringify(noteLines(bodyProducts))})`,
+    );
+    assertTrue(
+      noteLines(bodyProducts)[0].startsWith("NOTE;CHARSET=UTF-8:Produkter: Geitost"),
+      `vcard: the products-only NOTE carries CHARSET=UTF-8 and starts at "Produkter: " (got ${JSON.stringify(noteLines(bodyProducts)[0])})`,
+    );
+    const linesProducts = bodyProducts.split("\r\n");
+    // Position, pinned as buildVCard actually emits it: with no `about` there
+    // is no NOTE line for the products appendix to rewrite, so it takes the
+    // `else` branch and APPENDS — i.e. after EMAIL/ADR, not before EMAIL like
+    // the about-carrying cases (A) and (C). Asserted explicitly rather than
+    // left unpinned, so a future reorder has to be deliberate.
+    const noteIdxP = linesProducts.findIndex((l) => NOTE_LINE_RE.test(l));
+    const emailIdxP = linesProducts.findIndex((l) => /^EMAIL[;:]/.test(l));
+    const adrIdxP = linesProducts.findIndex((l) => /^ADR[;:]/.test(l));
+    assertTrue(
+      noteIdxP >= 0 && emailIdxP > 0 && adrIdxP > emailIdxP && noteIdxP === adrIdxP + 1,
+      `vcard: the products-only NOTE is appended straight after ADR (NOTE@${noteIdxP}, EMAIL@${emailIdxP}, ADR@${adrIdxP})`,
+    );
+    assertTrue(
+      !linesProducts.some((l) => l.startsWith("NOTE:")),
+      "vcard: no un-parameterised bare 'NOTE:' line is ever emitted",
+    );
+
+    // ── (C) about but NO products — the plain single-NOTE path ───────────
+    const vcIdAboutOnly = vcRegister("Fjordbær Gård", "Leikanger");
+    vcKnowledge.upsertKnowledge(vcIdAboutOnly, {
+      about: "Bær og saft frå Sognefjorden.",
+      email: "post@fjordbaer.test.invalid",
+      address: "Fjordvegen 3",
+      postalCode: "6863",
+    });
+    const bodyAbout = String(vcInvoke(vcIdAboutOnly).body);
+    assertEq(
+      noteLines(bodyAbout).length,
+      1,
+      `vcard: EXACTLY ONE NOTE property with about and NO products (got ${noteLines(bodyAbout).length})`,
+    );
+    assertEq(
+      noteLines(bodyAbout)[0],
+      "NOTE;CHARSET=UTF-8:Bær og saft frå Sognefjorden.",
+      "vcard: about-only NOTE is the about text, CHARSET-parameterised",
+    );
+    const linesAbout = bodyAbout.split("\r\n");
+    const noteIdxA = linesAbout.findIndex((l) => NOTE_LINE_RE.test(l));
+    const emailIdxA = linesAbout.findIndex((l) => /^EMAIL[;:]/.test(l));
+    assertTrue(
+      noteIdxA >= 0 && emailIdxA > 0 && noteIdxA < emailIdxA,
+      `vcard: about-only NOTE is positioned before EMAIL (NOTE@${noteIdxA}, EMAIL@${emailIdxA})`,
+    );
+
+    // ── The response headers the route actually sets ─────────────────────
+    assertEq(
+      vcResBoth.headers["Content-Type"],
+      "text/vcard; charset=utf-8",
+      "vcard: Content-Type declares UTF-8 (the RFC 2426 way — CHARSET= above is the 2.1 belt-and-suspenders)",
+    );
+    assertEq(
+      vcResBoth.headers["Content-Disposition"],
+      "attachment; filename=\"Bjoernstad_Gaard.vcf\"; filename*=UTF-8''Bj%C3%B8rnstad%20G%C3%A5rd.vcf",
+      "vcard: the route sets the RFC 6266 Content-Disposition built from the agent's real name",
+    );
+  } finally {
+    initModVc.__setDbForTesting(prevVcDb);
+    (vcRegistry as any)._agentsCache = null;
+    (vcRegistry as any)._statsCache = null;
+    vcDb.close();
+  }
+}
+
+// ── The pure header builder, exercised directly ─────────────────────────
+// (These were already functional and are kept as-is, plus new coverage for
+// the round-2 finding that `filename*` was being built from the ASCII-ish
+// safeFileName() output and so DESTROYED every non-Norwegian non-ASCII name:
+// `vcardContentDisposition("北京")` used to yield `filename*=UTF-8''_.vcf`.)
+{
   const { vcardContentDisposition } =
     require("../src/routes/marketplace") as typeof import("../src/routes/marketplace");
 
   const cd = vcardContentDisposition("Bjørnstad Gård");
   assertEq(
     cd,
-    "attachment; filename=\"Bjoernstad_Gaard.vcf\"; filename*=UTF-8''Bj%C3%B8rnstad_G%C3%A5rd.vcf",
+    "attachment; filename=\"Bjoernstad_Gaard.vcf\"; filename*=UTF-8''Bj%C3%B8rnstad%20G%C3%A5rd.vcf",
     "vcard: Content-Disposition has ASCII fallback + RFC 5987 filename*"
   );
   assertTrue(
@@ -8502,7 +8713,7 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   );
   assertEq(
     vcardContentDisposition("Ærfuglen Øst Ås"),
-    "attachment; filename=\"AErfuglen_OEst_AAs.vcf\"; filename*=UTF-8''%C3%86rfuglen_%C3%98st_%C3%85s.vcf",
+    "attachment; filename=\"AErfuglen_OEst_AAs.vcf\"; filename*=UTF-8''%C3%86rfuglen%20%C3%98st%20%C3%85s.vcf",
     "vcard: uppercase ÆØÅ transliterate to AE/OE/AA in the ASCII fallback"
   );
   assertTrue(
@@ -8513,6 +8724,90 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     vcardContentDisposition(""),
     "attachment; filename=\"agent.vcf\"; filename*=UTF-8''agent.vcf",
     "vcard: empty name falls back to agent.vcf on both parameters"
+  );
+
+  // ── filename* must carry the REAL name, not safeFileName()'s output ───
+  assertEq(
+    vcardContentDisposition("北京"),
+    "attachment; filename=\"agent.vcf\"; filename*=UTF-8''%E5%8C%97%E4%BA%AC.vcf",
+    "vcard: CJK name survives verbatim in filename* (regression: used to be '_.vcf')"
+  );
+  assertEq(
+    vcardContentDisposition("Мосфильм"),
+    "attachment; filename=\"agent.vcf\"; filename*=UTF-8''%D0%9C%D0%BE%D1%81%D1%84%D0%B8%D0%BB%D1%8C%D0%BC.vcf",
+    "vcard: Cyrillic name survives verbatim in filename*"
+  );
+  assertEq(
+    vcardContentDisposition("Café Ünïcode 北京"),
+    "attachment; filename=\"Caf_ncode_.vcf\"; filename*=UTF-8''Caf%C3%A9%20%C3%9Cn%C3%AFcode%20%E5%8C%97%E4%BA%AC.vcf",
+    "vcard: accented Latin + CJK survive verbatim in filename* (regression: 'Caf_n_code_.vcf')"
+  );
+  assertEq(
+    vcardContentDisposition("Gård 🧀"),
+    "attachment; filename=\"Gaard_.vcf\"; filename*=UTF-8''G%C3%A5rd%20%F0%9F%A7%80.vcf",
+    "vcard: an emoji (surrogate PAIR) is preserved and percent-encoded, not dropped"
+  );
+  assertEq(
+    vcardContentDisposition("Kari's (Gård)!*"),
+    "attachment; filename=\"Kari_s_Gaard_.vcf\"; filename*=UTF-8''Kari%27s%20%28G%C3%A5rd%29%21%2A.vcf",
+    "vcard: encodeRfc5987's non-attr-char pass ['()!*] is reachable and percent-encodes them"
+  );
+
+  // ── Hostile inputs: the header must stay 7-bit ASCII and un-escapable ─
+  const hostile: string[] = [
+    "Evil\r\nSet-Cookie: a=b",
+    "Evil\" ; filename=\"pwn.exe",
+    "\u0000nul",
+    "\nline",
+    "\rcr",
+    "lone\uD800surrogate",
+    "lone\uDC00surrogate",
+    "\uD800",
+    "x".repeat(200),
+    "Ø".repeat(200),
+    "🧀".repeat(80),
+    "北京",
+    "Café Ünïcode 北京",
+    "a/b\\c",
+    "",
+    "   ",
+  ];
+  for (const name of hostile) {
+    const h = vcardContentDisposition(name);
+    assertTrue(
+      !/[^\x20-\x7E]/.test(h),
+      `vcard-hostile: header for ${JSON.stringify(name).slice(0, 40)} is printable 7-bit ASCII only (got ${JSON.stringify(h).slice(0, 120)})`
+    );
+    assertTrue(
+      /^attachment; filename="[a-zA-Z0-9_.-]+"; filename\*=UTF-8''[A-Za-z0-9%.~_-]+$/.test(h),
+      `vcard-hostile: header for ${JSON.stringify(name).slice(0, 40)} matches the exact two-parameter grammar — no CR/LF/quote/semicolon escapes (got ${JSON.stringify(h).slice(0, 160)})`
+    );
+    // Exactly two `;`-separated parameters and exactly two `"` characters.
+    assertEq(
+      (h.match(/"/g) || []).length,
+      2,
+      `vcard-hostile: exactly two quote characters for ${JSON.stringify(name).slice(0, 40)}`
+    );
+    assertEq(
+      h.split(";").length,
+      3,
+      `vcard-hostile: exactly two parameters (2 semicolons) for ${JSON.stringify(name).slice(0, 40)}`
+    );
+  }
+  assertEq(
+    vcardContentDisposition("Evil\r\nSet-Cookie: a=b"),
+    "attachment; filename=\"Evil_Set-Cookie_a_b.vcf\"; filename*=UTF-8''EvilSet-Cookie%3A%20a%3Db.vcf",
+    "vcard-hostile: CRLF is stripped from both halves"
+  );
+  assertEq(
+    vcardContentDisposition("Evil\" ; filename=\"pwn.exe"),
+    "attachment; filename=\"Evil_filename_pwn_exe.vcf\"; filename*=UTF-8''Evil%22%20%3B%20filename%3D%22pwn.exe.vcf",
+    "vcard-hostile: quote/semicolon are percent-encoded in filename*, collapsed in the ASCII half"
+  );
+  assertEq(
+    vcardContentDisposition("\uD800"),
+    "attachment; filename=\"agent.vcf\"; filename*=UTF-8''agent.vcf",
+    "vcard-hostile: a name that is nothing but a lone surrogate falls back to agent.vcf (encodeURIComponent would have thrown)"
   );
 }
 
