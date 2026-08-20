@@ -45,6 +45,16 @@
  *       10-18") — proves the defect floor is per field, not global
  *   (j) rollback round-trip: planGardssalgContentRollback proposes restoring
  *       (c)'s old value, with no rollback-side changes needed
+ *   (l) a blank value passed DIRECTLY to the service function (past the
+ *       route's own check) -> {ok:false, reason:"value_required"}, column
+ *       UNCHANGED, zero audit rows — the classifier calls blank NOT defective
+ *       on purpose, so without the service-level guard this blanked a good
+ *       value and wrote an audit row asserting it; plus the route's existing
+ *       400 value_required, unchanged
+ *   (m) exhaustiveness: a field forced past the type system throws, and the
+ *       column + field_provenance + audit table are all untouched afterwards
+ *       (the transaction rolled back — no phantom audit row for
+ *       planGardssalgContentRollback to act on)
  */
 
 export interface TestSummary {
@@ -517,6 +527,98 @@ export function runOpplevelserGardssalgSetContentFieldTests(
         "no-such-provider", "about_text", GOOD_ABOUT, "s"
       );
       assertTrue(!directNotFound.ok && directNotFound.reason === "provider_not_found", "k6: direct call reports provider_not_found");
+
+      // ── (l) blank value passed DIRECTLY to the service -> value_required ──
+      // The classifier reports blank as NOT defective on purpose (blank is
+      // fill-only's job), so without the service's own blank guard this call
+      // would BLANK a good column and still write an audit row asserting the
+      // change. Route-level coverage (f3/f4) cannot prove this — the route
+      // returns before ever calling the service.
+      mkProvider({
+        id: "scf-direct-blank",
+        navn: "Direct Blank Gard",
+        about_text: GOOD_ABOUT,
+        created_at: "2026-01-12 00:00:00",
+      });
+      const directBlank = store.applyGardssalgSetContentField(
+        "scf-direct-blank", "about_text", "   ", "manuell verifisering"
+      );
+      assertTrue(!directBlank.ok, "l1: whitespace-only value rejected by the SERVICE, not just the route");
+      assertEq(
+        directBlank.ok ? null : directBlank.reason,
+        "value_required",
+        "l2: direct blank rejection reports reason value_required",
+      );
+      assertEq(getProviderRow("scf-direct-blank").about_text, GOOD_ABOUT, "l3: column UNCHANGED — a good value was NOT blanked");
+      assertEq(getAuditRows("scf-direct-blank").length, 0, "l4: NO audit row for the refused blank write");
+      const directEmpty = store.applyGardssalgSetContentField(
+        "scf-direct-blank", "about_text", "", "manuell verifisering"
+      );
+      assertEq(
+        directEmpty.ok ? null : directEmpty.reason,
+        "value_required",
+        "l5: empty-string value rejected the same way as whitespace-only",
+      );
+      assertEq(getProviderRow("scf-direct-blank").about_text, GOOD_ABOUT, "l6: column still UNCHANGED after the empty-string call");
+      assertEq(getAuditRows("scf-direct-blank").length, 0, "l7: still NO audit row after the empty-string call");
+
+      // The HTTP contract is unchanged by the new service-level reason: the
+      // route's own earlier blank check still answers first, with the same
+      // 400 value_required it always did.
+      mkProvider({
+        id: "scf-route-blank",
+        navn: "Route Blank Gard",
+        about_text: GOOD_ABOUT,
+        created_at: "2026-01-13 00:00:00",
+      });
+      const routeBlankRes = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: { provider_id: "scf-route-blank", field: "about_text", value: "   ", source: "s" },
+      });
+      assertEq(routeBlankRes.status, 400, "l8: route still returns 400 for a blank value (contract unchanged)");
+      assertEq(routeBlankRes.body, { error: "value_required" }, "l9: route body is still exactly { error: 'value_required' }");
+      assertEq(getProviderRow("scf-route-blank").about_text, GOOD_ABOUT, "l10: route-level blank leaves the column UNCHANGED");
+      assertEq(getAuditRows("scf-route-blank").length, 0, "l11: route-level blank writes NO audit row");
+
+      // ── (m) unmatched field: throws, and the transaction rolls back ───────
+      // Forced past the type system the way a future fourth text column would
+      // reach the switch if someone added it without a case. Before the
+      // `default:` this fell through with NO UPDATE while the audit INSERT
+      // still ran — a phantom audit row that planGardssalgContentRollback
+      // then acts on, destroying real data. Asserting the throw alone is not
+      // enough: the point is that NOTHING was written.
+      mkProvider({
+        id: "scf-unmatched-field",
+        navn: "Unmatched Field Gard",
+        about_text: GOOD_ABOUT,
+        created_at: "2026-01-14 00:00:00",
+      });
+      const productsBefore = expDb
+        .prepare(`SELECT products FROM experience_providers WHERE id = ?`)
+        .get("scf-unmatched-field") as { products: string | null };
+      let unmatchedThrew = false;
+      try {
+        store.applyGardssalgSetContentField(
+          "scf-unmatched-field",
+          "products" as any,
+          "Eplemost, sider og saft fra egen frukthage i Hardanger.",
+          "manuell verifisering",
+        );
+      } catch {
+        unmatchedThrew = true;
+      }
+      assertTrue(unmatchedThrew, "m1: an unmatched field throws instead of falling through the switch");
+      const unmatchedAfter = expDb
+        .prepare(`SELECT products, about_text, field_provenance FROM experience_providers WHERE id = ?`)
+        .get("scf-unmatched-field") as {
+          products: string | null;
+          about_text: string | null;
+          field_provenance: string | null;
+        };
+      assertEq(unmatchedAfter.products, productsBefore.products, "m2: the target column is UNCHANGED after the throw");
+      assertEq(unmatchedAfter.about_text, GOOD_ABOUT, "m3: no other content column was touched either");
+      assertEq(unmatchedAfter.field_provenance, null, "m4: field_provenance was not stamped either");
+      assertEq(getAuditRows("scf-unmatched-field").length, 0, "m5: NO audit row — the transaction rolled back (no phantom row for rollback to act on)");
     } finally {
       if (prevExperiencesDbPath === undefined) {
         delete process.env.EXPERIENCES_DB_PATH;

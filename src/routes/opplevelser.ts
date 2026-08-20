@@ -8296,6 +8296,15 @@ router.post("/admin/gardssalg-set-content-field", requireAdmin, (req: Request, r
       res.status(409).json({ error: "owner_locked" });
       return;
     }
+    if (result.reason === "value_required") {
+      // Unreachable over HTTP — the blank check above already returned this
+      // exact 400. Mapped anyway so the service's own blank guard (defense in
+      // depth for direct callers) can never surface as a 400 defective_value
+      // with a null defect_type; the wire contract stays byte-for-byte what
+      // the earlier check produces.
+      res.status(400).json({ error: "value_required" });
+      return;
+    }
     // defect_type is surfaced so the caller can act on it (regenerate a
     // longer about_text vs. strip UI chrome are different fixes) rather than
     // guessing why a value was refused.

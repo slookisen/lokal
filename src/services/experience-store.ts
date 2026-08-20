@@ -5047,6 +5047,7 @@ export type GardssalgSetContentFieldResult =
   | { ok: true; old_value: string | null; new_value: string }
   | { ok: false; reason: "provider_not_found" }
   | { ok: false; reason: "owner_locked" }
+  | { ok: false; reason: "value_required" }
   | { ok: false; reason: "defective_value"; defect_type: GardssalgDefectType | null };
 
 /**
@@ -5071,7 +5072,7 @@ export type GardssalgSetContentFieldResult =
  * judge — accepting products here would mean writing it through NO quality
  * gate at all, which is exactly what this endpoint exists to avoid.
  *
- * Two gates, both mandatory, in this order:
+ * Three gates, all mandatory, in this order:
  *   1. Owner-lock (isGardssalgFieldOwnerLocked, below) — re-read fresh from
  *      the row, never from a caller snapshot. Unlike the phone/email
  *      siblings (which deliberately skip content_source, having no
@@ -5080,7 +5081,18 @@ export type GardssalgSetContentFieldResult =
  *      applyGardssalgProviderContent and applyGardssalgQualityReplacement
  *      already enforce applies here too. An admin lever is not an exemption
  *      from an owner's own edit.
- *   2. Objective defect (classifyGardssalgFieldDefect) on the SUPPLIED
+ *   2. Non-blank value, checked HERE and not only in the route. This gate is
+ *      not redundant: classifyGardssalgFieldDefect deliberately reports a
+ *      blank value as NOT defective ("blank -> fill-only's job, not this
+ *      classifier's", gardssalg-quality-update.ts), so without this check a
+ *      fully type-checking direct call — applyGardssalgSetContentField(id,
+ *      "about_text", "   ", src) — would sail past gate 3, BLANK a good
+ *      value, and write an audit row asserting the change. Blanking is the
+ *      most destructive outcome this function can produce, so the guard sits
+ *      on the function itself; the route keeps its own earlier blank check
+ *      (which maps this reason back onto the same 400 `value_required`), and
+ *      the two together are defense in depth for non-HTTP callers.
+ *   3. Objective defect (classifyGardssalgFieldDefect) on the SUPPLIED
  *      value. Called WITHOUT `othersForField`, exactly like the candidate-
  *      side classification in planGardssalgFieldReplacement: the
  *      duplicate-of-other-provider check compares against the whole live
@@ -5092,7 +5104,7 @@ export type GardssalgSetContentFieldResult =
  *      exactly the same failure modes as the scraped one).
  *
  * There is deliberately no `force`/override parameter: an escape hatch past
- * gate 2 would make the gate decorative, and a genuinely-good value that
+ * gate 3 would make the gate decorative, and a genuinely-good value that
  * trips the classifier is a classifier bug to fix, not a value to smuggle in.
  *
  * What is NOT touched, on purpose: content_source, content_evidence_url,
@@ -5138,7 +5150,14 @@ export function applyGardssalgSetContentField(
   if (isGardssalgFieldOwnerLocked(row, field)) return { ok: false, reason: "owner_locked" };
 
   const trimmed = value.trim();
-  // Gate 2 — objective defect on the supplied value. No othersForField: see
+  // Gate 2 — non-blank. MUST run before the classifier: classifyGardssalgFieldDefect
+  // reports a blank value as NOT defective on purpose (blank is fill-only's
+  // job, not the classifier's), so without this a direct caller passing "" or
+  // "   " would blank an existing good value AND get an audit row asserting
+  // the change. The route checks this too; this is the same check on the
+  // function itself, for callers that never go through HTTP.
+  if (!trimmed) return { ok: false, reason: "value_required" };
+  // Gate 3 — objective defect on the supplied value. No othersForField: see
   // doc comment. Returns before any write, so a rejected value leaves neither
   // a column change nor an audit row behind.
   const defect = classifyGardssalgFieldDefect(field, trimmed);
@@ -5188,6 +5207,23 @@ export function applyGardssalgSetContentField(
           `UPDATE experience_providers SET opening_hours_text = @value, field_provenance = @field_provenance WHERE id = @id`
         ).run({ id: providerId, value: trimmed, field_provenance: provenanceJson });
         break;
+      default: {
+        // Do NOT "simplify" this away. Without it an unmatched field falls
+        // through with NO UPDATE while the audit INSERT below still runs —
+        // a PHANTOM audit row claiming a change that never happened, which
+        // planGardssalgContentRollback then acts on and uses to DESTROY real
+        // data (it restores old_value over a column this write never
+        // touched). Throwing aborts the transaction before the INSERT, so
+        // better-sqlite3 rolls the whole thing back and nothing is written.
+        //
+        // The `never` assignment makes the same case a COMPILE error the day
+        // a fourth GardssalgQualityFieldName is added: TypeScript does not
+        // flag a non-exhaustive switch on its own, so without this the switch
+        // would silently stay at three cases. Same defense-in-depth
+        // discipline applyGardssalgContentRollback applies to field_name.
+        const _exhaustive: never = field;
+        throw new Error(`unsupported field: ${String(_exhaustive)}`);
+      }
     }
     // Exactly ONE audit row, same shape every other gårdssalg writer uses —
     // this is what makes the write reversible through the EXISTING POST
