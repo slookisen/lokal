@@ -133,6 +133,7 @@ import {
   selectGardssalgProvidersForOrgnrBackfill,
   getGardssalgProviderOrgnrTarget,
   applyGardssalgProviderOrgnr,
+  getGardssalgOrgnrWriteBlocker,
   gardssalgOrgnrAutoWriteEligible,
   upsertGardssalgOrgnrReviewQueue,
   clearGardssalgOrgnrReviewQueueEntry,
@@ -10050,7 +10051,12 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
         continue;
       }
       if (dryRun) {
-        approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        const blocker = getGardssalgOrgnrWriteBlocker(providerId, orgNr);
+        if (blocker !== null) {
+          rejected.push({ provider_id: providerId, reason: blocker });
+        } else {
+          approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        }
         continue;
       }
       try {
@@ -10115,7 +10121,12 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
         continue;
       }
       if (dryRun) {
-        approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        const blocker = getGardssalgOrgnrWriteBlocker(providerId, orgNr);
+        if (blocker !== null) {
+          rejected.push({ provider_id: providerId, reason: blocker });
+        } else {
+          approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        }
         continue;
       }
       try {
@@ -10135,7 +10146,12 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
     }
 
     if (dryRun) {
-      approved.push({ provider_id: providerId, org_nr: orgNr });
+      const blocker = getGardssalgOrgnrWriteBlocker(providerId, orgNr);
+      if (blocker !== null) {
+        rejected.push({ provider_id: providerId, reason: blocker });
+      } else {
+        approved.push({ provider_id: providerId, org_nr: orgNr });
+      }
       continue;
     }
     try {

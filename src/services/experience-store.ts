@@ -5587,12 +5587,45 @@ export function gardssalgOrgnrAutoWriteEligible(
  * applyGardssalgProviderAddress). Returns the field names actually written
  * (empty array if nothing to write).
  */
+/**
+ * Pure, read-only pre-check for applyGardssalgProviderOrgnr's write guards —
+ * runs the exact same checks, in the exact same order, but returns a
+ * distinct reason string instead of silently returning [] so a dry-run
+ * caller can report the real outcome instead of assuming success. Returns
+ * null when the write would be allowed to proceed.
+ */
+export function getGardssalgOrgnrWriteBlocker(providerId: string, orgNr: string): string | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, content_source, org_nr, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; content_source: string | null; org_nr: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return "provider_not_found";
+  if (row.content_source === "manual" || row.content_source === "claim") return "owner_locked";
+
+  const cleanOrgNr = (orgNr || "").trim();
+  // Norwegian org numbers are exactly 9 digits — nothing else may reach the
+  // UNIQUE-indexed column (also subsumes the empty-string check).
+  if (!/^\d{9}$/.test(cleanOrgNr)) return "invalid_format";
+  if (row.org_nr && row.org_nr.trim() !== "") return "already_filled"; // fill-only
+
+  const conflict = db
+    .prepare(`SELECT id FROM experience_providers WHERE org_nr = ? AND id != ?`)
+    .get(cleanOrgNr, providerId) as { id: string } | undefined;
+  if (conflict) return "org_nr_conflict";
+
+  return null;
+}
+
 export function applyGardssalgProviderOrgnr(
   providerId: string,
   orgNr: string,
   evidenceUrl: string,
   batchId?: string
 ): string[] {
+  if (getGardssalgOrgnrWriteBlocker(providerId, orgNr) !== null) return [];
+
   const db = getDb(VERTICAL);
   const row = db
     .prepare(`SELECT id, content_source, org_nr, field_provenance FROM experience_providers WHERE id = ?`)
@@ -5600,18 +5633,8 @@ export function applyGardssalgProviderOrgnr(
     | { id: string; content_source: string | null; org_nr: string | null; field_provenance: string | null }
     | undefined;
   if (!row) return [];
-  if (row.content_source === "manual" || row.content_source === "claim") return [];
 
   const cleanOrgNr = (orgNr || "").trim();
-  // Norwegian org numbers are exactly 9 digits — nothing else may reach the
-  // UNIQUE-indexed column (also subsumes the empty-string check).
-  if (!/^\d{9}$/.test(cleanOrgNr)) return [];
-  if (row.org_nr && row.org_nr.trim() !== "") return []; // fill-only
-
-  const conflict = db
-    .prepare(`SELECT id FROM experience_providers WHERE org_nr = ? AND id != ?`)
-    .get(cleanOrgNr, providerId) as { id: string } | undefined;
-  if (conflict) return [];
 
   let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
   if (row.field_provenance) {
