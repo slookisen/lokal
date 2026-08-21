@@ -32,6 +32,23 @@
  *   (d) Malformed/junk JSON already in the field_provenance column is
  *       tolerated (no throw, treated as empty) when a provenance PUT
  *       comes in.
+ *
+ * 2026-08-21 dental-enrichment-spotcheck-vs-envelope-avstemming: dental was
+ * the one vertical of three (vs. RFB's knowledge-service.ts and experiences'
+ * experience-store.ts) whose write path never stamped last_enriched_at when
+ * a record was marked enriched, so the weekly QA spot-check (GET
+ * /admin/agents/recently-enriched, which filters WHERE last_enriched_at >=
+ * ?) could never find real enrichment writes. Fixed in updateDentalAgent()
+ * (src/services/dental-store.ts). Additional coverage here, exercised
+ * through this same PUT route since that's how Stage X (the enrichment
+ * worker) actually calls it:
+ *   (e) PUT that sets enrichment_state: "enriched" -> last_enriched_at is
+ *       stamped to a fresh, non-null timestamp on the row.
+ *   (f) PUT that sets enrichment_state: "raw" -> last_enriched_at is left
+ *       untouched (stays null).
+ *   (g) PUT with NO enrichment_state key at all (an ordinary field-only PUT,
+ *       Stage X's per-field pattern) -> last_enriched_at is left untouched
+ *       (a pre-existing value is preserved, regression guard).
  */
 
 export interface TestSummary {
@@ -193,7 +210,53 @@ export function runDentalAgentPutFieldProvenanceTests(
         field_provenance: "{not valid json",
       });
 
+      const insertAgentWithEnrichment = dentalDb.prepare(
+        `INSERT INTO dental_agents (id, navn, hjemmeside, telefon, field_provenance, enrichment_state, last_enriched_at)
+         VALUES (@id, @navn, @hjemmeside, @telefon, @field_provenance, @enrichment_state, @last_enriched_at)`,
+      );
+
+      // (e) subject: raw, never enriched -> PUT will mark it "enriched".
+      insertAgentWithEnrichment.run({
+        id: "clinic-enrich-stamp",
+        navn: "Stempel Tannlege AS",
+        hjemmeside: "https://stempel.example.no",
+        telefon: "22223333",
+        field_provenance: null,
+        enrichment_state: "raw",
+        last_enriched_at: null,
+      });
+
+      // (f) subject: PUT will transition it to "thin_site" (not "enriched").
+      insertAgentWithEnrichment.run({
+        id: "clinic-thin-site-transition",
+        navn: "Tynn Tannlege AS",
+        hjemmeside: "https://tynn.example.no",
+        telefon: "33334444",
+        field_provenance: null,
+        enrichment_state: "raw",
+        last_enriched_at: null,
+      });
+
+      // (g) subject: already enriched with a pre-existing last_enriched_at —
+      // an ordinary field-only PUT (no enrichment_state key at all, Stage
+      // X's per-field pattern) must leave it byte-identical.
+      insertAgentWithEnrichment.run({
+        id: "clinic-field-only-put",
+        navn: "Felt-Only Tannlege AS",
+        hjemmeside: "https://feltonly.example.no",
+        telefon: "44445555",
+        field_provenance: null,
+        enrichment_state: "enriched",
+        last_enriched_at: "2026-07-01T00:00:00.000Z",
+      });
+
       const dentalRouter = (require("./dental") as typeof import("./dental")).default as any;
+
+      function getEnrichmentColumns(id: string): { enrichment_state: string | null; last_enriched_at: string | null } {
+        return dentalDb
+          .prepare("SELECT enrichment_state, last_enriched_at FROM dental_agents WHERE id = ?")
+          .get(id) as { enrichment_state: string | null; last_enriched_at: string | null };
+      }
 
       function getProvColumn(id: string): string | null {
         const row = dentalDb.prepare("SELECT field_provenance FROM dental_agents WHERE id = ?").get(id) as
@@ -300,6 +363,69 @@ export function runDentalAgentPutFieldProvenanceTests(
         const parsed = raw ? JSON.parse(raw) : {};
         assertTrue(Array.isArray(parsed.phone) && parsed.phone.length === 1, "d3: junk treated as empty — only the new entry present");
         assertEq(parsed.phone[0].source_type, "hjemmeside_scrape", "d4: new entry recorded correctly despite prior junk");
+      }
+
+      // ── (e) enrichment_state: "enriched" -> last_enriched_at stamped ────
+      {
+        const before = Date.now();
+        const resp = await callRoute(dentalRouter, {
+          method: "PUT",
+          path: "/agents/clinic-enrich-stamp",
+          headers: { "x-admin-key": testKey },
+          body: {
+            enrichment_state: "enriched",
+          },
+        });
+        assertEq(resp.status, 200, "e1: PUT enrichment_state=enriched -> 200");
+
+        const row = getEnrichmentColumns("clinic-enrich-stamp");
+        assertEq(row.enrichment_state, "enriched", "e2: enrichment_state written as enriched");
+        assertTrue(!!row.last_enriched_at, "e3: last_enriched_at is no longer null");
+        const stampedMs = row.last_enriched_at ? new Date(row.last_enriched_at).getTime() : NaN;
+        assertTrue(
+          !Number.isNaN(stampedMs) && stampedMs <= Date.now() && stampedMs >= before - 5000,
+          "e4: last_enriched_at is a fresh timestamp (within a few seconds of now)",
+        );
+      }
+
+      // ── (f) enrichment_state: "thin_site" -> last_enriched_at NOT stamped ──
+      {
+        const resp = await callRoute(dentalRouter, {
+          method: "PUT",
+          path: "/agents/clinic-thin-site-transition",
+          headers: { "x-admin-key": testKey },
+          body: {
+            enrichment_state: "thin_site",
+          },
+        });
+        assertEq(resp.status, 200, "f1: PUT enrichment_state=thin_site -> 200");
+
+        const row = getEnrichmentColumns("clinic-thin-site-transition");
+        assertEq(row.enrichment_state, "thin_site", "f2: enrichment_state written as thin_site");
+        assertEq(row.last_enriched_at, null, "f3: last_enriched_at stays null — only 'enriched' stamps it");
+      }
+
+      // ── (g) ordinary field-only PUT, no enrichment_state key at all ─────
+      // (Stage X's actual per-field pattern) -> pre-existing last_enriched_at
+      // is left byte-identical (regression guard).
+      {
+        const before = getEnrichmentColumns("clinic-field-only-put").last_enriched_at;
+        const resp = await callRoute(dentalRouter, {
+          method: "PUT",
+          path: "/agents/clinic-field-only-put",
+          headers: { "x-admin-key": testKey },
+          body: {
+            telefon: "55556666", // unrelated field, no enrichment_state key
+          },
+        });
+        assertEq(resp.status, 200, "g1: field-only PUT (no enrichment_state key) -> 200");
+
+        const row = dentalDb
+          .prepare("SELECT telefon, last_enriched_at FROM dental_agents WHERE id = ?")
+          .get("clinic-field-only-put") as { telefon: string; last_enriched_at: string | null };
+        assertEq(row.telefon, "55556666", "g2: the field that WAS in the body (telefon) was written");
+        assertEq(row.last_enriched_at, before, "g3: last_enriched_at byte-identical to before (regression guard)");
+        assertEq(row.last_enriched_at, "2026-07-01T00:00:00.000Z", "g4: pre-existing last_enriched_at value preserved exactly");
       }
     } catch (err: any) {
       failed++;
