@@ -71,6 +71,7 @@ import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slu
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
+import adminDodBulkRoutes from "./routes/admin-dod-bulk";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
@@ -751,6 +752,13 @@ app.use("/admin/pool-blocker-explain", adminLimiter, adminPoolBlockerExplainRout
 // predicate) — the enumeration primitive Skive 3's "batches of 25 until the
 // cohort is exhausted" plan needed but never had. GET /admin/homepage-provenance-cohort.
 app.use("/admin/homepage-provenance-cohort", adminLimiter, adminHomepageProvenanceCohortRoutes);
+// scripts/dod-scorecard.py (A2A repo) has carried a `provenance + per-agent
+// verification_status: MEASUREMENT-PENDING` placeholder for ~2 months: no
+// bulk endpoint exposed field_provenance/verification_status per-agent, so
+// the script could only sample. READ-ONLY, paginated, per-producer
+// verification_status + provenance/content signals for all 8 DoD checks in
+// one batch call. GET /admin/dod-bulk.
+app.use("/admin/dod-bulk", adminLimiter, adminDodBulkRoutes);
 // dev-requests/2026-08-07-rfb-contact-extraction.md: corroborated contact-
 // email extraction from a producer's own website for RFB `agents` rows whose
 // contact_email is blank or DNS-flagged-dead — writes agents.contact_email
