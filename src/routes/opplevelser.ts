@@ -9999,7 +9999,73 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
 
     const entry = byProvider.get(providerId);
     if (!entry) {
-      rejected.push({ provider_id: providerId, reason: "not_in_review_queue" });
+      if (!manualVerified) {
+        rejected.push({ provider_id: providerId, reason: "not_in_review_queue" });
+        continue;
+      }
+      // manual_verified with NO queue row (dev-request 2026-08-2x-gardssalg-
+      // orgnr-review-approve-uten-koe-rad): the review queue is not the only
+      // source of a provider's org_nr evidence — an earlier backfill can have
+      // rejected a provider conservatively (e.g.
+      // stripped_name_requires_postal_match / no_brreg_candidate) before ever
+      // writing a queue row, stranding a human-verified org_nr with nowhere
+      // to land. This branch looks the provider up directly in the catalog
+      // (same query pattern as the listing-homepage-discovery route) instead
+      // of requiring a pre-existing queue row, then runs the EXACT SAME
+      // evidence gates the queued manual_verified path below already
+      // enforces: 9-digit format, Brreg existence, active status, and
+      // provider/registered-name token overlap. The flag is still only a
+      // REQUEST — the server verifies it itself before writing, same as the
+      // queued case below.
+      const catalogRow = getExpDb("experiences")
+        .prepare(`SELECT id, navn FROM experience_providers WHERE id = ?`)
+        .get(providerId) as { id: string; navn: string | null } | undefined;
+      if (!catalogRow) {
+        rejected.push({ provider_id: providerId, reason: "provider_not_found_in_catalog" });
+        continue;
+      }
+      if (!/^\d{9}$/.test(orgNr)) {
+        rejected.push({ provider_id: providerId, reason: "manual_verify_invalid_orgnr_format" });
+        continue;
+      }
+      const verdict = await verifyOrgNumber(orgNr);
+      if (!verdict.exists) {
+        rejected.push({ provider_id: providerId, reason: "manual_verify_orgnr_not_found_in_brreg" });
+        continue;
+      }
+      if (!verdict.active) {
+        rejected.push({
+          provider_id: providerId,
+          reason: `manual_verify_orgnr_not_active${verdict.flag ? `_${verdict.flag}` : ""}`,
+          brreg_name: verdict.name ?? undefined,
+        });
+        continue;
+      }
+      if (!brregNameOverlapsProviderName(catalogRow.navn, verdict.name)) {
+        rejected.push({
+          provider_id: providerId,
+          reason: "manual_verify_name_mismatch",
+          brreg_name: verdict.name ?? undefined,
+        });
+        continue;
+      }
+      if (dryRun) {
+        approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        continue;
+      }
+      try {
+        const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`;
+        const written = applyGardssalgProviderOrgnr(providerId, orgNr, evidenceUrl);
+        if (written.length > 0) {
+          clearGardssalgOrgnrReviewQueueEntry(providerId);
+          approved.push({ provider_id: providerId, org_nr: orgNr, manual_verified: true, brreg_name: verdict.name ?? undefined });
+        } else {
+          rejected.push({ provider_id: providerId, reason: "write_refused_filled_locked_or_conflict" });
+        }
+      } catch (err) {
+        console.error("[gardssalg-orgnr-review-approve] manual_verified write failed (no queue row):", err);
+        rejected.push({ provider_id: providerId, reason: "write_failed" });
+      }
       continue;
     }
     if (!entry.candidate_orgnr || entry.candidate_orgnr.trim() !== orgNr) {

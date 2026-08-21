@@ -30910,6 +30910,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gob.failures) failures.push("opplevelser-gardssalg-orgnr-backfill: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-backfill: ${gob.passed} passed, ${gob.failed} failed`);
 
+    // dev-request 2026-08-2x-gardssalg-orgnr-review-approve-uten-koe-rad:
+    // POST /admin/gardssalg-orgnr-review-approve's manual_verified path no
+    // longer requires a pre-existing gardssalg_orgnr_review_queue row — a
+    // provider an earlier org_nr-backfill rejected conservatively (and so
+    // never queued) can still receive an evidence-based org_nr approval, as
+    // long as it exists in experience_providers and the server's own live
+    // Brreg re-verification (existence + active + name overlap) passes. The
+    // queue-entry-exists paths are unchanged (asserted here as regression).
+    // Same in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-orgnr-review-approve: evidence-based approval without a queue row ──");
+    const { runOpplevelserGardssalgOrgnrReviewApproveTests } = require("../src/routes/opplevelser-gardssalg-orgnr-review-approve.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-orgnr-review-approve.test");
+    const gora = await runOpplevelserGardssalgOrgnrReviewApproveTests({ log: false });
+    passed += gora.passed;
+    failed += gora.failed;
+    for (const f of gora.failures) failures.push("opplevelser-gardssalg-orgnr-review-approve: " + f);
+    console.log(`  opplevelser-gardssalg-orgnr-review-approve: ${gora.passed} passed, ${gora.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2:
     // admin claim-grant — issueAdminGrantedClaimMagicLink()/
     // hasActiveNonRevokedClaim() (src/services/gardssalg-claim.ts) and
