@@ -12161,6 +12161,14 @@ export type GardssalgOutreachEligibility =
       navn: string | null;
       slug: string | null;
       epost: string; // trimmed, non-empty — guaranteed present when eligible:true
+      // Grep 7 (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply,
+      // Daniel 2026-08-20): the cross-platform 60-day cooldown no longer BLOCKS —
+      // a recent RFB send to the same address is reported here instead, so
+      // daily-prep/reports keep the pattern observable (both platforms share the
+      // literal From address, so complaints/bounces pool on one domain).
+      cross_platform_recent?: true;
+      cross_platform_last_sent_at?: string;
+      cross_platform_by?: string;
     };
 
 export function computeGardssalgOutreachSendEligibility(
@@ -12243,7 +12251,21 @@ export function computeGardssalgOutreachSendEligibility(
       continue;
     }
 
-    // ── Cross-platform cooldown: read-only, existing RFB outreach_sent_log
+    // ── Cross-platform history: read-only, existing RFB outreach_sent_log.
+    // Grep 7 (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply,
+    // Daniels beslutning 2026-08-20, ordrett i daniel-responses/2026-08-20-go-
+    // kryssplattform-og-discovery-sloyfe.md): this used to be a BLOCKING
+    // 60-day cooldown keyed on the recipient address; Daniel removed it — the
+    // two platforms are distinct products and may both mail a producer.
+    // Blocklist and each lane's OWN cooldown (the experience_outreach_sent_log
+    // check just above) apply unchanged. The residual risk named in that
+    // dev-request (both platforms share the literal From address
+    // kontakt@rettfrabonden.com, so one recipient can get two cold emails that
+    // read as one sender, and bounces/complaints pool on one domain's
+    // reputation) is deliberately kept OBSERVABLE rather than enforced: the
+    // lookup stays, and a recent cross-platform send is surfaced on the
+    // ELIGIBLE row as cross_platform_recent so daily-prep and run reports can
+    // show the overlap if reply/complaint rates ever diverge.
     const rfbDb = getRfbDb();
     const crossPrior = rfbDb
       .prepare(
@@ -12255,19 +12277,6 @@ export function computeGardssalgOutreachSendEligibility(
       )
       .get(email, cooldownCutoff) as { sent_at: string; vertical_id: string } | undefined;
 
-    if (crossPrior) {
-      out.push({
-        provider_id: providerId,
-        eligible: false,
-        status: "skipped",
-        reason: "cooldown_suppressed",
-        last_sent_at: crossPrior.sent_at,
-        suppressed_by: crossPrior.vertical_id,
-        cross_platform: true,
-      });
-      continue;
-    }
-
     out.push({
       provider_id: providerId,
       eligible: true,
@@ -12275,6 +12284,13 @@ export function computeGardssalgOutreachSendEligibility(
       navn: providerRow?.navn ?? null,
       slug: providerRow?.slug ?? null,
       epost: email,
+      ...(crossPrior
+        ? {
+            cross_platform_recent: true as const,
+            cross_platform_last_sent_at: crossPrior.sent_at,
+            cross_platform_by: crossPrior.vertical_id,
+          }
+        : {}),
     });
   }
 
@@ -12826,6 +12842,13 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
     last_sent_at?: string;
     suppressed_by?: string;
     cross_platform?: boolean;
+    // Grep 7 (2026-08-19-kursjustering-drikkefunnel-llm-og-supply): the
+    // cross-platform cooldown no longer blocks; on ELIGIBLE rows a recent
+    // RFB send to the same address is surfaced through these informational
+    // fields instead (see the eligibility function's own doc comment).
+    cross_platform_recent?: true;
+    cross_platform_last_sent_at?: string;
+    cross_platform_by?: string;
     // dev-request 2026-08-09-outreach-send-uten-crm-spor: present only on a
     // real (non-test) `sent` row — true when the send was filed in the CRM,
     // false when the mail went out but the CRM write failed. Absent on test
@@ -12873,8 +12896,17 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
       }
 
       // ── Eligible ──────────────────────────────────────────────────────
+      // Grep 7: carry the informational cross-platform fields through on the
+      // dry-run row (JSON.stringify drops them when absent, same convention
+      // as the skip branch above).
       if (!apply) {
-        results.push({ provider_id: elig.provider_id, status: "would_send" });
+        results.push({
+          provider_id: elig.provider_id,
+          status: "would_send",
+          cross_platform_recent: elig.cross_platform_recent,
+          cross_platform_last_sent_at: elig.cross_platform_last_sent_at,
+          cross_platform_by: elig.cross_platform_by,
+        });
         continue;
       }
 

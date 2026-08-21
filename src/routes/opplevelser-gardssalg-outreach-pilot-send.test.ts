@@ -27,9 +27,12 @@
  *       the same RFB db this suite already controls)
  *   (e) own-table cooldown skip -> skipped/cooldown_suppressed,
  *       suppressed_by:"experiences", no cross_platform flag
- *   (f) cross-platform cooldown skip -> skipped/cooldown_suppressed,
- *       suppressed_by:<the other vertical_id>, cross_platform:true (seeded
- *       in the EXISTING RFB outreach_sent_log, vertical_id='rfb')
+ *   (f) cross-platform history is INFORMATIONAL, not blocking (Grep 7,
+ *       dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply,
+ *       Daniel 2026-08-20): a recent RFB send to the same address (seeded in
+ *       the EXISTING RFB outreach_sent_log, vertical_id='rfb') leaves the
+ *       row would_send/eligible, flagged cross_platform_recent:true with
+ *       cross_platform_by naming the other vertical
  *   (g) dry-run zero-write: apply absent -> would_send for an eligible row,
  *       but NEITHER experience_outreach_sent_log NOR the transporter is
  *       touched (before/after SELECT + sent-array length)
@@ -351,7 +354,9 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       assertTrue(!ownCooldown.body.results[0].cross_platform, "e5: not flagged cross_platform");
       assertTrue(!!ownCooldown.body.results[0].last_sent_at, "e6: last_sent_at is populated");
 
-      // ── (f) cross-platform cooldown skip ─────────────────────────────
+      // ── (f) cross-platform history: informational, NOT blocking (Grep 7) ──
+      // Same seed as when this was a blocking cooldown — the assertion flips:
+      // the row must now stay eligible, carrying the informational flag.
       rfbDb
         .prepare(
           `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active)
@@ -364,12 +369,14 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
            VALUES ('agent-fixture-delta', 'post@fixture-delta.no', datetime('now', '-2 days'), 'email', 'rfb')`,
         )
         .run();
-      const crossCooldown = await callRoute(opplevelserRouter, { headers: auth, body: { provider_ids: ["prov-delta"] } });
-      assertEq(crossCooldown.status, 200, "f1: cross-platform cooldown row -> 200");
-      assertEq(crossCooldown.body.results[0].status, "skipped", "f2: status is skipped");
-      assertEq(crossCooldown.body.results[0].reason, "cooldown_suppressed", "f3: reason is cooldown_suppressed");
-      assertEq(crossCooldown.body.results[0].suppressed_by, "rfb", "f4: suppressed_by names the OTHER vertical (rfb)");
-      assertEq(crossCooldown.body.results[0].cross_platform, true, "f5: flagged cross_platform:true");
+      const crossRecent = await callRoute(opplevelserRouter, { headers: auth, body: { provider_ids: ["prov-delta"] } });
+      assertEq(crossRecent.status, 200, "f1: cross-platform history row -> 200");
+      assertEq(crossRecent.body.results[0].status, "would_send", "f2: status is would_send — RFB history no longer blocks");
+      assertTrue(!crossRecent.body.results[0].suppressed_by, "f3: no suppressed_by on the eligible row");
+      assertEq(crossRecent.body.results[0].cross_platform_recent, true, "f4: flagged cross_platform_recent:true (informational)");
+      assertEq(crossRecent.body.results[0].cross_platform_by, "rfb", "f5: cross_platform_by names the OTHER vertical (rfb)");
+      assertTrue(!!crossRecent.body.results[0].cross_platform_last_sent_at, "f6: cross_platform_last_sent_at is populated");
+      assertTrue(!crossRecent.body.results[0].reason, "f7: no cooldown_suppressed reason on the eligible row");
 
       // ── (g) dry-run zero-write for an eligible row ───────────────────
       const beforeLogCount = (
