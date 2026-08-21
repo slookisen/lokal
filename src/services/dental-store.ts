@@ -1260,6 +1260,20 @@ export function updateDentalAgent(
 
   if (sets.length === 0) return true; // nothing to do
   sets.push("updated_at = datetime('now')");
+  // 2026-08-21 dental-enrichment-spotcheck-vs-envelope-avstemming: dental was
+  // the one vertical of three (vs. knowledge-service.ts:473 /
+  // experience-store.ts:2506) that never stamped last_enriched_at when a
+  // record was marked enriched — so the weekly QA spot-check (GET
+  // /admin/agents/recently-enriched, which filters on last_enriched_at)
+  // could never find real enrichment writes even though enrichment_state was
+  // flipping correctly every day. Mirror experience-store.ts:2506 — stamp
+  // last_enriched_at together with enrichment_state in the same UPDATE, only
+  // when the patch marks the record "enriched". Leave last_enriched_at
+  // untouched for any other transition (e.g. "raw"/"thin_site", or an
+  // unrelated field-only PUT that never sets enrichment_state at all).
+  if (patch.enrichment_state === "enriched") {
+    sets.push("last_enriched_at = datetime('now')");
+  }
 
   db.prepare(`UPDATE dental_agents SET ${sets.join(", ")} WHERE id = @id`).run(
     params
