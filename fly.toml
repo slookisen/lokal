@@ -13,6 +13,11 @@ primary_region = 'arn'
   NODE_ENV = 'production'
   PORT = '3000'
   MEMORY_LIMIT_MB = '1024'
+  # Daily outreach candidate cap (Grep 6, lokal#665 — resolveDailyPrepMaxCandidates()).
+  # Non-secret feature flag, same convention as GARDSSALG_BOOKING_DISPATCH_ENABLED below.
+  # Daniel raised 4 -> 6 (live sesjon 2026-08-21) now that Grep 7 releases ~23 candidates;
+  # 10 is the code ceiling and the next step once second-touch opens ~8 Sept.
+  DAILY_PREP_MAX_CANDIDATES = '6'
   # Gårdssalg booking dispatch master switch (dev-request 2026-07-14-booking-flyt-v1).
   # Non-secret feature flag → lives here rather than in Fly secrets. SAFE by the
   # double gate: a booking only dispatches when BOTH this is "true" AND the specific
