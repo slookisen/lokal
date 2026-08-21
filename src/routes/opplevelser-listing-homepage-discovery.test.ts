@@ -900,6 +900,157 @@ export function runOpplevelserListingHomepageDiscoveryTests(
           }
         }
       }
+
+      // ── lh-11: approve lever, `{"auto": true}` mode (dev-request 2026-08-19-
+      //    kursjustering-drikkefunnel-llm-og-supply, "Grep 8 punkt 2 Del B").
+      //    Server-side selects ONLY pending rows with confidence EXACTLY 0.8
+      //    (the sole tier where the code fetched the candidate page and
+      //    verified the provider's own name on it) — never 1.0 (an unverified
+      //    Brreg registry `hjemmeside` lookup, NOT a stronger signal despite
+      //    the bigger number) and never 0.6 (web-search, no page verification
+      //    at all). Runs the exact same approve loop/write path as the
+      //    existing client-supplied 'approvals' mode. ─────────────────────
+      {
+        // Earlier sections (e.g. lh-6's guard scenario) can leave their own
+        // 'pending' rows sitting in the shared queue — wipe it first so this
+        // block's confidence-based selection counts are deterministic and
+        // depend only on the fixtures inserted below, not on other
+        // sections' leftover state.
+        expDb.prepare(`DELETE FROM experience_homepage_review_queue`).run();
+
+        const insertQueueRow = expDb.prepare(
+          `INSERT INTO experience_homepage_review_queue
+             (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, resolved_at)
+           VALUES (@id, @provider_id, @provider_name, @candidate_url, @candidate_url, @evidence, @confidence, @reason, 'test-fixture-auto', 'pending', @createdAt, NULL)`,
+        );
+
+        // ── lh-11a-h: mixed-confidence queue -> ONLY the 0.8 row is selected,
+        //    approved and written; the 1.0 and 0.6 rows are left untouched.
+        //    This block IS the explicit negative proof for confidence:1.0:
+        //    if `confidence === 0.8` were ever loosened to `confidence >= 0.8`,
+        //    the 1.0 row would also qualify and these assertions would fail
+        //    loudly (candidates_considered/approved_count would be 2, not 1,
+        //    and lh-auto-1p0's hjemmeside would no longer be null).
+        insertProvider.run({ id: "lh-auto-1p0", navn: "Auto Brreg Gård", hjemmeside: null, listing_url: null, content_source: null });
+        insertProvider.run({ id: "lh-auto-0p8", navn: "Auto Navneverifisert Gård", hjemmeside: null, listing_url: null, content_source: null });
+        insertProvider.run({ id: "lh-auto-0p6", navn: "Auto Websøk Gård", hjemmeside: null, listing_url: null, content_source: null });
+        insertQueueRow.run({ id: "lh-auto-1p0-row", provider_id: "lh-auto-1p0", provider_name: "Auto Brreg Gård", candidate_url: "https://auto-1p0-gard.no", evidence: '{"source":"brreg_hjemmeside"}', confidence: 1.0, reason: "brreg_website_candidate", createdAt: "2026-08-01 08:00:00" });
+        insertQueueRow.run({ id: "lh-auto-0p8-row", provider_id: "lh-auto-0p8", provider_name: "Auto Navneverifisert Gård", candidate_url: "https://auto-0p8-gard.no", evidence: '{"name_verified":true,"host":"auto-0p8-gard.no","listing_url":"https://visitnorway.no/produsent/auto-0p8"}', confidence: 0.8, reason: "listing_page_link_candidate", createdAt: "2026-08-01 09:00:00" });
+        insertQueueRow.run({ id: "lh-auto-0p6-row", provider_id: "lh-auto-0p6", provider_name: "Auto Websøk Gård", candidate_url: "https://auto-0p6-gard.no", evidence: '{"source":"web_search"}', confidence: 0.6, reason: "web_search_candidate", createdAt: "2026-08-01 10:00:00" });
+
+        const mixed = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/listing-homepage-review-approve",
+          body: { auto: true, apply: true },
+        });
+        assertEq(mixed.status, 200, "lh-11a: auto apply call succeeds");
+        assertEq(mixed.body.mode, "auto", "lh-11b: response carries mode: 'auto'");
+        assertEq(mixed.body.candidates_considered, 1, "lh-11c: candidates_considered counts ONLY the confidence:0.8 row, not 1.0 or 0.6");
+        assertEq(mixed.body.approved_count, 1, "lh-11d: exactly one row approved");
+        assertEq((mixed.body.approved as any[])[0]?.provider_id, "lh-auto-0p8", "lh-11e: the approved row is the 0.8 (name-verified) one");
+        assertEq(mixed.body.written_count, 1, "lh-11f: exactly one row written");
+        assertEq((mixed.body.written as any[])[0]?.provider_id, "lh-auto-0p8", "lh-11g: the written row is the 0.8 (name-verified) one");
+        const hj08 = (expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='lh-auto-0p8'`).get() as any).hjemmeside;
+        assertEq(hj08, "https://auto-0p8-gard.no", "lh-11h: hjemmeside persisted for the 0.8 row via the SAME write path as 'approvals' mode");
+        const q08 = (expDb.prepare(`SELECT status FROM experience_homepage_review_queue WHERE provider_id='lh-auto-0p8'`).get() as any).status;
+        assertEq(q08, "approved", "lh-11i: 0.8 row's queue status flipped to approved");
+        // EXPLICIT negative proof (dev-request's specific bug-class guard):
+        // the confidence:1.0 (unverified Brreg registry lookup) row must
+        // NEVER be auto-approved, no matter how high its number is.
+        const hj10 = (expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='lh-auto-1p0'`).get() as any).hjemmeside;
+        assertEq(hj10, null, "lh-11j: EXPLICIT NEGATIVE — confidence:1.0 row (unverified brreg registry lookup) is NEVER auto-approved");
+        const q10 = (expDb.prepare(`SELECT status FROM experience_homepage_review_queue WHERE provider_id='lh-auto-1p0'`).get() as any).status;
+        assertEq(q10, "pending", "lh-11k: confidence:1.0 row's queue status untouched, still pending");
+        const hj06 = (expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='lh-auto-0p6'`).get() as any).hjemmeside;
+        assertEq(hj06, null, "lh-11l: confidence:0.6 (web-search, no page verification) row is also never auto-approved");
+        const q06 = (expDb.prepare(`SELECT status FROM experience_homepage_review_queue WHERE provider_id='lh-auto-0p6'`).get() as any).status;
+        assertEq(q06, "pending", "lh-11m: confidence:0.6 row's queue status untouched, still pending");
+
+        // ── lh-11n: `auto:true` + a non-empty `approvals` array -> 400,
+        //    mutually exclusive, same contract as the gårdssalg auto lever.
+        const autoPlusApprovals = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/listing-homepage-review-approve",
+          body: { auto: true, approvals: [{ provider_id: "lh-auto-0p6", url: "https://auto-0p6-gard.no" }] },
+        });
+        assertEq(autoPlusApprovals.status, 400, "lh-11n: combining 'auto' and non-empty 'approvals' -> 400");
+        assertEq(
+          autoPlusApprovals.body.error, "cannot combine 'auto' and 'approvals' in the same call",
+          "lh-11o: exact error message for the mutually-exclusive combination",
+        );
+
+        // ── lh-11p-s: empty qualifying set -> approved/written/rejected all
+        //    empty arrays, no error. The 1.0/0.6 rows are still pending but
+        //    do not qualify (wrong confidence); clear them too so the queue
+        //    is fully empty and unambiguous.
+        expDb.prepare(`DELETE FROM experience_homepage_review_queue WHERE provider_id IN ('lh-auto-1p0', 'lh-auto-0p6')`).run();
+        const empty = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/listing-homepage-review-approve",
+          body: { auto: true, apply: true },
+        });
+        assertEq(empty.status, 200, "lh-11p: empty qualifying set is still a 200, no error");
+        assertEq(empty.body.candidates_considered, 0, "lh-11q: candidates_considered is 0");
+        assertEq(JSON.stringify(empty.body.approved), "[]", "lh-11r: approved is an empty array");
+        assertEq(JSON.stringify(empty.body.written), "[]", "lh-11s: written is an empty array");
+
+        // ── lh-11t-w: cap — more than GARDSSALG_AUTO_APPROVE_BATCH_CAP (30)
+        //    qualifying (confidence:0.8, pending) rows -> exactly 30
+        //    processed, candidates_considered shows the full UNCAPPED count.
+        //    Oldest-created_at-first ordering means the lowest-index rows
+        //    (earliest created_at below) are the ones inside the cap.
+        for (let i = 0; i < 35; i++) {
+          const pid = `lh-auto-cap-${i}`;
+          insertProvider.run({ id: pid, navn: `Auto Cap Gård ${i}`, hjemmeside: null, listing_url: null, content_source: null });
+          insertQueueRow.run({
+            id: `${pid}-row`,
+            provider_id: pid,
+            provider_name: `Auto Cap Gård ${i}`,
+            candidate_url: `https://auto-cap-gard-${i}.no`,
+            evidence: '{"name_verified":true}',
+            confidence: 0.8,
+            reason: "listing_page_link_candidate",
+            createdAt: `2026-08-02 ${String(i).padStart(2, "0")}:00:00`,
+          });
+        }
+        const cap = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/listing-homepage-review-approve",
+          body: { auto: true, apply: false },
+        });
+        assertEq(cap.body.candidates_considered, 35, "lh-11t: candidates_considered reports the full UNCAPPED count (35)");
+        assertEq(cap.body.approved_count, 30, "lh-11u: exactly GARDSSALG_AUTO_APPROVE_BATCH_CAP (30) processed");
+        const cappedQueueLeft = (expDb.prepare(`SELECT COUNT(*) c FROM experience_homepage_review_queue WHERE provider_id LIKE 'lh-auto-cap-%'`).get() as any).c;
+        assertEq(cappedQueueLeft, 35, "lh-11v: dry-run leaves ALL 35 rows in the queue (the cap bounds processing, not the queue itself)");
+        const cappedIds = new Set((cap.body.approved as any[]).map((a) => a.provider_id));
+        assertTrue(cappedIds.has("lh-auto-cap-0"), "lh-11w: the oldest-created_at row (index 0) is inside the cap");
+        assertTrue(!cappedIds.has("lh-auto-cap-34"), "lh-11x: the newest-created_at row (index 34) is outside the cap");
+      }
+
+      // ── lh-12: regression guard — the existing client-supplied 'approvals'
+      //    mode stays byte-for-byte unchanged when 'auto' is absent: no
+      //    'mode' or 'candidates_considered' field appears on its response.
+      //    (The full pre-existing lh-5/lh-6 approve-lever test blocks above
+      //    already exercise the unmodified 'approvals' path end-to-end and
+      //    remain untouched by this change, serving as the primary
+      //    regression guard; this block adds the explicit absent-field check
+      //    the auto-mode addition specifically needs.) ─────────────────────
+      {
+        insertProvider.run({ id: "lh-regress", navn: "Regresjon Gård", hjemmeside: null, listing_url: null, content_source: null });
+        expDb.prepare(
+          `INSERT INTO experience_homepage_review_queue
+             (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, resolved_at)
+           VALUES ('lh-regress-row', 'lh-regress', 'Regresjon Gård', 'https://regress-gard.no', 'https://regress-gard.no', '{"name_verified":true}', 0.8, 'listing_page_link_candidate', 'test-fixture-auto', 'pending', '2026-08-03 00:00:00', NULL)`,
+        ).run();
+        const manual = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/listing-homepage-review-approve",
+          body: { approvals: [{ provider_id: "lh-regress", url: "https://regress-gard.no" }], apply: true },
+        });
+        assertEq(manual.body.written_count, 1, "lh-12a: unmodified 'approvals' mode still writes as before");
+        assertTrue(!("mode" in manual.body), "lh-12b: no 'mode' field on the response when 'auto' is absent");
+        assertTrue(!("candidates_considered" in manual.body), "lh-12c: no 'candidates_considered' field when 'auto' is absent");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-listing-homepage-discovery: unexpected error: " + String(err?.stack || err?.message || err));
