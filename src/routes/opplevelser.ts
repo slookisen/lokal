@@ -4945,8 +4945,21 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
 // rejected. Writes go through applyGardssalgProviderWebsite (fill-only, lock
 // guard, shared-host identity re-check, audit + provenance), and the queue
 // entry is cleared on a confirmed write. Never an arbitrary-write surface.
+//
+// M0d Del A (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply,
+// "Grep 8 punkt 2"): an alternate, mutually-exclusive `{"auto": true, ...}`
+// request mode for exactly the org.nr-verified evidence tier of THIS one
+// queue — confidence is already a precise, testable proxy for that evidence
+// class at insertion time (1.0 == org_nr_found on the page), so this mode
+// server-side-selects the candidates instead of trusting a client-supplied
+// list, and then runs them through the SAME unchanged write loop below.
+// `min_confidence` defaults to 1.0 (Daniel's own bar for this tier) and must
+// be a finite number in [0,1]. Capped to GARDSSALG_AUTO_APPROVE_BATCH_CAP so
+// one call's blast radius stays bounded even though each item here is only a
+// DB write (no per-row network fetch like the discovery route's own cap).
+const GARDSSALG_AUTO_APPROVE_BATCH_CAP = 30;
 router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown; auto?: unknown; min_confidence?: unknown };
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -4956,23 +4969,59 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
     req.query?.apply === "true";
   const dryRun = !apply;
 
-  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
-    res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {provider_id, url}" });
+  const auto = body.auto === true;
+  if (auto && Array.isArray(body.approvals) && body.approvals.length > 0) {
+    res.status(400).json({ error: "cannot combine 'auto' and 'approvals' in the same call" });
     return;
   }
-  if (body.approvals.length > 200) {
-    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
-    return;
+
+  let minConfidence = 1.0;
+  if (auto) {
+    if (body.min_confidence !== undefined) {
+      const mc = body.min_confidence;
+      if (typeof mc !== "number" || !Number.isFinite(mc) || mc < 0 || mc > 1) {
+        res.status(400).json({ error: "min_confidence must be a number in [0,1]" });
+        return;
+      }
+      minConfidence = mc;
+    }
+  } else {
+    if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+      res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {provider_id, url}" });
+      return;
+    }
+    if (body.approvals.length > 200) {
+      res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+      return;
+    }
   }
 
   const queue = listGardssalgWebsiteReviewQueue();
   const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
+
+  // Server-side selection for auto mode — NEVER a client-supplied list in
+  // this mode, which is exactly what makes it safe to auto-run from the
+  // charter without curl+jq JSON-evidence parsing in a routine text file.
+  let candidatesConsidered = 0;
+  let approvalsInput: unknown[];
+  if (auto) {
+    const qualifying = queue
+      .filter((q) => q.confidence !== null && q.confidence !== undefined && q.confidence >= minConfidence)
+      .sort((a, b) => (a.updated_at < b.updated_at ? -1 : a.updated_at > b.updated_at ? 1 : 0));
+    candidatesConsidered = qualifying.length;
+    approvalsInput = qualifying
+      .slice(0, GARDSSALG_AUTO_APPROVE_BATCH_CAP)
+      .map((q) => ({ provider_id: q.provider_id, url: q.candidate_url }));
+  } else {
+    approvalsInput = body.approvals as unknown[];
+  }
+
   const seen = new Set<string>();
   const approved: Array<{ provider_id: string; url: string }> = [];
   const written: Array<{ provider_id: string; url: string }> = [];
   const rejected: Array<{ provider_id: string; reason: string }> = [];
 
-  for (const raw of body.approvals as unknown[]) {
+  for (const raw of approvalsInput) {
     const a = raw as { provider_id?: unknown; url?: unknown };
     const pid = typeof a?.provider_id === "string" ? a.provider_id.trim() : "";
     const url = typeof a?.url === "string" ? a.url.trim() : "";
@@ -5036,6 +5085,7 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, async (req:
     written_count: written.length,
     written,
     rejected,
+    ...(auto ? { mode: "auto" as const, min_confidence: minConfidence, candidates_considered: candidatesConsidered } : {}),
   });
 });
 

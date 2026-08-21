@@ -1279,6 +1279,142 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         }
       }
 
+      // ── wd-25: auto-mode approve — M0d Del A (dev-request 2026-08-19-
+      //    kursjustering-drikkefunnel-llm-og-supply, "Grep 8 punkt 2"):
+      //    server-side selection by confidence, NEVER a client-supplied list
+      //    in this mode, run through the SAME write loop as approvals-mode. ─
+      {
+        // Isolate from any queue rows left behind by earlier sections above.
+        expDb.prepare(`DELETE FROM gardssalg_website_review_queue`).run();
+
+        insertProvider.run({ id: "wd-auto-orgnr", navn: "Auto Orgnr Gard", org_nr: "922333444", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-auto-phone", navn: "Auto Phone Gard", org_nr: "922333445", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-auto-addr", navn: "Auto Addr Gard", org_nr: "922333446", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-auto-name", navn: "Auto Name Gard", org_nr: "922333447", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-auto-null", navn: "Auto Null Gard", org_nr: "922333448", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+
+        // Mixed confidence tiers, same graded scale the discovery route
+        // itself sets at insertion (1.0 org_nr / 0.95 phone / 0.92 address /
+        // 0.9 name+place); the last row mirrors the brreg-only insertion
+        // path, which never sets confidence at all (SQL NULL).
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "wd-auto-orgnr", provider_name: "Auto Orgnr Gard", candidate_url: "https://auto-orgnr-gard.no", final_url: "https://auto-orgnr-gard.no", confidence: 1.0, reason: "website_discovery_candidate" });
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "wd-auto-phone", provider_name: "Auto Phone Gard", candidate_url: "https://auto-phone-gard.no", final_url: "https://auto-phone-gard.no", confidence: 0.95, reason: "website_discovery_candidate" });
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "wd-auto-addr", provider_name: "Auto Addr Gard", candidate_url: "https://auto-addr-gard.no", final_url: "https://auto-addr-gard.no", confidence: 0.92, reason: "website_discovery_candidate" });
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "wd-auto-name", provider_name: "Auto Name Gard", candidate_url: "https://auto-name-gard.no", final_url: "https://auto-name-gard.no", confidence: 0.9, reason: "website_discovery_candidate" });
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "wd-auto-null", provider_name: "Auto Null Gard", candidate_url: "https://auto-null-gard.no", final_url: "https://auto-null-gard.no", reason: "brreg_registered_hjemmeside" });
+
+        // wd-25a-i: default min_confidence (1.0) only approves/writes the
+        //    org.nr-tier row.
+        const auto1 = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, apply: true },
+        });
+        assertEq(auto1.body.mode, "auto", "wd-25a: response reports mode:'auto'");
+        assertEq(auto1.body.min_confidence, 1, "wd-25b: default min_confidence is 1.0");
+        assertEq(auto1.body.candidates_considered, 1, "wd-25c: only the org_nr row qualifies at default min_confidence");
+        assertEq(auto1.body.approved_count, 1, "wd-25d: exactly one approved");
+        assertEq((auto1.body.approved as any[])[0]?.provider_id, "wd-auto-orgnr", "wd-25e: the org_nr-tier row is the one approved");
+        assertEq(auto1.body.written_count, 1, "wd-25f: exactly one written");
+        const rowAutoOrgnr = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-auto-orgnr'`).get() as any;
+        assertEq(rowAutoOrgnr.hjemmeside, "https://auto-orgnr-gard.no", "wd-25g: hjemmeside actually written for the org_nr row");
+        const qLeftAutoOrgnr = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-auto-orgnr'`).get() as any).c;
+        assertEq(qLeftAutoOrgnr, 0, "wd-25h: queue entry cleared for the auto-approved row");
+        const rowAutoPhoneUntouched = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-auto-phone'`).get() as any;
+        assertEq(rowAutoPhoneUntouched.hjemmeside, null, "wd-25i: lower-confidence rows are NOT written at default min_confidence");
+
+        // wd-25j-p: explicit min_confidence: 0.9 approves everything except
+        //    the NULL row (never selected at any threshold).
+        const auto2 = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, apply: true, min_confidence: 0.9 },
+        });
+        assertEq(auto2.body.min_confidence, 0.9, "wd-25j: min_confidence echoed back");
+        assertEq(auto2.body.candidates_considered, 3, "wd-25k: three remaining rows (phone/addr/name) qualify, NULL row excluded");
+        assertEq(auto2.body.approved_count, 3, "wd-25l: all three approved");
+        assertEq(auto2.body.written_count, 3, "wd-25m: all three written");
+        const approvedIds2 = (auto2.body.approved as any[]).map((a: any) => a.provider_id).sort();
+        assertEq(JSON.stringify(approvedIds2), JSON.stringify(["wd-auto-addr", "wd-auto-name", "wd-auto-phone"]), "wd-25n: exactly the three non-NULL, sub-org_nr-tier rows");
+        const rowAutoNullUntouched = expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-auto-null'`).get() as any;
+        assertEq(rowAutoNullUntouched.hjemmeside, null, "wd-25o: the NULL-confidence (unverified brreg-only) row is never auto-approved at any min_confidence");
+        const qLeftAutoNull = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-auto-null'`).get() as any).c;
+        assertEq(qLeftAutoNull, 1, "wd-25p: NULL-confidence row still sits untouched in the queue");
+
+        // wd-25q-s: min_confidence outside [0,1], or non-numeric -> 400.
+        const autoBadHigh = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, min_confidence: 1.5 },
+        });
+        assertEq(autoBadHigh.status, 400, "wd-25q: min_confidence > 1 -> 400");
+        const autoBadNeg = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, min_confidence: -0.1 },
+        });
+        assertEq(autoBadNeg.status, 400, "wd-25r: min_confidence < 0 -> 400");
+        const autoBadNaN = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, min_confidence: "1.0" },
+        });
+        assertEq(autoBadNaN.status, 400, "wd-25s: non-numeric min_confidence -> 400");
+
+        // wd-25t: auto:true + non-empty approvals -> 400 (mutually exclusive).
+        const autoPlusApprovals = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, approvals: [{ provider_id: "wd-auto-orgnr", url: "https://auto-orgnr-gard.no" }] },
+        });
+        assertEq(autoPlusApprovals.status, 400, "wd-25t: combining 'auto' and non-empty 'approvals' -> 400");
+
+        // wd-25u-y: empty qualifying set -> approved/written/rejected all
+        //    empty arrays, no error.
+        expDb.prepare(`DELETE FROM gardssalg_website_review_queue`).run();
+        const autoEmpty = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, apply: true },
+        });
+        assertEq(autoEmpty.status, 200, "wd-25u: empty qualifying set is still a 200");
+        assertEq(autoEmpty.body.candidates_considered, 0, "wd-25v: candidates_considered is 0");
+        assertEq(JSON.stringify(autoEmpty.body.approved), "[]", "wd-25w: approved is an empty array");
+        assertEq(JSON.stringify(autoEmpty.body.written), "[]", "wd-25x: written is an empty array");
+        assertEq(JSON.stringify(autoEmpty.body.rejected), "[]", "wd-25y: rejected is an empty array too — nothing to reject");
+
+        // wd-25z-ab: cap — >30 qualifying rows -> exactly 30 processed,
+        //    candidates_considered shows the full UNCAPPED count.
+        for (let i = 0; i < 35; i++) {
+          const pid = `wd-auto-cap-${i}`;
+          insertProvider.run({ id: pid, navn: `Auto Cap Gard ${i}`, org_nr: String(900000000 + i), kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+          expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: pid, provider_name: `Auto Cap Gard ${i}`, candidate_url: `https://auto-cap-gard-${i}.no`, final_url: `https://auto-cap-gard-${i}.no`, confidence: 1.0, reason: "website_discovery_candidate" });
+        }
+        const autoCap = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { auto: true, apply: false },
+        });
+        assertEq(autoCap.body.candidates_considered, 35, "wd-25z: candidates_considered reports the full UNCAPPED count");
+        assertEq(autoCap.body.approved_count, 30, "wd-25aa: exactly GARDSSALG_AUTO_APPROVE_BATCH_CAP (30) processed");
+        const cappedQueueLeft = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue`).get() as any).c;
+        assertEq(cappedQueueLeft, 35, "wd-25ab: dry-run leaves ALL 35 rows in the queue (the cap bounds processing, not the queue itself)");
+
+        // wd-25ac-ad: existing client-supplied 'approvals' mode stays
+        //    byte-for-byte unchanged when 'auto' is absent — no 'mode' field,
+        //    and NOT gated by the auto-mode confidence threshold at all.
+        expDb.prepare(`DELETE FROM gardssalg_website_review_queue`).run();
+        insertProvider.run({ id: "wd-manual-mode-check", navn: "Manual Mode Check Gard", org_nr: "922444555", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        expStore.upsertGardssalgWebsiteReviewQueue({ provider_id: "wd-manual-mode-check", provider_name: "Manual Mode Check Gard", candidate_url: "https://manual-mode-check-gard.no", final_url: "https://manual-mode-check-gard.no", confidence: 0.5, reason: "website_discovery_candidate" });
+        const manualStillWorks = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          url: "/admin/gardssalg-website-review-approve",
+          body: { approvals: [{ provider_id: "wd-manual-mode-check", url: "https://manual-mode-check-gard.no" }], apply: true },
+        });
+        assertEq(manualStillWorks.body.mode, undefined, "wd-25ac: non-auto response carries no 'mode' field");
+        assertEq(manualStillWorks.body.written_count, 1, "wd-25ad: client-supplied approvals mode still writes a sub-threshold-confidence row (auto's confidence gate never applies to this mode)");
+      }
+
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
