@@ -5542,8 +5542,31 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
 // itself called here. A guard-failed approval leaves the queue row 'pending'
 // (NOT approved, NOT rejected) — it may become writable later; only a
 // confirmed write ever moves a row out of 'pending'.
+//
+// M0d Del B (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply,
+// "Grep 8 punkt 2 Del B"): an alternate, mutually-exclusive `{"auto": true,
+// "apply": <bool>}` request mode for exactly ONE evidence tier of THIS one
+// queue — confidence: 0.8 (listing-homepage-discovery's own tier, set at
+// opplevelser.ts:5476-ish) is the ONLY tier where the code actually fetched
+// the candidate page and verified the provider's own name on it
+// (listingHomepageNameVerified). Deliberately EXACT equality
+// (`confidence === 0.8`), NEVER `>=`: in this queue the confidence scale is
+// NOT monotone evidence strength — 1.0 (brreg-website-discovery,
+// opplevelser.ts:5899-ish) is an UNVERIFIED Brreg registry `hjemmeside` field
+// lookup, never fetched/read from the page itself, so it is NOT a stronger
+// signal than 0.8 despite the larger number. A `>=` (or a `min_confidence`
+// threshold parameter inviting one) would auto-approve exactly the
+// weakest-verified tier under cover of the highest number — the same
+// identity-crossing bug class this whole quality track exists to prevent,
+// now in a different queue. See the dev-request's "Den kritiske fellen"
+// section. `gardssalg_orgnr_review_queue` is deliberately OUT of scope here
+// (permanently, not just this slice) — every row in that queue landed there
+// BECAUSE it was already vetoed by gardssalgOrgnrAutoWriteEligible; its
+// confidence reflects the Brreg match's own strength, not why the row is
+// queued, so a confidence filter there would re-implement the exact
+// identity-crossing class that route's own doc comment warns against.
 router.post("/admin/listing-homepage-review-approve", requireAdmin, (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown; auto?: unknown };
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -5553,13 +5576,21 @@ router.post("/admin/listing-homepage-review-approve", requireAdmin, (req: Reques
     req.query?.apply === "true";
   const dryRun = !apply;
 
-  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
-    res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {provider_id, url}" });
+  const auto = body.auto === true;
+  if (auto && Array.isArray(body.approvals) && body.approvals.length > 0) {
+    res.status(400).json({ error: "cannot combine 'auto' and 'approvals' in the same call" });
     return;
   }
-  if (body.approvals.length > 200) {
-    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
-    return;
+
+  if (!auto) {
+    if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+      res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {provider_id, url}" });
+      return;
+    }
+    if (body.approvals.length > 200) {
+      res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+      return;
+    }
   }
 
   const expDb = getExpDb("experiences");
@@ -5569,12 +5600,38 @@ router.post("/admin/listing-homepage-review-approve", requireAdmin, (req: Reques
     .prepare(`SELECT provider_id, candidate_url FROM experience_homepage_review_queue WHERE status = 'pending'`)
     .all() as Array<{ provider_id: string; candidate_url: string }>;
   const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
+
+  // Server-side selection for auto mode — NEVER a client-supplied list in
+  // this mode. Exact equality on confidence (see the doc comment above for
+  // why `>=` would be unsafe here), oldest-queued first (same anti-starvation
+  // rationale as the gårdssalg auto-approve twin above), capped to the same
+  // GARDSSALG_AUTO_APPROVE_BATCH_CAP constant that lever already introduced
+  // (reused, not redefined — one shared blast-radius knob for this whole
+  // family of auto-approve levers).
+  let candidatesConsidered = 0;
+  let approvalsInput: unknown[];
+  if (auto) {
+    const qualifying = expDb
+      .prepare(
+        `SELECT provider_id, candidate_url FROM experience_homepage_review_queue
+         WHERE status = 'pending' AND confidence = 0.8
+         ORDER BY created_at ASC`,
+      )
+      .all() as Array<{ provider_id: string; candidate_url: string }>;
+    candidatesConsidered = qualifying.length;
+    approvalsInput = qualifying
+      .slice(0, GARDSSALG_AUTO_APPROVE_BATCH_CAP)
+      .map((q) => ({ provider_id: q.provider_id, url: q.candidate_url }));
+  } else {
+    approvalsInput = body.approvals as unknown[];
+  }
+
   const seen = new Set<string>();
   const approved: Array<{ provider_id: string; url: string }> = [];
   const written: Array<{ provider_id: string; url: string }> = [];
   const rejected: Array<{ provider_id: string; reason: string }> = [];
 
-  for (const raw of body.approvals as unknown[]) {
+  for (const raw of approvalsInput) {
     const a = raw as { provider_id?: unknown; url?: unknown };
     const pid = typeof a?.provider_id === "string" ? a.provider_id.trim() : "";
     const url = typeof a?.url === "string" ? a.url.trim() : "";
@@ -5634,6 +5691,7 @@ router.post("/admin/listing-homepage-review-approve", requireAdmin, (req: Reques
     written_count: written.length,
     written,
     rejected,
+    ...(auto ? { mode: "auto" as const, candidates_considered: candidatesConsidered } : {}),
   });
 });
 
