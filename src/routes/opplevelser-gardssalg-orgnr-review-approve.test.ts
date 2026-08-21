@@ -192,6 +192,37 @@ export function runOpplevelserGardssalgOrgnrReviewApproveTests(opts: { log?: boo
         reason: "no_brreg_candidate",
       });
 
+      // (g) dry-run write-blocker fixtures — governance incident 2026-08-2x:
+      // dry-run previously reported `approved` for candidates whose real
+      // apply:true write would be refused (write_refused_filled_locked_or_
+      // conflict), because none of the three dryRun branches ever consulted
+      // the write guards before pushing to `approved`. One fixture per
+      // branch, each rigged so the underlying write WOULD be refused.
+      //
+      // (g1) no-queue-row + manual_verified branch: provider already has an
+      // org_nr (fill-only guard) -> already_filled.
+      insertProvider.run({ id: "orv-dryblock-filled", navn: "Dry Block Fylt Gard", org_nr: "910111098", content_source: "provider_site" });
+      // (g2) entry-exists-but-mismatched + manual_verified branch: provider
+      // is owner-locked (content_source manual) -> owner_locked.
+      insertProvider.run({ id: "orv-dryblock-owner", navn: "Dry Block Eier Gard", org_nr: null, content_source: "manual" });
+      expStore.upsertGardssalgOrgnrReviewQueue({
+        provider_id: "orv-dryblock-owner",
+        provider_name: "Dry Block Eier Gard",
+        candidate_orgnr: null,
+        reason: "no_brreg_candidate",
+      });
+      // (g3) standard queued-candidate-match branch (the exact shape of the
+      // live incident): a DIFFERENT provider already holds this org_nr ->
+      // org_nr_conflict.
+      insertProvider.run({ id: "orv-dryblock-conflict", navn: "Dry Block Konflikt Gard", org_nr: null, content_source: "provider_site" });
+      insertProvider.run({ id: "orv-dryblock-conflict-holder", navn: "Konflikt Innehaver Gard", org_nr: "910111009", content_source: "provider_site" });
+      expStore.upsertGardssalgOrgnrReviewQueue({
+        provider_id: "orv-dryblock-conflict",
+        provider_name: "Dry Block Konflikt Gard",
+        candidate_orgnr: "910111009",
+        reason: "exact_name_no_postal_match",
+      });
+
       // ── Brreg stub ──────────────────────────────────────────────────────
       const fetchedOrgNrs: string[] = [];
       globalThis.fetch = (async (url: string | URL | Request) => {
@@ -212,6 +243,10 @@ export function runOpplevelserGardssalgOrgnrReviewApproveTests(opts: { log?: boo
           // (e) queued-entry regression scenarios.
           "900111222": { status: 200, body: brregBody("900111222", "KOET MATCH GARD AS") },
           "900333444": { status: 200, body: brregBody("900333444", "KOET MANUELL GARD AS") },
+          // (g) dry-run write-blocker scenarios (g1/g2 pass Brreg fine — the
+          // point is the WRITE guard, not the evidence gate).
+          "910111008": { status: 200, body: brregBody("910111008", "DRY BLOCK FYLT GARD") },
+          "910111010": { status: 200, body: brregBody("910111010", "DRY BLOCK EIER GARD") },
         };
         const fixture = answers[orgNr];
         if (!fixture) return { status: 404, ok: false, json: async () => ({}) } as unknown as Response;
@@ -380,6 +415,51 @@ export function runOpplevelserGardssalgOrgnrReviewApproveTests(opts: { log?: boo
         .prepare(`SELECT org_nr FROM experience_providers WHERE id = 'orv-queued-mv'`)
         .get() as { org_nr: string | null };
       assertEq(queuedMvRow.org_nr, "900333444", "(e3) org_nr written via the entry-exists+manual_verified path");
+
+      // ═══ (g) dry-run must reflect a write the real apply would refuse ═══
+      // (g1) no-queue-row + manual_verified branch, fill-only guard.
+      const dryBlockFilledRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { approvals: [{ provider_id: "orv-dryblock-filled", org_nr: "910111008", manual_verified: true }] },
+      });
+      assertEq(dryBlockFilledRes.body.dry_run, true, "(g1) dry-run by default");
+      assertEq(dryBlockFilledRes.body.approved?.length, 0, "(g1) NOT approved — the real write would be fill-only-refused");
+      assertEq(dryBlockFilledRes.body.rejected?.[0]?.reason, "already_filled",
+        "(g1) dry-run now reports the true write-blocker reason");
+      const dryBlockFilledRow = expDb
+        .prepare(`SELECT org_nr FROM experience_providers WHERE id = 'orv-dryblock-filled'`)
+        .get() as { org_nr: string | null };
+      assertEq(dryBlockFilledRow.org_nr, "910111098", "(g1) dry-run left the existing org_nr untouched");
+
+      // (g2) entry-exists-but-mismatched + manual_verified branch, owner lock.
+      const dryBlockOwnerRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { approvals: [{ provider_id: "orv-dryblock-owner", org_nr: "910111010", manual_verified: true }] },
+      });
+      assertEq(dryBlockOwnerRes.body.approved?.length, 0, "(g2) NOT approved — the provider is owner-locked (content_source manual)");
+      assertEq(dryBlockOwnerRes.body.rejected?.[0]?.reason, "owner_locked",
+        "(g2) dry-run reports owner_locked instead of a false approval");
+      const dryBlockOwnerRow = expDb
+        .prepare(`SELECT org_nr FROM experience_providers WHERE id = 'orv-dryblock-owner'`)
+        .get() as { org_nr: string | null };
+      assertEq(dryBlockOwnerRow.org_nr, null, "(g2) dry-run wrote nothing");
+
+      // (g3) standard queued-candidate-match branch — the exact live-incident
+      // shape: candidate_orgnr matches the submission, no manual_verified
+      // needed, but a DIFFERENT provider already holds this org_nr.
+      const dryBlockConflictRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { approvals: [{ provider_id: "orv-dryblock-conflict", org_nr: "910111009" }] },
+      });
+      assertEq(dryBlockConflictRes.body.approved?.length, 0, "(g3) NOT approved — a different provider already holds this org_nr");
+      assertEq(dryBlockConflictRes.body.rejected?.[0]?.reason, "org_nr_conflict",
+        "(g3) dry-run reports org_nr_conflict — this is the exact reason that fixed the live incident");
+      assertTrue(!fetchedOrgNrs.includes("910111009"),
+        "(g3) the standard queued-candidate-match branch never calls Brreg, blocked or not");
+      const dryBlockConflictRow = expDb
+        .prepare(`SELECT org_nr FROM experience_providers WHERE id = 'orv-dryblock-conflict'`)
+        .get() as { org_nr: string | null };
+      assertEq(dryBlockConflictRow.org_nr, null, "(g3) dry-run wrote nothing");
 
       // ═══ misc: duplicate-in-request / invalid-item still work unchanged ═
       const dupRes = await callRoute(opplevelserRouter, {
