@@ -256,6 +256,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     const routerModule = routeModule.default;
     const {
       RFB_WD_HARD_CAP,
+      RFB_WD_AUTO_APPROVE_BATCH_CAP,
       rfbWebsiteHostExclusionReason,
       __setRfbWdRenderPageImplForTesting,
       evaluateRfbWebsiteCandidate,
@@ -330,6 +331,37 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
 
     function readQueueRow(agentId: string): any {
       return testDb.prepare("SELECT * FROM agents_website_review_queue WHERE agent_id = ?").get(agentId);
+    }
+
+    // Direct queue-row insert for the auto-approve tests below — mirrors the
+    // shape of the existing direct INSERT at (i) above, but exposes
+    // `confidence`/`updatedAt` so a test can control exactly which rows
+    // qualify for a given min_confidence and in what tiebreak order.
+    function insertQueueRow(o: {
+      id: string;
+      agentId: string;
+      candidateUrl: string;
+      finalUrl?: string | null;
+      confidence: number | null;
+      status?: string;
+      updatedAt?: string;
+      batchId?: string | null;
+    }): void {
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue
+           (id, agent_id, agent_name, candidate_url, final_url, confidence, status, batch_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`,
+      ).run(
+        o.id,
+        o.agentId,
+        o.agentId,
+        o.candidateUrl,
+        o.finalUrl ?? o.candidateUrl,
+        o.confidence,
+        o.status ?? "pending",
+        o.batchId ?? null,
+        o.updatedAt ?? new Date().toISOString(),
+      );
     }
 
     // ── (a) auth --
@@ -828,6 +860,169 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(rej?.reason, "no_longer_blank", "x2: fill-only guard fired");
       const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-race'").get() as any;
       assertEq(k.website, "https://allerede-satt.no", "x3: the existing value is untouched");
+    }
+
+    // ═══ dev-request 2026-08-22-rfb-website-review-auto-approve: server-side
+    //     auto-select mode ({"auto": true, "apply"?, "min_confidence"?}) ═══
+    //
+    // Every earlier test block above ((a)-(x)) has already left assorted
+    // 'pending' rows sitting in agents_website_review_queue from its own
+    // discovery/approve calls (wd-ok, wd-batch-1, wd-claimed, wd-race,
+    // wd-repl-ok, ...) — none of those agent_ids are referenced again after
+    // this point in the file (verified: no later block reads their queue row
+    // or agent_knowledge state), so this block starts by clearing the queue
+    // table to get a clean, deterministic slate for its own confidence-based
+    // selection assertions, rather than coupling this block's counts to
+    // whatever the earlier discovery-flow tests happened to accumulate.
+    testDb.prepare("DELETE FROM agents_website_review_queue").run();
+
+    // ── (aa) auto: default min_confidence (0.95) — selects only the
+    //     qualifying row, writes it through the SAME write path as the
+    //     manual-approvals branch, leaves the sub-threshold row untouched
+    //     and still pending --
+    {
+      insertAgent({ id: "wd-auto-hi", name: "Auto Høy Konfidens Gard" });
+      insertQueueRow({
+        id: "q-auto-hi",
+        agentId: "wd-auto-hi",
+        candidateUrl: "https://autohoeykonfidensgard.no",
+        confidence: 0.95,
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      });
+      insertAgent({ id: "wd-auto-lo", name: "Auto Lav Konfidens Gard" });
+      insertQueueRow({
+        id: "q-auto-lo",
+        agentId: "wd-auto-lo",
+        candidateUrl: "https://autolavkonfidensgard.no",
+        confidence: 0.9,
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      });
+
+      const r = await callApprove({ auto: true, apply: true });
+      assertEq(r.status, 200, "aa1: 200");
+      assertEq(r.body.mode, "auto", "aa2: response echoes mode: auto");
+      assertEq(r.body.min_confidence, 0.95, "aa3: default min_confidence is 0.95 (RFB's own bar, not gårdssalg's 1.0)");
+      assertEq(r.body.candidates_considered, 1, "aa4: only the >=0.95 row is considered");
+      assertEq(r.body.written_count, 1, "aa5: exactly one write");
+      assertTrue(
+        r.body.written.some((w: any) => w.agent_id === "wd-auto-hi"),
+        "aa6: the qualifying row was written",
+      );
+      assertTrue(
+        !r.body.written.some((w: any) => w.agent_id === "wd-auto-lo"),
+        "aa7: the sub-threshold row was NOT auto-selected",
+      );
+
+      const kHi = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-auto-hi'").get() as any;
+      assertEq(kHi.website, "https://autohoeykonfidensgard.no", "aa8: website column written for the qualifying agent");
+      const kLo = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-auto-lo'").get() as any;
+      assertTrue(!kLo.website, "aa9: website column untouched for the sub-threshold agent");
+      assertEq(readQueueRow("wd-auto-hi").status, "applied", "aa10: qualifying queue row flipped to applied");
+      assertEq(readQueueRow("wd-auto-lo").status, "pending", "aa11: sub-threshold queue row still pending");
+    }
+
+    // ── (ab) auto: explicit min_confidence — lowering the bar picks up the
+    //     row (aa) left behind at 0.90 --
+    {
+      const r = await callApprove({ auto: true, apply: true, min_confidence: 0.9 });
+      assertEq(r.status, 200, "ab1: 200");
+      assertEq(r.body.min_confidence, 0.9, "ab2: explicit min_confidence echoed back");
+      assertEq(r.body.candidates_considered, 1, "ab3: exactly the one remaining pending row qualifies at 0.90");
+      assertEq(r.body.written_count, 1, "ab4: exactly one write");
+      assertTrue(
+        r.body.written.some((w: any) => w.agent_id === "wd-auto-lo"),
+        "ab5: the previously sub-threshold row is now selected and written",
+      );
+      const kLo = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-auto-lo'").get() as any;
+      assertEq(kLo.website, "https://autolavkonfidensgard.no", "ab6: website column written");
+      assertEq(readQueueRow("wd-auto-lo").status, "applied", "ab7: queue row flipped to applied");
+    }
+
+    // ── (ac) auto: bad min_confidence values -> 400, nothing selected or
+    //     written --
+    {
+      const r1 = await callApprove({ auto: true, min_confidence: "high" });
+      assertEq(r1.status, 400, "ac1: non-number min_confidence -> 400");
+      assertTrue(typeof r1.body.error === "string" && r1.body.error.includes("min_confidence"), "ac2: error mentions min_confidence");
+
+      const r2 = await callApprove({ auto: true, min_confidence: -0.1 });
+      assertEq(r2.status, 400, "ac3: negative min_confidence -> 400");
+
+      const r3 = await callApprove({ auto: true, min_confidence: 1.5 });
+      assertEq(r3.status, 400, "ac4: min_confidence > 1 -> 400");
+
+      const r4 = await callApprove({ auto: true, min_confidence: Number.NaN });
+      assertEq(r4.status, 400, "ac5: NaN min_confidence -> 400");
+    }
+
+    // ── (ad) auto + approvals together -> 400, mutually exclusive --
+    {
+      const r = await callApprove({
+        auto: true,
+        approvals: [{ agent_id: "wd-auto-hi", url: "https://autohoeykonfidensgard.no" }],
+      });
+      assertEq(r.status, 400, "ad1: auto + non-empty approvals -> 400");
+      assertTrue(
+        typeof r.body.error === "string" && r.body.error.includes("auto") && r.body.error.includes("approvals"),
+        "ad2: error names both auto and approvals",
+      );
+    }
+
+    // ── (ae) auto: empty qualifying set — queue is empty at this point
+    //     ((aa)/(ab) applied both rows this block seeded) --
+    {
+      const r = await callApprove({ auto: true });
+      assertEq(r.status, 200, "ae1: 200");
+      assertEq(r.body.mode, "auto", "ae2: mode still echoed even with nothing to select");
+      assertEq(r.body.candidates_considered, 0, "ae3: nothing qualifies");
+      assertEq(r.body.approved_count, 0, "ae4: nothing approved");
+      assertEq(r.body.written_count, 0, "ae5: nothing written");
+      assertEq(r.body.dry_run, true, "ae6: apply defaults to false/dry-run, same as manual mode");
+    }
+
+    // ── (af) auto: cap enforcement — RFB_WD_AUTO_APPROVE_BATCH_CAP (30)
+    //     bounds the selected batch even when more rows qualify; dry-run so
+    //     no agents/agent_knowledge rows are needed (the write path is never
+    //     reached) --
+    {
+      const total = 35;
+      for (let i = 0; i < total; i++) {
+        insertQueueRow({
+          id: `q-cap-${i}`,
+          agentId: `wd-cap-${i}`,
+          candidateUrl: `https://capgard${i}.no`,
+          confidence: 1.0,
+          updatedAt: `2026-08-0${(i % 9) + 1}T00:00:00.000Z`,
+        });
+      }
+
+      const r = await callApprove({ auto: true });
+      assertEq(r.status, 200, "af1: 200");
+      assertEq(r.body.candidates_considered, total, "af2: candidates_considered is the UNCAPPED qualifying count");
+      assertEq(r.body.approved_count, RFB_WD_AUTO_APPROVE_BATCH_CAP, "af3: approved/selected batch is capped at RFB_WD_AUTO_APPROVE_BATCH_CAP");
+      assertEq(r.body.approved.length, RFB_WD_AUTO_APPROVE_BATCH_CAP, "af4: approved array itself is capped");
+    }
+
+    // ── (ag) the existing client-supplied `approvals` mode is unchanged: no
+    //     `mode` field in its response, and it is NOT gated by the auto
+    //     confidence threshold (a sub-0.95 row can still be approved when
+    //     explicitly named) --
+    {
+      insertAgent({ id: "wd-manual-lowconf", name: "Manuell Lav Konfidens Gard" });
+      insertQueueRow({
+        id: "q-manual-lowconf",
+        agentId: "wd-manual-lowconf",
+        candidateUrl: "https://manuelllavkonfidensgard.no",
+        confidence: 0.5,
+      });
+
+      const r = await callApprove({ approvals: [{ agent_id: "wd-manual-lowconf", url: "https://manuelllavkonfidensgard.no" }] });
+      assertEq(r.status, 200, "ag1: 200");
+      assertEq(r.body.approved_count, 1, "ag2: approved despite being far below the auto min_confidence default");
+      assertEq(r.body.dry_run, true, "ag3: dry-run default, same as before this slice");
+      assertTrue(!("mode" in r.body), "ag4: no mode field on the manual-approvals response");
+      assertTrue(!("min_confidence" in r.body), "ag5: no min_confidence field on the manual-approvals response");
+      assertTrue(!("candidates_considered" in r.body), "ag6: no candidates_considered field on the manual-approvals response");
     }
 
     // ═══ Skive 6 + 7 (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype) ═══
