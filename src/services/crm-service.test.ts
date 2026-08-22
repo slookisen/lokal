@@ -135,6 +135,38 @@ export function runCrmServiceTests(opts: { log?: boolean } = {}): TestSummary {
     assertEq(rows.length, 0, "unknown contact_email returns empty array");
   }
 
+  // ─── listThreadsByStatus() must surface last_outbound_at/last_inbound_at ─
+  // Regression guard: dev-request 2026-08-21-supervisor-duplikatvakt-last-outbound-at-
+  // manglende-felt. The SELECT in listThreadsByStatus() never selected these two
+  // crm_threads columns, so GET /admin/crm/threads?contact_email=... always returned
+  // undefined for them — which is exactly the field the supervisor's mandatory
+  // Steg-1 Check-1 duplicate-send guard reads to decide whether a contact was
+  // recently emailed (rfb-supervisor-current.md: `.threads[].last_outbound_at`).
+  {
+    insertContact("contact-outbound-visible", "outbound-visible@example.no", "Outbound Visible");
+    insertThread("thread-outbound-visible", "contact-outbound-visible", "in_progress", "Duplikatvakt-test");
+    crmService.recordOutboundReply({
+      threadId: "thread-outbound-visible",
+      vertical: "rfb",
+      toEmails: ["outbound-visible@example.no"],
+      subject: "Svar",
+      bodyText: "Her er svaret.",
+      deliveryStatus: "sent",
+      sentAt: "2026-08-20T10:00:00.000Z",
+    });
+    const rows = crmService.listThreadsByStatus(undefined, { contactEmail: "outbound-visible@example.no" });
+    assertEq(rows.length, 1, "listThreadsByStatus finds the seeded outbound thread");
+    assertEq(
+      rows[0]?.last_outbound_at,
+      "2026-08-20T10:00:00.000Z",
+      "listThreadsByStatus row carries last_outbound_at — regression guard for the duplicate-send-guard bug",
+    );
+    assertTrue(
+      rows[0]?.hasOwnProperty("last_inbound_at"),
+      "listThreadsByStatus row also carries last_inbound_at (same SELECT fix)",
+    );
+  }
+
   // ─── getThreadDetail() must surface c.provider_id ───────────────────────
   // Regression guard: the SELECT in getThreadDetail() read c.agent_id but not
   // c.provider_id, so GET /admin/crm/threads/:id had no way to tell a caller
