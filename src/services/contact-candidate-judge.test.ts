@@ -38,6 +38,21 @@
  *      same call); all-optional-fields contract (a call site that only has
  *      a candidate for one or two of the three fields never triggers a
  *      judge call for the field(s) it didn't pass a candidate for).
+ *   D. dev-request 2026-08-22-rfbweb-about-guard: the FOURTH field type,
+ *      "website" — classifyContactCandidateDefect's URL-shape backstop
+ *      (CSS-hex-color/Tailwind-class, missing-scheme/no-dot-host,
+ *      favicon/icon path, App Store/Play Store listing host) plus
+ *      judgeContactCandidate's website-specific prompt teaching and field
+ *      label. This module's own call-site integration tests for the two
+ *      NEW write paths this field type feeds — admin-agents-url-write.ts,
+ *      admin-knowledge.ts (both the `website` write in PUT / and the
+ *      about/description-substantiation check in POST
+ *      /homepage-content-refresh) — live near those routes' own test files,
+ *      same convention as the section-header comment above:
+ *        - src/routes/admin-agents-url-write.test.ts (section m)
+ *        - src/routes/admin-knowledge-website-write-guard.test.ts
+ *        - src/services/about-source-substantiation.test.ts (the about
+ *          check itself — a separate, non-LLM module)
  */
 
 export interface TestSummary {
@@ -336,6 +351,87 @@ export function runContactCandidateJudgeTests(
       } catch (err: any) {
         failed++;
         failures.push("contact-candidate-judge (section C): unexpected error: " + String(err?.stack || err?.message || err));
+      } finally {
+        globalThis.fetch = prevFetch;
+        if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Section D — dev-request 2026-08-22-rfbweb-about-guard: "website" field
+    // type. D1: classifyContactCandidateDefect (pure, no mocks). D2:
+    // judgeContactCandidate's website-specific label/prompt teaching.
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      // ── D1: CSS hex-color / Tailwind arbitrary-value class shape ───────
+      const hexVerdict = classifyContactCandidateDefect("website", "#3a7d44");
+      assertEq(hexVerdict.defective, true, "d-1: bare CSS hex color as a website candidate -> defective");
+      assertTrue(/hex|tailwind|css/i.test(hexVerdict.reason ?? ""), "d-2: reason mentions the CSS/hex/Tailwind shape");
+      const tailwindVerdict = classifyContactCandidateDefect("website", ".bg-[#79656569]");
+      assertEq(tailwindVerdict.defective, true, "d-3: Tailwind arbitrary-value class carrying a hex color -> also defective");
+
+      // ── D1: missing/invalid scheme, whitespace ──────────────────────────
+      assertEq(classifyContactCandidateDefect("website", "gard.no").defective, true, "d-4: bare domain with no scheme -> defective");
+      assertEq(classifyContactCandidateDefect("website", "ftp://gard.no").defective, true, "d-5: non-http(s) scheme -> defective");
+      assertEq(classifyContactCandidateDefect("website", "https://gard.no/med mellomrom").defective, true, "d-6: whitespace in the candidate -> defective");
+
+      // ── D1: host with no dot ────────────────────────────────────────────
+      assertEq(classifyContactCandidateDefect("website", "https://localhost").defective, true, "d-7: host with no dot -> defective");
+
+      // ── D1: favicon/icon file path — a structurally VALID http(s) URL
+      //    with a dotted host, so only this NEW check (not a bare scheme/
+      //    dot check) catches it. ──────────────────────────────────────────
+      const faviconPathVerdict = classifyContactCandidateDefect("website", "https://ekte-gard.no/favicon.ico");
+      assertEq(faviconPathVerdict.defective, true, "d-8: candidate URL pointing at /favicon.ico -> defective");
+      assertTrue(/favicon|icon/i.test(faviconPathVerdict.reason ?? ""), "d-9: reason mentions favicon/icon");
+      assertEq(classifyContactCandidateDefect("website", "https://ekte-gard.no/img/apple-touch-icon.png").defective, true, "d-10: apple-touch-icon.png path (any depth) -> also defective");
+      // Negative control: a real image path whose basename is NOT a known
+      // icon basename must NOT be flagged — the check is specific to the
+      // known favicon/icon filenames, not "any image extension".
+      assertEq(classifyContactCandidateDefect("website", "https://ekte-gard.no/produkter/bilde.png").defective, false, "d-11: an ordinary product-image path -> NOT defective (basename isn't a favicon/icon name)");
+
+      // ── D1: App Store / Play Store listing host — a real, live, dotted
+      //    host, never a producer's own homepage. ─────────────────────────
+      const appStoreVerdict = classifyContactCandidateDefect("website", "https://apps.apple.com/no/app/gardsbutikken/id1234567890");
+      assertEq(appStoreVerdict.defective, true, "d-12: apps.apple.com listing URL -> defective");
+      assertTrue(/app store|play store/i.test(appStoreVerdict.reason ?? ""), "d-13: reason mentions the App Store/Play Store shape");
+      assertEq(classifyContactCandidateDefect("website", "https://play.google.com/store/apps/details?id=no.gard.app").defective, true, "d-14: play.google.com listing URL -> also defective");
+
+      // ── D1: normal, legitimate website candidates must NOT be flagged ──
+      assertEq(classifyContactCandidateDefect("website", "https://ekte-gard.no").defective, false, "d-15: a plain, real-looking homepage URL -> NOT defective");
+      assertEq(classifyContactCandidateDefect("website", "https://www.ekte-gard.no/om-oss").defective, false, "d-16: a subpage of a real-looking domain -> NOT defective");
+      assertEq(classifyContactCandidateDefect("website", "").defective, false, "d-17: empty candidate -> not defective (no-candidate case, not this classifier's job)");
+    } catch (err: any) {
+      failed++;
+      failures.push("contact-candidate-judge (section D1): unexpected error: " + String(err?.stack || err?.message || err));
+    }
+
+    {
+      const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+      const prevFetch = globalThis.fetch;
+      try {
+        process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+        let capturedInit: any = null;
+        globalThis.fetch = (async (_url: any, init: any) => {
+          capturedInit = init;
+          return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "GODKJENN\nDette ser ut som produsentens egen nettside." }] }) };
+        }) as unknown as typeof fetch;
+        const v = await judgeContactCandidate({
+          fieldType: "website",
+          candidate: "https://ekte-gard.no",
+          sourceContext: "Velkommen til Ekte Gård — vi selger egen honning og ost.",
+          businessName: "Ekte Gård AS",
+        });
+        assertEq(v.approved, true, "d-18: a clean website candidate + GODKJENN mock -> approved:true");
+        const prompt: string = JSON.parse(capturedInit.body).messages[0].content;
+        assertTrue(/nettside/i.test(prompt), "d-19: prompt uses the Norwegian website field label ('nettside'), not 'telefonnummer'/'e-postadresse'");
+        assertTrue(prompt.includes("Kandidat (nettside): https://ekte-gard.no"), "d-20: prompt's candidate line is labeled with the website field");
+        assertTrue(/favicon/i.test(prompt), "d-21: prompt teaches the favicon/icon-path failure mode");
+        assertTrue(/app store|play store/i.test(prompt), "d-22: prompt teaches the App Store/Play Store failure mode");
+      } catch (err: any) {
+        failed++;
+        failures.push("contact-candidate-judge (section D2): unexpected error: " + String(err?.stack || err?.message || err));
       } finally {
         globalThis.fetch = prevFetch;
         if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;

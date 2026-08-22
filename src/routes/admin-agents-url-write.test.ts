@@ -30,6 +30,14 @@
  *   (j) shape validation, required reason, empty-string-is-not-a-clear
  *   (k) idempotence, LEFT JOIN (no knowledge row), batch hygiene
  *   (l) pure helpers
+ *   (m) dev-request 2026-08-22-rfbweb-about-guard: the new shared
+ *       website-candidate junk-shape backstop (contact-candidate-judge.ts's
+ *       classifyContactCandidateDefect("website", ...)) — favicon/icon file
+ *       path and App Store/Play Store listing host, the two junk classes
+ *       NEITHER the pre-existing isUsableHomepageUrl/isPlatformOwnedHost/
+ *       isDirectoryHost checks above catch (both are structurally VALID
+ *       http(s) URLs with a dotted, non-platform, non-directory host) — plus
+ *       a negative control proving an ordinary real subpage is unaffected.
  */
 
 import Database from "better-sqlite3";
@@ -192,6 +200,12 @@ export function runAdminAgentsUrlWriteTests(opts: { log?: boolean } = {}): Promi
       // (10) our own site standing in as the producer's homepage (4 measured)
       insertAgent.run("uw-platform", "Plattform AS", "https://rettfrabonden.com/agent/solvang", "key-uw-plat", null);
       insertKnowledge.run("uw-platform", "{}");
+
+      // (11) dedicated fixture for section (m) — a fresh agent untouched by
+      // any earlier section's writes, so its starting value is never
+      // load-bearing on another section's mutation order.
+      insertAgent.run("uw-junkshape", "Junkform AS", "https://www.ergagardsutsalg.no", "key-uw-junk", null);
+      insertKnowledge.run("uw-junkshape", "{}");
 
       delete require.cache[require.resolve("./admin-agents-url-write")];
       const routeMod = require("./admin-agents-url-write");
@@ -356,6 +370,20 @@ export function runAdminAgentsUrlWriteTests(opts: { log?: boolean } = {}): Promi
       assertEq(r.status, 400, "uw-53: empty items -> 400");
       r = await post({});
       assertEq(r.status, 400, "uw-54: missing items -> 400");
+
+      // ── (m) website junk-shape backstop (favicon path / app-store host) ─
+      r = await post(SET("uw-junkshape", "https://www.ergagardsutsalg.no/favicon.ico"), testKey, APPLY);
+      assertEq(r.body?.results?.[0]?.outcome, "rejected_junk_pattern", "uw-69: a favicon-file-path URL is refused — a structurally VALID URL the pre-existing checks would have let through");
+      assertTrue(!!r.body?.results?.[0]?.detail && /favicon|icon/i.test(r.body.results[0].detail), "uw-70: rejection detail names the favicon/icon shape");
+      assertEq(urlOf("uw-junkshape"), "https://www.ergagardsutsalg.no", "uw-71: real homepage untouched by the refusal");
+      r = await post(SET("uw-junkshape", "https://apps.apple.com/no/app/gardsbutikken/id1234567890"), testKey, APPLY);
+      assertEq(r.body?.results?.[0]?.outcome, "rejected_junk_pattern", "uw-72: an App Store listing URL is refused — also structurally valid, not in DIRECTORY_HOSTS");
+      assertTrue(!!r.body?.results?.[0]?.detail && /app store|play store/i.test(r.body.results[0].detail), "uw-73: rejection detail names the App Store/Play Store shape");
+      // Negative control: an ordinary real subpage clears the new backstop
+      // exactly like it always cleared the pre-existing checks.
+      r = await post(SET("uw-junkshape", "https://www.ergagardsutsalg.no/om-oss"), testKey, APPLY);
+      assertEq(r.body?.results?.[0]?.outcome, "written", "uw-74: an ordinary real subpage is unaffected by the new backstop");
+      assertEq(urlOf("uw-junkshape"), "https://www.ergagardsutsalg.no/om-oss", "uw-75: ...and actually written");
 
       // ── (l) pure helpers ────────────────────────────────────────────────
       assertEq(routeMod.hostOf("https://WWW.Gard.NO/side?x=1"), "gard.no", "uw-55: hostOf lowercases and strips www/path");

@@ -40073,3 +40073,59 @@ runSerial(async () => {
     failures.push("enrichment-write-pause-shared-primitives: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-22-rfbweb-about-guard: the shared website-candidate
+// junk-shape backstop (contact-candidate-judge.ts's new "website" field
+// type — see that module's own Section D) wired into two write paths that
+// previously had NO extraction guard at all: admin-agents-url-write.ts's
+// `agents.url` (new outcome "rejected_junk_pattern" — see that file's own
+// updated test above) and admin-knowledge.ts's PUT / `agent_knowledge.
+// website` (new admin-knowledge-website-write-guard.test.ts). Plus a
+// standalone, deterministic (non-LLM) about/description-vs-source-text
+// substantiation check (about-source-substantiation.ts), wired into POST
+// /admin/homepage-content-refresh's about/description write (new
+// admin-knowledge-about-substantiation.test.ts). Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-22-rfbweb-about-guard: website junk-shape backstop + about-source substantiation ──");
+  try {
+    const { runAdminKnowledgeWebsiteWriteGuardTests } =
+      require("../src/routes/admin-knowledge-website-write-guard.test") as
+        typeof import("../src/routes/admin-knowledge-website-write-guard.test");
+    const wwg = await runAdminKnowledgeWebsiteWriteGuardTests({ log: false });
+    passed += wwg.passed;
+    failed += wwg.failed;
+    for (const f of wwg.failures) failures.push("admin-knowledge-website-write-guard: " + f);
+    console.log(`  admin-knowledge-website-write-guard: ${wwg.passed} passed, ${wwg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-knowledge-website-write-guard: unexpected error: " + String(err?.message || err));
+  }
+
+  try {
+    const { runAdminKnowledgeAboutSubstantiationTests } =
+      require("../src/routes/admin-knowledge-about-substantiation.test") as
+        typeof import("../src/routes/admin-knowledge-about-substantiation.test");
+    const abs = await runAdminKnowledgeAboutSubstantiationTests({ log: false });
+    passed += abs.passed;
+    failed += abs.failed;
+    for (const f of abs.failures) failures.push("admin-knowledge-about-substantiation: " + f);
+    console.log(`  admin-knowledge-about-substantiation: ${abs.passed} passed, ${abs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-knowledge-about-substantiation: unexpected error: " + String(err?.message || err));
+  }
+
+  try {
+    const { runAboutSourceSubstantiationTests } = require("../src/services/about-source-substantiation.test") as
+      typeof import("../src/services/about-source-substantiation.test");
+    const ass = await runAboutSourceSubstantiationTests({ log: false });
+    passed += ass.passed;
+    failed += ass.failed;
+    for (const f of ass.failures) failures.push("about-source-substantiation: " + f);
+    console.log(`  about-source-substantiation: ${ass.passed} passed, ${ass.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("about-source-substantiation: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -116,6 +116,15 @@ import {
   meetsAboutQualityBar,
 } from "../services/search-enrich";
 import { fetchPage, discoverContentLinks, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
+// dev-request 2026-08-22-rfbweb-about-guard: the shared website-candidate
+// junk-shape backstop (see admin-agents-url-write.ts's own import comment
+// for why only the deterministic backstop half is used, never the LLM
+// judge, at the PUT / website-write site below) + the new, standalone,
+// deterministic about/description-vs-source-text substantiation check (used
+// at the homepage-content-refresh about/description write site further
+// down, which DOES have real source-page text on hand).
+import { classifyContactCandidateDefect } from "../services/contact-candidate-judge";
+import { checkAboutCandidateSubstantiatedBySource } from "../services/about-source-substantiation";
 
 const router = Router();
 
@@ -596,7 +605,45 @@ router.put("/", (req: Request, res: Response) => {
   if (typeof body.email === "string") columnUpdates.push({ col: "email", val: body.email });
   if (typeof body.postalCode === "string")
     columnUpdates.push({ col: "postal_code", val: body.postalCode });
-  if (typeof body.website === "string") columnUpdates.push({ col: "website", val: body.website });
+  // dev-request 2026-08-22-rfbweb-about-guard: `website` had NO extraction
+  // guard at all — every other factual column above at least goes through
+  // this route's own orch-pr-17 correct-not-just-add gate downstream (for
+  // an OVERWRITE of a populated legacy value); `website` never did, on TOP
+  // of never having a junk-shape backstop either. A junk candidate (CSS-hex-
+  // color/Tailwind-class string, favicon/icon file path, App Store/Play
+  // Store listing host) is silently dropped from the write set — treated
+  // EXACTLY like the caller never sent a website field at all, never a
+  // 400/error, mirroring gateContactCandidates' "rejected == no candidate
+  // found" contract — and surfaced back in the response as
+  // `website_rejected_reason` so the enrichment SKILL can log it (same
+  // "log the rejection reason, don't just silently drop it" discipline as
+  // marketplace.ts's own gateRfbContactCandidates call sites). An empty
+  // string (the existing "clear the website" spelling) is NEVER junk — it
+  // is not a candidate URL at all, so it skips the classifier entirely and
+  // clears exactly as before. Only the deterministic backstop is called
+  // here, never the LLM judge half of contact-candidate-judge.ts's shared
+  // "website" field type: this route receives already-extracted column
+  // values from the enrichment SKILL, not the raw source-page text those
+  // values were extracted from, so there is nothing meaningful to judge the
+  // candidate against (see admin-agents-url-write.ts's own comment on the
+  // same call for the fuller reasoning, which applies here identically).
+  let websiteRejectedReason: string | undefined;
+  if (typeof body.website === "string") {
+    const trimmedWebsite = body.website.trim();
+    if (trimmedWebsite === "") {
+      columnUpdates.push({ col: "website", val: body.website });
+    } else {
+      const websiteDefect = classifyContactCandidateDefect("website", trimmedWebsite);
+      if (websiteDefect.defective) {
+        websiteRejectedReason = websiteDefect.reason;
+        console.log(
+          `[admin-knowledge] website candidate "${trimmedWebsite}" REJECTED for agent ${agentId} by junk-pattern backstop — ${websiteDefect.reason}; not written`,
+        );
+      } else {
+        columnUpdates.push({ col: "website", val: body.website });
+      }
+    }
+  }
   if (body.products !== undefined)
     columnUpdates.push({ col: "products", val: JSON.stringify(body.products) });
   if (body.openingHours !== undefined)
@@ -880,6 +927,11 @@ router.put("/", (req: Request, res: Response) => {
     // orch-pr-17: present only when allow_correct was on — per-field outcome of
     // the correct-not-just-add guard (applied / refused / added / noop).
     ...(allowCorrect ? { allow_correct: true, corrections } : {}),
+    // dev-request 2026-08-22-rfbweb-about-guard: present only when a website
+    // candidate was actually rejected by the junk-pattern backstop — absent
+    // (not `null`/`undefined`) on every ordinary call, so no existing
+    // consumer's shape assertion changes.
+    ...(websiteRejectedReason ? { website_rejected_reason: websiteRejectedReason } : {}),
   });
 });
 
@@ -1392,6 +1444,10 @@ homepageContentRefreshRouter.post(
     const changed: Array<{ agent_id: string; fields: string[] }> = [];
     const skippedCurated: Array<{ agent_id: string; fields: string[] }> = [];
     const errors: Array<{ agent_id: string; error: string }> = [];
+    // dev-request 2026-08-22-rfbweb-about-guard: about/description candidates
+    // dropped because summarizeAbout()'s output could not be substantiated
+    // against the fetched page's own text — see the write-set loop below.
+    const skippedUnsubstantiated: Array<{ agent_id: string; reason: string }> = [];
 
     // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).
     const HCR_CONCURRENCY = 3;
@@ -1504,10 +1560,38 @@ homepageContentRefreshRouter.post(
       // Build candidate content fields.
       const candidates: HcrFieldWrite[] = [];
 
-      // about / description from summarizeAbout — only if it clears the quality bar.
+      // about / description from summarizeAbout — only if it clears the quality
+      // bar AND is actually substantiated by the page we just fetched.
+      //
+      // dev-request 2026-08-22-rfbweb-about-guard (reference incident: the
+      // "Li Lynghonning" agent showed a stale/mismatched about-text that did
+      // not match its actual source page): meetsAboutQualityBar only judges
+      // WHETHER aboutSummary reads as real, substantive prose (long enough,
+      // not nav/boilerplate-shaped) — it has never checked that the text is
+      // actually FROM this page. checkAboutCandidateSubstantiatedBySource is
+      // that check: a deterministic (no LLM) verbatim-or-close-paraphrase
+      // match against `primaryHtml` (raw, so `<meta ...content="...">`
+      // og:description/meta-description candidates — two of summarizeAbout's
+      // three extraction modes — still match even though their text never
+      // appears in tag-stripped visible text) concatenated with `contentText`
+      // (tag-stripped, so a prose candidate broken across inline tags still
+      // reads as contiguous text). Fail-closed: any candidate this cannot
+      // verify is dropped, exactly like summarizeAbout had returned nothing —
+      // never written, never silently trusted.
       if (meetsAboutQualityBar(aboutSummary)) {
-        candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
-        candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+        const substantiation = checkAboutCandidateSubstantiatedBySource(
+          aboutSummary,
+          `${primaryHtml}\n${contentText}`,
+        );
+        if (substantiation.substantiated) {
+          candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
+          candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+        } else {
+          skippedUnsubstantiated.push({ agent_id: agentId, reason: substantiation.reason });
+          console.log(
+            `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — not substantiated by fetched page (${fetchUrl}): ${substantiation.reason}`,
+          );
+        }
       }
 
       // products from the detected platform categories → ProductInfo[] shape.
@@ -1693,6 +1777,12 @@ homepageContentRefreshRouter.post(
       by_field: byField,
       changed,
       skipped_curated: skippedCurated,
+      // dev-request 2026-08-22-rfbweb-about-guard: about/description candidates
+      // dropped for failing the source-substantiation check — additive, absent
+      // key would be equally valid here, but an always-present (possibly
+      // empty) array matches this endpoint's existing `errors`/`changed`
+      // shape better than an optional field would.
+      skipped_unsubstantiated: skippedUnsubstantiated,
       errors,
       parked_now: parkedNow,
     });

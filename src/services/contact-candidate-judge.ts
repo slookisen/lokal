@@ -37,9 +37,26 @@
  * (gateContactCandidates) treats a rejected candidate for a given field
  * EXACTLY like "no candidate was found" for that field — callers write
  * `null`, never a partially-trusted value.
+ *
+ * dev-request 2026-08-22-rfbweb-about-guard: a FOURTH field type, `website`,
+ * added on top of Grep 5b's three (phone/email/address) — two write paths
+ * (admin-agents-url-write.ts's `agents.url`, admin-knowledge.ts's
+ * `agent_knowledge.website`) had NO extraction guard at all. Only
+ * `classifyContactCandidateDefect`'s deterministic backstop is extended for
+ * `website` and wired into those two routes — `judgeContactCandidate`
+ * already accepts `fieldType: "website"` generically (no code change needed
+ * there) and its prompt is taught the website-specific junk classes below,
+ * but NEITHER of the two wired-in routes calls it: neither has the raw
+ * source-page text a meaningful judgment needs (see those routes' own
+ * comments for why). `gateContactCandidates`'s 3-field batch shape is
+ * deliberately NOT extended to a 4th slot — both website write sites judge
+ * exactly one field per call, never phone+email+address+website together,
+ * so composing it into that particular batch shape would just be unused
+ * surface. A future call site that DOES have real source-page text can call
+ * `judgeContactCandidate({ fieldType: "website", ... })` directly.
  */
 
-export type ContactFieldType = "phone" | "email" | "address";
+export type ContactFieldType = "phone" | "email" | "address" | "website";
 
 export interface ContactCandidateDefectVerdict {
   defective: boolean;
@@ -55,10 +72,64 @@ const CONTACT_JUDGE_FAVICON_LOCAL_PARTS = new Set([
 
 /** Same set as marketplace.ts's EMAIL_ICON_EXTENSIONS — icon/image file
  *  extensions that satisfy a bare "2+ letters" TLD-shape check but are
- *  never a real email domain. */
+ *  never a real email domain. Reused below for the WEBSITE field type's
+ *  favicon-path check (same file-extension shape, applied to a URL path's
+ *  final segment instead of an email domain's TLD). */
 const CONTACT_JUDGE_EMAIL_ICON_EXTENSIONS = new Set([
   "png", "ico", "jpg", "jpeg", "svg", "gif", "webp", "bmp",
 ]);
+
+/** dev-request 2026-08-22-rfbweb-about-guard: website-candidate junk shapes,
+ *  adapted from the SAME W34 defect classes marketplace.ts's judge already
+ *  teaches for phone/email (CSS-hex-color, favicon filename, App-ID
+ *  substring) — mirrored here as a raw-URL-shape backstop instead of a
+ *  domain-embedded-in-email shape, since `agents.url` /
+ *  `agent_knowledge.website` take a whole candidate URL, not a bare domain. */
+
+/** Bare CSS hex-color value, e.g. "#3a7d44" or "#fff". */
+const WEBSITE_JUDGE_CSS_HEX_RE = /^#[0-9a-f]{3,8}$/i;
+/** A Tailwind arbitrary-value class carrying a hex color, e.g.
+ *  ".bg-[#79656569]" — the exact W34 shape marketplace.ts's own prompt
+ *  teaches for the phone field, here misread as a URL instead of a phone
+ *  number. */
+const WEBSITE_JUDGE_TAILWIND_HEX_RE = /\[#[0-9a-f]{3,8}\]/i;
+/** Same basenames as CONTACT_JUDGE_FAVICON_LOCAL_PARTS, reused for a URL
+ *  PATH's final segment (e.g. ".../favicon.ico") instead of an email
+ *  local-part. */
+const WEBSITE_JUDGE_ICON_BASENAMES = CONTACT_JUDGE_FAVICON_LOCAL_PARTS;
+/** App Store / Play Store listing hosts — a real, live, dotted host, so
+ *  neither the missing-scheme nor the no-dot-in-host structural checks
+ *  below can catch it, but never the producer's OWN homepage: it's a
+ *  store's listing PAGE for their app, the "App-ID-shaped junk" class the
+ *  spec calls out, adapted from a numeric App-ID substring to the host that
+ *  actually carries one in a real candidate URL. */
+const WEBSITE_JUDGE_APP_STORE_HOSTS = new Set([
+  "apps.apple.com", "itunes.apple.com", "play.google.com",
+]);
+
+/** Registrable-ish host of a candidate website URL, lowercased, `www.`
+ *  stripped, URL userinfo (`user:pass@`) discarded — same shape as
+ *  admin-agents-url-write.ts's own hostOf(), reimplemented locally (not
+ *  imported) so this services/ module never depends on a routes/ file, per
+ *  this file's own documented layering rule (see the module header
+ *  comment). "" when unparseable. */
+function websiteCandidateHost(url: string): string {
+  const m = /^https?:\/\/([^/?#]+)/i.exec(url.trim());
+  if (!m) return "";
+  const authority = m[1];
+  const at = authority.lastIndexOf("@");
+  const hostPart = at === -1 ? authority : authority.slice(at + 1);
+  return hostPart.toLowerCase().replace(/:\d+$/, "").replace(/^www\./, "");
+}
+
+/** The final path segment of a candidate URL (after the host, before any
+ *  query/fragment), e.g. "https://gard.no/img/favicon.ico" -> "favicon.ico".
+ *  "" when the URL has no path or is unparseable. */
+function websiteCandidateLastPathSegment(url: string): string {
+  const m = /^https?:\/\/[^/?#]+([^?#]*)/i.exec(url.trim());
+  const rawPath = m?.[1] ?? "";
+  return rawPath.split("/").filter(Boolean).pop() ?? "";
+}
 
 /** True if `digits` contains a run of the same character repeated `minRun`
  *  or more times in a row — mirrors marketplace.ts's
@@ -141,6 +212,41 @@ export function classifyContactCandidateDefect(
     return { defective: false };
   }
 
+  if (fieldType === "website") {
+    // CSS hex-color / Tailwind arbitrary-value class shape, e.g. "#3a7d44"
+    // or ".bg-[#79656569]" — checked FIRST, on the raw candidate, before the
+    // scheme check below (a bare hex/class string never has a scheme, but
+    // giving it its own reason keeps the rejection honest about WHY, not
+    // just "no scheme").
+    if (WEBSITE_JUDGE_CSS_HEX_RE.test(trimmed) || WEBSITE_JUDGE_TAILWIND_HEX_RE.test(trimmed)) {
+      return { defective: true, reason: "candidate is a CSS hex-color / Tailwind arbitrary-value string, not a URL" };
+    }
+    if (!/^https?:\/\//i.test(trimmed) || /\s/.test(trimmed)) {
+      return { defective: true, reason: "candidate does not parse as a URL (missing http(s) scheme, or contains whitespace)" };
+    }
+    const host = websiteCandidateHost(trimmed);
+    if (!host || !host.includes(".") || host.startsWith(".") || host.endsWith(".")) {
+      return { defective: true, reason: "candidate does not parse as a URL with a real host (no domain TLD)" };
+    }
+    // Favicon/icon file path misread as the homepage itself — a real,
+    // reachable host, but the candidate points at an icon asset, not a page.
+    const lastSegment = websiteCandidateLastPathSegment(trimmed).toLowerCase();
+    const dotIdx = lastSegment.lastIndexOf(".");
+    if (dotIdx > 0) {
+      const base = lastSegment.slice(0, dotIdx);
+      const ext = lastSegment.slice(dotIdx + 1);
+      if (WEBSITE_JUDGE_ICON_BASENAMES.has(base) && CONTACT_JUDGE_EMAIL_ICON_EXTENSIONS.has(ext)) {
+        return { defective: true, reason: "candidate's path is a favicon/icon file, not a homepage URL" };
+      }
+    }
+    // App Store / Play Store listing — a real, live, dotted host, never the
+    // producer's own homepage.
+    if (WEBSITE_JUDGE_APP_STORE_HOSTS.has(host)) {
+      return { defective: true, reason: "candidate is an App Store / Play Store listing host, not the producer's own website" };
+    }
+    return { defective: false };
+  }
+
   // fieldType === "email"
   const atIdx = trimmed.lastIndexOf("@");
   if (atIdx <= 0 || atIdx === trimmed.length - 1) {
@@ -179,6 +285,7 @@ const CONTACT_JUDGE_SOURCE_CONTEXT_CHAR_CAP = 4000;
 function fieldLabelFor(fieldType: ContactFieldType): string {
   if (fieldType === "phone") return "telefonnummer";
   if (fieldType === "address") return "adresse";
+  if (fieldType === "website") return "nettside";
   return "e-postadresse";
 }
 
@@ -216,6 +323,7 @@ Automatisk tekstuttrekk fra nettsider har GJENTATTE GANGER feilaktig plukket opp
 - Et favicon- eller ikon-filnavn (f.eks. "favicon@2x.png", "apple-touch-icon.png") tolket som e-postadresse fordi filnavnet inneholder "@".
 - Annen generisk sidestøy: versjonsnumre, produkt-SKUer, datoer, postnumre, org-numre, eller andre tall-/tekststrenger som tilfeldigvis matcher formatet til ${fieldLabel}, men ikke faktisk ER kontaktinformasjon for DENNE produsenten.
 - For adresser spesielt: en tredjeparts/paraplyorganisasjons adresse (f.eks. en bransjeforening eller et markedslag) feilaktig tilskrevet denne ENKELTPRODUSENTEN, eller en generisk plattform-/malbedrift-adresse.
+- For nettsider spesielt: en favicon- eller ikon-filsti (f.eks. "https://gard.no/favicon.ico") tolket som selve hjemmesiden, eller en App Store-/Play Store-oppføring (f.eks. "apps.apple.com"/"play.google.com") tolket som produsentens EGEN nettside når det bare er butikkoppføringen for appen deres, ikke produsentens eget nettsted.
 
 Godkjenn KUN hvis kandidaten er en plausibel, ekte, SPESIFIKK ${fieldLabel} for akkurat DENNE produsenten, gitt kildekonteksten. Ved minste tvil om at dette faktisk er ekte kontaktinformasjon — eller om det heller ser ut som en av feilkildene over — svar ${CONTACT_JUDGE_REJECT_TOKEN}.
 

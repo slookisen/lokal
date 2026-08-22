@@ -66,6 +66,12 @@ import {
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
   enrichmentWritePauseBlockForAgents,
 } from "../services/enrichment-write-pause";
+// dev-request 2026-08-22-rfbweb-about-guard: the shared website-candidate
+// junk-shape backstop (CSS-hex-color/Tailwind-class, favicon/icon file
+// path, App Store/Play Store listing host) — see the classifyContactCandidate
+// Defect("website", ...) call below for why only the deterministic backstop
+// is wired in here (not the LLM judge half of that module).
+import { classifyContactCandidateDefect } from "../services/contact-candidate-judge";
 
 const router = Router();
 
@@ -188,6 +194,7 @@ type ItemOutcome =
   | "rejected_invalid_url"
   | "rejected_platform_host"
   | "rejected_directory_host"
+  | "rejected_junk_pattern"
   | "rejected_missing_reason"
   | "rejected_invalid_item"
   | "not_found"
@@ -364,6 +371,35 @@ router.post("/", (req: Request, res: Response) => {
     if (newValue !== null && !allowDirectory && isDirectoryHost(newValue)) {
       results.push({ agent_id: agentId, outcome: "rejected_directory_host", new_value: newValue });
       continue;
+    }
+    // dev-request 2026-08-22-rfbweb-about-guard: the shared website-candidate
+    // junk-shape backstop — CSS-hex-color/Tailwind-class strings, favicon/
+    // icon file paths, and App Store/Play Store listing hosts, none of which
+    // the three structural checks above catch (a favicon path or app-store
+    // listing is a structurally VALID http(s) URL with a dotted host). Only
+    // the deterministic backstop half of contact-candidate-judge.ts's shared
+    // "website" field type is called here, never judgeContactCandidate (the
+    // LLM half): this route accepts a bare {agent_id, url, reason} — it has
+    // no raw source-page text to judge a candidate against, and this is an
+    // admin-key-gated, reason-REQUIRED, per-row-audited corrections tool
+    // (an operator explicitly stating why they're overriding a value), not
+    // a raw-extraction write path — forcing an LLM call with no real
+    // evidence behind it would not be a meaningful judgment, and would make
+    // every legitimate manual correction batch depend on ANTHROPIC_API_KEY
+    // being configured, a behavior change this route's own tests (and the
+    // "no regression on the 445 verified homepages" acceptance bar) do not
+    // ask for. See this PR's own report for the full reasoning.
+    if (newValue !== null) {
+      const websiteDefect = classifyContactCandidateDefect("website", newValue);
+      if (websiteDefect.defective) {
+        results.push({
+          agent_id: agentId,
+          outcome: "rejected_junk_pattern",
+          new_value: newValue,
+          detail: websiteDefect.reason,
+        });
+        continue;
+      }
     }
 
     const cur = db.prepare(LOCK_SNAPSHOT_SQL).get(agentId) as LockSnapshot | undefined;
