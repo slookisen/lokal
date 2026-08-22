@@ -69,6 +69,7 @@ import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-mer
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
 import adminRfbWebsiteDiscoveryRoutes from "./routes/admin-rfb-website-discovery";
+import adminRfbBrregSelfSufficiencyRoutes from "./routes/admin-rfb-brreg-selfsufficiency";
 import adminPoolBlockerExplainRoutes from "./routes/admin-pool-blocker-explain";
 import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provenance-cohort";
 import adminDodBulkRoutes from "./routes/admin-dod-bulk";
@@ -749,6 +750,14 @@ app.use("/admin", adminLimiter, descriptionTruncationSweepRouter);
 // agent_knowledge directly. POST /admin/rfb-website-discovery,
 // GET /admin/rfb-website-review-queue (read-only, pending rows only).
 app.use("/admin", adminLimiter, adminRfbWebsiteDiscoveryRoutes);
+// dev-request 2026-08-22-rfb-website-email-selvforsyning: combined org_nr +
+// website + phone-evidence self-sufficiency batch job — extended name-match
+// heuristics (domain-token, personal-name-ENK) for org_nr, then Brreg's own
+// registered hjemmeside/telefon/mobil as an additional website-discovery +
+// evidence source, feeding the SAME org-nr-backfill and rfb-website-
+// discovery machinery above (never a new write path). POST
+// /admin/rfb-brreg-selfsufficiency (dry-run by default).
+app.use("/admin", adminLimiter, adminRfbBrregSelfSufficiencyRoutes);
 // dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype punkt 2: READ-ONLY
 // per-agent gate diagnosis — names which pool-VIEW leg and which
 // homepage-provenance-batch auto-select leg blocks a given agent, with the

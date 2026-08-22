@@ -690,6 +690,30 @@ export type RfbWdCandidateOutcome =
   | { outcome: "already_has_website"; agent_id: string; agent_name: string }
   | { outcome: "not_found"; agent_id: string };
 
+// `reason` (dev-request 2026-08-22-rfb-website-email-selvforsyning) —
+// additive optional 7th param, defaulting to the exact literal this
+// function's only caller-so-far already hardcoded inline
+// ("website_discovery_candidate_external"). Omitting it (every call site
+// that existed before this dev-request) is byte-identical to before —
+// this is the ONLY planned change to this shared function, kept additive
+// per the same discipline this codebase already used for the digraph-
+// folding precedent (2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-
+// outreach). Lets the new selvforsyning route tag its own Brreg-sourced
+// candidates with a distinct queue `reason` (e.g. "brreg_register_candidate")
+// so provenance shows WHICH intake produced a given queued row.
+//
+// `contactOverride` (same dev-request) — additive optional 8th param. This
+// function has always hardcoded `mobil: null` in the evidenceTarget it
+// builds below (see that literal a few lines down) even though
+// gardssalgWebsiteEvidenceMatch (services/experience-store.ts) has accepted
+// a separate `mobil` field on its `target` all along — RFB agents' own
+// telefon/mobil were simply never threaded in from anywhere but `t.phone`.
+// A caller holding BETTER contact evidence (e.g. Brreg's own registered
+// telefon/mobil, which fetchBrregContact returns) can now pass it through
+// here instead of settling for the row's own (possibly blank or stale)
+// agent_knowledge.phone. `undefined` on either sub-field (the default,
+// every existing call site) falls back to today's exact values
+// (`t.phone`/`null`) — zero behavior change for the existing caller.
 export async function evaluateRfbWebsiteCandidate(
   db: ReturnType<typeof getDb>,
   candidate: { agentId: string; url: string },
@@ -697,6 +721,8 @@ export async function evaluateRfbWebsiteCandidate(
   hostsProposedThisBatch: Set<string>,
   fallbackCounters: RfbWdFallbackCounters,
   batchId: string,
+  reason: string = "website_discovery_candidate_external",
+  contactOverride?: { telefon?: string | null; mobil?: string | null },
 ): Promise<RfbWdCandidateOutcome> {
   let t = getRfbWebsiteDiscoveryTarget(db, candidate.agentId);
   if (!t && ensureKnowledgeRowForExternalCandidate(db, candidate.agentId)) {
@@ -719,8 +745,8 @@ export async function evaluateRfbWebsiteCandidate(
     navn: t.name,
     kommune: t.city,
     poststed: null as string | null,
-    telefon: t.phone,
-    mobil: null as string | null,
+    telefon: contactOverride?.telefon !== undefined ? contactOverride.telefon : t.phone,
+    mobil: contactOverride?.mobil !== undefined ? contactOverride.mobil : (null as string | null),
     adresse: t.address,
     postnummer: t.postal_code,
   };
@@ -754,7 +780,7 @@ export async function evaluateRfbWebsiteCandidate(
       evidence: hit.evidence,
       confidence,
       batch_id: batchId,
-      reason: "website_discovery_candidate_external",
+      reason,
     });
     return {
       outcome: "proposed",
@@ -767,10 +793,10 @@ export async function evaluateRfbWebsiteCandidate(
     };
   }
 
-  let reason: string;
-  if (excludedHere.length > 0) reason = excludedHere[0].reason;
-  else reason = "no_candidate_verified";
-  return { outcome: "rejected", agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere };
+  let rejectReason: string;
+  if (excludedHere.length > 0) rejectReason = excludedHere[0].reason;
+  else rejectReason = "no_candidate_verified";
+  return { outcome: "rejected", agent_id: t.id, agent_name: t.name, reason: rejectReason, tried, excluded: excludedHere };
 }
 
 const router = Router();

@@ -604,6 +604,7 @@ export async function runAdminEnrichmentWritePauseTests(
         // the registry primitive; admin-rfb-website-discovery.ts carries the
         // review-approve lever and applyRfbAgentWebsite itself;
         // marketplace-registry.ts is register(), the one INSERT into `agents`.
+        "routes/admin-rfb-brreg-selfsufficiency.ts",
         "routes/admin-rfb-website-discovery.ts",
         "routes/marketplace.ts",
         "services/marketplace-registry.ts",

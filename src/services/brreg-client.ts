@@ -573,6 +573,19 @@ export type BrregContact = {
   hjemmeside: string | null;
   epost: string | null;
   telefon: string | null;
+  // Additive (dev-request 2026-08-22-rfb-website-email-selvforsyning) — the
+  // raw `mobil` field, exposed SEPARATELY from `telefon`'s own existing
+  // telefon-preferred/mobil-fallback folding above. `telefon`'s value and
+  // semantics are completely unchanged by this addition (every existing
+  // caller reading only `.telefon`/`.epost`/`.hjemmeside` sees byte-identical
+  // behaviour). This field exists for a caller that needs telefon AND mobil
+  // as two INDEPENDENT evidence signals — e.g.
+  // gardssalgWebsiteEvidenceMatch's (services/experience-store.ts) own
+  // `target.telefon`/`target.mobil`, which already try both as separate
+  // phone candidates; without this, a caller could only ever hand that
+  // matcher the already-folded `telefon` value, silently discarding
+  // whichever of the two numbers `telefon` didn't end up holding.
+  mobil: string | null;
 };
 
 // Own small per-process cache keyed by orgNr — deliberately NOT shared with
@@ -645,6 +658,7 @@ export async function fetchBrregContact(
     hjemmeside: pickBrregContactField(json.hjemmeside),
     epost: pickBrregContactField(json.epostadresse),
     telefon: pickBrregContactField(json.telefon) ?? pickBrregContactField(json.mobil),
+    mobil: pickBrregContactField(json.mobil),
   };
   contactCache.set(cleanOrgNr, result);
   return result;

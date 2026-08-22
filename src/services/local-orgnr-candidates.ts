@@ -126,18 +126,42 @@ export function localOrgnrCandidateCount(): number {
  * a null return as "fall through to the Brreg network search", never as an
  * error.
  */
-export function findLocalOrgnrCandidate(name: string, postalCode?: string | null): LocalOrgnrHit | null {
+// `opts.kommuneFilter: true` (additive, default off — byte-identical
+// behaviour when omitted) — dev-request 2026-08-22-rfb-website-email-
+// selvforsyning, heuristic (3): narrows the CANDIDATE SET to records whose
+// postal_code shares the caller's postalCode's first 2 digits (a rough
+// kommune/region proxy — this vendored file carries no real kommunenummer
+// column) BEFORE scoring, rather than only using postal_code to bump the
+// confidence tier after the fact. Cuts false ties among common surnames/
+// words scattered nationally (e.g. "Haugen") down to the caller's own
+// region. Silently inert (no filtering) when the caller passes no
+// postalCode — there is nothing to narrow by. Never used by the existing
+// org-nr-backfill route (admin-agents.ts) — only by the new selvforsyning
+// route's riskier, broader-net heuristics (domain-token, personal-name-ENK).
+export function findLocalOrgnrCandidate(
+  name: string,
+  postalCode?: string | null,
+  opts?: { kommuneFilter?: boolean },
+): LocalOrgnrHit | null {
   const cleanName = (name || "").trim();
   if (!cleanName) return null;
 
   const records = loadRecords();
   if (records.length === 0) return null;
 
+  const cleanPostal = (postalCode || "").trim();
+  const kommunePrefix =
+    opts?.kommuneFilter && cleanPostal.length >= 2 ? cleanPostal.slice(0, 2) : null;
+
   let best: LocalOrgnrHit | null = null;
   const exactOrgnrs = new Set<string>();
 
   for (const r of records) {
     if (!r || typeof r.orgnr !== "string" || typeof r.name !== "string") continue;
+    if (kommunePrefix) {
+      const rPostal = (r.postal_code || "").trim();
+      if (rPostal.slice(0, 2) !== kommunePrefix) continue;
+    }
     // Normalize again here (in addition to loadRecords' own normalization)
     // so a record injected straight into the cache via
     // __setLocalOrgnrCandidatesForTesting (bypassing loadRecords entirely)

@@ -279,7 +279,11 @@ export function runOpplevelserGardssalgContactBackfillTests(
 
       brregClient.__clearBrregWebsiteCacheForTesting();
       const c2 = await brregClient.fetchBrregContact("810000002");
-      assertEq(c2, { hjemmeside: null, epost: null, telefon: null }, "a4: blank-string fields all become null");
+      assertEq(
+        c2,
+        { hjemmeside: null, epost: null, telefon: null, mobil: null },
+        "a4: blank-string fields all become null (mobil is additive — dev-request 2026-08-22-rfb-website-email-selvforsyning)",
+      );
 
       brregClient.__clearBrregWebsiteCacheForTesting();
       const c3 = await brregClient.fetchBrregContact("810000003");
