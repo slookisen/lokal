@@ -533,6 +533,9 @@ app.get("/health", (_req, res) => {
     try { dbSizeMb = Math.round(fs.statSync(dbPath).size / 1024 / 1024 * 10) / 10; } catch {}
 
     // Row counts for key tables
+    // database.agents = all rows in `agents` with is_active=1 (no umbrella/vetted filter).
+    // See dev-request 2026-08-21-rfb-produsenttall-kilde-til-sannhet for why this differs
+    // from traffic.totalAgents (below) and from llms.txt's producer count.
     const agentCount = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE is_active = 1").get() as any).c;
     const pvCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
     const queryCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
@@ -585,6 +588,11 @@ app.get("/health", (_req, res) => {
         pageViews: pvCount,
         queries: queryCount,
       },
+      // traffic.totalAgents = marketplaceRegistry.getStats().totalAgents = COUNT(*) FROM agents
+      // with NO filter at all (includes inactive + umbrella-tagged rows). This is the SAME
+      // underlying value as GET /api/stats' registry.totalAgents (src/routes/a2a.ts, the
+      // /api/stats handler) — both call the same cached getStats(). See dev-request
+      // 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
       traffic: {
         lastHourPageViews: recentPv,
         totalAgents: stats.totalAgents,
