@@ -1437,7 +1437,14 @@ interface AgentOrgNrBackfillTargetRow {
   city: string | null;
 }
 
-interface AgentOrgNrReviewQueueEntry {
+// Exported (dev-request 2026-08-22-rfb-website-email-selvforsyning) so the
+// sibling POST /admin/rfb-brreg-selfsufficiency route
+// (admin-rfb-brreg-selfsufficiency.ts) can feed its OWN new candidate
+// generators (domain-token-as-name, personal-name-ENK, kommune-pre-filter)
+// into this exact shape rather than inventing a parallel one — "export,
+// don't duplicate" (the same ground rule rfbWdExistingWebsiteHosts's own
+// export comment names, admin-rfb-website-discovery.ts).
+export interface AgentOrgNrReviewQueueEntry {
   agent_id: string;
   agent_name?: string | null;
   candidate_orgnr?: string | null;
@@ -1451,7 +1458,10 @@ interface AgentOrgNrReviewQueueEntry {
 
 // Shared WHERE clause for both the count and the capped batch query (mirrors
 // brregSweepCandidateWhereSql's "one source of truth for both" convention).
-function agentsOrgNrBackfillCandidateWhereSql(): string {
+// Exported (2026-08-22-rfb-website-email-selvforsyning) so the sibling
+// selvforsyning route's own org_nr-missing cohort selector reuses this EXACT
+// predicate instead of drifting from it.
+export function agentsOrgNrBackfillCandidateWhereSql(): string {
   return `
     a.role = 'producer'
     AND a.is_active = 1
@@ -1670,7 +1680,11 @@ export function applyAgentOrgNr(
   return ["org_nr"];
 }
 
-function upsertAgentOrgNrReviewQueue(db: ReturnType<typeof getDb>, entry: AgentOrgNrReviewQueueEntry): void {
+// Exported (2026-08-22-rfb-website-email-selvforsyning) — the selvforsyning
+// route's new org_nr candidate generators (domain-token, personal-name-ENK)
+// must land any non-auto-write outcome in the SAME review queue via the SAME
+// upsert idiom, never a second write path.
+export function upsertAgentOrgNrReviewQueue(db: ReturnType<typeof getDb>, entry: AgentOrgNrReviewQueueEntry): void {
   db.prepare(
     `INSERT INTO agents_org_nr_review_queue
        (id, agent_id, agent_name, candidate_orgnr, candidate_name, candidate_confidence,
@@ -1701,7 +1715,10 @@ function upsertAgentOrgNrReviewQueue(db: ReturnType<typeof getDb>, entry: AgentO
   });
 }
 
-function clearAgentOrgNrReviewQueueEntry(db: ReturnType<typeof getDb>, agentId: string): void {
+// Exported (2026-08-22-rfb-website-email-selvforsyning) — a confirmed
+// selvforsyning-route write must clear any stale queue row the same way this
+// route's own apply branch already does.
+export function clearAgentOrgNrReviewQueueEntry(db: ReturnType<typeof getDb>, agentId: string): void {
   db.prepare(`DELETE FROM agents_org_nr_review_queue WHERE agent_id = ?`).run(agentId);
 }
 
