@@ -261,13 +261,29 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     // or exceed the 63-octet DNS label limit once IDNA-encoded (bug 3). This
     // asserts the invariant for the WHOLE function's output, not just the
     // punycode source: nothing outside [a-z0-9.-] may ever appear anywhere
-    // in the returned array.
-    const punctuationNames = ["Nordmann & Sønn Gård", "O'Brien Gård"];
+    // in the returned array. Also includes a literal "." in the raw name
+    // (round-2 re-review bug): a stray "." in a raw token can make
+    // domainToASCII split the result into MORE than the intended two labels
+    // ("<label>.no"), and only the first label was ever validated — letting
+    // a second, unvalidated label (with raw "&" etc.) leak through. Assert
+    // both the whole-array [a-z0-9.-] invariant AND that no host has more
+    // than 2 dots total (i.e. no spurious extra label ever appears) — the
+    // dot-count check is the one that would actually have caught this exact
+    // bug, since a malformed second label like "xn--nordmann&snngrd-tlb33a"
+    // still only contains chars from [a-z0-9.-] plus "&", so it fails the
+    // first invariant anyway, but a purely-legal-looking multi-label result
+    // (e.g. from a name with "." but no other punctuation) would sail past
+    // the [a-z0-9.-] check alone and only the dot-count check catches it.
+    const punctuationNames = ["Nordmann & Sønn Gård", "O'Brien Gård", "Åse.Nordmann&Sønn Gård"];
     for (const name of punctuationNames) {
       const hosts = gardssalgWebsiteCandidateHosts(name);
       assertTrue(
         hosts.every((h) => /^[a-z0-9.-]+$/.test(h)),
         `gwch-5: '${name}' → no malformed host containing anything outside [a-z0-9.-] appears anywhere in the returned array (got: ${JSON.stringify(hosts)})`,
+      );
+      assertTrue(
+        hosts.every((h) => (h.match(/\./g) || []).length <= 2),
+        `gwch-5: '${name}' → no host has more than 2 dots total (no spurious extra DNS label from a stray "." in the raw name) (got: ${JSON.stringify(hosts)})`,
       );
     }
   }

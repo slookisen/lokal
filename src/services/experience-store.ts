@@ -6440,10 +6440,20 @@ export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
     if (rawLabel.length >= 4) {
       const rawHost = `${rawLabel}.no`;
       const punycodeHost = (require("node:url") as typeof import("node:url")).domainToASCII(rawHost);
-      const encodedLabel = punycodeHost.split(".")[0] || "";
+      const punycodeLabels = punycodeHost.split(".");
+      const encodedLabel = punycodeLabels[0] || "";
       if (
         punycodeHost &&
         punycodeHost !== rawHost &&
+        // This source only intends single joined labels under ".no" (see
+        // JSDoc above): exactly two DNS labels, "<label>.no". A raw token
+        // containing stray punctuation (e.g. a literal "." from a business
+        // name like "Ole H. Nordmann Gård") can make domainToASCII split the
+        // result into MORE than two labels — and every label past the first
+        // was never validated below, letting malformed content (raw "&",
+        // over-length labels) back in through the unchecked tail. Reject
+        // the whole candidate outright when it isn't exactly one label + TLD.
+        punycodeLabels.length === 2 &&
         encodedLabel.startsWith("xn--") &&
         /^[a-z0-9-]+$/i.test(encodedLabel) &&
         encodedLabel.length <= 63 &&
