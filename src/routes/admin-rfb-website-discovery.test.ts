@@ -107,6 +107,19 @@
  *   ac3 — same function called directly returns `already_has_website`
  *       WITHOUT any fetch/queue-write when the target agent's
  *       agent_knowledge.website is already non-blank.
+ *
+ * dev-request 2026-08-22-rfb-website-email-selvforsyning, punkt 4b
+ * (ensureRfbKnowledgeRowsForAutoSelectCohort — batch knowledge-row creation
+ * for the auto-select/blank-mode path):
+ *   (kr) a producer agent with no agent_knowledge row at all gets one
+ *       created by a blank-mode auto-select call; knowledge_rows_created in
+ *       the response is >= 1; the agent is actually scanned in that SAME
+ *       call (present in proposed/rejected, not silently absent — proves
+ *       verification_status is set to a value rfbWdSelectSql's own filter
+ *       accepts, not left at the schema default); a repeat call is
+ *       idempotent (0 rows created, 0 new rows in the DB).
+ *   (kr-agg) aggregator_replace mode never invokes the backfill — response
+ *       always reports knowledge_rows_created: 0.
  * renderPage() itself is injected via the module-level
  * __setRfbWdRenderPageImplForTesting() test hook (mirrors
  * __setRfbCxRowDelayForTesting, admin-rfb-contact-extraction.ts) rather than
@@ -1072,6 +1085,145 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
 
       setRfbWdRenderPageImplForTesting!(null);
       delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // dev-request 2026-08-22-rfb-website-email-selvforsyning, punkt 4b —
+    // knowledge-row creation for the auto-select/blank-mode cohort
+    // (ensureRfbKnowledgeRowsForAutoSelectCohort), mirroring the safety net
+    // ensureKnowledgeRowForExternalCandidate already gives the external-
+    // candidates path, but for the batch path.
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── (kr) a producer agent seeded with NO agent_knowledge row at all is
+    //     invisible to rfbWdSelectSql's INNER JOIN until a blank-mode
+    //     auto-select call backfills it; the response reports how many rows
+    //     it created, and a repeat call is idempotent (INSERT OR IGNORE) --
+    {
+      // insertAgent() always creates the agent_knowledge row alongside the
+      // agents row, so this seeds the `agents` row directly, mirroring
+      // insertAgent()'s own INSERT exactly, MINUS the agent_knowledge insert
+      // — the one and only way in this suite to reach the state this dev-
+      // request measured (a producer with literally no knowledge row).
+      testDb.prepare(
+        `INSERT INTO agents (
+           id, name, description, provider, contact_email, url, role, api_key,
+           org_nr, city, vertical_id, created_at
+         ) VALUES (?, ?, 't', 't', 'x@example.com', 'https://example.com', ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "wd-no-knowledge-row", "Zqvex Kunnskapsloes Gard", "producer", "key-wd-no-knowledge-row",
+        null, "Testby", "rfb", "2026-01-01 00:00:00",
+      );
+      // gardssalgWebsiteCandidateHosts("Zqvex Kunnskapsloes Gard")'s first
+      // (and here, only-fixtured) guess — matching evidence so the agent, if
+      // actually scanned, is proposed rather than merely rejected-but-tried.
+      // This is the crux of the reviewer finding: without the
+      // verification_status fix, this agent's own knowledge-less row is
+      // invisible to selectRfbWebsiteDiscoveryTargets's INNER JOIN, so no
+      // fetch to this host ever happens even though the row exists.
+      fixtures.set(
+        "https://zqvexkunnskapsloesgard.no",
+        htmlResponse("<html><body>Zqvex Kunnskapsloes Gard ligger i Testby</body></html>", {
+          finalUrl: "https://zqvexkunnskapsloesgard.no",
+        }),
+      );
+
+      const before = testDb.prepare("SELECT 1 FROM agent_knowledge WHERE agent_id = ?").get("wd-no-knowledge-row");
+      assertTrue(!before, "kr0: setup — the agent starts with no agent_knowledge row at all");
+
+      const r1 = await callDiscovery({ limit: RFB_WD_HARD_CAP });
+      assertEq(r1.status, 200, "kr1: 200");
+      const after = testDb.prepare("SELECT 1 FROM agent_knowledge WHERE agent_id = ?").get("wd-no-knowledge-row");
+      assertTrue(!!after, "kr2: the agent now has an agent_knowledge row after a blank-mode auto-select call");
+      assertTrue(
+        typeof r1.body.knowledge_rows_created === "number" && r1.body.knowledge_rows_created >= 1,
+        "kr3: knowledge_rows_created is >= 1 in the response",
+      );
+      // The actual gap the reviewer found: a row being CREATED is not the
+      // same as the row's agent being SELECTABLE in that same call. Prove
+      // the backfilled agent was really scanned (present in proposed or
+      // rejected — not silently absent from both), same convention as (y)'s
+      // seenIds check above.
+      const seenIdsKr = new Set<string>([
+        ...r1.body.proposed.map((p: any) => p.agent_id),
+        ...r1.body.rejected.map((x: any) => x.agent_id),
+      ]);
+      assertTrue(
+        seenIdsKr.has("wd-no-knowledge-row"),
+        "kr3b: the backfilled agent is NOT silently invisible — it was actually scanned as a target in this same call",
+      );
+      const propKr = r1.body.proposed.find((p: any) => p.agent_id === "wd-no-knowledge-row");
+      assertTrue(!!propKr, "kr3c: the backfilled agent is proposed (verified against its fixture)");
+      if (propKr) {
+        assertEq(propKr.candidate_url, "https://zqvexkunnskapsloesgard.no", "kr3d: proposed candidate_url as expected");
+      }
+
+      // Idempotent: a second blank-mode call must not double-count (or
+      // double-insert) the same, now-already-has-a-row agent — INSERT OR
+      // IGNORE really is doing the ignoring.
+      const knowledgeRowCountBefore = (testDb.prepare("SELECT COUNT(*) AS c FROM agent_knowledge").get() as any).c;
+      const r2 = await callDiscovery({ limit: RFB_WD_HARD_CAP });
+      const knowledgeRowCountAfter = (testDb.prepare("SELECT COUNT(*) AS c FROM agent_knowledge").get() as any).c;
+      assertEq(knowledgeRowCountAfter, knowledgeRowCountBefore, "kr4: a second call creates no additional agent_knowledge rows");
+      assertEq(r2.body.knowledge_rows_created, 0, "kr5: the second call's knowledge_rows_created is 0 (nothing left to backfill)");
+    }
+
+    // ── (kr-umbrella) regression: ensureRfbKnowledgeRowsForAutoSelectCohort's
+    //     batch INSERT...SELECT must mirror rfbWdSelectSql's own
+    //     `umbrella_type IS NULL` exclusion — an umbrella/venue agent with NO
+    //     agent_knowledge row must NOT get one manufactured by the blank-mode
+    //     backfill (it would otherwise land in the platform-wide verifier's
+    //     pending_verify cohort despite being able to structurally never have
+    //     a producer website) --
+    {
+      // Same raw-INSERT-minus-agent_knowledge pattern as (kr0) above, so this
+      // agent starts knowledge-less; umbrella_type is then set the same way
+      // insertAgent()'s umbrellaType option does (UPDATE after the fact,
+      // since it isn't in the base column list).
+      testDb.prepare(
+        `INSERT INTO agents (
+           id, name, description, provider, contact_email, url, role, api_key,
+           org_nr, city, vertical_id, created_at
+         ) VALUES (?, ?, 't', 't', 'x@example.com', 'https://example.com', ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "wd-umbrella-no-knowledge-row", "Zqvex Umbrellalos Torget", "producer", "key-wd-umbrella-no-knowledge-row",
+        null, "Testby", "rfb", "2026-01-01 00:00:00",
+      );
+      testDb.prepare(`UPDATE agents SET umbrella_type = ? WHERE id = ?`).run("venue", "wd-umbrella-no-knowledge-row");
+
+      const beforeU = testDb
+        .prepare("SELECT 1 FROM agent_knowledge WHERE agent_id = ?")
+        .get("wd-umbrella-no-knowledge-row");
+      assertTrue(!beforeU, "kru0: setup — the umbrella agent starts with no agent_knowledge row at all");
+
+      const rU = await callDiscovery({ limit: RFB_WD_HARD_CAP });
+      assertEq(rU.status, 200, "kru1: 200");
+
+      const afterU = testDb
+        .prepare("SELECT 1 FROM agent_knowledge WHERE agent_id = ?")
+        .get("wd-umbrella-no-knowledge-row");
+      assertTrue(
+        !afterU,
+        "kru2: the umbrella agent still has NO agent_knowledge row after a blank-mode auto-select call — the batch backfill did not manufacture one for it",
+      );
+
+      const seenIdsKru = new Set<string>([
+        ...rU.body.proposed.map((p: any) => p.agent_id),
+        ...rU.body.rejected.map((x: any) => x.agent_id),
+      ]);
+      assertTrue(
+        !seenIdsKru.has("wd-umbrella-no-knowledge-row"),
+        "kru3: the umbrella agent was never scanned as a target — excluded at the batch-insert layer, not just the SELECT layer",
+      );
+    }
+
+    // ── (kr-agg) regression: aggregator_replace mode never invokes the batch
+    //     knowledge-row backfill (it requires an already-non-blank current
+    //     website, so a knowledge-less agent could never qualify there
+    //     anyway) — the response always reports knowledge_rows_created: 0 --
+    {
+      const r = await callDiscovery({ mode: "aggregator_replace", limit: 1 });
+      assertEq(r.body.knowledge_rows_created, 0, "kr-agg1: aggregator_replace mode reports knowledge_rows_created: 0");
     }
 
     // ════════════════════════════════════════════════════════════════════
