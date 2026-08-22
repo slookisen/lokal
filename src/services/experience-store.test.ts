@@ -34,6 +34,9 @@ import {
   isContentFieldHomepageSourced,
   isExperienceContentGenuinelyThin,
   classifyProviderContentBucket,
+  // Grep 4c: navnegjetting v3 — first-word-only, ø→oe-alone, and
+  // punycode/IDN candidate sources added to the tier-1 domain-guess heuristic.
+  gardssalgWebsiteCandidateHosts,
 } from "./experience-store";
 
 export interface TestSummary {
@@ -187,6 +190,59 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
   assertEq(gardssalgProductsEligible("not valid json"), false, "gardssalgProductsEligible: malformed non-JSON value → false, conservative (never silently overwritten)");
   assertEq(gardssalgProductsEligible('{"not":"an array"}'), false, "gardssalgProductsEligible: valid JSON but not an array (an object) → false");
   assertEq(gardssalgProductsEligible("[1,2,3]"), false, "gardssalgProductsEligible: valid non-empty JSON array (even of non-strings) → false, only an EMPTY array is eligible");
+
+  // ── gardssalgWebsiteCandidateHosts v3 (Grep 4c: navnegjetting v3) — three
+  //    new candidate sources appended AFTER the existing v1/v2 candidates:
+  //    (a) first-word-only, (b) ø→oe-alone with å/æ left as raw diacritics,
+  //    (c) one punycode/IDN guess. ────────────────────────────────────────
+  {
+    // (a) multi-word name → a first-word-only candidate appears (in addition
+    // to the pre-existing all-tokens candidates).
+    const torgersenHosts = gardssalgWebsiteCandidateHosts("Torgersen Gård");
+    assertTrue(
+      torgersenHosts.includes("torgersengard.no"),
+      "gwch-1a: 'Torgersen Gård' still yields the pre-existing all-tokens v1 candidate torgersengard.no",
+    );
+    assertTrue(
+      torgersenHosts.includes("torgersen.no"),
+      "gwch-1b: 'Torgersen Gård' also yields the v3 first-word-only candidate torgersen.no",
+    );
+
+    // Single-token name: no first-word-only candidate distinct from the
+    // existing all-tokens variant, so nothing new/duplicate is added for it.
+    const singleTokenHosts = gardssalgWebsiteCandidateHosts("Einord");
+    assertEq(
+      singleTokenHosts.filter((h) => h === "einord.no").length,
+      1,
+      "gwch-1c: single-token name 'Einord' → einord.no appears exactly once (first-word-only variant skipped, not duplicated)",
+    );
+
+    // (b) ø→oe-alone variant differs from BOTH existing v1 (ø→o/å→a) and v2
+    // (ø→oe/å→aa) outputs for a name containing å: å is dropped (not
+    // translated), so the label is shorter than either existing variant.
+    const blabaerHosts = gardssalgWebsiteCandidateHosts("Blåbær Gård");
+    assertTrue(blabaerHosts.includes("blabaergard.no"), "gwch-2a: 'Blåbær Gård' still yields the v1 (å→a) candidate blabaergard.no");
+    assertTrue(blabaerHosts.includes("blaabaergaard.no"), "gwch-2b: 'Blåbær Gård' still yields the v2 (å→aa) candidate blaabaergaard.no");
+    assertTrue(
+      blabaerHosts.includes("blbrgrd.no"),
+      "gwch-2c: 'Blåbær Gård' yields the v3 ø→oe-alone candidate blbrgrd.no (å dropped, not translated) — distinct from both v1 and v2",
+    );
+
+    // (c) name WITH diacritics → a punycode/IDN candidate is present.
+    const punycodeHosts = gardssalgWebsiteCandidateHosts("Torgersen Gård");
+    assertTrue(
+      punycodeHosts.some((h) => h.startsWith("xn--") && h.endsWith(".no")),
+      "gwch-3a: 'Torgersen Gård' (has å) yields a punycode/IDN candidate (xn--...·.no)",
+    );
+
+    // name with NO diacritics → domainToASCII would just echo the ascii
+    // label back, so no duplicate punycode candidate is added.
+    const plainHosts = gardssalgWebsiteCandidateHosts("Ola Nordmann Gruppen AS");
+    assertTrue(
+      !plainHosts.some((h) => h.startsWith("xn--")),
+      "gwch-3b: 'Ola Nordmann Gruppen AS' (no diacritics) → no punycode candidate (would just duplicate the plain label)",
+    );
+  }
 
   // ── scanGardssalgProviderRowForMojibake (dev-request 2026-07-21-
   //    opplevagent-norske-tegn-encoding, criterion 3) — DETECTION only, one

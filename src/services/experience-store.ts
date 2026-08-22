@@ -6373,39 +6373,71 @@ export function getGardssalgWebsiteDiscoveryTarget(providerId: string): (Gardssa
  * Deterministic candidate hosts from the provider's own display name: the
  * «— Sted»-pruned name, org-form suffix dropped, in the two common Norwegian
  * domain transliterations (ø→o/å→a and ø→oe/å→aa; æ→ae in both), each as
- * joined and hyphenated labels under .no. Max 4, degenerate labels (<4 or
+ * joined and hyphenated labels under .no. Max 10, degenerate labels (<4 or
  * >63 chars) dropped. Pure — exported for tests.
  */
 export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
   const tokens = gardssalgSearchName(navn).toLowerCase().split(/\s+/).filter(Boolean);
   while (tokens.length > 1 && BRREG_ORG_SUFFIX_TOKENS.has(tokens[tokens.length - 1])) tokens.pop();
-  const variants = [
-    tokens.map((t) => t.replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")),
-    tokens.map((t) => t.replace(/æ/g, "ae").replace(/ø/g, "oe").replace(/å/g, "aa")),
-  ];
+
+  const translit1 = (t: string) => t.replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a");
+  const translit2 = (t: string) => t.replace(/æ/g, "ae").replace(/ø/g, "oe").replace(/å/g, "aa");
+  const asciiClean = (t: string) => t.replace(/[^a-z0-9]/g, "");
+  const variants = [tokens.map(translit1), tokens.map(translit2)];
+
   const hosts: string[] = [];
+  const addHost = (label: string, tld: string) => {
+    if (label.length < 4 || label.length > 63) return;
+    const host = `${label}.${tld}`;
+    if (!hosts.includes(host)) hosts.push(host);
+  };
+
   for (const v of variants) {
-    const clean = v.map((t) => t.replace(/[^a-z0-9]/g, "")).filter(Boolean);
+    const clean = v.map(asciiClean).filter(Boolean);
     if (clean.length === 0) continue;
-    for (const label of [clean.join(""), clean.join("-")]) {
-      if (label.length < 4 || label.length > 63) continue;
-      const host = `${label}.no`;
-      if (!hosts.includes(host)) hosts.push(host);
-    }
+    addHost(clean.join(""), "no");
+    addHost(clean.join("-"), "no");
   }
   // v2: breweries in particular brand on .com (measured 2026-07-30: 7 Fjell
   // Bryggeri's real site is 7fjellbryggeri.com — tier 1 guessed only .no and
   // missed it). One .com per transliteration, joined label only, appended
   // AFTER the .no guesses so the cheaper national TLD is still tried first.
   for (const v of variants) {
-    const clean = v.map((t) => t.replace(/[^a-z0-9]/g, "")).filter(Boolean);
+    const clean = v.map(asciiClean).filter(Boolean);
     if (clean.length === 0) continue;
-    const label = clean.join("");
-    if (label.length < 4 || label.length > 63) continue;
-    const host = `${label}.com`;
-    if (!hosts.includes(host)) hosts.push(host);
+    addHost(clean.join(""), "com");
   }
-  return hosts.slice(0, 6);
+  // v3: three more free guesses, added AFTER v1/v2 so the cheaper/likelier
+  // ones are still tried first — (a) first-word-only (e.g. "Torgersen Gård"
+  // often really lives at torgersen.no, not torgersengard.no); (b) an
+  // ø→oe-alone label with å/æ left as raw diacritics that the ascii-strip
+  // below silently drops, a genuinely different shape from v1/v2; (c) one
+  // punycode/IDN guess for the small number of producers who registered the
+  // actual diacritic domain.
+  if (tokens.length > 1) {
+    for (const translit of [translit1, translit2]) {
+      addHost(asciiClean(translit(tokens[0])), "no");
+    }
+  }
+  {
+    const clean = tokens.map((t) => asciiClean(t.replace(/ø/g, "oe"))).filter(Boolean);
+    if (clean.length > 0) {
+      addHost(clean.join(""), "no");
+      addHost(clean.join("-"), "no");
+    }
+  }
+  {
+    const rawLabel = tokens.join("");
+    if (rawLabel.length >= 4 && rawLabel.length <= 63) {
+      const rawHost = `${rawLabel}.no`;
+      const punycodeHost = (require("node:url") as typeof import("node:url")).domainToASCII(rawHost);
+      if (punycodeHost && punycodeHost !== rawHost && punycodeHost.split(".")[0]?.startsWith("xn--") && !hosts.includes(punycodeHost)) {
+        hosts.push(punycodeHost);
+      }
+    }
+  }
+
+  return hosts.slice(0, 10);
 }
 
 // ─── Gårdssalg search-based website-discovery candidates (dev-request
