@@ -123,7 +123,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         const h2 = expStore.gardssalgWebsiteCandidateHosts("Bjørkegård Sideri — Hardanger");
         assertTrue(h2.includes("bjorkegardsideri.no"), "wd-a3: ø→o/å→a variant, «— Sted» pruned before generation");
         assertTrue(h2.includes("bjoerkegaardsideri.no"), "wd-a4: ø→oe/å→aa variant generated too");
-        assertTrue(h2.length <= 6, "wd-a5: at most 6 candidates (v2 — .no guesses plus .com variants)");
+        assertTrue(h2.length <= 10, "wd-a5: at most 10 candidates (v3 — .no/.com guesses plus first-word/ø-oe-alone/punycode variants)");
         const h3 = expStore.gardssalgWebsiteCandidateHosts("Ås AS");
         assertEq(h3.length, 0, "wd-a6: degenerate too-short label yields no candidates");
       }
