@@ -1358,6 +1358,13 @@ class MarketplaceRegistry {
       return this._agentsCache;
     }
     // Phase 5.11 A4.1: getActiveAgents powers producer-discovery surfaces; exclude umbrellas
+    // Narrowest of the four agent-count filters in the platform: is_active=1 AND
+    // umbrella_type IS NULL AND is_vetted=1 (getStats()'s `total`/activeProducers above
+    // only apply a subset of these). This is what powers llms.txt's producer count
+    // (`agents.length` in src/routes/discovery.ts's /llms.txt handler, via
+    // marketplaceRegistry.getActiveAgents()) — the smallest of the publicly-visible
+    // agent counts, because it's the only one that requires vetted + non-umbrella +
+    // active all at once. See dev-request 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
     const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 ORDER BY trust_score DESC, created_at DESC").all() as any[];
     this._agentsCache = rows.map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
@@ -1406,8 +1413,15 @@ class MarketplaceRegistry {
       return this._statsCache;
     }
     const db = getDb();
+    // Unfiltered COUNT(*) — includes inactive and umbrella-tagged agents. Consumed by
+    // /health's traffic.totalAgents AND /api/stats' registry.totalAgents (a2a.ts) — same
+    // cached call, same number, by construction. See dev-request
+    // 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
     const total = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
     // Phase 5.11 A4.1: activeProducers stat should exclude umbrella-tagged agents
+    // This is registry.activeProducers in /api/stats — a distinct, narrower count than
+    // `total`/totalAgents above (is_active + non-umbrella producers only). See dev-request
+    // 2026-08-21-rfb-produsenttall-kilde-til-sannhet.
     const activeProducers = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE role = 'producer' AND is_active = 1 AND umbrella_type IS NULL").get() as any).c;
     // Phase 5.11 A4.1: cities stat should not count umbrella locations
     const citiesRows = db.prepare("SELECT DISTINCT city FROM agents WHERE city IS NOT NULL AND umbrella_type IS NULL").all() as any[];
