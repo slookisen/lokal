@@ -1252,6 +1252,8 @@ class CrmService {
         t.assigned_to,
         t.message_count,
         t.last_message_at,
+        t.last_inbound_at,
+        t.last_outbound_at,
         t.created_at,
         c.id          AS contact_id,
         c.email       AS contact_email,
