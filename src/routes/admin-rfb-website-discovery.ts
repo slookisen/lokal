@@ -434,6 +434,36 @@ function ensureKnowledgeRowForExternalCandidate(db: ReturnType<typeof getDb>, ag
   return true;
 }
 
+// Batch counterpart to ensureKnowledgeRowForExternalCandidate just above —
+// same "knowledge-less rows are invisible to rfbWdSelectSql's INNER JOIN"
+// reasoning, but for the auto-select/blank-mode path (dev-request
+// 2026-08-22-rfb-website-email-selvforsyning, punkt 4b), which previously had
+// no equivalent safety net. verification_status is set explicitly to
+// 'pending_verify' (rather than left at the schema default 'unverified') so
+// the row also clears rfbWdSelectSql's own
+// `k.verification_status IN ('pending_verify','review_required')` filter —
+// without that, the row would exist but still be invisible to the very
+// SELECT this function exists to unblock. Returns the number of rows
+// actually inserted.
+// `a.umbrella_type IS NULL` mirrors rfbWdSelectSql's own umbrella-agent
+// exclusion (see that function's doc comment above, ~line 329) — without it
+// this batch-insert manufactures pending_verify agent_knowledge rows for
+// umbrella/venue agents too, pulling them into the platform-wide verifier
+// sweep's pending_verify cohort even though they can structurally never have
+// a producer website.
+function ensureRfbKnowledgeRowsForAutoSelectCohort(db: ReturnType<typeof getDb>): number {
+  return db
+    .prepare(
+      `INSERT OR IGNORE INTO agent_knowledge (agent_id, verification_status)
+       SELECT a.id, 'pending_verify' FROM agents a
+        WHERE a.role = 'producer'
+          AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+          AND a.umbrella_type IS NULL
+          AND NOT EXISTS (SELECT 1 FROM agent_knowledge k WHERE k.agent_id = a.id)`,
+    )
+    .run().changes;
+}
+
 // All hosts already carried by some OTHER agent's live agent_knowledge.website
 // — a candidate landing on one of these is never this row's own site (mirrors
 // gardssalgSharedHostCounts' role, re-implemented locally per the file
@@ -847,6 +877,10 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
   const notFound: string[] = [];
   const alreadyHasWebsite: Array<{ agent_id: string; agent_name: string; reason?: string }> = [];
   let targets: RfbWdTargetRow[] = [];
+  // Only assigned in blank mode's auto-select branch below; every other path
+  // (external_candidates, agentIds override, aggregator_replace) leaves this
+  // at 0 — see ensureRfbKnowledgeRowsForAutoSelectCohort's doc comment.
+  let knowledgeRowsCreated = 0;
 
   // ── External-candidate intake (punkt 4a) — mutually exclusive with every
   //    other selection path so a call's cohort is never ambiguous ───────────
@@ -950,6 +984,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       not_found: notFound,
       headless_fallback_attempted: fallbackCountersExt.attempted,
       headless_fallback_verified: fallbackCountersExt.verified,
+      knowledge_rows_created: 0,
     });
     return;
   }
@@ -1007,6 +1042,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         return true;
       });
     } else {
+      knowledgeRowsCreated = ensureRfbKnowledgeRowsForAutoSelectCohort(db);
       targets = selectRfbWebsiteDiscoveryTargets(db, limit);
       // Auto-select's own WHERE already excludes non-blank website, but the
       // check is repeated defensively so the two selection paths can never
@@ -1137,6 +1173,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     not_found: notFound,
     headless_fallback_attempted: fallbackCounters.attempted,
     headless_fallback_verified: fallbackCounters.verified,
+    knowledge_rows_created: knowledgeRowsCreated,
   });
 });
 
