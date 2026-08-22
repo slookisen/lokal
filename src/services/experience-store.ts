@@ -6408,12 +6408,51 @@ export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
     addHost(clean.join(""), "com");
   }
   // v3: three more free guesses, added AFTER v1/v2 so the cheaper/likelier
-  // ones are still tried first — (a) first-word-only (e.g. "Torgersen Gård"
-  // often really lives at torgersen.no, not torgersengard.no); (b) an
-  // ø→oe-alone label with å/æ left as raw diacritics that the ascii-strip
-  // below silently drops, a genuinely different shape from v1/v2; (c) one
-  // punycode/IDN guess for the small number of producers who registered the
-  // actual diacritic domain.
+  // ones are still tried first — (a) one punycode/IDN guess for the small
+  // number of producers who registered the actual diacritic domain (placed
+  // immediately after the base v1/v2 sources — NOT last — so it isn't
+  // starved out by slice(0, 10) once the first-word and ø→oe-alone sources
+  // below add their own entries for realistic 3+ token names; see the
+  // CHANGES-REQUESTED fix-up for the "Blåbær Gård Bryggeri" repro that
+  // dropped it when it was appended last); (b) first-word-only (e.g.
+  // "Torgersen Gård" often really lives at torgersen.no, not
+  // torgersengard.no); (c) an ø→oe-alone label with å/æ left as raw
+  // diacritics that the ascii-strip below silently drops, a genuinely
+  // different shape from v1/v2.
+  {
+    // The punycode candidate is built from the RAW joined tokens (so
+    // diacritics survive into the IDNA encoding step below), not through
+    // asciiClean — asciiClean strips non a-z0-9 characters, which would
+    // strip out æ/ø/å themselves and defeat the point of this source.
+    // Because the input isn't punctuation-stripped, domainToASCII (WHATWG
+    // non-strict) can pass stray ASCII punctuation (e.g. "&", "'") through
+    // into the encoded label verbatim instead of rejecting it — so the
+    // encoded label is validated as a legal DNS label (ASCII
+    // letters/digits/hyphens only) AFTER encoding. The >=4 floor is still
+    // applied to the RAW label first (same "is this a meaningful name at
+    // all" floor every other source in this function applies, e.g. addHost),
+    // but the <=63 DNS-octet ceiling is checked on the ENCODED label, since
+    // punycode encoding is always longer than its diacritic input and can
+    // cross the 63-octet wire limit even when the raw label was well within
+    // it — the raw label alone can't tell you whether the encoded form is a
+    // legal DNS label.
+    const rawLabel = tokens.join("");
+    if (rawLabel.length >= 4) {
+      const rawHost = `${rawLabel}.no`;
+      const punycodeHost = (require("node:url") as typeof import("node:url")).domainToASCII(rawHost);
+      const encodedLabel = punycodeHost.split(".")[0] || "";
+      if (
+        punycodeHost &&
+        punycodeHost !== rawHost &&
+        encodedLabel.startsWith("xn--") &&
+        /^[a-z0-9-]+$/i.test(encodedLabel) &&
+        encodedLabel.length <= 63 &&
+        !hosts.includes(punycodeHost)
+      ) {
+        hosts.push(punycodeHost);
+      }
+    }
+  }
   if (tokens.length > 1) {
     for (const translit of [translit1, translit2]) {
       addHost(asciiClean(translit(tokens[0])), "no");
@@ -6424,16 +6463,6 @@ export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
     if (clean.length > 0) {
       addHost(clean.join(""), "no");
       addHost(clean.join("-"), "no");
-    }
-  }
-  {
-    const rawLabel = tokens.join("");
-    if (rawLabel.length >= 4 && rawLabel.length <= 63) {
-      const rawHost = `${rawLabel}.no`;
-      const punycodeHost = (require("node:url") as typeof import("node:url")).domainToASCII(rawHost);
-      if (punycodeHost && punycodeHost !== rawHost && punycodeHost.split(".")[0]?.startsWith("xn--") && !hosts.includes(punycodeHost)) {
-        hosts.push(punycodeHost);
-      }
     }
   }
 

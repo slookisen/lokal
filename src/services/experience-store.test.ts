@@ -242,6 +242,34 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
       !plainHosts.some((h) => h.startsWith("xn--")),
       "gwch-3b: 'Ola Nordmann Gruppen AS' (no diacritics) → no punycode candidate (would just duplicate the plain label)",
     );
+
+    // gwch-4: CHANGES-REQUESTED fix-up, bug 1 — a realistic 3+ token name
+    // must NOT have its punycode candidate starved out by slice(0, 10).
+    // Before the fix-up the punycode source was appended LAST (after
+    // first-word and ø→oe-alone), so for 3-token names the first 10 slots
+    // were already filled by v1/v2/first-word/ø-oe-alone before the
+    // punycode push ever ran. It is now generated right after the base
+    // v1/v2 sources instead.
+    const blabaerBryggeriHosts = gardssalgWebsiteCandidateHosts("Blåbær Gård Bryggeri");
+    assertTrue(
+      blabaerBryggeriHosts.some((h) => h.startsWith("xn--") && h.endsWith(".no")),
+      "gwch-4: 'Blåbær Gård Bryggeri' (3 tokens, has diacritics) still yields a punycode/IDN candidate — regression guard for the reorder fixing bug 1 (previously starved out by slice(0, 10))",
+    );
+
+    // gwch-5: CHANGES-REQUESTED fix-up, bugs 2/3 — the punycode source must
+    // never leak a malformed "host" containing raw ASCII punctuation (bug 2)
+    // or exceed the 63-octet DNS label limit once IDNA-encoded (bug 3). This
+    // asserts the invariant for the WHOLE function's output, not just the
+    // punycode source: nothing outside [a-z0-9.-] may ever appear anywhere
+    // in the returned array.
+    const punctuationNames = ["Nordmann & Sønn Gård", "O'Brien Gård"];
+    for (const name of punctuationNames) {
+      const hosts = gardssalgWebsiteCandidateHosts(name);
+      assertTrue(
+        hosts.every((h) => /^[a-z0-9.-]+$/.test(h)),
+        `gwch-5: '${name}' → no malformed host containing anything outside [a-z0-9.-] appears anywhere in the returned array (got: ${JSON.stringify(hosts)})`,
+      );
+    }
   }
 
   // ── scanGardssalgProviderRowForMojibake (dev-request 2026-07-21-
