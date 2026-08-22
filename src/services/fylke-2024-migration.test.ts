@@ -15,6 +15,10 @@
  *   6. no input at all (neither field, or both blank) -> needs_review
  *      ("no_kommune_data")
  *   7. kommunenummer takes precedence over kommune when both are given
+ *   8. Sami kommune-name aliases (Kåfjord/Karasjok/Kautokeino ->
+ *      Gáivuotna/Kárášjohka/Guovdageaidnu), plus regression checks that the
+ *      canonical Sami names and the kommunenummer-based path both still
+ *      resolve unaffected
  *
  * Run standalone: npx tsx src/services/fylke-2024-migration.test.ts
  * Wired into tests/test.ts via runFylke2024MigrationTests().
@@ -146,6 +150,62 @@ export function runFylke2024MigrationTests(opts: { log?: boolean } = {}): TestSu
     resolveFylke2024({ kommunenummer: "9999", kommune: "Tromsø" }),
     { needs_review: "kommunenummer_not_found:9999" },
     "7b: an invalid kommunenummer reports needs_review even though a valid kommune was also given (kommunenummer takes precedence, never silently falls back)"
+  );
+
+  // ── 8. Sami kommune-name aliases ──────────────────────────────────────
+  assertEq(
+    resolveFylke2024({ kommune: "Kåfjord" }),
+    { fylke: "Troms" },
+    "8a: kommune 'Kåfjord' (Norwegian name, vendored table only has Sami 'Gáivuotna') resolves to {fylke: 'Troms'}"
+  );
+  assertEq(
+    resolveFylke2024({ kommune: "Karasjok" }),
+    { fylke: "Finnmark" },
+    "8b: kommune 'Karasjok' (Norwegian name, vendored table only has Sami 'Kárášjohka') resolves to {fylke: 'Finnmark'}"
+  );
+  assertEq(
+    resolveFylke2024({ kommune: "Kautokeino" }),
+    { fylke: "Finnmark" },
+    "8c: kommune 'Kautokeino' (Norwegian name, vendored table only has Sami 'Guovdageaidnu') resolves to {fylke: 'Finnmark'}"
+  );
+  assertEq(
+    resolveFylke2024({ kommune: "kafjord" }),
+    { fylke: "Troms" },
+    "8d: the Norwegian-name alias is case/diacritic-insensitive ('kafjord' still resolves via kommuneKey's å->a fold)"
+  );
+  // Regression: the canonical Sami primary names must still resolve directly
+  // and unaffected by the alias fold.
+  assertEq(
+    resolveFylke2024({ kommune: "Gáivuotna" }),
+    { fylke: "Troms" },
+    "8e: canonical Sami name 'Gáivuotna' still resolves directly to {fylke: 'Troms'} (unaffected by the alias)"
+  );
+  assertEq(
+    resolveFylke2024({ kommune: "Kárášjohka" }),
+    { fylke: "Finnmark" },
+    "8f: canonical Sami name 'Kárášjohka' still resolves directly to {fylke: 'Finnmark'} (unaffected by the alias)"
+  );
+  assertEq(
+    resolveFylke2024({ kommune: "Guovdageaidnu" }),
+    { fylke: "Finnmark" },
+    "8g: canonical Sami name 'Guovdageaidnu' still resolves directly to {fylke: 'Finnmark'} (unaffected by the alias)"
+  );
+  // Regression: the kommunenummer-based path (already working before this
+  // change) must remain unaffected.
+  assertEq(
+    resolveFylke2024({ kommunenummer: "5540" }),
+    { fylke: "Troms" },
+    "8h: kommunenummer 5540 (Gáivuotna/Kåfjord) resolves to {fylke: 'Troms'} — kommunenummer path unaffected"
+  );
+  assertEq(
+    resolveFylke2024({ kommunenummer: "5610" }),
+    { fylke: "Finnmark" },
+    "8i: kommunenummer 5610 (Kárášjohka/Karasjok) resolves to {fylke: 'Finnmark'} — kommunenummer path unaffected"
+  );
+  assertEq(
+    resolveFylke2024({ kommunenummer: "5612" }),
+    { fylke: "Finnmark" },
+    "8j: kommunenummer 5612 (Guovdageaidnu/Kautokeino) resolves to {fylke: 'Finnmark'} — kommunenummer path unaffected"
   );
 
   return { passed, failed, failures };

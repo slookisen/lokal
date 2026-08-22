@@ -89,6 +89,18 @@ function kommuneKey(name: string): string {
   return fylkeKey(stripKommuneDisambiguator(name));
 }
 
+// Kommuner the vendored table lists ONLY under their Sami primary name — the
+// everyday Norwegian name a geocoder/manual `kommune` entry would typically
+// carry instead. 1:1, unambiguous (unlike Herøy/Våler) — safe to fold in
+// before the name-match below. Source: 2026-08-07 fylke-2024-migration
+// close-out residual analysis (grep on the source CSV confirmed no Norwegian-
+// name entry exists for these three).
+const KOMMUNE_NAME_ALIASES: Record<string, string> = {
+  [kommuneKey("Kåfjord")]: kommuneKey("Gáivuotna"),
+  [kommuneKey("Karasjok")]: kommuneKey("Kárášjohka"),
+  [kommuneKey("Kautokeino")]: kommuneKey("Guovdageaidnu"),
+};
+
 /**
  * resolveFylke2024(opts) — resolve the correct 2024-era fylke for one row,
  * given whatever location data it carries. Never guesses:
@@ -119,8 +131,12 @@ export function resolveFylke2024(opts: {
 
   if (kommune) {
     const rows = loadRows();
-    const qKey = kommuneKey(kommune);
+    let qKey = kommuneKey(kommune);
     if (!qKey) return { needs_review: "no_kommune_data" };
+    // Fold a Norwegian name onto its Sami-primary-name counterpart (the form
+    // actually present in the vendored table) BEFORE matching — see
+    // KOMMUNE_NAME_ALIASES above.
+    if (qKey in KOMMUNE_NAME_ALIASES) qKey = KOMMUNE_NAME_ALIASES[qKey];
     const matches = rows.filter((r) => r && typeof r.kommunenavn === "string" && kommuneKey(r.kommunenavn) === qKey);
     // Exactly one row-name-key match -> resolved. Zero (unknown kommune) or
     // more than one (a genuine vendored-table name collision, e.g. Herøy /
