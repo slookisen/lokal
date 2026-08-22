@@ -1348,10 +1348,27 @@ export function applyRfbAgentWebsite(
   return result;
 }
 
+// Auto-select mode (dev-request 2026-08-22-rfb-website-review-auto-approve):
+// a mutually-exclusive `{"auto": true, "apply"?, "min_confidence"?}` request
+// mode that server-side-selects queued candidates instead of trusting a
+// client-supplied `approvals` list, then runs them through the SAME
+// unchanged write loop below — mirrors the gårdssalg twin
+// (POST /admin/gardssalg-website-review-approve, opplevelser.ts,
+// GARDSSALG_AUTO_APPROVE_BATCH_CAP) byte-for-byte in shape, adapted to this
+// route's own agent_id/candidate_url/final_url/batch_id naming. `min_confidence`
+// defaults to 0.95 (NOT the gårdssalg twin's 1.0) — rfbWdConfidence's own
+// scale for THIS table grants 1.0 for org.nr evidence and 0.95 for phone
+// evidence, so a >=0.95 floor captures BOTH tiers, exactly the backlog
+// dev-request's own bar: "konfidens ≥0.95 (org.nr- eller telefon-evidens på
+// siden) auto-approves".
+// Capped to RFB_WD_AUTO_APPROVE_BATCH_CAP so one call's blast radius stays
+// bounded even though each item here is only a DB write.
+export const RFB_WD_AUTO_APPROVE_BATCH_CAP = 30;
+
 router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown; auto?: unknown; min_confidence?: unknown };
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -1361,13 +1378,68 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
     req.query?.apply === "true";
   const dryRun = !apply;
 
-  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
-    res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {agent_id, url}" });
+  const auto = body.auto === true;
+  if (auto && Array.isArray(body.approvals) && body.approvals.length > 0) {
+    res.status(400).json({ error: "cannot combine 'auto' and 'approvals' in the same call" });
     return;
   }
-  if (body.approvals.length > 200) {
-    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
-    return;
+
+  let minConfidence = 0.95;
+  if (auto) {
+    if (body.min_confidence !== undefined) {
+      const mc = body.min_confidence;
+      if (typeof mc !== "number" || !Number.isFinite(mc) || mc < 0 || mc > 1) {
+        res.status(400).json({ error: "min_confidence must be a number in [0,1]" });
+        return;
+      }
+      minConfidence = mc;
+    }
+  } else {
+    if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+      res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {agent_id, url}" });
+      return;
+    }
+    if (body.approvals.length > 200) {
+      res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+      return;
+    }
+  }
+
+  // Queue queried BEFORE the write-pause gate (reordered from the pre-auto
+  // version of this route) so `auto` mode has a `pending` cohort to select
+  // from before the pause check needs the selected agent_ids to check
+  // against — non-auto mode's pause check still runs over the same
+  // client-supplied `body.approvals` it always did, just after this query
+  // instead of before it (the query itself has no side effect either mode
+  // needs gated).
+  const db = getDb();
+  ensureRfbWebsiteReviewQueueTable(db);
+  const pending = db
+    .prepare(`SELECT * FROM agents_website_review_queue WHERE status = 'pending'`)
+    .all() as Array<{
+    agent_id: string;
+    candidate_url: string;
+    final_url: string | null;
+    batch_id: string | null;
+    confidence: number | null;
+    updated_at: string;
+  }>;
+  const byAgent = new Map(pending.map((q) => [q.agent_id, q]));
+
+  // Server-side selection for auto mode — NEVER a client-supplied list in
+  // this mode.
+  let candidatesConsidered = 0;
+  let approvalsInput: unknown[];
+  if (auto) {
+    const qualifying = pending
+      .filter((q) => q.confidence !== null && q.confidence !== undefined && q.confidence >= minConfidence)
+      .sort((a, b) => (a.updated_at < b.updated_at ? -1 : a.updated_at > b.updated_at ? 1 : 0));
+    candidatesConsidered = qualifying.length;
+    approvalsInput = qualifying
+      .slice(0, RFB_WD_AUTO_APPROVE_BATCH_CAP)
+      .map((q) => ({ agent_id: q.agent_id, url: q.candidate_url }));
+  } else {
+    approvalsInput = body.approvals as unknown[];
   }
 
   // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
@@ -1376,14 +1448,15 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
   // `POST $BASE/admin/rfb-website-review-approve?apply=1`). Gated on the
   // APPLY path only — a dry run performs no write at all, and leaving it
   // reachable during a pause is what lets an operator still MEASURE the queue
-  // while writes are frozen. Gated per-REQUEST over every agent_id named in
-  // the body, so a batch spanning a paused vertical is blocked whole: zero
-  // writes, not a partially-applied batch. `getDb` passed as a thunk so a
-  // getDb() throw also fails closed here.
+  // while writes are frozen. Gated per-REQUEST over every agent_id in
+  // `approvalsInput` (the auto-selected list in auto mode, the client-
+  // supplied list otherwise), so a batch spanning a paused vertical is
+  // blocked whole: zero writes, not a partially-applied batch. `getDb`
+  // passed as a thunk so a getDb() throw also fails closed here.
   if (apply) {
     const pauseBlock = enrichmentWritePauseBlockForAgents(
       getDb,
-      (body.approvals as unknown[]).map((raw) => {
+      approvalsInput.map((raw) => {
         const id = (raw as { agent_id?: unknown } | null)?.agent_id;
         return typeof id === "string" ? id : "";
       }),
@@ -1394,19 +1467,12 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
     }
   }
 
-  const db = getDb();
-  ensureRfbWebsiteReviewQueueTable(db);
-  const pending = db
-    .prepare(`SELECT * FROM agents_website_review_queue WHERE status = 'pending'`)
-    .all() as Array<{ agent_id: string; candidate_url: string; final_url: string | null; batch_id: string | null }>;
-  const byAgent = new Map(pending.map((q) => [q.agent_id, q]));
-
   const seen = new Set<string>();
   const approved: Array<{ agent_id: string; url: string }> = [];
   const written: Array<{ agent_id: string; url: string }> = [];
   const rejected: Array<{ agent_id: string; reason: string }> = [];
 
-  for (const raw of body.approvals as unknown[]) {
+  for (const raw of approvalsInput) {
     const a = raw as { agent_id?: unknown; url?: unknown };
     const aid = typeof a?.agent_id === "string" ? a.agent_id.trim() : "";
     const url = typeof a?.url === "string" ? a.url.trim() : "";
@@ -1457,6 +1523,7 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
     written_count: written.length,
     written,
     rejected,
+    ...(auto ? { mode: "auto" as const, min_confidence: minConfidence, candidates_considered: candidatesConsidered } : {}),
   });
 });
 
