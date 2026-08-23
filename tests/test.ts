@@ -40129,3 +40129,26 @@ runSerial(async () => {
     failures.push("about-source-substantiation: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: RFB's
+// second (lower-bar) verification line + the paraply(umbrella)-routing
+// guard, both gated behind RFB_SECOND_LINE_VERIFICATION_ENABLED (default
+// OFF). Own harness: in-memory better-sqlite3 DB + __setDbForTesting /
+// __initSchemaForTesting (same seam as lokal-agent-verifier-pending-verify-
+// parking.test.ts), restored in `finally`. Tail position is the convention
+// for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: RFB second verification line + paraply-routing guard ──");
+  try {
+    const { runLokalAgentVerifierSecondLineTests } = require("../src/agents/lokal-agent-verifier-second-line.test") as
+      typeof import("../src/agents/lokal-agent-verifier-second-line.test");
+    const sl = await runLokalAgentVerifierSecondLineTests({ log: false });
+    passed += sl.passed;
+    failed += sl.failed;
+    for (const f of sl.failures) failures.push("lokal-agent-verifier-second-line: " + f);
+    console.log(`  lokal-agent-verifier-second-line: ${sl.passed} passed, ${sl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-second-line: unexpected error: " + String(err?.message || err));
+  }
+});

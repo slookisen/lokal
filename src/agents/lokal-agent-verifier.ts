@@ -26,6 +26,7 @@ import {
   hasHomepageEvidence,
   hostFromUrlLike,
   registrableDomain,
+  coerceProvenanceToArrayShape,
   FREE_MAIL_DOMAINS,
   type FieldName,
   type ProvenanceRecord,
@@ -38,6 +39,14 @@ import {
 // agents.contact_email, rather than hand-rolling new ones for
 // agent_knowledge.email. See the Steg B block in runVerifierBatch for why.
 import { isPlatformOwnedEmailDomain, isSyntacticallyValidEmail } from "../routes/admin-agents-contact-email-write";
+// dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: the RFB
+// second verification line (Fase-1, items 1+2). classifyContactCandidateDefect
+// is reused AS-IS for the second line's junk-email backstop (favicon local-
+// parts / icon-extension TLDs / basic structural parsing) — see the "Guard
+// #4" block in runVerifierBatch — rather than re-deriving that detection.
+import { classifyContactCandidateDefect } from "../services/contact-candidate-judge";
+import { judgeSecondLineProfile, type SecondLineProfileJudgeVerdict } from "../services/second-line-profile-judge";
+import { scoreNameMatch } from "../services/brreg-client";
 
 export interface VerifierResult {
   agent_id: string;
@@ -68,6 +77,11 @@ export interface VerifierResult {
   // that case is counted/reported but never changes the outcome.
   email_ownership_unproven: boolean;
   email_ownership_report_only: boolean;
+  // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: true
+  // iff THIS run promoted the agent to 'verified' via the second (lower-
+  // bar) line rather than first-line + cross-source. Always false when
+  // RFB_SECOND_LINE_VERIFICATION_ENABLED is unset/not "true".
+  verified_second_line: boolean;
   // agent display name, carried through so buildRunEnvelope can surface
   // report-only examples as {agent_id, name} without a second DB read.
   agent_name: string | null;
@@ -85,6 +99,14 @@ export interface BrregLookupResult {
   is_active: boolean;
   is_konkurs: boolean;
   naering?: string | null;
+  // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: the
+  // registered Brreg name (foretaksnavn), optional and additive — existing
+  // callers/tests that build a BrregLookupResult without it are unaffected
+  // (computeKvalitetsGate itself never reads this field). Used ONLY by the
+  // second verification line's computeSecondLineIdentitySources to detect a
+  // "Brreg name-match" accepted identity source, via brreg-client.ts's
+  // existing scoreNameMatch — reused, not re-implemented.
+  navn?: string | null;
 }
 
 // NACE-blacklist (Phase 5.5 — surfaces here as advisory flags).
@@ -701,6 +723,14 @@ export function applyVerifierOutcome(
     // are left untouched so the existing test-suite is not broken).
     url_last_probed?: string | null;
     url_last_status?: number | null;
+    // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel
+    // (guardrail b): when set, permanently stamps this agent as having
+    // been verified via the SECOND (lower-bar) line rather than the first
+    // — see the dedicated best-effort write block below. Omitted (or
+    // false) on every call from the flag-off / first-line-only path, so
+    // those columns are simply never touched then.
+    verified_second_line?: boolean;
+    second_line_sources?: string[];
   }
 ): void {
   if (outcome.url_last_probed !== undefined || outcome.url_last_status !== undefined) {
@@ -814,6 +844,34 @@ export function applyVerifierOutcome(
   } catch {
     // pending_verify parking columns not present in this DB — skip.
   }
+
+  // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel
+  // (guardrail b): permanent second-line provenance stamp. Only ever SETS
+  // the columns (never resets them back to 0/NULL) — the marker's whole
+  // purpose is to stay "permanently distinguishable from first-line
+  // verified agents" even if a later run also clears first-line on its own
+  // merits, so Daniel's manual-sampling process (guardrail c) can always
+  // find every agent that was EVER promoted via the lower-bar line.
+  // Best-effort / try-catch, same convention as the two blocks above — the
+  // columns are added by an idempotent ALTER (src/database/init.ts) and
+  // may be absent in minimal test-harness schemas.
+  if (outcome.verified_second_line) {
+    try {
+      db.prepare(
+        `UPDATE agent_knowledge SET
+           verified_second_line       = 1,
+           verified_second_line_at    = ?,
+           verified_second_line_sources = ?
+         WHERE agent_id = ?`
+      ).run(
+        outcome.runStartedAt,
+        JSON.stringify(outcome.second_line_sources ?? []),
+        agentId
+      );
+    } catch {
+      // verified_second_line columns not present in this DB — skip.
+    }
+  }
 }
 
 // ─── PR-21 / WO-19 (2026-05-10): standalone url_last_probe writer ──
@@ -868,7 +926,7 @@ export function deriveVerificationStatus(
   passes: boolean,
   flags: string[],
   cross_source_verdict?: CrossSourceVerdict | boolean
-): "verified" | "review_required" | "pending_verify" | "data_insufficient" {
+): "verified" | "review_required" | "pending_verify" | "data_insufficient" | "paraply_epost_mangler" {
   if (!passes) {
     // Basic gate failed — reviewable if NACE/Brreg issues, otherwise retry
     if (flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive")) {
@@ -891,6 +949,287 @@ export function deriveVerificationStatus(
   return "verified";
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ─── RFB second verification line (dev-request 2026-08-23-rfb-andrelinje-
+//     verifisering-lav-terskel, Fase-1 items 1+2) ─────────────────────────
+//
+// A second, LOWER-BAR verification line, attempted ONLY when the first
+// line (computeKvalitetsGate above) did NOT pass — i.e. only for producers
+// who would otherwise land in pending_verify/review_required/
+// data_insufficient. It exists so a producer with no live website — but a
+// plausible own-domain-or-free-mail email plus at least one corroborating
+// identity source — can still be verified and contacted. First-line logic,
+// thresholds and behaviour are UNTOUCHED by any of this: everything below
+// is a strictly ADDITIVE overlay, gated end-to-end behind the
+// RFB_SECOND_LINE_VERIFICATION_ENABLED env flag (read at call time in
+// runVerifierBatch — see the flag-off byte-identical contract there).
+//
+// Guardrail (f) — NACE-blacklist / Brreg-deleted-or-bankrupt disqualifies
+// on BOTH lines, no exceptions: this is enforced by REUSING
+// computeKvalitetsGate's own `gate.reasons.no_wrong_fit` /
+// `gate.reasons.brreg_active` (computed once per agent either way) — never
+// re-implemented here. See computeSecondLineVerification below.
+
+/**
+ * Curated umbrella/trade-association email-routing domains for RFB
+ * producers (dev-request item 2, "paraply-routing"). Deliberately a
+ * CURATED subset — not every KNOWN_DIRECTORY_HOSTS entry (cross-source-
+ * validator.ts) is a membership/trade organisation in this sense (e.g.
+ * facebook.com/tripadvisor.com are generic listing platforms, never a
+ * producer's own parent org) — chosen from the RFB-relevant subset of that
+ * same curated list (market-network / trade-body hosts already referenced
+ * there), mirroring the sibling opplevagent-side precedent for this exact
+ * policy (src/services/experience-store.ts's UMBRELLA_EMAIL_DOMAINS /
+ * isUmbrellaContactEmail, "e-post til DEM, aldri til paraplyen").
+ *
+ * KNOWN LIMITATION (documented per the dev-request's own instruction): this
+ * static list is a narrow, explicit fallback for producers with no
+ * `agent_affiliations` row yet. The PRIMARY signal is schema-based — see
+ * isParaplyRoutedEmail's `affiliatedUmbrellaDomains` parameter, populated
+ * in runVerifierBatch from an active agent_affiliations link to an
+ * umbrella agent's own domain (a genuine per-agent "this email belongs to
+ * an umbrella" signal already in the schema, not invented here). This
+ * static list is defence-in-depth for the (likely common, today) case
+ * where no affiliation row exists yet. A future slice could grow this list
+ * from confirmed incidents the way experience-store.ts's sibling list
+ * documents each entry's evidence — left minimal here per the spec's
+ * explicit "narrowest possible check" instruction.
+ */
+export const RFB_PARAPLY_EMAIL_DOMAINS: ReadonlySet<string> = new Set([
+  "hanen.no",
+  "bondensmarked.no",
+  "bondensmarkedtroms.no",
+  "bondesmarked.no",
+  "rekonorge.no",
+  "rekoring.no",
+  "reko.no",
+  "mathallenoslo.no",
+]);
+
+/**
+ * True when `email`'s registrable domain is a known umbrella/trade-
+ * association inbox — either the curated static fallback
+ * (RFB_PARAPLY_EMAIL_DOMAINS) or one of `affiliatedUmbrellaDomains` (the
+ * schema-based signal: domains of umbrella agents this producer has an
+ * ACTIVE agent_affiliations link to, resolved by the caller). A blank/
+ * malformed email is never "paraply" (it simply is not an address — that
+ * is the junk-email backstop's job, not this one's).
+ */
+export function isParaplyRoutedEmail(
+  email: string | null | undefined,
+  affiliatedUmbrellaDomains: readonly string[] = []
+): boolean {
+  const dom = emailDomain(email ?? null);
+  if (!dom) return false;
+  const matchesSet = (set: Iterable<string>) =>
+    Array.from(set).some((u) => dom === u || dom.endsWith(`.${u}`));
+  if (matchesSet(RFB_PARAPLY_EMAIL_DOMAINS)) return true;
+  return matchesSet(affiliatedUmbrellaDomains.filter((d): d is string => !!d));
+}
+
+/**
+ * getAffiliatedUmbrellaDomains — the SCHEMA-BASED half of item 2's paraply
+ * signal: registrable domains of every umbrella agent this producer has an
+ * ACTIVE agent_affiliations link to (Phase 5.11's producer↔umbrella model —
+ * see database/init.ts's "Umbrella agents schema" migration). Resolved via
+ * the umbrella agent's OWN `agents.url` — its own homepage/contact domain —
+ * the same host-extraction helpers (hostFromUrlLike/registrableDomain)
+ * domain-coherence already uses elsewhere in this file. Only ever called
+ * when the second line is enabled (see the flag-off byte-identical
+ * contract on runVerifierBatch); a throwing/missing table is swallowed so a
+ * DB without Phase 5.11's schema degrades to "no affiliation-based
+ * domains" rather than failing the whole verifier run.
+ */
+export function getAffiliatedUmbrellaDomains(db: any, producerId: string): string[] {
+  try {
+    const rows = db
+      .prepare(
+        `SELECT au.url AS umbrella_url
+           FROM agent_affiliations aff
+           JOIN agents au ON au.id = aff.umbrella_id
+          WHERE aff.producer_id = ?
+            AND aff.status = 'active'`
+      )
+      .all(producerId) as Array<{ umbrella_url: string | null }>;
+    const domains = new Set<string>();
+    for (const r of rows) {
+      if (!r.umbrella_url) continue;
+      const host = hostFromUrlLike(r.umbrella_url);
+      const root = host ? registrableDomain(host) : null;
+      if (root) domains.add(root);
+    }
+    return Array.from(domains);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * computeSecondLineIdentitySources — requirement 3: at least one ACCEPTED
+ * identity source must fire for the second line to even be attempted.
+ * Deterministic, pure. Sources recognised:
+ *   - own_website        : gate.reasons.website_ok was true (a live site
+ *                          exists — just not enough on its own to clear
+ *                          first line, e.g. thin content or a cross-source
+ *                          miss).
+ *   - facebook_official_page : any field_provenance record carries
+ *                          source_type === "facebook_official_page" (the
+ *                          same Tier-B source_type TIER_B/init.ts's PR23
+ *                          backfill already write — see database/init.ts
+ *                          ~L2333-2432).
+ *   - hanen_no / bondensmarked_no : any field_provenance record's
+ *                          source_url resolves (via the SAME
+ *                          hostFromUrlLike/registrableDomain helpers
+ *                          domain-coherence already uses) to hanen.no /
+ *                          bondensmarked.no — independent of whatever
+ *                          source_type string was used to write it.
+ *   - brreg_name_match    : brreg.navn (Brreg's registered name) scores
+ *                          ≥0.80 against the producer's platform name via
+ *                          brreg-client.ts's existing scoreNameMatch
+ *                          (first-token match, reused not re-implemented).
+ *
+ * The "≥2 signals (name+place OR name+org-nr)" strength requirement for
+ * whichever source fires is a JUDGMENT call, not a regex — deliberately
+ * left to judgeSecondLineProfile's explicit identity-reasoning rubric
+ * (see that module's prompt) rather than hand-rolled here, for the same
+ * reason contact-candidate-judge.ts leaves "is this really evidence for
+ * THIS entity" to the LLM: a deterministic version would just be
+ * regex-testing for a city-name substring, which is exactly the
+ * generic/wrong-entity trap the whole-profile judge exists to catch.
+ */
+export function computeSecondLineIdentitySources(input: {
+  website_ok: boolean;
+  field_provenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>;
+  brreg: BrregLookupResult | null;
+  producer_name: string | null;
+}): string[] {
+  const sources = new Set<string>();
+  if (input.website_ok) sources.add("own_website");
+
+  let coerced: Record<string, ProvenanceRecord[]> = {};
+  try {
+    coerced = coerceProvenanceToArrayShape(input.field_provenance as Record<string, unknown>);
+  } catch {
+    coerced = {};
+  }
+  for (const field of Object.keys(coerced)) {
+    for (const rec of coerced[field] ?? []) {
+      const r = rec as Partial<ProvenanceRecord> | null | undefined;
+      if (!r || typeof r !== "object") continue;
+      if (r.source_type === "facebook_official_page") sources.add("facebook_official_page");
+      if (typeof r.source_url === "string" && r.source_url) {
+        const host = hostFromUrlLike(r.source_url);
+        const root = host ? registrableDomain(host) : null;
+        if (root === "hanen.no") sources.add("hanen_no");
+        if (root === "bondensmarked.no") sources.add("bondensmarked_no");
+      }
+    }
+  }
+
+  if (input.brreg?.navn && input.producer_name) {
+    const score = scoreNameMatch(input.producer_name, input.brreg.navn, null, null);
+    if (score >= 0.8) sources.add("brreg_name_match");
+  }
+
+  return Array.from(sources);
+}
+
+export interface SecondLineGateResult {
+  passes: boolean;
+  reasons: {
+    nace_brreg_ok: boolean;
+    email_present: boolean;
+    email_not_junk: boolean;
+    email_not_paraply: boolean;
+    has_accepted_source: boolean;
+    judge_approved: boolean;
+  };
+  sources: string[];
+  judge_reason?: string;
+}
+
+/**
+ * computeSecondLineVerification — the composed second-line gate. ALL of
+ * the following must hold for `passes: true`:
+ *   (f) gate_reasons.no_wrong_fit && gate_reasons.brreg_active — REUSED
+ *       verbatim from computeKvalitetsGate's own output, never
+ *       re-implemented (requirement f, binding).
+ *   1. an email is present, is not junk (classifyContactCandidateDefect,
+ *      reused from contact-candidate-judge.ts) and is not paraply-routed
+ *      (item 2 — a paraply email can NEVER pass the second line either).
+ *   3. computeSecondLineIdentitySources(...) returns ≥1 accepted source.
+ *   2. judgeSecondLineProfile approves (whole-profile identity reasoning;
+ *      fail-closed — see that module's own contract). The judge is ONLY
+ *      ever called once the three deterministic checks above already
+ *      hold, mirroring gateContactCandidates' "cheap backstop first, LLM
+ *      only if it could still matter" cost-control ordering.
+ *
+ * `judgeFn` is injectable purely for test isolation (mirrors
+ * runVerifierBatch's own opts.headProbe/opts.brregLookup injection
+ * pattern) — defaults to the real judgeSecondLineProfile.
+ */
+export async function computeSecondLineVerification(input: {
+  producer_name: string | null;
+  city: string | null;
+  about: string | null;
+  products: unknown[];
+  email: string | null;
+  field_provenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>;
+  brreg: BrregLookupResult | null;
+  gate_reasons: { website_ok: boolean; no_wrong_fit: boolean; brreg_active: boolean };
+  affiliated_umbrella_domains?: readonly string[];
+  judgeFn?: (params: {
+    businessName: string;
+    city: string | null;
+    about: string | null;
+    products: unknown[];
+    email: string;
+    acceptedSources: readonly string[];
+    brregName?: string | null;
+  }) => Promise<SecondLineProfileJudgeVerdict>;
+}): Promise<SecondLineGateResult> {
+  const nace_brreg_ok = input.gate_reasons.no_wrong_fit && input.gate_reasons.brreg_active;
+
+  const email = (input.email ?? "").trim() || null;
+  const email_present = !!email;
+  const email_not_junk = email_present && !classifyContactCandidateDefect("email", email!).defective;
+  const email_not_paraply = email_present && !isParaplyRoutedEmail(email, input.affiliated_umbrella_domains ?? []);
+
+  const sources = computeSecondLineIdentitySources({
+    website_ok: input.gate_reasons.website_ok,
+    field_provenance: input.field_provenance,
+    brreg: input.brreg,
+    producer_name: input.producer_name,
+  });
+  const has_accepted_source = sources.length > 0;
+
+  const deterministicOk = nace_brreg_ok && email_present && email_not_junk && email_not_paraply && has_accepted_source;
+
+  let judge_approved = false;
+  let judge_reason: string | undefined;
+  if (deterministicOk) {
+    const judgeFn = input.judgeFn ?? judgeSecondLineProfile;
+    const verdict = await judgeFn({
+      businessName: input.producer_name || "Ukjent produsent",
+      city: input.city,
+      about: input.about,
+      products: input.products,
+      email: email!,
+      acceptedSources: sources,
+      brregName: input.brreg?.navn ?? null,
+    });
+    judge_approved = verdict.approved;
+    judge_reason = verdict.reason;
+  }
+
+  return {
+    passes: deterministicOk && judge_approved,
+    reasons: { nace_brreg_ok, email_present, email_not_junk, email_not_paraply, has_accepted_source, judge_approved },
+    sources,
+    judge_reason,
+  };
+}
+
 // Main loop. Caller (Fly Machine job, test, or manual) provides a
 // brregLookup function (or null to skip Brreg).
 export async function runVerifierBatch(opts: {
@@ -901,6 +1240,11 @@ export async function runVerifierBatch(opts: {
   // PR-27: Optional override for the candidate-picker. Defaults to
   // pickBatch. Pass pickReviewQueueBatch to drain the review queue.
   pickFn?: (db: any, limit?: number) => any[];
+  // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: test
+  // seam ONLY — lets tests inject a mock judge without a real
+  // ANTHROPIC_API_KEY / network call. Never used in production (production
+  // always uses the real judgeSecondLineProfile).
+  secondLineJudgeFn?: Parameters<typeof computeSecondLineVerification>[0]["judgeFn"];
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -911,6 +1255,17 @@ export async function runVerifierBatch(opts: {
   const limit = opts.batchSize ?? 30;
   const startedAt = new Date().toISOString();
   const runId = `run-${startedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-rfb`;
+
+  // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: default
+  // OFF, read from process.env AT CALL TIME (mirrors the existing
+  // DOMAIN_RECONCILIATION_PARKING_DISABLED / PENDING_VERIFY_PARKING_DISABLED
+  // idiom in this same file — toggling never needs a restart). When this is
+  // NOT exactly "true", the entire second-line + paraply-routing block
+  // below is skipped in full for every agent: no extra judge calls, no
+  // extra DB reads/writes, no change whatsoever to `newVerification` beyond
+  // what first-line + the existing guards already compute — i.e. BYTE-
+  // IDENTICAL to pre-this-PR behaviour.
+  const secondLineEnabled = process.env.RFB_SECOND_LINE_VERIFICATION_ENABLED === "true";
 
   const pickFn = opts.pickFn ?? pickBatch;
   const candidates = pickFn(db, limit);
@@ -1273,6 +1628,82 @@ export async function runVerifierBatch(opts: {
       );
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // ─── RFB second verification line + paraply-routing guard (dev-request
+    //     2026-08-23-rfb-andrelinje-verifisering-lav-terskel, Fase-1 items
+    //     1+2) — strictly ADDITIVE overlay on top of everything above.
+    // Skipped in FULL — zero judge calls, zero extra DB reads/writes, zero
+    // change to `newVerification` beyond what first-line + the existing
+    // guards already computed — whenever RFB_SECOND_LINE_VERIFICATION_ENABLED
+    // is not exactly "true". This is what makes flag-off behaviour byte-
+    // identical to pre-this-PR runVerifierBatch.
+    // ═══════════════════════════════════════════════════════════════════
+    let verifiedSecondLine = false;
+    let secondLineSources: string[] = [];
+    if (secondLineEnabled) {
+      const affiliatedUmbrellaDomains = getAffiliatedUmbrellaDomains(db, agent.id);
+
+      // Item 1 — second line, only attempted when first line did NOT pass
+      // (gate.passes === false — the exact trigger condition the spec
+      // names; an agent that cleared computeKvalitetsGate but got
+      // downgraded by a LATER guard above never reaches this branch).
+      if (!gate.passes) {
+        const secondLine = await computeSecondLineVerification({
+          producer_name: agent.name ?? null,
+          city: agent.location_city ?? null,
+          about: agent.about,
+          products,
+          email: agent.email,
+          field_provenance: fieldProv,
+          brreg,
+          gate_reasons: {
+            website_ok: gate.reasons.website_ok,
+            no_wrong_fit: gate.reasons.no_wrong_fit,
+            brreg_active: gate.reasons.brreg_active,
+          },
+          affiliated_umbrella_domains: affiliatedUmbrellaDomains,
+          judgeFn: opts.secondLineJudgeFn,
+        });
+        (crossSourceResults as Record<string, unknown>).second_line = {
+          attempted: true,
+          passes: secondLine.passes,
+          reasons: secondLine.reasons,
+          sources: secondLine.sources,
+          judge_reason: secondLine.judge_reason,
+        };
+        if (secondLine.passes) {
+          verifiedSecondLine = true;
+          secondLineSources = secondLine.sources;
+          newVerification = "verified";
+          console.log(
+            `[verifier] ${agent.id} (${agent.name ?? "?"}) second-line verified (sources: ${secondLine.sources.join(", ") || "none"})`,
+          );
+        }
+      }
+
+      // Item 2 — paraply-routing guard. Applies to EITHER line's outcome —
+      // a paraply-routed contact email must NEVER yield 'verified', and per
+      // the dev-request's own wording ("...instead of leaving the agent at
+      // whatever it would otherwise be, whenever this specific condition is
+      // hit") this is an UNCONDITIONAL override, not only a downgrade of a
+      // would-be 'verified': whatever newVerification currently holds
+      // (pending_verify / review_required / data_insufficient / verified),
+      // a paraply-routed email replaces it with the first-class
+      // 'paraply_epost_mangler' status so the daily brief can surface
+      // "needs a real, own contact address" as its own actionable bucket
+      // rather than it being buried inside a generic pending/review count.
+      if (isParaplyRoutedEmail(agent.email, affiliatedUmbrellaDomains)) {
+        newVerification = "paraply_epost_mangler";
+        verifiedSecondLine = false;
+        secondLineSources = [];
+        gate.flags.push("paraply_epost_mangler");
+        (crossSourceResults as Record<string, unknown>).paraply_epost_mangler = true;
+        console.log(
+          `[verifier] ${agent.id} (${agent.name ?? "?"}) paraply-routed email — verification_status=paraply_epost_mangler`,
+        );
+      }
+    }
+
     const nowInPool = newVerification === "verified" && newEnrichment !== "thin";
     const eligibleAt = nowInPool && !wasInPool ? startedAt : null;
 
@@ -1285,6 +1716,8 @@ export async function runVerifierBatch(opts: {
       cross_source_reason: crossSourceResults,
       url_last_probed: probeResult ? startedAt : null,
       url_last_status: probeResult ? probeResult.status : null,
+      verified_second_line: verifiedSecondLine,
+      second_line_sources: secondLineSources,
     });
 
     results.push({
@@ -1305,6 +1738,7 @@ export async function runVerifierBatch(opts: {
       domain_incoherent: !coherence.coherent,
       email_ownership_unproven: emailOwnershipUnproven,
       email_ownership_report_only: emailOwnershipReportOnly,
+      verified_second_line: verifiedSecondLine,
       agent_name: agent.name ?? null,
       prior_verification_status: agent.verification_status,
     });
@@ -1353,6 +1787,11 @@ export function buildRunEnvelope(input: {
   const emailOwnershipReportOnlyExamples = emailOwnershipReportOnlyResults
     .slice(0, 5)
     .map((x) => ({ agent_id: x.agent_id, name: x.agent_name }));
+  // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel: always
+  // 0 when the flag is off (verified_second_line is only ever true when
+  // secondLineEnabled). Lets the daily brief show the new pool growth.
+  const verifiedSecondLineResults = r.filter((x) => x.verified_second_line);
+  const paraplyBlocked = r.filter((x) => x.new_verification_status === "paraply_epost_mangler").length;
 
   return {
     run_id: input.run_id,
@@ -1388,6 +1827,15 @@ export function buildRunEnvelope(input: {
         value: newlyEligible,
         meta: { kind: "outreach_pool_added", detail: "transitioned to verified+(partial|rich)" },
       },
+      {
+        type: "db_state_change",
+        value: verifiedSecondLineResults.length,
+        meta: {
+          kind: "agents_verified_second_line",
+          examples: verifiedSecondLineResults.slice(0, 5).map((x) => ({ agent_id: x.agent_id, name: x.agent_name })),
+        },
+      },
+      { type: "db_state_change", value: paraplyBlocked, meta: { kind: "agents_paraply_epost_mangler" } },
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]
         : []),
