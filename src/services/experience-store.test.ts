@@ -34,6 +34,9 @@ import {
   isContentFieldHomepageSourced,
   isExperienceContentGenuinelyThin,
   classifyProviderContentBucket,
+  // Grep 4c: navnegjetting v3 — first-word-only, ø→oe-alone, and
+  // punycode/IDN candidate sources added to the tier-1 domain-guess heuristic.
+  gardssalgWebsiteCandidateHosts,
 } from "./experience-store";
 
 export interface TestSummary {
@@ -187,6 +190,163 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
   assertEq(gardssalgProductsEligible("not valid json"), false, "gardssalgProductsEligible: malformed non-JSON value → false, conservative (never silently overwritten)");
   assertEq(gardssalgProductsEligible('{"not":"an array"}'), false, "gardssalgProductsEligible: valid JSON but not an array (an object) → false");
   assertEq(gardssalgProductsEligible("[1,2,3]"), false, "gardssalgProductsEligible: valid non-empty JSON array (even of non-strings) → false, only an EMPTY array is eligible");
+
+  // ── gardssalgWebsiteCandidateHosts v3 (Grep 4c: navnegjetting v3) — three
+  //    new candidate sources appended AFTER the existing v1/v2 candidates:
+  //    (a) first-word-only, (b) ø→oe-alone with å/æ left as raw diacritics,
+  //    (c) one punycode/IDN guess. ────────────────────────────────────────
+  {
+    // (a) multi-word name → a first-word-only candidate appears (in addition
+    // to the pre-existing all-tokens candidates).
+    const torgersenHosts = gardssalgWebsiteCandidateHosts("Torgersen Gård");
+    assertTrue(
+      torgersenHosts.includes("torgersengard.no"),
+      "gwch-1a: 'Torgersen Gård' still yields the pre-existing all-tokens v1 candidate torgersengard.no",
+    );
+    assertTrue(
+      torgersenHosts.includes("torgersen.no"),
+      "gwch-1b: 'Torgersen Gård' also yields the v3 first-word-only candidate torgersen.no",
+    );
+
+    // Single-token name: no first-word-only candidate distinct from the
+    // existing all-tokens variant, so nothing new/duplicate is added for it.
+    const singleTokenHosts = gardssalgWebsiteCandidateHosts("Einord");
+    assertEq(
+      singleTokenHosts.filter((h) => h === "einord.no").length,
+      1,
+      "gwch-1c: single-token name 'Einord' → einord.no appears exactly once (first-word-only variant skipped, not duplicated)",
+    );
+
+    // (b) ø→oe-alone variant differs from BOTH existing v1 (ø→o/å→a) and v2
+    // (ø→oe/å→aa) outputs for a name containing å: å is dropped (not
+    // translated), so the label is shorter than either existing variant.
+    const blabaerHosts = gardssalgWebsiteCandidateHosts("Blåbær Gård");
+    assertTrue(blabaerHosts.includes("blabaergard.no"), "gwch-2a: 'Blåbær Gård' still yields the v1 (å→a) candidate blabaergard.no");
+    assertTrue(blabaerHosts.includes("blaabaergaard.no"), "gwch-2b: 'Blåbær Gård' still yields the v2 (å→aa) candidate blaabaergaard.no");
+    assertTrue(
+      blabaerHosts.includes("blbrgrd.no"),
+      "gwch-2c: 'Blåbær Gård' yields the v3 ø→oe-alone candidate blbrgrd.no (å dropped, not translated) — distinct from both v1 and v2",
+    );
+
+    // (c) name WITH diacritics → a punycode/IDN candidate is present.
+    const punycodeHosts = gardssalgWebsiteCandidateHosts("Torgersen Gård");
+    assertTrue(
+      punycodeHosts.some((h) => h.startsWith("xn--") && h.endsWith(".no")),
+      "gwch-3a: 'Torgersen Gård' (has å) yields a punycode/IDN candidate (xn--...·.no)",
+    );
+
+    // name with NO diacritics → domainToASCII would just echo the ascii
+    // label back, so no duplicate punycode candidate is added.
+    const plainHosts = gardssalgWebsiteCandidateHosts("Ola Nordmann Gruppen AS");
+    assertTrue(
+      !plainHosts.some((h) => h.startsWith("xn--")),
+      "gwch-3b: 'Ola Nordmann Gruppen AS' (no diacritics) → no punycode candidate (would just duplicate the plain label)",
+    );
+
+    // gwch-4: CHANGES-REQUESTED fix-up, bug 1 — a realistic 3+ token name
+    // must NOT have its punycode candidate starved out by slice(0, 10).
+    // Before the fix-up the punycode source was appended LAST (after
+    // first-word and ø→oe-alone), so for 3-token names the first 10 slots
+    // were already filled by v1/v2/first-word/ø-oe-alone before the
+    // punycode push ever ran. It is now generated right after the base
+    // v1/v2 sources instead.
+    const blabaerBryggeriHosts = gardssalgWebsiteCandidateHosts("Blåbær Gård Bryggeri");
+    assertTrue(
+      blabaerBryggeriHosts.some((h) => h.startsWith("xn--") && h.endsWith(".no")),
+      "gwch-4: 'Blåbær Gård Bryggeri' (3 tokens, has diacritics) still yields a punycode/IDN candidate — regression guard for the reorder fixing bug 1 (previously starved out by slice(0, 10))",
+    );
+
+    // gwch-5: CHANGES-REQUESTED fix-up, bugs 2/3 — the punycode source must
+    // never leak a malformed "host" containing raw ASCII punctuation (bug 2)
+    // or exceed the 63-octet DNS label limit once IDNA-encoded (bug 3). This
+    // asserts the invariant for the WHOLE function's output, not just the
+    // punycode source: nothing outside [a-z0-9.-] may ever appear anywhere
+    // in the returned array. Also includes a literal "." in the raw name
+    // (round-2 re-review bug): a stray "." in a raw token can make
+    // domainToASCII split the result into MORE than the intended two labels
+    // ("<label>.no"), and only the first label was ever validated — letting
+    // a second, unvalidated label (with raw "&" etc.) leak through. Assert
+    // both the whole-array [a-z0-9.-] invariant AND that no host has more
+    // than 2 dots total (i.e. no spurious extra label ever appears) — the
+    // dot-count check is the one that would actually have caught this exact
+    // bug, since a malformed second label like "xn--nordmann&snngrd-tlb33a"
+    // still only contains chars from [a-z0-9.-] plus "&", so it fails the
+    // first invariant anyway, but a purely-legal-looking multi-label result
+    // (e.g. from a name with "." but no other punctuation) would sail past
+    // the [a-z0-9.-] check alone and only the dot-count check catches it.
+    const punctuationNames = ["Nordmann & Sønn Gård", "O'Brien Gård", "Åse.Nordmann&Sønn Gård"];
+    for (const name of punctuationNames) {
+      const hosts = gardssalgWebsiteCandidateHosts(name);
+      assertTrue(
+        hosts.every((h) => /^[a-z0-9.-]+$/.test(h)),
+        `gwch-5: '${name}' → no malformed host containing anything outside [a-z0-9.-] appears anywhere in the returned array (got: ${JSON.stringify(hosts)})`,
+      );
+      assertTrue(
+        hosts.every((h) => (h.match(/\./g) || []).length <= 2),
+        `gwch-5: '${name}' → no host has more than 2 dots total (no spurious extra DNS label from a stray "." in the raw name) (got: ${JSON.stringify(hosts)})`,
+      );
+    }
+
+    // gwch-6: PR #682 round 4 (Daniel-authorized 4th iteration) — round 3's
+    // finding: domainToASCII does NOT fail-closed on a WHATWG forbidden host
+    // code point (/, \, ?, #, etc.) — it silently TRUNCATES the string at
+    // that character instead of rejecting it. When a dot-like separator
+    // precedes the truncating character, the truncated remainder can still
+    // coincidentally split into exactly 2 labels, sailing past the old
+    // `punycodeLabels.length === 2` check with a completely unvalidated
+    // second "label". "Åse.Nordmann/Sønn Gård" is the exact repro from the
+    // failure report: raw label "åse.nordmann/sønngård" → domainToASCII
+    // truncates at "/" and yields "xn--se-xia.nordmann" — 2 labels, first
+    // one a well-formed "xn--..." — which the old check let through even
+    // though there is no ".no" (or any TLD) anywhere in the result. The new
+    // anchored `/^xn--[a-z0-9-]+\.no$/i` check requires the literal ".no" to
+    // be the entire remainder of the string, so no truncation can satisfy
+    // it regardless of which forbidden character caused it.
+    {
+      const name = "Åse.Nordmann/Sønn Gård";
+      const hosts = gardssalgWebsiteCandidateHosts(name);
+      assertTrue(
+        !hosts.some((h) => h.startsWith("xn--")),
+        `gwch-6a: '${name}' (forbidden host code point "/" truncates domainToASCII's output before ".no") → the punycode candidate is correctly OMITTED, not just malformed (got: ${JSON.stringify(hosts)})`,
+      );
+      assertTrue(
+        !hosts.includes("xn--se-xia.nordmann"),
+        `gwch-6b: '${name}' → the specific round-3 repro malformed host "xn--se-xia.nordmann" (no .no TLD) never appears`,
+      );
+      // The other candidate sources (v1/v2, first-word-only, ø→oe-alone) for
+      // this same input are unaffected by rejecting the punycode source.
+      assertTrue(
+        hosts.includes("asenordmannsonngard.no"),
+        `gwch-6c: '${name}' → the v1 (å→a) all-tokens candidate asenordmannsonngard.no is still present`,
+      );
+      assertTrue(
+        hosts.includes("aasenordmannsoenngaard.no"),
+        `gwch-6d: '${name}' → the v2 (å→aa) all-tokens candidate aasenordmannsoenngaard.no is still present`,
+      );
+      assertTrue(
+        hosts.includes("asenordmannsonn.no"),
+        `gwch-6e: '${name}' → the v3 first-word-only candidate asenordmannsonn.no is still present`,
+      );
+      assertTrue(
+        hosts.includes("senordmannsoenngrd.no"),
+        `gwch-6f: '${name}' → the v3 ø→oe-alone candidate senordmannsoenngrd.no is still present`,
+      );
+    }
+
+    // gwch-7: positive case for the round-4 anchored regex itself — a plain
+    // diacritic name with no forbidden host code points must still produce a
+    // valid, fully-anchored "xn--...·.no" candidate (not just "some xn--
+    // candidate exists", gwch-3a already covers that loosely — this pins the
+    // exact expected encoded value so the anchored regex isn't accidentally
+    // over-strict and rejecting legitimate encodings).
+    {
+      const hosts = gardssalgWebsiteCandidateHosts("Torgersen Gård");
+      assertTrue(
+        hosts.includes("xn--torgersengrd-2cb.no"),
+        `gwch-7: 'Torgersen Gård' → the exact punycode candidate xn--torgersengrd-2cb.no is present and matches /^xn--[a-z0-9-]+\\.no$/i in full (got: ${JSON.stringify(hosts)})`,
+      );
+    }
+  }
 
   // ── scanGardssalgProviderRowForMojibake (dev-request 2026-07-21-
   //    opplevagent-norske-tegn-encoding, criterion 3) — DETECTION only, one

@@ -6373,39 +6373,112 @@ export function getGardssalgWebsiteDiscoveryTarget(providerId: string): (Gardssa
  * Deterministic candidate hosts from the provider's own display name: the
  * «— Sted»-pruned name, org-form suffix dropped, in the two common Norwegian
  * domain transliterations (ø→o/å→a and ø→oe/å→aa; æ→ae in both), each as
- * joined and hyphenated labels under .no. Max 4, degenerate labels (<4 or
+ * joined and hyphenated labels under .no. Max 10, degenerate labels (<4 or
  * >63 chars) dropped. Pure — exported for tests.
  */
 export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
   const tokens = gardssalgSearchName(navn).toLowerCase().split(/\s+/).filter(Boolean);
   while (tokens.length > 1 && BRREG_ORG_SUFFIX_TOKENS.has(tokens[tokens.length - 1])) tokens.pop();
-  const variants = [
-    tokens.map((t) => t.replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")),
-    tokens.map((t) => t.replace(/æ/g, "ae").replace(/ø/g, "oe").replace(/å/g, "aa")),
-  ];
+
+  const translit1 = (t: string) => t.replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a");
+  const translit2 = (t: string) => t.replace(/æ/g, "ae").replace(/ø/g, "oe").replace(/å/g, "aa");
+  const asciiClean = (t: string) => t.replace(/[^a-z0-9]/g, "");
+  const variants = [tokens.map(translit1), tokens.map(translit2)];
+
   const hosts: string[] = [];
+  const addHost = (label: string, tld: string) => {
+    if (label.length < 4 || label.length > 63) return;
+    const host = `${label}.${tld}`;
+    if (!hosts.includes(host)) hosts.push(host);
+  };
+
   for (const v of variants) {
-    const clean = v.map((t) => t.replace(/[^a-z0-9]/g, "")).filter(Boolean);
+    const clean = v.map(asciiClean).filter(Boolean);
     if (clean.length === 0) continue;
-    for (const label of [clean.join(""), clean.join("-")]) {
-      if (label.length < 4 || label.length > 63) continue;
-      const host = `${label}.no`;
-      if (!hosts.includes(host)) hosts.push(host);
-    }
+    addHost(clean.join(""), "no");
+    addHost(clean.join("-"), "no");
   }
   // v2: breweries in particular brand on .com (measured 2026-07-30: 7 Fjell
   // Bryggeri's real site is 7fjellbryggeri.com — tier 1 guessed only .no and
   // missed it). One .com per transliteration, joined label only, appended
   // AFTER the .no guesses so the cheaper national TLD is still tried first.
   for (const v of variants) {
-    const clean = v.map((t) => t.replace(/[^a-z0-9]/g, "")).filter(Boolean);
+    const clean = v.map(asciiClean).filter(Boolean);
     if (clean.length === 0) continue;
-    const label = clean.join("");
-    if (label.length < 4 || label.length > 63) continue;
-    const host = `${label}.com`;
-    if (!hosts.includes(host)) hosts.push(host);
+    addHost(clean.join(""), "com");
   }
-  return hosts.slice(0, 6);
+  // v3: three more free guesses, added AFTER v1/v2 so the cheaper/likelier
+  // ones are still tried first — (a) one punycode/IDN guess for the small
+  // number of producers who registered the actual diacritic domain (placed
+  // immediately after the base v1/v2 sources — NOT last — so it isn't
+  // starved out by slice(0, 10) once the first-word and ø→oe-alone sources
+  // below add their own entries for realistic 3+ token names; see the
+  // CHANGES-REQUESTED fix-up for the "Blåbær Gård Bryggeri" repro that
+  // dropped it when it was appended last); (b) first-word-only (e.g.
+  // "Torgersen Gård" often really lives at torgersen.no, not
+  // torgersengard.no); (c) an ø→oe-alone label with å/æ left as raw
+  // diacritics that the ascii-strip below silently drops, a genuinely
+  // different shape from v1/v2.
+  {
+    // The punycode candidate is built from the RAW joined tokens (so
+    // diacritics survive into the IDNA encoding step below), not through
+    // asciiClean — asciiClean strips non a-z0-9 characters, which would
+    // strip out æ/ø/å themselves and defeat the point of this source.
+    // Because the input isn't punctuation-stripped, domainToASCII (WHATWG
+    // non-strict) can pass stray ASCII punctuation (e.g. "&", "'") through
+    // into the encoded label verbatim instead of rejecting it — so the
+    // encoded label is validated as a legal DNS label (ASCII
+    // letters/digits/hyphens only) AFTER encoding. The >=4 floor is still
+    // applied to the RAW label first (same "is this a meaningful name at
+    // all" floor every other source in this function applies, e.g. addHost),
+    // but the <=63 DNS-octet ceiling is checked on the ENCODED label, since
+    // punycode encoding is always longer than its diacritic input and can
+    // cross the 63-octet wire limit even when the raw label was well within
+    // it — the raw label alone can't tell you whether the encoded form is a
+    // legal DNS label.
+    const rawLabel = tokens.join("");
+    if (rawLabel.length >= 4) {
+      const rawHost = `${rawLabel}.no`;
+      const punycodeHost = (require("node:url") as typeof import("node:url")).domainToASCII(rawHost);
+      // domainToASCII (WHATWG non-strict) does not fail-closed on a forbidden
+      // host code point (/, \, ?, #, etc.) — it silently TRUNCATES the string
+      // at that character instead of rejecting it. A dot-like separator
+      // (ASCII "." or a Unicode dot-equivalent such as U+3002/U+FF0E/U+FF61,
+      // which IDNA/UTS-46 also treats as a label boundary) preceding the
+      // truncating character can leave a truncated remainder that still
+      // splits into exactly two labels by coincidence, with the second label
+      // fully producer-name-controlled and never validated (round 3 finding,
+      // see the Grep 4c failure report). A split().length === 2 check can be
+      // fooled this way regardless of which forbidden character truncated
+      // the string, so instead require the WHOLE encoded host to match
+      // "<xn-- label>.no" anchored start-to-end — no truncation can produce a
+      // string that still ends in a literal ".no" with nothing following it.
+      const encodedLabel = punycodeHost.split(".")[0] || "";
+      if (
+        punycodeHost &&
+        punycodeHost !== rawHost &&
+        /^xn--[a-z0-9-]+\.no$/i.test(punycodeHost) &&
+        encodedLabel.length <= 63 &&
+        !hosts.includes(punycodeHost)
+      ) {
+        hosts.push(punycodeHost);
+      }
+    }
+  }
+  if (tokens.length > 1) {
+    for (const translit of [translit1, translit2]) {
+      addHost(asciiClean(translit(tokens[0])), "no");
+    }
+  }
+  {
+    const clean = tokens.map((t) => asciiClean(t.replace(/ø/g, "oe"))).filter(Boolean);
+    if (clean.length > 0) {
+      addHost(clean.join(""), "no");
+      addHost(clean.join("-"), "no");
+    }
+  }
+
+  return hosts.slice(0, 10);
 }
 
 // ─── Gårdssalg search-based website-discovery candidates (dev-request
