@@ -1282,6 +1282,16 @@ export function applyRfbAgentWebsite(
     }
     if (fresh.website && fresh.website.trim() !== "") {
       result = { written: false, reason: "no_longer_blank" };
+      // Permanently unwritable (another writer already filled the field) —
+      // unlike owner_claimed_row_locked/curated_field_locked/host_already_in_use,
+      // this can never resolve itself, so leaving the row 'pending' only makes
+      // every future auto-call re-pick and re-reject it forever (dev-request
+      // 2026-08-22-rfb-website-email-selvforsyning, Grep 3-nit).
+      db.prepare(
+        `UPDATE agents_website_review_queue
+            SET status = 'superseded', updated_at = datetime('now')
+          WHERE agent_id = ? AND status = 'pending'`,
+      ).run(agentId);
       return;
     }
     // Shared-host re-check at write time: the host must not have been taken
@@ -1302,6 +1312,13 @@ export function applyRfbAgentWebsite(
       .run(candidateUrl, agentId);
     if (upd.changes !== 1) {
       result = { written: false, reason: "no_longer_blank" };
+      // Same permanent-unwritable case as the pre-check above, reached via
+      // the race window instead (Grep 3-nit).
+      db.prepare(
+        `UPDATE agents_website_review_queue
+            SET status = 'superseded', updated_at = datetime('now')
+          WHERE agent_id = ? AND status = 'pending'`,
+      ).run(agentId);
       return;
     }
 
