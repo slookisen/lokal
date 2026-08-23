@@ -18,7 +18,7 @@
  *       proposed + a 'pending' row lands in agents_website_review_queue.
  *   (c) candidate rejected: every candidate host fetches successfully but
  *       none carries matching evidence -> rejected reason
- *       'no_candidate_verified', nothing queued.
+ *       'evidence_mismatch', nothing queued.
  *   (d) aggregator-host candidate rejected: a producer name whose first
  *       candidate host is a curated directory domain -> rejected reason
  *       'blocklisted_directory_domain', that host never fetched.
@@ -86,8 +86,8 @@
  *       RENDERED text/finalUrl, headless_fallback_attempted/_verified both 1.
  *   (hf-d) flag ON, fallback returns `renderer_unavailable` — never a
  *       throw, never a negative signal against the producer: falls through
- *       to the same generic `no_candidate_verified` rejection reason as
- *       every other unverified miss.
+ *       to the same generic `evidence_mismatch` rejection reason as
+ *       every other unverified miss (never a renderer-specific reason).
  *   (hf-e) flag ON, plain fetch unverified but shouldEscalateToRender is
  *       false (a genuinely small static page, no <script>) — fallback
  *       never attempted.
@@ -408,9 +408,28 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(r.body.proposed.length, 0, "c1: nothing proposed");
       assertEq(r.body.rejected.length, 1, "c2: one rejection");
       assertEq(r.body.rejected[0].agent_id, "wd-none", "c3: rejection is for the right agent");
-      assertEq(r.body.rejected[0].reason, "no_candidate_verified", "c4: reason is no_candidate_verified");
+      assertEq(r.body.rejected[0].reason, "evidence_mismatch", "c4: reason is evidence_mismatch (Grep 4f)");
       assertTrue(r.body.rejected[0].tried.length > 0, "c5: at least one host was actually fetched");
       assertTrue(!readQueueRow("wd-none"), "c6: nothing queued for this agent");
+    }
+
+    // ── (c2) candidate rejected: every candidate host genuinely fails to
+    //     fetch (Grep 4f, dev-request 2026-08-22-rfb-website-email-
+    //     selvforsyning) — distinct reason from (c)'s "fetched fine, no
+    //     evidence" case, both of which used to collapse into the same
+    //     generic 'no_candidate_verified' --
+    {
+      insertAgent({ id: "wd-unreachable", name: "Uraakelig Fjellgard", orgNr: "966666667", city: "Lom" });
+      // No fixtures set for any of this producer's candidate hosts — the stub
+      // fetch falls through to notFoundResponse() (HTTP 404) for every one.
+
+      const r = await callDiscovery({ agentIds: ["wd-unreachable"] });
+      assertEq(r.body.proposed.length, 0, "c2-1: nothing proposed");
+      assertEq(r.body.rejected.length, 1, "c2-2: one rejection");
+      assertEq(r.body.rejected[0].agent_id, "wd-unreachable", "c2-3: rejection is for the right agent");
+      assertEq(r.body.rejected[0].reason, "fetch_failed:http_404", "c2-4: reason names fetch-page.ts's own truthful classifier, not the generic evidence reason");
+      assertTrue(r.body.rejected[0].tried.length > 0, "c2-5: at least one host was actually attempted");
+      assertTrue(!readQueueRow("wd-unreachable"), "c2-6: nothing queued for this agent");
     }
 
     // ── (d) aggregator-host candidate rejected --
@@ -1140,7 +1159,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       insertAgent({ id: "wd-pick-new-2", name: "Zqvex Pickstrategy Newtwo Gard", city: "Testby", createdAt: "2026-08-05 00:00:00" });
       insertAgent({ id: "wd-pick-new-3", name: "Zqvex Pickstrategy Newthree Gard", city: "Testby", createdAt: "2026-08-10 00:00:00" });
       // No fixtures set for any of these hosts — every attempt is rejected
-      // (no_candidate_verified), but that's irrelevant here: the pick
+      // (fetch_failed:http_404, Grep 4f), but that's irrelevant here: the pick
       // strategy only governs WHICH row(s) selectRfbWebsiteDiscoveryTargets
       // returns from the eligible cohort, not whether they later verify.
 
@@ -1191,7 +1210,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const r = await callDiscovery({ agentIds: ["wd-hf-off"] });
       assertEq(r.body.proposed.length, 0, "hf-a1: nothing proposed (flag off, unchanged behaviour)");
       const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-hf-off");
-      assertEq(rej?.reason, "no_candidate_verified", "hf-a2: same rejection reason as before this slice existed");
+      assertEq(rej?.reason, "evidence_mismatch", "hf-a2: same rejection reason as before this slice existed (Grep 4f: evidence_mismatch)");
       assertEq(renderCalls, 0, "hf-a3: renderPage was never invoked");
       assertEq(r.body.headless_fallback_attempted, 0, "hf-a4: headless_fallback_attempted is 0");
       assertEq(r.body.headless_fallback_verified, 0, "hf-a5: headless_fallback_verified is 0");
@@ -1262,7 +1281,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     // ── (hf-d) flag ON, fallback returns renderer_unavailable — treated as
     //     no-candidate, no throw, nothing recorded as a negative signal
     //     against the producer (still falls through to the generic
-    //     no_candidate_verified reason, never a renderer-specific one) --
+    //     evidence_mismatch reason, never a renderer-specific one) --
     {
       process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
       let renderCalls = 0;
@@ -1289,7 +1308,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(!threw, "hf-d1: renderer_unavailable never throws / never crashes the batch");
       assertEq(r!.body.proposed.length, 0, "hf-d2: nothing proposed");
       const rej = r!.body.rejected.find((x: any) => x.agent_id === "wd-hf-unavail");
-      assertEq(rej?.reason, "no_candidate_verified", "hf-d3: generic no-candidate reason, NOT a renderer-specific/negative one");
+      assertEq(rej?.reason, "evidence_mismatch", "hf-d3: generic no-candidate reason, NOT a renderer-specific/negative one");
       assertEq(renderCalls, 1, "hf-d4: renderPage was invoked exactly once");
       assertEq(r!.body.headless_fallback_attempted, 1, "hf-d5: an attempt IS still counted (renderer_unavailable is about the machine, not the site)");
       assertEq(r!.body.headless_fallback_verified, 0, "hf-d6: never counted as a verified flip");
@@ -1315,7 +1334,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const r = await callDiscovery({ agentIds: ["wd-hf-small"] });
       assertEq(r.body.proposed.length, 0, "hf-e1: nothing proposed");
       const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-hf-small");
-      assertEq(rej?.reason, "no_candidate_verified", "hf-e2: rejected exactly as before this slice existed");
+      assertEq(rej?.reason, "evidence_mismatch", "hf-e2: rejected exactly as before this slice existed (Grep 4f: evidence_mismatch)");
       assertEq(renderCalls, 0, "hf-e3: renderPage was never invoked — not a JS-shell shape");
       assertEq(r.body.headless_fallback_attempted, 0, "hf-e4: headless_fallback_attempted is 0");
       assertEq(r.body.headless_fallback_verified, 0, "hf-e5: headless_fallback_verified is 0");
