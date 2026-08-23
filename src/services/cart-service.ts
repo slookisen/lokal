@@ -90,6 +90,12 @@ export function generateConfirmToken(): string {
 // ─── Producer eligibility check ─────────────────────────────────────────────
 // A product can only be added to a cart if its producer is verified and
 // non-umbrella — mirrors the catalog feed filter.
+//
+// dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel (fix-up,
+// code-review CHANGES-REQUESTED on 36580f2b): verified_second_line=1 is a
+// deliberately lower bar meant to unlock OUTREACH/CONTACT only — it is NOT
+// sufficient for real customer checkout. Exclude it here explicitly so
+// second-line-only producers cannot receive real orders.
 
 export function isProducerEligible(agentId: string): boolean {
   const db = _cartTestDb ?? getDb();
@@ -99,6 +105,7 @@ export function isProducerEligible(agentId: string): boolean {
     WHERE a.id = ?
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
+      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
   `).get(agentId);
   return !!row;
 }

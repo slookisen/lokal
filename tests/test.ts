@@ -24616,7 +24616,8 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       products TEXT DEFAULT '[]',
-      verification_status TEXT NOT NULL DEFAULT 'unverified'
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      verified_second_line INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE products (
       id TEXT PRIMARY KEY,
@@ -24896,7 +24897,8 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       products TEXT DEFAULT '[]',
-      verification_status TEXT NOT NULL DEFAULT 'unverified'
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      verified_second_line INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE products (
       id TEXT PRIMARY KEY,
@@ -40150,5 +40152,44 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("lokal-agent-verifier-second-line: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel (fix-up,
+// code-review CHANGES-REQUESTED on 36580f2b): verified_second_line=1 must
+// NOT be commerce-eligible — cart-service.isProducerEligible() and the
+// public catalog feed/agent-products endpoints must exclude it, while
+// first-line-verified agents stay completely unaffected. Own harness: same
+// seam as cart-service-supply-graph.test.ts / marketplace-catalog-supply-
+// graph.test.ts, restored in `finally`.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel (fix-up): cart-service excludes verified_second_line ──");
+  try {
+    const { runCartServiceSecondLineTests } = require("../src/services/cart-service-second-line.test") as
+      typeof import("../src/services/cart-service-second-line.test");
+    const csl = runCartServiceSecondLineTests({ log: false });
+    passed += csl.passed;
+    failed += csl.failed;
+    for (const f of csl.failures) failures.push("cart-service-second-line: " + f);
+    console.log(`  cart-service-second-line: ${csl.passed} passed, ${csl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cart-service-second-line: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel (fix-up): marketplace-catalog excludes verified_second_line ──");
+  try {
+    const { runMarketplaceCatalogSecondLineTests } = require("../src/routes/marketplace-catalog-second-line.test") as
+      typeof import("../src/routes/marketplace-catalog-second-line.test");
+    const mcsl = await runMarketplaceCatalogSecondLineTests({ log: false });
+    passed += mcsl.passed;
+    failed += mcsl.failed;
+    for (const f of mcsl.failures) failures.push("marketplace-catalog-second-line: " + f);
+    console.log(`  marketplace-catalog-second-line: ${mcsl.passed} passed, ${mcsl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-catalog-second-line: unexpected error: " + String(err?.message || err));
   }
 });
