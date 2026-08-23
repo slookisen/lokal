@@ -51,12 +51,28 @@
 //       `telefon: t.phone, mobil: null` never had Brreg's OWN registered
 //       numbers wired in for RFB agents at all).
 //
-// Scope boundary (explicit, load-bearing): Brreg's `epostadresse` field is
-// NEVER read or written by this route. Email-from-Brreg is a separate,
-// still-pending Daniel approval — this slice only ever touches org_nr,
-// website, and phone-as-evidence. `fetchBrregContact`'s `epost` field is
-// fetched (one call returns all three) but discarded immediately, never
-// stored, never logged into any queue/audit row.
+//   (d) Brreg epostadresse -> agents.contact_email — dev-request
+//       2026-08-22-rfb-website-email-selvforsyning, Grep 1d. Daniel gave
+//       explicit GO (daniel-responses/): "ja, godkjenn Brreg som e-postkilde
+//       — egen side vinner ved avvik" (approve Brreg as an email source, own
+//       site wins on conflict). Reuses the SAME `contact` object already
+//       fetched for parts (b)/(c) — no second fetchBrregContact call. The
+//       candidate always passes through the shared LLM-judge +
+//       deterministic-backstop gate (gateContactCandidates,
+//       services/contact-candidate-judge.ts — same shared gate
+//       admin-rfb-contact-extraction.ts's email leg uses) AND the
+//       isPlatformOwnedEmailDomain check BEFORE it is ever compared against
+//       an existing contact_email. A non-blank existing contact_email that
+//       DIFFERS from the gate-approved Brreg candidate is NEVER overwritten
+//       — "egen side vinner ved avvik": the discrepancy is still always
+//       routed through the judge (so the verdict is visible in the
+//       response), but automated conflict resolution never wins over the
+//       producer's own site. Only ever writes `agents.contact_email` when it
+//       was blank to begin with. Never a second write path — this route's
+//       own applyRfbBssEmailWrite is the sole writer for this column from
+//       this slice, mirroring applyRfbCxWrite's write discipline (fresh
+//       claimed_at/curated_fields re-read immediately before write, one
+//       agent_knowledge_audit row per write).
 //
 // Dry-run-by-default, matching BOTH sibling batch routes this one calls into
 // (`apply` truthy check, identical spelling/precedence to
@@ -71,6 +87,7 @@
 // same as every other admin route file in this codebase.
 
 import { Router, Request, Response } from "express";
+import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import {
   findLocalOrgnrCandidate,
@@ -106,6 +123,16 @@ import {
   enrichmentWritePauseBlockForAgents,
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
 } from "../services/enrichment-write-pause";
+import {
+  isPlatformOwnedEmailDomain,
+  isContactEmailCurated,
+} from "./admin-agents-contact-email-write";
+// dev-request 2026-08-22-rfb-website-email-selvforsyning, Grep 1d: Daniel's
+// explicit GO (daniel-responses/) approved Brreg's own registered `epost` as
+// a contact-email source, own-site-wins-on-conflict. Same shared LLM-judge +
+// deterministic-backstop gate as admin-rfb-contact-extraction.ts's email leg
+// (Grep 5b) — see contact-candidate-judge.ts's own doc comment.
+import { gateContactCandidates } from "../services/contact-candidate-judge";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -167,6 +194,8 @@ interface RfbBssTargetRow {
   website: string | null;
   phone: string | null;
   address: string | null;
+  contact_email: string | null;
+  curated_fields: string | null;
 }
 
 // Combined cohort: a row qualifies if it is missing org_nr OR missing
@@ -193,8 +222,9 @@ function rfbBssCandidateWhereSql(): string {
 function rfbBssSelectSql(extraWhere: string): string {
   return `
     SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at,
-           a.city AS city, a.url AS url,
-           k.postal_code AS postal_code, k.website AS website, k.phone AS phone, k.address AS address
+           a.city AS city, a.url AS url, a.contact_email AS contact_email,
+           k.postal_code AS postal_code, k.website AS website, k.phone AS phone, k.address AS address,
+           k.curated_fields AS curated_fields
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
      WHERE ${rfbBssCandidateWhereSql()} ${extraWhere}
@@ -238,8 +268,9 @@ function getRfbBssTarget(db: ReturnType<typeof getDb>, agentId: string): RfbBssT
   const row = db
     .prepare(
       `SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at,
-              a.city AS city, a.url AS url,
-              k.postal_code AS postal_code, k.website AS website, k.phone AS phone, k.address AS address
+              a.city AS city, a.url AS url, a.contact_email AS contact_email,
+              k.postal_code AS postal_code, k.website AS website, k.phone AS phone, k.address AS address,
+              k.curated_fields AS curated_fields
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'`,
@@ -601,17 +632,150 @@ export interface RfbBssWebsiteResolution {
   detail?: string;
 }
 
+// ─── Part (d): Brreg epostadresse -> agents.contact_email ──────────────────
+
+export type RfbBssEmailOutcome =
+  | "email_already_present"
+  | "no_brreg_epost"
+  | "email_written"
+  | "email_would_write"
+  | "email_conflict_kept_own"
+  | "email_rejected_by_gate"
+  | "email_rejected_platform_domain"
+  | "email_skipped_locked"
+  | "email_skipped_curated"
+  | "not_attempted";
+
+export interface RfbBssEmailResolution {
+  outcome: RfbBssEmailOutcome;
+  detail?: string;
+}
+
+/**
+ * Writes ONE agent's contact_email from a gate-approved Brreg candidate.
+ * Mirrors applyRfbCxWrite (admin-rfb-contact-extraction.ts) AS CLOSELY AS
+ * POSSIBLE: same transaction shape, same fresh-read-immediately-before-write
+ * discipline (re-reads claimed_at/contact_email/curated_fields from a live
+ * SELECT inside the transaction, not the stale `target` snapshot passed by
+ * the caller), same agent_knowledge_audit insert shape.
+ */
+function applyRfbBssEmailWrite(
+  db: ReturnType<typeof getDb>,
+  agentId: string,
+  newEmail: string,
+  orgNr: string,
+  batchId: string,
+): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } {
+  const tx = db.transaction((): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } => {
+    const cur = db
+      .prepare(
+        `SELECT a.claimed_at AS claimed_at, a.contact_email AS contact_email, k.curated_fields AS curated_fields
+           FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.id = ?`,
+      )
+      .get(agentId) as { claimed_at: string | null; contact_email: string | null; curated_fields: string | null } | undefined;
+
+    if (!cur) return { outcome: "skippedLocked" }; // vanished mid-batch — treat as untouchable, never write
+    if (cur.claimed_at) return { outcome: "skippedLocked", oldValue: cur.contact_email };
+    if (isContactEmailCurated(cur.curated_fields)) return { outcome: "skippedCurated", oldValue: cur.contact_email };
+
+    db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(newEmail, agentId);
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+         (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, 'contact_email', ?, ?, 'system', NULL, datetime('now'), ?)`,
+    ).run(randomUUID(), agentId, cur.contact_email, newEmail, `rfb-brreg-selfsufficiency org_nr:${orgNr} batch:${batchId}`);
+
+    return { outcome: "written", oldValue: cur.contact_email };
+  });
+  return tx();
+}
+
+/**
+ * Resolves (or writes, or vetoes) a Brreg-sourced contact_email for ONE
+ * target row that already has an org_nr AND a fetched Brreg `contact` object
+ * (reused from the SAME fetchBrregContact call parts (b)/(c) already made —
+ * this function never fetches Brreg itself). "Egen side vinner ved avvik"
+ * (Daniel's GO, dev-request 2026-08-22-rfb-website-email-selvforsyning): a
+ * non-blank existing contact_email that DIFFERS from the gate-approved Brreg
+ * candidate is NEVER overwritten — the candidate is still always routed
+ * through gateContactCandidates first (so the discrepancy is visible in the
+ * response as email_conflict_kept_own), but the existing value always wins.
+ * Never throws.
+ */
+export async function resolveEmailForTarget(
+  db: ReturnType<typeof getDb>,
+  target: RfbBssTargetRow,
+  orgNr: string,
+  brregEpost: string | null,
+  batchId: string,
+  apply: boolean,
+): Promise<RfbBssEmailResolution> {
+  if (!brregEpost || !brregEpost.trim()) {
+    return { outcome: "no_brreg_epost" };
+  }
+
+  // Cheap, deterministic, checked BEFORE the LLM gate to avoid wasting a
+  // judge call on an obviously-wrong candidate — mirrors
+  // admin-rfb-contact-extraction.ts's own check ordering.
+  if (isPlatformOwnedEmailDomain(brregEpost)) {
+    return { outcome: "email_rejected_platform_domain" };
+  }
+
+  const gated = await gateContactCandidates({
+    businessName: target.name,
+    sourceContext: `Data fra Brønnøysundregistrene (Brreg) for org.nr ${orgNr}: epost=${JSON.stringify(brregEpost)}.`,
+    candidateEmail: brregEpost,
+  });
+  if (!gated.email) {
+    return { outcome: "email_rejected_by_gate", detail: gated.emailRejectedReason ?? "avvist av dommer" };
+  }
+  const gateApprovedEmail = gated.email;
+
+  const existing = (target.contact_email ?? "").trim();
+  if (existing && existing.toLowerCase() !== gateApprovedEmail.trim().toLowerCase()) {
+    return {
+      outcome: "email_conflict_kept_own",
+      detail: `existing="${existing}" brreg_candidate="${gateApprovedEmail}"`,
+    };
+  }
+  if (existing && existing.toLowerCase() === gateApprovedEmail.trim().toLowerCase()) {
+    return { outcome: "email_already_present" };
+  }
+
+  if (!apply) {
+    return { outcome: "email_would_write" };
+  }
+
+  const written = applyRfbBssEmailWrite(db, target.id, gateApprovedEmail, orgNr, batchId);
+  if (written.outcome === "written") return { outcome: "email_written" };
+  if (written.outcome === "skippedLocked") return { outcome: "email_skipped_locked" };
+  return { outcome: "email_skipped_curated" };
+}
+
 /**
  * Resolves (or queues, or gives up on) a website + contact-evidence proposal
- * for ONE target row that already has (or just got) an org_nr. ONE
- * fetchBrregContact call serves both this leg's `hjemmeside` need and the
- * `telefon`/`mobil` evidence threaded into evaluateRfbWebsiteCandidate's new
- * `contactOverride` param. `epost` is read off the same response (one round
- * trip, not three) and immediately discarded — see this file's own header
- * for why (Brreg-email-as-write-source is explicitly out of scope for this
- * slice). Never writes agent_knowledge.website directly — that remains
- * evaluateRfbWebsiteCandidate's exclusive privilege (queue-only, never a
- * direct column write). Never throws.
+ * for ONE target row that already has (or just got) an org_nr, AND (part d)
+ * a Brreg-sourced contact_email resolution. ONE fetchBrregContact call
+ * serves the `hjemmeside` need, the `telefon`/`mobil` evidence threaded into
+ * evaluateRfbWebsiteCandidate's `contactOverride` param, AND (part d)
+ * `epost` — no second fetchBrregContact call for the email leg. Never writes
+ * agent_knowledge.website directly — that remains evaluateRfbWebsiteCandidate's
+ * exclusive privilege (queue-only, never a direct column write). Never
+ * throws.
+ *
+ * Scope boundary (explicit, load-bearing, part d): the email leg is only
+ * ever computed when a Brreg `contact` fetch actually happens — and this
+ * route's own cohort (rfbBssCandidateWhereSql) only requires org_nr-missing
+ * OR website-missing, so a row that already has a website in this cohort
+ * only qualified because org_nr was missing. This function's own early
+ * return (target.website already non-blank -> no fetch at all) means such a
+ * row's email outcome is `not_attempted` — Grep 1d does NOT widen the fetch
+ * trigger to also cover "has website, missing email" rows in this slice; a
+ * future slice can if that gap matters in practice. Likewise, when the
+ * Brreg contact fetch itself throws/returns null, the email outcome is also
+ * `not_attempted` (not a distinct email-specific fetch-failure outcome) —
+ * same simplification as the website leg's own `brreg_contact_fetch_failed`.
  */
 export async function resolveWebsiteAndContactForTarget(
   db: ReturnType<typeof getDb>,
@@ -622,9 +786,10 @@ export async function resolveWebsiteAndContactForTarget(
   hostsProposedThisBatch: Set<string>,
   fallbackCounters: RfbWdFallbackCounters,
   fetchImpl: typeof fetch,
-): Promise<RfbBssWebsiteResolution> {
+  apply: boolean,
+): Promise<RfbBssWebsiteResolution & { email: RfbBssEmailResolution }> {
   if (target.website && target.website.trim() !== "") {
-    return { outcome: "website_already_present" };
+    return { outcome: "website_already_present", email: { outcome: "not_attempted" } };
   }
 
   let contact: BrregContact | null;
@@ -634,12 +799,15 @@ export async function resolveWebsiteAndContactForTarget(
     contact = null;
   }
   if (!contact) {
-    return { outcome: "brreg_contact_fetch_failed" };
+    return { outcome: "brreg_contact_fetch_failed", email: { outcome: "not_attempted" } };
   }
-  // `contact.epost` is deliberately never read past this point — scope
-  // boundary, see file header.
+
+  // Part (d): computed BEFORE the hjemmeside check below — email resolution
+  // is independent of whether a hjemmeside was found.
+  const email = await resolveEmailForTarget(db, target, orgNr, contact.epost, batchId, apply);
+
   if (!contact.hjemmeside) {
-    return { outcome: "no_brreg_hjemmeside" };
+    return { outcome: "no_brreg_hjemmeside", email };
   }
 
   const outcome = await evaluateRfbWebsiteCandidate(
@@ -655,13 +823,13 @@ export async function resolveWebsiteAndContactForTarget(
 
   switch (outcome.outcome) {
     case "proposed":
-      return { outcome: "website_proposed" };
+      return { outcome: "website_proposed", email };
     case "already_has_website":
-      return { outcome: "website_already_present" };
+      return { outcome: "website_already_present", email };
     case "not_found":
-      return { outcome: "agent_not_found" };
+      return { outcome: "agent_not_found", email };
     case "rejected":
-      return { outcome: "website_rejected", detail: outcome.reason };
+      return { outcome: "website_rejected", detail: outcome.reason, email };
   }
 }
 
@@ -757,6 +925,20 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
     };
     const websiteRejectReasons: Record<string, number> = {};
 
+    const emailCounts: Record<RfbBssEmailOutcome, number> = {
+      email_already_present: 0,
+      no_brreg_epost: 0,
+      email_written: 0,
+      email_would_write: 0,
+      email_conflict_kept_own: 0,
+      email_rejected_by_gate: 0,
+      email_rejected_platform_domain: 0,
+      email_skipped_locked: 0,
+      email_skipped_curated: 0,
+      not_attempted: 0,
+    };
+    const emailRejectReasons: Record<string, number> = {};
+
     const details: Array<{
       agent_id: string;
       agent_name: string;
@@ -765,6 +947,8 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
       org_nr: string | null;
       website_outcome: RfbBssWebsiteOutcome | "skipped_no_org_nr";
       website_reject_reason?: string;
+      email_outcome: RfbBssEmailOutcome;
+      email_detail?: string;
     }> = [];
     const errors: Array<{ agent_id: string; stage: "org_nr" | "website"; error: string }> = [];
 
@@ -789,11 +973,13 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
             : null;
 
       let websiteResolution: RfbBssWebsiteResolution | { outcome: "skipped_no_org_nr" };
+      let emailResolution: RfbBssEmailResolution;
       if (!effectiveOrgNr) {
         websiteResolution = { outcome: "skipped_no_org_nr" };
+        emailResolution = { outcome: "not_attempted" };
       } else {
         try {
-          websiteResolution = await resolveWebsiteAndContactForTarget(
+          const combined = await resolveWebsiteAndContactForTarget(
             db,
             t,
             effectiveOrgNr,
@@ -802,15 +988,24 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
             hostsProposedThisBatch,
             fallbackCounters,
             rfbBssFetchImpl,
+            apply,
           );
+          const { email, ...website } = combined;
+          websiteResolution = website;
+          emailResolution = email;
         } catch (e: any) {
           errors.push({ agent_id: t.id, stage: "website", error: e?.message ?? String(e) });
           websiteResolution = { outcome: "brreg_contact_fetch_failed" };
+          emailResolution = { outcome: "not_attempted" };
         }
       }
       websiteCounts[websiteResolution.outcome]++;
       if ("detail" in websiteResolution && websiteResolution.detail) {
         websiteRejectReasons[websiteResolution.detail] = (websiteRejectReasons[websiteResolution.detail] ?? 0) + 1;
+      }
+      emailCounts[emailResolution.outcome]++;
+      if (emailResolution.detail) {
+        emailRejectReasons[emailResolution.detail] = (emailRejectReasons[emailResolution.detail] ?? 0) + 1;
       }
 
       details.push({
@@ -821,6 +1016,8 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
         org_nr: orgNrResolution.orgNr ?? (t.org_nr && t.org_nr.trim() !== "" ? t.org_nr : null),
         website_outcome: websiteResolution.outcome,
         ...("detail" in websiteResolution && websiteResolution.detail ? { website_reject_reason: websiteResolution.detail } : {}),
+        email_outcome: emailResolution.outcome,
+        ...(emailResolution.detail ? { email_detail: emailResolution.detail } : {}),
       });
     }
 
@@ -836,6 +1033,7 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
       skipped_locked: skippedLocked,
       org_nr: { ...orgNrCounts, by_source: orgNrBySource },
       website: { ...websiteCounts, reject_reasons: websiteRejectReasons },
+      email: { ...emailCounts, reject_reasons: emailRejectReasons },
       headless_fallback_attempted: fallbackCounters.attempted,
       headless_fallback_verified: fallbackCounters.verified,
       details,
