@@ -346,7 +346,11 @@ export function pickBatch(db: any, limit = 30): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status NOT IN ('opt_out')
+        WHERE k.verification_status NOT IN ('opt_out', 'terminal_unconfirmable')
+     -- dev-request 2026-08-23-terminal-unconfirmable: demonstrably
+     -- unconfirmable agents (Brreg-dead, or zero identity sources on the
+     -- second line) are removed from the hourly sweep permanently, same as
+     -- opt_out — see deriveVerificationStatus / the second-line block above.
      -- Round-robin: same ordering rationale as pickBatchBiased's ORDER
      -- constant below (skive F) — sweep_processed_at first so every agent
      -- is processed once before any repeat, dead-URL priority as tie-break.
@@ -921,14 +925,41 @@ export function applyUrlProbeResult(
 // Older callers still pass the boolean cross_source_passes; we accept either
 // for backwards compat.
 //
+// dev-request 2026-08-23-terminal-unconfirmable: Brreg showing the business
+// as deleted/bankrupt (brreg_konkurs) or inactive (brreg_inactive) is a
+// PERMANENT, structural disqualifier — the second-line gate further down
+// this file computes `nace_brreg_ok = gate_reasons.no_wrong_fit &&
+// gate_reasons.brreg_active`, so a brreg_active:false agent can never pass
+// the second line either (deterministicOk is always false there). It is
+// therefore safe to terminal-mark such an agent immediately rather than
+// leaving it to loop in review_required forever. Gated behind
+// RFB_TERMINAL_UNCONFIRMABLE_ENABLED, read at call time (same "no restart
+// needed" idiom as RFB_SECOND_LINE_VERIFICATION_ENABLED /
+// PENDING_VERIFY_PARKING_DISABLED elsewhere in this file) — when the flag
+// is not exactly "true", this branch never fires and behaviour is byte-
+// identical to before. The nace_blacklist-only case (no brreg flag) is
+// COMPLETELY UNCHANGED by this — still review_required, flag on or off.
+//
 // Pure function.
 export function deriveVerificationStatus(
   passes: boolean,
   flags: string[],
   cross_source_verdict?: CrossSourceVerdict | boolean
-): "verified" | "review_required" | "pending_verify" | "data_insufficient" | "paraply_epost_mangler" {
+):
+  | "verified"
+  | "review_required"
+  | "pending_verify"
+  | "data_insufficient"
+  | "paraply_epost_mangler"
+  | "terminal_unconfirmable" {
   if (!passes) {
     // Basic gate failed — reviewable if NACE/Brreg issues, otherwise retry
+    const brregDead = flags.includes("brreg_konkurs") || flags.includes("brreg_inactive");
+    if (brregDead && process.env.RFB_TERMINAL_UNCONFIRMABLE_ENABLED === "true") {
+      // Brreg-dead wins regardless of whether a nace_blacklist flag is ALSO
+      // present — permanent disqualifier either way.
+      return "terminal_unconfirmable";
+    }
     if (flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive")) {
       return "review_required";
     }
@@ -1367,6 +1398,21 @@ export async function runVerifierBatch(opts: {
       { fieldProvenance: fieldProv, knowledgePhone: agent.phone, knowledgeAddress: agent.address },
     );
     let newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
+    if (newVerification === "terminal_unconfirmable") {
+      // dev-request 2026-08-23-terminal-unconfirmable: stamp WHY into the
+      // persisted cross_source_reason JSON (mirrors how other flag-based
+      // markers like paraply_epost_mangler are added to crossSourceResults
+      // at the call site rather than inside the pure deriveVerificationStatus).
+      // computeKvalitetsGate only ever sets one of these two flags
+      // (is_konkurs checked before is_active — see the brreg block above),
+      // so a simple includes() check is unambiguous here.
+      (crossSourceResults as Record<string, unknown>).terminal_reason = gate.flags.includes("brreg_konkurs")
+        ? "brreg_konkurs"
+        : "brreg_inactive";
+      console.log(
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) terminal_unconfirmable (${(crossSourceResults as Record<string, unknown>).terminal_reason}) — removed from hourly sweep`,
+      );
+    }
     if (inferenceOnlyFields.length > 0) {
       // Quarantine: a factual field has only inference sources. Never promote
       // to the pool; downgrade `verified`/`pool_eligible` to review_required so
@@ -1678,6 +1724,24 @@ export async function runVerifierBatch(opts: {
           console.log(
             `[verifier] ${agent.id} (${agent.name ?? "?"}) second-line verified (sources: ${secondLine.sources.join(", ") || "none"})`,
           );
+        } else if (
+          process.env.RFB_TERMINAL_UNCONFIRMABLE_ENABLED === "true" &&
+          !secondLine.reasons.has_accepted_source &&
+          newVerification === "pending_verify"
+        ) {
+          // dev-request 2026-08-23-terminal-unconfirmable: first line found
+          // NO flags at all (not brreg-dead, not nace-blacklist — those are
+          // already handled by deriveVerificationStatus above and never
+          // reach here as 'pending_verify') AND the second line found ZERO
+          // identity sources across own-website/facebook_official_page/
+          // hanen.no/bondensmarked.no/Brreg-name-match. There is nothing
+          // left to corroborate this agent against — terminal-mark it so it
+          // stops looping in pending_verify forever.
+          newVerification = "terminal_unconfirmable";
+          (crossSourceResults as Record<string, unknown>).terminal_reason = "zero_identity_sources";
+          console.log(
+            `[verifier] ${agent.id} (${agent.name ?? "?"}) terminal_unconfirmable (zero_identity_sources) — removed from hourly sweep`,
+          );
         }
       }
 
@@ -1792,6 +1856,10 @@ export function buildRunEnvelope(input: {
   // secondLineEnabled). Lets the daily brief show the new pool growth.
   const verifiedSecondLineResults = r.filter((x) => x.verified_second_line);
   const paraplyBlocked = r.filter((x) => x.new_verification_status === "paraply_epost_mangler").length;
+  // dev-request 2026-08-23-terminal-unconfirmable: always 0 when
+  // RFB_TERMINAL_UNCONFIRMABLE_ENABLED is off. Lets the daily brief see how
+  // many agents this run permanently removed from the hourly sweep.
+  const terminalUnconfirmable = r.filter((x) => x.new_verification_status === "terminal_unconfirmable").length;
 
   return {
     run_id: input.run_id,
@@ -1836,6 +1904,7 @@ export function buildRunEnvelope(input: {
         },
       },
       { type: "db_state_change", value: paraplyBlocked, meta: { kind: "agents_paraply_epost_mangler" } },
+      { type: "db_state_change", value: terminalUnconfirmable, meta: { kind: "agents_terminal_unconfirmable" } },
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]
         : []),

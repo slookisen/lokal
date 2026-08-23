@@ -40155,6 +40155,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-08-23-terminal-unconfirmable: new `terminal_unconfirmable`
+// verification status so demonstrably unconfirmable agents (Brreg-dead, or
+// zero identity sources on the second line) stop looping in the hourly
+// verifier sweep, gated behind RFB_TERMINAL_UNCONFIRMABLE_ENABLED (default
+// OFF). Own harness: same in-memory better-sqlite3 DB seam as the sibling
+// second-line suite above, restored in `finally`. Tail position mirrors
+// that sibling's own registration convention, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-23-terminal-unconfirmable: terminal_unconfirmable verification status ──");
+  try {
+    const { runLokalAgentVerifierTerminalUnconfirmableTests } = require("../src/agents/lokal-agent-verifier-terminal-unconfirmable.test") as
+      typeof import("../src/agents/lokal-agent-verifier-terminal-unconfirmable.test");
+    const tu = await runLokalAgentVerifierTerminalUnconfirmableTests({ log: false });
+    passed += tu.passed;
+    failed += tu.failed;
+    for (const f of tu.failures) failures.push("lokal-agent-verifier-terminal-unconfirmable: " + f);
+    console.log(`  lokal-agent-verifier-terminal-unconfirmable: ${tu.passed} passed, ${tu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-terminal-unconfirmable: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel (fix-up,
 // code-review CHANGES-REQUESTED on 36580f2b): verified_second_line=1 must
 // NOT be commerce-eligible — cart-service.isProducerEligible() and the
