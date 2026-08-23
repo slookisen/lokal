@@ -4132,6 +4132,54 @@ function initSchema(db: Database.Database): void {
     console.error("Migration enrichment_write_pause failed:", err);
   }
 
+  // ─── dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel
+  //     (Fase-1, item 1, guardrail b) ────────────────────────────────────
+  // Permanent provenance stamp distinguishing an agent verified via RFB's
+  // NEW second (lower-bar) verification line from one verified via the
+  // ordinary first line + cross-source check. See
+  // src/agents/lokal-agent-verifier.ts's computeSecondLineVerification /
+  // applyVerifierOutcome for how these are read/written — the verifier only
+  // ever SETS these (never resets them), so the marker stays permanently
+  // queryable ("was this agent EVER promoted via the lower-bar line?") even
+  // if a later run also clears first-line on its own merits. Entirely
+  // additive/nullable — every existing row is unaffected
+  // (verified_second_line stays NULL/0, i.e. "no", for every agent that
+  // predates this migration).
+  //
+  //   verified_second_line         : 1 iff this agent has EVER been
+  //                                  promoted to 'verified' via the second
+  //                                  line. Default 0 so `WHERE
+  //                                  verified_second_line = 1` is a simple,
+  //                                  indexable sampling query for Daniel's
+  //                                  manual-review process (guardrail c —
+  //                                  no in-app review gate is built here by
+  //                                  design; this column is what makes that
+  //                                  manual sampling possible after the
+  //                                  fact).
+  //   verified_second_line_at      : ISO-8601 timestamp of the run that set
+  //                                  the flag.
+  //   verified_second_line_sources : JSON array of the accepted identity
+  //                                  source keys that fired (e.g.
+  //                                  ["facebook_official_page"]) — audit
+  //                                  trail for why the judge was even
+  //                                  reached.
+  //
+  // Idempotent ALTERs, same defensive try/catch idiom as every other
+  // migration in this file.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN verified_second_line INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agent_knowledge ADD COLUMN verified_second_line_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN verified_second_line_sources TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_agent_knowledge_verified_second_line
+         ON agent_knowledge(verified_second_line) WHERE verified_second_line = 1`
+    );
+  } catch { /* index already created */ }
+
 }
 
 export function closeDb(): void {

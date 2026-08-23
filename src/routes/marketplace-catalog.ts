@@ -194,6 +194,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
     WHERE p.availability = 'in_stock'
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
+      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
       ${cityFilter}
   `).get(...params) as { total: number };
 
@@ -222,6 +223,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
     WHERE p.availability = 'in_stock'
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
+      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
       ${cityFilter}
     ORDER BY p.updated_at DESC, p.id
     LIMIT ? OFFSET ?
@@ -290,6 +292,7 @@ INNER JOIN agent_knowledge k ON k.agent_id = a.id
      WHERE a.id = ?
        AND a.umbrella_type IS NULL
        AND k.verification_status = 'verified'
+       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
   `).get(id) as { id: string } | undefined;
   if (!agent) {
     res.status(404).json({ success: false, error: "Agent not found or not discoverable" });
