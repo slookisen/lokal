@@ -6440,22 +6440,24 @@ export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
     if (rawLabel.length >= 4) {
       const rawHost = `${rawLabel}.no`;
       const punycodeHost = (require("node:url") as typeof import("node:url")).domainToASCII(rawHost);
-      const punycodeLabels = punycodeHost.split(".");
-      const encodedLabel = punycodeLabels[0] || "";
+      // domainToASCII (WHATWG non-strict) does not fail-closed on a forbidden
+      // host code point (/, \, ?, #, etc.) — it silently TRUNCATES the string
+      // at that character instead of rejecting it. A dot-like separator
+      // (ASCII "." or a Unicode dot-equivalent such as U+3002/U+FF0E/U+FF61,
+      // which IDNA/UTS-46 also treats as a label boundary) preceding the
+      // truncating character can leave a truncated remainder that still
+      // splits into exactly two labels by coincidence, with the second label
+      // fully producer-name-controlled and never validated (round 3 finding,
+      // see the Grep 4c failure report). A split().length === 2 check can be
+      // fooled this way regardless of which forbidden character truncated
+      // the string, so instead require the WHOLE encoded host to match
+      // "<xn-- label>.no" anchored start-to-end — no truncation can produce a
+      // string that still ends in a literal ".no" with nothing following it.
+      const encodedLabel = punycodeHost.split(".")[0] || "";
       if (
         punycodeHost &&
         punycodeHost !== rawHost &&
-        // This source only intends single joined labels under ".no" (see
-        // JSDoc above): exactly two DNS labels, "<label>.no". A raw token
-        // containing stray punctuation (e.g. a literal "." from a business
-        // name like "Ole H. Nordmann Gård") can make domainToASCII split the
-        // result into MORE than two labels — and every label past the first
-        // was never validated below, letting malformed content (raw "&",
-        // over-length labels) back in through the unchecked tail. Reject
-        // the whole candidate outright when it isn't exactly one label + TLD.
-        punycodeLabels.length === 2 &&
-        encodedLabel.startsWith("xn--") &&
-        /^[a-z0-9-]+$/i.test(encodedLabel) &&
+        /^xn--[a-z0-9-]+\.no$/i.test(punycodeHost) &&
         encodedLabel.length <= 63 &&
         !hosts.includes(punycodeHost)
       ) {

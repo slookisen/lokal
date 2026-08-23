@@ -286,6 +286,66 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
         `gwch-5: '${name}' → no host has more than 2 dots total (no spurious extra DNS label from a stray "." in the raw name) (got: ${JSON.stringify(hosts)})`,
       );
     }
+
+    // gwch-6: PR #682 round 4 (Daniel-authorized 4th iteration) — round 3's
+    // finding: domainToASCII does NOT fail-closed on a WHATWG forbidden host
+    // code point (/, \, ?, #, etc.) — it silently TRUNCATES the string at
+    // that character instead of rejecting it. When a dot-like separator
+    // precedes the truncating character, the truncated remainder can still
+    // coincidentally split into exactly 2 labels, sailing past the old
+    // `punycodeLabels.length === 2` check with a completely unvalidated
+    // second "label". "Åse.Nordmann/Sønn Gård" is the exact repro from the
+    // failure report: raw label "åse.nordmann/sønngård" → domainToASCII
+    // truncates at "/" and yields "xn--se-xia.nordmann" — 2 labels, first
+    // one a well-formed "xn--..." — which the old check let through even
+    // though there is no ".no" (or any TLD) anywhere in the result. The new
+    // anchored `/^xn--[a-z0-9-]+\.no$/i` check requires the literal ".no" to
+    // be the entire remainder of the string, so no truncation can satisfy
+    // it regardless of which forbidden character caused it.
+    {
+      const name = "Åse.Nordmann/Sønn Gård";
+      const hosts = gardssalgWebsiteCandidateHosts(name);
+      assertTrue(
+        !hosts.some((h) => h.startsWith("xn--")),
+        `gwch-6a: '${name}' (forbidden host code point "/" truncates domainToASCII's output before ".no") → the punycode candidate is correctly OMITTED, not just malformed (got: ${JSON.stringify(hosts)})`,
+      );
+      assertTrue(
+        !hosts.includes("xn--se-xia.nordmann"),
+        `gwch-6b: '${name}' → the specific round-3 repro malformed host "xn--se-xia.nordmann" (no .no TLD) never appears`,
+      );
+      // The other candidate sources (v1/v2, first-word-only, ø→oe-alone) for
+      // this same input are unaffected by rejecting the punycode source.
+      assertTrue(
+        hosts.includes("asenordmannsonngard.no"),
+        `gwch-6c: '${name}' → the v1 (å→a) all-tokens candidate asenordmannsonngard.no is still present`,
+      );
+      assertTrue(
+        hosts.includes("aasenordmannsoenngaard.no"),
+        `gwch-6d: '${name}' → the v2 (å→aa) all-tokens candidate aasenordmannsoenngaard.no is still present`,
+      );
+      assertTrue(
+        hosts.includes("asenordmannsonn.no"),
+        `gwch-6e: '${name}' → the v3 first-word-only candidate asenordmannsonn.no is still present`,
+      );
+      assertTrue(
+        hosts.includes("senordmannsoenngrd.no"),
+        `gwch-6f: '${name}' → the v3 ø→oe-alone candidate senordmannsoenngrd.no is still present`,
+      );
+    }
+
+    // gwch-7: positive case for the round-4 anchored regex itself — a plain
+    // diacritic name with no forbidden host code points must still produce a
+    // valid, fully-anchored "xn--...·.no" candidate (not just "some xn--
+    // candidate exists", gwch-3a already covers that loosely — this pins the
+    // exact expected encoded value so the anchored regex isn't accidentally
+    // over-strict and rejecting legitimate encodings).
+    {
+      const hosts = gardssalgWebsiteCandidateHosts("Torgersen Gård");
+      assertTrue(
+        hosts.includes("xn--torgersengrd-2cb.no"),
+        `gwch-7: 'Torgersen Gård' → the exact punycode candidate xn--torgersengrd-2cb.no is present and matches /^xn--[a-z0-9-]+\\.no$/i in full (got: ${JSON.stringify(hosts)})`,
+      );
+    }
   }
 
   // ── scanGardssalgProviderRowForMojibake (dev-request 2026-07-21-
