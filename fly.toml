@@ -44,6 +44,14 @@ primary_region = 'arn'
   # switch as above, for marketplace.ts's processAgent() homepage-provenance
   # batch. Already shipped flag-OFF for the same reason.
   HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED = 'true'
+  # dev-request 2026-08-22-rfb-kildebredde-loft-pilot-forst.md, Fase 1 item 3
+  # (Daniel-autorisert 2026-08-23, daniel-responses/2026-08-23-go-tre-beslutninger-og-
+  # effektmaal.md, beslutning C): slar PA andrelinje-verifisering + paraply-ruting
+  # (PR #684, allerede kodet+testet+deployet flagg-AV) for resten av pending_verify-
+  # koen (~880). Ingen ny kode her - kun flagget. Rollback: sett til 'false' eller
+  # fjern linjen; profiler allerede satt `verified_second_line=1` beholder stempelet
+  # (permanent provenance, uendret ved flagg-av) men INGEN NYE skrives mens AV.
+  RFB_SECOND_LINE_VERIFICATION_ENABLED = 'true'
 
 [[mounts]]
   source = 'lokal_data'
