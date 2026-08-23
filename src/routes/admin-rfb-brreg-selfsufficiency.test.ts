@@ -11,12 +11,14 @@
  * external-candidates-intake function evaluateRfbWebsiteCandidate
  * (admin-rfb-website-discovery.ts), threading Brreg's own `telefon`/`mobil`
  * through as anchor-field evidence via that function's new (additive)
- * `contactOverride` param.
- *
- * Scope boundary covered by ABSENCE, not a positive assertion: Brreg's
- * `epostadresse` field is never read into any queue row / audit row / DB
- * column anywhere in this suite's fixtures or assertions — this slice never
- * touches email at all (see the route file's own header).
+ * `contactOverride` param, and (d) — Grep 1d, dev-request
+ * 2026-08-22-rfb-website-email-selvforsyning, Daniel's explicit GO —
+ * resolves Brreg's own `epostadresse` into `agents.contact_email` through
+ * the SAME shared LLM-judge + deterministic-backstop gate
+ * (gateContactCandidates, services/contact-candidate-judge.ts) used
+ * elsewhere in this codebase, with "egen side vinner ved avvik" (own site
+ * wins on conflict): a non-blank existing contact_email that differs from
+ * the gate-approved Brreg candidate is NEVER overwritten.
  *
  * Covers (src/routes/admin-rfb-brreg-selfsufficiency.ts):
  *   (a) 403 without X-Admin-Key.
@@ -88,6 +90,48 @@
  *       exact/corroborated candidate; org_nr_outcome 'written' in details[].
  *   (q) Route-level: a claimed (locked) agent via agentIds override ->
  *       skipped_locked, never resolved/queued.
+ *   (r) Part (d): resolveEmailForTarget — blank contact_email + gate-approved
+ *       Brreg epost -> `email_written` (apply) / `email_would_write`
+ *       (dry-run), with an agent_knowledge_audit row asserted for the apply
+ *       case and none for the dry-run case.
+ *   (s) Part (d): gate rejects via the cheap deterministic backstop
+ *       classifier (favicon-shaped local part) -> `email_rejected_by_gate`,
+ *       never written.
+ *   (t) Part (d): Brreg epost on a platform-owned domain
+ *       (isPlatformOwnedEmailDomain) -> `email_rejected_platform_domain`,
+ *       and the judge/gate is proven NEVER called (call-count assertion) —
+ *       the cheap check runs before the LLM judge.
+ *   (u) Part (d): existing contact_email non-blank and DIFFERENT from the
+ *       gate-approved Brreg candidate -> `email_conflict_kept_own`,
+ *       agents.contact_email UNCHANGED, no audit row — "egen side vinner ved
+ *       avvik".
+ *   (v) Part (d): existing contact_email case-insensitively EQUALS the
+ *       gate-approved Brreg candidate -> `email_already_present`, no write;
+ *       the gate is still proven to have run first (comparison is AFTER
+ *       gating, per spec).
+ *   (w) Part (d): agents.claimed_at set BETWEEN scan and write (simulated
+ *       race) -> `email_skipped_locked`, caught by the write function's own
+ *       fresh re-read, not the outer batch scan.
+ *   (x) Part (d): curated_fields locks "contact_email" BETWEEN scan and
+ *       write (same race-simulation approach) -> `email_skipped_curated`.
+ *   (x2/x3) Grep 1d TOCTOU fix: agents.contact_email itself (not just
+ *       claimed_at/curated_fields) changes BETWEEN scan and write via a
+ *       concurrent writer — (x2) the concurrent value DIFFERS from the
+ *       gate-approved Brreg candidate -> `email_conflict_at_write_time`, the
+ *       concurrently-written value survives, no audit row; (x3) the
+ *       concurrent value case-insensitively MATCHES the Brreg candidate ->
+ *       same outcome (folded no-op), no write, no audit row.
+ *   (y) Part (d) scope-boundary regression guard (folded into (i) above,
+ *       assertions i3/i4): a row whose website was already non-blank at scan
+ *       time never triggers a Brreg fetch at all, so its email outcome is
+ *       `not_attempted` and the judge is never called for it — proving this
+ *       is the deliberate, documented scope boundary, not an accidental
+ *       fetch-skip bug.
+ *   (z) Route-level: the response's new `email: {...}` block carries every
+ *       RfbBssEmailOutcome key (plus `reject_reasons`) with correct counts
+ *       across a small multi-row batch mixing email_written/no_brreg_epost/
+ *       not_attempted/email_conflict_kept_own in one call, and each row's
+ *       `details[]` entry carries its own `email_outcome`/`email_detail`.
  *
  * All Brreg I/O is stubbed via this route's OWN injectable fetch seam
  * (__setRfbBrregSelfSufficiencyFetchForTesting) for every direct Brreg call
@@ -206,6 +250,15 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   const prevFetch = globalThis.fetch;
+  // Part (d), Grep 1d: resolveEmailForTarget's gateContactCandidates ->
+  // judgeContactCandidate calls globalThis.fetch DIRECTLY (no injectable
+  // seam of its own — same as admin-rfb-contact-extraction.ts's own email
+  // leg, see contact-candidate-judge.ts's own doc comment) to
+  // https://api.anthropic.com/v1/messages. Mocked below via the SAME
+  // combined stub this suite already points both the injectable seam and
+  // globalThis.fetch at, matching admin-rfb-contact-extraction.test.ts's own
+  // convention of parsing the candidate back out of the prompt text.
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -220,10 +273,31 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
   let searchCallCount = 0;
   let detailCallCount = 0;
   let pageCallCount = 0;
+  let anthropicCallCount = 0;
+  // Candidate strings (exact, case-sensitive) the fake judge should AVVIS
+  // rather than GODKJENN — every fixture not listed here is approved, same
+  // "everything plausible is approved by default" convention as
+  // admin-rfb-contact-extraction.test.ts's own anthropicRejectCandidates set.
+  const anthropicRejectCandidates = new Set<string>();
 
   function stubFetch(): typeof fetch {
-    return (async (url: string | URL | Request) => {
+    return (async (url: string | URL | Request, init?: any) => {
       const u = String(url);
+      if (u.includes("api.anthropic.com")) {
+        anthropicCallCount++;
+        const body = init?.body ? JSON.parse(init.body) : {};
+        const prompt: string = body?.messages?.[0]?.content ?? "";
+        const m = prompt.match(/^Kandidat \([^)]+\): (.+)$/m);
+        const candidate = m ? m[1].trim() : "";
+        if (anthropicRejectCandidates.has(candidate)) {
+          return jsonResponse(200, {
+            content: [{ type: "text", text: "AVVIS\nSer ut som sidestøy, ikke ekte kontaktinfo for denne produsenten." }],
+          });
+        }
+        return jsonResponse(200, {
+          content: [{ type: "text", text: "GODKJENN\nEkte kontaktinfo for produsenten." }],
+        });
+      }
       if (u.includes("navn=")) {
         searchCallCount++;
         for (const [key, fx] of searchFixtures) {
@@ -252,6 +326,7 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
     __setDbForTesting(testDb as any);
     __initSchemaForTesting(testDb as any);
     process.env.ADMIN_KEY = ADMIN_KEY;
+    process.env.ANTHROPIC_API_KEY = "rfb-bss-test-anthropic-key";
     delete process.env.ANALYTICS_ADMIN_KEY;
 
     const combinedStub = stubFetch();
@@ -267,6 +342,8 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       "../routes/admin-knowledge",
       "../services/brreg-client",
       "../services/local-orgnr-candidates",
+      "../services/contact-candidate-judge",
+      "../routes/admin-agents-contact-email-write",
     ]) {
       try { delete require.cache[require.resolve(mod)]; } catch { /* ignore */ }
     }
@@ -280,6 +357,7 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       pickDomainSourceForTarget,
       resolveOrgNrForTarget,
       resolveWebsiteAndContactForTarget,
+      resolveEmailForTarget,
       __setRfbBrregSelfSufficiencyFetchForTesting,
     } = routeModule;
     __setRfbBrregSelfSufficiencyFetchForTesting(combinedStub);
@@ -317,22 +395,38 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       role?: string; verticalId?: string | null; umbrellaType?: string | null;
       createdAt?: string; postalCode?: string | null; website?: string | null;
       phone?: string | null; address?: string | null;
+      contactEmail?: string | null; curatedFields?: string | null;
     }): void {
       testDb.prepare(
         `INSERT INTO agents (
            id, name, description, provider, contact_email, url, role, api_key,
            org_nr, claimed_at, city, is_active, vertical_id, umbrella_type, created_at
-         ) VALUES (?, ?, 't', 't', 'x@example.com', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, 't', 't', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
-        o.id, o.name, o.url ?? "https://example.com", o.role ?? "producer", `key-${o.id}`,
+        // agents.contact_email is NOT NULL (src/database/init.ts) — default
+        // preserves the pre-part-(d) fixture value ('x@example.com') for
+        // every existing call site; part (d)'s own tests pass
+        // contactEmail:"" explicitly for a "blank, eligible to receive a
+        // Brreg-sourced address" row (the route's own blank check is
+        // `.trim() === ""`, so "" behaves identically to a true NULL would).
+        o.id, o.name, o.contactEmail !== undefined ? o.contactEmail : "x@example.com",
+        o.url ?? "https://example.com", o.role ?? "producer", `key-${o.id}`,
         o.orgNr ?? null, o.claimedAt ?? null, o.city ?? null,
         o.isActive ?? 1, o.verticalId ?? "rfb", o.umbrellaType ?? null,
         o.createdAt ?? "2026-01-01 00:00:00",
       );
-      if (o.postalCode !== undefined || o.website !== undefined || o.phone !== undefined || o.address !== undefined) {
+      if (
+        o.postalCode !== undefined || o.website !== undefined || o.phone !== undefined ||
+        o.address !== undefined || o.curatedFields !== undefined
+      ) {
         testDb.prepare(
-          `INSERT INTO agent_knowledge (agent_id, postal_code, website, phone, address, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-        ).run(o.id, o.postalCode ?? null, o.website ?? null, o.phone ?? null, o.address ?? null, new Date().toISOString());
+          `INSERT INTO agent_knowledge (agent_id, postal_code, website, phone, address, curated_fields, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          // agent_knowledge.curated_fields is NOT NULL DEFAULT '{}'
+          // (src/database/init.ts) — "{}" is the "not locked" sentinel.
+          o.id, o.postalCode ?? null, o.website ?? null, o.phone ?? null, o.address ?? null,
+          o.curatedFields ?? "{}", new Date().toISOString(),
+        );
       }
     }
     function readAgent(id: string): any {
@@ -346,6 +440,25 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
     }
     function clearWebsiteQueue(): void {
       testDb.prepare("DELETE FROM agents_website_review_queue").run();
+    }
+    function readAuditRows(agentId: string, fieldName: string): any[] {
+      return testDb
+        .prepare("SELECT * FROM agent_knowledge_audit WHERE agent_id = ? AND field_name = ? ORDER BY changed_at ASC")
+        .all(agentId, fieldName);
+    }
+    // Builds an RfbBssTargetRow-shaped object straight off a live agents/
+    // agent_knowledge read — mirrors every other test group's own `t` literal
+    // shape (id/name/org_nr/claimed_at/city/url/postal_code/website/phone/
+    // address), extended with contact_email/curated_fields (part d).
+    function targetRow(id: string): any {
+      const a = readAgent(id);
+      const k = testDb.prepare("SELECT * FROM agent_knowledge WHERE agent_id = ?").get(id) as any;
+      return {
+        id: a.id, name: a.name, org_nr: a.org_nr, claimed_at: a.claimed_at,
+        city: a.city, url: a.url, postal_code: k?.postal_code ?? null, website: k?.website ?? null,
+        phone: k?.phone ?? null, address: k?.address ?? null,
+        contact_email: a.contact_email ?? null, curated_fields: k?.curated_fields ?? null,
+      };
     }
 
     // ── (b) domainTokenCandidateName ──────────────────────────────────────
@@ -475,14 +588,21 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
     insertAgent({ id: "web-already-has", name: "Web Already Has AS", orgNr: "911000111", website: "https://existing.no", createdAt: "2026-02-01 00:00:00" });
     {
       const target = readAgent("web-already-has");
-      const t = { id: target.id, name: target.name, org_nr: target.org_nr, claimed_at: null, city: null, url: null, postal_code: null, website: "https://existing.no", phone: null, address: null };
+      const t = { id: target.id, name: target.name, org_nr: target.org_nr, claimed_at: null, city: null, url: null, postal_code: null, website: "https://existing.no", phone: null, address: null, contact_email: null, curated_fields: null };
       const detailBefore = detailCallCount;
       const existingHosts = rfbWdExistingWebsiteHosts(testDb as any);
       const result = await resolveWebsiteAndContactForTarget(
-        testDb as any, t as any, "911000111", "test-batch-i", existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub,
+        testDb as any, t as any, "911000111", "test-batch-i", existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub, false,
       );
       assertEq(result.outcome, "website_already_present", "i1: already-has-website -> website_already_present");
       assertEq(detailCallCount, detailBefore, "i2: fetchBrregContact NEVER called for an already-webbed row");
+      // Part (d) scope-boundary regression guard: this route's own cohort
+      // only requires org_nr-missing OR website-missing, so a row that
+      // already has a website only qualified because org_nr was missing —
+      // no Brreg fetch happens at all, so the email leg is a documented
+      // `not_attempted`, not a fetch or a gate call.
+      assertEq(result.email.outcome, "not_attempted", "i3: already-has-website row -> email not_attempted (no Brreg fetch at all, deliberate scope boundary)");
+      assertEq(anthropicCallCount, 0, "i4: the judge is never even called for an already-webbed row");
     }
 
     // ── (j) fetchBrregContact resolves to null (network failure) -> graceful
@@ -490,13 +610,18 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
     detailFixtures.set("911000222", "network_error");
     {
       const target = readAgent("web-brreg-fail");
-      const t = { id: target.id, name: target.name, org_nr: target.org_nr, claimed_at: null, city: null, url: null, postal_code: null, website: null, phone: null, address: null };
+      const t = { id: target.id, name: target.name, org_nr: target.org_nr, claimed_at: null, city: null, url: null, postal_code: null, website: null, phone: null, address: null, contact_email: null, curated_fields: null };
       const existingHosts = rfbWdExistingWebsiteHosts(testDb as any);
       const result = await resolveWebsiteAndContactForTarget(
-        testDb as any, t as any, "911000222", "test-batch-j", existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub,
+        testDb as any, t as any, "911000222", "test-batch-j", existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub, false,
       );
       assertEq(result.outcome, "brreg_contact_fetch_failed", "j1: network failure handled gracefully -> brreg_contact_fetch_failed");
       assertTrue(!readWebsiteQueueRow("web-brreg-fail"), "j2: nothing queued");
+      // Part (d): the SAME fetch failure that fails the website leg also
+      // means the email leg never got a `contact` object to read `epost`
+      // from — simplification per spec, not a distinct email-fetch-failure
+      // outcome.
+      assertEq(result.email.outcome, "not_attempted", "j3: Brreg fetch failure -> email not_attempted too");
     }
 
     // ── (k) Brreg contact has no hjemmeside -> no_brreg_hjemmeside ────────
@@ -504,13 +629,17 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
     detailFixtures.set("911000333", { status: 200, body: activeDetail("911000333", "Web No Hjemmeside AS", { hjemmeside: null }) });
     {
       const target = readAgent("web-no-hjemmeside");
-      const t = { id: target.id, name: target.name, org_nr: target.org_nr, claimed_at: null, city: null, url: null, postal_code: null, website: null, phone: null, address: null };
+      const t = { id: target.id, name: target.name, org_nr: target.org_nr, claimed_at: null, city: null, url: null, postal_code: null, website: null, phone: null, address: null, contact_email: null, curated_fields: null };
       const existingHosts = rfbWdExistingWebsiteHosts(testDb as any);
       const result = await resolveWebsiteAndContactForTarget(
-        testDb as any, t as any, "911000333", "test-batch-k", existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub,
+        testDb as any, t as any, "911000333", "test-batch-k", existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub, false,
       );
       assertEq(result.outcome, "no_brreg_hjemmeside", "k1: no hjemmeside on file -> no_brreg_hjemmeside");
       assertTrue(!readWebsiteQueueRow("web-no-hjemmeside"), "k2: nothing queued");
+      // Part (d): the fixture carries no epostadresse either -> the
+      // independent email leg still ran (contact WAS fetched successfully)
+      // but found nothing.
+      assertEq(result.email.outcome, "no_brreg_epost", "k3: no epostadresse on file -> no_brreg_epost");
     }
 
     // ── (l) telefon/mobil evidence threading ───────────────────────────────
@@ -571,9 +700,10 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       const existingHosts = rfbWdExistingWebsiteHosts(testDb as any);
       const routeResult = await resolveWebsiteAndContactForTarget(
         testDb as any, targetForFn as any, "911000444", "test-batch-l-route",
-        existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub,
+        existingHosts, new Set(), { attempted: 0, verified: 0 }, combinedStub, false,
       );
       assertEq(routeResult.outcome, "website_proposed", "l6: full route wiring (fetchBrregContact -> contactOverride) proposes the candidate");
+      assertEq(routeResult.email.outcome, "no_brreg_epost", "l7: no epostadresse on this fixture -> email leg no_brreg_epost, independent of the website leg's own outcome");
     }
 
     // ── (m) evaluateRfbWebsiteCandidate reason-param regression guard ─────
@@ -656,6 +786,228 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       assertTrue(!res.body.details.some((d: any) => d.agent_id === "route-locked"), "q4: locked agent never appears in details[]");
     }
 
+    // ═══ Part (d), Grep 1d: Brreg epostadresse -> agents.contact_email ═══
+    // dev-request 2026-08-22-rfb-website-email-selvforsyning. Daniel's
+    // explicit GO: "ja, godkjenn Brreg som e-postkilde — egen side vinner
+    // ved avvik". resolveEmailForTarget is unit-tested directly below (the
+    // exported seam this slice's spec calls for); (z) covers the full
+    // route-level response shape across a mixed batch.
+
+    // ── (r) blank contact_email + Brreg epost + gate approves -> written
+    //        (apply) / would_write (dry-run) ─────────────────────────────
+    insertAgent({ id: "email-apply-write", name: "Email Apply Write AS", orgNr: "912000101", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const t = targetRow("email-apply-write");
+      assertEq(t.contact_email, "", "r0: sanity — contact_email starts blank");
+      const auditBefore = readAuditRows("email-apply-write", "contact_email").length;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, t as any, "912000101", "post@bondensgaard-r1.no", "test-batch-r-apply", true,
+      );
+      assertEq(resolution.outcome, "email_written", "r1: blank contact_email + gate-approved Brreg epost -> email_written in apply mode");
+      assertEq(readAgent("email-apply-write").contact_email, "post@bondensgaard-r1.no", "r2: agents.contact_email actually written");
+      const auditRows = readAuditRows("email-apply-write", "contact_email");
+      assertEq(auditRows.length, auditBefore + 1, "r3: exactly one agent_knowledge_audit row inserted for this write");
+      const auditRow = auditRows[auditRows.length - 1];
+      assertEq(auditRow.old_value, "", "r4: audit row old_value is the blank string it was before (was blank)");
+      assertEq(auditRow.new_value, "post@bondensgaard-r1.no", "r5: audit row new_value is the written address");
+      assertEq(auditRow.changed_by, "system", "r6: audit row changed_by is 'system' (CHECK constraint)");
+      assertTrue(
+        String(auditRow.notes).includes("rfb-brreg-selfsufficiency") && String(auditRow.notes).includes("912000101") && String(auditRow.notes).includes("test-batch-r-apply"),
+        "r7: audit row notes carry the route tag, org_nr, and batch_id",
+      );
+    }
+    insertAgent({ id: "email-dryrun-write", name: "Email Dryrun Write AS", orgNr: "912000102", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const t = targetRow("email-dryrun-write");
+      const resolution = await resolveEmailForTarget(
+        testDb as any, t as any, "912000102", "post@bondensgaard-r2.no", "test-batch-r-dryrun", false,
+      );
+      assertEq(resolution.outcome, "email_would_write", "r8: same shape, dry-run -> email_would_write");
+      assertEq(readAgent("email-dryrun-write").contact_email, "", "r9: dry-run never writes");
+      assertEq(readAuditRows("email-dryrun-write", "contact_email").length, 0, "r10: dry-run leaves no audit row");
+    }
+
+    // ── (s) gate rejects (backstop classifier: favicon-shaped local part) ──
+    insertAgent({ id: "email-gate-reject", name: "Email Gate Reject AS", orgNr: "912000103", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const t = targetRow("email-gate-reject");
+      const resolution = await resolveEmailForTarget(
+        testDb as any, t as any, "912000103", "favicon@somefarm-s1.no", "test-batch-s", true,
+      );
+      assertEq(resolution.outcome, "email_rejected_by_gate", "s1: favicon-shaped local part -> email_rejected_by_gate");
+      assertTrue(!!resolution.detail && resolution.detail.startsWith("backstop classifier:"), "s2: detail names the backstop classifier, not the LLM judge (cheaper check caught it first)");
+      assertEq(readAgent("email-gate-reject").contact_email, "", "s3: never written");
+    }
+
+    // ── (t) Brreg epost is a platform-owned domain -> rejected BEFORE the
+    //        judge is ever called (cheap, deterministic check first) ──────
+    insertAgent({ id: "email-platform-domain", name: "Email Platform Domain AS", orgNr: "912000104", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const t = targetRow("email-platform-domain");
+      const anthropicBefore = anthropicCallCount;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, t as any, "912000104", "kontakt@rettfrabonden.com", "test-batch-t", true,
+      );
+      assertEq(resolution.outcome, "email_rejected_platform_domain", "t1: rettfrabonden.com epost -> email_rejected_platform_domain");
+      assertEq(anthropicCallCount, anthropicBefore, "t2: the judge/gate is NEVER called for a platform-owned domain (call-count assertion)");
+      assertEq(readAgent("email-platform-domain").contact_email, "", "t3: never written");
+    }
+
+    // ── (u) existing contact_email non-blank, DIFFERS from the gate-approved
+    //        Brreg candidate -> email_conflict_kept_own, existing NEVER
+    //        overwritten ("egen side vinner ved avvik") ────────────────────
+    insertAgent({
+      id: "email-conflict", name: "Email Conflict AS", orgNr: "912000105",
+      contactEmail: "gammel@egenside-u1.no", createdAt: "2026-02-01 00:00:00",
+    });
+    {
+      const t = targetRow("email-conflict");
+      const auditBefore = readAuditRows("email-conflict", "contact_email").length;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, t as any, "912000105", "annen@brreg-u1.no", "test-batch-u", true,
+      );
+      assertEq(resolution.outcome, "email_conflict_kept_own", "u1: existing differs from gate-approved Brreg candidate -> email_conflict_kept_own");
+      assertTrue(
+        !!resolution.detail && resolution.detail.includes("gammel@egenside-u1.no") && resolution.detail.includes("annen@brreg-u1.no"),
+        "u2: detail carries BOTH the existing and the Brreg candidate values",
+      );
+      assertEq(readAgent("email-conflict").contact_email, "gammel@egenside-u1.no", "u3: agents.contact_email UNCHANGED — own site wins on conflict");
+      assertEq(readAuditRows("email-conflict", "contact_email").length, auditBefore, "u4: no new audit row for this field from this batch");
+    }
+
+    // ── (v) existing contact_email case-insensitively EQUALS the Brreg
+    //        candidate -> email_already_present, no write; the gate is still
+    //        called first (comparison happens AFTER gating) ────────────────
+    insertAgent({
+      id: "email-already-present", name: "Email Already Present AS", orgNr: "912000106",
+      contactEmail: "SAME@Farm-v1.NO", createdAt: "2026-02-01 00:00:00",
+    });
+    {
+      const t = targetRow("email-already-present");
+      const anthropicBefore = anthropicCallCount;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, t as any, "912000106", "same@farm-v1.no", "test-batch-v", true,
+      );
+      assertEq(resolution.outcome, "email_already_present", "v1: case-insensitive match -> email_already_present");
+      assertTrue(anthropicCallCount > anthropicBefore, "v2: the gate WAS still called before the comparison (order per spec)");
+      assertEq(readAgent("email-already-present").contact_email, "SAME@Farm-v1.NO", "v3: original casing untouched, no write attempted");
+    }
+
+    // ── (w) agents.claimed_at set BETWEEN scan and write (race) ->
+    //        email_skipped_locked, caught by the write function's own fresh
+    //        re-read, not the outer batch scan ──────────────────────────────
+    insertAgent({ id: "email-locked-race", name: "Email Locked Race AS", orgNr: "912000107", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const staleTarget = targetRow("email-locked-race"); // captured BEFORE the row gets locked
+      testDb.prepare("UPDATE agents SET claimed_at = ? WHERE id = ?").run("2026-02-02 00:00:00", "email-locked-race");
+      const resolution = await resolveEmailForTarget(
+        testDb as any, staleTarget as any, "912000107", "post@bondensgaard-w1.no", "test-batch-w", true,
+      );
+      assertEq(resolution.outcome, "email_skipped_locked", "w1: locked between scan and write -> email_skipped_locked");
+      assertEq(readAgent("email-locked-race").contact_email, "", "w2: never written");
+      assertEq(readAuditRows("email-locked-race", "contact_email").length, 0, "w3: no audit row");
+    }
+
+    // ── (x) curated_fields locks "contact_email" BETWEEN scan and write
+    //        (same race-simulation approach as (w)) -> email_skipped_curated
+    insertAgent({
+      id: "email-curated-race", name: "Email Curated Race AS", orgNr: "912000108",
+      contactEmail: "", curatedFields: "{}", createdAt: "2026-02-01 00:00:00",
+    });
+    {
+      const staleTarget = targetRow("email-curated-race"); // captured BEFORE curated_fields locks it
+      testDb.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?").run(
+        JSON.stringify({ contact_email: true }), "email-curated-race",
+      );
+      const resolution = await resolveEmailForTarget(
+        testDb as any, staleTarget as any, "912000108", "post@bondensgaard-x1.no", "test-batch-x", true,
+      );
+      assertEq(resolution.outcome, "email_skipped_curated", "x1: curated_fields locked between scan and write -> email_skipped_curated");
+      assertEq(readAgent("email-curated-race").contact_email, "", "x2: never written");
+      assertEq(readAuditRows("email-curated-race", "contact_email").length, 0, "x3: no audit row");
+    }
+
+    // ── (x2) Grep 1d TOCTOU fix: agents.contact_email itself changes BETWEEN
+    //        scan and write via a CONCURRENT writer (simulates
+    //        admin-agents-contact-email-write.ts / admin-rfb-contact-
+    //        extraction.ts's own write path landing a REAL address on this
+    //        exact row) -> the fresh re-read inside applyRfbBssEmailWrite's
+    //        own transaction catches it -> email_conflict_at_write_time; the
+    //        concurrently-written value survives, is NOT overwritten by the
+    //        Brreg candidate, and no audit row is inserted for this attempt.
+    insertAgent({ id: "email-write-race-differs", name: "Email Write Race Differs AS", orgNr: "912000109", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const staleTarget = targetRow("email-write-race-differs"); // captured BEFORE the concurrent writer landed a value
+      testDb.prepare("UPDATE agents SET contact_email = ? WHERE id = ?").run("real-owner-address@egen-side.no", "email-write-race-differs");
+      const auditBefore = readAuditRows("email-write-race-differs", "contact_email").length;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, staleTarget as any, "912000109", "brreg-candidate@somewhere.no", "test-batch-x2", true,
+      );
+      assertEq(resolution.outcome, "email_conflict_at_write_time", "x2a: concurrent writer landed a DIFFERENT real address between scan and write -> email_conflict_at_write_time");
+      assertEq(readAgent("email-write-race-differs").contact_email, "real-owner-address@egen-side.no", "x2b: the concurrently-written value survives — NOT overwritten by the Brreg candidate");
+      assertEq(readAuditRows("email-write-race-differs", "contact_email").length, auditBefore, "x2c: no new audit row for this write attempt");
+    }
+
+    // ── (x3) symmetric case: the concurrent write happens to match the Brreg
+    //        candidate exactly, case-insensitively -> harmless no-op, folded
+    //        into the SAME outcome (still no write attempted — already
+    //        satisfied), no audit row ────────────────────────────────────────
+    insertAgent({ id: "email-write-race-matches", name: "Email Write Race Matches AS", orgNr: "912000110", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const staleTarget = targetRow("email-write-race-matches"); // captured BEFORE the concurrent writer landed a value
+      testDb.prepare("UPDATE agents SET contact_email = ? WHERE id = ?").run("Post@Bondensgaard-X3.NO", "email-write-race-matches");
+      const auditBefore = readAuditRows("email-write-race-matches", "contact_email").length;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, staleTarget as any, "912000110", "post@bondensgaard-x3.no", "test-batch-x3", true,
+      );
+      assertEq(resolution.outcome, "email_conflict_at_write_time", "x3a: concurrent write case-insensitively MATCHES the Brreg candidate -> no-op, folded into email_conflict_at_write_time");
+      assertEq(readAgent("email-write-race-matches").contact_email, "Post@Bondensgaard-X3.NO", "x3b: original concurrently-written value untouched, no write attempted");
+      assertEq(readAuditRows("email-write-race-matches", "contact_email").length, auditBefore, "x3c: no new audit row");
+    }
+
+    // ── (y) already covered as a regression guard in (i) above: a row whose
+    //        target.website was already non-blank at scan time -> the email
+    //        leg is `not_attempted` and NEITHER fetchBrregContact NOR the
+    //        judge is ever called for that row (assertions i3/i4).
+
+    // ── (z) route-level response shape: the new `email: {...}` block's keys
+    //        are all present with correct counts across a mixed batch ──────
+    insertAgent({ id: "route-email-rz1", name: "Route Email RZ1 AS", orgNr: "912000201", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    insertAgent({ id: "route-email-rz2", name: "Route Email RZ2 AS", orgNr: "912000202", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    insertAgent({ id: "route-email-rz3", name: "Qzxk99 Route Email RZ3 NonMatch", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    insertAgent({
+      id: "route-email-rz4", name: "Route Email RZ4 AS", orgNr: "912000204",
+      contactEmail: "min@egenside-rz4.no", createdAt: "2026-02-01 00:00:00",
+    });
+    detailFixtures.set("912000201", { status: 200, body: activeDetail("912000201", "Route Email RZ1 AS", { hjemmeside: null, epostadresse: "kontakt@bondensgaard-rz1.no" }) });
+    detailFixtures.set("912000202", { status: 200, body: activeDetail("912000202", "Route Email RZ2 AS", { hjemmeside: null }) });
+    detailFixtures.set("912000204", { status: 200, body: activeDetail("912000204", "Route Email RZ4 AS", { hjemmeside: null, epostadresse: "annen@brreg-rz4.no" }) });
+    {
+      const res = await callRoute({ agentIds: ["route-email-rz1", "route-email-rz2", "route-email-rz3", "route-email-rz4"], apply: true });
+      assertEq(res.status, 200, "z1: mixed-batch apply call -> 200");
+      const expectedEmailBlockKeys = [
+        "email_already_present", "no_brreg_epost", "email_written", "email_would_write",
+        "email_conflict_kept_own", "email_conflict_at_write_time", "email_rejected_by_gate", "email_rejected_platform_domain",
+        "email_skipped_locked", "email_skipped_curated", "not_attempted", "reject_reasons",
+      ];
+      for (const key of expectedEmailBlockKeys) {
+        assertTrue(Object.prototype.hasOwnProperty.call(res.body.email, key), `z2: response email block has key '${key}'`);
+      }
+      assertEq(res.body.email.email_written, 1, "z3: exactly one email_written (rz1)");
+      assertEq(res.body.email.no_brreg_epost, 1, "z4: exactly one no_brreg_epost (rz2)");
+      assertEq(res.body.email.not_attempted, 1, "z5: exactly one not_attempted (rz3 — no org_nr, no candidate found)");
+      assertEq(res.body.email.email_conflict_kept_own, 1, "z6: exactly one email_conflict_kept_own (rz4)");
+      assertEq(res.body.email.email_already_present, 0, "z7: zero email_already_present in this mix");
+      assertEq(readAgent("route-email-rz1").contact_email, "kontakt@bondensgaard-rz1.no", "z8: rz1 actually written");
+      assertEq(readAgent("route-email-rz4").contact_email, "min@egenside-rz4.no", "z9: rz4's own contact_email untouched (conflict, own site wins)");
+      const detailRz1 = res.body.details.find((d: any) => d.agent_id === "route-email-rz1");
+      assertEq(detailRz1?.email_outcome, "email_written", "z10: details[] carries the per-row email_outcome");
+      const detailRz4 = res.body.details.find((d: any) => d.agent_id === "route-email-rz4");
+      assertEq(detailRz4?.email_outcome, "email_conflict_kept_own", "z11: details[] email_outcome for the conflict row");
+      assertTrue(!!detailRz4?.email_detail, "z12: details[] carries email_detail for a rejected/conflicted row");
+      assertTrue(Object.keys(res.body.email.reject_reasons).length >= 1, "z13: reject_reasons carries at least the conflict's detail string");
+    }
+
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-brreg-selfsufficiency: unexpected error: " + String(err?.stack || err?.message || err));
@@ -665,6 +1017,8 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
     else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
+    if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
     try {
       if (prevDb) (require("../database/init") as typeof import("../database/init")).__setDbForTesting(prevDb);
     } catch {
