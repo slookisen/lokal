@@ -860,6 +860,11 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(rej?.reason, "no_longer_blank", "x2: fill-only guard fired");
       const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-race'").get() as any;
       assertEq(k.website, "https://allerede-satt.no", "x3: the existing value is untouched");
+      // Grep 3-nit (dev-request 2026-08-22-rfb-website-email-selvforsyning):
+      // no_longer_blank is permanently unwritable — the queue row must not
+      // stay 'pending' to be re-picked and re-rejected by every future call.
+      const q = readQueueRow("wd-race");
+      assertEq(q.status, "superseded", "x4: no_longer_blank flips the queue row out of pending");
     }
 
     // ═══ dev-request 2026-08-22-rfb-website-review-auto-approve: server-side
@@ -1023,6 +1028,43 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(!("mode" in r.body), "ag4: no mode field on the manual-approvals response");
       assertTrue(!("min_confidence" in r.body), "ag5: no min_confidence field on the manual-approvals response");
       assertTrue(!("candidates_considered" in r.body), "ag6: no candidates_considered field on the manual-approvals response");
+    }
+
+    // ── (ah) Grep 3-nit (dev-request 2026-08-22-rfb-website-email-selvforsyning):
+    //     a no_longer_blank rejection in auto mode must retire the queue row —
+    //     otherwise every subsequent auto call re-picks and re-rejects it
+    //     forever, even though the outcome can never change --
+    {
+      // Clean slate — (af)'s cap-enforcement block left 35 confidence-1.0
+      // rows 'pending' (it was dry-run, so nothing wrote or superseded them),
+      // which would otherwise get swept up alongside this block's own row by
+      // the default min_confidence filter. Same precedent as the auto-mode
+      // section's own opening DELETE above.
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-auto-race", name: "Auto Race Gard" });
+      insertQueueRow({
+        id: "q-auto-race",
+        agentId: "wd-auto-race",
+        candidateUrl: "https://autoracegard.no",
+        confidence: 1.0,
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      });
+      testDb.prepare("UPDATE agent_knowledge SET website = 'https://allerede-satt-auto.no' WHERE agent_id = 'wd-auto-race'").run();
+
+      const r1 = await callApprove({ auto: true, apply: true });
+      assertEq(r1.body.candidates_considered, 1, "ah1: the row qualifies and is picked in the first auto call");
+      assertTrue(
+        r1.body.rejected.some((x: any) => x.agent_id === "wd-auto-race" && x.reason === "no_longer_blank"),
+        "ah2: rejected as no_longer_blank",
+      );
+      assertEq(readQueueRow("wd-auto-race").status, "superseded", "ah3: queue row flipped out of pending");
+
+      const r2 = await callApprove({ auto: true, apply: true });
+      assertEq(r2.body.candidates_considered, 0, "ah4: a second auto call no longer even considers the superseded row");
+      assertTrue(
+        !r2.body.rejected.some((x: any) => x.agent_id === "wd-auto-race"),
+        "ah5: never re-rejected — it is not in the pending pool at all, not silently re-approved either",
+      );
     }
 
     // ═══ Skive 6 + 7 (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype) ═══
