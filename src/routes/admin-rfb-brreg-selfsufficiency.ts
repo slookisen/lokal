@@ -640,6 +640,7 @@ export type RfbBssEmailOutcome =
   | "email_written"
   | "email_would_write"
   | "email_conflict_kept_own"
+  | "email_conflict_at_write_time"
   | "email_rejected_by_gate"
   | "email_rejected_platform_domain"
   | "email_skipped_locked"
@@ -665,8 +666,8 @@ function applyRfbBssEmailWrite(
   newEmail: string,
   orgNr: string,
   batchId: string,
-): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } {
-  const tx = db.transaction((): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } => {
+): { outcome: "written" | "skippedLocked" | "skippedCurated" | "conflictAtWriteTime"; oldValue?: string | null } {
+  const tx = db.transaction((): { outcome: "written" | "skippedLocked" | "skippedCurated" | "conflictAtWriteTime"; oldValue?: string | null } => {
     const cur = db
       .prepare(
         `SELECT a.claimed_at AS claimed_at, a.contact_email AS contact_email, k.curated_fields AS curated_fields
@@ -678,6 +679,24 @@ function applyRfbBssEmailWrite(
     if (!cur) return { outcome: "skippedLocked" }; // vanished mid-batch — treat as untouchable, never write
     if (cur.claimed_at) return { outcome: "skippedLocked", oldValue: cur.contact_email };
     if (isContactEmailCurated(cur.curated_fields)) return { outcome: "skippedCurated", oldValue: cur.contact_email };
+
+    // Grep 1d TOCTOU fix: contact_email itself is re-checked fresh here too,
+    // symmetric with the claimed_at/curated_fields checks above — the scan-
+    // time decision in resolveEmailForTarget only compared the STALE `target`
+    // snapshot against the gate-approved candidate, so a concurrent writer
+    // (e.g. admin-agents-contact-email-write.ts, or admin-rfb-contact-
+    // extraction.ts's own write path) can land a real address on this exact
+    // row in the window between that scan and this write. Folded into ONE
+    // outcome ("conflictAtWriteTime") whether the freshly-read value DIFFERS
+    // from newEmail (a genuine race — "egen side vinner ved avvik" applies
+    // here too, so never overwrite) or already EQUALS it case-insensitively
+    // (already-satisfied no-op) — both cases mean "don't write, something
+    // non-blank is already there", so there is no caller-visible need to
+    // split them into two separate outcomes.
+    const curEmail = (cur.contact_email ?? "").trim();
+    if (curEmail) {
+      return { outcome: "conflictAtWriteTime", oldValue: cur.contact_email };
+    }
 
     db.prepare(`UPDATE agents SET contact_email = ? WHERE id = ?`).run(newEmail, agentId);
     db.prepare(
@@ -750,6 +769,12 @@ export async function resolveEmailForTarget(
   const written = applyRfbBssEmailWrite(db, target.id, gateApprovedEmail, orgNr, batchId);
   if (written.outcome === "written") return { outcome: "email_written" };
   if (written.outcome === "skippedLocked") return { outcome: "email_skipped_locked" };
+  if (written.outcome === "conflictAtWriteTime") {
+    return {
+      outcome: "email_conflict_at_write_time",
+      detail: `existing_at_write_time="${written.oldValue ?? ""}" brreg_candidate="${gateApprovedEmail}"`,
+    };
+  }
   return { outcome: "email_skipped_curated" };
 }
 
@@ -931,6 +956,7 @@ router.post("/rfb-brreg-selfsufficiency", async (req: Request, res: Response) =>
       email_written: 0,
       email_would_write: 0,
       email_conflict_kept_own: 0,
+      email_conflict_at_write_time: 0,
       email_rejected_by_gate: 0,
       email_rejected_platform_domain: 0,
       email_skipped_locked: 0,

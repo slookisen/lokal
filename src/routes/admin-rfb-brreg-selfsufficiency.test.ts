@@ -114,6 +114,13 @@
  *       fresh re-read, not the outer batch scan.
  *   (x) Part (d): curated_fields locks "contact_email" BETWEEN scan and
  *       write (same race-simulation approach) -> `email_skipped_curated`.
+ *   (x2/x3) Grep 1d TOCTOU fix: agents.contact_email itself (not just
+ *       claimed_at/curated_fields) changes BETWEEN scan and write via a
+ *       concurrent writer — (x2) the concurrent value DIFFERS from the
+ *       gate-approved Brreg candidate -> `email_conflict_at_write_time`, the
+ *       concurrently-written value survives, no audit row; (x3) the
+ *       concurrent value case-insensitively MATCHES the Brreg candidate ->
+ *       same outcome (folded no-op), no write, no audit row.
  *   (y) Part (d) scope-boundary regression guard (folded into (i) above,
  *       assertions i3/i4): a row whose website was already non-blank at scan
  *       time never triggers a Brreg fetch at all, so its email outcome is
@@ -920,6 +927,44 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       assertEq(readAuditRows("email-curated-race", "contact_email").length, 0, "x3: no audit row");
     }
 
+    // ── (x2) Grep 1d TOCTOU fix: agents.contact_email itself changes BETWEEN
+    //        scan and write via a CONCURRENT writer (simulates
+    //        admin-agents-contact-email-write.ts / admin-rfb-contact-
+    //        extraction.ts's own write path landing a REAL address on this
+    //        exact row) -> the fresh re-read inside applyRfbBssEmailWrite's
+    //        own transaction catches it -> email_conflict_at_write_time; the
+    //        concurrently-written value survives, is NOT overwritten by the
+    //        Brreg candidate, and no audit row is inserted for this attempt.
+    insertAgent({ id: "email-write-race-differs", name: "Email Write Race Differs AS", orgNr: "912000109", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const staleTarget = targetRow("email-write-race-differs"); // captured BEFORE the concurrent writer landed a value
+      testDb.prepare("UPDATE agents SET contact_email = ? WHERE id = ?").run("real-owner-address@egen-side.no", "email-write-race-differs");
+      const auditBefore = readAuditRows("email-write-race-differs", "contact_email").length;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, staleTarget as any, "912000109", "brreg-candidate@somewhere.no", "test-batch-x2", true,
+      );
+      assertEq(resolution.outcome, "email_conflict_at_write_time", "x2a: concurrent writer landed a DIFFERENT real address between scan and write -> email_conflict_at_write_time");
+      assertEq(readAgent("email-write-race-differs").contact_email, "real-owner-address@egen-side.no", "x2b: the concurrently-written value survives — NOT overwritten by the Brreg candidate");
+      assertEq(readAuditRows("email-write-race-differs", "contact_email").length, auditBefore, "x2c: no new audit row for this write attempt");
+    }
+
+    // ── (x3) symmetric case: the concurrent write happens to match the Brreg
+    //        candidate exactly, case-insensitively -> harmless no-op, folded
+    //        into the SAME outcome (still no write attempted — already
+    //        satisfied), no audit row ────────────────────────────────────────
+    insertAgent({ id: "email-write-race-matches", name: "Email Write Race Matches AS", orgNr: "912000110", contactEmail: "", createdAt: "2026-02-01 00:00:00" });
+    {
+      const staleTarget = targetRow("email-write-race-matches"); // captured BEFORE the concurrent writer landed a value
+      testDb.prepare("UPDATE agents SET contact_email = ? WHERE id = ?").run("Post@Bondensgaard-X3.NO", "email-write-race-matches");
+      const auditBefore = readAuditRows("email-write-race-matches", "contact_email").length;
+      const resolution = await resolveEmailForTarget(
+        testDb as any, staleTarget as any, "912000110", "post@bondensgaard-x3.no", "test-batch-x3", true,
+      );
+      assertEq(resolution.outcome, "email_conflict_at_write_time", "x3a: concurrent write case-insensitively MATCHES the Brreg candidate -> no-op, folded into email_conflict_at_write_time");
+      assertEq(readAgent("email-write-race-matches").contact_email, "Post@Bondensgaard-X3.NO", "x3b: original concurrently-written value untouched, no write attempted");
+      assertEq(readAuditRows("email-write-race-matches", "contact_email").length, auditBefore, "x3c: no new audit row");
+    }
+
     // ── (y) already covered as a regression guard in (i) above: a row whose
     //        target.website was already non-blank at scan time -> the email
     //        leg is `not_attempted` and NEITHER fetchBrregContact NOR the
@@ -942,7 +987,7 @@ export async function runAdminRfbBrregSelfSufficiencyTests(opts: { log?: boolean
       assertEq(res.status, 200, "z1: mixed-batch apply call -> 200");
       const expectedEmailBlockKeys = [
         "email_already_present", "no_brreg_epost", "email_written", "email_would_write",
-        "email_conflict_kept_own", "email_rejected_by_gate", "email_rejected_platform_domain",
+        "email_conflict_kept_own", "email_conflict_at_write_time", "email_rejected_by_gate", "email_rejected_platform_domain",
         "email_skipped_locked", "email_skipped_curated", "not_attempted", "reject_reasons",
       ];
       for (const key of expectedEmailBlockKeys) {
