@@ -565,7 +565,15 @@ async function tryRfbWebsiteCandidateHost(
     userAgent: RFB_WD_USER_AGENT,
     timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
   });
-  if (!result.ok) return null;
+  // Grep 4f (dev-request 2026-08-22-rfb-website-email-selvforsyning): the
+  // site never answered at all -- distinct from `evidence_mismatch` below
+  // (site answered, page just didn't carry matching evidence). `result.reason`
+  // is fetch-page.ts's own truthful classifier (dns_not_found/timeout/http_404/
+  // etc.), so this is a real, site-side diagnostic, not a guess.
+  if (!result.ok) {
+    excludedHere.push({ host, reason: `fetch_failed:${result.reason}` });
+    return null;
+  }
 
   const finalHost = rfbWdHostFromUrl(result.finalUrl) || host;
   if (finalHost !== host) {
@@ -613,6 +621,12 @@ async function tryRfbWebsiteCandidateHost(
     // never a negative signal recorded against the producer.
   }
 
+  // Grep 4f: the page DID answer (fetch, and — when attempted — render, both
+  // succeeded) but never carried matching evidence. Deliberately generic and
+  // non-renderer-specific even when a render attempt was involved, so a
+  // machine-side `renderer_unavailable` can never surface as a signal about
+  // the site (see the fall-through comment above this).
+  excludedHere.push({ host: finalHost, reason: "evidence_mismatch" });
   return null;
 }
 
