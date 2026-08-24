@@ -125,6 +125,13 @@ import { fetchPage, discoverContentLinks, type FetchPageResult, type FetchPersis
 // down, which DOES have real source-page text on hand).
 import { classifyContactCandidateDefect } from "../services/contact-candidate-judge";
 import { checkAboutCandidateSubstantiatedBySource } from "../services/about-source-substantiation";
+// dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding (round-2
+// review finding): THIS is the endpoint lokal-agent-enrichment PUTs into —
+// the exact write path the "Helios Trondheim" defect class targets — and it
+// had zero content validation on `description` before this. Same detector,
+// same rejection message shape as marketplace.ts's three gates; see the
+// write site below (agentColumnUpdates) for the call.
+import { looksLikeCodeArtifact } from "../services/description-quality";
 
 const router = Router();
 
@@ -656,8 +663,28 @@ router.put("/", (req: Request, res: Response) => {
   // normalized to a JSON-array string (accepts string[] or a pre-serialized
   // JSON string; a non-array primitive is wrapped defensively as []).
   const agentColumnUpdates: { col: string; val: unknown }[] = [];
-  if (typeof body.description === "string")
+  if (typeof body.description === "string") {
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-2 review finding): this is the live agent-driven enrichment
+    // write path (lokal-agent-enrichment PUTs here) with no prior content
+    // validation on `description` — structurally the same defect class as
+    // the Helios Trondheim incident this whole dev-request exists to fix.
+    // Reject BEFORE any write (before the transaction below, before the
+    // allow_correct gating, before any other column is touched) — mirrors
+    // marketplace.ts's three description-write gates exactly, same error
+    // shape, for consistency across every write surface into
+    // agents.description. A `null` description is NOT specially guarded
+    // here: the `typeof === "string"` check above already makes null a
+    // no-op (same as an omitted field), never a raw SQL NOT NULL crash, so
+    // there is nothing to add there (this route's write set is built from
+    // explicit type checks, not a generic pass-through of the whole body,
+    // unlike marketplaceRegistry.updateAgent()).
+    if (looksLikeCodeArtifact(body.description)) {
+      res.status(400).json({ error: "description contains code/script artifacts — rejected" });
+      return;
+    }
     agentColumnUpdates.push({ col: "description", val: body.description });
+  }
   if (body.categories !== undefined) {
     let catVal: string;
     if (typeof body.categories === "string") {

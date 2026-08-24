@@ -450,6 +450,21 @@ router.post("/register", (req: Request, res: Response) => {
 
     const registration = AgentRegistrationSchema.parse(req.body);
 
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): marketplaceRegistry.register()
+    // below writes `registration.description` straight into
+    // `agents.description` with zero content validation of its own —
+    // AgentRegistrationSchema only enforces `min(10)` length. This is the
+    // PUBLIC, unauthenticated self-registration endpoint, so this check
+    // matters even though a freshly self-registered agent starts
+    // quarantined (isVetted:false) pending human review below — the same
+    // defect class this dev-request exists to fix, just caught one step
+    // earlier than a human reviewer would.
+    if (looksLikeCodeArtifact(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
+
     // Blocklist gate — quietly reject without leaking why.
     const blocked = isBlocked({
       name: registration.name,
@@ -2099,6 +2114,19 @@ router.post("/admin/register", (req: Request, res: Response) => {
 
   try {
     const registration = AdminRegistrationSchema.parse(req.body);
+
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): this is the endpoint
+    // lokal-agent-enrichment itself registers producers through (see the
+    // enrichment-write-pause gate comment right above this handler), and
+    // marketplaceRegistry.register() below writes `registration.description`
+    // straight into `agents.description` with zero content validation of
+    // its own — AdminRegistrationSchema only defaults it to "". An empty
+    // default correctly passes (looksLikeCodeArtifact("") === false).
+    if (looksLikeCodeArtifact(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
 
     // Blocklist gate — discovery agent should never re-insert a producer who opted out.
     const blocked = isBlocked({
@@ -4642,6 +4670,18 @@ router.post("/admin/umbrellas", (req: Request, res: Response) => {
       res.status(400).json({ success: false, error: `umbrella_type must be one of: ${Array.from(UMBRELLA_TYPES).join(", ")}` });
       return;
     }
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): this INSERTs straight into the
+    // SAME `agents.description` column the rest of this dev-request gates —
+    // found unguarded, distinct from the three PUT/PATCH /agents/:id and
+    // /agents/:id/description sites already covered above. `description`
+    // is already coerced to "" for any non-string body value, so there is
+    // no NOT NULL-crash case here to guard separately (unlike the
+    // umbrella-meta PATCH sibling below); only the content check is needed.
+    if (description && looksLikeCodeArtifact(description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
 
     const db = getDb();
 
@@ -4791,6 +4831,32 @@ router.patch("/admin/agents/:id/umbrella-meta", (req: Request, res: Response) =>
     }
     if (typeof body.description === "string" && body.description.length > 2000) {
       res.status(400).json({ success: false, error: "description length 0-2000" });
+      return;
+    }
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): this UPDATEs `agents.description`
+    // straight from the body via the generic Object.keys(body) SET-clause
+    // loop below, with only a length bound above it — found unguarded, the
+    // same defect class as the three sites already gated elsewhere in this
+    // file. Two checks, same order/shape as descriptionWriteGuardError above
+    // (not reused directly — that helper is scoped to the PUT/PATCH
+    // /agents/:id pair and returns a bare {error} shape, whereas every other
+    // validation branch on THIS endpoint already answers {success:false,
+    // error} — matching this endpoint's own local convention, not the other
+    // handler's):
+    //   1. Explicit `null` — unlike POST /admin/umbrellas above (which
+    //      coerces any non-string to ""), this route's generic SET-clause
+    //      loop writes body.description VERBATIM, so an explicit
+    //      `{"description": null}` would otherwise reach agents.description
+    //      (TEXT NOT NULL) as a raw SqliteError caught only by this route's
+    //      broad try/catch → a generic 500 instead of a clean 400.
+    //   2. looksLikeCodeArtifact() — scraped JS/CMS-bootstrap code content.
+    if (body.description === null) {
+      res.status(400).json({ success: false, error: "description cannot be null — agents.description is NOT NULL" });
+      return;
+    }
+    if (typeof body.description === "string" && looksLikeCodeArtifact(body.description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
       return;
     }
 

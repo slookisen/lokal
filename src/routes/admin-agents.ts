@@ -479,6 +479,24 @@ router.post("/register", async (req: Request, res: Response) => {
   }
   const trimmedPhone = typeof phone === "string" ? phone.trim() : "";
 
+  // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+  // (round-3 repo-wide re-search finding): this INSERT below writes a
+  // caller-supplied `description` straight into `agents.description` — the
+  // same defect class the rest of this dev-request gates, and this
+  // registration surface is literally the one the enrichment-write-pause
+  // gate right above already treats as part of the same automated
+  // agent-driven write family ("registered 5 producers in violation on
+  // 2026-08-20"). An empty/omitted description falls through to a safe
+  // generated fallback string below and is never checked here — only a
+  // caller-supplied, non-empty value is.
+  if (typeof description === "string" && description.trim() && looksLikeCodeArtifact(description)) {
+    res.status(400).json({
+      error: "description contains code/script artifacts — rejected",
+      detail: "description contains code/script artifacts — rejected",
+    });
+    return;
+  }
+
   const VALID_VERTICALS = ["rfb", "dental", "experiences"] as const;
   if (!VALID_VERTICALS.includes(vertical_id as typeof VALID_VERTICALS[number])) {
     res.status(400).json({

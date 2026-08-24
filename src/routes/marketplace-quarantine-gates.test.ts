@@ -121,7 +121,7 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
 
   // ── req/res test harness — no HTTP server, no port; invokes the real
   // handler function pulled directly off the router's own stack ──────────
-  function findRouteHandler(router: any, path: string, method: "get" | "post"): Function {
+  function findRouteHandler(router: any, path: string, method: "get" | "post" | "patch"): Function {
     const layer = (router.stack as any[]).find(
       (l: any) => l.route && l.route.path === path && l.route.methods?.[method],
     );
@@ -263,6 +263,14 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     const llmsTxtHandler = findRouteHandler(discoveryRouter, "/llms.txt", "get");
     const llmsFullTxtHandler = findRouteHandler(discoveryRouter, "/llms-full.txt", "get");
     const agentsJsonHandler = findRouteHandler(discoveryRouter, "/.well-known/agents.json", "get");
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): four more write surfaces into
+    // `agents.description` found unguarded — see the assertions block below
+    // ("description code-artifact guard — round-3 additional write paths").
+    const adminRegisterHandler = findRouteHandler(marketplaceRouter, "/admin/register", "post");
+    const adminUmbrellaCreateHandler = findRouteHandler(marketplaceRouter, "/admin/umbrellas", "post");
+    const adminUmbrellaMetaHandler = findRouteHandler(marketplaceRouter, "/admin/agents/:id/umbrella-meta", "patch");
+    const adminAgentsRegisterHandler = findRouteHandler(adminAgentsRouter, "/register", "post");
 
     const SUITE_ADMIN_KEY_LOCAL = process.env.ADMIN_KEY || "suite-canonical-admin-key-20260730";
 
@@ -735,6 +743,142 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
         blocklistRows.some((r: any) => r.identifier_type === "email" && r.identifier_value === normalizeEmail("spammer@example-spam.test")),
         "d10-email: blocklist entry captures the deleted unvetted agent's email (would be missing without includeUnvetted:true on the pre-delete lookup)",
       );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // (e) description code-artifact guard — round-3 additional write paths
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding.
+    // A repo-wide re-search for OTHER unguarded writes into
+    // `agents.description` (beyond the PUT/PATCH /agents/:id,
+    // /agents/:id/description and PUT /admin/knowledge sites already
+    // covered by this dev-request's own dedicated test files) found four
+    // more: the PUBLIC POST /register (asserted above too, via the
+    // Mikhailo-replay fixture, but only with a NORMAL description — this
+    // adds the rejection case), POST /admin/register, POST /admin/umbrellas
+    // and PATCH /admin/agents/:id/umbrella-meta. Each gets a rejection case
+    // (400, nothing written) and a normal-value case (succeeds unaffected).
+    {
+      const CODE_ARTIFACT = "<script>var a=1;var b=2;function(){};</script>";
+
+      // ── e1: POST /register (public) — code-artifact description → 400,
+      // no agents row created (same body as the "a" Mikhailo fixture,
+      // minus the spoof fields, description swapped for a code artifact).
+      {
+        const before = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        const r = await invokeHandler(registerHandler, makeReq({
+          body: {
+            name: "E1 Codeart Gård",
+            description: CODE_ARTIFACT,
+            provider: "E1 Codeart Gård",
+            contactEmail: "e1-codeart@example.test",
+            url: "https://e1-codeart.example.test",
+            role: "producer",
+            skills: [{ id: "sell-goods", name: "Selger varer", description: "Selger varer", tags: [] }],
+          },
+        }));
+        assertEq(r.status, 400, "e1: POST /register — code-artifact description → 400");
+        assertEq(r.body?.error, "description contains code/script artifacts — rejected", "e1b: error message matches the other write-site gates");
+        const after = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        assertEq(after.n, before.n, "e1c: no agents row created by the rejected registration");
+      }
+
+      // ── e2: POST /admin/register — code-artifact description → 400,
+      // no agents row created. name is the only required field.
+      {
+        const before = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        const r = await invokeHandler(adminRegisterHandler, makeReq({
+          body: { name: "E2 Codeart Admin Gård", description: CODE_ARTIFACT },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(r.status, 400, "e2: POST /admin/register — code-artifact description → 400");
+        assertEq(r.body?.error, "description contains code/script artifacts — rejected", "e2b: error message matches the other write-site gates");
+        const after = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        assertEq(after.n, before.n, "e2c: no agents row created by the rejected admin registration");
+      }
+
+      // ── e3: POST /admin/umbrellas — code-artifact description → 400, no
+      // row created; a NORMAL description → 201 and is written verbatim
+      // (false-positive guard for this write site too).
+      let e3UmbrellaId = "";
+      {
+        const before = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        const rBad = await invokeHandler(adminUmbrellaCreateHandler, makeReq({
+          body: { name: "E3 Codeart Paraply", umbrella_type: "market_network", description: CODE_ARTIFACT },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(rBad.status, 400, "e3: POST /admin/umbrellas — code-artifact description → 400");
+        assertEq(rBad.body?.error, "description contains code/script artifacts — rejected", "e3b: error message matches the other write-site gates");
+        const afterBad = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        assertEq(afterBad.n, before.n, "e3c: no agents row created by the rejected umbrella creation");
+
+        const normalDesc = "Nasjonalt nettverk for lokale bondens marked-arrangementer.";
+        const rOk = await invokeHandler(adminUmbrellaCreateHandler, makeReq({
+          body: { name: "E3 OK Paraply", umbrella_type: "market_network", description: normalDesc },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(rOk.status, 201, "e3d: POST /admin/umbrellas — normal description → 201, not flagged");
+        e3UmbrellaId = rOk.body?.data?.id || "";
+        const row = testDb.prepare("SELECT description FROM agents WHERE id = ?").get(e3UmbrellaId) as any;
+        assertEq(row?.description, normalDesc, "e3e: normal umbrella description written verbatim");
+      }
+
+      // ── e4: PATCH /admin/agents/:id/umbrella-meta — code-artifact
+      // description → 400, existing value UNCHANGED; explicit null → 400
+      // (agents.description is TEXT NOT NULL — same null-guard discipline
+      // as the PUT/PATCH /agents/:id sibling gates); a normal description
+      // → 200 and IS written (regression guard: the checks above must not
+      // block a legitimate umbrella-meta update).
+      {
+        assertTrue(!!e3UmbrellaId, "setup: e3's umbrella agent exists for e4 to PATCH");
+        const before = testDb.prepare("SELECT description FROM agents WHERE id = ?").get(e3UmbrellaId) as any;
+
+        const rBad = await invokeHandler(adminUmbrellaMetaHandler, makeReq({
+          params: { id: e3UmbrellaId },
+          body: { description: CODE_ARTIFACT },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(rBad.status, 400, "e4: PATCH /admin/agents/:id/umbrella-meta — code-artifact description → 400");
+        assertEq(rBad.body?.error, "description contains code/script artifacts — rejected", "e4b: error message matches the other write-site gates");
+        const afterBad = testDb.prepare("SELECT description FROM agents WHERE id = ?").get(e3UmbrellaId) as any;
+        assertEq(afterBad?.description, before?.description, "e4c: description UNCHANGED after rejected umbrella-meta PATCH");
+
+        const rNull = await invokeHandler(adminUmbrellaMetaHandler, makeReq({
+          params: { id: e3UmbrellaId },
+          body: { description: null },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(rNull.status, 400, "e4d: PATCH /admin/agents/:id/umbrella-meta — explicit null description → 400 (not a raw SQL 500)");
+        const afterNull = testDb.prepare("SELECT description FROM agents WHERE id = ?").get(e3UmbrellaId) as any;
+        assertEq(afterNull?.description, before?.description, "e4e: description still UNCHANGED after rejected null PATCH");
+
+        const rOk = await invokeHandler(adminUmbrellaMetaHandler, makeReq({
+          params: { id: e3UmbrellaId },
+          body: { description: "Oppdatert paraplybeskrivelse, helt normal tekst." },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(rOk.status, 200, "e4f: PATCH /admin/agents/:id/umbrella-meta — normal description → 200 (guard does not block a real update)");
+        const afterOk = testDb.prepare("SELECT description FROM agents WHERE id = ?").get(e3UmbrellaId) as any;
+        assertEq(afterOk?.description, "Oppdatert paraplybeskrivelse, helt normal tekst.", "e4g: normal umbrella-meta description written");
+      }
+
+      // ── e5: POST /register (admin-agents.ts) — code-artifact description
+      // → 400, no agents row created. name/url/city/vertical_id required.
+      {
+        const before = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        const r = await invokeHandler(adminAgentsRegisterHandler, makeReq({
+          body: {
+            name: "E5 Codeart Discovery Gård",
+            url: "https://e5-codeart.example.test",
+            city: "Bergen",
+            vertical_id: "rfb",
+            description: CODE_ARTIFACT,
+          },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(r.status, 400, "e5: admin-agents.ts POST /register — code-artifact description → 400");
+        const after = testDb.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+        assertEq(after.n, before.n, "e5b: no agents row created by the rejected discovery registration");
+      }
     }
   } catch (err) {
     failed++;

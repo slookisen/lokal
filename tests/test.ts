@@ -7565,6 +7565,72 @@ const _pr24Promise = (async function runPr24Tests() {
         assertEq(aRow.description, "CURATED description — do not touch", "PR-A-E14: curated description PRESERVED (never overwritten by homepage)");
       }
 
+      // ── PR-A endpoint: description code-artifact guard (round-2 review ──────
+      // finding, dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-
+      // opprydding) — PUT /admin/knowledge is the endpoint lokal-agent-
+      // enrichment actually PUTs into (the live agent-driven write path this
+      // whole dev-request targets), and it had zero content validation on
+      // `description`. Same detector + same error shape as marketplace.ts's
+      // three sibling gates.
+      {
+        // ── PR-A-CODEART: scraped-JS description → 400, rejected BEFORE any
+        // write (both description AND a co-present other field stay untouched —
+        // proves the whole request is refused atomically, not just the
+        // description column).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key, description) VALUES ('prA-codeart', 'PR-A Codeart', 'pra-codeart', 'producer', 'k', ?)"
+        ).run("Original untouched description.");
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-codeart",
+          about: "Skal ikke skrives heller.",
+          description: "<script>var a=1;var b=2;function(){};</script>",
+        }, PR24_KEY);
+        assertEq(resp.status, 400, "PR-A-CODEART-1: code-artifact description → 400");
+        assertEq(resp.body?.error, "description contains code/script artifacts — rejected",
+          "PR-A-CODEART-2: error message matches marketplace.ts's three sibling gates");
+        const aRow = pr24db.prepare("SELECT description FROM agents WHERE id = 'prA-codeart'").get() as any;
+        assertEq(aRow.description, "Original untouched description.", "PR-A-CODEART-3: agents.description UNCHANGED after rejected PUT");
+        const kRow = pr24db.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'prA-codeart'").get() as any;
+        assertTrue(kRow === undefined, "PR-A-CODEART-4: about NOT written either — whole request rejected before the transaction, not just description");
+      }
+
+      {
+        // ── PR-A-CODEART: ordinary description that merely NAMES a technology
+        // in prose → 200, not flagged (mirrors the false-positive guard already
+        // proven on the marketplace.ts gates — must hold on this route too).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('prA-normal', 'PR-A Normal', 'pra-normal', 'producer', 'k')"
+        ).run();
+        const normalDesc = "Vi bruker moderne teknologi og JavaScript-baserte verktøy i gårdsdriften vår.";
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-normal",
+          description: normalDesc,
+        }, PR24_KEY, true);
+        assertEq(resp.status, 200, "PR-A-CODEART-5: normal description (names JavaScript in prose) → 200, not flagged");
+        const aRow = pr24db.prepare("SELECT description FROM agents WHERE id = 'prA-normal'").get() as any;
+        assertEq(aRow.description, normalDesc, "PR-A-CODEART-6: normal description written unchanged");
+      }
+
+      {
+        // ── PR-A-CODEART: a PUT that updates OTHER fields without touching
+        // `description` at all → completely unaffected by this guard
+        // (regression guard — the check must gate on `description` specifically).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key, description) VALUES ('prA-nodesc', 'PR-A No Desc', 'pra-nodesc', 'producer', 'k', ?)"
+        ).run("Preexisting description untouched.");
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-nodesc",
+          about: "Oppdatert about uten description i body.",
+          address: "Nyveien 1, 5678 Sted",
+        }, PR24_KEY, true);
+        assertEq(resp.status, 200, "PR-A-CODEART-7: PUT without a description field → 200 (guard does not block other fields)");
+        const aRow = pr24db.prepare("SELECT description FROM agents WHERE id = 'prA-nodesc'").get() as any;
+        assertEq(aRow.description, "Preexisting description untouched.", "PR-A-CODEART-8: description column untouched when omitted from body");
+        const kRow = pr24db.prepare("SELECT about, address FROM agent_knowledge WHERE agent_id = 'prA-nodesc'").get() as any;
+        assertEq(kRow.about, "Oppdatert about uten description i body.", "PR-A-CODEART-9: about column written normally");
+        assertEq(kRow.address, "Nyveien 1, 5678 Sted", "PR-A-CODEART-10: address column written normally");
+      }
+
     } finally {
       // Close server (admin key is the suite-wide canonical constant — no
       // process.env mutation to restore).
