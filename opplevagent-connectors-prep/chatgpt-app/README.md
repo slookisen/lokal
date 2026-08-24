@@ -12,13 +12,15 @@
 
 - **MCP endpoint:** `https://opplevagent.no/mcp`
 - **App manifest:** `manifest.json` in this directory (schema_version v1)
-- **Icon (PNG, required by the Apps form):** `../assets/opplevagent-square-green-512.png`
-  (square 512×512, full-bleed, no rounded corners — OpenAI crops circularly).
-  `../assets/opplevagent-square-blue-512.png` is a fjord-blue alternative if Daniel
-  wants Opplevagent visually distinct from the Rett fra Bonden green. The old note
-  stands: `https://opplevagent.no/favicon.svg` is SVG-only and `favicon-192.png`
-  still 404s (re-verified 2026-08-24; serving PNG icon routes is filed as dev-request
-  `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`).
+- **Icon (PNG, required by the Apps form):** `../assets/opplevagent-brand-512.png` —
+  Opplevagent's OWN constellation mark (teal/olive/amber dots + orange spark on
+  white), extracted 2026-08-24 from the live site header's inline SVG. Square
+  512×512, no rounded corners (OpenAI crops circularly). The earlier sprout-based
+  `opplevagent-square-{green,blue}-512.png` were the WRONG brand for Opplevagent
+  (generated from the shared favicon.svg, which serves the RFB sprout on all hosts —
+  itself a brand bug, now covered by dev-request
+  `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`); kept only as history.
+  `favicon-192.png` still 404s (re-verified 2026-08-24; same dev-request).
 - **Policy URLs (both 200, re-verified 2026-08-24):**
   - Privacy: `https://opplevagent.no/personvern`
   - Terms: `https://opplevagent.no/vilkar`
