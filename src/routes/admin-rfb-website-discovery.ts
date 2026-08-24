@@ -60,6 +60,10 @@ import {
 } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+// Grep 4d fix-up (review finding 3): reuse the existing punycode decoder +
+// Norwegian transliterator -- read-only reuse, not reimplemented -- for the
+// IDN-host marker-check normalization in rfbWdPageReferencesOwnHost below.
+import { decodePunycodeLabel, transliterateNorwegian } from "../services/cross-source-validator";
 import { braveSearch, type BraveResult } from "../services/search-enrich";
 import { mergeFieldProvenance } from "./admin-knowledge";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
@@ -605,7 +609,28 @@ export function rfbWdPageReferencesOwnHost(html: string, host: string): boolean 
   // fetch_contaminated rejections on valid-but-unusual hostnames; the real
   // evidence-matching step downstream is still the actual gate.
   if (label.length < 3) return true;
-  return html.toLowerCase().includes(label);
+  const htmlLower = html.toLowerCase();
+  if (htmlLower.includes(label)) return true;
+  // Grep 4d fix-up (review finding 3): a genuine IDN/punycode-registered
+  // producer host (label starting "xn--", e.g. real in-production Norwegian
+  // producers like svanøylaks.no) will essentially never appear as its raw
+  // ACE string in the page's real Unicode HTML -- decode it to Unicode
+  // first, and also check a Norwegian-transliterated ASCII variant (æ/ø/å ->
+  // ae/oe/aa), since Norwegian registrants commonly render either form on
+  // the page -- before concluding the marker is genuinely absent. Reuses
+  // cross-source-validator.ts's existing decoder/transliterator (no
+  // reimplementation); still .includes()-only, still no regex, still
+  // preprocessing the label rather than changing the matching strategy.
+  if (label.startsWith("xn--")) {
+    const unicodeLabel = decodePunycodeLabel(label).toLowerCase();
+    // decodePunycodeLabel fails safe by returning the input unchanged on
+    // malformed/truncated input -- `unicodeLabel !== label` also guards
+    // against re-checking the exact same raw string we already just missed.
+    if (unicodeLabel !== label && unicodeLabel.length >= 3 && htmlLower.includes(unicodeLabel)) return true;
+    const transliterated = transliterateNorwegian(unicodeLabel);
+    if (transliterated !== unicodeLabel && transliterated.length >= 3 && htmlLower.includes(transliterated)) return true;
+  }
+  return false;
 }
 
 async function tryRfbWebsiteCandidateHost(
@@ -672,6 +697,18 @@ async function tryRfbWebsiteCandidateHost(
     // A redirect could differ between the two calls, so recompute finalHost
     // for the retry the same way the original fetch above does.
     const retryFinalHost = rfbWdHostFromUrl(retryResult.finalUrl) || host;
+    // Grep 4d fix-up (review finding 1): the retry's OWN redirect target
+    // needs the same dedup/exclusion re-check the ORIGINAL fetch's redirect
+    // gets above (rfbWdCheckFinalHostExclusion) -- otherwise a retry that
+    // happens to land on an already-in-use/already-proposed-this-batch/
+    // excluded host could sail past the marker check below and reach the
+    // review queue with none of this function's other dedup/exclusion
+    // guards ever applied to it.
+    if (retryFinalHost !== finalHost) {
+      if (rfbWdCheckFinalHostExclusion(retryFinalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
+        return null;
+      }
+    }
     if (!rfbWdPageReferencesOwnHost(retryResult.html, retryFinalHost)) {
       excludedHere.push({ host: retryFinalHost, reason: "fetch_contaminated" });
       return null;
@@ -721,20 +758,35 @@ async function tryRfbWebsiteCandidateHost(
           timeoutMs: RFB_WD_RENDER_TIMEOUT_MS,
         });
         if (!retryRendered.ok) {
+          // Grep 4d fix-up (review finding 2): return immediately after this
+          // push, matching the plain-fetch retry path above -- otherwise
+          // execution falls through to this function's bottom, which pushes
+          // a SECOND, contradictory evidence_mismatch entry for the same
+          // rejected attempt.
           excludedHere.push({ host: renderedFinalHost, reason: "fetch_contaminated" });
-        } else {
-          const retryRenderedFinalHost = rfbWdHostFromUrl(retryRendered.finalUrl) || finalHost;
-          renderMarkerOk = rfbWdPageReferencesOwnHost(retryRendered.html, retryRenderedFinalHost);
-          if (!renderMarkerOk) {
-            excludedHere.push({ host: retryRenderedFinalHost, reason: "fetch_contaminated" });
-          } else {
-            // Retry passed the marker check: use ITS content/finalHost for
-            // everything downstream -- the first, contaminated render is
-            // discarded, never used as evidence.
-            rendered = retryRendered;
-            renderedFinalHost = retryRenderedFinalHost;
+          return null;
+        }
+        const retryRenderedFinalHost = rfbWdHostFromUrl(retryRendered.finalUrl) || finalHost;
+        // Grep 4d fix-up (review finding 1): re-check the retry's OWN
+        // redirect target against the same dedup/exclusion guard, mirroring
+        // the plain-fetch retry fix above.
+        if (retryRenderedFinalHost !== renderedFinalHost) {
+          if (rfbWdCheckFinalHostExclusion(retryRenderedFinalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
+            return null;
           }
         }
+        renderMarkerOk = rfbWdPageReferencesOwnHost(retryRendered.html, retryRenderedFinalHost);
+        if (!renderMarkerOk) {
+          // Grep 4d fix-up (review finding 2): return immediately -- see the
+          // comment on the !retryRendered.ok branch above.
+          excludedHere.push({ host: retryRenderedFinalHost, reason: "fetch_contaminated" });
+          return null;
+        }
+        // Retry passed the marker check: use ITS content/finalHost for
+        // everything downstream -- the first, contaminated render is
+        // discarded, never used as evidence.
+        rendered = retryRendered;
+        renderedFinalHost = retryRenderedFinalHost;
       }
 
       if (renderMarkerOk) {

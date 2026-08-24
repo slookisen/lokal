@@ -2202,6 +2202,43 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         true,
         "4d-a7: match is case-insensitive",
       );
+
+      // (4d-a8..4d-a10) review finding 3: IDN/punycode hosts -- a genuine
+      // producer's page renders the REAL Unicode domain name, never the raw
+      // "xn--..." ACE string, so the raw-label check alone would false-
+      // reject it. "xn--torgersengrd-2cb" is a real punycode label already
+      // used elsewhere in this codebase's own tests (experience-store.test.ts
+      // gwch-7, producer name "Torgersen Gård") -- decoding it here (rather
+      // than inventing a fake string) guarantees it's genuinely
+      // round-trippable, per the task's own guidance.
+      const { decodePunycodeLabel: __decodePunycodeLabelForTest } = require("../services/cross-source-validator") as
+        typeof import("../services/cross-source-validator");
+      const idnHost = "xn--torgersengrd-2cb.no";
+      const decodedUnicode = __decodePunycodeLabelForTest("xn--torgersengrd-2cb"); // "torgersengård"
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          `<html><body>Velkommen til ${decodedUnicode} — gardsutsalg siden 1962</body></html>`,
+          idnHost,
+        ),
+        true,
+        "4d-a8: IDN/punycode host -- page carries the real decoded Unicode name -> marker passes (no false fetch_contaminated)",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          `<html><body>Velkommen til Torgersengaard — gardsutsalg siden 1962</body></html>`,
+          idnHost,
+        ),
+        true,
+        "4d-a9: IDN/punycode host -- page carries the Norwegian-transliterated ASCII spelling (å -> aa) -> marker passes",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          "<html><body>En helt annen side — ingen tilknytning til noen gard</body></html>",
+          idnHost,
+        ),
+        false,
+        "4d-a10: IDN/punycode host -- genuinely unrelated page (neither raw label, decoded Unicode, nor transliterated form present) -> still correctly false",
+      );
     }
 
     // ── (4d-b) plain-fetch integration: 1st call answers with the WRONG
@@ -2298,6 +2335,60 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       globalThis.fetch = stubFetch();
     }
 
+    // ── (4d-e) plain-fetch integration (review finding 1): the RETRY's own
+    //     redirect target must be re-checked against the same
+    //     dedup/exclusion guard the ORIGINAL fetch's redirect gets
+    //     (rfbWdCheckFinalHostExclusion) -- a retry that passes the marker
+    //     check but redirects to an already-in-use host must be rejected via
+    //     THAT host's exclusion reason, never proceed to evidence matching
+    //     or a queue write ──
+    {
+      let retryRedirCalls = 0;
+      globalThis.fetch = (async (url: any) => {
+        const urlStr = String(url);
+        if (urlStr === "https://retryredirgard.no") {
+          retryRedirCalls++;
+          if (retryRedirCalls === 1) {
+            // 1st call: WRONG page, no self-reference -> triggers the retry.
+            return htmlResponse("<html><body>En helt annen side</body></html>", { finalUrl: urlStr });
+          }
+          // 2nd call (the retry): redirects to a host that's ALREADY in
+          // existingHosts, and (deliberately) DOES carry the self-reference
+          // marker for that redirected host -- so this exercises the
+          // exclusion re-check, not the marker check.
+          return htmlResponse(
+            `<html><head><link rel="canonical" href="https://existinggard.no/"></head><body>Existing Gard — org.nr 944000099</body></html>`,
+            { finalUrl: "https://existinggard.no/" },
+          );
+        }
+        return notFoundResponse();
+      }) as unknown as typeof fetch;
+
+      insertAgent({ id: "wd-4d-retryredir", name: "Retryredir Gard", orgNr: "944000015", city: "Bodø" });
+      const outcome = await evaluateRfbWebsiteCandidate(
+        testDb as any,
+        { agentId: "wd-4d-retryredir", url: "https://retryredirgard.no" },
+        new Set<string>(["existinggard.no"]),
+        new Set<string>(),
+        { attempted: 0, verified: 0 },
+        "wd-4d-retryredir-batch",
+      );
+      assertEq(outcome.outcome, "rejected", "4d-e1: retry's redirect lands on an already-in-use host -> rejected, never proposed");
+      assertTrue(
+        outcome.outcome === "rejected" && outcome.reason === "host_already_in_use",
+        "4d-e2: rejection reason is host_already_in_use (the exclusion check's own reason) — NOT fetch_contaminated",
+      );
+      assertEq(
+        outcome.outcome === "rejected" ? outcome.excluded : null,
+        [{ host: "existinggard.no", reason: "host_already_in_use" }],
+        "4d-e3: excludedHere contains EXACTLY the exclusion check's own push — fetch_contaminated is NOT also pushed",
+      );
+      assertEq(retryRedirCalls, 2, "4d-e4: exactly one retry, same as every other 4d case");
+      assertTrue(!readQueueRow("wd-4d-retryredir"), "4d-e5: no queue write happens");
+
+      globalThis.fetch = stubFetch();
+    }
+
     // ── (4d-d) render-fallback branch: same three scenarios mirrored via
     //     renderPageImplForTesting — plain fetch is a JS shell (forces
     //     escalation to render) and itself carries no evidence, so every
@@ -2351,7 +2442,20 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
 
       // (4d-d2) render retry ALSO fails the marker check (both calls answer
       // with the wrong page's html) -> the top-level rejection reason is
-      // fetch_contaminated, and nothing is queued.
+      // fetch_contaminated, and nothing is queued. Review finding 2: asserts
+      // excludedHere is EXACTLY one entry (matching the rigor of the
+      // plain-fetch path's 4d-c3), not a weaker `.some()` -- this is the
+      // test that should have caught (or been too weak to catch) the
+      // missing `return null` that let a second, contradictory
+      // evidence_mismatch entry slip in before the fix. Uses
+      // evaluateRfbWebsiteCandidate directly (a single explicit candidate
+      // URL, like 4d-b/4d-c/4d-e), NOT callDiscovery's multi-candidate-host
+      // tier-1 name-guessing loop -- the latter would append its own
+      // fetch_failed:* entries for the OTHER guessed hosts, making an exact
+      // one-entry assertion meaningless. The plain-fetch step's own marker
+      // check needs a manual self-reference comment here (bypassing
+      // stubFetch's fixture-keyed auto-injection, which only applies when
+      // dispatched through the `fixtures` map).
       {
         let renderCalls = 0;
         setRfbWdRenderPageImplForTesting!(async (url: string) => {
@@ -2364,25 +2468,39 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
             elapsedMs: 10,
           };
         });
+        const jsShellSelfRef = `<html><body><!-- selfref:hfbothwronggard2.no --><script>var pad = "${"x".repeat(2500)}";</script><div id="root">App</div></body></html>`;
+        globalThis.fetch = (async (url: any) => {
+          const urlStr = String(url);
+          if (urlStr === "https://hfbothwronggard2.no") {
+            return htmlResponse(jsShellSelfRef, { finalUrl: urlStr });
+          }
+          return notFoundResponse();
+        }) as unknown as typeof fetch;
 
-        insertAgent({ id: "wd-4d-hfbothwrong", name: "Hfbothwrong Gard", orgNr: "944000013", city: "Voss" });
-        fixtures.set("https://hfbothwronggard.no", htmlResponse(jsShell, { finalUrl: "https://hfbothwronggard.no" }));
-
-        const r = await callDiscovery({ agentIds: ["wd-4d-hfbothwrong"] });
-        assertEq(r.body.proposed.length, 0, "4d-d2a: nothing proposed");
-        const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-4d-hfbothwrong");
-        assertTrue(!!rej, "4d-d2b: the agent was rejected");
-        assertEq(rej?.reason, "fetch_contaminated", "4d-d2c: top-level rejection reason is fetch_contaminated");
+        insertAgent({ id: "wd-4d-hfbothwrong2", name: "Hfbothwrong Gard", orgNr: "944000013", city: "Voss" });
+        const outcome = await evaluateRfbWebsiteCandidate(
+          testDb as any,
+          { agentId: "wd-4d-hfbothwrong2", url: "https://hfbothwronggard2.no" },
+          rfbWdExistingWebsiteHosts(testDb as any),
+          new Set<string>(),
+          { attempted: 0, verified: 0 },
+          "wd-4d-hfbothwrong2-batch",
+        );
+        assertEq(outcome.outcome, "rejected", "4d-d2a: nothing proposed");
         assertTrue(
-          (rej?.excluded ?? []).some(
-            (x: any) => x.host === "hfbothwronggard.no" && x.reason === "fetch_contaminated",
-          ),
-          "4d-d2d: excludedHere carries a fetch_contaminated entry for the render-fallback host",
+          outcome.outcome === "rejected" && outcome.reason === "fetch_contaminated",
+          "4d-d2c: top-level rejection reason is fetch_contaminated",
+        );
+        assertEq(
+          outcome.outcome === "rejected" ? outcome.excluded : null,
+          [{ host: "hfbothwronggard2.no", reason: "fetch_contaminated" }],
+          "4d-d2d: excludedHere contains EXACTLY {host, reason: fetch_contaminated} — nothing else pushed (no contradictory evidence_mismatch fall-through)",
         );
         assertEq(renderCalls, 2, "4d-d2e: renderFn called exactly twice — one sequential retry, never a loop");
-        assertTrue(!readQueueRow("wd-4d-hfbothwrong"), "4d-d2f: no queue write happens from contaminated render content");
+        assertTrue(!readQueueRow("wd-4d-hfbothwrong2"), "4d-d2f: no queue write happens from contaminated render content");
 
         setRfbWdRenderPageImplForTesting!(null);
+        globalThis.fetch = stubFetch();
       }
 
       // (4d-d3) render retry FAILS OUTRIGHT (!ok on the retry, not just a
@@ -2419,6 +2537,74 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         assertTrue(!readQueueRow("wd-4d-hfretryfail"), "4d-d3d: no queue write happens");
 
         setRfbWdRenderPageImplForTesting!(null);
+      }
+
+      // (4d-f) render-fallback integration (review finding 1): same
+      // retry-redirect exclusion re-check as (4d-e), but for the render
+      // fallback's own retry -- the retry's render passes the marker check
+      // but redirects to a host already carried by a different agent's live
+      // website -> rejected via host_already_in_use, never proposed. Uses
+      // evaluateRfbWebsiteCandidate directly (single explicit candidate URL,
+      // same reasoning as 4d-d2 above) so excludedHere carries exactly the
+      // exclusion check's own push, with no other-candidate-host noise from
+      // callDiscovery's tier-1 name-guessing loop.
+      {
+        let renderCalls = 0;
+        setRfbWdRenderPageImplForTesting!(async (url: string) => {
+          renderCalls++;
+          if (renderCalls === 1) {
+            return {
+              ok: true,
+              html: "<html><body>En helt annen renderet side</body></html>",
+              text: "En helt annen renderet side",
+              finalUrl: url,
+              elapsedMs: 10,
+            };
+          }
+          // 2nd call (the retry): redirects to a host ALREADY carried by a
+          // different agent's live website, and (deliberately) DOES carry
+          // the self-reference marker for that redirected host.
+          return {
+            ok: true,
+            html: `<html><head><link rel="canonical" href="https://existingrenderedgard.no/"></head><body>Existingrendered Gard — org.nr 944000097</body></html>`,
+            text: "Existingrendered Gard — org.nr 944000097",
+            finalUrl: "https://existingrenderedgard.no/",
+            elapsedMs: 10,
+          };
+        });
+        const jsShellSelfRef = `<html><body><!-- selfref:hfretryredirgard2.no --><script>var pad = "${"x".repeat(2500)}";</script><div id="root">App</div></body></html>`;
+        globalThis.fetch = (async (url: any) => {
+          const urlStr = String(url);
+          if (urlStr === "https://hfretryredirgard2.no") {
+            return htmlResponse(jsShellSelfRef, { finalUrl: urlStr });
+          }
+          return notFoundResponse();
+        }) as unknown as typeof fetch;
+
+        insertAgent({ id: "wd-4d-hfretryredir2", name: "Hfretryredir Gard", orgNr: "944000016", city: "Voss" });
+        const outcome = await evaluateRfbWebsiteCandidate(
+          testDb as any,
+          { agentId: "wd-4d-hfretryredir2", url: "https://hfretryredirgard2.no" },
+          new Set<string>(["existingrenderedgard.no"]),
+          new Set<string>(),
+          { attempted: 0, verified: 0 },
+          "wd-4d-hfretryredir2-batch",
+        );
+        assertEq(outcome.outcome, "rejected", "4d-f1: render retry's redirect lands on an already-in-use host -> never proposed");
+        assertTrue(
+          outcome.outcome === "rejected" && outcome.reason === "host_already_in_use",
+          "4d-f3: rejection reason is host_already_in_use — NOT fetch_contaminated",
+        );
+        assertEq(
+          outcome.outcome === "rejected" ? outcome.excluded : null,
+          [{ host: "existingrenderedgard.no", reason: "host_already_in_use" }],
+          "4d-f4: excludedHere contains EXACTLY the exclusion check's own push",
+        );
+        assertEq(renderCalls, 2, "4d-f5: exactly one render retry");
+        assertTrue(!readQueueRow("wd-4d-hfretryredir2"), "4d-f6: no queue write happens");
+
+        setRfbWdRenderPageImplForTesting!(null);
+        globalThis.fetch = stubFetch();
       }
 
       delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
