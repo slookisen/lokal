@@ -608,8 +608,16 @@ export async function runAdminEnrichmentWritePauseTests(
         "routes/admin-rfb-website-discovery.ts",
         "routes/marketplace.ts",
         "services/marketplace-registry.ts",
+        // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding,
+        // round-2 review finding 3: the description-code-artifact sweep route
+        // writes producer content (agents.description) the same as the
+        // url-write sibling, and is now wired to the same gate the same way
+        // — plus its own test file, which sets up pause state directly via
+        // the service to prove the wiring.
+        "routes/admin-agents-description-code-artifact-sweep.test.ts",
+        "routes/admin-agents-description-code-artifact-sweep.ts",
       ].sort(),
-      "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the two test files",
+      "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );
 
     // No YAML anywhere near this guard: controller/enrichment-write-pause.yaml

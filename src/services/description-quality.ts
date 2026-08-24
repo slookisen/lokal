@@ -190,30 +190,71 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 // search-enrich.ts:1279-1284, which catches only the word, never the syntax
 // — that check is not reused here.)
 //
-// Four independent signal classes:
+// Five independent signal classes (reworked post-review — round 1 shipped
+// with only classes 2-4 below plus the <script>/<style> class; an
+// independent code-reviewer then actually RAN the detector against 5
+// extremely common real-world bootstrap/analytics snippets — WordPress
+// `_wpemojiSettings`, a Google Tag Manager snippet, a jQuery
+// `$(document).ready(...)` theme inline script, a Shopify `Shopify.shop`/
+// `Shopify.locale` bootstrap, and a Next.js hydration payload
+// (`self.__next_f.push(...)`) — and found all 5 were FALSE NEGATIVES. Root
+// cause the reviewer traced in class 3 below: real minified/bundled JS from
+// Terser/UglifyJS downlevels almost everything to `var` alone, so a class
+// that required 2 DISTINCT declaration keywords (var/let/const) could
+// structurally never reach its own threshold on realistic minified code, and
+// classes 2/4 alone were not consistently enough either. Fixed two ways at
+// once, deliberately not just special-cased for the 5 named snippets:
+//   - class 1b below (new): known-ubiquitous provider/CMS bootstrap
+//     signatures that are unambiguous alone, the same posture the literal
+//     `<script>` tag already had in class 1 — nobody writes
+//     "_wpemojiSettings" or "self.__next_f.push(...)" as prose either.
+//   - class 3 below (reworked): the "assignment activity" half now accepts
+//     var-only minified shapes (repeated `var x =` declarations, or an IIFE
+//     wrapper), not only >=2 DISTINCT keywords.
+//
 //   1. UNAMBIGUOUS ALONE: a literal `<script`/`</script>`/`<style` tag
 //      substring anywhere in the text — enough on its own (mirrors
 //      isJunkDescription's rule-1 skip-link pattern: real code markup is
 //      never legitimate prose no matter where it lands).
+//   1b. UNAMBIGUOUS ALONE (new): a known-ubiquitous provider/CMS bootstrap
+//      signature — `_wpemojiSettings` (WordPress), `dataLayer` together with
+//      a `gtag(`/`ga(` call (Google Tag Manager/Analytics), `Shopify.shop`/
+//      `Shopify.locale` (Shopify storefront bootstrap), `__next_f.push`
+//      (Next.js App Router hydration payload), or a jQuery/`$`
+//      `(document).ready(` call (classic theme inline script). Same
+//      unambiguous-alone posture as class 1 — these are provider-specific
+//      code tokens, structurally impossible to appear in Norwegian
+//      producer prose, so no second class is required.
 //   2. CMS/framework bootstrap tokens: `Y.Squarespace`, `Static.
 //      SQUARESPACE_CONTEXT`, `window.<name>` followed by `.`/`(`,
-//      `document.`, `!function(`, `typeof exports`. Any one of these makes
-//      this ONE class true (not one class per token) — several appearing
-//      together still only counts once here.
-//   3. JS-syntax density: `function(`/`function (` present AND at least 2 of
-//      (var/let/const, each followed by `=`) present AND semicolon density
-//      over the whole string > 1.5 per 100 chars. All three must hold
-//      together — this is what keeps a sentence merely naming "function" or
-//      "variabel" from flagging on its own.
+//      `document.<name>` followed by `.`/`(` (anchored the same way as the
+//      `window.` check — a bare "document.pdf"/"document.docx" mention
+//      must NOT contribute; the identifier immediately after `document.`
+//      must itself be immediately followed by `.` or `(`, i.e. an actual
+//      member-access/call shape), `!function(`, `typeof exports`. Any one of
+//      these makes this ONE class true (not one class per token) — several
+//      appearing together still only counts once here.
+//   3. JS-syntax density: `function(`/`function (` present AND semicolon
+//      density over the whole string > 1.5 per 100 chars AND some
+//      "assignment activity" — now ANY of: (a) >=2 DISTINCT declaration
+//      keywords among var/let/const, each followed by `=` (source mixing
+//      declaration forms), (b) >=2 REPEATED `var <name> =` declarations
+//      (the var-only minified shape most Terser/UglifyJS output actually
+//      produces), or (c) an IIFE wrapper shape `(function(...){...})(...)`
+//      (the single most common minified-bundle wrapper, present regardless
+//      of which declaration keyword the body uses). All three of
+//      function()-present / assignment-activity / semicolon-density must
+//      hold together — this is what keeps a sentence merely naming
+//      "function" or "variabel" from flagging on its own.
 //   4. Brace density: `{`/`}` count >= 4 AND > 2.0 per 100 chars (minified-
 //      JS shape) over a string of at least 40 chars — Norwegian prose
 //      essentially never contains curly braces at all, so this stays
 //      conservative even at a low absolute threshold.
-// Flags true when class 1 fires alone, OR when >=2 of classes {2,3,4} fire
-// together — never on any single one of classes 2-4 alone.
+// Flags true when class 1 or 1b fires alone, OR when >=2 of classes {2,3,4}
+// fire together — never on any single one of classes 2-4 alone.
 //
 // Examples (see tests/test.ts "description-junk-guard" section for the full
-// table):
+// table, including the 5 real-world snippets named above):
 //   - A Squarespace-bootstrap-shaped fixture like
 //     `Y.Squarespace = Y.Squarespace || {}; Static.SQUARESPACE_CONTEXT =
 //     {"website":{"id":"123"}}; window.Y.Squarespace.afterBodyLoad(Y);`
@@ -224,12 +265,36 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 //     `function(){var a=1;var b=2;let c=3;const d=4;if(a){b=c;}return
 //     a+b+c+d;}` -> true (class 3 [JS-syntax density] + class 4 [brace
 //     density] both fire, no CMS tokens needed)
+//   - A WordPress-shaped `window._wpemojiSettings = {...}; !function(window,
+//     document,navigator){var Util,i,tests;...}(window,document,navigator);`
+//     -> true (class 1b [`_wpemojiSettings`] alone, unambiguous)
+//   - A GTM-shaped `window.dataLayer = window.dataLayer || [];
+//     function gtag(){dataLayer.push(arguments);} gtag('js', new Date());`
+//     -> true (class 1b [`dataLayer` + `gtag(`] alone, unambiguous)
+//   - A jQuery theme inline script `$(document).ready(function() {
+//     $('.nav-toggle').on('click', function(){ $('.menu').slideToggle();
+//     }); });` -> true (class 1b [`$(document).ready(`] alone, unambiguous)
+//   - A Shopify bootstrap `var Shopify = Shopify || {}; Shopify.shop =
+//     "example.myshopify.com"; Shopify.locale = "en";`
+//     -> true (class 1b [`Shopify.shop`] alone, unambiguous)
+//   - A Next.js hydration payload `self.__next_f.push([1,"ad:I[47690,[],
+//     \"ClientPageRoot\"]\n"])` -> true (class 1b [`__next_f.push`] alone,
+//     unambiguous)
 //   - "Vi bruker moderne teknologi og JavaScript-baserte verktøy i
 //      gårdsdriften vår."                                     -> false
 //     (names a technology in plain prose; no code syntax at all)
 //   - "Vi driver med økologisk grønnsaksdyrking og selger direkte fra
 //      gården hver lørdag."                                   -> false
 //     (ordinary description, zero signals)
+//   - "Vi driver en liten nettbutikk med lokale produkter fra gården, og
+//      frakt kan bestilles direkte via telefon."                -> false
+//     (names "nettbutikk"; no code syntax)
+//   - "Vi tilbyr digital markedsføring og rådgivning til andre bønder i
+//      regionen vår."                                          -> false
+//     (names "digital markedsføring"; no code syntax)
+//   - "Vi bruker moderne verktøy og teknologi for å sikre kvalitet i alle
+//      ledd av produksjonen."                                  -> false
+//     (names "moderne verktøy"; no code syntax)
 export function looksLikeCodeArtifact(text: string | null | undefined): boolean {
   if (!text || typeof text !== "string") return false;
   const trimmed = text.trim();
@@ -238,25 +303,46 @@ export function looksLikeCodeArtifact(text: string | null | undefined): boolean 
   // Class 1 — unambiguous alone: a literal script/style tag substring.
   if (/<\/?script\b|<style\b/i.test(trimmed)) return true;
 
-  // Class 2 — CMS/framework bootstrap tokens.
+  // Class 1b — unambiguous alone: known-ubiquitous provider/CMS bootstrap
+  // signatures. See the module doc comment above for why each is safe to
+  // trust alone (structurally impossible in Norwegian producer prose).
+  const providerSignatureSignal =
+    trimmed.includes("_wpemojiSettings") ||
+    (trimmed.includes("dataLayer") && /\b(?:gtag|ga)\s*\(/.test(trimmed)) ||
+    trimmed.includes("Shopify.shop") ||
+    trimmed.includes("Shopify.locale") ||
+    trimmed.includes("__next_f.push") ||
+    /(?:\$|jQuery)\(\s*document\s*\)\.ready\s*\(/.test(trimmed);
+  if (providerSignatureSignal) return true;
+
+  // Class 2 — CMS/framework bootstrap tokens. `document.` is anchored the
+  // same way `window.` already was — the identifier right after the dot
+  // must itself be immediately followed by `.`/`(` (an actual member-
+  // access/call shape), so a stray "document.pdf" mention can't contribute.
   const cmsBootstrapSignal =
     trimmed.includes("Y.Squarespace") ||
     trimmed.includes("Static.SQUARESPACE_CONTEXT") ||
     /window\.[A-Za-z_$][\w$]*\s*[.(]/.test(trimmed) ||
-    trimmed.includes("document.") ||
+    /document\.[A-Za-z_$][\w$]*\s*[.(]/.test(trimmed) ||
     trimmed.includes("!function(") ||
     trimmed.includes("typeof exports");
 
-  // Class 3 — JS-syntax density: function() + >=2 of var/let/const= + high
-  // semicolon density, ALL three together (see class comment above for why
-  // this guards against prose that merely names a technology).
+  // Class 3 — JS-syntax density: function() present AND some "assignment
+  // activity" AND high semicolon density, ALL three together (see class
+  // comment above for why this guards against prose that merely names a
+  // technology, and for why the assignment-activity check now has 3 ways
+  // to fire instead of requiring 2 distinct declaration keywords).
   const hasFunctionParen = /function\s*\(/.test(trimmed);
-  let assignmentKeywordCount = 0;
-  if (/\bvar\s+\w+\s*=/.test(trimmed)) assignmentKeywordCount++;
-  if (/\blet\s+\w+\s*=/.test(trimmed)) assignmentKeywordCount++;
-  if (/\bconst\s+\w+\s*=/.test(trimmed)) assignmentKeywordCount++;
+  const distinctAssignmentKeywords =
+    (/\bvar\s+\w+\s*=/.test(trimmed) ? 1 : 0) +
+    (/\blet\s+\w+\s*=/.test(trimmed) ? 1 : 0) +
+    (/\bconst\s+\w+\s*=/.test(trimmed) ? 1 : 0);
+  const repeatedVarDeclarations = (trimmed.match(/\bvar\s+\w+\s*=/g) ?? []).length;
+  const isIifeWrapper = /\(\s*function\s*\([^)]*\)\s*\{/.test(trimmed) && /\}\s*\)\s*\(/.test(trimmed);
+  const hasAssignmentActivity =
+    distinctAssignmentKeywords >= 2 || repeatedVarDeclarations >= 2 || isIifeWrapper;
   const semicolonDensity = (trimmed.match(/;/g)?.length ?? 0) / (trimmed.length / 100);
-  const jsSyntaxDensitySignal = hasFunctionParen && assignmentKeywordCount >= 2 && semicolonDensity > 1.5;
+  const jsSyntaxDensitySignal = hasFunctionParen && hasAssignmentActivity && semicolonDensity > 1.5;
 
   // Class 4 — brace density (minified-JS shape). A minimum length AND a
   // minimum raw count are required in addition to the density ratio, so a

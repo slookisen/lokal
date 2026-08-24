@@ -1,7 +1,10 @@
 /**
  * marketplace-patch-description-artifact-guard.test.ts — tests for the
- * write-time code-artifact gate on `PATCH /agents/:id` (dev-request
- * 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding, Endring 3).
+ * write-time code-artifact gate on `PATCH /agents/:id`, `PUT /agents/:id`,
+ * and `PUT /agents/:id/description` (dev-request 2026-08-24-produsent
+ * beskrivelser-skrapt-js-opprydding, Endring 3 + the round-2 review's
+ * finding 2: the reviewer found the latter two write paths reached the same
+ * unprotected sink and were not gated by the first pass).
  *
  * Mirrors marketplace-availability-patch.test.ts's structure exactly:
  *   - in-memory better-sqlite3 DB injected via __setDbForTesting +
@@ -13,7 +16,7 @@
  *     TestSummary; wired into tests/test.ts via runSerial().
  *     Standalone: npx tsx src/routes/marketplace-patch-description-artifact-guard.test.ts
  *
- * Covers:
+ * Covers, for PATCH /agents/:id:
  *   (1) a description containing code/script artifacts -> 400, BEFORE any
  *       write (DB confirmed unchanged).
  *   (2) a normal description -> 200, written exactly as before the gate
@@ -29,6 +32,23 @@
  *       branch, not inside just one of them.
  *   (6) unauthenticated code-artifact PATCH -> 403 (auth gate still runs
  *       FIRST — a 400 must never leak past authorization).
+ *   (7) explicit `description: null` -> 400 (clean guard), never the
+ *       uncaught SqliteError/HTTP 500 the reviewer reproduced live against
+ *       the pre-existing (unguarded) behavior.
+ *
+ * And, added in the round-2 review pass, the two additional write paths:
+ *   (8)-(11) PUT /agents/:id (agent's own X-API-Key): code-artifact -> 400
+ *       (row untouched), normal description -> 200 (regression control),
+ *       explicit null -> 400 (same clean guard as PATCH).
+ *   (12)-(16) PUT /agents/:id/description: code-artifact -> 400 under each
+ *       of its three accepted auth modes (X-Admin-Key, X-Claim-Token,
+ *       X-API-Key — X-Claim-Token is the most realistic real-world path for
+ *       this exact defect, a producer pasting scraped page text into their
+ *       own claimed listing), normal description -> 200 (regression
+ *       control, existing length/shape validation unchanged), explicit
+ *       null -> 400 via the route's PRE-EXISTING "description må være
+ *       string" type check (already safe before this dev-request; verified
+ *       here as a regression guard, not a new code path).
  */
 
 import Database from "better-sqlite3";
@@ -147,6 +167,17 @@ export function runMarketplacePatchDescriptionArtifactGuardTests(
       );
       insertAgent.run("pg-a", "Gard A AS", NORMAL_DESC, "api-key-pg-a");
       insertAgent.run("pg-b", "Gard B AS", NORMAL_DESC, "api-key-pg-b");
+      insertAgent.run("pg-c", "Gard C AS", NORMAL_DESC, "api-key-pg-c");
+      insertAgent.run("pg-d", "Gard D AS", NORMAL_DESC, "api-key-pg-d");
+
+      // A verified claim on pg-c — this is the most realistic real-world
+      // path for this exact defect: a producer pastes scraped page text
+      // into their OWN claimed listing via X-Claim-Token.
+      db.prepare(
+        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, claim_token, claim_token_expires_at)
+         VALUES ('claim-pg-c', 'pg-c', 'Eier C', 'eier-c@example.com', 'verified', 'claim-token-pg-c',
+                 datetime('now', '+30 days'))`,
+      ).run();
 
       delete require.cache[require.resolve("./marketplace")];
       const marketplaceMod = require("./marketplace");
@@ -238,6 +269,172 @@ export function runMarketplacePatchDescriptionArtifactGuardTests(
         }, rePin);
         assertEq(r.status, 403, "pg-14: unauthenticated request -> 403 (auth gate runs before the artifact gate)");
         assertEq(descOf("pg-b"), NORMAL_DESC, "pg-15: unauthenticated PATCH never touched the row");
+      }
+
+      // ── (7) explicit `description: null` -> 400, clean guard ───────────
+      // (round-2 review finding 4 — pre-existing bug, reproduced live by the
+      // reviewer as an uncaught SqliteError -> HTTP 500 with a leaked stack
+      // trace; now caught cleanly BEFORE the write.)
+      {
+        const r = await callRoute(router, {
+          method: "PATCH",
+          url: "/agents/pg-a",
+          headers: { "x-admin-key": testAdminKey },
+          body: { description: null },
+        }, rePin);
+        assertEq(r.status, 400, "pg-16: PATCH description:null -> 400, not a 500");
+        assertEq(
+          r.body?.error,
+          "description cannot be null — agents.description is NOT NULL",
+          "pg-17: null-guard carries a clean, specific error message",
+        );
+        assertEq(descOf("pg-a"), TECH_MENTION_DESC, "pg-18: row untouched by the rejected null PATCH");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // PUT /agents/:id — round-2 review finding 2, write path #1
+      // ═══════════════════════════════════════════════════════════════
+
+      // ── (8) code-artifact description -> 400, BEFORE any write ─────────
+      {
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-d",
+          headers: { "x-api-key": "api-key-pg-d" },
+          body: { description: SQUARESPACE_JUNK },
+        }, rePin);
+        assertEq(r.status, 400, "pgput-01: PUT /agents/:id code-artifact description -> 400");
+        assertEq(
+          r.body?.error,
+          "description contains code/script artifacts — rejected",
+          "pgput-02: same rejection message as the PATCH gate",
+        );
+        assertEq(descOf("pg-d"), NORMAL_DESC, "pgput-03: rejected PUT never touched the row");
+      }
+
+      // ── (9) normal description -> 200, written exactly as before ───────
+      {
+        const newDesc = "Vi selger poteter og gulrøtter rett fra jordet, hele høsten.";
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-d",
+          headers: { "x-api-key": "api-key-pg-d" },
+          body: { description: newDesc },
+        }, rePin);
+        assertEq(r.status, 200, "pgput-04: normal description PUT -> 200 (regression control)");
+        assertEq(r.body?.success, true, "pgput-05: normal description PUT -> success:true");
+        assertEq(descOf("pg-d"), newDesc, "pgput-06: row actually updated");
+      }
+
+      // ── (10) PUT that never touches `description` -> 200, unaffected ───
+      {
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-d",
+          headers: { "x-api-key": "api-key-pg-d" },
+          body: { name: "Gard D Oppdatert AS" },
+        }, rePin);
+        assertEq(r.status, 200, "pgput-07: PUT without a 'description' key -> 200, gate never even runs");
+        assertEq(descOf("pg-d"), "Vi selger poteter og gulrøtter rett fra jordet, hele høsten.", "pgput-08: description column untouched");
+      }
+
+      // ── (11) explicit `description: null` -> 400, clean guard ──────────
+      {
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-d",
+          headers: { "x-api-key": "api-key-pg-d" },
+          body: { description: null },
+        }, rePin);
+        assertEq(r.status, 400, "pgput-09: PUT description:null -> 400, not a 500");
+        assertEq(
+          r.body?.error,
+          "description cannot be null — agents.description is NOT NULL",
+          "pgput-10: same clean null-guard message as PATCH",
+        );
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // PUT /agents/:id/description — round-2 review finding 2, write
+      // path #2 ("PR-42"). Existing length/type validation is UNCHANGED —
+      // these tests only add coverage for the new code-artifact check.
+      // ═══════════════════════════════════════════════════════════════
+
+      // ── (12) code-artifact -> 400 under X-Admin-Key ─────────────────────
+      {
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-c/description",
+          headers: { "x-admin-key": testAdminKey },
+          body: { description: SQUARESPACE_JUNK },
+        }, rePin);
+        assertEq(r.status, 400, "pgdesc-01: X-Admin-Key code-artifact description -> 400");
+        assertEq(
+          r.body?.error,
+          "description contains code/script artifacts — rejected",
+          "pgdesc-02: same rejection message text, wrapped in this route's {success,error} shape",
+        );
+        assertEq(r.body?.success, false, "pgdesc-03: success:false in the rejection body");
+        assertEq(descOf("pg-c"), NORMAL_DESC, "pgdesc-04: rejected PUT .../description never touched the row");
+      }
+
+      // ── (13) code-artifact -> 400 under X-Claim-Token (the most
+      // realistic real-world path: a producer's own claim) ────────────────
+      {
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-c/description",
+          headers: { "x-claim-token": "claim-token-pg-c" },
+          body: { description: SQUARESPACE_JUNK },
+        }, rePin);
+        assertEq(r.status, 400, "pgdesc-05: X-Claim-Token code-artifact description -> 400");
+        assertEq(descOf("pg-c"), NORMAL_DESC, "pgdesc-06: rejected claim-token PUT never touched the row");
+      }
+
+      // ── (14) code-artifact -> 400 under X-API-Key ───────────────────────
+      {
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-c/description",
+          headers: { "x-api-key": "api-key-pg-c" },
+          body: { description: SQUARESPACE_JUNK },
+        }, rePin);
+        assertEq(r.status, 400, "pgdesc-07: X-API-Key code-artifact description -> 400");
+        assertEq(descOf("pg-c"), NORMAL_DESC, "pgdesc-08: rejected API-key PUT never touched the row");
+      }
+
+      // ── (15) normal description -> 200, written exactly as before
+      // (regression control — existing length/shape validation unchanged) ─
+      {
+        const newDesc = "Vi driver med bærproduksjon og selger rett fra gården hver helg.";
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-c/description",
+          headers: { "x-claim-token": "claim-token-pg-c" },
+          body: { description: newDesc },
+        }, rePin);
+        assertEq(r.status, 200, "pgdesc-09: normal description PUT .../description -> 200 (regression control)");
+        assertEq(r.body?.success, true, "pgdesc-10: success:true");
+        assertEq(descOf("pg-c"), newDesc, "pgdesc-11: row actually updated");
+      }
+
+      // ── (16) explicit `description: null` -> 400 via the route's
+      // PRE-EXISTING "description må være string" type check (already safe
+      // before this dev-request; verified here as a regression guard). ────
+      {
+        const r = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/pg-c/description",
+          headers: { "x-claim-token": "claim-token-pg-c" },
+          body: { description: null },
+        }, rePin);
+        assertEq(r.status, 400, "pgdesc-12: PUT .../description with description:null -> 400, not a 500");
+        assertEq(r.body?.error, "description må være string.", "pgdesc-13: pre-existing type-check message, unchanged");
+        assertEq(
+          descOf("pg-c"),
+          "Vi driver med bærproduksjon og selger rett fra gården hver helg.",
+          "pgdesc-14: row untouched by the rejected null PUT",
+        );
       }
     } finally {
       initMod.__setDbForTesting(prevDb);

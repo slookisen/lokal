@@ -25,19 +25,28 @@
 // only the first DESCRIPTION_SWEEP_MAX_ITEMS (200) of them are actually
 // processed/written in one call.
 //
-// Deliberately NOT wired to the enrichment-write-pause gate (services/
-// enrichment-write-pause.ts) that url-write's router-level handler also
-// carries: the byggspec's "copy precisely, don't reinvent" pointer names
-// only that sibling's lock/transaction/audit function (lines 233-273), not
-// its router-level pause check, and this route's write is materially
-// different from the automated-enrichment-write incident class that gate
-// exists for (2026-08-20) — it deterministically blanks an already-broken
-// field to '' with a fully reversible audit row, never writes fresh scraped
-// content, and its only automated caller (a future scheduled-agents step,
-// explicitly out of scope for this PR) only ever runs it in dry-run. A
-// human operator invoking apply=true here would already be aware of any
-// live incident-response pause. Left as a documented decision for review,
-// not silently dropped.
+// ── Wired to the enrichment-write-pause gate (round-2 review finding 3) ────
+// The first pass left this route OUT of the enrichment-write-pause gate
+// (services/enrichment-write-pause.ts) that url-write's router-level handler
+// also carries, reasoning that the byggspec's "copy precisely, don't
+// reinvent" pointer named only that sibling's lock/transaction/audit
+// function (lines 233-273 below), not its router-level pause check. An
+// independent reviewer flagged this as a real gap, not a settled call: this
+// route writes producer CONTENT (`agents.description`) — the exact thing the
+// pause exists to stop mid-incident — and the "it deterministically blanks
+// to '' with a full audit trail" distinction does not actually matter to the
+// pause's own purpose (stop ANY producer-content write while a vertical is
+// paused, no exceptions argued case-by-case at each call site — that
+// case-by-case erosion is precisely how the 2026-08-20 incident happened).
+// So this route is now wired in, the SAME way and at the SAME point as the
+// url-write sibling (admin-agents-url-write.ts:276-301): fails CLOSED, blocks
+// the WHOLE request (never a per-item outcome), and runs unconditionally
+// regardless of apply/dry-run. See the router.post handler below for the one
+// unavoidable structural difference: url-write's target ids come straight
+// off the caller's body, so its gate runs before touching the DB at all;
+// this route's target ids only exist after the full-catalog scan (there is
+// no caller-supplied list to gate on), so the gate runs immediately after
+// that read-only scan instead — still strictly before the FIRST write.
 //
 // ── Value rule ───────────────────────────────────────────────────────────
 // `agents.description` is TEXT NOT NULL (database/init.ts) — the cleaned
@@ -53,6 +62,10 @@ import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { looksLikeCodeArtifact } from "../services/description-quality";
+import {
+  enrichmentWritePauseBlockForAgents,
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+} from "../services/enrichment-write-pause";
 
 const router = Router();
 
@@ -203,6 +216,45 @@ function applyDescriptionSweep(
 router.post("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
+  const db = db_();
+
+  // Full-catalog scan (AC1 requires quantifying the WHOLE catalog, not just
+  // the batch this call will write) — read-only, no lock/claim considerations
+  // apply to a scan, only to the write below. Done BEFORE the pause gate for
+  // a purely structural reason (see this route's own header comment): unlike
+  // url-write, whose target ids come straight off the caller's body, this
+  // route has no caller-supplied id list — the gate needs to know which ids
+  // it would touch, and that set only exists after this read.
+  const allRows = db
+    .prepare(`SELECT id, name, description FROM agents ORDER BY id ASC`)
+    .all() as CandidateRow[];
+  const scanned = allRows.length;
+  const candidates = allRows.filter((r) => looksLikeCodeArtifact(r.description));
+  const candidatesConsidered = candidates.length;
+  const batch = candidates.slice(0, DESCRIPTION_SWEEP_MAX_ITEMS);
+
+  // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
+  // pause-mekanisk-gjerde; wired in here per round-2 review finding 3) ──────
+  // Same discipline as the url-write sibling's own gate
+  // (admin-agents-url-write.ts:276-301): fails CLOSED, blocks the WHOLE
+  // request (never a per-item outcome) so a paused catalog performs ZERO
+  // writes, and runs unconditionally — BEFORE the apply/dry-run branch below
+  // — same as the sibling gates regardless of dry-run. Scoped to exactly
+  // `batch`, the rows this call could actually write (candidates beyond the
+  // per-call cap can never be written by THIS call, so they can't need to
+  // gate it); an empty batch still resolves to the default vertical ('rfb'),
+  // same as an empty `items` array does on the url-write sibling.
+  {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      db_,
+      batch.map((c) => c.id),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
   const body = (req.body ?? {}) as { apply?: unknown; reason?: unknown };
   const apply =
     body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true" ||
@@ -212,19 +264,6 @@ router.post("/", (req: Request, res: Response) => {
     typeof body.reason === "string" && body.reason.trim()
       ? body.reason.trim()
       : "description-code-artifact-sweep";
-
-  const db = db_();
-
-  // Full-catalog scan (AC1 requires quantifying the WHOLE catalog, not just
-  // the batch this call will write) — read-only, no lock/claim considerations
-  // apply to a scan, only to the write below.
-  const allRows = db
-    .prepare(`SELECT id, name, description FROM agents ORDER BY id ASC`)
-    .all() as CandidateRow[];
-  const scanned = allRows.length;
-  const candidates = allRows.filter((r) => looksLikeCodeArtifact(r.description));
-  const candidatesConsidered = candidates.length;
-  const batch = candidates.slice(0, DESCRIPTION_SWEEP_MAX_ITEMS);
 
   const batchTag = `desc-code-artifact-sweep-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
 

@@ -34690,6 +34690,86 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
     assertTrue(dq.looksLikeCodeArtifact(null) === false, "codeartifact: null -> false");
     assertTrue(dq.looksLikeCodeArtifact(undefined) === false, "codeartifact: undefined -> false");
 
+    // ── Round-2 review findings: the 5 real-world false negatives the
+    // independent reviewer confirmed by actually running the function
+    // against them, plus additional realistic negative prose examples. ────
+
+    // (1) WordPress `_wpemojiSettings` bootstrap — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        'window._wpemojiSettings = {"baseUrl":"https:\\/\\/s.w.org\\/images\\/core\\/emoji\\/14.0.0\\/72x72\\/","ext":".png","svgUrl":"https:\\/\\/s.w.org\\/images\\/core\\/emoji\\/14.0.0\\/svg\\/","svgExt":".svg","source":{"concatemoji":"https:\\/\\/example.com\\/wp-includes\\/js\\/wp-emoji-release.min.js?ver=6.4.3"}}; !function(window,document,navigator){var Util,i,tests;Util={}}(window,document,navigator);'
+      ) === true,
+      "codeartifact: WordPress _wpemojiSettings bootstrap -> true (class 1b, unambiguous alone)"
+    );
+
+    // (2) Google Tag Manager / gtag.js snippet, WITHOUT any surrounding
+    // <script> tag (the payload alone, as it would land in a scraped
+    // description) — class 1b (dataLayer + gtag() alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', 'GA-XXXXXXX');"
+      ) === true,
+      "codeartifact: Google Tag Manager snippet (dataLayer + gtag()) -> true (class 1b, unambiguous alone)"
+    );
+
+    // (3) jQuery $(document).ready(...) theme inline script — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "$(document).ready(function() { $('.nav-toggle').on('click', function(){ $('.menu').slideToggle(); }); });"
+      ) === true,
+      "codeartifact: jQuery $(document).ready(...) theme inline script -> true (class 1b, unambiguous alone)"
+    );
+
+    // (4) Shopify Shopify.shop/Shopify.locale analytics bootstrap — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        'var Shopify = Shopify || {}; Shopify.shop = "example.myshopify.com"; Shopify.locale = "en"; Shopify.currency = {"active":"USD","rate":"1.0"};'
+      ) === true,
+      "codeartifact: Shopify Shopify.shop/Shopify.locale bootstrap -> true (class 1b, unambiguous alone)"
+    );
+
+    // (5) Next.js App Router hydration payload — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        'self.__next_f.push([1,"ad:I[47690,[],\\"ClientPageRoot\\"]\\n"])\nself.__next_f.push([1,"b:[\\"$\\",\\"$Lad\\",null,{\\"Component\\":\\"$c\\"}]\\n"])'
+      ) === true,
+      "codeartifact: Next.js hydration payload (self.__next_f.push) -> true (class 1b, unambiguous alone)"
+    );
+
+    // (6) var-only minified JS (the root cause the reviewer traced in class
+    // 3 — Terser/UglifyJS downlevels almost everything to `var` alone, so a
+    // detector requiring 2 DISTINCT declaration keywords structurally could
+    // never fire on this shape). No provider-signature token at all, so this
+    // exercises the reworked class 3 (repeated var declarations) + class 4
+    // (brace density) directly, not class 1b.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "(function(){var a=1;var b=2;var c=3;var d=4;if(a){b=c;}return a+b+c+d;})();"
+      ) === true,
+      "codeartifact: var-only minified JS with an IIFE wrapper -> true (reworked class 3 [repeated var / IIFE] + class 4 [brace density])"
+    );
+
+    // Negative: additional realistic Norwegian producer prose mentioning
+    // tech-adjacent terms, none of which are code syntax.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Vi driver en liten nettbutikk med lokale produkter fra gården, og frakt kan bestilles direkte via telefon."
+      ) === false,
+      "codeartifact: prose mentioning 'nettbutikk' -> false"
+    );
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Vi tilbyr digital markedsføring og rådgivning til andre bønder i regionen vår."
+      ) === false,
+      "codeartifact: prose mentioning 'digital markedsføring' -> false"
+    );
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Vi bruker moderne verktøy og teknologi for å sikre kvalitet i alle ledd av produksjonen."
+      ) === false,
+      "codeartifact: prose mentioning 'vi bruker moderne verktøy' -> false"
+    );
+
     // A single weak signal class alone (e.g. only CMS-token class, no brace/
     // semicolon density) must NOT flag — the detector requires >=2 classes
     // (or the unambiguous <script>/<style> tag) per the byggspec's explicit

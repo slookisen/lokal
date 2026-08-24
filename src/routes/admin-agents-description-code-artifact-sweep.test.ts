@@ -30,10 +30,17 @@
  *       candidates_considered/scanned show the full pre-cap count (own
  *       isolated DB, seeded separately from the sections above so earlier
  *       writes never change this count)
+ *   (m)-(o) [Section D, own isolated DB] round-2 review finding 3: this
+ *       route is now wired to the enrichment-write-pause gate the same way
+ *       the url-write sibling is — a live pause on 'rfb' -> 423 {paused:true}
+ *       with ZERO writes (dry-run request included, since the gate runs
+ *       unconditionally before the apply/dry-run branch, same discipline as
+ *       the sibling), and clearing the pause restores normal behavior.
  */
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+import { setEnrichmentWritePause } from "../services/enrichment-write-pause";
 
 export interface TestSummary {
   passed: number;
@@ -296,10 +303,9 @@ export function runAdminAgentsDescriptionCodeArtifactSweepTests(
         assertEq(resultFor(r.body, "ds-no-knowledge"), undefined, "ds-32b: same for the LEFT JOIN row cleaned above");
         assertEq(resultFor(r.body, "ds-claimed")?.outcome, "would_write", "ds-32c: the still-locked claimed row keeps showing up on every re-run (nothing wrote it, so it's still a candidate)");
 
-        // Note: this route is deliberately NOT wired to the
-        // enrichment-write-pause gate — see the route file's own header
-        // comment for why (a documented, deliberate decision, not an
-        // oversight).
+        // Note: enrichment-write-pause wiring is exercised separately below
+        // (Section D, own isolated DB) — see this route's own header comment
+        // for why it is now wired the same way the url-write sibling is.
 
         // ── (j) empty catalog is exercised separately below (own DB) ─────
       } finally {
@@ -386,6 +392,78 @@ export function runAdminAgentsDescriptionCodeArtifactSweepTests(
         assertEq(r.body?.batch_size, routeMod.DESCRIPTION_SWEEP_MAX_ITEMS, "ds-44: batch_size is capped at DESCRIPTION_SWEEP_MAX_ITEMS");
         assertEq(r.body?.results?.length, routeMod.DESCRIPTION_SWEEP_MAX_ITEMS, "ds-45: exactly the capped number of results is returned");
         assertEq(routeMod.DESCRIPTION_SWEEP_MAX_ITEMS, 200, "ds-46: the cap itself is 200, per the byggspec");
+      } finally {
+        try {
+          const routeMod = require("./admin-agents-description-code-artifact-sweep");
+          routeMod.__setDescriptionSweepDbForTesting(null);
+        } catch {
+          /* ignore */
+        }
+        try {
+          db.close();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    // ─── Section D: enrichment-write-pause wiring (round-2 review finding
+    // 3) — own isolated DB, one candidate agent, vertical_id='rfb'. ────────
+    {
+      const db = new Database(":memory:");
+      try {
+        initMod.__initSchemaForTesting(db as any);
+
+        const insertAgent = db.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id)
+           VALUES (?, ?, ?, 'test', 'post@example.no', 'https://example.no', 'producer', ?, 'rfb')`,
+        );
+        insertAgent.run("ds-pause-rfb", "Pauset Gård AS", SQUARESPACE_JUNK, "key-ds-pause-rfb");
+
+        const routeMod = require("./admin-agents-description-code-artifact-sweep");
+        const router = routeMod.default;
+        routeMod.__setDescriptionSweepDbForTesting(db as any);
+
+        function post(body: any, query?: Record<string, string>): Promise<RouteResult> {
+          return callRoute(router, {
+            method: "POST",
+            url: "/",
+            headers: { "x-admin-key": testKey },
+            body,
+            query,
+          });
+        }
+        function descOf(id: string): string | null {
+          const row = db.prepare(`SELECT description FROM agents WHERE id = ?`).get(id) as { description: string } | undefined;
+          return row?.description ?? null;
+        }
+        function auditCount(): number {
+          return (db.prepare(`SELECT COUNT(*) AS n FROM agent_knowledge_audit`).get() as { n: number }).n;
+        }
+
+        // ── (m) pause 'rfb' -> dry-run request also gets 423, zero writes ──
+        setEnrichmentWritePause(db as any, { vertical: "rfb", enabled: true, reason: "test-pause" }, "test-actor");
+        let r = await post({});
+        assertEq(r.status, 423, "dspause-01: paused 'rfb' -> dry-run sweep request -> 423 (gate runs unconditionally)");
+        assertEq(r.body?.paused, true, "dspause-02: … paused:true");
+        assertEq(r.body?.vertical, "rfb", "dspause-03: … vertical resolved from agents.vertical_id");
+        assertEq(r.body?.reason, "test-pause", "dspause-04: … stored reason surfaced");
+        assertEq(r.body?.fail_closed, false, "dspause-05: … a real pause, not a lookup failure");
+        assertEq(descOf("ds-pause-rfb"), SQUARESPACE_JUNK, "dspause-06: dry-run under pause touched nothing");
+
+        // ── (n) apply request under the same pause -> also 423, zero writes ─
+        r = await post({ reason: "should-not-run" }, { apply: "1" });
+        assertEq(r.status, 423, "dspause-07: paused 'rfb' -> apply=1 sweep request -> 423 too");
+        assertEq(descOf("ds-pause-rfb"), SQUARESPACE_JUNK, "dspause-08: apply under pause changed NOTHING");
+        assertEq(auditCount(), 0, "dspause-09: apply under pause wrote NO audit row");
+
+        // ── (o) clearing the pause restores normal behavior ─────────────
+        setEnrichmentWritePause(db as any, { vertical: "rfb", enabled: false, cleared_by: "test-actor" }, "test-actor");
+        r = await post({ reason: "post-clear" }, { apply: "1" });
+        assertEq(r.status, 200, "dspause-10: cleared pause -> sweep works normally again");
+        assertEq(r.body?.dry_run, false, "dspause-11: apply=1 honored again");
+        assertEq(descOf("ds-pause-rfb"), "", "dspause-12: row cleaned exactly as it would have been without the pause");
+        assertEq(auditCount(), 1, "dspause-13: exactly one audit row written post-clear");
       } finally {
         try {
           const routeMod = require("./admin-agents-description-code-artifact-sweep");
