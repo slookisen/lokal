@@ -38783,6 +38783,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-08-24-rfb-mcp-verktoybeskrivelser-vs-virkelighet:
+// Funn A — lokal_list_umbrellas SELECTed `id` but never rendered it, so
+// lokal_get_umbrella_members's own "use lokal_list_umbrellas to find IDs"
+// instruction was unreachable. Funn B — lokal_info / lokal_search
+// descriptions promised a guaranteed "full price list" / "exact prices in
+// NOK" that the actual free-text-parsed price coverage doesn't back up.
+// Own in-memory DB, same duck-typed-server harness as mcp-search-geo above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-rfb-mcp-verktoybeskrivelser-vs-virkelighet (umbrella id + price honesty) ──");
+  try {
+    const { runMcpUmbrellaAndPriceRealityTests } = require("../src/routes/mcp-umbrella-and-price-reality.test") as
+      typeof import("../src/routes/mcp-umbrella-and-price-reality.test");
+    const msg = await runMcpUmbrellaAndPriceRealityTests({ log: false });
+    passed += msg.passed;
+    failed += msg.failed;
+    for (const f of msg.failures) failures.push("mcp-umbrella-and-price-reality: " + f);
+    console.log(`  mcp-umbrella-and-price-reality: ${msg.passed} passed, ${msg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-umbrella-and-price-reality: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)

@@ -252,7 +252,7 @@ export function registerTools(
       // the user's coordinates when it knows them — previously there was no
       // way to express "near me" at all, so every location-aware question was
       // answered from a place NAME or not at all.
-      description: "Search for local food producers in Norway AND get their products with prices. ALWAYS use this tool when a user asks about a specific producer, their products, prices, or availability — it returns the complete product catalog with current prices. Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info and the full product list with prices. Read-only: it never contacts a producer on the user's behalf.",
+      description: "Search for local food producers in Norway and get their product listings. ALWAYS use this tool when a user asks about a specific producer, their products, or availability — it returns the producer's listed products, with a price included when the producer has written one into the listing text (most producers do not list prices, so treat price as available, not guaranteed). Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info and product names, with prices only where the producer has provided them. Read-only: it never contacts a producer on the user's behalf.",
       inputSchema: {
         query: z.string().default("").describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'. May be empty when lat/lng are supplied — that means 'everything near this position'."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply this for 'near me' searches when you know where the user is."),
@@ -433,7 +433,7 @@ export function registerTools(
     "lokal_info",
     {
       title: "Producer details",
-      description: "Get a specific producer's COMPLETE product catalog with prices, contact details, opening hours, and delivery options. Use when you already have an agentId from lokal_search. Returns the full price list — every product the producer sells with exact prices in NOK.",
+      description: "Get a specific producer's full listed product catalog, contact details, opening hours, and delivery options. Use when you already have an agentId from lokal_search. Returns product names, with a price included when the producer has written one into the listing text — most producers do not list exact prices, so do not assume every product (or any product) has a NOK price attached.",
       inputSchema: {
         agentId: z.string().describe("The producer's agent ID (UUID)"),
       },
@@ -600,6 +600,13 @@ export function registerTools(
           const where = u.city ? ` — ${u.city}` : "";
           const members = (u.umbrella_member_count || 0) > 0 ? ` · ${u.umbrella_member_count} medlemmer` : "";
           sections.push(`- **${u.name}**${where}${members}`);
+          // dev-request 2026-08-24-rfb-mcp-verktoybeskrivelser-vs-virkelighet
+          // (Funn A): `id` was already selected in the SQL above but never
+          // rendered — so lokal_get_umbrella_members's own "use
+          // lokal_list_umbrellas to find IDs" instruction was unreachable.
+          // Expose the umbrella's existing stable id instead of inventing a
+          // new identifier scheme.
+          sections.push(`  umbrellaId: ${u.id}`);
           sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(u.name)}`, getClientIdentity?.())}`);
         }
       }
