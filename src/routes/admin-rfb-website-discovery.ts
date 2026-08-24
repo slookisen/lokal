@@ -766,7 +766,7 @@ export async function evaluateRfbWebsiteCandidate(
   fallbackCounters: RfbWdFallbackCounters,
   batchId: string,
   reason: string = "website_discovery_candidate_external",
-  contactOverride?: { telefon?: string | null; mobil?: string | null },
+  contactOverride?: { telefon?: string | null; mobil?: string | null; kommune?: string | null },
 ): Promise<RfbWdCandidateOutcome> {
   let t = getRfbWebsiteDiscoveryTarget(db, candidate.agentId);
   if (!t && ensureKnowledgeRowForExternalCandidate(db, candidate.agentId)) {
@@ -787,7 +787,7 @@ export async function evaluateRfbWebsiteCandidate(
   const evidenceTarget = {
     orgNr: t.org_nr,
     navn: t.name,
-    kommune: t.city,
+    kommune: contactOverride?.kommune !== undefined ? contactOverride.kommune : t.city,
     poststed: null as string | null,
     telefon: contactOverride?.telefon !== undefined ? contactOverride.telefon : t.phone,
     mobil: contactOverride?.mobil !== undefined ? contactOverride.mobil : (null as string | null),
@@ -858,17 +858,44 @@ const router = Router();
 interface RfbWdExternalCandidate {
   agentId: string;
   url: string;
+  // Grep 4e (dev-request 2026-08-22-rfb-website-email-selvforsyning) —
+  // additive optional field mirroring evaluateRfbWebsiteCandidate's
+  // contactOverride 8th param (built for Grep 1c's BSS route). Lets an
+  // external-candidate caller (e.g. a web-search session holding Brreg's
+  // registered kommune/telefon/mobil for this agent) thread that evidence
+  // through the shared evidenceTarget instead of relying solely on the
+  // row's own (possibly NULL) city/phone. Omitted → undefined, never
+  // coerced to null, so evaluateRfbWebsiteCandidate's `!== undefined`
+  // fallback-to-t.city/t.phone logic is unaffected — byte-identical to
+  // before for every existing caller.
+  contactOverride?: { telefon?: string | null; mobil?: string | null; kommune?: string | null };
 }
 
 function parseExternalCandidates(raw: unknown): RfbWdExternalCandidate[] | null {
   if (!Array.isArray(raw)) return null;
   const out: RfbWdExternalCandidate[] = [];
   for (const item of raw) {
-    const o = item as { agentId?: unknown; url?: unknown };
+    const o = item as { agentId?: unknown; url?: unknown; contactOverride?: unknown };
     const agentId = typeof o?.agentId === "string" ? o.agentId.trim() : "";
     const url = typeof o?.url === "string" ? o.url.trim() : "";
     if (!agentId || !url) return null; // malformed item poisons the whole call — 400, never a silent partial run
-    out.push({ agentId, url });
+    let contactOverride: RfbWdExternalCandidate["contactOverride"];
+    if (o?.contactOverride !== undefined) {
+      if (typeof o.contactOverride !== "object" || o.contactOverride === null || Array.isArray(o.contactOverride)) {
+        return null; // malformed contactOverride poisons the whole call — same 400-all-or-nothing convention as agentId/url above
+      }
+      const co = o.contactOverride as { telefon?: unknown; mobil?: unknown; kommune?: unknown };
+      const isStringOrNullOrUndefined = (v: unknown) => v === undefined || v === null || typeof v === "string";
+      if (!isStringOrNullOrUndefined(co.telefon) || !isStringOrNullOrUndefined(co.mobil) || !isStringOrNullOrUndefined(co.kommune)) {
+        return null; // wrong sub-field type poisons the whole call — same convention
+      }
+      contactOverride = {
+        telefon: co.telefon as string | null | undefined,
+        mobil: co.mobil as string | null | undefined,
+        kommune: co.kommune as string | null | undefined,
+      };
+    }
+    out.push({ agentId, url, contactOverride });
   }
   return out;
 }
@@ -956,6 +983,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         hostsProposedExt,
         fallbackCountersExt,
         batchId,
+        undefined,
+        c.contactOverride,
       );
 
       switch (outcome.outcome) {

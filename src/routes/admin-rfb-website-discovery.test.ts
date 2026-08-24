@@ -722,6 +722,81 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(wrongMode.status, 400, "r3: aggregator_replace with candidates -> 400");
     }
 
+    // ── (p2) Grep 4e (dev-request 2026-08-22-rfb-website-email-selvforsyning):
+    //     external-candidate intake threads a caller-supplied contactOverride
+    //     (kommune+telefon, mirroring Grep 1c's BSS-route usage of the SAME
+    //     evaluateRfbWebsiteCandidate 8th param) into evidenceTarget — a row
+    //     with city=NULL AND phone=NULL on file can now still verify against
+    //     a page that carries the producer's Brreg-registered kommune/telefon
+    //     instead of its own (missing) city/phone. Byggspec's (s) --
+    {
+      insertAgent({ id: "wd-ext-anchor-ok", name: "Fjell Delikatesser", city: null, phone: null });
+      fixtures.set(
+        "https://fjelldelikatesser-butikk.no",
+        htmlResponse("<html><body>Fjell kommune. Telefon: 912 34 567.</body></html>", { finalUrl: "https://fjelldelikatesser-butikk.no" }),
+      );
+      const r = await callDiscovery({
+        candidates: [
+          {
+            agentId: "wd-ext-anchor-ok",
+            url: "https://fjelldelikatesser-butikk.no/om-oss",
+            contactOverride: { kommune: "Fjell", telefon: "91234567" },
+          },
+        ],
+      });
+      assertEq(r.body.proposed.length, 1, "p2-1: exactly one proposal (contactOverride supplied the missing anchor evidence)");
+      assertEq(r.body.proposed[0].evidence.place_found, true, "p2-2: kommune override matched on the page");
+      assertEq(r.body.proposed[0].evidence.phone_found, true, "p2-3: telefon override matched on the page");
+      const row = readQueueRow("wd-ext-anchor-ok");
+      assertTrue(!!row, "p2-4: queue row inserted");
+    }
+
+    // ── (p3) same page/evidence as (p2), but a DIFFERENT city=NULL/phone=NULL
+    //     agent whose candidate is sent WITHOUT contactOverride — proves (p2)
+    //     is the override doing the work, not some other change (mutation-
+    //     test discipline: this case must fail if the fix in
+    //     evaluateRfbWebsiteCandidate is reverted). Byggspec's (t) --
+    {
+      insertAgent({ id: "wd-ext-anchor-noover", name: "Fjell Delikatesser To", city: null, phone: null });
+      fixtures.set(
+        "https://fjelldelikatesser2-butikk.no",
+        htmlResponse("<html><body>Fjell kommune. Telefon: 912 34 567.</body></html>", { finalUrl: "https://fjelldelikatesser2-butikk.no" }),
+      );
+      const r = await callDiscovery({
+        candidates: [{ agentId: "wd-ext-anchor-noover", url: "https://fjelldelikatesser2-butikk.no/om-oss" }],
+      });
+      assertEq(r.body.proposed.length, 0, "p3-1: nothing proposed without contactOverride (city/phone both NULL on the row)");
+      assertEq(r.body.rejected.length, 1, "p3-2: one rejection");
+      assertEq(r.body.rejected[0].reason, "evidence_mismatch", "p3-3: rejected for lack of evidence, not some other reason");
+      assertTrue(!readQueueRow("wd-ext-anchor-noover"), "p3-4: nothing queued");
+    }
+
+    // ── (p4) contactOverride with ONLY kommune (telefon/mobil omitted) --
+    //     independent-fields proof: telefon evidence-matching still falls
+    //     back to the row's own t.phone unaffected, not all-or-nothing.
+    //     Byggspec's (u) --
+    {
+      insertAgent({ id: "wd-ext-anchor-partial", name: "Nordkapp Sjomat", city: null, phone: "91234567" });
+      fixtures.set(
+        "https://nordkappsjomat-butikk.no",
+        htmlResponse("<html><body>Nordkapp. Telefon: 91234567.</body></html>", { finalUrl: "https://nordkappsjomat-butikk.no" }),
+      );
+      const r = await callDiscovery({
+        candidates: [
+          {
+            agentId: "wd-ext-anchor-partial",
+            url: "https://nordkappsjomat-butikk.no/om-oss",
+            contactOverride: { kommune: "Nordkapp" },
+          },
+        ],
+      });
+      assertEq(r.body.proposed.length, 1, "p4-1: proposed — kommune override + phone fallback to t.phone together verify");
+      assertEq(r.body.proposed[0].evidence.place_found, true, "p4-2: kommune override matched (telefon/mobil omitted from the override)");
+      assertEq(r.body.proposed[0].evidence.phone_found, true, "p4-3: telefon evidence still matched via t.phone, unaffected by the kommune-only override");
+      const row = readQueueRow("wd-ext-anchor-partial");
+      assertTrue(!!row, "p4-4: queue row inserted");
+    }
+
     // ── (s) external candidate for a row that already has a website --
     {
       insertAgent({ id: "wd-ext-has", name: "Solheim Gartneri", website: "https://solheimgartneri.no" });
