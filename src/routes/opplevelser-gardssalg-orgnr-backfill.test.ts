@@ -609,6 +609,225 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
       const routeReviewRows = listRes2.body.entries.filter((e: any) => e.provider_id === "route-review");
       assertEq(routeReviewRows.length, 1, "u4: exactly one review-queue row for route-review");
 
+      // ── (w)-(aa) heuristic candidate-generation wiring (dev-request
+      // 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2):
+      // domain-token + personal-name-ENK, reused verbatim from PR #679
+      // (admin-rfb-brreg-selfsufficiency.ts) — only attempted when the base
+      // Brreg name-search finds NOTHING, funnel through the SAME veto chain
+      // + write path as the base chain above (never a new write path).
+      const localCandidates = require("../services/local-orgnr-candidates") as typeof import("../services/local-orgnr-candidates");
+      brregClient.__clearBrregCacheForTesting();
+
+      localCandidates.__setLocalOrgnrCandidatesForTesting([
+        { orgnr: "916000001", name: "Torgersen", postal_code: "3300", city: "Hokksund", source: "lokalmat" },
+        { orgnr: "988776655", name: "Bråstein ENK", postal_code: "4300", city: "Sandnes", source: "debio" },
+        // Deliberately findable via the domain-token heuristic (matches
+        // heur-base-wins' own hjemmeside below) — a "poison" candidate that
+        // must NEVER be reached, since that provider's base Brreg
+        // name-search already finds an exact hit (test z below).
+        { orgnr: "917000009", name: "Basewins", postal_code: "1450", city: "Nesoddtangen", source: "debio" },
+        // Regression fixture (independent review finding, mirrors PR #679's
+        // own "Blocker 3" / admin-agents-org-nr-backfill.test.ts case
+        // w1-w5): a WEAK (sub-1.0, first-token+postal tier = 0.95) local hit
+        // for the SAME domain-token-derived name a live Brreg search also
+        // matches at the clean exact-match tier (1.0) — the live hit must
+        // win, never the weaker local one (test ab below).
+        { orgnr: "955000001", name: "Liveblocker Handel", postal_code: "6000", city: "Ålesund", source: "lokalmat" },
+      ]);
+
+      insertProvider.run({
+        id: "heur-domain-corrob", navn: "Torgersen Gardsbutikk", org_nr: null,
+        content_source: null, postnummer: "3300", poststed: "Hokksund",
+        catalog_hidden: null, created_at: "2026-03-01 00:00:00",
+      });
+      expDb.exec(`UPDATE experience_providers SET hjemmeside = 'https://torgersenmat.no' WHERE id = 'heur-domain-corrob'`);
+
+      insertProvider.run({
+        id: "heur-domain-uncorrob", navn: "Torgersen Sjokolade", org_nr: null,
+        content_source: null, postnummer: "3310", poststed: null,
+        catalog_hidden: null, created_at: "2026-03-01 00:00:00",
+      });
+      expDb.exec(`UPDATE experience_providers SET hjemmeside = 'https://torgersenmat.no' WHERE id = 'heur-domain-uncorrob'`);
+
+      insertProvider.run({
+        id: "heur-personal-corrob", navn: "Bråstein", org_nr: null,
+        content_source: null, postnummer: "4300", poststed: "Sandnes",
+        catalog_hidden: null, created_at: "2026-03-01 00:00:00",
+      });
+
+      insertProvider.run({
+        id: "heur-base-wins", navn: "Base Wins Gard", org_nr: null,
+        content_source: null, postnummer: "1450", poststed: "Nesoddtangen",
+        catalog_hidden: null, created_at: "2026-03-01 00:00:00",
+      });
+      expDb.exec(`UPDATE experience_providers SET hjemmeside = 'https://basewinsmat.no' WHERE id = 'heur-base-wins'`);
+
+      insertProvider.run({
+        id: "heur-no-candidate", navn: "Zzyzx Unfindable Gardsprodukter", org_nr: null,
+        content_source: null, postnummer: "9999", poststed: null,
+        catalog_hidden: null, created_at: "2026-03-01 00:00:00",
+      });
+      expDb.exec(`UPDATE experience_providers SET hjemmeside = 'https://zzyzxmat.no' WHERE id = 'heur-no-candidate'`);
+
+      insertProvider.run({
+        id: "heur-live-beats-weak-local", navn: "Live Beats Weak Local Gard", org_nr: null,
+        content_source: null, postnummer: "6000", poststed: "Ålesund",
+        catalog_hidden: null, created_at: "2026-03-01 00:00:00",
+      });
+      expDb.exec(`UPDATE experience_providers SET hjemmeside = 'https://liveblockermat.no' WHERE id = 'heur-live-beats-weak-local'`);
+
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const u = String(url);
+        const dm = u.match(/\/enheter\/(\d{9})$/);
+        if (dm) {
+          return { ok: true, status: 200, json: async () => ({ organisasjonsnummer: dm[1], navn: "SUNN TESTENHET AS" }) } as unknown as Response;
+        }
+        if (u.includes("navn=Base%20Wins%20Gard")) {
+          // Base search finds an exact match directly — heuristics must
+          // never even be attempted for this provider (test z below).
+          return {
+            ok: true, status: 200,
+            json: async () => ({
+              _embedded: { enheter: [{
+                organisasjonsnummer: "914500001", navn: "Base Wins Gard",
+                forretningsadresse: { adresse: ["Vinnerveien 1"], postnummer: "1450", poststed: "Nesoddtangen" },
+              }] },
+            }),
+          } as unknown as Response;
+        }
+        // Live Brreg has a CLEAN EXACT (1.0) match for the domain-token
+        // heuristic's own derived name "Liveblocker" — the local vendored
+        // file's own hit for this same name is a WEAKER 0.95 (test ab
+        // below): this live hit must win the comparison, never be shadowed.
+        if (u.includes("navn=Liveblocker&size=5")) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({
+              _embedded: { enheter: [{
+                organisasjonsnummer: "955000002", navn: "Liveblocker",
+                forretningsadresse: { adresse: ["Blokkveien 1"], postnummer: "6000", poststed: "Ålesund" },
+              }] },
+            }),
+          } as unknown as Response;
+        }
+        // Every other base-search name (Torgersen Gardsbutikk, Torgersen
+        // Sjokolade, Bråstein, Zzyzx Unfindable Gardsprodukter, Live Beats
+        // Weak Local Gard) AND every live heuristic-fallback query that
+        // isn't otherwise handled: no candidate — these fixtures rely
+        // entirely on the LOCAL vendored file above, proving the
+        // local-first-then-live order.
+        return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+      }) as typeof fetch;
+
+      // (w) domain-token hit, corroborated (postnummer + poststed both
+      //     match) -> written.
+      const dtRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["heur-domain-corrob"], apply: true },
+      });
+      const dtChanged = dtRes.body.changed.find((c: any) => c.provider_id === "heur-domain-corrob");
+      assertTrue(!!dtChanged, "w1: domain-token candidate (corroborated) appears in changed[]");
+      assertEq(dtChanged?.candidate_source, "local_json_lokalmat", "w2: candidate_source tags the local-JSON hit's own source (LocalOrgnrHit.local_source)");
+      assertEq(dtChanged?.org_nr, "916000001", "w3: written org_nr matches the domain-token-derived local candidate");
+      assertEq(getProviderRow("heur-domain-corrob").org_nr, "916000001", "w4: actually written to the row");
+
+      // (x) personal-name-ENK hit, corroborated -> written.
+      const pnRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["heur-personal-corrob"], apply: true },
+      });
+      const pnChanged = pnRes.body.changed.find((c: any) => c.provider_id === "heur-personal-corrob");
+      assertTrue(!!pnChanged, "x1: personal-name-ENK candidate (corroborated) appears in changed[]");
+      assertEq(pnChanged?.candidate_source, "local_json_debio", "x2: candidate_source tags the local-JSON hit's own source");
+      assertEq(pnChanged?.org_nr, "988776655", "x3: written org_nr matches the personal-name-ENK-derived local candidate");
+      assertEq(getProviderRow("heur-personal-corrob").org_nr, "988776655", "x4: actually written to the row");
+
+      // (y) heuristic hit with NO postal/poststed corroboration on the
+      //     target -> queued as needs_human_review-shaped
+      //     ("heuristic_name_requires_postal_match"), never auto-written —
+      //     even though the SAME candidate as (w) was found.
+      const dtUncorrobRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["heur-domain-uncorrob"], apply: true },
+      });
+      assertTrue(
+        dtUncorrobRes.body.unresolved.some((u: any) => u.provider_id === "heur-domain-uncorrob" && u.reason === "heuristic_name_requires_postal_match"),
+        "y1: uncorroborated domain-token hit -> unresolved reason heuristic_name_requires_postal_match",
+      );
+      assertTrue(
+        !dtUncorrobRes.body.changed.some((c: any) => c.provider_id === "heur-domain-uncorrob"),
+        "y2: never auto-written",
+      );
+      assertEq(getProviderRow("heur-domain-uncorrob").org_nr, null, "y3: row remains blank");
+      const yQueueRow = getReviewQueueRow("heur-domain-uncorrob");
+      assertTrue(!!yQueueRow, "y4: upserted into the review queue");
+      assertEq(yQueueRow.candidate_orgnr, "916000001", "y5: review-queue row carries the found (unconfirmed) candidate org_nr");
+
+      // (z) base search wins when it finds something — heuristics are never
+      //     even attempted. Proven via a "poison" local candidate
+      //     (heur-base-wins' own hjemmeside resolves, via the domain-token
+      //     heuristic alone, to a DIFFERENT, fully-corroborated,
+      //     auto-write-eligible local candidate — see the fixture set
+      //     above): if the heuristic path were wrongly attempted even
+      //     though the base search already found a hit, the wrong org_nr
+      //     (the poison candidate's) would land on the row instead. A
+      //     process-wide call-count spy on findLocalOrgnrCandidate was
+      //     tried and dropped here — tsx/esbuild's CJS interop binds a
+      //     named import to a snapshot of the export at require time, not a
+      //     live module.exports property lookup, so reassigning the
+      //     property post-import is invisible to callers in THIS
+      //     toolchain's own transpiled output (confirmed empirically); the
+      //     poison-candidate technique proves the same thing without
+      //     depending on that.
+      const bwRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["heur-base-wins"], apply: true },
+      });
+      const bwChanged = bwRes.body.changed.find((c: any) => c.provider_id === "heur-base-wins");
+      assertTrue(!!bwChanged, "z1: base-search candidate appears in changed[]");
+      assertEq(bwChanged?.candidate_source, "brreg_name_search", "z2: candidate_source is the UNCHANGED base tag — proves the domain-token heuristic never ran (it would have tagged local_json_debio)");
+      assertEq(bwChanged?.org_nr, "914500001", "z3: written org_nr matches the BASE search hit, not the poison local candidate (917000009)");
+      assertEq(getProviderRow("heur-base-wins").org_nr, "914500001", "z3b: the base hit's org_nr is what actually landed on the row");
+
+      // (aa) domain-token AND personal-name-ENK both find nothing (local
+      //      AND live) -> falls through to the existing no_brreg_candidate
+      //      outcome, unchanged.
+      const ncRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["heur-no-candidate"], apply: true },
+      });
+      assertTrue(
+        ncRes.body.unresolved.some((u: any) => u.provider_id === "heur-no-candidate" && u.reason === "no_brreg_candidate"),
+        "aa1: no heuristic candidate anywhere -> unresolved reason no_brreg_candidate",
+      );
+      const ncQueueRow = getReviewQueueRow("heur-no-candidate");
+      assertTrue(!!ncQueueRow, "aa2: upserted into the review queue");
+      assertEq(ncQueueRow.candidate_orgnr, null, "aa3: no candidate fields on a no_brreg_candidate row");
+
+      // (ab) regression (independent review finding): a WEAK (sub-1.0)
+      // local-JSON hit for a heuristic's derived name must NOT
+      // unconditionally shadow a CLEANER (1.0, exact) live Brreg match for
+      // the same name — mirrors resolveOrgNrForTarget's own
+      // local-vs-live comparison (admin-rfb-brreg-selfsufficiency.ts, PR
+      // #679) and its own regression-guard test (admin-agents-org-nr-
+      // backfill.test.ts, case w1-w5). The local candidate here ("955000001",
+      // 0.95 confidence) is deliberately findable and would be an
+      // otherwise-plausible auto-write candidate on its own — but the live
+      // hit ("955000002", 1.0 confidence, corroborated) must be the one
+      // that wins and gets written.
+      const lbRes = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["heur-live-beats-weak-local"], apply: true },
+      });
+      const lbChanged = lbRes.body.changed.find((c: any) => c.provider_id === "heur-live-beats-weak-local");
+      assertTrue(!!lbChanged, "ab1: the (live-hit-wins) domain-token candidate appears in changed[]");
+      assertEq(lbChanged?.candidate_source, "domain_token_name_match", "ab2: candidate_source is the LIVE heuristic tag, not local_json_lokalmat — proves the live hit won the comparison");
+      assertEq(lbChanged?.org_nr, "955000002", "ab3: written org_nr is the LIVE Brreg hit, not the weaker (0.95) local candidate (955000001)");
+      assertEq(getProviderRow("heur-live-beats-weak-local").org_nr, "955000002", "ab4: actually written to the row");
+      assertTrue(!lbRes.body.unresolved.some((u: any) => u.provider_id === "heur-live-beats-weak-local"), "ab5: not queued — the live hit was clean + corroborated, auto-write eligible");
+
+      localCandidates.__setLocalOrgnrCandidatesForTesting(null);
+
       // (s) errors[]: write failure during apply.
       insertProvider.run({
         id: "route-write-fail", navn: "Route Write Fail Gard", org_nr: null,

@@ -55,9 +55,16 @@ import {
   gardssalgWebsiteCandidateHosts,
   gardssalgPageText,
   gardssalgWebsiteEvidenceMatch,
+  gardssalgWebsiteSearchQuery,
+  gardssalgWebsiteSearchCandidateHosts,
 } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+// Grep 4d fix-up (review finding 3): reuse the existing punycode decoder +
+// Norwegian transliterator -- read-only reuse, not reimplemented -- for the
+// IDN-host marker-check normalization in rfbWdPageReferencesOwnHost below.
+import { decodePunycodeLabel, transliterateNorwegian } from "../services/cross-source-validator";
+import { braveSearch, type BraveResult } from "../services/search-enrich";
 import { mergeFieldProvenance } from "./admin-knowledge";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
@@ -68,6 +75,16 @@ import {
   enrichmentWritePauseBlockForAgents,
   sendEnrichmentWritePausedIfPaused,
 } from "../services/enrichment-write-pause";
+// Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier): the
+// SHARED LLM-judge + deterministic-backstop module (src/services/
+// contact-candidate-judge.ts) — reused as-is, NOT reimplemented, for the
+// new POST /admin/rfb-website-review-judge route below. That module's
+// `fieldType: "website"` branch already exists (dev-request 2026-08-22-
+// rfbweb-about-guard) and is generic; this is simply its third call site.
+import {
+  classifyContactCandidateDefect,
+  judgeContactCandidate,
+} from "../services/contact-candidate-judge";
 
 // ─── agents_website_review_queue (lazy, ensureXTable pattern) ──────────────
 //
@@ -208,6 +225,38 @@ export interface RfbWdFallbackCounters {
 let renderPageImplForTesting: typeof renderPage | null = null;
 export function __setRfbWdRenderPageImplForTesting(impl: typeof renderPage | null): void {
   renderPageImplForTesting = impl;
+}
+
+// ─── injectable search seam for this route's own tier-2 (Brave Search)
+// fallback leg ───────────────────────────────────────────────────────────
+// Mirrors dentalWdSearchImpl/__setDentalWdSearchForTesting/
+// effectiveDentalWdSearchImpl (admin-dental-hjemmeside-discovery.ts) exactly,
+// adapted to rfb naming — that file is the primary template for this leg
+// (see file header). Tier 2 is genuinely OPTIONAL in production (unlike
+// tier 1's name-guessing, which always runs), so this override slot starts
+// at null rather than at a real implementation. Production code never calls
+// the setter; the real wiring lives in effectiveRfbWdSearchImpl() below,
+// which is evaluated FRESH on every call (never cached at module-load
+// time) — when a test override is set it always wins, otherwise production
+// wires the real braveSearch(query, key, RFB_WD_SEARCH_MAX_CANDIDATES) when
+// a Brave key is configured (BRAVE_API_KEY / BRAVE_SEARCH_API_KEY) or stays
+// null — tier 2 silently skipped, tier 1's own result is used unchanged —
+// when neither is set.
+export type RfbWdSearchFn = (query: string) => Promise<BraveResult[]>;
+let rfbWdSearchImpl: RfbWdSearchFn | null = null;
+export function __setRfbWdSearchForTesting(impl: RfbWdSearchFn | null): void {
+  rfbWdSearchImpl = impl;
+}
+
+// Mirrors DENTAL_WD_SEARCH_MAX_CANDIDATES's naming/role exactly — caps both
+// the braveSearch `count` param and the number of hosts extracted from its
+// results.
+export const RFB_WD_SEARCH_MAX_CANDIDATES = 5;
+
+function effectiveRfbWdSearchImpl(): RfbWdSearchFn | null {
+  if (rfbWdSearchImpl) return rfbWdSearchImpl;
+  const braveKey = process.env.BRAVE_API_KEY || process.env.BRAVE_SEARCH_API_KEY || "";
+  return braveKey ? (query: string) => braveSearch(query, braveKey, RFB_WD_SEARCH_MAX_CANDIDATES) : null;
 }
 
 // ─── Local, RFB-scoped re-implementation of the aggregator/directory +
@@ -537,6 +586,53 @@ function rfbWdCheckFinalHostExclusion(
   return false;
 }
 
+// Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning, Pilot-
+// FUNN 2026-08-22 P1): a lightweight, mechanical self-reference "content
+// marker" check -- does the fetched HTML mention its own host ANYWHERE
+// (<link rel="canonical">, og:url, absolute links, footer copyright text,
+// <title>, etc. -- deliberately broad, since the goal is "does the page
+// mention itself at all", not one specific tag format)? Guards against a
+// proxy/cache returning a completely different site's content, which
+// otherwise either false-positive-matches as evidence or false-rejects as
+// evidence_mismatch (masking the real cause) -- contamination measured in
+// 4/10 research batches in the pilot. `host` is normalized the same "label"
+// way gardssalgWebsiteCandidateHosts (services/experience-store.ts)
+// already does for host variants: strip an optional "www." prefix, then
+// take the second-level-domain label (everything before the first ".").
+// Plain case-insensitive string .includes() only, deliberately no regex --
+// avoid any regex-engine risk on attacker/scraper-controlled HTML.
+export function rfbWdPageReferencesOwnHost(html: string, host: string): boolean {
+  const bareHost = host.toLowerCase().replace(/^www\./, "");
+  const label = bareHost.split(".")[0] || "";
+  // Fail-OPEN when the normalized label is too short to safely match on
+  // (bare IP, TLD-only edge case) -- conservative, avoids false
+  // fetch_contaminated rejections on valid-but-unusual hostnames; the real
+  // evidence-matching step downstream is still the actual gate.
+  if (label.length < 3) return true;
+  const htmlLower = html.toLowerCase();
+  if (htmlLower.includes(label)) return true;
+  // Grep 4d fix-up (review finding 3): a genuine IDN/punycode-registered
+  // producer host (label starting "xn--", e.g. real in-production Norwegian
+  // producers like svanøylaks.no) will essentially never appear as its raw
+  // ACE string in the page's real Unicode HTML -- decode it to Unicode
+  // first, and also check a Norwegian-transliterated ASCII variant (æ/ø/å ->
+  // ae/oe/aa), since Norwegian registrants commonly render either form on
+  // the page -- before concluding the marker is genuinely absent. Reuses
+  // cross-source-validator.ts's existing decoder/transliterator (no
+  // reimplementation); still .includes()-only, still no regex, still
+  // preprocessing the label rather than changing the matching strategy.
+  if (label.startsWith("xn--")) {
+    const unicodeLabel = decodePunycodeLabel(label).toLowerCase();
+    // decodePunycodeLabel fails safe by returning the input unchanged on
+    // malformed/truncated input -- `unicodeLabel !== label` also guards
+    // against re-checking the exact same raw string we already just missed.
+    if (unicodeLabel !== label && unicodeLabel.length >= 3 && htmlLower.includes(unicodeLabel)) return true;
+    const transliterated = transliterateNorwegian(unicodeLabel);
+    if (transliterated !== unicodeLabel && transliterated.length >= 3 && htmlLower.includes(transliterated)) return true;
+  }
+  return false;
+}
+
 async function tryRfbWebsiteCandidateHost(
   host: string,
   evidenceTarget: Parameters<typeof gardssalgWebsiteEvidenceMatch>[1],
@@ -561,17 +657,67 @@ async function tryRfbWebsiteCandidateHost(
   }
 
   tried.push(host);
-  const result = await fetchPage(`https://${host}`, {
+  let result = await fetchPage(`https://${host}`, {
     userAgent: RFB_WD_USER_AGENT,
     timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
   });
-  if (!result.ok) return null;
+  // Grep 4f (dev-request 2026-08-22-rfb-website-email-selvforsyning): the
+  // site never answered at all -- distinct from `evidence_mismatch` below
+  // (site answered, page just didn't carry matching evidence). `result.reason`
+  // is fetch-page.ts's own truthful classifier (dns_not_found/timeout/http_404/
+  // etc.), so this is a real, site-side diagnostic, not a guess.
+  if (!result.ok) {
+    excludedHere.push({ host, reason: `fetch_failed:${result.reason}` });
+    return null;
+  }
 
-  const finalHost = rfbWdHostFromUrl(result.finalUrl) || host;
+  let finalHost = rfbWdHostFromUrl(result.finalUrl) || host;
   if (finalHost !== host) {
     if (rfbWdCheckFinalHostExclusion(finalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
       return null;
     }
+  }
+
+  // Grep 4d: content-marker guard against proxy/cache contamination -- see
+  // rfbWdPageReferencesOwnHost's doc comment. Exactly ONE sequential
+  // re-fetch of the SAME url on a miss, never a retry loop. If the retry
+  // also fails the marker check (or fails outright), reject as
+  // fetch_contaminated -- a third, distinct reason class from
+  // fetch_failed:*/evidence_mismatch -- and never let the contaminated
+  // content reach evidence matching or the review queue.
+  if (!rfbWdPageReferencesOwnHost(result.html, finalHost)) {
+    const retryResult = await fetchPage(`https://${host}`, {
+      userAgent: RFB_WD_USER_AGENT,
+      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+    });
+    if (!retryResult.ok) {
+      excludedHere.push({ host: finalHost, reason: "fetch_contaminated" });
+      return null;
+    }
+    // A redirect could differ between the two calls, so recompute finalHost
+    // for the retry the same way the original fetch above does.
+    const retryFinalHost = rfbWdHostFromUrl(retryResult.finalUrl) || host;
+    // Grep 4d fix-up (review finding 1): the retry's OWN redirect target
+    // needs the same dedup/exclusion re-check the ORIGINAL fetch's redirect
+    // gets above (rfbWdCheckFinalHostExclusion) -- otherwise a retry that
+    // happens to land on an already-in-use/already-proposed-this-batch/
+    // excluded host could sail past the marker check below and reach the
+    // review queue with none of this function's other dedup/exclusion
+    // guards ever applied to it.
+    if (retryFinalHost !== finalHost) {
+      if (rfbWdCheckFinalHostExclusion(retryFinalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
+        return null;
+      }
+    }
+    if (!rfbWdPageReferencesOwnHost(retryResult.html, retryFinalHost)) {
+      excludedHere.push({ host: retryFinalHost, reason: "fetch_contaminated" });
+      return null;
+    }
+    // Retry passed the marker check: use ITS content/finalHost for
+    // everything downstream -- the first, contaminated fetch is discarded,
+    // never used as evidence.
+    result = retryResult;
+    finalHost = retryFinalHost;
   }
 
   const pageText = gardssalgPageText(result.html);
@@ -588,22 +734,68 @@ async function tryRfbWebsiteCandidateHost(
   if (rfbWdHeadlessFallbackEnabled() && shouldEscalateToRender(result.html)) {
     fallbackCounters.attempted++;
     const renderFn = renderPageImplForTesting ?? renderPage;
-    const rendered = await renderFn(`https://${finalHost}`, {
+    let rendered = await renderFn(`https://${finalHost}`, {
       userAgent: RFB_WD_USER_AGENT,
       timeoutMs: RFB_WD_RENDER_TIMEOUT_MS,
     });
     if (rendered.ok) {
-      const renderedFinalHost = rfbWdHostFromUrl(rendered.finalUrl) || finalHost;
+      let renderedFinalHost = rfbWdHostFromUrl(rendered.finalUrl) || finalHost;
       if (renderedFinalHost !== finalHost) {
         if (rfbWdCheckFinalHostExclusion(renderedFinalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
           return null;
         }
       }
-      const renderedPageText = gardssalgPageText(rendered.html);
-      const renderedEvidence = gardssalgWebsiteEvidenceMatch(renderedPageText, evidenceTarget);
-      if (renderedEvidence.verified) {
-        fallbackCounters.verified++;
-        return { host: renderedFinalHost, finalUrl: rendered.finalUrl, evidence: renderedEvidence };
+
+      // Grep 4d: same content-marker guard/one-retry pattern as the plain
+      // fetch above -- "any fetch used as evidence" explicitly covers this
+      // render-fallback path too, matching the same renderer-agnostic
+      // discipline the evidence_mismatch fall-through below already
+      // follows in this function.
+      let renderMarkerOk = rfbWdPageReferencesOwnHost(rendered.html, renderedFinalHost);
+      if (!renderMarkerOk) {
+        const retryRendered = await renderFn(`https://${finalHost}`, {
+          userAgent: RFB_WD_USER_AGENT,
+          timeoutMs: RFB_WD_RENDER_TIMEOUT_MS,
+        });
+        if (!retryRendered.ok) {
+          // Grep 4d fix-up (review finding 2): return immediately after this
+          // push, matching the plain-fetch retry path above -- otherwise
+          // execution falls through to this function's bottom, which pushes
+          // a SECOND, contradictory evidence_mismatch entry for the same
+          // rejected attempt.
+          excludedHere.push({ host: renderedFinalHost, reason: "fetch_contaminated" });
+          return null;
+        }
+        const retryRenderedFinalHost = rfbWdHostFromUrl(retryRendered.finalUrl) || finalHost;
+        // Grep 4d fix-up (review finding 1): re-check the retry's OWN
+        // redirect target against the same dedup/exclusion guard, mirroring
+        // the plain-fetch retry fix above.
+        if (retryRenderedFinalHost !== renderedFinalHost) {
+          if (rfbWdCheckFinalHostExclusion(retryRenderedFinalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
+            return null;
+          }
+        }
+        renderMarkerOk = rfbWdPageReferencesOwnHost(retryRendered.html, retryRenderedFinalHost);
+        if (!renderMarkerOk) {
+          // Grep 4d fix-up (review finding 2): return immediately -- see the
+          // comment on the !retryRendered.ok branch above.
+          excludedHere.push({ host: retryRenderedFinalHost, reason: "fetch_contaminated" });
+          return null;
+        }
+        // Retry passed the marker check: use ITS content/finalHost for
+        // everything downstream -- the first, contaminated render is
+        // discarded, never used as evidence.
+        rendered = retryRendered;
+        renderedFinalHost = retryRenderedFinalHost;
+      }
+
+      if (renderMarkerOk) {
+        const renderedPageText = gardssalgPageText(rendered.html);
+        const renderedEvidence = gardssalgWebsiteEvidenceMatch(renderedPageText, evidenceTarget);
+        if (renderedEvidence.verified) {
+          fallbackCounters.verified++;
+          return { host: renderedFinalHost, finalUrl: rendered.finalUrl, evidence: renderedEvidence };
+        }
       }
     }
     // !rendered.ok (including `renderer_unavailable` — this machine simply
@@ -613,6 +805,12 @@ async function tryRfbWebsiteCandidateHost(
     // never a negative signal recorded against the producer.
   }
 
+  // Grep 4f: the page DID answer (fetch, and — when attempted — render, both
+  // succeeded) but never carried matching evidence. Deliberately generic and
+  // non-renderer-specific even when a render attempt was involved, so a
+  // machine-side `renderer_unavailable` can never surface as a signal about
+  // the site (see the fall-through comment above this).
+  excludedHere.push({ host: finalHost, reason: "evidence_mismatch" });
   return null;
 }
 
@@ -752,7 +950,7 @@ export async function evaluateRfbWebsiteCandidate(
   fallbackCounters: RfbWdFallbackCounters,
   batchId: string,
   reason: string = "website_discovery_candidate_external",
-  contactOverride?: { telefon?: string | null; mobil?: string | null },
+  contactOverride?: { telefon?: string | null; mobil?: string | null; kommune?: string | null },
 ): Promise<RfbWdCandidateOutcome> {
   let t = getRfbWebsiteDiscoveryTarget(db, candidate.agentId);
   if (!t && ensureKnowledgeRowForExternalCandidate(db, candidate.agentId)) {
@@ -773,7 +971,7 @@ export async function evaluateRfbWebsiteCandidate(
   const evidenceTarget = {
     orgNr: t.org_nr,
     navn: t.name,
-    kommune: t.city,
+    kommune: contactOverride?.kommune !== undefined ? contactOverride.kommune : t.city,
     poststed: null as string | null,
     telefon: contactOverride?.telefon !== undefined ? contactOverride.telefon : t.phone,
     mobil: contactOverride?.mobil !== undefined ? contactOverride.mobil : (null as string | null),
@@ -844,17 +1042,44 @@ const router = Router();
 interface RfbWdExternalCandidate {
   agentId: string;
   url: string;
+  // Grep 4e (dev-request 2026-08-22-rfb-website-email-selvforsyning) —
+  // additive optional field mirroring evaluateRfbWebsiteCandidate's
+  // contactOverride 8th param (built for Grep 1c's BSS route). Lets an
+  // external-candidate caller (e.g. a web-search session holding Brreg's
+  // registered kommune/telefon/mobil for this agent) thread that evidence
+  // through the shared evidenceTarget instead of relying solely on the
+  // row's own (possibly NULL) city/phone. Omitted → undefined, never
+  // coerced to null, so evaluateRfbWebsiteCandidate's `!== undefined`
+  // fallback-to-t.city/t.phone logic is unaffected — byte-identical to
+  // before for every existing caller.
+  contactOverride?: { telefon?: string | null; mobil?: string | null; kommune?: string | null };
 }
 
 function parseExternalCandidates(raw: unknown): RfbWdExternalCandidate[] | null {
   if (!Array.isArray(raw)) return null;
   const out: RfbWdExternalCandidate[] = [];
   for (const item of raw) {
-    const o = item as { agentId?: unknown; url?: unknown };
+    const o = item as { agentId?: unknown; url?: unknown; contactOverride?: unknown };
     const agentId = typeof o?.agentId === "string" ? o.agentId.trim() : "";
     const url = typeof o?.url === "string" ? o.url.trim() : "";
     if (!agentId || !url) return null; // malformed item poisons the whole call — 400, never a silent partial run
-    out.push({ agentId, url });
+    let contactOverride: RfbWdExternalCandidate["contactOverride"];
+    if (o?.contactOverride !== undefined) {
+      if (typeof o.contactOverride !== "object" || o.contactOverride === null || Array.isArray(o.contactOverride)) {
+        return null; // malformed contactOverride poisons the whole call — same 400-all-or-nothing convention as agentId/url above
+      }
+      const co = o.contactOverride as { telefon?: unknown; mobil?: unknown; kommune?: unknown };
+      const isStringOrNullOrUndefined = (v: unknown) => v === undefined || v === null || typeof v === "string";
+      if (!isStringOrNullOrUndefined(co.telefon) || !isStringOrNullOrUndefined(co.mobil) || !isStringOrNullOrUndefined(co.kommune)) {
+        return null; // wrong sub-field type poisons the whole call — same convention
+      }
+      contactOverride = {
+        telefon: co.telefon as string | null | undefined,
+        mobil: co.mobil as string | null | undefined,
+        kommune: co.kommune as string | null | undefined,
+      };
+    }
+    out.push({ agentId, url, contactOverride });
   }
   return out;
 }
@@ -942,6 +1167,8 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         hostsProposedExt,
         fallbackCountersExt,
         batchId,
+        undefined,
+        c.contactOverride,
       );
 
       switch (outcome.outcome) {
@@ -1069,6 +1296,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     evidence: RfbWdEvidence;
     confidence: number;
     existing_url?: string | null;
+    search_attempted: boolean;
   }> = [];
   const rejected: Array<{
     agent_id: string;
@@ -1076,6 +1304,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     reason: string;
     tried: string[];
     excluded: Array<{ host: string; reason: string }>;
+    search_attempted: boolean;
   }> = [];
 
   for (const t of targets) {
@@ -1106,6 +1335,46 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         fallbackCounters,
       );
       if (hit) break;
+    }
+
+    // ── Tier 2 (Brave Search fallback) ──────────────────────────────────
+    // Only when tier 1 exhausted every name-guessed host without a verified
+    // hit AND a search impl is actually wired (a Brave key configured, or a
+    // test override via __setRfbWdSearchForTesting) — never runs when tier 1
+    // already found something, and RFB_WD_DEFAULT_LIMIT/RFB_WD_HARD_CAP are
+    // the only cost guard needed (at most one Brave call per row, only on a
+    // tier-1 miss). The hosts this leg finds are run through the EXACT same
+    // tryRfbWebsiteCandidateHost() tier 1 uses, threaded through the SAME
+    // tried/excludedHere/existingHosts/hostsProposedThisBatch/fallbackCounters
+    // state — no separate evidence-matching or exclusion path.
+    let searchAttempted = false;
+    if (!hit) {
+      const searchImpl = effectiveRfbWdSearchImpl();
+      if (searchImpl) {
+        searchAttempted = true;
+        try {
+          const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
+          const results = await searchImpl(query);
+          const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
+          for (const host of searchHosts) {
+            hit = await tryRfbWebsiteCandidateHost(
+              host,
+              evidenceTarget,
+              existingHosts,
+              hostsProposedThisBatch,
+              tried,
+              excludedHere,
+              fallbackCounters,
+            );
+            if (hit) break;
+          }
+        } catch {
+          // A search failure (network/HTTP error) must not abort the row —
+          // tier 2 simply found nothing, exactly as if the search response
+          // had been empty. No retry, mirrors braveSearch's own no-retry
+          // contract; never a 500 propagated to the caller.
+        }
+      }
     }
 
     if (hit) {
@@ -1144,6 +1413,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         evidence: hit.evidence,
         confidence,
         existing_url: existingUrl,
+        search_attempted: searchAttempted,
       });
     } else {
       // No verified candidate. Reason: if no candidate host could even be
@@ -1158,7 +1428,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       if (hosts.length === 0) reason = "no_candidate_hosts";
       else if (excludedHere.length > 0) reason = excludedHere[0].reason;
       else reason = "no_candidate_verified";
-      rejected.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere });
+      rejected.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere, search_attempted: searchAttempted });
     }
   }
 
@@ -1541,6 +1811,309 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
     written,
     rejected,
     ...(auto ? { mode: "auto" as const, min_confidence: minConfidence, candidates_considered: candidatesConsidered } : {}),
+  });
+});
+
+// ─── POST /admin/rfb-website-review-judge (Grep 3 slice 2) ──────────────────
+//
+// dev-request 2026-08-24-grep3-website-judge-tier. The >=0.95 auto-approve
+// route above (rfb-website-review-approve, `auto: true`) already drains
+// org_nr/phone-evidence rows. Everything in [0.90, 0.95) — the "name+place"
+// (0.90, rfbWdConfidence's floor) and "address_found || postnr_found"
+// (0.92) tiers — currently just sits `pending` forever: not confident
+// enough for the deterministic auto-approve bar, but too costly to review
+// by hand at RFB's ~981-agent scale. This route adds an LLM-judge tier for
+// EXACTLY that band, reusing contact-candidate-judge.ts's shared
+// classify+judge pair rather than writing a second LLM-calling function —
+// this codebase's own "one shared judge module, many call sites" discipline
+// (see that module's own file-header comment).
+//
+// On GODKJENN: writes through applyRfbAgentWebsite — the SAME function
+// (and therefore the SAME terminal state) the >=0.95 auto=true path already
+// uses. Confirmed by reading applyRfbAgentWebsite's body in full (above):
+// on a successful write it sets agents_website_review_queue.status =
+// 'applied' (the exact string asserted by this file's own auto-approve
+// tests, e.g. "aa10: qualifying queue row flipped to applied") — a
+// judge-approved row lands in that identical state, not a parallel one.
+//
+// On AVVIS / any fail-closed outcome: the row's `status` column is left
+// UNTOUCHED ('pending') — only `reason` is updated (a plain SQL UPDATE) so
+// the judge's verdict is visible on the row without ever silently
+// resolving it. A rejected row stays eligible for a human reviewer, or for
+// re-judging on a later run (there is no "already judged, don't ask again"
+// marker — a future slice could add one; out of scope here, since nothing
+// in this slice makes re-judging incorrect, only potentially redundant).
+export const RFB_WD_JUDGE_MIN_CONFIDENCE = 0.9;
+export const RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
+
+// The stored `evidence` column (upsertRfbWebsiteReviewQueue, above) is
+// JSON.stringify(RfbWdEvidence) — ONLY the boolean match flags
+// (org_nr_found/name_found/place_found/phone_found/address_found/
+// postnr_found/verified). The raw fetched page text that satisfied those
+// flags (tryRfbWebsiteCandidateHost's `pageText`/`result.html`, above) is
+// NEVER persisted anywhere on this row or elsewhere — confirmed by reading
+// upsertRfbWebsiteReviewQueue's INSERT column list in full. Re-fetching the
+// candidate page here just to hand the judge raw text would add a second
+// live network round-trip to every judge run (this route already avoids
+// that cost the auto-approve tier also avoids); the structured evidence
+// flags already tell the judge WHICH ownership signals matched — the same
+// summary a human reviewer of this queue sees in the `evidence` column
+// today — so this constructs a compact synthetic Norwegian context
+// sentence from those flags instead of the unavailable raw text.
+function rfbWdJudgeSourceContext(row: {
+  final_url: string | null;
+  candidate_url: string;
+  evidence: string | null;
+  confidence: number | null;
+}): string {
+  const url = row.final_url || row.candidate_url;
+  let evidence: Partial<RfbWdEvidence> = {};
+  try {
+    const parsed = JSON.parse(row.evidence || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) evidence = parsed;
+  } catch {
+    // malformed/missing evidence JSON -> treat as no matched signals; the
+    // judge still gets the URL and confidence, just no signal list.
+  }
+  const matched: string[] = [];
+  if (evidence.org_nr_found) matched.push("organisasjonsnummer");
+  if (evidence.name_found) matched.push("produsentnavn");
+  if (evidence.place_found) matched.push("sted/kommune");
+  if (evidence.phone_found) matched.push("telefonnummer");
+  if (evidence.address_found) matched.push("adresse");
+  if (evidence.postnr_found) matched.push("postnummer");
+  const matchedText = matched.length > 0 ? matched.join(", ") : "ingen strukturerte treff";
+  const confidenceText = typeof row.confidence === "number" ? row.confidence.toFixed(2) : "ukjent";
+  return (
+    `Automatisk nettside-oppdagelse fant kandidat-URL-en ${url} og verifiserte følgende ` +
+    `eierskapssignaler på siden mot produsentens registrerte data: ${matchedText} ` +
+    `(evidensbasert konfidens: ${confidenceText}). Selve sidens rå tekstinnhold er ikke ` +
+    `lagret her — kun disse strukturerte treffene fra det opprinnelige sidebesøket.`
+  );
+}
+
+interface RfbWdJudgeQueueRow {
+  id: string;
+  agent_id: string;
+  agent_name: string | null;
+  candidate_url: string;
+  final_url: string | null;
+  evidence: string | null;
+  confidence: number | null;
+  reason: string | null;
+  batch_id: string | null;
+}
+
+function rfbWdJudgeAppendReason(db: ReturnType<typeof getDb>, rowId: string, note: string): void {
+  db.prepare(
+    `UPDATE agents_website_review_queue SET reason = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'`,
+  ).run(note, rowId);
+}
+
+router.post("/rfb-website-review-judge", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { limit?: unknown };
+  let limit = RFB_WD_AUTO_APPROVE_BATCH_CAP;
+  if (body.limit !== undefined) {
+    const l = body.limit;
+    if (typeof l !== "number" || !Number.isFinite(l) || !Number.isInteger(l) || l < 0) {
+      res.status(400).json({ error: "limit must be a non-negative integer" });
+      return;
+    }
+    limit = Math.min(l, RFB_WD_AUTO_APPROVE_BATCH_CAP);
+  }
+
+  // `limit: 0` — a safe true no-op for a post-deploy smoke probe: query
+  // nothing, mutate nothing. Returned BEFORE touching the DB at all.
+  if (limit === 0) {
+    res.json({ processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] });
+    return;
+  }
+
+  const db = getDb();
+  ensureRfbWebsiteReviewQueueTable(db);
+
+  const pending = db
+    .prepare(
+      `SELECT id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, batch_id
+         FROM agents_website_review_queue
+        WHERE status = 'pending' AND confidence >= ? AND confidence < ?
+        ORDER BY updated_at ASC
+        LIMIT ?`,
+    )
+    .all(RFB_WD_JUDGE_MIN_CONFIDENCE, RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, limit) as RfbWdJudgeQueueRow[];
+
+  // Enrichment write-pause gate (same discipline as POST
+  // /rfb-website-review-approve's `apply` path, above) — gated over the
+  // WHOLE selected batch before any write, so a paused vertical blocks the
+  // batch whole: zero writes, never a partially-applied one. This route has
+  // no dry-run mode (every GODKJENN writes), so the gate always runs here,
+  // unlike the approve route's `apply`-conditional check.
+  if (pending.length > 0) {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      getDb,
+      pending.map((q) => q.agent_id),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  let approved = 0;
+  let rejected = 0;
+  const results: Array<{ agent_id: string; verdict: "GODKJENN" | "AVVIS"; reason: string }> = [];
+
+  for (const q of pending) {
+    // Cheap structural backstop first — cost control, same ordering
+    // contact-candidate-judge.ts's own gateContactCandidates uses: a
+    // structurally-defective candidate never spends an LLM call.
+    const defect = classifyContactCandidateDefect("website", q.candidate_url);
+    if (defect.defective) {
+      const note = `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`;
+      rfbWdJudgeAppendReason(db, q.id, note);
+      rejected++;
+      results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+      continue;
+    }
+
+    let verdict: { approved: boolean; reason?: string };
+    try {
+      verdict = await judgeContactCandidate({
+        fieldType: "website",
+        candidate: q.candidate_url,
+        sourceContext: rfbWdJudgeSourceContext(q),
+        businessName: q.agent_name || q.agent_id,
+      });
+    } catch (err: any) {
+      // judgeContactCandidate's own contract never throws, but this loop
+      // must fail-closed even if that contract is ever violated — never let
+      // one row's unexpected error crash the rest of the batch.
+      verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+    }
+
+    if (!verdict.approved) {
+      const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
+      rfbWdJudgeAppendReason(db, q.id, note);
+      rejected++;
+      results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+      continue;
+    }
+
+    try {
+      const w = applyRfbAgentWebsite(db, q.agent_id, q.candidate_url, q.final_url || q.candidate_url, q.batch_id);
+      if (w.written) {
+        approved++;
+        results.push({ agent_id: q.agent_id, verdict: "GODKJENN", reason: verdict.reason ?? "godkjent av LLM-dommer" });
+      } else {
+        // The judge said GODKJENN, but a write-time guard (fill-only race,
+        // owner claim, host already in use, …) still blocked the write —
+        // applyRfbAgentWebsite itself already left the row in whatever
+        // status that guard implies ('pending' or 'superseded'); this route
+        // only layers the judge's own reasoning on top via `reason`.
+        const note = `judge GODKJENN but write blocked: ${w.reason}`;
+        db.prepare(`UPDATE agents_website_review_queue SET reason = ? WHERE id = ?`).run(note, q.id);
+        rejected++;
+        results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+      }
+    } catch (err: any) {
+      // A pause that went live between this request's batch-level gate and
+      // this item's write: applyRfbAgentWebsite's own internal gate caught
+      // it. Abort the WHOLE remaining batch with the shared 423, exactly
+      // like POST /rfb-website-review-approve does for the same race.
+      if (sendEnrichmentWritePausedIfPaused(err, res)) return;
+      const note = `judge GODKJENN but write threw: ${err?.message ?? String(err)}`;
+      rfbWdJudgeAppendReason(db, q.id, note);
+      rejected++;
+      results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+    }
+  }
+
+  const stillPendingRow = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM agents_website_review_queue
+        WHERE status = 'pending' AND confidence >= ? AND confidence < ?`,
+    )
+    .get(RFB_WD_JUDGE_MIN_CONFIDENCE, RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE) as { c: number };
+
+  res.json({
+    processed: pending.length,
+    approved,
+    rejected,
+    still_pending: stillPendingRow.c,
+    results,
+  });
+});
+
+// ─── GET /admin/rfb-website-review-queue-staleness (Grep 3 slice 2) ─────────
+//
+// Read-only queue-age report over ALL `pending` agents_website_review_queue
+// rows (every confidence tier, not just the judge band above — a stuck
+// >=0.95 row that never got auto-approved, e.g. because auto-approve simply
+// hasn't run recently, is just as much an operational staleness signal as a
+// stuck judge-band row). Mirrors opplevelser.ts's
+// computeGardssalgQueueAgeReport in SHAPE (count/stale_count/oldest_first)
+// but is a fresh, LOCAL, RFB-scoped implementation — per this file's own
+// header rule ("a fresh, RFB-scoped re-implementation, NOT a call into
+// opplevelser.ts") and the explicit instruction not to import
+// GS_VTP_QUEUE_STALE_DAYS: this queue's own SLA is 48h (2 days), not
+// gårdssalg's 7-day bar, so it needs and gets its own threshold constant.
+// Adds `p95_age_days` on top of the gårdssalg report shape — not present
+// there today.
+export const RFB_WD_REVIEW_QUEUE_STALE_DAYS = 2;
+
+// SQLite `datetime('now')` UTC string -> epoch ms. Local re-implementation
+// (not imported) of the same shape as opplevelser.ts's own
+// gsVtpParseSqliteUtcMs, per this file's no-opplevelser.ts-imports rule.
+function rfbWdParseSqliteUtcMs(raw: string): number {
+  const iso = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const withZone = /[zZ]$|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`;
+  const ms = Date.parse(withZone);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+// Pure p95 helper — sort ages ascending, p95 = ages[ceil(0.95*n)-1] for
+// n>0, else null (no rows -> no percentile to report; distinct from `0`,
+// which would misleadingly claim "queue is instantly fresh"). Exported for
+// direct unit testing.
+export function rfbWdQueueP95AgeDays(sortedAscendingAges: number[]): number | null {
+  const n = sortedAscendingAges.length;
+  if (n === 0) return null;
+  const idx = Math.min(n - 1, Math.max(0, Math.ceil(0.95 * n) - 1));
+  return sortedAscendingAges[idx];
+}
+
+router.get("/rfb-website-review-queue-staleness", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+  ensureRfbWebsiteReviewQueueTable(db);
+  const rows = db
+    .prepare(`SELECT agent_id, agent_name, created_at FROM agents_website_review_queue WHERE status = 'pending'`)
+    .all() as Array<{ agent_id: string; agent_name: string | null; created_at: string }>;
+
+  const nowMs = Date.now();
+  const withAge = rows.map((r) => {
+    const createdMs = rfbWdParseSqliteUtcMs(r.created_at);
+    const ageDays = Number.isFinite(createdMs) ? Math.max(0, Math.floor((nowMs - createdMs) / 86_400_000)) : 0;
+    return { agent_id: r.agent_id, agent_name: r.agent_name, age_days: ageDays };
+  });
+
+  const ascendingAges = withAge.map((r) => r.age_days).sort((a, b) => a - b);
+  const staleCount = withAge.filter((r) => r.age_days > RFB_WD_REVIEW_QUEUE_STALE_DAYS).length;
+
+  const oldestFirst = [...withAge]
+    .sort((a, b) => b.age_days - a.age_days)
+    .slice(0, 20)
+    .map((r) => ({ agent_id: r.agent_id, agent_name: r.agent_name, age_days: r.age_days }));
+
+  res.json({
+    count: withAge.length,
+    stale_count: staleCount,
+    stale_threshold_days: RFB_WD_REVIEW_QUEUE_STALE_DAYS,
+    p95_age_days: rfbWdQueueP95AgeDays(ascendingAges),
+    oldest_first: oldestFirst,
   });
 });
 

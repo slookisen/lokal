@@ -18,7 +18,7 @@
  *       proposed + a 'pending' row lands in agents_website_review_queue.
  *   (c) candidate rejected: every candidate host fetches successfully but
  *       none carries matching evidence -> rejected reason
- *       'no_candidate_verified', nothing queued.
+ *       'evidence_mismatch', nothing queued.
  *   (d) aggregator-host candidate rejected: a producer name whose first
  *       candidate host is a curated directory domain -> rejected reason
  *       'blocklisted_directory_domain', that host never fetched.
@@ -86,8 +86,8 @@
  *       RENDERED text/finalUrl, headless_fallback_attempted/_verified both 1.
  *   (hf-d) flag ON, fallback returns `renderer_unavailable` — never a
  *       throw, never a negative signal against the producer: falls through
- *       to the same generic `no_candidate_verified` rejection reason as
- *       every other unverified miss.
+ *       to the same generic `evidence_mismatch` rejection reason as
+ *       every other unverified miss (never a renderer-specific reason).
  *   (hf-e) flag ON, plain fetch unverified but shouldEscalateToRender is
  *       false (a genuinely small static page, no <script>) — fallback
  *       never attempted.
@@ -164,6 +164,13 @@ function htmlResponse(html: string, opts: { status?: number; finalUrl?: string }
     url: opts.finalUrl,
     headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
     arrayBuffer: async () => new TextEncoder().encode(html).buffer,
+    // Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning):
+    // tags this Response as eligible for stubFetch()'s self-reference-
+    // marker auto-injection below — scoped to htmlResponse() output only,
+    // never to unrelated Response-shaped mocks (e.g. judgeApiResponse's
+    // api.anthropic.com JSON mock) that share the same `fixtures` map/
+    // stubFetch dispatcher but have no arrayBuffer/pageish shape at all.
+    __selfRefEligible: true,
   } as unknown as Response;
 }
 
@@ -214,12 +221,22 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   const prevHeadlessFallbackEnabled = process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+  const prevBraveApiKey = process.env.BRAVE_API_KEY;
+  const prevBraveSearchApiKey = process.env.BRAVE_SEARCH_API_KEY;
+  // Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier) — the
+  // judge-route tests below flip this env var (contact-candidate-judge.ts
+  // reads it directly) and must restore it, same discipline as every other
+  // env var this suite already saves/restores.
+  const prevAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
   const prevFetch = globalThis.fetch;
   // Hoisted so `finally` (a sibling block scope of `try`) can still reach it
   // to reset the render-page injection point back to null even if an
   // assertion throws mid-suite.
   let setRfbWdRenderPageImplForTesting:
     | typeof import("../routes/admin-rfb-website-discovery")["__setRfbWdRenderPageImplForTesting"]
+    | undefined;
+  let setRfbWdSearchForTesting:
+    | typeof import("../routes/admin-rfb-website-discovery")["__setRfbWdSearchForTesting"]
     | undefined;
 
   const testDb = new Database(":memory:");
@@ -233,12 +250,52 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
   const fixtures: Map<string, Response> = new Map();
   const fetchCalls: string[] = [];
 
+  // Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning):
+  // rfbWdPageReferencesOwnHost now requires every candidate page's raw html
+  // to mention its own host somewhere. Every pre-existing fixture in this
+  // suite represents the candidate's OWN genuine page (evidence-bearing or
+  // not — even a "no evidence anywhere" fixture is still that host's real
+  // page, not contamination), so this single, central point appends an
+  // invisible self-reference marker (an HTML comment — stripped by both
+  // visibleTextOf and gardssalgPageText's tag-stripping regex, so it can
+  // never leak into extracted evidence text) keyed on the ACTUAL requested
+  // url, rather than editing dozens of individual fixture strings by hand.
+  // Scoped to `__selfRefEligible` (htmlResponse() output only) so unrelated
+  // Response-shaped mocks dispatched through the same map (e.g.
+  // judgeApiResponse's api.anthropic.com JSON mock, which has no
+  // arrayBuffer/pageish shape) are left untouched. The suite's OWN new
+  // Grep 4d contamination tests deliberately bypass this by swapping
+  // globalThis.fetch directly (same pattern the jg-c/jg-d/jg-e/jg-f blocks
+  // above already use) rather than going through `fixtures`, so they can
+  // construct genuinely non-self-referencing "wrong page" content.
+  function withSelfReferenceMarker(fx: Response, urlStr: string): Response {
+    return {
+      ...(fx as unknown as Record<string, unknown>),
+      arrayBuffer: async () => {
+        const buf = await fx.arrayBuffer();
+        const html = new TextDecoder().decode(buf);
+        let host = "";
+        try {
+          host = new URL(urlStr).hostname.toLowerCase();
+        } catch {
+          host = "";
+        }
+        const marked = host ? `${html}<!-- selfref:${host} -->` : html;
+        return new TextEncoder().encode(marked).buffer;
+      },
+    } as unknown as Response;
+  }
+
   function stubFetch(): typeof fetch {
     return (async (url: string | URL | Request) => {
       const urlStr = String(url);
       fetchCalls.push(urlStr);
       const fx = fixtures.get(urlStr);
-      return fx ?? notFoundResponse();
+      if (!fx) return notFoundResponse();
+      if (fx.ok && (fx as unknown as { __selfRefEligible?: boolean }).__selfRefEligible) {
+        return withSelfReferenceMarker(fx, urlStr);
+      }
+      return fx;
     }) as typeof fetch;
   }
 
@@ -259,10 +316,19 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       RFB_WD_AUTO_APPROVE_BATCH_CAP,
       rfbWebsiteHostExclusionReason,
       __setRfbWdRenderPageImplForTesting,
+      __setRfbWdSearchForTesting,
       evaluateRfbWebsiteCandidate,
       rfbWdExistingWebsiteHosts,
+      // Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier)
+      rfbWdQueueP95AgeDays,
+      RFB_WD_JUDGE_MIN_CONFIDENCE,
+      RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE,
+      RFB_WD_REVIEW_QUEUE_STALE_DAYS,
+      // Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning)
+      rfbWdPageReferencesOwnHost,
     } = routeModule;
     setRfbWdRenderPageImplForTesting = __setRfbWdRenderPageImplForTesting;
+    setRfbWdSearchForTesting = __setRfbWdSearchForTesting;
 
     function getHandler(method: "get" | "post", path: string) {
       const layer = routerModule.stack.find(
@@ -408,9 +474,28 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(r.body.proposed.length, 0, "c1: nothing proposed");
       assertEq(r.body.rejected.length, 1, "c2: one rejection");
       assertEq(r.body.rejected[0].agent_id, "wd-none", "c3: rejection is for the right agent");
-      assertEq(r.body.rejected[0].reason, "no_candidate_verified", "c4: reason is no_candidate_verified");
+      assertEq(r.body.rejected[0].reason, "evidence_mismatch", "c4: reason is evidence_mismatch (Grep 4f)");
       assertTrue(r.body.rejected[0].tried.length > 0, "c5: at least one host was actually fetched");
       assertTrue(!readQueueRow("wd-none"), "c6: nothing queued for this agent");
+    }
+
+    // ── (c2) candidate rejected: every candidate host genuinely fails to
+    //     fetch (Grep 4f, dev-request 2026-08-22-rfb-website-email-
+    //     selvforsyning) — distinct reason from (c)'s "fetched fine, no
+    //     evidence" case, both of which used to collapse into the same
+    //     generic 'no_candidate_verified' --
+    {
+      insertAgent({ id: "wd-unreachable", name: "Uraakelig Fjellgard", orgNr: "966666667", city: "Lom" });
+      // No fixtures set for any of this producer's candidate hosts — the stub
+      // fetch falls through to notFoundResponse() (HTTP 404) for every one.
+
+      const r = await callDiscovery({ agentIds: ["wd-unreachable"] });
+      assertEq(r.body.proposed.length, 0, "c2-1: nothing proposed");
+      assertEq(r.body.rejected.length, 1, "c2-2: one rejection");
+      assertEq(r.body.rejected[0].agent_id, "wd-unreachable", "c2-3: rejection is for the right agent");
+      assertEq(r.body.rejected[0].reason, "fetch_failed:http_404", "c2-4: reason names fetch-page.ts's own truthful classifier, not the generic evidence reason");
+      assertTrue(r.body.rejected[0].tried.length > 0, "c2-5: at least one host was actually attempted");
+      assertTrue(!readQueueRow("wd-unreachable"), "c2-6: nothing queued for this agent");
     }
 
     // ── (d) aggregator-host candidate rejected --
@@ -701,6 +786,81 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(malformed.status, 400, "r2: malformed candidate item -> 400");
       const wrongMode = await callDiscovery({ candidates: [{ agentId: "x", url: "https://x.no" }], mode: "aggregator_replace" });
       assertEq(wrongMode.status, 400, "r3: aggregator_replace with candidates -> 400");
+    }
+
+    // ── (p2) Grep 4e (dev-request 2026-08-22-rfb-website-email-selvforsyning):
+    //     external-candidate intake threads a caller-supplied contactOverride
+    //     (kommune+telefon, mirroring Grep 1c's BSS-route usage of the SAME
+    //     evaluateRfbWebsiteCandidate 8th param) into evidenceTarget — a row
+    //     with city=NULL AND phone=NULL on file can now still verify against
+    //     a page that carries the producer's Brreg-registered kommune/telefon
+    //     instead of its own (missing) city/phone. Byggspec's (s) --
+    {
+      insertAgent({ id: "wd-ext-anchor-ok", name: "Fjell Delikatesser", city: null, phone: null });
+      fixtures.set(
+        "https://fjelldelikatesser-butikk.no",
+        htmlResponse("<html><body>Fjell kommune. Telefon: 912 34 567.</body></html>", { finalUrl: "https://fjelldelikatesser-butikk.no" }),
+      );
+      const r = await callDiscovery({
+        candidates: [
+          {
+            agentId: "wd-ext-anchor-ok",
+            url: "https://fjelldelikatesser-butikk.no/om-oss",
+            contactOverride: { kommune: "Fjell", telefon: "91234567" },
+          },
+        ],
+      });
+      assertEq(r.body.proposed.length, 1, "p2-1: exactly one proposal (contactOverride supplied the missing anchor evidence)");
+      assertEq(r.body.proposed[0].evidence.place_found, true, "p2-2: kommune override matched on the page");
+      assertEq(r.body.proposed[0].evidence.phone_found, true, "p2-3: telefon override matched on the page");
+      const row = readQueueRow("wd-ext-anchor-ok");
+      assertTrue(!!row, "p2-4: queue row inserted");
+    }
+
+    // ── (p3) same page/evidence as (p2), but a DIFFERENT city=NULL/phone=NULL
+    //     agent whose candidate is sent WITHOUT contactOverride — proves (p2)
+    //     is the override doing the work, not some other change (mutation-
+    //     test discipline: this case must fail if the fix in
+    //     evaluateRfbWebsiteCandidate is reverted). Byggspec's (t) --
+    {
+      insertAgent({ id: "wd-ext-anchor-noover", name: "Fjell Delikatesser To", city: null, phone: null });
+      fixtures.set(
+        "https://fjelldelikatesser2-butikk.no",
+        htmlResponse("<html><body>Fjell kommune. Telefon: 912 34 567.</body></html>", { finalUrl: "https://fjelldelikatesser2-butikk.no" }),
+      );
+      const r = await callDiscovery({
+        candidates: [{ agentId: "wd-ext-anchor-noover", url: "https://fjelldelikatesser2-butikk.no/om-oss" }],
+      });
+      assertEq(r.body.proposed.length, 0, "p3-1: nothing proposed without contactOverride (city/phone both NULL on the row)");
+      assertEq(r.body.rejected.length, 1, "p3-2: one rejection");
+      assertEq(r.body.rejected[0].reason, "evidence_mismatch", "p3-3: rejected for lack of evidence, not some other reason");
+      assertTrue(!readQueueRow("wd-ext-anchor-noover"), "p3-4: nothing queued");
+    }
+
+    // ── (p4) contactOverride with ONLY kommune (telefon/mobil omitted) --
+    //     independent-fields proof: telefon evidence-matching still falls
+    //     back to the row's own t.phone unaffected, not all-or-nothing.
+    //     Byggspec's (u) --
+    {
+      insertAgent({ id: "wd-ext-anchor-partial", name: "Nordkapp Sjomat", city: null, phone: "91234567" });
+      fixtures.set(
+        "https://nordkappsjomat-butikk.no",
+        htmlResponse("<html><body>Nordkapp. Telefon: 91234567.</body></html>", { finalUrl: "https://nordkappsjomat-butikk.no" }),
+      );
+      const r = await callDiscovery({
+        candidates: [
+          {
+            agentId: "wd-ext-anchor-partial",
+            url: "https://nordkappsjomat-butikk.no/om-oss",
+            contactOverride: { kommune: "Nordkapp" },
+          },
+        ],
+      });
+      assertEq(r.body.proposed.length, 1, "p4-1: proposed — kommune override + phone fallback to t.phone together verify");
+      assertEq(r.body.proposed[0].evidence.place_found, true, "p4-2: kommune override matched (telefon/mobil omitted from the override)");
+      assertEq(r.body.proposed[0].evidence.phone_found, true, "p4-3: telefon evidence still matched via t.phone, unaffected by the kommune-only override");
+      const row = readQueueRow("wd-ext-anchor-partial");
+      assertTrue(!!row, "p4-4: queue row inserted");
     }
 
     // ── (s) external candidate for a row that already has a website --
@@ -1140,7 +1300,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       insertAgent({ id: "wd-pick-new-2", name: "Zqvex Pickstrategy Newtwo Gard", city: "Testby", createdAt: "2026-08-05 00:00:00" });
       insertAgent({ id: "wd-pick-new-3", name: "Zqvex Pickstrategy Newthree Gard", city: "Testby", createdAt: "2026-08-10 00:00:00" });
       // No fixtures set for any of these hosts — every attempt is rejected
-      // (no_candidate_verified), but that's irrelevant here: the pick
+      // (fetch_failed:http_404, Grep 4f), but that's irrelevant here: the pick
       // strategy only governs WHICH row(s) selectRfbWebsiteDiscoveryTargets
       // returns from the eligible cohort, not whether they later verify.
 
@@ -1191,7 +1351,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const r = await callDiscovery({ agentIds: ["wd-hf-off"] });
       assertEq(r.body.proposed.length, 0, "hf-a1: nothing proposed (flag off, unchanged behaviour)");
       const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-hf-off");
-      assertEq(rej?.reason, "no_candidate_verified", "hf-a2: same rejection reason as before this slice existed");
+      assertEq(rej?.reason, "evidence_mismatch", "hf-a2: same rejection reason as before this slice existed (Grep 4f: evidence_mismatch)");
       assertEq(renderCalls, 0, "hf-a3: renderPage was never invoked");
       assertEq(r.body.headless_fallback_attempted, 0, "hf-a4: headless_fallback_attempted is 0");
       assertEq(r.body.headless_fallback_verified, 0, "hf-a5: headless_fallback_verified is 0");
@@ -1233,7 +1393,13 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         renderCalls++;
         return {
           ok: true,
-          html: "<html><body>Hf Escalates Gard — org.nr 911 100 003</body></html>",
+          // Grep 4d: unlike fixtures.set()'d plain-fetch content, this
+          // literal renderPage-impl return bypasses stubFetch()'s
+          // self-reference auto-injection entirely, so the marker is added
+          // by hand here — a <link rel="canonical"> carrying the render's
+          // own finalUrl, the same realistic idiom a real rendered page
+          // would carry.
+          html: `<html><head><link rel="canonical" href="${url}"></head><body>Hf Escalates Gard — org.nr 911 100 003</body></html>`,
           text: "Hf Escalates Gard — org.nr 911 100 003",
           finalUrl: url,
           elapsedMs: 42,
@@ -1262,7 +1428,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     // ── (hf-d) flag ON, fallback returns renderer_unavailable — treated as
     //     no-candidate, no throw, nothing recorded as a negative signal
     //     against the producer (still falls through to the generic
-    //     no_candidate_verified reason, never a renderer-specific one) --
+    //     evidence_mismatch reason, never a renderer-specific one) --
     {
       process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
       let renderCalls = 0;
@@ -1289,7 +1455,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertTrue(!threw, "hf-d1: renderer_unavailable never throws / never crashes the batch");
       assertEq(r!.body.proposed.length, 0, "hf-d2: nothing proposed");
       const rej = r!.body.rejected.find((x: any) => x.agent_id === "wd-hf-unavail");
-      assertEq(rej?.reason, "no_candidate_verified", "hf-d3: generic no-candidate reason, NOT a renderer-specific/negative one");
+      assertEq(rej?.reason, "evidence_mismatch", "hf-d3: generic no-candidate reason, NOT a renderer-specific/negative one");
       assertEq(renderCalls, 1, "hf-d4: renderPage was invoked exactly once");
       assertEq(r!.body.headless_fallback_attempted, 1, "hf-d5: an attempt IS still counted (renderer_unavailable is about the machine, not the site)");
       assertEq(r!.body.headless_fallback_verified, 0, "hf-d6: never counted as a verified flip");
@@ -1315,7 +1481,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const r = await callDiscovery({ agentIds: ["wd-hf-small"] });
       assertEq(r.body.proposed.length, 0, "hf-e1: nothing proposed");
       const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-hf-small");
-      assertEq(rej?.reason, "no_candidate_verified", "hf-e2: rejected exactly as before this slice existed");
+      assertEq(rej?.reason, "evidence_mismatch", "hf-e2: rejected exactly as before this slice existed (Grep 4f: evidence_mismatch)");
       assertEq(renderCalls, 0, "hf-e3: renderPage was never invoked — not a JS-shell shape");
       assertEq(r.body.headless_fallback_attempted, 0, "hf-e4: headless_fallback_attempted is 0");
       assertEq(r.body.headless_fallback_verified, 0, "hf-e5: headless_fallback_verified is 0");
@@ -1536,6 +1702,913 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(fetchCalls.length, fetchCallsBefore, "ac3: zero fetch calls when the agent already has a website");
       assertTrue(!readQueueRow("eval-ac3"), "ac3: nothing queued for an agent that already has a website");
     }
+
+    // ── (s) tier-2 (Brave Search) fallback leg ───────────────────────────
+    // dev-requests/2026-08-24-... (Grep 2, this slice): mirrors
+    // admin-dental-hjemmeside-discovery.test.ts's own (q) block idioms —
+    // a FIFO queue of BraveResult[] fed through __setRfbWdSearchForTesting,
+    // never touching the network. Every clinic^H^H^Hproducer below has NO
+    // fixture registered for any of its tier-1 name-guessed hosts, so tier 1
+    // always misses first (fetch_failed:http_404) — tier 2 is what's under
+    // test.
+    {
+      const { gardssalgWebsiteCandidateHosts } = require("../services/experience-store") as
+        typeof import("../services/experience-store");
+      const searchCalls: string[] = [];
+      const searchResponseQueue: Array<Array<{ title: string; url: string; description: string }>> = [];
+      setRfbWdSearchForTesting!(async (query: string) => {
+        searchCalls.push(query);
+        const next = searchResponseQueue.shift();
+        if (next === undefined) return [];
+        return next;
+      });
+
+      // (s1) tier 1 exhausted (no fixtures for any guessed host) + tier-2
+      // mock returns a hit that verifies via org_nr on the (stubbed) page ->
+      // proposed, search_attempted:true, winning host is the SEARCH result's
+      // host, not a tier-1 name-guessed one.
+      insertAgent({ id: "wd-s1", name: "Uoppdaget Gardsprodukter AS", orgNr: "977100001", city: "Bodø" });
+      fixtures.set(
+        "https://faktiskhjemmeside.no",
+        htmlResponse("<html><body>Uoppdaget Gardsprodukter — org.nr 977 100 001</body></html>", {
+          finalUrl: "https://faktiskhjemmeside.no",
+        }),
+      );
+      searchResponseQueue.push([
+        { title: "Uoppdaget Gardsprodukter", url: "https://faktiskhjemmeside.no", description: "Gardsprodukter fra Bodø" },
+      ]);
+
+      const rS1 = await callDiscovery({ agentIds: ["wd-s1"] });
+      assertEq(rS1.body.proposed.length, 1, "s1a: proposed via tier 2 after tier 1 exhausted");
+      const propS1 = rS1.body.proposed[0];
+      assertEq(propS1.agent_id, "wd-s1", "s1b: proposal is for the right agent");
+      assertEq(propS1.candidate_url, "https://faktiskhjemmeside.no", "s1c: winning host is the SEARCH result's host, not a tier-1 name-guess");
+      assertTrue(
+        !gardssalgWebsiteCandidateHosts("Uoppdaget Gardsprodukter AS").some((h) => propS1.candidate_url.includes(h)),
+        "s1d: the winning host is not among tier 1's own name-guessed candidates",
+      );
+      assertEq(propS1.evidence.org_nr_found, true, "s1e: verified via org_nr, same evidence contract as tier 1");
+      assertEq(propS1.search_attempted, true, "s1f: search_attempted:true on a row where tier 2 actually ran");
+      {
+        const row = readQueueRow("wd-s1");
+        assertTrue(!!row, "s1g: a queue row was inserted");
+        assertEq(row.candidate_url, "https://faktiskhjemmeside.no", "s1h: queue row candidate_url is the search-discovered host");
+      }
+
+      // (s2) tier 1 finds a hit directly -> tier-2 mock is NEVER called
+      // (proves the gate is "only when tier 1 exhausted", not "always run").
+      insertAgent({ id: "wd-s2", name: "Nordvik Gardsysteri AS", orgNr: "977100002", city: "Namsos" });
+      fixtures.set(
+        "https://nordvikgardsysteri.no",
+        htmlResponse("<html><body>Nordvik Gardsysteri — org.nr 977 100 002</body></html>", {
+          finalUrl: "https://nordvikgardsysteri.no",
+        }),
+      );
+      const searchCallsBeforeS2 = searchCalls.length;
+
+      const rS2 = await callDiscovery({ agentIds: ["wd-s2"] });
+      assertEq(rS2.body.proposed.length, 1, "s2a: proposed via tier 1 directly");
+      assertEq(rS2.body.proposed[0].candidate_url, "https://nordvikgardsysteri.no", "s2b: winning host is tier 1's own guessed host");
+      assertEq(rS2.body.proposed[0].search_attempted, false, "s2c: search_attempted:false — tier 2 never ran");
+      assertEq(searchCalls.length, searchCallsBeforeS2, "s2d: zero NEW search calls recorded — tier 2 was never invoked");
+
+      // (s3) no key/override configured (override reset to null, Brave env
+      // vars unset) -> route behaves exactly as before this change
+      // (tier-1-only), no error, search_attempted === false — proves the
+      // silent-skip contract.
+      setRfbWdSearchForTesting!(null);
+      delete process.env.BRAVE_API_KEY;
+      delete process.env.BRAVE_SEARCH_API_KEY;
+      const searchCallsBeforeS3 = searchCalls.length;
+      insertAgent({ id: "wd-s3", name: "Uskrevet Gardsbutikk AS", orgNr: "977100003", city: "Alta" });
+      // No fixtures for any of this producer's tier-1 candidate hosts — the
+      // stub fetch falls through to notFoundResponse() (HTTP 404) for every
+      // one, exactly as (c2) above.
+
+      const rS3 = await callDiscovery({ agentIds: ["wd-s3"] });
+      assertEq(rS3.body.proposed.length, 0, "s3a: nothing proposed — unwired tier 2 changes nothing about tier 1's own outcome");
+      assertEq(rS3.body.rejected.length, 1, "s3b: one rejection, exactly as tier-1-only behaviour before this change");
+      assertEq(rS3.body.rejected[0].reason, "fetch_failed:http_404", "s3c: rejection reason is tier 1's own, unaffected by tier 2");
+      assertEq(rS3.body.rejected[0].search_attempted, false, "s3d: search_attempted === false — the silent-skip contract");
+      assertEq(searchCalls.length, searchCallsBeforeS3, "s3e: zero search calls — tier 2 never even attempted with no key/override");
+      assertTrue(!readQueueRow("wd-s3"), "s3f: nothing queued");
+
+      // (s4) tier-2 mock THROWS (simulated Brave API failure) -> the row is
+      // rejected exactly as it would be today (no candidate found via tier
+      // 2), NOT a 500 from the route — proves the fail-soft/no-retry
+      // contract. A second row in the SAME batch (a normal tier-1 hit)
+      // proves the rest of the batch still completes.
+      setRfbWdSearchForTesting!(async (query: string) => {
+        searchCalls.push(query);
+        throw new Error("simulated Brave API failure");
+      });
+      insertAgent({ id: "wd-s4", name: "Feilsoek Gardsvarer AS", orgNr: "977100004", city: "Tromsø" });
+      insertAgent({ id: "wd-s4b", name: "Solvik Gardsysteri AS", orgNr: "977100005", city: "Kirkenes" });
+      fixtures.set(
+        "https://solvikgardsysteri.no",
+        htmlResponse("<html><body>Solvik Gardsysteri — org.nr 977 100 005</body></html>", {
+          finalUrl: "https://solvikgardsysteri.no",
+        }),
+      );
+
+      const rS4 = await callDiscovery({ agentIds: ["wd-s4", "wd-s4b"] });
+      assertEq(rS4.status, 200, "s4a: a thrown search call never propagates as a 500 — the route still answers 200");
+      const rejS4 = rS4.body.rejected.find((r: any) => r.agent_id === "wd-s4");
+      assertTrue(!!rejS4, "s4b: wd-s4 is rejected (tier 2 threw, found nothing) rather than erroring the whole call");
+      assertEq(rejS4?.reason, "fetch_failed:http_404", "s4c: rejection reason is tier 1's own original reason, unaffected by the tier-2 throw");
+      assertEq(rejS4?.search_attempted, true, "s4d: search_attempted:true — tier 2 WAS invoked, it just threw");
+      assertTrue(!readQueueRow("wd-s4"), "s4e: nothing queued for wd-s4");
+      const propS4b = rS4.body.proposed.find((r: any) => r.agent_id === "wd-s4b");
+      assertTrue(!!propS4b, "s4f: the REST of the batch (wd-s4b, a normal tier-1 hit) still completes despite wd-s4's tier-2 throw");
+      assertEq(propS4b?.candidate_url, "https://solvikgardsysteri.no", "s4g: wd-s4b proposed via its own tier-1 hit");
+
+      setRfbWdSearchForTesting!(null);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier):
+    // POST /admin/rfb-website-review-judge — the [0.90, 0.95) LLM-judge
+    // tier — and GET /admin/rfb-website-review-queue-staleness.
+    //
+    // globalThis.fetch is reused for the judge's own Anthropic call: it is
+    // still keyed off the `fixtures` map by exact URL string (same
+    // stubFetch() convention as every block above), so a fixture at
+    // "https://api.anthropic.com/v1/messages" — the exact endpoint
+    // judgeContactCandidate (src/services/contact-candidate-judge.ts)
+    // fetches — drives the mocked judge response, mirroring both this
+    // file's own fetch-mocking convention and contact-candidate-judge.
+    // test.ts's own (globalThis.fetch stubbed, JSON body shaped
+    // {content:[{type:"text", text:"GODKJENN\n..."}]}).
+    // ═══════════════════════════════════════════════════════════════════
+
+    function judgeApiResponse(text: string): Response {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text }] }),
+      } as unknown as Response;
+    }
+
+    const postJudge = getHandler("post", "/rfb-website-review-judge");
+    const getStaleness = getHandler("get", "/rfb-website-review-queue-staleness");
+    async function callJudge(
+      body: Record<string, unknown> = {},
+      headers: Record<string, string> = { "x-admin-key": ADMIN_KEY },
+    ): Promise<{ status: number; body: any }> {
+      const res = fakeRes();
+      await postJudge({ headers, body, query: {} } as any, res as any);
+      return { status: res.statusCode, body: res.body };
+    }
+    async function callStaleness(
+      headers: Record<string, string> = { "x-admin-key": ADMIN_KEY },
+    ): Promise<{ status: number; body: any }> {
+      const res = fakeRes();
+      await getStaleness({ headers, query: {} } as any, res as any);
+      return { status: res.statusCode, body: res.body };
+    }
+
+    // ── rfbWdQueueP95AgeDays: pure unit tests (no DB, no HTTP) ──────────────
+    {
+      assertEq(rfbWdQueueP95AgeDays([]), null, "p95-1: empty array -> null");
+      assertEq(rfbWdQueueP95AgeDays([7]), 7, "p95-2: single value -> that value");
+      // Hand-computed: ages 1..20 ascending (n=20) -> idx = ceil(0.95*20)-1
+      // = ceil(19)-1 = 18 -> the 19th value (0-indexed 18) = 19.
+      const oneToTwenty = Array.from({ length: 20 }, (_, i) => i + 1);
+      assertEq(rfbWdQueueP95AgeDays(oneToTwenty), 19, "p95-3: 1..20 ascending -> p95 is 19 (hand-computed)");
+      // Hand-computed: n=4, idx = ceil(0.95*4)-1 = ceil(3.8)-1 = 4-1 = 3 ->
+      // the max (small-n edge case, still exercises the formula honestly).
+      assertEq(rfbWdQueueP95AgeDays([10, 20, 30, 40]), 40, "p95-4: n=4 -> idx 3 -> the max value");
+    }
+
+    // ═══ POST /admin/rfb-website-review-judge ═══
+    //
+    // Clean slate — earlier blocks in this file left assorted 'pending'/
+    // 'applied'/'superseded' rows behind; none are referenced again after
+    // this point, so this section starts from an empty queue for
+    // deterministic band-selection and still_pending counts, same
+    // convention as the (aa)-(ac) auto-approve block above.
+    testDb.prepare("DELETE FROM agents_website_review_queue").run();
+
+    // ── auth ──
+    {
+      const r = await callJudge({}, {});
+      assertEq(r.status, 403, "jg-auth: POST without X-Admin-Key -> 403");
+    }
+
+    // ── (jg-a) approve path: GODKJENN -> writes through the SAME
+    //     applyRfbAgentWebsite path the >=0.95 auto=true tier uses, queue
+    //     row lands in the IDENTICAL terminal status ('applied') asserted
+    //     by (u6)/(aa10)/(ab7) above ──
+    {
+      insertAgent({ id: "wd-jg-ok", name: "Solbakken Gardsutsalg AS" });
+      insertQueueRow({
+        id: "q-jg-ok",
+        agentId: "wd-jg-ok",
+        candidateUrl: "https://solbakkengardsutsalg.no",
+        confidence: 0.92,
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      });
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+      fixtures.set(
+        "https://api.anthropic.com/v1/messages",
+        judgeApiResponse("GODKJENN\nDette er en plausibel egen nettside for produsenten."),
+      );
+
+      const r = await callJudge({});
+      assertEq(r.status, 200, "jg-a1: 200");
+      assertEq(r.body.processed, 1, "jg-a2: exactly one row processed");
+      assertEq(r.body.approved, 1, "jg-a3: exactly one approved");
+      assertEq(r.body.rejected, 0, "jg-a4: nothing rejected");
+      assertEq(r.body.still_pending, 0, "jg-a5: nothing left pending in-band");
+      assertEq(r.body.results[0]?.agent_id, "wd-jg-ok", "jg-a6: result is for the right agent");
+      assertEq(r.body.results[0]?.verdict, "GODKJENN", "jg-a7: result verdict is GODKJENN");
+
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-ok'").get() as any;
+      assertEq(k.website, "https://solbakkengardsutsalg.no", "jg-a8: website column written via applyRfbAgentWebsite");
+      const q = testDb.prepare("SELECT status FROM agents_website_review_queue WHERE agent_id = 'wd-jg-ok'").get() as any;
+      assertEq(q.status, "applied", "jg-a9: queue row flipped to 'applied' — the SAME terminal status the auto=true tier produces");
+      const audit = testDb
+        .prepare("SELECT * FROM agent_knowledge_audit WHERE agent_id = 'wd-jg-ok' AND field_name = 'website'")
+        .get() as any;
+      assertTrue(!!audit, "jg-a10: agent_knowledge_audit row appended (same write path as the >=0.95 tier)");
+    }
+
+    // ── (jg-b) reject path: AVVIS -> row stays 'pending', reason appended,
+    //     no write ──
+    {
+      // (jg-a)'s row is now 'applied' (excluded by the route's own WHERE
+      // status='pending'), but a rejected row from a later block would
+      // stay 'pending' and accumulate into the next block's selection —
+      // start each isolated sub-block from an empty queue so `processed`
+      // stays exactly 1 per block, same discipline as the (aa)-(ac) and
+      // jg-f blocks' own DELETE.
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-rej", name: "Nordheim Gardsprodukter AS" });
+      insertQueueRow({
+        id: "q-jg-rej",
+        agentId: "wd-jg-rej",
+        candidateUrl: "https://nordheimgardsprodukter.no",
+        confidence: 0.9,
+        updatedAt: "2026-08-01T00:00:01.000Z",
+      });
+      fixtures.set(
+        "https://api.anthropic.com/v1/messages",
+        judgeApiResponse("AVVIS\nDette ser ut som generisk sidestøy, ikke ekte nettside-eierskap."),
+      );
+
+      const r = await callJudge({});
+      assertEq(r.body.processed, 1, "jg-b1: one row processed");
+      assertEq(r.body.approved, 0, "jg-b2: nothing approved");
+      assertEq(r.body.rejected, 1, "jg-b3: one rejected");
+      assertEq(r.body.results[0]?.verdict, "AVVIS", "jg-b4: result verdict is AVVIS");
+
+      const q = testDb
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-rej'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-b5: status column untouched — still 'pending'");
+      assertTrue(
+        typeof q.reason === "string" && q.reason.includes("LLM judge AVVIS"),
+        "jg-b6: reason column carries the judge's verdict",
+      );
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-rej'").get() as any;
+      assertTrue(!k.website, "jg-b7: website column still blank — no write");
+    }
+
+    // ── (jg-c) fail-closed path: a judge-side failure (simulated network
+    //     throw) resolves EXACTLY like a reject — no write, status
+    //     untouched, reason appended ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-fail", name: "Steinbru Gardsmat AS" });
+      insertQueueRow({
+        id: "q-jg-fail",
+        agentId: "wd-jg-fail",
+        candidateUrl: "https://steinbrugardsmat.no",
+        confidence: 0.93,
+        updatedAt: "2026-08-01T00:00:02.000Z",
+      });
+      globalThis.fetch = (async (url: any) => {
+        if (String(url) === "https://api.anthropic.com/v1/messages") {
+          throw new Error("simulated network failure");
+        }
+        return notFoundResponse();
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({});
+      assertEq(r.body.processed, 1, "jg-c1: one row processed");
+      assertEq(r.body.approved, 0, "jg-c2: nothing approved");
+      assertEq(r.body.rejected, 1, "jg-c3: fail-closed counts as rejected");
+      const q = testDb
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-fail'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-c4: status untouched on fail-closed, same as a plain reject");
+      assertTrue(typeof q.reason === "string" && q.reason.length > 0, "jg-c5: reason column carries the fail-closed note");
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-fail'").get() as any;
+      assertTrue(!k.website, "jg-c6: website column still blank — no write");
+
+      // Restore the URL-keyed stub for the remaining blocks.
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (jg-d) deterministic backstop short-circuit: a structurally
+    //     defective candidate (favicon path) never spends an LLM call ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-backstop", name: "Favikon Gardsbutikk AS" });
+      insertQueueRow({
+        id: "q-jg-backstop",
+        agentId: "wd-jg-backstop",
+        candidateUrl: "https://favikongardsbutikk.no/favicon.ico",
+        confidence: 0.91,
+        updatedAt: "2026-08-01T00:00:03.000Z",
+      });
+      globalThis.fetch = (async () => {
+        throw new Error("jg-d: the LLM judge must NOT be called for a backstop-rejected candidate");
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({});
+      assertEq(r.body.rejected, 1, "jg-d1: rejected via the cheap backstop, not the LLM");
+      assertEq(r.body.results[0]?.verdict, "AVVIS", "jg-d2: verdict is AVVIS");
+      assertTrue(
+        (r.body.results[0]?.reason as string).includes("judge backstop AVVIS"),
+        "jg-d3: reason attributes the rejection to the backstop classifier, not the LLM",
+      );
+      const q = testDb
+        .prepare("SELECT status FROM agents_website_review_queue WHERE agent_id = 'wd-jg-backstop'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-d4: status untouched");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (jg-e) limit: 0 — a safe true no-op: zero rows touched, queue
+    //     unchanged, no fetch calls at all ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-zero", name: "Nullgrense Gardsprodukter AS" });
+      insertQueueRow({
+        id: "q-jg-zero",
+        agentId: "wd-jg-zero",
+        candidateUrl: "https://nullgrensegardsprodukter.no",
+        confidence: 0.9,
+        updatedAt: "2026-08-01T00:00:04.000Z",
+      });
+      globalThis.fetch = (async () => {
+        throw new Error("jg-e: limit:0 must query and mutate nothing — no fetch call of any kind");
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({ limit: 0 });
+      assertEq(r.status, 200, "jg-e1: 200");
+      assertEq(r.body, { processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] }, "jg-e2: exact no-op shape");
+      const q = testDb
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-zero'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-e3: row completely untouched");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (jg-f) confidence-band boundary: rows below 0.90 or at/above 0.95
+    //     are never selected by this route (0.95+ is the OTHER route's
+    //     job) ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-below", name: "Under Terskel AS" });
+      insertQueueRow({ id: "q-jg-below", agentId: "wd-jg-below", candidateUrl: "https://underterskel.no", confidence: 0.89 });
+      insertAgent({ id: "wd-jg-above", name: "Over Terskel AS" });
+      insertQueueRow({ id: "q-jg-above", agentId: "wd-jg-above", candidateUrl: "https://overterskel.no", confidence: 0.95 });
+      globalThis.fetch = (async () => {
+        throw new Error("jg-f: neither out-of-band row should ever reach the judge");
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({});
+      assertEq(r.body.processed, 0, "jg-f1: neither out-of-band row is selected");
+      assertEq(RFB_WD_JUDGE_MIN_CONFIDENCE, 0.9, "jg-f2: band floor is 0.90 (inclusive)");
+      assertEq(RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, 0.95, "jg-f3: band ceiling is 0.95 (exclusive)");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ═══ GET /admin/rfb-website-review-queue-staleness ═══
+    testDb.prepare("DELETE FROM agents_website_review_queue").run();
+
+    // ── auth ──
+    {
+      const r = await callStaleness({});
+      assertEq(r.status, 403, "st-auth: GET without X-Admin-Key -> 403");
+    }
+
+    // ── (st-a) empty queue -> zeroed report, null p95 ──
+    {
+      const r = await callStaleness();
+      assertEq(r.status, 200, "st-a1: 200");
+      assertEq(r.body.count, 0, "st-a2: count 0");
+      assertEq(r.body.stale_count, 0, "st-a3: stale_count 0");
+      assertEq(r.body.stale_threshold_days, RFB_WD_REVIEW_QUEUE_STALE_DAYS, "st-a4: threshold echoed (2 days, this queue's own 48h SLA)");
+      assertEq(r.body.p95_age_days, null, "st-a5: p95_age_days is null on an empty queue");
+      assertEq(r.body.oldest_first, [], "st-a6: oldest_first empty");
+    }
+
+    // ── (st-b) three pending rows at known ages (1, 3, 5 days old) ──
+    {
+      function daysAgoSqlite(days: number): string {
+        return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 19).replace("T", " ");
+      }
+      insertAgent({ id: "wd-st-1", name: "En Dag Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-1', 'wd-st-1', 'En Dag Gard AS', 'https://endaggard.no', 'pending', ?, ?)`,
+      ).run(daysAgoSqlite(1), daysAgoSqlite(1));
+      insertAgent({ id: "wd-st-3", name: "Tre Dager Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-3', 'wd-st-3', 'Tre Dager Gard AS', 'https://tredagergard.no', 'pending', ?, ?)`,
+      ).run(daysAgoSqlite(3), daysAgoSqlite(3));
+      insertAgent({ id: "wd-st-5", name: "Fem Dager Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-5', 'wd-st-5', 'Fem Dager Gard AS', 'https://femdagergard.no', 'pending', ?, ?)`,
+      ).run(daysAgoSqlite(5), daysAgoSqlite(5));
+      // A non-pending row (already applied) must never appear in the report.
+      insertAgent({ id: "wd-st-applied", name: "Alt Behandlet Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-applied', 'wd-st-applied', 'Alt Behandlet Gard AS', 'https://altbehandletgard.no', 'applied', ?, ?)`,
+      ).run(daysAgoSqlite(10), daysAgoSqlite(10));
+
+      const r = await callStaleness();
+      assertEq(r.body.count, 3, "st-b1: count 3 — the applied row is excluded");
+      // threshold is 2 days: the 1-day row is fresh, the 3- and 5-day rows
+      // are stale.
+      assertEq(r.body.stale_count, 2, "st-b2: stale_count 2 (3-day and 5-day rows)");
+      // ages ascending [1,3,5], n=3 -> idx = ceil(0.95*3)-1 = ceil(2.85)-1
+      // = 3-1 = 2 -> ages[2] = 5 (hand-computed, matches rfbWdQueueP95AgeDays
+      // unit test p95-4's same small-n-collapses-to-max shape).
+      assertEq(r.body.p95_age_days, 5, "st-b3: p95_age_days is 5 (hand-computed)");
+      assertEq(r.body.oldest_first.length, 3, "st-b4: oldest_first has all 3 pending rows (well under the ~20 cap)");
+      assertEq(r.body.oldest_first[0]?.agent_id, "wd-st-5", "st-b5: oldest row (5 days) is first");
+      assertEq(r.body.oldest_first[0]?.age_days, 5, "st-b6: oldest row's age_days is 5");
+      assertEq(r.body.oldest_first[2]?.agent_id, "wd-st-1", "st-b7: youngest (1 day) row is last");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning,
+    // Pilot-FUNN 2026-08-22 P1): content-marker guard against proxy/cache
+    // contamination — rfbWdPageReferencesOwnHost + the one-retry pattern in
+    // tryRfbWebsiteCandidateHost, both the plain-fetch stage and the
+    // headless-render fallback stage.
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ── (4d-a) rfbWdPageReferencesOwnHost — pure helper unit tests ──
+    {
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          `<html><head><link rel="canonical" href="https://fjelldalgard.no/"></head><body>Fjelldal Gard — org.nr 944444444</body></html>`,
+          "fjelldalgard.no",
+        ),
+        true,
+        "4d-a1: host label present in html -> true",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost("<html><body>Fjelldal Gard — org.nr 944444444</body></html>", "annengard.no"),
+        false,
+        "4d-a2: host label absent from html -> false",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          `<html><head><link rel="canonical" href="https://fjelldalgard.no/"></head></html>`,
+          "www.fjelldalgard.no",
+        ),
+        true,
+        "4d-a3: www. prefix on the HOST param is stripped before deriving the label -> still matches",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost("<html><body>ingen selvreferanse her</body></html>", "www.fjelldalgard.no"),
+        false,
+        "4d-a4: www. prefix stripped, but the (still-absent) label correctly reports false",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost("<html><body>anything at all</body></html>", "no.no"),
+        true,
+        "4d-a5: normalized label shorter than 3 chars ('no') -> fail-OPEN, true",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost("<html><body>anything at all</body></html>", "1.2.3.4"),
+        true,
+        "4d-a6: bare-IP-shaped host normalizes to a short label ('1') -> fail-OPEN, true",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost("HTML MENTIONS FjellDalGard SOMEWHERE", "fjelldalgard.no"),
+        true,
+        "4d-a7: match is case-insensitive",
+      );
+
+      // (4d-a8..4d-a10) review finding 3: IDN/punycode hosts -- a genuine
+      // producer's page renders the REAL Unicode domain name, never the raw
+      // "xn--..." ACE string, so the raw-label check alone would false-
+      // reject it. "xn--torgersengrd-2cb" is a real punycode label already
+      // used elsewhere in this codebase's own tests (experience-store.test.ts
+      // gwch-7, producer name "Torgersen Gård") -- decoding it here (rather
+      // than inventing a fake string) guarantees it's genuinely
+      // round-trippable, per the task's own guidance.
+      const { decodePunycodeLabel: __decodePunycodeLabelForTest } = require("../services/cross-source-validator") as
+        typeof import("../services/cross-source-validator");
+      const idnHost = "xn--torgersengrd-2cb.no";
+      const decodedUnicode = __decodePunycodeLabelForTest("xn--torgersengrd-2cb"); // "torgersengård"
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          `<html><body>Velkommen til ${decodedUnicode} — gardsutsalg siden 1962</body></html>`,
+          idnHost,
+        ),
+        true,
+        "4d-a8: IDN/punycode host -- page carries the real decoded Unicode name -> marker passes (no false fetch_contaminated)",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          `<html><body>Velkommen til Torgersengaard — gardsutsalg siden 1962</body></html>`,
+          idnHost,
+        ),
+        true,
+        "4d-a9: IDN/punycode host -- page carries the Norwegian-transliterated ASCII spelling (å -> aa) -> marker passes",
+      );
+      assertEq(
+        rfbWdPageReferencesOwnHost(
+          "<html><body>En helt annen side — ingen tilknytning til noen gard</body></html>",
+          idnHost,
+        ),
+        false,
+        "4d-a10: IDN/punycode host -- genuinely unrelated page (neither raw label, decoded Unicode, nor transliterated form present) -> still correctly false",
+      );
+    }
+
+    // ── (4d-b) plain-fetch integration: 1st call answers with the WRONG
+    //     page's html (no self-reference), 2nd call (the retry) answers
+    //     with the RIGHT page's html (self-reference + matching evidence)
+    //     -> the candidate proceeds to evidence matching using the SECOND
+    //     call's content, proving the retry's content is actually used,
+    //     not the first (contaminated) fetch's ──
+    {
+      let retryOkCalls = 0;
+      globalThis.fetch = (async (url: any) => {
+        const urlStr = String(url);
+        if (urlStr === "https://retryokgard.no") {
+          retryOkCalls++;
+          if (retryOkCalls === 1) {
+            // WRONG page: a proxy/cache hit for a totally unrelated site —
+            // no mention of retryokgard.no anywhere, and (deliberately) no
+            // matching evidence either, so a false-positive proposal here
+            // would be a real bug, not just a marker-check miss.
+            return htmlResponse("<html><body>En helt annen side — ingen tilknytning</body></html>", {
+              finalUrl: urlStr,
+            });
+          }
+          // RIGHT page (the ONE retry): carries both the self-reference
+          // marker AND the matching org_nr evidence.
+          return htmlResponse(
+            `<html><head><link rel="canonical" href="https://retryokgard.no/"></head><body>Retryok Gard — org.nr 944000010</body></html>`,
+            { finalUrl: urlStr },
+          );
+        }
+        return notFoundResponse();
+      }) as unknown as typeof fetch;
+
+      insertAgent({ id: "wd-4d-retryok", name: "Retryok Gard", orgNr: "944000010", city: "Bodø" });
+      const outcome = await evaluateRfbWebsiteCandidate(
+        testDb as any,
+        { agentId: "wd-4d-retryok", url: "https://retryokgard.no" },
+        rfbWdExistingWebsiteHosts(testDb as any),
+        new Set<string>(),
+        { attempted: 0, verified: 0 },
+        "wd-4d-retryok-batch",
+      );
+      assertEq(outcome.outcome, "proposed", "4d-b1: wrong-then-right retry still proposes, using the retry's content");
+      assertTrue(
+        outcome.outcome === "proposed" && outcome.evidence.org_nr_found === true,
+        "4d-b2: evidence matched via org_nr — present ONLY in the retry's (2nd call's) content",
+      );
+      assertEq(retryOkCalls, 2, "4d-b3: the SAME url was fetched exactly twice — one sequential retry, never a loop");
+      const row = readQueueRow("wd-4d-retryok");
+      assertTrue(!!row, "4d-b4: a queue row was inserted from the retry-verified content");
+      assertEq(row?.candidate_url, "https://retryokgard.no", "4d-b5: queue row candidate_url is the (shared) origin");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (4d-c) plain-fetch integration: BOTH calls answer with the wrong
+    //     page's html -> excludedHere contains exactly
+    //     {host, reason:"fetch_contaminated"}, no queue write happens ──
+    {
+      let bothWrongCalls = 0;
+      globalThis.fetch = (async (url: any) => {
+        const urlStr = String(url);
+        if (urlStr === "https://bothwronggard.no") {
+          bothWrongCalls++;
+          return htmlResponse("<html><body>Fortsatt feil side — ingen tilknytning</body></html>", {
+            finalUrl: urlStr,
+          });
+        }
+        return notFoundResponse();
+      }) as unknown as typeof fetch;
+
+      insertAgent({ id: "wd-4d-bothwrong", name: "Bothwrong Gard", orgNr: "944000011", city: "Bodø" });
+      const outcome = await evaluateRfbWebsiteCandidate(
+        testDb as any,
+        { agentId: "wd-4d-bothwrong", url: "https://bothwronggard.no" },
+        rfbWdExistingWebsiteHosts(testDb as any),
+        new Set<string>(),
+        { attempted: 0, verified: 0 },
+        "wd-4d-bothwrong-batch",
+      );
+      assertEq(outcome.outcome, "rejected", "4d-c1: both fetches contaminated -> rejected");
+      assertTrue(
+        outcome.outcome === "rejected" && outcome.reason === "fetch_contaminated",
+        "4d-c2: top-level rejection reason is fetch_contaminated — a third, distinct reason class from fetch_failed:*/evidence_mismatch",
+      );
+      assertEq(
+        outcome.outcome === "rejected" ? outcome.excluded : null,
+        [{ host: "bothwronggard.no", reason: "fetch_contaminated" }],
+        "4d-c3: excludedHere contains EXACTLY {host, reason: fetch_contaminated} — nothing else pushed",
+      );
+      assertEq(bothWrongCalls, 2, "4d-c4: exactly ONE retry — the same url fetched exactly twice, never a loop");
+      assertTrue(!readQueueRow("wd-4d-bothwrong"), "4d-c5: no queue write happens from contaminated content");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (4d-e) plain-fetch integration (review finding 1): the RETRY's own
+    //     redirect target must be re-checked against the same
+    //     dedup/exclusion guard the ORIGINAL fetch's redirect gets
+    //     (rfbWdCheckFinalHostExclusion) -- a retry that passes the marker
+    //     check but redirects to an already-in-use host must be rejected via
+    //     THAT host's exclusion reason, never proceed to evidence matching
+    //     or a queue write ──
+    {
+      let retryRedirCalls = 0;
+      globalThis.fetch = (async (url: any) => {
+        const urlStr = String(url);
+        if (urlStr === "https://retryredirgard.no") {
+          retryRedirCalls++;
+          if (retryRedirCalls === 1) {
+            // 1st call: WRONG page, no self-reference -> triggers the retry.
+            return htmlResponse("<html><body>En helt annen side</body></html>", { finalUrl: urlStr });
+          }
+          // 2nd call (the retry): redirects to a host that's ALREADY in
+          // existingHosts, and (deliberately) DOES carry the self-reference
+          // marker for that redirected host -- so this exercises the
+          // exclusion re-check, not the marker check.
+          return htmlResponse(
+            `<html><head><link rel="canonical" href="https://existinggard.no/"></head><body>Existing Gard — org.nr 944000099</body></html>`,
+            { finalUrl: "https://existinggard.no/" },
+          );
+        }
+        return notFoundResponse();
+      }) as unknown as typeof fetch;
+
+      insertAgent({ id: "wd-4d-retryredir", name: "Retryredir Gard", orgNr: "944000015", city: "Bodø" });
+      const outcome = await evaluateRfbWebsiteCandidate(
+        testDb as any,
+        { agentId: "wd-4d-retryredir", url: "https://retryredirgard.no" },
+        new Set<string>(["existinggard.no"]),
+        new Set<string>(),
+        { attempted: 0, verified: 0 },
+        "wd-4d-retryredir-batch",
+      );
+      assertEq(outcome.outcome, "rejected", "4d-e1: retry's redirect lands on an already-in-use host -> rejected, never proposed");
+      assertTrue(
+        outcome.outcome === "rejected" && outcome.reason === "host_already_in_use",
+        "4d-e2: rejection reason is host_already_in_use (the exclusion check's own reason) — NOT fetch_contaminated",
+      );
+      assertEq(
+        outcome.outcome === "rejected" ? outcome.excluded : null,
+        [{ host: "existinggard.no", reason: "host_already_in_use" }],
+        "4d-e3: excludedHere contains EXACTLY the exclusion check's own push — fetch_contaminated is NOT also pushed",
+      );
+      assertEq(retryRedirCalls, 2, "4d-e4: exactly one retry, same as every other 4d case");
+      assertTrue(!readQueueRow("wd-4d-retryredir"), "4d-e5: no queue write happens");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (4d-d) render-fallback branch: same three scenarios mirrored via
+    //     renderPageImplForTesting — plain fetch is a JS shell (forces
+    //     escalation to render) and itself carries no evidence, so every
+    //     assertion below is really exercising the RENDER path's own
+    //     marker+retry guard, not the plain-fetch one from (4d-b)/(4d-c) ──
+    {
+      process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = "true";
+      const jsShell = `<html><body><script>var pad = "${"x".repeat(2500)}";</script><div id="root">App</div></body></html>`;
+
+      // (4d-d1) render retry SUCCEEDS: 1st render call answers with the
+      // wrong page's html, 2nd (the retry) answers with the right page's
+      // html (self-reference + matching evidence) -> proposed, using the
+      // RETRY's content.
+      {
+        let renderCalls = 0;
+        setRfbWdRenderPageImplForTesting!(async (url: string) => {
+          renderCalls++;
+          if (renderCalls === 1) {
+            return {
+              ok: true,
+              html: "<html><body>En helt annen renderet side</body></html>",
+              text: "En helt annen renderet side",
+              finalUrl: url,
+              elapsedMs: 10,
+            };
+          }
+          return {
+            ok: true,
+            html: `<html><head><link rel="canonical" href="${url}"></head><body>Hfretryok Gard — org.nr 944000012</body></html>`,
+            text: "Hfretryok Gard — org.nr 944000012",
+            finalUrl: url,
+            elapsedMs: 10,
+          };
+        });
+
+        insertAgent({ id: "wd-4d-hfretryok", name: "Hfretryok Gard", orgNr: "944000012", city: "Voss" });
+        fixtures.set("https://hfretryokgard.no", htmlResponse(jsShell, { finalUrl: "https://hfretryokgard.no" }));
+
+        const r = await callDiscovery({ agentIds: ["wd-4d-hfretryok"] });
+        assertEq(r.body.proposed.length, 1, "4d-d1a: render retry succeeded -> proposed");
+        assertEq(
+          r.body.proposed[0]?.evidence?.org_nr_found,
+          true,
+          "4d-d1b: evidence matched via org_nr — present ONLY in the render retry's content",
+        );
+        assertEq(renderCalls, 2, "4d-d1c: renderFn called exactly twice — one sequential retry, never a loop");
+        assertTrue(!!readQueueRow("wd-4d-hfretryok"), "4d-d1d: a queue row was inserted from the render-retry-verified content");
+
+        setRfbWdRenderPageImplForTesting!(null);
+      }
+
+      // (4d-d2) render retry ALSO fails the marker check (both calls answer
+      // with the wrong page's html) -> the top-level rejection reason is
+      // fetch_contaminated, and nothing is queued. Review finding 2: asserts
+      // excludedHere is EXACTLY one entry (matching the rigor of the
+      // plain-fetch path's 4d-c3), not a weaker `.some()` -- this is the
+      // test that should have caught (or been too weak to catch) the
+      // missing `return null` that let a second, contradictory
+      // evidence_mismatch entry slip in before the fix. Uses
+      // evaluateRfbWebsiteCandidate directly (a single explicit candidate
+      // URL, like 4d-b/4d-c/4d-e), NOT callDiscovery's multi-candidate-host
+      // tier-1 name-guessing loop -- the latter would append its own
+      // fetch_failed:* entries for the OTHER guessed hosts, making an exact
+      // one-entry assertion meaningless. The plain-fetch step's own marker
+      // check needs a manual self-reference comment here (bypassing
+      // stubFetch's fixture-keyed auto-injection, which only applies when
+      // dispatched through the `fixtures` map).
+      {
+        let renderCalls = 0;
+        setRfbWdRenderPageImplForTesting!(async (url: string) => {
+          renderCalls++;
+          return {
+            ok: true,
+            html: "<html><body>Fortsatt feil renderet side</body></html>",
+            text: "Fortsatt feil renderet side",
+            finalUrl: url,
+            elapsedMs: 10,
+          };
+        });
+        const jsShellSelfRef = `<html><body><!-- selfref:hfbothwronggard2.no --><script>var pad = "${"x".repeat(2500)}";</script><div id="root">App</div></body></html>`;
+        globalThis.fetch = (async (url: any) => {
+          const urlStr = String(url);
+          if (urlStr === "https://hfbothwronggard2.no") {
+            return htmlResponse(jsShellSelfRef, { finalUrl: urlStr });
+          }
+          return notFoundResponse();
+        }) as unknown as typeof fetch;
+
+        insertAgent({ id: "wd-4d-hfbothwrong2", name: "Hfbothwrong Gard", orgNr: "944000013", city: "Voss" });
+        const outcome = await evaluateRfbWebsiteCandidate(
+          testDb as any,
+          { agentId: "wd-4d-hfbothwrong2", url: "https://hfbothwronggard2.no" },
+          rfbWdExistingWebsiteHosts(testDb as any),
+          new Set<string>(),
+          { attempted: 0, verified: 0 },
+          "wd-4d-hfbothwrong2-batch",
+        );
+        assertEq(outcome.outcome, "rejected", "4d-d2a: nothing proposed");
+        assertTrue(
+          outcome.outcome === "rejected" && outcome.reason === "fetch_contaminated",
+          "4d-d2c: top-level rejection reason is fetch_contaminated",
+        );
+        assertEq(
+          outcome.outcome === "rejected" ? outcome.excluded : null,
+          [{ host: "hfbothwronggard2.no", reason: "fetch_contaminated" }],
+          "4d-d2d: excludedHere contains EXACTLY {host, reason: fetch_contaminated} — nothing else pushed (no contradictory evidence_mismatch fall-through)",
+        );
+        assertEq(renderCalls, 2, "4d-d2e: renderFn called exactly twice — one sequential retry, never a loop");
+        assertTrue(!readQueueRow("wd-4d-hfbothwrong2"), "4d-d2f: no queue write happens from contaminated render content");
+
+        setRfbWdRenderPageImplForTesting!(null);
+        globalThis.fetch = stubFetch();
+      }
+
+      // (4d-d3) render retry FAILS OUTRIGHT (!ok on the retry, not just a
+      // marker miss) -> same fetch_contaminated outcome, never a throw.
+      {
+        let renderCalls = 0;
+        setRfbWdRenderPageImplForTesting!(async (url: string) => {
+          renderCalls++;
+          if (renderCalls === 1) {
+            return {
+              ok: true,
+              html: "<html><body>En annen renderet side, uten selvreferanse</body></html>",
+              text: "En annen renderet side, uten selvreferanse",
+              finalUrl: url,
+              elapsedMs: 10,
+            };
+          }
+          return {
+            ok: false,
+            reason: "renderer_unavailable",
+            detail: "simulated retry failure",
+            elapsedMs: 3,
+          };
+        });
+
+        insertAgent({ id: "wd-4d-hfretryfail", name: "Hfretryfail Gard", orgNr: "944000014", city: "Voss" });
+        fixtures.set("https://hfretryfailgard.no", htmlResponse(jsShell, { finalUrl: "https://hfretryfailgard.no" }));
+
+        const r = await callDiscovery({ agentIds: ["wd-4d-hfretryfail"] });
+        assertEq(r.body.proposed.length, 0, "4d-d3a: nothing proposed");
+        const rej = r.body.rejected.find((x: any) => x.agent_id === "wd-4d-hfretryfail");
+        assertEq(rej?.reason, "fetch_contaminated", "4d-d3b: a failed retry (not just a marker miss) is still fetch_contaminated");
+        assertEq(renderCalls, 2, "4d-d3c: renderFn called exactly twice — one sequential retry, never a loop");
+        assertTrue(!readQueueRow("wd-4d-hfretryfail"), "4d-d3d: no queue write happens");
+
+        setRfbWdRenderPageImplForTesting!(null);
+      }
+
+      // (4d-f) render-fallback integration (review finding 1): same
+      // retry-redirect exclusion re-check as (4d-e), but for the render
+      // fallback's own retry -- the retry's render passes the marker check
+      // but redirects to a host already carried by a different agent's live
+      // website -> rejected via host_already_in_use, never proposed. Uses
+      // evaluateRfbWebsiteCandidate directly (single explicit candidate URL,
+      // same reasoning as 4d-d2 above) so excludedHere carries exactly the
+      // exclusion check's own push, with no other-candidate-host noise from
+      // callDiscovery's tier-1 name-guessing loop.
+      {
+        let renderCalls = 0;
+        setRfbWdRenderPageImplForTesting!(async (url: string) => {
+          renderCalls++;
+          if (renderCalls === 1) {
+            return {
+              ok: true,
+              html: "<html><body>En helt annen renderet side</body></html>",
+              text: "En helt annen renderet side",
+              finalUrl: url,
+              elapsedMs: 10,
+            };
+          }
+          // 2nd call (the retry): redirects to a host ALREADY carried by a
+          // different agent's live website, and (deliberately) DOES carry
+          // the self-reference marker for that redirected host.
+          return {
+            ok: true,
+            html: `<html><head><link rel="canonical" href="https://existingrenderedgard.no/"></head><body>Existingrendered Gard — org.nr 944000097</body></html>`,
+            text: "Existingrendered Gard — org.nr 944000097",
+            finalUrl: "https://existingrenderedgard.no/",
+            elapsedMs: 10,
+          };
+        });
+        const jsShellSelfRef = `<html><body><!-- selfref:hfretryredirgard2.no --><script>var pad = "${"x".repeat(2500)}";</script><div id="root">App</div></body></html>`;
+        globalThis.fetch = (async (url: any) => {
+          const urlStr = String(url);
+          if (urlStr === "https://hfretryredirgard2.no") {
+            return htmlResponse(jsShellSelfRef, { finalUrl: urlStr });
+          }
+          return notFoundResponse();
+        }) as unknown as typeof fetch;
+
+        insertAgent({ id: "wd-4d-hfretryredir2", name: "Hfretryredir Gard", orgNr: "944000016", city: "Voss" });
+        const outcome = await evaluateRfbWebsiteCandidate(
+          testDb as any,
+          { agentId: "wd-4d-hfretryredir2", url: "https://hfretryredirgard2.no" },
+          new Set<string>(["existingrenderedgard.no"]),
+          new Set<string>(),
+          { attempted: 0, verified: 0 },
+          "wd-4d-hfretryredir2-batch",
+        );
+        assertEq(outcome.outcome, "rejected", "4d-f1: render retry's redirect lands on an already-in-use host -> never proposed");
+        assertTrue(
+          outcome.outcome === "rejected" && outcome.reason === "host_already_in_use",
+          "4d-f3: rejection reason is host_already_in_use — NOT fetch_contaminated",
+        );
+        assertEq(
+          outcome.outcome === "rejected" ? outcome.excluded : null,
+          [{ host: "existingrenderedgard.no", reason: "host_already_in_use" }],
+          "4d-f4: excludedHere contains EXACTLY the exclusion check's own push",
+        );
+        assertEq(renderCalls, 2, "4d-f5: exactly one render retry");
+        assertTrue(!readQueueRow("wd-4d-hfretryredir2"), "4d-f6: no queue write happens");
+
+        setRfbWdRenderPageImplForTesting!(null);
+        globalThis.fetch = stubFetch();
+      }
+
+      delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -1547,6 +2620,17 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
     if (prevHeadlessFallbackEnabled === undefined) delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
     else process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = prevHeadlessFallbackEnabled;
+    if (prevBraveApiKey === undefined) delete process.env.BRAVE_API_KEY;
+    else process.env.BRAVE_API_KEY = prevBraveApiKey;
+    if (prevBraveSearchApiKey === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
+    else process.env.BRAVE_SEARCH_API_KEY = prevBraveSearchApiKey;
+    if (prevAnthropicApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicApiKey;
+    try {
+      if (setRfbWdSearchForTesting) setRfbWdSearchForTesting(null);
+    } catch {
+      /* best-effort restore */
+    }
     try {
       if (setRfbWdRenderPageImplForTesting) setRfbWdRenderPageImplForTesting(null);
     } catch {

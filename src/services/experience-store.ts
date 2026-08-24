@@ -5468,6 +5468,12 @@ export type GardssalgOrgnrBackfillTarget = {
   content_source: string | null;
   postnummer: string | null;
   poststed: string | null;
+  // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2
+  // — the provider's own hjemmeside, additive so the route's domain-token
+  // heuristic (pickDomainSourceForTarget, admin-rfb-brreg-selfsufficiency.ts)
+  // has something to work with. experience_providers.hjemmeside already
+  // exists (no migration needed) — this only widens the two SELECTs below.
+  hjemmeside: string | null;
 };
 
 /**
@@ -5483,7 +5489,7 @@ export function selectGardssalgProvidersForOrgnrBackfill(limit = 48): GardssalgO
   const cap = Math.max(1, Math.min(48, limit));
   return db
     .prepare(
-      `SELECT id, navn, org_nr, content_source, postnummer, poststed
+      `SELECT id, navn, org_nr, content_source, postnummer, poststed, hjemmeside
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (org_nr IS NULL OR TRIM(org_nr) = '')
@@ -5507,7 +5513,7 @@ export function getGardssalgProviderOrgnrTarget(providerId: string): GardssalgOr
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, org_nr, content_source, postnummer, poststed
+      `SELECT id, navn, org_nr, content_source, postnummer, poststed, hjemmeside
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
@@ -5966,6 +5972,19 @@ export type GardssalgOrgnrReviewQueueEntry = {
   candidate_name?: string | null;
   candidate_confidence?: number | null;
   candidate_address?: string | null;
+  // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2
+  // — which candidate-generation strategy produced this row's candidate
+  // (mirrors admin-agents.ts's own agents_org_nr_review_queue.candidate_source
+  // convention). Additive/optional, defaults null so every existing caller
+  // (which never passes it) is unaffected. NOT YET persisted to a DB column
+  // — gardssalg_orgnr_review_queue predates this tag and adding the column
+  // is a schema/migration change out of scope for this slice (both columns
+  // this slice touches, experience_providers.hjemmeside and the written
+  // org_nr itself, already exist) — the value still flows all the way to
+  // this call so a future migration only needs to add the column, and it is
+  // already surfaced for observability via the route's own live response
+  // (`changed[]`'s candidate_source field).
+  candidate_source?: string | null;
   reason: string;
   batch_id?: string | null;
 };
@@ -6006,6 +6025,13 @@ export function upsertGardssalgOrgnrReviewQueue(entry: GardssalgOrgnrReviewQueue
     candidate_address: entry.candidate_address ?? null,
     reason: entry.reason,
     batch_id: entry.batch_id ?? null,
+    // candidate_source: not bound into the SQL above (no column yet — see
+    // GardssalgOrgnrReviewQueueEntry's own doc comment) — better-sqlite3
+    // silently ignores extra bind-object properties that aren't referenced
+    // by name in the prepared statement, so passing it here is a harmless
+    // no-op today and costs nothing to keep once a migration adds the
+    // column.
+    candidate_source: entry.candidate_source ?? null,
   });
 }
 

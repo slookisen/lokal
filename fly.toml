@@ -52,6 +52,22 @@ primary_region = 'arn'
   # fjern linjen; profiler allerede satt `verified_second_line=1` beholder stempelet
   # (permanent provenance, uendret ved flagg-av) men INGEN NYE skrives mens AV.
   RFB_SECOND_LINE_VERIFICATION_ENABLED = 'true'
+  # dev-request 2026-08-22-rfb-kildebredde-loft-pilot-forst.md item 5 (Fase 1):
+  # turns on lokal-agent-verifier.ts's terminal-unconfirmable classification
+  # (Brreg-slettet/konkurs, or zero identity sources on the second line) —
+  # code already shipped flag-OFF in #687 (gate is `=== "true"`, so this line
+  # is what actually turns it on). Moves those rows to a permanent
+  # terminal_unconfirmable status and out of pickBatch's rotation instead of
+  # cycling them through pending_verify forever. To pause again: set to
+  # 'false' or remove the line — takes effect on next call, no restart
+  # needed; already-terminal rows keep their stamp (see rollback text in the
+  # dev-request). NB (2026-08-24, PR #694 review): the brreg_konkurs/inactive
+  # branch this flag also gates is currently dead code in production — no
+  # real caller wires a brregLookup into runVerifierBatch — so this flag's
+  # only live effect today is the zero-identity-sources branch, and only
+  # once RFB_SECOND_LINE_VERIFICATION_ENABLED above is also 'true'. See
+  # dev-request FUNN block for the brregLookup gap.
+  RFB_TERMINAL_UNCONFIRMABLE_ENABLED = 'true'
 
 [[mounts]]
   source = 'lokal_data'

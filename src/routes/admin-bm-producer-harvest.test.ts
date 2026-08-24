@@ -495,9 +495,15 @@ export function runAdminBmProducerHarvestTests(opts: { log?: boolean } = {}): Pr
         // separate request from the bondensmarked.no producer-page fetch
         // above — both go through this SAME injected globalThis.fetch, keyed
         // by the exact origin fetchPage requests.
+        // Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning):
+        // tryRfbWebsiteCandidateHost now requires the fetched page to
+        // mention its own host somewhere (rfbWdPageReferencesOwnHost) before
+        // trusting it as evidence — a <link rel="canonical"> carrying the
+        // candidate's own origin is the minimal realistic addition, same
+        // idiom a real producer page would carry.
         const candidateHostPages: Record<string, string> = {
-          "https://urlproposedgard.no": `<html><body>Urlproposed Gård — org.nr 977 000 001</body></html>`,
-          "https://sharedhost-slice5.no": `<html><body>Urlbatch1 Gård — org.nr 977 000 002</body></html>`,
+          "https://urlproposedgard.no": `<html><head><link rel="canonical" href="https://urlproposedgard.no/"></head><body>Urlproposed Gård — org.nr 977 000 001</body></html>`,
+          "https://sharedhost-slice5.no": `<html><head><link rel="canonical" href="https://sharedhost-slice5.no/"></head><body>Urlbatch1 Gård — org.nr 977 000 002</body></html>`,
         };
         // Counts every fetch that is neither the bondensmarked.no sitemap nor
         // a bondensmarked.no producer page — i.e. every candidate-host fetch
