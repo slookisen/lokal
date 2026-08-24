@@ -62,13 +62,24 @@ async function shoot(browser, html, { name, data, width, scale, testWidths }) {
   }
 }
 
+// NOTE: discover_experiences' real formatted response (src/routes/experiences-mcp.ts,
+// the `formatted = results.map(...)` block) does NOT include a `slug` field — only
+// get_experience does. An earlier version of this mock fabricated `slug` on list
+// items, which was dishonest about what this screenshot represents AND masked a
+// real, separate production bug: EXPERIENCES_LIST_HTML's "Les mer" link reads
+// `e.slug`, so every real experiences-list card's link renders
+// `.../opplevelse/undefined` today. Filed as its own dev-request (see
+// dev-requests/2026-08-24-discover-experiences-list-manglende-slug.md) — this mock
+// intentionally matches the REAL (buggy) response shape rather than papering over
+// it, so the screenshots stay honest even though the visual result is unaffected
+// (slug is only used in an invisible href, never rendered as text).
 const listDataTroms = {
   results: [
-    { title: "Arctic Explorer — Northern Lights Cruise from Tromsø", category: "sightseeing_transport", fylke: "Troms", kommune: "Tromsø", price_from: 800, duration_min: 180, slug: "arctic-explorer-northern-lights-cruise-from-tromso--72cad3eb" },
-    { title: "Aurora Safari Camp — Fjord Tours Tromsø", category: "natur_friluft", fylke: "Troms", kommune: "Tromsø", price_from: 1490, duration_min: null, slug: "aurora-safari-camp-fjord-tours-tromso--f09aea75" },
-    { title: "Fjellheisen — Tromsø Cable Car & Arctic Panorama", category: "sightseeing_transport", fylke: "Troms", kommune: "Tromsø", price_from: null, duration_min: null, slug: "fjellheisen-tromso-cable-car-arctic-panorama" },
-    { title: "Dog Sledding in Tromsø — Best Arctic", category: "vinter_sno", fylke: "Troms", kommune: "Tromsø", price_from: null, duration_min: 75, slug: "dog-sledding-in-tromso-best-arctic" },
-    { title: "Indoor Water Park & Spa — Nordlysbadet Harstad", category: "velvaere_spa", fylke: "Troms", kommune: "Harstad", price_from: 195, duration_min: 120, slug: "indoor-water-park-spa-nordlysbadet-harstad" },
+    { title: "Arctic Explorer — Northern Lights Cruise from Tromsø", category: "sightseeing_transport", fylke: "Troms", kommune: "Tromsø", price_from: 800, duration_min: 180 },
+    { title: "Aurora Safari Camp — Fjord Tours Tromsø", category: "natur_friluft", fylke: "Troms", kommune: "Tromsø", price_from: 1490, duration_min: null },
+    { title: "Fjellheisen — Tromsø Cable Car & Arctic Panorama", category: "sightseeing_transport", fylke: "Troms", kommune: "Tromsø", price_from: null, duration_min: null },
+    { title: "Dog Sledding in Tromsø — Best Arctic", category: "vinter_sno", fylke: "Troms", kommune: "Tromsø", price_from: null, duration_min: 75 },
+    { title: "Indoor Water Park & Spa — Nordlysbadet Harstad", category: "velvaere_spa", fylke: "Troms", kommune: "Harstad", price_from: 195, duration_min: 120 },
   ],
 };
 
@@ -90,10 +101,10 @@ const detailDataAurora = {
 
 const listDataMixed = {
   results: [
-    { title: "Alta Museum — UNESCO World Heritage Rock Art Centre", category: "kultur_historie", fylke: "Finnmark", kommune: "Alta", price_from: null, duration_min: 90, slug: "alta-museum-unesco-world-heritage-rock-art-centre" },
-    { title: "Aquarama Spa — Southern Norway's Largest Spa Centre in Kristiansand", category: "velvaere_spa", fylke: "Agder", kommune: "Kristiansand", price_from: null, duration_min: 120, slug: "aquarama-spa-southern-norways-largest-spa-centre-in-kristiansand" },
-    { title: "Alpine Skiing at Hafjell — Family Ski Paradise", category: "vinter_sno", fylke: "Innlandet", kommune: "Øyer", price_from: null, duration_min: null, slug: "alpine-skiing-at-hafjell-family-ski-paradise" },
-    { title: "Andenes Whale Safari — Sperm Whale Watching from the Arctic", category: "dyreliv_safari", fylke: "Nordland", kommune: "Andøy", price_from: 1100, duration_min: 240, slug: "andenes-whale-safari-sperm-whale-watching-from-the-arctic--b8646006" },
+    { title: "Alta Museum — UNESCO World Heritage Rock Art Centre", category: "kultur_historie", fylke: "Finnmark", kommune: "Alta", price_from: null, duration_min: 90 },
+    { title: "Aquarama Spa — Southern Norway's Largest Spa Centre in Kristiansand", category: "velvaere_spa", fylke: "Agder", kommune: "Kristiansand", price_from: null, duration_min: 120 },
+    { title: "Alpine Skiing at Hafjell — Family Ski Paradise", category: "vinter_sno", fylke: "Innlandet", kommune: "Øyer", price_from: null, duration_min: null },
+    { title: "Andenes Whale Safari — Sperm Whale Watching from the Arctic", category: "dyreliv_safari", fylke: "Nordland", kommune: "Andøy", price_from: 1100, duration_min: 240 },
   ],
 };
 

@@ -41,3 +41,17 @@ er på standard søkesti).
 - `prompts.txt` — prompt som "produserte" hvert bilde (katalogkrav).
 - `generate-screenshots.js` — reproduserbar generator (les fra kilden, ikke en
   hardkodet HTML-kopi).
+
+## Datatroskap — feltparitet mot ekte respons (rettet i uavhengig review)
+
+Mock-dataene i `generate-screenshots.js` speiler nøyaktig feltsettet den ekte
+`discover_experiences`/`get_experience`-responsen returnerer — ingen oppdiktede
+felt. Én runde fjernet et `slug`-felt fra `experiences-list`-mocken (var
+oppdiktet der; `discover_experiences` sin formaterte respons har IKKE `slug`,
+kun `get_experience` har det). Dette var usynlig i selve bildet (lenketeksten
+er «Les mer ↗», ikke URL-en), men avslørte en ekte, separat produksjonsfeil:
+`EXPERIENCES_LIST_HTML`s «Les mer»-lenke leser `e.slug`, så ALLE ekte
+`experiences-list`-kort i produksjon lenker i dag til
+`.../opplevelse/undefined`. Rutet som egen sak:
+`dev-requests/2026-08-24-discover-experiences-list-manglende-slug.md`
+(A2A-repoet) — utenfor scope for denne skiven (ingen serverkode endres her).
