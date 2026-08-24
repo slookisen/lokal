@@ -1,0 +1,38 @@
+MCP Apps catalog screenshots — prompt/image pairing
+(dev-request 2026-08-24-mcp-apps-skjermbilder-opplevagent)
+
+Each image is a direct, pixel-accurate render of the live `ui://opplevagent/...`
+HTML resource served by src/routes/experiences-mcp.ts, populated with real
+opplevagent.no catalog data (fetched 2026-08-24) via window.openai.getToolOutput —
+the same data-injection contract ChatGPT/Claude use to fill the card in production.
+No prompt text or chat chrome is included, per the catalog's "app response only" rule.
+
+01-experiences-list-troms.png
+  Prompt: "Hva kan vi finne på i Troms om vinteren?"
+  Card: ui://opplevagent/experiences-list (discover_experiences)
+  Data: 5 real Troms experiences (Arctic Explorer nordlyscruise, Aurora Safari Camp,
+  Fjellheisen, Dog Sledding, Nordlysbadet Harstad).
+
+02-experience-detail-arctic-explorer.png
+  Prompt: "Vis meg detaljer om nordlyscruise fra Tromsø"
+  Card: ui://opplevagent/experience-detail (get_experience)
+  Data: "Arctic Explorer — Northern Lights Cruise from Tromsø" (real record,
+  verification_status: verified).
+
+03-experience-detail-aurora-safari.png
+  Prompt: "Fortell meg mer om Aurora Safari Camp i Tromsø"
+  Card: ui://opplevagent/experience-detail (get_experience)
+  Data: "Aurora Safari Camp — Fjord Tours Tromsø" (real record, no booking button —
+  shows the card's layout when booking_url differs in shape from example 02).
+
+04-experiences-list-national-mix.png
+  Prompt: "Vis meg noen ulike opplevelser rundt om i Norge"
+  Card: ui://opplevagent/experiences-list (discover_experiences)
+  Data: 4 real experiences spanning Finnmark, Agder, Innlandet and Nordland —
+  demonstrates the card across varied categories/price/duration field presence
+  (several fields are legitimately null in production; shown as-is, not padded).
+
+Regeneration: `node opplevagent-connectors-prep/assets/generate-screenshots.js`
+(reads the card templates live from src/routes/experiences-mcp.ts — never hand-
+copy the HTML, see that file's own comment for why). Requires Playwright with a
+Chromium binary; set PLAYWRIGHT_CHROMIUM_PATH if not on the default lookup path.
