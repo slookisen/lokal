@@ -846,7 +846,7 @@ function registrableLabel(root: string): string {
 // Minimal RFC-3492 Bootstring decoder — decodes a single `xn--` ACE label to
 // the unicode string it encodes. Only the label (without the `xn--` prefix) is
 // passed in. Avoids the deprecated `node:punycode` module.
-function decodePunycodeLabel(label: string): string {
+export function decodePunycodeLabel(label: string): string {
   if (!label.startsWith("xn--")) return label;
   const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700;
   const INITIAL_BIAS = 72, INITIAL_N = 128;
@@ -891,7 +891,7 @@ function decodePunycodeLabel(label: string): string {
 // Handles both directions of the common mappings used by Norwegian domain registrants:
 //   æ → ae   ø → oe   å → aa
 // (ø→o is not applied globally as it can cause spurious collapses)
-function transliterateNorwegian(s: string): string {
+export function transliterateNorwegian(s: string): string {
   return s
     .replace(/æ/g, "ae")
     .replace(/ø/g, "oe")
