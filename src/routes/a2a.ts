@@ -597,10 +597,50 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   res.json(card);
 });
 
+// ─── Host-locked vertical detection for /api/stats ──────────────────────
+// a2a.ts is mounted ONCE, globally, at root (app.use("/", a2aRoutes) in
+// index.ts) and the finn-tannlege.com / opplevagent.no host-routing gates
+// in index.ts both pass /api/* through to this same shared router — so
+// without this, GET /api/stats answered EVERY host with RFB's `agents`
+// table numbers (marketplaceRegistry.getStats()), even on the dental/
+// experiences hosts. Host signal: req.hostname substring match — same
+// hostname-based lock routes/analytics.ts's lockedVerticalForHost() already
+// uses to scope /admin/analytics per-host. Kept as a small local mirror
+// (not a cross-route import — routes/*.ts don't import each other
+// elsewhere in this codebase) with the IDENTICAL substrings, rather than
+// reusing analytics.ts's helper directly.
+function lockedVerticalForStatsHost(req: Request): "dental" | "experiences" | undefined {
+  const h = (req.hostname || "").toLowerCase();
+  if (h.includes("finn-tannlege")) return "dental";
+  if (h.includes("opplevagent")) return "experiences";
+  return undefined;
+}
+
 // GET /api/stats — Platform stats (combined)
-router.get("/api/stats", (_req: Request, res: Response) => {
+router.get("/api/stats", (req: Request, res: Response) => {
   const legacyStats = store.getStats();
-  const registryStats = marketplaceRegistry.getStats();
+
+  // dental/experiences hosts get their OWN vertical's numbers; every other
+  // host (rettfrabonden.com, lokal.fly.dev, localhost, ...) keeps the exact
+  // pre-existing marketplaceRegistry.getStats() call/behavior — untouched,
+  // since /health also depends on that same cached call (see
+  // marketplace-registry.ts's getStats() doc comment).
+  //
+  // dental-store.ts/experience-store.ts are require()'d HERE, lazily,
+  // rather than statically imported at module top-level: a2a.ts is
+  // require()'d very early by unrelated test setup (tests/test.ts, well
+  // before any dental-store fixture block runs), and a static top-level
+  // import would drag dental-store.ts's module (and the db-factory handle
+  // it captures at that time) into the cache prematurely — which several
+  // existing dental-store test blocks aren't defensive against (they
+  // assume dental-store.ts is untouched until they first require() it). A
+  // lazy require here keeps a2a.ts's own module load side-effect-free for
+  // dental/experiences, matching its behavior before this change.
+  const statsVertical = lockedVerticalForStatsHost(req);
+  const registryStats =
+    statsVertical === "dental" ? (require("../services/dental-store") as typeof import("../services/dental-store")).getDentalMarketplaceStats() :
+    statsVertical === "experiences" ? (require("../services/experience-store") as typeof import("../services/experience-store")).getExperiencesMarketplaceStats() :
+    marketplaceRegistry.getStats();
 
   res.json({
     success: true,
