@@ -216,6 +216,11 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
   const prevHeadlessFallbackEnabled = process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
   const prevBraveApiKey = process.env.BRAVE_API_KEY;
   const prevBraveSearchApiKey = process.env.BRAVE_SEARCH_API_KEY;
+  // Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier) — the
+  // judge-route tests below flip this env var (contact-candidate-judge.ts
+  // reads it directly) and must restore it, same discipline as every other
+  // env var this suite already saves/restores.
+  const prevAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
   const prevFetch = globalThis.fetch;
   // Hoisted so `finally` (a sibling block scope of `try`) can still reach it
   // to reset the render-page injection point back to null even if an
@@ -267,6 +272,11 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       __setRfbWdSearchForTesting,
       evaluateRfbWebsiteCandidate,
       rfbWdExistingWebsiteHosts,
+      // Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier)
+      rfbWdQueueP95AgeDays,
+      RFB_WD_JUDGE_MIN_CONFIDENCE,
+      RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE,
+      RFB_WD_REVIEW_QUEUE_STALE_DAYS,
     } = routeModule;
     setRfbWdRenderPageImplForTesting = __setRfbWdRenderPageImplForTesting;
     setRfbWdSearchForTesting = __setRfbWdSearchForTesting;
@@ -1759,6 +1769,332 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
 
       setRfbWdSearchForTesting!(null);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier):
+    // POST /admin/rfb-website-review-judge — the [0.90, 0.95) LLM-judge
+    // tier — and GET /admin/rfb-website-review-queue-staleness.
+    //
+    // globalThis.fetch is reused for the judge's own Anthropic call: it is
+    // still keyed off the `fixtures` map by exact URL string (same
+    // stubFetch() convention as every block above), so a fixture at
+    // "https://api.anthropic.com/v1/messages" — the exact endpoint
+    // judgeContactCandidate (src/services/contact-candidate-judge.ts)
+    // fetches — drives the mocked judge response, mirroring both this
+    // file's own fetch-mocking convention and contact-candidate-judge.
+    // test.ts's own (globalThis.fetch stubbed, JSON body shaped
+    // {content:[{type:"text", text:"GODKJENN\n..."}]}).
+    // ═══════════════════════════════════════════════════════════════════
+
+    function judgeApiResponse(text: string): Response {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text }] }),
+      } as unknown as Response;
+    }
+
+    const postJudge = getHandler("post", "/rfb-website-review-judge");
+    const getStaleness = getHandler("get", "/rfb-website-review-queue-staleness");
+    async function callJudge(
+      body: Record<string, unknown> = {},
+      headers: Record<string, string> = { "x-admin-key": ADMIN_KEY },
+    ): Promise<{ status: number; body: any }> {
+      const res = fakeRes();
+      await postJudge({ headers, body, query: {} } as any, res as any);
+      return { status: res.statusCode, body: res.body };
+    }
+    async function callStaleness(
+      headers: Record<string, string> = { "x-admin-key": ADMIN_KEY },
+    ): Promise<{ status: number; body: any }> {
+      const res = fakeRes();
+      await getStaleness({ headers, query: {} } as any, res as any);
+      return { status: res.statusCode, body: res.body };
+    }
+
+    // ── rfbWdQueueP95AgeDays: pure unit tests (no DB, no HTTP) ──────────────
+    {
+      assertEq(rfbWdQueueP95AgeDays([]), null, "p95-1: empty array -> null");
+      assertEq(rfbWdQueueP95AgeDays([7]), 7, "p95-2: single value -> that value");
+      // Hand-computed: ages 1..20 ascending (n=20) -> idx = ceil(0.95*20)-1
+      // = ceil(19)-1 = 18 -> the 19th value (0-indexed 18) = 19.
+      const oneToTwenty = Array.from({ length: 20 }, (_, i) => i + 1);
+      assertEq(rfbWdQueueP95AgeDays(oneToTwenty), 19, "p95-3: 1..20 ascending -> p95 is 19 (hand-computed)");
+      // Hand-computed: n=4, idx = ceil(0.95*4)-1 = ceil(3.8)-1 = 4-1 = 3 ->
+      // the max (small-n edge case, still exercises the formula honestly).
+      assertEq(rfbWdQueueP95AgeDays([10, 20, 30, 40]), 40, "p95-4: n=4 -> idx 3 -> the max value");
+    }
+
+    // ═══ POST /admin/rfb-website-review-judge ═══
+    //
+    // Clean slate — earlier blocks in this file left assorted 'pending'/
+    // 'applied'/'superseded' rows behind; none are referenced again after
+    // this point, so this section starts from an empty queue for
+    // deterministic band-selection and still_pending counts, same
+    // convention as the (aa)-(ac) auto-approve block above.
+    testDb.prepare("DELETE FROM agents_website_review_queue").run();
+
+    // ── auth ──
+    {
+      const r = await callJudge({}, {});
+      assertEq(r.status, 403, "jg-auth: POST without X-Admin-Key -> 403");
+    }
+
+    // ── (jg-a) approve path: GODKJENN -> writes through the SAME
+    //     applyRfbAgentWebsite path the >=0.95 auto=true tier uses, queue
+    //     row lands in the IDENTICAL terminal status ('applied') asserted
+    //     by (u6)/(aa10)/(ab7) above ──
+    {
+      insertAgent({ id: "wd-jg-ok", name: "Solbakken Gardsutsalg AS" });
+      insertQueueRow({
+        id: "q-jg-ok",
+        agentId: "wd-jg-ok",
+        candidateUrl: "https://solbakkengardsutsalg.no",
+        confidence: 0.92,
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      });
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+      fixtures.set(
+        "https://api.anthropic.com/v1/messages",
+        judgeApiResponse("GODKJENN\nDette er en plausibel egen nettside for produsenten."),
+      );
+
+      const r = await callJudge({});
+      assertEq(r.status, 200, "jg-a1: 200");
+      assertEq(r.body.processed, 1, "jg-a2: exactly one row processed");
+      assertEq(r.body.approved, 1, "jg-a3: exactly one approved");
+      assertEq(r.body.rejected, 0, "jg-a4: nothing rejected");
+      assertEq(r.body.still_pending, 0, "jg-a5: nothing left pending in-band");
+      assertEq(r.body.results[0]?.agent_id, "wd-jg-ok", "jg-a6: result is for the right agent");
+      assertEq(r.body.results[0]?.verdict, "GODKJENN", "jg-a7: result verdict is GODKJENN");
+
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-ok'").get() as any;
+      assertEq(k.website, "https://solbakkengardsutsalg.no", "jg-a8: website column written via applyRfbAgentWebsite");
+      const q = testDb.prepare("SELECT status FROM agents_website_review_queue WHERE agent_id = 'wd-jg-ok'").get() as any;
+      assertEq(q.status, "applied", "jg-a9: queue row flipped to 'applied' — the SAME terminal status the auto=true tier produces");
+      const audit = testDb
+        .prepare("SELECT * FROM agent_knowledge_audit WHERE agent_id = 'wd-jg-ok' AND field_name = 'website'")
+        .get() as any;
+      assertTrue(!!audit, "jg-a10: agent_knowledge_audit row appended (same write path as the >=0.95 tier)");
+    }
+
+    // ── (jg-b) reject path: AVVIS -> row stays 'pending', reason appended,
+    //     no write ──
+    {
+      // (jg-a)'s row is now 'applied' (excluded by the route's own WHERE
+      // status='pending'), but a rejected row from a later block would
+      // stay 'pending' and accumulate into the next block's selection —
+      // start each isolated sub-block from an empty queue so `processed`
+      // stays exactly 1 per block, same discipline as the (aa)-(ac) and
+      // jg-f blocks' own DELETE.
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-rej", name: "Nordheim Gardsprodukter AS" });
+      insertQueueRow({
+        id: "q-jg-rej",
+        agentId: "wd-jg-rej",
+        candidateUrl: "https://nordheimgardsprodukter.no",
+        confidence: 0.9,
+        updatedAt: "2026-08-01T00:00:01.000Z",
+      });
+      fixtures.set(
+        "https://api.anthropic.com/v1/messages",
+        judgeApiResponse("AVVIS\nDette ser ut som generisk sidestøy, ikke ekte nettside-eierskap."),
+      );
+
+      const r = await callJudge({});
+      assertEq(r.body.processed, 1, "jg-b1: one row processed");
+      assertEq(r.body.approved, 0, "jg-b2: nothing approved");
+      assertEq(r.body.rejected, 1, "jg-b3: one rejected");
+      assertEq(r.body.results[0]?.verdict, "AVVIS", "jg-b4: result verdict is AVVIS");
+
+      const q = testDb
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-rej'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-b5: status column untouched — still 'pending'");
+      assertTrue(
+        typeof q.reason === "string" && q.reason.includes("LLM judge AVVIS"),
+        "jg-b6: reason column carries the judge's verdict",
+      );
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-rej'").get() as any;
+      assertTrue(!k.website, "jg-b7: website column still blank — no write");
+    }
+
+    // ── (jg-c) fail-closed path: a judge-side failure (simulated network
+    //     throw) resolves EXACTLY like a reject — no write, status
+    //     untouched, reason appended ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-fail", name: "Steinbru Gardsmat AS" });
+      insertQueueRow({
+        id: "q-jg-fail",
+        agentId: "wd-jg-fail",
+        candidateUrl: "https://steinbrugardsmat.no",
+        confidence: 0.93,
+        updatedAt: "2026-08-01T00:00:02.000Z",
+      });
+      globalThis.fetch = (async (url: any) => {
+        if (String(url) === "https://api.anthropic.com/v1/messages") {
+          throw new Error("simulated network failure");
+        }
+        return notFoundResponse();
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({});
+      assertEq(r.body.processed, 1, "jg-c1: one row processed");
+      assertEq(r.body.approved, 0, "jg-c2: nothing approved");
+      assertEq(r.body.rejected, 1, "jg-c3: fail-closed counts as rejected");
+      const q = testDb
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-fail'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-c4: status untouched on fail-closed, same as a plain reject");
+      assertTrue(typeof q.reason === "string" && q.reason.length > 0, "jg-c5: reason column carries the fail-closed note");
+      const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-fail'").get() as any;
+      assertTrue(!k.website, "jg-c6: website column still blank — no write");
+
+      // Restore the URL-keyed stub for the remaining blocks.
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (jg-d) deterministic backstop short-circuit: a structurally
+    //     defective candidate (favicon path) never spends an LLM call ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-backstop", name: "Favikon Gardsbutikk AS" });
+      insertQueueRow({
+        id: "q-jg-backstop",
+        agentId: "wd-jg-backstop",
+        candidateUrl: "https://favikongardsbutikk.no/favicon.ico",
+        confidence: 0.91,
+        updatedAt: "2026-08-01T00:00:03.000Z",
+      });
+      globalThis.fetch = (async () => {
+        throw new Error("jg-d: the LLM judge must NOT be called for a backstop-rejected candidate");
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({});
+      assertEq(r.body.rejected, 1, "jg-d1: rejected via the cheap backstop, not the LLM");
+      assertEq(r.body.results[0]?.verdict, "AVVIS", "jg-d2: verdict is AVVIS");
+      assertTrue(
+        (r.body.results[0]?.reason as string).includes("judge backstop AVVIS"),
+        "jg-d3: reason attributes the rejection to the backstop classifier, not the LLM",
+      );
+      const q = testDb
+        .prepare("SELECT status FROM agents_website_review_queue WHERE agent_id = 'wd-jg-backstop'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-d4: status untouched");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (jg-e) limit: 0 — a safe true no-op: zero rows touched, queue
+    //     unchanged, no fetch calls at all ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-zero", name: "Nullgrense Gardsprodukter AS" });
+      insertQueueRow({
+        id: "q-jg-zero",
+        agentId: "wd-jg-zero",
+        candidateUrl: "https://nullgrensegardsprodukter.no",
+        confidence: 0.9,
+        updatedAt: "2026-08-01T00:00:04.000Z",
+      });
+      globalThis.fetch = (async () => {
+        throw new Error("jg-e: limit:0 must query and mutate nothing — no fetch call of any kind");
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({ limit: 0 });
+      assertEq(r.status, 200, "jg-e1: 200");
+      assertEq(r.body, { processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] }, "jg-e2: exact no-op shape");
+      const q = testDb
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-zero'")
+        .get() as any;
+      assertEq(q.status, "pending", "jg-e3: row completely untouched");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ── (jg-f) confidence-band boundary: rows below 0.90 or at/above 0.95
+    //     are never selected by this route (0.95+ is the OTHER route's
+    //     job) ──
+    {
+      testDb.prepare("DELETE FROM agents_website_review_queue").run();
+      insertAgent({ id: "wd-jg-below", name: "Under Terskel AS" });
+      insertQueueRow({ id: "q-jg-below", agentId: "wd-jg-below", candidateUrl: "https://underterskel.no", confidence: 0.89 });
+      insertAgent({ id: "wd-jg-above", name: "Over Terskel AS" });
+      insertQueueRow({ id: "q-jg-above", agentId: "wd-jg-above", candidateUrl: "https://overterskel.no", confidence: 0.95 });
+      globalThis.fetch = (async () => {
+        throw new Error("jg-f: neither out-of-band row should ever reach the judge");
+      }) as unknown as typeof fetch;
+
+      const r = await callJudge({});
+      assertEq(r.body.processed, 0, "jg-f1: neither out-of-band row is selected");
+      assertEq(RFB_WD_JUDGE_MIN_CONFIDENCE, 0.9, "jg-f2: band floor is 0.90 (inclusive)");
+      assertEq(RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, 0.95, "jg-f3: band ceiling is 0.95 (exclusive)");
+
+      globalThis.fetch = stubFetch();
+    }
+
+    // ═══ GET /admin/rfb-website-review-queue-staleness ═══
+    testDb.prepare("DELETE FROM agents_website_review_queue").run();
+
+    // ── auth ──
+    {
+      const r = await callStaleness({});
+      assertEq(r.status, 403, "st-auth: GET without X-Admin-Key -> 403");
+    }
+
+    // ── (st-a) empty queue -> zeroed report, null p95 ──
+    {
+      const r = await callStaleness();
+      assertEq(r.status, 200, "st-a1: 200");
+      assertEq(r.body.count, 0, "st-a2: count 0");
+      assertEq(r.body.stale_count, 0, "st-a3: stale_count 0");
+      assertEq(r.body.stale_threshold_days, RFB_WD_REVIEW_QUEUE_STALE_DAYS, "st-a4: threshold echoed (2 days, this queue's own 48h SLA)");
+      assertEq(r.body.p95_age_days, null, "st-a5: p95_age_days is null on an empty queue");
+      assertEq(r.body.oldest_first, [], "st-a6: oldest_first empty");
+    }
+
+    // ── (st-b) three pending rows at known ages (1, 3, 5 days old) ──
+    {
+      function daysAgoSqlite(days: number): string {
+        return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 19).replace("T", " ");
+      }
+      insertAgent({ id: "wd-st-1", name: "En Dag Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-1', 'wd-st-1', 'En Dag Gard AS', 'https://endaggard.no', 'pending', ?, ?)`,
+      ).run(daysAgoSqlite(1), daysAgoSqlite(1));
+      insertAgent({ id: "wd-st-3", name: "Tre Dager Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-3', 'wd-st-3', 'Tre Dager Gard AS', 'https://tredagergard.no', 'pending', ?, ?)`,
+      ).run(daysAgoSqlite(3), daysAgoSqlite(3));
+      insertAgent({ id: "wd-st-5", name: "Fem Dager Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-5', 'wd-st-5', 'Fem Dager Gard AS', 'https://femdagergard.no', 'pending', ?, ?)`,
+      ).run(daysAgoSqlite(5), daysAgoSqlite(5));
+      // A non-pending row (already applied) must never appear in the report.
+      insertAgent({ id: "wd-st-applied", name: "Alt Behandlet Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-applied', 'wd-st-applied', 'Alt Behandlet Gard AS', 'https://altbehandletgard.no', 'applied', ?, ?)`,
+      ).run(daysAgoSqlite(10), daysAgoSqlite(10));
+
+      const r = await callStaleness();
+      assertEq(r.body.count, 3, "st-b1: count 3 — the applied row is excluded");
+      // threshold is 2 days: the 1-day row is fresh, the 3- and 5-day rows
+      // are stale.
+      assertEq(r.body.stale_count, 2, "st-b2: stale_count 2 (3-day and 5-day rows)");
+      // ages ascending [1,3,5], n=3 -> idx = ceil(0.95*3)-1 = ceil(2.85)-1
+      // = 3-1 = 2 -> ages[2] = 5 (hand-computed, matches rfbWdQueueP95AgeDays
+      // unit test p95-4's same small-n-collapses-to-max shape).
+      assertEq(r.body.p95_age_days, 5, "st-b3: p95_age_days is 5 (hand-computed)");
+      assertEq(r.body.oldest_first.length, 3, "st-b4: oldest_first has all 3 pending rows (well under the ~20 cap)");
+      assertEq(r.body.oldest_first[0]?.agent_id, "wd-st-5", "st-b5: oldest row (5 days) is first");
+      assertEq(r.body.oldest_first[0]?.age_days, 5, "st-b6: oldest row's age_days is 5");
+      assertEq(r.body.oldest_first[2]?.agent_id, "wd-st-1", "st-b7: youngest (1 day) row is last");
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -1774,6 +2110,8 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     else process.env.BRAVE_API_KEY = prevBraveApiKey;
     if (prevBraveSearchApiKey === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
     else process.env.BRAVE_SEARCH_API_KEY = prevBraveSearchApiKey;
+    if (prevAnthropicApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicApiKey;
     try {
       if (setRfbWdSearchForTesting) setRfbWdSearchForTesting(null);
     } catch {

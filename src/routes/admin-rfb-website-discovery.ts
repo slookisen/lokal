@@ -71,6 +71,16 @@ import {
   enrichmentWritePauseBlockForAgents,
   sendEnrichmentWritePausedIfPaused,
 } from "../services/enrichment-write-pause";
+// Grep 3 slice 2 (dev-request 2026-08-24-grep3-website-judge-tier): the
+// SHARED LLM-judge + deterministic-backstop module (src/services/
+// contact-candidate-judge.ts) — reused as-is, NOT reimplemented, for the
+// new POST /admin/rfb-website-review-judge route below. That module's
+// `fieldType: "website"` branch already exists (dev-request 2026-08-22-
+// rfbweb-about-guard) and is generic; this is simply its third call site.
+import {
+  classifyContactCandidateDefect,
+  judgeContactCandidate,
+} from "../services/contact-candidate-judge";
 
 // ─── agents_website_review_queue (lazy, ensureXTable pattern) ──────────────
 //
@@ -1662,6 +1672,309 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
     written,
     rejected,
     ...(auto ? { mode: "auto" as const, min_confidence: minConfidence, candidates_considered: candidatesConsidered } : {}),
+  });
+});
+
+// ─── POST /admin/rfb-website-review-judge (Grep 3 slice 2) ──────────────────
+//
+// dev-request 2026-08-24-grep3-website-judge-tier. The >=0.95 auto-approve
+// route above (rfb-website-review-approve, `auto: true`) already drains
+// org_nr/phone-evidence rows. Everything in [0.90, 0.95) — the "name+place"
+// (0.90, rfbWdConfidence's floor) and "address_found || postnr_found"
+// (0.92) tiers — currently just sits `pending` forever: not confident
+// enough for the deterministic auto-approve bar, but too costly to review
+// by hand at RFB's ~981-agent scale. This route adds an LLM-judge tier for
+// EXACTLY that band, reusing contact-candidate-judge.ts's shared
+// classify+judge pair rather than writing a second LLM-calling function —
+// this codebase's own "one shared judge module, many call sites" discipline
+// (see that module's own file-header comment).
+//
+// On GODKJENN: writes through applyRfbAgentWebsite — the SAME function
+// (and therefore the SAME terminal state) the >=0.95 auto=true path already
+// uses. Confirmed by reading applyRfbAgentWebsite's body in full (above):
+// on a successful write it sets agents_website_review_queue.status =
+// 'applied' (the exact string asserted by this file's own auto-approve
+// tests, e.g. "aa10: qualifying queue row flipped to applied") — a
+// judge-approved row lands in that identical state, not a parallel one.
+//
+// On AVVIS / any fail-closed outcome: the row's `status` column is left
+// UNTOUCHED ('pending') — only `reason` is updated (a plain SQL UPDATE) so
+// the judge's verdict is visible on the row without ever silently
+// resolving it. A rejected row stays eligible for a human reviewer, or for
+// re-judging on a later run (there is no "already judged, don't ask again"
+// marker — a future slice could add one; out of scope here, since nothing
+// in this slice makes re-judging incorrect, only potentially redundant).
+export const RFB_WD_JUDGE_MIN_CONFIDENCE = 0.9;
+export const RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
+
+// The stored `evidence` column (upsertRfbWebsiteReviewQueue, above) is
+// JSON.stringify(RfbWdEvidence) — ONLY the boolean match flags
+// (org_nr_found/name_found/place_found/phone_found/address_found/
+// postnr_found/verified). The raw fetched page text that satisfied those
+// flags (tryRfbWebsiteCandidateHost's `pageText`/`result.html`, above) is
+// NEVER persisted anywhere on this row or elsewhere — confirmed by reading
+// upsertRfbWebsiteReviewQueue's INSERT column list in full. Re-fetching the
+// candidate page here just to hand the judge raw text would add a second
+// live network round-trip to every judge run (this route already avoids
+// that cost the auto-approve tier also avoids); the structured evidence
+// flags already tell the judge WHICH ownership signals matched — the same
+// summary a human reviewer of this queue sees in the `evidence` column
+// today — so this constructs a compact synthetic Norwegian context
+// sentence from those flags instead of the unavailable raw text.
+function rfbWdJudgeSourceContext(row: {
+  final_url: string | null;
+  candidate_url: string;
+  evidence: string | null;
+  confidence: number | null;
+}): string {
+  const url = row.final_url || row.candidate_url;
+  let evidence: Partial<RfbWdEvidence> = {};
+  try {
+    const parsed = JSON.parse(row.evidence || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) evidence = parsed;
+  } catch {
+    // malformed/missing evidence JSON -> treat as no matched signals; the
+    // judge still gets the URL and confidence, just no signal list.
+  }
+  const matched: string[] = [];
+  if (evidence.org_nr_found) matched.push("organisasjonsnummer");
+  if (evidence.name_found) matched.push("produsentnavn");
+  if (evidence.place_found) matched.push("sted/kommune");
+  if (evidence.phone_found) matched.push("telefonnummer");
+  if (evidence.address_found) matched.push("adresse");
+  if (evidence.postnr_found) matched.push("postnummer");
+  const matchedText = matched.length > 0 ? matched.join(", ") : "ingen strukturerte treff";
+  const confidenceText = typeof row.confidence === "number" ? row.confidence.toFixed(2) : "ukjent";
+  return (
+    `Automatisk nettside-oppdagelse fant kandidat-URL-en ${url} og verifiserte følgende ` +
+    `eierskapssignaler på siden mot produsentens registrerte data: ${matchedText} ` +
+    `(evidensbasert konfidens: ${confidenceText}). Selve sidens rå tekstinnhold er ikke ` +
+    `lagret her — kun disse strukturerte treffene fra det opprinnelige sidebesøket.`
+  );
+}
+
+interface RfbWdJudgeQueueRow {
+  id: string;
+  agent_id: string;
+  agent_name: string | null;
+  candidate_url: string;
+  final_url: string | null;
+  evidence: string | null;
+  confidence: number | null;
+  reason: string | null;
+  batch_id: string | null;
+}
+
+function rfbWdJudgeAppendReason(db: ReturnType<typeof getDb>, rowId: string, note: string): void {
+  db.prepare(
+    `UPDATE agents_website_review_queue SET reason = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'`,
+  ).run(note, rowId);
+}
+
+router.post("/rfb-website-review-judge", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { limit?: unknown };
+  let limit = RFB_WD_AUTO_APPROVE_BATCH_CAP;
+  if (body.limit !== undefined) {
+    const l = body.limit;
+    if (typeof l !== "number" || !Number.isFinite(l) || !Number.isInteger(l) || l < 0) {
+      res.status(400).json({ error: "limit must be a non-negative integer" });
+      return;
+    }
+    limit = Math.min(l, RFB_WD_AUTO_APPROVE_BATCH_CAP);
+  }
+
+  // `limit: 0` — a safe true no-op for a post-deploy smoke probe: query
+  // nothing, mutate nothing. Returned BEFORE touching the DB at all.
+  if (limit === 0) {
+    res.json({ processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] });
+    return;
+  }
+
+  const db = getDb();
+  ensureRfbWebsiteReviewQueueTable(db);
+
+  const pending = db
+    .prepare(
+      `SELECT id, agent_id, agent_name, candidate_url, final_url, evidence, confidence, reason, batch_id
+         FROM agents_website_review_queue
+        WHERE status = 'pending' AND confidence >= ? AND confidence < ?
+        ORDER BY updated_at ASC
+        LIMIT ?`,
+    )
+    .all(RFB_WD_JUDGE_MIN_CONFIDENCE, RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE, limit) as RfbWdJudgeQueueRow[];
+
+  // Enrichment write-pause gate (same discipline as POST
+  // /rfb-website-review-approve's `apply` path, above) — gated over the
+  // WHOLE selected batch before any write, so a paused vertical blocks the
+  // batch whole: zero writes, never a partially-applied one. This route has
+  // no dry-run mode (every GODKJENN writes), so the gate always runs here,
+  // unlike the approve route's `apply`-conditional check.
+  if (pending.length > 0) {
+    const pauseBlock = enrichmentWritePauseBlockForAgents(
+      getDb,
+      pending.map((q) => q.agent_id),
+    );
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+  }
+
+  let approved = 0;
+  let rejected = 0;
+  const results: Array<{ agent_id: string; verdict: "GODKJENN" | "AVVIS"; reason: string }> = [];
+
+  for (const q of pending) {
+    // Cheap structural backstop first — cost control, same ordering
+    // contact-candidate-judge.ts's own gateContactCandidates uses: a
+    // structurally-defective candidate never spends an LLM call.
+    const defect = classifyContactCandidateDefect("website", q.candidate_url);
+    if (defect.defective) {
+      const note = `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`;
+      rfbWdJudgeAppendReason(db, q.id, note);
+      rejected++;
+      results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+      continue;
+    }
+
+    let verdict: { approved: boolean; reason?: string };
+    try {
+      verdict = await judgeContactCandidate({
+        fieldType: "website",
+        candidate: q.candidate_url,
+        sourceContext: rfbWdJudgeSourceContext(q),
+        businessName: q.agent_name || q.agent_id,
+      });
+    } catch (err: any) {
+      // judgeContactCandidate's own contract never throws, but this loop
+      // must fail-closed even if that contract is ever violated — never let
+      // one row's unexpected error crash the rest of the batch.
+      verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+    }
+
+    if (!verdict.approved) {
+      const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
+      rfbWdJudgeAppendReason(db, q.id, note);
+      rejected++;
+      results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+      continue;
+    }
+
+    try {
+      const w = applyRfbAgentWebsite(db, q.agent_id, q.candidate_url, q.final_url || q.candidate_url, q.batch_id);
+      if (w.written) {
+        approved++;
+        results.push({ agent_id: q.agent_id, verdict: "GODKJENN", reason: verdict.reason ?? "godkjent av LLM-dommer" });
+      } else {
+        // The judge said GODKJENN, but a write-time guard (fill-only race,
+        // owner claim, host already in use, …) still blocked the write —
+        // applyRfbAgentWebsite itself already left the row in whatever
+        // status that guard implies ('pending' or 'superseded'); this route
+        // only layers the judge's own reasoning on top via `reason`.
+        const note = `judge GODKJENN but write blocked: ${w.reason}`;
+        db.prepare(`UPDATE agents_website_review_queue SET reason = ? WHERE id = ?`).run(note, q.id);
+        rejected++;
+        results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+      }
+    } catch (err: any) {
+      // A pause that went live between this request's batch-level gate and
+      // this item's write: applyRfbAgentWebsite's own internal gate caught
+      // it. Abort the WHOLE remaining batch with the shared 423, exactly
+      // like POST /rfb-website-review-approve does for the same race.
+      if (sendEnrichmentWritePausedIfPaused(err, res)) return;
+      const note = `judge GODKJENN but write threw: ${err?.message ?? String(err)}`;
+      rfbWdJudgeAppendReason(db, q.id, note);
+      rejected++;
+      results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
+    }
+  }
+
+  const stillPendingRow = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM agents_website_review_queue
+        WHERE status = 'pending' AND confidence >= ? AND confidence < ?`,
+    )
+    .get(RFB_WD_JUDGE_MIN_CONFIDENCE, RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE) as { c: number };
+
+  res.json({
+    processed: pending.length,
+    approved,
+    rejected,
+    still_pending: stillPendingRow.c,
+    results,
+  });
+});
+
+// ─── GET /admin/rfb-website-review-queue-staleness (Grep 3 slice 2) ─────────
+//
+// Read-only queue-age report over ALL `pending` agents_website_review_queue
+// rows (every confidence tier, not just the judge band above — a stuck
+// >=0.95 row that never got auto-approved, e.g. because auto-approve simply
+// hasn't run recently, is just as much an operational staleness signal as a
+// stuck judge-band row). Mirrors opplevelser.ts's
+// computeGardssalgQueueAgeReport in SHAPE (count/stale_count/oldest_first)
+// but is a fresh, LOCAL, RFB-scoped implementation — per this file's own
+// header rule ("a fresh, RFB-scoped re-implementation, NOT a call into
+// opplevelser.ts") and the explicit instruction not to import
+// GS_VTP_QUEUE_STALE_DAYS: this queue's own SLA is 48h (2 days), not
+// gårdssalg's 7-day bar, so it needs and gets its own threshold constant.
+// Adds `p95_age_days` on top of the gårdssalg report shape — not present
+// there today.
+export const RFB_WD_REVIEW_QUEUE_STALE_DAYS = 2;
+
+// SQLite `datetime('now')` UTC string -> epoch ms. Local re-implementation
+// (not imported) of the same shape as opplevelser.ts's own
+// gsVtpParseSqliteUtcMs, per this file's no-opplevelser.ts-imports rule.
+function rfbWdParseSqliteUtcMs(raw: string): number {
+  const iso = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const withZone = /[zZ]$|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`;
+  const ms = Date.parse(withZone);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+// Pure p95 helper — sort ages ascending, p95 = ages[ceil(0.95*n)-1] for
+// n>0, else null (no rows -> no percentile to report; distinct from `0`,
+// which would misleadingly claim "queue is instantly fresh"). Exported for
+// direct unit testing.
+export function rfbWdQueueP95AgeDays(sortedAscendingAges: number[]): number | null {
+  const n = sortedAscendingAges.length;
+  if (n === 0) return null;
+  const idx = Math.min(n - 1, Math.max(0, Math.ceil(0.95 * n) - 1));
+  return sortedAscendingAges[idx];
+}
+
+router.get("/rfb-website-review-queue-staleness", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+  ensureRfbWebsiteReviewQueueTable(db);
+  const rows = db
+    .prepare(`SELECT agent_id, agent_name, created_at FROM agents_website_review_queue WHERE status = 'pending'`)
+    .all() as Array<{ agent_id: string; agent_name: string | null; created_at: string }>;
+
+  const nowMs = Date.now();
+  const withAge = rows.map((r) => {
+    const createdMs = rfbWdParseSqliteUtcMs(r.created_at);
+    const ageDays = Number.isFinite(createdMs) ? Math.max(0, Math.floor((nowMs - createdMs) / 86_400_000)) : 0;
+    return { agent_id: r.agent_id, agent_name: r.agent_name, age_days: ageDays };
+  });
+
+  const ascendingAges = withAge.map((r) => r.age_days).sort((a, b) => a - b);
+  const staleCount = withAge.filter((r) => r.age_days > RFB_WD_REVIEW_QUEUE_STALE_DAYS).length;
+
+  const oldestFirst = [...withAge]
+    .sort((a, b) => b.age_days - a.age_days)
+    .slice(0, 20)
+    .map((r) => ({ agent_id: r.agent_id, agent_name: r.agent_name, age_days: r.age_days }));
+
+  res.json({
+    count: withAge.length,
+    stale_count: staleCount,
+    stale_threshold_days: RFB_WD_REVIEW_QUEUE_STALE_DAYS,
+    p95_age_days: rfbWdQueueP95AgeDays(ascendingAges),
+    oldest_first: oldestFirst,
   });
 });
 
