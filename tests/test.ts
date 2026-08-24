@@ -30930,6 +30930,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gora.failures) failures.push("opplevelser-gardssalg-orgnr-review-approve: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-review-approve: ${gora.passed} passed, ${gora.failed} failed`);
 
+    // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3:
+    // POST /admin/gardssalg-orgnr-review-judge — LLM-judge tier for the
+    // org.nr review queue's mid-confidence ('needs_human_review') rows,
+    // mirroring RFB Grep 3 slice 2's rfb-website-review-judge (services/
+    // orgnr-identity-judge.ts's own judgeOrgnrIdentityMatch). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-orgnr-review-judge: LLM-judge tier for the org.nr review queue ──");
+    const { runOpplevelserGardssalgOrgnrReviewJudgeTests } = require("../src/routes/opplevelser-gardssalg-orgnr-review-judge.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-orgnr-review-judge.test");
+    const gorj = await runOpplevelserGardssalgOrgnrReviewJudgeTests({ log: false });
+    passed += gorj.passed;
+    failed += gorj.failed;
+    for (const f of gorj.failures) failures.push("opplevelser-gardssalg-orgnr-review-judge: " + f);
+    console.log(`  opplevelser-gardssalg-orgnr-review-judge: ${gorj.passed} passed, ${gorj.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2:
     // admin claim-grant — issueAdminGrantedClaimMagicLink()/
     // hasActiveNonRevokedClaim() (src/services/gardssalg-claim.ts) and

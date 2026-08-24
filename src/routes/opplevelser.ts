@@ -623,6 +623,12 @@ import { getDb as getExperiencesDbHandle } from "../database/db-factory";
 // (applyGardssalgProviderContact's own gate call lives inside
 // experience-store.ts and needs no separate import here).
 import { gateContactCandidates } from "../services/contact-candidate-judge";
+// dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3 —
+// LLM-judge tier for the org.nr review queue's mid-confidence rows (name+
+// place evidence, short of the exact-match auto-write bar). A SEPARATE
+// module from contact-candidate-judge.ts on purpose — see that file's own
+// header and orgnr-identity-judge.ts's own header for why.
+import { judgeOrgnrIdentityMatch } from "../services/orgnr-identity-judge";
 // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 4 —
 // fetch-integrity content-marker guard (mirror of RFB Grep 4d): one
 // mechanism, two callers — reused as-is from admin-rfb-website-discovery.ts,
@@ -10521,6 +10527,196 @@ router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, async (req: R
   res.json({ dry_run: dryRun, approved_count: approved.length, approved, rejected });
 });
 
+// ─── POST /admin/gardssalg-orgnr-review-judge (item 3) ──────────────────────
+//
+// dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3 —
+// mirrors RFB Grep 3 slice 2's shipped `POST /admin/rfb-website-review-judge`
+// (admin-rfb-website-discovery.ts, PR lokal#691) shape/conventions, but for
+// gardssalg_orgnr_review_queue's `reason = 'needs_human_review'` rows
+// specifically — confirmed by reading the actual veto chain
+// (evaluateGardssalgOrgnrCandidateVetoChain, above) that this reason string,
+// not a bare confidence filter, is exactly item 3's "mellomkonfidens-rader
+// (navn+sted-bevis)": every other veto outcome
+// (stripped_name_requires_postal_match / heuristic_name_requires_postal_match
+// / ambiguous_exact_name_ties / previously_rolled_back / brreg_not_active /
+// no_brreg_candidate) means something other than "just needs a second
+// opinion on a name/place match" and is left untouched by this route.
+//
+// No classifyContactCandidateDefect backstop here — that classifier judges
+// free-text phone/email/address/website candidates extracted from page
+// text, not a structured registry name+address match; not applicable.
+//
+// No gårdssalg-scoped enrichment write-pause gate is wired in here: this
+// codebase's enrichment-write-pause module (services/enrichment-write-
+// pause.ts) DOES define an "experiences" vertical, but grepping
+// opplevelser.ts confirms NOTHING in this file — not this route, not the
+// orgnr-backfill route, not gardssalg-orgnr-review-approve itself — ever
+// imports or calls it today. Per the byggspec's own instruction ("if you
+// cannot find a gårdssalg-scoped pause gate, note that in your summary and
+// skip this step rather than guessing"), this route does not invent a new
+// gate of its own; it inherits exactly the same (absent) pause coverage its
+// write target (gardssalg-orgnr-review-approve) already has.
+export const GARDSSALG_ORGNR_JUDGE_BATCH_CAP = 30;
+
+interface GardssalgOrgnrJudgeQueueRow {
+  id: string;
+  provider_id: string;
+  provider_name: string | null;
+  candidate_orgnr: string | null;
+  candidate_name: string | null;
+  candidate_address: string | null;
+  reason: string;
+  updated_at: string;
+}
+
+/** Mirrors RFB's rfbWdJudgeAppendReason: guarded on the ORIGINAL reason so a
+ *  row that changed underneath this run (cleared/re-resolved by a concurrent
+ *  backfill) is never clobbered. */
+function gardssalgOrgnrJudgeAppendReason(db: Database.Database, providerId: string, note: string): void {
+  db.prepare(
+    `UPDATE gardssalg_orgnr_review_queue SET reason = ?, updated_at = datetime('now') WHERE provider_id = ? AND reason = 'needs_human_review'`,
+  ).run(note, providerId);
+}
+
+router.post("/admin/gardssalg-orgnr-review-judge", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { limit?: unknown };
+  let limit = GARDSSALG_ORGNR_JUDGE_BATCH_CAP;
+  if (body.limit !== undefined) {
+    const l = body.limit;
+    if (typeof l !== "number" || !Number.isFinite(l) || !Number.isInteger(l) || l < 0) {
+      res.status(400).json({ error: "limit must be a non-negative integer" });
+      return;
+    }
+    limit = Math.min(l, GARDSSALG_ORGNR_JUDGE_BATCH_CAP);
+  }
+
+  // `limit: 0` — a safe true no-op for a post-deploy smoke probe: query
+  // nothing, mutate nothing. Returned BEFORE touching the DB at all.
+  if (limit === 0) {
+    res.json({ processed: 0, approved: 0, rejected: 0, still_pending: 0, results: [] });
+    return;
+  }
+
+  const db = getExpDb("experiences");
+  const pending = db
+    .prepare(
+      `SELECT id, provider_id, provider_name, candidate_orgnr, candidate_name, candidate_address, reason, updated_at
+         FROM gardssalg_orgnr_review_queue
+        WHERE reason = 'needs_human_review'
+        ORDER BY updated_at ASC
+        LIMIT ?`,
+    )
+    .all(limit) as GardssalgOrgnrJudgeQueueRow[];
+
+  let approved = 0;
+  let rejected = 0;
+  const results: Array<{ provider_id: string; verdict: "GODKJENN" | "AVVIS"; reason: string }> = [];
+
+  for (const q of pending) {
+    try {
+      if (!q.candidate_orgnr || !q.candidate_name) {
+        // Should not happen for a 'needs_human_review' row (the veto chain
+        // only ever queues this reason alongside a resolved Brreg
+        // candidate) — but fail-closed rather than call the judge with
+        // nothing to judge, or attempt an approve call with no org_nr.
+        const note = "judge AVVIS: mangler kandidatdata (org.nr/navn) på kø-raden — avvist fail-closed";
+        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+        rejected++;
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+        continue;
+      }
+
+      // Cheap, best-effort lookup of the provider's own known kommune/
+      // poststed to give the judge place context beyond the candidate's own
+      // Brreg address. Never blocks the judge call — the params are
+      // optional, so a lookup failure just omits them.
+      let providerKommune: string | null = null;
+      let providerPoststed: string | null = null;
+      try {
+        const providerRow = getProviderById(q.provider_id) as
+          | { kommune?: string | null; poststed?: string | null }
+          | null;
+        providerKommune = providerRow?.kommune ?? null;
+        providerPoststed = providerRow?.poststed ?? null;
+      } catch {
+        // best-effort only
+      }
+
+      let verdict: { approved: boolean; reason?: string };
+      try {
+        verdict = await judgeOrgnrIdentityMatch({
+          providerName: q.provider_name ?? "",
+          providerKommune,
+          providerPoststed,
+          candidateName: q.candidate_name,
+          candidateAddress: q.candidate_address,
+        });
+      } catch (err: any) {
+        // judgeOrgnrIdentityMatch's own contract never throws, but this loop
+        // must fail-closed even if that contract is ever violated — never
+        // let one row's unexpected error crash the rest of the batch.
+        verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+      }
+
+      if (!verdict.approved) {
+        const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
+        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+        rejected++;
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+        continue;
+      }
+
+      // GODKJENN — reuse gardssalg-orgnr-review-approve's FULL guarded write
+      // path in-process (fill-only/lock/UNIQUE guards, audit/provenance,
+      // queue-entry clearing on success), never a second write path.
+      const approveResp = await callGardssalgAdminRouteInProcess("/admin/gardssalg-orgnr-review-approve", {
+        approvals: [{ provider_id: q.provider_id, org_nr: q.candidate_orgnr }],
+        apply: true,
+      });
+      const approvedList = Array.isArray(approveResp.body?.approved) ? approveResp.body.approved : [];
+      const wasApproved = approvedList.some((a: any) => a?.provider_id === q.provider_id);
+      if (wasApproved) {
+        approved++;
+        results.push({ provider_id: q.provider_id, verdict: "GODKJENN", reason: verdict.reason ?? "godkjent av LLM-dommer" });
+      } else {
+        // The judge said GODKJENN, but a write-time guard on the approve
+        // route (fill-only race, owner claim, org_nr conflict, …) still
+        // blocked the write.
+        const rejectedList = Array.isArray(approveResp.body?.rejected) ? approveResp.body.rejected : [];
+        const innerReason = rejectedList.find((r: any) => r?.provider_id === q.provider_id)?.reason;
+        const note = `judge GODKJENN but write blocked: ${innerReason ?? "unknown"}`;
+        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+        rejected++;
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+      }
+    } catch (err: any) {
+      // Never let one row's unexpected error crash the rest of the batch —
+      // fail THAT row closed, continue with the rest.
+      const note = `uventet feil under dommer/skriving — avvist fail-closed: ${err?.message ?? String(err)}`;
+      try {
+        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+      } catch {
+        // best-effort — the row's reason may not update, but the outcome is
+        // still correctly counted/reported below.
+      }
+      rejected++;
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+    }
+  }
+
+  const stillPendingRow = db
+    .prepare(`SELECT COUNT(*) AS c FROM gardssalg_orgnr_review_queue WHERE reason = 'needs_human_review'`)
+    .get() as { c: number };
+
+  res.json({
+    processed: pending.length,
+    approved,
+    rejected,
+    still_pending: stillPendingRow.c,
+    results,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-content-rollback (admin) ─────────
 //
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1
@@ -14221,6 +14417,20 @@ export interface GsVtpQueueAgeRow {
 }
 
 /**
+ * Pure p95 helper — sort ages ascending, p95 = ages[ceil(0.95*n)-1] for
+ * n>0, else null (no rows -> no percentile to report; distinct from `0`,
+ * which would misleadingly claim "queue is instantly fresh"). Mirrors RFB's
+ * own rfbWdQueueP95AgeDays (admin-rfb-website-discovery.ts) exactly.
+ * Exported for direct unit testing.
+ */
+export function gardssalgQueueP95AgeDays(sortedAscendingAges: number[]): number | null {
+  const n = sortedAscendingAges.length;
+  if (n === 0) return null;
+  const idx = Math.min(n - 1, Math.max(0, Math.ceil(0.95 * n) - 1));
+  return sortedAscendingAges[idx];
+}
+
+/**
  * Count + age (oldest-first) report for ONE approval queue (AK9). Always
  * computed over the FULL current queue table — never scoped to a single
  * batch's providers — because a queue's own drainage is a platform-wide
@@ -14229,6 +14439,13 @@ export interface GsVtpQueueAgeRow {
  * (should not happen — the column has a NOT NULL DEFAULT) reports age_days:0
  * rather than throwing, so one bad row can never take down the whole report.
  * Pure (caller supplies `nowMs`) — exported for tests.
+ *
+ * dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3 —
+ * `p95_age_days` is a purely ADDITIVE field on top of the two pre-existing
+ * keys (count/stale_count unchanged in name and behavior); all three
+ * existing callers (gardssalg-review-queues-staleness,
+ * gardssalg-veien-til-pool, and that same route's own inline report) keep
+ * working unchanged, they simply now also receive this extra key.
  */
 export function computeGardssalgQueueAgeReport(
   entries: Array<{ provider_id: string; provider_name?: string | null; created_at: string; reason?: string | null }>,
@@ -14237,6 +14454,7 @@ export function computeGardssalgQueueAgeReport(
   count: number;
   stale_count: number;
   stale_threshold_days: number;
+  p95_age_days: number | null;
   oldest_first: GsVtpQueueAgeRow[];
 } {
   const rows: GsVtpQueueAgeRow[] = entries.map((e) => {
@@ -14250,11 +14468,13 @@ export function computeGardssalgQueueAgeReport(
       stale: ageDays > GS_VTP_QUEUE_STALE_DAYS,
     };
   });
+  const ascendingAges = rows.map((r) => r.age_days).sort((a, b) => a - b);
   rows.sort((a, b) => b.age_days - a.age_days);
   return {
     count: rows.length,
     stale_count: rows.filter((r) => r.stale).length,
     stale_threshold_days: GS_VTP_QUEUE_STALE_DAYS,
+    p95_age_days: gardssalgQueueP95AgeDays(ascendingAges),
     oldest_first: rows,
   };
 }
