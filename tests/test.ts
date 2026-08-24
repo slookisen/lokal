@@ -25584,6 +25584,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _tynneProfilerImprovePromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbContactJudgePromise; } catch { /* errors already pushed to failures */ }
   try { await _contactCandidateJudgePromise; } catch { /* errors already pushed to failures */ }
+  try { await _orgnrIdentityJudgePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -30930,6 +30931,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gora.failures) failures.push("opplevelser-gardssalg-orgnr-review-approve: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-review-approve: ${gora.passed} passed, ${gora.failed} failed`);
 
+    // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3:
+    // POST /admin/gardssalg-orgnr-review-judge — LLM-judge tier for the
+    // org.nr review queue's mid-confidence ('needs_human_review') rows,
+    // mirroring RFB Grep 3 slice 2's rfb-website-review-judge (services/
+    // orgnr-identity-judge.ts's own judgeOrgnrIdentityMatch). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-orgnr-review-judge: LLM-judge tier for the org.nr review queue ──");
+    const { runOpplevelserGardssalgOrgnrReviewJudgeTests } = require("../src/routes/opplevelser-gardssalg-orgnr-review-judge.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-orgnr-review-judge.test");
+    const gorj = await runOpplevelserGardssalgOrgnrReviewJudgeTests({ log: false });
+    passed += gorj.passed;
+    failed += gorj.failed;
+    for (const f of gorj.failures) failures.push("opplevelser-gardssalg-orgnr-review-judge: " + f);
+    console.log(`  opplevelser-gardssalg-orgnr-review-judge: ${gorj.passed} passed, ${gorj.failed} failed`);
+
     // dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas, item 2:
     // admin claim-grant — issueAdminGrantedClaimMagicLink()/
     // hasActiveNonRevokedClaim() (src/services/gardssalg-claim.ts) and
@@ -34353,6 +34369,44 @@ const _contactCandidateJudgePromise: Promise<void> = new Promise<void>(r => {
   }
 })();
 
+// dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3:
+// unit tests for judgeOrgnrIdentityMatch (src/services/orgnr-identity-judge.
+// ts), the fail-closed LLM judge behind POST /admin/gardssalg-orgnr-review-
+// judge — mirrors contact-candidate-judge.test.ts's own Section B direct-
+// unit-test structure and fetch-mocking convention (globalThis.fetch
+// stubbed, ANTHROPIC_API_KEY and globalThis.fetch saved/restored). Chained
+// after _contactCandidateJudgePromise, the current tail of this serial
+// chain, for the same reason every other fetch-swapping suite in this
+// family is chained rather than run in parallel. (The route-level
+// integration tests proving POST /admin/gardssalg-orgnr-review-judge itself
+// wires this judge in live in opplevelser-gardssalg-orgnr-review-judge.
+// test.ts, already wired in the runSerial chain above.)
+let _orgnrIdentityJudgeResolve: () => void = () => {};
+const _orgnrIdentityJudgePromise: Promise<void> = new Promise<void>(r => {
+  _orgnrIdentityJudgeResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contactCandidateJudgePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling (item 3): orgnr-identity-judge ──");
+  try {
+    const { runOrgnrIdentityJudgeTests } = require("../src/services/orgnr-identity-judge.test") as
+      typeof import("../src/services/orgnr-identity-judge.test");
+    const oij = await runOrgnrIdentityJudgeTests({ log: false });
+    passed += oij.passed;
+    failed += oij.failed;
+    for (const f of oij.failures) failures.push("orgnr-identity-judge: " + f);
+    console.log(`  orgnr-identity-judge: ${oij.passed} passed, ${oij.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("orgnr-identity-judge: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orgnrIdentityJudgeResolve();
+  }
+})();
+
 // ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
@@ -34410,7 +34464,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _expNoYieldBackoffPromise, _contentRefreshErrorsByPersistencePromise, _lowQualitySelectorPromise,
   _junkEmailReplacePromise, _rfbAgentsRetroScanPromise,
   _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
-  _rfbContactJudgePromise, _contactCandidateJudgePromise,
+  _rfbContactJudgePromise, _contactCandidateJudgePromise, _orgnrIdentityJudgePromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);

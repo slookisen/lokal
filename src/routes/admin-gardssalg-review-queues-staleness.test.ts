@@ -187,6 +187,10 @@ export function runAdminGardssalgReviewQueuesStalenessTests(opts: { log?: boolea
         assertEq(JSON.stringify(r.body.website_review_queue?.oldest_first), "[]", "s1g: website_review_queue.oldest_first []");
         assertEq(r.body.orgnr_review_queue?.stale_threshold_days, staleThresholdDays, "s1h: threshold reported (orgnr)");
         assertEq(r.body.website_review_queue?.stale_threshold_days, staleThresholdDays, "s1i: threshold reported (website)");
+        // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling,
+        // item 3 — p95_age_days additive field, null on an empty queue.
+        assertEq(r.body.orgnr_review_queue?.p95_age_days, null, "s1j: p95_age_days null on empty orgnr queue");
+        assertEq(r.body.website_review_queue?.p95_age_days, null, "s1k: p95_age_days null on empty website queue");
       }
 
       // ── s2: a stale orgnr row (well over the threshold) ──────────────────
@@ -206,6 +210,8 @@ export function runAdminGardssalgReviewQueuesStalenessTests(opts: { log?: boolea
         assertEq(row?.name, "Gammel Orgnr Gard", "s2e: row carries the provider name");
         assertEq(row?.reason, "no_brreg_candidate", "s2f: row carries the queue reason");
         assertTrue(typeof row?.age_days === "number" && row.age_days >= staleThresholdDays + 4, "s2g: age_days reflects the backdated created_at");
+        // item 3 — with exactly 1 row, p95_age_days equals that row's own age.
+        assertEq(r.body.orgnr_review_queue?.p95_age_days, row?.age_days, "s2h: p95_age_days equals the single row's age");
       }
 
       // ── s3: a fresh (today) orgnr row alongside the old one ──────────────

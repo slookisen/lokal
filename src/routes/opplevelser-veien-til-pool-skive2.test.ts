@@ -231,6 +231,25 @@ export function runVeienTilPoolSkive2Tests(opts: { log?: boolean } = {}): Promis
         assertEq(report.oldest_first[1]?.stale, false, "vtp2-7d: 1 dag -> ikke stale");
         assertEq(report.stale_count, 1, "vtp2-7e: stale_count teller korrekt");
         assertEq(report.stale_threshold_days, opplevelserModule.GS_VTP_QUEUE_STALE_DAYS, "vtp2-7f: terskelen rapporteres");
+        // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling,
+        // item 3 — p95_age_days is additive: 2 rows, ages [1, 21] ascending,
+        // ceil(0.95*2)-1 = 1 -> the older row's age (21).
+        assertEq(report.p95_age_days, 21, "vtp2-7g: p95_age_days over 2 rows picks the older row's age");
+      }
+
+      // ═══ vtp2-7h..vtp2-7k: gardssalgQueueP95AgeDays (PURE, AK9, item 3) ═══
+      {
+        const p95 = opplevelserModule.gardssalgQueueP95AgeDays;
+        assertEq(p95([]), null, "vtp2-7h: empty array -> null (never 0 — distinct from 'instantly fresh')");
+        assertEq(p95([5]), 5, "vtp2-7i: single value -> that value");
+        // A known multi-value case, mirroring RFB's own rfbWdQueueP95AgeDays
+        // contract exactly: ages 1..20 ascending, n=20,
+        // ceil(0.95*20)-1 = 19-1 = 18 -> ages[18] = 19.
+        const ages20 = Array.from({ length: 20 }, (_, i) => i + 1); // [1..20]
+        assertEq(p95(ages20), 19, "vtp2-7j: 20 ascending values 1..20 -> p95 index 18 -> value 19");
+        // n=10, ceil(0.95*10)-1 = 10-1 = 9 -> the LAST (max) value.
+        const ages10 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 100];
+        assertEq(p95(ages10), 100, "vtp2-7k: 10 ascending values -> p95 index 9 -> the max value");
       }
 
       // ═══ vtp2-8..vtp2-10: rute-plumbing ═══
