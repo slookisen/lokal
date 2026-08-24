@@ -40302,3 +40302,30 @@ runSerial(async () => {
     failures.push("marketplace-catalog-second-line: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-24-evidence-url-verifisering-gate: `experiences.
+// evidence_url` was never independently fetched/checked by anything
+// downstream (unlike the sibling hjemmeside-verification gate). New
+// isEvidenceUrlVerified()/deriveEvidenceUrlStatus() read side, new
+// POST /admin/evidence-url-verification-sweep write side (reuses
+// gardssalgWebsiteEvidenceMatch + the rfbWdPageReferencesOwnHost
+// fetch-integrity/contamination-retry pattern unchanged), and
+// GET /admin/providers/recently-enriched now exposes the derived status.
+// Own dedicated in-memory-db harness (mirrors the sibling hjemmeside gate
+// test file's own harness). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-evidence-url-verifisering-gate: evidence_url fetch+verify gate ──");
+  try {
+    const { runOpplevelserEvidenceUrlVerificationGateTests } = require("../src/routes/opplevelser-evidence-url-verification-gate.test") as
+      typeof import("../src/routes/opplevelser-evidence-url-verification-gate.test");
+    const euv = await runOpplevelserEvidenceUrlVerificationGateTests({ log: false });
+    passed += euv.passed;
+    failed += euv.failed;
+    for (const f of euv.failures) failures.push("opplevelser-evidence-url-verification-gate: " + f);
+    console.log(`  opplevelser-evidence-url-verification-gate: ${euv.passed} passed, ${euv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-evidence-url-verification-gate: unexpected error: " + String(err?.message || err));
+  }
+});

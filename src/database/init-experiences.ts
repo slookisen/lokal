@@ -1581,5 +1581,32 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN terminal_status TEXT DEFAULT NULL");
   } catch { /* already present */ }
 
+  // ─── experiences.evidence_url_verification (dev-request 2026-08-24-
+  // evidence-url-verifisering-gate) ───────────────────────────────────────
+  // `experiences.evidence_url` (the citation substantiating that a specific
+  // experience/supplier is real) was never independently fetched or checked
+  // by anything downstream — unlike experience_providers.hjemmeside, which
+  // the website-verification sweep confirms before content-refresh trusts it
+  // (field_provenance.hjemmeside_verification, isHjemmesideVerified() in
+  // routes/opplevelser.ts). A row could pass hjemmeside-based enrichment
+  // forever while keeping an evidence_url nothing ever fetched.
+  //
+  // NEW, ADDITIVE column only — mirrors field_provenance.hjemmeside_
+  // verification's JSON shape ({verified, classification, checked_at,
+  // evidence?}) but lives on `experiences` (not experience_providers),
+  // because evidence_url is itself an experiences column. NEVER touches or
+  // overwrites `evidence_url` itself — see isEvidenceUrlVerified() /
+  // deriveEvidenceUrlStatus() (routes/opplevelser.ts) for the read side and
+  // POST /admin/evidence-url-verification-sweep for the write side. NULL
+  // (the default, and every pre-existing row's starting state) reads as
+  // "not verified" via isEvidenceUrlVerified()'s fail-closed contract — no
+  // retroactive backfill of existing rows in this slice (task spec
+  // non-goal); a future batch job can sweep historical rows if wanted.
+  // Setting it back to NULL is the rollback — no separate migration needed,
+  // and no existing column's semantics change.
+  try {
+    db.exec("ALTER TABLE experiences ADD COLUMN evidence_url_verification TEXT");
+  } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

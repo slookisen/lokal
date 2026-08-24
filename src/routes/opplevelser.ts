@@ -2490,6 +2490,76 @@ export function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean
   }
 }
 
+// dev-request 2026-08-24-evidence-url-verifisering-gate: `experiences.
+// evidence_url` (the citation a specific EXPERIENCE row carries — "this
+// is where we found proof this experience/supplier is real") had the exact
+// same trust gap the hjemmeside gate above closed for the PROVIDER's own
+// site: nothing ever independently fetched or confirmed it, so a row could
+// sail through content-refresh's hjemmeside-based enrichment forever while
+// keeping an evidence_url that was never actually checked (e.g. written "as
+// a template" by a harvest run). Mirrors isHjemmesideVerified()'s shape and
+// fail-closed contract EXACTLY, just against a NEW, separate stamp
+// (`experiences.evidence_url_verification`, its own additive column — see
+// init-experiences.ts) on a DIFFERENT table (experiences, not
+// experience_providers, since evidence_url is itself an experiences column).
+// Deliberately NOT unified with isHjemmesideVerified() into one shared
+// helper — same reasoning as isHjemmesideVerified's own doc comment: this
+// codebase's convention is a local, minimal shape scoped to just the one
+// check rather than a premature shared abstraction, and the two gates cover
+// different fields on different tables for different reasons.
+interface EvidenceUrlVerificationEntry {
+  verified?: unknown;
+  classification?: unknown;
+}
+
+/**
+ * Fail-closed gate: true only when `experiences.evidence_url_verification`
+ * exists and verified === true (strict boolean comparison — deliberate, see
+ * isHjemmesideVerified's own doc comment: a loose/truthy check here would
+ * silently accept `verified: "true"` or `verified: 1`, which this stamp's
+ * writer never produces but a future caller could accidentally pass
+ * straight through). Missing column, missing/malformed JSON, or
+ * verified !== true (this includes classification "unverified" and rows the
+ * sweep never scanned at all) -> false. Any ambiguity resolves to "not
+ * verified" — never to "assume verified".
+ */
+export function isEvidenceUrlVerified(evidenceUrlVerificationRaw: string | null): boolean {
+  if (!evidenceUrlVerificationRaw) return false;
+  try {
+    const parsed = JSON.parse(evidenceUrlVerificationRaw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const entry = parsed as EvidenceUrlVerificationEntry;
+    return entry.verified === true;
+  } catch {
+    return false; // malformed existing JSON -> fail closed, never treat as verified
+  }
+}
+
+export type EvidenceUrlStatus = "verified" | "evidence_url_unverified";
+
+/**
+ * Spec (dev-request 2026-08-24-evidence-url-verifisering-gate), AC1/AC3: the
+ * additive, OBSERVABLE status for one experience row's evidence_url — never
+ * writes anything, never touches/overwrites the `evidence_url` value itself
+ * (read-side projection only). `null` means "not applicable" — a row with no
+ * evidence_url set carries no citation to verify in the first place, so the
+ * new status must not appear on it at all (an absent evidence_url is not the
+ * same claim as an unverified one). For a row that DOES carry an
+ * evidence_url, this NEVER returns "verified" just because some other gate
+ * (e.g. the hjemmeside gate above) passed — only isEvidenceUrlVerified()
+ * returning true on THIS row's own evidence_url_verification stamp does
+ * that (AC1: a row whose evidence_url was never independently fetched stays
+ * "evidence_url_unverified" no matter what content-refresh did elsewhere on
+ * that same row).
+ */
+export function deriveEvidenceUrlStatus(
+  evidenceUrl: string | null,
+  evidenceUrlVerificationRaw: string | null,
+): EvidenceUrlStatus | null {
+  if (!evidenceUrl || !evidenceUrl.trim()) return null;
+  return isEvidenceUrlVerified(evidenceUrlVerificationRaw) ? "verified" : "evidence_url_unverified";
+}
+
 // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A. Same
 // local-shape-per-stamp convention as HjemmesideVerificationEntry just above
 // (no shared typed FieldProvenance interface anywhere in this codebase — see
@@ -18416,6 +18486,259 @@ router.post("/admin/gardssalg-website-verification-remediation", requireAdmin, a
   }
 });
 
+// ─── POST /api/opplevelser/admin/evidence-url-verification-sweep ────────────
+//
+// dev-request 2026-08-24-evidence-url-verifisering-gate. `experiences.
+// evidence_url` (the citation substantiating that a specific experience/
+// supplier is real) is NEVER independently fetched or checked by the
+// hjemmeside-verification gate above, by content-refresh, or by
+// GET /admin/providers/recently-enriched's spot-check basis — a row can
+// carry an evidence_url that was never actually fetched in the first place
+// (e.g. written "as a template" by a harvest run) and nothing ever detects
+// it. This route is the "actually fetch and check it" half — mirrors the
+// hjemmeside-verification sweep's shape (gardssalg-website-verification.ts /
+// GET+POST .../gardssalg-website-verification-*) one level down: fetch,
+// evidence-match via the SAME gardssalgWebsiteEvidenceMatch (name/place
+// marker) machinery, fail-closed classification, stamp provenance — just for
+// a different field, on a different table (experiences.
+// evidence_url_verification, NEW/additive — see init-experiences.ts).
+//
+// Fetch-integrity: evFetchWithIntegrityGuard() below reuses
+// rfbWdPageReferencesOwnHost (admin-rfb-website-discovery.ts) with the SAME
+// one-sequential-retry-then-reject pattern tryGardssalgCandidateHosts uses
+// above in this file — a proxy/cache returning the wrong site's HTML for
+// this evidence_url must never reach evidence matching.
+//
+// Dry-run (apply omitted/false): zero DB writes, reports the classification
+// every scanned row WOULD get. Apply: read-modify-writes
+// experiences.evidence_url_verification only — `evidence_url` itself is
+// NEVER touched/overwritten (task spec: purely additive, so a revert
+// restores today's missing-behaviour state with no data loss).
+//
+// Selection: explicit `experienceIds` (bounded, always re-checked regardless
+// of current status — the caller asked for these specifically), or
+// auto-select (no experienceIds): rows with a non-blank evidence_url, not
+// merged away (canonical_id IS NULL), NOT already stamped verified:true —
+// an already-confirmed row has nothing left to gain from a re-fetch, so
+// auto-select only ever spends outbound requests on rows still needing one.
+// A row that failed evidence-matching last run stays in the auto-select
+// pool (it is NOT stamped verified:true), so it is retried on the next call
+// — this is deliberate, mirroring the hjemmeside sweep's own re-scan
+// discipline; there is no separate parking mechanism for evidence_url in
+// this slice (non-goal: no retroactive bulk-update tooling beyond the plain
+// coded mechanism).
+const EVIDENCE_URL_VERIFICATION_MAX_ITEMS = 50;
+const EVIDENCE_URL_VERIFICATION_DEFAULT_LIMIT = 25;
+
+interface EvidenceUrlVerificationRow {
+  experience_id: string;
+  evidence_url: string | null;
+  provider_id: string | null;
+  title: string;
+  provider_navn: string | null;
+  org_nr: string | null;
+  kommune: string | null;
+  poststed: string | null;
+  telefon: string | null;
+  mobil: string | null;
+  adresse: string | null;
+  postnummer: string | null;
+}
+
+const EVIDENCE_URL_VERIFICATION_ROW_SQL_COLS = `
+  e.id AS experience_id, e.evidence_url, e.provider_id, e.title,
+  p.navn AS provider_navn, p.org_nr, p.kommune, p.poststed,
+  p.telefon, p.mobil, p.adresse, p.postnummer
+    FROM experiences e
+    LEFT JOIN experience_providers p ON p.id = e.provider_id`;
+
+/**
+ * Fetch ONE evidence_url with the same fetch-integrity guard
+ * tryGardssalgCandidateHosts (above in this file) applies to a producer's
+ * homepage candidates: SSRF-guarded fetch (wdFetchPage), then
+ * rfbWdPageReferencesOwnHost self-reference check; on a miss, exactly ONE
+ * sequential re-fetch of the SAME url, re-checked against its own
+ * (possibly different, on a differing redirect) final host; a second miss
+ * rejects immediately as `fetch_contaminated` rather than falling through
+ * to evidence matching with still-suspect content — never a retry loop.
+ */
+async function evFetchWithIntegrityGuard(
+  url: string,
+): Promise<
+  | { ok: true; html: string; finalUrl: string; host: string }
+  | { ok: false; reason: "fetch_failed" | "fetch_contaminated" }
+> {
+  let page = await wdFetchPage(url);
+  if (!page) return { ok: false, reason: "fetch_failed" };
+  let finalHost = hostFromUrlLike(page.finalUrl) || hostFromUrlLike(url) || "";
+  if (!rfbWdPageReferencesOwnHost(page.html, finalHost)) {
+    const retryPage = await wdFetchPage(url);
+    if (!retryPage) return { ok: false, reason: "fetch_contaminated" };
+    const retryFinalHost = hostFromUrlLike(retryPage.finalUrl) || finalHost;
+    if (!rfbWdPageReferencesOwnHost(retryPage.html, retryFinalHost)) {
+      // Immediate reject — never fall through to evidence matching against
+      // still-contaminated content (mirrors the identical guard at the
+      // tryGardssalgCandidateHosts call site above in this file).
+      return { ok: false, reason: "fetch_contaminated" };
+    }
+    page = retryPage;
+    finalHost = retryFinalHost;
+  }
+  return { ok: true, html: page.html, finalUrl: page.finalUrl, host: finalHost };
+}
+
+router.post("/admin/evidence-url-verification-sweep", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { experienceIds?: unknown; limit?: unknown; apply?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+
+  const expDb = getExpDb("experiences");
+  try {
+    let rows: EvidenceUrlVerificationRow[];
+    if (Array.isArray(body.experienceIds) && body.experienceIds.length > 0) {
+      const ids = (body.experienceIds as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim())
+        .slice(0, EVIDENCE_URL_VERIFICATION_MAX_ITEMS);
+      if (ids.length === 0) {
+        res.status(400).json({ error: "experienceIds must contain at least one non-blank string" });
+        return;
+      }
+      const placeholders = ids.map(() => "?").join(",");
+      rows = expDb
+        .prepare(`SELECT ${EVIDENCE_URL_VERIFICATION_ROW_SQL_COLS} WHERE e.id IN (${placeholders})`)
+        .all(...ids) as EvidenceUrlVerificationRow[];
+    } else {
+      let limit = Number(body.limit);
+      if (!Number.isFinite(limit) || limit <= 0) limit = EVIDENCE_URL_VERIFICATION_DEFAULT_LIMIT;
+      limit = Math.min(EVIDENCE_URL_VERIFICATION_MAX_ITEMS, Math.floor(limit));
+      rows = expDb
+        .prepare(
+          `SELECT ${EVIDENCE_URL_VERIFICATION_ROW_SQL_COLS}
+            WHERE e.evidence_url IS NOT NULL AND TRIM(e.evidence_url) != ''
+              AND e.canonical_id IS NULL
+              AND (e.evidence_url_verification IS NULL
+                   OR e.evidence_url_verification NOT LIKE '%"verified":true%')
+            ORDER BY e.updated_at ASC
+            LIMIT ?`
+        )
+        .all(limit) as EvidenceUrlVerificationRow[];
+    }
+
+    const results: Array<{
+      experience_id: string;
+      provider_id: string | null;
+      evidence_url: string | null;
+      classification: "verified" | "unverified" | "skipped_no_evidence_url";
+      reason?: string;
+    }> = [];
+    let verifiedCount = 0;
+    let unverifiedCount = 0;
+    const checkedAt = new Date().toISOString();
+
+    for (const row of rows) {
+      const evidenceUrl = row.evidence_url && row.evidence_url.trim() ? row.evidence_url.trim() : null;
+      if (!evidenceUrl) {
+        // Explicit-ids path only — auto-select's own WHERE already excludes
+        // this; never a fetch, never a write, never counted toward either
+        // tally.
+        results.push({
+          experience_id: row.experience_id,
+          provider_id: row.provider_id,
+          evidence_url: null,
+          classification: "skipped_no_evidence_url",
+        });
+        continue;
+      }
+
+      const host = hostFromUrlLike(evidenceUrl);
+      let classification: "verified" | "unverified" = "unverified";
+      let reason: string | undefined;
+      let evidence: ReturnType<typeof gardssalgWebsiteEvidenceMatch> | null = null;
+
+      if (host && isDirectoryOrAggregatorHost(host)) {
+        // Funn 4 discipline (gardssalg-website-verification.ts): a
+        // directory/aggregator host is never ownership/existence evidence —
+        // never fetched.
+        reason = "aggregator_host";
+      } else {
+        const fetched = await evFetchWithIntegrityGuard(evidenceUrl);
+        if (!fetched.ok) {
+          reason = fetched.reason;
+        } else {
+          const pageText = gardssalgPageText(fetched.html);
+          const pageTitle = gardssalgPageTitle(fetched.html);
+          const target = {
+            orgNr: row.org_nr,
+            // Provider name preferred (registry-sourced); the experience's
+            // own title is the fallback ONLY when the row is unmatched to a
+            // provider (provider_id null) or the provider join otherwise
+            // came back empty — gardssalgWebsiteEvidenceMatch requires a
+            // non-null navn, and experiences.title is NOT NULL per schema.
+            navn: row.provider_navn || row.title,
+            kommune: row.kommune,
+            poststed: row.poststed,
+            telefon: row.telefon,
+            mobil: row.mobil,
+            adresse: row.adresse,
+            postnummer: row.postnummer,
+          };
+          evidence = gardssalgWebsiteEvidenceMatch(pageText, target, pageTitle);
+          // Strict boolean comparison — same discipline as
+          // gardssalgWebsiteEvidenceMatch's own callers elsewhere in this
+          // file (never a bare truthy check).
+          if (evidence.verified === true) {
+            classification = "verified";
+          } else {
+            reason = "evidence_mismatch";
+          }
+        }
+      }
+
+      if (classification === "verified") verifiedCount++;
+      else unverifiedCount++;
+
+      if (apply) {
+        const entry: Record<string, unknown> = {
+          verified: classification === "verified",
+          classification,
+          checked_at: checkedAt,
+        };
+        if (evidence) entry.evidence = evidence;
+        if (reason) entry.reason = reason;
+        // evidence_url_verification ONLY — evidence_url itself and
+        // updated_at are never touched by this write (additive-only per
+        // spec; leaving updated_at alone also keeps this sweep from
+        // disturbing the unrelated "most recently touched" ordering
+        // GET /admin/providers/recently-enriched's enriched_experiences
+        // window relies on).
+        expDb
+          .prepare(`UPDATE experiences SET evidence_url_verification = ? WHERE id = ?`)
+          .run(JSON.stringify(entry), row.experience_id);
+      }
+
+      results.push({
+        experience_id: row.experience_id,
+        provider_id: row.provider_id,
+        evidence_url: evidenceUrl,
+        classification,
+        ...(reason ? { reason } : {}),
+      });
+    }
+
+    res.json({
+      success: true,
+      dry_run: !apply,
+      scanned: rows.length,
+      verified: verifiedCount,
+      unverified: unverifiedCount,
+      results,
+    });
+  } catch (err) {
+    console.error("[evidence-url-verification-sweep] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/fylke-2024-migration ───────────────────────
 //
 // dev-request 2026-08-07-orch-fylke-2024-migrasjon. Norway's fylke (county)
@@ -19377,7 +19700,7 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
       expRowsStmt = expDb.prepare(
       `SELECT id, title, description, category, subcategory, booking_url,
               content_source, evidence_url, discovery_source,
-              content_field_evidence, updated_at
+              content_field_evidence, evidence_url_verification, updated_at
          FROM experiences
         WHERE provider_id = ?
           AND enrichment_state IN ('enriched', 'verified')
@@ -19504,6 +19827,21 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
           // consumer would have to parse to use and could then disagree with
           // (round-8 review, MINOR 3).
           delete out.content_field_evidence;
+          // AC3 (dev-request 2026-08-24-evidence-url-verifisering-gate): expose
+          // the NEW evidence_url_verification status so the spot-check lane can
+          // choose to exclude/flag unverified-evidence_url rows. Same
+          // convention as content_field_evidence just above — the raw
+          // provenance JSON is an INPUT to this projection, never part of its
+          // output; the derived status is what a consumer actually needs.
+          // Absent (not `null`/`false`) when the row carries no evidence_url at
+          // all — "not applicable" is a different claim than "unverified" (see
+          // deriveEvidenceUrlStatus's own doc comment).
+          const evidenceUrlStatus = deriveEvidenceUrlStatus(
+            typeof row.evidence_url === "string" ? row.evidence_url : null,
+            typeof row.evidence_url_verification === "string" ? row.evidence_url_verification : null,
+          );
+          delete out.evidence_url_verification;
+          if (evidenceUrlStatus) out.evidence_url_status = evidenceUrlStatus;
           let judgeable = 0;
           for (const field of JUDGED_FIELDS) {
             if (out[field] === null || out[field] === undefined || out[field] === "") continue;
