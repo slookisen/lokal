@@ -75,6 +75,7 @@ import { buildGardssalgProvenanceSummary, type ProvenanceSummary } from "./cross
 import { containsMojibake, mojibakeSnippet } from "./search-enrich";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 import { haversineDistanceKm } from "./geocoding-service";
+import { NORWAY_BBOX } from "./geo-distance";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
 // reuse the SAME diacritic-fold/lowercase normaliser findOrgnumberByName's
 // own name-matching already uses, for the poststed EXACT-match comparison in
@@ -785,6 +786,22 @@ export type ExperienceMapPoint = {
   geo_precision: "address" | "kommune";
 };
 
+// ─── Map-marker coordinate sanity gate (Daniel, live sesjon 2026-08-24) ────
+// Both map-point queries below append this. It is a DISPLAY gate only: a row
+// whose stored coordinate cannot be a Norwegian position (0/0 from a failed
+// geocode, a swapped lat/lon pair) keeps its card, its profile page and its
+// search hits — it just gets no marker until the geocode is fixed, because
+// Leaflet's fitBounds() covers the full extent of the marker set and a single
+// null-island point drags the whole map out over the Atlantic (confirmed on
+// prod 2026-08-24: 2 of 165 gårdssalg markers sat at 0/0 off West Africa).
+// Box + rationale: NORWAY_BBOX in services/geo-distance.ts. Inlined as
+// literals rather than bound params because both call sites build their WHERE
+// clause by string concatenation with their own separately-ordered param
+// lists — the numbers come from a frozen const, never from user input.
+const NORWAY_BBOX_SQL = (latCol: string, lonCol: string): string =>
+  ` AND ${latCol} BETWEEN ${NORWAY_BBOX.minLat} AND ${NORWAY_BBOX.maxLat}` +
+  ` AND ${lonCol} BETWEEN ${NORWAY_BBOX.minLon} AND ${NORWAY_BBOX.maxLon}`;
+
 /**
  * Published experiences matching an optional category/fylke/provider filter
  * that ALSO have a real geocode. Reuses browseWhere()/PUBLISH_GATE_SQL
@@ -815,6 +832,7 @@ export function listPublishedExperienceMapPoints(
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE ${sql}
          AND e.loc_lat IS NOT NULL AND e.loc_lon IS NOT NULL AND e.geo_precision IS NOT NULL
+         ${NORWAY_BBOX_SQL("e.loc_lat", "e.loc_lon")}
        ${CARD_ORDER}`
     )
     .all(params) as Array<{
@@ -2850,6 +2868,7 @@ export function listGardssalgProviderMapPoints(filter?: GardssalgProviderTypeFil
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (catalog_hidden IS NULL OR catalog_hidden != 1)
           AND lat IS NOT NULL AND lon IS NOT NULL
+          ${NORWAY_BBOX_SQL("lat", "lon")}
           AND slug IS NOT NULL AND slug != ''${typeFilter.sql}
         ORDER BY navn`
     )

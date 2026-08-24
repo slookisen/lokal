@@ -210,13 +210,19 @@ export function runExperiencesSeoForsideSeksjoneringTests(opts: { log?: boolean 
 
       // ── Change B: dark-launch CTA copy (NO) ────────────────────────────
       assertTrue(homeA.body.includes('id="drikkested"'), "a7: sanity — #drikkested section renders (≥5 providers clears the gate)");
-      assertTrue(homeA.body.includes(">Meld interesse — åpner snart<"), "a8: dark-launch CTA text (NO) renders");
+      // Daniel 2026-08-24, punkt 2: the pre-booking CTA no longer says
+      // «Meld interesse — åpner snart» (it read as "this vertical hasn't
+      // launched" about a live, browsable catalog). Same state machine, new
+      // pre-booking copy: it points at the catalog instead.
+      assertTrue(homeA.body.includes(">Se alle drikkeprodusentene<"), "a8: pre-booking CTA text (NO) renders");
+      assertTrue(!/åpner snart/.test(homeA.body), "a8b: no 'åpner snart' launch promise anywhere on the homepage");
       assertTrue(!homeA.body.includes(">Book besøk &amp; smaking<") && !homeA.body.includes(">Book besøk & smaking<"), "a9: live CTA text (NO) does NOT render in dark-launch state");
 
       // ── Change B: dark-launch CTA copy (EN) ────────────────────────────
       const homeAEn = await callHtmlRoute(A.router, "/", "en");
       assertTrue(homeAEn.handled && homeAEn.status === 200, `a10: GET / (en) renders 200 in dark-launch state (got ${homeAEn.status})`);
-      assertTrue(homeAEn.body.includes(">Register interest — opening soon<"), "a11: dark-launch CTA text (EN) renders");
+      assertTrue(homeAEn.body.includes(">Browse the drink producers<"), "a11: pre-booking CTA text (EN) renders");
+      assertTrue(!/opening soon/i.test(homeAEn.body), "a11b: no 'opening soon' launch promise anywhere on the EN homepage");
       assertTrue(!homeAEn.body.includes(">Book a visit &amp; tasting<") && !homeAEn.body.includes(">Book a visit & tasting<"), "a12: live CTA text (EN) does NOT render in dark-launch state");
 
       // ════════════════════════════════════════════════════════════════
@@ -232,7 +238,7 @@ export function runExperiencesSeoForsideSeksjoneringTests(opts: { log?: boolean 
 
       const homeB = await callHtmlRoute(B.router, "/");
       assertTrue(homeB.handled && homeB.status === 200, `b1: GET / renders 200 (dispatch on, no real bookable provider) (got ${homeB.status})`);
-      assertTrue(homeB.body.includes(">Meld interesse — åpner snart<"), "b2: still dark-launch copy — dispatch on alone is not enough");
+      assertTrue(homeB.body.includes(">Se alle drikkeprodusentene<"), "b2: still pre-booking copy — dispatch on alone is not enough");
       assertTrue(!homeB.body.includes(">Book besøk &amp; smaking<") && !homeB.body.includes(">Book besøk & smaking<"), "b3: live copy does not render just because dispatch is on");
       assertTrue(B.store.countGardssalgProvidersBookable() === 0, "b4: countGardssalgProvidersBookable() excludes the catalog_hidden=1 booking_live=1 row");
 
@@ -254,13 +260,13 @@ export function runExperiencesSeoForsideSeksjoneringTests(opts: { log?: boolean 
       const homeC = await callHtmlRoute(C.router, "/");
       assertTrue(homeC.handled && homeC.status === 200, `c1: GET / renders 200 in live state (got ${homeC.status})`);
       assertTrue(homeC.body.includes(">Book besøk &amp; smaking<") || homeC.body.includes(">Book besøk & smaking<"), "c2: live CTA text (NO) renders");
-      assertTrue(!homeC.body.includes(">Meld interesse — åpner snart<"), "c3: dark-launch CTA text (NO) does NOT render in live state");
+      assertTrue(!homeC.body.includes(">Se alle drikkeprodusentene<"), "c3: pre-booking CTA text (NO) does NOT render in live state");
       assertTrue(C.store.countGardssalgProvidersBookable() === 1, "c4: countGardssalgProvidersBookable() counts exactly the 1 real booking_live=1 provider (hidden row excluded)");
 
       const homeCEn = await callHtmlRoute(C.router, "/", "en");
       assertTrue(homeCEn.handled && homeCEn.status === 200, `c5: GET / (en) renders 200 in live state (got ${homeCEn.status})`);
       assertTrue(homeCEn.body.includes(">Book a visit &amp; tasting<") || homeCEn.body.includes(">Book a visit & tasting<"), "c6: live CTA text (EN) renders");
-      assertTrue(!homeCEn.body.includes(">Register interest — opening soon<"), "c7: dark-launch CTA text (EN) does NOT render in live state");
+      assertTrue(!homeCEn.body.includes(">Browse the drink producers<"), "c7: pre-booking CTA text (EN) does NOT render in live state");
 
       // ── Change A still holds in the live state ─────────────────────────
       const catGridC = sectionSlice(homeC.body, "kategorier");

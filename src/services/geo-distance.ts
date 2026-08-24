@@ -95,3 +95,41 @@ export const KM_PER_DEG_LAT = (Math.PI / 180) * EARTH_RADIUS_KM;
 export function kmPerDegLng(latDeg: number): number {
   return KM_PER_DEG_LAT * Math.cos(toRadians(latDeg));
 }
+
+// ─── Norway coordinate sanity gate ───────────────────────────────────
+// Daniel, live sesjon 2026-08-24 (UX-gjennomgang opplevagent.no, punkt 5):
+// «Kartet burde være zoomet inn på Norge, og vi burde unngå å ha plasseringer
+// utenfor Afrika (mangler sikkert koordinater).»
+//
+// Two producers on prod carried lat=0/lon=0 — "null island" in the Gulf of
+// Guinea, ~5 000 km off the coast of West Africa. Nothing rendered them
+// wrongly; the maps faithfully plotted what the DB held. But Leaflet's
+// fitBounds() covers the FULL extent of the marker set, so those two points
+// alone forced every map that included them to open zoomed out over the
+// Atlantic instead of over Norway.
+//
+// The box below is a plausibility gate, not a precise border: it covers the
+// mainland (57.9–71.2 °N, 4.5–31.1 °E), Svalbard (up to ~81 °N / ~35 °E) and
+// Jan Mayen (~71 °N / −9 °E) with a little slack on every side. It is
+// deliberately coarse — its job is to catch coordinates that CANNOT be
+// Norwegian (0/0 from a failed geocode, a swapped lat/lon pair, a foreign
+// address), never to adjudicate whether a point is on the right side of a
+// fjord.
+export const NORWAY_BBOX = { minLat: 57.0, maxLat: 81.5, minLon: -10.0, maxLon: 36.0 } as const;
+
+/**
+ * True when (lat, lon) could plausibly be a position in Norway. Rejects
+ * non-finite values and 0/0 by construction (lat 0 is far below minLat).
+ * Callers use this to decide whether a stored coordinate is trustworthy
+ * enough to plot — a row that fails it keeps every other surface it has
+ * (card, profile, search); only its map marker is withheld until the geocode
+ * is fixed.
+ */
+export function isPlausibleNorwayCoord(lat: number | null | undefined, lon: number | null | undefined): boolean {
+  if (typeof lat !== "number" || typeof lon !== "number") return false;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+  return (
+    lat >= NORWAY_BBOX.minLat && lat <= NORWAY_BBOX.maxLat &&
+    lon >= NORWAY_BBOX.minLon && lon <= NORWAY_BBOX.maxLon
+  );
+}

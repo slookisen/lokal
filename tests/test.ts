@@ -19849,19 +19849,26 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   assertTrue(badgeSvgP2.body.includes("Finn oss på Opplevagent"),
     "p2-09z-f: badge body includes the 'Finn oss på Opplevagent' copy");
 
-  // p2-10: homepage quick-chip uses the correct full fylke URL (fixes broken link
-  // where /fylke/Troms was 404 in production — DB stores "Troms og Finnmark").
-  // Scoped to the hero "quick" chip row specifically: the homepage's DB-driven
-  // fylke-grid (dev-request 2026-07-04-opplevagent-besokstall-og-forside-friskhet,
-  // item 3) legitimately lists every live fylke incl. this test's seeded "Troms"
-  // row with a correct /fylke/Troms link, so a whole-body check would false-fail
-  // on that unrelated, intentional section.
+  // p2-10: the hero quick-chip row carries NO hardcoded fylke chips.
+  // History: it used to hold "Oslo" + "Troms og Finnmark", and this test
+  // pinned the full canonical /fylke/Troms%20og%20Finnmark href (the DB
+  // stores the full name, so the short /fylke/Troms form 404'd in
+  // production). Daniel 2026-08-24, punkt 1: «vi trenger ikke vise oslo og
+  // troms og finnmark» — both chips are gone from the hero, so what this
+  // block now pins is the absence, plus the fact that fylke links did NOT
+  // disappear from the page: the DB-driven fylke-grid below (p2-10c) is
+  // where they live, and it is still correct.
   const homeChipP2 = invokeSeo("/", {}, "/");
   const quickRowP2 = (homeChipP2.body.match(/<div class="quick"[\s\S]*?<\/div>/) || [""])[0];
-  assertTrue(quickRowP2.includes('href="/fylke/Troms%20og%20Finnmark"'),
-    "p2-10a: homepage quick-chip links to /fylke/Troms%20og%20Finnmark (full canonical name)");
+  assertTrue(quickRowP2.length > 0, "p2-10a-pre: sanity — the hero quick-chip row is present");
+  assertTrue(!/href="\/fylke\//.test(quickRowP2),
+    "p2-10a: hero quick-chip row carries no hardcoded fylke chips at all");
   assertTrue(!/href="\/fylke\/Troms"/.test(quickRowP2),
     "p2-10b: homepage hero quick-chip row does NOT contain the stale /fylke/Troms short-form href");
+  // The «Nær meg» control moved INTO that same row (one row of controls
+  // under the search box instead of three stacked ones).
+  assertTrue(quickRowP2.includes('id="homeGeoBtn"'),
+    "p2-10a2: the «Nær meg» control now sits inside the hero quick-chip row");
 
   // p2-10c/d (dev-request 2026-07-04-opplevagent-besokstall-og-forside-friskhet,
   // item 3): homepage fylke-grid + top-10 kommuner chips — DB-driven, no new
@@ -20421,6 +20428,29 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   dbKG.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ?, catalog_hidden = 1 WHERE id = ?")
     .run("destilleri", "high", provHiddenId);
 
+  // Daniel 2026-08-24, punkt 5: "null island" (lat 0 / lon 0) — exactly the
+  // two rows found on prod, which put a 2-marker cluster in the Gulf of
+  // Guinea and forced the map's fitBounds() to open over the Atlantic
+  // instead of Norway. The producer is real; only its coordinate is not, so
+  // it must keep its card and lose only its marker.
+  const provNullIslandId = expStoreKG.createProvider({
+    navn: "Nulløya Bryggeri", org_nr: "912345676",
+    fylke: "Viken", kommune: "Hvaler", poststed: "Hvaler",
+    lat: 0, lon: 0, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKG.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("bryggeri", "approximate", provNullIslandId);
+
+  // Same gate, second shape: a swapped lat/lon pair (Oslo's 59.91/10.75 read
+  // the wrong way round lands in the Gulf of Guinea too).
+  const provSwappedId = expStoreKG.createProvider({
+    navn: "Speilvendt Destilleri", org_nr: "912345677",
+    fylke: "Oslo", kommune: "Oslo", poststed: "Oslo",
+    lat: 10.75, lon: 59.91, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  dbKG.prepare("UPDATE experience_providers SET producer_type = ?, geocode_confidence = ? WHERE id = ?")
+    .run("destilleri", "high", provSwappedId);
+
   expStoreKG.backfillProviderSlugs();
   const allProviders = expStoreKG.listGardssalgProviders(100, 0);
   const exactSlug = allProviders.find((p) => p.id === provExactId)!.slug as string;
@@ -20430,7 +20460,7 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   // kg-store-01: listGardssalgProviderMapPoints() query correctness.
   const mapPointsKG = expStoreKG.listGardssalgProviderMapPoints();
   const mapSlugsKG = mapPointsKG.map((p) => p.slug).sort();
-  assertEq(mapSlugsKG.length, 3, "kg-store-01a: exactly 3 producers have coordinates (no-geo + hidden excluded)");
+  assertEq(mapSlugsKG.length, 3, "kg-store-01a: exactly 3 producers have plottable coordinates (no-geo + hidden + implausible excluded)");
   assertEq(
     JSON.stringify(mapSlugsKG),
     JSON.stringify([exactSlug, approxSlug, unknownConfSlug].sort()),
@@ -20441,6 +20471,20 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   const hiddenSlugKG = (dbKG.prepare("SELECT slug FROM experience_providers WHERE id = ?").get(provHiddenId) as any).slug;
   assertTrue(!mapSlugsKG.includes(hiddenSlugKG),
     "kg-store-01d: the catalog_hidden producer never appears in the map points, even though it has coordinates");
+  // kg-store-02 (Daniel 2026-08-24, punkt 5): coordinates outside the Norway
+  // plausibility box never become markers, whichever way they are wrong.
+  const nullIslandSlugKG = allProviders.find((p) => p.id === provNullIslandId)!.slug as string;
+  const swappedSlugKG = allProviders.find((p) => p.id === provSwappedId)!.slug as string;
+  assertTrue(!mapSlugsKG.includes(nullIslandSlugKG),
+    "kg-store-02a: a lat 0 / lon 0 producer never reaches the map points");
+  assertTrue(!mapSlugsKG.includes(swappedSlugKG),
+    "kg-store-02b: a swapped lat/lon producer never reaches the map points");
+  assertTrue(
+    expStoreKG.listGardssalgProviders(100, 0).some((p) => p.id === provNullIslandId) &&
+    expStoreKG.listGardssalgProviders(100, 0).some((p) => p.id === provSwappedId),
+    "kg-store-02c: both keep their catalog rows — the gate withholds a marker, it does not delist a producer"
+  );
+
   const exactPointKG = mapPointsKG.find((p) => p.slug === exactSlug)!;
   assertEq(exactPointKG.geocode_confidence, "high", "kg-store-01e: geocode_confidence is returned verbatim, never fabricated");
   assertEq(exactPointKG.lat, 61.11, "kg-store-01f: marker carries the real lat");
@@ -20493,9 +20537,17 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   assertTrue(!!dataMatchKG, "kg-03a: data island is present and matchable");
   const markersKG: Array<{ slug: string; navn: string; producerTypeLabel: string | null; sted: string | null; lat: number; lon: number; approx: boolean }> =
     dataMatchKG ? JSON.parse(dataMatchKG[1]) : [];
-  assertEq(markersKG.length, 3, "kg-03b: exactly 3 markers (no-geo + hidden excluded)");
+  assertEq(markersKG.length, 3, "kg-03b: exactly 3 markers (no-geo + hidden + the 2 implausible-coordinate rows excluded)");
   assertTrue(!markersKG.some((m) => m.navn === "Ugeokodet Vingård"), "kg-03c: not-yet-geocoded producer never appears on the map");
   assertTrue(!markersKG.some((m) => m.navn === "Skjult Destilleri"), "kg-03d: catalog_hidden producer never appears on the map");
+  assertTrue(!markersKG.some((m) => m.navn === "Nulløya Bryggeri" || m.navn === "Speilvendt Destilleri"),
+    "kg-03e: implausible coordinates never appear on the map (Daniel 2026-08-24, punkt 5)");
+  assertTrue(gardKG.body.includes("Nulløya Bryggeri") && gardKG.body.includes("Speilvendt Destilleri"),
+    "kg-03f: …but both producers still show in the card grid — only the marker is withheld");
+  assertTrue(
+    markersKG.every((m) => m.lat >= 57 && m.lat <= 81.5 && m.lon >= -10 && m.lon <= 36),
+    "kg-03g: every rendered marker sits inside the Norway plausibility box, so fitBounds() frames Norway"
+  );
 
   // kg-04: geocode_confidence -> marker precision, never fabricated/leaked.
   const exactMarkerKG = markersKG.find((m) => m.slug === exactSlug)!;
@@ -20513,6 +20565,17 @@ console.log("\n── opplevagent kart-gardssalg: /kategori/gardssalg Leaflet ma
   assertEq(profileKG.status, 200, "kg-05a: the exact marker's slug resolves to a real, live produsent-profil page");
   const profileApproxKG = invokeSeo("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: approxSlug }, `/kategori/gardssalg/produsent/${approxSlug}`);
   assertEq(profileApproxKG.status, 200, "kg-05b: the approx marker's slug ALSO resolves to a real, live produsent-profil page");
+
+  // kg-05c/d (Daniel 2026-08-24, punkt 5): the same coordinate gate applies to
+  // the single-point mini-map on a producer's own profile — a 0/0 row must
+  // fall back to "posisjon ikke registrert", never render a mini-map of the
+  // Atlantic and label it as this producer's location.
+  const profileNullIslandKG = invokeSeo("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: nullIslandSlugKG }, `/kategori/gardssalg/produsent/${nullIslandSlugKG}`);
+  assertEq(profileNullIslandKG.status, 200, "kg-05c: a producer with an implausible coordinate still has a live profile page");
+  assertTrue(profileNullIslandKG.body.includes("Nøyaktig posisjon er ikke registrert ennå."),
+    "kg-05d: …and its profile shows the honest no-position fallback instead of a mini-map");
+  assertTrue(!profileNullIslandKG.body.includes('id="mini-map"'),
+    "kg-05e: …with no mini-map container at all");
 
   // kg-06: lazy-init discipline (same as the fylke map).
   assertTrue(!/<script src="\/leaflet\/leaflet\.js"/.test(gardKG.body),
