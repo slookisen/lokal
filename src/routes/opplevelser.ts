@@ -135,6 +135,11 @@ import {
   applyGardssalgProviderOrgnr,
   getGardssalgOrgnrWriteBlocker,
   gardssalgOrgnrAutoWriteEligible,
+  // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2
+  // — the heuristic-derived-candidate corroboration veto below calls this
+  // directly (postnummer OR poststed, unlike the base chain's own narrower
+  // postnummer-only stripped-name check, left untouched for byte-parity).
+  gardssalgOrgnrPostalCorroborated,
   upsertGardssalgOrgnrReviewQueue,
   clearGardssalgOrgnrReviewQueueEntry,
   listGardssalgOrgnrReviewQueue,
@@ -576,7 +581,20 @@ import { isMatchableDomain } from "../services/gardssalg-rfb-enrich";
 // (same normalization scoreNameMatch itself uses internally for its
 // first-token tier, re-exposed here so the audit route can pre-bucket rows
 // instead of comparing every row against every other row).
-import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch, normaliseName } from "../services/brreg-client";
+import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch, normaliseName, type BrregHit } from "../services/brreg-client";
+// dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2 —
+// two already-reviewed org-nr candidate-generation heuristics (PR #679,
+// admin-rfb-brreg-selfsufficiency.ts) reused verbatim by the gårdssalg
+// org-nr backfill route below, plus the local vendored Lokalmat/Debio
+// candidate lookup (services/local-orgnr-candidates.ts) those heuristics
+// try first. Nothing here is reimplemented — see the route's own doc
+// comment for the exact wiring.
+import {
+  domainTokenCandidateName,
+  pickDomainSourceForTarget,
+  looksLikePersonalName,
+} from "./admin-rfb-brreg-selfsufficiency";
+import { findLocalOrgnrCandidate } from "../services/local-orgnr-candidates";
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter — kommune→fylke best-effort
 // ved landing av nye NACE-oppdagede providere.
 import { cityToFylke } from "../services/norway-fylke";
@@ -9603,6 +9621,40 @@ router.post("/admin/gardssalg-producer-type-classify", requireAdmin, async (req:
 // `unresolved` in this response (reason "needs_human_review" or
 // "no_brreg_candidate").
 //
+// dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 2 —
+// when the base Brreg name-search above finds NOTHING, two ADDITIONAL,
+// already-reviewed candidate-generation heuristics are tried before giving
+// up (mirrors PR #679's resolveOrgNrForTarget, admin-rfb-brreg-
+// selfsufficiency.ts, which added the SAME two heuristics for the RFB-side
+// agents_org_nr_review_queue — reused here verbatim, not reimplemented):
+//   1. domain-token-as-company-name: pickDomainSourceForTarget picks the
+//      provider's own hjemmeside (skipping directory/social/platform
+//      hosts), domainTokenCandidateName derives a company-name candidate
+//      from it (e.g. "torgersenmat.no" -> "Torgersen").
+//   2. personal-name-ENK: only when the (possibly display-suffix-stripped)
+//      search name looks like a 1-2-token personal name
+//      (looksLikePersonalName) — tries "<name> ENK".
+// Each heuristic tries the local vendored Lokalmat/Debio candidate file
+// first (findLocalOrgnrCandidate, services/local-orgnr-candidates.ts, with
+// its additive kommuneFilter:true option to cut false ties down to the
+// provider's own postal region), falling back to a live Brreg name-search
+// only if the local file has nothing. EVERY hit — base or heuristic, local
+// or live — funnels through the EXACT SAME veto chain
+// (evaluateGardssalgOrgnrCandidateVetoChain below: ambiguous exact-name
+// ties -> forced corroboration -> previously-rolled-back ->
+// gardssalgOrgnrAutoWriteEligible -> live verifyOrgNumber liveness) and the
+// EXACT SAME write path (applyGardssalgProviderOrgnr) as the base chain
+// always has — never a new write path. A heuristic-derived hit additionally
+// ALWAYS requires postal/poststed corroboration
+// (gardssalgOrgnrPostalCorroborated) before it can be eligible, regardless
+// of what gardssalgOrgnrAutoWriteEligible's own confidence check would
+// otherwise allow — same "we derived this name ourselves" reasoning the
+// base chain's own nameWasStripped veto already applies, just unconditional
+// (a heuristic name is NEVER Brreg's own registered display name) and via
+// the fuller postnummer-OR-poststed check rather than the base chain's
+// narrower postnummer-only comparison (which is left untouched, byte-for-
+// byte, for base-search regression safety).
+//
 // Body: { providerIds?: string[], limit?: number, apply?: boolean }. Same
 // dry-run-by-default convention, providerIds de-dup-before-limit, and
 // hard-cap-at-48 convention as every other gårdssalg admin route in this
@@ -9612,6 +9664,126 @@ router.post("/admin/gardssalg-producer-type-classify", requireAdmin, async (req:
 
 const GS_OB_DEFAULT_LIMIT = 48;
 const GS_OB_HARD_CAP = 48; // there are only 74 gårdssalg providers total
+
+/**
+ * Tries ONE candidate-generation strategy's search name against the local
+ * vendored Lokalmat/Debio file first (kommune-region-prefiltered). Only
+ * SHORT-CIRCUITS to that local hit when it's already the exact-match tier
+ * (confidence >= 1.0) — anything weaker (findLocalOrgnrCandidate's own floor
+ * is 0.9) still ALSO tries a live Brreg name-search for the same name, and
+ * whichever of the two scores higher wins (local wins ties, since it's the
+ * cheaper source — never queried again once picked). Mirrors
+ * resolveOrgNrForTarget's own local-vs-live comparison exactly
+ * (admin-rfb-brreg-selfsufficiency.ts, PR #679) — a sub-1.0 local hit must
+ * never silently shadow a cleaner live exact match. Returns null when
+ * neither source finds anything — callers should treat that exactly like
+ * "this strategy found no candidate", never an error. `liveSourceType` tags
+ * a LIVE hit; a LOCAL hit is instead tagged from the hit's own
+ * `local_source` (local_json_lokalmat / local_json_debio) — this is
+ * deliberately reachable in THIS route (unlike PR #679's own version of
+ * this idea, which always keeps its fixed heuristic tag even for a local
+ * hit): the base chain here never calls findLocalOrgnrCandidate at all (see
+ * the route's own byte-parity requirement), so local_json_* can only ever
+ * be observed via a heuristic attempt, and collapsing it into the fixed
+ * heuristic tag would make that source type unreachable/unobservable.
+ */
+async function gardssalgOrgnrHeuristicLookup(
+  name: string,
+  postnummer: string | null,
+  liveSourceType: string,
+): Promise<{ hit: BrregHit; sourceType: string } | null> {
+  const localHit = findLocalOrgnrCandidate(name, postnummer, { kommuneFilter: true });
+  // Only short-circuit to the local hit when it's ALREADY the exact-match
+  // tier (1.0) — a sub-1.0 local hit (findLocalOrgnrCandidate's own floor is
+  // 0.9) must not unconditionally shadow a better, cleaner live Brreg match
+  // for the same derived name. Mirrors resolveOrgNrForTarget's own
+  // local-vs-live comparison (admin-rfb-brreg-selfsufficiency.ts, PR #679) —
+  // "local first ONLY when it's already as good as it can get, live
+  // fallback + higher-confidence-wins otherwise" — byte-for-byte the same
+  // shape, not reimplemented from scratch.
+  if (localHit && localHit.confidence >= 1.0) {
+    return { hit: localHit, sourceType: `local_json_${localHit.local_source}` };
+  }
+  const liveHit = await findOrgnumberByName(name, postnummer);
+  if (liveHit && (!localHit || liveHit.confidence > localHit.confidence)) {
+    return { hit: liveHit, sourceType: liveSourceType };
+  }
+  if (localHit) {
+    return { hit: localHit, sourceType: `local_json_${localHit.local_source}` };
+  }
+  return null;
+}
+
+/**
+ * Runs the two heuristics in order (domain-token, then personal-name-ENK),
+ * stopping at the first that produces ANY hit. Only ever called when the
+ * base Brreg name-search already found nothing — see the route body below.
+ */
+async function resolveGardssalgOrgnrHeuristicHit(
+  t: GardssalgOrgnrBackfillTarget,
+  searchName: string,
+): Promise<{ hit: BrregHit; sourceType: string } | null> {
+  const domainSource = pickDomainSourceForTarget({ website: t.hjemmeside, url: null });
+  const domainToken = domainSource ? domainTokenCandidateName(domainSource) : null;
+  if (domainToken) {
+    const found = await gardssalgOrgnrHeuristicLookup(domainToken, t.postnummer, "domain_token_name_match");
+    if (found) return found;
+  }
+  if (looksLikePersonalName(searchName)) {
+    const found = await gardssalgOrgnrHeuristicLookup(`${searchName} ENK`, t.postnummer, "personal_name_enk_match");
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * The SINGLE veto-chain code path every org_nr candidate this route ever
+ * produces — base Brreg name-search hit, domain-token heuristic hit, or
+ * personal-name-ENK heuristic hit — funnels through, so there is exactly
+ * one place this logic can drift, not three. `corroborationVeto` is the
+ * reason string to veto with IF `gardssalgOrgnrPostalCorroborated`-shaped
+ * corroboration is required and missing for THIS candidate — the caller
+ * decides both whether corroboration is required and which check/reason to
+ * use (the base chain's own narrower postnummer-only stripped-name check,
+ * left byte-identical to before this change, vs. a heuristic hit's fuller,
+ * always-required postnummer-OR-poststed check) — this function only ever
+ * consumes that pre-computed veto, in the same relative ORDER the original
+ * single-attempt version of this route always checked it (ambiguous ties
+ * first, then the corroboration veto, then previously-rolled-back, then the
+ * liveness check gated on auto-write-eligibility).
+ */
+async function evaluateGardssalgOrgnrCandidateVetoChain(
+  providerId: string,
+  t: GardssalgOrgnrBackfillTarget,
+  hit: BrregHit,
+  corroborationVeto: string | null,
+): Promise<string | null> {
+  let vetoReason: string | null = null;
+  if ((hit.exact_ties ?? (hit.confidence === 1.0 ? 1 : 0)) > 1) {
+    vetoReason = "ambiguous_exact_name_ties";
+  } else if (corroborationVeto) {
+    vetoReason = corroborationVeto;
+  } else {
+    let rolledBack = false;
+    try {
+      rolledBack = gardssalgOrgnrWasRolledBack(providerId);
+    } catch {
+      rolledBack = false;
+    }
+    if (rolledBack) vetoReason = "previously_rolled_back";
+  }
+  if (!vetoReason && gardssalgOrgnrAutoWriteEligible(t, hit)) {
+    // Liveness LAST (one extra Brreg call, cached): an exact-name match to
+    // a bankrupt/deregistered org must not claim the row.
+    try {
+      const ver = await verifyOrgNumber(hit.orgnumber);
+      if (!ver.exists || !ver.active) vetoReason = "brreg_not_active";
+    } catch {
+      vetoReason = "brreg_verify_failed";
+    }
+  }
+  return vetoReason;
+}
 
 router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
@@ -9647,7 +9819,7 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
   }
 
   let scanned = 0;
-  const changed: Array<{ provider_id: string; org_nr: string; source_url: string }> = [];
+  const changed: Array<{ provider_id: string; org_nr: string; source_url: string; candidate_source: string }> = [];
   const skippedLocked: string[] = [];
   const unresolved: Array<{ provider_id: string; reason: string }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
@@ -9674,12 +9846,51 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
     const searchName = gardssalgSearchName(t.navn);
     const nameWasStripped = searchName !== t.navn.replace(/\s+/g, " ").trim();
 
-    let hit: Awaited<ReturnType<typeof findOrgnumberByName>>;
+    let hit: BrregHit | null;
     try {
       hit = await findOrgnumberByName(searchName, t.postnummer);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
       continue;
+    }
+
+    let sourceType = "brreg_name_search";
+    let corroborationVeto: string | null = null;
+
+    if (hit) {
+      // The name we searched is OUR truncation of the display name — demand
+      // the strongest corroboration channel (exact postnummer) before
+      // trusting a match against a name we ourselves shortened. Byte-
+      // identical to the original single-attempt version of this check —
+      // base-search regression safety.
+      if (nameWasStripped && !(t.postnummer && hit.brreg_postal && t.postnummer.trim() === hit.brreg_postal.trim())) {
+        corroborationVeto = "stripped_name_requires_postal_match";
+      }
+    } else {
+      // Base Brreg name-search found NOTHING — try the two heuristics,
+      // stopping at the first that produces ANY hit, before giving up
+      // (dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling,
+      // item 2). Same try/catch discipline as the base search above: a
+      // genuine network failure surfaces via errors[], never a silent miss.
+      let heuristic: { hit: BrregHit; sourceType: string } | null;
+      try {
+        heuristic = await resolveGardssalgOrgnrHeuristicHit(t, searchName);
+      } catch (e: any) {
+        errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+        continue;
+      }
+      if (heuristic) {
+        hit = heuristic.hit;
+        sourceType = heuristic.sourceType;
+        // A heuristic-derived name is ALWAYS self-guessed (a domain token,
+        // or a personal name we ourselves appended "ENK" to) — never
+        // Brreg's own registered display name. Same "we derived this
+        // ourselves" reasoning as nameWasStripped above, but unconditional
+        // and via the fuller postnummer-OR-poststed corroboration check.
+        if (!gardssalgOrgnrPostalCorroborated(t, hit)) {
+          corroborationVeto = "heuristic_name_requires_postal_match";
+        }
+      }
     }
     scanned++;
 
@@ -9692,45 +9903,16 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
         candidate_name: null,
         candidate_confidence: null,
         candidate_address: null,
+        candidate_source: null,
         reason: "no_brreg_candidate",
       });
       continue;
     }
 
-    // ── Write-bar veto chain (integration review B1/M3/M5) — each veto is a
-    // review-queue outcome, never a write. Order: cheapest checks first.
-    let vetoReason: string | null = null;
-    if ((hit.exact_ties ?? (hit.confidence === 1.0 ? 1 : 0)) > 1) {
-      // ≥2 exact-name hits in one response (ENK vs AS with the same pruned
-      // name, bankrupt predecessor + successor, …): which one wins is
-      // response-order luck — structurally ambiguous, a human must pick.
-      vetoReason = "ambiguous_exact_name_ties";
-    } else if (nameWasStripped && !(t.postnummer && hit.brreg_postal && t.postnummer.trim() === hit.brreg_postal.trim())) {
-      // The name we searched is OUR truncation of the display name — demand
-      // the strongest corroboration channel (exact postnummer) before
-      // trusting a match against a name we ourselves shortened.
-      vetoReason = "stripped_name_requires_postal_match";
-    } else {
-      // A human deliberately rolled this provider's org_nr back — the same
-      // deterministic Brreg answer must not silently re-apply it. The audit
-      // lookup itself is best-effort (an audit-storage failure must surface
-      // through the WRITE path's own error handling, not turn this read
-      // into a request-killing 500).
-      let rolledBack = false;
-      try { rolledBack = gardssalgOrgnrWasRolledBack(providerId); } catch { rolledBack = false; }
-      if (rolledBack) vetoReason = "previously_rolled_back";
-    }
-    if (!vetoReason && gardssalgOrgnrAutoWriteEligible(t, hit)) {
-      // Liveness LAST (one extra Brreg call, cached): an exact-name match to
-      // a bankrupt/deregistered org must not claim the row — the successor
-      // entity case is exactly the wrong-identity write Daniel's rule bans.
-      try {
-        const ver = await verifyOrgNumber(hit.orgnumber);
-        if (!ver.exists || !ver.active) vetoReason = "brreg_not_active";
-      } catch {
-        vetoReason = "brreg_verify_failed";
-      }
-    }
+    // ── Write-bar veto chain (integration review B1/M3/M5; item 2 above
+    // extended this to be the ONE code path every candidate source funnels
+    // through) — each veto is a review-queue outcome, never a write.
+    const vetoReason = await evaluateGardssalgOrgnrCandidateVetoChain(providerId, t, hit, corroborationVeto);
     if (vetoReason) {
       unresolved.push({ provider_id: providerId, reason: vetoReason });
       upsertGardssalgOrgnrReviewQueue({
@@ -9740,6 +9922,7 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
         candidate_name: hit.name,
         candidate_confidence: hit.confidence,
         candidate_address: hit.address,
+        candidate_source: sourceType,
         reason: vetoReason,
       });
       continue;
@@ -9754,20 +9937,27 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
         candidate_name: hit.name,
         candidate_confidence: hit.confidence,
         candidate_address: hit.address,
+        candidate_source: sourceType,
         reason: "needs_human_review",
       });
       continue;
     }
 
-    const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(hit.orgnumber)}`;
+    // Local-JSON hits get their own evidence-URL scheme (mirrors PR #679's
+    // own local-json:// convention) — there is no live Brreg search-result
+    // URL for a candidate that was never actually looked up over the
+    // network.
+    const evidenceUrl = sourceType.startsWith("local_json_")
+      ? `local-json://${sourceType.slice("local_json_".length)}/${encodeURIComponent(hit.orgnumber)}`
+      : `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(hit.orgnumber)}`;
 
     if (dryRun) {
-      changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl });
+      changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl, candidate_source: sourceType });
     } else {
       try {
         const written = applyGardssalgProviderOrgnr(providerId, hit.orgnumber, evidenceUrl);
         if (written.length > 0) {
-          changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl });
+          changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl, candidate_source: sourceType });
           // A confirmed, applied write supersedes any stale review-queue
           // entry an earlier run may have left for this provider.
           clearGardssalgOrgnrReviewQueueEntry(providerId);
