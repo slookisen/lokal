@@ -214,12 +214,17 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
   const prevHeadlessFallbackEnabled = process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
+  const prevBraveApiKey = process.env.BRAVE_API_KEY;
+  const prevBraveSearchApiKey = process.env.BRAVE_SEARCH_API_KEY;
   const prevFetch = globalThis.fetch;
   // Hoisted so `finally` (a sibling block scope of `try`) can still reach it
   // to reset the render-page injection point back to null even if an
   // assertion throws mid-suite.
   let setRfbWdRenderPageImplForTesting:
     | typeof import("../routes/admin-rfb-website-discovery")["__setRfbWdRenderPageImplForTesting"]
+    | undefined;
+  let setRfbWdSearchForTesting:
+    | typeof import("../routes/admin-rfb-website-discovery")["__setRfbWdSearchForTesting"]
     | undefined;
 
   const testDb = new Database(":memory:");
@@ -259,10 +264,12 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       RFB_WD_AUTO_APPROVE_BATCH_CAP,
       rfbWebsiteHostExclusionReason,
       __setRfbWdRenderPageImplForTesting,
+      __setRfbWdSearchForTesting,
       evaluateRfbWebsiteCandidate,
       rfbWdExistingWebsiteHosts,
     } = routeModule;
     setRfbWdRenderPageImplForTesting = __setRfbWdRenderPageImplForTesting;
+    setRfbWdSearchForTesting = __setRfbWdSearchForTesting;
 
     function getHandler(method: "get" | "post", path: string) {
       const layer = routerModule.stack.find(
@@ -1630,6 +1637,128 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       assertEq(fetchCalls.length, fetchCallsBefore, "ac3: zero fetch calls when the agent already has a website");
       assertTrue(!readQueueRow("eval-ac3"), "ac3: nothing queued for an agent that already has a website");
     }
+
+    // ── (s) tier-2 (Brave Search) fallback leg ───────────────────────────
+    // dev-requests/2026-08-24-... (Grep 2, this slice): mirrors
+    // admin-dental-hjemmeside-discovery.test.ts's own (q) block idioms —
+    // a FIFO queue of BraveResult[] fed through __setRfbWdSearchForTesting,
+    // never touching the network. Every clinic^H^H^Hproducer below has NO
+    // fixture registered for any of its tier-1 name-guessed hosts, so tier 1
+    // always misses first (fetch_failed:http_404) — tier 2 is what's under
+    // test.
+    {
+      const { gardssalgWebsiteCandidateHosts } = require("../services/experience-store") as
+        typeof import("../services/experience-store");
+      const searchCalls: string[] = [];
+      const searchResponseQueue: Array<Array<{ title: string; url: string; description: string }>> = [];
+      setRfbWdSearchForTesting!(async (query: string) => {
+        searchCalls.push(query);
+        const next = searchResponseQueue.shift();
+        if (next === undefined) return [];
+        return next;
+      });
+
+      // (s1) tier 1 exhausted (no fixtures for any guessed host) + tier-2
+      // mock returns a hit that verifies via org_nr on the (stubbed) page ->
+      // proposed, search_attempted:true, winning host is the SEARCH result's
+      // host, not a tier-1 name-guessed one.
+      insertAgent({ id: "wd-s1", name: "Uoppdaget Gardsprodukter AS", orgNr: "977100001", city: "Bodø" });
+      fixtures.set(
+        "https://faktiskhjemmeside.no",
+        htmlResponse("<html><body>Uoppdaget Gardsprodukter — org.nr 977 100 001</body></html>", {
+          finalUrl: "https://faktiskhjemmeside.no",
+        }),
+      );
+      searchResponseQueue.push([
+        { title: "Uoppdaget Gardsprodukter", url: "https://faktiskhjemmeside.no", description: "Gardsprodukter fra Bodø" },
+      ]);
+
+      const rS1 = await callDiscovery({ agentIds: ["wd-s1"] });
+      assertEq(rS1.body.proposed.length, 1, "s1a: proposed via tier 2 after tier 1 exhausted");
+      const propS1 = rS1.body.proposed[0];
+      assertEq(propS1.agent_id, "wd-s1", "s1b: proposal is for the right agent");
+      assertEq(propS1.candidate_url, "https://faktiskhjemmeside.no", "s1c: winning host is the SEARCH result's host, not a tier-1 name-guess");
+      assertTrue(
+        !gardssalgWebsiteCandidateHosts("Uoppdaget Gardsprodukter AS").some((h) => propS1.candidate_url.includes(h)),
+        "s1d: the winning host is not among tier 1's own name-guessed candidates",
+      );
+      assertEq(propS1.evidence.org_nr_found, true, "s1e: verified via org_nr, same evidence contract as tier 1");
+      assertEq(propS1.search_attempted, true, "s1f: search_attempted:true on a row where tier 2 actually ran");
+      {
+        const row = readQueueRow("wd-s1");
+        assertTrue(!!row, "s1g: a queue row was inserted");
+        assertEq(row.candidate_url, "https://faktiskhjemmeside.no", "s1h: queue row candidate_url is the search-discovered host");
+      }
+
+      // (s2) tier 1 finds a hit directly -> tier-2 mock is NEVER called
+      // (proves the gate is "only when tier 1 exhausted", not "always run").
+      insertAgent({ id: "wd-s2", name: "Nordvik Gardsysteri AS", orgNr: "977100002", city: "Namsos" });
+      fixtures.set(
+        "https://nordvikgardsysteri.no",
+        htmlResponse("<html><body>Nordvik Gardsysteri — org.nr 977 100 002</body></html>", {
+          finalUrl: "https://nordvikgardsysteri.no",
+        }),
+      );
+      const searchCallsBeforeS2 = searchCalls.length;
+
+      const rS2 = await callDiscovery({ agentIds: ["wd-s2"] });
+      assertEq(rS2.body.proposed.length, 1, "s2a: proposed via tier 1 directly");
+      assertEq(rS2.body.proposed[0].candidate_url, "https://nordvikgardsysteri.no", "s2b: winning host is tier 1's own guessed host");
+      assertEq(rS2.body.proposed[0].search_attempted, false, "s2c: search_attempted:false — tier 2 never ran");
+      assertEq(searchCalls.length, searchCallsBeforeS2, "s2d: zero NEW search calls recorded — tier 2 was never invoked");
+
+      // (s3) no key/override configured (override reset to null, Brave env
+      // vars unset) -> route behaves exactly as before this change
+      // (tier-1-only), no error, search_attempted === false — proves the
+      // silent-skip contract.
+      setRfbWdSearchForTesting!(null);
+      delete process.env.BRAVE_API_KEY;
+      delete process.env.BRAVE_SEARCH_API_KEY;
+      const searchCallsBeforeS3 = searchCalls.length;
+      insertAgent({ id: "wd-s3", name: "Uskrevet Gardsbutikk AS", orgNr: "977100003", city: "Alta" });
+      // No fixtures for any of this producer's tier-1 candidate hosts — the
+      // stub fetch falls through to notFoundResponse() (HTTP 404) for every
+      // one, exactly as (c2) above.
+
+      const rS3 = await callDiscovery({ agentIds: ["wd-s3"] });
+      assertEq(rS3.body.proposed.length, 0, "s3a: nothing proposed — unwired tier 2 changes nothing about tier 1's own outcome");
+      assertEq(rS3.body.rejected.length, 1, "s3b: one rejection, exactly as tier-1-only behaviour before this change");
+      assertEq(rS3.body.rejected[0].reason, "fetch_failed:http_404", "s3c: rejection reason is tier 1's own, unaffected by tier 2");
+      assertEq(rS3.body.rejected[0].search_attempted, false, "s3d: search_attempted === false — the silent-skip contract");
+      assertEq(searchCalls.length, searchCallsBeforeS3, "s3e: zero search calls — tier 2 never even attempted with no key/override");
+      assertTrue(!readQueueRow("wd-s3"), "s3f: nothing queued");
+
+      // (s4) tier-2 mock THROWS (simulated Brave API failure) -> the row is
+      // rejected exactly as it would be today (no candidate found via tier
+      // 2), NOT a 500 from the route — proves the fail-soft/no-retry
+      // contract. A second row in the SAME batch (a normal tier-1 hit)
+      // proves the rest of the batch still completes.
+      setRfbWdSearchForTesting!(async (query: string) => {
+        searchCalls.push(query);
+        throw new Error("simulated Brave API failure");
+      });
+      insertAgent({ id: "wd-s4", name: "Feilsoek Gardsvarer AS", orgNr: "977100004", city: "Tromsø" });
+      insertAgent({ id: "wd-s4b", name: "Solvik Gardsysteri AS", orgNr: "977100005", city: "Kirkenes" });
+      fixtures.set(
+        "https://solvikgardsysteri.no",
+        htmlResponse("<html><body>Solvik Gardsysteri — org.nr 977 100 005</body></html>", {
+          finalUrl: "https://solvikgardsysteri.no",
+        }),
+      );
+
+      const rS4 = await callDiscovery({ agentIds: ["wd-s4", "wd-s4b"] });
+      assertEq(rS4.status, 200, "s4a: a thrown search call never propagates as a 500 — the route still answers 200");
+      const rejS4 = rS4.body.rejected.find((r: any) => r.agent_id === "wd-s4");
+      assertTrue(!!rejS4, "s4b: wd-s4 is rejected (tier 2 threw, found nothing) rather than erroring the whole call");
+      assertEq(rejS4?.reason, "fetch_failed:http_404", "s4c: rejection reason is tier 1's own original reason, unaffected by the tier-2 throw");
+      assertEq(rejS4?.search_attempted, true, "s4d: search_attempted:true — tier 2 WAS invoked, it just threw");
+      assertTrue(!readQueueRow("wd-s4"), "s4e: nothing queued for wd-s4");
+      const propS4b = rS4.body.proposed.find((r: any) => r.agent_id === "wd-s4b");
+      assertTrue(!!propS4b, "s4f: the REST of the batch (wd-s4b, a normal tier-1 hit) still completes despite wd-s4's tier-2 throw");
+      assertEq(propS4b?.candidate_url, "https://solvikgardsysteri.no", "s4g: wd-s4b proposed via its own tier-1 hit");
+
+      setRfbWdSearchForTesting!(null);
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
@@ -1641,6 +1770,15 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
     else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
     if (prevHeadlessFallbackEnabled === undefined) delete process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED;
     else process.env.RFB_WD_HEADLESS_FALLBACK_ENABLED = prevHeadlessFallbackEnabled;
+    if (prevBraveApiKey === undefined) delete process.env.BRAVE_API_KEY;
+    else process.env.BRAVE_API_KEY = prevBraveApiKey;
+    if (prevBraveSearchApiKey === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
+    else process.env.BRAVE_SEARCH_API_KEY = prevBraveSearchApiKey;
+    try {
+      if (setRfbWdSearchForTesting) setRfbWdSearchForTesting(null);
+    } catch {
+      /* best-effort restore */
+    }
     try {
       if (setRfbWdRenderPageImplForTesting) setRfbWdRenderPageImplForTesting(null);
     } catch {
