@@ -95,6 +95,35 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ── Wrong-entity parking (dev-request 2026-08-23-dental-wrong-entity-
+  // streak-parking, 2026-08-24): an INDEPENDENT strike counter from
+  // extraction_attempts/extraction_unreachable_since above. That mechanism
+  // only tracks "fetched fine but never yielded >=3 committable fields"
+  // (reason:"insufficient_yield ..."); it does NOT track the separate
+  // failure mode where the enrichment sub-agent flags the fetched page as
+  // describing a DIFFERENT clinic entirely (directory listing, wrong chain
+  // branch, same-named-but-different clinic — reason:"wrong_entity"). Before
+  // this column pair existed, a wrong_entity result just released the claim
+  // with no backoff, so those records got re-claimed and re-flagged every
+  // single cycle forever. Mirrors the RFB/`agent_knowledge.wrong_entity_streak`
+  // twin (PR #309) at the CONCEPT level (an independent streak so the two
+  // failure kinds never contaminate each other's counter), but reuses THIS
+  // file's own stamp-based idiom (dentalExtractionParkingCols immediately
+  // above) rather than PR #309's rotation-based one, since dental's
+  // schema/idiom differs slightly from agent_knowledge's: 3 consecutive
+  // wrong_entity results stamp wrong_entity_unreachable_since (30-day
+  // backoff, same DENTAL_PARK_AFTER_ATTEMPTS/DENTAL_PARK_BACKOFF_MS tuning
+  // constants as extraction_attempts), and any real-yield success
+  // (`ok:true`) resets BOTH streaks/stamps to 0/NULL. Idempotent ALTERs —
+  // error = already present.
+  const dentalWrongEntityParkingCols = [
+    "ALTER TABLE dental_agents ADD COLUMN wrong_entity_streak INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE dental_agents ADD COLUMN wrong_entity_unreachable_since TEXT",
+  ];
+  for (const stmt of dentalWrongEntityParkingCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ── Stage V helfo_agreement auto-correction (dev-request 2026-07-12-dental-
   // enrichment-universe-growth-and-queue-hygiene, item 4 / slice 4a, 2026-07-20):
   // Stage V re-fetches a sample of clinics each cycle and checks the site's

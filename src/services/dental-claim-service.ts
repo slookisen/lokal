@@ -49,6 +49,13 @@ export type ClaimFilter = {
   // DENTAL_EXTRACTION_PARKING_DISABLED="true" is an additional global
   // rollback flag, mirroring DENTAL_HOMEPAGE_PARKING_DISABLED's idiom
   // (dental-store.ts) for the sibling homepage-parking exclusion.
+  //
+  // dev-request 2026-08-23-dental-wrong-entity-streak-parking (2026-08-24):
+  // this SAME flag now also gates the independent wrong_entity_streak /
+  // wrong_entity_unreachable_since exclusion (a separate 3-strike counter
+  // for "fetched page describes a different clinic" results, distinct from
+  // the insufficient-yield extraction failures this flag originally covered
+  // -- see recordDentalExtractionResult()'s doc comment in dental-store.ts).
   excludeParkedExtraction?: boolean;
 };
 
@@ -170,6 +177,20 @@ export function buildWhereClause(
   // backoff window as the homepage-parking twin (dental-store.ts
   // DENTAL_PARK_BACKOFF_MS).
   //
+  // dev-request 2026-08-23-dental-wrong-entity-streak-parking (2026-08-24):
+  // ALSO exclude clinics parked by 3 consecutive wrong_entity results
+  // (wrong_entity_unreachable_since set AND within the last 30 days) -- an
+  // INDEPENDENT streak from extraction_attempts/extraction_unreachable_since
+  // above (see recordDentalExtractionResult()'s doc comment, dental-store.ts,
+  // for why the two counters are kept separate; mirrors the RFB
+  // agent_knowledge.wrong_entity_streak twin, PR #309). A row is excluded if
+  // EITHER stamp is actively parking it -- same 30-day window, same literal
+  // `datetime('now','-30 days')` SQL style as the extraction clause, gated
+  // by the SAME excludeParkedExtraction flag / rollback env var (no
+  // separate new flag -- a wrong-entity result is reported through the same
+  // POST /admin/extraction-result endpoint as an ordinary extraction
+  // failure, so it shares that endpoint's exclusion toggle).
+  //
   // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3:
   // default-ON as of 2026-07-30 (see the ClaimFilter.excludeParkedExtraction
   // doc comment above for the measured evidence this is based on) -- applied
@@ -180,6 +201,9 @@ export function buildWhereClause(
   if (filter.excludeParkedExtraction !== false && !extractionParkingDisabled) {
     conditions.push(
       "(extraction_unreachable_since IS NULL OR extraction_unreachable_since <= datetime('now','-30 days'))"
+    );
+    conditions.push(
+      "(wrong_entity_unreachable_since IS NULL OR wrong_entity_unreachable_since <= datetime('now','-30 days'))"
     );
   }
 

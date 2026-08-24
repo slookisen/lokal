@@ -491,28 +491,132 @@ export function recordDentalHomepageFetchResult(
 // option (opt-in), not listDentalAgents/excludeParked — extraction parking
 // only ever needs to keep dead rows out of the CLAIM pool, not the public
 // read-side listing.
+//
+// ── Wrong-entity streak (dev-request 2026-08-23-dental-wrong-entity-streak-
+// parking, 2026-08-24) ────────────────────────────────────────────────────
+// `reason: "wrong_entity"` failures are a SEPARATE failure mode from the
+// "fetched fine but insufficient yield" ordinary-failure path above: the
+// enrichment sub-agent is reporting that the fetched page describes a
+// DIFFERENT clinic entirely (directory listing, wrong chain branch, same-
+// named-but-different clinic), not that this clinic's own page yielded too
+// little. Mixing that into extraction_attempts would let a handful of
+// wrong-entity noise blow through the SAME 3-strike budget an otherwise-
+// healthy record needs for transient insufficient-yield hiccups, and vice
+// versa — so it gets its OWN independent counter/stamp
+// (wrong_entity_streak / wrong_entity_unreachable_since), mirroring the RFB
+// `agent_knowledge.wrong_entity_streak` twin (PR #309: "independent
+// wrong_entity_streak backoff for ownership-guard rejections") at the
+// concept level, reusing THIS function's own stamp-based idiom (same
+// DENTAL_PARK_AFTER_ATTEMPTS / DENTAL_PARK_BACKOFF_MS constants, same
+// RE-STAMP-after-expired-backoff fix above) rather than PR #309's rotation-
+// based one. Branching:
+//   - ok:true (real yield) resets BOTH extraction_attempts/
+//     extraction_unreachable_since AND wrong_entity_streak/
+//     wrong_entity_unreachable_since in the same UPDATE — real progress
+//     clears both backoffs (RFB precedent's exact behaviour).
+//   - ok:false, reason:"wrong_entity" increments wrong_entity_streak ONLY
+//     (extraction_attempts is left untouched) and stamps
+//     wrong_entity_unreachable_since at 3 strikes (same RE-STAMP-after-
+//     expired-backoff logic as extraction_attempts above).
+//   - ok:false, any other/no reason: COMPLETELY UNCHANGED from before this
+//     dev-request — still increments extraction_attempts only. The two
+//     counters never interact in either direction.
+// The claim-pool exclusion this feeds is dental-claim-service.ts's
+// buildWhereClause() `excludeParkedExtraction` option — extended to also
+// exclude rows parked by wrong_entity_unreachable_since (excludes if EITHER
+// stamp is actively parking the row).
 export function recordDentalExtractionResult(
   id: string,
   ok: boolean,
   reason?: string,
-): { found: boolean; attempts: number; parked: boolean; parked_now: boolean } {
+): {
+  found: boolean;
+  attempts: number;
+  parked: boolean;
+  parked_now: boolean;
+  wrong_entity_streak: number;
+  wrong_entity_parked: boolean;
+  wrong_entity_parked_now: boolean;
+} {
   const db = getDb("dental");
   const exists = db.prepare("SELECT id FROM dental_agents WHERE id = ?").get(id);
-  if (!exists) return { found: false, attempts: 0, parked: false, parked_now: false };
+  if (!exists) {
+    return {
+      found: false,
+      attempts: 0,
+      parked: false,
+      parked_now: false,
+      wrong_entity_streak: 0,
+      wrong_entity_parked: false,
+      wrong_entity_parked_now: false,
+    };
+  }
 
   if (ok) {
     db.prepare(
-      "UPDATE dental_agents SET extraction_attempts = 0, extraction_unreachable_since = NULL WHERE id = ?"
+      "UPDATE dental_agents SET extraction_attempts = 0, extraction_unreachable_since = NULL, " +
+      "wrong_entity_streak = 0, wrong_entity_unreachable_since = NULL WHERE id = ?"
     ).run(id);
-    return { found: true, attempts: 0, parked: false, parked_now: false };
+    return {
+      found: true,
+      attempts: 0,
+      parked: false,
+      parked_now: false,
+      wrong_entity_streak: 0,
+      wrong_entity_parked: false,
+      wrong_entity_parked_now: false,
+    };
+  }
+
+  if (reason === "wrong_entity") {
+    db.prepare(
+      "UPDATE dental_agents SET wrong_entity_streak = wrong_entity_streak + 1 WHERE id = ?"
+    ).run(id);
+    const weRow = db
+      .prepare(
+        "SELECT extraction_attempts, wrong_entity_streak, wrong_entity_unreachable_since FROM dental_agents WHERE id = ?"
+      )
+      .get(id) as {
+        extraction_attempts: number;
+        wrong_entity_streak: number;
+        wrong_entity_unreachable_since: string | null;
+      };
+
+    let wrongEntityParkedNow = false;
+    if (weRow.wrong_entity_streak >= DENTAL_PARK_AFTER_ATTEMPTS) {
+      const since = weRow.wrong_entity_unreachable_since;
+      const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
+      if (!since || expired) {
+        db.prepare("UPDATE dental_agents SET wrong_entity_unreachable_since = ? WHERE id = ?")
+          .run(new Date().toISOString(), id);
+        wrongEntityParkedNow = true;
+      }
+    }
+    const wrongEntityParked = weRow.wrong_entity_streak >= DENTAL_PARK_AFTER_ATTEMPTS;
+    console.log(`[dental] wrong-entity failure for ${id}: streak=${weRow.wrong_entity_streak}`);
+    return {
+      found: true,
+      attempts: weRow.extraction_attempts,
+      parked: weRow.extraction_attempts >= DENTAL_PARK_AFTER_ATTEMPTS,
+      parked_now: false,
+      wrong_entity_streak: weRow.wrong_entity_streak,
+      wrong_entity_parked: wrongEntityParked,
+      wrong_entity_parked_now: wrongEntityParkedNow,
+    };
   }
 
   db.prepare(
     "UPDATE dental_agents SET extraction_attempts = extraction_attempts + 1 WHERE id = ?"
   ).run(id);
   const row = db
-    .prepare("SELECT extraction_attempts, extraction_unreachable_since FROM dental_agents WHERE id = ?")
-    .get(id) as { extraction_attempts: number; extraction_unreachable_since: string | null };
+    .prepare(
+      "SELECT extraction_attempts, extraction_unreachable_since, wrong_entity_streak FROM dental_agents WHERE id = ?"
+    )
+    .get(id) as {
+      extraction_attempts: number;
+      extraction_unreachable_since: string | null;
+      wrong_entity_streak: number;
+    };
 
   let parkedNow = false;
   if (row.extraction_attempts >= DENTAL_PARK_AFTER_ATTEMPTS) {
@@ -528,7 +632,15 @@ export function recordDentalExtractionResult(
   if (reason) {
     console.log(`[dental] extraction failure for ${id}: ${reason}`);
   }
-  return { found: true, attempts: row.extraction_attempts, parked, parked_now: parkedNow };
+  return {
+    found: true,
+    attempts: row.extraction_attempts,
+    parked,
+    parked_now: parkedNow,
+    wrong_entity_streak: row.wrong_entity_streak,
+    wrong_entity_parked: row.wrong_entity_streak >= DENTAL_PARK_AFTER_ATTEMPTS,
+    wrong_entity_parked_now: false,
+  };
 }
 
 // ── Stage V field auto-correction (dev-request 2026-07-12-dental-

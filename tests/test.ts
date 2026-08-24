@@ -36736,6 +36736,21 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
   }
 })();
 
+// ── dev-request 2026-08-23-dental-wrong-entity-streak-parking (2026-08-24) ──
+// Independent wrong_entity_streak / wrong_entity_unreachable_since backoff,
+// wired in like the standalone dental-claim-service.test.ts / dental-stage-
+// v-drift-result.test.ts suites above/below.
+console.log("\n── dental-wrong-entity-streak (independent wrong_entity backoff) ──");
+{
+  const { runDentalWrongEntityStreakTests } = require("../src/services/dental-wrong-entity-streak.test") as
+    typeof import("../src/services/dental-wrong-entity-streak.test");
+  const wes = runDentalWrongEntityStreakTests({ log: false });
+  passed += wes.passed;
+  failed += wes.failed;
+  for (const f of wes.failures) failures.push("dental-wrong-entity-streak: " + f);
+  console.log(`  dental-wrong-entity-streak: ${wes.passed} passed, ${wes.failed} failed`);
+}
+
 // ── slice 4a: Stage V helfo_agreement auto-correction (dev-request 2026-07-12-
 // dental-enrichment-universe-growth-and-queue-hygiene, item 4, 2026-07-20) ────
 // Covers recordStageVFieldObservation() (dental-store.ts) directly, mirroring

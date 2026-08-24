@@ -560,6 +560,21 @@ router.post("/admin/homepage-fetch-result", requireAdmin, (req: Request, res: Re
 // dental-claim-service.ts's buildWhereClause() excludeParkedExtraction
 // option (opt-in). `reason` is optional and used for observability only
 // (logged on failure) — it is not persisted.
+//
+// dev-request 2026-08-23-dental-wrong-entity-streak-parking (2026-08-24):
+// `reason: "wrong_entity"` is now special-cased on the `ok:false` path — it
+// signals a SEPARATE failure mode from an ordinary insufficient-yield
+// extraction failure: the enrichment sub-agent flagged the fetched page as
+// describing a DIFFERENT clinic (directory listing, wrong chain branch,
+// same-named-but-different clinic), not that this clinic's own page yielded
+// too little. It increments its own independent wrong_entity_streak (NOT
+// extraction_attempts) and parks via wrong_entity_unreachable_since at 3
+// strikes — see recordDentalExtractionResult()'s doc comment (dental-
+// store.ts) for the full independent-streak design (mirrors the RFB
+// agent_knowledge.wrong_entity_streak twin, PR #309). Any other reason (or
+// none) behaves exactly as before this dev-request. The response now also
+// reports the wrong-entity streak/parked state alongside the existing
+// extraction-attempts fields.
 router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Response) => {
   try {
     const { agentId, ok, reason } = (req.body ?? {}) as { agentId?: unknown; ok?: unknown; reason?: unknown };
@@ -573,7 +588,15 @@ router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Respon
       res.status(404).json({ error: "Not found" });
       return;
     }
-    res.json({ agent_id: agentId.trim(), attempts: r.attempts, parked: r.parked, parked_now: r.parked_now });
+    res.json({
+      agent_id: agentId.trim(),
+      attempts: r.attempts,
+      parked: r.parked,
+      parked_now: r.parked_now,
+      wrong_entity_streak: r.wrong_entity_streak,
+      wrong_entity_parked: r.wrong_entity_parked,
+      wrong_entity_parked_now: r.wrong_entity_parked_now,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Internal error" });
   }
