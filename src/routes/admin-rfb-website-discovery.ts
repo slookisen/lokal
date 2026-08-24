@@ -582,6 +582,32 @@ function rfbWdCheckFinalHostExclusion(
   return false;
 }
 
+// Grep 4d (dev-request 2026-08-22-rfb-website-email-selvforsyning, Pilot-
+// FUNN 2026-08-22 P1): a lightweight, mechanical self-reference "content
+// marker" check -- does the fetched HTML mention its own host ANYWHERE
+// (<link rel="canonical">, og:url, absolute links, footer copyright text,
+// <title>, etc. -- deliberately broad, since the goal is "does the page
+// mention itself at all", not one specific tag format)? Guards against a
+// proxy/cache returning a completely different site's content, which
+// otherwise either false-positive-matches as evidence or false-rejects as
+// evidence_mismatch (masking the real cause) -- contamination measured in
+// 4/10 research batches in the pilot. `host` is normalized the same "label"
+// way gardssalgWebsiteCandidateHosts (services/experience-store.ts)
+// already does for host variants: strip an optional "www." prefix, then
+// take the second-level-domain label (everything before the first ".").
+// Plain case-insensitive string .includes() only, deliberately no regex --
+// avoid any regex-engine risk on attacker/scraper-controlled HTML.
+export function rfbWdPageReferencesOwnHost(html: string, host: string): boolean {
+  const bareHost = host.toLowerCase().replace(/^www\./, "");
+  const label = bareHost.split(".")[0] || "";
+  // Fail-OPEN when the normalized label is too short to safely match on
+  // (bare IP, TLD-only edge case) -- conservative, avoids false
+  // fetch_contaminated rejections on valid-but-unusual hostnames; the real
+  // evidence-matching step downstream is still the actual gate.
+  if (label.length < 3) return true;
+  return html.toLowerCase().includes(label);
+}
+
 async function tryRfbWebsiteCandidateHost(
   host: string,
   evidenceTarget: Parameters<typeof gardssalgWebsiteEvidenceMatch>[1],
@@ -606,7 +632,7 @@ async function tryRfbWebsiteCandidateHost(
   }
 
   tried.push(host);
-  const result = await fetchPage(`https://${host}`, {
+  let result = await fetchPage(`https://${host}`, {
     userAgent: RFB_WD_USER_AGENT,
     timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
   });
@@ -620,11 +646,41 @@ async function tryRfbWebsiteCandidateHost(
     return null;
   }
 
-  const finalHost = rfbWdHostFromUrl(result.finalUrl) || host;
+  let finalHost = rfbWdHostFromUrl(result.finalUrl) || host;
   if (finalHost !== host) {
     if (rfbWdCheckFinalHostExclusion(finalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
       return null;
     }
+  }
+
+  // Grep 4d: content-marker guard against proxy/cache contamination -- see
+  // rfbWdPageReferencesOwnHost's doc comment. Exactly ONE sequential
+  // re-fetch of the SAME url on a miss, never a retry loop. If the retry
+  // also fails the marker check (or fails outright), reject as
+  // fetch_contaminated -- a third, distinct reason class from
+  // fetch_failed:*/evidence_mismatch -- and never let the contaminated
+  // content reach evidence matching or the review queue.
+  if (!rfbWdPageReferencesOwnHost(result.html, finalHost)) {
+    const retryResult = await fetchPage(`https://${host}`, {
+      userAgent: RFB_WD_USER_AGENT,
+      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+    });
+    if (!retryResult.ok) {
+      excludedHere.push({ host: finalHost, reason: "fetch_contaminated" });
+      return null;
+    }
+    // A redirect could differ between the two calls, so recompute finalHost
+    // for the retry the same way the original fetch above does.
+    const retryFinalHost = rfbWdHostFromUrl(retryResult.finalUrl) || host;
+    if (!rfbWdPageReferencesOwnHost(retryResult.html, retryFinalHost)) {
+      excludedHere.push({ host: retryFinalHost, reason: "fetch_contaminated" });
+      return null;
+    }
+    // Retry passed the marker check: use ITS content/finalHost for
+    // everything downstream -- the first, contaminated fetch is discarded,
+    // never used as evidence.
+    result = retryResult;
+    finalHost = retryFinalHost;
   }
 
   const pageText = gardssalgPageText(result.html);
@@ -641,22 +697,53 @@ async function tryRfbWebsiteCandidateHost(
   if (rfbWdHeadlessFallbackEnabled() && shouldEscalateToRender(result.html)) {
     fallbackCounters.attempted++;
     const renderFn = renderPageImplForTesting ?? renderPage;
-    const rendered = await renderFn(`https://${finalHost}`, {
+    let rendered = await renderFn(`https://${finalHost}`, {
       userAgent: RFB_WD_USER_AGENT,
       timeoutMs: RFB_WD_RENDER_TIMEOUT_MS,
     });
     if (rendered.ok) {
-      const renderedFinalHost = rfbWdHostFromUrl(rendered.finalUrl) || finalHost;
+      let renderedFinalHost = rfbWdHostFromUrl(rendered.finalUrl) || finalHost;
       if (renderedFinalHost !== finalHost) {
         if (rfbWdCheckFinalHostExclusion(renderedFinalHost, existingHosts, hostsProposedThisBatch, excludedHere)) {
           return null;
         }
       }
-      const renderedPageText = gardssalgPageText(rendered.html);
-      const renderedEvidence = gardssalgWebsiteEvidenceMatch(renderedPageText, evidenceTarget);
-      if (renderedEvidence.verified) {
-        fallbackCounters.verified++;
-        return { host: renderedFinalHost, finalUrl: rendered.finalUrl, evidence: renderedEvidence };
+
+      // Grep 4d: same content-marker guard/one-retry pattern as the plain
+      // fetch above -- "any fetch used as evidence" explicitly covers this
+      // render-fallback path too, matching the same renderer-agnostic
+      // discipline the evidence_mismatch fall-through below already
+      // follows in this function.
+      let renderMarkerOk = rfbWdPageReferencesOwnHost(rendered.html, renderedFinalHost);
+      if (!renderMarkerOk) {
+        const retryRendered = await renderFn(`https://${finalHost}`, {
+          userAgent: RFB_WD_USER_AGENT,
+          timeoutMs: RFB_WD_RENDER_TIMEOUT_MS,
+        });
+        if (!retryRendered.ok) {
+          excludedHere.push({ host: renderedFinalHost, reason: "fetch_contaminated" });
+        } else {
+          const retryRenderedFinalHost = rfbWdHostFromUrl(retryRendered.finalUrl) || finalHost;
+          renderMarkerOk = rfbWdPageReferencesOwnHost(retryRendered.html, retryRenderedFinalHost);
+          if (!renderMarkerOk) {
+            excludedHere.push({ host: retryRenderedFinalHost, reason: "fetch_contaminated" });
+          } else {
+            // Retry passed the marker check: use ITS content/finalHost for
+            // everything downstream -- the first, contaminated render is
+            // discarded, never used as evidence.
+            rendered = retryRendered;
+            renderedFinalHost = retryRenderedFinalHost;
+          }
+        }
+      }
+
+      if (renderMarkerOk) {
+        const renderedPageText = gardssalgPageText(rendered.html);
+        const renderedEvidence = gardssalgWebsiteEvidenceMatch(renderedPageText, evidenceTarget);
+        if (renderedEvidence.verified) {
+          fallbackCounters.verified++;
+          return { host: renderedFinalHost, finalUrl: rendered.finalUrl, evidence: renderedEvidence };
+        }
       }
     }
     // !rendered.ok (including `renderer_unavailable` — this machine simply
