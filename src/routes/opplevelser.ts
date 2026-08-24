@@ -10571,11 +10571,21 @@ interface GardssalgOrgnrJudgeQueueRow {
 
 /** Mirrors RFB's rfbWdJudgeAppendReason: guarded on the ORIGINAL reason so a
  *  row that changed underneath this run (cleared/re-resolved by a concurrent
- *  backfill) is never clobbered. */
-function gardssalgOrgnrJudgeAppendReason(db: Database.Database, providerId: string, note: string): void {
-  db.prepare(
+ *  backfill) is never clobbered. Returns the number of rows the guarded
+ *  UPDATE actually matched (0 or 1) so callers can tell whether the note was
+ *  really persisted, rather than assuming it landed. */
+function gardssalgOrgnrJudgeAppendReason(db: Database.Database, providerId: string, note: string): number {
+  const result = db.prepare(
     `UPDATE gardssalg_orgnr_review_queue SET reason = ?, updated_at = datetime('now') WHERE provider_id = ? AND reason = 'needs_human_review'`,
   ).run(note, providerId);
+  return result.changes;
+}
+
+/** If the guarded UPDATE above matched zero rows (the queue row changed
+ *  concurrently between the batch SELECT and this row's turn), the reported
+ *  reason must say so honestly instead of silently claiming the note landed. */
+function gardssalgOrgnrJudgeReportedReason(note: string, changes: number): string {
+  return changes > 0 ? note : `${note} (queue row changed concurrently, note not persisted)`;
 }
 
 router.post("/admin/gardssalg-orgnr-review-judge", requireAdmin, async (req: Request, res: Response) => {
@@ -10620,9 +10630,9 @@ router.post("/admin/gardssalg-orgnr-review-judge", requireAdmin, async (req: Req
         // candidate) — but fail-closed rather than call the judge with
         // nothing to judge, or attempt an approve call with no org_nr.
         const note = "judge AVVIS: mangler kandidatdata (org.nr/navn) på kø-raden — avvist fail-closed";
-        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+        const changes = gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
         rejected++;
-        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgOrgnrJudgeReportedReason(note, changes) });
         continue;
       }
 
@@ -10660,9 +10670,9 @@ router.post("/admin/gardssalg-orgnr-review-judge", requireAdmin, async (req: Req
 
       if (!verdict.approved) {
         const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
-        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+        const changes = gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
         rejected++;
-        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgOrgnrJudgeReportedReason(note, changes) });
         continue;
       }
 
@@ -10685,22 +10695,24 @@ router.post("/admin/gardssalg-orgnr-review-judge", requireAdmin, async (req: Req
         const rejectedList = Array.isArray(approveResp.body?.rejected) ? approveResp.body.rejected : [];
         const innerReason = rejectedList.find((r: any) => r?.provider_id === q.provider_id)?.reason;
         const note = `judge GODKJENN but write blocked: ${innerReason ?? "unknown"}`;
-        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+        const changes = gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
         rejected++;
-        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+        results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgOrgnrJudgeReportedReason(note, changes) });
       }
     } catch (err: any) {
       // Never let one row's unexpected error crash the rest of the batch —
       // fail THAT row closed, continue with the rest.
       const note = `uventet feil under dommer/skriving — avvist fail-closed: ${err?.message ?? String(err)}`;
+      let changes = 0;
       try {
-        gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
+        changes = gardssalgOrgnrJudgeAppendReason(db, q.provider_id, note);
       } catch {
         // best-effort — the row's reason may not update, but the outcome is
-        // still correctly counted/reported below.
+        // still correctly counted/reported below (changes stays 0, so the
+        // reported reason honestly notes the write didn't land).
       }
       rejected++;
-      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: note });
+      results.push({ provider_id: q.provider_id, verdict: "AVVIS", reason: gardssalgOrgnrJudgeReportedReason(note, changes) });
     }
   }
 
