@@ -43,7 +43,7 @@ honey, fish, baked goods and farm-made specialties.
 Every listing carries what you need to actually buy: direct contact details, opening
 hours, the producer's current product range with prices, and certifications such as
 Debio-organic and Nyt Norge so you can verify quality before you go. You can look up
-which networks a producer belongs to (Bondens marked, Hanen, REKO), find upcoming
+which networks a producer belongs to (Bondens marked, Hanen), find upcoming
 farmers'-market dates, and search around a place name rather than a postcode.
 
 You can also assemble a pickup order: build a cart from one or more producers and send it
@@ -55,7 +55,7 @@ visit, sourcing Norwegian ingredients for a restaurant, or supporting short-chai
 food systems. The catalogue is continuously verified against public registries and the
 producers' own sites, so opening hours and contact details stay current.
 ```
-1320 characters (measured, newlines included). Well inside the 2000 limit.
+1314 characters (measured, newlines included). Well inside the 2000 limit.
 
 **Unwrap before pasting.** The hard line wrapping above is for this file's readability
 only. A textarea preserves every newline, including the mid-paragraph ones, and how the

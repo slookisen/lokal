@@ -54,7 +54,7 @@ and `destructiveHint` (read live from the endpoint 2026-08-24).
 | `lokal_discover` | Discover producers by filter | *(same)* | Filtered discovery. Live `inputSchema` accepts `categories`, `tags`, `lat`, `lng`, `maxDistanceKm`, `limit` — certification filtering goes through `tags`; there is no separate region or trust-score parameter. |
 | `lokal_info` | Producer details | *(same)* | Full detail record for one producer. |
 | `lokal_stats` | Platform statistics | *(same)* | Totals and coverage across the catalogue. |
-| `lokal_list_umbrellas` | List umbrella organizations | *(same)* | Bondens marked, Hanen, REKO and other networks. |
+| `lokal_list_umbrellas` | List umbrella organizations | *(same)* | The 72 umbrellas live today: 14 `market_network` (Bondens marked), 57 `venue`, 1 `industry_org` (Hanen). **No REKO umbrella exists** — the server's own tool description claims one, but REKO rings are producer records, not umbrellas. Defaults to `limit: 50` and truncates silently. |
 | `lokal_get_umbrella_members` | Get producers in an umbrella's network | *(same)* | Members of one umbrella. |
 | `lokal_get_producer_affiliations` | Get a producer's umbrella affiliations | *(same)* | The inverse lookup. |
 | `lokal_bm_next_markets` | Get upcoming Bondens marked events | **Upcoming Bondens marked events** | Upcoming farmers'-market dates. |

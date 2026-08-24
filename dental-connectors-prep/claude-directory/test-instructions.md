@@ -37,11 +37,13 @@ gives no dental advice.
   an empty answer and read it as a broken tool. Do not add it to the review path until the
   chain data is actually populated.
 - **Prompt 3 names a county, not a town, on purpose.** `tannlege_akutt`'s live
-  `inputSchema` has exactly one property, `fylke` — no free-text query. Asked with a town
-  name it silently ignores the filter and returns the national total (732), which reads as
-  "every clinic in Norway is your local emergency dentist". With `fylke: "Rogaland"` it
-  correctly returns 43 (Oslo 144, Vestland 76). Town-level emergency search goes through
-  `tannlege_search` with `akutt: true` instead.
+  `inputSchema` has exactly one property, `fylke` — no free-text query. Measured live:
+  `{"fylke":"Rogaland"}` → **43** (Oslo 144, Vestland 76), but `{"fylke":"Stavanger"}` — a
+  town, not a county — → **0**. Omitting `fylke` entirely, or passing an unrecognised
+  property such as `{"query":"Stavanger"}`, returns the unfiltered national **732**. So the
+  two ways to get this wrong fail in *opposite* directions: a town name silently yields
+  nothing, while an ignored parameter silently yields every emergency clinic in Norway.
+  Town-level emergency search goes through `tannlege_search` with `akutt: true` instead.
 - The county breakdown in prompt 4 includes two housekeeping rows — `Ukjent` (27) and
   `TEST` (1). Harmless, but worth knowing before a reviewer asks what `TEST` is.
 - **Prompt 1 deliberately uses an ASCII-only city.** The first draft said "Tromsø", which
