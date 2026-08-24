@@ -55,9 +55,12 @@ import {
   gardssalgWebsiteCandidateHosts,
   gardssalgPageText,
   gardssalgWebsiteEvidenceMatch,
+  gardssalgWebsiteSearchQuery,
+  gardssalgWebsiteSearchCandidateHosts,
 } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+import { braveSearch, type BraveResult } from "../services/search-enrich";
 import { mergeFieldProvenance } from "./admin-knowledge";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
@@ -208,6 +211,38 @@ export interface RfbWdFallbackCounters {
 let renderPageImplForTesting: typeof renderPage | null = null;
 export function __setRfbWdRenderPageImplForTesting(impl: typeof renderPage | null): void {
   renderPageImplForTesting = impl;
+}
+
+// ─── injectable search seam for this route's own tier-2 (Brave Search)
+// fallback leg ───────────────────────────────────────────────────────────
+// Mirrors dentalWdSearchImpl/__setDentalWdSearchForTesting/
+// effectiveDentalWdSearchImpl (admin-dental-hjemmeside-discovery.ts) exactly,
+// adapted to rfb naming — that file is the primary template for this leg
+// (see file header). Tier 2 is genuinely OPTIONAL in production (unlike
+// tier 1's name-guessing, which always runs), so this override slot starts
+// at null rather than at a real implementation. Production code never calls
+// the setter; the real wiring lives in effectiveRfbWdSearchImpl() below,
+// which is evaluated FRESH on every call (never cached at module-load
+// time) — when a test override is set it always wins, otherwise production
+// wires the real braveSearch(query, key, RFB_WD_SEARCH_MAX_CANDIDATES) when
+// a Brave key is configured (BRAVE_API_KEY / BRAVE_SEARCH_API_KEY) or stays
+// null — tier 2 silently skipped, tier 1's own result is used unchanged —
+// when neither is set.
+export type RfbWdSearchFn = (query: string) => Promise<BraveResult[]>;
+let rfbWdSearchImpl: RfbWdSearchFn | null = null;
+export function __setRfbWdSearchForTesting(impl: RfbWdSearchFn | null): void {
+  rfbWdSearchImpl = impl;
+}
+
+// Mirrors DENTAL_WD_SEARCH_MAX_CANDIDATES's naming/role exactly — caps both
+// the braveSearch `count` param and the number of hosts extracted from its
+// results.
+export const RFB_WD_SEARCH_MAX_CANDIDATES = 5;
+
+function effectiveRfbWdSearchImpl(): RfbWdSearchFn | null {
+  if (rfbWdSearchImpl) return rfbWdSearchImpl;
+  const braveKey = process.env.BRAVE_API_KEY || process.env.BRAVE_SEARCH_API_KEY || "";
+  return braveKey ? (query: string) => braveSearch(query, braveKey, RFB_WD_SEARCH_MAX_CANDIDATES) : null;
 }
 
 // ─── Local, RFB-scoped re-implementation of the aggregator/directory +
@@ -1112,6 +1147,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     evidence: RfbWdEvidence;
     confidence: number;
     existing_url?: string | null;
+    search_attempted: boolean;
   }> = [];
   const rejected: Array<{
     agent_id: string;
@@ -1119,6 +1155,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
     reason: string;
     tried: string[];
     excluded: Array<{ host: string; reason: string }>;
+    search_attempted: boolean;
   }> = [];
 
   for (const t of targets) {
@@ -1149,6 +1186,46 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         fallbackCounters,
       );
       if (hit) break;
+    }
+
+    // ── Tier 2 (Brave Search fallback) ──────────────────────────────────
+    // Only when tier 1 exhausted every name-guessed host without a verified
+    // hit AND a search impl is actually wired (a Brave key configured, or a
+    // test override via __setRfbWdSearchForTesting) — never runs when tier 1
+    // already found something, and RFB_WD_DEFAULT_LIMIT/RFB_WD_HARD_CAP are
+    // the only cost guard needed (at most one Brave call per row, only on a
+    // tier-1 miss). The hosts this leg finds are run through the EXACT same
+    // tryRfbWebsiteCandidateHost() tier 1 uses, threaded through the SAME
+    // tried/excludedHere/existingHosts/hostsProposedThisBatch/fallbackCounters
+    // state — no separate evidence-matching or exclusion path.
+    let searchAttempted = false;
+    if (!hit) {
+      const searchImpl = effectiveRfbWdSearchImpl();
+      if (searchImpl) {
+        searchAttempted = true;
+        try {
+          const query = gardssalgWebsiteSearchQuery({ navn: t.name, kommune: t.city });
+          const results = await searchImpl(query);
+          const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, RFB_WD_SEARCH_MAX_CANDIDATES);
+          for (const host of searchHosts) {
+            hit = await tryRfbWebsiteCandidateHost(
+              host,
+              evidenceTarget,
+              existingHosts,
+              hostsProposedThisBatch,
+              tried,
+              excludedHere,
+              fallbackCounters,
+            );
+            if (hit) break;
+          }
+        } catch {
+          // A search failure (network/HTTP error) must not abort the row —
+          // tier 2 simply found nothing, exactly as if the search response
+          // had been empty. No retry, mirrors braveSearch's own no-retry
+          // contract; never a 500 propagated to the caller.
+        }
+      }
     }
 
     if (hit) {
@@ -1187,6 +1264,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
         evidence: hit.evidence,
         confidence,
         existing_url: existingUrl,
+        search_attempted: searchAttempted,
       });
     } else {
       // No verified candidate. Reason: if no candidate host could even be
@@ -1201,7 +1279,7 @@ router.post("/rfb-website-discovery", async (req: Request, res: Response) => {
       if (hosts.length === 0) reason = "no_candidate_hosts";
       else if (excludedHere.length > 0) reason = excludedHere[0].reason;
       else reason = "no_candidate_verified";
-      rejected.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere });
+      rejected.push({ agent_id: t.id, agent_name: t.name, reason, tried, excluded: excludedHere, search_attempted: searchAttempted });
     }
   }
 
