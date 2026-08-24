@@ -565,6 +565,29 @@ export class AnalyticsService {
   private static SUMMARY_CACHE_TTL = 120_000; // 2 minutes
 
   /**
+   * Page-view count for an arbitrary window, excluding owner traffic (cached 2 min).
+   * A single indexed COUNT(*) on analytics_page_views(created_at) — cheaper than
+   * getSummary() when only the count is needed (e.g. a 30-day "monthly visits" figure).
+   */
+  getPageViewCount(hoursBack: number, vertical?: VerticalId): number {
+    const cacheKey = `pvcount:${hoursBack}:${vertical || "all"}`;
+    const cached = this._summaryCache.get(cacheKey);
+    if (cached && (Date.now() - cached.time) < AnalyticsService.SUMMARY_CACHE_TTL) {
+      return cached.data;
+    }
+    const db = getDb();
+    const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
+    const V = vertical ? " AND vertical_id = ?" : "";
+    const vp: string[] = vertical ? [vertical] : [];
+    const result = db.prepare(`
+      SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
+    `).get(cutoff, ...vp) as any;
+    const count = result.count as number;
+    this._summaryCache.set(cacheKey, { data: count, time: Date.now() });
+    return count;
+  }
+
+  /**
    * Get analytics summary for a time range (cached 2 min)
    * @param vertical Optional vertical filter ('rfb' | 'dental'). Undefined = all verticals combined.
    */

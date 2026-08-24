@@ -187,16 +187,19 @@ router.post("/tag-owner", (req: Request, res: Response) => {
 
 /**
  * GET /admin/analytics/summary
- * High-level analytics for the last 24 hours
+ * High-level analytics for the last 24 hours, plus a trailing-30-day `monthly_visits`
+ * count (consumed by marketing-comms-agent's social-proof line).
  */
 router.get("/summary", (req: Request, res: Response) => {
   const vertical = parseVertical(req);
   const summary = analyticsService.getSummary(24, vertical);
+  const monthlyVisits = analyticsService.getPageViewCount(24 * 30, vertical);
   res.json({
     timeframe: "last 24 hours",
     vertical: vertical || "all",
     timestamp: new Date().toISOString(),
     ...summary,
+    monthly_visits: monthlyVisits,
   });
 });
 
