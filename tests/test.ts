@@ -16963,6 +16963,84 @@ console.log("\n── FIX finn-tannlege: search filters + sparse-specialty ─�
   dbFactory.__resetDbFactoryForTesting();
 })();
 
+// ── FIX dev-request 2026-08-24-tannlege-sok-case-folding-oe ──────────
+// Root cause: `q LIKE @q` relied on SQLite's built-in LIKE/LOWER()/UPPER()
+// case-fold, which is ASCII-only -- confirmed empirically (SQLite's own
+// LOWER('Ø') returns 'Ø' unchanged; same for Æ and non-initial Å). The
+// live-prod symptom ("Tromsø" -> 0 hits, "TROMSØ" -> 79) looked
+// Ø-specific only because `poststed` is stored ALL-UPPERCASE (Posten/
+// BRREG convention): Å-cities happen to already carry a capital Å as
+// their *initial* letter in natural spelling ("Ålesund"), so they never
+// actually exercised the missing fold either -- Ø (and Æ) just made it
+// visible because they commonly sit lowercase mid/end-of-word in the
+// natural spelling ("Tromsø", "Bodø", "Førde"). Fix: both sides of the
+// `navn`/`poststed` LIKE now go through the `nb_lower` scalar function
+// (database/init-dental.ts, backed by JS's Unicode-aware toLowerCase())
+// instead of SQLite's built-in fold.
+//
+// This block reproduces the exact failure with Ø in BOTH the query and a
+// stored value (poststed="TROMSØ", the real-world convention) — it must
+// fail on pre-fix code (LIKE with no nb_lower) and pass after the fix.
+console.log("\n── FIX dev-request 2026-08-24-tannlege-sok-case-folding-oe: Ø/Æ/Å case-folding ──");
+(() => {
+  const prevPathOe = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPathOe = require.resolve("../src/database/db-factory");
+  delete require.cache[dbFactoryPathOe];
+  const dbFactoryOe = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryOe.__resetDbFactoryForTesting();
+
+  const dentalStorePathOe = require.resolve("../src/services/dental-store");
+  delete require.cache[dentalStorePathOe];
+  const storeOe = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  const { createDentalAgent: createOe, countPublicDentalAgents: countOe } = storeOe;
+
+  // poststed stored ALL-UPPERCASE, exactly like the real Posten/BRREG data.
+  createOe({ navn: "Nord Tannklinikk", poststed: "TROMSØ", fylke: "Troms og Finnmark" });
+  createOe({ navn: "Vest Tannklinikk", poststed: "BODØ", fylke: "Nordland" });
+  createOe({ navn: "Sogn Tannklinikk", poststed: "FØRDE", fylke: "Vestland" });
+  // Æ control — not measured against prod in the dev-request, checked here.
+  createOe({ navn: "Øy Tannklinikk", poststed: "ÆRFUGLVÆR", fylke: "Nordland" });
+  // Existing controls: pure ASCII, and Å (initial-letter, so it never
+  // actually exercised the fold either — kept here as a no-regression
+  // anchor for both).
+  createOe({ navn: "Bergen Tannklinikk", poststed: "BERGEN", fylke: "Vestland" });
+  createOe({ navn: "Ålesund Tannklinikk", poststed: "ÅLESUND", fylke: "Møre og Romsdal" });
+
+  // 1. THE bug, reproduced directly: natural-cased "Tromsø" must find the
+  //    TROMSØ clinic — this is 0 on pre-fix code (LIKE '%Tromsø%' against
+  //    the ASCII-only-folded 'TROMSØ' misses on the ø/Ø byte).
+  assertTrue(countOe({ q: "Tromsø" }) === 1, "oe-fix: natural-cased 'Tromsø' finds the TROMSØ clinic");
+  assertTrue(countOe({ q: "TROMSØ" }) === 1, "oe-fix: 'TROMSØ' (matches stored case) finds the clinic");
+  assertTrue(countOe({ q: "tromsø" }) === 1, "oe-fix: lowercase 'tromsø' finds the clinic");
+  assertEq(countOe({ q: "Tromsø" }), countOe({ q: "TROMSØ" }), "oe-fix: 'Tromsø' and 'TROMSØ' return identical counts");
+
+  // 2. Bodø / Førde — same pattern, other Ø-cities from the dev-request table.
+  assertTrue(countOe({ q: "Bodø" }) === 1, "oe-fix: natural-cased 'Bodø' finds the BODØ clinic");
+  assertEq(countOe({ q: "Bodø" }), countOe({ q: "BODØ" }), "oe-fix: 'Bodø' and 'BODØ' return identical counts");
+  assertTrue(countOe({ q: "Førde" }) === 1, "oe-fix: natural-cased 'Førde' finds the FØRDE clinic");
+  assertEq(countOe({ q: "Førde" }), countOe({ q: "FØRDE" }), "oe-fix: 'Førde' and 'FØRDE' return identical counts");
+
+  // 3. Æ — dev-request acceptance criterion 4: must be explicitly answered.
+  //    Confirmed affected by the same root cause and fixed by the same
+  //    general mechanism (no letter-specific special-casing).
+  assertTrue(countOe({ q: "Ærfuglvær" }) === 1, "oe-fix: natural-cased 'Ærfuglvær' finds the ÆRFUGLVÆR clinic");
+  assertEq(countOe({ q: "Ærfuglvær" }), countOe({ q: "ÆRFUGLVÆR" }), "oe-fix: 'Ærfuglvær' and 'ÆRFUGLVÆR' return identical counts");
+  assertEq(countOe({ q: "ærfuglvær" }), countOe({ q: "ÆRFUGLVÆR" }), "oe-fix: 'ærfuglvær' and 'ÆRFUGLVÆR' return identical counts");
+
+  // 4. Controls must be UNCHANGED by the fix (no regression on what
+  //    already worked, per dev-request acceptance criterion 2).
+  assertTrue(countOe({ q: "Bergen" }) === 1, "oe-fix: control 'Bergen' unchanged");
+  assertEq(countOe({ q: "Bergen" }), countOe({ q: "BERGEN" }), "oe-fix: 'Bergen'/'BERGEN' still identical (ASCII control)");
+  assertEq(countOe({ q: "bergen" }), countOe({ q: "BERGEN" }), "oe-fix: 'bergen'/'BERGEN' still identical (ASCII control)");
+  assertTrue(countOe({ q: "Ålesund" }) === 1, "oe-fix: control 'Ålesund' unchanged");
+  assertEq(countOe({ q: "Ålesund" }), countOe({ q: "ÅLESUND" }), "oe-fix: 'Ålesund'/'ÅLESUND' still identical (Å control)");
+
+  if (prevPathOe === undefined) delete process.env.DENTAL_DB_PATH;
+  else process.env.DENTAL_DB_PATH = prevPathOe;
+  dbFactoryOe.__resetDbFactoryForTesting();
+})();
 
 
 

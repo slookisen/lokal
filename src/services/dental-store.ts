@@ -400,6 +400,26 @@ function pushSpecialtyClause(
   params.specialtyPerson = `%"specialty":"${specialty}"%`;
 }
 
+// dev-request 2026-08-24-tannlege-sok-case-folding-oe: the free-text `q`
+// filter used raw `navn LIKE @q OR poststed LIKE @q`, relying on SQLite's
+// built-in LIKE case-fold -- which is ASCII-only (verified: SQLite's own
+// LOWER('Ø') returns 'Ø' unchanged; same for Æ and non-initial Å). That
+// silently zeroed out natural-cased queries against `poststed`, which is
+// stored ALL-UPPERCASE (Posten/BRREG convention). Both sides of the
+// comparison now go through the `nb_lower` scalar function registered in
+// database/init-dental.ts (backed by JS's Unicode-aware toLowerCase(),
+// which DOES fold Æ/Ø/Å), so the match no longer depends on SQLite's
+// internal fold table at all. Query-side only -- no change to what's
+// stored in `navn`/`poststed`.
+function pushFreeTextClause(
+  where: string[],
+  params: Record<string, unknown>,
+  q: string
+): void {
+  where.push("(nb_lower(navn) LIKE @q OR nb_lower(poststed) LIKE @q)");
+  params.q = `%${q.toLowerCase()}%`;
+}
+
 // ── Dead-homepage parking (enrichment-metode slice 1, 2026-07-16) ────────────
 // Mirrors the RFB PR #248 semantics: 3 consecutive fetch failures park the
 // clinic (homepage_unreachable_since stamped) for 30 days; a successful fetch
@@ -865,8 +885,7 @@ export function listDentalAgents(
   }
   // PR-109 / PR-105 additive filters
   if (parsed.q) {
-    where.push("(navn LIKE @q OR poststed LIKE @q)");
-    params.q = `%${parsed.q}%`;
+    pushFreeTextClause(where, params, parsed.q);
   }
   if (parsed.helfo_agreement !== undefined) {
     where.push("helfo_agreement = @helfo_agreement");
@@ -908,7 +927,7 @@ export function countDentalAgents(filter: ListFilter = {}): number {
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
   if (parsed.verification_status) { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
   if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
-  if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
+  if (parsed.q) { pushFreeTextClause(where, params, parsed.q); }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
@@ -942,7 +961,7 @@ export function countPublicDentalAgents(filter: ListFilter = {}): number {
     params.verification_status = parsed.verification_status;
   }
   if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
-  if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
+  if (parsed.q) { pushFreeTextClause(where, params, parsed.q); }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
@@ -982,7 +1001,7 @@ export function listPublicDentalAgents(
     params.verification_status = parsed.verification_status;
   }
   if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
-  if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
+  if (parsed.q) { pushFreeTextClause(where, params, parsed.q); }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }

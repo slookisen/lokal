@@ -21,6 +21,32 @@
 import Database from "better-sqlite3";
 
 export function initDentalSchema(db: Database.Database): void {
+  // dev-request 2026-08-24-tannlege-sok-case-folding-oe: SQLite's built-in
+  // LIKE / LOWER() / UPPER() only case-fold ASCII (A-Z/a-z) -- confirmed
+  // empirically, e.g. LOWER('Ø') returns 'Ø' unchanged, not 'ø'. That is
+  // NOT specific to Ø: none of Æ/Ø/Å fold via the built-ins. The reported
+  // bug ("Tromsø" -> 0 hits, "TROMSØ" -> 79) looked Ø-specific only because
+  // `poststed` is stored ALL-UPPERCASE (Posten/BRREG convention, e.g.
+  // "TROMSØ") while natural Norwegian queries are mixed-case: for
+  // Å-cities the letter is virtually always the initial, already-capital
+  // letter of the name ("Ålesund"), so it happens to already match the
+  // uppercase-stored column without any folding being needed -- Å never
+  // actually folded either, the mismatch just never had a chance to show.
+  // Ø (and Æ) very often appear lowercase mid/end-of-word in the natural
+  // spelling ("Tromsø", "Bodø", "Førde"), so the same missing fold is
+  // exposed there. This is a QUERY-side comparison bug, not a stored-data
+  // bug -- `poststed` being uppercase is an intentional, pre-existing
+  // convention (see dental-store.ts listPoststeder) and is left alone.
+  //
+  // Fix: a deterministic scalar function backed by JS's Unicode-aware
+  // String.prototype.toLowerCase() (which folds Æ/Ø/Å correctly, unlike
+  // SQLite's ASCII-only LOWER()), used on BOTH sides of every free-text
+  // LIKE comparison in dental-store.ts so the match no longer depends on
+  // SQLite's internal case-fold table at all.
+  db.function("nb_lower", { deterministic: true }, (value: unknown) =>
+    typeof value === "string" ? value.toLowerCase() : value
+  );
+
   // dental_agents — one row per clinic (organisasjon)
   try {
     db.exec(`
