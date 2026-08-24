@@ -33,6 +33,9 @@ path; submitting sends a real request to a real farm. No payment is involved at 
   for a short review path, not full coverage.
 - `lokal_geocode` is worth a fifth prompt ("what is near Voss?") if a reviewer asks how
   location search resolves place names.
-- The cart caution mirrors the same warning already carried in
-  `opplevagent-connectors-prep/chatgpt-app/README.md` for `book_gardssalg`: never drive a
-  real write tool to completion against a real provider in a demo or review recording.
+- The cart caution states the rule directly rather than citing a precedent: never drive a
+  real write tool to completion against a real provider in a demo or review recording. (An
+  earlier draft attributed this warning to
+  `opplevagent-connectors-prep/chatgpt-app/README.md`; that file on `main` contains no such
+  warning and does not mention `book_gardssalg` at all. The equivalent caution is being
+  added there by the still-open lokal#701 — do not cite it as existing until that merges.)

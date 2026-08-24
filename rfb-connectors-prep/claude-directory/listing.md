@@ -57,9 +57,11 @@ producers' own sites, so opening hours and contact details stay current.
 ```
 1320 characters (measured, newlines included). Well inside the 2000 limit.
 
-The hard line wrapping is for this file's readability. Paste the block as-is — the portal
-textarea keeps the paragraph breaks, which is what matters; the mid-paragraph wraps
-collapse harmlessly on render.
+**Unwrap before pasting.** The hard line wrapping above is for this file's readability
+only. A textarea preserves every newline, including the mid-paragraph ones, and how the
+portal renders them is not something we can verify without portal access — so do not bet
+on it. Join each paragraph into a single line, keeping the blank line between paragraphs,
+then paste.
 
 ## Categories
 

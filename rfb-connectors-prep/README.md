@@ -4,7 +4,8 @@ Paste-ready submission package for the **Anthropic connectors directory**
 (`claude.ai/admin-settings/directory/submissions/new`) for the remote MCP server at
 `https://rettfrabonden.com/mcp`.
 
-Same shape as `opplevagent-connectors-prep/`. Filed from dev-request
+Sibling of `opplevagent-connectors-prep/` (this one is organised as a single
+`claude-directory/` folder, since it targets one portal). Filed from dev-request
 `A2A/dev-requests/2026-08-24-claude-connector-pakker-rfb-dental.md`; runbook context in
 `A2A/protocols/chatgpt-apps-submission-handoff-2026-08-24.md` §C.
 
@@ -36,10 +37,13 @@ platform-orchestrator wake that built this package
   `documentation` field in `https://rettfrabonden.com/.well-known/mcp.json`.
   Machine-readable overview: `https://rettfrabonden.com/llms.txt` (200).
 - **Icon:** `assets/rfb-square-512.png` (512×512, square, no rounded corners — clients
-  crop circularly themselves). `https://rettfrabonden.com/favicon.svg` is 200 but SVG-only;
-  `favicon-192.png` still 404s (tracked in dev-request
-  `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`), so the icon is supplied as a file
-  upload, not a URL.
+  crop circularly themselves). The domain serves no square PNG *route*:
+  `https://rettfrabonden.com/favicon.svg` is 200 but SVG-only and `favicon-192.png` 404s
+  (tracked in dev-request `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`). It does
+  serve `https://rettfrabonden.com/favicon.ico` (200, `image/vnd.microsoft.icon`, 39 131
+  bytes) — that is what `.well-known/mcp.json` points its `icon` field at — but `.ico` is
+  not what the directory wants, so the icon is supplied as a **file upload** from `assets/`,
+  not as a URL.
 - **Producer count:** use the form **«over 1 600»** / "more than 1,600". Deliberate: the
   platform's own three counters disagree and each is honest about a different thing —
   `llms.txt` says 1631 registered producers, `/health` reports `agents: 1712` /

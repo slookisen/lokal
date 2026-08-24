@@ -37,31 +37,38 @@ credentials and no payment details.
 ## 3. Tools
 
 **14 tools. 11 read-only, 3 write, 0 destructive.** All carry `title`, `readOnlyHint`
-and `destructiveHint` annotations (read live from the endpoint 2026-08-24).
+and `destructiveHint` (read live from the endpoint 2026-08-24).
+
+> **Two title fields, and they disagree.** Each tool carries a top-level `title` *and* an
+> `annotations.title`. For 7 of the 14 RFB tools the two strings differ — the annotation is
+> a shortened form. Both are reproduced below verbatim, because which one a client displays
+> depends on the client. Do not paste one and describe it as "the" title. Logged as a
+> finding on the dev-request; the divergence is a server-side data question, not something
+> this documentation package can resolve.
 
 ### Read-only (11)
 
-| Tool | Title | What it does |
-|---|---|---|
-| `lokal_search` | Search local food producers | Free-text search; returns producers **with their product catalogue and current prices**. |
-| `lokal_discover` | Discover producers by filter | Filtered discovery (category, region, certification, trust score). |
-| `lokal_info` | Producer details | Full detail record for one producer. |
-| `lokal_stats` | Platform statistics | Totals and coverage across the catalogue. |
-| `lokal_list_umbrellas` | List umbrella organizations | Bondens marked, Hanen, REKO and other networks. |
-| `lokal_get_umbrella_members` | Get producers in an umbrella's network | Members of one umbrella. |
-| `lokal_get_producer_affiliations` | Get a producer's umbrella affiliations | The inverse lookup. |
-| `lokal_bm_next_markets` | Get upcoming Bondens marked events | Upcoming farmers'-market dates. |
-| `lokal_geocode` | Geocode a Norwegian place name | Place name → coordinates, for location-scoped search. |
-| `lokal_cart_view` | View shopping cart | Reads back a cart the user already created. |
-| `lokal_order_status` | Get order status | Reads back the status of a submitted pickup order. |
+| Tool | `title` | `annotations.title` | What it does |
+|---|---|---|---|
+| `lokal_search` | Search local food producers | *(same)* | Free-text search; returns producers **with their product catalogue and current prices**. |
+| `lokal_discover` | Discover producers by filter | *(same)* | Filtered discovery. Live `inputSchema` accepts `categories`, `tags`, `lat`, `lng`, `maxDistanceKm`, `limit` — certification filtering goes through `tags`; there is no separate region or trust-score parameter. |
+| `lokal_info` | Producer details | *(same)* | Full detail record for one producer. |
+| `lokal_stats` | Platform statistics | *(same)* | Totals and coverage across the catalogue. |
+| `lokal_list_umbrellas` | List umbrella organizations | *(same)* | Bondens marked, Hanen, REKO and other networks. |
+| `lokal_get_umbrella_members` | Get producers in an umbrella's network | *(same)* | Members of one umbrella. |
+| `lokal_get_producer_affiliations` | Get a producer's umbrella affiliations | *(same)* | The inverse lookup. |
+| `lokal_bm_next_markets` | Get upcoming Bondens marked events | **Upcoming Bondens marked events** | Upcoming farmers'-market dates. |
+| `lokal_geocode` | Geocode a Norwegian place name | **Geocode Norwegian place** | Place name → coordinates, for location-scoped search. |
+| `lokal_cart_view` | View shopping cart | **View cart** | Reads back a cart the user already created. |
+| `lokal_order_status` | Get order status | **Order status** | Reads back the status of a submitted pickup order. |
 
 ### Write (3) — never destructive
 
-| Tool | Title | What it writes |
-|---|---|---|
-| `lokal_cart_create` | Create a shopping cart | Creates an empty cart. |
-| `lokal_cart_add_item` | Add item to shopping cart | Adds a product line to that cart. |
-| `lokal_cart_submit` | Submit cart and place pickup orders | Sends the cart to the producer(s) as a **pickup request**. |
+| Tool | `title` | `annotations.title` | What it writes |
+|---|---|---|---|
+| `lokal_cart_create` | Create a shopping cart | **Create shopping cart** | Creates an empty cart. |
+| `lokal_cart_add_item` | Add item to shopping cart | **Add cart item** | Adds a product line to that cart. |
+| `lokal_cart_submit` | Submit cart and place pickup orders | **Submit cart** | Sends the cart to the producer(s) as a **pickup request**. |
 
 All three report `destructiveHint: false`: they only ever create new records. Nothing in
 this server deletes or overwrites user data, and no tool touches another user's data.

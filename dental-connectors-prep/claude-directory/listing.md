@@ -46,7 +46,7 @@ something you can act on. Just over a thousand clinics have at least one registe
 specialist, searchable by specialty.
 
 Every record carries the clinic's address, contact details and county, so you can go
-straight from "I need a dentist in Tromsø tonight" to a phone number.
+straight from "I need a dentist in Bergen tonight" to a phone number.
 
 The data comes from public sources — Brønnøysundregistrene, the Norwegian
 health-personnel register (HPR), and the clinics' own websites — and is refreshed
@@ -58,9 +58,11 @@ what they offer and how to reach them; the clinical conversation belongs with th
 ```
 1292 characters (measured, newlines included). Well inside the 2000 limit.
 
-The hard line wrapping is for this file's readability. Paste the block as-is — the portal
-textarea keeps the paragraph breaks, which is what matters; the mid-paragraph wraps
-collapse harmlessly on render.
+**Unwrap before pasting.** The hard line wrapping above is for this file's readability
+only. A textarea preserves every newline, including the mid-paragraph ones, and how the
+portal renders them is not something we can verify without portal access — so do not bet
+on it. Join each paragraph into a single line, keeping the blank line between paragraphs,
+then paste.
 
 ## Categories
 
@@ -74,6 +76,9 @@ Secondary: **Search** or **Reference** — the service is a directory, not a car
 - **Do** keep the "no dental advice" sentence. A health-adjacent listing is read more
   strictly than a shopping one, and the disclaimer is true: the server returns directory
   records only.
+- **No `Ø` place name appears in this copy.** Search does not case-fold `Ø` today
+  (`"Tromsø"` returns 0 live, `"TROMSØ"` returns 79), so an example city spelled with `Ø`
+  would advertise a query that fails. Routed to the dev-request queue as a server defect.
 - The clinic figure is given as "roughly 6,900" rather than the exact live 6,961, because
   the count moves daily and the listing text is not easy to edit afterwards. The exact
   figure belongs in `tannlege_stats` output, where it stays current on its own.

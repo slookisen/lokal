@@ -4,7 +4,8 @@ Paste-ready submission package for the **Anthropic connectors directory**
 (`claude.ai/admin-settings/directory/submissions/new`) for the remote MCP server at
 `https://finn-tannlege.com/mcp`.
 
-Same shape as `opplevagent-connectors-prep/` and `rfb-connectors-prep/`. Filed from
+Sibling of `opplevagent-connectors-prep/` and `rfb-connectors-prep/` (this one is
+organised as a single `claude-directory/` folder, since it targets one portal). Filed from
 dev-request `A2A/dev-requests/2026-08-24-claude-connector-pakker-rfb-dental.md`; runbook
 context in `A2A/protocols/chatgpt-apps-submission-handoff-2026-08-24.md` §C.
 
@@ -61,9 +62,11 @@ platform-orchestrator wake that built this package
 
 1. **Terms of service page missing** (blocker, above).
 2. **No square PNG icon.** The directory wants a square raster icon; this domain serves
-   only an SVG favicon. One needs producing, the same way
-   `opplevagent-connectors-prep/assets/` and `rfb-connectors-prep/assets/` already have
-   one. Related: dev-request `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`.
+   only an SVG favicon. One needs producing, the same way `rfb-connectors-prep/assets/`
+   has one — note that `opplevagent-connectors-prep/` has no `assets/` directory on main
+   either, and its own `chatgpt-app/README.md` records the same missing-PNG-route gap, so
+   this vertical is not an outlier. Related: dev-request
+   `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`.
 3. **`tannlege_kjeder` currently returns an empty world.** The tool works, but live
    `tannlege_stats` reports `chain_count: 0` — no clinic is presently tagged as belonging
    to a chain. The tool is real and correctly annotated; it just has no data behind it

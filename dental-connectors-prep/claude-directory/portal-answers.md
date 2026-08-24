@@ -37,15 +37,20 @@ are no user accounts and no write operations, so there is nothing to authenticat
 ## 3. Tools
 
 **5 tools. All read-only, none destructive.** Every one carries `title`, `readOnlyHint`
-and `destructiveHint` annotations (read live from the endpoint 2026-08-24).
+and `destructiveHint` (read live from the endpoint 2026-08-24).
 
-| Tool | Title | What it does |
-|---|---|---|
-| `tannlege_search` | Search Norwegian dental clinics | Free-text search plus filters: county (fylke), specialty, Helfo direct-billing agreement, emergency duty (akuttvakt). |
-| `tannlege_info` | Get full details for a dental clinic | Full record for one clinic. |
-| `tannlege_stats` | Norwegian dental market statistics | Totals, county breakdown, Helfo / akuttvakt / specialist counts. |
-| `tannlege_akutt` | Find emergency-duty dental clinics in Norway | Clinics offering akuttvakt. |
-| `tannlege_kjeder` | List Norwegian dental chains | Chain listing. **Returns nothing today** — live `tannlege_stats` reports `chain_count: 0`; no clinic is currently tagged to a chain. |
+> **Two title fields, and they disagree.** Each tool carries a top-level `title` *and* an
+> `annotations.title`. For 2 of the 5 dental tools the two strings differ. Both are
+> reproduced below verbatim, because which one a client displays depends on the client.
+> Logged as a finding on the dev-request.
+
+| Tool | `title` | `annotations.title` | What it does |
+|---|---|---|---|
+| `tannlege_search` | Search Norwegian dental clinics | *(same)* | Free-text search plus filters: county (fylke), specialty, Helfo direct-billing agreement, emergency duty (akuttvakt). |
+| `tannlege_info` | Get full details for a dental clinic | **Get dental clinic details** | Full record for one clinic. |
+| `tannlege_stats` | Norwegian dental market statistics | *(same)* | Totals, county breakdown, Helfo / akuttvakt / specialist counts. |
+| `tannlege_akutt` | Find emergency-duty dental clinics in Norway | **Find emergency-duty dental clinics** | Clinics offering akuttvakt. |
+| `tannlege_kjeder` | List Norwegian dental chains | *(same)* | Chain listing. **Returns nothing today** — live `tannlege_stats` reports `chain_count: 0`; no clinic is currently tagged to a chain. |
 
 The connector performs **no writes of any kind**. There is no cart, no booking, no form
 submission, nothing that creates or modifies a record.
@@ -147,3 +152,11 @@ instructions and prompts in `test-instructions.md` in this directory.
   `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`.
 - **`tannlege_kjeder` has no data today** (`chain_count: 0`). The tool is real and
   correctly annotated, but must not be sold as a headline feature in the listing copy.
+- **Search does not case-fold `Ø` (live defect, confirmed 2026-08-24).** `tannlege_search`
+  with `query: "Tromsø"` returns **0** results while `"TROMSØ"` returns **79**. The same
+  split shows on `Bodø` (1 vs 58) and `Førde` (1 vs 31). ASCII folds correctly
+  (`bergen`/`BERGEN`/`Bergen` all 273) and so does `Å` (`Ålesund`/`ÅLESUND` both 82) — the
+  bug is specific to `Ø`. This silently breaks the most natural way a Norwegian user types
+  a place name. Keep `Ø` place names out of the reviewer prompts until it is fixed, and do
+  not let listing copy promise a `Ø`-city example. Routed to the dev-request queue as its
+  own item — it is a server defect, not a documentation problem.

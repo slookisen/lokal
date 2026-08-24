@@ -9,15 +9,16 @@ Norwegian or English, whichever you ask in.
 
 Try these four:
 
-1. "Find a dentist in Tromsø"
+1. "Find a dentist in Bergen"
    -> tannlege_search. Returns clinics with address and contact details.
 
 2. "Which dental clinics in Oslo have a Helfo agreement?"
    -> tannlege_search with the Helfo filter. Helfo is the Norwegian state direct-billing
       arrangement; it changes what the patient pays up front.
 
-3. "I need emergency dental care in Bergen tonight"
-   -> tannlege_akutt. Returns clinics offering emergency duty (akuttvakt).
+3. "I need emergency dental care in Rogaland tonight"
+   -> tannlege_akutt. Returns clinics offering emergency duty (akuttvakt). This tool
+      filters by county (fylke) only, so name a county rather than a town.
 
 4. "How many dental clinics are there in Norway, by county?"
    -> tannlege_stats. Returns the totals and the per-county breakdown.
@@ -35,5 +36,17 @@ gives no dental advice.
   reports `chain_count: 0`, so a reviewer asking "which dental chains are there?" would get
   an empty answer and read it as a broken tool. Do not add it to the review path until the
   chain data is actually populated.
+- **Prompt 3 names a county, not a town, on purpose.** `tannlege_akutt`'s live
+  `inputSchema` has exactly one property, `fylke` — no free-text query. Asked with a town
+  name it silently ignores the filter and returns the national total (732), which reads as
+  "every clinic in Norway is your local emergency dentist". With `fylke: "Rogaland"` it
+  correctly returns 43 (Oslo 144, Vestland 76). Town-level emergency search goes through
+  `tannlege_search` with `akutt: true` instead.
 - The county breakdown in prompt 4 includes two housekeeping rows — `Ukjent` (27) and
   `TEST` (1). Harmless, but worth knowing before a reviewer asks what `TEST` is.
+- **Prompt 1 deliberately uses an ASCII-only city.** The first draft said "Tromsø", which
+  returns **0** results live: search does not case-fold `Ø` (`"Tromsø"` 0 vs `"TROMSØ"` 79;
+  same on `Bodø` 1/58 and `Førde` 1/31, while `Å` and plain ASCII fold correctly). Handing
+  a reviewer a prompt that returns nothing is the exact failure this file warns about for
+  `tannlege_kjeder`. Restore a `Ø` city here only after the collation bug is fixed —
+  it is routed to the dev-request queue as its own item.
