@@ -623,6 +623,11 @@ import { getDb as getExperiencesDbHandle } from "../database/db-factory";
 // (applyGardssalgProviderContact's own gate call lives inside
 // experience-store.ts and needs no separate import here).
 import { gateContactCandidates } from "../services/contact-candidate-judge";
+// dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 4 —
+// fetch-integrity content-marker guard (mirror of RFB Grep 4d): one
+// mechanism, two callers — reused as-is from admin-rfb-website-discovery.ts,
+// never reimplemented here. See tryGardssalgCandidateHosts below.
+import { rfbWdPageReferencesOwnHost } from "./admin-rfb-website-discovery";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -4660,9 +4665,9 @@ async function tryGardssalgCandidateHosts(
       continue;
     }
     tried.push(host);
-    const page = await wdFetchPage(`https://${host}`);
+    let page = await wdFetchPage(`https://${host}`);
     if (!page) continue;
-    const finalHost = hostFromUrlLike(page.finalUrl) || host;
+    let finalHost = hostFromUrlLike(page.finalUrl) || host;
     if (finalHost !== host) {
       const listedFinal = gardssalgWebsiteHostExclusionReason(finalHost);
       if (listedFinal) {
@@ -4673,6 +4678,53 @@ async function tryGardssalgCandidateHosts(
         excludedHere.push({ host: finalHost, reason: "host_already_in_catalog" });
         continue;
       }
+    }
+    // Fetch-integritetsvern (dev-request 2026-08-23-opplevagent-drikke-
+    // selvforsyning-speiling, item 4 — mirror of RFB Grep 4d,
+    // tryRfbWebsiteCandidateHost in admin-rfb-website-discovery.ts): guards
+    // against a proxy/cache returning a completely different site's HTML for
+    // this candidate host. rfbWdPageReferencesOwnHost is reused as-is — one
+    // mechanism, two callers. Exactly ONE sequential re-fetch of the SAME
+    // url on a miss, never a retry loop. If the retry also fails the marker
+    // check (or fails outright), reject as fetch_contaminated — a reason
+    // class distinct from evidence_mismatch/the exclusion reasons above —
+    // and never let the contaminated content reach evidence matching.
+    if (!rfbWdPageReferencesOwnHost(page.html, finalHost)) {
+      const retryPage = await wdFetchPage(`https://${host}`);
+      if (!retryPage) {
+        excludedHere.push({ host: finalHost, reason: "fetch_contaminated" });
+        continue;
+      }
+      // A redirect could differ between the two calls, so recompute
+      // finalHost for the retry the same way the original fetch above does,
+      // and re-run the SAME exclusion re-check against ITS OWN redirect
+      // target (RFB PR review finding 1) — not just the marker check.
+      const retryFinalHost = hostFromUrlLike(retryPage.finalUrl) || host;
+      if (retryFinalHost !== finalHost) {
+        const listedRetryFinal = gardssalgWebsiteHostExclusionReason(retryFinalHost);
+        if (listedRetryFinal) {
+          excludedHere.push({ host: retryFinalHost, reason: listedRetryFinal });
+          continue;
+        }
+        if ((hostCounts.get(retryFinalHost) || 0) >= 1) {
+          excludedHere.push({ host: retryFinalHost, reason: "host_already_in_catalog" });
+          continue;
+        }
+      }
+      if (!rfbWdPageReferencesOwnHost(retryPage.html, retryFinalHost)) {
+        // RFB PR review finding 2: continue immediately here — never fall
+        // through to evidence matching below with the still-contaminated
+        // page (that would either crash on stale content or silently
+        // produce a second, contradictory exclusion entry).
+        excludedHere.push({ host: retryFinalHost, reason: "fetch_contaminated" });
+        continue;
+      }
+      // Retry passed the marker check: use ITS content/finalHost for
+      // everything downstream (evidence matching, subpage follow-up) — the
+      // first, contaminated fetch is discarded entirely, never used as
+      // evidence.
+      page = retryPage;
+      finalHost = retryFinalHost;
     }
     const evTarget = {
       orgNr: target.org_nr,
