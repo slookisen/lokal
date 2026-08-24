@@ -50,12 +50,12 @@ and `destructiveHint` (read live from the endpoint 2026-08-24).
 
 | Tool | `title` | `annotations.title` | What it does |
 |---|---|---|---|
-| `lokal_search` | Search local food producers | *(same)* | Free-text search; returns producers **with their product catalogue and current prices**. |
+| `lokal_search` | Search local food producers | *(same)* | Free-text search; returns producers with contact details and their product **names**. It returns no prices — the response defers explicitly ("Bruk `lokal_info` … for full prisliste"). |
 | `lokal_discover` | Discover producers by filter | *(same)* | Filtered discovery. Live `inputSchema` accepts `categories`, `tags`, `lat`, `lng`, `maxDistanceKm`, `limit` — certification filtering goes through `tags`; there is no separate region or trust-score parameter. |
 | `lokal_info` | Producer details | *(same)* | Full detail record for one producer. |
 | `lokal_stats` | Platform statistics | *(same)* | Totals and coverage across the catalogue. |
 | `lokal_list_umbrellas` | List umbrella organizations | *(same)* | The 72 umbrellas live today: 14 `market_network` (Bondens marked), 57 `venue`, 1 `industry_org` (Hanen). **No REKO umbrella exists** — the server's own tool description claims one, but REKO rings are producer records, not umbrellas. Defaults to `limit: 50` and truncates silently. |
-| `lokal_get_umbrella_members` | Get producers in an umbrella's network | *(same)* | Members of one umbrella. |
+| `lokal_get_umbrella_members` | Get producers in an umbrella's network | *(same)* | Members of one umbrella. **Requires `umbrellaId` as a UUID**, and no tool currently emits umbrella UUIDs — `lokal_list_umbrellas` returns names and profile URLs only, despite its schema saying "Use lokal_list_umbrellas to find IDs". In practice this tool is not reachable end-to-end today. |
 | `lokal_get_producer_affiliations` | Get a producer's umbrella affiliations | *(same)* | The inverse lookup. |
 | `lokal_bm_next_markets` | Get upcoming Bondens marked events | **Upcoming Bondens marked events** | Upcoming farmers'-market dates. |
 | `lokal_geocode` | Geocode a Norwegian place name | **Geocode Norwegian place** | Place name → coordinates, for location-scoped search. |
@@ -81,8 +81,9 @@ Answer for the portal's "what does this connector do / does it read or write" st
 Rett fra Bonden is Norway's open directory of small-scale food producers — farms, farm
 shops, REKO rings, farmers' markets and cooperatives. The connector lets Claude search
 more than 1,600 producers by place, product type, category or certification, read a
-producer's live product range and prices, look up which networks a producer belongs to,
-and find upcoming farmers'-market dates.
+producer's product range, look up which networks a producer belongs to, and find upcoming
+farmers'-market dates. Prices appear only where a producer has supplied them — most
+records today carry product names without a price.
 
 It both reads and writes. Reading is the bulk of it (11 of 14 tools). The three write
 tools let a user assemble a pickup order and send it to the producer: create a cart, add
@@ -96,7 +97,7 @@ Concrete use cases to list:
 - Travelling in Norway and looking for local food near where you are.
 - Planning a farm-shop or gårdsbutikk visit, with opening hours and contact details.
 - Sourcing Norwegian ingredients for a restaurant or event.
-- Checking certifications (Debio organic, Nyt Norge) before buying.
+- Checking certifications (Debio organic) before buying.
 - Assembling a pickup order from one or more producers.
 
 ## 5. Listing
