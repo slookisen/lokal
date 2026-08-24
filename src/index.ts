@@ -64,6 +64,7 @@ import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write
 import adminAgentsContactEmailWriteRoutes from "./routes/admin-agents-contact-email-write";
 import adminAgentsContactEmailDnsCheckRoutes from "./routes/admin-agents-contact-email-dns-check";
 import adminAgentsUrlWriteRoutes from "./routes/admin-agents-url-write";
+import adminAgentsDescriptionCodeArtifactSweepRoutes from "./routes/admin-agents-description-code-artifact-sweep";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
@@ -630,6 +631,14 @@ app.use("/admin/agents/contact-email-dns-check", adminLimiter, adminAgentsContac
 // POST /admin/agents/url-write (dev-request 2026-08-01-rfb-agents-url-skrivespak).
 // Same ordering rule as the sibling above — mount BEFORE /admin/agents.
 app.use("/admin/agents/url-write", adminLimiter, adminAgentsUrlWriteRoutes);
+// POST /admin/agents/description-code-artifact-sweep (dev-request 2026-08-24-
+// produsentbeskrivelser-skrapt-js-opprydding, Endring 4). Same ordering rule
+// as the siblings above — mount BEFORE /admin/agents.
+app.use(
+  "/admin/agents/description-code-artifact-sweep",
+  adminLimiter,
+  adminAgentsDescriptionCodeArtifactSweepRoutes,
+);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
 // state that services/enrichment-write-pause.ts enforces on every enrichment

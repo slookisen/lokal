@@ -23,7 +23,7 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
-import { isJunkDescription } from "../services/description-quality";
+import { isJunkDescription, looksLikeCodeArtifact } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
@@ -1160,6 +1160,23 @@ router.patch("/agents/:id", (req: Request, res: Response) => {
 
   if (!authorized) {
     res.status(403).json({ error: "Krever X-Admin-Key eller X-API-Key header" });
+    return;
+  }
+
+  // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: this
+  // is the unsanitized write path the root-cause analysis identified — the
+  // automatic enrichment sweep (search-enrich.ts) always strips <script>/
+  // <style> before storing text, but this admin/agent-driven PATCH had no
+  // validation on `description` at all. Reject BEFORE the write, not after —
+  // a normal description (including one that merely mentions "JavaScript" in
+  // prose) must NOT be rejected; only actual code syntax trips the detector,
+  // see description-quality.ts's looksLikeCodeArtifact doc comment.
+  if (
+    req.body &&
+    Object.prototype.hasOwnProperty.call(req.body, "description") &&
+    looksLikeCodeArtifact((req.body as { description?: unknown }).description as string | null | undefined)
+  ) {
+    res.status(400).json({ error: "description contains code/script artifacts — rejected" });
     return;
   }
 

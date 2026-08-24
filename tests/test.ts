@@ -34638,6 +34638,75 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
       "descjunk: borderline — 'kontakt' and 'produkter' each mentioned once in flowing prose -> false (density well under threshold)"
     );
 
+    // ── looksLikeCodeArtifact: scraped JS/CMS-bootstrap code detector ────────
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding. A
+    // THIRD failure mode in description-quality.ts, checked separately from
+    // rules 1-4 above (its own, freer threshold — see the function's own doc
+    // comment for the full rationale). Threshold/class-based, NOT single-word
+    // matching (Daniel's explicit requirement).
+    assertTrue(typeof dq.looksLikeCodeArtifact === "function", "descjunk: description-quality.ts exports looksLikeCodeArtifact");
+
+    // Positive: a literal <script> tag is unambiguous alone (class 1).
+    assertTrue(
+      dq.looksLikeCodeArtifact('<script>window.dataLayer = window.dataLayer || [];</script> Velkommen til gården vår!') === true,
+      "codeartifact: a literal <script> tag alone flags true, regardless of surrounding prose"
+    );
+    assertTrue(
+      dq.looksLikeCodeArtifact('Se mer på nettsiden. <style>.hero{display:none}</style>') === true,
+      "codeartifact: a literal <style> tag alone flags true"
+    );
+
+    // Positive: Squarespace-bootstrap-shaped fixture (NOT the real live
+    // Helios text — this dev-request's research never captured it verbatim,
+    // this is a same-shape stand-in). CMS-token class + brace-density class
+    // both fire (2 of classes 2-4), no <script> tag needed.
+    const squarespaceJunk =
+      'Y.Squarespace = Y.Squarespace || {}; Static.SQUARESPACE_CONTEXT = {"website":{"id":"123"},"cacheBust":"abc"}; window.Y.Squarespace.afterBodyLoad(Y);';
+    assertTrue(
+      dq.looksLikeCodeArtifact(squarespaceJunk) === true,
+      "codeartifact: Squarespace-bootstrap-shaped fixture -> true (CMS-token class + brace-density class both fire)"
+    );
+
+    // Positive: generic minified-JS shape — JS-syntax-density class +
+    // brace-density class, no CMS tokens at all.
+    assertTrue(
+      dq.looksLikeCodeArtifact('function(){var a=1;var b=2;let c=3;const d=4;if(a){b=c;}return a+b+c+d;}') === true,
+      "codeartifact: generic minified-JS shape (function()+var/let/const=+high semicolon/brace density) -> true"
+    );
+
+    // Negative (CRITICAL — Daniel's own explicit requirement): normal prose
+    // that merely NAMES a technology must NOT flag — only actual code SYNTAX
+    // does, never the word alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact("Vi bruker moderne teknologi og JavaScript-baserte verktøy i gårdsdriften vår.") === false,
+      "codeartifact: prose that merely mentions 'JavaScript' -> false (word alone is never enough)"
+    );
+    // Negative: an ordinary short description, no tech-related content at all.
+    assertTrue(
+      dq.looksLikeCodeArtifact("Vi selger egg og grønnsaker rett fra gården hver lørdag.") === false,
+      "codeartifact: ordinary description with zero code signals -> false (regression guard)"
+    );
+    assertTrue(dq.looksLikeCodeArtifact("") === false, "codeartifact: empty string -> false");
+    assertTrue(dq.looksLikeCodeArtifact(null) === false, "codeartifact: null -> false");
+    assertTrue(dq.looksLikeCodeArtifact(undefined) === false, "codeartifact: undefined -> false");
+
+    // A single weak signal class alone (e.g. only CMS-token class, no brace/
+    // semicolon density) must NOT flag — the detector requires >=2 classes
+    // (or the unambiguous <script>/<style> tag) per the byggspec's explicit
+    // threshold requirement, never a single class alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact("Vi henviser til document. for mer informasjon om driften vår, ta gjerne kontakt.") === false,
+      "codeartifact: a single class-2 token substring ('document.') alone, with no other signal class, does not reach the >=2-class threshold"
+    );
+
+    // isJunkDescription() itself must pick up the new rule for free (Endring
+    // 2 — wired in as an additional early rule, no call site needs its own
+    // change).
+    assertTrue(
+      dq.isJunkDescription(squarespaceJunk) === true,
+      "descjunk: isJunkDescription() picks up looksLikeCodeArtifact's verdict via the new early rule"
+    );
+
     // ── Render-guard wiring: every output path that surfaces agent.description
     // / knowledge.about imports the guard AND logs (never silently) when it
     // suppresses something. Source-presence checks mirror the geo-faq-cc
@@ -38513,6 +38582,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding, Endring
+// 3: the code-artifact write-time gate on PATCH /agents/:id. Own in-memory DB
+// (swaps the shared getDb() singleton) — runs via runSerial() same as the
+// availability-patch suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: PATCH /agents/:id description-artifact gate ──");
+  try {
+    const { runMarketplacePatchDescriptionArtifactGuardTests } = require("../src/routes/marketplace-patch-description-artifact-guard.test") as
+      typeof import("../src/routes/marketplace-patch-description-artifact-guard.test");
+    const pg = await runMarketplacePatchDescriptionArtifactGuardTests({ log: false });
+    passed += pg.passed;
+    failed += pg.failed;
+    for (const f of pg.failures) failures.push("marketplace-patch-description-artifact-guard: " + f);
+    console.log(`  marketplace-patch-description-artifact-guard: ${pg.passed} passed, ${pg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-patch-description-artifact-guard: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-13-supply-graph-v1, salvage slice (2026-07-27):
 // cart-service addCartItem()/submitCart() staleness hardening — gate on
 // EFFECTIVE availability, not the raw column. Own in-memory DB (swaps both
@@ -39729,6 +39818,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("url-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding, Endring
+// 4: POST /admin/agents/description-code-artifact-sweep. Same DB-swap
+// discipline as the url-write sibling above — runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: description-code-artifact-sweep ──");
+  try {
+    const { runAdminAgentsDescriptionCodeArtifactSweepTests } = require("../src/routes/admin-agents-description-code-artifact-sweep.test") as
+      typeof import("../src/routes/admin-agents-description-code-artifact-sweep.test");
+    const ds = await runAdminAgentsDescriptionCodeArtifactSweepTests({ log: false });
+    passed += ds.passed;
+    failed += ds.failed;
+    for (const f of ds.failures) failures.push("description-code-artifact-sweep: " + f);
+    console.log(`  description-code-artifact-sweep: ${ds.passed} passed, ${ds.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("description-code-artifact-sweep: unexpected error: " + String(err?.message || err));
   }
 });
 
