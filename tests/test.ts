@@ -40392,3 +40392,26 @@ runSerial(async () => {
     failures.push("opplevelser-evidence-url-verification-gate: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-24-opplevagent-kategorifarger-og-profil-remake: the
+// per-category colour system (services/category-palette.ts — one map shared by
+// every HTML surface AND the OG-image service) and the experience-profile
+// remake (drawn category cover instead of the dotted placeholder box, shared
+// S1 chrome). Own in-memory-db harness, same shape as the sibling
+// experiences-seo test files. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-opplevagent-kategorifarger-og-profil-remake: kategorifarger + profil-cover ──");
+  try {
+    const { runExperiencesSeoKategorifargerTests } = require("../src/routes/experiences-seo-kategorifarger.test") as
+      typeof import("../src/routes/experiences-seo-kategorifarger.test");
+    const kfg = await runExperiencesSeoKategorifargerTests({ log: false });
+    passed += kfg.passed;
+    failed += kfg.failed;
+    for (const f of kfg.failures) failures.push("experiences-seo-kategorifarger: " + f);
+    console.log(`  experiences-seo-kategorifarger: ${kfg.passed} passed, ${kfg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-kategorifarger: unexpected error: " + String(err?.message || err));
+  }
+});

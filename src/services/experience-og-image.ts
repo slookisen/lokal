@@ -42,6 +42,7 @@
  * module.)
  */
 
+import { CATEGORY_COLORS } from "./category-palette";
 import { escapeHtml } from "../routes/experiences-seo";
 
 const OG_IMAGE_WIDTH = 1200;
@@ -72,26 +73,14 @@ const BRAND_FJORD_900 = "#0b2e29";
 // a single category (tilbyder pages, /opplevelser, /sok, /fylke, /kommune).
 export const DEFAULT_OG_ACCENT = "#0e3c36"; // --fjord-800
 
-// Companion color map to CATEGORY_LABELS in experiences-seo.ts (same keys,
-// ~line 149 there) — one distinct, on-brand color per category, drawn from
-// the same palette used throughout experiences-seo.ts's <style> blocks
-// (--fjord-900/800/700/600, --teal-500/400, --amber-500/400, --gold,
-// --olive). Kept here (not imported) since experiences-seo.ts's
-// CATEGORY_LABELS is not exported and duplicating ten short hex strings is
-// far simpler/safer than exporting+threading a whole label map just to key
-// off its keys.
-export const CATEGORY_OG_ACCENT_COLORS: Record<string, string> = {
-  vinter_sno: "#3cc3b4", // --teal-400 (icy)
-  sightseeing_transport: "#0c7264", // --fjord-600
-  dyreliv_safari: "#6f7a4f", // --olive
-  natur_friluft: "#0f5a50", // --fjord-700
-  kultur_historie: "#c98a2b", // --gold
-  overnatting_opplevelse: "#0b2e29", // --fjord-900
-  adrenalin_action: "#ff5d3b", // --amber-500 / --coral-500
-  velvaere_spa: "#12a594", // --teal-500
-  mat_drikke: "#ff8566", // --amber-400
-  gardssalg: "#0e3c36", // --fjord-800
-};
+// The per-category accent for the shared-link preview image is the SAME map
+// every on-page surface reads (services/category-palette.ts) — Daniel,
+// 2026-08-24: «marker de ulike kategoriene i sin farge». Until then this file
+// held its own independent ten-colour map, so a category could be icy teal in
+// a Facebook preview and something else entirely on the page that preview
+// linked to. Re-exported under the original name because callers and
+// experience-og-image.test.ts already address it that way.
+export const CATEGORY_OG_ACCENT_COLORS: Record<string, string> = CATEGORY_COLORS;
 
 /** Resolve a category slug to its OG accent color, falling back to the brand default. */
 export function resolveOgAccentColor(category?: string | null): string {

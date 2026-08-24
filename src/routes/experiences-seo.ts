@@ -168,6 +168,7 @@ import {
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
+import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-palette";
 // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 4
 // (gårdssalg-kort-konsistens): the SAME "Navn — Sted" display-suffix parser
 // admin-agents.ts already reuses for RFB producer names (its own doc comment
@@ -978,6 +979,149 @@ function catLabel(c: string | null | undefined): string {
   return CATEGORY_LABELS[c] || c.replace(/_/g, " ");
 }
 
+// Category colours live in services/category-palette.ts — ONE map shared by
+// every HTML surface here AND by the OG-image service, so a category can never
+// wear one colour on the page and a different one in a shared-link preview.
+// See that file for the palette's rationale and its contrast contract.
+
+/** The colour for a category slug OR a human label. Goes through the same
+ *  resolveCategoryIconKey() the icons use, so the colour and the glyph on any
+ *  given surface always come from the same resolved key — including the
+ *  pre-data example labels on the homepage ("Natur & friluft") and legacy
+ *  internal slugs. */
+function categoryColor(catOrLabel: string | null | undefined): string {
+  const direct = String(catOrLabel ?? "").toLowerCase();
+  if (CATEGORY_COLORS[direct]) return CATEGORY_COLORS[direct];
+  const key = resolveCategoryIconKey(catOrLabel);
+  return (key && CATEGORY_COLORS[key]) || CATEGORY_COLOR_FALLBACK;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Cover illustrations — Daniel, live sesjon 2026-08-24: «opplevelses
+// profilene får seg en liten remake og bildene blir forbedret».
+//
+// What a visitor saw before this: a 2:1 dotted beige rectangle with a 72px
+// line icon and the category name in the middle — the emptiest thing on the
+// page occupying its most valuable space. The `experiences` table has NO image
+// column (see database/init-experiences.ts) and we hold no licence to
+// anybody's photos, so the honest fix is not "find a picture" — it is to make
+// the generated art actually worth its space.
+//
+// So: an inline SVG landscape built from the experience's own category. Sky
+// wash + sun in the category colour, three depth layers, and a shape family
+// chosen by what the category IS (mountains for fjell/vinter/adrenalin, water
+// for fjord/dyreliv, rolling hills for mat/gårdssalg/velvære, rooflines for
+// kultur/overnatting). Everything is deterministic in the slug, so a given
+// experience always draws the same picture (no shuffling between requests, no
+// layout shift) while the catalogue as a whole doesn't look stamped from one
+// mould.
+//
+// Zero bytes over the wire beyond the HTML itself: no <img>, no external host,
+// no CLS, and it renders identically in a text-only/crawler fetch.
+// ─────────────────────────────────────────────────────────────
+type CoverFamily = "fjell" | "fjord" | "skog" | "by";
+
+const CATEGORY_COVER_FAMILY: Record<string, CoverFamily> = {
+  natur_friluft: "fjell",
+  vinter_sno: "fjell",
+  adrenalin_action: "fjell",
+  sightseeing_transport: "fjord",
+  dyreliv_safari: "fjord",
+  kajakk: "fjord",
+  mat_drikke: "skog",
+  gardssalg: "skog",
+  velvaere_spa: "skog",
+  kultur_historie: "by",
+  overnatting_opplevelse: "by",
+};
+
+function coverFamily(catOrLabel: string | null | undefined): CoverFamily {
+  const direct = String(catOrLabel ?? "").toLowerCase();
+  if (CATEGORY_COVER_FAMILY[direct]) return CATEGORY_COVER_FAMILY[direct];
+  const key = resolveCategoryIconKey(catOrLabel);
+  return CATEGORY_COVER_FAMILY[key] ?? "fjell";
+}
+
+// FNV-1a over the seed string. Deterministic and dependency-free — the point
+// is a stable per-experience variation, not cryptographic anything.
+function coverSeed(seedSource: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < seedSource.length; i++) {
+    h ^= seedSource.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return Math.abs(h | 0);
+}
+
+// The three depth layers of one cover, back to front. Each family returns SVG
+// path `d` strings only — fill/opacity are applied by the caller, so the
+// colour rule stays in ONE place no matter how many families exist.
+function coverLayers(family: CoverFamily, seed: number): string[] {
+  // Two small, bounded jitters (never enough to break a silhouette).
+  const a = (seed % 7) * 6;          // 0-36
+  const b = ((seed >> 4) % 5) * 8;   // 0-32
+  switch (family) {
+    case "fjell":
+      return [
+        `M0 ${208 - a} L118 ${128 - a} L232 ${196 - a} L352 ${104 - a} L470 ${192 - a} L596 ${126 - a} L706 ${198 - a} L800 ${150 - a} L800 340 L0 340 Z`,
+        `M0 ${262 - b} L96 ${196 - b} L214 ${256 - b} L338 ${180 - b} L462 ${254 - b} L594 ${190 - b} L724 ${258 - b} L800 ${216 - b} L800 340 L0 340 Z`,
+        `M0 300 Q140 268 268 296 T528 292 T800 276 L800 340 L0 340 Z`,
+      ];
+    case "fjord":
+      return [
+        `M0 ${196 - a} L112 ${124 - a} L206 ${188 - a} L318 ${132 - a} L430 ${194 - a} L556 ${118 - a} L676 ${192 - a} L800 ${146 - a} L800 340 L0 340 Z`,
+        `M0 ${238 - b} Q118 ${212 - b} 236 ${238 - b} T472 ${238 - b} T800 ${230 - b} L800 340 L0 340 Z`,
+        `M0 286 Q104 266 208 286 T416 286 T624 286 T800 280 L800 340 L0 340 Z`,
+      ];
+    case "skog":
+      return [
+        `M0 ${226 - a} Q152 ${162 - a} 308 ${218 - a} T612 ${196 - a} T800 ${222 - a} L800 340 L0 340 Z`,
+        `M0 ${268 - b} Q136 ${222 - b} 284 ${262 - b} T574 ${238 - b} T800 ${266 - b} L800 340 L0 340 Z`,
+        `M0 302 Q168 282 330 302 T660 300 T800 292 L800 340 L0 340 Z`,
+      ];
+    case "by":
+      return [
+        // Roofline: pitched roofs of varying height, then a solid base.
+        `M0 340 L0 ${232 - a} L64 ${232 - a} L96 ${196 - a} L128 ${232 - a} L214 ${232 - a} L214 ${180 - a} L268 ${180 - a} L268 ${232 - a} L360 ${232 - a} L392 ${190 - a} L424 ${232 - a} L520 ${232 - a} L520 ${172 - a} L578 ${172 - a} L578 ${232 - a} L688 ${232 - a} L720 ${198 - a} L752 ${232 - a} L800 ${232 - a} L800 340 Z`,
+        `M0 340 L0 ${276 - b} L108 ${276 - b} L142 ${242 - b} L176 ${276 - b} L306 ${276 - b} L306 ${236 - b} L372 ${236 - b} L372 ${276 - b} L512 ${276 - b} L548 ${240 - b} L584 ${276 - b} L800 ${276 - b} L800 340 Z`,
+        `M0 306 Q160 292 320 306 T640 304 T800 298 L800 340 L0 340 Z`,
+      ];
+  }
+}
+
+/**
+ * A category cover as inline SVG. `seedSource` is whatever should make this
+ * particular cover stable — the experience slug on a detail page.
+ *
+ * Purely decorative: `aria-hidden` on the art, with the human-readable name
+ * carried by the caller's own label chip / figure aria-label, so a screen
+ * reader hears the category once, not twice.
+ */
+function categoryCoverSvg(catOrLabel: string | null | undefined, seedSource: string): string {
+  const c = categoryColor(catOrLabel);
+  const seed = coverSeed(seedSource || String(catOrLabel ?? "opplevelse"));
+  const family = coverFamily(catOrLabel);
+  const layers = coverLayers(family, seed);
+  // Gradient id must be unique per rendered cover (two on one page would
+  // otherwise share the first one's stops). Derived from the same seed, so it
+  // is stable across requests for a given experience.
+  const gid = `oaCover${seed.toString(36)}`;
+  const sunX = 120 + (seed % 5) * 130;
+  const opacities = [0.3, 0.55, 0.9];
+  const paths = layers
+    .map((d, i) => `<path d="${d}" fill="${c}" opacity="${opacities[i]}"/>`)
+    .join("");
+  return `<svg class="cover-art" viewBox="0 0 800 340" preserveAspectRatio="xMidYMid slice" aria-hidden="true" focusable="false">
+<defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="${c}" stop-opacity=".08"/><stop offset="1" stop-color="${c}" stop-opacity=".30"/>
+</linearGradient></defs>
+<rect width="800" height="340" fill="#f3efe6"/>
+<rect width="800" height="340" fill="url(#${gid})"/>
+<circle cx="${sunX}" cy="86" r="38" fill="#fff" opacity=".5"/>
+${paths}
+</svg>`;
+}
+
 // Build the URL for a page's per-page branded og:image (dev-request
 // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — served by the
 // GET /og-image.svg route below. Query-param based (not a new path segment)
@@ -1566,8 +1710,14 @@ router.get("/", (req: Request, res: Response) => {
       const href = usingFallbackCats
         ? `/opplevelser`
         : `/kategori/${encodeURIComponent(c.category)}`;
-      return `<a class="cat-card" href="${href}">
-        <span class="cat-ico" aria-hidden="true">${catIconSvg(c.category, 26)}</span>
+      // Daniel 2026-08-24: each card wears its own category colour — the icon
+      // tile in a wash of it, a matching top edge. Same categoryColor() source
+      // the listing cards, chips and covers read, and it resolves the pre-data
+      // example LABELS too ("Natur & friluft"), so the fallback grid is
+      // coloured exactly like the live one.
+      const cc = categoryColor(c.category);
+      return `<a class="cat-card" style="border-top-color:${cc}" href="${href}">
+        <span class="cat-ico" aria-hidden="true" style="color:${cc};background:${cc}1f;border:1px solid ${cc}33">${catIconSvg(c.category, 26)}</span>
         <span class="cat-body">
           <span class="cat-name">${escapeHtml(catLabel(c.category))}</span>
           ${count}
@@ -1822,10 +1972,10 @@ ${ldScripts}
 
   /* category grid */
   .cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
-  .cat-card{display:flex;align-items:center;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:18px 18px;box-shadow:var(--sh-sm);transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}
+  .cat-card{display:flex;align-items:center;gap:14px;background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--fjord-700);border-radius:var(--r-md);padding:15px 18px 18px;box-shadow:var(--sh-sm);transition:transform .16s ease,box-shadow .16s ease}
   .section-alt .cat-card{background:var(--canvas)}
-  .cat-card:hover{transform:translateY(-3px);box-shadow:var(--sh-md);border-color:var(--teal-400);text-decoration:none}
-  .cat-ico{flex:0 0 50px;width:50px;height:50px;border-radius:13px;display:flex;align-items:center;justify-content:center;color:var(--fjord-700);background:linear-gradient(150deg,var(--canvas-2),#dff0e6)}
+  .cat-card:hover{transform:translateY(-3px);box-shadow:var(--sh-md);text-decoration:none}
+  .cat-ico{flex:0 0 50px;width:50px;height:50px;border-radius:13px;display:flex;align-items:center;justify-content:center}
   .cat-body{display:flex;flex-direction:column;gap:3px;min-width:0}
   .cat-name{font-weight:700;color:var(--ink);font-size:1rem;letter-spacing:-.01em}
   .cat-count{font-size:.82rem;color:var(--mist)}
@@ -1851,6 +2001,7 @@ ${ldScripts}
   .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.82rem;font-weight:600;border:1px solid var(--line)}
   .chip:hover{text-decoration:none;border-color:var(--teal-400);color:var(--fjord-700)}
   .chip .n{color:var(--mist);font-weight:600}
+  .chip-dot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:0 0 9px}
 
   /* how it works */
   .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;counter-reset:step}
@@ -2819,10 +2970,16 @@ function renderHeroMedia(exp: Record<string, unknown>, cat: string | null, place
     const alt = `${String(exp.title ?? "Opplevelse")}${place ? " – " + place : ""}`;
     return `<figure class="hero-media"><img src="${escapeHtml(img)}" alt="${escapeHtml(alt)}" loading="lazy" decoding="async" width="1080" height="540"></figure>`;
   }
-  const glyph = catIconSvg(cat, 72, "hero-glyph");
-  return `<figure class="hero-media hero-placeholder" role="img" aria-label="${escapeHtml(catLabel(cat))} — illustrasjon">
-      ${glyph}
-      <figcaption class="hero-cap">${escapeHtml(catLabel(cat))}</figcaption>
+  // No photo (no row has one — the table has no image column): draw the
+  // category's own cover instead of the old dotted-box-with-an-icon. See
+  // categoryCoverSvg()'s doc comment for why generated art, not a stock photo.
+  // Seeded on the slug so this experience always gets the same picture.
+  const seed = String(exp.slug ?? exp.id ?? exp.title ?? "opplevelse");
+  const c = categoryColor(cat);
+  const label = catLabel(cat);
+  return `<figure class="hero-media hero-cover" role="img" aria-label="${escapeHtml(label)} — illustrasjon">
+      ${categoryCoverSvg(cat, seed)}
+      <figcaption class="cover-chip" style="background:${c}"><span class="cover-chip-ico" aria-hidden="true">${catIconSvg(cat, 18)}</span>${escapeHtml(label)}</figcaption>
     </figure>`;
 }
 
@@ -2900,8 +3057,13 @@ function renderOpplevelseDetail(
   const metaDesc = metaDescRaw.length > 155 ? metaDescRaw.slice(0, 152).trim() + "…" : metaDescRaw;
 
   // Badges row.
+  // Daniel 2026-08-24: every category-bearing element on this page takes the
+  // category's own colour (categoryColor(), the same map the icons, cards and
+  // chips read) instead of one site-wide teal — so a Vinter & snø profile
+  // reads as Vinter & snø at a glance, not as "some page on Opplevagent".
+  const catColor = categoryColor(cat);
   const badges: string[] = [];
-  if (cat) badges.push(`<a class="badge badge-cat" href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>`);
+  if (cat) badges.push(`<a class="badge badge-cat" style="background:${catColor};border-color:${catColor}" href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>`);
   if (exp.indoor_outdoor) badges.push(`<span class="badge">${escapeHtml(ioLabel(exp.indoor_outdoor))}</span>`);
   for (const s of exp.season || []) badges.push(`<span class="badge">${escapeHtml(seasonLabel(s))}</span>`);
   if (brregVerified) badges.push(`<span class="badge badge-verified" title="Tilbyder verifisert mot Brønnøysundregistrene">✓ Brreg-verifisert</span>`);
@@ -3014,7 +3176,7 @@ function renderOpplevelseDetail(
 
   // Related grid (these links resolve — they are other detail pages).
   const relCards = related
-    .map((r) => `<a class="rel-card" href="/opplevelse/${encodeURIComponent(r.slug)}">
+    .map((r) => `<a class="rel-card" style="border-left-color:${categoryColor(r.category ?? cat)}" href="/opplevelse/${encodeURIComponent(r.slug)}">
         <span class="rel-title">${escapeHtml(r.title)}</span>
         <span class="rel-meta">${escapeHtml([r.kommune, r.fylke].filter(Boolean).join(", "))}</span>
       </a>`)
@@ -3139,8 +3301,10 @@ ${ldScripts}
   .head .place{margin-top:8px;color:var(--ink-soft);font-size:1rem;display:flex;align-items:center;gap:7px}
   .badges{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 4px}
   .badge{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.8rem;font-weight:600;border:1px solid var(--line)}
+  /* Colour comes from an inline style (the row's own category); this rule
+     only carries the shape + the white text the palette guarantees ≥4.5:1 on. */
   a.badge-cat{background:var(--fjord-800);color:#fff;border-color:var(--fjord-800)}
-  a.badge-cat:hover{background:var(--fjord-700);text-decoration:none}
+  a.badge-cat:hover{text-decoration:none;filter:brightness(1.08)}
   .badge-verified{background:#e7f6ec;color:#0f7a3d;border-color:#bfe6cd}
   .layout{display:grid;grid-template-columns:1fr 340px;gap:32px;margin:26px 0 10px;align-items:start}
   @media(max-width:860px){.layout{grid-template-columns:1fr;gap:22px}}
@@ -3148,10 +3312,15 @@ ${ldScripts}
   .lede-soft{color:var(--ink-soft)}
   .hero-media{margin:0 0 24px;border-radius:var(--r-lg);overflow:hidden;border:1px solid var(--line);box-shadow:var(--sh-sm)}
   .hero-media img{display:block;width:100%;height:auto;aspect-ratio:2/1;object-fit:cover}
-  .hero-placeholder{position:relative;aspect-ratio:2/1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:linear-gradient(150deg,var(--canvas-2),var(--canvas));color:var(--fjord-600)}
-  .hero-placeholder::after{content:"";position:absolute;inset:0;background-image:radial-gradient(circle at 1px 1px,rgba(15,81,50,.10) 1px,transparent 0);background-size:18px 18px;pointer-events:none}
-  .hero-glyph{position:relative;z-index:1;opacity:.85}
-  .hero-cap{position:relative;z-index:1;font-size:.82rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--mist)}
+  /* Daniel 2026-08-24: the old .hero-placeholder (dotted beige box + centred
+     icon) is replaced by a drawn category cover — see categoryCoverSvg().
+     Shorter than the old 2:1 too: the art earns its space, but the facts
+     below it are what the visitor came for. */
+  .hero-cover{position:relative;aspect-ratio:20/9;background:var(--canvas-2)}
+  .hero-cover .cover-art{position:absolute;inset:0;width:100%;height:100%}
+  .cover-chip{position:absolute;left:16px;bottom:14px;display:inline-flex;align-items:center;gap:8px;padding:7px 15px 7px 12px;border-radius:var(--r-pill);color:#fff;font-size:.82rem;font-weight:700;letter-spacing:.01em;box-shadow:0 2px 10px rgba(24,19,13,.22)}
+  .cover-chip svg{width:18px;height:18px}
+  @media(max-width:560px){.hero-cover{aspect-ratio:16/9}.cover-chip{left:12px;bottom:10px;font-size:.78rem}}
   .facts{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
   .facts th,.facts td{text-align:left;padding:12px 16px;font-size:.92rem;border-bottom:1px solid var(--line);vertical-align:top}
   .facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
@@ -3177,22 +3346,25 @@ ${ldScripts}
   .related{margin:34px 0 10px}
   .related h2{font-size:1.2rem;font-weight:800;color:var(--fjord-900);margin-bottom:14px}
   .rel-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
-  .rel-card{display:flex;flex-direction:column;gap:4px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
-  .rel-card:hover{text-decoration:none;border-color:var(--fjord-600);box-shadow:var(--sh-sm)}
+  .rel-card{display:flex;flex-direction:column;gap:4px;background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--fjord-700);border-radius:var(--r-md);padding:14px 16px 14px 15px}
+  .rel-card:hover{text-decoration:none;box-shadow:var(--sh-md);transform:translateY(-2px)}
   .rel-title{font-weight:700;color:var(--ink);font-size:.95rem}
   .rel-meta{font-size:.82rem;color:var(--mist)}
   .site-foot{margin-top:48px;border-top:1px solid var(--line);background:var(--canvas-2)}
   .foot-inner{max-width:var(--maxw);margin:0 auto;padding:26px 24px;font-size:.84rem;color:var(--mist);display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between}
   .foot-inner a{color:var(--ink-soft)}
+/* S1 shared chrome, appended LAST on purpose so its nav/footer rules win over
+   the slim ones above (same technique as /kategori/gardssalg). The experience
+   profile was the last human-facing page still wearing the legacy two-link
+   nav + mini footer — Daniel 2026-08-24 asked for a profile remake, and
+   "looks like the rest of the site" is half of that. */
+${OA_CHROME_CSS}
 </style>
 ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
-<nav class="site-nav"><div class="nav-inner">
-  <a class="brand" href="/">${brandInner("light")}</a>
-  <span class="nav-links"><a href="/">Forsiden</a><a href="/#kategorier">Kategorier</a></span>
-</div></nav>
+${oaSiteNav({ lang })}
 <main id="main" class="container">
   <nav class="breadcrumb" aria-label="Brødsmuler">
     <a href="/">Forsiden</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(exp.title)}
@@ -3217,10 +3389,7 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
   </div>
   ${relBlock}
 </main>
-<footer class="site-foot"><div class="foot-inner">
-  <span>© ${new Date().getFullYear()} Opplevagent — norske opplevelser, håndplukket og verifisert.</span>
-  <span><a href="/">Forsiden</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
-</div></footer>
+${oaSiteFooter({ lang })}
 </body>
 </html>`;
 }
@@ -3282,6 +3451,10 @@ const BROWSE_CSS = `
   .breadcrumb a{color:var(--ink-soft)}
   .breadcrumb .sep{margin:0 8px;color:var(--line)}
   .head{padding:14px 0 6px}
+  /* Category-coloured page head (Daniel 2026-08-24) — only /kategori/:category
+     passes an accent; every other browse page keeps the plain .head. */
+  .head-accent{border-left:5px solid var(--fjord-700);padding-left:18px;border-radius:2px}
+  .head-eyebrow{display:flex;align-items:center;gap:8px;font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px}
   .head h1{font-size:clamp(1.5rem,3.4vw,2.3rem);font-weight:800;letter-spacing:-.025em;line-height:1.14;color:var(--fjord-900)}
   .head .lede{margin-top:8px;color:var(--ink-soft);font-size:1rem;max-width:60ch}
   .count{margin-top:6px;font-size:.86rem;color:var(--mist)}
@@ -3314,9 +3487,15 @@ const BROWSE_CSS = `
   .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.82rem;font-weight:600;border:1px solid var(--line)}
   .chip:hover{text-decoration:none;border-color:var(--teal-400);color:var(--fjord-700)}
   .chip .n{color:var(--mist);font-weight:600}
+  .chip-dot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:0 0 9px}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;margin:22px 0 8px}
   .card{display:flex;flex-direction:column;gap:8px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:18px 18px;box-shadow:var(--sh-sm);transition:transform .14s ease,box-shadow .14s ease,border-color .14s ease}
   .card:hover{transform:translateY(-3px);box-shadow:var(--sh-md);border-color:var(--teal-400);text-decoration:none}
+  /* Category-coloured experience card (Daniel 2026-08-24). The colour arrives
+     as an inline border-top-color from renderCard(); this rule only gives it
+     the edge to paint and keeps the hover from repainting that edge teal. */
+  .card-cat{border-top:4px solid var(--fjord-700);padding-top:15px}
+  .card-cat:hover{border-color:var(--line);border-top-color:inherit}
   .card .c-title{font-weight:700;color:var(--ink);font-size:1.04rem;letter-spacing:-.01em;line-height:1.25}
   .card .c-place{font-size:.84rem;color:var(--mist);display:flex;align-items:center;gap:6px}
   .card .c-place svg{flex:0 0 14px;color:var(--fjord-600)}
@@ -3713,8 +3892,13 @@ function renderCard(
   const distanceHtml = distanceLabel
     ? `<span class="c-distance">${PIN_SVG}${escapeHtml(distanceLabel)}</span>`
     : "";
+  // Daniel 2026-08-24: a listing card carries its category's colour — a thin
+  // top edge plus the category tag itself — so a mixed grid is scannable by
+  // colour instead of being 24 identical white rectangles. Same categoryColor()
+  // source as the icons, the covers and the detail page.
+  const cardColor = categoryColor(row.category);
   const tags: string[] = [];
-  if (row.category) tags.push(`<span class="tag tag-cat">${escapeHtml(catLabel(row.category))}</span>`);
+  if (row.category) tags.push(`<span class="tag tag-cat" style="background:${cardColor};border-color:${cardColor}">${escapeHtml(catLabel(row.category))}</span>`);
   if (row.indoor_outdoor) tags.push(`<span class="tag">${escapeHtml(ioLabel(row.indoor_outdoor))}</span>`);
   if (row.price_from) tags.push(`<span class="tag">fra ${row.price_from} kr</span>`);
   else if (row.price_band && PRICE_BAND_LABELS[row.price_band]) tags.push(`<span class="tag">${escapeHtml(PRICE_BAND_LABELS[row.price_band] as string)}</span>`);
@@ -3727,7 +3911,7 @@ function renderCard(
   for (const t of filterBadges) {
     tags.push(`<span class="tag tag-filter">${escapeHtml(FILTER_TAG_LABELS[t])}</span>`);
   }
-  return `<a class="card" href="/opplevelse/${encodeURIComponent(row.slug)}">
+  return `<a class="card card-cat" style="border-top-color:${cardColor}" href="/opplevelse/${encodeURIComponent(row.slug)}">
     <span class="c-title">${escapeHtml(displayTitle)}</span>
     ${place ? `<span class="c-place">${PIN_SVG}${escapeHtml(place)}</span>` : ""}
     ${distanceHtml}
@@ -3820,6 +4004,13 @@ function renderBrowsePage(opts: {
   // output preserved) — only passed by /kategori/:category for its three
   // supported category motifs.
   sketchMotif?: StillSketchMotif;
+  // dev-request 2026-08-24-opplevagent-kategorifarger-og-profil-remake:
+  // the page's own category colour (categoryColor()). Passed ONLY by
+  // /kategori/:category — every other caller omits it and renders exactly as
+  // before. Paints the h1's accent rule and the eyebrow, so a category page
+  // announces which category it is before a single card is read.
+  accentColor?: string;
+  accentLabel?: string;
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -3945,7 +4136,8 @@ ${opts.map ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
 ${navHtml}
 ${stageOpen}<main id="main" class="container">
   <nav class="breadcrumb" aria-label="Brødsmuler">${crumbHtml}</nav>
-  <header class="head">
+  <header class="head${opts.accentColor ? " head-accent" : ""}"${opts.accentColor ? ` style="border-left-color:${opts.accentColor}"` : ""}>
+    ${opts.accentColor && opts.accentLabel ? `<p class="head-eyebrow" style="color:${opts.accentColor}"><span class="chip-dot" aria-hidden="true" style="background:${opts.accentColor}"></span>${escapeHtml(opts.accentLabel)}</p>` : ""}
     <h1>${escapeHtml(opts.h1)}</h1>
     ${opts.lede ? `<p class="lede">${escapeHtml(opts.lede)}</p>` : ""}
     <p class="count">${opts.total} ${opts.total === 1 ? "opplevelse" : "opplevelser"}</p>
@@ -3987,8 +4179,12 @@ function facetChips(): string {
   try { cats = listPublishedCategories(); } catch { cats = []; }
   try { fylker = listPublishedFylker(); } catch { fylker = []; }
   if (cats.length === 0 && fylker.length === 0) return "";
+  // Daniel 2026-08-24: the category chips carry the same colour dot the
+  // gårdssalg type chips already use — the colour a visitor picks here is the
+  // colour they then see on the cards. Fylke chips stay dotless (a place has
+  // no category colour to claim).
   const catChips = cats
-    .map((c) => `<a class="chip" href="/kategori/${encodeURIComponent(c.category)}">${escapeHtml(catLabel(c.category))} <span class="n">${c.count}</span></a>`)
+    .map((c) => `<a class="chip" href="/kategori/${encodeURIComponent(c.category)}"><span class="chip-dot" aria-hidden="true" style="background:${categoryColor(c.category)}"></span>${escapeHtml(catLabel(c.category))} <span class="n">${c.count}</span></a>`)
     .join("");
   const fylkeChips = fylker
     .map((f) => `<a class="chip" href="/fylke/${encodeURIComponent(f.fylke)}">${escapeHtml(f.fylke)} <span class="n">${f.count}</span></a>`)
@@ -6808,6 +7004,10 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     useSharedChrome: true,
     navActive: "kategorier",
     sketchMotif: CATEGORY_STILL_SKETCH_MOTIF[category],
+    // Daniel 2026-08-24: the category page announces its own colour — same
+    // categoryColor() the cards in the grid below it are painted with.
+    accentColor: categoryColor(category),
+    accentLabel: "Kategori",
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
