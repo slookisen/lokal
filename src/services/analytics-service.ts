@@ -575,16 +575,21 @@ export class AnalyticsService {
     if (cached && (Date.now() - cached.time) < AnalyticsService.SUMMARY_CACHE_TTL) {
       return cached.data;
     }
-    const db = getDb();
-    const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
-    const V = vertical ? " AND vertical_id = ?" : "";
-    const vp: string[] = vertical ? [vertical] : [];
-    const result = db.prepare(`
-      SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
-    `).get(cutoff, ...vp) as any;
-    const count = result.count as number;
-    this._summaryCache.set(cacheKey, { data: count, time: Date.now() });
-    return count;
+    try {
+      const db = getDb();
+      const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
+      const V = vertical ? " AND vertical_id = ?" : "";
+      const vp: string[] = vertical ? [vertical] : [];
+      const result = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
+      `).get(cutoff, ...vp) as any;
+      const count = result.count as number;
+      this._summaryCache.set(cacheKey, { data: count, time: Date.now() });
+      return count;
+    } catch (err) {
+      console.error("[analytics] Failed to get page view count:", err);
+      return 0;
+    }
   }
 
   /**
