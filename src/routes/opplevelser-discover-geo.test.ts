@@ -277,6 +277,22 @@ export function runOpplevelserDiscoverGeoTests(opts: { log?: boolean } = {}): Pr
         "f7: every MCP result row carries a numeric distance_km and a valid geo_precision"
       );
 
+      // ── (f8/f9) discover_experiences carries a working slug per row ────
+      // dev-request 2026-08-24-discover-experiences-list-manglende-slug: the
+      // formatted response omitted `slug`, so EXPERIENCES_LIST_HTML's «Les
+      // mer ↗» card link rendered .../opplevelse/undefined for every real
+      // list card. Mirrors get_experience's existing `slug` field (same
+      // source: `experience.slug ?? null`).
+      assertTrue(
+        toolResult.experiences.every((e: any) => typeof e.slug === "string" && e.slug.length > 0),
+        "f8: every discover_experiences result row carries a non-empty slug"
+      );
+      const { getPublishedExperienceBySlug } = expStore;
+      assertTrue(
+        toolResult.experiences.every((e: any) => getPublishedExperienceBySlug(e.slug)?.id === e.id),
+        "f9: every returned slug actually resolves to the same experience via getPublishedExperienceBySlug (the exact lookup /opplevelse/:slug uses) — proves the Les-mer link would work, not just that the field is present"
+      );
+
       // ── (g) A2A opplevelser_discover skill accepts the same geo args ──
       const { handleExperiencesMessageSend } = require("./experiences-a2a") as typeof import("./experiences-a2a");
       const a2aResult: any = handleExperiencesMessageSend(

@@ -439,6 +439,7 @@ function registerExperienceTools(
 
         const formatted = results.map((e) => ({
           id: e.id,
+          slug: e.slug ?? null,
           title: e.title,
           title_no: e.title_no ?? null,
           category: e.category ?? null,
