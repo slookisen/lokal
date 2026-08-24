@@ -20,7 +20,10 @@
 3. Select **MCP** as the connector type.
 4. Paste the MCP URL: `https://opplevagent.no/mcp`
 5. Upload `manifest.json` when prompted, or fill in the form fields from it.
-6. Upload a screenshot showing ChatGPT rendering experience cards (take one after testing).
+6. Upload a screenshot showing ChatGPT rendering experience cards — real-data
+   renders of both card templates are ready in `../assets/` (`01-`–`04-`.png,
+   `prompts.txt`), optional/reusable here; take a fresh in-ChatGPT one too if
+   preferred (either satisfies this step).
 7. Review the policy URLs and contact email, then click **Submit for review**.
 
 ## Testing before submit
