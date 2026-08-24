@@ -74,6 +74,40 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
     else { failed++; failures.push(`✗ ${label}`); if (log) console.log(`  ✗ ${label}`); }
   }
 
+  // Fetch-integritetsvern (dev-request 2026-08-23-opplevagent-drikke-
+  // selvforsyning-speiling, item 4 — mirror of RFB Grep 4d): now that
+  // tryGardssalgCandidateHosts requires every candidate page's raw HTML to
+  // mention its own host (rfbWdPageReferencesOwnHost, reused from
+  // admin-rfb-website-discovery.ts), every pre-existing fixture below that
+  // represents a candidate's OWN genuine front page (evidence-bearing or
+  // not) needs to keep self-referencing. Unlike admin-rfb-website-
+  // discovery.test.ts, this suite has no central fixtures-map/stubFetch
+  // dispatcher to hook a marker into in one place — each block below builds
+  // its own inline `globalThis.fetch = async (url) => {...}` — so this one
+  // wrapper is applied at each such assignment instead, appending an
+  // invisible self-reference HTML comment (stripped by both
+  // gardssalgPageText's and gardssalgEmbeddedPageText's tag-stripping, so it
+  // can never leak into extracted evidence/title text) to every successful,
+  // text()-bearing response, keyed on the response's OWN `url` (the final
+  // URL after any redirect, matching what the guard actually checks against).
+  // Responses with no `text()` (e.g. wd-23's arrayBuffer-based sweep-
+  // verification mock, a different call site entirely, out of scope here)
+  // and failed (`ok: false`) responses pass through untouched. The NEW
+  // fetch-integrity tests further below deliberately build their OWN raw
+  // dispatcher (not wrapped) so they can construct genuinely non-self-
+  // referencing "wrong" content.
+  function withSelfReferencingFetch(impl: typeof fetch): typeof fetch {
+    return (async (url: string | URL | Request, init?: any) => {
+      const resp: any = await (impl as any)(url, init);
+      if (!resp || !resp.ok || typeof resp.text !== "function") return resp;
+      let host = "";
+      try { host = new URL(String(resp.url || url)).hostname.toLowerCase(); } catch { host = ""; }
+      if (!host) return resp;
+      const origText = resp.text.bind(resp);
+      return { ...resp, text: async () => `${await origText()}<!-- selfref:${host} -->` };
+    }) as unknown as typeof fetch;
+  }
+
   return (async () => {
     const prevFetch = globalThis.fetch;
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
@@ -267,7 +301,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       insertProvider.run({ id: "wd-redir-taken", navn: "Viderekoblet Gard", org_nr: "988000002", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
 
       let fetchCalls: string[] = [];
-      globalThis.fetch = (async (url: string | URL | Request) => {
+      globalThis.fetch = withSelfReferencingFetch((async (url: string | URL | Request) => {
         const urlStr = String(url);
         fetchCalls.push(urlStr);
         const mk = (html: string, finalUrl?: string) =>
@@ -289,7 +323,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         }
         // Everything else: unreachable.
         return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
-      }) as unknown as typeof fetch;
+      }) as unknown as typeof fetch);
 
       // ── wd-1: auth + validation. ────────────────────────────────────────
       {
@@ -715,14 +749,14 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
 
         const searchFetchCalls: string[] = [];
         const prevFetch2 = globalThis.fetch;
-        globalThis.fetch = (async (url: string | URL | Request) => {
+        globalThis.fetch = withSelfReferencingFetch((async (url: string | URL | Request) => {
           const urlStr = String(url);
           searchFetchCalls.push(urlStr);
           if (urlStr.startsWith("https://kveldsrosideri-ekte.no")) {
             return { ok: true, status: 200, url: urlStr, text: async () => "<html><body>Kveldsro Sideri — org.nr 999 111 222 — Ulvik</body></html>" } as unknown as Response;
           }
           return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
-        }) as unknown as typeof fetch;
+        }) as unknown as typeof fetch);
 
         try {
           const r = await callRoute(opplevelserRouter, {
@@ -861,7 +895,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
 
         const subFetchCalls: string[] = [];
         const prevFetch3 = globalThis.fetch;
-        globalThis.fetch = (async (url: string | URL | Request) => {
+        globalThis.fetch = withSelfReferencingFetch((async (url: string | URL | Request) => {
           const u = String(url);
           subFetchCalls.push(u);
           // Front page: name only (no place, no org) + a /kontakt link.
@@ -885,7 +919,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
               "<html><body>Telefonbrygg Nord — ring +47 912 34 567</body></html>" } as unknown as Response;
           }
           return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
-        }) as unknown as typeof fetch;
+        }) as unknown as typeof fetch);
 
         try {
           const r = await callRoute(opplevelserRouter, {
@@ -947,7 +981,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
 
         const titleFetchCalls: string[] = [];
         const prevFetch4 = globalThis.fetch;
-        globalThis.fetch = (async (url: string | URL | Request) => {
+        globalThis.fetch = withSelfReferencingFetch((async (url: string | URL | Request) => {
           const u = String(url);
           titleFetchCalls.push(u);
           // Guessed front-page host for "Kaldvik Gardsutsalg": name+place
@@ -959,7 +993,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
               "<body>Kaldvik Gardsutsalg i vakre Alta.</body></html>" } as unknown as Response;
           }
           return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
-        }) as unknown as typeof fetch;
+        }) as unknown as typeof fetch);
 
         try {
           const r = await callRoute(opplevelserRouter, {
@@ -986,7 +1020,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
 
         const subTitleFetchCalls: string[] = [];
         const prevFetch5 = globalThis.fetch;
-        globalThis.fetch = (async (url: string | URL | Request) => {
+        globalThis.fetch = withSelfReferencingFetch((async (url: string | URL | Request) => {
           const u = String(url);
           subTitleFetchCalls.push(u);
           if (u === "https://morkgardsutsalg.no" || u === "https://morkgardsutsalg.no/") {
@@ -999,7 +1033,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
               "<body>Mork Gardsutsalg ligger i Alta.</body></html>" } as unknown as Response;
           }
           return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
-        }) as unknown as typeof fetch;
+        }) as unknown as typeof fetch);
 
         try {
           const r = await callRoute(opplevelserRouter, {
@@ -1229,7 +1263,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
 
         const rejHostFetchCalls: string[] = [];
         const prevFetch8 = globalThis.fetch;
-        globalThis.fetch = (async (url: string | URL | Request) => {
+        globalThis.fetch = withSelfReferencingFetch((async (url: string | URL | Request) => {
           const urlStr = String(url);
           rejHostFetchCalls.push(urlStr);
           // Would VERIFY if ever fetched — proves any exclusion observed
@@ -1243,7 +1277,7 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
             return { ok: true, status: 200, url: urlStr, text: async () => "<html><head><title>Kveldsro Sideri</title></head><body>Kveldsro Sideri, Ulvik</body></html>" } as unknown as Response;
           }
           return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
-        }) as unknown as typeof fetch;
+        }) as unknown as typeof fetch);
 
         try {
           const r = await callRoute(opplevelserRouter, {
@@ -1413,6 +1447,123 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         });
         assertEq(manualStillWorks.body.mode, undefined, "wd-25ac: non-auto response carries no 'mode' field");
         assertEq(manualStillWorks.body.written_count, 1, "wd-25ad: client-supplied approvals mode still writes a sub-threshold-confidence row (auto's confidence gate never applies to this mode)");
+      }
+
+      // ── wd-26/27/28 (dev-request 2026-08-23-opplevagent-drikke-
+      //    selvforsyning-speiling, item 4 — mirror of RFB Grep 4d): fetch-
+      //    integritetsvern at the gårdssalg front-page candidate-host call
+      //    site inside tryGardssalgCandidateHosts, reusing
+      //    rfbWdPageReferencesOwnHost as-is (one mechanism, two callers).
+      //    Deliberately a raw, UNWRAPPED fetch mock (bypassing
+      //    withSelfReferencingFetch above) so these three cases can
+      //    construct genuinely non-self-referencing "wrong page" content on
+      //    purpose, with a per-url call counter to tell the original fetch
+      //    apart from its one retry. ─────────────────────────────────────
+      {
+        insertProvider.run({ id: "wd-fic-retry", navn: "Retry Sider Gard", org_nr: "955100001", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-fic-both", navn: "Both Wrong Gard", org_nr: "955100002", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-fic-redirect", navn: "Redirect Contam Gard", org_nr: "955100003", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+
+        // Deliberately TIER-1 only (no search override, mirroring wd-19/
+        // wd-20's title-gate tests above): gardssalgWebsiteCandidateHosts
+        // already generates a fully-hyphenated guess for a 3-word name
+        // (confirmed: "Retry Sider Gard" -> retry-sider-gard.no,
+        // "Both Wrong Gard" -> both-wrong-gard.no, "Redirect Contam Gard" ->
+        // redirect-contam-gard.no, each alongside 3 sibling guesses that
+        // fall through to the unconditional 404 below), so each scenario's
+        // target host is reached deterministically via tier 1 alone — no
+        // search stub needed, and no risk of the SAME host being tried
+        // twice via both tiers (which would double the excludedHere/fetch-
+        // call counts below).
+        const ficFetchCalls: Record<string, number> = {};
+        const prevFetchFic = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const u = String(url);
+          ficFetchCalls[u] = (ficFetchCalls[u] || 0) + 1;
+          const n = ficFetchCalls[u];
+
+          if (u === "https://retry-sider-gard.no") {
+            if (n === 1) {
+              // First fetch: a proxy/cache contamination — a completely
+              // unrelated site's content. No self-reference to
+              // retry-sider-gard.no anywhere, and no matching evidence
+              // either (so if this content were ever (wrongly) used, the
+              // row would fall through unverified, not just "differently
+              // verified" — proving the retry's content, not the first's,
+              // is what actually wins below).
+              return { ok: true, status: 200, url: u, text: async () => "<html><body>Helt urelatert cache-treff — feil nettsted.</body></html>" } as unknown as Response;
+            }
+            // Retry (2nd call, the SAME url): the real page — self-
+            // referencing AND evidence-bearing.
+            return { ok: true, status: 200, url: u, text: async () =>
+              "<html><body>Retry Sider Gard i Voss — org.nr 955 100 001 — retry-sider-gard.no</body></html>" } as unknown as Response;
+          }
+          if (u === "https://both-wrong-gard.no") {
+            // BOTH calls (the original AND its one retry) return the exact
+            // same non-self-referencing wrong content.
+            return { ok: true, status: 200, url: u, text: async () => "<html><body>Feil side — aldri denne produsenten.</body></html>" } as unknown as Response;
+          }
+          if (u === "https://redirect-contam-gard.no") {
+            if (n === 1) {
+              // First fetch: same-host, non-self-referencing wrong content
+              // (no redirect yet).
+              return { ok: true, status: 200, url: u, text: async () => "<html><body>Feil innhold ved forste forsok.</body></html>" } as unknown as Response;
+            }
+            // Retry (2nd call): this time the redirect lands on a host
+            // ALREADY carried by another provider (wd-owner's
+            // solbakkengard.no, set up in the fixtures near the top of this
+            // suite) — that host's OWN exclusion guard must fire before the
+            // marker check ever runs on this retry's content (RFB PR review
+            // finding 1).
+            return { ok: true, status: 200, url: "https://solbakkengard.no/ny-side", text: async () =>
+              "<html><body>Dette landet feil, men ser fint ut.</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-fic-retry", "wd-fic-both", "wd-fic-redirect"], apply: true },
+          });
+
+          // wd-26: wrong-then-right retry — the candidate is still
+          //    proposed, using the RETRY's content.
+          const retryProp = (r.body.proposed as any[]).find((p) => p.provider_id === "wd-fic-retry");
+          assertTrue(!!retryProp, "wd-26a: a contaminated first fetch followed by a matching retry is still proposed");
+          assertEq(retryProp?.candidate_url, "https://retry-sider-gard.no", "wd-26b: proposed candidate is the retried host");
+          assertEq(retryProp?.evidence?.org_nr_found, true, "wd-26c: verified evidence can only have come from the RETRY's content — the first fetch carried none at all");
+          assertEq(ficFetchCalls["https://retry-sider-gard.no"], 2, "wd-26d: exactly one retry — the host was fetched exactly twice, never a retry loop");
+          const retryQ = expDb.prepare(`SELECT candidate_url FROM gardssalg_website_review_queue WHERE provider_id='wd-fic-retry'`).get() as any;
+          assertEq(retryQ?.candidate_url, "https://retry-sider-gard.no", "wd-26e: queued candidate_url is the retried origin");
+
+          // wd-27: both-wrong — rejected, excludedHere carries exactly one
+          //    fetch_contaminated entry, no queue write.
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-fic-both"), "wd-27a: never proposed when both the fetch and its retry fail the marker check");
+          const bothEx = (r.body.excluded as any[]).find((e) => e.provider_id === "wd-fic-both");
+          assertTrue(!!bothEx, "wd-27b: an excluded-hosts entry exists for the provider");
+          const bothContaminated = ((bothEx?.hosts as any[]) || []).filter((h: any) => h.reason === "fetch_contaminated");
+          assertEq(bothContaminated.length, 1, "wd-27c: excludedHere contains exactly ONE fetch_contaminated entry");
+          assertEq(bothContaminated[0]?.host, "both-wrong-gard.no", "wd-27d: the contaminated entry is reported against the tried host");
+          assertEq(ficFetchCalls["https://both-wrong-gard.no"], 2, "wd-27e: exactly one retry — fetched exactly twice, never a retry loop");
+          const bothQ = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-fic-both'`).get() as any).c;
+          assertEq(bothQ, 0, "wd-27f: no review-queue write for the both-wrong candidate");
+
+          // wd-28: the retry's OWN redirect target lands on an already-
+          //    excluded/already-in-catalog host — rejected via THAT host's
+          //    own exclusion reason, excludedHere contains exactly that one
+          //    entry, never fetch_contaminated (RFB PR review finding 1).
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-fic-redirect"), "wd-28a: never proposed when the retry's redirect lands on an excluded host");
+          const redirEx = (r.body.excluded as any[]).find((e) => e.provider_id === "wd-fic-redirect");
+          assertTrue(!!redirEx, "wd-28b: an excluded-hosts entry exists for the provider");
+          assertEq((redirEx?.hosts as any[])?.length, 1, "wd-28c: excludedHere contains EXACTLY that one entry");
+          assertEq(redirEx?.hosts?.[0]?.host, "solbakkengard.no", "wd-28d: the exclusion is reported against the retry's OWN redirect target");
+          assertEq(redirEx?.hosts?.[0]?.reason, "host_already_in_catalog", "wd-28e: rejected via the redirect target's OWN exclusion reason, NOT fetch_contaminated");
+          const redirQ = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-fic-redirect'`).get() as any).c;
+          assertEq(redirQ, 0, "wd-28f: no review-queue write for the redirect-excluded candidate");
+        } finally {
+          globalThis.fetch = prevFetchFic;
+        }
       }
 
     } catch (err: any) {
