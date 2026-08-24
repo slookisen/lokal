@@ -44,6 +44,17 @@ primary_region = 'arn'
   # switch as above, for marketplace.ts's processAgent() homepage-provenance
   # batch. Already shipped flag-OFF for the same reason.
   HOMEPAGE_PROVENANCE_HEADLESS_FALLBACK_ENABLED = 'true'
+  # dev-request 2026-08-22-rfb-kildebredde-loft-pilot-forst.md item 5 (Fase 1):
+  # turns on lokal-agent-verifier.ts's terminal-unconfirmable classification
+  # (Brreg-slettet/konkurs, or zero identity sources on the second line) —
+  # code already shipped flag-OFF in #687 (gate is `=== "true"`, so this line
+  # is what actually turns it on). Moves those rows to a permanent
+  # terminal_unconfirmable status and out of pickBatch's rotation instead of
+  # cycling them through pending_verify forever. To pause again: set to
+  # 'false' or remove the line — takes effect on next call, no restart
+  # needed; already-terminal rows keep their stamp (see rollback text in the
+  # dev-request).
+  RFB_TERMINAL_UNCONFIRMABLE_ENABLED = 'true'
 
 [[mounts]]
   source = 'lokal_data'
