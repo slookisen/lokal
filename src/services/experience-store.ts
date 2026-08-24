@@ -2628,6 +2628,57 @@ export function countGardssalgProvidersBookable(): number {
   return row.c;
 }
 
+// ─── orchestrator-pr-1: /api/stats host-scoped registry stats ──────────────
+// GET /api/stats (src/routes/a2a.ts) used to answer EVERY host — including
+// opplevagent.no — with marketplaceRegistry.getStats()'s RFB `agents`
+// numbers. This is the experiences vertical's own stats source, shaped
+// identically to marketplaceRegistry.getStats() (`{ totalAgents,
+// activeProducers, cities, totalListings }`) so the route handler can treat
+// every vertical uniformly. See dev-requests/2026-08-2x-... and the RFB
+// visibility-growth routine's repeated "known, out of scope" flag
+// (2026-08-19..22).
+export interface ExperiencesMarketplaceStats {
+  totalAgents: number;
+  activeProducers: number;
+  cities: string[];
+  totalListings: number;
+}
+
+export function getExperiencesMarketplaceStats(): ExperiencesMarketplaceStats {
+  const db = getDb(VERTICAL);
+
+  // totalAgents: unfiltered COUNT(*) over ALL experience_providers rows —
+  // mirrors marketplaceRegistry.getStats()'s `total` (raw row count,
+  // includes rows that aren't publicly visible).
+  const totalAgents = (db.prepare("SELECT COUNT(*) AS c FROM experience_providers").get() as { c: number }).c;
+
+  // activeProducers: reuses countGardssalgProviders()'s EXACT gate — the
+  // established, tested "is this a real, publicly-visible gårdssalg
+  // provider" filter also used by listGardssalgProviders()/the /kategori/
+  // gardssalg catalog. Deliberately NOT re-deriving the SQL here.
+  const activeProducers = countGardssalgProviders();
+
+  // cities: kommune is the closest analog to RFB's `city` (this table also
+  // has poststed/fylke, but kommune is the municipality-level granularity
+  // RFB's city stat uses). Scoped to the same visibility gate as
+  // activeProducers, same relationship as RFB's own cities-exclude-umbrella
+  // filtering.
+  const cityRows = db.prepare(
+    `SELECT DISTINCT kommune FROM experience_providers
+      WHERE kommune IS NOT NULL
+        AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+        AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+  ).all() as Array<{ kommune: string }>;
+  const cities = cityRows.map((r) => r.kommune);
+
+  // totalListings: reuses countPublishedExperiences() (no filter = every
+  // PUBLISHED experience across all providers) — a real "bookable listing"
+  // count, unlike dental which has no listings concept at all.
+  const totalListings = countPublishedExperiences();
+
+  return { totalAgents, activeProducers, cities, totalListings };
+}
+
 export type GardssalgProviderRow = {
   id: string;
   navn: string;

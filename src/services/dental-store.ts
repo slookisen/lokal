@@ -969,6 +969,61 @@ export function getDentalStats(): DentalStats {
   return { total, per_fylke, helfo_count, chain_count, acute_count, specialist_clinic_count };
 }
 
+// ─── orchestrator-pr-1: /api/stats host-scoped registry stats ──────────────
+// GET /api/stats (src/routes/a2a.ts) used to answer EVERY host — including
+// finn-tannlege.com — with marketplaceRegistry.getStats()'s RFB `agents`
+// numbers. This is dental's own stats source, shaped identically to
+// marketplaceRegistry.getStats() (`{ totalAgents, activeProducers, cities,
+// totalListings }`) so the route handler can treat every vertical
+// uniformly. See dev-requests/2026-08-2x-... and the RFB visibility-growth
+// routine's repeated "known, out of scope" flag (2026-08-19..22).
+//
+// dental_agents has NO is_active/umbrella_type column (unlike RFB's
+// `agents` table) — but it DOES have `is_inactive` (permanently-closed
+// clinics) and `verification_status` ('rejected' rows), the SAME gate
+// getDentalStats() above and getAvailableSpecialties() already use as
+// "is this a real, currently-open clinic". Mirrored here rather than
+// inventing a new filter.
+export interface DentalMarketplaceStats {
+  totalAgents: number;
+  activeProducers: number;
+  cities: string[];
+  totalListings: number;
+}
+
+export function getDentalMarketplaceStats(): DentalMarketplaceStats {
+  const db = getDb("dental");
+
+  // totalAgents: unfiltered COUNT(*) — mirrors marketplaceRegistry.getStats()'s
+  // `total` (includes rejected/closed rows), same "raw row count" meaning.
+  const totalAgents = (db.prepare("SELECT COUNT(*) AS c FROM dental_agents").get() as { c: number }).c;
+
+  // activeProducers: the same "real, currently-open clinic" gate as
+  // getDentalStats()/getAvailableSpecialties() above (verification_status
+  // != 'rejected' AND not is_inactive). dental has no separate
+  // producer/umbrella distinction, so this is the closest honest analog to
+  // marketplaceRegistry's activeProducers.
+  const activeProducers = (db.prepare(
+    "SELECT COUNT(*) AS c FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)"
+  ).get() as { c: number }).c;
+
+  // cities: dental_agents has NO `kommune` column (only postnummer/poststed/
+  // fylke) — poststed is the closest analog to RFB's `city`. Scoped to the
+  // same active gate as activeProducers, same relationship as RFB's own
+  // cities-exclude-umbrella filtering.
+  const cityRows = db.prepare(
+    "SELECT DISTINCT poststed FROM dental_agents WHERE poststed IS NOT NULL AND verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)"
+  ).all() as Array<{ poststed: string }>;
+  const cities = cityRows.map((r) => r.poststed);
+
+  // totalListings: dental has no "listings" concept distinct from a clinic
+  // profile (unlike RFB's `listings` table). Reporting the same
+  // activeProducers count rather than fabricating a number — each visible
+  // clinic profile IS the "listing" here.
+  const totalListings = activeProducers;
+
+  return { totalAgents, activeProducers, cities, totalListings };
+}
 
 export function upsertDentalPerson(input: DentalPerson): string {
   const parsed = DentalPersonSchema.parse(input);

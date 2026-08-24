@@ -38960,6 +38960,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── orchestrator-pr-1: /api/stats host-scoped registry stats (dental/experiences hosts no longer see RFB's numbers) ──");
+  try {
+    const { runA2aStatsVerticalTests } = require("../src/routes/a2a-stats-vertical.test") as
+      typeof import("../src/routes/a2a-stats-vertical.test");
+    const asv = await runA2aStatsVerticalTests({ log: false });
+    passed += asv.passed;
+    failed += asv.failed;
+    for (const f of asv.failures) failures.push("a2a-stats-vertical: " + f);
+    console.log(`  a2a-stats-vertical: ${asv.passed} passed, ${asv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("a2a-stats-vertical: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ a2a-stats-vertical: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-08-09-cs-rutine-to-plattformer-og-tradhistorikk: skive 1 (send-path crm_messages + backfill + double-send guard) ──");
   try {
     const { runCrmSendMessageHistoryTests } = require("../src/routes/crm-send-message-history.test") as
