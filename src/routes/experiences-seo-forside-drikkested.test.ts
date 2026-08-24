@@ -305,10 +305,12 @@ export function runExperiencesSeoForsideDrikkestedTests(opts: { log?: boolean } 
       // arbeidspunkt 1 (slice 6): the CTA is now state-driven
       // (renderDrikkestedFeatureSection()'s `bookable` param) instead of the
       // old static "Explore drink stops" string. Phase A's fixtures have no
-      // booking_live=1 provider, so the section renders in its dark-launch
+      // booking_live=1 provider, so the section renders in its pre-booking
       // state here — see experiences-seo-forside-seksjonering.test.ts for
-      // full dark-launch/live CTA-copy coverage in both languages.
-      assertTrue(homeEn.body.includes("Register interest — opening soon"), "d4: EN CTA label rendered (dark-launch state)");
+      // full pre-booking/live CTA-copy coverage in both languages. That
+      // pre-booking label stopped promising a launch on 2026-08-24 (Daniel,
+      // punkt 2) and points at the live catalog instead.
+      assertTrue(homeEn.body.includes("Browse the drink producers"), "d4: EN CTA label rendered (pre-booking state)");
       assertTrue(!homeEn.body.includes("Besøk lokale drikkeprodusenter"), "d5: no NO title leaks into the EN render");
 
       // ── (f) /kategori/gardssalg renders the drikke motif ──────────────

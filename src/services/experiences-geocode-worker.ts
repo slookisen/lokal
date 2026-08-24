@@ -49,6 +49,7 @@ import {
   type GeocodeDeps,
 } from "./dental-geocode-worker";
 import { geocodingService } from "./geocoding-service";
+import { isPlausibleNorwayCoord } from "./geo-distance";
 
 const VERTICAL = "experiences";
 
@@ -324,7 +325,17 @@ export async function experiencesGeocodeTick(
       if (!geo && row.fylke) {
         geo = await geocodingService.geocode(row.fylke);
       }
-      if (geo) {
+      // Coordinate sanity gate (Daniel, live sesjon 2026-08-24): a geocode
+      // result that cannot be a Norwegian position — 0/0 "null island" is the
+      // one seen on prod, where 2 providers ended up ~5 000 km off West
+      // Africa and dragged the /kategori/gardssalg map's fitBounds() out over
+      // the Atlantic — is treated as NOT resolved rather than written. The row
+      // stays lat IS NULL, so this same fallback retries it next tick (exactly
+      // what the "no negative-cache column" branch below already relies on),
+      // instead of being poisoned with a coordinate no surface can trust. The
+      // display-side gate in experience-store.ts's map queries hides the rows
+      // already written before this guard existed; this stops new ones.
+      if (geo && isPlausibleNorwayCoord(geo.lat, geo.lng)) {
         updateProviderApprox.run(geo.lat, geo.lng, row.id);
         stats.providers_kommune_fallback++;
       } else {

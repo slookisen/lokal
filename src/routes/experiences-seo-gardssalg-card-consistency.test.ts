@@ -315,6 +315,38 @@ export function runExperiencesSeoGardssalgCardConsistencyTests(opts: { log?: boo
         /\.gs-card-cta-paused\{[^}]*background:var\(--canvas-2\)/.test(r.body),
         "g3: the paused class uses the neutral canvas-2 background, not the active fill",
       );
+
+      // ── (h) per-type card colour (Daniel 2026-08-24, punkt 4: «agentkortene
+      // er litt anonyme med sin hvite farge — vurder å bruke hver
+      // kategorifarge på hele kortet»). The colour comes from the SAME
+      // DRINK_TYPE_META entry the badge already reads, so a card can never
+      // wear one type's colour and another type's badge. ───────────────────
+      {
+        const bryggeriCard = cardSliceFor("Trysil Bryggeri");
+        const mjoderiCard = cardSliceFor("Aktivert Mjøderi");
+        const untypedCard = cardSliceFor("Ukjent Type Gård");
+        assertTrue(bryggeriCard.includes("border-top:5px solid #c58a2a"),
+          "h1: a bryggeri card carries the bryggeri hue (#c58a2a) as its top edge");
+        assertTrue(mjoderiCard.includes("border-top:5px solid #7c5cbb"),
+          "h2: a mjøderi card carries the mjød hue (#7c5cbb) — the colour is per type, not one shared accent");
+        assertTrue(!/background:#fff;border-radius:12px/.test(bryggeriCard),
+          "h3: the flat white card background is gone");
+        assertTrue(untypedCard.includes("border-top:5px solid #0f5a50"),
+          "h4: a NULL-producer_type card falls back to the brand teal — colour never implies a type it doesn't have");
+        assertTrue(
+          !/#c58a2a|#4a8c3f|#7c5cbb|#c0577c|#6c6c6c|#2a7d9c/.test(untypedCard),
+          "h5: …and carries no drink-type hue anywhere on it",
+        );
+        // The paused CTA takes the card's colour as an OUTLINE (white fill),
+        // so it keeps the outline-vs-fill distinction from the active CTA
+        // that stops it reading as bookable while it isn't.
+        const pausedCtaIdx = bryggeriCard.indexOf('class="gs-card-cta-paused"');
+        const pausedCta = bryggeriCard.slice(pausedCtaIdx, bryggeriCard.indexOf(">", pausedCtaIdx));
+        assertTrue(/background:#fff/.test(pausedCta) && /color:#c58a2a/.test(pausedCta),
+          "h6: the paused CTA is outlined in the card's own colour on a white fill");
+        assertTrue(!/background:var\(--fjord-700\)/.test(pausedCta),
+          "h7: the paused CTA never takes the active CTA's solid fill");
+      }
     } catch (err: any) {
       failed++;
       failures.push("experiences-seo-gardssalg-card-consistency: unexpected error: " + String(err?.stack || err?.message || err));

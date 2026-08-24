@@ -118,6 +118,7 @@ import { isGardssalgContactEmailFlaggedForReview } from "./opplevelser";
 // duplicating any of that data/logic — see the fallback's own doc comment.
 import { key as fylkeFoldKey, ALIAS_TO_CANONICAL, EQUIVALENCE_CLASSES } from "../services/norway-fylke";
 import { geocodingService } from "../services/geocoding-service";
+import { isPlausibleNorwayCoord } from "../services/geo-distance";
 // dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
 // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info, Goal 2:
@@ -1226,8 +1227,8 @@ export const GARDSSALG_TYPE_SLUG_ALIASES: Record<string, string> = {
 // ─────────────────────────────────────────────────────────────
 export function homeStrings(lang: Lang) {
   const no = {
-    metaTitle: "Opplevagent — Kuratert markedsplass for norske opplevelser",
-    metaDesc: "Opplevagent er en kuratert markedsplass for norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Søkbar for AI-agenter etter sted, vær, sesong og gruppestørrelse.",
+    metaTitle: "Opplevagent — norske opplevelser, håndplukket og verifisert",
+    metaDesc: "Håndplukkede norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Alle tilbydere er verifisert mot Brønnøysundregistrene, og katalogen er søkbar for AI-agenter.",
     ogTitle: "Opplevagent — norske opplevelser, søkbart for AI-agenter",
     ogImageAlt: "Opplevagent — markedsplass for norske opplevelser",
     skip: "Hopp til hovedinnhold",
@@ -1242,15 +1243,15 @@ export function homeStrings(lang: Lang) {
     navProviders: "For tilbydere",
     heroPill: "A2A-markedsplass for norske opplevelser",
     heroH1: "Hva kan vi finne på ", heroAccent: "i dag?",
-    heroSub: "Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.",
+    heroSub: "Fra hvalsafari og trehytter til fjellturer, matopplevelser og lasertag &mdash; håndplukkede norske opplevelser, samlet ett sted.",
     searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: hvalsafari, Oslo, mat …", searchBtn: "Finn opplevelser",
-    hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ". Agenter kan kalle ", hintPost2: " direkte.",
+    hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ".",
     // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
     // Goal 3: the reiserute (route/corridor) capability existed but was
     // invisible right next to the ONE search box that can now trigger it —
     // Daniel: «dette nevnes ikke i informasjonen som ligger nær søkefeltet».
     // Keep this in sync with the `en` object below.
-    hintRoutePre: "\u{1F697} Skal du ut og kjøre? Skriv ", hintRouteLink: "«Oslo til Bergen»", hintRoutePost: " rett i søkefeltet over, så finner vi opplevelser, gårdssalg og drikkesteder langs ruten &mdash; eller sett opp ", hintRouteLink2: "en hel reiserute", hintRoutePost2: " selv.",
+    hintRoutePre: "\u{1F697} Skal du ut og kjøre? Skriv ", hintRouteLink: "«Oslo til Bergen»", hintRoutePost: " i søkefeltet, så finner vi stopp langs veien &mdash; eller planlegg ", hintRouteLink2: "hele reiseruten", hintRoutePost2: ".",
     quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
     // dev-request 2026-07-25-reisesok fix 0f(ii): homepage «Nær meg».
     nearMeBtn: "Nær meg", nearMeRadiusLabel: "Søkeradius", nearMeLoading: "Henter posisjon…", nearMeDenied: "Posisjon avslått",
@@ -1259,6 +1260,7 @@ export function homeStrings(lang: Lang) {
     counterPageviews: "Sidevisninger", counterRealVisitors: "Ekte besøkende", counterAiSearch: "AI-søk", counterCrawlers: "Crawlere &amp; bots",
     counterExperiences: "Opplevelser", counterProviders: "Tilbydere", counterMunicipalities: "Kommuner",
     counterAiExplain: "AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.",
+    counterNoteShort: "AI-søk = en assistent hentet svar fra oss i sanntid.",
     counterWindowPre: "Siste", counterWindowPost: "dager",
     counterSincePre: "Tall siden",
     networkLabel: "En del av A2A-nettverket:", networkTagline: "Bygget for både mennesker og AI-agenter",
@@ -1268,27 +1270,38 @@ export function homeStrings(lang: Lang) {
     // Keep in sync with the `en` object below.
     drikkeKicker: "Nytt", drikkeTitle: "Besøk lokale drikkeprodusenter",
     drikkeIntro: "Bryggeri, sideri, mjøderi og destilleri åpner dørene for smaking og omvisning &mdash; book besøket direkte hos produsenten, verifisert mot Brønnøysundregistrene.",
-    // drikkeCta is superseded by the state-driven drikkeCtaDarkLaunch/
+    // Pre-booking variant of the intro: the catalog IS live and browsable, so
+    // it says what a visitor can do today (finn, les, ta kontakt) instead of
+    // promising a booking flow no producer has activated yet.
+    drikkeIntroBrowse: "Bryggeri, sideri, mjøderi og destilleri over hele landet &mdash; se hvem som holder til der du er, hva de tilbyr og hvordan du tar kontakt. Alle verifisert mot Brønnøysundregistrene.",
+    // drikkeCta is superseded by the state-driven drikkeCtaBrowse/
     // drikkeCtaLive pair below (renderDrikkestedFeatureSection() no longer
     // renders this static string) — kept defined rather than deleted in
     // case another surface still reads it; grep before reusing.
     drikkeCta: "Utforsk drikkesteder", drikkeAria: "Drikkeprodusenter etter type", drikkeChipCountAria: "produsenter",
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
     // 1 (slice 6): state-driven CTA variants for renderDrikkestedFeatureSection()
-    // — dark-launch copy never promises active booking; live copy is
+    // — the pre-booking copy never promises active booking; live copy is
     // booking-forward. Keep in sync with the `en` object below.
-    drikkeCtaDarkLaunch: "Meld interesse — åpner snart", drikkeCtaLive: "Book besøk &amp; smaking",
-    catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
+    // Daniel 2026-08-24, punkt 2: the pre-booking CTA used to read «Meld
+    // interesse — åpner snart», which said "this vertical has not launched"
+    // about a catalog that has been live and browsable for weeks (177
+    // producers on prod). The state distinction is real and stays — no
+    // producer has activated booking yet, so the live CTA must not appear —
+    // but the honest thing to offer meanwhile is the catalog itself, not a
+    // waiting list.
+    drikkeCtaBrowse: "Se alle drikkeprodusentene", drikkeCtaLive: "Book besøk &amp; smaking",
+    catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kategoriene &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
     fylkeKicker: "Steder", fylkeTitle: "Utforsk etter fylke", fylkeIntro: "Se hvor opplevelsene finnes &mdash; velg et fylke for en fullstendig oversikt.", fylkeAria: "Fylker",
     kommuneTitle: "Populære kommuner", kommuneAria: "Populære kommuner",
-    howKicker: "Tillitsmodell", howTitle: "Slik funker det", howSub: "Kuratert, verifisert og beriket &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.",
+    howKicker: "Tillitsmodell", howTitle: "Slik funker det", howSub: "Håndplukket, verifisert og utfylt &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.",
     srcLabel: "Kilde:",
-    s1t: "Kuratert innhenting", s1b: "Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked, men et utvalg av reelle norske tilbydere.", s1src: "kuraterte tilbyderkilder",
+    s1t: "Håndplukket utvalg", s1b: "Vi henter inn opplevelser fortløpende fra utvalgte kilder &mdash; ikke et åpent annonsemarked, men ekte norske tilbydere vi har plukket ut.", s1src: "utvalgte tilbyderkilder",
     s2t: "Verifisert tilbyder", s2bPre: "Hver tilbyder kontrolleres mot Brønnøysundregistrene for å bekrefte at det står et ", s2bStrong: "aktivt selskap", s2bPost: " bak opplevelsen.", s2src: "Brønnøysundregistrene (Brreg)",
-    s3t: "Beriket innhold", s3b: "Detaljer berikes fra tilbyderens egen nettside, slik at beskrivelser, varighet og praktisk info blir presise og oppdaterte.", s3src: "tilbyderens egen side",
+    s3t: "Utfylt med detaljer", s3b: "Vi henter detaljer fra tilbyderens egen nettside, slik at beskrivelser, varighet og praktisk info blir presise og oppdaterte.", s3src: "tilbyderens egen side",
     agentsKicker: "For AI-agenter", agentsTitle: "Bygget for å bli spurt av agenter", agentsBody: "Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.",
     endpointsAria: "Endepunkter for agenter", codeAria: "Eksempler på agent-kall", codeCmt1: "# message/send &mdash; naturlig språk", codeCmt2: "«hva kan vi finne på i Tromsø i vinter?»",
-    footTagline: "Kuratert markedsplass for norske opplevelser og aktiviteter &mdash; søkbar for mennesker og AI-agenter.", footExplore: "Utforsk", footAgents: "For agenter", footPrivacy: "Personvern", footTerms: "Vilkår", footVerified: "Tilbydere verifisert mot Brønnøysundregistrene",
+    footTagline: "Norske opplevelser og aktiviteter, håndplukket og verifisert &mdash; søkbart for mennesker og AI-agenter.", footExplore: "Utforsk", footAgents: "For agenter", footPrivacy: "Personvern", footTerms: "Vilkår", footVerified: "Tilbydere verifisert mot Brønnøysundregistrene",
   };
   const en: typeof no = {
     metaTitle: "Opplevagent — curated marketplace for Norwegian experiences",
@@ -1303,11 +1316,11 @@ export function homeStrings(lang: Lang) {
     navProviders: "For providers",
     heroPill: "A2A marketplace for Norwegian experiences",
     heroH1: "What can we do ", heroAccent: "today?",
-    heroSub: "From whale safaris and treehouses to guided mountain hikes, food experiences and laser tag &mdash; a curated overview of Norwegian experiences, built to be discovered and queried by AI agents.",
+    heroSub: "From whale safaris and treehouses to mountain hikes, food experiences and laser tag &mdash; hand-picked Norwegian experiences, gathered in one place.",
     searchAria: "Find experiences", searchLabel: "Describe what you want to do, or type a place", searchPlaceholder: "Search: whale safari, Oslo, food …", searchBtn: "Find experiences",
-    hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ". Agents can call ", hintPost2: " directly.",
+    hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ".",
     // Keep in sync with the `no` object above.
-    hintRoutePre: "\u{1F697} Driving somewhere? Type ", hintRouteLink: "“Oslo to Bergen”", hintRoutePost: " straight into the search box above and we'll surface experiences, farm shops and drink stops along the way &mdash; or set up ", hintRouteLink2: "a full route", hintRoutePost2: " yourself.",
+    hintRoutePre: "\u{1F697} Driving somewhere? Type ", hintRouteLink: "“Oslo to Bergen”", hintRoutePost: " in the search box and we'll find stops along the way &mdash; or plan ", hintRouteLink2: "the full route", hintRoutePost2: ".",
     quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
     nearMeBtn: "Near me", nearMeRadiusLabel: "Search radius", nearMeLoading: "Locating…", nearMeDenied: "Location denied",
     trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
@@ -1315,23 +1328,27 @@ export function homeStrings(lang: Lang) {
     counterPageviews: "Page views", counterRealVisitors: "Real visitors", counterAiSearch: "AI search", counterCrawlers: "Crawlers &amp; bots",
     counterExperiences: "Experiences", counterProviders: "Providers", counterMunicipalities: "Municipalities",
     counterAiExplain: "AI search: a human asked ChatGPT, Claude or Perplexity, and the assistant fetched information from us in real time. Crawlers: automated indexing and scraping.",
+    counterNoteShort: "AI search = an assistant fetched answers from us in real time.",
     counterWindowPre: "Last", counterWindowPost: "days",
     counterSincePre: "Figures since",
     networkLabel: "Part of the A2A network:", networkTagline: "Built for both humans and AI agents",
     // Keep in sync with the `no` object above (S2 drikkested feature section).
     drikkeKicker: "New", drikkeTitle: "Visit local drink producers",
     drikkeIntro: "Breweries, cideries, meaderies and distilleries open their doors for tastings and tours &mdash; book your visit directly with the producer, verified against the Norwegian business registry.",
+    // Keep in sync with the `no` object above.
+    drikkeIntroBrowse: "Breweries, cideries, meaderies and distilleries across the country &mdash; see who's near you, what they offer and how to get in touch. All verified against the Norwegian business registry.",
     drikkeCta: "Explore drink stops", drikkeAria: "Drink producers by type", drikkeChipCountAria: "producers",
-    // Keep in sync with the `no` object above (arbeidspunkt 1, slice 6).
-    drikkeCtaDarkLaunch: "Register interest — opening soon", drikkeCtaLive: "Book a visit &amp; tasting",
+    // Keep in sync with the `no` object above (arbeidspunkt 1, slice 6 +
+    // Daniel 2026-08-24, punkt 2).
+    drikkeCtaBrowse: "Browse the drink producers", drikkeCtaLive: "Book a visit &amp; tasting",
     catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
     fylkeKicker: "Places", fylkeTitle: "Explore by county", fylkeIntro: "See where the experiences are &mdash; pick a county for a full overview.", fylkeAria: "Counties",
     kommuneTitle: "Popular municipalities", kommuneAria: "Popular municipalities",
-    howKicker: "Trust model", howTitle: "How it works", howSub: "Curated, verified and enriched &mdash; three steps that set Opplevagent apart from an ordinary listing.",
+    howKicker: "Trust model", howTitle: "How it works", howSub: "Hand-picked, verified and filled in &mdash; three steps that set Opplevagent apart from an ordinary listing.",
     srcLabel: "Source:",
-    s1t: "Curated collection", s1b: "Experiences are gathered continuously from curated sources &mdash; not an open ad market, but a selection of real Norwegian providers.", s1src: "curated provider sources",
+    s1t: "Hand-picked selection", s1b: "We gather experiences continuously from selected sources &mdash; not an open ad market, but real Norwegian providers we have picked out.", s1src: "selected provider sources",
     s2t: "Verified provider", s2bPre: "Each provider is checked against the Norwegian business registry to confirm there's an ", s2bStrong: "active company", s2bPost: " behind the experience.", s2src: "Brønnøysund business registry (Brreg)",
-    s3t: "Enriched content", s3b: "Details are enriched from the provider's own website, so descriptions, duration and practical info are accurate and up to date.", s3src: "the provider's own site",
+    s3t: "Filled in with detail", s3b: "We pull details from the provider's own website, so descriptions, duration and practical info are accurate and up to date.", s3src: "the provider's own site",
     agentsKicker: "For AI agents", agentsTitle: "Built to be queried by agents", agentsBody: "Opplevagent exposes open, machine-readable surfaces following the A2A protocol. Agents can discover the offering, read the contract and run intent searches &mdash; without scraping.",
     endpointsAria: "Endpoints for agents", codeAria: "Examples of agent calls", codeCmt1: "# message/send &mdash; natural language", codeCmt2: "«what can we do in Tromsø this winter?»",
     footTagline: "Curated marketplace for Norwegian experiences and activities &mdash; searchable for humans and AI agents.", footExplore: "Explore", footAgents: "For agents", footPrivacy: "Privacy", footTerms: "Terms", footVerified: "Providers verified against the Norwegian business registry",
@@ -1423,9 +1440,9 @@ export function renderDrikkestedFeatureSection(
         <div class="drikkested-copy">
           <span class="kicker">${S.drikkeKicker}</span>
           <h2 id="drikkested-title">${S.drikkeTitle}</h2>
-          <p>${S.drikkeIntro}</p>
+          <p>${bookable ? S.drikkeIntro : S.drikkeIntroBrowse}</p>
           ${chips ? `<div class="drink-chips" role="list" aria-label="${S.drikkeAria}">${chips}</div>` : ""}
-          <a class="drikkested-cta" href="/kategori/gardssalg">${bookable ? S.drikkeCtaLive : S.drikkeCtaDarkLaunch}</a>
+          <a class="drikkested-cta" href="/kategori/gardssalg">${bookable ? S.drikkeCtaLive : S.drikkeCtaBrowse}</a>
         </div>
         <div class="drikkested-decor" aria-hidden="true">${decor}</div>
       </div>
@@ -1485,7 +1502,7 @@ router.get("/", (req: Request, res: Response) => {
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
     </div>
-    <div class="counter-note">${S.counterAiExplain} &middot; ${S.counterWindowPre} ${counters.windowDays} ${S.counterWindowPost}${sinceDateFragment}</div>
+    <div class="counter-note">${S.counterNoteShort} &middot; ${S.counterWindowPre} ${counters.windowDays} ${S.counterWindowPost}${sinceDateFragment}</div>
     <div class="network-strip">${S.networkLabel}
       <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot;
       <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a>
@@ -1623,7 +1640,7 @@ router.get("/", (req: Request, res: Response) => {
       name: "Opplevagent",
       url: url,
       description:
-        "Kuratert markedsplass for norske opplevelser og aktiviteter — bygget for å bli oppdaget og spurt av AI-agenter.",
+        "Håndplukkede norske opplevelser og aktiviteter — verifiserte tilbydere, søkbart for både folk og AI-agenter.",
       inLanguage: lang === "en" ? "en-US" : "nb-NO",
       potentialAction: {
         "@type": "SearchAction",
@@ -1740,8 +1757,15 @@ ${ldScripts}
     .discover-form button{width:100%;padding:14px}
   }
   .discover-hint{margin-top:16px;font-size:.85rem;color:rgba(255,255,255,.82)}
-  .discover-hint code{background:rgba(255,255,255,.16);padding:2px 7px;border-radius:6px;font-size:.82em}
-  .quick{margin-top:22px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+  .quick{margin-top:22px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center;align-items:center}
+  /* «Nær meg» + radius live INSIDE the chip row (Daniel 2026-08-24, punkt 1)
+     — one row of controls under the search box instead of three stacked ones.
+     Styled to match .quick a exactly so the row reads as a single set. */
+  .quick-geo{display:inline-flex;align-items:center;gap:6px}
+  .quick-geo button,.quick-geo select{padding:7px 15px;border-radius:var(--r-pill);background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);color:#fff;font-size:.82rem;font-weight:600;cursor:pointer;font-family:inherit}
+  .quick-geo select{padding:7px 10px}
+  .quick-geo select option{color:#18130d}
+  .quick-geo button:hover,.quick-geo select:hover{background:rgba(255,255,255,.26)}
   .quick a{display:inline-flex;align-items:center;gap:6px;padding:7px 15px;border-radius:var(--r-pill);background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);color:#fff;font-size:.82rem;font-weight:600;backdrop-filter:blur(4px)}
   .quick a:hover{background:rgba(255,255,255,.26);text-decoration:none}
 
@@ -1889,7 +1913,7 @@ ${oaSiteNav({ active: "hjem", lang })}
           </span>
           <button type="submit">${S.searchBtn}</button>
         </form>
-        <p class="discover-hint">${S.hintPre}<a href="/opplevelser" style="color:#fff;text-decoration:underline">${S.hintLink}</a>${S.hintPost}<code>GET /api/opplevelser/discover</code>${S.hintPost2}</p>
+        <p class="discover-hint">${S.hintPre}<a href="/opplevelser" style="color:#fff;text-decoration:underline">${S.hintLink}</a>${S.hintPost}</p>
         <!-- dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
              Goal 3: the hero hint didn't mention reiserute (route/corridor)
              search at all — Daniel: «dette nevnes ikke i informasjonen som
@@ -1903,22 +1927,33 @@ ${oaSiteNav({ active: "hjem", lang })}
              a visitor sees offered no way to search by position without
              typing a place name first (navigator.geolocation grep = 0 on both
              homepages). Same progressive-enhancement contract as
-             renderNearMeBox(): the block removes itself when the browser has
-             no geolocation API, and nothing else on the page changes. -->
-        <div class="home-nearme" style="margin-top:12px">
-          <button type="button" id="homeGeoBtn" style="padding:10px 18px;border-radius:var(--r-pill,999px);border:1.5px solid rgba(255,255,255,.55);background:rgba(255,255,255,.10);color:#fff;font-weight:650;font-size:.88rem;cursor:pointer">\u{1F4CD} ${S.nearMeBtn}</button>
-          <select id="home-radius" aria-label="${S.nearMeRadiusLabel}" style="margin-left:8px;padding:8px 6px;border-radius:8px;border:1.5px solid rgba(255,255,255,.45);background:rgba(255,255,255,.12);color:#fff;font-size:.82rem;cursor:pointer">
-            <option value="25" style="color:#18130d">25 km</option>
-            <option value="50" selected style="color:#18130d">50 km</option>
-            <option value="100" style="color:#18130d">100 km</option>
-            <option value="200" style="color:#18130d">200 km</option>
-          </select>
+             renderNearMeBox(): the control removes itself when the browser has
+             no geolocation API, and nothing else on the page changes.
+             Daniel 2026-08-24, punkt 1: it used to sit in its own row above
+             the quick chips — four stacked rows of small print under one
+             search box. Same control, same script, now the first item IN the
+             chip row; hiding it drops the <span id="home-nearme"> only, never
+             the whole row. The two hardcoded fylke chips (Oslo / Troms og
+             Finnmark) were removed in the same pass — the DB-driven fylke-grid
+             further down the page is where fylke links belong. -->
+        <div class="quick" role="list" aria-label="${S.quickAria}">
+          <span role="listitem" class="quick-geo" id="home-nearme">
+            <button type="button" id="homeGeoBtn">\u{1F4CD} ${S.nearMeBtn}</button>
+            <select id="home-radius" aria-label="${S.nearMeRadiusLabel}">
+              <option value="25">25 km</option>
+              <option value="50" selected>50 km</option>
+              <option value="100">100 km</option>
+              <option value="200">200 km</option>
+            </select>
+          </span>
+          <a role="listitem" href="/sok?q=natur">${S.qNature}</a>
+          <a role="listitem" href="/opplevelser">${S.qAll}</a>
         </div>
         <script>
         (function(){
           var b = document.getElementById('homeGeoBtn');
           if (!b) return;
-          if (!('geolocation' in navigator)) { b.parentNode.style.display = 'none'; return; }
+          if (!('geolocation' in navigator)) { var w = document.getElementById('home-nearme'); if (w) w.style.display = 'none'; return; }
           b.addEventListener('click', function(){
             var original = b.innerHTML;
             b.textContent = '\u23F3 ${S.nearMeLoading}';
@@ -1936,12 +1971,6 @@ ${oaSiteNav({ active: "hjem", lang })}
           });
         })();
         </script>
-        <div class="quick" role="list" aria-label="${S.quickAria}">
-          <a role="listitem" href="/fylke/Oslo">Oslo</a>
-          <a role="listitem" href="/fylke/Troms%20og%20Finnmark">Troms og Finnmark</a>
-          <a role="listitem" href="/sok?q=natur">${S.qNature}</a>
-          <a role="listitem" href="/opplevelser">${S.qAll}</a>
-        </div>
       </div>
     </div>
   </section>
@@ -2867,7 +2896,7 @@ function renderOpplevelseDetail(
 
   // Meta description: own summary if present, else a generated one.
   const metaDescRaw = safeExpDescription
-    || `${exp.title}${place ? " i " + place : ""}. ${catLabel(cat)} på Opplevagent — kuratert markedsplass for norske opplevelser med Brreg-verifiserte tilbydere.`;
+    || `${exp.title}${place ? " i " + place : ""}. ${catLabel(cat)} på Opplevagent — håndplukkede norske opplevelser med Brreg-verifiserte tilbydere.`;
   const metaDesc = metaDescRaw.length > 155 ? metaDescRaw.slice(0, 152).trim() + "…" : metaDescRaw;
 
   // Badges row.
@@ -2964,7 +2993,13 @@ function renderOpplevelseDetail(
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
          <span><strong>${escapeHtml(place || "Posisjon")}</strong><span class="map-sub">Åpne i kart (OpenStreetMap)</span></span>
        </a>`;
-  const mapBlock = (lat !== null && lon !== null)
+  // Daniel 2026-08-24, punkt 5: a stored coordinate that cannot be a
+  // Norwegian position (0/0 from a failed geocode, a swapped pair) is treated
+  // as "no position" here, exactly as the map queries treat it as "no marker"
+  // — otherwise this card opens a mini-map of the open Atlantic and asserts it
+  // is where the experience is. Same gate, same honesty rule as the
+  // approximate-precision labelling above.
+  const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
     ? renderMiniMapSection({ lat, lon, approx: geoIsApprox, label: place || "Posisjon" }, osmLinkHtml)
     : `<div class="map-card map-fallback">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
@@ -3183,7 +3218,7 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
   ${relBlock}
 </main>
 <footer class="site-foot"><div class="foot-inner">
-  <span>© ${new Date().getFullYear()} Opplevagent — kuratert markedsplass for norske opplevelser.</span>
+  <span>© ${new Date().getFullYear()} Opplevagent — norske opplevelser, håndplukket og verifisert.</span>
   <span><a href="/">Forsiden</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
 </div></footer>
 </body>
@@ -3635,7 +3670,7 @@ const BROWSE_NAV = `<a class="skip-link" href="#main">Hopp til innhold</a>
 
 function browseFooter(): string {
   return `<footer class="site-foot"><div class="foot-inner">
-  <span>© ${new Date().getFullYear()} Opplevagent — kuratert markedsplass for norske opplevelser.</span>
+  <span>© ${new Date().getFullYear()} Opplevagent — norske opplevelser, håndplukket og verifisert.</span>
   <span><a href="/opplevelser">Alle opplevelser</a> · <a href="/reise">Langs ruten</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
 </div></footer>`;
 }
@@ -4069,8 +4104,8 @@ router.get("/opplevelser", (req: Request, res: Response) => {
     title: "Alle opplevelser | Opplevagent",
     h1: "Alle opplevelser",
     metaDesc:
-      "Bla i alle kuraterte norske opplevelser på Opplevagent — hvalsafari, trehytter, guidede turer, mat og mer. Tilbydere verifisert mot Brønnøysundregistrene.",
-    lede: "Kuratert oversikt over norske opplevelser og aktiviteter. Filtrer på kategori eller fylke, eller søk fritt.",
+      "Bla i alle håndplukkede norske opplevelser på Opplevagent — hvalsafari, trehytter, guidede turer, mat og mer. Tilbydere verifisert mot Brønnøysundregistrene.",
+    lede: "Håndplukket oversikt over norske opplevelser og aktiviteter. Filtrer på kategori eller fylke, eller søk fritt.",
     canonicalPath: "/opplevelser",
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser" }],
     rows,
@@ -4521,14 +4556,23 @@ export function renderGardssalgTypeChips(
       }
     }
   }
-  function chip(href: string, label: string, count: number, active: boolean): string {
-    return `<a class="chip${active ? " chip-active" : ""}"${active ? ' aria-current="page"' : ""} href="${href}">${escapeHtml(label)} <span class="n">${count}</span></a>`;
+  // Daniel 2026-08-24, punkt 4: the filter chips carry the same per-type
+  // colour dot the homepage drikkested chips already use (one source:
+  // DRINK_TYPE_META via drinkTypeMeta()), so the colour a visitor picks in
+  // the filter row is the colour they then see on the cards below. «Alle»
+  // has no type and stays dotless.
+  function chip(href: string, label: string, count: number, active: boolean, color?: string | null): string {
+    const dot = color
+      ? `<span aria-hidden="true" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${color};margin-right:7px;vertical-align:baseline"></span>`
+      : "";
+    return `<a class="chip${active ? " chip-active" : ""}"${active ? ' aria-current="page"' : ""} href="${href}">${dot}${escapeHtml(label)} <span class="n">${count}</span></a>`;
   }
   const chips: string[] = [chip("/kategori/gardssalg", "Alle", total, activeSlug === null)];
   for (const [slug, def] of Object.entries(GARDSSALG_TYPE_PAGES)) {
     const count = bySlug.get(slug) ?? 0;
     if (count <= 0) continue;
-    chips.push(chip(`/kategori/gardssalg/${slug}`, def.label, count, activeSlug === slug));
+    const color = drinkTypeMeta(def.producerTypes[0] ?? null)?.color ?? null;
+    chips.push(chip(`/kategori/gardssalg/${slug}`, def.label, count, activeSlug === slug, color));
   }
   return `<nav class="chips gardssalg-type-chips" aria-label="Filtrer produsenter etter type">${chips.join("")}</nav>`;
 }
@@ -4636,6 +4680,17 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
   function renderProviderCard(p: GardssalgProviderRow): string {
     const { title, sted } = gardssalgCardTitleAndSted(p);
     const badge = drinkBadge(p.producer_type);
+    // Daniel 2026-08-24, punkt 4: «agentkortene er litt anonyme med sin hvite
+    // farge — vurder å bruke hver kategorifarge på hele kortet». The card now
+    // carries its own drink type's colour (DRINK_TYPE_META, the same single
+    // source the badge, the homepage chips and the type chips already read)
+    // as a top edge, a border and a soft top-down wash. Deliberately a WASH,
+    // not a saturated fill: the four DRINK_TYPE_META hues are chosen for
+    // small badges, and body text on a full-strength #4a8c3f / #c0577c card
+    // would fall under the contrast bar this codebase holds elsewhere.
+    // rfb-seed rows with no producer_type keep the brand teal, so an
+    // untyped card is neutral rather than mislabelled by colour.
+    const accent = drinkTypeMeta(p.producer_type)?.color ?? "#0f5a50";
     // BEHAVIOR CHANGE (2026-07-02 gårdssalg-book fix): the "Book besøk" CTA
     // points at the new SSR reservation panel (/kategori/gardssalg/book/<slug>)
     // instead of /tilbyder/<slug>. The old /tilbyder/<slug> target 404'd for
@@ -4666,8 +4721,13 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     // Distinct from the 2026-08-09 "positive markers only" decision above —
     // that was about the badge/marker row, not this button's own label.
     const bookingPaused = isBookingPaused(p.booking_live, p.catalog_hidden);
+    // The paused CTA keeps its OUTLINE-vs-FILL distinction from the active
+    // one (that is what stops it looking bookable while it isn't — see
+    // .gs-card-cta-paused's own comment); punkt 4 only swaps its flat grey
+    // for the card's own colour, so a grid of not-yet-activated producers
+    // stops reading as a grid of disabled buttons.
     const link = bookHref
-      ? `<a href="${bookHref}" class="${bookingPaused ? "gs-card-cta-paused" : "gs-card-cta"}">${bookingPaused ? "Meld interesse" : "Book besøk"}</a>`
+      ? `<a href="${bookHref}" class="${bookingPaused ? "gs-card-cta-paused" : "gs-card-cta"}"${bookingPaused ? ` style="background:#fff;border-color:${accent}66;color:${accent}"` : ""}>${bookingPaused ? "Meld interesse" : "Book besøk"}</a>`
       : "";
     // Cards carry POSITIVE markers only (dev-request 2026-08-09-gardssalg-
     // kommer-snart-fjernes-eier-aktivert-booking, AC5 options — Daniel
@@ -4690,7 +4750,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     const markerRow = cardMarkers.length
       ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">${cardMarkers.join("")}</div>`
       : "";
-    return `<article style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
+    return `<article style="background:linear-gradient(180deg,${accent}1f 0%,${accent}08 55%,#fff 100%);border:1px solid ${accent}3d;border-top:5px solid ${accent};border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
   <div style="padding:16px 16px 12px">
     ${sted ? `<div style="font-size:.78rem;color:#7a7163;margin-bottom:4px">${escapeHtml(sted)}</div>` : ""}
     <div style="margin-bottom:6px">${nameHtml}</div>
@@ -5124,7 +5184,9 @@ router.get(
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
            <span><strong>${escapeHtml(sted || "Posisjon")}</strong><span class="map-sub">${geoApprox ? "Ca. posisjon (kommune) – åpne i kart" : "Åpne i kart (OpenStreetMap)"}</span></span>
          </a>`;
-    const mapBlock = (lat !== null && lon !== null)
+    // Same coordinate sanity gate as the /opplevelse/:slug "Sted" card — see
+    // its comment (Daniel 2026-08-24, punkt 5).
+    const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
       ? renderMiniMapSection({ lat, lon, approx: geoApprox, label: sted || "Posisjon" }, osmLinkHtml)
       : `<div class="map-card map-fallback">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
@@ -6507,7 +6569,7 @@ export function buildCategoryAnswerFirstOpening(params: {
     : "";
   const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
 
-  return `${params.label} på Opplevagent: ${countPhrase}${spreadPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
+  return `${params.label} på Opplevagent: ${countPhrase}${spreadPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
 }
 
 // GEO: answer-first SSR opening for kommune (municipality) pages — the
@@ -6539,7 +6601,7 @@ export function buildKommuneAnswerFirstOpening(params: {
   const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
   const fylkePart = params.fylke ? ` (${params.fylke})` : "";
 
-  return `Opplevelser i ${params.kommune}${fylkePart}: ${countPhrase}${categoryPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
+  return `Opplevelser i ${params.kommune}${fylkePart}: ${countPhrase}${categoryPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
 }
 
 // GEO: FAQPage JSON-LD for the produkt×by "query landing pages" — the final
@@ -6633,7 +6695,7 @@ export function buildProduktByAnswerFirstOpening(params: {
   const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
   const fylkePart = params.fylke ? ` (${params.fylke})` : "";
 
-  return `${params.categoryLabel} i ${params.kommune}${fylkePart}: ${countPhrase}${providerPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
+  return `${params.categoryLabel} i ${params.kommune}${fylkePart}: ${countPhrase}${providerPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
 }
 
 // Category slug -> still-sketch motif (dev-request 2026-08-08-opplevagent-
@@ -6728,7 +6790,7 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     lang: req.lang,
     title: `${label} | Opplevagent`,
     h1: label,
-    metaDesc: `${label} i Norge — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"} i kategorien.`,
+    metaDesc: `${label} i Norge — håndplukkede opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"} i kategorien.`,
     lede,
     canonicalPath,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: label }],
@@ -6899,8 +6961,8 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     lang: req.lang,
     title: `Opplevelser i ${fylke} | Opplevagent`,
     h1: `Opplevelser i ${fylke}`,
-    metaDesc: `Kuraterte opplevelser og aktiviteter i ${fylke} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
-    lede: `Hva kan du finne på i ${fylke}? Kuratert oversikt over opplevelser i fylket.`,
+    metaDesc: `Håndplukkede opplevelser og aktiviteter i ${fylke} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    lede: `Hva kan du finne på i ${fylke}? Håndplukket oversikt over opplevelser i fylket.`,
     canonicalPath: fylkeCanonicalPath,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: fylke }],
     rows: effectiveRows,
@@ -6961,7 +7023,7 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
   ];
 
   const kommuneCanonicalPath = `/kommune/${encodeURIComponent(kommune)}`;
-  const genericKommuneLede = `Hva kan du finne på i ${kommune}? Kuratert oversikt over opplevelser i kommunen.`;
+  const genericKommuneLede = `Hva kan du finne på i ${kommune}? Håndplukket oversikt over opplevelser i kommunen.`;
   // GEO: FAQPage JSON-LD — see buildKommuneFaqJsonLd for the quality gate.
   // The same getKommuneFaqStats() aggregate also feeds the answer-first
   // opening paragraph (buildKommuneAnswerFirstOpening) below — one query, two
@@ -7024,7 +7086,7 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     lang: req.lang,
     title: `Opplevelser i ${kommune} | Opplevagent`,
     h1: `Opplevelser i ${kommune}`,
-    metaDesc: `Kuraterte opplevelser og aktiviteter i ${kommune}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    metaDesc: `Håndplukkede opplevelser og aktiviteter i ${kommune}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
     lede: kommuneLede,
     canonicalPath: kommuneCanonicalPath,
     crumbs,
@@ -7149,7 +7211,7 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
     lang: req.lang,
     title: `${label} i ${kommune} | Opplevagent`,
     h1: `${label} i ${kommune}`,
-    metaDesc: `${label} i ${kommune} — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    metaDesc: `${label} i ${kommune} — håndplukkede opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
     lede,
     canonicalPath,
     crumbs,
@@ -7207,7 +7269,7 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
   const brregVerified = Number(provider.brreg_verified) === 1;
   const provSite = safeHttpUrl(provider.hjemmeside);
   const place = placeOf({ kommune: provider.kommune as string | null, fylke: provider.fylke as string | null });
-  let ledeBits = `Alle kuraterte opplevelser fra ${navn}`;
+  let ledeBits = `Alle håndplukkede opplevelser fra ${navn}`;
   if (place) ledeBits += ` (${place})`;
   ledeBits += ".";
   const verifiedNote = brregVerified
@@ -7712,10 +7774,10 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     ? "Opplevelser nær deg"
     : "Søk i opplevelser";
   const metaDesc = q
-    ? `Søkeresultater for «${q}» på Opplevagent — kuraterte norske opplevelser med verifiserte tilbydere.`
+    ? `Søkeresultater for «${q}» på Opplevagent — håndplukkede norske opplevelser med verifiserte tilbydere.`
     : hasGeo
-    ? "Opplevelser nær deg, sortert etter avstand — kuraterte norske opplevelser med verifiserte tilbydere."
-    : "Søk blant kuraterte norske opplevelser på Opplevagent — etter sted, kategori eller aktivitet.";
+    ? "Opplevelser nær deg, sortert etter avstand — håndplukkede norske opplevelser med verifiserte tilbydere."
+    : "Søk blant håndplukkede norske opplevelser på Opplevagent — etter sted, kategori eller aktivitet.";
   const emptyTitle = hasQuery ? `Ingen treff${q ? ` for «${q}»` : ""}` : "Skriv inn et søk";
   const emptyBody = hasQuery
     ? "Prøv et annet søkeord eller fjern et filter. Du kan også bla i alle opplevelser."
@@ -8109,9 +8171,9 @@ router.get("/proveniens", (_req: Request, res: Response) => {
   res.send(legalPage("Slik verifiserer vi dataene våre / How we verify our data", `<div class="lang"><a href="#en">English</a></div>
 <h1>Slik verifiserer vi dataene våre</h1>
 <p>Opplevagent skraper ikke bare en nettside og publiserer det vi finner. Hver tilbyder og opplevelse kobles til hvor informasjonen kom fra, og tilbydere krysssjekkes mot en offentlig kilde før de får merket "verifisert". Her er de tre stegene.</p>
-<h2>1. Kuratert innhenting</h2><p>Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked der hvem som helst kan legge inn en oppføring, men et utvalg av reelle norske tilbydere.</p>
+<h2>1. Håndplukket utvalg</h2><p>Vi henter inn opplevelser fortløpende fra utvalgte kilder &mdash; ikke et åpent annonsemarked der hvem som helst kan legge inn en oppføring, men ekte norske tilbydere vi har plukket ut.</p>
 <h2>2. Verifisert tilbyder</h2><p>Hver tilbyder kontrolleres mot <strong>Brønnøysundregistrene</strong> for å bekrefte at det står et aktivt, registrert selskap bak opplevelsen &mdash; organisasjonsnummer og status hentes direkte derfra. Tilbydere som består denne sjekken får et <span style="display:inline-flex;align-items:center;gap:4px;background:#e7f6ec;color:#0f7a3d;border:1px solid #bfe6cd;border-radius:20px;padding:2px 10px;font-size:.82rem;font-weight:600">&#10003; Brreg-verifisert</span>-merke og vises med organisasjonsnummer på tilbyderens profil.</p>
-<h2>3. Beriket innhold</h2><p>Detaljer som beskrivelse, varighet og praktisk info berikes fra tilbyderens egen nettside, med kildehenvisning, slik at teksten er presis og oppdatert &mdash; ikke gjettet.</p>
+<h2>3. Utfylt med detaljer</h2><p>Detaljer som beskrivelse, varighet og praktisk info hentes fra tilbyderens egen nettside, med kildehenvisning, slik at teksten er presis og oppdatert &mdash; ikke gjettet.</p>
 <h2>Hva hvis en tilbyder ikke er verifisert ennå?</h2><p>Opplevelser fra en tilbyder vi ennå ikke har fått bekreftet mot Brønnøysundregistrene publiseres ikke på nettstedet &mdash; verken opplevelsene eller tilbyderens egen profilside &mdash; før den bekreftelsen er på plass. Så snart tilbyderen er bekreftet som et aktivt, registrert selskap, blir opplevelsene synlige med Brreg-merket.</p>
 <h2>Hva vi ikke gjør</h2><p>Vi gjetter ikke fakta om en tilbyder og presenterer det som bekreftet. Innhold hentet fra en tilbyders egen side vises som en faktaoppsummering med kildehenvisning, ikke som en juridisk bekreftelse &mdash; det eneste juridisk bekreftede feltet er det som er kryssjekket mot Brønnøysundregistrene.</p>
 <p style="background:#f0f7f4;border-left:4px solid #12a594;border-radius:0 10px 10px 0;padding:16px 20px;margin:24px 0">Etter hvert som forventningene til åpenhet rundt KI og datagrunnlag øker i Europa, mener vi at å vise selve verifiseringsarbeidet vårt er god praksis. Denne siden beskriver hva vi faktisk gjør i dag &mdash; det er ikke en påstand om sertifisering eller samsvar med noe bestemt regelverk.</p>
@@ -8810,7 +8872,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
   <footer class="gom-footer"><a href="/">opplevagent.no</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/.well-known/agent-card.json">Agent Card</a></footer>` : `
   <section class="gom-hero">
     <h1>Oppdag norske opplevelser via opplevagent-mcp</h1>
-    <p>Be Claude, ChatGPT eller en annen MCP-kompatibel AI-assistent om å søke i Opplevagents kuraterte, Brreg-verifiserte katalog over norske opplevelser og aktiviteter.</p>
+    <p>Be Claude, ChatGPT eller en annen MCP-kompatibel AI-assistent om å søke i Opplevagents håndplukkede, Brreg-verifiserte katalog over norske opplevelser og aktiviteter.</p>
   </section>
   <section class="gom-sec">
     <h2>Hva er dette?</h2>

@@ -345,8 +345,11 @@ export async function runExperiencesSeoSokBoostTests(opts: { log?: boolean } = {
       assertTrue(typeof en.hintRoutePre === "string" && en.hintRoutePre.length > 0, "hero-2: en locale has a route hint string");
       assertTrue(/oslo/i.test(no.hintRouteLink) && /bergen/i.test(no.hintRouteLink), "hero-3: no route hint gives a concrete route example");
       assertTrue(/oslo/i.test(en.hintRouteLink) && /bergen/i.test(en.hintRouteLink), "hero-4: en route hint gives a concrete route example");
-      // Pre-existing copy (bla i alle opplevelser / browse all experiences,
-      // and the /api/opplevelser/discover mention) must be preserved verbatim.
+      // Pre-existing copy (bla i alle opplevelser / browse all experiences)
+      // must be preserved verbatim. The /api/opplevelser/discover mention
+      // that used to sit in this same hint line is GONE as of Daniel's
+      // 2026-08-24 UX pass, punkt 1 — «gir ikke mening for de fleste uten
+      // ai kunnskap» — see hero-10/hero-11 below.
       assertTrue(no.hintLink === "bla i alle opplevelser", "hero-5: no 'browse all experiences' copy preserved verbatim");
       assertTrue(en.hintLink === "browse all experiences", "hero-6: en 'browse all experiences' copy preserved verbatim");
     }
@@ -356,8 +359,13 @@ export async function runExperiencesSeoSokBoostTests(opts: { log?: boolean } = {
       assertTrue(r.body.includes('href="/reise"'), "hero-8: the homepage hero links to /reise");
       assertTrue(r.body.includes(">bla i alle opplevelser<") || r.body.includes("bla i alle opplevelser"),
         "hero-9: the existing 'browse all experiences' hint is still rendered");
-      assertTrue(r.body.includes("GET /api/opplevelser/discover"),
-        "hero-10: the existing /api/opplevelser/discover mention is still rendered");
+      const heroHint = (r.body.match(/<p class="discover-hint">[\s\S]*?<\/p>/) || [""])[0];
+      assertTrue(heroHint.length > 0 && !/api\/opplevelser\/discover/.test(heroHint),
+        "hero-10: the hero hint no longer puts a raw REST endpoint in front of human visitors");
+      // …but the endpoint itself is NOT hidden from agents: the homepage's own
+      // "For AI-agenter" code-card still documents the same call.
+      assertTrue(/<span class="pth">\/api\/opplevelser\/discover<\/span>/.test(r.body),
+        "hero-11: the agents section still documents GET /api/opplevelser/discover");
     }
   } catch (err: any) {
     failed++;

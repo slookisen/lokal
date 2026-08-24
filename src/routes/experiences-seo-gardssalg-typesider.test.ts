@@ -327,17 +327,28 @@ export function runExperiencesSeoGardssalgTypesiderTests(opts: { log?: boolean }
         chipsBase.includes('<a class="chip chip-active" aria-current="page" href="/kategori/gardssalg">Alle <span class="n">6</span></a>'),
         "g2: «Alle» chip is active on the base page with the full visible count (6 — incl. the NULL-type row, excl. the hidden row)"
       );
+      // Each type chip carries its own colour dot as of Daniel's 2026-08-24
+      // punkt 4 (same DRINK_TYPE_META hue the cards below now wear), so the
+      // label no longer sits directly after the '>' — the href → dot → label
+      // → count sequence is what's pinned.
+      function typeChipRe(slug: string, color: string, label: string, count: number): RegExp {
+        return new RegExp(
+          `href="/kategori/gardssalg/${slug}">` +
+          `<span aria-hidden="true" style="[^"]*background:${color}[^"]*"></span>` +
+          `${label} <span class="n">${count}</span>`
+        );
+      }
       assertTrue(
-        chipsBase.includes('href="/kategori/gardssalg/bryggeri">Bryggeri <span class="n">2</span>'),
-        "g3: Bryggeri chip links its type page with aggregated count 2"
+        typeChipRe("bryggeri", "#c58a2a", "Bryggeri", 2).test(chipsBase),
+        "g3: Bryggeri chip links its type page with aggregated count 2, dotted in the bryggeri hue"
       );
       assertTrue(
-        chipsBase.includes('href="/kategori/gardssalg/sider">Sider <span class="n">2</span>'),
-        "g4: Sider chip aggregates cideri+sideri to count 2"
+        typeChipRe("sider", "#4a8c3f", "Sider", 2).test(chipsBase),
+        "g4: Sider chip aggregates cideri+sideri to count 2, dotted in the sider hue"
       );
       assertTrue(
-        chipsBase.includes('href="/kategori/gardssalg/mjod">Mjød <span class="n">1</span>'),
-        "g5: Mjød chip shows count 1"
+        typeChipRe("mjod", "#7c5cbb", "Mjød", 1).test(chipsBase),
+        "g5: Mjød chip shows count 1, dotted in the mjød hue"
       );
       for (const absentHref of ["/kategori/gardssalg/kombucha", "/kategori/gardssalg/destilleri", "/kategori/gardssalg/fruktvin"]) {
         assertTrue(!chipsBase.includes(`href="${absentHref}"`), `g6: no chip for the empty type ${absentHref}`);
