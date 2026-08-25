@@ -2585,10 +2585,9 @@ router.get("/agents.txt", serveAgentsTxt);
 // verification for the Opplevagent app fails (measured 2026-08-24).
 // ═══════════════════════════════════════════════════════════════
 
-// Issued by the OpenAI Apps form when the Opplevagent app reaches the
-// MCP/domain-verification step. Placeholder until then — do NOT merge
-// to main while this is the placeholder value.
-const OPENAI_APPS_CHALLENGE_TOKEN = "PENDING-DANIEL-TOKEN";
+// Issued by the OpenAI Apps form at the Opplevagent app's MCP/domain-
+// verification step (2026-08-25).
+const OPENAI_APPS_CHALLENGE_TOKEN = "4jYu5lciublhwHxBSXCP9bmTyrke4k1f4xioIEsH5Ng";
 
 router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) => {
   res.header("Content-Type", "text/plain");
