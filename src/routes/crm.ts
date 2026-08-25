@@ -1178,7 +1178,12 @@ router.get("/outbox/pending", (req, res) => {
 // Agent reports completion of a queued action
 router.post("/outbox/:id/result", (req, res) => {
   const schema = z.object({
-    status: z.enum(["completed", "failed"]),
+    // 'superseded' (dev-request 2026-08-25-cs-outbox-result-mangler-superseded-
+    // status): the case this row was queued for closed via a DIFFERENT channel
+    // than the row itself represents (e.g. a gmail_draft row superseded by a
+    // resend_send that actually resolved the thread) — distinct from
+    // 'completed', which means THIS row's own send/draft is what did it.
+    status: z.enum(["completed", "failed", "superseded"]),
     resultId: z.string().optional(),
     error: z.string().optional(),
   });
@@ -1196,6 +1201,8 @@ router.post("/outbox/:id/result", (req, res) => {
       contactId: row.contact_id,
       type: parsed.data.status === "completed"
         ? (row.intent === "gmail_draft" ? "draft_created" : "sent")
+        : parsed.data.status === "superseded"
+        ? "superseded"
         : "send_failed",
       actor: row.created_by,
       payload: { outboxId: req.params.id, resultId: parsed.data.resultId, error: parsed.data.error },
@@ -1226,8 +1233,12 @@ router.post("/outbox/:id/result", (req, res) => {
     // forward. getLatestOutboundMessageId is kept ONLY as a fallback for
     // outbox rows that predate this column (e.g. rows from before this
     // migration shipped) — those still behave exactly as before.
+    // 'superseded' deliberately skips this sync: it means THIS row's own
+    // send/draft never happened (something else resolved the case), so there
+    // is no "sent"/"draft_in_gmail"/"failed" delivery outcome to record for
+    // whatever message getLatestOutboundMessageId would otherwise guess at.
     const msgId = row.crm_message_id ?? crmService.getLatestOutboundMessageId(row.thread_id);
-    if (msgId) {
+    if (msgId && parsed.data.status !== "superseded") {
       const newStatus = parsed.data.status === "completed"
         ? (row.intent === "gmail_draft" ? "draft_in_gmail" : "sent")
         : "failed";

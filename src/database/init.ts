@@ -779,7 +779,7 @@ function initSchema(db: Database.Database): void {
       thread_id TEXT REFERENCES crm_threads(id) ON DELETE SET NULL,
       contact_id TEXT REFERENCES crm_contacts(id) ON DELETE SET NULL,
       intent TEXT NOT NULL CHECK(intent IN ('gmail_draft','resend_send')),
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed')),
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed','superseded')),
       to_emails TEXT NOT NULL,
       cc_emails TEXT,
       subject TEXT NOT NULL,
@@ -837,6 +837,87 @@ function initSchema(db: Database.Database): void {
     db.exec("ALTER TABLE crm_outbox ADD COLUMN crm_message_id TEXT REFERENCES crm_messages(id) ON DELETE SET NULL");
   } catch (e) {
     // column already exists — fine
+  }
+
+  // crm_outbox.status CHECK widened to include 'superseded' — dev-request
+  // 2026-08-25-cs-outbox-result-mangler-superseded-status. Before this, an
+  // outbox row resolved via a different channel than the row itself (e.g. a
+  // gmail_draft row whose case actually closed via resend_send/resend_smtp)
+  // had to be force-fit into 'completed' with a foreign resultId, collapsing
+  // "this row did the work" and "this row was moot, something else did" into
+  // one status. SQLite can't ALTER a CHECK in place, so widen via the same
+  // rebuild-table pattern as the PR-58/PR-64 agent_affiliations migrations
+  // above — idempotent: only runs when the current CHECK doesn't already
+  // include 'superseded'.
+  //
+  // vertical_id (post-review fix): the Phase 4.6a loop further below adds
+  // vertical_id to crm_outbox via ALTER — on every real prod DB by the time
+  // this migration ships, that column already carries real per-vertical
+  // values ('dental', 'experiences', ...), NOT just 'rfb'. A rebuild whose
+  // column list omits it would drop the column entirely; the Phase 4.6a
+  // ALTER would then re-add it fresh with DEFAULT 'rfb' for every row,
+  // silently reclassifying every existing non-rfb outbox row — the exact
+  // failure mode `crm-vertical.test.ts` was written to guard against
+  // (dev-request 2026-07-27-crm-plattformadskillelse-opplevagent). Guard
+  // with its own ALTER first (idempotent, mirrors crm_message_id above) so
+  // the column is guaranteed present before the rebuild reads it, then carry
+  // it through explicitly in both the new table and the copy.
+  try {
+    db.exec("ALTER TABLE crm_outbox ADD COLUMN vertical_id TEXT NOT NULL DEFAULT 'rfb'");
+  } catch (e) {
+    // column already exists — fine (expected: Phase 4.6a already added it)
+  }
+  try {
+    const schemaRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='crm_outbox'"
+    ).get() as { sql: string } | undefined;
+    const needsRebuild = schemaRow && !/'superseded'/.test(schemaRow.sql);
+    if (needsRebuild) {
+      const tx = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE crm_outbox__superseded_new (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT REFERENCES crm_threads(id) ON DELETE SET NULL,
+            contact_id TEXT REFERENCES crm_contacts(id) ON DELETE SET NULL,
+            intent TEXT NOT NULL CHECK(intent IN ('gmail_draft','resend_send')),
+            status TEXT DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed','superseded')),
+            to_emails TEXT NOT NULL,
+            cc_emails TEXT,
+            subject TEXT NOT NULL,
+            body_text TEXT NOT NULL,
+            body_html TEXT,
+            reply_to_message_id TEXT,
+            result_id TEXT,
+            error TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            processed_at TEXT,
+            created_by TEXT NOT NULL CHECK(created_by IN ('claude','daniel')),
+            crm_message_id TEXT REFERENCES crm_messages(id) ON DELETE SET NULL,
+            vertical_id TEXT NOT NULL DEFAULT 'rfb'
+          )
+        `);
+        db.exec(`
+          INSERT INTO crm_outbox__superseded_new
+            (id, thread_id, contact_id, intent, status, to_emails, cc_emails,
+             subject, body_text, body_html, reply_to_message_id, result_id,
+             error, created_at, processed_at, created_by, crm_message_id, vertical_id)
+          SELECT id, thread_id, contact_id, intent, status, to_emails, cc_emails,
+                 subject, body_text, body_html, reply_to_message_id, result_id,
+                 error, created_at, processed_at, created_by, crm_message_id, vertical_id
+          FROM crm_outbox
+        `);
+        db.exec(`DROP TABLE crm_outbox`);
+        db.exec(`ALTER TABLE crm_outbox__superseded_new RENAME TO crm_outbox`);
+        // Indexes were dropped with the old table — recreate them now so
+        // the same boot doesn't leave them missing.
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_outbox_status ON crm_outbox(status)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_crm_outbox_intent ON crm_outbox(intent)`);
+      });
+      tx();
+      console.log("[init][cs-outbox-superseded] crm_outbox.status CHECK widened to include 'superseded'");
+    }
+  } catch (e) {
+    console.warn("[init][cs-outbox-superseded] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch
