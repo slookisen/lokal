@@ -39,6 +39,22 @@
  *   (d) Each of the other three fingerprint triggers in isolation
  *       (online_booking_url, social_media.facebook, field_provenance key)
  *       -> 400 on a non-synthetic id, proving "any ONE field is enough".
+ *
+ * 2026-08-25 dental price_band enum guard (production data audit):
+ * DentalAgentSchema.price_band was a bare z.string(), so PUT /agents/:id
+ * (the enrichment worker's actual write path) would persist any string,
+ * which is how off-spec values like "medium"/"high" reached the DB. Fixed
+ * by making price_band a z.enum of the canonical rimelig|standard|premium|
+ * ukjent values (dental-specific.yaml), reusing the same PRICE_BAND_ENUM
+ * constant already enforced by updateDentalPriceBand() (dead code, no
+ * route calls it). Covers:
+ *   (e) PUT with a valid enum value ("standard") -> 200, written for real.
+ *   (f) PUT with an off-enum value ("medium") -> tolerant-strip path kicks
+ *       in (same as any other invalid field): 200, price_band listed in
+ *       stripped_fields, NOT in fields_updated, and the row's price_band
+ *       stays unchanged (untouched, not garbage) on a follow-up GET.
+ *   (g) PUT with price_band: null -> 200, clears a previously-set value
+ *       (nullable() is preserved; the enum guard doesn't disallow clearing).
  */
 
 export interface TestSummary {
@@ -212,6 +228,45 @@ export function runDentalTests(
         specialists: null,
       });
 
+      // (e)-(g) subjects: price_band enum guard (2026-08-25).
+      const insertAgentWithPriceBand = dentalDb.prepare(
+        `INSERT INTO dental_agents (id, navn, hjemmeside, telefon, om_oss, specialists, price_band)
+         VALUES (@id, @navn, @hjemmeside, @telefon, @om_oss, @specialists, @price_band)`,
+      );
+      // (e) subject: no price_band yet — PUT a valid enum value onto it.
+      insertAgentWithPriceBand.run({
+        id: "clinic-real-006",
+        navn: "Sjette Tannlegeklinikk AS",
+        hjemmeside: null,
+        telefon: null,
+        om_oss: null,
+        specialists: null,
+        price_band: null,
+      });
+      // (f) subject: already has a valid price_band — an off-enum PUT must
+      // leave it untouched (tolerant-strip), not overwrite it with garbage.
+      insertAgentWithPriceBand.run({
+        id: "clinic-real-007",
+        navn: "Syvende Tannlegeklinikk AS",
+        hjemmeside: null,
+        telefon: null,
+        om_oss: null,
+        specialists: null,
+        price_band: "standard",
+      });
+      // (g) subject: already has a valid price_band — PUT price_band: null
+      // must still be allowed to clear it (enum guard doesn't touch
+      // nullable()).
+      insertAgentWithPriceBand.run({
+        id: "clinic-real-008",
+        navn: "Attende Tannlegeklinikk AS",
+        hjemmeside: null,
+        telefon: null,
+        om_oss: null,
+        specialists: null,
+        price_band: "premium",
+      });
+
       const dentalRouter = (require("./dental") as typeof import("./dental")).default as any;
 
       // ── (a) test-fingerprint payload on a real id -> 400, row untouched ──
@@ -326,6 +381,108 @@ export function runDentalTests(
           body: { field_provenance: { _smoke_test_provenance_probe: { sources: [] } } },
         });
         assertEq(resp3.status, 400, "d3: field_provenance _smoke_test key fingerprint alone -> 400");
+      }
+
+      // ── (e) valid price_band enum value -> 200, actually written ──
+      {
+        const resp = await callRoute(dentalRouter, {
+          method: "PUT",
+          path: "/agents/clinic-real-006",
+          headers: { "x-admin-key": testKey },
+          body: { price_band: "standard" },
+        });
+        assertEq(resp.status, 200, "e1: valid price_band enum value -> 200");
+        assertEq(resp.body?.updated, true, "e2: valid price_band PUT reports updated: true");
+        assertTrue(
+          Array.isArray(resp.body?.fields_updated) && resp.body.fields_updated.includes("price_band"),
+          "e3: fields_updated includes price_band",
+        );
+        assertTrue(
+          resp.body?.stripped_fields === undefined,
+          "e4: no stripped_fields for a valid enum value",
+        );
+
+        const getResp = await callRoute(dentalRouter, {
+          method: "GET",
+          path: "/agents/clinic-real-006",
+          headers: {},
+        });
+        assertEq(
+          getResp.body?.agent?.price_band,
+          "standard",
+          "e5: the valid price_band value was actually written",
+        );
+      }
+
+      // ── (f) off-enum price_band value -> tolerant-strip, NOT written ──
+      {
+        const resp = await callRoute(dentalRouter, {
+          method: "PUT",
+          path: "/agents/clinic-real-007",
+          headers: { "x-admin-key": testKey },
+          // "medium" is off-spec (not in rimelig|standard|premium|ukjent) —
+          // paired with a valid companion field so the PUT as a whole still
+          // succeeds per the tolerant-strip philosophy (one bad field must
+          // not 400/422 the whole enrichment write).
+          body: { price_band: "medium", telefon: "87654321" },
+        });
+        assertEq(resp.status, 200, "f1: off-enum price_band alongside a valid field -> 200 (tolerant-strip)");
+        assertEq(resp.body?.updated, true, "f2: tolerant-strip PUT still reports updated: true");
+        assertTrue(
+          Array.isArray(resp.body?.stripped_fields) && resp.body.stripped_fields.includes("price_band"),
+          "f3: stripped_fields includes price_band",
+        );
+        assertTrue(
+          Array.isArray(resp.body?.fields_updated) && !resp.body.fields_updated.includes("price_band"),
+          "f4: fields_updated does NOT include price_band",
+        );
+        assertTrue(
+          Array.isArray(resp.body?.fields_updated) && resp.body.fields_updated.includes("telefon"),
+          "f5: the valid companion field (telefon) was still written",
+        );
+
+        const getResp = await callRoute(dentalRouter, {
+          method: "GET",
+          path: "/agents/clinic-real-007",
+          headers: {},
+        });
+        assertEq(
+          getResp.body?.agent?.price_band,
+          "standard",
+          "f6: price_band is UNCHANGED (still the pre-existing valid value, not \"medium\")",
+        );
+        assertEq(
+          getResp.body?.agent?.telefon,
+          "87654321",
+          "f7: the valid companion field was actually written",
+        );
+      }
+
+      // ── (g) price_band: null -> still allowed, clears the field ──
+      {
+        const resp = await callRoute(dentalRouter, {
+          method: "PUT",
+          path: "/agents/clinic-real-008",
+          headers: { "x-admin-key": testKey },
+          body: { price_band: null },
+        });
+        assertEq(resp.status, 200, "g1: price_band: null -> 200 (nullable() preserved by the enum guard)");
+        assertEq(resp.body?.updated, true, "g2: null-clearing PUT reports updated: true");
+        assertTrue(
+          Array.isArray(resp.body?.fields_updated) && resp.body.fields_updated.includes("price_band"),
+          "g3: fields_updated includes price_band",
+        );
+
+        const getResp = await callRoute(dentalRouter, {
+          method: "GET",
+          path: "/agents/clinic-real-008",
+          headers: {},
+        });
+        assertEq(
+          getResp.body?.agent?.price_band,
+          null,
+          "g4: price_band was actually cleared to null",
+        );
       }
     } catch (err: any) {
       failed++;
