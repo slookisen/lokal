@@ -40550,6 +40550,22 @@ runSerial(async () => {
   }
 });
 
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-acp-produktfeed-rfb: ACP CSV product feed (marketplace-catalog /acp-feed.csv) ──");
+  try {
+    const { runMarketplaceCatalogAcpFeedTests } = require("../src/routes/marketplace-catalog-acp-feed.test") as
+      typeof import("../src/routes/marketplace-catalog-acp-feed.test");
+    const mcaf = await runMarketplaceCatalogAcpFeedTests({ log: false });
+    passed += mcaf.passed;
+    failed += mcaf.failed;
+    for (const f of mcaf.failures) failures.push("marketplace-catalog-acp-feed: " + f);
+    console.log(`  marketplace-catalog-acp-feed: ${mcaf.passed} passed, ${mcaf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-catalog-acp-feed: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-24-evidence-url-verifisering-gate: `experiences.
 // evidence_url` was never independently fetched/checked by anything
 // downstream (unlike the sibling hjemmeside-verification gate). New

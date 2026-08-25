@@ -28,13 +28,9 @@
  *
  * Run standalone:  npx tsx src/routes/marketplace-catalog-acp-feed.test.ts
  *
- * NOT wired into tests/test.ts's require()-list on purpose — the spec for
- * this slice (dev-request 2026-08-24-acp-produktfeed-rfb) names exactly 5
- * files to touch and tests/test.ts is not one of them ("PR hygiene requires
- * a tight diff"). runMarketplaceCatalogAcpFeedTests() is exported with the
- * same shape as the sibling *.test.ts files' runners specifically so a
- * follow-up slice can wire it into the gate with a one-line, low-risk diff
- * to tests/test.ts.
+ * Wired into tests/test.ts (mirrors the marketplace-catalog-second-line
+ * require() block) so this runs under the full suite / CI, not just
+ * standalone.
  */
 
 import Database from "better-sqlite3";
