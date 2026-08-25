@@ -64,11 +64,7 @@
  */
 
 import type Database from "better-sqlite3";
-import {
-  parseContentFieldEvidence,
-  HARVEST_PROVENANCE_SENTINEL,
-  BLANK_PROVENANCE_SENTINEL,
-} from "./experience-store";
+import { parseContentFieldEvidence } from "./experience-store";
 
 export interface HoldoutExperienceRow {
   id: string;
@@ -110,15 +106,27 @@ const HOLDOUT_JUDGED_FIELDS = ["description", "category", "price_from"] as const
  * Returns null when there is truly nothing fetchable to check against (no
  * per-field evidence AND no evidence_url) — the caller must treat that as
  * unresolved, never fabricate a comparison.
+ *
+ * FIX (2026-08-25 review round 2): a per-field provenance value is rejected
+ * by SHAPE (must look like an http(s) URL), not by enumerating known
+ * sentinel constants. An enumerated check missed a real, actively-written
+ * third sentinel (`generated:katalogfelt-llm`, the LLM description-backfill
+ * endpoint's provenance marker) and would silently miss any FUTURE sentinel
+ * too. It also threw on a non-string field value (`src.trim is not a
+ * function`) since the outer JSON-shape guard in parseContentFieldEvidence
+ * doesn't type-check each value — one malformed row anywhere in the holdout
+ * pool crashed the entire endpoint. The `typeof`/regex guard below rejects
+ * both classes of bad input the same way a plain string field is rejected:
+ * fall through to the next judged field, then to legacy evidence_url, then
+ * null — never throw, never fabricate a comparison against garbage.
  */
 export function resolveHoldoutEvidenceUrl(row: HoldoutExperienceRow): string | null {
   const evidence = parseContentFieldEvidence(row.content_field_evidence);
   for (const field of HOLDOUT_JUDGED_FIELDS) {
     const src = evidence[field];
-    if (!src) continue;
+    if (typeof src !== "string") continue;
     const trimmed = src.trim();
-    if (!trimmed) continue;
-    if (trimmed === HARVEST_PROVENANCE_SENTINEL || trimmed === BLANK_PROVENANCE_SENTINEL) continue;
+    if (!/^https?:\/\//i.test(trimmed)) continue;
     return trimmed;
   }
   const legacy = row.evidence_url?.trim();

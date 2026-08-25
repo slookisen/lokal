@@ -389,6 +389,40 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
           null,
           "rh-5: no genuine citation anywhere -> null, never fabricates a URL to check against"
         );
+
+        // rh-6 (2026-08-25 review round 2): a THIRD, real sentinel this module
+        // didn't previously know about by name — "generated:katalogfelt-llm",
+        // written by the LLM description-backfill endpoint — must be rejected
+        // by SHAPE (not an http(s) URL), same as any other non-URL value,
+        // falling through to the legacy evidence_url. Locks in that the fix
+        // is enumeration-proof against sentinels this module has never heard
+        // of, not just the two it imported before.
+        const unknownSentinel: HoldoutExperienceRow = {
+          ...ROW_BASE,
+          evidence_url: "https://legacy-fallback-2.no/",
+          content_field_evidence: JSON.stringify({ description: "generated:katalogfelt-llm" }),
+        };
+        assertEq(
+          resolveHoldoutEvidenceUrl(unknownSentinel),
+          "https://legacy-fallback-2.no/",
+          "rh-6: an unenumerated sentinel is rejected by shape, legacy evidence_url used as last resort"
+        );
+
+        // rh-7 (2026-08-25 review round 2): a malformed row where a judged
+        // field's content_field_evidence value is not a string at all (e.g.
+        // a number) must never throw — it falls through exactly like a
+        // missing/sentinel value, never crashing the whole holdout endpoint
+        // over one bad row.
+        const nonStringField: HoldoutExperienceRow = {
+          ...ROW_BASE,
+          evidence_url: "https://legacy-fallback-3.no/",
+          content_field_evidence: JSON.stringify({ description: 12345 }),
+        };
+        assertEq(
+          resolveHoldoutEvidenceUrl(nonStringField),
+          "https://legacy-fallback-3.no/",
+          "rh-7: a non-string per-field value never throws, falls through to legacy evidence_url"
+        );
       }
 
       // ═══════════════════════════════════════════════════════════════════
