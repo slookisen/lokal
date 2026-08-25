@@ -849,6 +849,24 @@ function initSchema(db: Database.Database): void {
   // rebuild-table pattern as the PR-58/PR-64 agent_affiliations migrations
   // above — idempotent: only runs when the current CHECK doesn't already
   // include 'superseded'.
+  //
+  // vertical_id (post-review fix): the Phase 4.6a loop further below adds
+  // vertical_id to crm_outbox via ALTER — on every real prod DB by the time
+  // this migration ships, that column already carries real per-vertical
+  // values ('dental', 'experiences', ...), NOT just 'rfb'. A rebuild whose
+  // column list omits it would drop the column entirely; the Phase 4.6a
+  // ALTER would then re-add it fresh with DEFAULT 'rfb' for every row,
+  // silently reclassifying every existing non-rfb outbox row — the exact
+  // failure mode `crm-vertical.test.ts` was written to guard against
+  // (dev-request 2026-07-27-crm-plattformadskillelse-opplevagent). Guard
+  // with its own ALTER first (idempotent, mirrors crm_message_id above) so
+  // the column is guaranteed present before the rebuild reads it, then carry
+  // it through explicitly in both the new table and the copy.
+  try {
+    db.exec("ALTER TABLE crm_outbox ADD COLUMN vertical_id TEXT NOT NULL DEFAULT 'rfb'");
+  } catch (e) {
+    // column already exists — fine (expected: Phase 4.6a already added it)
+  }
   try {
     const schemaRow = db.prepare(
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='crm_outbox'"
@@ -874,17 +892,18 @@ function initSchema(db: Database.Database): void {
             created_at TEXT DEFAULT (datetime('now')),
             processed_at TEXT,
             created_by TEXT NOT NULL CHECK(created_by IN ('claude','daniel')),
-            crm_message_id TEXT REFERENCES crm_messages(id) ON DELETE SET NULL
+            crm_message_id TEXT REFERENCES crm_messages(id) ON DELETE SET NULL,
+            vertical_id TEXT NOT NULL DEFAULT 'rfb'
           )
         `);
         db.exec(`
           INSERT INTO crm_outbox__superseded_new
             (id, thread_id, contact_id, intent, status, to_emails, cc_emails,
              subject, body_text, body_html, reply_to_message_id, result_id,
-             error, created_at, processed_at, created_by, crm_message_id)
+             error, created_at, processed_at, created_by, crm_message_id, vertical_id)
           SELECT id, thread_id, contact_id, intent, status, to_emails, cc_emails,
                  subject, body_text, body_html, reply_to_message_id, result_id,
-                 error, created_at, processed_at, created_by, crm_message_id
+                 error, created_at, processed_at, created_by, crm_message_id, vertical_id
           FROM crm_outbox
         `);
         db.exec(`DROP TABLE crm_outbox`);

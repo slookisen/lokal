@@ -58,6 +58,10 @@
  *           it leaves the pending queue without ever being recorded as
  *           "completed", and the linked crm_messages row is left untouched
  *           rather than guessed at a delivery outcome.
+ *   m42-m44 same dev-request, post-review fix — the upgrade path: a legacy
+ *           (pre-PR) crm_outbox with a real, already-backfilled non-'rfb'
+ *           vertical_id survives the 'superseded' CHECK-widening rebuild
+ *           without that column being silently dropped and reset to 'rfb'.
  *
  * Standalone: npx tsx src/routes/crm-send-message-history.test.ts
  * Wired into tests/test.ts via runCrmSendMessageHistoryTests().
@@ -619,6 +623,79 @@ export async function runCrmSendMessageHistoryTests(opts: { log?: boolean } = {}
 
       const linkedMessage = db.prepare("SELECT delivery_status FROM crm_messages WHERE id = ?").get(supersededMessageId) as any;
       assertEq(linkedMessage?.delivery_status, "queued", "m41: the linked crm_messages row is left untouched (still 'queued') — 'superseded' means THIS row's own draft never happened, so there is no delivery outcome to guess at for it");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // m42-m44 — THE UPGRADE PATH for the 'superseded' migration (post-review
+    // fix). Every other test here boots a fresh DB, which already has
+    // 'superseded' baked into crm_outbox's inline CREATE TABLE — the
+    // table-rebuild migration never fires and its column list is never
+    // exercised. A real prod DB is NOT fresh: it already went through the
+    // Phase 4.6a vertical_id backfill (crm_outbox.vertical_id populated with
+    // real values like 'dental'/'experiences', not just 'rfb') long before
+    // this PR ships. A first version of the rebuild's explicit column list
+    // omitted vertical_id entirely, which silently dropped the column and
+    // let the later Phase 4.6a ALTER re-add it fresh with DEFAULT 'rfb' for
+    // EVERY row — reclassifying every existing non-rfb outbox row. Mirrors
+    // crm-vertical.test.ts's own cv47-cv49 legacy-DB upgrade pattern.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const legacy = new Database(":memory:");
+      try {
+        __setDbForTesting(legacy);
+        __initSchemaForTesting(legacy);
+
+        // Recreate today's real prod shape: crm_outbox WITHOUT 'superseded'
+        // in the CHECK (pre-this-PR), but WITH vertical_id already present
+        // and populated with a real non-'rfb' value (post-Phase-4.6a).
+        legacy.exec(`DROP TABLE crm_outbox`);
+        legacy.exec(`
+          CREATE TABLE crm_outbox (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT REFERENCES crm_threads(id) ON DELETE SET NULL,
+            contact_id TEXT REFERENCES crm_contacts(id) ON DELETE SET NULL,
+            intent TEXT NOT NULL CHECK(intent IN ('gmail_draft','resend_send')),
+            status TEXT DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed')),
+            to_emails TEXT NOT NULL,
+            cc_emails TEXT,
+            subject TEXT NOT NULL,
+            body_text TEXT NOT NULL,
+            body_html TEXT,
+            reply_to_message_id TEXT,
+            result_id TEXT,
+            error TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            processed_at TEXT,
+            created_by TEXT NOT NULL CHECK(created_by IN ('claude','daniel')),
+            crm_message_id TEXT REFERENCES crm_messages(id) ON DELETE SET NULL,
+            vertical_id TEXT NOT NULL DEFAULT 'rfb'
+          )
+        `);
+        legacy.prepare(`
+          INSERT INTO crm_outbox (id, intent, status, to_emails, subject, body_text, created_by, vertical_id)
+          VALUES ('legacy-outbox-1', 'gmail_draft', 'completed', '[]', 'Historisk', 'Historisk utkast.', 'daniel', 'dental')
+        `).run();
+
+        const beforeCheck = (legacy.prepare(
+          `SELECT sql FROM sqlite_master WHERE type='table' AND name='crm_outbox'`
+        ).get() as any).sql as string;
+        assertTrue(!/'superseded'/.test(beforeCheck), "m42: the legacy pre-PR shape is in place before the upgrade — no 'superseded' in the CHECK yet");
+        const beforeVertical = (legacy.prepare(`SELECT vertical_id FROM crm_outbox WHERE id = 'legacy-outbox-1'`).get() as any).vertical_id;
+        assertEq(beforeVertical, "dental", "m42b: …and the row's real vertical_id ('dental') is in place before the upgrade");
+
+        __initSchemaForTesting(legacy); // the upgrade boot — fires the rebuild migration
+
+        const afterCheck = (legacy.prepare(
+          `SELECT sql FROM sqlite_master WHERE type='table' AND name='crm_outbox'`
+        ).get() as any).sql as string;
+        assertTrue(/'superseded'/.test(afterCheck), "m43: upgrading actually widens the CHECK to include 'superseded'");
+
+        const afterVertical = (legacy.prepare(`SELECT vertical_id FROM crm_outbox WHERE id = 'legacy-outbox-1'`).get() as any).vertical_id;
+        assertEq(afterVertical, "dental", "m44: …and the pre-existing row's vertical_id survives the rebuild as 'dental' — NOT silently reset to 'rfb'");
+      } finally {
+        try { legacy.close(); } catch { /* already closed */ }
+        __setDbForTesting(db);
+      }
     }
   } catch (err) {
     failed++;
