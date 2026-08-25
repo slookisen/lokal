@@ -625,6 +625,7 @@ function serveApiIndex(_req: Request, res: Response): void {
       ai_plugin: `${BASE_URL}/.well-known/ai-plugin.json`,
       agent_card: `${BASE_URL}/.well-known/agent-card.json`,
       mcp_server_card: `${BASE_URL}/.well-known/mcp/server-card.json`,
+      acp_product_feed: `${BASE_URL}/api/marketplace/catalog/acp-feed.csv`,
     },
   });
 }
