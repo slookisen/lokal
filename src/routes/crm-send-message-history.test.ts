@@ -52,6 +52,12 @@
  *           no crm_messages/outbox side effects; a real subject (including
  *           "Re: faktisk oppfølging", which has content beyond the prefix)
  *           still succeeds.
+ *   m36-m41 dev-request 2026-08-25-cs-outbox-result-mangler-superseded-
+ *           status — POST /outbox/:id/result accepts status:"superseded"
+ *           for a row whose case actually resolved via a different channel:
+ *           it leaves the pending queue without ever being recorded as
+ *           "completed", and the linked crm_messages row is left untouched
+ *           rather than guessed at a delivery outcome.
  *
  * Standalone: npx tsx src/routes/crm-send-message-history.test.ts
  * Wired into tests/test.ts via runCrmSendMessageHistoryTests().
@@ -561,6 +567,58 @@ export async function runCrmSendMessageHistoryTests(opts: { log?: boolean } = {}
 
       const afterOk = crmService.getThreadDetail(subjectThreadId) as any;
       assertEq(afterOk.messages.length, 3, "m35: the two legitimate sends both landed (1 seeded inbound + 2 outbound replies)");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // m36-m41 — dev-request 2026-08-25-cs-outbox-result-mangler-
+    // superseded-status: POST /outbox/:id/result accepts status:"superseded"
+    // for a row whose case actually resolved via a DIFFERENT channel than
+    // the row itself represents — distinct from "completed" and without
+    // guessing a delivery outcome for the linked crm_messages row.
+    // ═══════════════════════════════════════════════════════════════
+    {
+      const supersededThreadId = "send-history-superseded-thread-1";
+      db.prepare(`
+        INSERT INTO crm_threads (id, contact_id, subject, category, severity, vertical_id, message_count)
+        VALUES (?, ?, 'Løst via annen kanal', 'innkommende', 'normal', 'rfb', 1)
+      `).run(supersededThreadId, contact.id);
+      db.prepare(`
+        INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, sent_at, delivery_status, vertical_id)
+        VALUES ('inbound-superseded-1', ?, 'in', 'kunde@example.no', '[]', '[]', 'Løst via annen kanal', 'Spørsmål.', datetime('now','-1 hour'), 'sent', 'rfb')
+      `).run(supersededThreadId);
+
+      const draftReply = await call("POST", `/threads/${supersededThreadId}/send`, {
+        intent: "gmail_draft",
+        toEmails: ["kunde@example.no"],
+        subject: "Re: Løst via annen kanal",
+        bodyText: "Utkast som viser seg unødvendig.",
+        createdBy: "daniel",
+      });
+      assertEq(draftReply.status, 200, "m36: queuing the gmail_draft reply succeeds");
+      const supersededOutboxId = draftReply.body?.outboxId as string;
+      const supersededMessageId = draftReply.body?.internalMessageId as string;
+
+      const pendingBefore = crmService.listPendingOutbox("gmail_draft", 200);
+      assertTrue(pendingBefore.some((o: any) => o.id === supersededOutboxId), "m37: the row is in the pending queue before resolution");
+
+      // Case actually resolved via resend_send on the same thread, not via
+      // this queued draft — report the outbox row as superseded, carrying
+      // the OTHER channel's message id as resultId for the audit trail.
+      const result = await call("POST", `/outbox/${supersededOutboxId}/result`, {
+        status: "superseded",
+        resultId: "resend-msg-elsewhere-1",
+      });
+      assertEq(result.status, 200, "m38: POST /outbox/:id/result accepts status:\"superseded\"");
+
+      const row = db.prepare("SELECT status, result_id FROM crm_outbox WHERE id = ?").get(supersededOutboxId) as any;
+      assertEq(row?.status, "superseded", "m39: crm_outbox.status is 'superseded', not folded into 'completed'");
+      assertEq(row?.result_id, "resend-msg-elsewhere-1", "m39b: the other channel's id is still recorded as result_id");
+
+      const pendingAfter = crmService.listPendingOutbox("gmail_draft", 200);
+      assertTrue(!pendingAfter.some((o: any) => o.id === supersededOutboxId), "m40: the row is gone from the pending queue without ever having counted as 'completed'");
+
+      const linkedMessage = db.prepare("SELECT delivery_status FROM crm_messages WHERE id = ?").get(supersededMessageId) as any;
+      assertEq(linkedMessage?.delivery_status, "queued", "m41: the linked crm_messages row is left untouched (still 'queued') — 'superseded' means THIS row's own draft never happened, so there is no delivery outcome to guess at for it");
     }
   } catch (err) {
     failed++;

@@ -63,7 +63,7 @@ export type Severity = "p0" | "p1" | "p2" | "normal";
 export type Direction = "in" | "out";
 export type Actor = "claude" | "daniel" | "system";
 export type OutboxIntent = "gmail_draft" | "resend_send";
-export type OutboxStatus = "pending" | "processing" | "completed" | "failed";
+export type OutboxStatus = "pending" | "processing" | "completed" | "failed" | "superseded";
 
 export interface IngestThreadInput {
   threadId: string;                  // Gmail threadId — canonical
