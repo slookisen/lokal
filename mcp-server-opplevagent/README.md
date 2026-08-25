@@ -38,6 +38,8 @@ https://opplevagent.no/mcp
 | `discover_experiences` | Search experiences by county (fylke), category, weather, season, indoor/outdoor, group size, age, price, duration |
 | `list_experience_categories` | List all categories with experience counts |
 | `get_experience` | Full details for one experience via UUID |
+| `discover_gardssalg` | Search gårdssalg (farm-sale) drink producers by county, municipality, producer type, near-me distance, and booking status |
+| `book_gardssalg` | Submit a pending booking request to a gårdssalg producer (never confirms — the producer responds) |
 
 ## Examples
 

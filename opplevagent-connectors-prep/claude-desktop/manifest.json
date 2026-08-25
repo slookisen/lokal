@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "opplevagent-mcp",
   "display_name": "Opplevagent — Norske opplevelser og aktiviteter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for discovering Norwegian local experiences and activities via Opplevagent — search, info, categories.",
   "long_description": "Opplevagent connects you to a curated, Brreg-verified marketplace of Norwegian experiences and activities. Search by county (fylke), category, weather, season, indoor/outdoor, group size, age, price, and duration. Every result includes location, description, and a booking URL where available.\n\nExamples:\n- \"hva kan vi finne på i Troms om vinteren?\"\n- \"utendørsaktiviteter i Oslo for 4 personer\"\n- \"opplevelser som passer i regnvær i Bergen\"\n- \"familievennlige aktiviteter under 500 kr\"",
   "author": {
@@ -38,6 +38,14 @@
     {
       "name": "get_experience",
       "description": "Fetch complete details for a single experience by its UUID — full description, location, indoor/outdoor, season, weather suitability, group size/age limits, price, duration, languages, and booking URL."
+    },
+    {
+      "name": "discover_gardssalg",
+      "description": "Search Norway's gårdssalg (farm-sale) vertical — Brreg-verified drink producers (bryggeri/cideri/vingård/destilleri/mjøderi/seltzeri) selling direct from the farm — by county, municipality, producer type, near-me distance, and booking status."
+    },
+    {
+      "name": "book_gardssalg",
+      "description": "Submit a pending booking request to a gårdssalg producer discovered via discover_gardssalg. Never creates a confirmed booking — the producer reviews and responds; only producers with an active booking status can be booked."
     }
   ],
   "keywords": [

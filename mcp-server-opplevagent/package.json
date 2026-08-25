@@ -1,6 +1,6 @@
 {
   "name": "opplevagent-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "mcpName": "io.github.slookisen/opplevagent-mcp",
   "description": "MCP server for opplevagent.no — find Norwegian experiences and activities from Claude Desktop, ChatGPT, and other AI assistants. Curated, Brreg-verified experiences searchable by county, category, weather, season, and group size.",
   "main": "index.js",
