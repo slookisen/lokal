@@ -49,7 +49,7 @@ import {
   type GeocodeDeps,
 } from "./dental-geocode-worker";
 import { geocodingService } from "./geocoding-service";
-import { isPlausibleNorwayCoord } from "./geo-distance";
+import { isPlausibleNorwayCoord, NORWAY_BBOX } from "./geo-distance";
 
 const VERTICAL = "experiences";
 
@@ -158,6 +158,13 @@ export type ExperiencesGeocodeResult = {
   providers_no_match: number;
   providers_kommune_fallback: number;
   providers_fallback_unresolved: number;
+  // 2026-08-25: a geocoder answer that cannot be a Norwegian position, refused
+  // at the write instead of being stored (see Step A / Step D).
+  providers_implausible_rejected: number;
+  // Rows whose already-stored coordinate was impossible and has been cleared
+  // so the normal ladder can resolve it properly (Step 0).
+  providers_coords_reset: number;
+  experiences_coords_reset: number;
   experiences_address_precision: number;
   experiences_kommune_precision: number;
   experiences_unresolved: number;
@@ -199,6 +206,9 @@ export async function experiencesGeocodeTick(
     providers_no_match: 0,
     providers_kommune_fallback: 0,
     providers_fallback_unresolved: 0,
+    providers_implausible_rejected: 0,
+    providers_coords_reset: 0,
+    experiences_coords_reset: 0,
     experiences_address_precision: 0,
     experiences_kommune_precision: 0,
     experiences_unresolved: 0,
@@ -210,19 +220,73 @@ export async function experiencesGeocodeTick(
     duration_ms: 0,
   };
 
+  // ─── Step 0 — repair coordinates that cannot be Norwegian ──────────
+  // Daniel, 2026-08-25: «har lagt med begge adressene på bildet. burde vært
+  // lett å funnet selv, i stedet for å sette 0.0» — and he is right. Two
+  // producers sat at lat 0 / lon 0 while their real street address was in
+  // our own `adresse` column the whole time (and Kartverket resolves both on
+  // the first query). Step A's gate below used to skip them, Step D stamped a
+  // centroid that came back 0/0, and the row was then STUCK: every later step
+  // keys on `lat IS NULL`, so a poisoned coordinate is never retried.
+  //
+  // This step is the way out. It clears any stored coordinate that cannot be
+  // a Norwegian position, putting the row back in the normal ladder — Step A
+  // will now geocode it from the address it already has. Self-healing: no
+  // admin call, no manual SQL, and it also catches any future row that picks
+  // up a bad coordinate from a source we don't control.
+  const resetProviderCoords = db.prepare(
+    `UPDATE experience_providers
+        SET lat = NULL, lon = NULL, geocode_source = NULL, geocode_confidence = NULL,
+            updated_at = datetime('now')
+      WHERE lat IS NOT NULL AND lon IS NOT NULL
+        AND (lat NOT BETWEEN ${NORWAY_BBOX.minLat} AND ${NORWAY_BBOX.maxLat}
+             OR lon NOT BETWEEN ${NORWAY_BBOX.minLon} AND ${NORWAY_BBOX.maxLon})`
+  );
+  const resetExperienceCoords = db.prepare(
+    `UPDATE experiences
+        SET loc_lat = NULL, loc_lon = NULL, geo_precision = NULL,
+            updated_at = datetime('now')
+      WHERE loc_lat IS NOT NULL AND loc_lon IS NOT NULL
+        AND (loc_lat NOT BETWEEN ${NORWAY_BBOX.minLat} AND ${NORWAY_BBOX.maxLat}
+             OR loc_lon NOT BETWEEN ${NORWAY_BBOX.minLon} AND ${NORWAY_BBOX.maxLon})`
+  );
+  try {
+    stats.providers_coords_reset = resetProviderCoords.run().changes;
+    stats.experiences_coords_reset = resetExperienceCoords.run().changes;
+    if (stats.providers_coords_reset || stats.experiences_coords_reset) {
+      console.log(
+        `[experiences-geocode] cleared impossible coordinates: ` +
+        `providers=${stats.providers_coords_reset} experiences=${stats.experiences_coords_reset} ` +
+        `(rows return to the normal geocode ladder)`
+      );
+    }
+  } catch (err) {
+    stats.errors++;
+    console.error("[experiences-geocode] coordinate repair sweep failed:", err);
+  }
+
   // ─── Step A — provider address geocoding ───────────────────────────
-  // Exact mirror of dental-geocode-worker's WHERE clause: excludes both
-  // successfully-geocoded rows (lat IS NOT NULL) and prior no_match rows
-  // (geocode_confidence='no_match'), so the worker is naturally idempotent
-  // across ticks and never re-hammers a dead address.
+  // Excludes both successfully-geocoded rows (lat IS NOT NULL) and prior
+  // no_match rows (geocode_confidence='no_match'), so the worker is naturally
+  // idempotent across ticks and never re-hammers a dead address.
+  //
+  // `postnummer` is NOT required (changed 2026-08-25, Daniel's finding above).
+  // It used to mirror dental-geocode-worker's WHERE clause exactly, which also
+  // demanded a separate postnummer column — but experience_providers routinely
+  // holds the whole address in `adresse` ("Utgårdsveien 4, 1684 Vesterøy")
+  // with postnummer empty, and those rows were dropped straight past the
+  // geocoder into Step D's kommune centroid. geocodeOne() builds a free-text
+  // Kartverket query, so an embedded or absent postcode is fine as long as
+  // there is a street line: both of the rows that exposed this bug resolve on
+  // the FIRST query with 1 hit each. A row whose address genuinely doesn't
+  // resolve still lands on `no_match` and drops to Step D as before — the
+  // fallback is now the last resort it was meant to be, not the first stop.
   const providerRows = db
     .prepare(
-      `SELECT id, adresse, postnummer, poststed
+      `SELECT id, adresse, postnummer, poststed, kommune
        FROM experience_providers
        WHERE adresse IS NOT NULL
          AND adresse <> ''
-         AND postnummer IS NOT NULL
-         AND postnummer <> ''
          AND lat IS NULL
          AND geocode_confidence IS NULL
        ORDER BY id
@@ -231,8 +295,9 @@ export async function experiencesGeocodeTick(
     .all(limit) as Array<{
     id: string;
     adresse: string;
-    postnummer: string;
+    postnummer: string | null;
     poststed: string | null;
+    kommune: string | null;
   }>;
 
   const updateProviderGeocoded = db.prepare(
@@ -250,16 +315,29 @@ export async function experiencesGeocodeTick(
 
   for (const row of providerRows) {
     try {
+      // poststed falls back to kommune: with no postnummer, the place name is
+      // what disambiguates a street that exists in several municipalities.
       const result = await geocodeOne(
         row.adresse,
-        row.postnummer,
-        row.poststed ?? "",
+        row.postnummer ?? "",
+        row.poststed ?? row.kommune ?? "",
         deps
       );
       stats.providers_processed++;
 
       if (result.confidence === "no_match") {
         stats.providers_no_match++;
+        updateProviderNoMatch.run(row.id);
+      } else if (!isPlausibleNorwayCoord(result.lat, result.lng)) {
+        // Same sanity gate as Step D's write below: a geocoder answer that
+        // cannot be a Norwegian position is treated as no match, never
+        // written. This is what stops a 0/0 from entering the DB at all.
+        stats.providers_no_match++;
+        stats.providers_implausible_rejected++;
+        console.warn(
+          `[experiences-geocode] rejected implausible coordinate for provider ${row.id}: ` +
+          `${result.lat}/${result.lng} (${result.reason})`
+        );
         updateProviderNoMatch.run(row.id);
       } else {
         if (result.confidence === "high") stats.providers_high++;
@@ -296,7 +374,7 @@ export async function experiencesGeocodeTick(
             geocode_confidence = 'no_match'
             OR (
               geocode_confidence IS NULL
-              AND (adresse IS NULL OR adresse = '' OR postnummer IS NULL OR postnummer = '')
+              AND (adresse IS NULL OR adresse = '')
             )
           )
           AND ((kommune IS NOT NULL AND kommune <> '') OR (fylke IS NOT NULL AND fylke <> ''))

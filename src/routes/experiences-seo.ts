@@ -3241,7 +3241,13 @@ function renderOpplevelseDetail(
     touristType: catLabel(cat),
     address: { "@type": "PostalAddress", addressLocality: exp.kommune || undefined, addressRegion: exp.fylke || undefined, addressCountry: "NO" },
   };
-  if (lat !== null && lon !== null) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+  // Structured data must never publish a coordinate we would refuse to draw.
+  // Daniel 2026-08-25: the map gate shipped a day earlier stopped at the
+  // rendering layer, so two rows at lat 0 / lon 0 were still being handed to
+  // Google as `"geo": {"latitude": 0, "longitude": 0}` — a confident claim
+  // that a Norwegian brewery sits in the Gulf of Guinea. Omitting the node
+  // entirely is valid schema.org and says nothing rather than something false.
+  if (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
   // Offer — only when there is a concrete starting price. Price bands alone are
   // too coarse for a valid schema.org Offer (no numeric price), so band-only
   // rows are intentionally left without an Offer node.
@@ -5466,7 +5472,13 @@ router.get(
         addressCountry: "NO",
       },
     };
-    if (lat !== null && lon !== null) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+    // Structured data must never publish a coordinate we would refuse to draw.
+  // Daniel 2026-08-25: the map gate shipped a day earlier stopped at the
+  // rendering layer, so two rows at lat 0 / lon 0 were still being handed to
+  // Google as `"geo": {"latitude": 0, "longitude": 0}` — a confident claim
+  // that a Norwegian brewery sits in the Gulf of Guinea. Omitting the node
+  // entirely is valid schema.org and says nothing rather than something false.
+  if (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon)) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
     if (site) ld.sameAs = [site];
     if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
     // Same review gate as the visible "E-post" fact row above — see
