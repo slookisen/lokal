@@ -6,8 +6,33 @@
  * Makes charters/experiences-enrichment.yaml's `wrong_content_rate`
  * guardrail (status: not_computable_yet, threshold 0.02, since 2026-06-17)
  * actually computable: sample enriched `experiences` rows and grade the
- * written description/category/price against the row's own `evidence_url`
- * (the live source page it was enriched from).
+ * written description/category/price against the page they were actually
+ * enriched from.
+ *
+ * FIX (2026-08-25, wrong_content_rate = 0.25 root-cause): this module used to
+ * re-fetch `experiences.evidence_url` and treat it as "the live source page
+ * it was enriched from" — that is exactly the claim `applyExperienceContent`'s
+ * own doc comment (src/services/experience-store.ts) warns is false:
+ * `evidence_url` is DISCOVERY-time provenance, written ONCE at
+ * createExperience() from the ORIGINAL harvest row and never updated again by
+ * either the twice-daily content-refresh writer or a richer re-harvest merge.
+ * The page actually used to WRITE a field's current value is recorded
+ * PER-FIELD in `content_field_evidence` (JSON: field -> source URL), stamped
+ * by applyExperienceContent on every write. The two can point at completely
+ * different pages — a row harvested from one listing, then enriched months
+ * later from its real homepage — and comparing the enriched fields against
+ * the wrong (stale, discovery-time) page produces exactly the false-mismatch
+ * pattern the 2026-08-25 holdout run (0.25, 12x threshold) hit: e.g. an
+ * experience's stored content re-graded against a completely unrelated page
+ * that happens to be the ORIGINAL discovery source, not the enrichment
+ * source. `resolveHoldoutEvidenceUrl()` below fixes this by preferring the
+ * per-field `content_field_evidence` URL for whichever judged field actually
+ * carries one (description, then category, then price_from — the fields
+ * content-refresh writes and this judge grades), falling back to the legacy
+ * `evidence_url` only when NO field carries genuine per-field provenance
+ * (rows written before content_field_evidence existed). A row with neither is
+ * excluded from the holdout pool entirely (see sampleEnrichedExperiencesFor
+ * Holdout) rather than graded against a citation known to be untrustworthy.
  *
  * Two pieces:
  *   - sampleEnrichedExperiencesForHoldout(db, n): pure-ish DB read, the
@@ -39,6 +64,11 @@
  */
 
 import type Database from "better-sqlite3";
+import {
+  parseContentFieldEvidence,
+  HARVEST_PROVENANCE_SENTINEL,
+  BLANK_PROVENANCE_SENTINEL,
+} from "./experience-store";
 
 export interface HoldoutExperienceRow {
   id: string;
@@ -47,7 +77,52 @@ export interface HoldoutExperienceRow {
   category: string | null;
   price_band: string | null;
   price_from: number | null;
-  evidence_url: string;
+  // Legacy discovery-time citation — see the module header. Never fetched
+  // directly by the caller any more; resolveHoldoutEvidenceUrl() below is the
+  // only sanctioned way to turn a row into a URL to check content against.
+  // Nullable despite the SQL below still filtering NOT NULL rows in the
+  // common case: content_field_evidence-only rows (no legacy evidence_url at
+  // all) are now also eligible, so the type must not lie about that.
+  evidence_url: string | null;
+  content_field_evidence: string | null;
+}
+
+// Judged fields, in priority order, that content-refresh actually writes and
+// this holdout actually grades (title is never touched by content-refresh —
+// see applyExperienceContent — so it has no per-field evidence entry and is
+// deliberately not in this list). The first field that carries a genuine
+// (non-sentinel) per-field source URL wins; in the overwhelming common case
+// all fields written by the SAME content-refresh pass share one URL anyway,
+// so the choice among them rarely matters — this only breaks ties when a
+// row's fields were filled by different passes over time.
+const HOLDOUT_JUDGED_FIELDS = ["description", "category", "price_from"] as const;
+
+/**
+ * Resolve the actual page a holdout row's graded content should be checked
+ * against. Prefers the PER-FIELD provenance in `content_field_evidence`
+ * (stamped by applyExperienceContent at write time — the true "what page did
+ * this field's value come from") over the row's `evidence_url` column, which
+ * is DISCOVERY-time provenance frozen at insert and never updated by
+ * enrichment (see module header). Falls back to `evidence_url` only when NO
+ * judged field carries genuine per-field provenance at all (older rows
+ * written before content_field_evidence existed) — never silently prefers
+ * the known-untrustworthy column when a trustworthy one is available.
+ * Returns null when there is truly nothing fetchable to check against (no
+ * per-field evidence AND no evidence_url) — the caller must treat that as
+ * unresolved, never fabricate a comparison.
+ */
+export function resolveHoldoutEvidenceUrl(row: HoldoutExperienceRow): string | null {
+  const evidence = parseContentFieldEvidence(row.content_field_evidence);
+  for (const field of HOLDOUT_JUDGED_FIELDS) {
+    const src = evidence[field];
+    if (!src) continue;
+    const trimmed = src.trim();
+    if (!trimmed) continue;
+    if (trimmed === HARVEST_PROVENANCE_SENTINEL || trimmed === BLANK_PROVENANCE_SENTINEL) continue;
+    return trimmed;
+  }
+  const legacy = row.evidence_url?.trim();
+  return legacy || null;
 }
 
 // Pool cap for the initial SQL read — avoids ORDER BY RANDOM() on a
@@ -59,7 +134,12 @@ const HOLDOUT_POOL_CAP = 500;
 /**
  * Selects up to `n` rows from `experiences` eligible for the wrong_content_
  * rate holdout: enrichment_state='enriched' AND content_source='provider_
- * site' AND evidence_url IS NOT NULL. Read-only — a single SELECT, zero
+ * site' AND (evidence_url IS NOT NULL OR content_field_evidence IS NOT
+ * NULL) — the SQL-level pass admits either citation source, then the pool is
+ * filtered (in JS) to rows resolveHoldoutEvidenceUrl() can actually resolve
+ * to a real, non-sentinel URL — a row with no genuinely-checkable citation at
+ * all carries no signal for the holdout and must not be sampled into it (see
+ * resolveHoldoutEvidenceUrl's doc comment). Read-only — a single SELECT, zero
  * writes. `n` is used as-is (the caller — the admin route — is responsible
  * for clamping the requested sample_size to its own cap before calling
  * this).
@@ -71,17 +151,20 @@ export function sampleEnrichedExperiencesForHoldout(
   const safeN = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
   if (safeN <= 0) return [];
 
-  const pool = db
+  const rawPool = db
     .prepare(
-      `SELECT id, title, description, category, price_band, price_from, evidence_url
+      `SELECT id, title, description, category, price_band, price_from,
+              evidence_url, content_field_evidence
          FROM experiences
         WHERE enrichment_state = 'enriched'
           AND content_source = 'provider_site'
-          AND evidence_url IS NOT NULL
+          AND (evidence_url IS NOT NULL OR content_field_evidence IS NOT NULL)
         ORDER BY updated_at DESC
         LIMIT ?`,
     )
     .all(HOLDOUT_POOL_CAP) as HoldoutExperienceRow[];
+
+  const pool = rawPool.filter((row) => resolveHoldoutEvidenceUrl(row) !== null);
 
   // Fisher-Yates shuffle in JS — the pool is already capped by the SQL LIMIT
   // above, so this never touches more than HOLDOUT_POOL_CAP rows.

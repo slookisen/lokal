@@ -491,6 +491,7 @@ import {
 import {
   sampleEnrichedExperiencesForHoldout,
   judgeExperienceContentMatch,
+  resolveHoldoutEvidenceUrl,
 } from "../services/experience-content-judge";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
@@ -20022,8 +20023,12 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
 // hygiene, item 5 ("wrong_content_rate holdout"), slice claimed
 // 2026-08-07T05:56Z. Makes charters/experiences-enrichment.yaml's
 // `wrong_content_rate` guardrail (status: not_computable_yet since 06-17)
-// actually computable: samples enriched `experiences` rows, re-fetches each
-// row's own `evidence_url` (the live source page it was enriched from), and
+// actually computable: samples enriched `experiences` rows, re-fetches the
+// page resolveHoldoutEvidenceUrl() resolves for each row (the actual
+// enrichment-time source recorded per-field in content_field_evidence — NOT
+// the row's raw `evidence_url`, which is stale DISCOVERY-time provenance; see
+// experience-content-judge.ts's module header for the 2026-08-25 root-cause
+// fix, wrong_content_rate 0.25 -> re-diagnosed as a wrong-citation bug), and
 // asks an LLM judge whether the stored description/category/price plausibly
 // matches that source.
 //
@@ -20078,13 +20083,29 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
     const results: Array<{ experience_id: string; verdict: "MATCH" | "MISMATCH" | "unresolved"; reasoning: string }> = [];
 
     for (const row of rows) {
-      const fetchResult = await fetchPage(row.evidence_url, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+      // resolveHoldoutEvidenceUrl() — not the row's raw evidence_url — is the
+      // page actually cited as this row's content source. sampleEnriched
+      // ExperiencesForHoldout() only ever returns rows this resolves for, so
+      // a null here would mean the sampler's own filter regressed; failing
+      // closed to unresolved rather than falling back to the known-stale
+      // evidence_url column (which is exactly the bug this fixed).
+      const effectiveUrl = resolveHoldoutEvidenceUrl(row);
+      if (!effectiveUrl) {
+        unresolved++;
+        results.push({
+          experience_id: row.id,
+          verdict: "unresolved",
+          reasoning: "ingen gyldig kilde-URL å sjekke mot (verken content_field_evidence eller evidence_url) — avvist fail-closed",
+        });
+        continue;
+      }
+      const fetchResult = await fetchPage(effectiveUrl, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
       if (!fetchResult.ok) {
         unresolved++;
         results.push({
           experience_id: row.id,
           verdict: "unresolved",
-          reasoning: `henting av evidence_url feilet: ${fetchResult.reason} (${fetchResult.detail})`,
+          reasoning: `henting av kildeside feilet: ${fetchResult.reason} (${fetchResult.detail})`,
         });
         continue;
       }
