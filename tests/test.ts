@@ -41025,6 +41025,32 @@ runSerial(async () => {
   }
 });
 
+// experiences-content-judge-sweep: POST /api/opplevelser/admin/experiences-
+// content-judge-sweep — the retro-clean sweep for `experiences` rows that
+// predate the harvest admission gate PR #721 added (that gate only stops NEW
+// fabricated rows from being admitted; it never touched existing rows).
+// DRY-RUN-BY-DEFAULT mechanism: fetches evidence_url, re-judges content via
+// judgeExperienceContentMatch, quarantines genuine MISMATCH rows to
+// needs_review, and separately nulls byte-identical boilerplate-copy
+// descriptions. Building + testing the mechanism only — no real mass-apply
+// against production data is part of this change. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experiences-content-judge-sweep: retro-clean sweep for pre-PR#721 rows ──");
+  try {
+    const { runOpplevelserExperiencesContentJudgeSweepTests } = require("../src/routes/opplevelser-experiences-content-judge-sweep.test") as
+      typeof import("../src/routes/opplevelser-experiences-content-judge-sweep.test");
+    const cjs = await runOpplevelserExperiencesContentJudgeSweepTests({ log: false });
+    passed += cjs.passed;
+    failed += cjs.failed;
+    for (const f of cjs.failures) failures.push("opplevelser-experiences-content-judge-sweep: " + f);
+    console.log(`  opplevelser-experiences-content-judge-sweep: ${cjs.passed} passed, ${cjs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-content-judge-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-06-23-experiences-richer-profiles, slice F2 (honest
 // wrong_content_rate measurement): GET /admin/experiences/:id/provenance —
 // the raw, admin-gated provenance read surface the 2026-08-25 WCR audit had
