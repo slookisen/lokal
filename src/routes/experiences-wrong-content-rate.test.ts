@@ -13,6 +13,15 @@
  *     0-denominator → null case), fetchPage-failure rows landing in
  *     `unresolved` (never silently counted as matched), and sample_size
  *     cap enforcement (>100 clamps to 100).
+ *   - Slice F2 honest-measurement fixes (dev-request 2026-06-23-
+ *     experiences-richer-profiles, section (d) below): the judge sees the
+ *     page's labeled og:description/meta-description content (a verbatim
+ *     meta-derived description grades MATCH, not the pre-F2 false
+ *     MISMATCH); parked-domain and hard-404 citations land in `unresolved`
+ *     with distinct `citation_gone:*` reasons and stay out of BOTH the
+ *     numerator and the denominator; and the additive published/unpublished
+ *     sub-aggregates stratify the rate over the SAME publish-gate predicate
+ *     /discover uses.
  *
  * Same conventions as opplevelser-listing-homepage-discovery.test.ts: an
  * in-memory experiences DB (EXPERIENCES_DB_PATH=":memory:"), fresh requires
@@ -529,6 +538,20 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
           assertEq(byId.get("wcr-mismatch")?.verdict, "MISMATCH", "wcr-3i: wcr-mismatch's own result verdict is MISMATCH");
           assertEq(byId.get("wcr-fetchfail")?.verdict, "unresolved", "wcr-3j: fetchPage-failed row is 'unresolved', NEVER 'matched'");
           assertEq(byId.get("wcr-judgefail")?.verdict, "unresolved", "wcr-3k: judge-failed row is 'unresolved', NEVER 'matched' or 'mismatched'");
+
+          // Slice F2 (honest measurement) — machine-readable unresolved
+          // causes: an ordinary fetch failure and a judge failure carry their
+          // OWN reason codes, distinct from the citation_gone:* family
+          // exercised in section (d) below.
+          assertEq(byId.get("wcr-fetchfail")?.reason, "fetch_failed:ssrf_blocked", "wcr-3l: fetch-failure carries reason 'fetch_failed:<FetchFailureReason>'");
+          assertEq(byId.get("wcr-judgefail")?.reason, "judge_failed", "wcr-3m: judge-failure carries reason 'judge_failed'");
+          assertEq(byId.get("wcr-match")?.reason, undefined, "wcr-3n: a genuine MATCH verdict carries NO reason field");
+
+          // Slice F2 — additive strata are present and consistent with the
+          // overall tallies (all 4 seeded rows are unpublished: none is
+          // verification_status='verified', so the publish gate fails).
+          assertEq(r.body.published, { sample_size: 0, matched: 0, mismatched: 0, unresolved: 0, wrong_content_rate: null }, "wcr-3o: published stratum is empty (no seeded row passes the publish gate) with a null rate");
+          assertEq(r.body.unpublished, { sample_size: 4, matched: 1, mismatched: 1, unresolved: 2, wrong_content_rate: 0.5 }, "wcr-3p: unpublished stratum carries all 4 rows with the same rate math as the top level");
         }
 
         // ── wcr-3.5: root-cause regression (2026-08-25, wrong_content_rate
@@ -661,6 +684,209 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
         if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
         else process.env.ADMIN_KEY = prevAdminKey;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (d) Slice F2 — honest-measurement fixes (dev-request 2026-06-23-
+      //     experiences-richer-profiles): meta-description inclusion,
+      //     citation_gone routing (parked / hard 404), and published/
+      //     unpublished stratification. Own fresh in-memory DB + fresh
+      //     router require, same harness shape as section (c), so the
+      //     mixed fixture set here is exactly what the aggregates cover.
+      // ═══════════════════════════════════════════════════════════════════
+
+      // ── md-1..md-5: extractMetaDescriptions — pure unit tests of the
+      //    shared extractor (search-enrich.ts) the route feeds the judge
+      //    with. og first, meta-name fallback, dedupe, entity decode. ──────
+      {
+        const { extractMetaDescriptions } = require("../services/search-enrich") as
+          typeof import("../services/search-enrich");
+        assertEq(
+          extractMetaDescriptions('<html><head><meta property="og:description" content="Fra og-taggen."><meta name="description" content="Fra meta-taggen."></head><body></body></html>'),
+          ["Fra og-taggen.", "Fra meta-taggen."],
+          "md-1: both og:description and meta description extracted, og first",
+        );
+        assertEq(
+          extractMetaDescriptions('<html><head><meta name="description" content="Bare meta her."></head><body></body></html>'),
+          ["Bare meta her."],
+          "md-2: meta name=description alone is extracted",
+        );
+        assertEq(
+          extractMetaDescriptions('<html><head><meta property="og:description" content="Samme tekst."><meta name="description" content="Samme tekst."></head><body></body></html>'),
+          ["Samme tekst."],
+          "md-3: identical og + meta values are deduped to one entry",
+        );
+        assertEq(
+          extractMetaDescriptions("<html><head></head><body><p>Ingen meta.</p></body></html>"),
+          [],
+          "md-4: a page with neither tag -> [], never a fabricated entry",
+        );
+        assertEq(
+          extractMetaDescriptions('<html><head><meta name="description" content="R&oslash;yk &amp; sild"></head><body></body></html>'),
+          ["Røyk & sild"],
+          "md-5: HTML entities in the attribute are decoded",
+        );
+      }
+
+      const prevDbPathD = process.env.EXPERIENCES_DB_PATH;
+      const prevAdminKeyD = process.env.ADMIN_KEY;
+      const testKeyD = process.env.ADMIN_KEY || "wcr-test-admin-key";
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
+      process.env.ADMIN_KEY = testKeyD;
+
+      const cachePathsD = [
+        require.resolve("../database/db-factory"),
+        require.resolve("../services/experience-store"),
+        require.resolve("../services/experience-content-judge"),
+        require.resolve("./opplevelser"),
+      ];
+      for (const p of cachePathsD) delete require.cache[p];
+
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+        const expDb = dbFactory.getDb("experiences");
+        const oppl = require("./opplevelser") as typeof import("./opplevelser");
+        const opplevelserRouter = oppl.default as any;
+        const adminHeaders = { "x-admin-key": testKeyD };
+
+        // verification_status is explicit per row here — 'verified' rows (no
+        // provider, confidence NULL, canonical_id NULL) pass the SAME
+        // PUBLISH_GATE_SQL predicate /discover uses; 'pending_verify' rows
+        // fail it. That split IS the stratification fixture.
+        const insertD = expDb.prepare(
+          `INSERT INTO experiences
+             (id, title, slug, description, category, price_band, price_from,
+              evidence_url, verification_status, content_source, enrichment_state)
+           VALUES
+             (@id, @title, @slug, @description, @category, @price_band, @price_from,
+              @evidence_url, @verification_status, 'provider_site', 'enriched')`,
+        );
+        const baseD = { description: "d", category: "c", price_band: "standard", price_from: 500 };
+        // Published stratum: 2 that will MATCH + 1 parked citation.
+        insertD.run({ ...baseD, id: "d-pub-match-1", title: "Seterbesøk med smaksprøver", slug: "d-pub-match-1", evidence_url: "https://pub-match-1.no/", verification_status: "verified" });
+        insertD.run({ ...baseD, id: "d-pub-match-2", title: "Fjelltur med guide", slug: "d-pub-match-2", evidence_url: "https://pub-match-2.no/", verification_status: "verified" });
+        insertD.run({ ...baseD, id: "d-pub-parked", title: "Sirdalstur", slug: "d-pub-parked", evidence_url: "https://parked-domain.no/", verification_status: "verified" });
+        // Unpublished stratum: the meta-derived-description row (the IDDIS
+        // shape), 2 genuine mismatches, and a hard-404 citation.
+        insertD.run({
+          ...baseD,
+          id: "d-unpub-meta",
+          title: "Sildehuset museum",
+          slug: "d-unpub-meta",
+          // Stored description is VERBATIM the page's meta description — the
+          // live IDDIS case. The page's visible body says nothing like it.
+          description: "Kjenn røyken fra brislingovnene i det gamle sjøhuset.",
+          evidence_url: "https://meta-only.no/",
+          verification_status: "pending_verify",
+        });
+        insertD.run({ ...baseD, id: "d-unpub-mm-1", title: "Kajakkutleie", slug: "d-unpub-mm-1", evidence_url: "https://unpub-mm-1.no/", verification_status: "pending_verify" });
+        insertD.run({ ...baseD, id: "d-unpub-mm-2", title: "Vandretur i lia", slug: "d-unpub-mm-2", evidence_url: "https://unpub-mm-2.no/", verification_status: "pending_verify" });
+        insertD.run({ ...baseD, id: "d-unpub-404", title: "Fjordcruise", slug: "d-unpub-404", evidence_url: "https://gone-404.no/", verification_status: "pending_verify" });
+
+        // Parked lander: HTTP 200, tiny visible text with registrar
+        // boilerplate — and deliberately WITH a meta description, locking in
+        // that the parked check runs BEFORE meta extraction (parking
+        // boilerplate must never be fed to the judge as page content).
+        const parkedHtml =
+          '<html><head><meta name="description" content="Domenet parked-domain.no kan være til salgs."></head>' +
+          "<body><h1>Domenet er til salgs</h1><p>Kontakt oss for å kjøpe dette domenet.</p></body></html>";
+        const metaOnlyHtml =
+          '<html><head><meta name="description" content="Kjenn røyken fra brislingovnene i det gamle sjøhuset."></head>' +
+          "<body><nav>Hjem Program Billetter Kontakt</nav></body></html>";
+
+        let metaRowPrompt: string | null = null;
+        globalThis.fetch = (async (url: any, init: any) => {
+          const urlStr = String(url);
+          if (urlStr === "https://pub-match-1.no/") return mkPageResponse("<html><body>Seterbesøk med smaksprøver av egen ost hele sommeren.</body></html>", urlStr);
+          if (urlStr === "https://pub-match-2.no/") return mkPageResponse("<html><body>Fjelltur med guide i vakker natur.</body></html>", urlStr);
+          if (urlStr === "https://parked-domain.no/") return mkPageResponse(parkedHtml, urlStr);
+          if (urlStr === "https://meta-only.no/") return mkPageResponse(metaOnlyHtml, urlStr);
+          if (urlStr === "https://unpub-mm-1.no/") return mkPageResponse("<html><body>Denne siden handler om noe helt annet.</body></html>", urlStr);
+          if (urlStr === "https://unpub-mm-2.no/") return mkPageResponse("<html><body>Også en helt urelatert side.</body></html>", urlStr);
+          if (urlStr === "https://gone-404.no/") {
+            // fetchPage classifies this via classifyHttpStatus -> http_404
+            // (permanent) with no retry — no body read happens.
+            return { ok: false, status: 404, statusText: "Not Found", headers: { get: () => null } } as unknown as Response;
+          }
+          if (urlStr === "https://api.anthropic.com/v1/messages") {
+            const body = JSON.parse(init?.body ?? "{}");
+            const promptText: string = body?.messages?.[0]?.content ?? "";
+            if (promptText.includes("Kajakkutleie") || promptText.includes("Vandretur")) {
+              return mkAnthropicResponse("MISMATCH\nSiden handler om noe annet.");
+            }
+            if (promptText.includes("Sildehuset")) {
+              metaRowPrompt = promptText;
+              // The judge only sees a match for the meta-derived row if the
+              // route actually handed it the labeled meta content — a
+              // body-only page text (the pre-F2 behavior) grades MISMATCH.
+              return promptText.includes("Sidens meta-beskrivelse:") && promptText.includes("brislingovnene")
+                ? mkAnthropicResponse("MATCH\nBeskrivelsen er ordrett sidens egen meta-beskrivelse.")
+                : mkAnthropicResponse("MISMATCH\nBeskrivelsen finnes ikke i sideteksten.");
+            }
+            return mkAnthropicResponse("MATCH\nStemmer med kilden.");
+          }
+          throw new Error("wcr-d: unexpected fetch URL: " + urlStr);
+        }) as unknown as typeof fetch;
+
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample_size: 50 } });
+        assertEq(r.status, 200, "wcr-d1: mixed published/unpublished cohort -> 200");
+        assertEq(r.body.sample_size, 7, "wcr-d2: all 7 eligible rows sampled");
+
+        const byId = new Map<string, any>((r.body.results as any[]).map((x) => [x.experience_id, x]));
+
+        // Gap 1 — meta inclusion: the IDDIS-shaped row now grades MATCH.
+        assertEq(byId.get("d-unpub-meta")?.verdict, "MATCH", "wcr-d3: a description verbatim from the page's meta description grades MATCH (was a false MISMATCH when the judge saw body text only)");
+        assertTrue(metaRowPrompt !== null, "wcr-d4: the judge WAS invoked for the meta row (not short-circuited)");
+        {
+          const p = metaRowPrompt ?? "";
+          const labelIdx = p.indexOf("Sidens meta-beskrivelse:");
+          const bodyIdx = p.indexOf("Hjem Program Billetter");
+          assertTrue(labelIdx >= 0, "wcr-d5a: judged page text carries the labeled meta block");
+          assertTrue(bodyIdx >= 0, "wcr-d5b: judged page text still carries the visible body text");
+          assertTrue(labelIdx < bodyIdx, "wcr-d5c: meta block comes FIRST, so the 4000-char combined cap can never silently truncate it away");
+        }
+
+        // Gap 2 — citation-gone routing: parked + hard 404 land in
+        // unresolved with distinct citation_gone:* reasons, never MISMATCH.
+        assertEq(byId.get("d-pub-parked")?.verdict, "unresolved", "wcr-d6a: a parked-domain citation is 'unresolved', never a MISMATCH");
+        assertEq(byId.get("d-pub-parked")?.reason, "citation_gone:parked", "wcr-d6b: parked citation carries reason 'citation_gone:parked'");
+        assertEq(byId.get("d-unpub-404")?.verdict, "unresolved", "wcr-d7a: a hard-404 citation is 'unresolved', never a MISMATCH");
+        assertEq(byId.get("d-unpub-404")?.reason, "citation_gone:http_404", "wcr-d7b: hard-404 citation carries reason 'citation_gone:http_404'");
+
+        // Both citation_gone rows are excluded from BOTH numerator and
+        // denominator: rate = 2 mismatches / (3 matched + 2 mismatched).
+        assertEq(r.body.matched, 3, "wcr-d8a: matched = 3 (2 published + the meta-derived row)");
+        assertEq(r.body.mismatched, 2, "wcr-d8b: mismatched = 2 (citation_gone rows NOT counted as mismatches)");
+        assertEq(r.body.unresolved, 2, "wcr-d8c: unresolved = 2 (parked + 404)");
+        assertEq(r.body.wrong_content_rate, 0.4, "wcr-d8d: rate = 2/5 — citation_gone rows in neither numerator nor denominator");
+
+        // Gap 3 — stratification: published (the guardrail number) vs
+        // unpublished sub-aggregates, same rate math per stratum.
+        assertEq(
+          r.body.published,
+          { sample_size: 3, matched: 2, mismatched: 0, unresolved: 1, wrong_content_rate: 0 },
+          "wcr-d9a: published stratum — 2 matched, 0 mismatched, 1 unresolved (parked), rate 0",
+        );
+        assertEq(
+          r.body.unpublished,
+          { sample_size: 4, matched: 1, mismatched: 2, unresolved: 1, wrong_content_rate: 2 / 3 },
+          "wcr-d9b: unpublished stratum — 1 matched (meta row), 2 mismatched, 1 unresolved (404), rate 2/3",
+        );
+        assertEq(byId.get("d-pub-match-1")?.published, true, "wcr-d9c: a verified row's result is flagged published:true");
+        assertEq(byId.get("d-unpub-meta")?.published, false, "wcr-d9d: a pending_verify row's result is flagged published:false");
+        // Top-level semantics unchanged: overall counts equal the strata sums.
+        assertEq(
+          r.body.published.sample_size + r.body.unpublished.sample_size,
+          r.body.sample_size,
+          "wcr-d9e: strata partition the sample exactly (no row double-counted or dropped)",
+        );
+      } finally {
+        for (const p of cachePathsD) delete require.cache[p];
+        if (prevDbPathD === undefined) delete process.env.EXPERIENCES_DB_PATH;
+        else process.env.EXPERIENCES_DB_PATH = prevDbPathD;
+        if (prevAdminKeyD === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKeyD;
       }
     } catch (err: any) {
       failed++;

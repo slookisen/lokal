@@ -41024,3 +41024,26 @@ runSerial(async () => {
     failures.push("experiences-geocode-adresse-foerst: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-06-23-experiences-richer-profiles, slice F2 (honest
+// wrong_content_rate measurement): GET /admin/experiences/:id/provenance —
+// the raw, admin-gated provenance read surface the 2026-08-25 WCR audit had
+// to reverse-engineer via keyset tricks. (The slice's measurement fixes —
+// meta inclusion, citation_gone routing, stratification — live in the
+// existing experiences-wrong-content-rate suite above.) Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-06-23-experiences-richer-profiles, slice F2: experiences provenance read ──");
+  try {
+    const { runExperiencesProvenanceReadTests } = require("../src/routes/experiences-provenance-read.test") as
+      typeof import("../src/routes/experiences-provenance-read.test");
+    const ppr = await runExperiencesProvenanceReadTests({ log: false });
+    passed += ppr.passed;
+    failed += ppr.failed;
+    for (const f of ppr.failures) failures.push("experiences-provenance-read: " + f);
+    console.log(`  experiences-provenance-read: ${ppr.passed} passed, ${ppr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-provenance-read: unexpected error: " + String(err?.message || err));
+  }
+});
