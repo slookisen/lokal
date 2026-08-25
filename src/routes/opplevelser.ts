@@ -520,6 +520,11 @@ import {
 // + candidate sampler for POST /admin/experiences-wrong-content-rate below.
 import {
   sampleEnrichedExperiencesForHoldout,
+  // dev-request 2026-08-25-wcr-holdout-pool-dekker-ikke-publisert-flate: the
+  // published-quota half of the holdout pool below — draws straight from
+  // PUBLISH_GATE_SQL instead of the enrichment_state/content_source filter,
+  // since most published rows are harvest-filled, not enrichment-filled.
+  samplePublishedExperiencesForHoldout,
   judgeExperienceContentMatch,
   resolveHoldoutEvidenceUrl,
   // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
@@ -20444,7 +20449,34 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
 
   try {
     const expDb = getExpDb("experiences");
-    const rows = sampleEnrichedExperiencesForHoldout(expDb, sampleSize);
+
+    // dev-request 2026-08-25-wcr-holdout-pool-dekker-ikke-publisert-flate:
+    // half the sample is drawn from rows that ACTUALLY PASS PUBLISH_GATE_SQL
+    // (samplePublishedExperiencesForHoldout — independent of enrichment_state/
+    // content_source), so the `published` stratum below can never come back
+    // sample_size:0 the way it did when the whole sample came from the
+    // enrichment-only selector. The remainder is drawn from the existing
+    // enriched-pool selector, sized DOWN by however many rows the published
+    // quota already filled, so total fetch+judge cost per request stays
+    // bounded by sampleSize exactly as before this change.
+    const publishedQuota = Math.ceil(sampleSize / 2);
+    const publishedPool = samplePublishedExperiencesForHoldout(expDb, publishedQuota);
+    const unpublishedRows = sampleEnrichedExperiencesForHoldout(
+      expDb,
+      sampleSize - publishedPool.rows.length,
+    );
+
+    // A published-quota row can theoretically ALSO satisfy the unpublished
+    // selector's own criteria (enrichment_state='enriched' AND content_
+    // source='provider_site') — dedup by id, published-quota rows winning,
+    // so no row is ever double-counted or double-fetched below.
+    const seenIds = new Set<string>();
+    const rows: HoldoutExperienceRow[] = [];
+    for (const row of [...publishedPool.rows, ...unpublishedRows]) {
+      if (seenIds.has(row.id)) continue;
+      seenIds.add(row.id);
+      rows.push(row);
+    }
 
     // Per-row publish check — the EXACT PUBLISH_GATE_SQL predicate /discover
     // and the public by-id/slug reads use, reused (not re-stated) so the
@@ -20585,6 +20617,20 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
       // wrong-content rate over rows the public surfaces actually serve.
       published: stratumAggregate(strata[1]!),
       unpublished: stratumAggregate(strata[0]!),
+      // dev-request 2026-08-25-wcr-holdout-pool-dekker-ikke-publisert-flate,
+      // AC2: how much of the published-gate pool this run considered was NOT
+      // even genuinely checkable (no resolvable citation at all) — reported
+      // honestly so a pool where e.g. 90% can't be checked never reads as
+      // "measured green" just because the unchecked rows silently vanished
+      // before reaching `rows`/`published` above.
+      published_pool: {
+        considered: publishedPool.considered,
+        checkable: publishedPool.checkable,
+        excluded_rate:
+          publishedPool.considered > 0
+            ? (publishedPool.considered - publishedPool.checkable) / publishedPool.considered
+            : null,
+      },
       results,
     });
   } catch (err) {
