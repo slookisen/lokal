@@ -216,17 +216,24 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 //      substring anywhere in the text — enough on its own (mirrors
 //      isJunkDescription's rule-1 skip-link pattern: real code markup is
 //      never legitimate prose no matter where it lands).
-//   1b. UNAMBIGUOUS ALONE (new): a known-ubiquitous provider/CMS bootstrap
+//   1b. UNAMBIGUOUS ALONE: a known-ubiquitous provider/CMS bootstrap
 //      signature — `_wpemojiSettings` (WordPress), `dataLayer` together with
 //      a `gtag(`/`ga(` call (Google Tag Manager/Analytics), `Shopify.shop`/
 //      `Shopify.locale` (Shopify storefront bootstrap), `__next_f.push`
-//      (Next.js App Router hydration payload), or a jQuery/`$`
-//      `(document).ready(` call (classic theme inline script). Same
+//      (Next.js App Router hydration payload), a jQuery/`$`
+//      `(document).ready(` call (classic theme inline script), or
+//      `Y.Squarespace`/`Static.SQUARESPACE_CONTEXT` (Squarespace storefront
+//      bootstrap — moved here from class 2 on 2026-08-25 after the live
+//      Helios Trondheim description, the actual case that motivated this
+//      whole detector, was found to still slip through with it in the
+//      weaker class: a real `SQUARESPACE_CONTEXT` payload is a large,
+//      mostly-flat JSON literal that typically has neither the brace
+//      density of class 4 nor the function/assignment shape of class 3, so
+//      requiring a companion class structurally under-catches it). Same
 //      unambiguous-alone posture as class 1 — these are provider-specific
 //      code tokens, structurally impossible to appear in Norwegian
 //      producer prose, so no second class is required.
-//   2. CMS/framework bootstrap tokens: `Y.Squarespace`, `Static.
-//      SQUARESPACE_CONTEXT`, `window.<name>` followed by `.`/`(`,
+//   2. CMS/framework bootstrap tokens: `window.<name>` followed by `.`/`(`,
 //      `document.<name>` followed by `.`/`(` (anchored the same way as the
 //      `window.` check — a bare "document.pdf"/"document.docx" mention
 //      must NOT contribute; the identifier immediately after `document.`
@@ -255,12 +262,15 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 //
 // Examples (see tests/test.ts "description-junk-guard" section for the full
 // table, including the 5 real-world snippets named above):
-//   - A Squarespace-bootstrap-shaped fixture like
-//     `Y.Squarespace = Y.Squarespace || {}; Static.SQUARESPACE_CONTEXT =
-//     {"website":{"id":"123"}}; window.Y.Squarespace.afterBodyLoad(Y);`
-//     -> true (class 2 [CMS tokens] + class 4 [brace density] both fire —
-//     deliberately NOT the real Helios live text, which this dev-request's
-//     research did not capture verbatim; this is a same-shape stand-in)
+//   - The real live Helios Trondheim text that motivated this detector,
+//     captured verbatim via `lokal_info` 2026-08-25 (not a same-shape
+//     stand-in): `Grønn Guide Trondheim Static = window.Static || {};
+//     Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":
+//     ["supports_versioned_template_assets","campaigns_merch_state", …]`
+//     -> true (class 1b [`Static.SQUARESPACE_CONTEXT`] alone, unambiguous —
+//     this string has only 3 braces and no function()/assignment shape, so
+//     it would NOT have fired at all under the old class-2-only placement;
+//     see tests/test.ts for the full byte-for-byte fixture)
 //   - A generic minified-JS shape like
 //     `function(){var a=1;var b=2;let c=3;const d=4;if(a){b=c;}return
 //     a+b+c+d;}` -> true (class 3 [JS-syntax density] + class 4 [brace
@@ -312,7 +322,23 @@ export function looksLikeCodeArtifact(text: string | null | undefined): boolean 
     trimmed.includes("Shopify.shop") ||
     trimmed.includes("Shopify.locale") ||
     trimmed.includes("__next_f.push") ||
-    /(?:\$|jQuery)\(\s*document\s*\)\.ready\s*\(/.test(trimmed);
+    /(?:\$|jQuery)\(\s*document\s*\)\.ready\s*\(/.test(trimmed) ||
+    // Squarespace bootstrap tokens — moved here from class 2 (2026-08-25,
+    // Helios Trondheim live-verification gap). These were left in class 2
+    // (needs a class-3/4 companion) when round 1 promoted the other five
+    // providers' tokens to this unambiguous-alone class; a real Squarespace
+    // `SQUARESPACE_CONTEXT` payload is typically a large, mostly-flat JSON
+    // literal (string/array-heavy), so it structurally tends to miss both
+    // the brace-density threshold (class 4) and the function/assignment
+    // shape (class 3) — exactly what happened to the live Helios Trondheim
+    // description this whole detector was built to catch (confirmed via
+    // `POST /admin/agents/description-code-artifact-sweep {"apply":false}`
+    // returning 0 candidates against prod, then reproducing class-by-class
+    // against the real captured text). Same "structurally impossible in
+    // Norwegian producer prose" reasoning as the other five class-1b
+    // members applies identically here.
+    trimmed.includes("Y.Squarespace") ||
+    trimmed.includes("Static.SQUARESPACE_CONTEXT");
   if (providerSignatureSignal) return true;
 
   // Class 2 — CMS/framework bootstrap tokens. `document.` is anchored the
@@ -320,8 +346,6 @@ export function looksLikeCodeArtifact(text: string | null | undefined): boolean 
   // must itself be immediately followed by `.`/`(` (an actual member-
   // access/call shape), so a stray "document.pdf" mention can't contribute.
   const cmsBootstrapSignal =
-    trimmed.includes("Y.Squarespace") ||
-    trimmed.includes("Static.SQUARESPACE_CONTEXT") ||
     /window\.[A-Za-z_$][\w$]*\s*[.(]/.test(trimmed) ||
     /document\.[A-Za-z_$][\w$]*\s*[.(]/.test(trimmed) ||
     trimmed.includes("!function(") ||
