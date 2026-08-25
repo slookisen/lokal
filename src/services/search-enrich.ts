@@ -1003,8 +1003,58 @@ export function extractProductMentions(text: string): string[] {
 }
 
 /**
+ * Extract the page's meta-level descriptions — og:description and
+ * <meta name="description"> — decoded, whitespace-collapsed, in priority
+ * order (og first, matching summarizeAbout's long-standing preference),
+ * deduped, empty entries dropped. Returns [] when the page carries neither.
+ * Uncapped: callers apply their own length policy (summarizeAbout caps at
+ * ~300 chars; the wrong_content_rate judge feeds it into a 4000-char
+ * combined-text cap). PURE.
+ *
+ * Pulled out of summarizeAbout (dev-request 2026-06-23-experiences-richer-
+ * profiles, slice F2) so the wrong_content_rate holdout judge can see the
+ * SAME meta content the description writer's primary extraction path reads —
+ * a description faithfully derived from a page's meta description used to
+ * score MISMATCH because the judged text was body-only (visibleTextOf) and
+ * the meta content lives in an HTML attribute, invisible to it.
+ */
+export function extractMetaDescriptions(html: string): string[] {
+  if (!html) return [];
+  // Shared decoder (see decodeHtmlEntities): covers everything the previous
+  // local chain in summarizeAbout used to — &quot; and &#39; included, the
+  // latter via the generic numeric-reference branch.
+  const decode = decodeHtmlEntities;
+  const clean = (raw: string | undefined): string =>
+    raw ? decode(raw).replace(/\s+/g, " ").trim() : "";
+
+  // og:description (property OR name, attribute order tolerant).
+  const ogContentFirst = html.match(
+    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:description["']/i,
+  );
+  const ogPropFirst = html.match(
+    /<meta[^>]+(?:property|name)=["']og:description["'][^>]+content=["']([^"']+)["']/i,
+  );
+  const og = clean(ogPropFirst?.[1] ?? ogContentFirst?.[1]);
+
+  // <meta name="description">.
+  const mdPropFirst = html.match(
+    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
+  );
+  const mdContentFirst = html.match(
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
+  );
+  const md = clean(mdPropFirst?.[1] ?? mdContentFirst?.[1]);
+
+  const out: string[] = [];
+  if (og) out.push(og);
+  if (md && md !== og) out.push(md);
+  return out;
+}
+
+/**
  * Produce a DETERMINISTIC extractive "about" summary from the page HTML:
- *   1. prefer og:description, else <meta name="description">,
+ *   1. prefer og:description, else <meta name="description">
+ *      (via extractMetaDescriptions above),
  *   2. else the first meaningful visible paragraph (≥40 chars) of body text.
  * Whitespace-collapsed, decoded, capped at ~300 chars (cut on a word boundary).
  * No generative text — purely extractive. PURE.
@@ -1018,30 +1068,11 @@ export function summarizeAbout(html: string): string {
     const lastSpace = slice.lastIndexOf(" ");
     return (lastSpace > 200 ? slice.slice(0, lastSpace) : slice).trim();
   };
-  // Shared decoder (see decodeHtmlEntities): covers everything this local
-  // chain used to — &quot; and &#39; included, the latter now via the generic
-  // numeric-reference branch.
-  const decode = decodeHtmlEntities;
 
-  // (1) og:description (property OR name, attribute order tolerant).
-  const ogContentFirst = html.match(
-    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:description["']/i,
-  );
-  const ogPropFirst = html.match(
-    /<meta[^>]+(?:property|name)=["']og:description["'][^>]+content=["']([^"']+)["']/i,
-  );
-  const og = ogPropFirst?.[1] ?? ogContentFirst?.[1];
-  if (og && og.trim()) return cap(decode(og));
-
-  // (2) <meta name="description">.
-  const mdPropFirst = html.match(
-    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
-  );
-  const mdContentFirst = html.match(
-    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
-  );
-  const md = mdPropFirst?.[1] ?? mdContentFirst?.[1];
-  if (md && md.trim()) return cap(decode(md));
+  // (1)+(2) og:description, else <meta name="description"> — the shared
+  // extractor returns them in exactly that priority order.
+  const metas = extractMetaDescriptions(html);
+  if (metas.length > 0) return cap(metas[0]!);
 
   // (3) first meaningful visible paragraph of body text (structure-aware:
   // nav/header/footer/aside chrome and disguised nav-menu <ul>/<ol> blocks
