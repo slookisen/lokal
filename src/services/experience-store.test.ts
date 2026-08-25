@@ -1143,6 +1143,102 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     }
   }
 
+  // ── getPublishedExperienceById() + stampExperienceAdmissionVerdict() ─────
+  // (dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+  // slice, 2026-08-25). The publish-gated by-id read must apply the exact
+  // same PUBLISH_GATE_SQL as /discover — a quarantined (needs_review),
+  // dedup-merged-away (canonical_id set), or inactive-provider row is
+  // indistinguishable from a missing id — while the RAW getExperienceById()
+  // (internal/admin) still returns every one of them. Same in-memory-DB
+  // scaffold as the gfc-clear block above.
+  {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("./experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const db = dbFactory.getDb("experiences");
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+
+      const activeProviderId = expStore.createProvider({
+        navn: "Publisert Gard AS", kommune: "Tromsø", fylke: "Troms",
+        brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      });
+      const publishedId = expStore.createExperience({
+        title: "Publisert hvalsafari", provider_id: activeProviderId,
+        kommune: "Tromsø", fylke: "Troms",
+        verification_status: "verified", confidence: "high",
+      } as any);
+      const quarantinedId = expStore.createExperience({
+        title: "Karantene nordlystur", provider_id: activeProviderId,
+        kommune: "Tromsø", fylke: "Troms",
+        verification_status: "needs_review", confidence: "high",
+      } as any);
+      const mergedId = expStore.createExperience({
+        title: "Duplikat fjordcruise", provider_id: activeProviderId,
+        kommune: "Tromsø", fylke: "Troms",
+        verification_status: "verified", confidence: "high",
+      } as any);
+      db.prepare("UPDATE experiences SET canonical_id = ? WHERE id = ?").run(publishedId, mergedId);
+
+      const inactiveProviderId = expStore.createProvider({
+        navn: "Inaktiv Gard AS", kommune: "Bergen", fylke: "Vestland",
+        brreg_verified: 1, brreg_active: 0, verification_status: "verified",
+      });
+      const inactiveProvExpId = expStore.createExperience({
+        title: "Brevandring hos inaktiv", provider_id: inactiveProviderId,
+        kommune: "Bergen", fylke: "Vestland",
+        verification_status: "verified", confidence: "high",
+      } as any);
+
+      // ── published row passes the gate, same shape as the raw read ──────
+      const published = expStore.getPublishedExperienceById(publishedId);
+      assertTrue(!!published, "pub-id-1a: a verified/active/canonical row IS returned by the gated read");
+      assertEq(published?.id, publishedId, "pub-id-1b: ...and it is the requested row");
+      assertTrue(published !== null && "phone" in (published as object), "pub-id-1c: gated read keeps the hydrated shape (phone key present, like getExperienceById)");
+
+      // ── every gate-failing shape -> null, exactly like a missing id ────
+      assertEq(expStore.getPublishedExperienceById(quarantinedId), null, "pub-id-2: a needs_review (quarantined) row is NOT served by id");
+      assertEq(expStore.getPublishedExperienceById(mergedId), null, "pub-id-3: a dedup-merged-away row (canonical_id set) is NOT served by id");
+      assertEq(expStore.getPublishedExperienceById(inactiveProvExpId), null, "pub-id-4: a row whose provider is brreg_active=0 is NOT served by id");
+      assertEq(expStore.getPublishedExperienceById("00000000-0000-0000-0000-000000000000"), null, "pub-id-5: a missing id is null — indistinguishable from the gated cases above");
+
+      // ── the RAW read (internal/admin) still returns them all ───────────
+      assertTrue(!!expStore.getExperienceById(quarantinedId), "pub-id-6a: raw getExperienceById still returns the quarantined row (admin/diagnostic path unchanged)");
+      assertTrue(!!expStore.getExperienceById(mergedId), "pub-id-6b: raw getExperienceById still returns the merged-away row");
+      assertTrue(!!expStore.getExperienceById(inactiveProvExpId), "pub-id-6c: raw getExperienceById still returns the inactive-provider row");
+
+      // ── admission-verdict stamp roundtrip ──────────────────────────────
+      expStore.stampExperienceAdmissionVerdict(quarantinedId, "mismatch: siden handler om noe helt annet");
+      const stamped = db
+        .prepare("SELECT admission_verdict, admission_checked_at FROM experiences WHERE id = ?")
+        .get(quarantinedId) as { admission_verdict: string | null; admission_checked_at: string | null };
+      assertEq(stamped.admission_verdict, "mismatch: siden handler om noe helt annet", "pub-id-7a: stampExperienceAdmissionVerdict writes the inspectable verdict text");
+      assertTrue(!!stamped.admission_checked_at, "pub-id-7b: ...and stamps admission_checked_at");
+      const unstamped = db
+        .prepare("SELECT admission_verdict, admission_checked_at FROM experiences WHERE id = ?")
+        .get(publishedId) as { admission_verdict: string | null; admission_checked_at: string | null };
+      assertEq(unstamped, { admission_verdict: null, admission_checked_at: null }, "pub-id-7c: rows the gate never saw keep both columns NULL");
+    } catch (err: any) {
+      failed++;
+      failures.push("published-experience-by-id (experience-store): unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch { /* best-effort */ }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+  }
+
   return { passed, failed, failures };
 }
 

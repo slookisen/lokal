@@ -17,7 +17,14 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import {
   createExperience,
-  getExperienceById,
+  // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+  // slice (2026-08-25): the PUBLISH-GATED by-id read for the public
+  // GET /:id surface — the raw getExperienceById stays internal/admin-only
+  // (see its doc comment in experience-store.ts) and is no longer imported
+  // here at all.
+  getPublishedExperienceById,
+  // Same slice: bulk-load admission-gate verdict stamp.
+  stampExperienceAdmissionVerdict,
   discoverExperiencesRelaxed,
   buildRelaxationNote,
   buildNarrowingSuggestions,
@@ -473,7 +480,18 @@ import {
   buildPageEvidence,
   containsMojibake,
   type PageEvidence,
+  // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+  // slice (2026-08-25) — content-level parked/for-sale-domain lander
+  // detector; a parked page is treated as a FAILED fetch by the
+  // content-refresh writer below (see its doc comment in search-enrich.ts).
+  looksLikeParkedDomainPage,
 } from "../services/search-enrich";
+// Same slice — significant-title-token check for the homepage-boilerplate
+// description guard (descriptionMentionsExperienceTitle below): reuses the
+// dedup pass's own title tokenizer (diacritics folded, stopwords and <3-char
+// tokens dropped, crude plural-s stemming) rather than growing a second,
+// subtly-different tokenization of the same titles.
+import { titleTokens } from "../services/experience-dedup";
 // dev-request 2026-07-27-fetch-infrastruktur-diagnose (P0-1) — the shared,
 // CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
@@ -492,6 +510,10 @@ import {
   sampleEnrichedExperiencesForHoldout,
   judgeExperienceContentMatch,
   resolveHoldoutEvidenceUrl,
+  // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+  // slice (2026-08-25): the bulk-load admission gate below reuses the SAME
+  // judge, shaping a not-yet-inserted harvest candidate into this row type.
+  type HoldoutExperienceRow,
 } from "../services/experience-content-judge";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
@@ -1336,6 +1358,82 @@ export function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
 const MAX_PROVIDERS_PER_CALL = 200;
 const BRREG_PACE_MS = 200; // 150–300ms politeness window between Brreg calls
 
+// ─── Harvest admission gate (dev-request 2026-06-23-experiences-richer-
+// profiles, faithfulness-inflow slice, 2026-08-25) ──────────────────────────
+//
+// Empirical classification of the vertical's wrong_content_rate breach
+// (0.31–0.34 vs the 0.02 threshold) traced ~11 of 17 provably-wrong rows to
+// THIS endpoint's inflow: the harvest routine's LLM composes titles/prices/
+// categories and posts them with third-party/DMO-portal/dead evidence_urls,
+// and the server validated only the Zod SHAPE — nothing ever checked that
+// the row's content is substantiated by its own evidence page. So in APPLY
+// mode, every row about to be INSERTED as a NEW experience that carries an
+// evidence_url is now fetched (fetchPage — same SSRF guard/classified-failure
+// contract as every other fetch in this file) and graded by the existing
+// fail-closed LLM judge (judgeExperienceContentMatch) against that page:
+//
+//   MATCH      → insert exactly as today (Brreg classification decides
+//                verification_status).
+//   MISMATCH   → still insert (harvested data is never dropped) but FORCE
+//                verification_status='needs_review' regardless of what the
+//                Brreg classification would have granted, verdict + judge
+//                reasoning stamped on the row (admission_verdict/
+//                admission_checked_at — see init-experiences.ts).
+//   unresolved → (evidence fetch failed, judge failed, or the per-request
+//                judge budget below is spent) fail CLOSED the same way:
+//                insert as needs_review, reason stamped. A row whose content
+//                cannot be verified must never be admitted as `verified`.
+//
+// Deliberately NOT gated: rows with NO evidence_url (the existing
+// evidence-backed rule already caps those providers at `unverified`→
+// needs_review; a verified_active provider's bare row keeps today's
+// behavior — no page exists to judge against), the existing-match/update
+// branch (no new row is admitted there), and DRY-RUN calls (a dry-run must
+// spend zero fetch/LLM budget — it only reports that the gate would run).
+//
+// Budget: harvest keeps its runs at ~25 rows, so ADMISSION_GATE_MAX_JUDGED
+// = 50 gives 2x headroom; rows past the cap in one call are NOT judged but
+// still fail closed to needs_review ("admission-gate cap"), so a giant call
+// can never buy its way past the gate by exhausting the budget.
+const ADMISSION_GATE_MAX_JUDGED = 50;
+// Bound what a runaway judge reasoning can write into the row stamp.
+const ADMISSION_VERDICT_STAMP_MAX_CHARS = 500;
+
+type AdmissionOutcome = { status: "match" | "mismatch" | "unresolved"; reason: string };
+
+/**
+ * Run one NOT-YET-INSERTED bulk-load row through the admission gate: fetch
+ * its own evidence_url and ask the fail-closed judge whether the candidate's
+ * composed content (title/category/price) is substantiated by that page.
+ * Never throws — every failure path resolves to `unresolved` (fail-closed).
+ */
+async function judgeBulkLoadCandidate(r: BulkRow, evidenceUrl: string): Promise<AdmissionOutcome> {
+  const judgeRow: HoldoutExperienceRow = {
+    // Synthetic id — the row does not exist yet; the judge only echoes this
+    // into nothing (its prompt uses title/description/category/price).
+    id: `bulk-load-candidate:${r.provider_name.trim()}`,
+    title: r.title,
+    description: null, // BulkRowSchema carries no description field
+    category: r.category ?? null,
+    price_band: null,
+    price_from: r.price_from ?? null,
+    evidence_url: evidenceUrl,
+    content_field_evidence: null,
+  };
+  const fetchResult = await fetchPage(evidenceUrl, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+  if (!fetchResult.ok) {
+    return {
+      status: "unresolved",
+      reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.persistence})`,
+    };
+  }
+  const judged = await judgeExperienceContentMatch(judgeRow, visibleTextOf(fetchResult.html));
+  if (!judged.ok) return { status: "unresolved", reason: judged.reasoning };
+  return judged.verdict === "MATCH"
+    ? { status: "match", reason: judged.reasoning }
+    : { status: "mismatch", reason: judged.reasoning };
+}
+
 router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response) => {
   let body: z.infer<typeof BulkLoadSchema>;
   try {
@@ -1384,6 +1482,20 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
   // follows the same convention.
   let rejectedBlocklisted = 0;
   const rejectedBlocklistedProviders: Array<{ provider_name: string; matched_by?: string; matched_value?: string }> = [];
+
+  // Admission-gate tallies (see the block comment above ADMISSION_GATE_MAX_
+  // JUDGED). `judged` = rows the gate actually evaluated (fetch + judge
+  // attempted; match + mismatch + unresolved partition it). `capped` = rows
+  // that hit the per-request budget and were admitted fail-closed as
+  // needs_review WITHOUT spending a fetch/judge call — its own bucket so a
+  // capped run is visibly different from a judge outage.
+  const admissionGate = { judged: 0, match: 0, mismatch: 0, unresolved: 0, capped: 0 };
+  const admissionGateResults: Array<{
+    provider_name: string;
+    title: string;
+    verdict: "match" | "mismatch" | "unresolved";
+    reason: string;
+  }> = [];
 
   // ── 2–3. Classify + (conditionally) insert, one provider at a time. ─
   for (let i = 0; i < providerNames.length; i++) {
@@ -1509,8 +1621,34 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           skipped++;
           continue;
         }
+        // ── Admission gate (apply mode, NEW inserts with an evidence_url
+        // only — see the block comment above ADMISSION_GATE_MAX_JUDGED). Runs
+        // BEFORE the insert so its outcome can decide verification_status;
+        // MISMATCH/unresolved rows are still inserted, just quarantined. ──
+        let admission: AdmissionOutcome | null = null;
+        const evidenceUrl = r.evidence_url?.trim();
+        if (evidenceUrl) {
+          if (admissionGate.judged >= ADMISSION_GATE_MAX_JUDGED) {
+            admission = {
+              status: "unresolved",
+              reason: `admission-gate cap: over ${ADMISSION_GATE_MAX_JUDGED} nye rader i ett kall — ikke dømt, satt i karantene fail-closed`,
+            };
+            admissionGate.capped++;
+          } else {
+            admissionGate.judged++;
+            admission = await judgeBulkLoadCandidate(r, evidenceUrl);
+            admissionGate[admission.status]++;
+          }
+          admissionGateResults.push({
+            provider_name: name,
+            title: r.title,
+            verdict: admission.status,
+            reason: admission.reason,
+          });
+        }
+
         try {
-          createExperience({
+          const newExperienceId = createExperience({
             provider_id: providerId,
             provider_match_status: "matched",
             title: r.title,
@@ -1527,10 +1665,29 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             evidence_url: r.evidence_url ?? null,
             confidence: r.confidence ?? null,
             discovery_source: "bulk-load",
+            // A non-MATCH gate outcome forces needs_review no matter what the
+            // Brreg classification would have granted — a row whose content
+            // could not be verified against its own evidence page must never
+            // be admitted as `verified` (fail-closed, mirrors the judge's own
+            // contract). Rows the gate never saw (no evidence_url) keep
+            // today's Brreg-derived status unchanged.
             verification_status:
-              verdict.classification === "verified_active" ? "verified" : "needs_review",
+              admission && admission.status !== "match"
+                ? "needs_review"
+                : verdict.classification === "verified_active" ? "verified" : "needs_review",
           });
           experiencesInserted += 1;
+          if (admission) {
+            // Stamp verdict + reasoning so a quarantined row is reviewable
+            // without re-running the judge. Best-effort: a failed stamp must
+            // never undo/skip an already-correct insert.
+            try {
+              stampExperienceAdmissionVerdict(
+                newExperienceId,
+                `${admission.status}: ${admission.reason}`.slice(0, ADMISSION_VERDICT_STAMP_MAX_CHARS),
+              );
+            } catch { /* best-effort */ }
+          }
         } catch {
           // e.g. a slug UNIQUE collision from a concurrent insert — treat as skip.
           skipped++;
@@ -1552,6 +1709,16 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     excluded_inactive: excludedInactive,
     rejected_blocklisted: rejectedBlocklisted,
     rejected_blocklisted_providers: rejectedBlocklistedProviders,
+    // Admission-gate report (faithfulness-inflow slice). Dry-run spends zero
+    // fetch/judge budget by design, so it can only announce that the gate
+    // WOULD run on apply — it cannot pre-compute verdicts without paying the
+    // exact cost the dry-run convention exists to avoid.
+    admission_gate: dryRun
+      ? {
+          dry_run: true,
+          note: "admission gate kjøres kun i apply-modus: hver NY rad med evidence_url dømmes mot sin egen evidensside før den slippes inn som verified",
+        }
+      : { ...admissionGate, results: admissionGateResults },
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
 });
@@ -1729,6 +1896,58 @@ function tallyGardssalgRenderStats(
   return { render_attempted, render_yield };
 }
 
+// ─── Description faithfulness guards (dev-request 2026-06-23-experiences-
+// richer-profiles, faithfulness-inflow slice, 2026-08-25) ────────────────────
+//
+// Empirical classification of the vertical's wrong_content_rate breach traced
+// ~5 of 17 provably-wrong rows to THIS route's description writer:
+// summarizeAbout(primaryHtml) extracts the provider HOMEPAGE's og:description
+// → meta description → first prose chunk, and that page is SITE-WIDE — so
+// experiences were getting site-wide marketing boilerplate ("Velkommen til
+// Svalbard - det ekte Arktis!" on a cruise row, a bus-tour company's
+// site-wide meta), scraped nav junk ("Hopp til hovedinnhold Klipp og Lim"),
+// and even parked-domain sales text (sirdal.com) as their per-experience
+// `description`. Three guards close this, all on the WRITE path only:
+//
+//   1. parked-domain page (looksLikeParkedDomainPage) → the whole fetch is
+//      treated as failed (nothing on a parking lander is about the provider);
+//   2. junk description (isJunkDescription, the same render-time guard the
+//      rfb vertical already applies) → the description write is skipped;
+//   3. homepage-boilerplate (descriptionMentionsExperienceTitle below) → a
+//      homepage-derived description that never names the experience is site
+//      marketing, not a description of THIS experience → skipped for that
+//      experience.
+// A skipped write leaves the field BLANK — blank is honest; the LLM
+// catalog-writer lane (POST /admin/experiences-katalogfelt below) handles
+// blanks later. Category/price/season/etc. writes are untouched: those are
+// extracted by keyword/structure matchers over the page, not lifted prose.
+
+/**
+ * Does `description` mention at least one significant token of the
+ * experience's own title? Applied ONLY to a description sourced from the
+ * provider's homepage (in this route the primary fetched page is always the
+ * provider's stored hjemmeside — i.e. the site root / provider-level page,
+ * never an experience-specific page), where a text that never names the
+ * experience is overwhelmingly site-wide marketing copy.
+ *
+ * Token semantics reuse the dedup pass's titleTokens() (experience-dedup.ts:
+ * diacritics folded, stopwords + <3-char tokens dropped, crude plural-s
+ * stemming), preferring SIGNIFICANT tokens (>=5 chars, the dedup pass's own
+ * distinctiveness bar) and falling back to all comparison-worthy tokens when
+ * a title has no >=5-char token at all (e.g. "RIB Oslo"). A title that
+ * yields NO comparable token whatsoever cannot be assessed — the guard then
+ * keeps today's behavior (write) rather than permanently blanking a row it
+ * cannot reason about. PURE.
+ */
+function descriptionMentionsExperienceTitle(description: string, title: string): boolean {
+  const tokens = titleTokens(title);
+  if (tokens.length === 0) return true; // nothing to check against — cannot assess
+  const significant = tokens.filter((t) => t.length >= 5);
+  const pool = significant.length > 0 ? significant : tokens;
+  const descTokens = new Set(titleTokens(description));
+  return pool.some((t) => descTokens.has(t));
+}
+
 async function crFetchHomepageContent(homepageUrl: string): Promise<CrFetchOutcome> {
   const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
   const primary = await crFetchPage(fetchUrl);
@@ -1837,6 +2056,19 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   // http_unreachable_per_run metric the way ordinary fetch failures do.
   const excludedUnverifiedWebsite: Array<{ provider_id: string; reason: string }> = [];
 
+  // Faithfulness-inflow slice (dev-request 2026-06-23-experiences-richer-
+  // profiles): description candidates the guards WITHHELD, named per skip so
+  // the enrichment routine's dry-run/apply reports stay informative instead
+  // of a description silently never appearing. `experience_id` is set for the
+  // per-experience homepage-boilerplate skip; the junk skip is provider-level
+  // (the candidate itself is junk, no experience would ever get it).
+  const descriptionGuardSkips: Array<{
+    provider_id: string;
+    experience_id?: string;
+    reason: "junk_description" | "homepage_boilerplate_no_title_token";
+    candidate_snippet: string;
+  }> = [];
+
   async function processOne(t: ContentRefreshTarget): Promise<void> {
     const providerId = t.id;
 
@@ -1918,6 +2150,44 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       }
       return;
     }
+    // ── Parked-domain guard (faithfulness-inflow slice) — BEFORE the
+    // fetch-success bookkeeping: a lapsed domain resolving to a registrar's
+    // parking lander answers HTTP 200, but nothing on it is about the
+    // provider (live incident: sirdal.com's parking text became an
+    // experience description). Treated as a FAILED fetch: classified error,
+    // nothing extracted, nothing written — and in apply mode it counts a
+    // parking strike exactly like a `permanent` fetch failure (a parked
+    // domain is a dead homepage; routing the provider toward the 3-strike
+    // park + website-discovery handoff is the correct remedy, not retrying).
+    if (looksLikeParkedDomainPage(fetched.primaryHtml)) {
+      errors.push({
+        provider_id: providerId,
+        error: `fetch_failed:parked_domain (permanent) for ${t.hjemmeside}`,
+        persistence: "permanent",
+      });
+      if (apply) {
+        try {
+          const p = recordProviderHomepageFetchResult(providerId, false);
+          if (p.parked_now) {
+            parkedNow.push(providerId);
+            // Same website-discovery handoff as the permanent-failure branch
+            // above (Skive 1, dev-request 2026-08-17-forsyningskjede-
+            // samarbeid-og-kvalitetsoppdatering). Best-effort.
+            try {
+              enqueueProviderWorkQueueItem({
+                provider_id: providerId,
+                provider_name: t.navn ?? null,
+                from_system: "berikelse",
+                to_system: "discovery",
+                reason: "parked_needs_replacement",
+                batch_id: null,
+              });
+            } catch { /* best-effort */ }
+          }
+        } catch { /* best-effort */ }
+      }
+      return;
+    }
     if (apply) {
       try { recordProviderHomepageFetchResult(providerId, true); } catch { /* best-effort */ }
     }
@@ -1936,7 +2206,22 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     const tagsResult    = extractActivityTags(contentText);
     const bookingResult = extractBookingUrl(primaryHtml, fetched.fetchUrl);
 
-    const candidateDescription = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
+    // ── Junk-description guard (faithfulness-inflow slice) — the same
+    // render-time isJunkDescription() the rfb vertical applies (description-
+    // quality.ts, imported below as expDescIsJunk), now applied BEFORE the
+    // write: scraped nav/skip-link/contact-block junk ("Hopp til
+    // hovedinnhold Klipp og Lim") must never become a stored description.
+    // Skipping leaves the field blank — blank is honest (see the guard block
+    // comment above descriptionMentionsExperienceTitle).
+    let candidateDescription = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
+    if (candidateDescription && expDescIsJunk(candidateDescription)) {
+      descriptionGuardSkips.push({
+        provider_id: providerId,
+        reason: "junk_description",
+        candidate_snippet: candidateDescription.slice(0, 120),
+      });
+      candidateDescription = null;
+    }
     const candidateCategory = expCategories.length > 0 ? expCategories[0] : null;
     const candidateActivityTags = tagsResult.values.length > 0 ? tagsResult.values : null;
     const candidateSeason = seasonResult.values.length > 0 ? seasonResult.values : null;
@@ -1973,7 +2258,33 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     const expRows = getExperiencesForProvider(providerId);
     const writtenFields = new Set<string>();
     const lockedExpIds: string[] = [];
-    const toApply: Array<{ id: string }> = [];
+    // title/description carried along for the per-experience homepage-
+    // boilerplate guard below (faithfulness-inflow slice).
+    const toApply: Array<{ id: string; title: string; description: string | null }> = [];
+
+    // ── Homepage-boilerplate guard (faithfulness-inflow slice), decided PER
+    // EXPERIENCE: the candidate description is extracted from the provider's
+    // homepage (the primary page this route fetches is always t.hjemmeside —
+    // a provider-level page, never an experience-specific one), so a text
+    // that never names the experience is site-wide marketing, not a
+    // description of THIS experience — skip that experience's description
+    // write, keep every other field's write untouched. The skip is recorded
+    // (dry-run and apply alike) only when the write would otherwise actually
+    // have happened (blank, unlocked field), so the report never lists
+    // no-op skips.
+    const descriptionAllowedFor = (e: { id: string; title: string; description: string | null }): boolean => {
+      if (!candidateDescription) return false;
+      if (descriptionMentionsExperienceTitle(candidateDescription, e.title)) return true;
+      if (!e.description || !String(e.description).trim()) {
+        descriptionGuardSkips.push({
+          provider_id: providerId,
+          experience_id: e.id,
+          reason: "homepage_boilerplate_no_title_token",
+          candidate_snippet: candidateDescription.slice(0, 120),
+        });
+      }
+      return false;
+    };
 
     const candidateObj = {
       description:    candidateDescription,
@@ -1999,7 +2310,7 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
         if (anyThin) lockedExpIds.push(e.id);
         continue;
       }
-      toApply.push({ id: e.id });
+      toApply.push({ id: e.id, title: e.title, description: e.description ?? null });
     }
 
     if (lockedExpIds.length > 0) {
@@ -2009,7 +2320,10 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     if (dryRun) {
       for (const e of expRows) {
         if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") continue;
-        if (candidateDescription && (!e.description || !String(e.description).trim())) writtenFields.add("description");
+        // descriptionAllowedFor() mirrors the apply branch exactly (junk +
+        // homepage-boilerplate guards), so a dry-run honestly reports which
+        // writes would be skipped — the skips land in description_guard_skips.
+        if ((!e.description || !String(e.description).trim()) && descriptionAllowedFor(e)) writtenFields.add("description");
         if (candidateCategory && (!e.category || !String(e.category).trim())) writtenFields.add("category");
         if (candidateObj.price_from !== null && !e.price_from) writtenFields.add("price_from");
         if (candidateObj.duration_min !== null && !e.duration_min) writtenFields.add("duration_min");
@@ -2021,9 +2335,15 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     } else {
       for (const a of toApply) {
         try {
+          // Per-experience candidate: the homepage-boilerplate guard may
+          // withhold the description for THIS experience while every other
+          // field (and other experiences' descriptions) writes as before.
+          const perExperienceCandidate = descriptionAllowedFor(a)
+            ? candidateObj
+            : { ...candidateObj, description: null };
           // fetched.fetchUrl is the page this content was extracted from — the
           // same URL the per-field provenance above records as source_url.
-          const fields = applyExperienceContent(a.id, candidateObj, fetched.fetchUrl);
+          const fields = applyExperienceContent(a.id, perExperienceCandidate, fetched.fetchUrl);
           for (const f of fields) writtenFields.add(f);
         } catch (e: any) {
           errors.push({ provider_id: providerId, error: `write_failed ${a.id}: ${e?.message ?? String(e)}`, persistence: "internal" });
@@ -2075,6 +2395,11 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     // guardrail metric and would misread aggregator-URL rot as real
     // unreachability).
     excluded_unverified_website: excludedUnverifiedWebsite,
+    // Faithfulness-inflow slice: description candidates the junk/homepage-
+    // boilerplate guards withheld (parked-domain pages land in `errors` as
+    // fetch_failed:parked_domain instead) — named per skip, dry-run and
+    // apply alike, so enrichment reports show WHY a description stayed blank.
+    description_guard_skips: descriptionGuardSkips,
     // Why selection stopped this call: "real-exhaustion" only when the SQL
     // candidate window is genuinely tapped out; "scan_cap_reached" when the
     // hard CONTENT_REFRESH_HARD_SCAN_CAP scan budget stopped the search
@@ -21251,8 +21576,15 @@ router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, 
 });
 
 // ─── GET /api/opplevelser/:id — single experience ───────────────────
+// PUBLISH-GATED (dev-request 2026-06-23-experiences-richer-profiles,
+// faithfulness-inflow slice, 2026-08-25): reads through
+// getPublishedExperienceById(), which applies the SAME PUBLISH_GATE_SQL as
+// /discover and the HTML detail pages — a quarantined (needs_review/
+// rejected) or dedup-merged-away row now 404s exactly like a missing id,
+// instead of being served in full to anyone holding its UUID (the raw
+// getExperienceById() stays internal/admin-only; see its doc comment).
 router.get("/:id", (req: Request, res: Response) => {
-  const exp = getExperienceById(req.params.id as string);
+  const exp = getPublishedExperienceById(req.params.id as string);
   if (!exp) {
     res.status(404).json({ error: "Not found" });
     return;

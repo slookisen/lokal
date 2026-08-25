@@ -406,6 +406,37 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Harvest admission-gate verdict columns (dev-request 2026-06-23-
+  // experiences-richer-profiles, faithfulness-inflow slice, 2026-08-25) ──────
+  // POST /admin/bulk-load (apply mode) now runs each NEW evidence-backed row
+  // through the fail-closed LLM content judge (judgeExperienceContentMatch,
+  // experience-content-judge.ts) BEFORE admitting it as `verified`: the judge
+  // grades the candidate's own title/category/price against the live
+  // evidence_url page. A MISMATCH or an unresolvable check (fetch failure,
+  // judge failure, per-request judge-budget cap) still INSERTS the row —
+  // never drop harvested data — but forces verification_status='needs_review'
+  // regardless of what the Brreg classification would have granted.
+  //
+  // admission_verdict: human-inspectable outcome text, "<match|mismatch|
+  //   unresolved>: <judge reasoning>" — the reasoning is what makes a
+  //   quarantined row reviewable without re-running the judge. NULL means
+  //   "never gated" (pre-gate rows, rows without an evidence_url, rows
+  //   admitted via a dry-run-only call, or non-bulk-load writers).
+  // admission_checked_at: when the gate ran for this row (datetime('now'),
+  //   same convention as brreg_checked_at). NULL whenever admission_verdict
+  //   is NULL.
+  // Same additive/idempotent ALTER idiom as the provenance block above; both
+  // columns are stamped only by stampExperienceAdmissionVerdict()
+  // (experience-store.ts) and read by humans/report tooling, never by any
+  // query-layer filter — so no index.
+  const admissionGateCols = [
+    "ALTER TABLE experiences ADD COLUMN admission_verdict TEXT",
+    "ALTER TABLE experiences ADD COLUMN admission_checked_at TEXT",
+  ];
+  for (const stmt of admissionGateCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ─── Dedup / canonical-merge columns (dev-request 2026-07-04-opplevagent-
   // dedup-og-norske-titler, item 1, 2026-07-10) ─────────────────────────────
   // Same real-world experience was harvested from multiple sources into

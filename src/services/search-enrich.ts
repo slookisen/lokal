@@ -1057,6 +1057,70 @@ export function summarizeAbout(html: string): string {
   return cap(visible);
 }
 
+// ─── Parked/for-sale-domain page detector (dev-request 2026-06-23-
+// experiences-richer-profiles, faithfulness-inflow slice, 2026-08-25) ────────
+//
+// A provider domain that has LAPSED and been re-registered by a parking
+// service still fetches with HTTP 200 and often carries a meta description —
+// so summarizeAbout() happily extracts registrar/marketplace boilerplate and
+// the content-refresh writer stores it as a per-experience description.
+// Live incident: sirdal.com is a parked domain and its parking text became
+// an experience's description. The dental vertical's classifyHjemmeside()
+// (dental-hjemmeside-classifier.ts) only catches the rare case where the
+// URL's own HOSTNAME is a parking service; its own doc comment names the
+// common case — a normal-looking domain that RESOLVES to a parking page —
+// as needing a live fetch, which is exactly the position this content-level
+// detector sits in (the page is already fetched).
+//
+// CONSERVATIVE by design (a false positive costs a real provider its
+// enrichment fetch): flags only when BOTH hold —
+//   1. the page's visible text is TINY (< PARKED_PAGE_MAX_VISIBLE_CHARS) —
+//      parking lander pages are one headline + one sales CTA, while a real
+//      producer homepage practically always carries nav + footer + prose
+//      well past this bound; and
+//   2. that text contains a telltale domain-parking/for-sale phrase
+//      (English + Norwegian registrar boilerplate).
+// A large page mentioning "domain is for sale" in e.g. a blog post about
+// domains is NOT flagged (fails 1); a small-but-real "under construction"
+// producer page without sales boilerplate is NOT flagged (fails 2).
+const PARKED_PAGE_MAX_VISIBLE_CHARS = 1500;
+const PARKED_PAGE_PHRASES: readonly string[] = [
+  // English registrar/marketplace boilerplate
+  "domain is for sale",
+  "this domain is for sale",
+  "buy this domain",
+  "purchase this domain",
+  "domain may be for sale",
+  "the domain owner is offering it for sale",
+  "domain parking",
+  "parked domain",
+  "this web page is parked",
+  "parked free",
+  // Norwegian registrar boilerplate
+  "domenet er til salgs",
+  "dette domenet er til salgs",
+  "kjop dette domenet", // accents pre-stripped below — matches "kjøp dette domenet"
+  "domenet kan vaere til salgs",
+  "domenet er parkert",
+  "dette domenet er parkert",
+  "domenet er registrert av",
+];
+
+/**
+ * True when a fetched page looks like a parked/for-sale domain lander rather
+ * than the provider's real site — see the block comment above for the exact
+ * two-signal rule and its safety posture. Callers must treat a parked page
+ * as a FAILED fetch (extract nothing, write nothing): parking text is
+ * content about the DOMAIN MARKET, never about the provider. PURE.
+ */
+export function looksLikeParkedDomainPage(html: string): boolean {
+  if (!html) return false;
+  const visible = extractVisibleText(html);
+  if (visible.length >= PARKED_PAGE_MAX_VISIBLE_CHARS) return false;
+  const hay = stripNorwegianAccents(visible.toLowerCase());
+  return PARKED_PAGE_PHRASES.some((phrase) => hay.includes(phrase));
+}
+
 // Norwegian visit/tasting keywords used by summarizeVisit() below — a page
 // sentence/paragraph mentioning any of these is a reasonable signal that it
 // describes what a gårdssalg visit actually includes (as opposed to generic

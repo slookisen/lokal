@@ -133,10 +133,18 @@ export function runOpplevelserExperienceProvenanceTests(
       const store = require("../services/experience-store") as typeof import("../services/experience-store");
 
       // ── (a) provider with real field_provenance + brreg_checked_at ────────
+      // brreg_active: 1 on every provider fixture below (faithfulness-inflow
+      // slice, 2026-08-25): GET /:id now reads through the publish-gated
+      // getPublishedExperienceById(), whose PUBLISH_GATE_SQL requires the
+      // joined provider to be brreg_active=1 — these fixtures predate that
+      // gate and must stay publishable so this file keeps testing the
+      // provenance summary, not the new gate (which has its own tests in
+      // experience-store.test.ts).
       const providerWithProv = store.createProvider({
         navn: "Gårdsbutikk Med Proveniens",
         telefon: "12345678",
         brreg_verified: 1,
+        brreg_active: 1,
       } as any);
       expDb
         .prepare(
@@ -161,6 +169,7 @@ export function runOpplevelserExperienceProvenanceTests(
         navn: "Gårdsbutikk Uten Proveniens",
         telefon: "87654321",
         brreg_verified: 0,
+        brreg_active: 1,
       } as any);
       const expNoProv = store.createExperience({
         title: "Gårdsbesøk uten proveniens",
@@ -172,6 +181,7 @@ export function runOpplevelserExperienceProvenanceTests(
       const providerUnverified = store.createProvider({
         navn: "Gårdsbutikk Ikke Brreg-sjekket",
         brreg_verified: 0,
+        brreg_active: 1,
       } as any);
       expDb
         .prepare(`UPDATE experience_providers SET field_provenance = @fp WHERE id = @id`)
