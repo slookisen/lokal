@@ -40599,3 +40599,29 @@ runSerial(async () => {
     failures.push("experiences-seo-kategorifarger: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-25-opplevagent-geokoding-adresse-foerst: Daniel found two
+// producers stored at lat 0 / lon 0 whose real street address sat in our own
+// `adresse` column the whole time («burde vært lett å funnet selv, i stedet for
+// å sette 0.0»). Step A's gate demanded a separate postnummer and skipped them,
+// Step D stamped a centroid that came back 0/0, and the row was then stuck
+// forever (every step keys on lat IS NULL). Fixes: address-first Step A, a
+// Step 0 repair sweep that clears impossible coordinates back into the ladder,
+// a write-side refusal of implausible geocoder answers, and serving-side gates
+// so 0/0 never reaches schema.org or the agent APIs. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-25-opplevagent-geokoding-adresse-foerst: adresse-først + reparasjonssveip ──");
+  try {
+    const { runExperiencesGeocodeAdresseFoerstTests } = require("../src/services/experiences-geocode-adresse-foerst.test") as
+      typeof import("../src/services/experiences-geocode-adresse-foerst.test");
+    const gaf = await runExperiencesGeocodeAdresseFoerstTests({ log: false });
+    passed += gaf.passed;
+    failed += gaf.failed;
+    for (const f of gaf.failures) failures.push("experiences-geocode-adresse-foerst: " + f);
+    console.log(`  experiences-geocode-adresse-foerst: ${gaf.passed} passed, ${gaf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-geocode-adresse-foerst: unexpected error: " + String(err?.message || err));
+  }
+});

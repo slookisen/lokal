@@ -11,6 +11,7 @@
 // (the /mcp surface lands in a follow-up PR, mirroring dental F4).
 // Admin POST requires X-Admin-Key (same env var as rfb/dental).
 
+import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { Router, Request, Response, NextFunction } from "express";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -746,8 +747,11 @@ router.get("/discover", (req: Request, res: Response) => {
             fylke: row.fylke ?? null,
             kommune: row.kommune ?? null,
             producer_type: row.producer_type ?? null,
-            lat: row.lat ?? null,
-            lon: row.lon ?? null,
+            // An impossible coordinate is reported as "we do not know", not as a
+            // position (Daniel 2026-08-25). An agent that trusts lat/lon would
+            // otherwise route a traveller at a producer sitting on 0/0.
+            lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
+            lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
             geocode_confidence: row.geocode_confidence ?? null,
             booking: {
               live,
