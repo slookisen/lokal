@@ -23,7 +23,7 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone, national8, stripLeadingContactLabel } from "../services/contact-normalizer";
-import { isJunkDescription } from "../services/description-quality";
+import { isJunkDescription, looksLikeCodeArtifact } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
@@ -449,6 +449,21 @@ router.post("/register", (req: Request, res: Response) => {
     }
 
     const registration = AgentRegistrationSchema.parse(req.body);
+
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): marketplaceRegistry.register()
+    // below writes `registration.description` straight into
+    // `agents.description` with zero content validation of its own —
+    // AgentRegistrationSchema only enforces `min(10)` length. This is the
+    // PUBLIC, unauthenticated self-registration endpoint, so this check
+    // matters even though a freshly self-registered agent starts
+    // quarantined (isVetted:false) pending human review below — the same
+    // defect class this dev-request exists to fix, just caught one step
+    // earlier than a human reviewer would.
+    if (looksLikeCodeArtifact(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
 
     // Blocklist gate — quietly reject without leaking why.
     const blocked = isBlocked({
@@ -1112,6 +1127,45 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
   res.json(card);
 });
 
+// ─── Shared write-time `description` guard ───────────────────────────────
+// dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding. Used by
+// every producer-content write surface below that can receive a raw
+// `description` field straight from the caller's body with no prior
+// validation: PUT /agents/:id, PATCH /agents/:id, and (for its
+// code-artifact half only — see the call site) PUT /agents/:id/description.
+//
+// Two independent checks, in order:
+//   1. Explicit `null`. `agents.description` is TEXT NOT NULL
+//      (database/init.ts). `marketplaceRegistry.updateAgent()` writes
+//      `updates.description` straight into a parameterized
+//      `SET description = ?` with no type check of its own, so an explicit
+//      `{"description": null}` body reaches SQLite as a literal NULL and
+//      throws an uncaught SqliteError — Express's default error handler then
+//      answers a bare HTTP 500 with a leaked stack trace (file paths
+//      included). Pre-existing bug, not introduced by this dev-request;
+//      closed here because both PUT and PATCH are already being touched for
+//      the code-artifact check right below. looksLikeCodeArtifact(null)
+//      correctly returns false (it is a content detector, not a presence
+//      detector), so it cannot catch this on its own — a separate check is
+//      required.
+//   2. looksLikeCodeArtifact() — scraped JS/CMS-bootstrap code landed
+//      verbatim in the description (see that function's own doc comment in
+//      description-quality.ts for the full signal-class rationale).
+//
+// Returns the exact {status, body} to send, or null when the value is fine
+// to write. Callers only invoke this when the caller's body actually SETS
+// `description` (their own `hasOwnProperty` check) — a PATCH/PUT that never
+// touches the field must sail through unaffected.
+function descriptionWriteGuardError(description: unknown): { status: number; body: { error: string } } | null {
+  if (description === null) {
+    return { status: 400, body: { error: "description cannot be null — agents.description is NOT NULL" } };
+  }
+  if (looksLikeCodeArtifact(description as string | null | undefined)) {
+    return { status: 400, body: { error: "description contains code/script artifacts — rejected" } };
+  }
+  return null;
+}
+
 // ─── PUT /agents/:id — Update agent (authenticated) ──────────
 // Agents can update their own info using their API key
 
@@ -1127,6 +1181,19 @@ router.put("/agents/:id", (req: Request, res: Response) => {
   if (!agent || agent.id !== agentId) {
     res.status(403).json({ error: "Ikke autorisert" });
     return;
+  }
+
+  // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: this
+  // is one of the two write paths the round-2 review found unguarded — a
+  // producer's own X-API-Key reaches updateAgent() with zero validation on
+  // `description`. Same shared guard as the PATCH sibling below (null +
+  // code-artifact), same error shape.
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, "description")) {
+    const guardErr = descriptionWriteGuardError((req.body as { description?: unknown }).description);
+    if (guardErr) {
+      res.status(guardErr.status).json(guardErr.body);
+      return;
+    }
   }
 
   const updated = marketplaceRegistry.updateAgent(agentId, req.body);
@@ -1161,6 +1228,25 @@ router.patch("/agents/:id", (req: Request, res: Response) => {
   if (!authorized) {
     res.status(403).json({ error: "Krever X-Admin-Key eller X-API-Key header" });
     return;
+  }
+
+  // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: this
+  // is the unsanitized write path the root-cause analysis identified — the
+  // automatic enrichment sweep (search-enrich.ts) always strips <script>/
+  // <style> before storing text, but this admin/agent-driven PATCH had no
+  // validation on `description` at all. Reject BEFORE the write, not after —
+  // a normal description (including one that merely mentions "JavaScript" in
+  // prose) must NOT be rejected; only actual code syntax trips the detector,
+  // see description-quality.ts's looksLikeCodeArtifact doc comment. Shared
+  // guard also rejects an explicit `description: null` before it can reach
+  // `agents.description`'s NOT NULL constraint as a raw SqliteError (see
+  // descriptionWriteGuardError's own doc comment above).
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, "description")) {
+    const guardErr = descriptionWriteGuardError((req.body as { description?: unknown }).description);
+    if (guardErr) {
+      res.status(guardErr.status).json(guardErr.body);
+      return;
+    }
   }
 
   const updated = marketplaceRegistry.updateAgent(agentId, req.body);
@@ -1877,6 +1963,22 @@ router.put("/agents/:id/description", (req: Request, res: Response) => {
       res.status(400).json({ success: false, error: "description må være 1-500 tegn etter trim." });
       return;
     }
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: the
+    // round-2 review found this route unguarded — reachable via
+    // X-Claim-Token (a producer's OWN claim, the most realistic real-world
+    // path for this exact defect: a producer pastes scraped page text in
+    // here themselves), X-Admin-Key, or X-API-Key — and it only validated
+    // length before this. Same detector as the PATCH/PUT siblings; message
+    // text matches theirs exactly, wrapped in this route's own
+    // {success, error} response shape (unchanged from every other
+    // validation branch in this handler). `null` is already rejected above
+    // by the `typeof body.description === "string"` check itself (falls
+    // through to the "må være string" branch below) — no separate null
+    // check needed on this route.
+    if (looksLikeCodeArtifact(trimmed)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
     updates.description = trimmed;
   } else if (body.description !== undefined) {
     res.status(400).json({ success: false, error: "description må være string." });
@@ -2012,6 +2114,19 @@ router.post("/admin/register", (req: Request, res: Response) => {
 
   try {
     const registration = AdminRegistrationSchema.parse(req.body);
+
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): this is the endpoint
+    // lokal-agent-enrichment itself registers producers through (see the
+    // enrichment-write-pause gate comment right above this handler), and
+    // marketplaceRegistry.register() below writes `registration.description`
+    // straight into `agents.description` with zero content validation of
+    // its own — AdminRegistrationSchema only defaults it to "". An empty
+    // default correctly passes (looksLikeCodeArtifact("") === false).
+    if (looksLikeCodeArtifact(registration.description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
 
     // Blocklist gate — discovery agent should never re-insert a producer who opted out.
     const blocked = isBlocked({
@@ -4555,6 +4670,18 @@ router.post("/admin/umbrellas", (req: Request, res: Response) => {
       res.status(400).json({ success: false, error: `umbrella_type must be one of: ${Array.from(UMBRELLA_TYPES).join(", ")}` });
       return;
     }
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): this INSERTs straight into the
+    // SAME `agents.description` column the rest of this dev-request gates —
+    // found unguarded, distinct from the three PUT/PATCH /agents/:id and
+    // /agents/:id/description sites already covered above. `description`
+    // is already coerced to "" for any non-string body value, so there is
+    // no NOT NULL-crash case here to guard separately (unlike the
+    // umbrella-meta PATCH sibling below); only the content check is needed.
+    if (description && looksLikeCodeArtifact(description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
+      return;
+    }
 
     const db = getDb();
 
@@ -4704,6 +4831,32 @@ router.patch("/admin/agents/:id/umbrella-meta", (req: Request, res: Response) =>
     }
     if (typeof body.description === "string" && body.description.length > 2000) {
       res.status(400).json({ success: false, error: "description length 0-2000" });
+      return;
+    }
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+    // (round-3 repo-wide re-search finding): this UPDATEs `agents.description`
+    // straight from the body via the generic Object.keys(body) SET-clause
+    // loop below, with only a length bound above it — found unguarded, the
+    // same defect class as the three sites already gated elsewhere in this
+    // file. Two checks, same order/shape as descriptionWriteGuardError above
+    // (not reused directly — that helper is scoped to the PUT/PATCH
+    // /agents/:id pair and returns a bare {error} shape, whereas every other
+    // validation branch on THIS endpoint already answers {success:false,
+    // error} — matching this endpoint's own local convention, not the other
+    // handler's):
+    //   1. Explicit `null` — unlike POST /admin/umbrellas above (which
+    //      coerces any non-string to ""), this route's generic SET-clause
+    //      loop writes body.description VERBATIM, so an explicit
+    //      `{"description": null}` would otherwise reach agents.description
+    //      (TEXT NOT NULL) as a raw SqliteError caught only by this route's
+    //      broad try/catch → a generic 500 instead of a clean 400.
+    //   2. looksLikeCodeArtifact() — scraped JS/CMS-bootstrap code content.
+    if (body.description === null) {
+      res.status(400).json({ success: false, error: "description cannot be null — agents.description is NOT NULL" });
+      return;
+    }
+    if (typeof body.description === "string" && looksLikeCodeArtifact(body.description)) {
+      res.status(400).json({ success: false, error: "description contains code/script artifacts — rejected" });
       return;
     }
 

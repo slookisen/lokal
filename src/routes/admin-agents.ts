@@ -96,6 +96,12 @@ import { pingIndexNow } from "../services/indexnow-service";
 // this file's own judgeRfbAboutCandidate below, which judges about-text
 // quality, not contact-field candidates.
 import { gateContactCandidates } from "../services/contact-candidate-judge";
+// dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: cheap
+// deterministic backstop ahead of the tynne-profiler judge call below — see
+// the call site's own comment for why this is safe to add here (candidate
+// text is LLM-generated, not raw scraped markup, so this is defense-in-depth
+// rather than the primary gate for this write path).
+import { looksLikeCodeArtifact } from "../services/description-quality";
 
 const router = Router();
 
@@ -472,6 +478,24 @@ router.post("/register", async (req: Request, res: Response) => {
     return;
   }
   const trimmedPhone = typeof phone === "string" ? phone.trim() : "";
+
+  // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding
+  // (round-3 repo-wide re-search finding): this INSERT below writes a
+  // caller-supplied `description` straight into `agents.description` — the
+  // same defect class the rest of this dev-request gates, and this
+  // registration surface is literally the one the enrichment-write-pause
+  // gate right above already treats as part of the same automated
+  // agent-driven write family ("registered 5 producers in violation on
+  // 2026-08-20"). An empty/omitted description falls through to a safe
+  // generated fallback string below and is never checked here — only a
+  // caller-supplied, non-empty value is.
+  if (typeof description === "string" && description.trim() && looksLikeCodeArtifact(description)) {
+    res.status(400).json({
+      error: "description contains code/script artifacts — rejected",
+      detail: "description contains code/script artifacts — rejected",
+    });
+    return;
+  }
 
   const VALID_VERTICALS = ["rfb", "dental", "experiences"] as const;
   if (!VALID_VERTICALS.includes(vertical_id as typeof VALID_VERTICALS[number])) {
@@ -4393,6 +4417,28 @@ async function processTynneProfilerRow(
             });
             if (!candidate) {
               fieldResults[f] = { field: f, outcome: "generation_failed" };
+              continue;
+            }
+            // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-
+            // opprydding: cheap deterministic code-artifact backstop, BEFORE
+            // the classifyAboutCheapBar prefilter and the judge call below.
+            // This write path is already gated (generation is LLM-produced
+            // from page text that extractVisibleText/buildPageEvidence never
+            // hands raw <script>/<style> markup to, and the result still
+            // faces the judge below) — the root-cause defect this dev-
+            // request fixes is PATCH /api/marketplace/agents/:id, a
+            // DIFFERENT write path with no such gating, not this one. This
+            // check is added here anyway per the byggspec's explicit ask, as
+            // a free, cheap, defense-in-depth backstop: it costs one
+            // deterministic regex pass and, when it fires, SAVES a judge/LLM
+            // call rather than adding one, so there is no realistic
+            // regression risk to weigh against adding it.
+            if (looksLikeCodeArtifact(candidate)) {
+              fieldResults[f] = {
+                field: f,
+                outcome: "generation_failed_cheap_bar",
+                reasoning: "fails the cheap bar (code artifact)",
+              };
               continue;
             }
             // Deterministic cheap-bar prefilter BEFORE the judge — same

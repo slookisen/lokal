@@ -7565,6 +7565,72 @@ const _pr24Promise = (async function runPr24Tests() {
         assertEq(aRow.description, "CURATED description — do not touch", "PR-A-E14: curated description PRESERVED (never overwritten by homepage)");
       }
 
+      // ── PR-A endpoint: description code-artifact guard (round-2 review ──────
+      // finding, dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-
+      // opprydding) — PUT /admin/knowledge is the endpoint lokal-agent-
+      // enrichment actually PUTs into (the live agent-driven write path this
+      // whole dev-request targets), and it had zero content validation on
+      // `description`. Same detector + same error shape as marketplace.ts's
+      // three sibling gates.
+      {
+        // ── PR-A-CODEART: scraped-JS description → 400, rejected BEFORE any
+        // write (both description AND a co-present other field stay untouched —
+        // proves the whole request is refused atomically, not just the
+        // description column).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key, description) VALUES ('prA-codeart', 'PR-A Codeart', 'pra-codeart', 'producer', 'k', ?)"
+        ).run("Original untouched description.");
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-codeart",
+          about: "Skal ikke skrives heller.",
+          description: "<script>var a=1;var b=2;function(){};</script>",
+        }, PR24_KEY);
+        assertEq(resp.status, 400, "PR-A-CODEART-1: code-artifact description → 400");
+        assertEq(resp.body?.error, "description contains code/script artifacts — rejected",
+          "PR-A-CODEART-2: error message matches marketplace.ts's three sibling gates");
+        const aRow = pr24db.prepare("SELECT description FROM agents WHERE id = 'prA-codeart'").get() as any;
+        assertEq(aRow.description, "Original untouched description.", "PR-A-CODEART-3: agents.description UNCHANGED after rejected PUT");
+        const kRow = pr24db.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'prA-codeart'").get() as any;
+        assertTrue(kRow === undefined, "PR-A-CODEART-4: about NOT written either — whole request rejected before the transaction, not just description");
+      }
+
+      {
+        // ── PR-A-CODEART: ordinary description that merely NAMES a technology
+        // in prose → 200, not flagged (mirrors the false-positive guard already
+        // proven on the marketplace.ts gates — must hold on this route too).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('prA-normal', 'PR-A Normal', 'pra-normal', 'producer', 'k')"
+        ).run();
+        const normalDesc = "Vi bruker moderne teknologi og JavaScript-baserte verktøy i gårdsdriften vår.";
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-normal",
+          description: normalDesc,
+        }, PR24_KEY, true);
+        assertEq(resp.status, 200, "PR-A-CODEART-5: normal description (names JavaScript in prose) → 200, not flagged");
+        const aRow = pr24db.prepare("SELECT description FROM agents WHERE id = 'prA-normal'").get() as any;
+        assertEq(aRow.description, normalDesc, "PR-A-CODEART-6: normal description written unchanged");
+      }
+
+      {
+        // ── PR-A-CODEART: a PUT that updates OTHER fields without touching
+        // `description` at all → completely unaffected by this guard
+        // (regression guard — the check must gate on `description` specifically).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key, description) VALUES ('prA-nodesc', 'PR-A No Desc', 'pra-nodesc', 'producer', 'k', ?)"
+        ).run("Preexisting description untouched.");
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-nodesc",
+          about: "Oppdatert about uten description i body.",
+          address: "Nyveien 1, 5678 Sted",
+        }, PR24_KEY, true);
+        assertEq(resp.status, 200, "PR-A-CODEART-7: PUT without a description field → 200 (guard does not block other fields)");
+        const aRow = pr24db.prepare("SELECT description FROM agents WHERE id = 'prA-nodesc'").get() as any;
+        assertEq(aRow.description, "Preexisting description untouched.", "PR-A-CODEART-8: description column untouched when omitted from body");
+        const kRow = pr24db.prepare("SELECT about, address FROM agent_knowledge WHERE agent_id = 'prA-nodesc'").get() as any;
+        assertEq(kRow.about, "Oppdatert about uten description i body.", "PR-A-CODEART-9: about column written normally");
+        assertEq(kRow.address, "Nyveien 1, 5678 Sted", "PR-A-CODEART-10: address column written normally");
+      }
+
     } finally {
       // Close server (admin key is the suite-wide canonical constant — no
       // process.env mutation to restore).
@@ -34772,6 +34838,155 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
       "descjunk: borderline — 'kontakt' and 'produkter' each mentioned once in flowing prose -> false (density well under threshold)"
     );
 
+    // ── looksLikeCodeArtifact: scraped JS/CMS-bootstrap code detector ────────
+    // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding. A
+    // THIRD failure mode in description-quality.ts, checked separately from
+    // rules 1-4 above (its own, freer threshold — see the function's own doc
+    // comment for the full rationale). Threshold/class-based, NOT single-word
+    // matching (Daniel's explicit requirement).
+    assertTrue(typeof dq.looksLikeCodeArtifact === "function", "descjunk: description-quality.ts exports looksLikeCodeArtifact");
+
+    // Positive: a literal <script> tag is unambiguous alone (class 1).
+    assertTrue(
+      dq.looksLikeCodeArtifact('<script>window.dataLayer = window.dataLayer || [];</script> Velkommen til gården vår!') === true,
+      "codeartifact: a literal <script> tag alone flags true, regardless of surrounding prose"
+    );
+    assertTrue(
+      dq.looksLikeCodeArtifact('Se mer på nettsiden. <style>.hero{display:none}</style>') === true,
+      "codeartifact: a literal <style> tag alone flags true"
+    );
+
+    // Positive: Squarespace-bootstrap-shaped fixture (NOT the real live
+    // Helios text — this dev-request's research never captured it verbatim,
+    // this is a same-shape stand-in). CMS-token class + brace-density class
+    // both fire (2 of classes 2-4), no <script> tag needed.
+    const squarespaceJunk =
+      'Y.Squarespace = Y.Squarespace || {}; Static.SQUARESPACE_CONTEXT = {"website":{"id":"123"},"cacheBust":"abc"}; window.Y.Squarespace.afterBodyLoad(Y);';
+    assertTrue(
+      dq.looksLikeCodeArtifact(squarespaceJunk) === true,
+      "codeartifact: Squarespace-bootstrap-shaped fixture -> true (CMS-token class + brace-density class both fire)"
+    );
+
+    // Positive: generic minified-JS shape — JS-syntax-density class +
+    // brace-density class, no CMS tokens at all.
+    assertTrue(
+      dq.looksLikeCodeArtifact('function(){var a=1;var b=2;let c=3;const d=4;if(a){b=c;}return a+b+c+d;}') === true,
+      "codeartifact: generic minified-JS shape (function()+var/let/const=+high semicolon/brace density) -> true"
+    );
+
+    // Negative (CRITICAL — Daniel's own explicit requirement): normal prose
+    // that merely NAMES a technology must NOT flag — only actual code SYNTAX
+    // does, never the word alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact("Vi bruker moderne teknologi og JavaScript-baserte verktøy i gårdsdriften vår.") === false,
+      "codeartifact: prose that merely mentions 'JavaScript' -> false (word alone is never enough)"
+    );
+    // Negative: an ordinary short description, no tech-related content at all.
+    assertTrue(
+      dq.looksLikeCodeArtifact("Vi selger egg og grønnsaker rett fra gården hver lørdag.") === false,
+      "codeartifact: ordinary description with zero code signals -> false (regression guard)"
+    );
+    assertTrue(dq.looksLikeCodeArtifact("") === false, "codeartifact: empty string -> false");
+    assertTrue(dq.looksLikeCodeArtifact(null) === false, "codeartifact: null -> false");
+    assertTrue(dq.looksLikeCodeArtifact(undefined) === false, "codeartifact: undefined -> false");
+
+    // ── Round-2 review findings: the 5 real-world false negatives the
+    // independent reviewer confirmed by actually running the function
+    // against them, plus additional realistic negative prose examples. ────
+
+    // (1) WordPress `_wpemojiSettings` bootstrap — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        'window._wpemojiSettings = {"baseUrl":"https:\\/\\/s.w.org\\/images\\/core\\/emoji\\/14.0.0\\/72x72\\/","ext":".png","svgUrl":"https:\\/\\/s.w.org\\/images\\/core\\/emoji\\/14.0.0\\/svg\\/","svgExt":".svg","source":{"concatemoji":"https:\\/\\/example.com\\/wp-includes\\/js\\/wp-emoji-release.min.js?ver=6.4.3"}}; !function(window,document,navigator){var Util,i,tests;Util={}}(window,document,navigator);'
+      ) === true,
+      "codeartifact: WordPress _wpemojiSettings bootstrap -> true (class 1b, unambiguous alone)"
+    );
+
+    // (2) Google Tag Manager / gtag.js snippet, WITHOUT any surrounding
+    // <script> tag (the payload alone, as it would land in a scraped
+    // description) — class 1b (dataLayer + gtag() alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', 'GA-XXXXXXX');"
+      ) === true,
+      "codeartifact: Google Tag Manager snippet (dataLayer + gtag()) -> true (class 1b, unambiguous alone)"
+    );
+
+    // (3) jQuery $(document).ready(...) theme inline script — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "$(document).ready(function() { $('.nav-toggle').on('click', function(){ $('.menu').slideToggle(); }); });"
+      ) === true,
+      "codeartifact: jQuery $(document).ready(...) theme inline script -> true (class 1b, unambiguous alone)"
+    );
+
+    // (4) Shopify Shopify.shop/Shopify.locale analytics bootstrap — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        'var Shopify = Shopify || {}; Shopify.shop = "example.myshopify.com"; Shopify.locale = "en"; Shopify.currency = {"active":"USD","rate":"1.0"};'
+      ) === true,
+      "codeartifact: Shopify Shopify.shop/Shopify.locale bootstrap -> true (class 1b, unambiguous alone)"
+    );
+
+    // (5) Next.js App Router hydration payload — class 1b alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        'self.__next_f.push([1,"ad:I[47690,[],\\"ClientPageRoot\\"]\\n"])\nself.__next_f.push([1,"b:[\\"$\\",\\"$Lad\\",null,{\\"Component\\":\\"$c\\"}]\\n"])'
+      ) === true,
+      "codeartifact: Next.js hydration payload (self.__next_f.push) -> true (class 1b, unambiguous alone)"
+    );
+
+    // (6) var-only minified JS (the root cause the reviewer traced in class
+    // 3 — Terser/UglifyJS downlevels almost everything to `var` alone, so a
+    // detector requiring 2 DISTINCT declaration keywords structurally could
+    // never fire on this shape). No provider-signature token at all, so this
+    // exercises the reworked class 3 (repeated var declarations) + class 4
+    // (brace density) directly, not class 1b.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "(function(){var a=1;var b=2;var c=3;var d=4;if(a){b=c;}return a+b+c+d;})();"
+      ) === true,
+      "codeartifact: var-only minified JS with an IIFE wrapper -> true (reworked class 3 [repeated var / IIFE] + class 4 [brace density])"
+    );
+
+    // Negative: additional realistic Norwegian producer prose mentioning
+    // tech-adjacent terms, none of which are code syntax.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Vi driver en liten nettbutikk med lokale produkter fra gården, og frakt kan bestilles direkte via telefon."
+      ) === false,
+      "codeartifact: prose mentioning 'nettbutikk' -> false"
+    );
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Vi tilbyr digital markedsføring og rådgivning til andre bønder i regionen vår."
+      ) === false,
+      "codeartifact: prose mentioning 'digital markedsføring' -> false"
+    );
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Vi bruker moderne verktøy og teknologi for å sikre kvalitet i alle ledd av produksjonen."
+      ) === false,
+      "codeartifact: prose mentioning 'vi bruker moderne verktøy' -> false"
+    );
+
+    // A single weak signal class alone (e.g. only CMS-token class, no brace/
+    // semicolon density) must NOT flag — the detector requires >=2 classes
+    // (or the unambiguous <script>/<style> tag) per the byggspec's explicit
+    // threshold requirement, never a single class alone.
+    assertTrue(
+      dq.looksLikeCodeArtifact("Vi henviser til document. for mer informasjon om driften vår, ta gjerne kontakt.") === false,
+      "codeartifact: a single class-2 token substring ('document.') alone, with no other signal class, does not reach the >=2-class threshold"
+    );
+
+    // isJunkDescription() itself must pick up the new rule for free (Endring
+    // 2 — wired in as an additional early rule, no call site needs its own
+    // change).
+    assertTrue(
+      dq.isJunkDescription(squarespaceJunk) === true,
+      "descjunk: isJunkDescription() picks up looksLikeCodeArtifact's verdict via the new early rule"
+    );
+
     // ── Render-guard wiring: every output path that surfaces agent.description
     // / knowledge.about imports the guard AND logs (never silently) when it
     // suppresses something. Source-presence checks mirror the geo-faq-cc
@@ -38647,6 +38862,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding, Endring
+// 3: the code-artifact write-time gate on PATCH /agents/:id. Own in-memory DB
+// (swaps the shared getDb() singleton) — runs via runSerial() same as the
+// availability-patch suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: PATCH /agents/:id description-artifact gate ──");
+  try {
+    const { runMarketplacePatchDescriptionArtifactGuardTests } = require("../src/routes/marketplace-patch-description-artifact-guard.test") as
+      typeof import("../src/routes/marketplace-patch-description-artifact-guard.test");
+    const pg = await runMarketplacePatchDescriptionArtifactGuardTests({ log: false });
+    passed += pg.passed;
+    failed += pg.failed;
+    for (const f of pg.failures) failures.push("marketplace-patch-description-artifact-guard: " + f);
+    console.log(`  marketplace-patch-description-artifact-guard: ${pg.passed} passed, ${pg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-patch-description-artifact-guard: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-13-supply-graph-v1, salvage slice (2026-07-27):
 // cart-service addCartItem()/submitCart() staleness hardening — gate on
 // EFFECTIVE availability, not the raw column. Own in-memory DB (swaps both
@@ -39913,6 +40148,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("url-write: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding, Endring
+// 4: POST /admin/agents/description-code-artifact-sweep. Same DB-swap
+// discipline as the url-write sibling above — runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding: description-code-artifact-sweep ──");
+  try {
+    const { runAdminAgentsDescriptionCodeArtifactSweepTests } = require("../src/routes/admin-agents-description-code-artifact-sweep.test") as
+      typeof import("../src/routes/admin-agents-description-code-artifact-sweep.test");
+    const ds = await runAdminAgentsDescriptionCodeArtifactSweepTests({ log: false });
+    passed += ds.passed;
+    failed += ds.failed;
+    for (const f of ds.failures) failures.push("description-code-artifact-sweep: " + f);
+    console.log(`  description-code-artifact-sweep: ${ds.passed} passed, ${ds.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("description-code-artifact-sweep: unexpected error: " + String(err?.message || err));
   }
 });
 
