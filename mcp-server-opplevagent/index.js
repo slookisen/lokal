@@ -28,7 +28,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const BASE_URL = (process.env.OPPLEVAGENT_URL || "https://opplevagent.no").replace(/\/$/, "");
-const USER_AGENT = "opplevagent-mcp/0.1.0";
+const USER_AGENT = "opplevagent-mcp/0.2.0";
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -40,11 +40,29 @@ async function fetchJSON(url) {
   return res.json();
 }
 
+// postJSON does NOT throw on a non-2xx response — book_gardssalg needs the
+// parsed body even on 400/200-paused/500 to report the real reason back to
+// the caller instead of a generic "HTTP xxx" error (mirrors createBooking's
+// own error-shaped responses in src/routes/opplevelser.ts).
+async function postJSON(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
 // ── MCP Server ────────────────────────────────────────────────
 
 const server = new McpServer({
   name: "opplevagent",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // Tool 1: discover_experiences
@@ -279,6 +297,201 @@ server.registerTool(
     }
 
     return { content: [{ type: "text", text: sections.join("\n") }] };
+  }
+);
+
+// Tool 4: discover_gardssalg
+// Mirrors the remote io.github.slookisen/opplevagent-mcp tool 1:1 (schema,
+// annotations, description — see src/routes/experiences-mcp.ts's
+// DiscoverGardssalgInputSchema + registerTool("discover_gardssalg", ...)),
+// but reached via the REST surface (GET /api/opplevelser/discover with
+// category=gardssalg_smaking) rather than an in-process store call, since
+// this stdio proxy only ever talks HTTP to BASE_URL. That REST route
+// (opplevelser.ts) reuses the exact same searchGardssalgProviders() store
+// function and returns byte-identical result shaping, so parity holds.
+server.registerTool(
+  "discover_gardssalg",
+  {
+    title: "Discover Norwegian farm-sale drink producers (gårdssalg)",
+    description:
+      "Search opplevagent.no's gårdssalg (farm-sale) vertical — Brreg-registered Norwegian drink " +
+      "producers (bryggeri/cideri/vingård/destilleri/mjøderi/seltzeri) selling directly from the farm. " +
+      "Finn norske gårdssalg-produsenter (drikkeprodusenter som selger direkte fra gården) etter fylke, " +
+      "kommune og produsenttype. / Filter by county (fylke), municipality (kommune), and producer type. " +
+      "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include a " +
+      "rounded distance_km and are sorted nearest-first, and rows with no geocoded location are excluded " +
+      "(never a fabricated distance). Returns name, location, producer type, and an honest booking status " +
+      "(live direct booking vs. a dark-launch 'coming soon' note — never overclaims booking availability). " +
+      "Examples: 'gårdssalg i Vestland', 'cideri near lat 60.4 / lng 5.3', 'bryggeri med booking'.",
+    inputSchema: {
+      fylke: z.string().optional().describe(
+        "Norwegian county (fylke) of the producer. Examples: 'Oslo', 'Vestland', 'Troms', 'Rogaland'"
+      ),
+      kommune: z.string().optional().describe(
+        "Norwegian municipality (kommune) of the producer. Examples: 'Tromsø', 'Bergen', 'Stavanger'"
+      ),
+      producer_type: z.string().optional().describe(
+        "Type of drink producer. Examples: 'bryggeri' (brewery), 'cideri' (cidery), 'vingård' (vineyard), 'destilleri' (distillery), 'mjøderi' (meadery), 'seltzeri'"
+      ),
+      booking_live: z.boolean().optional().describe(
+        "When true, only return producers that currently accept direct bookings. Omit to include producers regardless of booking status."
+      ),
+      lat: z.number().min(-90).max(90).optional().describe(
+        "Origin latitude for a near-me search (decimal degrees). Must be given together with lng. Example: 69.65 (Tromsø)"
+      ),
+      lng: z.number().min(-180).max(180).optional().describe(
+        "Origin longitude for a near-me search (decimal degrees). Must be given together with lat. Example: 18.95 (Tromsø)"
+      ),
+      radius_km: z.number().positive().max(5000).optional().describe(
+        "Max distance from lat/lng in kilometers. Only applies when lat/lng are given. Example: 50"
+      ),
+      limit: z.number().min(1).max(50).default(20).describe(
+        "Max results (default 20, max 50)"
+      ),
+    },
+    annotations: {
+      title: "Discover gårdssalg producers",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async ({ fylke, kommune, producer_type, booking_live, lat, lng, radius_km, limit }) => {
+    const params = new URLSearchParams();
+    params.append("category", "gardssalg_smaking");
+    if (fylke) params.append("fylke", fylke);
+    if (kommune) params.append("kommune", kommune);
+    if (producer_type) params.append("producer_type", producer_type);
+    // Only the literal string "true" is a real filter server-side (see
+    // opplevelser.ts's req.query.booking_live === "true" check) — omitting a
+    // false value here matches that "no filter" semantics exactly.
+    if (booking_live === true) params.append("booking_live", "true");
+    if (typeof lat === "number") params.append("lat", String(lat));
+    if (typeof lng === "number") params.append("lng", String(lng));
+    if (typeof radius_km === "number") params.append("radius_km", String(radius_km));
+    params.append("limit", String(limit ?? 20));
+
+    const data = await fetchJSON(`${BASE_URL}/api/opplevelser/discover?${params}`);
+    const results = Array.isArray(data.results) ? data.results : [];
+
+    const result = {
+      summary:
+        results.length === 0
+          ? "Ingen gårdssalg-produsenter funnet med de angitte filtrene. / No gårdssalg producers found matching the given filters."
+          : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`,
+      count: data.count ?? results.length,
+      filter_applied: data.query ?? {},
+      gardssalg_producers: results,
+    };
+
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+// Tool 5: book_gardssalg
+// Mirrors the remote tool's schema/annotations/description 1:1 (see
+// experiences-mcp.ts's BookGardssalgInputSchema + registerTool("book_gardssalg",
+// ...)), proxying to the SAME POST /api/opplevelser/book endpoint the web
+// booking form and the remote MCP tool both call — same BookingInputSchema
+// validation, same dark-launch-stop dispatch/booking_live gate, same
+// createBooking() write path. This stdio tool can therefore never do more
+// than remote: an unauthorized/paused producer is rejected identically.
+server.registerTool(
+  "book_gardssalg",
+  {
+    title: "Request a gårdssalg booking (pending — email confirmation required)",
+    description:
+      "Submit a booking REQUEST for a Norwegian gårdssalg (farm-sale) producer discovered via " +
+      "discover_gardssalg. Send inn en reservasjonsforespørsel for et gårdssalg-besøk. " +
+      "IMPORTANT: this NEVER creates a confirmed booking — it creates a PENDING request, exactly " +
+      "like the producer's own website form. The PRODUCER reviews the request and responds " +
+      "(confirms, proposes another time, or declines); guest_email only receives a read-only " +
+      "status link, never anything that can finalize the booking. No payment is involved " +
+      "(pickup/visit, pay on arrival, as today). Only producers with an active booking status " +
+      "(see discover_gardssalg's booking.live field) can be booked — a paused/not-yet-onboarded " +
+      "producer is rejected with a clear message, never a silent failure. " +
+      "VIKTIG: oppretter ALDRI en bekreftet booking — kun en avventende forespørsel; produsenten " +
+      "mottar forespørselen og svarer (bekrefter, foreslår nytt tidspunkt eller avslår). " +
+      "Required: provider_id (from discover_gardssalg), slot_at (requested date/time), party_size, " +
+      "guest_name, guest_email. Optional: experience_id, guest_phone, notes. " +
+      "Example: book a table for 4 at provider '3f1b2c4d-...' for '2026-08-15T13:00' for " +
+      "'Kari Nordmann' <kari@example.no>.",
+    inputSchema: {
+      provider_id: z.string().describe(
+        "The gårdssalg producer's id, from a discover_gardssalg result (NOT the profile slug). Example: '3f1b2c4d-...'"
+      ),
+      experience_id: z.string().optional().describe(
+        "Optional experience UUID if this booking is for a specific listed experience rather than a general gårdssalg visit."
+      ),
+      slot_at: z.string().describe(
+        "Requested visit date/time, local (Europe/Oslo), format 'YYYY-MM-DDTHH:MM'. Example: '2026-08-15T13:00'. This is a REQUEST — the producer may confirm, suggest another time, or decline."
+      ),
+      party_size: z.number().describe(
+        "Number of people in the group (1-50). Example: 4"
+      ),
+      guest_name: z.string().describe(
+        "Full name of the person the reservation is for. Example: 'Kari Nordmann'"
+      ),
+      guest_email: z.string().describe(
+        "Guest's email address — REQUIRED. Receives a confirmation-of-request email plus a read-only status link; the booking stays pending until the PRODUCER responds (confirms, proposes another time, or declines) — the guest's link cannot finalize anything. Example: 'kari@example.no'"
+      ),
+      guest_phone: z.string().optional().describe(
+        "Optional guest phone number."
+      ),
+      notes: z.string().optional().describe(
+        "Optional free-text note to the producer (e.g. dietary needs, arrival details)."
+      ),
+    },
+    annotations: {
+      title: "Request a gårdssalg booking",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ provider_id, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes }) => {
+    const body = { provider_id, slot_at, party_size, guest_name, guest_email };
+    if (experience_id) body.experience_id = experience_id;
+    if (guest_phone) body.guest_phone = guest_phone;
+    if (notes) body.notes = notes;
+
+    const { ok, status, data } = await postJSON(`${BASE_URL}/api/opplevelser/book`, body);
+
+    // 400: BookingInputSchema rejected the input (same validation POST
+    // /api/opplevelser/book runs) -- surface the field-level issues.
+    if (status === 400) {
+      const details = Array.isArray(data.details)
+        ? data.details.map((d) => `${(d.path || []).join(".") || "(root)"}: ${d.message}`).join("; ")
+        : (data.error || "ugyldig forespørsel");
+      return {
+        content: [{ type: "text", text: `Ugyldig forespørsel: ${details}. / Invalid request: ${details}.` }],
+        isError: true,
+      };
+    }
+
+    // 200 + paused:true: the dark-launch-stop gate rejected a not-yet-live
+    // producer -- not an HTTP error, a normal honest "not bookable yet" reply.
+    if (data && data.paused === true) {
+      return {
+        content: [{ type: "text", text: data.message || "Booking er ikke aktivert for denne produsenten ennå. / Booking is not activated for this producer yet." }],
+      };
+    }
+
+    if (!ok || data.success !== true) {
+      return {
+        content: [{ type: "text", text: "Kunne ikke opprette påmelding. / Could not create the booking request." }],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: `✅ Forespørsel registrert (${data.booking_ref}, status: ${data.status}). ${data.message}`,
+      }],
+    };
   }
 );
 
