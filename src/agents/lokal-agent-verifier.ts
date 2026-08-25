@@ -46,7 +46,25 @@ import { isPlatformOwnedEmailDomain, isSyntacticallyValidEmail } from "../routes
 // #4" block in runVerifierBatch — rather than re-deriving that detection.
 import { classifyContactCandidateDefect } from "../services/contact-candidate-judge";
 import { judgeSecondLineProfile, type SecondLineProfileJudgeVerdict } from "../services/second-line-profile-judge";
-import { scoreNameMatch } from "../services/brreg-client";
+import { scoreNameMatch, normaliseName, findOrgnumberByName, verifyOrgNumber, type BrregHit } from "../services/brreg-client";
+// dev-request 2026-08-25-terminal-sweep-false-positives: the fresh-lookup
+// death-check (checkFreshBrregDeathEvidence, below) reuses the SAME
+// search-attempt waterfall shape admin-rfb-brreg-selfsufficiency.ts's own
+// resolveOrgNrForTarget already uses for org-nr backfill (base name ->
+// domain-token -> personal-name-ENK) — just these three pure candidate-
+// generation helpers, never resolveOrgNrForTarget itself (that function is
+// coupled to a different feature's DB writes and has different accept
+// criteria — "what's its org-nr" vs. this file's "is this business dead").
+// No import cycle: admin-rfb-brreg-selfsufficiency.ts and everything it
+// imports are route/service modules that never import this file (verified
+// 2026-08-25); requiring it here only defines its Express router (no I/O at
+// module-load time — getDb()/network calls happen inside request handlers).
+import {
+  domainTokenCandidateName,
+  pickDomainSourceForTarget,
+  looksLikePersonalName,
+} from "../routes/admin-rfb-brreg-selfsufficiency";
+import { parseNameLocationSuffix } from "../services/location-suffix-parser";
 
 export interface VerifierResult {
   agent_id: string;
@@ -1261,6 +1279,194 @@ export async function computeSecondLineVerification(input: {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ─── dev-request 2026-08-25-terminal-sweep-false-positives ──────────────
+//
+// Fixes a measured false-positive in the RFB second verification line's
+// terminal-unconfirmable branch below: the ORIGINAL version terminal-marked
+// an agent the moment the second line found ZERO identity sources — i.e. on
+// the ABSENCE of data alone, never any fresh positive evidence (`brreg` in
+// this whole file always comes from opts.brregLookup, which no production
+// caller wires up — see the second-line branch's own comment below). A
+// 10-row random production sample of already-terminal_unconfirmable rows
+// found 7/10 were demonstrably live, active businesses whose anchor fields
+// simply hadn't been enriched yet — exactly the thin-profile cohort
+// admin-rfb-brreg-selfsufficiency.ts's self-supply engine exists to enrich,
+// killed before it ever got the chance to run.
+//
+// The two helpers below replace that single "no sources -> terminal" test
+// with a requirement for POSITIVE evidence, gathered FRESH at sweep time,
+// via one of two independent routes — see the terminal branch in
+// runVerifierBatch for how they're combined and the invariant they jointly
+// enforce ("no confident evidence either way -> stays pending_verify,
+// never terminal").
+// ═══════════════════════════════════════════════════════════════════════
+
+// A tiny, unambiguous set of Norwegian public-space words. Only ever
+// consulted as the LAST token of a TWO-token name (see
+// looksLikeNonProducerEntity below) — narrow on purpose: a longer name
+// ending in one of these (e.g. "Nordbys Gårdsutsalg på Torget") very
+// plausibly IS a producer, so it's deliberately left alone.
+//
+// NOTE: "plass"/"plassen" deliberately excluded (2026-08-25 review fix).
+// Unlike "torg(et)", "plass" is an extremely common, centuries-old suffix
+// for a smallholding/croft (a husmannsplass — e.g. "Kalvatveit Plass",
+// "Myra Plass", "Nordre Plass"), not a public square. A real, currently-
+// operating farm with exactly that two-token name and a thin profile would
+// otherwise wrongly match this pattern and go straight to
+// terminal_unconfirmable with zero Brreg evidence check — precisely the
+// false-positive this dev-request exists to prevent.
+const NON_PRODUCER_PLACE_SUFFIX_WORDS: ReadonlySet<string> = new Set([
+  "torg", "torget",
+]);
+
+// Curated, individually-evidenced denylist of specific names that read as a
+// producer name but are structurally not a company at all. Deliberately
+// tiny and append-only-with-evidence — mirrors the same curated-list
+// precedent as RFB_PARAPLY_EMAIL_DOMAINS above (a short, explicit list
+// beats a broad guess for exactly the false-positive-averse reason this
+// dev-request exists). Matched against the FULL normalised name, never a
+// substring, so it can never fire on an unrelated real producer whose name
+// happens to contain one of these words.
+const NON_PRODUCER_CURATED_NAMES: ReadonlySet<string> = new Set([
+  // "Ringerikserter" — a Beskyttet betegnelse (Norwegian protected
+  // geographical/product designation) for a pea variety historically grown
+  // around Ringerike by MANY unrelated producers; it names the product/
+  // designation, not any single company. Measured in the dev-request's own
+  // 10-row production sample (2026-08-25).
+  "ringerikserter",
+]);
+
+/**
+ * looksLikeNonProducerEntity(name) — a TIGHT, explicit pattern/heuristic
+ * check (per the dev-request's own instruction: prefer this over a new LLM
+ * judge for this narrow slice) identifying producer names that are
+ * structurally never going to be a company at all — a REKO-ring
+ * distribution point, a public square, or a specific curated protected
+ * designation — as distinct from a real producer whose Brreg record simply
+ * isn't found by this run's fresh lookup. Deliberately conservative: false
+ * positives HERE are exactly the bug this dev-request exists to fix, so
+ * every rule below only fires on strong, named-pattern evidence and is
+ * documented with why it can't reasonably catch a real producer. Pure —
+ * exported for tests.
+ *
+ *   1. REKO-ring distribution point: the name's FIRST token (after
+ *      diacritic/case normalisation) is exactly "reko". REKO-ring pickup
+ *      points are conventionally named "REKO <sted>" (e.g. "REKO Grorud")
+ *      — this codebase already treats the bare word "reko" as a non-
+ *      personal/business token for the same reason (see
+ *      admin-rfb-brreg-selfsufficiency.ts's RFB_BSS_PERSONAL_NAME_BLOCK_WORDS
+ *      and RFB_PARAPLY_EMAIL_DOMAINS's reko.no/rekoring.no/rekonorge.no
+ *      above) — a real producer's own name essentially never OPENS with
+ *      that exact token.
+ *   2. Public square/place: the name is EXACTLY two tokens and the second
+ *      is one of NON_PRODUCER_PLACE_SUFFIX_WORDS (e.g. "Adamstuen Torg").
+ *      Restricted to exactly two tokens so a longer, clearly-a-business
+ *      name that happens to end in "torget" is never caught. Deliberately
+ *      excludes "plass"/"plassen" — see that list's own comment.
+ *   3. NON_PRODUCER_CURATED_NAMES — see that list's own comment.
+ */
+export function looksLikeNonProducerEntity(name: string | null | undefined): {
+  match: boolean;
+  pattern: "reko_distribution_point" | "public_place_name" | "curated_designation" | null;
+} {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return { match: false, pattern: null };
+
+  const normalized = normaliseName(trimmed);
+  if (NON_PRODUCER_CURATED_NAMES.has(normalized)) {
+    return { match: true, pattern: "curated_designation" };
+  }
+
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return { match: false, pattern: null };
+
+  if (tokens[0] === "reko") return { match: true, pattern: "reko_distribution_point" };
+
+  if (tokens.length === 2 && NON_PRODUCER_PLACE_SUFFIX_WORDS.has(tokens[1])) {
+    return { match: true, pattern: "public_place_name" };
+  }
+
+  return { match: false, pattern: null };
+}
+
+/**
+ * checkFreshBrregDeathEvidence — attempts a FRESH Brreg name-search at
+ * sweep time (never relying on `brreg`/opts.brregLookup elsewhere in this
+ * file, which is always null in production — see the dev-request comment
+ * above) using the SAME search-attempt waterfall SHAPE
+ * admin-rfb-brreg-selfsufficiency.ts's resolveOrgNrForTarget already uses
+ * for org-nr backfill: base name (parseNameLocationSuffix's core_name, same
+ * strip-the-"— Sted"-suffix step that function applies), then a
+ * domain-token attempt (pickDomainSourceForTarget + domainTokenCandidateName
+ * off the agent's own website/url, when it has one), then a personal-name-
+ * ENK attempt (looksLikePersonalName) — each via findOrgnumberByName,
+ * stopping at the FIRST attempt that returns ANY hit (findOrgnumberByName
+ * itself already enforces a >=0.9 confidence floor — 1.0 exact or 0.95
+ * first-token+postal — before returning non-null, so "any hit" already
+ * means "confident match").
+ *
+ * Unlike resolveOrgNrForTarget, a hit here does NOT stop at "found a
+ * candidate" — this function's whole point is asking "is this business
+ * dead", so the hit's org-nr is immediately re-verified DIRECTLY via
+ * verifyOrgNumber (a separate, non-fuzzy GET /enheter/{orgNr} lookup) and
+ * only a dissolved/bankrupt result counts as evidence. A hit that turns out
+ * to be alive is itself a meaningful, terminal-BLOCKING answer (this is the
+ * "Aalan Gård turned out to have an active Brreg entity" case from the
+ * dev-request's own sample) — never treated as "try the next attempt".
+ *
+ * No postal-code filter is applied to the fresh search: runVerifierBatch's
+ * agent rows carry a free-text city, not a postal code, and
+ * findOrgnumberByName's own scoreNameMatch only USES a postal code when one
+ * is supplied — omitting it can only ever raise the confidence bar (an
+ * exact-normalised-name match is required, since the 0.95 first-token+
+ * postal tier becomes unreachable), never lower it into a false positive.
+ * Documented per the spec's own "you do not need a separate hard filter
+ * unless clearly required for precision" guidance.
+ *
+ * Returns "brreg_konkurs" (Brreg's `konkurs` flag) / "brreg_inactive"
+ * (Brreg's `slettedato` flag) ONLY when a confident hit's direct
+ * verifyOrgNumber() result is dissolved/bankrupt. Returns null for every
+ * other outcome — no hit found by ANY attempt, a hit found but the entity
+ * is still active/exists, or a network/parse failure (findOrgnumberByName /
+ * verifyOrgNumber both already fail closed to their own safe defaults, and
+ * are additionally wrapped here) — because absence of evidence is never
+ * grounds for a terminal mark; that is the core invariant this dev-request
+ * exists to enforce.
+ */
+export async function checkFreshBrregDeathEvidence(
+  input: { producer_name: string | null; website: string | null; url: string | null },
+  fetchImpl: typeof fetch,
+): Promise<"brreg_konkurs" | "brreg_inactive" | null> {
+  const rawName = (input.producer_name || "").trim();
+  if (!rawName) return null;
+
+  const { core_name } = parseNameLocationSuffix(rawName);
+  const baseName = core_name || rawName;
+
+  const searchNames: string[] = [baseName];
+
+  const domainSource = pickDomainSourceForTarget({ website: input.website, url: input.url });
+  const domainToken = domainSource ? domainTokenCandidateName(domainSource) : null;
+  if (domainToken) searchNames.push(domainToken);
+
+  if (looksLikePersonalName(baseName)) searchNames.push(`${baseName} ENK`);
+
+  let hit: BrregHit | null = null;
+  for (const searchName of searchNames) {
+    hit = await findOrgnumberByName(searchName, null, fetchImpl).catch(() => null);
+    if (hit) break;
+  }
+  if (!hit) return null;
+
+  const verified = await verifyOrgNumber(hit.orgnumber, fetchImpl).catch(() => null);
+  if (!verified || !verified.exists || verified.active) return null;
+
+  if (verified.flag === "bankrupt") return "brreg_konkurs";
+  if (verified.flag === "dissolved") return "brreg_inactive";
+  return null;
+}
+
 // Main loop. Caller (Fly Machine job, test, or manual) provides a
 // brregLookup function (or null to skip Brreg).
 export async function runVerifierBatch(opts: {
@@ -1276,6 +1482,13 @@ export async function runVerifierBatch(opts: {
   // ANTHROPIC_API_KEY / network call. Never used in production (production
   // always uses the real judgeSecondLineProfile).
   secondLineJudgeFn?: Parameters<typeof computeSecondLineVerification>[0]["judgeFn"];
+  // dev-request 2026-08-25-terminal-sweep-false-positives: test seam ONLY —
+  // the injectable-fetch impl threaded into checkFreshBrregDeathEvidence's
+  // findOrgnumberByName/verifyOrgNumber calls (mirrors
+  // __setRfbBrregSelfSufficiencyFetchForTesting's role for the sibling
+  // route this reuses search-attempt logic from). Defaults to the real
+  // global `fetch` — production always hits the live Brreg API.
+  terminalDeathCheckFetch?: typeof fetch;
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -1729,19 +1942,41 @@ export async function runVerifierBatch(opts: {
           !secondLine.reasons.has_accepted_source &&
           newVerification === "pending_verify"
         ) {
-          // dev-request 2026-08-23-terminal-unconfirmable: first line found
-          // NO flags at all (not brreg-dead, not nace-blacklist — those are
-          // already handled by deriveVerificationStatus above and never
-          // reach here as 'pending_verify') AND the second line found ZERO
-          // identity sources across own-website/facebook_official_page/
-          // hanen.no/bondensmarked.no/Brreg-name-match. There is nothing
-          // left to corroborate this agent against — terminal-mark it so it
-          // stops looping in pending_verify forever.
-          newVerification = "terminal_unconfirmable";
-          (crossSourceResults as Record<string, unknown>).terminal_reason = "zero_identity_sources";
-          console.log(
-            `[verifier] ${agent.id} (${agent.name ?? "?"}) terminal_unconfirmable (zero_identity_sources) — removed from hourly sweep`,
-          );
+          // dev-request 2026-08-25-terminal-sweep-false-positives: first
+          // line found no flags at all (not brreg-dead, not nace-blacklist
+          // — those are already handled by deriveVerificationStatus above
+          // and never reach here as 'pending_verify') AND the second line
+          // found ZERO identity sources across own-website/
+          // facebook_official_page/hanen.no/bondensmarked.no/Brreg-name-
+          // match. The ORIGINAL version of this branch terminal-marked
+          // right here, on that absence of sources ALONE — a measured
+          // production sample found 7/10 rows terminal-marked that way were
+          // demonstrably live, active businesses whose anchor fields simply
+          // hadn't been enriched yet ("no data" is not "proof of death").
+          // This branch now requires FRESH, POSITIVE evidence before a
+          // terminal mark — see checkFreshBrregDeathEvidence /
+          // looksLikeNonProducerEntity's own doc comments above for the two
+          // independent routes and why each is safe. Neither resolving
+          // (no confident Brreg match found at all, or a match found but
+          // still active/exists) leaves newVerification untouched at
+          // 'pending_verify' — never terminal on absence of data alone.
+          const nonProducer = looksLikeNonProducerEntity(agent.name);
+          const terminalReason: "non_producer_entity" | "brreg_konkurs" | "brreg_inactive" | null =
+            nonProducer.match
+              ? "non_producer_entity"
+              : await checkFreshBrregDeathEvidence(
+                  { producer_name: agent.name ?? null, website: agent.website ?? null, url: agent.agent_url ?? null },
+                  opts.terminalDeathCheckFetch ?? fetch,
+                );
+          if (terminalReason) {
+            newVerification = "terminal_unconfirmable";
+            (crossSourceResults as Record<string, unknown>).terminal_reason = terminalReason;
+            console.log(
+              `[verifier] ${agent.id} (${agent.name ?? "?"}) terminal_unconfirmable (${terminalReason}) — removed from hourly sweep`,
+            );
+          } else {
+            (crossSourceResults as Record<string, unknown>).terminal_check = "no_confident_death_evidence_stays_pending";
+          }
         }
       }
 
