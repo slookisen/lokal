@@ -3,6 +3,7 @@ import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { slugify } from "../utils/slug";
 import { getOwnerStats } from "../services/owner-stats-service";
+import { looksLikeCodeArtifact } from "../services/description-quality";
 import crypto from "crypto";
 
 const router = Router();
@@ -421,6 +422,24 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
         console.log(
           `[owner-portal] Skipped locked field ${field} (locked by ${curatedFieldInfo.by})`
         );
+        continue;
+      }
+
+      // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap:
+      // this handler writes the owner-submitted "description" field straight
+      // to `agent_knowledge.about` (dbField mapping above) with no content
+      // validation — another genuinely unguarded `about` write path found by
+      // the repo-wide search this dev-request required. Same detector as the
+      // admin-side `about`/`description` gates; skipped (not a hard 400) to
+      // match this route's existing per-field skip convention (locked
+      // fields above use the same skip-with-reason shape) rather than
+      // failing the whole multi-field save over one bad field.
+      if (dbField === "about" && typeof newValue === "string" && looksLikeCodeArtifact(newValue)) {
+        skippedFields.push({
+          field,
+          reason: "code_artifact_rejected",
+        });
+        console.log(`[owner-portal] Skipped field ${field} — looks like a code/script artifact`);
         continue;
       }
 

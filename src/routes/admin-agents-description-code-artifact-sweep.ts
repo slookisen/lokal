@@ -57,6 +57,23 @@
 // ordinary enrichment run (search-enrich.ts, which produces clean
 // descriptions BY CONSTRUCTION per this dev-request's root-cause section) to
 // refill.
+//
+// ── `agent_knowledge.about` (dev-request 2026-08-25-agent-knowledge-about-
+//    code-artifact-gap) ──────────────────────────────────────────────────
+// Second, parallel scan+clean pass added by that dev-request: `about` is
+// `description`'s sibling field (same "producer description" role) but was
+// never covered by this sweep — #706's own scan only ever touched
+// `agents.description`, and the real live Helios Trondheim defect turned
+// out to live in `agent_knowledge.about`, not `description`. Same
+// dry-run/apply/per-row-transaction/audit discipline as the description
+// pass above, kept as a clearly-separated SECOND scan within this same
+// handler (not merged into the description candidate set) so the existing
+// `scanned`/`candidates_considered`/`batch_size`/`counts`/`results`
+// response keys stay byte-for-byte unchanged for `description` — the new
+// `about_*`-prefixed keys carry the about pass's own counts/results.
+// ONE constraint difference from `description`: `agent_knowledge.about` is
+// NULLABLE (unlike `agents.description`'s TEXT NOT NULL), so the cleaned
+// value here is SQL NULL, not `''`.
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -153,24 +170,62 @@ const LOCK_SNAPSHOT_SQL = `
     LEFT JOIN agent_knowledge k ON k.agent_id = a.id
    WHERE a.id = ?`;
 
+// ─── `agent_knowledge.about` pass (dev-request 2026-08-25-agent-knowledge-
+//     about-code-artifact-gap) — same shape as the description types/SQL
+//     above, mirrored onto the sibling column. ────────────────────────────
+interface AboutCandidateRow {
+  id: string;
+  name: string;
+  about: string | null;
+}
+
+interface AboutLockSnapshot {
+  claimed_at: string | null;
+  about: string | null;
+  curated_fields: string | null;
+  verified_claims: number;
+}
+
+const ABOUT_LOCK_SNAPSHOT_SQL = `
+  SELECT a.claimed_at   AS claimed_at,
+         k.about        AS about,
+         k.curated_fields AS curated_fields,
+         (SELECT COUNT(*) FROM agent_claims c
+           WHERE c.agent_id = a.id AND c.status = 'verified') AS verified_claims
+    FROM agents a
+    LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+   WHERE a.id = ?`;
+
 /** Owner lock: `claimed_at` OR a verified row in agent_claims — same
  * two-source check as the url-write sibling's isOwnerLocked (that route's
- * own header documents the production gap a claimed_at-only check missed). */
-function isOwnerLocked(s: LockSnapshot): boolean {
+ * own header documents the production gap a claimed_at-only check missed).
+ * Structural param type — shared by BOTH the description and about
+ * LockSnapshot shapes above, which both carry these two fields. */
+function isOwnerLocked(s: { claimed_at: string | null; verified_claims: number }): boolean {
   return !!s.claimed_at || (s.verified_claims ?? 0) > 0;
 }
 
-/** True iff curated_fields locks the description field. Malformed/missing
- * JSON is treated as unlocked, same defensive parse as the url-write sibling. */
-export function isDescriptionCurated(curatedFieldsJson: string | null | undefined): boolean {
+/** True iff curated_fields locks the given field name (`description` or
+ * `about`). Malformed/missing JSON is treated as unlocked, same defensive
+ * parse as the url-write sibling. */
+export function isFieldCurated(
+  curatedFieldsJson: string | null | undefined,
+  fieldName: "description" | "about",
+): boolean {
   if (!curatedFieldsJson) return false;
   try {
     const parsed = JSON.parse(curatedFieldsJson);
     if (!parsed || typeof parsed !== "object") return false;
-    return !!(parsed as Record<string, unknown>)["description"];
+    return !!(parsed as Record<string, unknown>)[fieldName];
   } catch {
     return false;
   }
+}
+
+/** Thin `description`-specific wrapper over isFieldCurated — kept as its own
+ * named export since existing call sites/tests already reference this name. */
+export function isDescriptionCurated(curatedFieldsJson: string | null | undefined): boolean {
+  return isFieldCurated(curatedFieldsJson, "description");
 }
 
 /**
@@ -213,6 +268,46 @@ function applyDescriptionSweep(
   }
 }
 
+/**
+ * Clean ONE agent's `about` (agent_knowledge.about) — same discipline as
+ * applyDescriptionSweep above (fresh re-read of both locks + the current
+ * value, inside its own transaction, one agent_knowledge_audit row per
+ * change), with the ONE value-rule difference this dev-request calls out:
+ * `about` is nullable, so the cleaned value is SQL NULL, not `''`.
+ */
+function applyAboutSweep(
+  agentId: string,
+  reason: string,
+  batchTag: string,
+): { outcome: ItemOutcome; oldValue?: string | null; detail?: string } {
+  const db = db_();
+  try {
+    const tx = db.transaction((): { outcome: ItemOutcome; oldValue?: string | null; detail?: string } => {
+      const cur = db.prepare(ABOUT_LOCK_SNAPSHOT_SQL).get(agentId) as AboutLockSnapshot | undefined;
+      if (!cur) return { outcome: "not_found" };
+      if (isOwnerLocked(cur)) return { outcome: "skipped_claimed", oldValue: cur.about };
+      if (isFieldCurated(cur.curated_fields, "about")) return { outcome: "skipped_curated", oldValue: cur.about };
+      // Re-check the detector against the FRESH value too — same rationale
+      // as applyDescriptionSweep's own re-check comment above.
+      if (!looksLikeCodeArtifact(cur.about)) {
+        return { outcome: "skipped_unchanged", oldValue: cur.about };
+      }
+
+      db.prepare(`UPDATE agent_knowledge SET about = NULL WHERE agent_id = ?`).run(agentId);
+      db.prepare(
+        `INSERT INTO agent_knowledge_audit
+           (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+         VALUES (?, ?, 'about', ?, NULL, 'system', NULL, datetime('now'), ?)`,
+      ).run(randomUUID(), agentId, cur.about, `${batchTag}: ${reason}`);
+
+      return { outcome: "written", oldValue: cur.about };
+    });
+    return tx();
+  } catch (e: any) {
+    return { outcome: "error", detail: e?.message ?? String(e) };
+  }
+}
+
 router.post("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -233,21 +328,44 @@ router.post("/", (req: Request, res: Response) => {
   const candidatesConsidered = candidates.length;
   const batch = candidates.slice(0, DESCRIPTION_SWEEP_MAX_ITEMS);
 
+  // ── Second scan: `agent_knowledge.about` (dev-request 2026-08-25-agent-
+  // knowledge-about-code-artifact-gap) — same full-catalog-scan discipline,
+  // mirrored onto the sibling column, kept as its own separate candidate set
+  // (see this file's header comment for why the response keys stay split
+  // rather than merged into the description counts above). LEFT JOIN means
+  // an agent with no agent_knowledge row at all naturally scans as
+  // `about: null`, which looksLikeCodeArtifact() already treats as
+  // non-junk — no special-casing needed here.
+  const allAboutRows = db
+    .prepare(
+      `SELECT a.id AS id, a.name AS name, k.about AS about
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        ORDER BY a.id ASC`,
+    )
+    .all() as AboutCandidateRow[];
+  const aboutScanned = allAboutRows.length;
+  const aboutCandidates = allAboutRows.filter((r) => looksLikeCodeArtifact(r.about));
+  const aboutCandidatesConsidered = aboutCandidates.length;
+  const aboutBatch = aboutCandidates.slice(0, DESCRIPTION_SWEEP_MAX_ITEMS);
+
   // ── Enrichment write-pause gate (dev-request 2026-08-20-enrichment-write-
   // pause-mekanisk-gjerde; wired in here per round-2 review finding 3) ──────
   // Same discipline as the url-write sibling's own gate
   // (admin-agents-url-write.ts:276-301): fails CLOSED, blocks the WHOLE
   // request (never a per-item outcome) so a paused catalog performs ZERO
   // writes, and runs unconditionally — BEFORE the apply/dry-run branch below
-  // — same as the sibling gates regardless of dry-run. Scoped to exactly
-  // `batch`, the rows this call could actually write (candidates beyond the
-  // per-call cap can never be written by THIS call, so they can't need to
-  // gate it); an empty batch still resolves to the default vertical ('rfb'),
-  // same as an empty `items` array does on the url-write sibling.
+  // — same as the sibling gates regardless of dry-run. Scoped to the UNION of
+  // both candidate batches (description AND about — both are producer-
+  // content writes this pause exists to stop mid-incident); candidates
+  // beyond either per-call cap can never be written by THIS call, so they
+  // can't need to gate it. An empty batch still resolves to the default
+  // vertical ('rfb'), same as an empty `items` array does on the url-write
+  // sibling.
   {
     const pauseBlock = enrichmentWritePauseBlockForAgents(
       db_,
-      batch.map((c) => c.id),
+      [...batch.map((c) => c.id), ...aboutBatch.map((c) => c.id)],
     );
     if (pauseBlock) {
       res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
@@ -295,6 +413,35 @@ router.post("/", (req: Request, res: Response) => {
     return acc;
   }, {});
 
+  // ── `about` apply/dry-run pass — same batchTag/reason, own result set ────
+  const aboutResults: ResultItem[] = [];
+  if (dryRun) {
+    for (const c of aboutBatch) {
+      aboutResults.push({
+        agent_id: c.id,
+        name: c.name,
+        outcome: "would_write",
+        old_value_preview: previewValue(c.about),
+      });
+    }
+  } else {
+    for (const c of aboutBatch) {
+      const w = applyAboutSweep(c.id, reason, batchTag);
+      aboutResults.push({
+        agent_id: c.id,
+        name: c.name,
+        outcome: w.outcome,
+        old_value_preview: previewValue(w.oldValue ?? c.about),
+        ...(w.detail ? { detail: w.detail } : {}),
+      });
+    }
+  }
+
+  const aboutCounts = aboutResults.reduce<Record<string, number>>((acc, r) => {
+    acc[r.outcome] = (acc[r.outcome] ?? 0) + 1;
+    return acc;
+  }, {});
+
   res.json({
     success: true,
     dry_run: dryRun,
@@ -304,6 +451,16 @@ router.post("/", (req: Request, res: Response) => {
     batch_size: batch.length,
     counts,
     results,
+    // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap: the
+    // `about` pass's own counts/results, deliberately NOT merged into the
+    // keys above (see this file's header comment) so the description-only
+    // response shape existing callers/tests already rely on stays
+    // byte-for-byte unchanged.
+    about_scanned: aboutScanned,
+    about_candidates_considered: aboutCandidatesConsidered,
+    about_batch_size: aboutBatch.length,
+    about_counts: aboutCounts,
+    about_results: aboutResults,
   });
 });
 

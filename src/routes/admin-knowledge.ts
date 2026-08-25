@@ -606,7 +606,24 @@ router.put("/", (req: Request, res: Response) => {
   // of the existing knowledge-service.upsertKnowledge merge — `undefined`
   // preserves, explicit value overwrites).
   const columnUpdates: { col: string; val: unknown }[] = [];
-  if (typeof body.about === "string") columnUpdates.push({ col: "about", val: body.about });
+  if (typeof body.about === "string") {
+    // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap:
+    // `agent_knowledge.about` is `agents.description`'s sibling field (same
+    // "producer description" role, always read/written in pairs elsewhere in
+    // the codebase) but had ZERO validation here — #706 gated `description`
+    // below (see the `looksLikeCodeArtifact(body.description)` check further
+    // down this handler) and never touched this column. Same check, same
+    // error shape, same reject-before-any-write posture, mirrored onto
+    // `about`. This is the exact write path (`PUT /admin/knowledge`, the
+    // endpoint `lokal-agent-enrichment` PUTs into) that let the real live
+    // Helios Trondheim Squarespace-JS artifact land in `about` even after
+    // #706 shipped.
+    if (looksLikeCodeArtifact(body.about)) {
+      res.status(400).json({ error: "about contains code/script artifacts — rejected" });
+      return;
+    }
+    columnUpdates.push({ col: "about", val: body.about });
+  }
   if (typeof body.address === "string") columnUpdates.push({ col: "address", val: body.address });
   if (typeof body.phone === "string") columnUpdates.push({ col: "phone", val: body.phone });
   if (typeof body.email === "string") columnUpdates.push({ col: "email", val: body.email });
@@ -1611,8 +1628,26 @@ homepageContentRefreshRouter.post(
           `${primaryHtml}\n${contentText}`,
         );
         if (substantiation.substantiated) {
-          candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
-          candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+          // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap
+          // (round-3 finding from #706 that was identified but never actually
+          // fixed before that PR merged): both candidates below derive from
+          // the SAME `aboutSummary` value, so one check gates both — a
+          // code-artifact `aboutSummary` (e.g. scraped Squarespace bootstrap
+          // JS, the real live Helios Trondheim defect) must produce NEITHER
+          // the `about` nor the `description` candidate, same as if
+          // summarizeAbout had returned nothing at all.
+          if (looksLikeCodeArtifact(aboutSummary)) {
+            skippedUnsubstantiated.push({
+              agent_id: agentId,
+              reason: "about/description candidate looks like a scraped code/script artifact",
+            });
+            console.log(
+              `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like scraped code/script artifact (${fetchUrl})`,
+            );
+          } else {
+            candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
+            candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+          }
         } else {
           skippedUnsubstantiated.push({ agent_id: agentId, reason: substantiation.reason });
           console.log(

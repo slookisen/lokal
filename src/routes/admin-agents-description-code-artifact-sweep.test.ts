@@ -479,6 +479,167 @@ export function runAdminAgentsDescriptionCodeArtifactSweepTests(
       }
     }
 
+    // ─── Section E: `agent_knowledge.about` pass — dev-request 2026-08-25-
+    // agent-knowledge-about-code-artifact-gap. Own isolated DB, mirrors
+    // Section A's fixtures for `about`, plus the cross-contamination and
+    // both-columns-bad cases the byggspec explicitly calls out. ───────────
+    {
+      const db = new Database(":memory:");
+      try {
+        initMod.__initSchemaForTesting(db as any);
+
+        const insertAgent = db.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, claimed_at)
+           VALUES (?, ?, ?, 'test', 'post@example.no', 'https://example.no', 'producer', ?, 'rfb', ?)`,
+        );
+        const insertKnowledge = db.prepare(
+          `INSERT INTO agent_knowledge (agent_id, about, curated_fields) VALUES (?, ?, ?)`,
+        );
+
+        // (1) about-only bad row: description is clean, about is junk.
+        insertAgent.run("about-only", "About Only AS", NORMAL_DESC, "key-about-only", null);
+        insertKnowledge.run("about-only", SQUARESPACE_JUNK, "{}");
+
+        // (2) description-only bad row (about clean) — proves the about pass
+        // does not accidentally pick up or duplicate the description pass's
+        // own candidates.
+        insertAgent.run("desc-only", "Desc Only AS", SQUARESPACE_JUNK, "key-desc-only", null);
+        insertKnowledge.run("desc-only", NORMAL_DESC, "{}");
+
+        // (3) BOTH columns bad on the SAME row — each must get written
+        // independently with its OWN audit row (field_name 'about' vs
+        // 'description'), no cross-contamination between the two columns
+        // on one agent.
+        insertAgent.run("both-bad", "Both Bad AS", SQUARESPACE_JUNK, "key-both-bad", null);
+        insertKnowledge.run("both-bad", SQUARESPACE_JUNK, "{}");
+
+        // (4) about claimed_at row lock.
+        insertAgent.run("about-claimed", "About Claimed AS", NORMAL_DESC, "key-about-claimed", "2026-01-01T00:00:00.000Z");
+        insertKnowledge.run("about-claimed", SQUARESPACE_JUNK, "{}");
+
+        // (5) curated_fields locks `about` specifically (description
+        // untouched/clean — proves the two curated-field locks are
+        // independent, not one shared lock).
+        insertAgent.run("about-curated", "About Curated AS", NORMAL_DESC, "key-about-curated", null);
+        insertKnowledge.run("about-curated", SQUARESPACE_JUNK, JSON.stringify({ about: { by: "owner" } }));
+
+        // (6) a normal, non-junk about — must NEVER be a candidate.
+        insertAgent.run("about-clean", "About Clean AS", NORMAL_DESC, "key-about-clean", null);
+        insertKnowledge.run("about-clean", NORMAL_DESC, "{}");
+
+        // (7) about is NULL (no junk at all, the common case) — must never
+        // be a candidate (looksLikeCodeArtifact(null) === false).
+        insertAgent.run("about-null", "About Null AS", NORMAL_DESC, "key-about-null", null);
+        insertKnowledge.run("about-null", null, "{}");
+
+        delete require.cache[require.resolve("./admin-agents-description-code-artifact-sweep")];
+        const routeMod = require("./admin-agents-description-code-artifact-sweep");
+        const router = routeMod.default;
+        routeMod.__setDescriptionSweepDbForTesting(db as any);
+
+        function post(body: any, key: string | false = testKey, query?: Record<string, string>): Promise<RouteResult> {
+          const headers: Record<string, string> = {};
+          if (key !== false) headers["x-admin-key"] = key;
+          return callRoute(router, { method: "POST", url: "/", headers, body, query });
+        }
+        const APPLY = { apply: "1" };
+        function aboutOf(id: string): string | null {
+          const row = db.prepare(`SELECT about FROM agent_knowledge WHERE agent_id = ?`).get(id) as { about: string | null } | undefined;
+          return row?.about ?? null;
+        }
+        function descOf(id: string): string | null {
+          const row = db.prepare(`SELECT description FROM agents WHERE id = ?`).get(id) as { description: string } | undefined;
+          return row?.description ?? null;
+        }
+        function auditFor(id: string) {
+          return db
+            .prepare(
+              `SELECT field_name, old_value, new_value, changed_by, notes
+                 FROM agent_knowledge_audit WHERE agent_id = ? ORDER BY field_name`,
+            )
+            .all(id) as Array<{ field_name: string; old_value: string | null; new_value: string | null; changed_by: string; notes: string | null }>;
+        }
+        function aboutResultFor(body: any, agentId: string): any {
+          return (body?.about_results ?? []).find((r: any) => r.agent_id === agentId);
+        }
+        function descResultFor(body: any, agentId: string): any {
+          return (body?.results ?? []).find((r: any) => r.agent_id === agentId);
+        }
+
+        // ── dry-run: about-only + both-bad show up in about_results;
+        // desc-only shows up ONLY in results (description), not about_results. ──
+        let r = await post({});
+        assertEq(r.body?.dry_run, true, "dsa-01: dry-run by default");
+        assertEq(aboutResultFor(r.body, "about-only")?.outcome, "would_write", "dsa-02: about-only row -> would_write in about_results");
+        assertEq(descResultFor(r.body, "about-only"), undefined, "dsa-03: about-only row does NOT appear in the description results (description is clean)");
+        assertEq(aboutResultFor(r.body, "desc-only"), undefined, "dsa-04: desc-only row does NOT appear in about_results (about is clean)");
+        assertEq(descResultFor(r.body, "desc-only")?.outcome, "would_write", "dsa-05: desc-only row -> would_write in description results");
+        assertEq(aboutResultFor(r.body, "both-bad")?.outcome, "would_write", "dsa-06: both-bad row -> would_write in about_results");
+        assertEq(descResultFor(r.body, "both-bad")?.outcome, "would_write", "dsa-07: both-bad row ALSO would_write in description results — independent candidates");
+        assertEq(aboutResultFor(r.body, "about-clean"), undefined, "dsa-08: a normal about is never a candidate");
+        assertEq(aboutResultFor(r.body, "about-null"), undefined, "dsa-09: a NULL about is never a candidate");
+        assertEq(aboutOf("about-only"), SQUARESPACE_JUNK, "dsa-10: dry-run left the about column untouched");
+
+        // ── apply: everything eligible gets written, each with its OWN
+        // audit row; locks respected independently. ─────────────────────
+        r = await post({ reason: "about-sweep-test" }, testKey, APPLY);
+        assertEq(r.body?.dry_run, false, "dsa-11: apply=1 turns off dry-run");
+
+        // (1) about-only: about nulled, description untouched.
+        assertEq(aboutResultFor(r.body, "about-only")?.outcome, "written", "dsa-12: about-only -> written");
+        assertEq(aboutOf("about-only"), null, "dsa-13: about CLEARED TO NULL (agent_knowledge.about is nullable, unlike agents.description)");
+        assertEq(descOf("about-only"), NORMAL_DESC, "dsa-14: description column untouched (it was never junk)");
+        const auditAboutOnly = auditFor("about-only");
+        assertEq(auditAboutOnly.length, 1, "dsa-15: exactly one audit row for about-only");
+        assertEq(auditAboutOnly[0]?.field_name, "about", "dsa-16: audit names the RIGHT column (about, not description)");
+        assertEq(auditAboutOnly[0]?.old_value, SQUARESPACE_JUNK, "dsa-17: audit preserves the FULL old about value (reversible)");
+        assertEq(auditAboutOnly[0]?.new_value, null, "dsa-18: audit records new_value NULL (not empty string — about is nullable)");
+        assertTrue((auditAboutOnly[0]?.notes ?? "").includes("about-sweep-test"), "dsa-19: audit notes carry the caller's reason");
+
+        // (2) desc-only: description cleared to '', about untouched — proves
+        // no cross-contamination the OTHER direction (description sweep
+        // does not touch a clean about column).
+        assertEq(descOf("desc-only"), "", "dsa-20: desc-only description cleared to ''");
+        assertEq(aboutOf("desc-only"), NORMAL_DESC, "dsa-21: desc-only's about column untouched (it was never junk)");
+        const auditDescOnly = auditFor("desc-only");
+        assertEq(auditDescOnly.length, 1, "dsa-22: exactly one audit row for desc-only");
+        assertEq(auditDescOnly[0]?.field_name, "description", "dsa-23: audit names 'description' for the desc-only row");
+
+        // (3) both-bad: BOTH columns cleaned, TWO independent audit rows.
+        assertEq(aboutOf("both-bad"), null, "dsa-24: both-bad's about cleared to NULL");
+        assertEq(descOf("both-bad"), "", "dsa-25: both-bad's description cleared to ''");
+        const auditBothBad = auditFor("both-bad");
+        assertEq(auditBothBad.length, 2, "dsa-26: exactly TWO audit rows for both-bad (one per column)");
+        assertEq(auditBothBad.map((a) => a.field_name).sort(), ["about", "description"], "dsa-27: the two audit rows are for 'about' and 'description' respectively");
+        assertEq(auditBothBad.find((a) => a.field_name === "about")?.old_value, SQUARESPACE_JUNK, "dsa-28: both-bad's about audit carries the full old about value");
+        assertEq(auditBothBad.find((a) => a.field_name === "description")?.old_value, SQUARESPACE_JUNK, "dsa-29: both-bad's description audit carries the full old description value");
+
+        // (4) about claimed_at lock.
+        assertEq(aboutResultFor(r.body, "about-claimed")?.outcome, "skipped_claimed", "dsa-30: claimed_at row skipped for about");
+        assertEq(aboutOf("about-claimed"), SQUARESPACE_JUNK, "dsa-31: claimed row's about untouched");
+        assertEq(auditFor("about-claimed").length, 0, "dsa-32: claimed row wrote no audit for about");
+
+        // (5) about curated_fields lock — description's OWN curated lock is
+        // independent (this row's description was never junk anyway, so
+        // nothing to prove there beyond dsa-08/09 above already covering a
+        // clean description on other rows).
+        assertEq(aboutResultFor(r.body, "about-curated")?.outcome, "skipped_curated", "dsa-33: curated about skipped");
+        assertEq(aboutOf("about-curated"), SQUARESPACE_JUNK, "dsa-34: curated row's about untouched");
+      } finally {
+        try {
+          const routeMod = require("./admin-agents-description-code-artifact-sweep");
+          routeMod.__setDescriptionSweepDbForTesting(null);
+        } catch {
+          /* ignore */
+        }
+        try {
+          db.close();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
     if (setKeyOurselves) delete process.env.ADMIN_KEY;
 
     return { passed, failed, failures };
