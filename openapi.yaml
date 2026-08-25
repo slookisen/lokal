@@ -403,6 +403,30 @@ paths:
           description: Place not found
         "400":
           description: Missing place parameter
+  /api/marketplace/catalog/acp-feed.csv:
+    get:
+      operationId: getAcpProductFeed
+      summary: ACP product feed (CSV)
+      description: >-
+        RFB-only, ACP-conformant (OpenAI Agentic Commerce Protocol, non-Ads)
+        CSV product feed of verified, in-stock, non-umbrella producers'
+        products, so they can be discovered in ChatGPT shopping surfaces.
+        Discovery-only — no checkout/payment integration
+        (is_eligible_checkout is always "false"). Reuses the same
+        filter/source as the JSON feed at /api/marketplace/catalog/feed.
+        Rows missing a required field (image_url or price) are skipped; the
+        count skipped is reported in the X-Acp-Feed-Skipped-Count response
+        header.
+      responses:
+        "200":
+          description: CSV product feed
+          content:
+            text/csv:
+              schema:
+                type: string
+              example: |
+                item_id,title,description,brand,url,image_url,price,availability,is_eligible_search,is_eligible_checkout,target_countries,product_category
+                prod-123,Økologiske Poteter,Ferske poteter fra gården,Åsen Gård,https://rettfrabonden.com/produsent/asen-gard,https://rettfrabonden.com/images/poteter.jpg,275.00 NOK,in_stock,true,false,NO,grønnsaker
   /api/stats:
     get:
       operationId: getPlatformStats

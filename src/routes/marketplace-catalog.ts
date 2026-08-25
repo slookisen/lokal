@@ -5,6 +5,7 @@
 // Endpoints:
 //   POST  /admin/products/backfill          — admin-only; upsert from agent_knowledge
 //   GET   /api/marketplace/catalog/feed     — public ACP feed (verified producers)
+//   GET   /api/marketplace/catalog/acp-feed.csv — public ACP non-Ads CSV product feed
 //   GET   /api/marketplace/catalog/agents/:id/products — public per-agent product list
 //
 // Route-path collision analysis (checked against src/routes/marketplace.ts):
@@ -272,6 +273,116 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
   }));
 
   res.json({ success: true, count: items.length, total, items });
+});
+
+// ─── RFC4180 CSV field escaping ───────────────────────────────────────────────
+// Wrap in double-quotes if the field contains a comma, a double-quote, or a
+// newline (\n / \r); any double-quote inside such a field is doubled ("→"").
+function escapeCsvField(value: string): string {
+  if (/[",\n\r]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/marketplace/catalog/acp-feed.csv
+// Public — no auth. OpenAI Agentic Commerce Protocol (ACP) non-Ads product
+// feed, CSV format, so RFB producers' products can be discovered in ChatGPT
+// shopping surfaces. Discovery-only — no checkout/payment (is_eligible_checkout
+// is always "false").
+//
+// Reuses the EXACT same filter/source as GET /feed above (same JOINs, same
+// WHERE clause) — this is a pure output-format addition, not a new query.
+// dev-request 2026-08-24-acp-produktfeed-rfb.
+// ────────────────────────────────────────────────────────────────────────────
+catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
+  const db = getDb();
+
+  const rows = db.prepare(`
+    SELECT
+      p.id,
+      p.name,
+      p.description,
+      p.price_nok,
+      p.currency,
+      p.availability,
+      p.availability_updated_at,
+      p.availability_source,
+      p.category,
+      p.image_url,
+      a.name AS agent_name
+    FROM products p
+    INNER JOIN agents a ON a.id = p.agent_id
+    INNER JOIN agent_knowledge k ON k.agent_id = p.agent_id
+    WHERE p.availability = 'in_stock'
+      AND a.umbrella_type IS NULL
+      AND k.verification_status = 'verified'
+      AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
+    ORDER BY p.updated_at DESC, p.id
+  `).all() as Array<{
+    id: string;
+    name: string;
+    description: string | null;
+    price_nok: number | null;
+    currency: string;
+    availability: string;
+    availability_updated_at: string | null;
+    availability_source: string;
+    category: string | null;
+    image_url: string | null;
+    agent_name: string;
+  }>;
+
+  const header = [
+    "item_id", "title", "description", "brand", "url", "image_url",
+    "price", "availability", "is_eligible_search", "is_eligible_checkout",
+    "target_countries", "product_category",
+  ];
+
+  const now = new Date();
+  let skippedMissingRequired = 0;
+  const lines: string[] = [header.join(",")];
+
+  for (const r of rows) {
+    // Required-field skip guard: image_url and price_nok are nullable
+    // columns. A row missing either is excluded entirely (telemetry-only,
+    // not an error).
+    if (!r.image_url || r.price_nok == null) {
+      skippedMissingRequired++;
+      continue;
+    }
+
+    const title = r.name.slice(0, 150);
+    const description = (r.description ?? "").slice(0, 5000);
+    const brand = r.agent_name.slice(0, 70);
+    const url = `${BASE_URL}/produsent/${slugify(r.agent_name)}`;
+    const price = `${r.price_nok.toFixed(2)} ${r.currency}`;
+    const availability = computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now);
+    const productCategory = r.category ?? "";
+
+    const fields = [
+      r.id,
+      title,
+      description,
+      brand,
+      url,
+      r.image_url,
+      price,
+      availability,
+      "true",
+      "false",
+      "NO",
+      productCategory,
+    ];
+
+    lines.push(fields.map(f => escapeCsvField(String(f))).join(","));
+  }
+
+  res.header("Content-Type", "text/csv; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.header("X-Acp-Feed-Skipped-Count", String(skippedMissingRequired));
+  res.send(lines.join("\r\n") + "\r\n");
 });
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -1197,6 +1197,13 @@ class MarketplaceRegistry {
           status: "live",
           description: "Agenstry A2A agent directory — auto-indexed from agent-card.json. 1,750+ agents indexed; drift-monitored.",
         },
+        {
+          channel: "acp-product-feed",
+          url: `${baseUrl}/api/marketplace/catalog/acp-feed.csv`,
+          install: `${baseUrl}/api/marketplace/catalog/acp-feed.csv`,
+          status: "live",
+          description: "ACP-conformant (OpenAI Agentic Commerce Protocol, non-Ads) CSV product feed for ChatGPT Shopping discovery — RFB-only, discovery-only (no checkout).",
+        },
       ],
 
       // ─── Lokal-specific metadata ───────────────────────────
