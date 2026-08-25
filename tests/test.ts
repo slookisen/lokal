@@ -31458,6 +31458,62 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of essc.failures) failures.push("experiences-seo-site-chrome: " + f);
     console.log(`  experiences-seo-site-chrome: ${essc.passed} passed, ${essc.failed} failed`);
 
+    // dev-request 2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering:
+    // extends the rfb-only PWA rollout (dev-request 2026-07-04-app-strategi-
+    // pwa, PRs #225/#245) to opplevagent.no — favicon-192/512.png routes on
+    // both rettfrabonden.com and opplevagent.no, plus a full PWA (manifest +
+    // service worker + install-prompt + page-shell head tags) on
+    // opplevagent.no. Covers the new /favicon-192.png, /favicon-512.png,
+    // /manifest.json, /sw.js, /install-prompt.js, /offline.html routes in
+    // experiences-seo.ts, plus the pwaHeadTags() regression guard on a
+    // sample of page shells (homepage, kategori, opplevelse-detail,
+    // produsent-profil). Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block.
+    console.log("\n── experiences-seo-pwa: opplevagent.no PWA (manifest/sw/install-prompt/icons) ──");
+    const { runExperiencesSeoPwaTests } = require("../src/routes/experiences-seo-pwa.test") as
+      typeof import("../src/routes/experiences-seo-pwa.test");
+    const espwa = await runExperiencesSeoPwaTests({ log: false });
+    passed += espwa.passed;
+    failed += espwa.failed;
+    for (const f of espwa.failures) failures.push("experiences-seo-pwa: " + f);
+    console.log(`  experiences-seo-pwa: ${espwa.passed} passed, ${espwa.failed} failed`);
+
+    // dev-request 2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering
+    // (continued): src/public/opplevagent-sw.test.ts and
+    // opplevagent-install-prompt.test.ts pin opplevagent-sw.js/
+    // opplevagent-offline.html/opplevagent-install-prompt.js — same file/
+    // source checks as the rfb sw.test.ts/install-prompt.test.ts pair
+    // (~line 900/943 above), just for the opplevagent files. Deliberately
+    // run HERE (inside this already-tracked gated block) rather than as
+    // their own top-level promise + ad-hoc-barrier entries like the rfb
+    // pair: these two files need no DB and no real server (unlike the rfb
+    // pair's express.static HTTP smoke test — the opplevagent files' HTTP
+    // reachability is already covered above by experiences-seo-pwa.test.ts
+    // driving the real router), so there is no independent async work here
+    // worth its own promise-plumbing.
+    console.log("\n── opplevagent-sw + opplevagent-offline.html (PWA service worker, opplevagent) ──");
+    const { runOpplevagentServiceWorkerTests, runOpplevagentServiceWorkerHttpTests } = require("../src/public/opplevagent-sw.test") as
+      typeof import("../src/public/opplevagent-sw.test");
+    const oasw = runOpplevagentServiceWorkerTests({ log: false });
+    passed += oasw.passed;
+    failed += oasw.failed;
+    for (const f of oasw.failures) failures.push("opplevagent-sw: " + f);
+    console.log(`  opplevagent-sw: ${oasw.passed} passed, ${oasw.failed} failed`);
+    const oaswHttp = await runOpplevagentServiceWorkerHttpTests({ log: false });
+    passed += oaswHttp.passed;
+    failed += oaswHttp.failed;
+    for (const f of oaswHttp.failures) failures.push("opplevagent-sw-http: " + f);
+    console.log(`  opplevagent-sw-http: ${oaswHttp.passed} passed, ${oaswHttp.failed} failed`);
+
+    console.log("── opplevagent-install-prompt: beforeinstallprompt install-button UX (opplevagent) ──");
+    const { runOpplevagentInstallPromptTests } = require("../src/public/opplevagent-install-prompt.test") as
+      typeof import("../src/public/opplevagent-install-prompt.test");
+    const oaip = await runOpplevagentInstallPromptTests({ log: false });
+    passed += oaip.passed;
+    failed += oaip.failed;
+    for (const f of oaip.failures) failures.push("opplevagent-install-prompt: " + f);
+    console.log(`  opplevagent-install-prompt: ${oaip.passed} passed, ${oaip.failed} failed`);
+
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 7
     // (fylkesblokk-kompaktering): max-width:560px media query compacting the
     // homepage "Utforsk etter fylke" grid to 2 columns on mobile (same

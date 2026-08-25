@@ -715,6 +715,8 @@ function portalShell(title: string, body: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="/favicon-192.png" sizes="192x192" type="image/png">
+  <link rel="icon" href="/favicon-512.png" sizes="512x512" type="image/png">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#2D5016">
   <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>

@@ -891,6 +891,8 @@ router.get(["/privacy", "/privacy-policy"], (_req: Request, res: Response) => {
 <html lang="no">
 <head>
 <meta charset="utf-8">
+<link rel="icon" href="/favicon-192.png" sizes="192x192" type="image/png">
+<link rel="icon" href="/favicon-512.png" sizes="512x512" type="image/png">
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#2D5016">
 <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
@@ -1023,6 +1025,8 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <meta name="description" content="Terms of Service for ${getConfig().display_name} (rettfrabonden.com) — A2A marketplace for local food in Norway.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" href="/favicon-192.png" sizes="192x192" type="image/png">
+<link rel="icon" href="/favicon-512.png" sizes="512x512" type="image/png">
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#2D5016">
 <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
