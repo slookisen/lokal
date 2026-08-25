@@ -1,5 +1,17 @@
 # Opplevagent — Claude Desktop connector submission checklist
 
+> **Re-verified 2026-08-24:** the REMOTE endpoint (`https://opplevagent.no/mcp`) now
+> exposes **5 tools** — the 3 below plus `discover_gardssalg` and `book_gardssalg` —
+> all with `title` + `readOnlyHint`/`destructiveHint` annotations (the Claude
+> directory's hard requirement, already satisfied). The npm stdio package
+> (`opplevagent-mcp@0.1.0`) still registers only the original 3; parity is filed as
+> dev-request `2026-08-24-opplevagent-npm-stdio-paritet`. A **directory submission
+> describes the remote server**, so use the 5-tool list there; this DXT manifest
+> describes the local stdio package and stays at 3 tools until the npm fix ships.
+> Note also: remote-server directory submissions go through the claude.ai submission
+> portal (requires a Team/Enterprise org); the DXT/.mcpb desktop-extension form is
+> separate and does NOT require an org.
+
 ## What's ready
 
 - **Remote MCP endpoint (streamable-http):** `https://opplevagent.no/mcp`

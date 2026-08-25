@@ -2800,6 +2800,29 @@ router.get("/.well-known/agents.txt", serveAgentsTxt);
 router.get("/agents.txt", serveAgentsTxt);
 
 // ═══════════════════════════════════════════════════════════
+// GET /.well-known/openai-apps-challenge — OpenAI Apps Directory
+//
+// WHY: OpenAI's Apps Directory submission requires a static-string
+// domain-verification endpoint at this exact path — token bytes as
+// the literal response body (no JSON wrapper, no whitespace). Same
+// pattern as rettfrabonden.com (discovery.ts, PR-99). Without this
+// route the trailing router.use() catch-all below answers the path
+// with the SPA-fallback HTML and a 404, and OpenAI's domain
+// verification for the Opplevagent app fails (measured 2026-08-24).
+// ═══════════════════════════════════════════════════════════════
+
+// Issued by the OpenAI Apps form at the Opplevagent app's MCP/domain-
+// verification step (2026-08-25).
+const OPENAI_APPS_CHALLENGE_TOKEN = "4jYu5lciublhwHxBSXCP9bmTyrke4k1f4xioIEsH5Ng";
+
+router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) => {
+  res.header("Content-Type", "text/plain");
+  res.header("Cache-Control", "public, max-age=300");
+  res.header("X-Content-Type-Options", "nosniff");
+  res.send(OPENAI_APPS_CHALLENGE_TOKEN);
+});
+
+// ═══════════════════════════════════════════════════════════
 // GET /.well-known/agent-card.json — A2A Agent Card (Opplevagent)
 // ═══════════════════════════════════════════════════════════
 
