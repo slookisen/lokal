@@ -1,10 +1,19 @@
 /**
- * sw.js — service worker for rettfrabonden.com (rfb host only).
+ * opplevagent-sw.js — service worker for opplevagent.no (experiences host).
  *
- * dev-request 2026-07-04-app-strategi-pwa, slice 2 of 3: service worker +
- * offline shell. Conservative cache strategy — this is NOT a full offline-app
- * cache, just enough to survive a flaky connection and show a branded offline
- * page instead of the browser's default error screen.
+ * dev-request 2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering: extends
+ * the already-shipped rfb-only PWA rollout (dev-request
+ * 2026-07-04-app-strategi-pwa, slice 2 of 3, PRs #225/#245 — see
+ * src/public/sw.js) to the opplevagent.no host. Structurally a close mirror
+ * of src/public/sw.js — same shouldBypass/install/activate/fetch logic,
+ * copied rather than reinvented — with only CACHE_VERSION and APP_SHELL
+ * changed for this host's own assets.
+ *
+ * Served via GET /sw.js from src/routes/experiences-seo.ts (this file is
+ * NOT reachable through express.static — the opplevagent.no host-gate in
+ * src/index.ts routes every non-API path into experiencesSeoRouter before
+ * express.static is ever mounted, so the route explicitly res.sendFile()s
+ * this file — see the route's own doc comment).
  *
  *  - install:  precache a small "app shell" (manifest, icons, favicon, the
  *              /offline.html fallback page) under a VERSIONED cache name.
@@ -24,31 +33,27 @@
  *        a network fallback, opportunistically re-caching successful GETs
  *        so repeat visits are fast.
  *
- * Registered only on the rfb host — see the inline registration script
- * added next to <link rel="manifest"> in app.html / selger.html /
- * dashboard.html / agent.html / seo.ts's shell() / conversation-ui.ts's
- * chatShell() / owner-portal.ts's portalShell() / discovery.ts's
- * privacy+terms pages. Dental (finn-tannlege.com) and experiences
- * (opplevagent.no) are excluded there.
+ * Registered only on the opplevagent.no host — see pwaHeadTags() in
+ * src/routes/experiences-seo.ts, which registers it unconditionally (this
+ * file only ever renders for opplevagent.no, so — unlike src/public/sw.js's
+ * rfb registration script — no hostname-exclusion regex is needed here).
  *
  * Isomorphic-ish for testability: the guard/precache-list logic is exported
- * via `module.exports` when running under Node (e.g. src/public/sw.test.ts),
- * and the actual `self.addEventListener(...)` registrations are skipped
- * outside a real service-worker global scope, so `require()`-ing this file
- * in a test never throws on a missing `self`/`caches`.
+ * via `module.exports` when running under Node (e.g.
+ * src/public/opplevagent-sw.test.ts), and the actual
+ * `self.addEventListener(...)` registrations are skipped outside a real
+ * service-worker global scope, so `require()`-ing this file in a test never
+ * throws on a missing `self`/`caches`.
  */
 
-const CACHE_VERSION = "rfb-pwa-v1";
+const CACHE_VERSION = "opplevagent-pwa-v1";
 
 // Small, rarely-changing "app shell" — precached on install.
 const APP_SHELL = [
   "/manifest.json",
-  "/logo-200.png",
-  "/logo-512.png",
   "/favicon-192.png",
   "/favicon-512.png",
   "/favicon.svg",
-  "/favicon.ico",
   "/offline.html",
 ];
 

@@ -88,6 +88,8 @@ export function runServiceWorkerTests(opts: { log?: boolean } = {}): TestSummary
       assertTrue(mod.APP_SHELL.includes("/manifest.json"), "APP_SHELL precaches /manifest.json");
       assertTrue(mod.APP_SHELL.includes("/logo-200.png"), "APP_SHELL precaches /logo-200.png");
       assertTrue(mod.APP_SHELL.includes("/logo-512.png"), "APP_SHELL precaches /logo-512.png");
+      assertTrue(mod.APP_SHELL.includes("/favicon-192.png"), "APP_SHELL precaches /favicon-192.png");
+      assertTrue(mod.APP_SHELL.includes("/favicon-512.png"), "APP_SHELL precaches /favicon-512.png");
       assertTrue(mod.APP_SHELL.includes("/offline.html"), "APP_SHELL precaches /offline.html");
     }
 

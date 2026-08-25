@@ -474,6 +474,8 @@ function shell(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/favicon-192.png" sizes="192x192" type="image/png">
+  <link rel="icon" href="/favicon-512.png" sizes="512x512" type="image/png">
   <link rel="apple-touch-icon" href="/logo-200.png">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#2D5016">

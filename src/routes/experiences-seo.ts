@@ -209,6 +209,51 @@ function baseUrl(): string {
   return OPPLEVAGENT_BASE_URL.replace(/\/$/, "");
 }
 
+// ═══════════════════════════════════════════════════════════
+// pwaHeadTags() — dev-request 2026-08-24-pwa-ikoner-alle-vertikaler-og-
+// verifisering: extends the already-shipped rfb-only PWA rollout
+// (dev-request 2026-07-04-app-strategi-pwa, PRs #225/#245) to opplevagent.no.
+//
+// Interpolated into every one of this file's ~10 page-shell <head> templates
+// (homepage, opplevelse-detail, renderBrowsePage — shared by
+// /opplevelser, /kategori/*, /fylke/*, /kommune/*, /tilbyder/* —, /sok,
+// /for-tilbydere, /kontakt, /guide-opplevelser-mcp, /reise, the legal pages,
+// and the 404 catch-all), right after each one's existing
+// `<link rel="icon" type="image/svg+xml" href="/favicon.svg">` line. A
+// single shared helper (instead of pasting the block ~10 times by hand)
+// makes it mechanically verifiable that every page shell got the same tags
+// — see the page-shell PWA-tag assertions in the opplevagent PWA route
+// tests, which would catch a future page template that forgets to call
+// this.
+//
+// `includeThemeColor` defaults to true (emits the manifest's coral
+// `#ff5d3b` theme-color). Four existing head blocks (homepage,
+// renderOpplevelseDetail, renderBrowsePage, /sok) already declare their own
+// `<meta name="theme-color" content="#0e3c36">` earlier in the same
+// <head> — those callers pass `includeThemeColor: false` so this helper
+// doesn't emit a second, conflicting theme-color meta tag on those pages
+// (browsers generally honor the LAST theme-color meta in the document, so a
+// second tag here would silently override the page's chosen #0e3c36 with
+// #ff5d3b instead of leaving it alone). Pages with no pre-existing
+// theme-color meta get the manifest's #ff5d3b for free.
+//
+// This file only ever renders on the opplevagent.no host (see the
+// host-gate in src/index.ts), so — unlike seo.ts's rfb equivalent — the
+// service-worker registration script here does NOT need the
+// `!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)` exclusion
+// guard: it always registers this host's own /sw.js.
+function pwaHeadTags(opts: { includeThemeColor?: boolean } = {}): string {
+  const themeColorTag =
+    opts.includeThemeColor === false
+      ? ""
+      : `\n<meta name="theme-color" content="#ff5d3b">`;
+  return `<link rel="icon" href="/favicon-192.png" sizes="192x192" type="image/png">
+<link rel="icon" href="/favicon-512.png" sizes="512x512" type="image/png">
+<link rel="manifest" href="/manifest.json">${themeColorTag}
+<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
+<script defer src="/install-prompt.js"></script>`;
+}
+
 // Exported: reused by src/services/experience-og-image.ts (per-page branded
 // og:image SVGs, dev-request 2026-07-12-opplevagent-serp-innholdsberikelse
 // item 3) so untrusted DB text (provider names, kommune names, …) gets the
@@ -1835,6 +1880,7 @@ router.get("/", (req: Request, res: Response) => {
 <link rel="alternate" hreflang="en" href="${url}/en">
 <link rel="alternate" hreflang="x-default" href="${url}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:title" content="${escapeHtml(S.ogTitle)}">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:type" content="website">
@@ -3249,6 +3295,7 @@ function renderOpplevelseDetail(
 <meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:title" content="${escapeHtml(exp.title)}">
 <meta property="og:description" content="${escapeHtml(metaDesc)}">
 <meta property="og:type" content="website">
@@ -4117,6 +4164,7 @@ function renderBrowsePage(opts: {
 <meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:title" content="${escapeHtml(opts.h1)}">
 <meta property="og:description" content="${escapeHtml(opts.metaDesc)}">
 <meta property="og:type" content="website">
@@ -5018,6 +5066,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
 <title>${escapeHtml(pageTitle)}</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <link rel="canonical" href="${canonical}">
+${pwaHeadTags()}
 ${jsonLd}
 <style>
 ${BROWSE_CSS}
@@ -5458,6 +5507,7 @@ router.get(
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <meta name="robots" content="${provider.catalog_hidden === 1 ? "noindex, nofollow" : "index, follow, max-snippet:-1, max-image-preview:large"}">
 <link rel="canonical" href="${canonical}">
+${pwaHeadTags()}
 <meta property="og:title" content="${escapeHtml(provider.navn)} | Opplevagent">
 <meta property="og:description" content="${escapeHtml(metaDesc)}">
 <meta property="og:type" content="website">
@@ -5704,6 +5754,7 @@ router.get(
 <meta name="description" content="Reserver en smaking eller omvisning hos ${escapeHtml(provider.navn)}${sted ? " i " + escapeHtml(sted) : ""}. Ingen betaling nå — kun en reservasjon.">
 <meta name="robots" content="noindex, follow">
 <link rel="canonical" href="${canonical}">
+${pwaHeadTags()}
 <style>
 ${BROWSE_CSS}
 .book-panel{max-width:520px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px}
@@ -5951,6 +6002,7 @@ router.get(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Reservasjon bekreftet | Opplevagent</title>
 <meta name="robots" content="noindex, nofollow">
+${pwaHeadTags()}
 <style>
 ${BROWSE_CSS}
 .confirm-panel{max-width:480px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px;text-align:center}
@@ -6084,6 +6136,7 @@ router.get(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bekreft oppmøte — ${escapeHtml(booking.booking_ref)} | Opplevagent</title>
 <meta name="robots" content="noindex, nofollow">
+${pwaHeadTags()}
 <style>
 ${BROWSE_CSS}
 .confirm-panel{max-width:480px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px}
@@ -6230,6 +6283,7 @@ function previsitPage(title: string, inner: string): string {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)} | Opplevagent</title>
 <meta name="robots" content="noindex, nofollow">
+${pwaHeadTags()}
 <style>
 ${BROWSE_CSS}
 .confirm-panel{max-width:520px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px}
@@ -8083,6 +8137,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
 <meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags({ includeThemeColor: false })}
 <meta property="og:title" content="${escapeHtml(h1)}">
 <meta property="og:description" content="${escapeHtml(metaDesc)}">
 <meta property="og:type" content="website">
@@ -8212,6 +8267,76 @@ router.get("/favicon.svg", (_req: Request, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// PWA — dev-request 2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering,
+// extending dev-request 2026-07-04-app-strategi-pwa (previously rfb-only,
+// PRs #225/#245) to opplevagent.no. Five routes, same
+// express.static-bypass reason documented on /favicon.svg above: the
+// opplevagent host-gate in index.ts routes every non-API path into this
+// router before express.static is ever reached, so both the pre-placed PNG
+// icon files under src/public/ and the new static PWA files under
+// src/public/opplevagent-*.{js,html} must be served explicitly here.
+//
+//   GET /favicon-192.png / /favicon-512.png  — the constellation-mark PNG
+//     icons (src/public/opplevagent-favicon-{192,512}.png), for
+//     <link rel="icon">/generic PWA-icon-detection tooling that looks for
+//     the conventional favicon-192.png/favicon-512.png filenames, and for
+//     manifest.json's icons array below.
+//   GET /manifest.json  — opplevagent-branded web app manifest (server-
+//     generated JSON, not a static file — unlike rfb's src/public/manifest.json
+//     — since experiences-seo.ts already generates every other JSON
+//     document on this host, e.g. agent-card.json/openapi.json above).
+//   GET /sw.js / /offline.html / /install-prompt.js  — close mirrors of
+//     src/public/sw.js / offline.html / install-prompt.js (same guard/
+//     cache/install-prompt logic, opplevagent branding + cache name), kept
+//     as their own static files under src/public/opplevagent-* rather than
+//     inlined as template strings — more maintainable for real JS/HTML, and
+//     testable with the exact same require()/vm.Script convention as the
+//     rfb originals (see opplevagent-sw.test.ts / opplevagent-install-prompt.test.ts).
+// ═══════════════════════════════════════════════════════════
+const OPPLEVAGENT_PUBLIC_DIR = path.join(__dirname, "..", "public");
+
+function serveOpplevagentPublicFile(fileName: string, contentType: string) {
+  return (_req: Request, res: Response, next: NextFunction) => {
+    let data: Buffer;
+    try {
+      data = fs.readFileSync(path.join(OPPLEVAGENT_PUBLIC_DIR, fileName));
+    } catch {
+      return next(); // missing on disk -> 404 catch-all, never a crash
+    }
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.send(data);
+  };
+}
+
+router.get("/favicon-192.png", serveOpplevagentPublicFile("opplevagent-favicon-192.png", "image/png"));
+router.get("/favicon-512.png", serveOpplevagentPublicFile("opplevagent-favicon-512.png", "image/png"));
+router.get("/sw.js", serveOpplevagentPublicFile("opplevagent-sw.js", "text/javascript; charset=utf-8"));
+router.get("/offline.html", serveOpplevagentPublicFile("opplevagent-offline.html", "text/html; charset=utf-8"));
+router.get("/install-prompt.js", serveOpplevagentPublicFile("opplevagent-install-prompt.js", "text/javascript; charset=utf-8"));
+
+router.get("/manifest.json", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.send(
+    JSON.stringify({
+      name: "Opplevagent",
+      short_name: "Opplevagent",
+      description:
+        "Håndplukkede norske opplevelser og aktiviteter — verifiserte tilbydere, søkbart for både folk og AI-agenter.",
+      start_url: "/",
+      display: "standalone",
+      background_color: "#f7f4ee",
+      theme_color: "#ff5d3b",
+      icons: [
+        { src: "/favicon-192.png", sizes: "192x192", type: "image/png" },
+        { src: "/favicon-512.png", sizes: "512x512", type: "image/png" },
+      ],
+    })
+  );
+});
+
+// ═══════════════════════════════════════════════════════════
 // GET /badge/opplevagent.svg — "Finn oss på Opplevagent" backlink badge
 // (dev-request 2026-07-12-opplevagent-lenkeplan, item 1). A small branded
 // "as seen on" pill that gårdssalg producers can embed on their own site to
@@ -8293,7 +8418,7 @@ router.get("/logo.svg", (_req: Request, res: Response) => {
 // ── Legal pages (privacy / terms) — Claude Connectors prerequisite. Bilingual NO/EN. ──
 const LEGAL_CSS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:760px;margin:0 auto;padding:48px 22px;color:#18130d;background:#f7f4ee;line-height:1.6}h1,h2{font-family:'Outfit',sans-serif;letter-spacing:-.01em}h1{font-size:1.9rem;border-bottom:2px solid #12a594;padding-bottom:.3rem;margin-bottom:.4rem}h2{font-size:1.18rem;color:#0c7264;margin:1.7rem 0 .35rem}a{color:#0c7264}.lang{text-align:right;font-size:.9rem;margin-bottom:.8rem}hr{margin:2.4rem 0;border:none;border-top:1px solid #e4ded0}footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid #e4ded0;font-size:.85rem;color:#7a7163}ul{margin:.4rem 0 .4rem 1.2rem}p{margin:.4rem 0}`;
 function legalPage(title: string, bodyHtml: string): string {
-  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow"><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a></footer></body></html>`;
+  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow"><link rel="icon" type="image/svg+xml" href="/favicon.svg">${pwaHeadTags()}<style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a></footer></body></html>`;
 }
 
 router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: Response) => {
@@ -8486,6 +8611,7 @@ function forTilbyderePage(opts: {
 ${opts.robotsMeta}
 ${opts.canonical}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
 ${opts.jsonLd}
 <style>
 ${BROWSE_CSS}
@@ -8801,6 +8927,7 @@ router.get("/kontakt", (_req: Request, res: Response) => {
 <meta name="robots" content="index, follow">
 <link rel="canonical" href="${url}/kontakt">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -9141,6 +9268,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
 <link rel="alternate" hreflang="en" href="${url}/en/guide-opplevelser-mcp">
 <link rel="alternate" hreflang="x-default" href="${url}/guide-opplevelser-mcp">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
 <meta property="og:title" content="${escapeHtml(title)}">
 <meta property="og:description" content="${escapeHtml(description)}">
 <meta property="og:type" content="website">
@@ -9327,6 +9455,7 @@ ${form}
 <meta name="robots" content="noindex, follow">
 <link rel="canonical" href="${baseUrl()}/reise">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
 <meta property="og:title" content="${escapeHtml(title)}">
 <meta property="og:description" content="${escapeHtml(description)}">
 <meta property="og:type" content="website">
@@ -9365,6 +9494,7 @@ router.use((_req: Request, res: Response) => {
 <title>Side ikke funnet (404) — Opplevagent</title>
 <meta name="robots" content="noindex, follow">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${pwaHeadTags()}
 <style>${BROWSE_CSS}${OA_CHROME_CSS}</style>
 </head>
 <body>
