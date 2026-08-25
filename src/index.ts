@@ -75,6 +75,7 @@ import adminHomepageProvenanceCohortRoutes from "./routes/admin-homepage-provena
 import adminDodBulkRoutes from "./routes/admin-dod-bulk";
 import adminRfbContactExtractionRoutes from "./routes/admin-rfb-contact-extraction";
 import adminCrmChimeraAgentClearRoutes from "./routes/admin-crm-chimera-agent-clear";
+import adminCrmChimeraContactsDiagnoseRoutes from "./routes/admin-crm-chimera-contacts-diagnose";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalHjemmesideDiscoveryRoutes from "./routes/admin-dental-hjemmeside-discovery";
@@ -701,6 +702,14 @@ app.use("/admin/contact-write-guard-retro-sweep", adminLimiter, adminContactWrit
 // contaminated fields. Dry-run by default; apply=true writes.
 // POST /admin/crm-chimera-agent-clear
 app.use("/admin/crm-chimera-agent-clear", adminLimiter, adminCrmChimeraAgentClearRoutes);
+// dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 3: the
+// remaining 13-contact diagnosis half. Read-only, dry-run-only — NO apply
+// mode at all, zero writes. Enumerates crm_contacts rows still on the
+// chimera agent_id and proposes a classification per contact (system /
+// producer-match / unknown) using the same matching tiers classifyEmail()
+// (crm-service.ts) uses, reimplemented read-only.
+// GET /admin/crm-chimera-contacts-diagnose
+app.use("/admin/crm-chimera-contacts-diagnose", adminLimiter, adminCrmChimeraContactsDiagnoseRoutes);
 // dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: moves
 // directory/booking-portal/industry-association URLs out of dental_agents.
 // hjemmeside into the additive directory_url column — dry-run by default,

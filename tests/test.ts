@@ -39691,6 +39691,33 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding, slice 3:
+// GET /admin/crm-chimera-contacts-diagnose
+// (src/routes/admin-crm-chimera-contacts-diagnose.ts) — the remaining
+// 13-contact diagnosis half. Read-only, dry-run-only (no apply mode at
+// all). Enumerates crm_contacts rows still on the chimera agent_id
+// (2b5fc7a6-b446-4bea-8c2d-21315c6c6e17) and proposes a classification per
+// contact (system-pattern / confident producer match / unknown), reusing
+// classifyEmail's matching tiers re-implemented read-only. Own harness
+// (__setDbForTesting/__initSchemaForTesting, real router handler pulled
+// off the route stack — mirrors admin-crm-chimera-agent-clear.test.ts's
+// harness). Runs via runSerial() like the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-23-crm-house-bucket-kimaere-opprydding: crm-chimera-contacts-diagnose (slice 3) ──");
+  try {
+    const { runAdminCrmChimeraContactsDiagnoseTests } = require("../src/routes/admin-crm-chimera-contacts-diagnose.test") as
+      typeof import("../src/routes/admin-crm-chimera-contacts-diagnose.test");
+    const ccd = await runAdminCrmChimeraContactsDiagnoseTests({ log: false });
+    passed += ccd.passed;
+    failed += ccd.failed;
+    for (const f of ccd.failures) failures.push("crm-chimera-contacts-diagnose: " + f);
+    console.log(`  crm-chimera-contacts-diagnose: ${ccd.passed} passed, ${ccd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-chimera-contacts-diagnose: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-29-blacklist-backfill-og-berikelsestriage, slice 3
 // (rfb measurement, 2026-07-30): dead-cohort parking for POST
 // /admin/homepage-content-refresh (routes/admin-knowledge.ts) — the route
