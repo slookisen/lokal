@@ -228,6 +228,11 @@ import {
   // page/`/discover` use, reused by the new catalog-wide coverage report
   // below rather than redefined.
   PUBLISH_GATE_SQL,
+  // dev-request 2026-06-23-experiences-richer-profiles, slice F2 — the SAME
+  // defensive content_field_evidence parser the holdout resolver uses,
+  // reused by GET /admin/experiences/:id/provenance below so the endpoint
+  // serves the parsed per-field map instead of a raw JSON string.
+  parseContentFieldEvidence,
   // dev-request 2026-07-19-gardssalg-agent-flater — REST /discover intercept
   // for category=gardssalg_smaking, reusing the EXACT SAME search surface as
   // the discover_gardssalg MCP tool (src/routes/experiences-mcp.ts) instead
@@ -485,6 +490,13 @@ import {
   // detector; a parked page is treated as a FAILED fetch by the
   // content-refresh writer below (see its doc comment in search-enrich.ts).
   looksLikeParkedDomainPage,
+  // dev-request 2026-06-23-experiences-richer-profiles, slice F2 (honest
+  // wrong_content_rate measurement) — the SAME og:description/meta-
+  // description extraction summarizeAbout (the description writer's primary
+  // source) reads, reused so the WCR holdout judge sees the meta content a
+  // faithful meta-derived description was written from (it lives in an HTML
+  // attribute, invisible to visibleTextOf).
+  extractMetaDescriptions,
 } from "../services/search-enrich";
 // Same slice — significant-title-token check for the homepage-boilerplate
 // description guard (descriptionMentionsExperienceTitle below): reuses the
@@ -20368,14 +20380,35 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
 //
 // Per-row outcome:
 //   - fetchPage(evidence_url) fails (any FetchFailureReason) → `unresolved`.
+//     A hard 404/410 is a DISTINCT unresolved condition ("the citation page
+//     no longer exists" — reason `citation_gone:http_404`/`:http_410`),
+//     never a content-quality signal; other failures carry reason
+//     `fetch_failed:<FetchFailureReason>`.
+//   - fetchPage succeeds but the page is a parked/for-sale-domain lander
+//     (looksLikeParkedDomainPage — the lapsed-domain case that produced a
+//     false MISMATCH on sirdal.com in the 2026-08-25 audit) → `unresolved`,
+//     reason `citation_gone:parked`. Parking boilerplate says nothing about
+//     the stored content's faithfulness at write time. (Soft-404 detection
+//     beyond the parked-page heuristic is deliberately NOT attempted here.)
 //   - fetchPage succeeds but judgeExperienceContentMatch() itself fails
 //     (missing key / network / non-200 / unparseable JSON / ambiguous
-//     verdict — `{ ok: false }`) → `unresolved`.
+//     verdict — `{ ok: false }`) → `unresolved`, reason `judge_failed`.
 //   - judge renders a genuine verdict → MATCH increments `matched`,
 //     MISMATCH increments `mismatched`.
 // A row NEVER lands in `matched` just because it couldn't be checked — the
 // fleet's fail-closed convention, applied here to keep the RATE honest
 // rather than to reject a write (there is no write here to reject).
+//
+// Judged page text (dev-request 2026-06-23-experiences-richer-profiles,
+// slice F2): the page's og:description/meta-description content — the
+// description writer's PRIMARY extraction source (summarizeAbout,
+// search-enrich.ts) — lives in an HTML attribute and is invisible to
+// visibleTextOf(), so a perfectly faithful meta-derived description used to
+// grade MISMATCH against its own source page (confirmed live: iddis.no's
+// stored description was VERBATIM the site's meta description). The judge
+// is therefore handed the labeled meta block ("Sidens meta-beskrivelse: …")
+// FIRST, then the visible text; the judge's 4000-char combined cap can only
+// truncate the visible-text tail, never the meta content.
 //
 // wrong_content_rate = mismatched / (matched + mismatched). `unresolved`
 // rows are excluded from that denominator entirely (they carry no signal
@@ -20384,6 +20417,17 @@ router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: R
 // (which would falsely claim a perfect measured score) and never a crash
 // (a bare NaN would serialize to `null` over JSON anyway via JSON.stringify,
 // but that's accidental — this is explicit).
+//
+// Stratification (slice F2, additive): every top-level field keeps its exact
+// pre-existing semantics; the response ADDITIONALLY carries `published` and
+// `unpublished` sub-aggregates (sample_size/matched/mismatched/unresolved/
+// wrong_content_rate each, same null-on-0-denominator rule). "Published"
+// means the row passes the SAME PUBLISH_GATE_SQL predicate /discover and
+// the public by-id/slug reads use — reused, not re-stated, so the strata
+// can never drift from what is actually served. The 2026-08-25 audit found
+// ALL 17 flagged mismatches were `needs_review` (not publicly served) rows;
+// the published-rows rate is the guardrail number that measures what agents
+// and humans actually see.
 const WCR_DEFAULT_SAMPLE_SIZE = 30;
 const WCR_MAX_SAMPLE_SIZE = 100;
 const WCR_THRESHOLD = 0.02;
@@ -20402,12 +20446,48 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
     const expDb = getExpDb("experiences");
     const rows = sampleEnrichedExperiencesForHoldout(expDb, sampleSize);
 
+    // Per-row publish check — the EXACT PUBLISH_GATE_SQL predicate /discover
+    // and the public by-id/slug reads use, reused (not re-stated) so the
+    // published/unpublished strata below can never drift from what the
+    // public surfaces actually serve. One indexed point-lookup per sampled
+    // row (≤ WCR_MAX_SAMPLE_SIZE), dwarfed by the fetch+judge cost per row.
+    const publishedCheckStmt = expDb.prepare(
+      `SELECT 1 FROM experiences e
+        LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.id = ? AND ${PUBLISH_GATE_SQL}`,
+    );
+
+    // Verdict tallies, overall + per publish-stratum. Index 0 = unpublished,
+    // 1 = published — a plain pair so every increment stays one line.
     let matched = 0;
     let mismatched = 0;
     let unresolved = 0;
-    const results: Array<{ experience_id: string; verdict: "MATCH" | "MISMATCH" | "unresolved"; reasoning: string }> = [];
+    const strata = [
+      { sample_size: 0, matched: 0, mismatched: 0, unresolved: 0 },
+      { sample_size: 0, matched: 0, mismatched: 0, unresolved: 0 },
+    ];
+    const results: Array<{
+      experience_id: string;
+      verdict: "MATCH" | "MISMATCH" | "unresolved";
+      reasoning: string;
+      published: boolean;
+      // Machine-readable unresolved cause — `citation_gone:*` (parked page /
+      // hard 404/410: the citation no longer exists, a different condition
+      // from a bad judgment), `fetch_failed:<reason>`, `judge_failed`, or
+      // `no_citation_url`. Absent on genuine MATCH/MISMATCH verdicts.
+      reason?: string;
+    }> = [];
 
     for (const row of rows) {
+      const isPublished = publishedCheckStmt.get(row.id) !== undefined;
+      const stratum = strata[isPublished ? 1 : 0]!;
+      stratum.sample_size++;
+      const markUnresolved = (reason: string, reasoning: string): void => {
+        unresolved++;
+        stratum.unresolved++;
+        results.push({ experience_id: row.id, verdict: "unresolved", reasoning, published: isPublished, reason });
+      };
+
       // resolveHoldoutEvidenceUrl() — not the row's raw evidence_url — is the
       // page actually cited as this row's content source. sampleEnriched
       // ExperiencesForHoldout() only ever returns rows this resolves for, so
@@ -20416,36 +20496,64 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
       // evidence_url column (which is exactly the bug this fixed).
       const effectiveUrl = resolveHoldoutEvidenceUrl(row);
       if (!effectiveUrl) {
-        unresolved++;
-        results.push({
-          experience_id: row.id,
-          verdict: "unresolved",
-          reasoning: "ingen gyldig kilde-URL å sjekke mot (verken content_field_evidence eller evidence_url) — avvist fail-closed",
-        });
+        markUnresolved(
+          "no_citation_url",
+          "ingen gyldig kilde-URL å sjekke mot (verken content_field_evidence eller evidence_url) — avvist fail-closed",
+        );
         continue;
       }
       const fetchResult = await fetchPage(effectiveUrl, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
       if (!fetchResult.ok) {
-        unresolved++;
-        results.push({
-          experience_id: row.id,
-          verdict: "unresolved",
-          reasoning: `henting av kildeside feilet: ${fetchResult.reason} (${fetchResult.detail})`,
-        });
+        // Hard 404/410 = the citation page no longer EXISTS — a supply-
+        // hygiene condition, not a judgeable content-faithfulness signal
+        // (the brosundet.no-shaped case from the 2026-08-25 audit). Named
+        // distinctly so report tooling can route it to citation repair
+        // instead of content review. fetchPage's own classified status is
+        // trusted as-is; no soft-404 guessing here.
+        const citationGone = fetchResult.reason === "http_404" || fetchResult.reason === "http_410";
+        markUnresolved(
+          citationGone ? `citation_gone:${fetchResult.reason}` : `fetch_failed:${fetchResult.reason}`,
+          citationGone
+            ? `kildesiden finnes ikke lenger (${fetchResult.reason}) — ikke dømmbar, holdt utenfor raten`
+            : `henting av kildeside feilet: ${fetchResult.reason} (${fetchResult.detail})`,
+        );
         continue;
       }
 
-      const pageText = visibleTextOf(fetchResult.html);
+      // Parked/for-sale-domain lander (HTTP 200, but the provider's domain
+      // has lapsed — sirdal.com in the audit): registrar boilerplate says
+      // nothing about the stored content's faithfulness at write time, so
+      // this is "citation gone", never a MISMATCH. Same detector the
+      // content-refresh writer uses (looksLikeParkedDomainPage).
+      if (looksLikeParkedDomainPage(fetchResult.html)) {
+        markUnresolved(
+          "citation_gone:parked",
+          "kildesiden er en parkert/til-salgs domeneside — domenet har falt, ikke dømmbar, holdt utenfor raten",
+        );
+        continue;
+      }
+
+      // Meta first (labeled), then visible text — see the route doc comment:
+      // the meta description is the description writer's primary source and
+      // must survive the judge's combined 4000-char cap.
+      const metaDescriptions = extractMetaDescriptions(fetchResult.html);
+      const metaBlock =
+        metaDescriptions.length > 0 ? `Sidens meta-beskrivelse: ${metaDescriptions.join(" — ")}\n\n` : "";
+      const pageText = metaBlock + visibleTextOf(fetchResult.html);
       const judged = await judgeExperienceContentMatch(row, pageText);
       if (!judged.ok) {
-        unresolved++;
-        results.push({ experience_id: row.id, verdict: "unresolved", reasoning: judged.reasoning });
+        markUnresolved("judge_failed", judged.reasoning);
         continue;
       }
 
-      if (judged.verdict === "MATCH") matched++;
-      else mismatched++;
-      results.push({ experience_id: row.id, verdict: judged.verdict, reasoning: judged.reasoning });
+      if (judged.verdict === "MATCH") {
+        matched++;
+        stratum.matched++;
+      } else {
+        mismatched++;
+        stratum.mismatched++;
+      }
+      results.push({ experience_id: row.id, verdict: judged.verdict, reasoning: judged.reasoning, published: isPublished });
     }
 
     const denominator = matched + mismatched;
@@ -20457,6 +20565,13 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
     const status: "under_threshold" | "over_threshold" =
       wrongContentRate !== null && wrongContentRate > WCR_THRESHOLD ? "over_threshold" : "under_threshold";
 
+    // Same rate math per stratum — unresolved excluded from the denominator,
+    // null (never 0) when nothing in the stratum was resolvable.
+    const stratumAggregate = (s: (typeof strata)[number]) => {
+      const d = s.matched + s.mismatched;
+      return { ...s, wrong_content_rate: d > 0 ? s.mismatched / d : null };
+    };
+
     res.json({
       sample_size: rows.length,
       matched,
@@ -20465,10 +20580,126 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
       wrong_content_rate: wrongContentRate,
       threshold: WCR_THRESHOLD,
       status,
+      // Additive strata (slice F2) — top-level fields above keep their exact
+      // pre-existing semantics. `published` is the guardrail stratum: the
+      // wrong-content rate over rows the public surfaces actually serve.
+      published: stratumAggregate(strata[1]!),
+      unpublished: stratumAggregate(strata[0]!),
       results,
     });
   } catch (err) {
     console.error("[opplevelser] admin/experiences-wrong-content-rate failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/experiences/:id/provenance ──────────────────
+//
+// dev-request 2026-06-23-experiences-richer-profiles, slice F2 (honest
+// wrong_content_rate measurement): the 2026-08-25 audit of 17 WCR-flagged
+// rows had NO direct way to read a single experiences row's provenance
+// columns — it had to reverse-engineer them via keyset-pagination tricks on
+// /admin/providers/all and friends. This endpoint is that missing read
+// surface: the raw row's identity/status/citation/provenance columns plus
+// its provider's identity, in one call.
+//
+// RAW lookup — deliberately NOT publish-gated: this is an admin diagnostic
+// surface (X-Admin-Key via requireAdmin, same gate as every sibling admin
+// route), and the rows an audit most needs to inspect are exactly the
+// quarantined `needs_review`/`rejected`/merged-away ones the public
+// PUBLISH_GATE_SQL surfaces hide. Same rationale as getExperienceById()'s
+// "INTERNAL/ADMIN + TEST USE ONLY" contract (experience-store.ts). The
+// response says which side of the gate the row is on (`published`) using
+// the SAME predicate, so the caller never has to re-derive it.
+//
+// READ-ONLY — a single SELECT, zero writes, no side effects. 404 on an
+// unknown id.
+router.get("/admin/experiences/:id/provenance", requireAdmin, (req: Request, res: Response) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) {
+    res.status(400).json({ error: "Path param 'id' is required" });
+    return;
+  }
+
+  try {
+    const expDb = getExpDb("experiences");
+    const row = expDb
+      .prepare(
+        `SELECT e.id, e.title, e.verification_status, e.confidence, e.canonical_id,
+                e.evidence_url, e.content_field_evidence, e.content_source,
+                e.enrichment_state, e.admission_verdict, e.admission_checked_at,
+                e.created_at, e.updated_at, e.provider_id,
+                (CASE WHEN ${PUBLISH_GATE_SQL} THEN 1 ELSE 0 END) AS published,
+                p.id AS p_id, p.navn AS p_navn, p.hjemmeside AS p_hjemmeside,
+                p.brreg_active AS p_brreg_active
+           FROM experiences e
+           LEFT JOIN experience_providers p ON p.id = e.provider_id
+          WHERE e.id = ?`,
+      )
+      .get(id) as
+      | {
+          id: string;
+          title: string;
+          verification_status: string | null;
+          confidence: string | null;
+          canonical_id: string | null;
+          evidence_url: string | null;
+          content_field_evidence: string | null;
+          content_source: string | null;
+          enrichment_state: string | null;
+          admission_verdict: string | null;
+          admission_checked_at: string | null;
+          created_at: string | null;
+          updated_at: string | null;
+          provider_id: string | null;
+          published: number;
+          p_id: string | null;
+          p_navn: string | null;
+          p_hjemmeside: string | null;
+          p_brreg_active: number | null;
+        }
+      | undefined;
+
+    if (!row) {
+      res.status(404).json({ error: "experience_not_found", id });
+      return;
+    }
+
+    res.json({
+      success: true,
+      experience: {
+        id: row.id,
+        title: row.title,
+        verification_status: row.verification_status,
+        confidence: row.confidence,
+        canonical_id: row.canonical_id,
+        published: row.published === 1,
+        evidence_url: row.evidence_url,
+        // Parsed per-field map (field -> source URL/sentinel). Same
+        // defensive parser the holdout resolver uses; null when the column
+        // itself is NULL (pre-provenance rows) so "never stamped" stays
+        // distinguishable from a stamped-but-empty map.
+        content_field_evidence:
+          row.content_field_evidence === null ? null : parseContentFieldEvidence(row.content_field_evidence),
+        content_source: row.content_source,
+        enrichment_state: row.enrichment_state,
+        admission_verdict: row.admission_verdict,
+        admission_checked_at: row.admission_checked_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      },
+      provider:
+        row.p_id === null
+          ? null
+          : {
+              id: row.p_id,
+              navn: row.p_navn,
+              hjemmeside: row.p_hjemmeside,
+              brreg_active: row.p_brreg_active,
+            },
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences/:id/provenance failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

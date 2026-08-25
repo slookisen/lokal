@@ -193,7 +193,10 @@ export type ExperienceContentJudgeVerdict =
 const JUDGE_MATCH_TOKEN = "MATCH";
 const JUDGE_MISMATCH_TOKEN = "MISMATCH";
 // Same cap style as GARDSSALG_JUDGE_CANDIDATE_CHAR_CAP
-// (src/routes/opplevelser.ts) — bounds LLM spend per row.
+// (src/routes/opplevelser.ts) — bounds LLM spend per row. The WCR route
+// prepends the page's labeled meta-description block (see its doc comment)
+// BEFORE the visible text, so this combined-text cap can only ever truncate
+// the visible-text tail — the meta content is never silently cut away.
 const JUDGE_PAGE_TEXT_CHAR_CAP = 4000;
 
 /**
@@ -220,7 +223,7 @@ export async function judgeExperienceContentMatch(
       ? `Prisklasse: ${row.price_band ?? "ukjent"}${row.price_from != null ? `, fra ${row.price_from} kr` : ""}`
       : "Prisklasse: (ikke satt)";
 
-  const prompt = `Du er en kvalitetsdommer som sjekker om innhold skrevet om en opplevelse faktisk stemmer med kildesiden det ble hentet fra. Under er (1) innholdet som er lagret i databasen for opplevelsen "${row.title}", og (2) den synlige teksten fra kildesiden (evidence_url) innholdet skal være hentet fra.
+  const prompt = `Du er en kvalitetsdommer som sjekker om innhold skrevet om en opplevelse faktisk stemmer med kildesiden det ble hentet fra. Under er (1) innholdet som er lagret i databasen for opplevelsen "${row.title}", og (2) tekst fra kildesiden (evidence_url) innholdet skal være hentet fra. Kildeteksten kan innledes med sidens egen meta-beskrivelse (merket «Sidens meta-beskrivelse:») etterfulgt av synlig sidetekst — meta-beskrivelsen er fullverdig sideinnhold og en vanlig primærkilde for lagrede beskrivelser, så innhold som stemmer med den regnes som å stemme med kilden.
 
 Lagret innhold:
 Tittel: ${row.title}
@@ -228,7 +231,7 @@ Beskrivelse: ${row.description ?? "(ingen)"}
 Kategori: ${row.category ?? "(ingen)"}
 ${priceLine}
 
-Synlig tekst fra kildesiden:
+Tekst fra kildesiden:
 ${cappedPageText}
 
 Vurder om det lagrede innholdet plausibelt stemmer overens med kildesiden — samme tilbyder/aktivitet, ikke åpenbart hentet fra feil side eller fabrikkert. Dette er IKKE en kvalitetsvurdering av hvor godt teksten er skrevet, kun om innholdet faktisk stemmer med kilden.
