@@ -481,6 +481,27 @@ export function createExperience(input: Experience): string {
   return id;
 }
 
+/**
+ * Stamp the harvest admission-gate outcome onto a just-created experience
+ * (dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+ * slice, 2026-08-25). `verdict` is the inspectable outcome text the
+ * bulk-load gate composes ("<match|mismatch|unresolved>: <judge reasoning>")
+ * — see init-experiences.ts's admission-gate column block for the column
+ * semantics. Write-once in practice (called only right after
+ * createExperience() in the bulk-load apply path), but idempotent-safe:
+ * re-stamping simply records the newest gate run. Never touches any other
+ * column — updated_at deliberately NOT bumped, since the gate verdict is
+ * metadata about the insert, not a content change.
+ */
+export function stampExperienceAdmissionVerdict(experienceId: string, verdict: string): void {
+  const db = getDb(VERTICAL);
+  db.prepare(
+    `UPDATE experiences
+        SET admission_verdict = @verdict, admission_checked_at = datetime('now')
+      WHERE id = @id`
+  ).run({ id: experienceId, verdict });
+}
+
 // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 (detail
 // completeness weave): surface provider phone in the single-experience API
 // row the same way booking_url already is — no fabrication, null when the
@@ -528,11 +549,68 @@ function providerProvenanceOf(providerId: string | null | undefined): Provenance
   );
 }
 
+/**
+ * RAW by-id read — NO publish gate. Returns the row whatever its
+ * verification_status/confidence/canonical_id state, including quarantined
+ * (`needs_review`/`rejected`) and dedup-merged-away rows.
+ *
+ * INTERNAL/ADMIN + TEST USE ONLY (dev-request 2026-06-23-experiences-richer-
+ * profiles, faithfulness-inflow slice, 2026-08-25): every PUBLIC by-id
+ * surface — GET /api/opplevelser/:id, the MCP `get_experience` tool
+ * (experiences-mcp.ts), and the A2A single-experience-by-UUID intent
+ * (experiences-a2a.ts) — must read through getPublishedExperienceById()
+ * below instead. Before that split, all three served quarantined and
+ * merged-away rows in full to any caller holding a UUID, while /discover
+ * and the HTML pages were PUBLISH_GATE_SQL-gated — i.e. the by-id door
+ * bypassed the exact quarantine the gate exists to enforce.
+ */
 export function getExperienceById(
   id: string
 ): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null; provenance?: ProvenanceSummary }) | null {
   const db = getDb(VERTICAL);
   const row = db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  const hydrated = hydrateExperience(row);
+  const provenance = providerProvenanceOf(hydrated.provider_id);
+  return {
+    ...hydrated,
+    phone: providerPhoneOf(hydrated.provider_id),
+    ...(provenance ? { provenance } : {}),
+  };
+}
+
+/**
+ * PUBLISH-GATED by-id read — the by-id twin of getPublishedExperienceBySlug()
+ * below, sharing the exact same PUBLISH_GATE_SQL predicate (verified +
+ * confidence NULL/high/medium + provider brreg_active + canonical_id IS
+ * NULL), so the set of rows reachable by UUID == the set /discover, the
+ * detail pages and the sitemap surface. Returns null for a missing id AND
+ * for a row failing the gate — a quarantined or merged-away row is
+ * indistinguishable from a nonexistent one on public surfaces (deliberate:
+ * a `needs_review` row's content is exactly what the quarantine is keeping
+ * out of circulation, and even confirming its existence to an arbitrary
+ * UUID-holder serves nothing). A dedup-merged row (canonical_id set) also
+ * returns null rather than redirecting: the slug surface 301s via
+ * resolveCanonicalSlugForDuplicate() because browsers follow redirects, but
+ * the JSON/MCP callers obtain UUIDs from /discover — which never serves
+ * merged rows — so a stale merged UUID is a not-found, kept simple.
+ *
+ * Response shape matches getExperienceById() exactly (tags + phone +
+ * optional provenance) so the three public routes' payloads are unchanged
+ * for every row that passes the gate.
+ */
+export function getPublishedExperienceById(
+  id: string
+): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null; provenance?: ProvenanceSummary }) | null {
+  if (!id) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT e.* FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.id = @id AND ${PUBLISH_GATE_SQL}`
+    )
+    .get({ id }) as Record<string, unknown> | undefined;
   if (!row) return null;
   const hydrated = hydrateExperience(row);
   const provenance = providerProvenanceOf(hydrated.provider_id);

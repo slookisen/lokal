@@ -165,7 +165,12 @@ export function runOpplevelserContentRefreshWebsiteVerificationGateTests(
         });
         db.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(opts2.fieldProvenance, providerId);
         const experienceId = store.createExperience({
-          title: `Gate Provider ${id} opplevelse`, provider_id: providerId, provider_match_status: "matched",
+          // Title shares significant tokens ("gårdsbutikk"/"grønnsaker") with
+          // ABOUT_TEXT below — required since the faithfulness-inflow slice's
+          // homepage-boilerplate guard (dev-request 2026-06-23-experiences-
+          // richer-profiles, 2026-08-25); this file tests the hjemmeside-
+          // verification gate, not that guard.
+          title: `Gårdsbutikk med grønnsaker ${id}`, provider_id: providerId, provider_match_status: "matched",
           fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
         });
         return { providerId, experienceId };
@@ -365,8 +370,12 @@ export function runOpplevelserContentRefreshWebsiteVerificationGateTests(
         "gate-f0: sanity — the seeded provider is genuinely outside the gårdssalg cohort (both legs null)",
       );
 
+      // Names "Fjellro" (a significant token of the experience title above)
+      // so the faithfulness-inflow slice's homepage-boilerplate guard admits
+      // the write this block asserts — realistic, too: a provider's own
+      // homepage description naming itself.
       const GEN_ABOUT_TEXT =
-        "Vi driver ein liten opplevingsbedrift med lokalmat og guida turar for heile familien, sommar som vinter.";
+        "Fjellro er ein liten opplevingsbedrift med lokalmat og guida turar for heile familien, sommar som vinter.";
       // org_nr in visible BODY text (gardssalgPageText strips all tags, so a
       // value living only inside a meta `content="..."` attribute would
       // never be seen by the evidence matcher) + an og:description meta tag

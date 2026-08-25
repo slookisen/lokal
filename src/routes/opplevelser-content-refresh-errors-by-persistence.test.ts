@@ -197,8 +197,14 @@ export function runOpplevelserContentRefreshErrorsByPersistenceTests(
           brreg_verified: 1, brreg_active: 1, verification_status: "verified",
         });
         db.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(verifiedProvenance(), providerId);
+        // Title shares a significant token ("gårdsbutikk") with ABOUT_TEXT
+        // below — required since the faithfulness-inflow slice's homepage-
+        // boilerplate guard (dev-request 2026-06-23-experiences-richer-
+        // profiles, 2026-08-25); this file tests error-persistence tallies,
+        // not that guard, and the write-fail trigger fixture needs the
+        // description write to actually be ATTEMPTED to raise its error.
         const experienceId = store.createExperience({
-          title: `CR Provider ${id} opplevelse`, provider_id: providerId, provider_match_status: "matched",
+          title: `Gårdsbutikk CR ${id}`, provider_id: providerId, provider_match_status: "matched",
           fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
         });
         return { providerId, experienceId };

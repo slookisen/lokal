@@ -35,7 +35,12 @@ import {
   discoverExperiencesRelaxed,
   buildRelaxationNote,
   buildNarrowingSuggestions,
-  getExperienceById,
+  // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-
+  // inflow slice (2026-08-25): the single-experience-by-UUID intent reads
+  // through the PUBLISH-GATED by-id variant — same PUBLISH_GATE_SQL as the
+  // discover skill — so a quarantined or dedup-merged-away row answers
+  // with the same not-found text as a missing id.
+  getPublishedExperienceById,
   listCategories,
   searchGardssalgProviders,
   type DiscoverFilter,
@@ -390,7 +395,10 @@ export function handleExperiencesMessageSend(
   );
   if (idMatch) {
     try {
-      const exp = getExperienceById(idMatch[1]!);
+      // Publish-gated read (see the import comment above): a quarantined or
+      // merged-away row answers with the same "Ingen opplevelse funnet"
+      // artifact as a missing id.
+      const exp = getPublishedExperienceById(idMatch[1]!);
       try { logExperiencesInteraction({ skill: "opplevelser_info", queryText: messageText || idMatch[1], ctx }); } catch { /* fail-open: never affects the response */ }
       if (!exp) {
         return rpcOk(id, {

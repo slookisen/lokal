@@ -245,8 +245,13 @@ export function runOpplevelserEvidenceUrlVerificationGateTests(
         brreg_verified: 1, brreg_active: 1, verification_status: "verified",
       });
       db.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(HJEMMESIDE_VERIFIED_STAMP, ac1ProviderId);
+      // Title shares a significant token ("gårdsutsalg") with AC1_ABOUT_TEXT
+      // below — required since the faithfulness-inflow slice's homepage-
+      // boilerplate guard (dev-request 2026-06-23-experiences-richer-
+      // profiles, 2026-08-25); this file tests the evidence_url gate, not
+      // that guard.
       const ac1ExperienceId = store.createExperience({
-        title: "AC1 Gard opplevelse", provider_id: ac1ProviderId, provider_match_status: "matched",
+        title: "AC1 gårdsutsalg", provider_id: ac1ProviderId, provider_match_status: "matched",
         fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
         evidence_url: "https://ac1-evidence-never-fetched.example/proof",
       });

@@ -17645,6 +17645,11 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   const prevPathExp18 = process.env.EXPERIENCES_DB_PATH;
   let server18: import("http").Server | null = null;
   let prevRfbDb18: unknown = null;
+  // Admission-gate stub bookkeeping (see the stub block inside the try) —
+  // hoisted out of the try so the finally can restore them.
+  let prevFetch18: typeof globalThis.fetch | null = null;
+  let prevAnthropicKey18: string | undefined;
+  let fetchStub18Installed = false;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
 
@@ -17751,6 +17756,49 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
         json: async () => ({ _embedded: { enheter } }),
       };
     });
+
+    // ── Faithfulness-inflow slice (dev-request 2026-06-23-experiences-
+    // richer-profiles, 2026-08-25): apply-mode bulk-load now runs each NEW
+    // evidence-backed row through fetchPage(evidence_url) + the fail-closed
+    // LLM admission judge BEFORE admitting it as `verified`. Stub BOTH
+    // (globalThis.fetch for evidence pages + the Anthropic endpoint, plus a
+    // dummy ANTHROPIC_API_KEY so the judge doesn't fail closed on a missing
+    // key) so this section stays fully offline AND its rows keep landing
+    // exactly as the pre-gate assertions below expect (the judge answers
+    // MATCH for every row; the gate's own verdict routing has its dedicated
+    // test file, src/routes/opplevelser-bulk-load-admission-gate.test.ts).
+    // The in-process HTTP calls to the router itself go through the `http`
+    // module, never through this stub.
+    prevFetch18 = globalThis.fetch;
+    prevAnthropicKey18 = process.env.ANTHROPIC_API_KEY;
+    fetchStub18Installed = true;
+    process.env.ANTHROPIC_API_KEY = "test-key-orch-pr-18";
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      if (urlStr === "https://api.anthropic.com/v1/messages") {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ content: [{ type: "text", text: "MATCH\nStemmer med kilden." }] }),
+        } as unknown as Response;
+      }
+      // Loopback passthrough: UN-CHAINED sibling blocks in this file (the
+      // PWA sw-http/install-prompt HTTP smoke tests) fetch their own local
+      // express servers via the REAL global fetch, and their requests can
+      // land inside this stub's window — hand loopback URLs to the real
+      // fetch untouched so this stub only ever answers the admission gate's
+      // outbound evidence-page fetches.
+      let host = "";
+      try { host = new URL(urlStr).hostname; } catch { /* fall through to mock */ }
+      if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
+        return (prevFetch18 as any)(url, init);
+      }
+      const bytes = new TextEncoder().encode("<html><body>Evidensside for bulk-load-testen.</body></html>");
+      return {
+        ok: true, status: 200, statusText: "OK", url: urlStr,
+        headers: { get: (h: string) => (h.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+        arrayBuffer: async () => bytes.buffer,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
 
     // ── Mount the REAL router on a minimal Express app. ────────────────
     const expressMod18 = (await import("express")).default;
@@ -18302,6 +18350,13 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   } finally {
     if (server18) {
       await new Promise<void>((resolve) => server18!.close(() => resolve()));
+    }
+    // Restore the fetch/key stubs the admission-gate stub block above set
+    // (no-op when the try threw before the stub block ran).
+    if (fetchStub18Installed) {
+      globalThis.fetch = prevFetch18!;
+      if (prevAnthropicKey18 === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey18;
     }
     if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
@@ -34324,6 +34379,80 @@ const _contentRefreshErrorsByPersistencePromise: Promise<void> = new Promise<voi
     failures.push("opplevelser-content-refresh-errors-by-persistence: unexpected error: " + String(err?.message || err));
   } finally {
     _contentRefreshErrorsByPersistenceResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+// slice (2026-08-25): description faithfulness guards on POST
+// /admin/content-refresh — junk-description guard (isJunkDescription applied
+// on the WRITE path), per-experience homepage-boilerplate guard (a homepage
+// description that never names the experience is skipped for it), and the
+// content-level parked-domain detector (a parking lander is a classified
+// failed fetch, never a description source). Own dedicated test file (own
+// in-memory prod-schema DB, swaps the shared experiences db-factory getDb()
+// singleton) — mirrors the block immediately above, so it must run strictly
+// after it; _contentRefreshErrorsByPersistencePromise is the current tail of
+// that serial chain.
+let _contentRefreshDescriptionGuardsResolve: () => void = () => {};
+const _contentRefreshDescriptionGuardsPromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshDescriptionGuardsResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshErrorsByPersistencePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── faithfulness-inflow: content-refresh description guards (junk/boilerplate/parked) ──");
+  try {
+    const { runOpplevelserContentRefreshDescriptionGuardsTests } = require("../src/routes/opplevelser-content-refresh-description-guards.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-description-guards.test");
+    const crdg = await runOpplevelserContentRefreshDescriptionGuardsTests({ log: false });
+    passed += crdg.passed;
+    failed += crdg.failed;
+    for (const f of crdg.failures) failures.push("opplevelser-content-refresh-description-guards: " + f);
+    console.log(`  opplevelser-content-refresh-description-guards: ${crdg.passed} passed, ${crdg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-description-guards: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshDescriptionGuardsResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// Same faithfulness-inflow slice: the harvest ADMISSION GATE on POST
+// /admin/bulk-load (apply mode) — every NEW evidence-backed row is judged
+// against its own evidence page by the fail-closed LLM judge before being
+// admitted as `verified`; MISMATCH/unresolved/capped rows are inserted
+// quarantined (needs_review) with the verdict stamped. Also covers the
+// composition with the publish-gated GET /:id. Own dedicated test file (own
+// in-memory prod-schema DB + pinned RFB db, swaps the shared experiences
+// db-factory getDb() singleton and globalThis.fetch) — chained strictly
+// after the description-guards block above.
+let _bulkLoadAdmissionGateResolve: () => void = () => {};
+const _bulkLoadAdmissionGatePromise: Promise<void> = new Promise<void>(r => {
+  _bulkLoadAdmissionGateResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshDescriptionGuardsPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── faithfulness-inflow: bulk-load admission gate (LLM judge on harvest inflow) ──");
+  try {
+    const { runOpplevelserBulkLoadAdmissionGateTests } = require("../src/routes/opplevelser-bulk-load-admission-gate.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-admission-gate.test");
+    const blag = await runOpplevelserBulkLoadAdmissionGateTests({ log: false });
+    passed += blag.passed;
+    failed += blag.failed;
+    for (const f of blag.failures) failures.push("opplevelser-bulk-load-admission-gate: " + f);
+    console.log(`  opplevelser-bulk-load-admission-gate: ${blag.passed} passed, ${blag.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-bulk-load-admission-gate: unexpected error: " + String(err?.message || err));
+  } finally {
+    _bulkLoadAdmissionGateResolve();
   }
 })();
 

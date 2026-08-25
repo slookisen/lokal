@@ -55,7 +55,12 @@ import {
   buildRelaxationNote,
   buildNarrowingSuggestions,
   listCategories,
-  getExperienceById,
+  // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-
+  // inflow slice (2026-08-25): get_experience reads through the PUBLISH-
+  // GATED by-id variant — same PUBLISH_GATE_SQL as discover_experiences —
+  // so a quarantined (needs_review/rejected) or dedup-merged-away row is
+  // indistinguishable from a missing id to MCP callers.
+  getPublishedExperienceById,
   searchGardssalgProviders,
   countGardssalgProviders,
   getProviderById,
@@ -629,7 +634,10 @@ function registerExperienceTools(
     },
     async ({ id }) => {
       try {
-        const experience = getExperienceById(id);
+        // Publish-gated read (see the import comment above): a row failing
+        // the publish gate returns the exact same not-found result as a
+        // missing id — never a distinguishable "exists but hidden" answer.
+        const experience = getPublishedExperienceById(id);
 
         if (!experience) {
           return {
