@@ -20473,6 +20473,238 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
   }
 });
 
+// ─── POST /api/opplevelser/admin/experiences-content-judge-sweep ────────────
+//
+// Retro-clean SWEEP for `experiences` rows that predate the harvest
+// admission gate PR #721 added (judgeBulkLoadCandidate / ADMISSION_GATE_MAX_
+// JUDGED, above). That gate only stops NEW fabricated/mismatched rows from
+// being ADMITTED at insert time — it never touched a single row already
+// sitting in the table before it shipped. This endpoint is the mechanism to
+// retro-check THOSE: same fail-closed judge (judgeExperienceContentMatch),
+// same fetchPage()/CR_UA/CR_FETCH_TIMEOUT_MS fetch infra, same
+// requireAdmin/X-Admin-Key + dry-run-by-default conventions as every other
+// admin route in this file.
+//
+// MECHANISM ONLY: building + testing this sweep is this slice's whole scope.
+// Whether/when to actually run `apply:true` against production data is a
+// human (Daniel) decision — out of scope here. This endpoint is never called
+// with apply:true by any cron/routine as part of this change.
+//
+// Row selection: `evidence_url IS NOT NULL` (something to re-check the row's
+// content against) AND `canonical_id IS NULL` (not already superseded/hidden
+// by dedup — see init-experiences.ts). Deliberately NOT filtered on
+// verification_status — both published and unpublished rows are in scope,
+// since an already-quarantined `needs_review` row is still worth a check (to
+// confirm the quarantine was warranted, and so its admission_checked_at
+// advances and it stops being resurfaced ahead of never-checked rows by the
+// ordering below). Ordered never-checked-first (`admission_checked_at IS
+// NULL`), then oldest-checked-first, so repeated calls sweep the table
+// forward instead of hammering the same head-of-queue rows forever. Capped at
+// `limit` (query param or body field, default/max SWEEP_MAX_LIMIT=50 rows per
+// call — same per-call budget discipline as ADMISSION_GATE_MAX_JUDGED above:
+// one fetchPage() + one judge call per row).
+//
+// Per-row outcome (mirrors judgeBulkLoadCandidate's fetch-then-judge shape
+// above — fetch AND judge run in BOTH dry-run and apply, so a dry-run's
+// report is a trustworthy preview; only the DB WRITES are apply-mode-only):
+//   - fetchPage(evidence_url) fails (any FetchFailureReason) -> `unresolved`.
+//   - judge returns {ok:false} (a judge-API failure, distinct from a genuine
+//     rendered verdict) -> `unresolved`.
+//   - judge renders MISMATCH -> apply mode: verification_status set to
+//     'needs_review' (touches no other column) and
+//     stampExperienceAdmissionVerdict(id, "mismatch: <reasoning>"). Dry-run:
+//     reported as would_be_action only, zero writes.
+//   - judge renders MATCH -> apply mode: no status change, but
+//     stampExperienceAdmissionVerdict(id, "match: <reasoning>") IS still
+//     called so admission_checked_at advances — otherwise the ordering above
+//     would keep re-selecting this row ahead of genuinely never-checked rows
+//     forever. Dry-run: reported only.
+//   - unresolved -> apply mode: stampExperienceAdmissionVerdict(id,
+//     "unresolved: <reasoning>") for the same admission_checked_at-
+//     advancement reason. Dry-run: reported only.
+//
+// Boilerplate-description nulling: a SEPARATE, independently-counted check —
+// not the judge verdict — for rows whose `description` is a byte-identical
+// copy of the evidence_url page's own visible text (a verbatim harvest-time
+// dump, not the "own summary" the schema's own comment requires — see
+// init-experiences.ts). Evaluated whenever the evidence_url fetch itself
+// succeeded (there must be real page text to compare against), independent of
+// what the judge verdict on that same row was — a MATCH row's description can
+// still be boilerplate. Apply mode: description is set to NULL (a blank field
+// is honest; a future content-writer can refill it later — this endpoint
+// never fabricates a replacement). Dry-run: reported only, zero writes.
+//
+// `apply` must be exactly boolean `true` to write anything; anything else
+// (absent, false, or any other value) is a dry-run. Response:
+// { success, dry_run, batch_id, scanned, counts:{match,mismatch,unresolved,
+// description_nulled}, results:[{id,verdict,reason,description_nulled,
+// would_be_action|action_taken}], remaining }. `remaining` = rows still
+// eligible by the same WHERE clause past this call's `limit` cap.
+const SWEEP_DEFAULT_LIMIT = 50;
+const SWEEP_MAX_LIMIT = 50;
+const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL";
+
+type ContentJudgeSweepRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  price_band: string | null;
+  price_from: number | null;
+  evidence_url: string | null;
+  content_field_evidence: string | null;
+  admission_checked_at: string | null;
+};
+
+router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { apply?: unknown; limit?: unknown };
+    const applyMode = body.apply === true;
+    const dryRun = !applyMode;
+
+    // `limit`: query param takes precedence over body when both are given
+    // (mirrors this route family's existing query/body tolerance elsewhere in
+    // this file); non-numeric/absent falls back to the default, and the
+    // result is always clamped to SWEEP_MAX_LIMIT regardless of what was
+    // requested (cost control — see the block comment above).
+    const rawQueryLimit = typeof req.query.limit === "string" ? req.query.limit : undefined;
+    let requestedLimit: number;
+    if (rawQueryLimit !== undefined) {
+      const n = parseInt(rawQueryLimit, 10);
+      requestedLimit = Number.isFinite(n) ? n : SWEEP_DEFAULT_LIMIT;
+    } else if (typeof body.limit === "number" && Number.isFinite(body.limit)) {
+      requestedLimit = Math.floor(body.limit);
+    } else {
+      requestedLimit = SWEEP_DEFAULT_LIMIT;
+    }
+    if (requestedLimit <= 0) requestedLimit = SWEEP_DEFAULT_LIMIT;
+    const limit = Math.min(SWEEP_MAX_LIMIT, requestedLimit);
+
+    const expDb = getExpDb("experiences");
+
+    const totalEligible = (
+      expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE}`).get() as { n: number }
+    ).n;
+
+    const rows = expDb
+      .prepare(
+        `SELECT id, title, description, category, price_band, price_from, evidence_url, content_field_evidence, admission_checked_at
+           FROM experiences
+          WHERE ${SWEEP_ELIGIBLE_WHERE}
+          ORDER BY admission_checked_at IS NULL DESC, admission_checked_at ASC
+          LIMIT ?`,
+      )
+      .all(limit) as ContentJudgeSweepRow[];
+
+    const counts = { match: 0, mismatch: 0, unresolved: 0, description_nulled: 0 };
+    const results: Array<{
+      id: string;
+      verdict: "MATCH" | "MISMATCH" | "unresolved";
+      reason: string;
+      description_nulled: boolean;
+      would_be_action?: string;
+      action_taken?: string;
+    }> = [];
+
+    const batchId = `content-judge-sweep-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
+
+    for (const row of rows) {
+      const evidenceUrl = (row.evidence_url ?? "").trim();
+
+      let outcome: { verdict: "MATCH" | "MISMATCH" | "unresolved"; reason: string };
+      let pageText: string | null = null;
+
+      if (!evidenceUrl) {
+        // Row selection guarantees evidence_url IS NOT NULL, but never trust
+        // a stored value to be non-blank sight-unseen — an empty STRING
+        // (distinct from NULL) must fail closed exactly like a genuine fetch
+        // failure, never silently skip the row or crash the batch.
+        outcome = { verdict: "unresolved", reason: "evidence_url er en tom streng — ingenting å hente, avvist fail-closed" };
+      } else {
+        const fetchResult = await fetchPage(evidenceUrl, { userAgent: CR_UA, timeoutMs: CR_FETCH_TIMEOUT_MS });
+        if (!fetchResult.ok) {
+          outcome = {
+            verdict: "unresolved",
+            reason: `henting av evidensside feilet: ${fetchResult.reason} (${fetchResult.detail})`,
+          };
+        } else {
+          pageText = visibleTextOf(fetchResult.html);
+          const judgeRow: HoldoutExperienceRow = {
+            id: row.id,
+            title: row.title,
+            description: row.description,
+            category: row.category,
+            price_band: row.price_band,
+            price_from: row.price_from,
+            evidence_url: row.evidence_url,
+            content_field_evidence: row.content_field_evidence,
+          };
+          const judged = await judgeExperienceContentMatch(judgeRow, pageText);
+          outcome = judged.ok
+            ? { verdict: judged.verdict, reason: judged.reasoning }
+            : { verdict: "unresolved", reason: judged.reasoning };
+        }
+      }
+
+      // Boilerplate-description check: SEPARATE from the judge verdict above,
+      // only meaningful when a real fetch actually happened (pageText !==
+      // null) — a fetch failure leaves nothing to compare the stored
+      // description against, so it is never counted as boilerplate on doubt.
+      const isBoilerplate = pageText !== null && row.description !== null && row.description === pageText;
+      if (isBoilerplate) counts.description_nulled++;
+
+      const verdictKey: "match" | "mismatch" | "unresolved" =
+        outcome.verdict === "MATCH" ? "match" : outcome.verdict === "MISMATCH" ? "mismatch" : "unresolved";
+      counts[verdictKey]++;
+
+      let descriptionNulled = false;
+      if (applyMode) {
+        if (outcome.verdict === "MISMATCH") {
+          expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(row.id);
+        }
+        // MATCH and unresolved are stamped too (see block comment above) —
+        // never skipped just because there's no status change to make.
+        stampExperienceAdmissionVerdict(row.id, `${verdictKey}: ${outcome.reason}`);
+        if (isBoilerplate) {
+          expDb.prepare(`UPDATE experiences SET description = NULL WHERE id = ?`).run(row.id);
+          descriptionNulled = true;
+        }
+      }
+
+      const actionText =
+        outcome.verdict === "MISMATCH"
+          ? "verification_status -> needs_review; admission_verdict stemplet (mismatch)"
+          : outcome.verdict === "MATCH"
+            ? "ingen statusendring; admission_verdict stemplet (match)"
+            : "ingen statusendring; admission_verdict stemplet (unresolved)";
+      const descText = isBoilerplate ? "; description nullstilt (boilerplate-kopi av kildeside)" : "";
+
+      results.push({
+        id: row.id,
+        verdict: outcome.verdict,
+        reason: outcome.reason,
+        description_nulled: descriptionNulled,
+        ...(dryRun
+          ? { would_be_action: `[dry-run] ${actionText}${descText}` }
+          : { action_taken: `${actionText}${descText}` }),
+      });
+    }
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      batch_id: batchId,
+      scanned: rows.length,
+      counts,
+      results,
+      remaining: Math.max(0, totalEligible - rows.length),
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-content-judge-sweep failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/providers/all ────────────────────────────────
 //
 // dev-request 2026-07-30-experience-providers-enumerate: the routine's
