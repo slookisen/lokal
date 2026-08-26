@@ -517,7 +517,7 @@ import {
 // dedup pass's own title tokenizer (diacritics folded, stopwords and <3-char
 // tokens dropped, crude plural-s stemming) rather than growing a second,
 // subtly-different tokenization of the same titles.
-import { titleTokens } from "../services/experience-dedup";
+import { titleTokens, titleSimilarity, CONTENT_TRANSFER_SIMILARITY_MIN } from "../services/experience-dedup";
 // dev-request 2026-07-27-fetch-infrastruktur-diagnose (P0-1) — the shared,
 // CLASSIFIED fetcher. It owns the charset-correct decode that used to be done
 // here via decodeHtmlBytes (PR lokal#365), and adds the named failure reason,
@@ -1631,7 +1631,17 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             confidence: r.confidence ?? null,
           });
           const existingScore = scoreExperienceRichness(match);
-          if (candidateScore > existingScore) {
+          // Part 1 (dev-request 2026-08-25-titlesmatch-ubiquity-herding):
+          // only transfer content onto the matched row when the titles
+          // themselves corroborate the match at CONTENT_TRANSFER_SIMILARITY_MIN
+          // full-string similarity — see the sibling gate in
+          // experience-store.ts's bulkInsertExperiences for the full
+          // rationale (titlesMatch() alone isn't license to overwrite blank
+          // fields on a row matched only via a shared, possibly
+          // provider-ubiquitous, token).
+          const titlesCorroborated =
+            titleSimilarity(r.title, match.title) >= CONTENT_TRANSFER_SIMILARITY_MIN;
+          if (candidateScore > existingScore && titlesCorroborated) {
             applyExperienceContent(match.id, {
               category: r.category ?? null,
               subcategory: r.subcategory ?? null,
@@ -1649,6 +1659,9 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
               // mismatch that is not an error.
             }, harvestProvenanceOf(r.evidence_url));
           }
+          // Either the existing row already has equal-or-better data, or
+          // (Part 1) the titles don't corroborate closely enough to trust a
+          // content write — both are legitimate "no write" outcomes.
           skipped++;
           continue;
         }

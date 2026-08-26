@@ -24,6 +24,9 @@ import {
   pickCanonical,
   groupDuplicateCandidates,
   buildProviderCorpusTokenCounts,
+  computeProviderUbiquitousTokens,
+  titleSimilarity,
+  CONTENT_TRANSFER_SIMILARITY_MIN,
   type DedupCandidateRow,
 } from "./experience-dedup";
 
@@ -465,6 +468,100 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       );
     }
 
+    // ── 9e. Bucket-local ubiquity demotion (dev-request 2026-08-25-
+    // titlesmatch-ubiquity-herding, Part 2): a provider's OWN brand/place
+    // name, repeated across >50% of its own titles (bucket size >= 3), is
+    // demoted from "sufficient rare-token evidence" to "requires
+    // GENERIC_TOKEN_CORROBORATION_MIN whole-string corroboration" — so
+    // DIFFERENT real experiences under the same brand no longer merge just
+    // because they share the brand token. "Molja Fyr" trio: three
+    // DIFFERENT experiences at the same place, sharing only the brand
+    // token "molja" (>= 5 chars, the only recurring SIGNIFICANT token —
+    // "fyr" is 3 chars, below SIGNIFICANT_TOKEN_MIN_LEN, so it never even
+    // reaches titlesMatch()'s significant-token check).
+    {
+      const moljaTitles = [
+        "Molja Fyr — Overnatting",
+        "Molja Fyr — Restaurantbesøk",
+        "Molja Fyr — Fyromvisning",
+      ];
+      const moljaUbiquitous = computeProviderUbiquitousTokens(moljaTitles);
+      assertTrue(
+        moljaUbiquitous.has("molja"),
+        "9e-1: 'molja' is detected as ubiquitous within the Molja Fyr bucket (3 of 3 titles = 100% > 50%)"
+      );
+
+      // Sanity check: WITHOUT the Part-2 demotion (old behavior — 4th arg
+      // omitted entirely), these two titles wrongly match on the shared,
+      // corpus-rare token "molja" alone — proves this fixture actually
+      // exercises the bug this fix addresses, not a pair that was already
+      // non-matching for unrelated reasons.
+      assertTrue(
+        titlesMatch(moljaTitles[0], moljaTitles[1], new Map()),
+        "9e-2: sanity check — WITHOUT the demotion, 'Overnatting' vs 'Restaurantbesøk' wrongly match via the shared rare token 'molja' alone"
+      );
+      // WITH the demotion applied, the same pair — sharing only the now-
+      // demoted "molja" — falls through to whole-string corroboration and
+      // correctly does NOT match.
+      assertTrue(
+        !titlesMatch(moljaTitles[0], moljaTitles[1], new Map(), moljaUbiquitous),
+        "9e-3: WITH the demotion, 'Overnatting' vs 'Restaurantbesøk' correctly do NOT match — different experiences under the same brand"
+      );
+      assertTrue(
+        !titlesMatch(moljaTitles[1], moljaTitles[2], new Map(), moljaUbiquitous),
+        "9e-4: ...nor do 'Restaurantbesøk' vs 'Fyromvisning'"
+      );
+      assertTrue(
+        !titlesMatch(moljaTitles[0], moljaTitles[2], new Map(), moljaUbiquitous),
+        "9e-5: ...nor do 'Overnatting' vs 'Fyromvisning'"
+      );
+
+      // 9e-6: groupDuplicateCandidates (the real caller) computes and
+      // applies the per-bucket demotion itself — proves the wiring, not
+      // just the pure function in isolation.
+      const moljaRows: DedupCandidateRow[] = moljaTitles.map((title, i) =>
+        row({ id: `molja-${i}`, provider_id: "prov-molja", kommune: "Molde", title })
+      );
+      assertEq(
+        groupDuplicateCandidates(moljaRows, new Map()).length,
+        0,
+        "9e-6: groupDuplicateCandidates finds ZERO duplicate groups among the Molja Fyr trio — the brand-name token alone no longer merges them"
+      );
+    }
+
+    // ── 9f. Part-2 regression guard: the Kon-Tiki cluster (test 3a / 9b-5)
+    // must be UNCHANGED — 'kontiki' appears in 2 of the 4 titles in that
+    // provider's bucket (see section 10 below), i.e. exactly 50%, which is
+    // NOT strictly greater than 50%, so it must NOT be demoted. Mirrors the
+    // exact fixture 3a/9b-5 use, but makes the ubiquity computation and its
+    // non-effect explicit.
+    {
+      const kontikiBucketTitles = [
+        "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…", // kontiki, heyerdahl
+        "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo", // heyerdahl, oslo
+        "Kon-Tiki Museum Oslo — Official Site", // kontiki, oslo
+        "Guidet fjelltur til Fløyen", // unrelated
+      ];
+      const kontikiUbiquitous = computeProviderUbiquitousTokens(kontikiBucketTitles);
+      assertTrue(
+        !kontikiUbiquitous.has("kontiki"),
+        "9f-1: 'kontiki' (2 of 4 = 50%) is NOT demoted — 50% does not clear the >50% bar"
+      );
+      assertTrue(
+        !kontikiUbiquitous.has("heyerdahl"),
+        "9f-2: 'heyerdahl' (2 of 4 = 50%) is likewise NOT demoted"
+      );
+      assertTrue(
+        titlesMatch(
+          "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…",
+          "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo",
+          new Map([["heyerdahl", 2]]),
+          kontikiUbiquitous
+        ),
+        "9f-3: 3a/9b-5 unchanged — Kon-Tiki / Thor Heyerdahl still matches via the (non-demoted) rare token 'heyerdahl', even when a real bucket-derived ubiquitous-token set is passed"
+      );
+    }
+
     // ── 10. runDedupPass + idempotency + re-harvest guard + discover-query invariant,
     //        against a real in-memory experiences DB ──
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
@@ -802,6 +899,151 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
         1,
         "13e: a genuinely different activity (neither title nor title_no overlaps) still inserts normally — the fix hasn't over-widened matching"
       );
+
+      // ── 14. Part 1 (dev-request 2026-08-25-titlesmatch-ubiquity-herding):
+      // content only transfers onto a re-harvest MATCH-branch row when the
+      // two titles corroborate at CONTENT_TRANSFER_SIMILARITY_MIN whole-
+      // string similarity — titlesMatch() alone (a shared-RARE-token
+      // candidate-key decision) is not license to WRITE one row's data onto
+      // another matched row's blank fields. Uses the EXACT Kon-Tiki/
+      // Heyerdahl pair from test 3a/9b-5 — a legitimate dedup MATCH via the
+      // rare token "heyerdahl" — whose whole-string similarity is
+      // nonetheless only ~0.13 (see the sanity check below), far under the
+      // 0.85 bar, so content must NOT transfer even though the two rows are
+      // correctly treated as the same real-world experience for dedup
+      // purposes.
+      {
+        const contentTransferProviderId = expStore.createProvider({
+          navn: "Kon-Tiki Content-Transfer Test AS",
+          kommune: "Oslo",
+          fylke: "Oslo",
+          brreg_verified: 1,
+          brreg_active: 1,
+        });
+        const thinExistingId = expStore.createExperience({
+          title: "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo",
+          provider_id: contentTransferProviderId,
+          kommune: "Oslo",
+          fylke: "Oslo",
+          confidence: "low",
+        });
+
+        assertTrue(
+          titleSimilarity(
+            "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…",
+            "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo"
+          ) < CONTENT_TRANSFER_SIMILARITY_MIN,
+          "14a: sanity check — the Kon-Tiki/Heyerdahl pair's whole-string similarity is well under the 0.85 content-transfer bar (they still legitimately dedup-MATCH via the rare token, just aren't worded closely enough to trust a content write)"
+        );
+
+        const contentTransferResult = expStore.bulkInsertExperiences([
+          {
+            title: "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…",
+            provider_id: contentTransferProviderId,
+            kommune: "Oslo",
+            fylke: "Oslo",
+            description:
+              "En rik og detaljert beskrivelse av Kon-Tiki Museet og Heyerdahls ekspedisjoner over Stillehavet.",
+            booking_url: "https://kon-tiki.example.no/book",
+            confidence: "high",
+          },
+        ]);
+        assertEq(
+          contentTransferResult.inserted,
+          0,
+          "14b: the candidate is correctly recognized as a re-harvest MATCH — zero new rows inserted"
+        );
+        assertEq(
+          contentTransferResult.updated,
+          0,
+          "14c: despite the candidate scoring richer than the thin existing row, NO content transfer happens — the titles don't corroborate closely enough (Part 1)"
+        );
+        assertEq(contentTransferResult.skipped, 1, "14d: the row is correctly counted as skipped, not updated");
+
+        const thinRowAfter = db
+          .prepare("SELECT description, booking_url FROM experiences WHERE id = ?")
+          .get(thinExistingId) as { description: string | null; booking_url: string | null } | undefined;
+        assertTrue(
+          !thinRowAfter?.description && !thinRowAfter?.booking_url,
+          "14e: the existing (thin) row's blank fields remain blank — no content was written onto it"
+        );
+      }
+
+      // ── 15. Part 2, end-to-end through the real re-harvest guard against a
+      // live DB: "Ringve" re-harvest variant. Three pre-existing rows for one
+      // provider all share the brand tokens "ringve"/"musikkmuseum" (a
+      // bucket of size 3, so Part 2's >50% demotion applies). A re-harvested
+      // "variant" title sharing ONLY those brand tokens (not the specific
+      // activity wording) must insert as its OWN NEW row, not silently merge
+      // onto one of the three via the demoted tokens alone.
+      {
+        const ringveProviderId = expStore.createProvider({
+          navn: "Ringve Musikkmuseum AS",
+          kommune: "Trondheim",
+          fylke: "Trøndelag",
+          brreg_verified: 1,
+          brreg_active: 1,
+          verification_status: "verified",
+        });
+        const ringveTitles = [
+          "Ringve Musikkmuseum — Omvisning",
+          "Ringve Musikkmuseum — Konsertopplevelse",
+          "Ringve Musikkmuseum — Hagevandring",
+        ];
+        for (const title of ringveTitles) {
+          expStore.createExperience({
+            title,
+            provider_id: ringveProviderId,
+            kommune: "Trondheim",
+            fylke: "Trøndelag",
+            verification_status: "verified",
+            confidence: "medium",
+          });
+        }
+
+        const ringveVariantTitle = "Ringve Musikkmuseum — Vinterkonsert";
+        const directRingveMatch = expStore.findExistingExperienceMatch({
+          provider_id: ringveProviderId,
+          title: ringveVariantTitle,
+          kommune: "Trondheim",
+        });
+        assertEq(
+          directRingveMatch,
+          null,
+          "15a: findExistingExperienceMatch finds NO match for the Ringve variant — the demoted brand tokens 'ringve'/'musikkmuseum' alone aren't sufficient once the bucket is >= 3 titles"
+        );
+
+        const beforeRingveCount = (db.prepare("SELECT COUNT(*) AS c FROM experiences").get() as { c: number }).c;
+        const ringveHarvestResult = expStore.bulkInsertExperiences([
+          {
+            title: ringveVariantTitle,
+            provider_id: ringveProviderId,
+            kommune: "Trondheim",
+            fylke: "Trøndelag",
+            confidence: "low",
+          },
+        ]);
+        const afterRingveCount = (db.prepare("SELECT COUNT(*) AS c FROM experiences").get() as { c: number }).c;
+        assertEq(
+          ringveHarvestResult.inserted,
+          1,
+          "15b: the Ringve-variant re-harvest inserts as its own NEW row, not a silent merge"
+        );
+        assertEq(
+          afterRingveCount,
+          beforeRingveCount + 1,
+          "15c: the experiences table gained exactly one row from the re-harvest"
+        );
+
+        // Sanity check: WITHOUT the Part-2 demotion (bucket-less corpus-only
+        // titlesMatch, i.e. the old pre-fix decision path), this same pair
+        // wrongly matches via the shared, corpus-rare brand token alone —
+        // proves the fixture exercises the bug this fix addresses.
+        assertTrue(
+          titlesMatch(ringveTitles[0], ringveVariantTitle, new Map()),
+          "15d: sanity check — WITHOUT the demotion, the Ringve variant wrongly matches the first seed title via the shared rare brand token alone"
+        );
+      }
     } catch (err: any) {
       failed++;
       failures.push("experience-dedup: unexpected error: " + String(err?.stack || err?.message || err));

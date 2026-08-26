@@ -105,6 +105,8 @@ import type { BraveResult } from "./search-enrich";
 import {
   findExistingCandidateMatch,
   scoreExperienceRichness,
+  titleSimilarity,
+  CONTENT_TRANSFER_SIMILARITY_MIN,
   type DedupCandidateRow,
   type ExperienceRichnessInput,
 } from "./experience-dedup";
@@ -1723,7 +1725,19 @@ export function bulkInsertExperiences(
         if (match) {
           const candidateScore = scoreExperienceRichness(row as ExperienceRichnessInput);
           const existingScore = scoreExperienceRichness(match);
-          if (candidateScore > existingScore) {
+          // Part 1 (dev-request 2026-08-25-titlesmatch-ubiquity-herding):
+          // content only transfers onto the matched row when the titles
+          // themselves corroborate the match at CONTENT_TRANSFER_SIMILARITY_MIN
+          // full-string similarity — titlesMatch() alone (a shared-token
+          // candidate-key decision) is not sufficient license to WRITE one
+          // row's data onto another matched row's blank fields; a same-
+          // provider match that only cleared titlesMatch() via a shared
+          // token (rare corpus-wide, but see Part 2 above for the
+          // provider-ubiquitous-token case that motivated this) must not
+          // silently overwrite a DIFFERENT real-world experience's data.
+          const titlesCorroborated =
+            titleSimilarity(row.title, match.title) >= CONTENT_TRANSFER_SIMILARITY_MIN;
+          if (candidateScore > existingScore && titlesCorroborated) {
             applyExperienceContent(match.id, {
               description: row.description ?? null,
               category: row.category ?? null,
@@ -1743,6 +1757,12 @@ export function bulkInsertExperiences(
             }, harvestProvenanceOf(row.evidence_url));
             updated++;
           } else {
+            // Either the existing row already has equal-or-better data, or
+            // (Part 1) the titles don't corroborate closely enough to trust
+            // writing this row's content onto the matched row — both are
+            // legitimate "no write" outcomes, so this counts as skipped, not
+            // an error (see 11c/13c in experience-dedup.test.ts, which accept
+            // skipped+updated === 1 as valid for exactly this reason).
             skipped++;
           }
           continue;
