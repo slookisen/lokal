@@ -336,7 +336,7 @@ import {
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
 // common-token rule merged some genuinely different experiences), consumed by
 // the two admin endpoints at the bottom of this file.
-import { auditMergedGroups } from "../services/experience-dedup-audit";
+import { auditMergedGroups, findCanonicalGroupsByTitle } from "../services/experience-dedup-audit";
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
 // Steg 2 — gårdssalg producer <-> experience/activity cross-table conflict
 // diagnosis (GET /admin/gardssalg-experience-conflict-audit) + remediation
@@ -23095,6 +23095,47 @@ router.post("/admin/experiences-canonical-group-merge", requireAdmin, (req: Requ
     }
   } catch (err) {
     console.error("[experiences-canonical-group-merge] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/opplevelser/admin/experiences-canonical-groups?title_contains= ──
+//
+// Read-only — zero writes. Companion lookup for POST
+// /admin/experiences-canonical-group-merge above: that route needs a
+// caller-supplied keep_canonical_id/remove_canonical_id pair, but neither GET
+// /admin/experiences-dedup-audit (suspect-flagged groups only), GET
+// /admin/experiences-provider-dedup-audit (still-duplicated providers only),
+// nor /sok (published/verified rows only) can resolve a canonical group's id
+// from a business name for a RAW, non-suspect, unpublished row — e.g. Ringve
+// (dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// FUNN "experiences-dedup-audit-mangler-navnesok-over-ikke-suspect-grupper":
+// Ringve's two canonical groups are each internally consistent, so neither
+// has ever had a 'suspect' row, and are therefore invisible to that audit).
+//
+// Case-insensitive substring match against title, checked against every row
+// (canonical anchors and rows already merged into one), published or not.
+// See findCanonicalGroupsByTitle()'s own doc comment
+// (services/experience-dedup-audit.ts) for why a match resolves to the row's
+// FULL group rather than just the matching row.
+router.get("/admin/experiences-canonical-groups", requireAdmin, (req: Request, res: Response) => {
+  const titleContains = typeof req.query.title_contains === "string" ? req.query.title_contains.trim() : "";
+  if (!titleContains) {
+    res.status(400).json({ error: "title_contains (ikke-tom streng) påkrevd" });
+    return;
+  }
+  try {
+    const db = getExpDb("experiences");
+    const { groups, groups_truncated } = findCanonicalGroupsByTitle(db, titleContains);
+    res.json({
+      success: true,
+      query: titleContains,
+      groups_returned: groups.length,
+      groups_truncated,
+      groups,
+    });
+  } catch (err) {
+    console.error("[experiences-canonical-groups] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

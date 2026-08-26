@@ -41282,3 +41282,26 @@ runSerial(async () => {
     failures.push("opplevelser-price-freshness-check: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// FUNN "experiences-dedup-audit-mangler-navnesok-over-ikke-suspect-grupper":
+// GET /admin/experiences-canonical-groups?title_contains= — read-only
+// companion lookup for POST /admin/experiences-canonical-group-merge, since
+// no existing read path can resolve a canonical group's id from a business
+// name for a RAW, non-suspect, unpublished row (e.g. Ringve). Tail position
+// is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-canonical-groups-lookup: name-search for canonical group ids ──");
+  try {
+    const { runOpplevelserExperiencesCanonicalGroupsLookupTests } = require("../src/routes/opplevelser-experiences-canonical-groups-lookup.test") as
+      typeof import("../src/routes/opplevelser-experiences-canonical-groups-lookup.test");
+    const ecgl = await runOpplevelserExperiencesCanonicalGroupsLookupTests({ log: false });
+    passed += ecgl.passed;
+    failed += ecgl.failed;
+    for (const f of ecgl.failures) failures.push("opplevelser-experiences-canonical-groups-lookup: " + f);
+    console.log(`  opplevelser-experiences-canonical-groups-lookup: ${ecgl.passed} passed, ${ecgl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-canonical-groups-lookup: unexpected error: " + String(err?.message || err));
+  }
+});
