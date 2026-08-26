@@ -64,7 +64,7 @@
  */
 
 import type Database from "better-sqlite3";
-import { parseContentFieldEvidence } from "./experience-store";
+import { parseContentFieldEvidence, PUBLISH_GATE_SQL } from "./experience-store";
 
 export interface HoldoutExperienceRow {
   id: string;
@@ -184,6 +184,80 @@ export function sampleEnrichedExperiencesForHoldout(
   }
 
   return pool.slice(0, Math.min(safeN, pool.length));
+}
+
+export interface PublishedHoldoutPool {
+  rows: HoldoutExperienceRow[];
+  considered: number; // published-gate rows examined (pool, capped at HOLDOUT_POOL_CAP)
+  checkable: number; // of those, how many resolveHoldoutEvidenceUrl() actually resolves for
+}
+
+/**
+ * Selects up to `n` rows from the rows that ACTUALLY PASS PUBLISH_GATE_SQL —
+ * the same predicate /discover, the detail page, and getPublishedExperience
+ * ById()/BySlug() use to decide what is genuinely served to the public.
+ *
+ * dev-request 2026-08-25-wcr-holdout-pool-dekker-ikke-publisert-flate: a
+ * 2026-08-25 production measurement found sampleEnrichedExperiencesForHoldout
+ * (above) — filtered to enrichment_state='enriched' AND content_source=
+ * 'provider_site' — essentially NEVER returns a row that is actually
+ * published: of the catalog's 558 published experiences, almost none were
+ * filled by the enrichment pass; most are harvest-filled. So the wrong_
+ * content_rate guardrail's `published` stratum always came back sample_size:
+ * 0 — the holdout measured the internal enriched-but-unpublished backlog,
+ * never what real users/agents are actually served. Unlike its sibling, this
+ * function does NOT filter on enrichment_state/content_source at all — it
+ * pulls straight from PUBLISH_GATE_SQL, because the point of THIS pool is to
+ * measure what is SERVED, not what the enrichment pass has touched.
+ *
+ * Published rows can lack `content_field_evidence` (harvest-filled, never
+ * touched by applyExperienceContent) — resolveHoldoutEvidenceUrl()'s fallback
+ * to the legacy `evidence_url` column covers most of those. Rows with
+ * NEITHER are still honestly excluded from `rows` (same discipline as the
+ * sibling sampler — no fabricated comparison against garbage), but silently
+ * dropping them here would let a pool where e.g. 90% of published rows carry
+ * no checkable citation at all read as "measured green" once the pool is
+ * mostly filtered away. `considered` (rows the publish gate actually admits,
+ * pool-capped) vs `checkable` (of those, how many resolveHoldoutEvidenceUrl()
+ * resolves for) lets the caller report that exclusion rate honestly instead
+ * of it disappearing into an empty-looking `rows` array.
+ */
+export function samplePublishedExperiencesForHoldout(
+  db: Database.Database,
+  n: number,
+): PublishedHoldoutPool {
+  const safeN = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  if (safeN <= 0) return { rows: [], considered: 0, checkable: 0 };
+
+  const rawPool = db
+    .prepare(
+      `SELECT e.id, e.title, e.description, e.category, e.price_band, e.price_from,
+              e.evidence_url, e.content_field_evidence
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE ${PUBLISH_GATE_SQL}
+        ORDER BY e.updated_at DESC
+        LIMIT ?`,
+    )
+    .all(HOLDOUT_POOL_CAP) as HoldoutExperienceRow[];
+
+  const pool = rawPool.filter((row) => resolveHoldoutEvidenceUrl(row) !== null);
+
+  // Same Fisher-Yates shuffle as sampleEnrichedExperiencesForHoldout above —
+  // the pool is already capped by the SQL LIMIT, so this never touches more
+  // than HOLDOUT_POOL_CAP rows.
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = pool[i]!;
+    pool[i] = pool[j]!;
+    pool[j] = tmp;
+  }
+
+  return {
+    rows: pool.slice(0, Math.min(safeN, pool.length)),
+    considered: rawPool.length,
+    checkable: pool.length,
+  };
 }
 
 export type ExperienceContentJudgeVerdict =

@@ -33,6 +33,7 @@
 import {
   judgeExperienceContentMatch,
   sampleEnrichedExperiencesForHoldout,
+  samplePublishedExperiencesForHoldout,
   resolveHoldoutEvidenceUrl,
   type HoldoutExperienceRow,
 } from "../services/experience-content-judge";
@@ -320,6 +321,79 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
 
         const sampledZero = sampleEnrichedExperiencesForHoldout(db as any, 0);
         assertEq(sampledZero.length, 0, "se-4: n=0 returns an empty array, no query-limit edge case crash");
+
+        db.close();
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (b1) samplePublishedExperiencesForHoldout — dev-request 2026-08-25-
+      //     wcr-holdout-pool-dekker-ikke-publisert-flate: the published-quota
+      //     sampler pulls straight from PUBLISH_GATE_SQL (verification_status
+      //     = 'verified', confidence NULL/high/medium, provider brreg_active
+      //     or no provider, canonical_id NULL) — independent of enrichment_
+      //     state/content_source — and reports `considered` (gate-passing
+      //     rows examined) vs `checkable` (of those, how many resolveHoldout
+      //     EvidenceUrl() actually resolves for) so an honest exclusion rate
+      //     can be reported instead of unchecka­ble rows silently vanishing.
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+        const db = new Database(":memory:");
+        db.exec(`
+          CREATE TABLE experiences (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            description TEXT,
+            category TEXT,
+            price_band TEXT,
+            price_from INTEGER,
+            evidence_url TEXT,
+            content_field_evidence TEXT,
+            verification_status TEXT,
+            confidence TEXT,
+            canonical_id TEXT,
+            provider_id TEXT,
+            updated_at TEXT
+          );
+          -- PUBLISH_GATE_SQL LEFT JOINs this table even when every row here
+          -- leaves provider_id NULL (its "p.id IS NULL OR ..." branch is what
+          -- passes then) — the table must still exist for the JOIN to parse.
+          CREATE TABLE experience_providers (
+            id TEXT PRIMARY KEY,
+            brreg_active INTEGER
+          );
+        `);
+        const insertP = db.prepare(
+          `INSERT INTO experiences (id, title, description, category, price_band, price_from, evidence_url, content_field_evidence, verification_status, confidence, canonical_id, provider_id, updated_at)
+           VALUES (@id, @title, @description, @category, @price_band, @price_from, @evidence_url, @content_field_evidence, @verification_status, @confidence, @canonical_id, @provider_id, @updated_at)`,
+        );
+        // Passes PUBLISH_GATE_SQL, checkable via evidence_url. provider_id
+        // left NULL -> PUBLISH_GATE_SQL's "p.id IS NULL OR p.brreg_active = 1"
+        // passes without any experience_providers row needing to exist.
+        insertP.run({ id: "p-pub-1", title: "A", description: "d", category: "c", price_band: "standard", price_from: 100, evidence_url: "https://p1.no", content_field_evidence: null, verification_status: "verified", confidence: null, canonical_id: null, provider_id: null, updated_at: "2026-08-01" });
+        insertP.run({ id: "p-pub-2", title: "B", description: "d", category: "c", price_band: "standard", price_from: 100, evidence_url: "https://p2.no", content_field_evidence: null, verification_status: "verified", confidence: "high", canonical_id: null, provider_id: null, updated_at: "2026-08-02" });
+        // Passes PUBLISH_GATE_SQL but carries NO checkable citation at all
+        // (no evidence_url, no content_field_evidence) — must be counted in
+        // `considered` but excluded from both `checkable` and `rows`.
+        insertP.run({ id: "p-pub-no-citation", title: "C", description: "d", category: "c", price_band: "standard", price_from: 100, evidence_url: null, content_field_evidence: null, verification_status: "verified", confidence: null, canonical_id: null, provider_id: null, updated_at: "2026-08-03" });
+        // Does NOT pass PUBLISH_GATE_SQL (verification_status != 'verified')
+        // -> excluded entirely, not even counted in `considered`.
+        insertP.run({ id: "p-not-published", title: "D", description: "d", category: "c", price_band: "standard", price_from: 100, evidence_url: "https://d.no", content_field_evidence: null, verification_status: "pending_verify", confidence: null, canonical_id: null, provider_id: null, updated_at: "2026-08-01" });
+
+        const publishedPool = samplePublishedExperiencesForHoldout(db as any, 10);
+        assertEq(publishedPool.rows.length, 2, "sp-1: only the 2 checkable, gate-passing rows land in rows");
+        const publishedIds = publishedPool.rows.map((r) => r.id).sort();
+        assertEq(publishedIds, ["p-pub-1", "p-pub-2"], "sp-2: exactly the checkable published rows, no-citation and non-published rows excluded from rows");
+        assertEq(publishedPool.considered, 3, "sp-3: considered counts all 3 gate-passing rows (including the no-citation one), NOT the non-published row");
+        assertEq(publishedPool.checkable, 2, "sp-4: checkable counts only the 2 rows resolveHoldoutEvidenceUrl() actually resolves for");
+
+        const smallPool = samplePublishedExperiencesForHoldout(db as any, 1);
+        assertEq(smallPool.rows.length, 1, "sp-5: n=1 returns exactly 1 row from a larger checkable pool");
+        assertEq(smallPool.considered, 3, "sp-6: considered is unaffected by n — it reflects the full gate-passing pool, not the requested slice");
+        assertEq(smallPool.checkable, 2, "sp-7: checkable is likewise unaffected by n");
+
+        const zeroPool = samplePublishedExperiencesForHoldout(db as any, 0);
+        assertEq(zeroPool, { rows: [], considered: 0, checkable: 0 }, "sp-8: n=0 returns an empty pool with considered/checkable both 0, no query-limit edge case crash");
 
         db.close();
       }
@@ -887,6 +961,214 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         else process.env.EXPERIENCES_DB_PATH = prevDbPathD;
         if (prevAdminKeyD === undefined) delete process.env.ADMIN_KEY;
         else process.env.ADMIN_KEY = prevAdminKeyD;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (e) dev-request 2026-08-25-wcr-holdout-pool-dekker-ikke-publisert-
+      //     flate — route-level AC1 regression test: a genuinely published
+      //     row (verification_status='verified'), deliberately NOT matching
+      //     the enrichment_state='enriched'/content_source='provider_site'
+      //     selector (proving it is samplePublishedExperiencesForHoldout, not
+      //     the pre-existing enriched-pool selector, surfacing it), must
+      //     produce published.sample_size >= 1 — before this dev-request the
+      //     `published` stratum always came back sample_size:0 in production.
+      // ═══════════════════════════════════════════════════════════════════
+      const prevDbPathE = process.env.EXPERIENCES_DB_PATH;
+      const prevAdminKeyE = process.env.ADMIN_KEY;
+      const testKeyE = process.env.ADMIN_KEY || "wcr-test-admin-key";
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
+      process.env.ADMIN_KEY = testKeyE;
+
+      const cachePathsE = [
+        require.resolve("../database/db-factory"),
+        require.resolve("../services/experience-store"),
+        require.resolve("../services/experience-content-judge"),
+        require.resolve("./opplevelser"),
+      ];
+      for (const p of cachePathsE) delete require.cache[p];
+
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+        const expDb = dbFactory.getDb("experiences");
+        const oppl = require("./opplevelser") as typeof import("./opplevelser");
+        const opplevelserRouter = oppl.default as any;
+        const adminHeaders = { "x-admin-key": testKeyE };
+
+        const insertE = expDb.prepare(
+          `INSERT INTO experiences
+             (id, title, slug, description, category, price_band, price_from,
+              evidence_url, content_field_evidence, verification_status, confidence,
+              canonical_id, provider_id, content_source, enrichment_state)
+           VALUES
+             (@id, @title, @slug, @description, @category, @price_band, @price_from,
+              @evidence_url, @content_field_evidence, @verification_status, @confidence,
+              @canonical_id, @provider_id, @content_source, @enrichment_state)`,
+        );
+        const baseE = { description: "d", category: "c", price_band: "standard", price_from: 500, confidence: null, canonical_id: null, provider_id: null };
+        // Genuinely published — but deliberately harvest-shaped
+        // (content_source != 'provider_site', enrichment_state != 'enriched')
+        // so it can ONLY be surfaced by samplePublishedExperiencesForHoldout,
+        // never by the pre-existing sampleEnrichedExperiencesForHoldout.
+        insertE.run({
+          ...baseE,
+          id: "e-served-1",
+          title: "Breføring på isbreen",
+          slug: "e-served-1",
+          evidence_url: "https://epub1.no/brefoering",
+          content_field_evidence: null,
+          verification_status: "verified",
+          content_source: "harvest",
+          enrichment_state: "matched",
+        });
+        // Published, but no checkable citation at all — must count in
+        // published_pool.considered without crashing, and must NOT appear in
+        // `results`/`rows`, pulling checkable < considered (excluded_rate > 0).
+        insertE.run({
+          ...baseE,
+          id: "e-served-no-citation",
+          title: "Bærplukking i skogen",
+          slug: "e-served-no-citation",
+          evidence_url: null,
+          content_field_evidence: null,
+          verification_status: "verified",
+          content_source: "harvest",
+          enrichment_state: "matched",
+        });
+
+        globalThis.fetch = (async (url: any, init: any) => {
+          const urlStr = String(url);
+          if (urlStr === "https://epub1.no/brefoering") {
+            return mkPageResponse("<html><body>Breføring på isbreen med erfaren guide.</body></html>", urlStr);
+          }
+          if (urlStr === "https://api.anthropic.com/v1/messages") {
+            return mkAnthropicResponse("MATCH\nStemmer med kilden.");
+          }
+          throw new Error("wcr-e: unexpected fetch URL: " + urlStr);
+        }) as unknown as typeof fetch;
+
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: {} });
+        assertEq(r.status, 200, "wcr-e1: request succeeds");
+        assertTrue(r.body.published.sample_size >= 1, "wcr-e2 (AC1): published.sample_size >= 1 — the published stratum is no longer always 0");
+        const servedResult = (r.body.results as any[]).find((x) => x.experience_id === "e-served-1");
+        assertTrue(!!servedResult, "wcr-e3: the harvest-shaped published row was sampled and judged even though it fails the enriched-pool selector");
+        assertEq(servedResult?.published, true, "wcr-e4: its own result is flagged published:true");
+
+        assertTrue(!!r.body.published_pool, "wcr-e5 (AC2): published_pool is present in the response");
+        assertTrue(r.body.published_pool.considered >= 2, "wcr-e6: published_pool.considered counts both published-gate rows (including the no-citation one)");
+        assertTrue(r.body.published_pool.checkable < r.body.published_pool.considered, "wcr-e7: published_pool.checkable is strictly less than considered — the no-citation row is excluded from checkable");
+        assertTrue(
+          typeof r.body.published_pool.excluded_rate === "number" && r.body.published_pool.excluded_rate > 0,
+          "wcr-e8: published_pool.excluded_rate is a positive number reflecting the unchecka­ble published row — never silently absent",
+        );
+        const noCitationResult = (r.body.results as any[]).find((x) => x.experience_id === "e-served-no-citation");
+        assertEq(noCitationResult, undefined, "wcr-e9: the no-citation published row is honestly excluded from rows/results, never fabricated a comparison");
+      } finally {
+        for (const p of cachePathsE) delete require.cache[p];
+        if (prevDbPathE === undefined) delete process.env.EXPERIENCES_DB_PATH;
+        else process.env.EXPERIENCES_DB_PATH = prevDbPathE;
+        if (prevAdminKeyE === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKeyE;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (f) route-level regression — CHANGES-REQUESTED fix: a row eligible
+      //     for BOTH samplePublishedExperiencesForHoldout AND the enriched-
+      //     pool selector must not cause dedup to under-fill `rows` below
+      //     sample_size. Before this fix, the unpublished draw was sized DOWN
+      //     to `sampleSize - publishedPool.rows.length` BEFORE dedup, so a
+      //     row the published quota already claimed had no spare unpublished
+      //     capacity to backfill it from — with a 10-row fully-overlapping
+      //     eligible pool and sample_size:10, dedup could (and, over many
+      //     runs, reliably did) leave `rows` short of 10. Seeding exactly
+      //     sample_size (10) doubly-eligible rows means the fixed code's
+      //     full-size unpublished draw (sampleEnrichedExperiencesForHoldout
+      //     called with `sampleSize`, not the old sized-down value) alone
+      //     already covers all 10 distinct ids, so the merged+capped `rows`
+      //     is deterministically 10 regardless of shuffle order or overlap —
+      //     proving the fix without relying on getting an unlucky draw.
+      // ═══════════════════════════════════════════════════════════════════
+      const prevDbPathF = process.env.EXPERIENCES_DB_PATH;
+      const prevAdminKeyF = process.env.ADMIN_KEY;
+      const testKeyF = process.env.ADMIN_KEY || "wcr-test-admin-key";
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
+      process.env.ADMIN_KEY = testKeyF;
+
+      const cachePathsF = [
+        require.resolve("../database/db-factory"),
+        require.resolve("../services/experience-store"),
+        require.resolve("../services/experience-content-judge"),
+        require.resolve("./opplevelser"),
+      ];
+      for (const p of cachePathsF) delete require.cache[p];
+
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+        const expDb = dbFactory.getDb("experiences");
+        const oppl = require("./opplevelser") as typeof import("./opplevelser");
+        const opplevelserRouter = oppl.default as any;
+        const adminHeaders = { "x-admin-key": testKeyF };
+
+        const insertF = expDb.prepare(
+          `INSERT INTO experiences
+             (id, title, slug, description, category, price_band, price_from,
+              evidence_url, verification_status, confidence, canonical_id,
+              provider_id, content_source, enrichment_state)
+           VALUES
+             (@id, @title, @slug, @description, @category, @price_band, @price_from,
+              @evidence_url, @verification_status, @confidence, @canonical_id,
+              @provider_id, @content_source, @enrichment_state)`,
+        );
+        const baseF = {
+          description: "d",
+          category: "c",
+          price_band: "standard",
+          price_from: 500,
+          confidence: null,
+          canonical_id: null,
+          provider_id: null,
+          verification_status: "verified",
+          content_source: "provider_site",
+          enrichment_state: "enriched",
+        };
+        // 10 distinct rows, each satisfying BOTH PUBLISH_GATE_SQL (verified,
+        // confidence NULL, no provider row so the provider clause passes
+        // vacuously, canonical_id NULL) AND the enriched-pool selector
+        // (enrichment_state='enriched', content_source='provider_site') —
+        // exactly the realistic overlap the module's own comments call out.
+        // http://localhost/* is SSRF-blocked before any network call, so
+        // every row resolves deterministically to `unresolved` with no fetch
+        // mock needed — sample_size (== rows.length, set before the per-row
+        // fetch/judge loop even runs) is all this test needs to check.
+        for (let i = 0; i < 10; i++) {
+          insertF.run({
+            ...baseF,
+            id: `wcr-overlap-${i}`,
+            title: `Overlap Test ${i}`,
+            slug: `wcr-overlap-${i}`,
+            evidence_url: `http://localhost/overlap-${i}`,
+          });
+        }
+        globalThis.fetch = (async () => {
+          throw new Error("wcr-f: no live fetch expected — every seeded row is SSRF-blocked before any fetch call");
+        }) as unknown as typeof fetch;
+
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample_size: 10 } });
+        assertEq(r.status, 200, "wcr-f1: request succeeds");
+        assertEq(
+          r.body.sample_size,
+          10,
+          "wcr-f2: sample_size comes back as the FULL requested count (10), not short — the dedup-under-fill bug is fixed",
+        );
+        const distinctIds = new Set((r.body.results as any[]).map((x) => x.experience_id));
+        assertEq(distinctIds.size, 10, "wcr-f3: all 10 results are for distinct experience ids, no double-counted row");
+      } finally {
+        for (const p of cachePathsF) delete require.cache[p];
+        if (prevDbPathF === undefined) delete process.env.EXPERIENCES_DB_PATH;
+        else process.env.EXPERIENCES_DB_PATH = prevDbPathF;
+        if (prevAdminKeyF === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKeyF;
       }
     } catch (err: any) {
       failed++;
