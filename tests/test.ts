@@ -18421,9 +18421,23 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     // Pin the in-memory experiences DB (so assertions can query it directly).
     const dbExpDedup = dbFactoryDedup.getDb("experiences");
 
-    // ── Seed a known-duplicate pair (mirrors the confirmed prod Kon-Tiki
-    //    case in src/services/experience-dedup.test.ts) + 1 distinct control
-    //    row from the SAME provider+kommune. ─────────────────────────────
+    // ── Seed the known-duplicate TRIO (mirrors the confirmed prod Kon-Tiki
+    //    cluster — "Kon-Tiki Museet 4x on /fylke/Oslo" per this block's own
+    //    header comment above — and the identical 3-variants-+-1-control
+    //    bucket already exercised in src/services/experience-dedup.test.ts's
+    //    section 10 real-DB test and its 9f pure-function regression guard)
+    //    + 1 distinct control row from the SAME provider+kommune. All 3
+    //    variants are required: with only 2 seeded (idThinDedup/idRichDedup)
+    //    + the control, "kontiki" sits at 2-of-3 (66.7%) of the bucket,
+    //    tripping titlesMatch()'s Part-2 bucket-ubiquity demotion (>50% of a
+    //    bucket sized >= 3) even though it's the genuine rare-token evidence
+    //    for a real duplicate, not a provider-ubiquitous brand token — a
+    //    round-2 review finding (dev-request 2026-08-25-titlesmatch-
+    //    ubiquity-herding fix-up). Seeding the 3rd real variant restores the
+    //    bucket to its true, confirmed-live shape: "kontiki" 2-of-4 (50%,
+    //    NOT demoted) and "heyerdahl" 2-of-4 (50%, NOT demoted either), so
+    //    the pair matches on undemoted rare-token merit alone — no need for
+    //    (and no risk of resurrecting) an ad hoc occurrence-count floor. ──
     const providerIdDedup = expStoreDedup.createProvider({
       navn: "Kon-Tiki Museet AS",
       kommune: "Oslo",
@@ -18454,6 +18468,17 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
       duration_min: 60,
       price_from: 150,
       booking_url: "https://kon-tiki.no/book",
+    });
+    // The 3rd confirmed-live variant — same real museum, shares "heyerdahl"
+    // with idThinDedup (not "kontiki") — exactly the row already used by
+    // experience-dedup.test.ts's idOther/section-10 and 9f fixtures.
+    const idOtherDedup = expStoreDedup.createExperience({
+      title: "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo",
+      provider_id: providerIdDedup,
+      kommune: "Oslo",
+      fylke: "Oslo",
+      verification_status: "verified",
+      confidence: "medium",
     });
     // Distinct, unrelated experience from the SAME provider+kommune — negative
     // control: must survive the pass untouched (never merged).
@@ -18537,6 +18562,7 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     // Nothing merged yet — sanity before the real call.
     assertEq(canonicalIdOf(idThinDedup), null, "db-2b: pre-call, seeded thin duplicate not yet merged");
     assertEq(canonicalIdOf(idRichDedup), null, "db-2c: pre-call, seeded rich duplicate not yet merged");
+    assertEq(canonicalIdOf(idOtherDedup), null, "db-2d: pre-call, seeded 3rd variant not yet merged");
 
     // ── db-3: correct key → 200, runs the real dedup pass. ─────────────
     {
@@ -18545,17 +18571,18 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
       assertEq(r.body.success, true, "db-3b: success: true");
       assertTrue(typeof r.body.groupsFound === "number" && r.body.groupsFound >= 1,
         "db-3c: groupsFound >= 1 (the seeded Kon-Tiki duplicate group)");
-      assertTrue(typeof r.body.rowsMerged === "number" && r.body.rowsMerged >= 1,
-        "db-3d: rowsMerged >= 1 (the thin duplicate folded into the richer row)");
+      assertTrue(typeof r.body.rowsMerged === "number" && r.body.rowsMerged >= 2,
+        "db-3d: rowsMerged >= 2 (both the thin duplicate AND the 3rd variant fold into the richer row)");
       assertTrue(Array.isArray(r.body.canonicalIds) && r.body.canonicalIds.includes(idRichDedup),
         "db-3e: canonicalIds includes the richer row (richness scoring picks it as canonical)");
     }
 
-    // ── db-4: DB state post-merge — exactly one row of the pair has
-    //    canonical_id IS NULL (the survivor); the other now points at it;
+    // ── db-4: DB state post-merge — exactly one row of the trio has
+    //    canonical_id IS NULL (the survivor); the other two now point at it;
     //    the unrelated control row is untouched. ───────────────────────
     assertEq(canonicalIdOf(idRichDedup), null, "db-4a: richer row is the canonical survivor — canonical_id stays NULL");
     assertEq(canonicalIdOf(idThinDedup), idRichDedup, "db-4b: thin duplicate's canonical_id now points at the survivor");
+    assertEq(canonicalIdOf(idOtherDedup), idRichDedup, "db-4b2: 3rd variant's canonical_id now also points at the survivor");
     assertEq(canonicalIdOf(idControlDedup), null, "db-4c: unrelated control row untouched — canonical_id still NULL");
 
     // ── db-5: idempotency — calling again finds nothing left to merge. ─
