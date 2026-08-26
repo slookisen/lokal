@@ -1639,5 +1639,71 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experiences ADD COLUMN evidence_url_verification TEXT");
   } catch { /* already present */ }
 
+  // ─── experiences.price_checked_at / price_check_attempts (dev-request
+  // 2026-08-25-experiences-pris-ferskhet) ─────────────────────────────────
+  // `experiences.price_from` is written once at harvest insertion (LLM-
+  // composed) or by the fill-if-blank content-refresh writer
+  // (applyExperienceContent -> extractPriceFrom) and is NEVER re-checked
+  // afterwards — the 2026-08-25 mismatch investigation found 2/17 rows whose
+  // stored price no longer matched the source page (130 vs 180 kr; 200 vs
+  // 195 kr), and grep confirmed no price_checked_at-style mechanism existed
+  // anywhere in this codebase. These two ADDITIVE columns back the sweep at
+  // POST /admin/price-freshness-check (routes/opplevelser.ts) that re-fetches
+  // a row's price provenance page and re-runs extractPriceFrom against it.
+  //
+  // price_checked_at: stamped on EVERY check attempt for this row that
+  //   yields a persistence-carrying outcome, whatever it is (unchanged,
+  //   corrected, nulled, or a fetch failure classified `permanent`/`blocked`
+  //   — see fetch-page.ts's FetchPersistence) — same "stamp on every
+  //   attempt, not just on success" idiom as
+  //   experience_providers.last_content_attempt_at, so a row that keeps
+  //   failing to fetch (for a real reason) still cycles to the back of the
+  //   NULLs-first selector instead of sorting first forever. Doubles as the
+  //   freshness-window clock (selectExperiencesForPriceFreshnessCheck's own
+  //   doc comment explains the exact combination with price_check_attempts
+  //   below). NULL means "never checked, or every attempt so far has been a
+  //   momentary `transient` blip" — read as "needs checking" by the
+  //   selector, never as a mismatch.
+  //   EXCEPTION (fix-up for a CHANGES-REQUESTED review finding, added after
+  //   the original 2026-08-25 landing): a `transient` fetch failure (timeout,
+  //   5xx, 429, connection reset — persistenceOf(), fetch-page.ts) stamps
+  //   NEITHER this column NOR price_check_attempts below. Not merely "don't
+  //   strike" — a genuine no-op, on purpose: this column doubles as the
+  //   freshness-window clock, so stamping "now" here would silently rest a
+  //   row that only ever hit momentary blips for the same 30-day window a
+  //   real park would (priceFreshnessExclusionSql's case (c) requires
+  //   price_check_attempts>0 to treat a row as an immediate-retry
+  //   candidate — a row left at attempts=0 by transient failures would
+  //   otherwise be indistinguishable from one just checked and found
+  //   correct). See routes/opplevelser.ts's price-freshness-check route,
+  //   the `!fetched.ok` branch's comment, for the full reasoning.
+  // price_check_attempts: increments ONLY on a genuine, NON-transient fetch
+  //   failure (permanent: DNS/404/410; or blocked: 401/403/empty-body — the
+  //   page could not be usefully re-fetched at all, and isn't expected to
+  //   answer differently on the next attempt) and resets to 0 on any outcome
+  //   that DID succeed in re-checking the price (unchanged, corrected, or
+  //   nulled) — a "checked, price already correct" result is explicitly NOT
+  //   a failure and must not count toward this counter, only toward
+  //   price_checked_at freshness. A `transient` failure touches neither (see
+  //   price_checked_at above) — it is retried on the very next sweep, same
+  //   as before this attempt, and never contributes to the 3-strike count.
+  //   Mirrors content_no_yield_streak's rationale: a permanently-unfetchable
+  //   page must not get retried forever, so 3 consecutive NON-transient
+  //   fetch failures rest the row for the freshness window (see
+  //   PRICE_CHECK_PARK_AFTER_ATTEMPTS, experience-store.ts) — same idea as
+  //   PROVIDER_PARK_AFTER_ATTEMPTS, one level down (per-experience, not
+  //   per-provider, since price_from lives on `experiences` not on the
+  //   provider).
+  // Setting both back to NULL/0 (or simply never running the sweep again) is
+  // the rollback — no separate migration needed, and no existing column's
+  // semantics change; price_from itself keeps whatever value it holds.
+  const priceFreshnessCols = [
+    "ALTER TABLE experiences ADD COLUMN price_checked_at TEXT",
+    "ALTER TABLE experiences ADD COLUMN price_check_attempts INTEGER NOT NULL DEFAULT 0",
+  ];
+  for (const stmt of priceFreshnessCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[experiences] schema initialized");
 }
