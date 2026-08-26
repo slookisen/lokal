@@ -35105,6 +35105,74 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
       "codeartifact: var-only minified JS with an IIFE wrapper -> true (reworked class 3 [repeated var / IIFE] + class 4 [brace density])"
     );
 
+    // (7) Facebook-Pixel-shaped unary-operator IIFE bootstrap
+    // (`!function(...){...}(...)`, NOT the parenthesized `(function(){})()`
+    // form) — dev-request 2026-08-26 unary-IIFE fix. Confirmed root cause:
+    // before this fix, class 2 (cmsBootstrapSignal) already fired here via
+    // its existing `!function(` substring check, but class 3
+    // (jsSyntaxDensitySignal) did NOT — `hasAssignmentActivity` was false
+    // (this shape assigns via bare identifiers like `i=w.fbq=...`, no var/
+    // let/const keywords at all) and the old `isIifeWrapper` regex required
+    // the parenthesized `(function(...){` / `})(`  shape, which this unary
+    // form never has — and class 4 (brace density) also didn't reliably
+    // clear its threshold on this shape (brace density ~0.9/100 chars here,
+    // under the 2.0 bar). Net: only 1 of {2,3,4} fired -> false negative.
+    // This fixture is a deliberately DISTINCT string from the one used to
+    // diagnose the bug (different parameter names w/d/s/l/i instead of
+    // f/b/e/v/n/t/s, a different fake pixel ID, and different handling of
+    // the last helper variable — a `var m = ...` declaration instead of a
+    // bare `s = ...` reassignment) so this is a genuine new regression test,
+    // not a copy of the diagnostic fixture.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "!function(w,d,s,l,i){if(w.fbq)return;i=w.fbq=function(){i.callMethod?i.callMethod.apply(i,arguments):i.queue.push(arguments)};if(!w._fbq)w._fbq=i;i.push=i;i.loaded=!0;i.version='2.0';i.queue=[];l=d.createElement(s);l.async=!0;l.src='https://connect.facebook.net/en_US/fbevents.js';var m=d.getElementsByTagName(s)[0];m.parentNode.insertBefore(l,m)}(window,document,'script');fbq('init','999888777666555');fbq('track','PageView');"
+      ) === true,
+      "codeartifact: Facebook-Pixel-shaped unary-operator IIFE bootstrap (!function(...){...}(...)) -> true (class 2 [!function(] + reworked class 3 [unary IIFE] both fire)"
+    );
+
+    // (8) A sibling unary-operator IIFE form using `+function(` instead of
+    // `!function(` (same ASI-defeating convention, common in minified
+    // library bootstraps that don't need the `!function` shape's implicit
+    // "discard return value" semantics). This fixture has NO CMS-bootstrap
+    // token at all (no `!function(`, no `window.`/`document.` member-access,
+    // no known provider signature) — it isolates the reworked class 3 (JS-
+    // syntax density, now recognizing the unary-IIFE assignment-activity
+    // sub-case) combining with class 4 (brace density) to reach the >=2-
+    // classes threshold, proving the sibling operators are handled by the
+    // same regex, not just `!`.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "+function($){$.fn.myPlugin=function(opts){this.each(function(){var el=$(this);el.data('opts',opts);el.addClass('is-init');});return this;}}(jQuery);"
+      ) === true,
+      "codeartifact: sibling unary-operator IIFE form (+function(...){...}(...)) -> true (reworked class 3 [unary IIFE] + class 4 [brace density])"
+    );
+
+    // Negative control (CRITICAL — proves the new unary-IIFE regex is
+    // anchored, not a loose "contains ! ... contains function( ... contains
+    // }(" scan): ordinary Norwegian prose containing a literal `!` at the
+    // end of one sentence, an unrelated later mention of the literal English
+    // word "function(" (naming a technology, not writing code), and an
+    // unrelated later literal "}(" substring inside a parenthetical aside —
+    // none of these are adjacent to each other the way the unary-IIFE shape
+    // requires (operator immediately before `function`, `}(` following as
+    // the wrapper's own call), so this must NOT flag.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Alt fungerer fint! Vi nevner bare at nettsiden vår har en JavaScript function(kode) et sted i bunnteksten, men det er utviklerens sak. Ellers baker vi brød med kjærlighet }( og selger det i gårdsbutikken)."
+      ) === false,
+      "codeartifact: prose with a stray '!', an unrelated 'function(' mention and an unrelated '}(' substring, none adjacent -> false (unary-IIFE regex requires the operator immediately before function() and is not a loose scan)"
+    );
+
+    // Negative control: plain Norwegian prose ending a sentence with "!",
+    // and no code syntax anywhere else at all -- the ordinary case the
+    // anchoring above must never touch.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Velkommen til gården vår! Vi held ope kvar laurdag, og set stor pris på besøk frå nær og fjern gjennom heile sesongen."
+      ) === false,
+      "codeartifact: plain prose ending a sentence with '!' and no code syntax at all -> false"
+    );
+
     // Negative: additional realistic Norwegian producer prose mentioning
     // tech-adjacent terms, none of which are code syntax.
     assertTrue(

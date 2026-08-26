@@ -240,9 +240,13 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 //      keywords among var/let/const, each followed by `=` (source mixing
 //      declaration forms), (b) >=2 REPEATED `var <name> =` declarations
 //      (the var-only minified shape most Terser/UglifyJS output actually
-//      produces), or (c) an IIFE wrapper shape `(function(...){...})(...)`
+//      produces), (c) an IIFE wrapper shape `(function(...){...})(...)`
 //      (the single most common minified-bundle wrapper, present regardless
-//      of which declaration keyword the body uses). All three of
+//      of which declaration keyword the body uses), or (d) a UNARY-operator
+//      IIFE wrapper shape `!function(...){...}(...)` (also `+function(`/
+//      `-function(`/`~function(`) — the classic Facebook-Pixel-bootstrap
+//      form, used instead of the parenthesized form to avoid ASI hazards
+//      when the expression opens a statement. All three of
 //      function()-present / assignment-activity / semicolon-density must
 //      hold together — this is what keeps a sentence merely naming
 //      "function" or "variabel" from flagging on its own.
@@ -338,7 +342,24 @@ export function looksLikeCodeArtifact(text: string | null | undefined): boolean 
     (/\blet\s+\w+\s*=/.test(trimmed) ? 1 : 0) +
     (/\bconst\s+\w+\s*=/.test(trimmed) ? 1 : 0);
   const repeatedVarDeclarations = (trimmed.match(/\bvar\s+\w+\s*=/g) ?? []).length;
-  const isIifeWrapper = /\(\s*function\s*\([^)]*\)\s*\{/.test(trimmed) && /\}\s*\)\s*\(/.test(trimmed);
+  // Paren-wrapped IIFE: `(function(...){ ... })(...)`.
+  const isParenIifeWrapper = /\(\s*function\s*\([^)]*\)\s*\{/.test(trimmed) && /\}\s*\)\s*\(/.test(trimmed);
+  // Unary-operator IIFE: `!function(...){ ... }(...)` (the classic Facebook
+  // Pixel bootstrap shape) and its siblings `+function(`/`-function(`/
+  // `~function(` — all four unary operators are used interchangeably in
+  // minified/concatenated JS bundles purely to defeat ASI (automatic-
+  // semicolon-insertion) hazards when a `function` expression opens a
+  // statement; none has any special meaning here beyond "not a function
+  // DECLARATION". Requires the operator immediately before `function` (not
+  // just present anywhere in the string) AND a matching `}(` call-shape
+  // afterward, so a stray `!` earlier in the text plus an unrelated
+  // `function(...)`/`}(` elsewhere can't combine into a false match on their
+  // own — same unanchored-but-practically-safe posture as the paren-form
+  // check above (an unrelated `}(` substring could in principle exist
+  // elsewhere in a very large string, but that shape essentially never
+  // occurs in Norwegian prose).
+  const isUnaryIifeWrapper = /[!+\-~]\s*function\s*\([^)]*\)\s*\{/.test(trimmed) && /\}\s*\(/.test(trimmed);
+  const isIifeWrapper = isParenIifeWrapper || isUnaryIifeWrapper;
   const hasAssignmentActivity =
     distinctAssignmentKeywords >= 2 || repeatedVarDeclarations >= 2 || isIifeWrapper;
   const semicolonDensity = (trimmed.match(/;/g)?.length ?? 0) / (trimmed.length / 100);
