@@ -41073,3 +41073,67 @@ runSerial(async () => {
     failures.push("experiences-provenance-read: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// spec-punkt 2: provider-level canonicalization for the museum/attraction
+// scope GET /admin/gardssalg-provider-dedup-audit's own scope-WHERE never
+// scans (root-cause probe: Vitensenteret/Ringve/Brosundet/Hunderfossen
+// persisting as 2-3 duplicate experience_providers rows). Pure signal-design
+// unit tests (no DB). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experience-provider-canonicalize: non-gårdssalg provider dedup signals ──");
+  try {
+    const { runExperienceProviderCanonicalizeTests } = require("../src/services/experience-provider-canonicalize.test") as
+      typeof import("../src/services/experience-provider-canonicalize.test");
+    const epc = await runExperienceProviderCanonicalizeTests({ log: false });
+    passed += epc.passed;
+    failed += epc.failed;
+    for (const f of epc.failures) failures.push("experience-provider-canonicalize: " + f);
+    console.log(`  experience-provider-canonicalize: ${epc.passed} passed, ${epc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-provider-canonicalize: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, spec-punkt 2: GET /admin/experiences-provider-dedup-audit
+// — the SQL-scope half (DB/HTTP wiring) of the module above. Tail position
+// is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-provider-dedup-audit: non-gårdssalg provider dedup scan ──");
+  try {
+    const { runOpplevelserExperiencesProviderDedupAuditTests } = require("../src/routes/opplevelser-experiences-provider-dedup-audit.test") as
+      typeof import("../src/routes/opplevelser-experiences-provider-dedup-audit.test");
+    const epda = await runOpplevelserExperiencesProviderDedupAuditTests({ log: false });
+    passed += epda.passed;
+    failed += epda.failed;
+    for (const f of epda.failures) failures.push("opplevelser-experiences-provider-dedup-audit: " + f);
+    console.log(`  opplevelser-experiences-provider-dedup-audit: ${epda.passed} passed, ${epda.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-provider-dedup-audit: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, spec-punkt 2: POST /admin/experiences-provider-dedup-merge
+// — the write lever, reusing gardssalg-provider-merge.ts's already-tested
+// merge machinery unchanged under a new route name for this scope, plus
+// proof that the EXISTING gardssalg-content-rollback lever restores a merge
+// made through this new route with no new wiring. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-provider-dedup-merge: non-gårdssalg provider merge lever ──");
+  try {
+    const { runOpplevelserExperiencesProviderDedupMergeTests } = require("../src/routes/opplevelser-experiences-provider-dedup-merge.test") as
+      typeof import("../src/routes/opplevelser-experiences-provider-dedup-merge.test");
+    const epdm = await runOpplevelserExperiencesProviderDedupMergeTests({ log: false });
+    passed += epdm.passed;
+    failed += epdm.failed;
+    for (const f of epdm.failures) failures.push("opplevelser-experiences-provider-dedup-merge: " + f);
+    console.log(`  opplevelser-experiences-provider-dedup-merge: ${epdm.passed} passed, ${epdm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-provider-dedup-merge: unexpected error: " + String(err?.message || err));
+  }
+});

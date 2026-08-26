@@ -381,6 +381,20 @@ import {
   GARDSSALG_PROVIDER_MERGE_MAX_PAIRS,
   type GardssalgProviderMergeResultItem,
 } from "../services/gardssalg-provider-merge";
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// spec-punkt 2 — provider-level canonicalization for the NON-gårdssalg
+// (museum/attraction/venue) scope the audit above never scans. Backs GET
+// /admin/experiences-provider-dedup-audit (auditExperienceProviderDuplicates)
+// and POST /admin/experiences-provider-dedup-merge (the preview/apply
+// wrappers, which reuse the gårdssalg import above for the provider-merge
+// half and add the child-experience repoint the plain gårdssalg merge never
+// needed — see that module's own doc comment).
+import {
+  auditExperienceProviderDuplicates,
+  previewExperienceProviderMergeWithRepoint,
+  applyExperienceProviderMergeWithRepoint,
+  type ExperienceProviderMergeWithRepointResult,
+} from "../services/experience-provider-canonicalize";
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
 // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice — a new,
 // independent sweep that checks each gårdssalg producer's stored hjemmeside
@@ -22512,6 +22526,171 @@ router.post("/admin/experiences-dedup-unmerge", requireAdmin, (req: Request, res
     unmerged: toUnmerge.map((r) => r.id),
     skipped,
   });
+});
+
+// ─── GET /api/opplevelser/admin/experiences-provider-dedup-audit ───────────
+//
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// spec-punkt 2. Root-cause probe found Vitensenteret/Ringve/Brosundet/
+// Hunderfossen persisting as 2-3 duplicate rows even after the experience-row
+// dedup pass above (runDedupPass / experiences-dedup-backfill) — confirmed
+// live (2026-08-26, GET .../admin/gardssalg-provider-lookup) to be duplicate
+// experience_providers ROWS (three separate ids for "Vitensenteret i
+// Trondheim" / "Vitensenteret Trondheim" / "Vitensenteret", none carrying an
+// org_nr), not a matcher defect in that pass — providerIdentityKey()
+// (experience-dedup.ts) correctly never bridges two DIFFERENT provider_ids
+// with no shared org_nr, so it was never going to catch this.
+//
+// This gap mirrors gårdssalg's own provider-dubletter dev-request (2026-07-
+// 31) exactly, EXCEPT that GET /admin/gardssalg-provider-dedup-audit's own
+// scan (`producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'`) never
+// even considers museums/attractions/venues — see services/experience-
+// provider-canonicalize.ts's module doc comment for the full signal design
+// (org_nr / domain / name-tier, same identity-vs-hint split and same
+// org_nr-conflict override as that audit, keyed on kommune instead of
+// postnummer). Read-only — zero writes; groupExperienceProviderCandidates()
+// only SELECTs and computes in memory.
+router.get("/admin/experiences-provider-dedup-audit", requireAdmin, (_req: Request, res: Response) => {
+  try {
+    const db = getExpDb("experiences");
+    const { totalProvidersScanned, groups } = auditExperienceProviderDuplicates(db);
+    res.json({
+      success: true,
+      total_providers_scanned: totalProvidersScanned,
+      groups_found: groups.length,
+      groups,
+    });
+  } catch (err) {
+    console.error("[experiences-provider-dedup-audit] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-provider-dedup-merge ──────────
+//
+// Same spec-punkt as the audit above. Executes an EXPLICIT, already
+// human-verified list of {remove_id, keep_id} decisions — this route never
+// detects duplicates itself (that's the read-only audit above). The provider-
+// merge HALF is deliberately not a new implementation: previewGardssalg
+// ProviderMergePair()/applyGardssalgProviderMergePair() (services/gardssalg-
+// provider-merge.ts) already operate generically on `experience_providers` —
+// every guard (org_nr-conflict fail-closed, owner-claim survivorship,
+// already-merged) and every fill field applies unchanged to a museum/
+// attraction provider row exactly as it does to a gårdssalg producer row;
+// nothing in that module's logic reads producer_type or rfb_seed_source.
+// Reusing it directly (via the preview/apply wrappers in experience-provider-
+// canonicalize.ts) also means a merge made through THIS route is restorable
+// through the SAME existing POST /admin/gardssalg-content-rollback lever
+// (batch_id, default "provider" entity_type) with no new wiring — that
+// route's dispatch is keyed on the row's TABLE (experience_providers), not on
+// which endpoint wrote it.
+//
+// The wrappers add ONE genuinely new step the plain gårdssalg merge never
+// needed: repointing every still-live `experiences.provider_id` from
+// `remove_id` onto `keep_id` (see experience-provider-canonicalize.ts's own
+// doc comment for why — merging the PROVIDER record alone does not, by
+// itself, make the experience-row dedup pass bucket that business's
+// separately-harvested activity rows together, since that pass keys on each
+// experience row's OWN provider_id, never on `merged_into`). Repointing is
+// reported per pair as `experiences_repointed` and only ever happens after a
+// REAL "merged" outcome — a rejected/errored/dry-run pair never touches
+// `experiences` at all. Repointing does NOT itself canonicalize those
+// experience rows into one — a subsequent POST /admin/experiences-dedup-
+// backfill run (already deployed, already tested, unchanged) does that, now
+// that they finally share one provider_id/kommune candidate key.
+//
+// KNOWN LIMITATION (not closed by this slice, bounded/human-verified usage
+// only): the repoint has NO audit-trail row and is therefore NOT reversed by
+// POST /admin/gardssalg-content-rollback — that lever's "no new wiring"
+// claim above covers only the reused PROVIDER-content half (fill-only
+// fields, org_nr move, merged_into), which DOES write gardssalg_content_audit
+// rows. Rolling back a batch un-merges the providers but leaves their child
+// `experiences.provider_id` pointed at `keep_id`. Never destructive (a
+// provider_id value, not data loss — recoverable by re-repointing by hand or
+// a second explicit call), but a caller relying on rollback to fully undo a
+// call to this route should know the repoint half isn't included.
+//
+// IDEMPOTENT "FINISH THE JOB" CASE: if a pair's PROVIDER side was already
+// merged by an earlier call — e.g. through the plain gårdssalg twin route,
+// before this repoint step existed — a call here for that same pair reports
+// outcome "rejected"/"allerede_fjernet_i_tidligere_slaaing" (the reused
+// evaluator's normal already-merged guard, unchanged) but STILL performs
+// (or, on dry-run, still reports) the repoint, so a pair merged before this
+// mechanism existed still ends up fully canonicalized on the very next call
+// — see experience-provider-canonicalize.ts's isAlreadyMergedIntoThisKeep().
+//
+// apply: dry-run by DEFAULT (same convention as every other admin write
+// route in this file, including the gårdssalg twin this mirrors).
+// Body: { pairs: [{ remove_id, keep_id, note? }], apply?, batch_id? }.
+// Response: { success, dry_run, batch_id, scanned, counts, results } — same
+// shape as POST /admin/gardssalg-provider-dedup-merge, plus
+// `experiences_repointed` on every result item.
+router.post("/admin/experiences-provider-dedup-merge", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { pairs?: unknown; apply?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.pairs) || body.pairs.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'pairs' array of {remove_id, keep_id}" });
+    return;
+  }
+  if (body.pairs.length > GARDSSALG_PROVIDER_MERGE_MAX_PAIRS) {
+    res.status(400).json({ error: `Too many pairs (max ${GARDSSALG_PROVIDER_MERGE_MAX_PAIRS} per call)` });
+    return;
+  }
+
+  const batchId =
+    typeof body.batch_id === "string" && body.batch_id.trim()
+      ? body.batch_id.trim()
+      : `exp-provider-merge-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const results: ExperienceProviderMergeWithRepointResult[] = [];
+
+    for (const raw of body.pairs as unknown[]) {
+      const it = (raw ?? {}) as { remove_id?: unknown; keep_id?: unknown; note?: unknown };
+      const removeId = typeof it.remove_id === "string" ? it.remove_id.trim() : "";
+      const keepId = typeof it.keep_id === "string" ? it.keep_id.trim() : "";
+      const note = typeof it.note === "string" && it.note.trim() ? it.note.trim() : null;
+
+      if (!removeId || !keepId) {
+        results.push({
+          remove_id: removeId || "(mangler)",
+          keep_id: keepId || "(mangler)",
+          outcome: "rejected",
+          reason: "ugyldig_par",
+          fields_filled: [],
+          org_nr_migrated: false,
+          experiences_repointed: 0,
+        });
+        continue;
+      }
+
+      if (dryRun) {
+        results.push(previewExperienceProviderMergeWithRepoint(expDb, removeId, keepId));
+      } else {
+        results.push(applyExperienceProviderMergeWithRepoint(expDb, removeId, keepId, note, batchId));
+      }
+    }
+
+    const counts = results.reduce<Record<string, number>>((acc, r) => {
+      acc[r.outcome] = (acc[r.outcome] ?? 0) + 1;
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      batch_id: batchId,
+      scanned: (body.pairs as unknown[]).length,
+      counts,
+      results,
+    });
+  } catch (err) {
+    console.error("[experiences-provider-dedup-merge] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/experiences-title-no-backfill ────────────
