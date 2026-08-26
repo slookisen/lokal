@@ -276,4 +276,100 @@ export function auditMergedGroups(db: Database.Database, opts: ClassifyOptions =
 // The workflow is therefore iterative and self-healing: audit -> un-merge
 // batch -> RE-AUDIT, until no new suspects appear.
 
+// ─── Canonical group name lookup — companion to POST .../experiences-
+// canonical-group-merge (src/routes/opplevelser.ts) ─────────────────────────
+//
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// FUNN "experiences-dedup-audit-mangler-navnesok-over-ikke-suspect-grupper".
+// The canonical-group-merge route needs a caller-supplied
+// keep_canonical_id/remove_canonical_id pair, but no existing read path can
+// resolve a canonical group's id from a business name for a RAW row: this
+// audit's own auditMergedGroups() above only returns groups containing at
+// least one 'suspect' row (a group where every row links cleanly, like
+// Ringve's two internally-consistent groups, never appears there), the
+// provider-dedup audit only lists STILL-duplicated providers, and /sok only
+// covers published/verified rows. Deliberately separate from
+// auditMergedGroups() rather than a filter on it: this lookup must also
+// surface CANONICAL rows with zero merged siblings (a lone, un-merged
+// business) and must never require a row to be 'suspect' to be found.
+//
+// Read-only — a single SELECT, no writes. Case-insensitive substring match
+// against title, checked against EVERY row (canonical anchors and rows
+// already merged into one), published or not. A match on any row resolves
+// to its FULL group (the canonical row plus every row merged into it) so
+// the response carries the exact canonical_id a caller can feed straight
+// into keep_canonical_id/remove_canonical_id — never just the matching row.
+
+export interface CanonicalGroupLookupMember {
+  id: string;
+  title: string;
+  provider_id: string | null;
+}
+
+export interface CanonicalGroupLookupResult {
+  canonical_id: string;
+  canonical_title: string;
+  provider_id: string | null;
+  member_count: number;
+  members: CanonicalGroupLookupMember[];
+}
+
+const CANONICAL_GROUP_LOOKUP_CAP = 50;
+
+export function findCanonicalGroupsByTitle(
+  db: Database.Database,
+  titleContains: string
+): { groups: CanonicalGroupLookupResult[]; groups_truncated: boolean } {
+  const needle = titleContains.trim().toLowerCase();
+  if (!needle) return { groups: [], groups_truncated: false };
+
+  const allRows = db
+    .prepare("SELECT id, title, provider_id, canonical_id FROM experiences")
+    .all() as Array<{ id: string; title: string; provider_id: string | null; canonical_id: string | null }>;
+
+  const byId = new Map(allRows.map((r) => [r.id, r]));
+  const groupIdOf = (row: { id: string; canonical_id: string | null }): string => row.canonical_id ?? row.id;
+
+  // Any row whose title matches pulls its WHOLE group in (not just itself).
+  const matchingGroupIds = new Set<string>();
+  for (const row of allRows) {
+    if (row.title.toLowerCase().includes(needle)) matchingGroupIds.add(groupIdOf(row));
+  }
+
+  const membersByGroup = new Map<string, CanonicalGroupLookupMember[]>();
+  for (const row of allRows) {
+    const groupId = groupIdOf(row);
+    if (!matchingGroupIds.has(groupId)) continue;
+    const member = { id: row.id, title: row.title, provider_id: row.provider_id };
+    const arr = membersByGroup.get(groupId);
+    if (arr) arr.push(member);
+    else membersByGroup.set(groupId, [member]);
+  }
+
+  const groups: CanonicalGroupLookupResult[] = [];
+  for (const groupId of matchingGroupIds) {
+    // Defensive: the canonical anchor itself could in principle be missing
+    // (data integrity edge case, not expected in practice) — fall back to an
+    // empty title rather than throwing, since this route is read-only triage.
+    const canonicalRow = byId.get(groupId);
+    const members = membersByGroup.get(groupId) ?? [];
+    groups.push({
+      canonical_id: groupId,
+      canonical_title: canonicalRow?.title ?? "",
+      provider_id: canonicalRow?.provider_id ?? null,
+      member_count: members.length,
+      members,
+    });
+  }
+
+  // Largest groups first — a caller hunting for "which group is the REAL
+  // one" cares most about the groups with the most already-merged evidence.
+  groups.sort((a, b) => b.member_count - a.member_count);
+
+  return {
+    groups: groups.slice(0, CANONICAL_GROUP_LOOKUP_CAP),
+    groups_truncated: groups.length > CANONICAL_GROUP_LOOKUP_CAP,
+  };
+}
+
 
