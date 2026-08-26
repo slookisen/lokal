@@ -17739,6 +17739,11 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   const prevPathExp18 = process.env.EXPERIENCES_DB_PATH;
   let server18: import("http").Server | null = null;
   let prevRfbDb18: unknown = null;
+  // Admission-gate stub bookkeeping (see the stub block inside the try) —
+  // hoisted out of the try so the finally can restore them.
+  let prevFetch18: typeof globalThis.fetch | null = null;
+  let prevAnthropicKey18: string | undefined;
+  let fetchStub18Installed = false;
   try {
     process.env.EXPERIENCES_DB_PATH = ":memory:";
 
@@ -17845,6 +17850,49 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
         json: async () => ({ _embedded: { enheter } }),
       };
     });
+
+    // ── Faithfulness-inflow slice (dev-request 2026-06-23-experiences-
+    // richer-profiles, 2026-08-25): apply-mode bulk-load now runs each NEW
+    // evidence-backed row through fetchPage(evidence_url) + the fail-closed
+    // LLM admission judge BEFORE admitting it as `verified`. Stub BOTH
+    // (globalThis.fetch for evidence pages + the Anthropic endpoint, plus a
+    // dummy ANTHROPIC_API_KEY so the judge doesn't fail closed on a missing
+    // key) so this section stays fully offline AND its rows keep landing
+    // exactly as the pre-gate assertions below expect (the judge answers
+    // MATCH for every row; the gate's own verdict routing has its dedicated
+    // test file, src/routes/opplevelser-bulk-load-admission-gate.test.ts).
+    // The in-process HTTP calls to the router itself go through the `http`
+    // module, never through this stub.
+    prevFetch18 = globalThis.fetch;
+    prevAnthropicKey18 = process.env.ANTHROPIC_API_KEY;
+    fetchStub18Installed = true;
+    process.env.ANTHROPIC_API_KEY = "test-key-orch-pr-18";
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      if (urlStr === "https://api.anthropic.com/v1/messages") {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ content: [{ type: "text", text: "MATCH\nStemmer med kilden." }] }),
+        } as unknown as Response;
+      }
+      // Loopback passthrough: UN-CHAINED sibling blocks in this file (the
+      // PWA sw-http/install-prompt HTTP smoke tests) fetch their own local
+      // express servers via the REAL global fetch, and their requests can
+      // land inside this stub's window — hand loopback URLs to the real
+      // fetch untouched so this stub only ever answers the admission gate's
+      // outbound evidence-page fetches.
+      let host = "";
+      try { host = new URL(urlStr).hostname; } catch { /* fall through to mock */ }
+      if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
+        return (prevFetch18 as any)(url, init);
+      }
+      const bytes = new TextEncoder().encode("<html><body>Evidensside for bulk-load-testen.</body></html>");
+      return {
+        ok: true, status: 200, statusText: "OK", url: urlStr,
+        headers: { get: (h: string) => (h.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+        arrayBuffer: async () => bytes.buffer,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
 
     // ── Mount the REAL router on a minimal Express app. ────────────────
     const expressMod18 = (await import("express")).default;
@@ -18397,6 +18445,13 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     if (server18) {
       await new Promise<void>((resolve) => server18!.close(() => resolve()));
     }
+    // Restore the fetch/key stubs the admission-gate stub block above set
+    // (no-op when the try threw before the stub block ran).
+    if (fetchStub18Installed) {
+      globalThis.fetch = prevFetch18!;
+      if (prevAnthropicKey18 === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevAnthropicKey18;
+    }
     if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
     try {
@@ -18460,9 +18515,23 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     // Pin the in-memory experiences DB (so assertions can query it directly).
     const dbExpDedup = dbFactoryDedup.getDb("experiences");
 
-    // ── Seed a known-duplicate pair (mirrors the confirmed prod Kon-Tiki
-    //    case in src/services/experience-dedup.test.ts) + 1 distinct control
-    //    row from the SAME provider+kommune. ─────────────────────────────
+    // ── Seed the known-duplicate TRIO (mirrors the confirmed prod Kon-Tiki
+    //    cluster — "Kon-Tiki Museet 4x on /fylke/Oslo" per this block's own
+    //    header comment above — and the identical 3-variants-+-1-control
+    //    bucket already exercised in src/services/experience-dedup.test.ts's
+    //    section 10 real-DB test and its 9f pure-function regression guard)
+    //    + 1 distinct control row from the SAME provider+kommune. All 3
+    //    variants are required: with only 2 seeded (idThinDedup/idRichDedup)
+    //    + the control, "kontiki" sits at 2-of-3 (66.7%) of the bucket,
+    //    tripping titlesMatch()'s Part-2 bucket-ubiquity demotion (>50% of a
+    //    bucket sized >= 3) even though it's the genuine rare-token evidence
+    //    for a real duplicate, not a provider-ubiquitous brand token — a
+    //    round-2 review finding (dev-request 2026-08-25-titlesmatch-
+    //    ubiquity-herding fix-up). Seeding the 3rd real variant restores the
+    //    bucket to its true, confirmed-live shape: "kontiki" 2-of-4 (50%,
+    //    NOT demoted) and "heyerdahl" 2-of-4 (50%, NOT demoted either), so
+    //    the pair matches on undemoted rare-token merit alone — no need for
+    //    (and no risk of resurrecting) an ad hoc occurrence-count floor. ──
     const providerIdDedup = expStoreDedup.createProvider({
       navn: "Kon-Tiki Museet AS",
       kommune: "Oslo",
@@ -18493,6 +18562,17 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
       duration_min: 60,
       price_from: 150,
       booking_url: "https://kon-tiki.no/book",
+    });
+    // The 3rd confirmed-live variant — same real museum, shares "heyerdahl"
+    // with idThinDedup (not "kontiki") — exactly the row already used by
+    // experience-dedup.test.ts's idOther/section-10 and 9f fixtures.
+    const idOtherDedup = expStoreDedup.createExperience({
+      title: "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo",
+      provider_id: providerIdDedup,
+      kommune: "Oslo",
+      fylke: "Oslo",
+      verification_status: "verified",
+      confidence: "medium",
     });
     // Distinct, unrelated experience from the SAME provider+kommune — negative
     // control: must survive the pass untouched (never merged).
@@ -18576,6 +18656,7 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
     // Nothing merged yet — sanity before the real call.
     assertEq(canonicalIdOf(idThinDedup), null, "db-2b: pre-call, seeded thin duplicate not yet merged");
     assertEq(canonicalIdOf(idRichDedup), null, "db-2c: pre-call, seeded rich duplicate not yet merged");
+    assertEq(canonicalIdOf(idOtherDedup), null, "db-2d: pre-call, seeded 3rd variant not yet merged");
 
     // ── db-3: correct key → 200, runs the real dedup pass. ─────────────
     {
@@ -18584,17 +18665,18 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
       assertEq(r.body.success, true, "db-3b: success: true");
       assertTrue(typeof r.body.groupsFound === "number" && r.body.groupsFound >= 1,
         "db-3c: groupsFound >= 1 (the seeded Kon-Tiki duplicate group)");
-      assertTrue(typeof r.body.rowsMerged === "number" && r.body.rowsMerged >= 1,
-        "db-3d: rowsMerged >= 1 (the thin duplicate folded into the richer row)");
+      assertTrue(typeof r.body.rowsMerged === "number" && r.body.rowsMerged >= 2,
+        "db-3d: rowsMerged >= 2 (both the thin duplicate AND the 3rd variant fold into the richer row)");
       assertTrue(Array.isArray(r.body.canonicalIds) && r.body.canonicalIds.includes(idRichDedup),
         "db-3e: canonicalIds includes the richer row (richness scoring picks it as canonical)");
     }
 
-    // ── db-4: DB state post-merge — exactly one row of the pair has
-    //    canonical_id IS NULL (the survivor); the other now points at it;
+    // ── db-4: DB state post-merge — exactly one row of the trio has
+    //    canonical_id IS NULL (the survivor); the other two now point at it;
     //    the unrelated control row is untouched. ───────────────────────
     assertEq(canonicalIdOf(idRichDedup), null, "db-4a: richer row is the canonical survivor — canonical_id stays NULL");
     assertEq(canonicalIdOf(idThinDedup), idRichDedup, "db-4b: thin duplicate's canonical_id now points at the survivor");
+    assertEq(canonicalIdOf(idOtherDedup), idRichDedup, "db-4b2: 3rd variant's canonical_id now also points at the survivor");
     assertEq(canonicalIdOf(idControlDedup), null, "db-4c: unrelated control row untouched — canonical_id still NULL");
 
     // ── db-5: idempotency — calling again finds nothing left to merge. ─
@@ -34422,6 +34504,80 @@ const _contentRefreshErrorsByPersistencePromise: Promise<void> = new Promise<voi
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+// slice (2026-08-25): description faithfulness guards on POST
+// /admin/content-refresh — junk-description guard (isJunkDescription applied
+// on the WRITE path), per-experience homepage-boilerplate guard (a homepage
+// description that never names the experience is skipped for it), and the
+// content-level parked-domain detector (a parking lander is a classified
+// failed fetch, never a description source). Own dedicated test file (own
+// in-memory prod-schema DB, swaps the shared experiences db-factory getDb()
+// singleton) — mirrors the block immediately above, so it must run strictly
+// after it; _contentRefreshErrorsByPersistencePromise is the current tail of
+// that serial chain.
+let _contentRefreshDescriptionGuardsResolve: () => void = () => {};
+const _contentRefreshDescriptionGuardsPromise: Promise<void> = new Promise<void>(r => {
+  _contentRefreshDescriptionGuardsResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshErrorsByPersistencePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── faithfulness-inflow: content-refresh description guards (junk/boilerplate/parked) ──");
+  try {
+    const { runOpplevelserContentRefreshDescriptionGuardsTests } = require("../src/routes/opplevelser-content-refresh-description-guards.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-description-guards.test");
+    const crdg = await runOpplevelserContentRefreshDescriptionGuardsTests({ log: false });
+    passed += crdg.passed;
+    failed += crdg.failed;
+    for (const f of crdg.failures) failures.push("opplevelser-content-refresh-description-guards: " + f);
+    console.log(`  opplevelser-content-refresh-description-guards: ${crdg.passed} passed, ${crdg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-content-refresh-description-guards: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contentRefreshDescriptionGuardsResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// Same faithfulness-inflow slice: the harvest ADMISSION GATE on POST
+// /admin/bulk-load (apply mode) — every NEW evidence-backed row is judged
+// against its own evidence page by the fail-closed LLM judge before being
+// admitted as `verified`; MISMATCH/unresolved/capped rows are inserted
+// quarantined (needs_review) with the verdict stamped. Also covers the
+// composition with the publish-gated GET /:id. Own dedicated test file (own
+// in-memory prod-schema DB + pinned RFB db, swaps the shared experiences
+// db-factory getDb() singleton and globalThis.fetch) — chained strictly
+// after the description-guards block above.
+let _bulkLoadAdmissionGateResolve: () => void = () => {};
+const _bulkLoadAdmissionGatePromise: Promise<void> = new Promise<void>(r => {
+  _bulkLoadAdmissionGateResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_contentRefreshDescriptionGuardsPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── faithfulness-inflow: bulk-load admission gate (LLM judge on harvest inflow) ──");
+  try {
+    const { runOpplevelserBulkLoadAdmissionGateTests } = require("../src/routes/opplevelser-bulk-load-admission-gate.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-admission-gate.test");
+    const blag = await runOpplevelserBulkLoadAdmissionGateTests({ log: false });
+    passed += blag.passed;
+    failed += blag.failed;
+    for (const f of blag.failures) failures.push("opplevelser-bulk-load-admission-gate: " + f);
+    console.log(`  opplevelser-bulk-load-admission-gate: ${blag.passed} passed, ${blag.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-bulk-load-admission-gate: unexpected error: " + String(err?.message || err));
+  } finally {
+    _bulkLoadAdmissionGateResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (items 1 + 3):
 // `select: "low_quality"` opt-in cohort on POST /admin/homepage-provenance-batch
 // (src/routes/marketplace.ts) — ranks agents worst-first by agents.trust_score
@@ -34950,44 +35106,43 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
       "codeartifact: a literal <style> tag alone flags true"
     );
 
-    // Positive: Squarespace-bootstrap-shaped fixture (NOT the real live
-    // Helios text — this is a same-shape stand-in kept for coverage of the
-    // OTHER class-2 signals it also happens to trip, e.g. the `window.`
-    // member-access shape and brace density). `Y.Squarespace`/
-    // `Static.SQUARESPACE_CONTEXT` themselves are now class 1b (unambiguous
-    // alone) — see the real-Helios-text test right below for why that
-    // promotion was necessary.
+    // Positive: Squarespace-bootstrap-shaped fixture, brace-dense enough to
+    // also fire class 4 on top of the class-1b Squarespace-token signal
+    // (both true after 2026-08-25's class-2 -> class-1b move; previously
+    // fired via class-2 + class-4 companionship instead — either way the
+    // verdict is unaffected, this fixture was never the gap).
     const squarespaceJunk =
       'Y.Squarespace = Y.Squarespace || {}; Static.SQUARESPACE_CONTEXT = {"website":{"id":"123"},"cacheBust":"abc"}; window.Y.Squarespace.afterBodyLoad(Y);';
     assertTrue(
       dq.looksLikeCodeArtifact(squarespaceJunk) === true,
-      "codeartifact: Squarespace-bootstrap-shaped fixture -> true (class 1b [Squarespace tokens] alone now suffices; class 2 [window. member-access] + class 4 [brace density] also both independently fire)"
+      "codeartifact: Squarespace-bootstrap-shaped fixture -> true (class 1b [Squarespace token] alone now; also class 4 [brace density])"
     );
 
-    // ── REGRESSION — dev-request 2026-08-25-agent-knowledge-about-code-
-    // artifact-gap: the EXACT real Helios Trondheim live text, pasted
-    // verbatim (not paraphrased) from the admin `/knowledge` endpoint probe
-    // against prod, 2026-08-25, `agent_knowledge.about`, 300 chars. This is
-    // the case #706 was supposed to fix and, per that same dev-request's
-    // post-deploy verification, was STILL live-broken after #706 shipped:
-    // this exact string only ever trips class 2 (it contains the literal
-    // substring `Static.SQUARESPACE_CONTEXT`) — it has no `function(` (class
-    // 3 can't fire) and only ~3 braces in 300 chars (class 4's density bar
-    // needs >2.0/100 chars AND >=4 raw braces — this string doesn't clear
-    // either), so class 2 alone was NEVER enough to catch it before
-    // `Y.Squarespace`/`Static.SQUARESPACE_CONTEXT` were promoted to class 1b
-    // above. Every prior review round's Squarespace fixture (including
-    // squarespaceJunk right above) happened to also trip class 4, which
-    // masked this gap for three full review rounds.
-    const realHeliosLiveText =
+    // Positive — REGRESSION GUARD (2026-08-25): the exact live Helios
+    // Trondheim description text, captured byte-for-byte via `lokal_info`
+    // against production (truncated exactly where the live formatted card
+    // truncates it — not edited or reconstructed). This is the real text
+    // that motivated the whole detector, and it slipped through UNCAUGHT
+    // under the original class-2-only placement: `POST
+    // /admin/agents/description-code-artifact-sweep {"apply":false}` against
+    // prod returned 0 candidates, and manually re-deriving each class against
+    // this exact string confirmed why — only class 2 fired (the
+    // `Static.SQUARESPACE_CONTEXT` token), with just 3 braces (density ~1.0,
+    // under class 4's >2.0 threshold) and no function()/assignment syntax
+    // (class 3), so the "needs a companion class" rule structurally could
+    // never catch it. Moving the Squarespace tokens to class 1b (this same
+    // commit) fixes it. This fixture must keep returning true on its own —
+    // if a future change to class 1b/2/4 regresses this, it means the
+    // original live defect would once again go undetected.
+    const heliosLiveText =
       'Grønn Guide Trondheim Static = window.Static || {}; Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":["supports_versioned_template_assets","campaigns_merch_state","marketing_landing_page","enable_form_submission_trigger","campaigns_table_v2","contacts_and_campaigns_redesign","marketing_automations",';
     assertTrue(
-      realHeliosLiveText.length === 300,
+      heliosLiveText.length === 300,
       "codeartifact: real Helios live-text fixture is exactly 300 chars, matching the verbatim probe (sanity check on the pasted literal itself)"
     );
     assertTrue(
-      dq.looksLikeCodeArtifact(realHeliosLiveText) === true,
-      "codeartifact: REAL Helios Trondheim live text (verbatim, agent_knowledge.about) -> true (class 1b [Static.SQUARESPACE_CONTEXT] alone — this is the exact live case that was still broken after #706, since the old class 2 alone was never sufficient here)"
+      dq.looksLikeCodeArtifact(heliosLiveText) === true,
+      "codeartifact: real live Helios Trondheim text -> true (class 1b [Static.SQUARESPACE_CONTEXT] alone — the exact gap this fix closes)"
     );
 
     // Positive: generic minified-JS shape — JS-syntax-density class +
@@ -35083,6 +35238,74 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
         "Vi lagde nettsiden vår selv med Squarespace, og oppdaterer den jevnlig med nye bilder fra gården."
       ) === false,
       "codeartifact: prose that merely NAMES 'Squarespace' (no literal Y.Squarespace/Static.SQUARESPACE_CONTEXT token) -> false, even after the class-1b promotion"
+    );
+
+    // (7) Facebook-Pixel-shaped unary-operator IIFE bootstrap
+    // (`!function(...){...}(...)`, NOT the parenthesized `(function(){})()`
+    // form) — dev-request 2026-08-26 unary-IIFE fix. Confirmed root cause:
+    // before this fix, class 2 (cmsBootstrapSignal) already fired here via
+    // its existing `!function(` substring check, but class 3
+    // (jsSyntaxDensitySignal) did NOT — `hasAssignmentActivity` was false
+    // (this shape assigns via bare identifiers like `i=w.fbq=...`, no var/
+    // let/const keywords at all) and the old `isIifeWrapper` regex required
+    // the parenthesized `(function(...){` / `})(`  shape, which this unary
+    // form never has — and class 4 (brace density) also didn't reliably
+    // clear its threshold on this shape (brace density ~0.9/100 chars here,
+    // under the 2.0 bar). Net: only 1 of {2,3,4} fired -> false negative.
+    // This fixture is a deliberately DISTINCT string from the one used to
+    // diagnose the bug (different parameter names w/d/s/l/i instead of
+    // f/b/e/v/n/t/s, a different fake pixel ID, and different handling of
+    // the last helper variable — a `var m = ...` declaration instead of a
+    // bare `s = ...` reassignment) so this is a genuine new regression test,
+    // not a copy of the diagnostic fixture.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "!function(w,d,s,l,i){if(w.fbq)return;i=w.fbq=function(){i.callMethod?i.callMethod.apply(i,arguments):i.queue.push(arguments)};if(!w._fbq)w._fbq=i;i.push=i;i.loaded=!0;i.version='2.0';i.queue=[];l=d.createElement(s);l.async=!0;l.src='https://connect.facebook.net/en_US/fbevents.js';var m=d.getElementsByTagName(s)[0];m.parentNode.insertBefore(l,m)}(window,document,'script');fbq('init','999888777666555');fbq('track','PageView');"
+      ) === true,
+      "codeartifact: Facebook-Pixel-shaped unary-operator IIFE bootstrap (!function(...){...}(...)) -> true (class 2 [!function(] + reworked class 3 [unary IIFE] both fire)"
+    );
+
+    // (8) A sibling unary-operator IIFE form using `+function(` instead of
+    // `!function(` (same ASI-defeating convention, common in minified
+    // library bootstraps that don't need the `!function` shape's implicit
+    // "discard return value" semantics). This fixture has NO CMS-bootstrap
+    // token at all (no `!function(`, no `window.`/`document.` member-access,
+    // no known provider signature) — it isolates the reworked class 3 (JS-
+    // syntax density, now recognizing the unary-IIFE assignment-activity
+    // sub-case) combining with class 4 (brace density) to reach the >=2-
+    // classes threshold, proving the sibling operators are handled by the
+    // same regex, not just `!`.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "+function($){$.fn.myPlugin=function(opts){this.each(function(){var el=$(this);el.data('opts',opts);el.addClass('is-init');});return this;}}(jQuery);"
+      ) === true,
+      "codeartifact: sibling unary-operator IIFE form (+function(...){...}(...)) -> true (reworked class 3 [unary IIFE] + class 4 [brace density])"
+    );
+
+    // Negative control (CRITICAL — proves the new unary-IIFE regex is
+    // anchored, not a loose "contains ! ... contains function( ... contains
+    // }(" scan): ordinary Norwegian prose containing a literal `!` at the
+    // end of one sentence, an unrelated later mention of the literal English
+    // word "function(" (naming a technology, not writing code), and an
+    // unrelated later literal "}(" substring inside a parenthetical aside —
+    // none of these are adjacent to each other the way the unary-IIFE shape
+    // requires (operator immediately before `function`, `}(` following as
+    // the wrapper's own call), so this must NOT flag.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Alt fungerer fint! Vi nevner bare at nettsiden vår har en JavaScript function(kode) et sted i bunnteksten, men det er utviklerens sak. Ellers baker vi brød med kjærlighet }( og selger det i gårdsbutikken)."
+      ) === false,
+      "codeartifact: prose with a stray '!', an unrelated 'function(' mention and an unrelated '}(' substring, none adjacent -> false (unary-IIFE regex requires the operator immediately before function() and is not a loose scan)"
+    );
+
+    // Negative control: plain Norwegian prose ending a sentence with "!",
+    // and no code syntax anywhere else at all -- the ordinary case the
+    // anchoring above must never touch.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Velkommen til gården vår! Vi held ope kvar laurdag, og set stor pris på besøk frå nær og fjern gjennom heile sesongen."
+      ) === false,
+      "codeartifact: plain prose ending a sentence with '!' and no code syntax at all -> false"
     );
 
     // Negative: additional realistic Norwegian producer prose mentioning
@@ -41029,5 +41252,191 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-geocode-adresse-foerst: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// experiences-content-judge-sweep: POST /api/opplevelser/admin/experiences-
+// content-judge-sweep — the retro-clean sweep for `experiences` rows that
+// predate the harvest admission gate PR #721 added (that gate only stops NEW
+// fabricated rows from being admitted; it never touched existing rows).
+// DRY-RUN-BY-DEFAULT mechanism: fetches evidence_url, re-judges content via
+// judgeExperienceContentMatch, quarantines genuine MISMATCH rows to
+// needs_review, and separately nulls byte-identical boilerplate-copy
+// descriptions. Building + testing the mechanism only — no real mass-apply
+// against production data is part of this change. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experiences-content-judge-sweep: retro-clean sweep for pre-PR#721 rows ──");
+  try {
+    const { runOpplevelserExperiencesContentJudgeSweepTests } = require("../src/routes/opplevelser-experiences-content-judge-sweep.test") as
+      typeof import("../src/routes/opplevelser-experiences-content-judge-sweep.test");
+    const cjs = await runOpplevelserExperiencesContentJudgeSweepTests({ log: false });
+    passed += cjs.passed;
+    failed += cjs.failed;
+    for (const f of cjs.failures) failures.push("opplevelser-experiences-content-judge-sweep: " + f);
+    console.log(`  opplevelser-experiences-content-judge-sweep: ${cjs.passed} passed, ${cjs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-content-judge-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-06-23-experiences-richer-profiles, slice F2 (honest
+// wrong_content_rate measurement): GET /admin/experiences/:id/provenance —
+// the raw, admin-gated provenance read surface the 2026-08-25 WCR audit had
+// to reverse-engineer via keyset tricks. (The slice's measurement fixes —
+// meta inclusion, citation_gone routing, stratification — live in the
+// existing experiences-wrong-content-rate suite above.) Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-06-23-experiences-richer-profiles, slice F2: experiences provenance read ──");
+  try {
+    const { runExperiencesProvenanceReadTests } = require("../src/routes/experiences-provenance-read.test") as
+      typeof import("../src/routes/experiences-provenance-read.test");
+    const ppr = await runExperiencesProvenanceReadTests({ log: false });
+    passed += ppr.passed;
+    failed += ppr.failed;
+    for (const f of ppr.failures) failures.push("experiences-provenance-read: " + f);
+    console.log(`  experiences-provenance-read: ${ppr.passed} passed, ${ppr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-provenance-read: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// spec-punkt 2: provider-level canonicalization for the museum/attraction
+// scope GET /admin/gardssalg-provider-dedup-audit's own scope-WHERE never
+// scans (root-cause probe: Vitensenteret/Ringve/Brosundet/Hunderfossen
+// persisting as 2-3 duplicate experience_providers rows). Pure signal-design
+// unit tests (no DB). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── experience-provider-canonicalize: non-gårdssalg provider dedup signals ──");
+  try {
+    const { runExperienceProviderCanonicalizeTests } = require("../src/services/experience-provider-canonicalize.test") as
+      typeof import("../src/services/experience-provider-canonicalize.test");
+    const epc = await runExperienceProviderCanonicalizeTests({ log: false });
+    passed += epc.passed;
+    failed += epc.failed;
+    for (const f of epc.failures) failures.push("experience-provider-canonicalize: " + f);
+    console.log(`  experience-provider-canonicalize: ${epc.passed} passed, ${epc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-provider-canonicalize: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, spec-punkt 2: GET /admin/experiences-provider-dedup-audit
+// — the SQL-scope half (DB/HTTP wiring) of the module above. Tail position
+// is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-provider-dedup-audit: non-gårdssalg provider dedup scan ──");
+  try {
+    const { runOpplevelserExperiencesProviderDedupAuditTests } = require("../src/routes/opplevelser-experiences-provider-dedup-audit.test") as
+      typeof import("../src/routes/opplevelser-experiences-provider-dedup-audit.test");
+    const epda = await runOpplevelserExperiencesProviderDedupAuditTests({ log: false });
+    passed += epda.passed;
+    failed += epda.failed;
+    for (const f of epda.failures) failures.push("opplevelser-experiences-provider-dedup-audit: " + f);
+    console.log(`  opplevelser-experiences-provider-dedup-audit: ${epda.passed} passed, ${epda.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-provider-dedup-audit: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Same dev-request, spec-punkt 2: POST /admin/experiences-provider-dedup-merge
+// — the write lever, reusing gardssalg-provider-merge.ts's already-tested
+// merge machinery unchanged under a new route name for this scope, plus
+// proof that the EXISTING gardssalg-content-rollback lever restores a merge
+// made through this new route with no new wiring. Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-provider-dedup-merge: non-gårdssalg provider merge lever ──");
+  try {
+    const { runOpplevelserExperiencesProviderDedupMergeTests } = require("../src/routes/opplevelser-experiences-provider-dedup-merge.test") as
+      typeof import("../src/routes/opplevelser-experiences-provider-dedup-merge.test");
+    const epdm = await runOpplevelserExperiencesProviderDedupMergeTests({ log: false });
+    passed += epdm.passed;
+    failed += epdm.failed;
+    for (const f of epdm.failures) failures.push("opplevelser-experiences-provider-dedup-merge: " + f);
+    console.log(`  opplevelser-experiences-provider-dedup-merge: ${epdm.passed} passed, ${epdm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-provider-dedup-merge: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// AC4 (Ringve specifically): POST /admin/experiences-canonical-group-merge —
+// the SEPARATE, explicit lever for folding two ALREADY-ASSIGNED canonical_id
+// groups into one, once a caller already knows they're the same business
+// (e.g. from the provider-merge route above). NO fuzzy title matching, NO
+// change to titlesMatch()/groupDuplicateCandidates()/runDedupPass(). Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-canonical-group-merge: explicit canonical-group merge lever ──");
+  try {
+    const { runOpplevelserExperiencesCanonicalGroupMergeTests } = require("../src/routes/opplevelser-experiences-canonical-group-merge.test") as
+      typeof import("../src/routes/opplevelser-experiences-canonical-group-merge.test");
+    const ecgm = await runOpplevelserExperiencesCanonicalGroupMergeTests({ log: false });
+    passed += ecgm.passed;
+    failed += ecgm.failed;
+    for (const f of ecgm.failures) failures.push("opplevelser-experiences-canonical-group-merge: " + f);
+    console.log(`  opplevelser-experiences-canonical-group-merge: ${ecgm.passed} passed, ${ecgm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-canonical-group-merge: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-25-experiences-pris-ferskhet: `experiences.price_from`
+// was written once at harvest/content-refresh time and NEVER re-checked —
+// selectExperiencesForPriceFreshnessCheck()/resolvePriceProvenanceUrl()/
+// priceFreshnessExclusionSql() (experience-store.ts, NULLs-first-then-oldest
+// selector + 3-strikes fetch-failure park, mirroring
+// selectProvidersForContentRefresh's own idiom one level down) and
+// POST /admin/price-freshness-check (routes/opplevelser.ts, re-fetches a
+// row's price provenance page and re-runs the SAME extractPriceFrom()
+// content-refresh uses). Own dedicated in-memory-db harness (mirrors the
+// sibling evidence-url-verification-gate test file's own harness). Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-25-experiences-pris-ferskhet: price_from freshness sweep ──");
+  try {
+    const { runOpplevelserPriceFreshnessCheckTests } = require("../src/routes/opplevelser-price-freshness-check.test") as
+      typeof import("../src/routes/opplevelser-price-freshness-check.test");
+    const pfc = await runOpplevelserPriceFreshnessCheckTests({ log: false });
+    passed += pfc.passed;
+    failed += pfc.failed;
+    for (const f of pfc.failures) failures.push("opplevelser-price-freshness-check: " + f);
+    console.log(`  opplevelser-price-freshness-check: ${pfc.passed} passed, ${pfc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-price-freshness-check: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// FUNN "experiences-dedup-audit-mangler-navnesok-over-ikke-suspect-grupper":
+// GET /admin/experiences-canonical-groups?title_contains= — read-only
+// companion lookup for POST /admin/experiences-canonical-group-merge, since
+// no existing read path can resolve a canonical group's id from a business
+// name for a RAW, non-suspect, unpublished row (e.g. Ringve). Tail position
+// is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-canonical-groups-lookup: name-search for canonical group ids ──");
+  try {
+    const { runOpplevelserExperiencesCanonicalGroupsLookupTests } = require("../src/routes/opplevelser-experiences-canonical-groups-lookup.test") as
+      typeof import("../src/routes/opplevelser-experiences-canonical-groups-lookup.test");
+    const ecgl = await runOpplevelserExperiencesCanonicalGroupsLookupTests({ log: false });
+    passed += ecgl.passed;
+    failed += ecgl.failed;
+    for (const f of ecgl.failures) failures.push("opplevelser-experiences-canonical-groups-lookup: " + f);
+    console.log(`  opplevelser-experiences-canonical-groups-lookup: ${ecgl.passed} passed, ${ecgl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-canonical-groups-lookup: unexpected error: " + String(err?.message || err));
   }
 });

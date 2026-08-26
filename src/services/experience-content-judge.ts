@@ -6,8 +6,33 @@
  * Makes charters/experiences-enrichment.yaml's `wrong_content_rate`
  * guardrail (status: not_computable_yet, threshold 0.02, since 2026-06-17)
  * actually computable: sample enriched `experiences` rows and grade the
- * written description/category/price against the row's own `evidence_url`
- * (the live source page it was enriched from).
+ * written description/category/price against the page they were actually
+ * enriched from.
+ *
+ * FIX (2026-08-25, wrong_content_rate = 0.25 root-cause): this module used to
+ * re-fetch `experiences.evidence_url` and treat it as "the live source page
+ * it was enriched from" — that is exactly the claim `applyExperienceContent`'s
+ * own doc comment (src/services/experience-store.ts) warns is false:
+ * `evidence_url` is DISCOVERY-time provenance, written ONCE at
+ * createExperience() from the ORIGINAL harvest row and never updated again by
+ * either the twice-daily content-refresh writer or a richer re-harvest merge.
+ * The page actually used to WRITE a field's current value is recorded
+ * PER-FIELD in `content_field_evidence` (JSON: field -> source URL), stamped
+ * by applyExperienceContent on every write. The two can point at completely
+ * different pages — a row harvested from one listing, then enriched months
+ * later from its real homepage — and comparing the enriched fields against
+ * the wrong (stale, discovery-time) page produces exactly the false-mismatch
+ * pattern the 2026-08-25 holdout run (0.25, 12x threshold) hit: e.g. an
+ * experience's stored content re-graded against a completely unrelated page
+ * that happens to be the ORIGINAL discovery source, not the enrichment
+ * source. `resolveHoldoutEvidenceUrl()` below fixes this by preferring the
+ * per-field `content_field_evidence` URL for whichever judged field actually
+ * carries one (description, then category, then price_from — the fields
+ * content-refresh writes and this judge grades), falling back to the legacy
+ * `evidence_url` only when NO field carries genuine per-field provenance
+ * (rows written before content_field_evidence existed). A row with neither is
+ * excluded from the holdout pool entirely (see sampleEnrichedExperiencesFor
+ * Holdout) rather than graded against a citation known to be untrustworthy.
  *
  * Two pieces:
  *   - sampleEnrichedExperiencesForHoldout(db, n): pure-ish DB read, the
@@ -39,6 +64,7 @@
  */
 
 import type Database from "better-sqlite3";
+import { parseContentFieldEvidence, PUBLISH_GATE_SQL } from "./experience-store";
 
 export interface HoldoutExperienceRow {
   id: string;
@@ -47,7 +73,64 @@ export interface HoldoutExperienceRow {
   category: string | null;
   price_band: string | null;
   price_from: number | null;
-  evidence_url: string;
+  // Legacy discovery-time citation — see the module header. Never fetched
+  // directly by the caller any more; resolveHoldoutEvidenceUrl() below is the
+  // only sanctioned way to turn a row into a URL to check content against.
+  // Nullable despite the SQL below still filtering NOT NULL rows in the
+  // common case: content_field_evidence-only rows (no legacy evidence_url at
+  // all) are now also eligible, so the type must not lie about that.
+  evidence_url: string | null;
+  content_field_evidence: string | null;
+}
+
+// Judged fields, in priority order, that content-refresh actually writes and
+// this holdout actually grades (title is never touched by content-refresh —
+// see applyExperienceContent — so it has no per-field evidence entry and is
+// deliberately not in this list). The first field that carries a genuine
+// (non-sentinel) per-field source URL wins; in the overwhelming common case
+// all fields written by the SAME content-refresh pass share one URL anyway,
+// so the choice among them rarely matters — this only breaks ties when a
+// row's fields were filled by different passes over time.
+const HOLDOUT_JUDGED_FIELDS = ["description", "category", "price_from"] as const;
+
+/**
+ * Resolve the actual page a holdout row's graded content should be checked
+ * against. Prefers the PER-FIELD provenance in `content_field_evidence`
+ * (stamped by applyExperienceContent at write time — the true "what page did
+ * this field's value come from") over the row's `evidence_url` column, which
+ * is DISCOVERY-time provenance frozen at insert and never updated by
+ * enrichment (see module header). Falls back to `evidence_url` only when NO
+ * judged field carries genuine per-field provenance at all (older rows
+ * written before content_field_evidence existed) — never silently prefers
+ * the known-untrustworthy column when a trustworthy one is available.
+ * Returns null when there is truly nothing fetchable to check against (no
+ * per-field evidence AND no evidence_url) — the caller must treat that as
+ * unresolved, never fabricate a comparison.
+ *
+ * FIX (2026-08-25 review round 2): a per-field provenance value is rejected
+ * by SHAPE (must look like an http(s) URL), not by enumerating known
+ * sentinel constants. An enumerated check missed a real, actively-written
+ * third sentinel (`generated:katalogfelt-llm`, the LLM description-backfill
+ * endpoint's provenance marker) and would silently miss any FUTURE sentinel
+ * too. It also threw on a non-string field value (`src.trim is not a
+ * function`) since the outer JSON-shape guard in parseContentFieldEvidence
+ * doesn't type-check each value — one malformed row anywhere in the holdout
+ * pool crashed the entire endpoint. The `typeof`/regex guard below rejects
+ * both classes of bad input the same way a plain string field is rejected:
+ * fall through to the next judged field, then to legacy evidence_url, then
+ * null — never throw, never fabricate a comparison against garbage.
+ */
+export function resolveHoldoutEvidenceUrl(row: HoldoutExperienceRow): string | null {
+  const evidence = parseContentFieldEvidence(row.content_field_evidence);
+  for (const field of HOLDOUT_JUDGED_FIELDS) {
+    const src = evidence[field];
+    if (typeof src !== "string") continue;
+    const trimmed = src.trim();
+    if (!/^https?:\/\//i.test(trimmed)) continue;
+    return trimmed;
+  }
+  const legacy = row.evidence_url?.trim();
+  return legacy || null;
 }
 
 // Pool cap for the initial SQL read — avoids ORDER BY RANDOM() on a
@@ -59,7 +142,12 @@ const HOLDOUT_POOL_CAP = 500;
 /**
  * Selects up to `n` rows from `experiences` eligible for the wrong_content_
  * rate holdout: enrichment_state='enriched' AND content_source='provider_
- * site' AND evidence_url IS NOT NULL. Read-only — a single SELECT, zero
+ * site' AND (evidence_url IS NOT NULL OR content_field_evidence IS NOT
+ * NULL) — the SQL-level pass admits either citation source, then the pool is
+ * filtered (in JS) to rows resolveHoldoutEvidenceUrl() can actually resolve
+ * to a real, non-sentinel URL — a row with no genuinely-checkable citation at
+ * all carries no signal for the holdout and must not be sampled into it (see
+ * resolveHoldoutEvidenceUrl's doc comment). Read-only — a single SELECT, zero
  * writes. `n` is used as-is (the caller — the admin route — is responsible
  * for clamping the requested sample_size to its own cap before calling
  * this).
@@ -71,17 +159,20 @@ export function sampleEnrichedExperiencesForHoldout(
   const safeN = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
   if (safeN <= 0) return [];
 
-  const pool = db
+  const rawPool = db
     .prepare(
-      `SELECT id, title, description, category, price_band, price_from, evidence_url
+      `SELECT id, title, description, category, price_band, price_from,
+              evidence_url, content_field_evidence
          FROM experiences
         WHERE enrichment_state = 'enriched'
           AND content_source = 'provider_site'
-          AND evidence_url IS NOT NULL
+          AND (evidence_url IS NOT NULL OR content_field_evidence IS NOT NULL)
         ORDER BY updated_at DESC
         LIMIT ?`,
     )
     .all(HOLDOUT_POOL_CAP) as HoldoutExperienceRow[];
+
+  const pool = rawPool.filter((row) => resolveHoldoutEvidenceUrl(row) !== null);
 
   // Fisher-Yates shuffle in JS — the pool is already capped by the SQL LIMIT
   // above, so this never touches more than HOLDOUT_POOL_CAP rows.
@@ -95,6 +186,80 @@ export function sampleEnrichedExperiencesForHoldout(
   return pool.slice(0, Math.min(safeN, pool.length));
 }
 
+export interface PublishedHoldoutPool {
+  rows: HoldoutExperienceRow[];
+  considered: number; // published-gate rows examined (pool, capped at HOLDOUT_POOL_CAP)
+  checkable: number; // of those, how many resolveHoldoutEvidenceUrl() actually resolves for
+}
+
+/**
+ * Selects up to `n` rows from the rows that ACTUALLY PASS PUBLISH_GATE_SQL —
+ * the same predicate /discover, the detail page, and getPublishedExperience
+ * ById()/BySlug() use to decide what is genuinely served to the public.
+ *
+ * dev-request 2026-08-25-wcr-holdout-pool-dekker-ikke-publisert-flate: a
+ * 2026-08-25 production measurement found sampleEnrichedExperiencesForHoldout
+ * (above) — filtered to enrichment_state='enriched' AND content_source=
+ * 'provider_site' — essentially NEVER returns a row that is actually
+ * published: of the catalog's 558 published experiences, almost none were
+ * filled by the enrichment pass; most are harvest-filled. So the wrong_
+ * content_rate guardrail's `published` stratum always came back sample_size:
+ * 0 — the holdout measured the internal enriched-but-unpublished backlog,
+ * never what real users/agents are actually served. Unlike its sibling, this
+ * function does NOT filter on enrichment_state/content_source at all — it
+ * pulls straight from PUBLISH_GATE_SQL, because the point of THIS pool is to
+ * measure what is SERVED, not what the enrichment pass has touched.
+ *
+ * Published rows can lack `content_field_evidence` (harvest-filled, never
+ * touched by applyExperienceContent) — resolveHoldoutEvidenceUrl()'s fallback
+ * to the legacy `evidence_url` column covers most of those. Rows with
+ * NEITHER are still honestly excluded from `rows` (same discipline as the
+ * sibling sampler — no fabricated comparison against garbage), but silently
+ * dropping them here would let a pool where e.g. 90% of published rows carry
+ * no checkable citation at all read as "measured green" once the pool is
+ * mostly filtered away. `considered` (rows the publish gate actually admits,
+ * pool-capped) vs `checkable` (of those, how many resolveHoldoutEvidenceUrl()
+ * resolves for) lets the caller report that exclusion rate honestly instead
+ * of it disappearing into an empty-looking `rows` array.
+ */
+export function samplePublishedExperiencesForHoldout(
+  db: Database.Database,
+  n: number,
+): PublishedHoldoutPool {
+  const safeN = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  if (safeN <= 0) return { rows: [], considered: 0, checkable: 0 };
+
+  const rawPool = db
+    .prepare(
+      `SELECT e.id, e.title, e.description, e.category, e.price_band, e.price_from,
+              e.evidence_url, e.content_field_evidence
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE ${PUBLISH_GATE_SQL}
+        ORDER BY e.updated_at DESC
+        LIMIT ?`,
+    )
+    .all(HOLDOUT_POOL_CAP) as HoldoutExperienceRow[];
+
+  const pool = rawPool.filter((row) => resolveHoldoutEvidenceUrl(row) !== null);
+
+  // Same Fisher-Yates shuffle as sampleEnrichedExperiencesForHoldout above —
+  // the pool is already capped by the SQL LIMIT, so this never touches more
+  // than HOLDOUT_POOL_CAP rows.
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = pool[i]!;
+    pool[i] = pool[j]!;
+    pool[j] = tmp;
+  }
+
+  return {
+    rows: pool.slice(0, Math.min(safeN, pool.length)),
+    considered: rawPool.length,
+    checkable: pool.length,
+  };
+}
+
 export type ExperienceContentJudgeVerdict =
   | { ok: true; verdict: "MATCH" | "MISMATCH"; reasoning: string }
   | { ok: false; reasoning: string };
@@ -102,7 +267,10 @@ export type ExperienceContentJudgeVerdict =
 const JUDGE_MATCH_TOKEN = "MATCH";
 const JUDGE_MISMATCH_TOKEN = "MISMATCH";
 // Same cap style as GARDSSALG_JUDGE_CANDIDATE_CHAR_CAP
-// (src/routes/opplevelser.ts) — bounds LLM spend per row.
+// (src/routes/opplevelser.ts) — bounds LLM spend per row. The WCR route
+// prepends the page's labeled meta-description block (see its doc comment)
+// BEFORE the visible text, so this combined-text cap can only ever truncate
+// the visible-text tail — the meta content is never silently cut away.
 const JUDGE_PAGE_TEXT_CHAR_CAP = 4000;
 
 /**
@@ -129,7 +297,7 @@ export async function judgeExperienceContentMatch(
       ? `Prisklasse: ${row.price_band ?? "ukjent"}${row.price_from != null ? `, fra ${row.price_from} kr` : ""}`
       : "Prisklasse: (ikke satt)";
 
-  const prompt = `Du er en kvalitetsdommer som sjekker om innhold skrevet om en opplevelse faktisk stemmer med kildesiden det ble hentet fra. Under er (1) innholdet som er lagret i databasen for opplevelsen "${row.title}", og (2) den synlige teksten fra kildesiden (evidence_url) innholdet skal være hentet fra.
+  const prompt = `Du er en kvalitetsdommer som sjekker om innhold skrevet om en opplevelse faktisk stemmer med kildesiden det ble hentet fra. Under er (1) innholdet som er lagret i databasen for opplevelsen "${row.title}", og (2) tekst fra kildesiden (evidence_url) innholdet skal være hentet fra. Kildeteksten kan innledes med sidens egen meta-beskrivelse (merket «Sidens meta-beskrivelse:») etterfulgt av synlig sidetekst — meta-beskrivelsen er fullverdig sideinnhold og en vanlig primærkilde for lagrede beskrivelser, så innhold som stemmer med den regnes som å stemme med kilden.
 
 Lagret innhold:
 Tittel: ${row.title}
@@ -137,7 +305,7 @@ Beskrivelse: ${row.description ?? "(ingen)"}
 Kategori: ${row.category ?? "(ingen)"}
 ${priceLine}
 
-Synlig tekst fra kildesiden:
+Tekst fra kildesiden:
 ${cappedPageText}
 
 Vurder om det lagrede innholdet plausibelt stemmer overens med kildesiden — samme tilbyder/aktivitet, ikke åpenbart hentet fra feil side eller fabrikkert. Dette er IKKE en kvalitetsvurdering av hvor godt teksten er skrevet, kun om innholdet faktisk stemmer med kilden.

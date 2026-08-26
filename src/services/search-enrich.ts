@@ -1003,8 +1003,58 @@ export function extractProductMentions(text: string): string[] {
 }
 
 /**
+ * Extract the page's meta-level descriptions — og:description and
+ * <meta name="description"> — decoded, whitespace-collapsed, in priority
+ * order (og first, matching summarizeAbout's long-standing preference),
+ * deduped, empty entries dropped. Returns [] when the page carries neither.
+ * Uncapped: callers apply their own length policy (summarizeAbout caps at
+ * ~300 chars; the wrong_content_rate judge feeds it into a 4000-char
+ * combined-text cap). PURE.
+ *
+ * Pulled out of summarizeAbout (dev-request 2026-06-23-experiences-richer-
+ * profiles, slice F2) so the wrong_content_rate holdout judge can see the
+ * SAME meta content the description writer's primary extraction path reads —
+ * a description faithfully derived from a page's meta description used to
+ * score MISMATCH because the judged text was body-only (visibleTextOf) and
+ * the meta content lives in an HTML attribute, invisible to it.
+ */
+export function extractMetaDescriptions(html: string): string[] {
+  if (!html) return [];
+  // Shared decoder (see decodeHtmlEntities): covers everything the previous
+  // local chain in summarizeAbout used to — &quot; and &#39; included, the
+  // latter via the generic numeric-reference branch.
+  const decode = decodeHtmlEntities;
+  const clean = (raw: string | undefined): string =>
+    raw ? decode(raw).replace(/\s+/g, " ").trim() : "";
+
+  // og:description (property OR name, attribute order tolerant).
+  const ogContentFirst = html.match(
+    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:description["']/i,
+  );
+  const ogPropFirst = html.match(
+    /<meta[^>]+(?:property|name)=["']og:description["'][^>]+content=["']([^"']+)["']/i,
+  );
+  const og = clean(ogPropFirst?.[1] ?? ogContentFirst?.[1]);
+
+  // <meta name="description">.
+  const mdPropFirst = html.match(
+    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
+  );
+  const mdContentFirst = html.match(
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
+  );
+  const md = clean(mdPropFirst?.[1] ?? mdContentFirst?.[1]);
+
+  const out: string[] = [];
+  if (og) out.push(og);
+  if (md && md !== og) out.push(md);
+  return out;
+}
+
+/**
  * Produce a DETERMINISTIC extractive "about" summary from the page HTML:
- *   1. prefer og:description, else <meta name="description">,
+ *   1. prefer og:description, else <meta name="description">
+ *      (via extractMetaDescriptions above),
  *   2. else the first meaningful visible paragraph (≥40 chars) of body text.
  * Whitespace-collapsed, decoded, capped at ~300 chars (cut on a word boundary).
  * No generative text — purely extractive. PURE.
@@ -1018,30 +1068,11 @@ export function summarizeAbout(html: string): string {
     const lastSpace = slice.lastIndexOf(" ");
     return (lastSpace > 200 ? slice.slice(0, lastSpace) : slice).trim();
   };
-  // Shared decoder (see decodeHtmlEntities): covers everything this local
-  // chain used to — &quot; and &#39; included, the latter now via the generic
-  // numeric-reference branch.
-  const decode = decodeHtmlEntities;
 
-  // (1) og:description (property OR name, attribute order tolerant).
-  const ogContentFirst = html.match(
-    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:description["']/i,
-  );
-  const ogPropFirst = html.match(
-    /<meta[^>]+(?:property|name)=["']og:description["'][^>]+content=["']([^"']+)["']/i,
-  );
-  const og = ogPropFirst?.[1] ?? ogContentFirst?.[1];
-  if (og && og.trim()) return cap(decode(og));
-
-  // (2) <meta name="description">.
-  const mdPropFirst = html.match(
-    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
-  );
-  const mdContentFirst = html.match(
-    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
-  );
-  const md = mdPropFirst?.[1] ?? mdContentFirst?.[1];
-  if (md && md.trim()) return cap(decode(md));
+  // (1)+(2) og:description, else <meta name="description"> — the shared
+  // extractor returns them in exactly that priority order.
+  const metas = extractMetaDescriptions(html);
+  if (metas.length > 0) return cap(metas[0]!);
 
   // (3) first meaningful visible paragraph of body text (structure-aware:
   // nav/header/footer/aside chrome and disguised nav-menu <ul>/<ol> blocks
@@ -1055,6 +1086,70 @@ export function summarizeAbout(html: string): string {
   }
   // Fallback: the leading slice of visible text.
   return cap(visible);
+}
+
+// ─── Parked/for-sale-domain page detector (dev-request 2026-06-23-
+// experiences-richer-profiles, faithfulness-inflow slice, 2026-08-25) ────────
+//
+// A provider domain that has LAPSED and been re-registered by a parking
+// service still fetches with HTTP 200 and often carries a meta description —
+// so summarizeAbout() happily extracts registrar/marketplace boilerplate and
+// the content-refresh writer stores it as a per-experience description.
+// Live incident: sirdal.com is a parked domain and its parking text became
+// an experience's description. The dental vertical's classifyHjemmeside()
+// (dental-hjemmeside-classifier.ts) only catches the rare case where the
+// URL's own HOSTNAME is a parking service; its own doc comment names the
+// common case — a normal-looking domain that RESOLVES to a parking page —
+// as needing a live fetch, which is exactly the position this content-level
+// detector sits in (the page is already fetched).
+//
+// CONSERVATIVE by design (a false positive costs a real provider its
+// enrichment fetch): flags only when BOTH hold —
+//   1. the page's visible text is TINY (< PARKED_PAGE_MAX_VISIBLE_CHARS) —
+//      parking lander pages are one headline + one sales CTA, while a real
+//      producer homepage practically always carries nav + footer + prose
+//      well past this bound; and
+//   2. that text contains a telltale domain-parking/for-sale phrase
+//      (English + Norwegian registrar boilerplate).
+// A large page mentioning "domain is for sale" in e.g. a blog post about
+// domains is NOT flagged (fails 1); a small-but-real "under construction"
+// producer page without sales boilerplate is NOT flagged (fails 2).
+const PARKED_PAGE_MAX_VISIBLE_CHARS = 1500;
+const PARKED_PAGE_PHRASES: readonly string[] = [
+  // English registrar/marketplace boilerplate
+  "domain is for sale",
+  "this domain is for sale",
+  "buy this domain",
+  "purchase this domain",
+  "domain may be for sale",
+  "the domain owner is offering it for sale",
+  "domain parking",
+  "parked domain",
+  "this web page is parked",
+  "parked free",
+  // Norwegian registrar boilerplate
+  "domenet er til salgs",
+  "dette domenet er til salgs",
+  "kjop dette domenet", // accents pre-stripped below — matches "kjøp dette domenet"
+  "domenet kan vaere til salgs",
+  "domenet er parkert",
+  "dette domenet er parkert",
+  "domenet er registrert av",
+];
+
+/**
+ * True when a fetched page looks like a parked/for-sale domain lander rather
+ * than the provider's real site — see the block comment above for the exact
+ * two-signal rule and its safety posture. Callers must treat a parked page
+ * as a FAILED fetch (extract nothing, write nothing): parking text is
+ * content about the DOMAIN MARKET, never about the provider. PURE.
+ */
+export function looksLikeParkedDomainPage(html: string): boolean {
+  if (!html) return false;
+  const visible = extractVisibleText(html);
+  if (visible.length >= PARKED_PAGE_MAX_VISIBLE_CHARS) return false;
+  const hay = stripNorwegianAccents(visible.toLowerCase());
+  return PARKED_PAGE_PHRASES.some((phrase) => hay.includes(phrase));
 }
 
 // Norwegian visit/tasting keywords used by summarizeVisit() below — a page

@@ -396,8 +396,14 @@ export function runOpplevelserContentRefreshScanWindowTests(
         JSON.stringify({ hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-01-01T00:00:00.000Z" } }),
         enrProviderB1,
       );
+      // Titles below share a significant token ("familiegård") with
+      // ABOUT_TEXT — required since the faithfulness-inflow slice's
+      // homepage-boilerplate guard (dev-request 2026-06-23-experiences-
+      // richer-profiles, 2026-08-25): a homepage description that never
+      // names the experience is no longer written, and this file tests the
+      // selector-window/write-path fixes, not that guard.
       const enrExpB1 = expStore.createExperience({
-        title: "Route fixture opplevelse", provider_id: enrProviderB1, provider_match_status: "matched",
+        title: "Familiegård route fixture", provider_id: enrProviderB1, provider_match_status: "matched",
         fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
       });
 
@@ -455,11 +461,11 @@ export function runOpplevelserContentRefreshScanWindowTests(
         provB2,
       );
       const lockedExpB2 = expStore.createExperience({
-        title: "Låst opplevelse", provider_id: provB2, provider_match_status: "matched",
+        title: "Familiegård låst", provider_id: provB2, provider_match_status: "matched",
         fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "verified",
       });
       const unlockedExpB2 = expStore.createExperience({
-        title: "Ulåst opplevelse", provider_id: provB2, provider_match_status: "matched",
+        title: "Familiegård ulåst", provider_id: provB2, provider_match_status: "matched",
         fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
       });
 

@@ -15,9 +15,35 @@
  *      RFB second verification line block in runVerifierBatch, which ALSO
  *      requires RFB_SECOND_LINE_VERIFICATION_ENABLED='true'.
  *
+ * ── dev-request 2026-08-25-terminal-sweep-false-positives (extends this
+ * suite, does not replace it) ──────────────────────────────────────────────
+ * The ORIGINAL version of criterion 2 terminal-marked the moment the second
+ * line found zero identity sources — on the ABSENCE of data alone. A
+ * measured production sample found 7/10 rows terminal-marked that way were
+ * demonstrably live, active businesses. Criterion 2 now REQUIRES fresh,
+ * positive evidence (see lokal-agent-verifier.ts's checkFreshBrregDeathEvidence
+ * / looksLikeNonProducerEntity doc comments) before a terminal mark; absent
+ * evidence now means the row stays `pending_verify`. Scenario (e) below is
+ * REWRITTEN to prove that new invariant (was previously the "zero sources ->
+ * instant terminal" case — that behaviour was exactly the bug). Scenarios
+ * (h)/(i)/(j)/(k) below are new: the 10 real measured fixture rows from the
+ * dev-request's own production sample (h), a positive brreg_konkurs/
+ * brreg_inactive fresh-evidence fixture (i), direct unit coverage of
+ * looksLikeNonProducerEntity's false-positive guards (j), and direct unit
+ * coverage of checkFreshBrregDeathEvidence's domain-token / personal-name-ENK
+ * waterfall attempts (k) — the two fallback attempts none of the (h)
+ * fixtures happen to exercise (their base-name attempt always resolves the
+ * search first).
+ *
  * Harness pattern copied verbatim from the sibling
  * lokal-agent-verifier-second-line.test.ts: in-memory better-sqlite3 DB via
  * initMod.__setDbForTesting/__initSchemaForTesting, restored in `finally`.
+ * The NEW fresh-Brreg-lookup fixtures below mirror
+ * admin-rfb-brreg-selfsufficiency.test.ts's own raw-fetch-stub convention
+ * (jsonResponse/searchHit/detail helpers, URL-pattern dispatch on `navn=`
+ * vs `/enheter/{9 digits}$`) since checkFreshBrregDeathEvidence calls the
+ * SAME brreg-client.ts functions (findOrgnumberByName/verifyOrgNumber) that
+ * route's own tests already stub the same way.
  *
  * Exported runLokalAgentVerifierTerminalUnconfirmableTests({log}) ->
  * TestSummary; wired into tests/test.ts via runSerial() immediately after
@@ -66,7 +92,82 @@ export function runLokalAgentVerifierTerminalUnconfirmableTests(
   }
 
   return (async () => {
-    const { runVerifierBatch, pickBatch } = require("./lokal-agent-verifier") as typeof import("./lokal-agent-verifier");
+    const { runVerifierBatch, pickBatch, checkFreshBrregDeathEvidence, looksLikeNonProducerEntity } =
+      require("./lokal-agent-verifier") as typeof import("./lokal-agent-verifier");
+    // brreg-client.ts's findOrgnumberByName/verifyOrgNumber caches are
+    // module-level (per-process), so a DIFFERENT test file that ran earlier
+    // in this same `npm test` process and happened to reuse one of this
+    // suite's fake org-numbers/search-names (small integers like
+    // "999888777" are a common placeholder across this codebase's test
+    // fixtures — see e.g. brreg-client.test.ts) can leave a stale cached
+    // result behind. Cleared here (mirrors the SAME clear-at-start
+    // convention brreg-client.test.ts / admin-rfb-brreg-selfsufficiency.test.ts
+    // / opplevelser-*.test.ts already use) so scenarios (h)/(i)/(k) below —
+    // the first in this file to call the REAL findOrgnumberByName/
+    // verifyOrgNumber (fetch-mocked, never real network) — always start
+    // from a clean slate regardless of suite run order.
+    const { __clearBrregCacheForTesting, __clearBrregVerifyCacheForTesting } =
+      require("../services/brreg-client") as typeof import("../services/brreg-client");
+    __clearBrregCacheForTesting();
+    __clearBrregVerifyCacheForTesting();
+
+    // ── Fresh-Brreg-lookup fetch stub (dev-request 2026-08-25) ──────────────
+    // Mirrors admin-rfb-brreg-selfsufficiency.test.ts's own raw-fetch-stub
+    // convention: findOrgnumberByName's request URL carries `?navn=<name>`,
+    // verifyOrgNumber's carries `/enheter/<9-digit-orgnr>`. Any search name /
+    // org-nr NOT registered in the fixture map returns an EMPTY/404 result —
+    // never a match — matching production's own fail-closed default so a
+    // scenario can prove "no match found" just by omitting a fixture.
+    function jsonResponse(status: number, body: Record<string, unknown>): Response {
+      return { status, ok: status >= 200 && status < 300, json: async () => body } as unknown as Response;
+    }
+    function searchHit(orgNr: string, navn: string) {
+      return { organisasjonsnummer: orgNr, navn, forretningsadresse: { adresse: ["Testveien 1"] } };
+    }
+    function activeDetail(orgNr: string, navn: string, extra: Record<string, unknown> = {}) {
+      return {
+        organisasjonsnummer: orgNr, navn, konkurs: false, underAvvikling: false,
+        underTvangsavviklingEllerTvangsopplosning: false, slettedato: null, ...extra,
+      };
+    }
+    function deadDetail(orgNr: string, navn: string, flag: "bankrupt" | "dissolved") {
+      return {
+        organisasjonsnummer: orgNr, navn,
+        konkurs: flag === "bankrupt",
+        underAvvikling: false,
+        underTvangsavviklingEllerTvangsopplosning: false,
+        slettedato: flag === "dissolved" ? "2026-01-15" : null,
+      };
+    }
+    // A scenario throwing if this is ever invoked proves "no fresh Brreg
+    // lookup was even attempted" (e.g. the non-producer-pattern short-circuit
+    // firing BEFORE any network call) — mirrors throwingJudge's role below.
+    const throwingDeathCheckFetch = (async () => {
+      throw new Error("checkFreshBrregDeathEvidence must NOT have called fetch in this scenario");
+    }) as unknown as typeof fetch;
+
+    function buildDeathCheckFetch(opts: {
+      bySearchName?: Record<string, { orgNr: string; navn: string }>;
+      byOrgNr?: Record<string, Record<string, unknown>>;
+    } = {}): typeof fetch {
+      return (async (url: string | URL | Request) => {
+        const u = String(url);
+        const sm = /[?&]navn=([^&]+)/.exec(u);
+        if (sm) {
+          const decoded = decodeURIComponent(sm[1]);
+          const fx = opts.bySearchName?.[decoded];
+          if (fx) return jsonResponse(200, { _embedded: { enheter: [searchHit(fx.orgNr, fx.navn)] } });
+          return jsonResponse(200, { _embedded: { enheter: [] } });
+        }
+        const dm = /\/enheter\/(\d{9})$/.exec(u);
+        if (dm) {
+          const fx = opts.byOrgNr?.[dm[1]];
+          if (!fx) return jsonResponse(404, {});
+          return jsonResponse(200, fx);
+        }
+        return jsonResponse(404, {});
+      }) as typeof fetch;
+    }
 
     const prevDb = initMod.getDb();
     const prevTerminalFlag = process.env.RFB_TERMINAL_UNCONFIRMABLE_ENABLED;
@@ -150,6 +251,12 @@ export function runLokalAgentVerifierTerminalUnconfirmableTests(
         brregLookup?: any;
         judgeFn?: any;
         headProbeStatus?: number | null;
+        // dev-request 2026-08-25-terminal-sweep-false-positives: the fresh-
+        // lookup fetch stub for checkFreshBrregDeathEvidence. Defaults to
+        // throwingDeathCheckFetch — a scenario that reaches the fresh-lookup
+        // branch WITHOUT passing this explicitly fails loudly (a network
+        // call attempt) rather than silently hitting the real Brreg API.
+        deathCheckFetch?: typeof fetch;
       } = {}) {
         const prevT = process.env.RFB_TERMINAL_UNCONFIRMABLE_ENABLED;
         const prevS = process.env.RFB_SECOND_LINE_VERIFICATION_ENABLED;
@@ -164,6 +271,7 @@ export function runLokalAgentVerifierTerminalUnconfirmableTests(
             headProbe: async () => (o.headProbeStatus === undefined ? null : o.headProbeStatus),
             brregLookup: o.brregLookup ?? null,
             secondLineJudgeFn: o.judgeFn,
+            terminalDeathCheckFetch: o.deathCheckFetch ?? throwingDeathCheckFetch,
           });
           return result.results[0];
         } finally {
@@ -247,22 +355,37 @@ export function runLokalAgentVerifierTerminalUnconfirmableTests(
       // (e) flag ON + RFB_SECOND_LINE_VERIFICATION_ENABLED='true': first
       //     line fails with NO brreg/nace flags at all (newVerification
       //     starts 'pending_verify'), second line finds ZERO identity
-      //     sources -> terminal_unconfirmable, terminal_reason:
-      //     'zero_identity_sources'.
+      //     sources -> REWRITTEN for dev-request 2026-08-25-terminal-sweep-
+      //     false-positives: a fresh Brreg lookup finds NO confident match
+      //     either -> stays 'pending_verify' (the core invariant this
+      //     dev-request exists to enforce — absence of data, even on BOTH
+      //     the identity-sources check AND the fresh lookup, is never
+      //     terminal grounds). This scenario used to assert the OPPOSITE
+      //     (instant terminal_unconfirmable on zero sources alone) — that
+      //     was exactly the measured false-positive bug.
       // ═══════════════════════════════════════════════════════════════
       // No website (-> website_ok=false, no own_website source), no
       // provenance records, no Brreg name match (brregLookup=null here) ->
       // computeSecondLineIdentitySources returns []. Gate fails on
       // website_ok alone (http_status null -> flags=['website_unreachable'],
       // no brreg/nace flag) -> deriveVerificationStatus -> 'pending_verify'.
-      seedAgent("e1", { website: null, email: "kari@testgard.no" });
+      seedAgent("e1", { name: "Testgård e1", website: null, email: "kari@e1-testgard.no" });
       {
-        const r = await runOne("e1", { terminalFlag: "true", secondLineFlag: "true", judgeFn: throwingJudge });
-        assertEq(r.new_verification_status, "terminal_unconfirmable", "e-1: flag ON both, zero identity sources -> terminal_unconfirmable");
+        const r = await runOne("e1", {
+          terminalFlag: "true",
+          secondLineFlag: "true",
+          judgeFn: throwingJudge,
+          // Empty fixture set -> every search-name attempt (base name, and
+          // whatever domain-token the agent's own registration url yields)
+          // returns zero Brreg hits -> checkFreshBrregDeathEvidence returns
+          // null -> no death evidence -> stays pending_verify.
+          deathCheckFetch: buildDeathCheckFetch({}),
+        });
+        assertEq(r.new_verification_status, "pending_verify", "e-1: flag ON both, zero identity sources AND no fresh Brreg death evidence -> stays pending_verify");
         const row = knowledgeRow("e1");
-        assertEq(row.verification_status, "terminal_unconfirmable", "e-2: DB also reflects terminal_unconfirmable");
+        assertEq(row.verification_status, "pending_verify", "e-2: DB also reflects pending_verify");
         const reason = JSON.parse(row.verification_review_reason || "{}");
-        assertEq(reason.terminal_reason, "zero_identity_sources", "e-3: persisted verification_review_reason.terminal_reason = 'zero_identity_sources'");
+        assertEq(reason.terminal_reason, undefined, "e-3: no terminal_reason stamped — never terminal on absence of data alone");
       }
 
       // ═══════════════════════════════════════════════════════════════
@@ -294,6 +417,258 @@ export function runLokalAgentVerifierTerminalUnconfirmableTests(
         const ids = batch.map((r: any) => r.id).filter((id: string) => id === "g-terminal" || id === "g-pending");
         assertTrue(ids.includes("g-pending"), "g-1: pickBatch includes the pending_verify row");
         assertTrue(!ids.includes("g-terminal"), "g-2: pickBatch excludes the terminal_unconfirmable row");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // (h) dev-request 2026-08-25-terminal-sweep-false-positives —
+      //     ACCEPTANCE TEST: the 10 real, measured production rows named in
+      //     the dev-request's own 10-row sample. Each seeded exactly like
+      //     (e) (no website, zero identity sources -> reaches the fresh-
+      //     lookup branch), differing only in producer_name and the fresh-
+      //     Brreg fixture wired up for it.
+      // ═══════════════════════════════════════════════════════════════
+      async function assertStaysNonTerminal(id: string, name: string, deathCheckFetch: typeof fetch, label: string) {
+        seedAgent(id, { name, website: null, email: `kari@${id}-testgard.no` });
+        const r = await runOne(id, { terminalFlag: "true", secondLineFlag: "true", judgeFn: throwingJudge, deathCheckFetch });
+        assertEq(r.new_verification_status, "pending_verify", `${label}: stays pending_verify (alive)`);
+        const reason = JSON.parse(knowledgeRow(id).verification_review_reason || "{}");
+        assertEq(reason.terminal_reason, undefined, `${label}: no terminal_reason stamped`);
+      }
+      async function assertGoesTerminal(
+        id: string,
+        name: string,
+        deathCheckFetch: typeof fetch,
+        expectedReason: string,
+        label: string,
+      ) {
+        seedAgent(id, { name, website: null, email: `kari@${id}-testgard.no` });
+        const r = await runOne(id, { terminalFlag: "true", secondLineFlag: "true", judgeFn: throwingJudge, deathCheckFetch });
+        assertEq(r.new_verification_status, "terminal_unconfirmable", `${label}: terminal_unconfirmable`);
+        const reason = JSON.parse(knowledgeRow(id).verification_review_reason || "{}");
+        assertEq(reason.terminal_reason, expectedReason, `${label}: terminal_reason = '${expectedReason}'`);
+      }
+
+      // 1. Aalan Gård — Brreg 969304252, active -> stays pending_verify.
+      await assertStaysNonTerminal(
+        "h1-aalan-gard", "Aalan Gård",
+        buildDeathCheckFetch({
+          bySearchName: { "Aalan Gård": { orgNr: "969304252", navn: "Aalan Gård" } },
+          byOrgNr: { "969304252": activeDetail("969304252", "Aalan Gård") },
+        }),
+        "h1 (Aalan Gård)",
+      );
+
+      // 2. Njardar (Leinøy) — Brreg 976200020 "NJARDAR AS", active -> stays
+      //    pending_verify. core_name strips the "(Leinøy)" location suffix
+      //    before searching, same as resolveOrgNrForTarget's own base attempt.
+      await assertStaysNonTerminal(
+        "h2-njardar", "Njardar (Leinøy)",
+        buildDeathCheckFetch({
+          bySearchName: { "Njardar": { orgNr: "976200020", navn: "NJARDAR AS" } },
+          byOrgNr: { "976200020": activeDetail("976200020", "NJARDAR AS") },
+        }),
+        "h2 (Njardar)",
+      );
+
+      // 3. Jenseg Bakeri og Konditori — Brreg 928335305, active, 31
+      //    employees -> stays pending_verify. This is the dev-request's own
+      //    headline example (NULL anchor fields at classification time, but
+      //    a real, active, 31-employee company).
+      await assertStaysNonTerminal(
+        "h3-jenseg", "Jenseg Bakeri og Konditori",
+        buildDeathCheckFetch({
+          bySearchName: { "Jenseg Bakeri og Konditori": { orgNr: "928335305", navn: "Jenseg Bakeri og Konditori" } },
+          byOrgNr: { "928335305": activeDetail("928335305", "Jenseg Bakeri og Konditori", { antallAnsatte: 31 }) },
+        }),
+        "h3 (Jenseg Bakeri og Konditori)",
+      );
+
+      // 4. Bærsentralen (Levanger) — Brreg 926888374, active -> stays
+      //    pending_verify.
+      await assertStaysNonTerminal(
+        "h4-baersentralen", "Bærsentralen (Levanger)",
+        buildDeathCheckFetch({
+          bySearchName: { "Bærsentralen": { orgNr: "926888374", navn: "Bærsentralen" } },
+          byOrgNr: { "926888374": activeDetail("926888374", "Bærsentralen") },
+        }),
+        "h4 (Bærsentralen)",
+      );
+
+      // 5. Delås gård (Skjeberg) — NO reliable Brreg match (every search
+      //    attempt returns zero hits) -> stays pending_verify. THIS is the
+      //    fixture proving the "no match found -> pending_verify, never
+      //    terminal" half of the invariant (as opposed to h1-h4/h6-h7's
+      //    "match found and active" half).
+      await assertStaysNonTerminal(
+        "h5-delas-gard", "Delås gård (Skjeberg)",
+        buildDeathCheckFetch({}), // no fixtures registered -> every attempt finds nothing
+        "h5 (Delås gård, no Brreg match at all)",
+      );
+
+      // 6. Daria Best Bakery (Mysen) — Brreg 928176738, active (ENK) ->
+      //    stays pending_verify.
+      await assertStaysNonTerminal(
+        "h6-daria-best-bakery", "Daria Best Bakery (Mysen)",
+        buildDeathCheckFetch({
+          bySearchName: { "Daria Best Bakery": { orgNr: "928176738", navn: "Daria Best Bakery" } },
+          byOrgNr: { "928176738": activeDetail("928176738", "Daria Best Bakery") },
+        }),
+        "h6 (Daria Best Bakery)",
+      );
+
+      // 7. Støylo Gard (Bykle) — Brreg 918800549, active (ENK) -> stays
+      //    pending_verify.
+      await assertStaysNonTerminal(
+        "h7-stoylo-gard", "Støylo Gard (Bykle)",
+        buildDeathCheckFetch({
+          bySearchName: { "Støylo Gard": { orgNr: "918800549", navn: "Støylo Gard" } },
+          byOrgNr: { "918800549": activeDetail("918800549", "Støylo Gard") },
+        }),
+        "h7 (Støylo Gard)",
+      );
+
+      // 8. REKO Grorud — a REKO-ring distribution point name, not a
+      //    producer -> terminal_unconfirmable via non_producer_entity.
+      //    throwingDeathCheckFetch (the runOne default) proves the pattern
+      //    match short-circuits BEFORE any fresh Brreg network call.
+      await assertGoesTerminal(
+        "h8-reko-grorud", "REKO Grorud",
+        throwingDeathCheckFetch,
+        "non_producer_entity",
+        "h8 (REKO Grorud)",
+      );
+
+      // 9. Adamstuen Torg — a public square name, not a producer ->
+      //    terminal_unconfirmable via non_producer_entity, no Brreg call.
+      await assertGoesTerminal(
+        "h9-adamstuen-torg", "Adamstuen Torg",
+        throwingDeathCheckFetch,
+        "non_producer_entity",
+        "h9 (Adamstuen Torg)",
+      );
+
+      // 10. Ringerikserter — a protected product designation, not a
+      //     producer -> terminal_unconfirmable via non_producer_entity, no
+      //     Brreg call.
+      await assertGoesTerminal(
+        "h10-ringerikserter", "Ringerikserter",
+        throwingDeathCheckFetch,
+        "non_producer_entity",
+        "h10 (Ringerikserter)",
+      );
+
+      // ═══════════════════════════════════════════════════════════════
+      // (i) positive brreg_konkurs/brreg_inactive path: a fresh lookup DOES
+      //     find death evidence -> terminal_unconfirmable via the correct
+      //     reason, not non_producer_entity.
+      // ═══════════════════════════════════════════════════════════════
+      await assertGoesTerminal(
+        "i1-konkurs-gard", "Nedlagt Gårdsmat AS",
+        buildDeathCheckFetch({
+          bySearchName: { "Nedlagt Gårdsmat AS": { orgNr: "915330147", navn: "Nedlagt Gårdsmat AS" } },
+          byOrgNr: { "915330147": deadDetail("915330147", "Nedlagt Gårdsmat AS", "bankrupt") },
+        }),
+        "brreg_konkurs",
+        "i1 (fresh lookup finds konkurs)",
+      );
+      await assertGoesTerminal(
+        "i2-slettet-gard", "Slettet Gårdsmat AS",
+        buildDeathCheckFetch({
+          bySearchName: { "Slettet Gårdsmat AS": { orgNr: "911222334", navn: "Slettet Gårdsmat AS" } },
+          byOrgNr: { "911222334": deadDetail("911222334", "Slettet Gårdsmat AS", "dissolved") },
+        }),
+        "brreg_inactive",
+        "i2 (fresh lookup finds slettet/dissolved)",
+      );
+
+      // ═══════════════════════════════════════════════════════════════
+      // (j) looksLikeNonProducerEntity — direct unit coverage of the
+      //     false-positive guards (never make the pattern broader than the
+      //     3 fixtures above require).
+      // ═══════════════════════════════════════════════════════════════
+      assertTrue(looksLikeNonProducerEntity("REKO Grorud").match, "j-1: 'REKO Grorud' matches (reko_distribution_point)");
+      assertEq(looksLikeNonProducerEntity("REKO Grorud").pattern, "reko_distribution_point", "j-2: pattern = reko_distribution_point");
+      assertTrue(looksLikeNonProducerEntity("Adamstuen Torg").match, "j-3: 'Adamstuen Torg' matches (public_place_name)");
+      assertTrue(looksLikeNonProducerEntity("Ringerikserter").match, "j-4: 'Ringerikserter' matches (curated_designation)");
+      assertTrue(
+        !looksLikeNonProducerEntity("Rekoveien Gård").match,
+        "j-5: 'Rekoveien Gård' does NOT match — 'reko' must be a whole FIRST token, not a substring",
+      );
+      assertTrue(
+        !looksLikeNonProducerEntity("Bjerke Gård").match,
+        "j-6: an ordinary 2-token farm name not ending in a place-word does NOT match",
+      );
+      assertTrue(
+        !looksLikeNonProducerEntity("Nordbys Gårdsutsalg på Torget").match,
+        "j-7: a longer (4-token) name ending in 'torget' does NOT match — only exactly-2-token names do",
+      );
+      assertTrue(!looksLikeNonProducerEntity("").match, "j-8: empty name does NOT match");
+      assertTrue(!looksLikeNonProducerEntity(null).match, "j-9: null name does NOT match");
+      assertTrue(
+        !looksLikeNonProducerEntity("Kalvatveit Plass").match,
+        "j-10: 'Kalvatveit Plass' does NOT match — 'plass' is a common husmannsplass " +
+          "(smallholding) farm-name suffix in Norwegian rural naming, not a public square; " +
+          "excluding it from NON_PRODUCER_PLACE_SUFFIX_WORDS falls through to the fresh-Brreg " +
+          "evidence path, same as any other real producer name (2026-08-25 review fix)",
+      );
+
+      // ═══════════════════════════════════════════════════════════════
+      // (k) checkFreshBrregDeathEvidence — direct unit coverage of the
+      //     domain-token and personal-name-ENK fallback attempts (none of
+      //     the (h) fixtures happen to exercise these since their base-name
+      //     attempt always resolves the search first).
+      // ═══════════════════════════════════════════════════════════════
+      {
+        // Base name ("Ukjent Produsentnavn") finds nothing; the agent's own
+        // website haugenbakst.no yields domain-token candidate "Haugenbakst"
+        // (no generic suffix to strip — see domainTokenCandidateName's own
+        // doc comment) which EXACTLY matches "Haugenbakst AS" after brreg-
+        // client.ts's own org-suffix pruning (confidence 1.0, no postal code
+        // needed), and that match is active -> null (not dead), proving the
+        // domain-token attempt is reached and its result correctly treated
+        // as terminal-BLOCKING (not "try the next attempt"). Org-nr/name
+        // deliberately distinct from every OTHER test file's own brreg-
+        // client fixtures (verified 2026-08-25) — brreg-client.ts's
+        // findOrgnumberByName/verifyOrgNumber caches are module-level and
+        // several suites in this repo run concurrently in the same `npm
+        // test` process (see tests/test.ts's own "SHARED GLOBAL STATE"
+        // header comment), so reusing another suite's exact search-name/
+        // org-nr pair here would race against it.
+        const fx = buildDeathCheckFetch({
+          bySearchName: { "Haugenbakst": { orgNr: "934102876", navn: "Haugenbakst AS" } },
+          byOrgNr: { "934102876": activeDetail("934102876", "Haugenbakst AS") },
+        });
+        const result = await checkFreshBrregDeathEvidence(
+          { producer_name: "Ukjent Produsentnavn", website: "https://haugenbakst.no", url: null },
+          fx,
+        );
+        assertEq(result, null, "k-1: domain-token attempt finds an ACTIVE company -> null (not dead)");
+      }
+      {
+        // Base name ("Kari Nilsen") and its domain-token attempt (none —
+        // no website/url given) both find nothing; "Kari Nilsen" is
+        // personal-name-shaped (looksLikePersonalName) so the personal-
+        // name-ENK attempt ("Kari Nilsen ENK") is tried and finds a hit
+        // that turns out dissolved -> "brreg_inactive". Org-nr chosen
+        // unique per the same cross-suite cache-race note above.
+        const fx = buildDeathCheckFetch({
+          bySearchName: { "Kari Nilsen ENK": { orgNr: "927741508", navn: "Kari Nilsen" } },
+          byOrgNr: { "927741508": deadDetail("927741508", "Kari Nilsen", "dissolved") },
+        });
+        const result = await checkFreshBrregDeathEvidence(
+          { producer_name: "Kari Nilsen", website: null, url: null },
+          fx,
+        );
+        assertEq(result, "brreg_inactive", "k-2: personal-name-ENK fallback attempt finds a dissolved match -> brreg_inactive");
+      }
+      {
+        // No name at all -> null immediately, no fetch call (fx would throw
+        // if invoked).
+        const result = await checkFreshBrregDeathEvidence(
+          { producer_name: null, website: null, url: null },
+          throwingDeathCheckFetch,
+        );
+        assertEq(result, null, "k-3: blank producer_name -> null, no fetch attempted");
       }
     } catch (err: any) {
       failed++;

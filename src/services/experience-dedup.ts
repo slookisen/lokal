@@ -124,6 +124,26 @@ function levenshteinSimilarity(a: string, b: string): number {
   return 1 - levenshtein(a, b) / maxLen;
 }
 
+/**
+ * Normalized whole-string similarity (0..1) between two RAW titles — folds
+ * diacritics/punctuation via normalizeExperienceTitle() first, then scores
+ * via Levenshtein distance. Exported for callers outside titlesMatch() that
+ * need the same "is this really the same wording" bar independently of the
+ * full candidate-key match decision — specifically the two re-harvest MATCH
+ * branches (experience-store.ts's bulkInsertExperiences, opplevelser.ts's
+ * bulk-load route) that decide whether to WRITE content onto an existing
+ * matched row, not just whether the row counts as a duplicate. dev-request
+ * 2026-08-25-titlesmatch-ubiquity-herding, Part 1: content should only ever
+ * transfer onto a matched row when the titles themselves corroborate that
+ * match at CONTENT_TRANSFER_SIMILARITY_MIN, so a same-provider match that
+ * only cleared titlesMatch() via a shared token (rare or, pre-Part-2,
+ * ubiquitous-but-unrecognized-as-such) can't silently overwrite a
+ * DIFFERENT real-world experience's blank fields with this row's data.
+ */
+export function titleSimilarity(a: string, b: string): number {
+  return levenshteinSimilarity(normalizeExperienceTitle(a), normalizeExperienceTitle(b));
+}
+
 // A shared token this long is distinctive enough on its own (proper nouns,
 // specific activity names) to call two titles the same real-world experience
 // — e.g. "Heyerdahl" shared between "Kon-Tiki Museet — Heyerdahl's Legendary
@@ -154,7 +174,122 @@ const SHARED_TOKEN_GENERIC_MIN = 5;
 // Confirmed false-positive pairs sit below 0.85 (Sjoa dagstur/kveldstur
 // ≈0.79, Klatring barn/voksne ≈0.74, Brevandring Nigardsbreen/Briksdalsbreen
 // ≈0.76); genuine near-identical rewording sits at/above it.
-const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
+//
+// Reused (exported) as the SAME bar for two other, related-but-distinct
+// purposes (dev-request 2026-08-25-titlesmatch-ubiquity-herding):
+//   - Part 1: the content-transfer corroboration threshold the two
+//     re-harvest MATCH branches (experience-store.ts / opplevelser.ts) now
+//     require before writing one row's content onto another matched row —
+//     see titleSimilarity() above.
+//   - Part 2: the same bar a BUCKET-LOCAL-UBIQUITOUS shared token gets
+//     demoted to (from "sufficient on its own") in titlesMatch() below.
+export const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
+
+/** Alias for GENERIC_TOKEN_CORROBORATION_MIN, named for its Part-1 use site
+ *  (content-transfer corroboration) — same value, kept as one named export
+ *  so callers outside this module don't have to know it's "the generic
+ *  token" constant to reach for the right number. */
+export const CONTENT_TRANSFER_SIMILARITY_MIN = GENERIC_TOKEN_CORROBORATION_MIN;
+
+// Bucket-local ubiquity fraction above which a shared significant token is
+// demoted from "rare evidence sufficient for a match" to "requires
+// GENERIC_TOKEN_CORROBORATION_MIN full-string corroboration" — dev-request
+// 2026-08-25-titlesmatch-ubiquity-herding, Part 2. See
+// computeProviderUbiquitousTokens() below for the full rationale.
+const PROVIDER_UBIQUITY_DEMOTION_THRESHOLD = 0.5;
+
+// Minimum bucket size (row count) for the ubiquity demotion to apply at all
+// — a 2-title bucket sharing a rare place token is a known, accepted
+// residual (see titlesMatch()'s doc comment); the demotion only kicks in
+// once a provider has enough titles for ">50% of the bucket" to be a
+// meaningful signal rather than "the only other title happens to match".
+//
+// This is the ONLY floor computeProviderUbiquitousTokens() applies — the
+// rule really is a plain ">50% of the bucket, bucket size >= 3" fraction, no
+// second/hidden condition on the token's own raw occurrence count.
+//
+// (Round-2 review history: an earlier revision of this fix ALSO required the
+// token's raw count to independently clear PROVIDER_UBIQUITY_MIN_BUCKET_SIZE
+// — reasoning that a token present in only 2 titles could clear ">50%"
+// purely because an unrelated third row shrinks the denominator, citing
+// tests/test.ts's orch-pr-dedup-backfill-endpoint HTTP fixture: 2 real
+// Kon-Tiki variants + 1 unrelated control is a 3-row bucket where "kontiki"
+// sits at 2/3 ≈ 66.7%. An independent review caught that this extra floor was
+// undisclosed in this comment (which claimed a flat ">50%" rule) AND unsound:
+// it has no teeth at bucket size 4+ (count >= 3 is already implied by >50%
+// there) but at bucket size exactly 3 it silently raises the effective bar
+// from ">50%" (2-of-3) to "100%" (3-of-3) — constructed counterexample: three
+// titles "Fjordly Kajakktur for Nybegynnere" / "Fjordly Sykkelutleie
+// Familiepakke" / "Guidet Fototur til Nordkapp", where "fjordly" is ALSO
+// 2-of-3 but the two Fjordly titles are genuinely DIFFERENT experiences (a
+// kayak tour vs. a bike rental) — the exact false-merge bug class this
+// module exists to close, left uncaught by requiring count >= 3. See 9g in
+// experience-dedup.test.ts for that regression guard.
+//
+// The actual bug wasn't the demotion rule — it was that the HTTP fixture
+// only seeded 2 of the 3 real Kon-Tiki variants confirmed live (a 3rd,
+// "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo", is already part of the
+// SAME confirmed cluster used by this file's own 9f test and by
+// experience-dedup.test.ts's section-10 real-DB test), so its bucket
+// under-counted the denominator and pushed "kontiki" past 50%. Completing
+// the fixture to the full known 3-variants-+-1-control shape (tests/test.ts,
+// orch-pr-dedup-backfill-endpoint) restores "kontiki" to 2-of-4 (50%, NOT
+// demoted) and the pair now matches on its true, undemoted rare-token merit
+// — no floor needed.
+const PROVIDER_UBIQUITY_MIN_BUCKET_SIZE = 3;
+
+/**
+ * Tokens that are locally UBIQUITOUS within one provider's own title bucket
+ * (dev-request 2026-08-25-titlesmatch-ubiquity-herding, Part 2): a token used
+ * in MORE THAN HALF of a provider's own ROWS (bucket size >=
+ * PROVIDER_UBIQUITY_MIN_BUCKET_SIZE, no other condition) — e.g. a brand/place
+ * name repeated on every listing ("Molja Fyr — Overnatting", "Molja Fyr —
+ * Restaurantbesøk", "Molja Fyr — Fyromvisning") — is locally "rare" by the
+ * corpus-wide, provider-DISTINCT count (few OTHER providers use it, so
+ * SHARED_TOKEN_GENERIC_MIN never fires) but is NOT distinctive evidence that
+ * two titles from THIS SAME provider describe the SAME real-world
+ * experience — it only proves they're the same brand/place. Requires >=
+ * PROVIDER_UBIQUITY_MIN_BUCKET_SIZE ROWS in the bucket in the first place
+ * before the fraction is trusted at all (see that constant's own comment —
+ * this is a plain ">50%" rule, deliberately with no hidden second floor).
+ *
+ * Bucket size and each token's presence are counted PER ROW, not per title
+ * STRING: a row's title and title_no are unioned into one token set (a
+ * token counts once for that row even if it appears in both languages),
+ * exactly mirroring how titlesOrTitleNoMatch() treats title/title_no as two
+ * views of the SAME row, not two separate bucket entries. Counting them as
+ * separate entries would silently inflate a 2-row bucket (one title_no
+ * populated) past the >= 3 threshold and falsely demote a token that is
+ * actually just this row's own title-vs-title_no cross-language link (see
+ * the 9c-1/9c-3 cross-language fixtures above, which are exactly this shape
+ * and must NOT be affected by Part 2).
+ */
+export function computeProviderUbiquitousTokens(
+  rows: Array<{ title?: string | null; title_no?: string | null } | string | null | undefined>
+): Set<string> {
+  const rowTokenSets: Array<Set<string>> = [];
+  for (const entry of rows) {
+    const row = typeof entry === "string" ? { title: entry, title_no: null } : entry;
+    if (!row) continue;
+    const tokens = new Set<string>();
+    if (row.title && row.title.trim()) for (const t of titleTokens(row.title)) tokens.add(t);
+    if (row.title_no && row.title_no.trim()) for (const t of titleTokens(row.title_no)) tokens.add(t);
+    if (tokens.size > 0) rowTokenSets.push(tokens);
+  }
+  if (rowTokenSets.length < PROVIDER_UBIQUITY_MIN_BUCKET_SIZE) return new Set();
+
+  const rowCounts = new Map<string, number>();
+  for (const tokens of rowTokenSets) {
+    for (const token of tokens) rowCounts.set(token, (rowCounts.get(token) ?? 0) + 1);
+  }
+  const ubiquitous = new Set<string>();
+  for (const [token, count] of rowCounts) {
+    if (count / rowTokenSets.length > PROVIDER_UBIQUITY_DEMOTION_THRESHOLD) {
+      ubiquitous.add(token);
+    }
+  }
+  return ubiquitous;
+}
 
 /**
  * True when two titles are plausibly the SAME real-world experience. Intended
@@ -171,11 +306,26 @@ const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
  * two genuinely different experiences that merely share a category word
  * (e.g. "Fjelltur til Galdhøpiggen" / "Fjelltur til Snøhetta") get treated as
  * the same real-world experience.
+ *
+ * `providerUbiquitousTokens` (optional, dev-request 2026-08-25-titlesmatch-
+ * ubiquity-herding, Part 2 — defaults to an empty Set, so every existing
+ * caller/test that omits it is completely unaffected): tokens the CALLER has
+ * determined are ubiquitous within this specific provider's own title bucket
+ * (see computeProviderUbiquitousTokens()). A shared token that is both
+ * corpus-rare AND provider-ubiquitous is demoted the same way a GENERIC
+ * token is — it no longer proves a match on its own, it only earns the
+ * candidate a shot at GENERIC_TOKEN_CORROBORATION_MIN whole-string
+ * corroboration. This closes the "provider's own brand name is always
+ * locally rare" gap: a provider whose brand appears in every one of its
+ * titles (e.g. "Molja Fyr — Overnatting" / "Molja Fyr — Restaurantbesøk")
+ * must not have DIFFERENT experiences merged just because they share the
+ * brand token.
  */
 export function titlesMatch(
   a: string,
   b: string,
-  corpusTokenCounts: Map<string, number>
+  corpusTokenCounts: Map<string, number>,
+  providerUbiquitousTokens: Set<string> = new Set()
 ): boolean {
   const tokensA = new Set(titleTokens(a));
   const tokensB = new Set(titleTokens(b));
@@ -190,7 +340,9 @@ export function titlesMatch(
 
   if (sharedSignificant.length > 0) {
     const hasRareToken = sharedSignificant.some(
-      (t) => (corpusTokenCounts.get(t) ?? 0) < SHARED_TOKEN_GENERIC_MIN
+      (t) =>
+        (corpusTokenCounts.get(t) ?? 0) < SHARED_TOKEN_GENERIC_MIN &&
+        !providerUbiquitousTokens.has(t)
     );
     if (hasRareToken) return true;
     return wholeStringSim >= GENERIC_TOKEN_CORROBORATION_MIN;
@@ -215,7 +367,8 @@ function titlesOrTitleNoMatch(
   aTitleNo: string | null | undefined,
   bTitle: string | null | undefined,
   bTitleNo: string | null | undefined,
-  corpusTokenCounts: Map<string, number>
+  corpusTokenCounts: Map<string, number>,
+  providerUbiquitousTokens: Set<string> = new Set()
 ): boolean {
   const candidatePairs: Array<[string | null | undefined, string | null | undefined]> = [
     [aTitle, bTitle],
@@ -224,7 +377,7 @@ function titlesOrTitleNoMatch(
     [aTitleNo, bTitleNo],
   ];
   for (const [x, y] of candidatePairs) {
-    if (x && x.trim() && y && y.trim() && titlesMatch(x, y, corpusTokenCounts)) return true;
+    if (x && x.trim() && y && y.trim() && titlesMatch(x, y, corpusTokenCounts, providerUbiquitousTokens)) return true;
   }
   return false;
 }
@@ -432,6 +585,13 @@ export function groupDuplicateCandidates(
   for (const bucket of buckets.values()) {
     if (bucket.length < 2) continue;
 
+    // Part 2 (dev-request 2026-08-25-titlesmatch-ubiquity-herding): compute
+    // this PROVIDER'S OWN locally-ubiquitous tokens once per bucket (not per
+    // pair) — the bucket IS the provider's own title set for this
+    // identity+kommune, exactly the scope computeProviderUbiquitousTokens()
+    // is meant to see.
+    const providerUbiquitousTokens = computeProviderUbiquitousTokens(bucket);
+
     const parent = bucket.map((_, i) => i);
     const find = (i: number): number => {
       while (parent[i] !== i) {
@@ -448,7 +608,8 @@ export function groupDuplicateCandidates(
             bucket[i].title_no,
             bucket[j].title,
             bucket[j].title_no,
-            corpusTokenCounts
+            corpusTokenCounts,
+            providerUbiquitousTokens
           )
         ) {
           const ri = find(i);
@@ -636,8 +797,25 @@ export function findExistingCandidateMatch(
     (r) => providerIdentityKey(r) === identity && (r.kommune || "").trim().toLowerCase() === kommuneKey
   );
   const corpus = loadCorpusTokenCounts(db);
+  // Part 2 (dev-request 2026-08-25-titlesmatch-ubiquity-herding): the
+  // existing unmerged rows for this provider+kommune ARE this provider's own
+  // title bucket — compute ubiquity from them, same as groupDuplicateCandidates
+  // does per-bucket, so a re-harvest candidate can't merge onto an existing
+  // row via a token that's only "rare" corpus-wide because it's really this
+  // provider's own brand/place name repeated across its own listings.
+  const providerUbiquitousTokens = computeProviderUbiquitousTokens(rows);
   for (const row of rows) {
-    if (titlesOrTitleNoMatch(row.title, row.title_no, candidate.title, candidate.title_no, corpus)) return row;
+    if (
+      titlesOrTitleNoMatch(
+        row.title,
+        row.title_no,
+        candidate.title,
+        candidate.title_no,
+        corpus,
+        providerUbiquitousTokens
+      )
+    )
+      return row;
   }
   return null;
 }

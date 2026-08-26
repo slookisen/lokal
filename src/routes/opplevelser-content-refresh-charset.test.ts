@@ -164,8 +164,14 @@ export function runOpplevelserContentRefreshCharsetTests(
           brreg_verified: 1, brreg_active: 1, verification_status: "verified",
         });
         expDb.prepare("UPDATE experience_providers SET field_provenance = ? WHERE id = ?").run(VERIFIED_PROVENANCE, providerId);
+        // Title shares a significant token ("grønnsaker"/"Toten") with
+        // ORIGINAL_ABOUT below — required since the faithfulness-inflow slice
+        // (dev-request 2026-06-23-experiences-richer-profiles, 2026-08-25):
+        // the writer now skips a homepage-derived description that never
+        // names the experience, and this file tests charset decoding of a
+        // WRITTEN description, not that guard.
         const experienceId = store.createExperience({
-          title: `Test Provider ${id} opplevelse`, provider_id: providerId, provider_match_status: "matched",
+          title: `Grønnsaker fra Toten ${id}`, provider_id: providerId, provider_match_status: "matched",
           fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
         });
         return { providerId, experienceId };

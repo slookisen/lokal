@@ -35,6 +35,18 @@ const VerificationStatusSchema = z.enum([
   "rejected",
 ]);
 
+// 2026-08-25 production data audit (dental price_band off-spec values):
+// canonical price_band enum per verticals/dental/dental-specific.yaml.
+// Single source of truth — reused both by the write-path schema below
+// (DentalAgentSchema.price_band) and by updateDentalPriceBand()'s own
+// runtime guard further down in this file. Previously that guard lived
+// next to updateDentalPriceBand() only, as a Set, with the schema left as
+// a bare z.string() — so the generic PUT /agents/:id route (the actual
+// production write path; updateDentalPriceBand() is never called by any
+// route) accepted any string, which is how "medium"/"high" reached the DB.
+// Hoisted here so both use sites share one literal list.
+const PRICE_BAND_ENUM = ["rimelig", "standard", "premium", "ukjent"] as const;
+
 export const DentalAgentSchema = z.object({
   id: z.string().optional(), // generated if absent
   org_nr: z.string().optional().nullable(),
@@ -55,7 +67,7 @@ export const DentalAgentSchema = z.object({
   helfo_agreement: HelfoAgreementSchema.optional(),
   languages_spoken: z.array(z.string()).optional(),
   acute_vakt: z.union([z.literal(0), z.literal(1)]).optional().nullable(),
-  price_band: z.string().optional().nullable(),
+  price_band: z.enum(PRICE_BAND_ENUM).optional().nullable(),
   chain_brand: z.string().optional().nullable(),
   is_chain_member: z.union([z.literal(0), z.literal(1)]).optional(),
   chain_parent_orgnr: z.string().optional().nullable(),
@@ -244,7 +256,10 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
       (row.helfo_agreement as DentalAgent["helfo_agreement"]) ?? undefined,
     languages_spoken: parseJsonArray(row.languages_spoken),
     acute_vakt: (row.acute_vakt as 0 | 1 | null) ?? null,
-    price_band: (row.price_band as string | null) ?? null,
+    // Cast (not validated) like helfo_agreement/verification_status above —
+    // hydration reads whatever is already in the DB, including pre-existing
+    // off-spec rows the 2026-08-25 enum guard doesn't retroactively touch.
+    price_band: (row.price_band as DentalAgent["price_band"]) ?? null,
     chain_brand: (row.chain_brand as string | null) ?? null,
     is_chain_member: (row.is_chain_member as 0 | 1) ?? 0,
     chain_parent_orgnr: (row.chain_parent_orgnr as string | null) ?? null,
@@ -1496,17 +1511,17 @@ export function updateDentalRating(
 // Updates price_band + price_band_source atomically. Validates enum value.
 // Called from Stage X enrichment when confidence >= 0.80.
 // Valid values: rimelig | standard | premium | ukjent (per dental-specific.yaml)
-
-const PRICE_BAND_ENUM = new Set(["rimelig", "standard", "premium", "ukjent"]);
+// PRICE_BAND_ENUM itself now lives above, next to DentalAgentSchema, so both
+// the schema and this function's runtime guard share one literal list.
 
 export function updateDentalPriceBand(
   id: string,
   priceBand: string,
   source: string
 ): boolean {
-  if (!PRICE_BAND_ENUM.has(priceBand)) {
+  if (!(PRICE_BAND_ENUM as readonly string[]).includes(priceBand)) {
     throw new Error(
-      `Invalid price_band value: ${priceBand}. Must be one of: ${[...PRICE_BAND_ENUM].join(", ")}`
+      `Invalid price_band value: ${priceBand}. Must be one of: ${PRICE_BAND_ENUM.join(", ")}`
     );
   }
   const db = getDb("dental");

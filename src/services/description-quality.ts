@@ -216,20 +216,23 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 //      substring anywhere in the text — enough on its own (mirrors
 //      isJunkDescription's rule-1 skip-link pattern: real code markup is
 //      never legitimate prose no matter where it lands).
-//   1b. UNAMBIGUOUS ALONE (new): a known-ubiquitous provider/CMS bootstrap
+//   1b. UNAMBIGUOUS ALONE: a known-ubiquitous provider/CMS bootstrap
 //      signature — `_wpemojiSettings` (WordPress), `dataLayer` together with
 //      a `gtag(`/`ga(` call (Google Tag Manager/Analytics), `Shopify.shop`/
 //      `Shopify.locale` (Shopify storefront bootstrap), `__next_f.push`
 //      (Next.js App Router hydration payload), a jQuery/`$`
 //      `(document).ready(` call (classic theme inline script), or
 //      `Y.Squarespace`/`Static.SQUARESPACE_CONTEXT` (Squarespace storefront
-//      bootstrap — promoted here from class 2 below by dev-request
-//      2026-08-25-agent-knowledge-about-code-artifact-gap, since the real
-//      live Helios Trondheim text only ever trips this one token and class 2
-//      alone was never enough to flag it). Same unambiguous-alone posture as
-//      class 1 — these are provider-specific code tokens, structurally
-//      impossible to appear in Norwegian producer prose, so no second class
-//      is required.
+//      bootstrap — moved here from class 2 on 2026-08-25 after the live
+//      Helios Trondheim description, the actual case that motivated this
+//      whole detector, was found to still slip through with it in the
+//      weaker class: a real `SQUARESPACE_CONTEXT` payload is a large,
+//      mostly-flat JSON literal that typically has neither the brace
+//      density of class 4 nor the function/assignment shape of class 3, so
+//      requiring a companion class structurally under-catches it). Same
+//      unambiguous-alone posture as class 1 — these are provider-specific
+//      code tokens, structurally impossible to appear in Norwegian
+//      producer prose, so no second class is required.
 //   2. CMS/framework bootstrap tokens: `window.<name>` followed by `.`/`(`,
 //      `document.<name>` followed by `.`/`(` (anchored the same way as the
 //      `window.` check — a bare "document.pdf"/"document.docx" mention
@@ -244,9 +247,13 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 //      keywords among var/let/const, each followed by `=` (source mixing
 //      declaration forms), (b) >=2 REPEATED `var <name> =` declarations
 //      (the var-only minified shape most Terser/UglifyJS output actually
-//      produces), or (c) an IIFE wrapper shape `(function(...){...})(...)`
+//      produces), (c) an IIFE wrapper shape `(function(...){...})(...)`
 //      (the single most common minified-bundle wrapper, present regardless
-//      of which declaration keyword the body uses). All three of
+//      of which declaration keyword the body uses), or (d) a UNARY-operator
+//      IIFE wrapper shape `!function(...){...}(...)` (also `+function(`/
+//      `-function(`/`~function(`) — the classic Facebook-Pixel-bootstrap
+//      form, used instead of the parenthesized form to avoid ASI hazards
+//      when the expression opens a statement. All three of
 //      function()-present / assignment-activity / semicolon-density must
 //      hold together — this is what keeps a sentence merely naming
 //      "function" or "variabel" from flagging on its own.
@@ -258,26 +265,16 @@ export function isJunkDescription(text: string | null | undefined): boolean {
 // fire together — never on any single one of classes 2-4 alone.
 //
 // Examples (see tests/test.ts "description-junk-guard" section for the full
-// table, including the 5 real-world snippets named above and the real
-// Helios Trondheim live text):
-//   - The REAL Helios Trondheim live text (fetched 2026-08-25 via the admin
-//     `/knowledge` endpoint, `agent_knowledge.about`, 300 chars, verbatim):
-//     `Grønn Guide Trondheim Static = window.Static || {};
-//     Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":[...` -> true
-//     (class 1b [`Static.SQUARESPACE_CONTEXT`] alone, unambiguous — this
-//     text has no `function(` so class 3 can't fire, and only ~3 braces in
-//     300 chars so class 4 can't cross its density bar either; class 2 alone
-//     was never sufficient against this exact real string, which is why the
-//     token was promoted to class 1b)
-//   - A Squarespace-bootstrap-shaped fixture like
-//     `Y.Squarespace = Y.Squarespace || {}; Static.SQUARESPACE_CONTEXT =
-//     {"website":{"id":"123"}}; window.Y.Squarespace.afterBodyLoad(Y);`
-//     -> true (class 1b [`Y.Squarespace`/`Static.SQUARESPACE_CONTEXT`] alone
-//     now suffices; class 2 [`window.` member-access] and class 4 [brace
-//     density] also both fire independently — this fixture is deliberately
-//     NOT the real Helios live text, which this dev-request's research did
-//     not originally capture verbatim; this is a same-shape stand-in kept
-//     for coverage of the OTHER class-2 tokens)
+// table, including the 5 real-world snippets named above):
+//   - The real live Helios Trondheim text that motivated this detector,
+//     captured verbatim via `lokal_info` 2026-08-25 (not a same-shape
+//     stand-in): `Grønn Guide Trondheim Static = window.Static || {};
+//     Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":
+//     ["supports_versioned_template_assets","campaigns_merch_state", …]`
+//     -> true (class 1b [`Static.SQUARESPACE_CONTEXT`] alone, unambiguous —
+//     this string has only 3 braces and no function()/assignment shape, so
+//     it would NOT have fired at all under the old class-2-only placement;
+//     see tests/test.ts for the full byte-for-byte fixture)
 //   - A generic minified-JS shape like
 //     `function(){var a=1;var b=2;let c=3;const d=4;if(a){b=c;}return
 //     a+b+c+d;}` -> true (class 3 [JS-syntax density] + class 4 [brace
@@ -330,6 +327,20 @@ export function looksLikeCodeArtifact(text: string | null | undefined): boolean 
     trimmed.includes("Shopify.locale") ||
     trimmed.includes("__next_f.push") ||
     /(?:\$|jQuery)\(\s*document\s*\)\.ready\s*\(/.test(trimmed) ||
+    // Squarespace bootstrap tokens — moved here from class 2 (2026-08-25,
+    // Helios Trondheim live-verification gap). These were left in class 2
+    // (needs a class-3/4 companion) when round 1 promoted the other five
+    // providers' tokens to this unambiguous-alone class; a real Squarespace
+    // `SQUARESPACE_CONTEXT` payload is typically a large, mostly-flat JSON
+    // literal (string/array-heavy), so it structurally tends to miss both
+    // the brace-density threshold (class 4) and the function/assignment
+    // shape (class 3) — exactly what happened to the live Helios Trondheim
+    // description this whole detector was built to catch (confirmed via
+    // `POST /admin/agents/description-code-artifact-sweep {"apply":false}`
+    // returning 0 candidates against prod, then reproducing class-by-class
+    // against the real captured text). Same "structurally impossible in
+    // Norwegian producer prose" reasoning as the other five class-1b
+    // members applies identically here.
     trimmed.includes("Y.Squarespace") ||
     trimmed.includes("Static.SQUARESPACE_CONTEXT");
   if (providerSignatureSignal) return true;
@@ -366,7 +377,24 @@ export function looksLikeCodeArtifact(text: string | null | undefined): boolean 
     (/\blet\s+\w+\s*=/.test(trimmed) ? 1 : 0) +
     (/\bconst\s+\w+\s*=/.test(trimmed) ? 1 : 0);
   const repeatedVarDeclarations = (trimmed.match(/\bvar\s+\w+\s*=/g) ?? []).length;
-  const isIifeWrapper = /\(\s*function\s*\([^)]*\)\s*\{/.test(trimmed) && /\}\s*\)\s*\(/.test(trimmed);
+  // Paren-wrapped IIFE: `(function(...){ ... })(...)`.
+  const isParenIifeWrapper = /\(\s*function\s*\([^)]*\)\s*\{/.test(trimmed) && /\}\s*\)\s*\(/.test(trimmed);
+  // Unary-operator IIFE: `!function(...){ ... }(...)` (the classic Facebook
+  // Pixel bootstrap shape) and its siblings `+function(`/`-function(`/
+  // `~function(` — all four unary operators are used interchangeably in
+  // minified/concatenated JS bundles purely to defeat ASI (automatic-
+  // semicolon-insertion) hazards when a `function` expression opens a
+  // statement; none has any special meaning here beyond "not a function
+  // DECLARATION". Requires the operator immediately before `function` (not
+  // just present anywhere in the string) AND a matching `}(` call-shape
+  // afterward, so a stray `!` earlier in the text plus an unrelated
+  // `function(...)`/`}(` elsewhere can't combine into a false match on their
+  // own — same unanchored-but-practically-safe posture as the paren-form
+  // check above (an unrelated `}(` substring could in principle exist
+  // elsewhere in a very large string, but that shape essentially never
+  // occurs in Norwegian prose).
+  const isUnaryIifeWrapper = /[!+\-~]\s*function\s*\([^)]*\)\s*\{/.test(trimmed) && /\}\s*\(/.test(trimmed);
+  const isIifeWrapper = isParenIifeWrapper || isUnaryIifeWrapper;
   const hasAssignmentActivity =
     distinctAssignmentKeywords >= 2 || repeatedVarDeclarations >= 2 || isIifeWrapper;
   const semicolonDensity = (trimmed.match(/;/g)?.length ?? 0) / (trimmed.length / 100);

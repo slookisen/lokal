@@ -105,6 +105,8 @@ import type { BraveResult } from "./search-enrich";
 import {
   findExistingCandidateMatch,
   scoreExperienceRichness,
+  titleSimilarity,
+  CONTENT_TRANSFER_SIMILARITY_MIN,
   type DedupCandidateRow,
   type ExperienceRichnessInput,
 } from "./experience-dedup";
@@ -481,6 +483,27 @@ export function createExperience(input: Experience): string {
   return id;
 }
 
+/**
+ * Stamp the harvest admission-gate outcome onto a just-created experience
+ * (dev-request 2026-06-23-experiences-richer-profiles, faithfulness-inflow
+ * slice, 2026-08-25). `verdict` is the inspectable outcome text the
+ * bulk-load gate composes ("<match|mismatch|unresolved>: <judge reasoning>")
+ * — see init-experiences.ts's admission-gate column block for the column
+ * semantics. Write-once in practice (called only right after
+ * createExperience() in the bulk-load apply path), but idempotent-safe:
+ * re-stamping simply records the newest gate run. Never touches any other
+ * column — updated_at deliberately NOT bumped, since the gate verdict is
+ * metadata about the insert, not a content change.
+ */
+export function stampExperienceAdmissionVerdict(experienceId: string, verdict: string): void {
+  const db = getDb(VERTICAL);
+  db.prepare(
+    `UPDATE experiences
+        SET admission_verdict = @verdict, admission_checked_at = datetime('now')
+      WHERE id = @id`
+  ).run({ id: experienceId, verdict });
+}
+
 // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 (detail
 // completeness weave): surface provider phone in the single-experience API
 // row the same way booking_url already is — no fabrication, null when the
@@ -528,11 +551,68 @@ function providerProvenanceOf(providerId: string | null | undefined): Provenance
   );
 }
 
+/**
+ * RAW by-id read — NO publish gate. Returns the row whatever its
+ * verification_status/confidence/canonical_id state, including quarantined
+ * (`needs_review`/`rejected`) and dedup-merged-away rows.
+ *
+ * INTERNAL/ADMIN + TEST USE ONLY (dev-request 2026-06-23-experiences-richer-
+ * profiles, faithfulness-inflow slice, 2026-08-25): every PUBLIC by-id
+ * surface — GET /api/opplevelser/:id, the MCP `get_experience` tool
+ * (experiences-mcp.ts), and the A2A single-experience-by-UUID intent
+ * (experiences-a2a.ts) — must read through getPublishedExperienceById()
+ * below instead. Before that split, all three served quarantined and
+ * merged-away rows in full to any caller holding a UUID, while /discover
+ * and the HTML pages were PUBLISH_GATE_SQL-gated — i.e. the by-id door
+ * bypassed the exact quarantine the gate exists to enforce.
+ */
 export function getExperienceById(
   id: string
 ): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null; provenance?: ProvenanceSummary }) | null {
   const db = getDb(VERTICAL);
   const row = db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  const hydrated = hydrateExperience(row);
+  const provenance = providerProvenanceOf(hydrated.provider_id);
+  return {
+    ...hydrated,
+    phone: providerPhoneOf(hydrated.provider_id),
+    ...(provenance ? { provenance } : {}),
+  };
+}
+
+/**
+ * PUBLISH-GATED by-id read — the by-id twin of getPublishedExperienceBySlug()
+ * below, sharing the exact same PUBLISH_GATE_SQL predicate (verified +
+ * confidence NULL/high/medium + provider brreg_active + canonical_id IS
+ * NULL), so the set of rows reachable by UUID == the set /discover, the
+ * detail pages and the sitemap surface. Returns null for a missing id AND
+ * for a row failing the gate — a quarantined or merged-away row is
+ * indistinguishable from a nonexistent one on public surfaces (deliberate:
+ * a `needs_review` row's content is exactly what the quarantine is keeping
+ * out of circulation, and even confirming its existence to an arbitrary
+ * UUID-holder serves nothing). A dedup-merged row (canonical_id set) also
+ * returns null rather than redirecting: the slug surface 301s via
+ * resolveCanonicalSlugForDuplicate() because browsers follow redirects, but
+ * the JSON/MCP callers obtain UUIDs from /discover — which never serves
+ * merged rows — so a stale merged UUID is a not-found, kept simple.
+ *
+ * Response shape matches getExperienceById() exactly (tags + phone +
+ * optional provenance) so the three public routes' payloads are unchanged
+ * for every row that passes the gate.
+ */
+export function getPublishedExperienceById(
+  id: string
+): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null; provenance?: ProvenanceSummary }) | null {
+  if (!id) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT e.* FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.id = @id AND ${PUBLISH_GATE_SQL}`
+    )
+    .get({ id }) as Record<string, unknown> | undefined;
   if (!row) return null;
   const hydrated = hydrateExperience(row);
   const provenance = providerProvenanceOf(hydrated.provider_id);
@@ -1645,7 +1725,19 @@ export function bulkInsertExperiences(
         if (match) {
           const candidateScore = scoreExperienceRichness(row as ExperienceRichnessInput);
           const existingScore = scoreExperienceRichness(match);
-          if (candidateScore > existingScore) {
+          // Part 1 (dev-request 2026-08-25-titlesmatch-ubiquity-herding):
+          // content only transfers onto the matched row when the titles
+          // themselves corroborate the match at CONTENT_TRANSFER_SIMILARITY_MIN
+          // full-string similarity — titlesMatch() alone (a shared-token
+          // candidate-key decision) is not sufficient license to WRITE one
+          // row's data onto another matched row's blank fields; a same-
+          // provider match that only cleared titlesMatch() via a shared
+          // token (rare corpus-wide, but see Part 2 above for the
+          // provider-ubiquitous-token case that motivated this) must not
+          // silently overwrite a DIFFERENT real-world experience's data.
+          const titlesCorroborated =
+            titleSimilarity(row.title, match.title) >= CONTENT_TRANSFER_SIMILARITY_MIN;
+          if (candidateScore > existingScore && titlesCorroborated) {
             applyExperienceContent(match.id, {
               description: row.description ?? null,
               category: row.category ?? null,
@@ -1665,6 +1757,12 @@ export function bulkInsertExperiences(
             }, harvestProvenanceOf(row.evidence_url));
             updated++;
           } else {
+            // Either the existing row already has equal-or-better data, or
+            // (Part 1) the titles don't corroborate closely enough to trust
+            // writing this row's content onto the matched row — both are
+            // legitimate "no write" outcomes, so this counts as skipped, not
+            // an error (see 11c/13c in experience-dedup.test.ts, which accept
+            // skipped+updated === 1 as valid for exactly this reason).
             skipped++;
           }
           continue;
@@ -2545,6 +2643,178 @@ export function markProviderContentAttempted(providerId: string): boolean {
     )
     .run(providerId);
   return res.changes > 0;
+}
+
+// ─── Price-freshness sweep (dev-request 2026-08-25-experiences-pris-
+// ferskhet) ───────────────────────────────────────────────────────────────
+//
+// `applyExperienceContent` above only ever FILLS a blank `price_from` — once
+// written (harvest-time or content-refresh), nothing ever re-checks it
+// against the source page again, so a wrong/stale harvested price is
+// permanent. This section is the SELECTOR half of the fix (the write side
+// lives in the sweep route, POST /admin/price-freshness-check,
+// routes/opplevelser.ts) — an experience-level analog of
+// selectProvidersForContentRefresh's NULLs-first-then-oldest ordering +
+// 3-strikes parking above, adapted to a row-level (not provider-level)
+// mechanism: price_from lives on `experiences`, not on the provider, so
+// there is nothing to park on `experience_providers` here. Does NOT touch
+// homepage_unreachable_since/content_no_yield_streak/last_content_attempt_at
+// or any provider-level parking column/logic at all.
+
+/** 30 days — same freshness-window convention as PROVIDER_PARK_BACKOFF_MS
+ *  above, reused here as the "how long a settled price-check outcome is
+ *  trusted before re-checking" window. */
+export const PRICE_FRESHNESS_WINDOW_MS = 30 * 86_400_000;
+
+/** Same "3 consecutive failures" convention as PROVIDER_PARK_AFTER_ATTEMPTS
+ *  above, applied to price_check_attempts (which only ever increments on a
+ *  genuine fetch failure — see init-experiences.ts's doc comment on that
+ *  column). */
+export const PRICE_CHECK_PARK_AFTER_ATTEMPTS = 3;
+
+/**
+ * The (NOT excluded) predicate for the price-freshness selector, mirroring
+ * providerParkingExclusionSql/noYieldBackoffExclusionSql's SQL-fragment
+ * shape above — AND this into a WHERE clause, alias optional.
+ *
+ * Unlike the provider-level mechanism, there is only ONE timestamp column
+ * here (`price_checked_at`) doing double duty as both "last attempt" and
+ * "freshness clock" — stamped on every check outcome, success or failure
+ * alike (see that column's own doc comment, init-experiences.ts). A row is
+ * eligible for (re-)selection when ANY of:
+ *
+ *   (a) price_checked_at IS NULL           — never checked at all;
+ *   (b) price_checked_at is past the freshness window — a SETTLED outcome
+ *       (unchanged/corrected/nulled; these always reset price_check_attempts
+ *       to 0) has aged out and is due for a re-check — this is what makes a
+ *       re-run within the window a no-op (acceptance criterion 3) and, once
+ *       the window passes, eligible again;
+ *   (c) price_check_attempts is 1 or 2 — a row that failed to fetch but
+ *       hasn't yet hit the 3-strike threshold must NOT wait out the full
+ *       freshness window before being retried (a transient DNS blip must not
+ *       cost 30 days) — it stays eligible on the very next sweep regardless
+ *       of how recently the last (failed) attempt was stamped. Ordering
+ *       (below) still pushes it behind older candidates, which is the
+ *       "not retried immediately within the SAME run" protection the write
+ *       side's own doc comment describes — this clause is what stops that
+ *       from becoming a hard 30-day exclusion.
+ *
+ * Once price_check_attempts reaches PRICE_CHECK_PARK_AFTER_ATTEMPTS (3),
+ * clause (c) no longer applies and the row is excluded exactly like a
+ * settled outcome — i.e. the 3-strike park IS the freshness window, exactly
+ * as the dev-request's spec asks ("the strikes-based park should itself
+ * expire/reset after the freshness window, same as the provider-level
+ * pattern's 30-day backoff") — until clause (b) lets it back in.
+ */
+export function priceFreshnessExclusionSql(alias = ""): string {
+  const checkedCol = alias ? `${alias}.price_checked_at` : "price_checked_at";
+  const attemptsCol = alias ? `${alias}.price_check_attempts` : "price_check_attempts";
+  const windowDays = PRICE_FRESHNESS_WINDOW_MS / 86_400_000;
+  return (
+    `AND (${checkedCol} IS NULL ` +
+    `OR ${checkedCol} <= datetime('now','-${windowDays} days') ` +
+    `OR (${attemptsCol} > 0 AND ${attemptsCol} < ${PRICE_CHECK_PARK_AFTER_ATTEMPTS}))`
+  );
+}
+
+/**
+ * Resolve the page a row's `price_from` should be re-checked against:
+ * prefers the PER-FIELD provenance in `content_field_evidence.price_from`
+ * (stamped by applyExperienceContent at write time — the true "what page
+ * this field's value actually came from"), falling back to the row's own
+ * `evidence_url` (discovery-time provenance) only when no genuine per-field
+ * entry exists. Exact same precedence/shape as
+ * experience-content-judge.ts's resolveHoldoutEvidenceUrl (narrowed to a
+ * single field) — a per-field value is accepted only when it SHAPE-looks
+ * like an http(s) URL (rejects the BLANK_PROVENANCE_SENTINEL and any other
+ * non-URL provenance marker without having to enumerate them). Returns null
+ * when there is truly nothing fetchable to re-check against — the caller
+ * must treat that as unresolved, never fabricate a comparison. PURE.
+ */
+export function resolvePriceProvenanceUrl(row: {
+  content_field_evidence?: string | null;
+  evidence_url?: string | null;
+}): string | null {
+  const evidence = parseContentFieldEvidence(row.content_field_evidence);
+  const src = evidence["price_from"];
+  if (typeof src === "string") {
+    const trimmed = src.trim();
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  }
+  const legacy = row.evidence_url?.trim();
+  return legacy || null;
+}
+
+export type PriceFreshnessTarget = {
+  id: string;
+  title: string;
+  price_from: number;
+  provenance_url: string;
+};
+
+// Over-fetch window for the SQL pre-filter below, same rationale as
+// CONTENT_REFRESH_CANDIDATE_WINDOW_MULTIPLIER/_MAX above: the per-field
+// provenance resolution (resolvePriceProvenanceUrl) parses JSON and can't be
+// expressed in SQL, so the SQL side over-fetches a window and the exact
+// per-row URL resolution + final LIMIT happen in JS. The SQL pre-filter
+// below already requires EITHER a non-blank evidence_url OR a
+// content_field_evidence blob that LOOKS LIKE it carries a price_from URL
+// (a cheap LIKE '%"price_from":"http%' check, matching the exact
+// JSON.stringify shape applyExperienceContent writes — see that function's
+// doc comment), so in practice almost every SQL-admitted row resolves in JS
+// too; this window only guards the rare edge case where it doesn't, so a
+// short run of non-resolving rows can never starve the selector.
+const PRICE_FRESHNESS_CANDIDATE_WINDOW_MULTIPLIER = 10;
+const PRICE_FRESHNESS_CANDIDATE_WINDOW_MAX = 500;
+
+/**
+ * Auto-select experiences eligible for a price-freshness check: has a price
+ * to check (price_from IS NOT NULL), NOT locked (isExperienceContentLocked —
+ * same LOCK MODEL every other content writer in this file respects), has a
+ * determinable provenance URL to re-fetch (content_field_evidence.price_from
+ * or evidence_url), and is not excluded by priceFreshnessExclusionSql above.
+ * Ordered NULLs-first then oldest price_checked_at, same convention as
+ * selectProvidersForContentRefresh. Capped by `limit` (caller is expected to
+ * have already clamped it against its own hard cap — PF_HARD_CAP,
+ * routes/opplevelser.ts — this function only guards against a nonsensical
+ * value).
+ */
+export function selectExperiencesForPriceFreshnessCheck(limit = 25): PriceFreshnessTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(200, Math.floor(limit) || 25));
+  const windowSize = Math.min(
+    PRICE_FRESHNESS_CANDIDATE_WINDOW_MAX,
+    Math.max(100, cap * PRICE_FRESHNESS_CANDIDATE_WINDOW_MULTIPLIER)
+  );
+
+  const rows = db
+    .prepare(
+      `SELECT id, title, price_from, content_field_evidence, evidence_url
+         FROM experiences
+        WHERE price_from IS NOT NULL
+          AND (verification_status IS NULL OR verification_status != 'verified')
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (
+            (evidence_url IS NOT NULL AND TRIM(evidence_url) != '')
+            OR content_field_evidence LIKE '%"price_from":"http%'
+          )
+          ${priceFreshnessExclusionSql()}
+        ORDER BY (price_checked_at IS NOT NULL), price_checked_at ASC, id ASC
+        LIMIT ?`
+    )
+    .all(windowSize) as Array<{
+      id: string; title: string; price_from: number;
+      content_field_evidence: string | null; evidence_url: string | null;
+    }>;
+
+  const out: PriceFreshnessTarget[] = [];
+  for (const row of rows) {
+    const provenanceUrl = resolvePriceProvenanceUrl(row);
+    if (!provenanceUrl) continue; // SQL LIKE pre-filter missed — belt-and-braces
+    out.push({ id: row.id, title: row.title, price_from: row.price_from, provenance_url: provenanceUrl });
+    if (out.length >= cap) break;
+  }
+  return out;
 }
 
 // ─── Gårdssalg feature flag ──────────────────────────────────────────────────
