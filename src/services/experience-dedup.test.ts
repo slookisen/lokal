@@ -562,6 +562,67 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       );
     }
 
+    // ── 9g. Round-2 review regression guard (dev-request 2026-08-25-
+    // titlesmatch-ubiquity-herding fix-up): the reviewer's Fjordly
+    // counterexample. Same bucket SHAPE as the Kon-Tiki HTTP fixture (3
+    // rows, the shared token sits at 2-of-3 ≈ 66.7%) but here the two
+    // titles sharing "fjordly" are genuinely DIFFERENT experiences (a kayak
+    // tour vs. a bike rental) — not near-identical rewording of the same
+    // real thing. Proves the plain ">50%, no occurrence-count floor"
+    // demotion rule correctly catches this shape (unlike an earlier revision
+    // of this fix, which required the token's raw count to ALSO clear >= 3
+    // — a floor with no teeth at exactly this bucket size, since 2-of-3
+    // never reaches count 3).
+    {
+      const fjordlyTitles = [
+        "Fjordly Kajakktur for Nybegynnere",
+        "Fjordly Sykkelutleie Familiepakke",
+        "Guidet Fototur til Nordkapp", // unrelated control
+      ];
+      const fjordlyUbiquitous = computeProviderUbiquitousTokens(fjordlyTitles);
+      assertTrue(
+        fjordlyUbiquitous.has("fjordly"),
+        "9g-1: 'fjordly' is detected as ubiquitous (2 of 3 = 66.7% > 50%) — the same shape as the Kon-Tiki HTTP fixture, but here it's a false positive to catch"
+      );
+
+      // The two Fjordly titles are NOT close full strings — nowhere near
+      // CONTENT_TRANSFER_SIMILARITY_MIN — so demotion must NOT be
+      // corroborated: they describe different activities (kayaking vs.
+      // bike rental), not the same real-world experience worded twice.
+      const fjordlySim = titleSimilarity(fjordlyTitles[0], fjordlyTitles[1]);
+      assertTrue(
+        fjordlySim < CONTENT_TRANSFER_SIMILARITY_MIN,
+        `9g-2: sanity check — kayak-tour vs. bike-rental whole-string similarity (${fjordlySim.toFixed(2)}) is well under the corroboration bar`
+      );
+
+      // Sanity check: WITHOUT the demotion, these two wrongly match via the
+      // shared rare token "fjordly" alone — proves the fixture actually
+      // exercises the bug, not a pair that was already non-matching.
+      assertTrue(
+        titlesMatch(fjordlyTitles[0], fjordlyTitles[1], new Map()),
+        "9g-3: sanity check — WITHOUT the demotion, kayak tour vs. bike rental wrongly match via the shared rare token 'fjordly' alone"
+      );
+      // WITH the (undemoted-floor-free) demotion applied, the same pair
+      // correctly does NOT match — no full-string corroboration, no other
+      // shared significant token.
+      assertTrue(
+        !titlesMatch(fjordlyTitles[0], fjordlyTitles[1], new Map(), fjordlyUbiquitous),
+        "9g-4: WITH the demotion, kayak tour vs. bike rental correctly do NOT match — different experiences under the same brand"
+      );
+
+      // groupDuplicateCandidates (the real caller) computes and applies the
+      // per-bucket demotion itself — proves the wiring, not just the pure
+      // function in isolation.
+      const fjordlyRows: DedupCandidateRow[] = fjordlyTitles.map((title, i) =>
+        row({ id: `fjordly-${i}`, provider_id: "prov-fjordly", kommune: "Sogndal", title })
+      );
+      assertEq(
+        groupDuplicateCandidates(fjordlyRows, new Map()).length,
+        0,
+        "9g-5: groupDuplicateCandidates finds ZERO duplicate groups among the Fjordly trio — the brand-name token alone no longer merges genuinely different activities"
+      );
+    }
+
     // ── 10. runDedupPass + idempotency + re-harvest guard + discover-query invariant,
     //        against a real in-memory experiences DB ──
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;

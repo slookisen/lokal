@@ -204,37 +204,54 @@ const PROVIDER_UBIQUITY_DEMOTION_THRESHOLD = 0.5;
 // once a provider has enough titles for ">50% of the bucket" to be a
 // meaningful signal rather than "the only other title happens to match".
 //
-// ALSO used (see computeProviderUbiquitousTokens() below) as the minimum
-// ABSOLUTE occurrence count a token itself must clear before its fraction is
-// trusted — not just PROVIDER_UBIQUITY_DEMOTION_THRESHOLD of the bucket.
-// Without that second condition, a token present in only 2 titles can still
-// clear ">50%" purely because an unrelated third/fourth row (a genuinely
-// different experience from the same provider, sharing nothing) shrinks the
-// denominator — confirmed by tests/test.ts's orch-pr-dedup-backfill-endpoint
-// HTTP fixture (db-3/db-4): 2 real Kon-Tiki title variants + 1 unrelated
-// control row is a 3-row bucket where "kontiki" sits at 2/3 ≈ 66.7% (> 50%)
-// yet is NOT the provider's ubiquitous brand token — it's the same confirmed
-// real-world duplicate this whole module exists to merge, and demoting it
-// would wrongly block that merge. Requiring the token's own count to ALSO
-// reach PROVIDER_UBIQUITY_MIN_BUCKET_SIZE keeps that pair merging (count 2 <
-// 3) while still demoting a token that recurs across a genuine plurality of
-// the bucket (e.g. "molja"/"ringve", each present in all 3 of 3 titles).
+// This is the ONLY floor computeProviderUbiquitousTokens() applies — the
+// rule really is a plain ">50% of the bucket, bucket size >= 3" fraction, no
+// second/hidden condition on the token's own raw occurrence count.
+//
+// (Round-2 review history: an earlier revision of this fix ALSO required the
+// token's raw count to independently clear PROVIDER_UBIQUITY_MIN_BUCKET_SIZE
+// — reasoning that a token present in only 2 titles could clear ">50%"
+// purely because an unrelated third row shrinks the denominator, citing
+// tests/test.ts's orch-pr-dedup-backfill-endpoint HTTP fixture: 2 real
+// Kon-Tiki variants + 1 unrelated control is a 3-row bucket where "kontiki"
+// sits at 2/3 ≈ 66.7%. An independent review caught that this extra floor was
+// undisclosed in this comment (which claimed a flat ">50%" rule) AND unsound:
+// it has no teeth at bucket size 4+ (count >= 3 is already implied by >50%
+// there) but at bucket size exactly 3 it silently raises the effective bar
+// from ">50%" (2-of-3) to "100%" (3-of-3) — constructed counterexample: three
+// titles "Fjordly Kajakktur for Nybegynnere" / "Fjordly Sykkelutleie
+// Familiepakke" / "Guidet Fototur til Nordkapp", where "fjordly" is ALSO
+// 2-of-3 but the two Fjordly titles are genuinely DIFFERENT experiences (a
+// kayak tour vs. a bike rental) — the exact false-merge bug class this
+// module exists to close, left uncaught by requiring count >= 3. See 9g in
+// experience-dedup.test.ts for that regression guard.
+//
+// The actual bug wasn't the demotion rule — it was that the HTTP fixture
+// only seeded 2 of the 3 real Kon-Tiki variants confirmed live (a 3rd,
+// "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo", is already part of the
+// SAME confirmed cluster used by this file's own 9f test and by
+// experience-dedup.test.ts's section-10 real-DB test), so its bucket
+// under-counted the denominator and pushed "kontiki" past 50%. Completing
+// the fixture to the full known 3-variants-+-1-control shape (tests/test.ts,
+// orch-pr-dedup-backfill-endpoint) restores "kontiki" to 2-of-4 (50%, NOT
+// demoted) and the pair now matches on its true, undemoted rare-token merit
+// — no floor needed.
 const PROVIDER_UBIQUITY_MIN_BUCKET_SIZE = 3;
 
 /**
  * Tokens that are locally UBIQUITOUS within one provider's own title bucket
  * (dev-request 2026-08-25-titlesmatch-ubiquity-herding, Part 2): a token used
- * in MORE THAN HALF of a provider's own ROWS, AND present in at least
- * PROVIDER_UBIQUITY_MIN_BUCKET_SIZE of them — e.g. a brand/place name
- * repeated on every listing ("Molja Fyr — Overnatting", "Molja Fyr —
+ * in MORE THAN HALF of a provider's own ROWS (bucket size >=
+ * PROVIDER_UBIQUITY_MIN_BUCKET_SIZE, no other condition) — e.g. a brand/place
+ * name repeated on every listing ("Molja Fyr — Overnatting", "Molja Fyr —
  * Restaurantbesøk", "Molja Fyr — Fyromvisning") — is locally "rare" by the
  * corpus-wide, provider-DISTINCT count (few OTHER providers use it, so
  * SHARED_TOKEN_GENERIC_MIN never fires) but is NOT distinctive evidence that
  * two titles from THIS SAME provider describe the SAME real-world
  * experience — it only proves they're the same brand/place. Requires >=
  * PROVIDER_UBIQUITY_MIN_BUCKET_SIZE ROWS in the bucket in the first place
- * before either check is trusted at all (see the constant's own comment for
- * why the token's own count needs the same floor, not just the fraction).
+ * before the fraction is trusted at all (see that constant's own comment —
+ * this is a plain ">50%" rule, deliberately with no hidden second floor).
  *
  * Bucket size and each token's presence are counted PER ROW, not per title
  * STRING: a row's title and title_no are unioned into one token set (a
@@ -267,10 +284,7 @@ export function computeProviderUbiquitousTokens(
   }
   const ubiquitous = new Set<string>();
   for (const [token, count] of rowCounts) {
-    if (
-      count / rowTokenSets.length > PROVIDER_UBIQUITY_DEMOTION_THRESHOLD &&
-      count >= PROVIDER_UBIQUITY_MIN_BUCKET_SIZE
-    ) {
+    if (count / rowTokenSets.length > PROVIDER_UBIQUITY_DEMOTION_THRESHOLD) {
       ubiquitous.add(token);
     }
   }
