@@ -41255,3 +41255,30 @@ runSerial(async () => {
     failures.push("opplevelser-experiences-canonical-group-merge: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-25-experiences-pris-ferskhet: `experiences.price_from`
+// was written once at harvest/content-refresh time and NEVER re-checked —
+// selectExperiencesForPriceFreshnessCheck()/resolvePriceProvenanceUrl()/
+// priceFreshnessExclusionSql() (experience-store.ts, NULLs-first-then-oldest
+// selector + 3-strikes fetch-failure park, mirroring
+// selectProvidersForContentRefresh's own idiom one level down) and
+// POST /admin/price-freshness-check (routes/opplevelser.ts, re-fetches a
+// row's price provenance page and re-runs the SAME extractPriceFrom()
+// content-refresh uses). Own dedicated in-memory-db harness (mirrors the
+// sibling evidence-url-verification-gate test file's own harness). Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-25-experiences-pris-ferskhet: price_from freshness sweep ──");
+  try {
+    const { runOpplevelserPriceFreshnessCheckTests } = require("../src/routes/opplevelser-price-freshness-check.test") as
+      typeof import("../src/routes/opplevelser-price-freshness-check.test");
+    const pfc = await runOpplevelserPriceFreshnessCheckTests({ log: false });
+    passed += pfc.passed;
+    failed += pfc.failed;
+    for (const f of pfc.failures) failures.push("opplevelser-price-freshness-check: " + f);
+    console.log(`  opplevelser-price-freshness-check: ${pfc.passed} passed, ${pfc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-price-freshness-check: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -302,6 +302,17 @@ import {
   getGardssalgProviderQualityUpdateTarget,
   listGardssalgFieldValuesForQualityUpdate,
   type GardssalgQualityUpdateTarget,
+  // dev-request 2026-08-25-experiences-pris-ferskhet — price_from is written
+  // once (harvest/content-refresh fill-if-blank) and never re-checked; this
+  // sweep re-fetches a row's price provenance page and re-runs
+  // extractPriceFrom against it. isExperienceContentLocked is the SAME LOCK
+  // MODEL predicate applyExperienceContent/selectProvidersForContentRefresh
+  // already enforce, reused here rather than re-derived (acceptance
+  // criterion 4: locked/verified fields are never touched).
+  isExperienceContentLocked,
+  selectExperiencesForPriceFreshnessCheck,
+  resolvePriceProvenanceUrl,
+  type PriceFreshnessTarget,
 } from "../services/experience-store";
 // dev-request 2026-08-17-forsyningskjede-samarbeid-og-kvalitetsoppdatering,
 // Skive 3 ("Kvalitetsstyrt oppdatering av ikke-tomme felt — erstatter
@@ -19120,6 +19131,258 @@ router.post("/admin/evidence-url-verification-sweep", requireAdmin, async (req: 
     });
   } catch (err) {
     console.error("[evidence-url-verification-sweep] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/price-freshness-check ──────────────────────
+//
+// dev-request 2026-08-25-experiences-pris-ferskhet. `experiences.price_from`
+// is written once at harvest insertion (LLM-composed) or by the
+// content-refresh writer's fill-if-blank extractPriceFrom regex
+// (applyExperienceContent), and is NEVER re-checked afterwards — the
+// 2026-08-25 mismatch investigation found 2/17 mismatch rows were simply
+// stale prices (130 vs 180 kr; 200 vs 195 kr) that no mechanism would ever
+// have caught. This sweep is that mechanism: for each selected row it
+// re-fetches the SAME page price_from was originally extracted from
+// (resolvePriceProvenanceUrl — prefers content_field_evidence.price_from,
+// falls back to evidence_url), re-runs the SAME extractPriceFrom() regex
+// content-refresh uses, and on divergence either corrects price_from (the
+// page still shows a clear price) or NULLS it (the page shows no price at
+// all — NEVER guesses a replacement, acceptance criterion 2). Dry-run by
+// default, apply=1 writes — same semantics as /admin/content-refresh above.
+//
+// SAFETY: writes ONLY experiences.price_from / .price_checked_at /
+// .price_check_attempts. Never touches evidence_url or
+// content_field_evidence (read-only citations for this sweep — see
+// resolvePriceProvenanceUrl) and never touches a row that
+// isExperienceContentLocked() (verified, or manual/claim-sourced) — the
+// selector excludes those already; this route re-checks the same predicate
+// per row as defense-in-depth for the experienceIds override path.
+//
+// Fetch: reuses crFetchPage()/extractVisibleText() — the SAME SSRF-guarded
+// fetch + visible-text extraction /admin/content-refresh uses above in this
+// file — against the SINGLE provenance URL (not a homepage+subpage crawl;
+// there is exactly one page to re-check per row here).
+const PF_DEFAULT_LIMIT = 25;
+const PF_HARD_CAP = 100;
+const PF_CONCURRENCY = 3;
+
+interface PriceFreshnessRow {
+  id: string;
+  title: string;
+  price_from: number | null;
+  content_source: string | null;
+  verification_status: string | null;
+  content_field_evidence: string | null;
+  evidence_url: string | null;
+}
+
+router.post("/admin/price-freshness-check", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { experienceIds?: unknown; limit?: unknown; apply?: unknown };
+
+  // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1 — same
+  // convention as /admin/content-refresh and .../evidence-url-verification-sweep.
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
+  const limit = Math.min(
+    PF_HARD_CAP,
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : PF_DEFAULT_LIMIT
+  );
+
+  const expDb = getExpDb("experiences");
+  try {
+    let rows: PriceFreshnessRow[];
+    let usedAutoSelect = false;
+    if (Array.isArray(body.experienceIds) && body.experienceIds.length > 0) {
+      const ids = (body.experienceIds as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim())
+        .slice(0, limit);
+      if (ids.length === 0) {
+        res.status(400).json({ error: "experienceIds must contain at least one non-blank string" });
+        return;
+      }
+      const placeholders = ids.map(() => "?").join(",");
+      rows = expDb
+        .prepare(
+          `SELECT id, title, price_from, content_source, verification_status,
+                  content_field_evidence, evidence_url
+             FROM experiences WHERE id IN (${placeholders})`
+        )
+        .all(...ids) as PriceFreshnessRow[];
+    } else {
+      usedAutoSelect = true;
+      const targets: PriceFreshnessTarget[] = selectExperiencesForPriceFreshnessCheck(limit);
+      // Re-select the full row shape by id — the selector's return type
+      // (PriceFreshnessTarget) already carries the resolved provenance_url,
+      // but the processing loop below wants the raw columns for the
+      // (redundant, defense-in-depth) lock check, same discipline as the
+      // explicit-id path.
+      if (targets.length === 0) {
+        rows = [];
+      } else {
+        const placeholders = targets.map(() => "?").join(",");
+        rows = expDb
+          .prepare(
+            `SELECT id, title, price_from, content_source, verification_status,
+                    content_field_evidence, evidence_url
+               FROM experiences WHERE id IN (${placeholders})`
+          )
+          .all(...targets.map((t) => t.id)) as PriceFreshnessRow[];
+      }
+    }
+
+    const corrected: Array<{ experience_id: string; before: number | null; after: number; provenance_url: string; snippet: string | null }> = [];
+    const nulled: Array<{ experience_id: string; before: number | null; provenance_url: string }> = [];
+    const wouldCorrect: Array<{ experience_id: string; before: number | null; after: number; provenance_url: string; snippet: string | null }> = [];
+    const wouldNull: Array<{ experience_id: string; before: number | null; provenance_url: string }> = [];
+    const errors: Array<{ experience_id: string; error: string; persistence: CrErrorPersistence }> = [];
+    const skippedLocked: Array<{ experience_id: string }> = [];
+    const skippedNoPrice: Array<{ experience_id: string }> = [];
+    const skippedNoProvenance: Array<{ experience_id: string }> = [];
+    let unchangedCount = 0;
+    let scanned = 0;
+
+    const updateCheckedAndAttempts = expDb.prepare(
+      `UPDATE experiences SET price_checked_at = ?, price_check_attempts = ? WHERE id = ?`
+    );
+    const updatePriceCorrected = expDb.prepare(
+      `UPDATE experiences SET price_from = ?, price_checked_at = ?, price_check_attempts = 0 WHERE id = ?`
+    );
+    const updatePriceNulled = expDb.prepare(
+      `UPDATE experiences SET price_from = NULL, price_checked_at = ?, price_check_attempts = 0 WHERE id = ?`
+    );
+
+    async function processOne(row: PriceFreshnessRow): Promise<void> {
+      scanned++;
+
+      // Defense-in-depth lock check — the auto-select path already excludes
+      // locked rows via SQL, but an explicit experienceIds call can name one
+      // directly (acceptance criterion 4: never touched even so).
+      if (isExperienceContentLocked({ content_source: row.content_source, verification_status: row.verification_status })) {
+        skippedLocked.push({ experience_id: row.id });
+        return;
+      }
+      if (row.price_from === null || row.price_from === undefined) {
+        skippedNoPrice.push({ experience_id: row.id });
+        return;
+      }
+      const provenanceUrl = resolvePriceProvenanceUrl(row);
+      if (!provenanceUrl) {
+        skippedNoProvenance.push({ experience_id: row.id });
+        return;
+      }
+
+      let fetched: FetchPageResult;
+      try {
+        fetched = await crFetchPage(provenanceUrl);
+      } catch (e: any) {
+        // Internal fault on our side (malformed stored URL, a bug) — NOT
+        // evidence the source page is unreachable. No price_checked_at
+        // stamp, no attempts strike (mirrors /admin/content-refresh's
+        // identical catch-block discipline above in this file).
+        errors.push({ experience_id: row.id, error: e?.message ?? String(e), persistence: "internal" });
+        return;
+      }
+
+      const checkedAt = new Date().toISOString();
+
+      if (!fetched.ok) {
+        errors.push({
+          experience_id: row.id,
+          error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${provenanceUrl}`,
+          persistence: fetched.persistence,
+        });
+        if (apply) {
+          try {
+            const attempts = (
+              expDb.prepare(`SELECT price_check_attempts FROM experiences WHERE id = ?`).get(row.id) as
+                | { price_check_attempts: number }
+                | undefined
+            )?.price_check_attempts ?? 0;
+            updateCheckedAndAttempts.run(checkedAt, attempts + 1, row.id);
+          } catch { /* best-effort */ }
+        }
+        return;
+      }
+
+      const pageText = extractVisibleText(fetched.html);
+      const priceResult = extractPriceFrom(pageText);
+
+      if (priceResult.value === null) {
+        // Page has no price today — NULL it, never guess a replacement
+        // (acceptance criterion 2, literally).
+        if (apply) {
+          try { updatePriceNulled.run(checkedAt, row.id); } catch { /* best-effort */ }
+          nulled.push({ experience_id: row.id, before: row.price_from, provenance_url: provenanceUrl });
+        } else {
+          wouldNull.push({ experience_id: row.id, before: row.price_from, provenance_url: provenanceUrl });
+        }
+        return;
+      }
+
+      if (priceResult.value === row.price_from) {
+        // Checked, already correct — NOT a failure: resets attempts to 0,
+        // just stamps freshness.
+        if (apply) {
+          try { updateCheckedAndAttempts.run(checkedAt, 0, row.id); } catch { /* best-effort */ }
+        }
+        unchangedCount++;
+        return;
+      }
+
+      // Divergent value found — the page still shows a clear (different)
+      // price.
+      if (apply) {
+        try { updatePriceCorrected.run(priceResult.value, checkedAt, row.id); } catch { /* best-effort */ }
+        corrected.push({
+          experience_id: row.id, before: row.price_from, after: priceResult.value,
+          provenance_url: provenanceUrl, snippet: priceResult.snippet,
+        });
+      } else {
+        wouldCorrect.push({
+          experience_id: row.id, before: row.price_from, after: priceResult.value,
+          provenance_url: provenanceUrl, snippet: priceResult.snippet,
+        });
+      }
+    }
+
+    // Bounded concurrency for the network fetches — same pattern as
+    // /admin/content-refresh above.
+    for (let i = 0; i < rows.length; i += PF_CONCURRENCY) {
+      const slice = rows.slice(i, i + PF_CONCURRENCY);
+      await Promise.all(slice.map((r) => processOne(r)));
+    }
+
+    res.json({
+      success: true,
+      dry_run: !apply,
+      auto_selected: usedAutoSelect,
+      scanned,
+      // Real exhaustion vs "there may be more behind the limit" — simple
+      // boolean, deliberately not a full stopReason type (spec: don't
+      // over-engineer this part). Only meaningful for auto-select; an
+      // explicit experienceIds call isn't a scan of a candidate window.
+      exhausted: usedAutoSelect ? rows.length < limit : null,
+      corrected,
+      nulled,
+      wouldCorrect,
+      wouldNull,
+      unchanged: unchangedCount,
+      errors,
+      skippedLocked,
+      skippedNoPrice,
+      skippedNoProvenance,
+    });
+  } catch (err) {
+    console.error("[price-freshness-check] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
