@@ -395,6 +395,17 @@ import {
   applyExperienceProviderMergeWithRepoint,
   type ExperienceProviderMergeWithRepointResult,
 } from "../services/experience-provider-canonicalize";
+// Same dev-request, AC4 (Ringve specifically) — the SEPARATE, explicit lever
+// for folding two ALREADY-ASSIGNED canonical_id groups into one, once a
+// caller already knows (e.g. from the provider merge above) that they're the
+// same business. NO fuzzy title matching — see that module's own doc
+// comment. Backs POST /admin/experiences-canonical-group-merge below.
+import {
+  previewCanonicalGroupMerge,
+  applyCanonicalGroupMerge,
+  type CanonicalGroupMergePreview,
+  type CanonicalGroupMergeApply,
+} from "../services/experience-canonical-group-merge";
 // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
 // Steg 3 ("nettside-verifisering-i-berikelse"), scoped-down slice — a new,
 // independent sweep that checks each gårdssalg producer's stored hjemmeside
@@ -22702,6 +22713,93 @@ router.post("/admin/experiences-provider-dedup-merge", requireAdmin, (req: Reque
     });
   } catch (err) {
     console.error("[experiences-provider-dedup-merge] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-canonical-group-merge ────────
+//
+// Same dev-request, AC4 (Ringve, Trondheim specifically). The provider-merge
+// route above closes the PROVIDER-identity half of the gap and repoints
+// child experience rows onto one shared provider_id — but that does NOT, by
+// itself, fold the business's raw experience rows into one catalog listing,
+// because runDedupPass()/groupDuplicateCandidates() (experience-dedup.ts)
+// only ever clusters rows that are STILL UNASSIGNED (canonical_id IS NULL);
+// it never revisits two groups that were EACH ALREADY assigned a
+// canonical_id by an earlier pass, however similar their titles look now.
+// Confirmed live 2026-08-26: Ringve's rows all share one provider_id (after
+// the merge above ran) but remain split across two canonical_id groups (~3
+// rows / ~14 rows) — titlesMatch()'s fuzzy bar simply never considered them
+// similar enough to bucket together in the first place.
+//
+// This route is the explicit, opt-in fix for exactly that shape: given two
+// canonical_id values a human/operator ALREADY KNOWS are the same business
+// (e.g. because the provider merge above just proved it), fold the `remove`
+// group into the `keep` group. NO fuzzy title matching, NO change to
+// titlesMatch()/groupDuplicateCandidates()/runDedupPass() — see
+// services/experience-canonical-group-merge.ts's own doc comment for the
+// full design (including why the provider-scoping guard is an explicit,
+// caller-supplied `expected_provider_id` rather than an assumption that the
+// two groups' own provider_ids already match — canonical groups can
+// legitimately span multiple provider_ids via the org_nr-preferring
+// providerIdentityKey() in experience-dedup.ts, so that assumption would
+// not be safe here).
+//
+// dry_run by DEFAULT (apply must be explicitly true) — same convention as
+// every other admin write route in this file. Insert-only/no DELETE: only
+// ever repoints experiences.canonical_id + updates the keep row's
+// merged_from. Idempotent — see the service module's header for why a
+// repeat call naturally reports zero rows to move rather than needing a
+// special "already done" branch.
+// Body: { keep_canonical_id, remove_canonical_id, expected_provider_id, apply? }.
+router.post("/admin/experiences-canonical-group-merge", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    keep_canonical_id?: unknown;
+    remove_canonical_id?: unknown;
+    expected_provider_id?: unknown;
+    apply?: unknown;
+  };
+  const keepId = typeof body.keep_canonical_id === "string" ? body.keep_canonical_id.trim() : "";
+  const removeId = typeof body.remove_canonical_id === "string" ? body.remove_canonical_id.trim() : "";
+  const expectedProviderId =
+    typeof body.expected_provider_id === "string" ? body.expected_provider_id.trim() : "";
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const dryRun = !apply;
+
+  try {
+    const db = getExpDb("experiences");
+    const result = dryRun
+      ? previewCanonicalGroupMerge(db, keepId, removeId, expectedProviderId)
+      : applyCanonicalGroupMerge(db, keepId, removeId, expectedProviderId);
+
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+
+    if (dryRun) {
+      const preview = result as CanonicalGroupMergePreview;
+      res.json({
+        success: true,
+        dry_run: true,
+        keep_canonical_id: preview.keep_canonical_id,
+        remove_canonical_id: preview.remove_canonical_id,
+        rows_to_move_count: preview.rows_to_move.length,
+        rows_to_move: preview.rows_to_move,
+      });
+    } else {
+      const applied = result as CanonicalGroupMergeApply;
+      res.json({
+        success: true,
+        dry_run: false,
+        keep_canonical_id: applied.keep_canonical_id,
+        remove_canonical_id: applied.remove_canonical_id,
+        rows_moved_count: applied.rows_moved.length,
+        rows_moved: applied.rows_moved,
+      });
+    }
+  } catch (err) {
+    console.error("[experiences-canonical-group-merge] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

@@ -41164,3 +41164,26 @@ runSerial(async () => {
     failures.push("opplevelser-experiences-provider-dedup-merge: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
+// AC4 (Ringve specifically): POST /admin/experiences-canonical-group-merge —
+// the SEPARATE, explicit lever for folding two ALREADY-ASSIGNED canonical_id
+// groups into one, once a caller already knows they're the same business
+// (e.g. from the provider-merge route above). NO fuzzy title matching, NO
+// change to titlesMatch()/groupDuplicateCandidates()/runDedupPass(). Tail
+// position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── opplevelser-experiences-canonical-group-merge: explicit canonical-group merge lever ──");
+  try {
+    const { runOpplevelserExperiencesCanonicalGroupMergeTests } = require("../src/routes/opplevelser-experiences-canonical-group-merge.test") as
+      typeof import("../src/routes/opplevelser-experiences-canonical-group-merge.test");
+    const ecgm = await runOpplevelserExperiencesCanonicalGroupMergeTests({ log: false });
+    passed += ecgm.passed;
+    failed += ecgm.failed;
+    for (const f of ecgm.failures) failures.push("opplevelser-experiences-canonical-group-merge: " + f);
+    console.log(`  opplevelser-experiences-canonical-group-merge: ${ecgm.passed} passed, ${ecgm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experiences-canonical-group-merge: unexpected error: " + String(err?.message || err));
+  }
+});
