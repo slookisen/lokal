@@ -56,6 +56,21 @@ export type ClaimFilter = {
   // for "fetched page describes a different clinic" results, distinct from
   // the insufficient-yield extraction failures this flag originally covered
   // -- see recordDentalExtractionResult()'s doc comment in dental-store.ts).
+  //
+  // dev-request 2026-08-26-dental-dead-homepage-no-strike-counter (2026-08-26):
+  // this SAME flag now ALSO gates a THIRD, older, previously-unwired parking
+  // mechanism: homepage_unreachable_since / homepage_fetch_attempts, set by
+  // recordDentalHomepageFetchResult() in dental-store.ts (enrichment-metode
+  // slice 1, 2026-07-16) and reported through POST /admin/homepage-fetch-
+  // result (src/routes/dental.ts). That mechanism mirrors RFB PR #248 exactly
+  // (3 consecutive fetch failures -> parked 30 days, any success -> full
+  // reset) and has existed since 2026-07-16, but until now it was never
+  // checked by this claim-pool query -- a homepage reported dead via that
+  // endpoint kept being re-claimed and re-fetched every cycle regardless.
+  // Wired onto this SAME flag/env var (no new flag) for the same reason
+  // wrong_entity_unreachable_since was above: it is yet another independent
+  // stamp-based parking signal already computed server-side, so there is no
+  // reason for a caller to opt into it separately from the other two.
   excludeParkedExtraction?: boolean;
 };
 
@@ -197,6 +212,23 @@ export function buildWhereClause(
   // unless the caller explicitly passes `false` (opt-out, preserved for a
   // caller that deliberately wants parked rows back, e.g. review tooling) or
   // the env rollback flag is set.
+  //
+  // dev-request 2026-08-26-dental-dead-homepage-no-strike-counter (2026-08-26):
+  // ALSO exclude clinics parked by homepage_unreachable_since -- a THIRD,
+  // independent parking stamp, older than both of the above (set by
+  // recordDentalHomepageFetchResult(), dental-store.ts, enrichment-metode
+  // slice 1, 2026-07-16; reported via POST /admin/homepage-fetch-result,
+  // src/routes/dental.ts) and mirroring RFB PR #248 exactly (3 consecutive
+  // homepage-fetch failures -> parked 30 days, any success -> full reset).
+  // That column pair already existed and was already being written by the
+  // reporting endpoint, but this claim-pool query never read it -- so a
+  // clinic whose homepage was reported dead kept being re-claimed and
+  // re-fetched every cycle regardless. Same 30-day window, same literal
+  // `datetime('now','-30 days')` SQL style, gated by the SAME
+  // excludeParkedExtraction flag / DENTAL_EXTRACTION_PARKING_DISABLED
+  // rollback env var as the other two stamps above (no new flag -- see the
+  // ClaimFilter.excludeParkedExtraction doc comment for why an already-
+  // computed server-side parking signal doesn't get its own opt-in).
   const extractionParkingDisabled = process.env.DENTAL_EXTRACTION_PARKING_DISABLED === "true";
   if (filter.excludeParkedExtraction !== false && !extractionParkingDisabled) {
     conditions.push(
@@ -204,6 +236,9 @@ export function buildWhereClause(
     );
     conditions.push(
       "(wrong_entity_unreachable_since IS NULL OR wrong_entity_unreachable_since <= datetime('now','-30 days'))"
+    );
+    conditions.push(
+      "(homepage_unreachable_since IS NULL OR homepage_unreachable_since <= datetime('now','-30 days'))"
     );
   }
 
