@@ -35012,15 +35012,39 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
       "codeartifact: a literal <style> tag alone flags true"
     );
 
-    // Positive: Squarespace-bootstrap-shaped fixture (NOT the real live
-    // Helios text — this dev-request's research never captured it verbatim,
-    // this is a same-shape stand-in). CMS-token class + brace-density class
-    // both fire (2 of classes 2-4), no <script> tag needed.
+    // Positive: Squarespace-bootstrap-shaped fixture, brace-dense enough to
+    // also fire class 4 on top of the class-1b Squarespace-token signal
+    // (both true after 2026-08-25's class-2 -> class-1b move; previously
+    // fired via class-2 + class-4 companionship instead — either way the
+    // verdict is unaffected, this fixture was never the gap).
     const squarespaceJunk =
       'Y.Squarespace = Y.Squarespace || {}; Static.SQUARESPACE_CONTEXT = {"website":{"id":"123"},"cacheBust":"abc"}; window.Y.Squarespace.afterBodyLoad(Y);';
     assertTrue(
       dq.looksLikeCodeArtifact(squarespaceJunk) === true,
-      "codeartifact: Squarespace-bootstrap-shaped fixture -> true (CMS-token class + brace-density class both fire)"
+      "codeartifact: Squarespace-bootstrap-shaped fixture -> true (class 1b [Squarespace token] alone now; also class 4 [brace density])"
+    );
+
+    // Positive — REGRESSION GUARD (2026-08-25): the exact live Helios
+    // Trondheim description text, captured byte-for-byte via `lokal_info`
+    // against production (truncated exactly where the live formatted card
+    // truncates it — not edited or reconstructed). This is the real text
+    // that motivated the whole detector, and it slipped through UNCAUGHT
+    // under the original class-2-only placement: `POST
+    // /admin/agents/description-code-artifact-sweep {"apply":false}` against
+    // prod returned 0 candidates, and manually re-deriving each class against
+    // this exact string confirmed why — only class 2 fired (the
+    // `Static.SQUARESPACE_CONTEXT` token), with just 3 braces (density ~1.0,
+    // under class 4's >2.0 threshold) and no function()/assignment syntax
+    // (class 3), so the "needs a companion class" rule structurally could
+    // never catch it. Moving the Squarespace tokens to class 1b (this same
+    // commit) fixes it. This fixture must keep returning true on its own —
+    // if a future change to class 1b/2/4 regresses this, it means the
+    // original live defect would once again go undetected.
+    const heliosLiveText =
+      'Grønn Guide Trondheim Static = window.Static || {}; Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":["supports_versioned_template_assets","campaigns_merch_state","marketing_landing_page","enable_form_submission_trigger","campaigns_table_v2","contacts_and_campaigns_redesign","marketing_automations",';
+    assertTrue(
+      dq.looksLikeCodeArtifact(heliosLiveText) === true,
+      "codeartifact: real live Helios Trondheim text -> true (class 1b [Static.SQUARESPACE_CONTEXT] alone — the exact gap this fix closes)"
     );
 
     // Positive: generic minified-JS shape — JS-syntax-density class +
