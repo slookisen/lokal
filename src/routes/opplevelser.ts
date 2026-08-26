@@ -20456,26 +20456,31 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
     // content_source), so the `published` stratum below can never come back
     // sample_size:0 the way it did when the whole sample came from the
     // enrichment-only selector. The remainder is drawn from the existing
-    // enriched-pool selector, sized DOWN by however many rows the published
-    // quota already filled, so total fetch+judge cost per request stays
-    // bounded by sampleSize exactly as before this change.
+    // enriched-pool selector, at the FULL sampleSize (not sized down by the
+    // published quota) — a published-quota row can theoretically ALSO satisfy
+    // the unpublished selector's own criteria (enrichment_state='enriched'
+    // AND content_source='provider_site'), and sizing the unpublished draw
+    // down by publishedPool.rows.length left no spare capacity to backfill
+    // rows the dedup below removes, silently under-filling `rows` below
+    // sampleSize. Drawing the unpublished pool at full size gives the dedup
+    // loop enough candidates to backfill from; the merged result is capped at
+    // sampleSize instead, which keeps the same total-cost bound (never more
+    // than sampleSize rows get fetched+judged below) without the shortfall.
     const publishedQuota = Math.ceil(sampleSize / 2);
     const publishedPool = samplePublishedExperiencesForHoldout(expDb, publishedQuota);
-    const unpublishedRows = sampleEnrichedExperiencesForHoldout(
-      expDb,
-      sampleSize - publishedPool.rows.length,
-    );
+    const unpublishedRows = sampleEnrichedExperiencesForHoldout(expDb, sampleSize);
 
-    // A published-quota row can theoretically ALSO satisfy the unpublished
-    // selector's own criteria (enrichment_state='enriched' AND content_
-    // source='provider_site') — dedup by id, published-quota rows winning,
-    // so no row is ever double-counted or double-fetched below.
+    // Dedup by id, published-quota rows winning, so no row is ever double-
+    // counted or double-fetched below — then cap at sampleSize (rather than
+    // sizing the unpublished draw down beforehand) so a row lost to dedup can
+    // still be backfilled from the larger unpublished pool.
     const seenIds = new Set<string>();
     const rows: HoldoutExperienceRow[] = [];
     for (const row of [...publishedPool.rows, ...unpublishedRows]) {
       if (seenIds.has(row.id)) continue;
       seenIds.add(row.id);
       rows.push(row);
+      if (rows.length >= sampleSize) break;
     }
 
     // Per-row publish check — the EXACT PUBLISH_GATE_SQL predicate /discover

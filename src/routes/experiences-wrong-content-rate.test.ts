@@ -1070,6 +1070,106 @@ export function runExperiencesWrongContentRateTests(log = false): Promise<TestSu
         if (prevAdminKeyE === undefined) delete process.env.ADMIN_KEY;
         else process.env.ADMIN_KEY = prevAdminKeyE;
       }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (f) route-level regression — CHANGES-REQUESTED fix: a row eligible
+      //     for BOTH samplePublishedExperiencesForHoldout AND the enriched-
+      //     pool selector must not cause dedup to under-fill `rows` below
+      //     sample_size. Before this fix, the unpublished draw was sized DOWN
+      //     to `sampleSize - publishedPool.rows.length` BEFORE dedup, so a
+      //     row the published quota already claimed had no spare unpublished
+      //     capacity to backfill it from — with a 10-row fully-overlapping
+      //     eligible pool and sample_size:10, dedup could (and, over many
+      //     runs, reliably did) leave `rows` short of 10. Seeding exactly
+      //     sample_size (10) doubly-eligible rows means the fixed code's
+      //     full-size unpublished draw (sampleEnrichedExperiencesForHoldout
+      //     called with `sampleSize`, not the old sized-down value) alone
+      //     already covers all 10 distinct ids, so the merged+capped `rows`
+      //     is deterministically 10 regardless of shuffle order or overlap —
+      //     proving the fix without relying on getting an unlucky draw.
+      // ═══════════════════════════════════════════════════════════════════
+      const prevDbPathF = process.env.EXPERIENCES_DB_PATH;
+      const prevAdminKeyF = process.env.ADMIN_KEY;
+      const testKeyF = process.env.ADMIN_KEY || "wcr-test-admin-key";
+      process.env.EXPERIENCES_DB_PATH = ":memory:";
+      process.env.ADMIN_KEY = testKeyF;
+
+      const cachePathsF = [
+        require.resolve("../database/db-factory"),
+        require.resolve("../services/experience-store"),
+        require.resolve("../services/experience-content-judge"),
+        require.resolve("./opplevelser"),
+      ];
+      for (const p of cachePathsF) delete require.cache[p];
+
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+        const expDb = dbFactory.getDb("experiences");
+        const oppl = require("./opplevelser") as typeof import("./opplevelser");
+        const opplevelserRouter = oppl.default as any;
+        const adminHeaders = { "x-admin-key": testKeyF };
+
+        const insertF = expDb.prepare(
+          `INSERT INTO experiences
+             (id, title, slug, description, category, price_band, price_from,
+              evidence_url, verification_status, confidence, canonical_id,
+              provider_id, content_source, enrichment_state)
+           VALUES
+             (@id, @title, @slug, @description, @category, @price_band, @price_from,
+              @evidence_url, @verification_status, @confidence, @canonical_id,
+              @provider_id, @content_source, @enrichment_state)`,
+        );
+        const baseF = {
+          description: "d",
+          category: "c",
+          price_band: "standard",
+          price_from: 500,
+          confidence: null,
+          canonical_id: null,
+          provider_id: null,
+          verification_status: "verified",
+          content_source: "provider_site",
+          enrichment_state: "enriched",
+        };
+        // 10 distinct rows, each satisfying BOTH PUBLISH_GATE_SQL (verified,
+        // confidence NULL, no provider row so the provider clause passes
+        // vacuously, canonical_id NULL) AND the enriched-pool selector
+        // (enrichment_state='enriched', content_source='provider_site') —
+        // exactly the realistic overlap the module's own comments call out.
+        // http://localhost/* is SSRF-blocked before any network call, so
+        // every row resolves deterministically to `unresolved` with no fetch
+        // mock needed — sample_size (== rows.length, set before the per-row
+        // fetch/judge loop even runs) is all this test needs to check.
+        for (let i = 0; i < 10; i++) {
+          insertF.run({
+            ...baseF,
+            id: `wcr-overlap-${i}`,
+            title: `Overlap Test ${i}`,
+            slug: `wcr-overlap-${i}`,
+            evidence_url: `http://localhost/overlap-${i}`,
+          });
+        }
+        globalThis.fetch = (async () => {
+          throw new Error("wcr-f: no live fetch expected — every seeded row is SSRF-blocked before any fetch call");
+        }) as unknown as typeof fetch;
+
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample_size: 10 } });
+        assertEq(r.status, 200, "wcr-f1: request succeeds");
+        assertEq(
+          r.body.sample_size,
+          10,
+          "wcr-f2: sample_size comes back as the FULL requested count (10), not short — the dedup-under-fill bug is fixed",
+        );
+        const distinctIds = new Set((r.body.results as any[]).map((x) => x.experience_id));
+        assertEq(distinctIds.size, 10, "wcr-f3: all 10 results are for distinct experience ids, no double-counted row");
+      } finally {
+        for (const p of cachePathsF) delete require.cache[p];
+        if (prevDbPathF === undefined) delete process.env.EXPERIENCES_DB_PATH;
+        else process.env.EXPERIENCES_DB_PATH = prevDbPathF;
+        if (prevAdminKeyF === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKeyF;
+      }
     } catch (err: any) {
       failed++;
       failures.push("experiences-wrong-content-rate: unexpected error: " + String(err?.stack || err?.message || err));
