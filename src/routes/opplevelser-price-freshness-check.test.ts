@@ -436,6 +436,53 @@ export function runOpplevelserPriceFreshnessCheckTests(
       const resetRow = getRow(expPark);
       assertEq(resetRow.price_check_attempts, 0, "park-5b: a SUCCESSFUL check resets price_check_attempts to 0");
       assertEq(resetRow.price_from, 250, "park-5c: unchanged outcome — price stays 250");
+
+      // ══════════════════════════════════════════════════════════════════
+      // (g) Transient fetch failures (e.g. HTTP 503) must NEVER count a
+      // strike — mirrors the persistence-aware provider-level 3-strikes
+      // convention (fetch-page.ts persistenceOf()). Unlike a permanent
+      // failure, a transient one leaves BOTH price_check_attempts AND
+      // price_checked_at untouched (see the route's doc comment on that
+      // `else` branch: price_checked_at doubles as the freshness-window
+      // clock here, so stamping it on a strike-exempt failure would still
+      // silently rest the row for the 30-day window via
+      // priceFreshnessExclusionSql's case (c) requiring attempts>0 — an
+      // indistinguishable-from-parked outcome even with attempts at 0).
+      // price_check_attempts stays at 0 after 3 consecutive transient
+      // failures, and the row remains eligible for reselection (not
+      // parked). Fix-up for the reviewer's CHANGES-REQUESTED finding on the
+      // price-freshness route.
+      // ══════════════════════════════════════════════════════════════════
+      const expTransient = seed("Transient-failure experience", { price_from: 275 });
+      db.prepare("UPDATE experiences SET evidence_url = ? WHERE id = ?").run(
+        "https://pf-transienttest.example/proof", expTransient,
+      );
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const host = new URL(String(url)).hostname;
+        if (host === "pf-transienttest.example") return mkResp(false, "", 503);
+        throw new Error(`price-freshness test (transient phase): fetch must NOT be called for host "${host}"`);
+      }) as typeof fetch;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const r = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          body: { experienceIds: [expTransient], apply: true },
+        });
+        assertEq(r.status, 200, `transient-${attempt}a: fetch-failure attempt ${attempt} call -> 200`);
+        const errList = r.body.errors as any[];
+        assertTrue(
+          errList.some((e) => e.experience_id === expTransient && e.persistence === "transient"),
+          `transient-${attempt}b: response.errors reports this failure with persistence:"transient"`,
+        );
+        const row = getRow(expTransient);
+        assertEq(row.price_check_attempts, 0, `transient-${attempt}c: price_check_attempts stays 0 after ${attempt} consecutive TRANSIENT failures`);
+        assertEq(row.price_checked_at, null, `transient-${attempt}d: price_checked_at stays NULL — a strike-exempt failure must not start the 30-day freshness clock either`);
+        assertEq(row.price_from, 275, `transient-${attempt}e: price_from untouched by a fetch failure`);
+        assertTrue(
+          selectExperiencesForPriceFreshnessCheck(50).some((t) => t.id === expTransient),
+          `transient-${attempt}f: still eligible for immediate reselection after ${attempt} consecutive transient failures — NOT parked`,
+        );
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-price-freshness-check: unexpected error: " + String(err?.stack || err?.message || err));

@@ -19153,7 +19153,9 @@ router.post("/admin/evidence-url-verification-sweep", requireAdmin, async (req: 
 // default, apply=1 writes — same semantics as /admin/content-refresh above.
 //
 // SAFETY: writes ONLY experiences.price_from / .price_checked_at /
-// .price_check_attempts. Never touches evidence_url or
+// .price_check_attempts — and even those two get NO write at all on a
+// `transient` fetch failure (timeout/5xx/429/connection reset): see the
+// `!fetched.ok` branch below. Never touches evidence_url or
 // content_field_evidence (read-only citations for this sweep — see
 // resolvePriceProvenanceUrl) and never touches a row that
 // isExperienceContentLocked() (verified, or manual/claim-sourced) — the
@@ -19300,7 +19302,37 @@ router.post("/admin/price-freshness-check", requireAdmin, async (req: Request, r
           error: `fetch_failed:${fetched.reason} (${fetched.persistence}) for ${provenanceUrl}`,
           persistence: fetched.persistence,
         });
-        if (apply) {
+        // PARKING NOW DEPENDS ON PERSISTENCE (mirrors the provider-level
+        // homepage-fetch strike convention above in this file, e.g. around
+        // recordProviderHomepageFetchResult / lines ~2195, 3410, 4181, 4438).
+        // A `transient` failure (timeout, 5xx, 429, connection reset) must
+        // NOT count a strike — only a `permanent` (or `blocked`) failure
+        // should.
+        //
+        // Deliberately SKIP the price_checked_at stamp too on a transient
+        // failure, not just the attempts increment — NOT a partial mirror of
+        // the sibling sites, but the FULL one: they skip their entire
+        // recordProviderHomepageFetchResult()/write call for `transient`, we
+        // skip our entire write. Reason this matters here specifically:
+        // unlike the provider-level mechanism (homepage_unreachable_since is
+        // a DEDICATED park column, separate from any "last attempted"
+        // timestamp), price_checked_at does double duty as BOTH the ordering
+        // clock AND the freshness-window exclusion clock
+        // (priceFreshnessExclusionSql's doc comment, experience-store.ts). If
+        // we stamped it to "now" here, a row that failed 3 CONSECUTIVE
+        // transient times (attempts left at 0, so never parked) would still
+        // read back as "checked_at is fresh AND attempts==0" — a database
+        // state indistinguishable from a row that was just checked and found
+        // CORRECT — which the exclusion SQL's case (c) requires
+        // attempts>0 to treat as an immediate-retry candidate. So without
+        // this, the row would silently sit out the same 30-day freshness
+        // window as a genuinely parked row anyway, defeating the whole point
+        // of not striking it. Leaving price_checked_at untouched keeps a
+        // purely-transient-failing row exactly as eligible as it was before
+        // this attempt (NULL if never checked, or its last real outcome's
+        // timestamp) — it is picked up again on the very next sweep, same as
+        // the provider-level sibling sites' rows are.
+        if (apply && fetched.persistence !== "transient") {
           try {
             const attempts = (
               expDb.prepare(`SELECT price_check_attempts FROM experiences WHERE id = ?`).get(row.id) as
