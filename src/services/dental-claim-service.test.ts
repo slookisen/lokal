@@ -305,6 +305,144 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
     );
   }
 
+  // ── dev-request 2026-08-26-dental-dead-homepage-no-strike-counter
+  // (2026-08-26): wiring the pre-existing (2026-07-16) homepage_unreachable_
+  // since / homepage_fetch_attempts parking stamp (recordDentalHomepageFetch
+  // Result(), dental-store.ts) onto this SAME excludeParkedExtraction flag --
+  // see the ClaimFilter.excludeParkedExtraction doc comment and the inline
+  // comment above the exclusion block in dental-claim-service.ts for the full
+  // rationale. Mirrors the item2a (extraction) / wrong_entity clause checks
+  // above at the buildWhereClause level first. ────────────────────────────
+  {
+    const filter: ClaimFilter = { excludeParkedExtraction: true };
+    const { clause } = buildWhereClause(filter, NOW);
+    assertTrue(
+      norm(clause).includes(
+        "(homepage_unreachable_since IS NULL OR homepage_unreachable_since <= datetime('now','-30 days'))"
+      ),
+      "hp-clause-01: excludeParkedExtraction=true adds the homepage 30d backoff exclusion clause"
+    );
+  }
+  {
+    // omitted is default-on -- same flag gates the homepage stamp too.
+    const { clause } = buildWhereClause({ enrichment_state: "raw", has_hjemmeside: true }, NOW);
+    assertTrue(
+      norm(clause).includes("homepage_unreachable_since"),
+      "hp-clause-02: omitted excludeParkedExtraction applies the homepage exclusion by default"
+    );
+  }
+  {
+    // explicit false remains a no-op (opt-out escape hatch preserved) for the homepage stamp too.
+    const { clause } = buildWhereClause({ excludeParkedExtraction: false }, NOW);
+    assertTrue(
+      !norm(clause).includes("homepage_unreachable_since"),
+      "hp-clause-03: excludeParkedExtraction=false remains a no-op for the homepage exclusion too"
+    );
+  }
+  {
+    // env rollback flag disables the homepage exclusion globally too (same var, no new flag).
+    const prev = process.env.DENTAL_EXTRACTION_PARKING_DISABLED;
+    process.env.DENTAL_EXTRACTION_PARKING_DISABLED = "true";
+    try {
+      const { clause } = buildWhereClause({}, NOW);
+      assertTrue(
+        !norm(clause).includes("homepage_unreachable_since"),
+        "hp-clause-04: DENTAL_EXTRACTION_PARKING_DISABLED=true also reverts the homepage exclusion, even with the filter omitted"
+      );
+    } finally {
+      if (prev === undefined) delete process.env.DENTAL_EXTRACTION_PARKING_DISABLED;
+      else process.env.DENTAL_EXTRACTION_PARKING_DISABLED = prev;
+    }
+  }
+  {
+    // composition with an existing filter (has_hjemmeside) -- both clauses present
+    const { clause } = buildWhereClause({ excludeParkedExtraction: true, has_hjemmeside: true }, NOW);
+    const c = norm(clause);
+    assertTrue(c.includes("homepage_unreachable_since"), "hp-clause-05: homepage exclusion present alongside has_hjemmeside");
+    assertTrue(
+      c.includes("hjemmeside IS NOT NULL AND hjemmeside <> ''"),
+      "hp-clause-06: has_hjemmeside=true clause still present alongside the homepage exclusion"
+    );
+  }
+
+  // ── same dev-request: end-to-end proof against real DB rows via
+  // claimBatch() -- a clause-substring check alone doesn't prove a row
+  // stamped "now" is actually excluded and a row stamped >30 days ago is
+  // actually still claimable, so this exercises the real claim pool.
+  // Follows the exact isolated-DB setup/teardown idiom used elsewhere for
+  // this same claim pool (tests/test.ts's "item2a" block and
+  // dental-wrong-entity-streak.test.ts): DENTAL_DB_PATH=":memory:",
+  // require-cache-busted fresh dental-store/dental-claim-service, and
+  // __resetDbFactoryForTesting() in a try/finally. ─────────────────────────
+  {
+    const prevPath = process.env.DENTAL_DB_PATH;
+    process.env.DENTAL_DB_PATH = ":memory:";
+
+    const dbFacPathHp = require.resolve("../database/db-factory");
+    const dentalStorePathHp = require.resolve("./dental-store");
+    const dentalClaimPathHp = require.resolve("./dental-claim-service");
+    delete require.cache[dbFacPathHp];
+    delete require.cache[dentalStorePathHp];
+    delete require.cache[dentalClaimPathHp];
+
+    const dbFacHp = require("../database/db-factory") as typeof import("../database/db-factory");
+    dbFacHp.__resetDbFactoryForTesting();
+    const dstoreHp = require("./dental-store") as typeof import("./dental-store");
+    const { claimBatch: claimBatchHp, releaseBatch: releaseBatchHp } =
+      require("./dental-claim-service") as typeof import("./dental-claim-service");
+
+    try {
+      const dentalDbHp = dbFacHp.getDb("dental");
+
+      const idParked = dstoreHp.createDentalAgent({ navn: "Dod Hjemmeside AS", org_nr: "911500111" } as any);
+      const idExpired = dstoreHp.createDentalAgent({ navn: "Utlopt Hjemmeside-Parkering AS", org_nr: "911500222" } as any);
+      const idClean = dstoreHp.createDentalAgent({ navn: "Frisk Hjemmeside AS", org_nr: "911500333" } as any);
+
+      // idParked: 3 strikes, stamped right now -- actively parked.
+      dentalDbHp
+        .prepare("UPDATE dental_agents SET homepage_fetch_attempts = 3, homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date().toISOString(), idParked);
+      // idExpired: 3 strikes, but the stamp is >30 days old -- backoff expired.
+      dentalDbHp
+        .prepare("UPDATE dental_agents SET homepage_fetch_attempts = 3, homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idExpired);
+
+      const claimedHp = claimBatchHp("hp-worker1", 10, { excludeParkedExtraction: true }).map((c: any) => c.id);
+      assertTrue(!claimedHp.includes(idParked), "hp-db-01: homepage_unreachable_since=now excluded by excludeParkedExtraction:true");
+      assertTrue(claimedHp.includes(idExpired), "hp-db-02: homepage_unreachable_since >30 days ago still claimable");
+      assertTrue(claimedHp.includes(idClean), "hp-db-03: never-parked row included");
+      releaseBatchHp("hp-worker1", [idParked, idExpired, idClean]);
+
+      // omitted (default-on) also applies -- same flag gates the homepage stamp too.
+      const claimedHpDefault = claimBatchHp("hp-worker2", 10, {}).map((c: any) => c.id);
+      assertTrue(
+        !claimedHpDefault.includes(idParked),
+        "hp-db-04: omitted excludeParkedExtraction excludes the homepage-parked row by default"
+      );
+      releaseBatchHp("hp-worker2", [idParked, idExpired, idClean]);
+
+      // explicit opt-out still works for the homepage stamp too.
+      const claimedHpOptOut = claimBatchHp("hp-worker3", 10, { excludeParkedExtraction: false }).map((c: any) => c.id);
+      assertTrue(
+        claimedHpOptOut.includes(idParked),
+        "hp-db-05: excludeParkedExtraction:false opts out of the homepage exclusion too"
+      );
+      releaseBatchHp("hp-worker3", [idParked, idExpired, idClean]);
+    } catch (err) {
+      failed++;
+      failures.push(
+        `homepage-parking claim-pool exclusion: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`
+      );
+    } finally {
+      if (prevPath === undefined) delete process.env.DENTAL_DB_PATH;
+      else process.env.DENTAL_DB_PATH = prevPath;
+      dbFacHp.__resetDbFactoryForTesting();
+      delete require.cache[dbFacPathHp];
+      delete require.cache[dentalStorePathHp];
+      delete require.cache[dentalClaimPathHp];
+    }
+  }
+
   return { passed, failed, failures };
 }
 
