@@ -38988,6 +38988,30 @@ runSerial(async () => {
   }
 });
 
+// POST /admin/agents/terminal-repark — categorical correction lever for the
+// #718 terminal-sweep predicate fix (dev-request
+// 2026-08-25-terminal-sweep-false-positives, Steg 1, Daniel-GO
+// "GO for masseparkering" 2026-08-25). Flips verification_status=
+// terminal_unconfirmable rows back to pending_verify EXCEPT confirmed-dead
+// (terminal_reason brreg_konkurs/brreg_inactive) and confirmed
+// non-producer (terminal_reason non_producer_entity) rows, per-row audit.
+// Own in-memory DB via its own seam (same discipline as the blocks above).
+runSerial(async () => {
+  console.log("\n── admin-agents-terminal-repark: terminal-sweep false-positive correction lever ──");
+  try {
+    const { runAdminAgentsTerminalReparkTests } = require("../src/routes/admin-agents-terminal-repark.test") as
+      typeof import("../src/routes/admin-agents-terminal-repark.test");
+    const tr = await runAdminAgentsTerminalReparkTests({ log: false });
+    passed += tr.passed;
+    failed += tr.failed;
+    for (const f of tr.failures) failures.push("agents-terminal-repark: " + f);
+    console.log(`  agents-terminal-repark: ${tr.passed} passed, ${tr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-terminal-repark: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // GET /admin/agents/duplicate-slugs — READ-ONLY slug-collision detector that
 // feeds the duplicate-merge lever above (which by design never detects
 // duplicates itself). Groups active `agents` rows by slugify(name) in JS
