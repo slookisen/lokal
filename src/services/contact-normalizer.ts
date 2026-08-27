@@ -440,20 +440,64 @@ export function stripLeadingContactLabel(
  *   3. Normalize spacing around commas to a single ", " so segment boundaries
  *      are stable.
  *   4. Strip leading/trailing punctuation and whitespace.
+ *   5. Collapse known formatting/spelling variants (see
+ *      canonicalizeAddressVariants) — a space before a house-number letter
+ *      suffix, and the veien/vegen + gate/gata street-suffix spelling pair.
  *
- * Street names, house numbers and letters are preserved verbatim (only cased
- * down). "Bjørkeveien 20B" → "bjørkeveien 20b".
+ * Street names and house numbers are otherwise preserved verbatim (only
+ * cased down). "Bjørkeveien 20B" → "bjørkeveien 20b".
  */
 export function normalizeAddress(raw: string): string {
   if (typeof raw !== "string") return "";
-  return raw
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    // normalize comma spacing to ", "
-    .replace(/\s*,\s*/g, ", ")
-    // strip surrounding punctuation / whitespace
-    .replace(/^[\s.,;:-]+|[\s.,;:-]+$/g, "")
-    .trim();
+  return canonicalizeAddressVariants(
+    raw
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      // normalize comma spacing to ", "
+      .replace(/\s*,\s*/g, ", ")
+      // strip surrounding punctuation / whitespace
+      .replace(/^[\s.,;:-]+|[\s.,;:-]+$/g, "")
+      .trim()
+  );
+}
+
+// dev-request 2026-08-27-verifier-agree-false-adresse-normalisering: two more
+// KNOWN Norwegian address-formatting variants that were still keying
+// otherwise-identical addresses differently and forcing agree=False:
+//
+//   1. A space between a house number and its single-letter suffix —
+//      "12 A" vs "12A" — both denote the same building; only a whitespace
+//      difference (real evidence: Li Lynghonning, homepage gave both forms
+//      across two enrichment passes, enrichment-reports/2026-08-27.md).
+//   2. The bokmål "-vei(en)" street-type suffix vs the dialectal/nynorsk
+//      "-veg(en)" spelling of the SAME word — "Liagrendveien" vs
+//      "Liagrendvegen" (real evidence: Lien Gård, homepage vs
+//      google_places, same address).
+//
+// Deliberately NOT included: the "-gate(n)"/"-gata" pair. It looks like the
+// same class of variant, but "gata"/"gate" are also ordinary word endings in
+// unrelated street names already covered by this module's own pinned tests
+// ("Storgata" must keep normalizing to "storgata", not "storgaten" — see
+// contact-normalizer.test.ts) and no real occurrence of this specific pair
+// was found in the evidence. Widening the whitelist without real evidence
+// risks exactly the kind of over-eager rewrite this fix must not become —
+// left for a future slice if a real gate/gata false-negative shows up.
+//
+// Both handled rules are whitelist/pattern-anchored and touch ONLY the
+// suffix/spacing — they never rewrite a street-name stem, house number, or
+// postcode, so two genuinely different streets or house numbers can never
+// be made to match (see the NEG cases in contact-normalizer.test.ts).
+// Exported so cross-source-validator.ts's own parseAddressCore() can apply
+// the identical canonicalization to its independently-computed comparison
+// key.
+const STREET_SUFFIX_PATTERN = /(veien|vegen|vei|veg)\b/gu;
+
+export function canonicalizeAddressVariants(text: string): string {
+  return text
+    // "12 a" / "20 b" -> "12a" / "20b" (house-number + single-letter suffix)
+    .replace(/(\d+)\s+([a-zæøå])\b/gu, "$1$2")
+    // "-vegen"/"-veg" -> canonical "-veien"/"-vei"
+    .replace(STREET_SUFFIX_PATTERN, (m) => (m === "veg" ? "vei" : m === "vegen" ? "veien" : m));
 }
 
 // A Norwegian postal-code + city tail, e.g. ", 1940 bjørkelangen" or
