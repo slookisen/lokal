@@ -30992,6 +30992,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gnd.failures) failures.push("opplevelser-gardssalg-nace-discovery: " + f);
     console.log(`  opplevelser-gardssalg-nace-discovery: ${gnd.passed} passed, ${gnd.failed} failed`);
 
+    // dev-request 2026-08-27-nace-til-drikkefunnel-bro, Skive 1: bridges
+    // already-registered drink-NACE agents (agents/agent_knowledge) into
+    // experience_providers — POST /admin/gardssalg-nace-agent-bridge. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-nace-agent-bridge: registrerte agenter inn i drikkefunnelen ──");
+    const { runOpplevelserGardssalgNaceAgentBridgeTests } = require("../src/routes/opplevelser-gardssalg-nace-agent-bridge.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-nace-agent-bridge.test");
+    const nab = await runOpplevelserGardssalgNaceAgentBridgeTests(false);
+    passed += nab.passed;
+    failed += nab.failed;
+    for (const f of nab.failures) failures.push("opplevelser-gardssalg-nace-agent-bridge: " + f);
+    console.log(`  opplevelser-gardssalg-nace-agent-bridge: ${nab.passed} passed, ${nab.failed} failed`);
+
     // dev-request 2026-07-19-brreg-nace-drikkeprodusenter, triage-oppfølging:
     // POST /admin/gardssalg-provider-visibility — the explicit-target
     // catalog_hidden lever for triaging non-visit-relevant discovery rows

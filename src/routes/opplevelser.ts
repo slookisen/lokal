@@ -11933,6 +11933,320 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-nace-agent-bridge (admin) ────────
+//
+// dev-request 2026-08-27-nace-til-drikkefunnel-bro, Skive 1. A drink-NACE
+// agent registered via POST /admin/agents/register (routes/admin-agents.ts)
+// lands ONLY in `agents`/`agent_knowledge` — every gårdssalg/drikkefunnel
+// pipeline (discovery, content-enrichment, outreach) reads exclusively from
+// `experience_providers`, so that agent is invisible to the whole funnel
+// until something bridges it across. This route is that bridge. Explicit
+// non-goal (spec Skive 2, NOT built here): the url-less-candidate intake
+// path — this route only ever touches agents that already exist.
+//
+// NACE→producer_type map: reuses GARDSSALG_NACE_PRODUCER_TYPE (above, this
+// file) verbatim — the SAME already-vetted 11.010/11.020/11.030/11.040/
+// 11.050/01.210 → destilleri/vingård/sideri/mjøderi/bryggeri/vingård map
+// POST /admin/gardssalg-nace-discovery already uses against a live Brreg
+// sweep (see that map's own doc comment for the SSB-Klass semantics and the
+// 01.210 judgement call). This route's input differs — agents already
+// registered locally, not a fresh Brreg page — but the code→producer_type
+// taxonomy must stay the ONE taxonomy, not a second hand-rolled copy.
+//
+// Where the NACE code actually lives on a registered agent (verified by
+// reading admin-agents.ts's own POST /register, not assumed): there is NO
+// dedicated nace_code column on `agents` — the value is folded into the
+// JSON `tags` array as the literal string `nace:<code>` ("if (nace_code)
+// builtTags.push(`nace:${nace_code}`);"). Read the same way here.
+//
+// Where org_nr actually lives (verified empirically — see PR description):
+// `agents` HAS a first-class `org_nr` TEXT column (ALTER TABLE, database/
+// init.ts), populated directly from the register request body at INSERT
+// time (admin-agents.ts) — NOT only the legacy `org_nr:<value>` tag string
+// (a one-time migration already back-filled the column from that tag for
+// any pre-existing rows). The column is therefore authoritative for every
+// agent this route can ever see, and dedup keys off it directly.
+//
+// Contact/address fields live on `agent_knowledge` (address, postal_code,
+// website, phone, email) keyed by agent_id — NOT on `agents` itself, which
+// only carries `city`.
+//
+// Dedup (never two rows for the same org_nr):
+//   1. org_nr present → skip if experience_providers ALREADY has that
+//      org_nr (any row, any source — rfb-seed, nace-discovery, manual, or a
+//      PRIOR run of this same bridge). This is also what makes the sweep
+//      idempotent: a bridged agent's org_nr is present on every later run.
+//   2. org_nr absent  → fall back to name (case-insensitive) + postal-code
+//      match against ALL existing experience_providers rows, for the same
+//      idempotency reason.
+//
+// Fill-only / never-overwrite: a dedup match of EITHER kind is always a
+// SKIP, never a write — like the sibling /admin/rfb-seed and /admin/
+// gardssalg-nace-discovery levers, this route only ever INSERTs a brand-new
+// row (no UPDATE exists in its non-rollback path), so it can never touch a
+// claimed/manually-edited row by construction. isBlocked() (services/
+// blocklist-service.ts — the same check /admin/gardssalg-nace-discovery
+// already runs) is applied per-candidate, on org_nr + website + name,
+// before any insert.
+//
+// catalog_hidden: every row this route creates is born catalog_hidden=1 —
+// excluded from listGardssalgProviders()/countGardssalgProviders()/
+// computeGardssalgReadinessRows() (readiness_tier "skjult") and therefore
+// from GET /admin/gardssalg-outreach-candidates (both modes require
+// readiness_tier === "outreach_ready") — until the ordinary enrichment/
+// verification pipeline clears it via the existing POST /admin/gardssalg-
+// provider-visibility lever, same as every other seed/discovery path.
+//
+// Batch/provenance + rollback: every row from one run carries
+// rfb_seed_source = a per-run "nace-agent-bridge-<timestamp>" tag — the
+// SAME column /admin/gardssalg-nace-discovery already overloads for its own
+// batch tags. Passing {rollbackBatch: "<tag>", apply} deletes exactly that
+// batch; claimed/manual rows survive and are reported separately —
+// byte-for-byte the same rollback contract as that sibling route.
+//
+// Retroactive + re-runnable: with no filter this is a full one-shot sweep
+// over every currently-registered, active, drink-NACE agent; the dedup
+// above makes a second call over the same agents a no-op (0 created, all
+// skipped_duplicate). Deliberately NOT wired synchronously into POST
+// /admin/agents/register itself: that route validates/inserts agents for
+// THREE verticals from dozens of external callers, and adding a cross-DB
+// (rfb → experiences) side-effect to its hot path would widen its blast
+// radius for a benefit (a few hours of latency) this dry-run-by-default,
+// idempotent, independently-schedulable sweep already delivers safely.
+// Intended to be invoked periodically (the same cron cadence as the other
+// enrichment sweeps) — NOT a relaxation of /register's own validation
+// (spec non-goal); this route only ever READS agents/agent_knowledge and
+// WRITES experience_providers.
+//
+// Dry-run default: identical `apply` truthy-check convention as every
+// sibling admin lever in this file.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+const NACE_AGENT_BRIDGE_TAG_PREFIX = "nace-agent-bridge-";
+
+router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; rollbackBatch?: unknown };
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true" ||
+    req.query?.apply === "1" || req.query?.apply === "true";
+  const dryRun = !apply;
+
+  // ── Batch rollback mode — same contract as gardssalg-nace-discovery's ────
+  if (typeof body.rollbackBatch === "string" && body.rollbackBatch.trim()) {
+    const tag = body.rollbackBatch.trim();
+    if (!tag.startsWith(NACE_AGENT_BRIDGE_TAG_PREFIX)) {
+      res.status(400).json({
+        error: `Refusing: rollbackBatch must be a "${NACE_AGENT_BRIDGE_TAG_PREFIX}*" batch tag produced by this route`,
+      });
+      return;
+    }
+    const expDb = getExpDb("experiences");
+    const tagged = expDb
+      .prepare(`SELECT id, navn, org_nr, content_source FROM experience_providers WHERE rfb_seed_source = ?`)
+      .all(tag) as Array<{ id: string; navn: string; org_nr: string | null; content_source: string | null }>;
+    // A provider claimed/manually curated AFTER the bridge must survive the
+    // batch undo — deleting it would destroy producer-entered content.
+    const skippedLocked = tagged.filter((r) => r.content_source === "manual" || r.content_source === "claim");
+    const rows = tagged.filter((r) => r.content_source !== "manual" && r.content_source !== "claim");
+    if (dryRun) {
+      res.json({ success: true, dry_run: true, batch_tag: tag, would_delete: rows.length, rows, skipped_locked: skippedLocked });
+      return;
+    }
+    const del = expDb
+      .prepare(
+        `DELETE FROM experience_providers
+          WHERE rfb_seed_source = ?
+            AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`
+      )
+      .run(tag);
+    res.json({ success: true, dry_run: false, batch_tag: tag, deleted: del.changes, rows, skipped_locked: skippedLocked });
+    return;
+  }
+
+  // ── Bridge (sweep) mode ──────────────────────────────────────────────────
+  const rfbDb = getRfbDb();
+  const expDb = getExpDb("experiences");
+
+  type NaceBridgeAgentRow = {
+    id: string;
+    name: string;
+    url: string | null;
+    city: string | null;
+    tags: string | null;
+    org_nr: string | null;
+    brreg_verified: number | null;
+  };
+  type NaceBridgeKnowledgeRow = {
+    address: string | null;
+    postal_code: string | null;
+    website: string | null;
+    phone: string | null;
+    email: string | null;
+  };
+
+  const naceCodes = Object.keys(GARDSSALG_NACE_PRODUCER_TYPE);
+  // Tags are a JSON array stored as TEXT — '"<tag>"' always appears verbatim
+  // (same convention /admin/rfb-seed's own tag matching above relies on).
+  const tagClauses = naceCodes.map(() => "tags LIKE ?").join(" OR ");
+  const tagParams = naceCodes.map((c) => `%"nace:${c}"%`);
+
+  let agents: NaceBridgeAgentRow[] = [];
+  try {
+    agents = rfbDb
+      .prepare(
+        `SELECT id, name, url, city, tags, org_nr, brreg_verified
+           FROM agents
+          WHERE is_active = 1 AND (${tagClauses})`
+      )
+      .all(...tagParams) as NaceBridgeAgentRow[];
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to query agents table", detail: err?.message ?? String(err) });
+    return;
+  }
+
+  // Date+time stamped, same as gardssalg-nace-discovery's batchTag — a
+  // date-only tag would collide across two same-day runs and rollbackBatch
+  // would then undo both at once.
+  const batchTag = `${NACE_AGENT_BRIDGE_TAG_PREFIX}${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  const knownOrgnr = new Set(
+    (expDb.prepare(`SELECT org_nr FROM experience_providers WHERE org_nr IS NOT NULL AND TRIM(org_nr) != ''`).all() as Array<{ org_nr: string }>)
+      .map((r) => r.org_nr.trim())
+  );
+  // Name+postal-code fallback dedup basis for org_nr-less agents. Updated as
+  // this very run creates rows (below) so two org_nr-less agents sharing a
+  // name+postal code within the SAME sweep don't both get created.
+  const nameAndPostalIndex = new Set(
+    (expDb.prepare(`SELECT navn, postnummer FROM experience_providers`).all() as Array<{ navn: string; postnummer: string | null }>)
+      .map((r) => `${r.navn.trim().toLowerCase()}|${(r.postnummer ?? "").trim()}`)
+  );
+  const isValidEmailForBridge = (v: string | null | undefined): v is string =>
+    typeof v === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+
+  const created: Array<{ agent_id: string; provider_id?: string; navn: string; org_nr: string | null; nace_code: string; producer_type: string }> = [];
+  const skippedDuplicate: Array<{ agent_id: string; navn: string; reason: string }> = [];
+  const skippedBlocklisted: Array<{ agent_id: string; navn: string; matched_by?: string; matched_value?: string }> = [];
+  const skippedNoMap: Array<{ agent_id: string; navn: string }> = [];
+  const errors: Array<{ agent_id: string; error: string }> = [];
+
+  for (const agent of agents) {
+    // The WHERE clause above is a LIKE prefilter — pin down the exact
+    // matched code (registration only ever writes one nace: tag per agent,
+    // but this is robust either way).
+    let tags: unknown[] = [];
+    try {
+      const parsed = JSON.parse(agent.tags || "[]");
+      if (Array.isArray(parsed)) tags = parsed;
+    } catch {
+      /* malformed tags — treated as no tags */
+    }
+    const naceTag = tags.find(
+      (t): t is string => typeof t === "string" && t.startsWith("nace:") && !!GARDSSALG_NACE_PRODUCER_TYPE[t.slice(5)]
+    );
+    if (!naceTag) {
+      skippedNoMap.push({ agent_id: agent.id, navn: agent.name });
+      continue;
+    }
+    const naceCode = naceTag.slice(5);
+    const producerType = GARDSSALG_NACE_PRODUCER_TYPE[naceCode];
+
+    let knowledge: NaceBridgeKnowledgeRow | undefined;
+    try {
+      knowledge = rfbDb
+        .prepare(`SELECT address, postal_code, website, phone, email FROM agent_knowledge WHERE agent_id = ?`)
+        .get(agent.id) as NaceBridgeKnowledgeRow | undefined;
+    } catch {
+      /* agent_knowledge row is optional */
+    }
+
+    // ── Dedup ────────────────────────────────────────────────────────────
+    const orgNr = agent.org_nr && agent.org_nr.trim() ? agent.org_nr.trim() : null;
+    const postal = (knowledge?.postal_code ?? "").trim();
+    const namePostalKey = `${agent.name.trim().toLowerCase()}|${postal}`;
+    if (orgNr) {
+      if (knownOrgnr.has(orgNr)) {
+        skippedDuplicate.push({ agent_id: agent.id, navn: agent.name, reason: "org_nr_exists" });
+        continue;
+      }
+    } else if (nameAndPostalIndex.has(namePostalKey)) {
+      skippedDuplicate.push({ agent_id: agent.id, navn: agent.name, reason: "name_postal_exists" });
+      continue;
+    }
+
+    // ── Blocklist ────────────────────────────────────────────────────────
+    const website = knowledge?.website || agent.url || undefined;
+    const blockCheck = isBlocked({ orgNr: orgNr ?? undefined, website, name: agent.name });
+    if (blockCheck.blocked) {
+      skippedBlocklisted.push({
+        agent_id: agent.id,
+        navn: agent.name,
+        matched_by: blockCheck.matchedBy,
+        matched_value: blockCheck.matchedValue,
+      });
+      continue;
+    }
+
+    if (dryRun) {
+      created.push({ agent_id: agent.id, navn: agent.name, org_nr: orgNr, nace_code: naceCode, producer_type: producerType });
+      if (orgNr) knownOrgnr.add(orgNr);
+      else nameAndPostalIndex.add(namePostalKey);
+      continue;
+    }
+
+    try {
+      const city = agent.city ?? null;
+      const providerId = createProvider({
+        org_nr: orgNr ?? undefined,
+        navn: agent.name,
+        adresse: knowledge?.address ?? undefined,
+        postnummer: knowledge?.postal_code ?? undefined,
+        poststed: city ?? undefined,
+        kommune: city ?? undefined,
+        fylke: cityToFylke(city) ?? undefined,
+        hjemmeside: website ?? undefined,
+        telefon: knowledge?.phone ?? undefined,
+        epost: isValidEmailForBridge(knowledge?.email) ? knowledge!.email : undefined,
+        naeringskode: naceCode,
+        brreg_verified: agent.brreg_verified ? 1 : 0,
+        source: "nace-agent-bridge",
+        confidence: "medium",
+      } as any);
+      // producer_type (the gårdssalg drink-taxonomy column — DISTINCT from
+      // createProvider()'s own generic `provider_type` column, which this
+      // route never touches) + rfb_seed_source (batch/provenance marker) +
+      // catalog_hidden are not among createProvider()'s own INSERT columns —
+      // stamped via the same follow-up UPDATE gardssalg-nace-discovery's own
+      // apply path uses.
+      expDb
+        .prepare(
+          `UPDATE experience_providers
+              SET producer_type = @pt, rfb_seed_source = @tag, catalog_hidden = 1
+            WHERE id = @id`
+        )
+        .run({ pt: producerType, tag: batchTag, id: providerId });
+      created.push({ agent_id: agent.id, provider_id: providerId, navn: agent.name, org_nr: orgNr, nace_code: naceCode, producer_type: producerType });
+      if (orgNr) knownOrgnr.add(orgNr);
+      else nameAndPostalIndex.add(namePostalKey);
+    } catch (err: any) {
+      errors.push({ agent_id: agent.id, error: err?.message ?? String(err) });
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    batch_tag: batchTag,
+    scanned: agents.length,
+    created_count: created.length,
+    skipped_duplicate_count: skippedDuplicate.length,
+    skipped_blocklisted_count: skippedBlocklisted.length,
+    created,
+    skipped_duplicate: skippedDuplicate,
+    skipped_blocklisted: skippedBlocklisted,
+    skipped_no_nace_map: skippedNoMap,
+    errors,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg/test-provider ─────────────────────
 //
 // dev-request 2026-07-14-booking-flyt-v1, slice 0: idempotent upsert of ONE
