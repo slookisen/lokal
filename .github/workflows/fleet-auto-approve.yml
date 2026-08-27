@@ -109,7 +109,41 @@ jobs:
             //      flag: PR body/labels now, the review-verdict doc once fetched in
             //      step 4 below (search for needsDanielRe again there).
             const needsDanielRe = /needs[_-]?daniel/i;
-            if (needsDanielRe.test(pr.body || '')) {
+            // Prose mentions of "needs_daniel" (PR body, review doc below) need
+            // negation-awareness — a bare substring test trips exactly as hard on a
+            // NEGATED mention ("not a protected path, no needs_daniel flag required")
+            // as on a real escalation. Recurred 3x (2026-08-24/26/27,
+            // dev-requests/2026-08-27-fleet-auto-approve-needs-daniel-substring-bug.md)
+            // — same defect class §4 below already fixed for VERDICT:-anchoring
+            // (lokal#171/#208), never applied here. Labels are exact short tags, not
+            // prose, so the label check below is intentionally left on the plain
+            // substring test — hasGenuineNeedsDanielFlag is for free-form text only.
+            //
+            // For every occurrence of the term, look back to the nearest
+            // sentence/clause boundary (., !, ?, newline, or comma) and require that
+            // no negation word (no/not/never/without/ingen/uten/aldri/ikke) appears
+            // in that same clause. A single un-negated occurrence anywhere in the
+            // text still trips the flag — fail closed toward escalation, same
+            // direction as before — this only silences occurrences that are
+            // themselves explicitly negated; it never requires reviewers to adopt a
+            // new required syntax they don't already use.
+            const NEEDS_DANIEL_NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
+            function hasGenuineNeedsDanielFlag(text) {
+              if (!text) return false;
+              const re = /needs[_-]?daniel/gi;
+              let m;
+              while ((m = re.exec(text))) {
+                const windowStart = Math.max(0, m.index - 80);
+                const preceding = text.slice(windowStart, m.index);
+                const boundaryMatch = preceding.match(/[.!?,\n][^.!?,\n]*$/);
+                const clause = boundaryMatch ? boundaryMatch[0] : preceding;
+                if (!NEEDS_DANIEL_NEGATION_RE.test(clause)) {
+                  return true;
+                }
+              }
+              return false;
+            }
+            if (hasGenuineNeedsDanielFlag(pr.body || '')) {
               await note('PR body carries a needs_daniel flag. Needs Daniel, no auto-approve.');
               core.info('needs_daniel in PR body — no-op');
               return;
@@ -318,7 +352,7 @@ jobs:
             // same hard stop as step 1.5 above): the review-verdict doc itself —
             // this is exactly where #455's reviewer wrote "(needs_daniel,
             // protected-path)" and the old gate never read it.
-            if (needsDanielRe.test(docText)) {
+            if (hasGenuineNeedsDanielFlag(docText)) {
               await note(`review doc "${rawRef}" carries a needs_daniel flag. Needs Daniel, no auto-approve.`);
               core.info('needs_daniel in review doc — no-op');
               return;
