@@ -120,7 +120,12 @@ jobs:
             // substring test — hasGenuineNeedsDanielFlag is for free-form text only.
             //
             // For every occurrence of the term, look back to the nearest
-            // sentence/clause boundary (., !, ?, newline, or comma) and require that
+            // sentence/clause boundary (., !, ?, newline, comma, colon, semicolon, or
+            // em/en-dash —/– — this repo's own house style joins clauses with an
+            // em-dash constantly, e.g. "Not fully protected on its own — but this
+            // needs_daniel because...", so omitting it would let an unrelated
+            // negation earlier in the sentence wrongly suppress a genuine escalation)
+            // and require that
             // no negation word (no/not/never/without/ingen/uten/aldri/ikke) appears
             // in that same clause. A single un-negated occurrence anywhere in the
             // text still trips the flag — fail closed toward escalation, same
@@ -135,7 +140,7 @@ jobs:
               while ((m = re.exec(text))) {
                 const windowStart = Math.max(0, m.index - 80);
                 const preceding = text.slice(windowStart, m.index);
-                const boundaryMatch = preceding.match(/[.!?,\n][^.!?,\n]*$/);
+                const boundaryMatch = preceding.match(/[.!?,;:—–\n][^.!?,;:—–\n]*$/);
                 const clause = boundaryMatch ? boundaryMatch[0] : preceding;
                 if (!NEEDS_DANIEL_NEGATION_RE.test(clause)) {
                   return true;
