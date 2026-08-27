@@ -494,8 +494,15 @@ const STREET_SUFFIX_PATTERN = /(veien|vegen|vei|veg)\b/gu;
 
 export function canonicalizeAddressVariants(text: string): string {
   return text
-    // "12 a" / "20 b" -> "12a" / "20b" (house-number + single-letter suffix)
-    .replace(/(\d+)\s+([a-zæøå])\b/gu, "$1$2")
+    // "12 a" / "20 b" -> "12a" / "20b" (house-number + single-letter suffix).
+    // Anchored to (comma | end-of-string) right after the letter — NOT a bare
+    // \b — so this can only fire on an actual trailing suffix position, never
+    // on a digit run followed by an unrelated one-letter word elsewhere in
+    // the address ("...12 i Tromsø", "...4 å Bakken"): \b alone treats any
+    // single letter as a boundary, matching those too and silently gluing
+    // them onto the number (found in independent review of this PR — PoC:
+    // "Nordgata 12 i Tromsø" vs "Nordgata 12i Tromsø" wrongly agreed).
+    .replace(/(\d+)\s+([a-zæøå])(?=,|$)/gu, "$1$2")
     // "-vegen"/"-veg" -> canonical "-veien"/"-vei"
     .replace(STREET_SUFFIX_PATTERN, (m) => (m === "veg" ? "vei" : m === "vegen" ? "veien" : m));
 }
