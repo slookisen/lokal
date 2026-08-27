@@ -119,20 +119,55 @@ jobs:
             // prose, so the label check below is intentionally left on the plain
             // substring test — hasGenuineNeedsDanielFlag is for free-form text only.
             //
-            // For every occurrence of the term, look back to the nearest
-            // sentence/clause boundary (., !, ?, newline, comma, colon, semicolon, or
-            // em/en-dash —/– — this repo's own house style joins clauses with an
-            // em-dash constantly, e.g. "Not fully protected on its own — but this
-            // needs_daniel because...", so omitting it would let an unrelated
-            // negation earlier in the sentence wrongly suppress a genuine escalation)
-            // and require that
-            // no negation word (no/not/never/without/ingen/uten/aldri/ikke) appears
-            // in that same clause. A single un-negated occurrence anywhere in the
+            // For every occurrence of the term, find the nearest clause boundary
+            // BEFORE it and require that no negation word
+            // (no/not/never/without/ingen/uten/aldri/ikke) appears between that
+            // boundary and the term. A single un-negated occurrence anywhere in the
             // text still trips the flag — fail closed toward escalation, same
             // direction as before — this only silences occurrences that are
             // themselves explicitly negated; it never requires reviewers to adopt a
             // new required syntax they don't already use.
+            //
+            // Two independent review rounds widened the boundary definition beyond
+            // a naive ./!/?/newline/comma set:
+            //  - punctuation/dash tokens, including the literal ASCII "--" (a far
+            //    more common em-dash substitute in raw plain-text/markdown than the
+            //    real — character) alongside —/–/./!/ ?/,/;/: and an open paren "("
+            //    (a parenthetical aside is its own clause);
+            //  - conjunction WORDS that signal a clause transition even with NO
+            //    punctuation before them at all (but/however/although/though/yet,
+            //    plus Norwegian men/likevel) — added after round-2 review found
+            //    "Not a protected path but needs_daniel given the scope" (zero
+            //    punctuation before "but") still let the earlier "Not" leak across
+            //    into a genuine escalation clause.
+            // Known residual gap (documented, not solved): two clauses fused with
+            // NEITHER punctuation NOR one of these conjunction words (a true
+            // run-on) can still leak a negation across. Judged an acceptable
+            // residual for a dependency-free textual heuristic running inline in a
+            // github-script step with no checkout — a fully general fix needs real
+            // sentence parsing. This does not weaken the fail-closed direction for
+            // any of the historical incidents or the recurring bug this check
+            // exists to catch; it narrows an already-narrow theoretical edge case.
             const NEEDS_DANIEL_NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
+            const NEEDS_DANIEL_CONJUNCTION_RE = /\b(but|however|although|though|yet|men|likevel)\b/gi;
+            const NEEDS_DANIEL_PUNCT_TOKENS = ['--', '—', '–', '\n', '.', '!', '?', ',', ';', ':', '('];
+            function needsDanielClauseStart(preceding) {
+              let best = 0;
+              for (const t of NEEDS_DANIEL_PUNCT_TOKENS) {
+                const idx = preceding.lastIndexOf(t);
+                if (idx !== -1) {
+                  const end = idx + t.length;
+                  if (end > best) best = end;
+                }
+              }
+              NEEDS_DANIEL_CONJUNCTION_RE.lastIndex = 0;
+              let cm;
+              while ((cm = NEEDS_DANIEL_CONJUNCTION_RE.exec(preceding))) {
+                const end = cm.index + cm[0].length;
+                if (end > best) best = end;
+              }
+              return best;
+            }
             function hasGenuineNeedsDanielFlag(text) {
               if (!text) return false;
               const re = /needs[_-]?daniel/gi;
@@ -140,8 +175,7 @@ jobs:
               while ((m = re.exec(text))) {
                 const windowStart = Math.max(0, m.index - 80);
                 const preceding = text.slice(windowStart, m.index);
-                const boundaryMatch = preceding.match(/[.!?,;:—–\n][^.!?,;:—–\n]*$/);
-                const clause = boundaryMatch ? boundaryMatch[0] : preceding;
+                const clause = preceding.slice(needsDanielClauseStart(preceding));
                 if (!NEEDS_DANIEL_NEGATION_RE.test(clause)) {
                   return true;
                 }
