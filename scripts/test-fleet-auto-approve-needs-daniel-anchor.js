@@ -29,17 +29,10 @@
  * protected path, no needs_daniel flag required") as on a real escalation,
  * and recurred 3x (2026-08-24/26/27) costing an extra review round each time.
  *
- * Fix: for every occurrence of the term, look back to the nearest
- * sentence/clause boundary (., !, ?, newline, comma, colon, semicolon, or
- * em/en-dash —/–) and require that no negation word
- * (no/not/never/without/ingen/uten/aldri/ikke) appears in that same clause.
- * The em/en-dash and colon/semicolon boundaries were added after an
- * independent review of this fix found the first cut (period/!/?/newline/
- * comma only) missed this repo's own house style of joining clauses with an
- * em-dash — "Not fully protected on its own — but this needs_daniel
- * because..." — which let an unrelated earlier negation wrongly suppress a
- * genuine escalation (cases 12-15 below). A single un-negated occurrence
- * anywhere in the text still
+ * Fix: for every occurrence of the term, find the nearest clause boundary
+ * BEFORE it and require that no negation word
+ * (no/not/never/without/ingen/uten/aldri/ikke) appears between that boundary
+ * and the term. A single un-negated occurrence anywhere in the text still
  * trips the flag — fail closed toward escalation, same direction as the
  * original check — this only silences occurrences that are themselves
  * explicitly negated. It never requires reviewers to adopt a new required
@@ -49,6 +42,27 @@
  * `needs_daniel`") keep working unchanged; see cases 5-9 below, drawn from
  * actual supervisor-inbox/ docs.
  *
+ * Two independent review rounds widened the boundary definition:
+ *  - Round 1 found the first cut (./!/?/newline/comma only) missed this
+ *    repo's own house style of joining clauses with an em-dash — "Not fully
+ *    protected on its own — but this needs_daniel because..." — added
+ *    colon/semicolon/em-dash/en-dash (cases 12-15).
+ *  - Round 2 found the widened version still missed the literal ASCII "--"
+ *    (a far more common em-dash substitute in raw plain-text/markdown than
+ *    the real — character), an open paren "(" (a parenthetical aside is its
+ *    own clause), and — the structurally different gap — clause transitions
+ *    with NO punctuation before them at all, signalled only by a conjunction
+ *    word (but/however/although/though/yet, plus Norwegian men/likevel).
+ *    Added all of these (cases 17-20), plus negative controls proving a
+ *    negation that IS in the same post-conjunction/paren clause still
+ *    correctly suppresses (cases 21-23).
+ *
+ * Known residual gap (documented, not solved): two clauses fused with
+ * NEITHER punctuation NOR one of the conjunction words above (a true
+ * run-on) can still leak a negation across. Judged an acceptable residual
+ * for a dependency-free textual heuristic running inline in a github-script
+ * step with no checkout — a fully general fix needs real sentence parsing.
+ *
  * PR labels are exact short tags, not prose, so the workflow's label check
  * is intentionally left on the original plain substring test — this
  * function is for free-form text only (PR body + review doc).
@@ -56,13 +70,31 @@
 function hasGenuineNeedsDanielFlag(text) {
   if (!text) return false;
   const NEGATION_RE = /\b(no|not|never|without|ingen|uten|aldri|ikke)\b/i;
+  const CONJUNCTION_RE = /\b(but|however|although|though|yet|men|likevel)\b/gi;
+  const PUNCT_TOKENS = ['--', '—', '–', '\n', '.', '!', '?', ',', ';', ':', '('];
+  function clauseStart(preceding) {
+    let best = 0;
+    for (const t of PUNCT_TOKENS) {
+      const idx = preceding.lastIndexOf(t);
+      if (idx !== -1) {
+        const end = idx + t.length;
+        if (end > best) best = end;
+      }
+    }
+    CONJUNCTION_RE.lastIndex = 0;
+    let cm;
+    while ((cm = CONJUNCTION_RE.exec(preceding))) {
+      const end = cm.index + cm[0].length;
+      if (end > best) best = end;
+    }
+    return best;
+  }
   const re = /needs[_-]?daniel/gi;
   let m;
   while ((m = re.exec(text))) {
     const windowStart = Math.max(0, m.index - 80);
     const preceding = text.slice(windowStart, m.index);
-    const boundaryMatch = preceding.match(/[.!?,;:—–\n][^.!?,;:—–\n]*$/);
-    const clause = boundaryMatch ? boundaryMatch[0] : preceding;
+    const clause = preceding.slice(clauseStart(preceding));
     if (!NEGATION_RE.test(clause)) {
       return true;
     }
@@ -183,42 +215,79 @@ check(
   true
 );
 
-// 12-15: adversarial cases found by independent review of the first cut of
-// this fix (which only recognized ./!/?/newline/comma as clause boundaries).
-// Each is a genuine escalation using an em-dash/colon/semicolon to join
-// clauses, with an unrelated negation word earlier in the SAME sentence —
-// exactly the "not fully X — but genuinely needs_daniel Y" rhetorical shape
-// this bug's own scenario invites reviewers to write. Under the pre-fix
-// boundary set these would have been WRONGLY suppressed (a real regression:
-// a genuine escalation silently passing auto-merge).
+// 12-15: round-1 adversarial cases. Each is a genuine escalation using an
+// em-dash/colon/semicolon to join clauses, with an unrelated negation word
+// earlier in the SAME sentence — the "not fully X — but genuinely
+// needs_daniel Y" rhetorical shape this bug's own scenario invites.
 check(
-  'case12 (adversarial, em-dash): "Not a protected path on its own — but this needs_daniel..." -> flagged',
+  'case12 (round1 adversarial, em-dash): "Not a protected path on its own — but this needs_daniel..." -> flagged',
   'Not a protected path on its own — but this needs_daniel because it also touches ADMIN_KEY rotation elsewhere.',
   true
 );
 check(
-  'case13 (adversarial, em-dash): "No single file here is protected — however ... needs_daniel..." -> flagged',
+  'case13 (round1 adversarial, em-dash): "No single file here is protected — however ... needs_daniel..." -> flagged',
   'No single file here is protected — however the combined diff needs_daniel review given the auth surface touched.',
   true
 );
 check(
-  'case14 (adversarial, em-dash + colon): "not merely cosmetic — needs_daniel: it rewrites..." -> flagged',
+  'case14 (round1 adversarial, em-dash + colon): "not merely cosmetic — needs_daniel: it rewrites..." -> flagged',
   'This is not merely cosmetic — needs_daniel: it rewrites the session cookie signing key derivation.',
   true
 );
 check(
-  'case15 (adversarial, semicolon): "Not blocking on its own; still needs_daniel..." -> flagged',
+  'case15 (round1 adversarial, semicolon): "Not blocking on its own; still needs_daniel..." -> flagged',
   'Not blocking on its own; still needs_daniel given the session-cookie change nearby.',
   true
 );
 
-// 16. Negative control for cases 12-15: a negation word that IS in the same
-// em-dash-joined clause as the term must still correctly suppress it (the
-// widened boundary set must not become "never suppress across a dash" —
-// only "don't let an EARLIER, unrelated clause's negation leak across").
+// 16. Negative control for cases 12-15: a negation word IN the same
+// em-dash-joined clause as the term must still correctly suppress it.
 check(
   'case16 (negative control): negation within the SAME em-dash clause -> not flagged',
   'This touches session cookies — but no `needs_daniel` flag is actually required here.',
+  false
+);
+
+// 17-20: round-2 adversarial cases (found against the round-1 fix).
+check(
+  'case17 (round2 adversarial, literal "--"): "...on its own -- but this needs_daniel..." -> flagged',
+  'Not fully protected on its own -- but this needs_daniel because of the admin-key rotation.',
+  true
+);
+check(
+  'case18 (round2 adversarial, "but" with ZERO punctuation before it): flagged',
+  'Not a protected path but needs_daniel given the scope',
+  true
+);
+check(
+  'case19 (round2 adversarial, "however" with ZERO punctuation before it): flagged',
+  'No protected path here however needs_daniel per the size of the diff',
+  true
+);
+check(
+  'case20 (round2 adversarial, open paren as a clause boundary): flagged',
+  'No issue with naming here (needs_daniel though, given the admin-key touch)',
+  true
+);
+
+// 21-23: negative controls for cases 17-20 — a negation word that IS in the
+// same conjunction/paren-opened clause as the term must still suppress it
+// (widening the boundary set must never become "never suppress after but/
+// however/(" — only "don't let an EARLIER, unrelated clause's negation
+// leak across").
+check(
+  'case21 (negative control, but+not in same clause): not flagged',
+  'This looks concerning but not actually needs_daniel here',
+  false
+);
+check(
+  'case22 (negative control, paren+not in same clause): not flagged',
+  'No issue with naming here (not needs_daniel, just a style nit)',
+  false
+);
+check(
+  'case23 (negative control, however+not in same clause): not flagged',
+  'Style nit only, however not needs_daniel in the strict sense',
   false
 );
 
