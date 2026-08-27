@@ -30,9 +30,16 @@
  * and recurred 3x (2026-08-24/26/27) costing an extra review round each time.
  *
  * Fix: for every occurrence of the term, look back to the nearest
- * sentence/clause boundary (., !, ?, newline, or comma) and require that no
- * negation word (no/not/never/without/ingen/uten/aldri/ikke) appears in that
- * same clause. A single un-negated occurrence anywhere in the text still
+ * sentence/clause boundary (., !, ?, newline, comma, colon, semicolon, or
+ * em/en-dash —/–) and require that no negation word
+ * (no/not/never/without/ingen/uten/aldri/ikke) appears in that same clause.
+ * The em/en-dash and colon/semicolon boundaries were added after an
+ * independent review of this fix found the first cut (period/!/?/newline/
+ * comma only) missed this repo's own house style of joining clauses with an
+ * em-dash — "Not fully protected on its own — but this needs_daniel
+ * because..." — which let an unrelated earlier negation wrongly suppress a
+ * genuine escalation (cases 12-15 below). A single un-negated occurrence
+ * anywhere in the text still
  * trips the flag — fail closed toward escalation, same direction as the
  * original check — this only silences occurrences that are themselves
  * explicitly negated. It never requires reviewers to adopt a new required
@@ -54,7 +61,7 @@ function hasGenuineNeedsDanielFlag(text) {
   while ((m = re.exec(text))) {
     const windowStart = Math.max(0, m.index - 80);
     const preceding = text.slice(windowStart, m.index);
-    const boundaryMatch = preceding.match(/[.!?,\n][^.!?,\n]*$/);
+    const boundaryMatch = preceding.match(/[.!?,;:—–\n][^.!?,;:—–\n]*$/);
     const clause = boundaryMatch ? boundaryMatch[0] : preceding;
     if (!NEGATION_RE.test(clause)) {
       return true;
@@ -174,6 +181,45 @@ check(
   'case11: one negated + one genuine mention in the same doc -> flagged',
   'Earlier draft said no needs_daniel flag required, but on reflection this needs_daniel review.',
   true
+);
+
+// 12-15: adversarial cases found by independent review of the first cut of
+// this fix (which only recognized ./!/?/newline/comma as clause boundaries).
+// Each is a genuine escalation using an em-dash/colon/semicolon to join
+// clauses, with an unrelated negation word earlier in the SAME sentence —
+// exactly the "not fully X — but genuinely needs_daniel Y" rhetorical shape
+// this bug's own scenario invites reviewers to write. Under the pre-fix
+// boundary set these would have been WRONGLY suppressed (a real regression:
+// a genuine escalation silently passing auto-merge).
+check(
+  'case12 (adversarial, em-dash): "Not a protected path on its own — but this needs_daniel..." -> flagged',
+  'Not a protected path on its own — but this needs_daniel because it also touches ADMIN_KEY rotation elsewhere.',
+  true
+);
+check(
+  'case13 (adversarial, em-dash): "No single file here is protected — however ... needs_daniel..." -> flagged',
+  'No single file here is protected — however the combined diff needs_daniel review given the auth surface touched.',
+  true
+);
+check(
+  'case14 (adversarial, em-dash + colon): "not merely cosmetic — needs_daniel: it rewrites..." -> flagged',
+  'This is not merely cosmetic — needs_daniel: it rewrites the session cookie signing key derivation.',
+  true
+);
+check(
+  'case15 (adversarial, semicolon): "Not blocking on its own; still needs_daniel..." -> flagged',
+  'Not blocking on its own; still needs_daniel given the session-cookie change nearby.',
+  true
+);
+
+// 16. Negative control for cases 12-15: a negation word that IS in the same
+// em-dash-joined clause as the term must still correctly suppress it (the
+// widened boundary set must not become "never suppress across a dash" —
+// only "don't let an EARLIER, unrelated clause's negation leak across").
+check(
+  'case16 (negative control): negation within the SAME em-dash clause -> not flagged',
+  'This touches session cookies — but no `needs_daniel` flag is actually required here.',
+  false
 );
 
 // ── Summary ─────────────────────────────────────────────────────────────
