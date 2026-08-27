@@ -17,6 +17,7 @@
 import {
   addressesMatch as contactAddressesMatch,
   phonesMatch as contactPhonesMatch,
+  canonicalizeAddressVariants,
 } from "./contact-normalizer";
 
 export type FieldName = "address" | "phone" | "business_status";
@@ -160,11 +161,13 @@ function normalizeAddress(raw: string): string {
 export function parseAddressCore(raw: string): { core: string; postcode: string | null } {
   const lower = (raw || "").toLowerCase().trim();
   const firstSeg = lower.split(",")[0] ?? lower;
-  const core = firstSeg
-    .replace(/[^\p{L}\p{N}\s/.-]/gu, " ")
-    .replace(/\s+/g, " ")
-    .replace(/^[\s.,-]+|[\s.,-]+$/g, "")
-    .trim();
+  const core = canonicalizeAddressVariants(
+    firstSeg
+      .replace(/[^\p{L}\p{N}\s/.-]/gu, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^[\s.,-]+|[\s.,-]+$/g, "")
+      .trim()
+  );
   const pcMatch = lower.match(/(?<!\d)(\d{4})(?!\d)/);
   return { core, postcode: pcMatch ? pcMatch[1] : null };
 }

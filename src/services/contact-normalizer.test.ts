@@ -113,6 +113,35 @@ export function runContactNormalizerTests(opts: { log?: boolean } = {}): TestSum
     assertEq(normalizeAddress("Storgata 1."), "storgata 1", "normalizeAddress strips trailing punctuation");
   }
 
+  // ── normalizeAddress: dev-request 2026-08-27-verifier-agree-false-adresse-
+  //    normalisering (house-number-letter spacing + veien/vegen spelling) ──────
+  {
+    assertEq(normalizeAddress("Austreimslia 12 a"), "austreimslia 12a", "normalizeAddress collapses space before house-letter suffix");
+    assertEq(normalizeAddress("Austreimslia 12a"), "austreimslia 12a", "normalizeAddress leaves glued house-letter suffix unchanged");
+    assertEq(normalizeAddress("Liagrendveien 262"), "liagrendveien 262", "normalizeAddress leaves bokmål -veien unchanged");
+    assertEq(normalizeAddress("Liagrendvegen 262"), "liagrendveien 262", "normalizeAddress canonicalizes -vegen to -veien");
+    assertEq(normalizeAddress("Kirkeveg 3"), "kirkevei 3", "normalizeAddress canonicalizes bare -veg to -vei");
+    // Regression guard: gate/gata is deliberately NOT touched (see
+    // canonicalizeAddressVariants' comment) — must not regress this existing pin.
+    assertEq(normalizeAddress("Storgata  1 ,  0150  Oslo"), "storgata 1, 0150 oslo", "normalizeAddress does not touch -gata (unevidenced, out of scope)");
+    // Regression guard (independent review finding on this PR): the house-
+    // letter collapse must NOT fire on a digit run followed by an unrelated
+    // one-letter Norwegian word ("i" = in, "å" = to) elsewhere in the
+    // address — only on an actual trailing house-letter suffix (right
+    // before a comma or end-of-string). PoC that must NOT collapse:
+    assertEq(normalizeAddress("Nordgata 12 i Tromsø"), "nordgata 12 i tromsø", "normalizeAddress NEG: '12 i <city>' is not a house-letter suffix, must not glue");
+    assertEq(normalizeAddress("Kirkeveien 8 i Bergen, 5003 Bergen"), "kirkeveien 8 i bergen, 5003 bergen", "normalizeAddress NEG: mid-string 'i' before more text must not glue");
+    // But a genuine trailing letter right before the postal tail still collapses:
+    assertEq(normalizeAddress("Bakken 4 å"), "bakken 4å", "normalizeAddress: trailing æøå house-letter still collapses at end-of-string");
+    // Regression guard (round-2 independent review finding): a 4-digit run
+    // is always a postnummer, never a house number — must NOT be glued to a
+    // following single-letter town name ("Å" is a real Norwegian village,
+    // Moskenes/Lofoten and others). Un-scoped, this broke splitAddress()'s
+    // existing postal-tail stripping for exactly this real place name.
+    assertEq(normalizeAddress("Strandveien 12, 8392 Å"), "strandveien 12, 8392 å", "normalizeAddress NEG: 4-digit postcode + single-letter town must not glue");
+    assertTrue(addressesMatch("Strandveien 12, 8392 Å", "Strandveien 12"), "addressesMatch: postal-tail with single-letter town name still strips correctly (regression guard)");
+  }
+
   // ── splitAddress: postal tail extraction ─────────────────────────────────────
   {
     assertEq(splitAddress("bjørkeveien 20b, 1940 bjørkelangen"), { street: "bjørkeveien 20b", postcode: "1940" }, "splitAddress separates street + postcode");
@@ -188,6 +217,79 @@ export function runContactNormalizerTests(opts: { log?: boolean } = {}): TestSum
     };
     const res = crossSourceAgreement(fp, "address");
     assertEq(res.verdict, "review_required", "integration: conflicting postcode ⇒ review_required");
+  }
+
+  // ── Integration: house-number-letter spacing agreement ───────────────────────
+  // Real pattern (Li Lynghonning, enrichment-reports/2026-08-27.md): two
+  // homepage-provenance passes wrote "12 a" and "12a" for the same building.
+  {
+    const fp: Record<string, ProvenanceRecord[]> = {
+      address: [
+        { value: "Austreimslia 12 a, 6995 Kyrkjebø", source_type: "homepage", fetched_at: "2026-08-27T00:00:00Z" },
+        { value: "Austreimslia 12a, 6995 Kyrkjebø", source_type: "google_places", fetched_at: "2026-08-27T00:00:00Z" },
+      ],
+    };
+    const res = crossSourceAgreement(fp, "address");
+    assertEq(res.verdict, "pool_eligible", "integration: house-number-letter spacing only ⇒ pool_eligible");
+    assertTrue(res.agree === true, "integration: house-number-letter spacing only ⇒ agree=true");
+  }
+
+  // ── Integration: veien/vegen spelling agreement ───────────────────────────────
+  // Real pattern (Lien Gård, enrichment-reports/2026-08-27.md): homepage wrote
+  // the bokmål "-veien" form, google_places the dialectal "-vegen" form, same
+  // street + house number + postcode.
+  {
+    const fp: Record<string, ProvenanceRecord[]> = {
+      address: [
+        { value: "Liagrendveien 262, 3812 Akkerhaugen", source_type: "homepage", fetched_at: "2026-08-27T00:00:00Z" },
+        { value: "Liagrendvegen 262, 3812 Akkerhaugen, Norge", source_type: "google_places", fetched_at: "2026-08-27T00:00:00Z" },
+      ],
+    };
+    const res = crossSourceAgreement(fp, "address");
+    assertEq(res.verdict, "pool_eligible", "integration: veien/vegen spelling only ⇒ pool_eligible");
+    assertTrue(res.agree === true, "integration: veien/vegen spelling only ⇒ agree=true");
+  }
+
+  // ── Integration: street-suffix ELISION still conflicts (known non-fix) ───────
+  // Real pattern (Borgund Chili, enrichment-reports/2026-08-27.md): one source
+  // drops the "-vegen" suffix entirely ("Vindhella" vs "Vindhellavegen"), which
+  // is a materially different comparison problem (whole-token elision, not a
+  // spelling/spacing variant) and is deliberately OUT of scope for this fix —
+  // pins that it correctly still stays review_required rather than silently
+  // starting to merge on a much weaker signal than the two cases above.
+  {
+    const fp: Record<string, ProvenanceRecord[]> = {
+      address: [
+        { value: "Vindhella 717, 6888 Borgund", source_type: "homepage", fetched_at: "2026-08-27T00:00:00Z" },
+        { value: "Vindhellavegen 717, 6888 Borgund, Norge", source_type: "google_places", fetched_at: "2026-08-27T00:00:00Z" },
+      ],
+    };
+    const res = crossSourceAgreement(fp, "address");
+    assertEq(res.verdict, "review_required", "integration: street-suffix elision is NOT merged (out of scope) ⇒ review_required");
+  }
+
+  // ── Integration: genuinely different addresses via a stray one-letter word
+  //    STILL conflict (independent review finding on this PR) ──────────────────
+  // "12 i Tromsø" (house 12, "in" Tromsø — no letter suffix) must never be
+  // confused with "12i Tromsø" (a DIFFERENT building, house-letter "I"). Both
+  // the primary byCore path (exact core match) and the addressesMatch
+  // relaxation path are exercised by these two pairs.
+  {
+    const fpCore: Record<string, ProvenanceRecord[]> = {
+      address: [
+        { value: "Nordgata 12 i Tromsø", source_type: "homepage", fetched_at: "2026-08-27T00:00:00Z" },
+        { value: "Nordgata 12i Tromsø", source_type: "google_places", fetched_at: "2026-08-27T00:00:00Z" },
+      ],
+    };
+    assertEq(crossSourceAgreement(fpCore, "address").verdict, "review_required", "integration NEG: 'N i X' vs 'Ni X' (byCore path) must not agree");
+
+    const fpRelax: Record<string, ProvenanceRecord[]> = {
+      address: [
+        { value: "Kirkeveien 8 i Bergen", source_type: "homepage", fetched_at: "2026-08-27T00:00:00Z" },
+        { value: "Kirkeveien 8i, 5003 Bergen", source_type: "google_places", fetched_at: "2026-08-27T00:00:00Z" },
+      ],
+    };
+    assertEq(crossSourceAgreement(fpRelax, "address").verdict, "review_required", "integration NEG: 'N i X' vs 'Ni, postcode X' (relaxation path) must not agree");
   }
 
   return { passed, failed, failures };
