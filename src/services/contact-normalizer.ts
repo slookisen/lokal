@@ -490,6 +490,16 @@ export function normalizeAddress(raw: string): string {
 // Exported so cross-source-validator.ts's own parseAddressCore() can apply
 // the identical canonicalization to its independently-computed comparison
 // key.
+//
+// Known accepted residual risk (round-2 independent review of this PR):
+// STREET_SUFFIX_PATTERN has no LEADING boundary (Norwegian street/farm names
+// compound without a separator, e.g. "Liagrend"+"veien", so one can't be
+// required), which means it would also fire inside an unrelated word ending
+// in the same letters — e.g. the archaic/dialectal word "kveg"/"kvegen"
+// ("cattle"), plausible as a farm/place name in this exact domain. No real
+// occurrence was found in the evidence (unlike the two rules above), so this
+// is deliberately left as-is rather than narrowed further without a real
+// case to test against — flag a follow-up dev-request if one turns up.
 const STREET_SUFFIX_PATTERN = /(veien|vegen|vei|veg)\b/gu;
 
 export function canonicalizeAddressVariants(text: string): string {
@@ -502,7 +512,19 @@ export function canonicalizeAddressVariants(text: string): string {
     // single letter as a boundary, matching those too and silently gluing
     // them onto the number (found in independent review of this PR — PoC:
     // "Nordgata 12 i Tromsø" vs "Nordgata 12i Tromsø" wrongly agreed).
-    .replace(/(\d+)\s+([a-zæøå])(?=,|$)/gu, "$1$2")
+    //
+    // The digit run must NOT be exactly 4 digits: Norwegian postnummer are
+    // always exactly 4 digits and commonly sit right before a single-letter
+    // town name ("Å" — a real village name, Moskenes/Lofoten and others), so
+    // an unqualified digit run would glue postcode+town too ("8392 Å" ->
+    // "8392å"), silently breaking splitAddress()'s existing postal-tail
+    // stripping (found in round-2 independent review of this PR — regression
+    // vs main: addressesMatch("Strandveien 12, 8392 Å", "Strandveien 12")
+    // flipped from true to false). Norwegian house numbers are practically
+    // never 4 digits, so excluding that one length costs us nothing real.
+    .replace(/(\d+)\s+([a-zæøå])(?=,|$)/gu, (m, num: string, letter: string) =>
+      num.length === 4 ? m : `${num}${letter}`
+    )
     // "-vegen"/"-veg" -> canonical "-veien"/"-vei"
     .replace(STREET_SUFFIX_PATTERN, (m) => (m === "veg" ? "vei" : m === "vegen" ? "veien" : m));
 }

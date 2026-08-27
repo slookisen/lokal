@@ -133,6 +133,13 @@ export function runContactNormalizerTests(opts: { log?: boolean } = {}): TestSum
     assertEq(normalizeAddress("Kirkeveien 8 i Bergen, 5003 Bergen"), "kirkeveien 8 i bergen, 5003 bergen", "normalizeAddress NEG: mid-string 'i' before more text must not glue");
     // But a genuine trailing letter right before the postal tail still collapses:
     assertEq(normalizeAddress("Bakken 4 å"), "bakken 4å", "normalizeAddress: trailing æøå house-letter still collapses at end-of-string");
+    // Regression guard (round-2 independent review finding): a 4-digit run
+    // is always a postnummer, never a house number — must NOT be glued to a
+    // following single-letter town name ("Å" is a real Norwegian village,
+    // Moskenes/Lofoten and others). Un-scoped, this broke splitAddress()'s
+    // existing postal-tail stripping for exactly this real place name.
+    assertEq(normalizeAddress("Strandveien 12, 8392 Å"), "strandveien 12, 8392 å", "normalizeAddress NEG: 4-digit postcode + single-letter town must not glue");
+    assertTrue(addressesMatch("Strandveien 12, 8392 Å", "Strandveien 12"), "addressesMatch: postal-tail with single-letter town name still strips correctly (regression guard)");
   }
 
   // ── splitAddress: postal tail extraction ─────────────────────────────────────
