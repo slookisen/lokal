@@ -349,6 +349,17 @@ export function looksLikeCodeArtifact(text: string | null | undefined): boolean 
   // same way `window.` already was — the identifier right after the dot
   // must itself be immediately followed by `.`/`(` (an actual member-
   // access/call shape), so a stray "document.pdf" mention can't contribute.
+  // NOTE: `Y.Squarespace` / `Static.SQUARESPACE_CONTEXT` used to live here
+  // but were promoted to class 1b (unambiguous alone) — dev-request
+  // 2026-08-25-agent-knowledge-about-code-artifact-gap. The real live Helios
+  // Trondheim text only ever trips this one Squarespace token (no
+  // `function(`, and not enough braces to cross class 4's density bar), so
+  // requiring a second class alongside it left the actual live case
+  // undetected even after this class existed. A Norwegian producer bio
+  // structurally cannot contain the literal string
+  // `Static.SQUARESPACE_CONTEXT` any more than it can contain
+  // `_wpemojiSettings` — same posture as the other five provider signatures
+  // above, so no second class should be required for this one either.
   const cmsBootstrapSignal =
     /window\.[A-Za-z_$][\w$]*\s*[.(]/.test(trimmed) ||
     /document\.[A-Za-z_$][\w$]*\s*[.(]/.test(trimmed) ||

@@ -6229,6 +6229,50 @@ const _m2Promise = (async function runOwnerPortalTests() {
         "m2-orders: Cache-Control is private (session-gated per-owner data)");
     }
 
+    // ── dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap:
+    //    POST /api/agents/:id/update-profile's "description" field (mapped
+    //    to agent_knowledge.about) had ZERO content validation — a genuinely
+    //    unguarded write path found by this dev-request's repo-wide search,
+    //    beyond the two sites the byggspec named explicitly. Same detector,
+    //    skipped (not a hard 400) to match this route's existing per-field
+    //    skip-with-reason convention (mirrors the curated-field-lock skip
+    //    right above it in owner-portal.ts). ─────────────────────────────
+    {
+      const REAL_HELIOS_ABOUT =
+        'Grønn Guide Trondheim Static = window.Static || {}; Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":["supports_versioned_template_assets","campaigns_merch_state","marketing_landing_page","enable_form_submission_trigger","campaigns_table_v2","contacts_and_campaigns_redesign","marketing_automations",';
+
+      const preAbout = (portalDb.prepare("SELECT about FROM agent_knowledge WHERE agent_id = ?").get(TEST_AGENT_ID) as any)?.about;
+
+      const rBad = await req("POST", `/api/agents/${TEST_AGENT_ID}/update-profile`, {
+        headers: { Cookie: `rfb_owner_session=${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ description: REAL_HELIOS_ABOUT }),
+        expectOk: true,
+      });
+      assertEq(rBad.status, 200, "m2-about-codeart-1: update-profile with a code-artifact description -> still 200 (per-field skip, not a hard failure)");
+      const badBody = JSON.parse(rBad.body);
+      assertTrue(!badBody.updated_fields.includes("about"), "m2-about-codeart-2: 'about' (the DB column the 'description' body field maps to) NOT in updated_fields");
+      assertTrue(
+        (badBody.skipped_fields ?? []).some((f: any) => f.field === "description" && f.reason === "code_artifact_rejected"),
+        "m2-about-codeart-3: 'description' reported in skipped_fields with reason=code_artifact_rejected",
+      );
+      const postAbout = (portalDb.prepare("SELECT about FROM agent_knowledge WHERE agent_id = ?").get(TEST_AGENT_ID) as any)?.about;
+      assertEq(postAbout, preAbout, "m2-about-codeart-4: agent_knowledge.about column UNCHANGED after the rejected update");
+
+      // Normal description text in the SAME call → written as before
+      // (regression guard — the new check must not block legitimate edits).
+      const normalDesc = "Vi driver med økologisk grønnsaksdyrking og selger direkte fra gården hver lørdag.";
+      const rOk = await req("POST", `/api/agents/${TEST_AGENT_ID}/update-profile`, {
+        headers: { Cookie: `rfb_owner_session=${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ description: normalDesc }),
+        expectOk: true,
+      });
+      assertEq(rOk.status, 200, "m2-about-codeart-5: normal description -> 200");
+      const okBody = JSON.parse(rOk.body);
+      assertTrue(okBody.updated_fields.includes("about"), "m2-about-codeart-6: normal description IS in updated_fields (reported under its DB column name, 'about')");
+      const writtenAbout = (portalDb.prepare("SELECT about FROM agent_knowledge WHERE agent_id = ?").get(TEST_AGENT_ID) as any)?.about;
+      assertEq(writtenAbout, normalDesc, "m2-about-codeart-7: normal description written verbatim to agent_knowledge.about");
+    }
+
     server.close();
   } catch (err) {
     failed++;
@@ -7629,6 +7673,56 @@ const _pr24Promise = (async function runPr24Tests() {
         const kRow = pr24db.prepare("SELECT about, address FROM agent_knowledge WHERE agent_id = 'prA-nodesc'").get() as any;
         assertEq(kRow.about, "Oppdatert about uten description i body.", "PR-A-CODEART-9: about column written normally");
         assertEq(kRow.address, "Nyveien 1, 5678 Sted", "PR-A-CODEART-10: address column written normally");
+      }
+
+      // ── PR-A endpoint: `about` code-artifact guard (dev-request 2026-08-25-
+      // agent-knowledge-about-code-artifact-gap) — `agent_knowledge.about` is
+      // `description`'s sibling field on this SAME route and had ZERO
+      // validation until now (the PR-A-CODEART block above only ever gated
+      // `description`). Mirrors that block's own coverage exactly, one field
+      // over. Uses the REAL live Helios Trondheim text (verbatim, from the
+      // admin `/knowledge` probe that found this gap) as the positive
+      // fixture — this route is the exact write path the dev-request centers
+      // on, so the regression test uses the exact real defect, not a stand-in.
+      {
+        const REAL_HELIOS_ABOUT =
+          'Grønn Guide Trondheim Static = window.Static || {}; Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":["supports_versioned_template_assets","campaigns_merch_state","marketing_landing_page","enable_form_submission_trigger","campaigns_table_v2","contacts_and_campaigns_redesign","marketing_automations",';
+
+        // ── PR-A-ABOUT-CODEART-1: code-artifact `about` → 400, rejected
+        // BEFORE any write (a co-present, otherwise-normal `address` field
+        // stays untouched too — proves the whole request is refused
+        // atomically, same discipline as PR-A-CODEART-1 above for
+        // description).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('prA-about-codeart', 'PR-A About Codeart', 'pra-about-codeart', 'producer', 'k')"
+        ).run();
+        const respBad = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-about-codeart",
+          about: REAL_HELIOS_ABOUT,
+          address: "Skal ikke skrives heller, 1234 Sted",
+        }, PR24_KEY);
+        assertEq(respBad.status, 400, "PR-A-ABOUT-CODEART-1: real Helios live text as `about` → 400");
+        assertEq(
+          respBad.body?.error,
+          "about contains code/script artifacts — rejected",
+          "PR-A-ABOUT-CODEART-2: error message mirrors the sibling description gate's shape, field-swapped",
+        );
+        const kRowBad = pr24db.prepare("SELECT about, address FROM agent_knowledge WHERE agent_id = 'prA-about-codeart'").get() as any;
+        assertTrue(kRowBad === undefined, "PR-A-ABOUT-CODEART-3: no agent_knowledge row written at all — whole request rejected before the transaction, not just `about`");
+
+        // ── PR-A-ABOUT-CODEART-4: normal `about` text → 200, unaffected
+        // (false-positive guard — mirrors PR-A-CODEART-5 for description).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('prA-about-normal', 'PR-A About Normal', 'pra-about-normal', 'producer', 'k')"
+        ).run();
+        const normalAbout = "Vi driver med økologisk grønnsaksdyrking og selger direkte fra gården hver lørdag.";
+        const respOk = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-about-normal",
+          about: normalAbout,
+        }, PR24_KEY, true);
+        assertEq(respOk.status, 200, "PR-A-ABOUT-CODEART-4: normal about text → 200, not flagged");
+        const kRowOk = pr24db.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'prA-about-normal'").get() as any;
+        assertEq(kRowOk.about, normalAbout, "PR-A-ABOUT-CODEART-5: normal about written verbatim");
       }
 
     } finally {
@@ -35056,6 +35150,10 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
     const heliosLiveText =
       'Grønn Guide Trondheim Static = window.Static || {}; Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":["supports_versioned_template_assets","campaigns_merch_state","marketing_landing_page","enable_form_submission_trigger","campaigns_table_v2","contacts_and_campaigns_redesign","marketing_automations",';
     assertTrue(
+      heliosLiveText.length === 300,
+      "codeartifact: real Helios live-text fixture is exactly 300 chars, matching the verbatim probe (sanity check on the pasted literal itself)"
+    );
+    assertTrue(
       dq.looksLikeCodeArtifact(heliosLiveText) === true,
       "codeartifact: real live Helios Trondheim text -> true (class 1b [Static.SQUARESPACE_CONTEXT] alone — the exact gap this fix closes)"
     );
@@ -35140,6 +35238,19 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
         "(function(){var a=1;var b=2;var c=3;var d=4;if(a){b=c;}return a+b+c+d;})();"
       ) === true,
       "codeartifact: var-only minified JS with an IIFE wrapper -> true (reworked class 3 [repeated var / IIFE] + class 4 [brace density])"
+    );
+
+    // Negative — dev-request 2026-08-25-agent-knowledge-about-code-artifact-
+    // gap requirement: promoting Y.Squarespace/Static.SQUARESPACE_CONTEXT to
+    // unambiguous-alone (class 1b) must NOT start flagging ordinary prose
+    // that merely NAMES the platform in passing (no literal code token, just
+    // the word "Squarespace") — the same "syntax, never the word alone"
+    // posture the JavaScript-mention negative test above already enforces.
+    assertTrue(
+      dq.looksLikeCodeArtifact(
+        "Vi lagde nettsiden vår selv med Squarespace, og oppdaterer den jevnlig med nye bilder fra gården."
+      ) === false,
+      "codeartifact: prose that merely NAMES 'Squarespace' (no literal Y.Squarespace/Static.SQUARESPACE_CONTEXT token) -> false, even after the class-1b promotion"
     );
 
     // (7) Facebook-Pixel-shaped unary-operator IIFE bootstrap

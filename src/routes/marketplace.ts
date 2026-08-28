@@ -1850,6 +1850,25 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
     }
   }
 
+  // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap: this is
+  // THIS ROUTE'S sibling-field gap the dev-request was filed for — the
+  // comment right above (Enrichment write-pause gate) already documents
+  // this as "by volume the most-used enrichment write" for `about`, yet
+  // (until now) `req.body` was passed straight into upsertKnowledge/
+  // ownerUpdate with ZERO content validation, while this route's OWN
+  // sibling endpoint two below (`PUT /agents/:id/description`) got the full
+  // looksLikeCodeArtifact gate on `description` back in #706. Same
+  // detector, same rejection message text as every other gate in this file,
+  // wrapped in this route's own {success, error} response shape. Guards
+  // both the admin/enrichment lane and the owner/claim-token lane — a
+  // producer pasting scraped page text into their own profile is exactly as
+  // real a path as the automated enrichment one (see the sibling
+  // `/agents/:id/description` gate's own comment for that precedent).
+  if (typeof req.body?.about === "string" && looksLikeCodeArtifact(req.body.about)) {
+    res.status(400).json({ success: false, error: "about contains code/script artifacts — rejected" });
+    return;
+  }
+
   try {
     if (isAdmin) {
       // Admin enrichment — preserve dataSource as "auto" (or what's in body)
@@ -2223,6 +2242,26 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
       data: a.data || a,
     }));
 
+    // dev-request 2026-08-25-agent-knowledge-about-code-artifact-gap: this
+    // batch route's own comment above already flags it as "the batch
+    // sibling of PUT /agents/:id/knowledge" — same knowledgeService.
+    // upsertKnowledge write, so it needs the same `about` code-artifact
+    // gate that route just got. Scoped to just the `about` field per entry
+    // (not the whole batch/agent) — mirrors homepage-content-refresh's
+    // "never produce this ONE candidate, everything else unaffected"
+    // discipline rather than failing an entire agent's enrichment (or the
+    // whole batch) over one bad field.
+    let aboutRejected = 0;
+    for (const e of enrichments) {
+      if (typeof e.data?.about === "string" && looksLikeCodeArtifact(e.data.about)) {
+        console.log(
+          `[admin/bulk-enrich] ${e.agentId} about candidate REJECTED by code-artifact detector — not written`,
+        );
+        e.data = { ...e.data, about: undefined };
+        aboutRejected++;
+      }
+    }
+
     const count = knowledgeService.bulkEnrich(enrichments);
 
     // Recalculate trust scores for all enriched agents
@@ -2237,7 +2276,12 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
     res.json({
       success: true,
       message: `Beriket ${count} av ${agents.length} agenter`,
-      data: { enriched: count, total: agents.length, trustScoresUpdated: trustUpdated },
+      data: {
+        enriched: count,
+        total: agents.length,
+        trustScoresUpdated: trustUpdated,
+        aboutCodeArtifactRejected: aboutRejected,
+      },
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });

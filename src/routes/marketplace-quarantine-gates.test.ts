@@ -880,6 +880,97 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
         assertEq(after.n, before.n, "e5b: no agents row created by the rejected discovery registration");
       }
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // (f) `about` code-artifact guard — dev-request 2026-08-25-agent-
+    // knowledge-about-code-artifact-gap. `agent_knowledge.about` is
+    // `description`'s sibling field and had ZERO write-time validation on
+    // TWO real, live marketplace.ts write surfaces this repo-wide re-search
+    // found (neither one named in the earlier #706 dev-request, which only
+    // ever covered `description`):
+    //   - PUT /agents/:id/knowledge — this ROUTE's OWN header comment
+    //     already documents it as "by volume the most-used enrichment
+    //     write" (the enrichment SKILL's PHASE 2D PUT), for `about`
+    //     specifically.
+    //   - POST /admin/bulk-enrich — this route's OWN header comment already
+    //     calls it "the batch sibling of PUT /agents/:id/knowledge".
+    // ══════════════════════════════════════════════════════════════════
+    {
+      const knowledgeHandler = findRouteHandler(marketplaceRouter, "/agents/:id/knowledge", "put" as any);
+      const bulkEnrichHandler = findRouteHandler(marketplaceRouter, "/admin/bulk-enrich", "post" as any);
+
+      const REAL_HELIOS_ABOUT =
+        'Grønn Guide Trondheim Static = window.Static || {}; Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":["supports_versioned_template_assets","campaigns_merch_state","marketing_landing_page","enable_form_submission_trigger","campaigns_table_v2","contacts_and_campaigns_redesign","marketing_automations",';
+
+      // ── f1: PUT /agents/:id/knowledge (admin lane) — code-artifact
+      // `about` → 400, rejected BEFORE any write (a co-present, otherwise-
+      // normal `phone` field stays untouched too — same atomicity proof as
+      // the description gates above). ─────────────────────────────────────
+      testDb.prepare(
+        "INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active, is_verified, is_vetted, origin, vertical_id, trust_score) " +
+        "VALUES ('f1-about-codeart', 'F1 About Codeart', 'test', 'test', 'post@example.no', 'https://f1-about-codeart.example.test', 'producer', 'key-f1-about', NULL, 1, 0, 1, 'discovery', 'rfb', 0.5)",
+      ).run();
+      {
+        const before = testDb.prepare("SELECT COUNT(*) AS n FROM agent_knowledge WHERE agent_id = 'f1-about-codeart'").get() as { n: number };
+        const r = await invokeHandler(knowledgeHandler, makeReq({
+          params: { id: "f1-about-codeart" },
+          body: { about: REAL_HELIOS_ABOUT, phone: "12345678" },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(r.status, 400, "f1: PUT /agents/:id/knowledge — real Helios live text as `about` → 400");
+        assertEq(r.body?.error, "about contains code/script artifacts — rejected", "f1b: error message mirrors the sibling description gates' shape, field-swapped");
+        const after = testDb.prepare("SELECT COUNT(*) AS n FROM agent_knowledge WHERE agent_id = 'f1-about-codeart'").get() as { n: number };
+        assertEq(after.n, before.n, "f1c: no agent_knowledge row created/changed by the rejected PUT (phone stayed unwritten too)");
+      }
+
+      // ── f2: PUT /agents/:id/knowledge — normal `about` text → 200,
+      // written normally (false-positive guard). ──────────────────────────
+      {
+        const normalAbout = "Vi driver med økologisk grønnsaksdyrking og selger direkte fra gården hver lørdag.";
+        const r = await invokeHandler(knowledgeHandler, makeReq({
+          params: { id: "f1-about-codeart" },
+          body: { about: normalAbout },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(r.status, 200, "f2: PUT /agents/:id/knowledge — normal about text → 200, not flagged");
+        const row = testDb.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'f1-about-codeart'").get() as any;
+        assertEq(row?.about, normalAbout, "f2b: normal about written verbatim");
+      }
+
+      // ── f3: POST /admin/bulk-enrich — a code-artifact `about` for ONE
+      // agent in a batch is dropped (that agent's OTHER fields still
+      // enrich), while a normal `about` for a SECOND agent in the SAME
+      // batch call writes normally — proves the field-scoped, per-entry
+      // drop (not a whole-batch or whole-agent failure), and no cross-
+      // contamination between the two agents in one call. ─────────────────
+      testDb.prepare(
+        "INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active, is_verified, is_vetted, origin, vertical_id, trust_score) " +
+        "VALUES ('f3-bulk-codeart', 'F3 Bulk Codeart', 'test', 'test', 'post@example.no', 'https://f3-bulk-codeart.example.test', 'producer', 'key-f3-bulk-codeart', NULL, 1, 0, 1, 'discovery', 'rfb', 0.5)",
+      ).run();
+      testDb.prepare(
+        "INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active, is_verified, is_vetted, origin, vertical_id, trust_score) " +
+        "VALUES ('f3-bulk-normal', 'F3 Bulk Normal', 'test', 'test', 'post@example.no', 'https://f3-bulk-normal.example.test', 'producer', 'key-f3-bulk-normal', NULL, 1, 0, 1, 'discovery', 'rfb', 0.5)",
+      ).run();
+      {
+        const normalAbout2 = "Vi tilbyr egg, honning og bær rett fra gårdsbutikken hver helg.";
+        const r = await invokeHandler(bulkEnrichHandler, makeReq({
+          body: {
+            agents: [
+              { agentId: "f3-bulk-codeart", data: { about: REAL_HELIOS_ABOUT, phone: "87654321" } },
+              { agentId: "f3-bulk-normal", data: { about: normalAbout2 } },
+            ],
+          },
+          headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        }));
+        assertEq(r.status, 200, "f3: POST /admin/bulk-enrich — batch with one code-artifact about → still 200");
+        assertEq(r.body?.data?.aboutCodeArtifactRejected, 1, "f3b: response reports exactly 1 about candidate rejected by the code-artifact detector");
+        const codeartRow = testDb.prepare("SELECT about, phone FROM agent_knowledge WHERE agent_id = 'f3-bulk-codeart'").get() as any;
+        assertTrue(!codeartRow?.about, "f3c: f3-bulk-codeart's about was NOT written");
+        assertEq(codeartRow?.phone, "87654321", "f3d: f3-bulk-codeart's OTHER field (phone) WAS still enriched — only `about` was dropped, not the whole agent");
+        const normalRow = testDb.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'f3-bulk-normal'").get() as any;
+        assertEq(normalRow?.about, normalAbout2, "f3e: f3-bulk-normal's about WAS written — unaffected by the other agent's rejection in the same batch");
+      }
+    }
   } catch (err) {
     failed++;
     failures.push(`marketplace-quarantine-gates: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
