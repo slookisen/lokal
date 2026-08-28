@@ -250,8 +250,54 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
       // Inactive drink agent — must never be scanned (is_active=0).
       insertAgent({ id: "agent-inactive", name: "Inaktiv Bryggeri", naceCode: "11.050", orgNr: "944444444", isActive: 0 });
 
-      const baselineProviderCount = countProviders(); // the two pre-seeded fixtures above
-      assertEq(baselineProviderCount, 2, "setup: two pre-seeded experience_providers fixtures");
+      // ═══ Name-only fallback fixtures (dev-request 2026-08-28-drink-nace-
+      // tag-backfill) — agents with NO nace: tag at all, exactly the shape
+      // of the ~27 real already-registered agents the fallback exists for
+      // (registered via a tag-blind path — Hanen import, the marketplace
+      // admin/register endpoint, or a seed script — never through
+      // POST /admin/agents/register). ══════════════════════════════════════
+
+      // Bridgeable via name fallback (bryggeri, 11.050) — org_nr-less, full
+      // contact info on agent_knowledge, same field-mapping shape as
+      // agent-brew above but reached WITHOUT any tags at all.
+      insertAgent({ id: "agent-fallback-brew", name: "Wilsgård Bryggeri — Torsken", url: "https://ignored-fallback.example.no", city: "Torsken" });
+      insertKnowledge("agent-fallback-brew", {
+        address: "Wilsgårdvegen 4", postal_code: "9392", website: "https://wilsgard.example.no",
+        phone: "45678901", email: "post@wilsgard.example.no",
+      });
+
+      // Bridgeable via name fallback (mjøderi, 11.040) — no agent_knowledge
+      // row at all, so hjemmeside must fall back to agents.url and org_nr
+      // stays null rather than fabricated.
+      insertAgent({ id: "agent-fallback-mjod", name: "Mjøderiet", url: "https://mjoderiet.example.no", city: "Hamar" });
+
+      // Blocklisted (org_nr), reached only via the name fallback (sideri).
+      insertAgent({ id: "agent-fallback-blocked", name: "Blokkert Sideri Gård", orgNr: "955555555" });
+      blocklistSvc.add({ orgNr: "955555555", reason: "test-fixture-block-fallback" });
+
+      // Name+postal-duplicate, reached only via the name fallback
+      // (bryggeri) — a MANUALLY-edited provider already exists with the
+      // same name (mixed case) + postal code.
+      insertAgent({ id: "agent-fallback-dup-namepostal", name: "Fallback Duplikat Bryggeri" });
+      insertKnowledge("agent-fallback-dup-namepostal", { postal_code: "8000" });
+
+      // Untagged, name does NOT match any fallback keyword — must never be
+      // scanned at all (excluded by the route's own WHERE prefilter, same
+      // as agent-nondrink above, just via the name arm instead of the tag
+      // arm).
+      insertAgent({ id: "agent-fallback-nonmatch", name: "Ukjent Gårdsbutikk" });
+
+      // Untagged, name DOES match (destilleri) but is_active=0 — must never
+      // be scanned, same as agent-inactive above.
+      insertAgent({ id: "agent-fallback-inactive", name: "Inaktiv Destilleri Gård", isActive: 0 });
+
+      insertProviderStmt.run({
+        id: "prov-manual-fallback-dup", navn: "FALLBACK DUPLIKAT BRYGGERI", org_nr: null, postnummer: "8000",
+        catalog_hidden: 0, content_source: "manual", about_text: "Manuelt redigert fallback-dublett.", producer_type: "bryggeri",
+      });
+
+      const baselineProviderCount = countProviders(); // the three pre-seeded fixtures above
+      assertEq(baselineProviderCount, 3, "setup: three pre-seeded experience_providers fixtures");
 
       // ── nab-1: auth ──────────────────────────────────────────────────────
       {
@@ -265,10 +311,10 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         const r = await callRoute(opplevelserRouter, { headers: auth, body: {} });
         assertEq(r.status, 200, "nab-2a: dry-run 200");
         assertEq(r.body.dry_run, true, "nab-2b: dry-run is the default (no apply flag)");
-        assertEq(r.body.scanned, 5, "nab-2c: exactly the 5 active drink-NACE agents are scanned (non-drink + inactive excluded)");
-        assertEq(r.body.created_count, 2, "nab-2d: exactly 2 bridgeable candidates (brew, vin)");
-        assertEq(r.body.skipped_duplicate_count, 2, "nab-2e: 2 skipped as duplicates (org_nr-dup, name+postal-dup)");
-        assertEq(r.body.skipped_blocklisted_count, 1, "nab-2f: 1 skipped as blocklisted");
+        assertEq(r.body.scanned, 9, "nab-2c: exactly the 9 active drink-NACE-or-obviously-drink-named agents are scanned (non-drink + inactive excluded, tag-matched + name-fallback-matched)");
+        assertEq(r.body.created_count, 4, "nab-2d: exactly 4 bridgeable candidates (brew, vin, fallback-brew, fallback-mjod)");
+        assertEq(r.body.skipped_duplicate_count, 3, "nab-2e: 3 skipped as duplicates (org_nr-dup, name+postal-dup, fallback name+postal-dup)");
+        assertEq(r.body.skipped_blocklisted_count, 2, "nab-2f: 2 skipped as blocklisted (tag-matched + name-fallback-matched)");
         assertTrue(String(r.body.batch_tag).startsWith("nace-agent-bridge-"), "nab-2g: batch_tag carries the route's own prefix");
         dryRunBatchTag = r.body.batch_tag;
 
@@ -278,6 +324,7 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         assertEq(brewCandidate?.producer_type, "bryggeri", "nab-2j: NACE 11.050 -> bryggeri");
         assertEq(brewCandidate?.nace_code, "11.050", "nab-2k: nace_code reported");
         assertTrue(!brewCandidate?.provider_id, "nab-2l: dry-run candidate carries no provider_id (nothing created)");
+        assertEq(brewCandidate?.nace_source, "tag", "nab-2l2: a real nace: tag takes priority and is reported as such");
 
         const vinCandidate = (r.body.created as any[]).find((c) => c.agent_id === "agent-vin");
         assertTrue(!!vinCandidate, "nab-2m: agent-vin is among the dry-run candidates");
@@ -288,7 +335,39 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         assertTrue(!!blockedEntry, "nab-2p: agent-blocked reported under skipped_blocklisted");
         assertEq(blockedEntry?.matched_by, "org_nr", "nab-2q: blocklist match reported as org_nr");
 
-        assertEq(countProviders(), baselineProviderCount, "nab-2r: dry-run writes NOTHING to experience_providers");
+        // ── name-fallback candidates (dev-request 2026-08-28-drink-nace-tag-
+        // backfill) — reached with ZERO nace: tags at all ──────────────────
+        const fbBrewCandidate = (r.body.created as any[]).find((c) => c.agent_id === "agent-fallback-brew");
+        assertTrue(!!fbBrewCandidate, "nab-2r1: agent-fallback-brew (no tags) is among the dry-run candidates via name fallback");
+        assertEq(fbBrewCandidate?.org_nr, null, "nab-2r2: name-fallback candidate reported as org_nr null, not fabricated");
+        assertEq(fbBrewCandidate?.nace_code, "11.050", "nab-2r3: name 'Wilsgård Bryggeri' -> 11.050 via keyword match");
+        assertEq(fbBrewCandidate?.producer_type, "bryggeri", "nab-2r4: NACE 11.050 -> bryggeri");
+        assertEq(fbBrewCandidate?.nace_source, "name_fallback", "nab-2r5: candidate reported as name-fallback-sourced, not a real tag");
+
+        const fbMjodCandidate = (r.body.created as any[]).find((c) => c.agent_id === "agent-fallback-mjod");
+        assertTrue(!!fbMjodCandidate, "nab-2r6: agent-fallback-mjod (no tags) is among the dry-run candidates via name fallback");
+        assertEq(fbMjodCandidate?.nace_code, "11.040", "nab-2r7: name 'Mjøderiet' -> 11.040 via keyword match");
+        assertEq(fbMjodCandidate?.producer_type, "mjøderi", "nab-2r8: NACE 11.040 -> mjøderi");
+        assertEq(fbMjodCandidate?.nace_source, "name_fallback", "nab-2r9: candidate reported as name-fallback-sourced");
+
+        const fbBlockedEntry = (r.body.skipped_blocklisted as any[]).find((c) => c.agent_id === "agent-fallback-blocked");
+        assertTrue(!!fbBlockedEntry, "nab-2s1: agent-fallback-blocked reported under skipped_blocklisted despite having no tags");
+        assertEq(fbBlockedEntry?.matched_by, "org_nr", "nab-2s2: blocklist match reported as org_nr");
+
+        const fbDupEntry = (r.body.skipped_duplicate as any[]).find((c) => c.agent_id === "agent-fallback-dup-namepostal");
+        assertTrue(!!fbDupEntry, "nab-2t1: agent-fallback-dup-namepostal reported under skipped_duplicate despite having no tags");
+        assertEq(fbDupEntry?.reason, "name_postal_exists", "nab-2t2: dedup reason is name+postal, same fallback dedup path as the tag-matched case");
+
+        const fbNonMatch = (r.body.created as any[])
+          .concat(r.body.skipped_duplicate, r.body.skipped_blocklisted, r.body.skipped_no_nace_map)
+          .find((c) => c.agent_id === "agent-fallback-nonmatch");
+        assertTrue(!fbNonMatch, "nab-2u: agent-fallback-nonmatch (no tag, no keyword match) is never scanned at all");
+        const fbInactiveMatch = (r.body.created as any[])
+          .concat(r.body.skipped_duplicate, r.body.skipped_blocklisted, r.body.skipped_no_nace_map)
+          .find((c) => c.agent_id === "agent-fallback-inactive");
+        assertTrue(!fbInactiveMatch, "nab-2v: agent-fallback-inactive (name matches but is_active=0) is never scanned");
+
+        assertEq(countProviders(), baselineProviderCount, "nab-2w: dry-run writes NOTHING to experience_providers");
       }
 
       // ── nab-3: APPLY — create exactly the 2 bridgeable rows ─────────────
@@ -297,11 +376,11 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         const r = await callRoute(opplevelserRouter, { headers: auth, body: { apply: true } });
         assertEq(r.status, 200, "nab-3a: apply 200");
         assertEq(r.body.dry_run, false, "nab-3b: apply mode reported");
-        assertEq(r.body.created_count, 2, "nab-3c: 2 rows created");
+        assertEq(r.body.created_count, 4, "nab-3c: 4 rows created (2 tag-matched, 2 name-fallback-matched)");
         applyBatchTag = r.body.batch_tag;
 
         // ── acceptance criterion 1: exact count increase, no false increases ──
-        assertEq(countProviders(), baselineProviderCount + 2, "nab-3d: experience_providers count increased by EXACTLY 2");
+        assertEq(countProviders(), baselineProviderCount + 4, "nab-3d: experience_providers count increased by EXACTLY 4");
 
         // ── new bryggeri row: full field mapping ────────────────────────────
         const brewRow = getProviderByOrgNr("911111111");
@@ -331,8 +410,33 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         assertEq(vinRow.producer_type, "vingård", "nab-3w: NACE 11.020 -> vingård");
         assertEq(vinRow.catalog_hidden, 1, "nab-3x: also born catalog_hidden=1");
 
+        // ── name-fallback rows: created from ZERO tags, distinguishable source ──
+        const fbBrewRow = getProviderByNavn("Wilsgård Bryggeri — Torsken");
+        assertTrue(!!fbBrewRow, "nab-3ba: fallback bryggeri row exists despite the agent carrying no nace: tag");
+        assertEq(fbBrewRow.org_nr, null, "nab-3bb: no org_nr fabricated");
+        assertEq(fbBrewRow.adresse, "Wilsgårdvegen 4", "nab-3bc: adresse from agent_knowledge.address");
+        assertEq(fbBrewRow.postnummer, "9392", "nab-3bd: postnummer from agent_knowledge.postal_code");
+        assertEq(fbBrewRow.poststed, "Torsken", "nab-3be: poststed falls back to agents.city");
+        assertEq(fbBrewRow.hjemmeside, "https://wilsgard.example.no", "nab-3bf: hjemmeside from agent_knowledge.website");
+        assertEq(fbBrewRow.epost, "post@wilsgard.example.no", "nab-3bg: epost from agent_knowledge.email");
+        assertEq(fbBrewRow.naeringskode, "11.050", "nab-3bh: naeringskode stamped from the keyword match");
+        assertEq(fbBrewRow.producer_type, "bryggeri", "nab-3bi: producer_type stamped");
+        assertEq(fbBrewRow.source, "nace-agent-bridge-name-fallback", "nab-3bj: source distinguishes a heuristic name-fallback match from a real tag match");
+        assertEq(fbBrewRow.catalog_hidden, 1, "nab-3bk: also born catalog_hidden=1 (unchanged contract)");
+        assertEq(fbBrewRow.rfb_seed_source, applyBatchTag, "nab-3bl: rfb_seed_source carries this same run's batch tag");
+
+        const fbMjodRow = getProviderByNavn("Mjøderiet");
+        assertTrue(!!fbMjodRow, "nab-3bm: fallback mjøderi row exists despite the agent carrying no nace: tag and no agent_knowledge row");
+        assertEq(fbMjodRow.org_nr, null, "nab-3bn: no org_nr fabricated");
+        assertEq(fbMjodRow.hjemmeside, "https://mjoderiet.example.no", "nab-3bo: hjemmeside falls back to agents.url when agent_knowledge is entirely absent");
+        assertEq(fbMjodRow.naeringskode, "11.040", "nab-3bp: naeringskode stamped from the keyword match");
+        assertEq(fbMjodRow.producer_type, "mjøderi", "nab-3bq: NACE 11.040 -> mjøderi");
+        assertEq(fbMjodRow.source, "nace-agent-bridge-name-fallback", "nab-3br: source distinguishes a heuristic name-fallback match");
+        assertEq(fbMjodRow.catalog_hidden, 1, "nab-3bs: also born catalog_hidden=1");
+
         // ── acceptance criterion 3/4: blocklisted org_nr never created ──────
         assertTrue(!getProviderByOrgNr("922222222"), "nab-3y: blocklisted org_nr never appears in experience_providers");
+        assertTrue(!getProviderByOrgNr("955555555"), "nab-3y2: name-fallback-matched blocklisted org_nr never appears in experience_providers either");
 
         // ── acceptance criterion 4: claimed/manual rows byte-identical ──────
         const claimedRow = expDb.prepare(`SELECT * FROM experience_providers WHERE id = 'prov-claimed-orgnr'`).get() as any;
@@ -345,6 +449,11 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         assertEq(manualRow.content_source, "manual", "nab-3ad: manual row's content_source untouched");
         assertEq(manualRow.about_text, "Manuelt redigert.", "nab-3ae: manual row's about_text untouched");
         assertEq(manualRow.rfb_seed_source, null, "nab-3af: manual row never got a batch tag stamped onto it");
+
+        const manualFallbackRow = expDb.prepare(`SELECT * FROM experience_providers WHERE id = 'prov-manual-fallback-dup'`).get() as any;
+        assertEq(manualFallbackRow.content_source, "manual", "nab-3ag: manual fallback-dedup row's content_source untouched");
+        assertEq(manualFallbackRow.about_text, "Manuelt redigert fallback-dublett.", "nab-3ah: manual fallback-dedup row's about_text untouched");
+        assertEq(manualFallbackRow.rfb_seed_source, null, "nab-3ai: manual fallback-dedup row never got a batch tag stamped onto it");
       }
 
       // ── nab-4: idempotency — re-running creates nothing new ─────────────
@@ -353,7 +462,7 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         const r = await callRoute(opplevelserRouter, { headers: auth, body: { apply: true } });
         assertEq(r.status, 200, "nab-4a: second apply 200");
         assertEq(r.body.created_count, 0, "nab-4b: acceptance criterion 6 — re-run creates ZERO new rows");
-        assertEq(r.body.skipped_duplicate_count, 4, "nab-4c: brew (org_nr) + vin (name+postal) now ALSO dedup-skipped, on top of the original 2");
+        assertEq(r.body.skipped_duplicate_count, 7, "nab-4c: brew/vin/fallback-brew/fallback-mjod now ALSO dedup-skipped (4), on top of the original 3 static duplicates");
         assertEq(countProviders(), countAfterFirstApply, "nab-4d: experience_providers count unchanged by the re-run");
       }
 
@@ -379,30 +488,34 @@ export function runOpplevelserGardssalgNaceAgentBridgeTests(
         const r = await callRoute(opplevelserRouter, { headers: auth, body: { rollbackBatch: applyBatchTag } });
         assertEq(r.status, 200, "nab-7a: rollback dry-run 200");
         assertEq(r.body.dry_run, true, "nab-7b: rollback defaults to dry-run too");
-        assertEq(r.body.would_delete, 2, "nab-7c: both bridged rows would be deleted");
+        assertEq(r.body.would_delete, 4, "nab-7c: all four bridged rows would be deleted (2 tag-matched, 2 name-fallback-matched)");
         assertEq((r.body.skipped_locked as any[]).length, 0, "nab-7d: nothing locked in THIS batch (the claimed/manual fixtures carry no batch tag)");
-        assertEq(countProviders(), baselineProviderCount + 2, "nab-7e: rollback dry-run deletes nothing");
+        assertEq(countProviders(), baselineProviderCount + 4, "nab-7e: rollback dry-run deletes nothing");
       }
 
       // ── nab-8: rollback apply — acceptance criterion 6 ──────────────────
       {
         const r = await callRoute(opplevelserRouter, { headers: auth, body: { rollbackBatch: applyBatchTag, apply: true } });
         assertEq(r.status, 200, "nab-8a: rollback apply 200");
-        assertEq(r.body.deleted, 2, "nab-8b: exactly the batch's 2 rows deleted");
+        assertEq(r.body.deleted, 4, "nab-8b: exactly the batch's 4 rows deleted");
         assertEq(countProviders(), baselineProviderCount, "nab-8c: rollback cleanly restores the pre-bridge row count");
         assertTrue(!getProviderByOrgNr("911111111"), "nab-8d: bryggeri row is gone");
         assertTrue(!getProviderByNavn("Fjordbobler Vineri"), "nab-8e: vingård row is gone");
+        assertTrue(!getProviderByNavn("Wilsgård Bryggeri — Torsken"), "nab-8e2: name-fallback bryggeri row is gone");
+        assertTrue(!getProviderByNavn("Mjøderiet"), "nab-8e3: name-fallback mjøderi row is gone");
         const claimedRow = expDb.prepare(`SELECT * FROM experience_providers WHERE id = 'prov-claimed-orgnr'`).get() as any;
         assertTrue(!!claimedRow, "nab-8f: rollback never touches the claimed fixture (different batch)");
         const manualRow = expDb.prepare(`SELECT * FROM experience_providers WHERE id = 'prov-manual-namepostal'`).get() as any;
         assertTrue(!!manualRow, "nab-8g: rollback never touches the manual fixture (different batch)");
+        const manualFallbackRow = expDb.prepare(`SELECT * FROM experience_providers WHERE id = 'prov-manual-fallback-dup'`).get() as any;
+        assertTrue(!!manualFallbackRow, "nab-8h: rollback never touches the manual fallback-dedup fixture (different batch)");
       }
 
       // ── nab-9: re-bridging after rollback re-creates cleanly ────────────
       {
         const r = await callRoute(opplevelserRouter, { headers: auth, body: { apply: true } });
-        assertEq(r.body.created_count, 2, "nab-9a: post-rollback sweep re-bridges both agents again (rollback is a true undo, not a permanent block)");
-        assertEq(countProviders(), baselineProviderCount + 2, "nab-9b: count matches the earlier apply exactly");
+        assertEq(r.body.created_count, 4, "nab-9a: post-rollback sweep re-bridges all four agents again (rollback is a true undo, not a permanent block)");
+        assertEq(countProviders(), baselineProviderCount + 4, "nab-9b: count matches the earlier apply exactly");
       }
 
       void dryRunBatchTag; // referenced for clarity above; no further assertion needed on its value

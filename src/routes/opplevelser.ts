@@ -12024,6 +12024,52 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 const NACE_AGENT_BRIDGE_TAG_PREFIX = "nace-agent-bridge-";
 
+// ── Name-only fallback signal (dev-request 2026-08-28-drink-nace-tag-
+// backfill) ──────────────────────────────────────────────────────────────
+// Post-deploy verification of the tag-only sweep above found it reaches only
+// 2 of ~29 already-registered, active agents whose NAME obviously names one
+// of the six drink types below (e.g. "Wilsgård Bryggeri — Torsken", "Kringler
+// Gårdsdestilleri", "Mjøderiet"). Root cause: POST /admin/agents/register
+// (admin-agents.ts) is the ONLY agent-registration surface that ever builds
+// a `nace:<code>` tag — it does so correctly today and is untouched here.
+// Every OTHER path that inserts a row into `agents` is tag-blind BY
+// CONSTRUCTION, not merely by omission at call time, so a per-agent
+// retroactive backfill would not stay fixed:
+//   - POST /api/marketplace/admin/register (routes/marketplace.ts) — the
+//     endpoint lokal-agent-enrichment actually registers producers through
+//     (see that route's own header comment) — validates against
+//     AdminRegistrationSchema (models/marketplace.ts), which has no
+//     nace_code concept at all, only a caller-supplied `tags` array.
+//   - POST /api/marketplace/register (public self-registration) and every
+//     src/_seeds/*.ts seed script — same schema, same gap, via the same
+//     marketplaceRegistry.register() (services/marketplace-registry.ts).
+//   - The Hanen-member-import path (routes/admin-hanen.ts's
+//     `INSERT INTO agents` under provider='hanen-import') omits the `tags`
+//     column from its INSERT entirely, so imported rows keep the schema
+//     default `'[]'` — Hanen (~400-500 farm-tourism/matagent members) is a
+//     plausible source of exactly this kind of obviously-drink-named row
+//     (bryggeri/sideri/destilleri/mjøderi are common farm-tourism
+//     categories) and will keep importing new members with the same gap.
+// A one-off backfill of the ~27 existing rows would leave the SAME hole
+// open for the next Hanen scrape or the next lokal-agent-enrichment sweep.
+// Rather than chase every current and future tag-blind call site, this
+// fallback widens the bridge's OWN candidate signal: an active agent with
+// NO recognised nace: tag is still scanned if its name unambiguously names
+// one of the SAME six drink types GARDSSALG_NACE_PRODUCER_TYPE already
+// recognises — no second taxonomy, just this map's own producer_type
+// vocabulary read the other way. Deliberately conservative (five distinct,
+// low-collision Norwegian morphemes, no generic words) — and low-risk even
+// on a false match, because every row this route creates is still born
+// catalog_hidden=1 (unchanged contract, see above) until the ordinary
+// enrichment/verification pipeline clears it.
+const DRINK_NAME_FALLBACK_PATTERNS: Array<{ keyword: string; re: RegExp; naceCode: string }> = [
+  { keyword: "destilleri", re: /destilleri/i, naceCode: "11.010" },
+  { keyword: "sideri", re: /sideri/i, naceCode: "11.030" },
+  { keyword: "mjøderi", re: /mjøderi/i, naceCode: "11.040" },
+  { keyword: "bryggeri", re: /bryggeri/i, naceCode: "11.050" },
+  { keyword: "vingård", re: /vingård/i, naceCode: "11.020" },
+];
+
 router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { apply?: unknown; rollbackBatch?: unknown };
   const apply =
@@ -12089,6 +12135,14 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
   // (same convention /admin/rfb-seed's own tag matching above relies on).
   const tagClauses = naceCodes.map(() => "tags LIKE ?").join(" OR ");
   const tagParams = naceCodes.map((c) => `%"nace:${c}"%`);
+  // Name-only fallback prefilter (see DRINK_NAME_FALLBACK_PATTERNS doc
+  // comment above) — widens the candidate set to agents with NO recognised
+  // nace: tag but an obviously-drink name. SQLite's default LIKE
+  // case-folds ASCII only, which is sufficient here: every keyword's
+  // non-ASCII character (ø/å) only ever appears lower-case in these
+  // Norwegian compound names regardless of how the leading letter is cased.
+  const nameFallbackClauses = DRINK_NAME_FALLBACK_PATTERNS.map(() => "name LIKE ?").join(" OR ");
+  const nameFallbackParams = DRINK_NAME_FALLBACK_PATTERNS.map((p) => `%${p.keyword}%`);
 
   let agents: NaceBridgeAgentRow[] = [];
   try {
@@ -12096,9 +12150,9 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
       .prepare(
         `SELECT id, name, url, city, tags, org_nr, brreg_verified
            FROM agents
-          WHERE is_active = 1 AND (${tagClauses})`
+          WHERE is_active = 1 AND ((${tagClauses}) OR (${nameFallbackClauses}))`
       )
-      .all(...tagParams) as NaceBridgeAgentRow[];
+      .all(...tagParams, ...nameFallbackParams) as NaceBridgeAgentRow[];
   } catch (err: any) {
     res.status(500).json({ error: "Failed to query agents table", detail: err?.message ?? String(err) });
     return;
@@ -12123,7 +12177,7 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
   const isValidEmailForBridge = (v: string | null | undefined): v is string =>
     typeof v === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 
-  const created: Array<{ agent_id: string; provider_id?: string; navn: string; org_nr: string | null; nace_code: string; producer_type: string }> = [];
+  const created: Array<{ agent_id: string; provider_id?: string; navn: string; org_nr: string | null; nace_code: string; producer_type: string; nace_source: "tag" | "name_fallback" }> = [];
   const skippedDuplicate: Array<{ agent_id: string; navn: string; reason: string }> = [];
   const skippedBlocklisted: Array<{ agent_id: string; navn: string; matched_by?: string; matched_value?: string }> = [];
   const skippedNoMap: Array<{ agent_id: string; navn: string }> = [];
@@ -12143,12 +12197,29 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
     const naceTag = tags.find(
       (t): t is string => typeof t === "string" && t.startsWith("nace:") && !!GARDSSALG_NACE_PRODUCER_TYPE[t.slice(5)]
     );
-    if (!naceTag) {
+    // Tag match takes priority (exact, registration-time signal); only an
+    // agent with NO recognised tag falls through to the name-only fallback
+    // (see DRINK_NAME_FALLBACK_PATTERNS doc comment above) — an agent that
+    // happens to carry both is bridged once, off the tag, unchanged from
+    // before this fallback existed.
+    let naceCode: string | undefined;
+    let producerType: string | undefined;
+    let naceSource: "tag" | "name_fallback" = "tag";
+    if (naceTag) {
+      naceCode = naceTag.slice(5);
+      producerType = GARDSSALG_NACE_PRODUCER_TYPE[naceCode];
+    } else {
+      const fallback = DRINK_NAME_FALLBACK_PATTERNS.find((p) => p.re.test(agent.name));
+      if (fallback) {
+        naceCode = fallback.naceCode;
+        producerType = GARDSSALG_NACE_PRODUCER_TYPE[naceCode];
+        naceSource = "name_fallback";
+      }
+    }
+    if (!naceCode || !producerType) {
       skippedNoMap.push({ agent_id: agent.id, navn: agent.name });
       continue;
     }
-    const naceCode = naceTag.slice(5);
-    const producerType = GARDSSALG_NACE_PRODUCER_TYPE[naceCode];
 
     let knowledge: NaceBridgeKnowledgeRow | undefined;
     try {
@@ -12187,7 +12258,7 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
     }
 
     if (dryRun) {
-      created.push({ agent_id: agent.id, navn: agent.name, org_nr: orgNr, nace_code: naceCode, producer_type: producerType });
+      created.push({ agent_id: agent.id, navn: agent.name, org_nr: orgNr, nace_code: naceCode, producer_type: producerType, nace_source: naceSource });
       if (orgNr) knownOrgnr.add(orgNr);
       else nameAndPostalIndex.add(namePostalKey);
       continue;
@@ -12208,7 +12279,12 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
         epost: isValidEmailForBridge(knowledge?.email) ? knowledge!.email : undefined,
         naeringskode: naceCode,
         brreg_verified: agent.brreg_verified ? 1 : 0,
-        source: "nace-agent-bridge",
+        // Distinguishable provenance for a name-fallback-created row (see
+        // DRINK_NAME_FALLBACK_PATTERNS doc comment above) — a heuristic
+        // match, not a registration-time nace_code, so it stays separately
+        // auditable/filterable from an exact tag match without changing
+        // this route's dedup/blocklist/catalog_hidden contract at all.
+        source: naceSource === "tag" ? "nace-agent-bridge" : "nace-agent-bridge-name-fallback",
         confidence: "medium",
       } as any);
       // producer_type (the gårdssalg drink-taxonomy column — DISTINCT from
@@ -12224,7 +12300,7 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
             WHERE id = @id`
         )
         .run({ pt: producerType, tag: batchTag, id: providerId });
-      created.push({ agent_id: agent.id, provider_id: providerId, navn: agent.name, org_nr: orgNr, nace_code: naceCode, producer_type: producerType });
+      created.push({ agent_id: agent.id, provider_id: providerId, navn: agent.name, org_nr: orgNr, nace_code: naceCode, producer_type: producerType, nace_source: naceSource });
       if (orgNr) knownOrgnr.add(orgNr);
       else nameAndPostalIndex.add(namePostalKey);
     } catch (err: any) {

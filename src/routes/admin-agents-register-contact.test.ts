@@ -359,6 +359,46 @@ export async function runAdminAgentsRegisterContactTests(
       assertTrue(emailProv === undefined, "caseG: no email provenance record fabricated when email wasn't given");
       assertTrue(Array.isArray(phoneProv) && phoneProv.length === 1, "caseG: phone provenance written even though email wasn't given");
     }
+    // ── Case H: nace_code -> nace: tag written (dev-request 2026-08-28-
+    //    drink-nace-tag-backfill regression guard). POST /admin/gardssalg-
+    //    nace-agent-bridge (routes/opplevelser.ts) finds already-registered
+    //    drink producers by matching this exact `nace:<code>` tag string —
+    //    this is the ONE registration surface that ever builds it (see that
+    //    route's own header comment). Root-cause investigation for that
+    //    dev-request found this endpoint's own tag-building logic already
+    //    correct and left it untouched; this case is new coverage closing a
+    //    gap that let it go untested, and proves a brand-new registration
+    //    with a drink-relevant NACE code keeps getting the tag going
+    //    forward. ─────────────────────────────────────────────────────────
+    {
+      const r = await callRegister({
+        name: "Ny Bryggeri Gård H",
+        url: "https://ny-bryggeri-gard-h.no",
+        city: "Ålesund",
+        vertical_id: "rfb",
+        source: "brreg-nace-discovery",
+        org_nr: "920000003",
+        nace_code: "11.050",
+      });
+      assertEq(r.status, 201, "caseH: registers (201) with a drink-relevant nace_code");
+      const agentId = r.body?.agent_id as string;
+      const row = readAgentRow(agentId);
+      assertTrue(String(row?.tags ?? "").includes('"nace:11.050"'), "caseH: agents.tags carries the literal nace:<code> tag the bridge's WHERE clause matches on");
+    }
+
+    // ── Case I: NO nace_code given -> no nace: tag fabricated ────────────
+    {
+      const r = await callRegister({
+        name: "Uten Nace Gård I",
+        url: "https://uten-nace-gard-i.no",
+        city: "Kristiansund",
+        vertical_id: "rfb",
+      });
+      assertEq(r.status, 201, "caseI: registers (201) with no nace_code at all");
+      const agentId = r.body?.agent_id as string;
+      const row = readAgentRow(agentId);
+      assertTrue(!String(row?.tags ?? "").includes("nace:"), "caseI: no nace: tag fabricated when nace_code wasn't supplied");
+    }
   } catch (err) {
     failed++;
     failures.push(`admin-agents-register-contact: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
