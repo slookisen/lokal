@@ -113,21 +113,33 @@ export async function runVerifierTick(opts: {
   batchSize?: number;
   reprocessReviewQueue?: boolean;
   biasGrowth?: boolean;
+  skipTickLock?: boolean;
 } = {}): Promise<VerifierTickResult> {
   const tickStartedAt = new Date().toISOString();
   const tickRunId = `run-${tickStartedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-tick`;
-  const lock = acquireLock({
-    agent: "lokal-agent-verifier-tick",
-    run_id: tickRunId,
-    started_at: tickStartedAt,
-    staleMinutes: 50,
-  });
-  if (!lock.acquired) {
-    return {
-      success: true,
-      skipped: true,
-      reason: `already ran this hour (locked by ${lock.holder.run_id} at ${lock.holder.started_at})`,
-    };
+  // dev-request 2026-08-28-enrichment-verifier-lock-blokkerer-force-promote:
+  // skipTickLock is a separate, explicitly-named opt-in that bypasses ONLY
+  // this acquireLock() call — every other caller (internal cron scheduler,
+  // plain HTTP route, force=1 alone, reprocess_review_queue=1 drain) still
+  // acquires the lock exactly as before. When set, go straight to running
+  // the batch: per this function's own design note above, there is no
+  // matching releaseLock() (natural staleness IS the release mechanism), so
+  // acquiring on a bypassed path would just pointlessly consume/refresh a
+  // lock nothing needs.
+  if (!opts.skipTickLock) {
+    const lock = acquireLock({
+      agent: "lokal-agent-verifier-tick",
+      run_id: tickRunId,
+      started_at: tickStartedAt,
+      staleMinutes: 50,
+    });
+    if (!lock.acquired) {
+      return {
+        success: true,
+        skipped: true,
+        reason: `already ran this hour (locked by ${lock.holder.run_id} at ${lock.holder.started_at})`,
+      };
+    }
   }
 
   const batchSize = Math.min(
@@ -242,8 +254,12 @@ export async function runVerifierTick(opts: {
 }
 
 // POST /admin/run-verifier
-//   Optional body: { batchSize?: number, force?: boolean }
-//   Optional query: ?force=1
+//   Optional body: { batchSize?: number, force?: boolean, skip_tick_lock?: boolean }
+//   Optional query: ?force=1&skip_tick_lock=1
+//   skip_tick_lock: separate from `force` — bypasses ONLY the DB-backed
+//   once-per-hour tick-lock (dev-request 2026-08-17-verifier-tick-lock),
+//   not the 22:00-06:00 UTC window check. Default off; every existing
+//   caller (including plain force=1) is unaffected unless it opts in.
 //   Returns: { success, run_id, results, skipped?: boolean, reason? }
 router.post("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
@@ -287,8 +303,21 @@ router.post("/", async (req: Request, res: Response) => {
     ? true
     : !(biasGrowthRaw === "0" || biasGrowthRaw === 0 || biasGrowthRaw === false || biasGrowthRaw === "false");
 
+  // dev-request 2026-08-28-enrichment-verifier-lock-blokkerer-force-promote:
+  // separate, explicitly-named opt-in that bypasses ONLY the DB-backed
+  // tick-lock inside runVerifierTick — NOT a replacement for `force` (which
+  // only bypasses the 22:00-06:00 UTC window check above) and NOT implied
+  // by `force=1` alone, so existing force=1 callers (e.g. the
+  // reprocess_review_queue=1 operator drain) keep respecting the tick-lock
+  // exactly as before. Default-off; only a caller that explicitly passes
+  // this flag skips the lock.
+  const skipTickLock =
+    req.query.skip_tick_lock === "1" ||
+    req.query.skip_tick_lock === "true" ||
+    (req.body && (req.body.skip_tick_lock === true || req.body.skip_tick_lock === "1"));
+
   try {
-    const tick = await runVerifierTick({ batchSize, reprocessReviewQueue, biasGrowth });
+    const tick = await runVerifierTick({ batchSize, reprocessReviewQueue, biasGrowth, skipTickLock });
 
     if (tick.skipped) {
       // dev-request 2026-08-17-verifier-tick-lock: same response shape as
@@ -324,6 +353,7 @@ router.post("/", async (req: Request, res: Response) => {
       envelope_recorded: tick.envelope_recorded,
       hour_utc: hourUTC,
       forced: !!force,
+      tick_lock_skipped: !!skipTickLock,
       reprocess_review_queue: tick.reprocess_review_queue,
       bias_growth: tick.bias_growth,
     });

@@ -243,7 +243,7 @@ export function runAdminRunVerifierDrainObservabilityTests(
         "brreg_inactive", "domain_incoherent", "email_domain_mismatch",
         "thin_content", "pool_added", "status_transitions", "transitioned",
         "by_new_status", "persisted", "envelope_recorded", "hour_utc",
-        "forced", "reprocess_review_queue", "bias_growth",
+        "forced", "tick_lock_skipped", "reprocess_review_queue", "bias_growth",
       ].sort();
       assertEq(
         Object.keys(round1.body).sort(),
@@ -370,6 +370,83 @@ export function runAdminRunVerifierDrainObservabilityTests(
         .prepare(`SELECT run_id, started_at FROM orchestrator_locks WHERE agent = 'lokal-agent-verifier-tick'`)
         .get() as { run_id: string; started_at: string } | undefined;
       assertEq(lockRowAfter, lockRowBefore, "lock-7: the lock row itself is untouched by the skipped call (still held by round 3's run_id)");
+
+      // ── dev-request 2026-08-28-enrichment-verifier-lock-blokkerer-force-promote ──
+      // Round 5: the lock is STILL held from round 3 (round 4 above proved a
+      // plain force=1 call, with no skip_tick_lock, is blocked by it). Now
+      // fire a call with skip_tick_lock=1 — this must run a real batch even
+      // though the lock is held, mirroring the enrichment-agent's
+      // 2B-PENDING caller.
+      insertAgent.run("agent-skip-lock", "Skiplockgard AS", "key-skip-lock");
+      insertKnowledge.run(
+        "agent-skip-lock",
+        "Testveien 3, 1400 Ski",
+        "91234569",
+        "kontakt@skiplockgard.no",
+        "En lang og god beskrivelse av gården vår med mye relevant innhold om produktene.",
+        JSON.stringify([{ name: "Sider" }, { name: "Eplemost" }]),
+        JSON.stringify({}),
+        "unverified",
+      );
+
+      const round5 = await callRoute(router, {
+        method: "POST",
+        url: "/",
+        headers: { "x-admin-key": ADMIN_KEY },
+        query: { force: "1", skip_tick_lock: "1", reprocess_review_queue: "0", batchSize: "5", bias_growth: "0" },
+        body: {},
+      });
+
+      assertEq(round5.status, 200, "skip-lock-1: round 5 (skip_tick_lock=1, lock held) responds 200");
+      assertEq(round5.body.skipped, undefined, "skip-lock-2: round 5 is NOT skipped despite the lock being held");
+      assertEq(round5.body.success, true, "skip-lock-3: round 5 success=true");
+      assertEq(round5.body.persisted, true, "skip-lock-4: round 5 persisted=true — a real batch ran");
+      assertEq(round5.body.tick_lock_skipped, true, "skip-lock-5: round 5 response reports tick_lock_skipped=true");
+      assertEq(round5.body.forced, true, "skip-lock-6: round 5 still reports forced=true (force and skip_tick_lock are independent fields)");
+
+      // Note: NOT asserting on `runs` row COUNT here — the run_id embeds
+      // only minute-resolution timestamps (see runVerifierBatch), so two
+      // real batch runs within the same test-execution minute (round 3 and
+      // round 5) can legitimately collide on `INSERT ... ON CONFLICT
+      // (run_id) DO NOTHING` and not add a second row; that collision is a
+      // pre-existing envelope-recording property, unrelated to
+      // skip_tick_lock. Instead prove the batch actually executed the way
+      // round 4's skip did NOT: the newly-seeded agent's row was written.
+      const skipLockAgentRow = db
+        .prepare(`SELECT verification_status, last_verified_at FROM agent_knowledge WHERE agent_id = ?`)
+        .get("agent-skip-lock") as { verification_status: string; last_verified_at: string } | undefined;
+      assertTrue(
+        !!skipLockAgentRow?.last_verified_at,
+        "skip-lock-7: round 5 actually wrote agent-skip-lock's last_verified_at — the batch-processing function WAS invoked, unlike round 4's skip",
+      );
+
+      const lockRowAfterSkip = db
+        .prepare(`SELECT run_id, started_at FROM orchestrator_locks WHERE agent = 'lokal-agent-verifier-tick'`)
+        .get() as { run_id: string; started_at: string } | undefined;
+      assertEq(
+        lockRowAfterSkip,
+        lockRowBefore,
+        "skip-lock-8: the lock row is completely untouched by the skip_tick_lock=1 call — it neither acquires nor refreshes it (still round 3's original run_id/started_at)",
+      );
+
+      // ── Round 6: with the lock STILL held (round 5 never touched it),
+      // a plain force=1 call (no skip_tick_lock) must STILL be blocked —
+      // proving skip_tick_lock is opt-in only and does not change behavior
+      // for callers that don't pass it, even after a skip_tick_lock=1 call
+      // has just run in between.
+      const round6 = await callRoute(router, {
+        method: "POST",
+        url: "/",
+        headers: { "x-admin-key": ADMIN_KEY },
+        query: { force: "1", reprocess_review_queue: "0", batchSize: "5" },
+        body: {},
+      });
+
+      assertEq(
+        round6.body,
+        { success: true, skipped: true, reason: `already ran this hour (locked by ${lockRowBefore?.run_id} at ${lockRowBefore?.started_at})` },
+        "skip-lock-9: round 6 (plain force=1, no skip_tick_lock) is still correctly blocked by the still-held lock — unaffected by round 5's bypass",
+      );
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
