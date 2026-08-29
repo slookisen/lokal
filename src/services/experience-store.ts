@@ -4922,13 +4922,31 @@ export function flagGardssalgContactEmailForReview(
  * reported back via the result's `contactGateRejected` field — without this,
  * a judge-rejected candidate wrote nothing and was indistinguishable from
  * "field already filled" / "row locked" to both callers of this function.
+ *
+ * `sourceType` (dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 3 —
+ * 1881/bransjeliste as an approved contact-candidate kildeklasse): OPTIONAL,
+ * additive 6th parameter. When a caller passes it, every field_provenance
+ * record this call writes carries it as an extra `source_type` key
+ * (`{source_url, fetched_at, source_type}`) instead of the plain
+ * `{source_url, fetched_at}` shape — so a 1881/siderklynga/hanen-sourced
+ * write is distinguishable from a homepage-scrape or Brreg-backfill write at
+ * read time, the same way computeSecondLineIdentitySources (lokal-agent-
+ * verifier.ts) already reads `source_type === "facebook_official_page"`
+ * elsewhere. The two EXISTING call sites (gardssalg-contact-extraction,
+ * gardssalg-contact-backfill) do not pass it, so their provenance shape is
+ * completely unchanged — this is purely additive, never a behaviour change
+ * for a caller that omits it. Every other guard (fill-only, lock, domain
+ * gate, LLM-judge gate) is completely untouched by this parameter — it only
+ * affects what gets written INTO the provenance record for a field that was
+ * already going to be written.
  */
 export async function applyGardssalgProviderContact(
   providerId: string,
   candidate: { epost?: string | null; telefon?: string | null; epostSource?: string | null },
   evidenceUrl: string,
   batchId?: string,
-  gateContext?: { businessName: string; sourceContext: string }
+  gateContext?: { businessName: string; sourceContext: string },
+  sourceType?: string
 ): Promise<GardssalgProviderContactWriteResult> {
   const db = getDb(VERTICAL);
   const row = db
@@ -5072,12 +5090,12 @@ export async function applyGardssalgProviderContact(
   sets.push("updated_at = datetime('now')");
 
   // ── field_provenance merge (read-modify-write, preserves other fields) ──
-  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  let provenance: Record<string, { source_url: string; fetched_at: string; source_type?: string }> = {};
   if (row.field_provenance) {
     try {
       const parsed = JSON.parse(row.field_provenance);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string; source_type?: string }>;
       }
     } catch {
       /* malformed existing JSON -> treat as empty rather than clobber the write */
@@ -5085,7 +5103,9 @@ export async function applyGardssalgProviderContact(
   }
   const fetchedAt = new Date().toISOString();
   for (const f of written) {
-    provenance[f] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+    provenance[f] = sourceType
+      ? { source_url: evidenceUrl, fetched_at: fetchedAt, source_type: sourceType }
+      : { source_url: evidenceUrl, fetched_at: fetchedAt };
   }
   sets.push("field_provenance = @field_provenance");
   params.field_provenance = JSON.stringify(provenance);

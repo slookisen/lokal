@@ -41502,3 +41502,27 @@ runSerial(async () => {
     failures.push("opplevelser-gardssalg-second-line: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 3: 1881.no /
+// bransje-medlemslister (siderklynga.no, hanen.no) as an approved contact-
+// candidate kildeklasse — POST /admin/gardssalg-kildeklasse-contact-intake,
+// gated behind GS_KILDEKLASSE_CONTACT_ENABLED (default OFF, a sibling flag to
+// Grep 2's own — see the route's own doc comment for why). Own dedicated
+// in-memory-db harness (mirrors the sibling gårdssalg route test files' own
+// harness). Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-28-gardssalg-kildebredde-wiring: 1881/bransjeliste kildeklasse contact intake ──");
+  try {
+    const { runOpplevelserGardssalgKildeklasseContactTests } = require("../src/routes/opplevelser-gardssalg-kildeklasse-contact.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-kildeklasse-contact.test");
+    const gkc = await runOpplevelserGardssalgKildeklasseContactTests(false);
+    passed += gkc.passed;
+    failed += gkc.failed;
+    for (const f of gkc.failures) failures.push("opplevelser-gardssalg-kildeklasse-contact: " + f);
+    console.log(`  opplevelser-gardssalg-kildeklasse-contact: ${gkc.passed} passed, ${gkc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-gardssalg-kildeklasse-contact: unexpected error: " + String(err?.message || err));
+  }
+});
