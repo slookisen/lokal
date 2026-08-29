@@ -1126,11 +1126,12 @@ export function getAffiliatedUmbrellaDomains(db: any, producerId: string): strin
  *                          same Tier-B source_type TIER_B/init.ts's PR23
  *                          backfill already write — see database/init.ts
  *                          ~L2333-2432).
- *   - hanen_no / bondensmarked_no : any field_provenance record's
- *                          source_url resolves (via the SAME
- *                          hostFromUrlLike/registrableDomain helpers
- *                          domain-coherence already uses) to hanen.no /
- *                          bondensmarked.no — independent of whatever
+ *   - hanen_no / bondensmarked_no / 1881_no / siderklynga_no : any
+ *                          field_provenance record's source_url resolves
+ *                          (via the SAME hostFromUrlLike/registrableDomain
+ *                          helpers domain-coherence already uses) to
+ *                          hanen.no / bondensmarked.no / 1881.no /
+ *                          siderklynga.no — independent of whatever
  *                          source_type string was used to write it.
  *   - brreg_name_match    : brreg.navn (Brreg's registered name) scores
  *                          ≥0.80 against the producer's platform name via
@@ -1171,6 +1172,13 @@ export function computeSecondLineIdentitySources(input: {
         const root = host ? registrableDomain(host) : null;
         if (root === "hanen.no") sources.add("hanen_no");
         if (root === "bondensmarked.no") sources.add("bondensmarked_no");
+        // dev-request 2026-08-28-gardssalg-kildebredde-wiring (Grep 2 gap found
+        // 2026-08-29, post-lokal#740): the spec's own AC2 names "1881-oppføring
+        // m/org.nr" and bransjelister as accepted identity sources, but only
+        // hanen.no/bondensmarked.no were ever wired here. Additive — same
+        // registrable-domain-match pattern as the two lines above.
+        if (root === "1881.no") sources.add("1881_no");
+        if (root === "siderklynga.no") sources.add("siderklynga_no");
       }
     }
   }

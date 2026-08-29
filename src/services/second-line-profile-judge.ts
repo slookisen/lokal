@@ -60,6 +60,8 @@ function sourceLabelsFor(sources: readonly string[]): string {
     facebook_official_page: "en offisiell Facebook-side registrert for produsenten",
     hanen_no: "en oppføring på hanen.no",
     bondensmarked_no: "en oppføring på bondensmarked.no",
+    "1881_no": "en oppføring på 1881.no",
+    siderklynga_no: "en oppføring på siderklynga.no",
     brreg_name_match: "et navnetreff mot Brønnøysundregistrene (Brreg)",
   };
   if (sources.length === 0) return "(ingen — skal ikke skje, dommeren kalles aldri uten minst én kilde)";
