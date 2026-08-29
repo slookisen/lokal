@@ -324,12 +324,24 @@ export function runOpplevelserGardssalgSecondLineTests(
       let judgeVerdictText = "GODKJENN\nNavn, sted og e-post stemmer overens.";
       let judgeShouldNotBeCalled = false;
       let judgeCallCount = 0;
+      // Fix-up regression hook (lost-update finding on the field_provenance
+      // read-modify-write): set to mutate the DB mid-flight, simulating a
+      // concurrent writer landing during computeGardssalgSecondLineVerification's
+      // own await (this mocked judge call stands in for that network round-
+      // trip). Runs once, right before the mocked judge response resolves —
+      // i.e. still inside the route's await window — then clears itself.
+      let concurrentWriteFn: (() => void) | null = null;
       globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
         const urlStr = String(url);
         if (urlStr.includes("api.anthropic.com")) {
           judgeCallCount++;
           if (judgeShouldNotBeCalled) {
             throw new Error("second-line judge must NOT have been called in this scenario");
+          }
+          if (concurrentWriteFn) {
+            const fn = concurrentWriteFn;
+            concurrentWriteFn = null;
+            fn();
           }
           return {
             ok: true,
@@ -577,6 +589,37 @@ export function runOpplevelserGardssalgSecondLineTests(
         assertEq(byId["c13a"], "verified", "c-13b: c13a verified");
         assertEq(byId["c13b"], "disqualified_terminal", "c-13c: c13b disqualified_terminal");
         assertEq(byId["c13-missing"], "not_found", "c-13d: c13-missing not_found");
+      }
+
+      // c-14: lost-update regression (fix-up for reviewer's blocking finding
+      // on 43a153d). A concurrent writer (simulated via concurrentWriteFn,
+      // fired from inside the mocked judge-fetch call — i.e. mid-await,
+      // exactly the window computeGardssalgSecondLineVerification's real
+      // network round-trip opens) stamps an UNRELATED field_provenance key
+      // on the SAME row before the route's own write lands. The route's
+      // write must be built from a FRESH re-read taken after the await, not
+      // from the row snapshot read at the top of the loop iteration — so the
+      // concurrent writer's key must survive, side-by-side with
+      // second_line_verification, in the final row.
+      seedProvider("c14");
+      {
+        concurrentWriteFn = () => {
+          const cur = readFieldProvenance("c14");
+          cur.concurrent_writer_stamp = { touched_at: "2026-08-29T12:00:00Z", by: "test-concurrent-writer" };
+          expDb
+            .prepare(`UPDATE experience_providers SET field_provenance = ? WHERE id = ?`)
+            .run(JSON.stringify(cur), "c14");
+        };
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { providerIds: ["c14"] } });
+        const item = r.body.results.find((x: any) => x.provider_id === "c14");
+        assertEq(item.outcome, "verified", "c-14a: c14 verifies normally despite the mid-flight concurrent write");
+        const prov = readFieldProvenance("c14") as any;
+        assertEq(prov.second_line_verification?.verified, true, "c-14b: second_line_verification.verified=true is written");
+        assertTrue(
+          prov.concurrent_writer_stamp?.by === "test-concurrent-writer",
+          "c-14c: lost-update regression — the concurrent writer's key survives the route's write (fresh re-read, not a stale pre-await snapshot)",
+        );
+        assertEq(concurrentWriteFn, null, "c-14d: concurrentWriteFn hook fired exactly once and cleared itself");
       }
     } catch (err: any) {
       failed++;

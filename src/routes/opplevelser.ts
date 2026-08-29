@@ -2897,9 +2897,16 @@ export function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean
 // producer" vs. "does 2.linje evidence (an owner-plausible, provenance-backed
 // email + a corroborating identity source + an LLM identity judge) let this
 // row pass the outreach-readiness gate WITHOUT a verified hjemmeside at
-// all"). Written ONLY by POST /admin/gardssalg-second-line-verify below, via
-// the exact same read-modify-write/never-clobber-other-keys discipline
-// applyGardssalgWebsiteVerification() already uses for hjemmeside_verification.
+// all"). Written ONLY by POST /admin/gardssalg-second-line-verify below.
+// That route's judge-gate call is an async network round-trip, so — unlike
+// applyGardssalgWebsiteVerification()'s synchronous db.transaction() write
+// for hjemmeside_verification, which has no I/O gap to race — the write here
+// re-reads field_provenance fresh from the DB immediately before merging,
+// after the await has already resolved, so a concurrent writer touching this
+// row during the await window is never clobbered. Same read-fresh-before-
+// merge discipline applyGardssalgSetContactEmail() (experience-store.ts)
+// uses, applied here because this route's shape (an async gate) differs from
+// applyGardssalgWebsiteVerification()'s.
 interface GardssalgSecondLineVerificationEntry {
   verified?: unknown;
   at?: unknown;
@@ -13868,13 +13875,19 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
 //      of its own, and this route reuses the existing one rather than
 //      inventing a new column/table) -> never verified/promoted here ->
 //      "disqualified_hard_bounced".
-//   5. computeGardssalgSecondLineVerification runs. passes:false ->
-//      "gate_failed" (with reasons/sources/judge_reason, so a caller can see
-//      exactly why — never a bare rejection). passes:true -> field_provenance.
-//      second_line_verification is stamped {verified:true, at, sources,
-//      judge_reason} via the SAME read-modify-write/never-clobber-other-keys
-//      pattern applyGardssalgWebsiteVerification uses for
-//      hjemmeside_verification -> "verified".
+//   5. computeGardssalgSecondLineVerification runs (an async judge-API call).
+//      passes:false -> "gate_failed" (with reasons/sources/judge_reason, so a
+//      caller can see exactly why — never a bare rejection). passes:true ->
+//      field_provenance is re-read FRESH from the DB right here (after the
+//      await, not from the pre-await snapshot read at the top of this loop
+//      iteration) and second_line_verification is merged into that fresh
+//      read — {verified:true, at, sources, judge_reason} — then written back,
+//      never clobbering other keys or a concurrent writer's changes made
+//      during the await window. This is the read-fresh-before-merge
+//      discipline applyGardssalgSetContactEmail() (experience-store.ts) uses,
+//      not applyGardssalgWebsiteVerification()'s synchronous-transaction
+//      approach — that one has no I/O gap to race, this route's async judge
+//      call does -> "verified".
 //
 // Never wired into any claim-link/magic-link generation path — "aldri
 // claim-lenker på 2.linje-evidens alene" — this route only stamps
@@ -14029,9 +14042,36 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
       continue;
     }
 
-    // Read-modify-write, never clobbering other field_provenance keys — same
-    // pattern applyGardssalgWebsiteVerification uses for hjemmeside_verification.
-    fieldProv.second_line_verification = {
+    // Re-read field_provenance FRESH from the DB, immediately before merging
+    // and writing. `fieldProv` above (parsed from the row fetched at the top
+    // of this loop iteration) is fine as a READ-ONLY input to the gate call —
+    // but computeGardssalgSecondLineVerification just above made a network
+    // round-trip to the judge API, so that snapshot may now be stale: a
+    // concurrent writer (a content-refresh sweep, applyGardssalgWebsiteVerification,
+    // a manual admin edit) could have mutated this row's field_provenance
+    // during the await window. Writing back into the stale snapshot would
+    // silently clobber whatever that writer set. This mirrors the discipline
+    // applyGardssalgSetContactEmail (experience-store.ts) uses — always
+    // re-read right before merge/write, never reuse a pre-await snapshot for
+    // the write. (applyGardssalgWebsiteVerification avoids the same class of
+    // bug differently, via a synchronous db.transaction with no I/O gap
+    // inside it; this route's judge call is async, so wrapping the await in
+    // a transaction isn't the right fix here — the fresh re-read is.)
+    const freshRow = expDb
+      .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+      .get(id) as { field_provenance: string | null } | undefined;
+    let freshFieldProv: Record<string, unknown> = {};
+    if (freshRow?.field_provenance) {
+      try {
+        const parsed = JSON.parse(freshRow.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          freshFieldProv = parsed as Record<string, unknown>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty, never clobber/throw */
+      }
+    }
+    freshFieldProv.second_line_verification = {
       verified: true,
       at: checkedAt,
       sources: gate.sources,
@@ -14039,7 +14079,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
     };
     expDb
       .prepare(`UPDATE experience_providers SET field_provenance = ?, updated_at = datetime('now') WHERE id = ?`)
-      .run(JSON.stringify(fieldProv), id);
+      .run(JSON.stringify(freshFieldProv), id);
 
     results.push({ provider_id: id, outcome: "verified", sources: gate.sources, judge_reason: gate.judge_reason });
   }
