@@ -1147,6 +1147,27 @@ export function getAffiliatedUmbrellaDomains(db: any, producerId: string): strin
  * regex-testing for a city-name substring, which is exactly the
  * generic/wrong-entity trap the whole-profile judge exists to catch.
  */
+// dev-request 2026-08-29-gs-second-line-kildeklasse-bredde (Del B): the
+// gardssalg-set-contact-email/-phone admin routes store their caller-supplied
+// `source` string VERBATIM into field_provenance.*.source_url — that field's
+// own contract is documented free-text, "not necessarily a URL" (e.g. a
+// session writes "session-kildebredde-2026-08-29 · https://www.1881.no/xyz").
+// hostFromUrlLike() (cross-source-validator.ts) expects a value that already
+// IS a bare host/URL and does not hunt for one embedded in a longer string,
+// so such records never matched below. Deliberately a LOCAL helper here
+// rather than widening hostFromUrlLike's own parsing contract — that helper
+// has ~15 other call sites (domain-coherence, umbrella matching, ...) that
+// already pass it clean URLs, so changing what it accepts is a much bigger
+// regression surface than this slice needs (mirrors the existing narrow-fix-
+// over-shared-helper pattern already used elsewhere in this codebase).
+// Fallback is exactly today's behavior: no embedded URL found -> return the
+// input unchanged, so hostFromUrlLike either parses it as-is (already-clean
+// URL/host strings) or fails to resolve a host the same way it does today.
+function extractUrlFromFreeText(raw: string): string {
+  const match = raw.match(/https?:\/\/\S+/i);
+  return match ? match[0] : raw;
+}
+
 export function computeSecondLineIdentitySources(input: {
   website_ok: boolean;
   field_provenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>;
@@ -1168,7 +1189,7 @@ export function computeSecondLineIdentitySources(input: {
       if (!r || typeof r !== "object") continue;
       if (r.source_type === "facebook_official_page") sources.add("facebook_official_page");
       if (typeof r.source_url === "string" && r.source_url) {
-        const host = hostFromUrlLike(r.source_url);
+        const host = hostFromUrlLike(extractUrlFromFreeText(r.source_url));
         const root = host ? registrableDomain(host) : null;
         if (root === "hanen.no") sources.add("hanen_no");
         if (root === "bondensmarked.no") sources.add("bondensmarked_no");

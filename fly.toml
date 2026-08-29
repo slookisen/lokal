@@ -80,6 +80,16 @@ primary_region = 'arn'
   # byte-identical to pre-#738 behavior. Existing stamps survive a flip-off
   # (permanent provenance) but no new ones are written while off.
   GS_SECOND_LINE_VERIFICATION_ENABLED = 'true'
+  # dev-request 2026-08-29-gs-second-line-kildeklasse-bredde.md Del C (PR #740,
+  # shipped flag-OFF as specified): enables POST
+  # /admin/gardssalg-kildeklasse-contact-intake (on-demand 1881/bransjeliste
+  # kildeklasse contact-candidate intake). Daniel's drive-order covers the
+  # flip (A2A daniel-responses/2026-08-29-storkonsern-50-og-drive-til-
+  # outreach.md). Deliberately NOT wired into any cron/sweep — flipping this
+  # starts no background volume; it only un-no-ops the endpoint. Gate is
+  # `=== "true"`, read fresh per call; fail-safe: anything else = off,
+  # byte-identical to pre-#740 behavior.
+  GS_KILDEKLASSE_CONTACT_ENABLED = 'true'
 
 [[mounts]]
   source = 'lokal_data'
