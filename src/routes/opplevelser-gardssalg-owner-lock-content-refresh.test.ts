@@ -236,7 +236,7 @@ export function runOpplevelserGardssalgOwnerLockContentRefreshTests(
         }
         const host = new URL(urlStr).hostname;
         fetchedHosts.push(host);
-        if (["ol1.example.no", "ol2.example.no", "ol3.example.no", "ol4.example.no"].includes(host)) {
+        if (["ol1.example.no", "ol2.example.no", "ol3.example.no", "ol4.example.no", "ol5.example.no"].includes(host)) {
           const html = htmlFor(host);
           return {
             ok: true, status: 200, text: async () => html,
@@ -344,6 +344,60 @@ export function runOpplevelserGardssalgOwnerLockContentRefreshTests(
         const rowAfterApply = getProviderRow("ol-4");
         assertEq(rowAfterApply.about_text, null, "ol4-13: apply — about_text still null, nothing written");
         assertEq(rowAfterApply.visit_text, null, "ol4-14: apply — visit_text still null, nothing written");
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // (5) dev-request 2026-08-29-gardssalg-products-write-and-field-lock,
+      //     Part B: an ADMIN-set lock (via the new gardssalg-set-field-lock
+      //     endpoint) on an ORDINARY row — content_source=null, NOT 'claim'
+      //     — must ALSO be honored here, in both dry-run and apply. Before
+      //     that dev-request, this was the exact gap: owner_locks was only
+      //     ever consulted for content_source='claim' rows (both inside
+      //     isGardssalgFieldOwnerLocked itself and via the extra
+      //     `t.content_source === "claim" &&`/`row.content_source ===
+      //     "claim" &&` guards this route and applyGardssalgProviderContent
+      //     used to carry at their own call sites), so an admin lock written
+      //     on a typical (non-claim) production row — like the Anikonic
+      //     Cider case this dev-request's Post-deploy verification section
+      //     names — would have been silently ignored by content-refresh.
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, field_provenance,
+              producer_type, enrichment_state, verification_status, source, confidence)
+           VALUES
+             ('ol-5', 'Ol5 Adminlaast Gard', 'experiences', 'https://ol5.example.no', NULL, NULL, NULL, NULL, @field_provenance,
+              'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
+        ).run({
+          field_provenance: verifiedProvenance({
+            owner_locks: { about_text: { locked_at: "2026-08-29T00:00:00.000Z", locked_by: "admin", source_url: "CS verifisert manuelt" } },
+          }),
+        });
+
+        const dry5 = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["ol-5"], apply: false },
+        });
+        assertEq(dry5.status, 200, "ol5-1: dry-run call -> 200");
+        assertTrue(!dry5.body.changed.some((c: any) => c.provider_id === "ol-5" && c.fields.includes("about_text")), "ol5-2: dry-run — about_text is NOT proposed as a change for the admin-locked field (the acceptance criterion this dev-request exists to satisfy)");
+        const dry5Entry = dry5.body.changed.find((c: any) => c.provider_id === "ol-5");
+        if (dry5Entry) {
+          assertEq(dry5Entry.fields, ["visit_text"], "ol5-3: dry-run — only the UNLOCKED sibling field (visit_text) is proposed, about_text is excluded");
+        }
+        const dry5LockedEntry = dry5.body.owner_field_locked.find((e: any) => e.provider_id === "ol-5");
+        if (dry5LockedEntry) {
+          assertTrue(dry5LockedEntry.fields.includes("about_text"), "ol5-4: if ol-5 appears in owner_field_locked, about_text is named");
+        }
+
+        const apply5 = await callRoute(opplevelserRouter, {
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["ol-5"], apply: true },
+        });
+        assertEq(apply5.status, 200, "ol5-5: apply call -> 200");
+        const rowAfterApply5 = getProviderRow("ol-5");
+        assertEq(rowAfterApply5.about_text, null, "ol5-6: apply — about_text is STILL null, the admin lock actually prevented the write (not just the dry-run preview)");
+        assertTrue(!!rowAfterApply5.visit_text, "ol5-7: apply — the unlocked sibling field (visit_text) WAS written, proving this is a per-field skip, not a full-row one");
       }
 
       // ── Direct applyGardssalgProviderContent call — pure per-field-gate
