@@ -68,6 +68,18 @@ primary_region = 'arn'
   # once RFB_SECOND_LINE_VERIFICATION_ENABLED above is also 'true'. See
   # dev-request FUNN block for the brregLookup gap.
   RFB_TERMINAL_UNCONFIRMABLE_ENABLED = 'true'
+  # dev-request 2026-08-28-gardssalg-kildebredde-wiring.md Grep 2 (PR #738,
+  # shipped flag-OFF as specified): enables POST /admin/gardssalg-second-line-verify
+  # (on-demand, max 48 ids per call, judge-API-gated, stamps
+  # field_provenance.second_line_verification) and the verified_second_line
+  # mirror in gardssalg-outreach-readiness. Daniel GO'd the flip in live
+  # session 2026-08-29 (A2A daniel-responses/2026-08-29-go-second-line-flipp-
+  # og-remapping-dev-request.md). Deliberately NOT wired into any cron/sweep —
+  # flipping this starts no background volume; it only un-no-ops the endpoint.
+  # Gate is `=== "true"`, read fresh per call; fail-safe: anything else = off,
+  # byte-identical to pre-#738 behavior. Existing stamps survive a flip-off
+  # (permanent provenance) but no new ones are written while off.
+  GS_SECOND_LINE_VERIFICATION_ENABLED = 'true'
 
 [[mounts]]
   source = 'lokal_data'
