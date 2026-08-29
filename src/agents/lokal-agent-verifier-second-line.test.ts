@@ -167,6 +167,61 @@ export function runLokalAgentVerifierSecondLineTests(
         }).length,
         "a-14d: source_url host proff.no (NOT in the accepted list) -> no source added, no false-positive widening",
       );
+      // dev-request 2026-08-29-gs-second-line-kildeklasse-bredde Del B: the
+      // gardssalg-set-contact-email/-phone admin routes store `source`
+      // VERBATIM into field_provenance.*.source_url, and that field is
+      // documented free-text ("not necessarily a URL") — a session's own
+      // write format embeds a real URL after a label+separator, e.g.
+      // "session-kildebredde-2026-08-29 · https://www.1881.no/some-path".
+      assertTrue(
+        computeSecondLineIdentitySources({
+          website_ok: false,
+          field_provenance: {
+            epost: [{ value: "x", source_type: "1881", source_url: "session-kildebredde-2026-08-29 · https://www.1881.no/some-path", fetched_at: "2026-08-29T00:00:00Z" }],
+          },
+          brreg: null,
+          producer_name: "Testgård",
+        }).includes("1881_no"),
+        "a-14e: free-text source_url with embedded https://www.1881.no URL -> 1881_no fires (Del B URL extraction)",
+      );
+      assertTrue(
+        computeSecondLineIdentitySources({
+          website_ok: false,
+          field_provenance: {
+            telefon: [{ value: "x", source_type: "siderklynga", source_url: "session-kildebredde-2026-08-29 · https://www.siderklynga.no/foo", fetched_at: "2026-08-29T00:00:00Z" }],
+          },
+          brreg: null,
+          producer_name: "Testgård",
+        }).includes("siderklynga_no"),
+        "a-14f: free-text source_url with embedded https://www.siderklynga.no URL -> siderklynga_no fires (Del B URL extraction)",
+      );
+      // Regression: a source_url that is ALREADY a bare clean URL must still
+      // resolve exactly as before Del B — extracting /https?:\/\/\S+/ from a
+      // string that IS already exactly a clean URL returns that same string.
+      assertTrue(
+        computeSecondLineIdentitySources({
+          website_ok: false,
+          field_provenance: {
+            epost: [{ value: "x", source_type: "directory_listing", source_url: "https://www.hanen.no/gard/xyz", fetched_at: "2026-08-29T00:00:00Z" }],
+          },
+          brreg: null,
+          producer_name: "Testgård",
+        }).includes("hanen_no"),
+        "a-14g: regression — already-clean source_url https://www.hanen.no/gard/xyz still fires hanen_no unchanged",
+      );
+      // No embedded URL at all -> falls through unchanged (same as today,
+      // hostFromUrlLike on the raw free-text string resolves no accepted host).
+      assertTrue(
+        !computeSecondLineIdentitySources({
+          website_ok: false,
+          field_provenance: {
+            epost: [{ value: "x", source_type: "phone_call", source_url: "telefonsamtale 2026-08-29, ingen lenke", fetched_at: "2026-08-29T00:00:00Z" }],
+          },
+          brreg: null,
+          producer_name: "Testgård",
+        }).length,
+        "a-14h: free-text source_url with NO embedded URL -> no source class fires, falls through unchanged",
+      );
       assertTrue(
         computeSecondLineIdentitySources({
           website_ok: false,
