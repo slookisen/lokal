@@ -41675,3 +41675,26 @@ runSerial(async () => {
     failures.push("gardssalg-owner-lock-broadening: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-29-verifier-claim-kind-katalog-gap — GET
+// /admin/verifier/claim-counts (src/routes/admin-verifier-claim-counts.ts):
+// read-only claim-kind count+sample endpoint (typed allowlist of 7 kinds)
+// so platform-verifier can verify claim kinds that were previously silently
+// unverifiable. Own dedicated in-memory-db harness (mirrors
+// admin-domain-coherence.test.ts's harness). Tail position is the
+// convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-29-verifier-claim-kind-katalog-gap: verifier claim-counts ──");
+  try {
+    const { runAdminVerifierClaimCountsTests } = require("../src/routes/admin-verifier-claim-counts.test") as
+      typeof import("../src/routes/admin-verifier-claim-counts.test");
+    const vcc = await runAdminVerifierClaimCountsTests({ log: false });
+    passed += vcc.passed;
+    failed += vcc.failed;
+    for (const f of vcc.failures) failures.push("admin-verifier-claim-counts: " + f);
+    console.log(`  admin-verifier-claim-counts: ${vcc.passed} passed, ${vcc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-verifier-claim-counts: unexpected error: " + String(err?.message || err));
+  }
+});

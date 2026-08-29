@@ -4222,7 +4222,10 @@ router.get("/admin/knowledge/:agentId/field-provenance", (req: Request, res: Res
   }
 });
 
-// ─── GET /admin/agents/dump ─────────────────────────────────
+// ─── GET /api/marketplace/admin/agents/dump ──────────────────
+// (mounted here at "/admin/agents/dump" because marketplaceRoutes itself is
+// mounted at "/api/marketplace" in src/index.ts — the real, callable path is
+// the full "/api/marketplace/admin/agents/dump", not a bare "/admin/agents/dump".)
 // Returns all active agents with contact info for outreach tooling.
 // Fields: id, name, city, email, website, contacted_at (derived from
 // crm_messages.sent_at, NULL if no outbound CRM message), is_claimed.
