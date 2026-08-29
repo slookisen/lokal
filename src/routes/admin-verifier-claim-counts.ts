@@ -15,18 +15,31 @@
 // admin-outreach-pool.ts).
 //
 // Timestamp footgun (see admin-domain-coherence.ts's stampParking() comment
-// for the original incident this mirrors): every timestamp column this
-// route reads (agent_knowledge.last_verified_at, updated_at,
-// homepage_unreachable_since, domain_reconciliation_checked_at) is written
-// via SQLite's own datetime('now'), which emits space-separated
-// "YYYY-MM-DD HH:MM:SS" — no 'T', no milliseconds, no 'Z'. A caller's
-// 'T'-separated ISO-8601 since/until compared directly (string BETWEEN)
-// against those columns would silently misorder same-day boundaries
-// (space 0x20 sorts below 'T' 0x54, so a same-day DB row would compare as
-// "before" a same-day ISO `since`). parseSinceUntil() below normalizes
-// every incoming since/until to that exact space-separated, no-ms, no-Z,
-// UTC form before it ever reaches a BETWEEN clause, so both sides of every
-// comparison are in the same format.
+// for the original incident this mirrors): the timestamp columns this route
+// reads are NOT written consistently. Only domain_reconciliation_checked_at
+// (via stampParking() in admin-domain-coherence.ts) is actually written via
+// SQLite's own datetime('now') (space-separated "YYYY-MM-DD HH:MM:SS", no
+// 'T', no ms, no 'Z'). The others are written as full JS ISO-8601 strings
+// (new Date().toISOString(), 'T'-separated, with milliseconds and a 'Z') at
+// most of their call sites — last_verified_at (lokal-agent-verifier.ts),
+// homepage_unreachable_since (admin-knowledge.ts, marketplace.ts) — and
+// updated_at is WORSE: mixed, depending on which code path last touched the
+// row (some sites use JS-ISO, others literal datetime('now')), so a given
+// row's format can't be assumed from its column alone.
+//
+// A raw string BETWEEN comparing two different formats is unsafe: SQLite's
+// default collation sorts 'T' (0x54) above ' ' (0x20), so a JS-ISO value
+// compared against a space-separated bound silently sorts as "later than it
+// should be" and can be excluded from a same-day window. Rather than track
+// which format each column/row is in, both sides of every BETWEEN below are
+// wrapped in SQLite's own datetime(...) function (`datetime(col) BETWEEN
+// datetime(?) AND datetime(?)`), which parses both the space-separated and
+// 'T'/ms/'Z' ISO-8601 forms and normalizes each to the same canonical
+// "YYYY-MM-DD HH:MM:SS" text before comparing — so the comparison is correct
+// regardless of which format any given row (or the incoming since/until)
+// happens to be in. Verified against this repo's actual better-sqlite3
+// engine in admin-verifier-claim-counts.test.ts, including a same-day/
+// same-hour JS-ISO fixture that reproduces the original bug.
 //
 // Known, documented imprecision — NOT a bug to "fix" here: kinds 2-4
 // (agents_review_required / agents_pending_verify / agents_data_insufficient)
@@ -63,11 +76,16 @@ function requireAdmin(req: Request, res: Response): boolean {
   return true;
 }
 
-// Normalizes an incoming since/until query value to the SAME space-separated,
-// no-ms, no-Z, UTC "YYYY-MM-DD HH:MM:SS" form that datetime('now') writes
-// into every timestamp column this route reads — see the file-header
-// footgun comment. Returns null for missing/non-string/unparseable input,
-// which the route turns into a 400.
+// Normalizes an incoming since/until query value to a canonical
+// space-separated, no-ms, no-Z, UTC "YYYY-MM-DD HH:MM:SS" form for the JSON
+// response echo (see the response payload below) and as the value bound
+// into the query. The DB-side comparison itself does not depend on this
+// normalization being exact — every BETWEEN in whereForKind() wraps both
+// sides in SQLite's datetime(...), which re-parses this string the same way
+// it parses each column's own value (space-separated or JS-ISO), so both
+// sides land in the same canonical form before comparing regardless. See the
+// file-header footgun comment. Returns null for missing/non-string/
+// unparseable input, which the route turns into a 400.
 function parseSinceUntil(raw: unknown): string | null {
   if (typeof raw !== "string" || !raw.trim()) return null;
   const d = new Date(raw);
@@ -91,28 +109,34 @@ type ClaimKind = (typeof KNOWN_KINDS)[number];
 // selects one of these literal strings via switch — nothing derived from
 // the query string reaches SQL. Each fragment takes exactly two `?`
 // placeholders (since, until, in that order).
+//
+// Every BETWEEN wraps BOTH the column and the bound placeholder in SQLite's
+// datetime(...) — see the file-header footgun comment for why: it lets the
+// comparison work uniformly whether the column's actual value is
+// space-separated (datetime('now')) or JS-ISO ('T'/ms/'Z'), without needing
+// to know which format any given row is in.
 function whereForKind(kind: ClaimKind): string {
   switch (kind) {
     case "agents_verified":
-      return `k.verification_status = 'verified' AND k.last_verified_at BETWEEN ? AND ?`;
+      return `k.verification_status = 'verified' AND datetime(k.last_verified_at) BETWEEN datetime(?) AND datetime(?)`;
     case "agents_review_required":
       // updated_at imprecision — see file-header comment. Not a bug.
-      return `k.verification_status = 'review_required' AND k.updated_at BETWEEN ? AND ?`;
+      return `k.verification_status = 'review_required' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
     case "agents_pending_verify":
       // updated_at imprecision — see file-header comment. Not a bug.
-      return `k.verification_status = 'pending_verify' AND k.updated_at BETWEEN ? AND ?`;
+      return `k.verification_status = 'pending_verify' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
     case "agents_data_insufficient":
       // updated_at imprecision — see file-header comment. Not a bug.
-      return `k.verification_status = 'data_insufficient' AND k.updated_at BETWEEN ? AND ?`;
+      return `k.verification_status = 'data_insufficient' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
     case "http_unreachable":
-      return `k.homepage_unreachable_since BETWEEN ? AND ?`;
+      return `datetime(k.homepage_unreachable_since) BETWEEN datetime(?) AND datetime(?)`;
     case "brreg_inactive_flagged":
       // updated_at imprecision — see file-header comment. Not a bug.
-      return `json_extract(k.verification_review_reason,'$.terminal_reason') = 'brreg_inactive' AND k.updated_at BETWEEN ? AND ?`;
+      return `json_extract(k.verification_review_reason,'$.terminal_reason') = 'brreg_inactive' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
     case "agents_domain_incoherent":
       // Real enum values written by stampParking() in admin-domain-coherence.ts
       // — confirmed by reading that file, not invented.
-      return `k.domain_reconciliation_outcome IN ('circular_scramble_candidate','manual_review_needed') AND k.domain_reconciliation_checked_at BETWEEN ? AND ?`;
+      return `k.domain_reconciliation_outcome IN ('circular_scramble_candidate','manual_review_needed') AND datetime(k.domain_reconciliation_checked_at) BETWEEN datetime(?) AND datetime(?)`;
   }
 }
 
@@ -163,6 +187,7 @@ router.get("/", (req: Request, res: Response) => {
            FROM agent_knowledge k
            INNER JOIN agents a ON a.id = k.agent_id
           WHERE a.is_active = 1 AND ${where}
+          ORDER BY a.id
           LIMIT 5`
       )
       .all(since, until) as Array<{ id: string; name: string }>;

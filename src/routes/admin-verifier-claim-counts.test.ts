@@ -31,6 +31,28 @@
  *   - Missing/malformed since/until -> 400.
  *   - No X-Admin-Key -> 403; wrong key -> 403; ADMIN_KEY unset -> 503.
  *   - sample caps at 5 even when count is higher.
+ *   - sample rows come back in a stable order (ORDER BY a.id) across repeat
+ *     calls with the same kind/window.
+ *
+ * Timestamp-format coverage (the actual bug this fix addresses — see the
+ * route file's header comment): production write sites do NOT uniformly
+ * write datetime('now')-style space-separated timestamps. last_verified_at
+ * and homepage_unreachable_since are written as JS ISO-8601
+ * (new Date().toISOString(), 'T'-separated with ms and 'Z') at their real
+ * call sites, and updated_at is MIXED — some call sites JS-ISO, others
+ * literal datetime('now'). So fixtures below deliberately use:
+ *   - last_verified_at / homepage_unreachable_since: JS-ISO form throughout
+ *     (matching the real write sites), via new Date(...).toISOString().
+ *   - domain_reconciliation_checked_at: kept in the space-separated
+ *     datetime('now')-style form it already correctly used (stampParking()
+ *     is the one write site that's actually right) — regression check that
+ *     the fix doesn't break the one column that was already correct.
+ *   - updated_at: explicit cases in BOTH formats (JS-ISO and space-separated)
+ *     to prove the mixed-format-per-row reality is handled.
+ * Plus a same-day/same-hour boundary case for agents_verified and
+ * http_unreachable that is the exact repro from the bug report: a JS-ISO
+ * last_verified_at seeded for "today", queried with a since/until window
+ * covering "today" — before the fix this silently returned count 0.
  */
 
 import Database from "better-sqlite3";
@@ -186,76 +208,104 @@ export function runAdminVerifierClaimCountsTests(
       }
 
       // Shared window for the boundary-behavior tests below. since/until are
-      // sent to the route as 'T'-separated ISO-8601 with a trailing 'Z' — the
-      // route's parseSinceUntil() must normalize both to the space-separated
-      // "YYYY-MM-DD HH:MM:SS" form the DB columns actually store before the
-      // BETWEEN comparison, per the file's own footgun comment. DB fixture
-      // values below are written directly in that space-separated form (the
-      // same convention datetime('now') itself writes), including exactly
-      // the since/until boundary values themselves.
+      // sent to the route as 'T'-separated ISO-8601 with a trailing 'Z'.
+      // Fixture values are written in the format each column is ACTUALLY
+      // written in at its real production call site (see file-header
+      // comment and this file's own top-of-file coverage note) — most as
+      // JS-ISO ('T'-separated, ms, 'Z', via new Date(...).toISOString()),
+      // domain_reconciliation_checked_at (the one genuinely-correct column)
+      // and the "*_DB" updated_at variants as space-separated
+      // datetime('now')-style text. The fix (datetime(...) wrapping both
+      // sides of every BETWEEN) must match correctly regardless of which of
+      // these two forms a given row is actually in.
       const SINCE_ISO = "2026-08-01T00:00:00Z";
       const UNTIL_ISO = "2026-08-31T23:59:59Z";
       const SINCE_DB = "2026-08-01 00:00:00";
       const UNTIL_DB = "2026-08-31 23:59:59";
-      const IN_WINDOW = "2026-08-15 12:00:00";
-      const JUST_BEFORE = "2026-07-31 23:59:59";
-      const JUST_AFTER = "2026-09-01 00:00:00";
+      // Exact boundary values in JS-ISO form (with ms) — same instants as
+      // SINCE_DB/UNTIL_DB, written the way last_verified_at/
+      // homepage_unreachable_since actually arrive in production.
+      const SINCE_JS = "2026-08-01T00:00:00.000Z";
+      const UNTIL_JS = "2026-08-31T23:59:59.000Z";
+      const IN_WINDOW_JS = "2026-08-15T12:00:00.000Z";
+      const IN_WINDOW_DB = "2026-08-15 12:00:00";
+      const JUST_BEFORE_JS = "2026-07-31T23:59:59.000Z";
+      const JUST_BEFORE_DB = "2026-07-31 23:59:59";
+      const JUST_AFTER_JS = "2026-09-01T00:00:00.000Z";
 
-      // ── kind 1: agents_verified (last_verified_at) ──────────────────────
-      seed("v-in", { verificationStatus: "verified", lastVerifiedAt: IN_WINDOW });
-      seed("v-since-boundary", { verificationStatus: "verified", lastVerifiedAt: SINCE_DB });
-      seed("v-until-boundary", { verificationStatus: "verified", lastVerifiedAt: UNTIL_DB });
-      seed("v-before", { verificationStatus: "verified", lastVerifiedAt: JUST_BEFORE });
-      seed("v-after", { verificationStatus: "verified", lastVerifiedAt: JUST_AFTER });
-      seed("v-wrongstatus", { verificationStatus: "pending_verify", lastVerifiedAt: IN_WINDOW });
-      seed("v-inactive", { verificationStatus: "verified", lastVerifiedAt: IN_WINDOW, isActive: 0 });
+      // ── kind 1: agents_verified (last_verified_at — real write site is
+      // JS-ISO throughout, lokal-agent-verifier.ts's new Date().toISOString()) ──
+      seed("v-in", { verificationStatus: "verified", lastVerifiedAt: IN_WINDOW_JS });
+      seed("v-since-boundary", { verificationStatus: "verified", lastVerifiedAt: SINCE_JS });
+      seed("v-until-boundary", { verificationStatus: "verified", lastVerifiedAt: UNTIL_JS });
+      seed("v-before", { verificationStatus: "verified", lastVerifiedAt: JUST_BEFORE_JS });
+      seed("v-after", { verificationStatus: "verified", lastVerifiedAt: JUST_AFTER_JS });
+      seed("v-wrongstatus", { verificationStatus: "pending_verify", lastVerifiedAt: IN_WINDOW_JS });
+      seed("v-inactive", { verificationStatus: "verified", lastVerifiedAt: IN_WINDOW_JS, isActive: 0 });
 
-      // ── kind 2: agents_review_required (updated_at) ──────────────────────
-      seed("rr-in", { verificationStatus: "review_required", updatedAt: IN_WINDOW });
-      seed("rr-before", { verificationStatus: "review_required", updatedAt: JUST_BEFORE });
-      seed("rr-wrongstatus", { verificationStatus: "verified", updatedAt: IN_WINDOW });
+      // ── kind 2: agents_review_required (updated_at — MIXED format in
+      // production: some call sites JS-ISO, others literal datetime('now').
+      // Both an in-window JS-ISO row and an in-window space-separated row
+      // are seeded to prove the fix counts both, not just one format.) ──
+      seed("rr-in-js", { verificationStatus: "review_required", updatedAt: IN_WINDOW_JS });
+      seed("rr-in-db", { verificationStatus: "review_required", updatedAt: IN_WINDOW_DB });
+      seed("rr-before", { verificationStatus: "review_required", updatedAt: JUST_BEFORE_JS });
+      seed("rr-wrongstatus", { verificationStatus: "verified", updatedAt: IN_WINDOW_JS });
 
-      // ── kind 3: agents_pending_verify (updated_at) ───────────────────────
-      seed("pv-in", { verificationStatus: "pending_verify", updatedAt: IN_WINDOW });
-      seed("pv-before", { verificationStatus: "pending_verify", updatedAt: JUST_BEFORE });
-      seed("pv-wrongstatus", { verificationStatus: "verified", updatedAt: IN_WINDOW });
+      // ── kind 3: agents_pending_verify (updated_at, mixed format — see kind 2) ──
+      seed("pv-in-js", { verificationStatus: "pending_verify", updatedAt: IN_WINDOW_JS });
+      seed("pv-in-db", { verificationStatus: "pending_verify", updatedAt: IN_WINDOW_DB });
+      seed("pv-before", { verificationStatus: "pending_verify", updatedAt: JUST_BEFORE_JS });
+      seed("pv-wrongstatus", { verificationStatus: "verified", updatedAt: IN_WINDOW_JS });
 
-      // ── kind 4: agents_data_insufficient (updated_at) ────────────────────
-      seed("di-in", { verificationStatus: "data_insufficient", updatedAt: IN_WINDOW });
-      seed("di-before", { verificationStatus: "data_insufficient", updatedAt: JUST_BEFORE });
-      seed("di-wrongstatus", { verificationStatus: "verified", updatedAt: IN_WINDOW });
+      // ── kind 4: agents_data_insufficient (updated_at, mixed format — see kind 2) ──
+      seed("di-in-js", { verificationStatus: "data_insufficient", updatedAt: IN_WINDOW_JS });
+      seed("di-in-db", { verificationStatus: "data_insufficient", updatedAt: IN_WINDOW_DB });
+      seed("di-before", { verificationStatus: "data_insufficient", updatedAt: JUST_BEFORE_JS });
+      seed("di-wrongstatus", { verificationStatus: "verified", updatedAt: IN_WINDOW_JS });
 
-      // ── kind 5: http_unreachable (homepage_unreachable_since) ───────────
-      seed("hu-in", { homepageUnreachableSince: IN_WINDOW });
-      seed("hu-before", { homepageUnreachableSince: JUST_BEFORE });
+      // ── kind 5: http_unreachable (homepage_unreachable_since — real write
+      // sites are JS-ISO, admin-knowledge.ts / marketplace.ts) ────────────
+      seed("hu-in", { homepageUnreachableSince: IN_WINDOW_JS });
+      seed("hu-before", { homepageUnreachableSince: JUST_BEFORE_JS });
       seed("hu-null", {});
 
-      // ── kind 6: brreg_inactive_flagged (json terminal_reason + updated_at) ──
-      seed("bi-in", {
+      // ── kind 6: brreg_inactive_flagged (json terminal_reason + updated_at,
+      // mixed format — see kind 2) ────────────────────────────────────────
+      seed("bi-in-js", {
         reviewReason: JSON.stringify({ terminal_reason: "brreg_inactive" }),
-        updatedAt: IN_WINDOW,
+        updatedAt: IN_WINDOW_JS,
+      });
+      seed("bi-in-db", {
+        reviewReason: JSON.stringify({ terminal_reason: "brreg_inactive" }),
+        updatedAt: IN_WINDOW_DB,
       });
       seed("bi-wrongreason", {
         reviewReason: JSON.stringify({ terminal_reason: "brreg_konkurs" }),
-        updatedAt: IN_WINDOW,
+        updatedAt: IN_WINDOW_JS,
       });
       seed("bi-before", {
         reviewReason: JSON.stringify({ terminal_reason: "brreg_inactive" }),
-        updatedAt: JUST_BEFORE,
+        updatedAt: JUST_BEFORE_JS,
       });
 
-      // ── kind 7: agents_domain_incoherent (outcome enum + checked_at) ────
-      seed("di2-scramble", { domainOutcome: "circular_scramble_candidate", domainCheckedAt: IN_WINDOW });
-      seed("di2-manual", { domainOutcome: "manual_review_needed", domainCheckedAt: IN_WINDOW });
-      seed("di2-noaction", { domainOutcome: "no_action_needed", domainCheckedAt: IN_WINDOW });
-      seed("di2-before", { domainOutcome: "circular_scramble_candidate", domainCheckedAt: JUST_BEFORE });
+      // ── kind 7: agents_domain_incoherent (outcome enum + checked_at —
+      // stampParking() is the one write site that's genuinely
+      // datetime('now')-style space-separated; kept that way here as a
+      // regression check that the fix doesn't break the column that was
+      // already correct) ──────────────────────────────────────────────────
+      seed("di2-scramble", { domainOutcome: "circular_scramble_candidate", domainCheckedAt: IN_WINDOW_DB });
+      seed("di2-manual", { domainOutcome: "manual_review_needed", domainCheckedAt: IN_WINDOW_DB });
+      seed("di2-noaction", { domainOutcome: "no_action_needed", domainCheckedAt: IN_WINDOW_DB });
+      seed("di2-before", { domainOutcome: "circular_scramble_candidate", domainCheckedAt: JUST_BEFORE_DB });
 
       // ── sample cap: 7 matching rows in a DIFFERENT window than the ones
       // above, so this doesn't perturb the agents_verified boundary counts.
+      // JS-ISO timestamp, matching last_verified_at's real write-site format.
       const CAP_SINCE_ISO = "2027-01-01T00:00:00Z";
       const CAP_UNTIL_ISO = "2027-01-31T23:59:59Z";
       for (let i = 1; i <= 7; i++) {
-        seed(`cap-${i}`, { verificationStatus: "verified", lastVerifiedAt: "2027-01-15 00:00:00" });
+        seed(`cap-${i}`, { verificationStatus: "verified", lastVerifiedAt: "2027-01-15T00:00:00.000Z" });
       }
 
       delete require.cache[require.resolve("./admin-verifier-claim-counts")];
@@ -319,30 +369,48 @@ export function runAdminVerifierClaimCountsTests(
       assertEq(vIds, ["v-in", "v-since-boundary", "v-until-boundary"], "vcc-17: agents_verified sample ids match exactly the 3 counted rows");
       assertTrue(result.body.sample.every((r: any) => typeof r.name === "string" && r.name.length > 0), "vcc-18: sample rows carry a name field");
 
-      // ── kind 2: agents_review_required ──────────────────────────────
+      // ── kind 2: agents_review_required — mixed updated_at format: one
+      // JS-ISO row (rr-in-js) and one space-separated row (rr-in-db) both
+      // must count, proving the fix handles both formats on the same column ──
       result = await get(`kind=agents_review_required&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
-      assertEq(result.body.count, 1, "vcc-19: agents_review_required count = 1 (excludes before-window and wrong-status)");
-      assertEq(result.body.sample.map((r: any) => r.id), ["rr-in"], "vcc-20: agents_review_required sample is exactly rr-in");
+      assertEq(result.body.count, 2, "vcc-19: agents_review_required count = 2 (JS-ISO row + space-separated row both match; excludes before-window and wrong-status)");
+      assertEq(
+        result.body.sample.map((r: any) => r.id).sort(),
+        ["rr-in-db", "rr-in-js"],
+        "vcc-20: agents_review_required sample is exactly the JS-ISO and space-separated in-window rows",
+      );
 
-      // ── kind 3: agents_pending_verify ───────────────────────────────
+      // ── kind 3: agents_pending_verify — same mixed-format proof as kind 2 ──
       result = await get(`kind=agents_pending_verify&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
-      assertEq(result.body.count, 1, "vcc-21: agents_pending_verify count = 1");
-      assertEq(result.body.sample.map((r: any) => r.id), ["pv-in"], "vcc-22: agents_pending_verify sample is exactly pv-in");
+      assertEq(result.body.count, 2, "vcc-21: agents_pending_verify count = 2 (JS-ISO + space-separated rows both match)");
+      assertEq(
+        result.body.sample.map((r: any) => r.id).sort(),
+        ["pv-in-db", "pv-in-js"],
+        "vcc-22: agents_pending_verify sample is exactly the JS-ISO and space-separated in-window rows",
+      );
 
-      // ── kind 4: agents_data_insufficient ────────────────────────────
+      // ── kind 4: agents_data_insufficient — same mixed-format proof as kind 2 ──
       result = await get(`kind=agents_data_insufficient&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
-      assertEq(result.body.count, 1, "vcc-23: agents_data_insufficient count = 1");
-      assertEq(result.body.sample.map((r: any) => r.id), ["di-in"], "vcc-24: agents_data_insufficient sample is exactly di-in");
+      assertEq(result.body.count, 2, "vcc-23: agents_data_insufficient count = 2 (JS-ISO + space-separated rows both match)");
+      assertEq(
+        result.body.sample.map((r: any) => r.id).sort(),
+        ["di-in-db", "di-in-js"],
+        "vcc-24: agents_data_insufficient sample is exactly the JS-ISO and space-separated in-window rows",
+      );
 
-      // ── kind 5: http_unreachable ─────────────────────────────────────
+      // ── kind 5: http_unreachable (JS-ISO fixture, real write-site format) ──
       result = await get(`kind=http_unreachable&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
       assertEq(result.body.count, 1, "vcc-25: http_unreachable count = 1 (excludes before-window and NULL)");
       assertEq(result.body.sample.map((r: any) => r.id), ["hu-in"], "vcc-26: http_unreachable sample is exactly hu-in");
 
-      // ── kind 6: brreg_inactive_flagged ──────────────────────────────
+      // ── kind 6: brreg_inactive_flagged — same mixed-format proof as kind 2 ──
       result = await get(`kind=brreg_inactive_flagged&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
-      assertEq(result.body.count, 1, "vcc-27: brreg_inactive_flagged count = 1 (excludes wrong terminal_reason and before-window)");
-      assertEq(result.body.sample.map((r: any) => r.id), ["bi-in"], "vcc-28: brreg_inactive_flagged sample is exactly bi-in");
+      assertEq(result.body.count, 2, "vcc-27: brreg_inactive_flagged count = 2 (JS-ISO + space-separated rows both match; excludes wrong terminal_reason and before-window)");
+      assertEq(
+        result.body.sample.map((r: any) => r.id).sort(),
+        ["bi-in-db", "bi-in-js"],
+        "vcc-28: brreg_inactive_flagged sample is exactly the JS-ISO and space-separated in-window rows",
+      );
 
       // ── kind 7: agents_domain_incoherent ────────────────────────────
       result = await get(`kind=agents_domain_incoherent&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
@@ -354,10 +422,44 @@ export function runAdminVerifierClaimCountsTests(
       // v-inactive not appearing in vcc-16/17, asserted explicitly here too) ──
       assertTrue(!vIds.includes("v-inactive"), "vcc-31: is_active=0 agent excluded even though it otherwise matches agents_verified");
 
-      // ── sample caps at 5 even when count is higher ──────────────────
+      // ── sample caps at 5 even when count is higher; ORDER BY a.id makes
+      // repeat calls with the same kind/window deterministic ─────────────
       result = await get(`kind=agents_verified&since=${CAP_SINCE_ISO}&until=${CAP_UNTIL_ISO}`);
       assertEq(result.body.count, 7, "vcc-32: sample-cap fixture count = 7");
       assertEq(result.body.sample.length, 5, "vcc-33: sample array caps at 5 even though count is 7");
+      assertEq(
+        result.body.sample.map((r: any) => r.id),
+        ["cap-1", "cap-2", "cap-3", "cap-4", "cap-5"],
+        "vcc-34: sample is ordered by a.id (stable — cap-1..cap-5, not arbitrary insertion/DB order)",
+      );
+      const repeatResult = await get(`kind=agents_verified&since=${CAP_SINCE_ISO}&until=${CAP_UNTIL_ISO}`);
+      assertEq(
+        repeatResult.body.sample.map((r: any) => r.id),
+        result.body.sample.map((r: any) => r.id),
+        "vcc-35: repeat call with same kind/window returns the same sample ids in the same order",
+      );
+
+      // ── same-day/same-hour boundary repro (the exact original bug): a
+      // JS-ISO last_verified_at / homepage_unreachable_since seeded for a
+      // single day, queried with a since/until window covering just that
+      // day. Before the fix (raw string BETWEEN against a space-separated-
+      // normalized bound), SQLite's default collation sorts 'T' (0x54)
+      // above ' ' (0x20), so this JS-ISO row would silently sort as "after"
+      // the window's until bound and be excluded — count 0 instead of 1. ──
+      const REPRO_DAY_SINCE_ISO = "2026-05-10T00:00:00Z";
+      const REPRO_DAY_UNTIL_ISO = "2026-05-10T23:59:59Z";
+      const REPRO_TS_VERIFIED = "2026-05-10T14:30:00.000Z";
+      seed("repro-verified", { verificationStatus: "verified", lastVerifiedAt: REPRO_TS_VERIFIED });
+      const REPRO_TS_UNREACHABLE = "2026-05-10T09:05:00.000Z";
+      seed("repro-unreachable", { homepageUnreachableSince: REPRO_TS_UNREACHABLE });
+
+      result = await get(`kind=agents_verified&since=${REPRO_DAY_SINCE_ISO}&until=${REPRO_DAY_UNTIL_ISO}`);
+      assertEq(result.body.count, 1, "vcc-36: [bug repro] agents_verified same-day JS-ISO last_verified_at is counted (was silently 0 before the datetime() fix)");
+      assertEq(result.body.sample.map((r: any) => r.id), ["repro-verified"], "vcc-37: [bug repro] agents_verified sample is exactly repro-verified");
+
+      result = await get(`kind=http_unreachable&since=${REPRO_DAY_SINCE_ISO}&until=${REPRO_DAY_UNTIL_ISO}`);
+      assertEq(result.body.count, 1, "vcc-38: [bug repro] http_unreachable same-day JS-ISO homepage_unreachable_since is counted (was silently 0 before the datetime() fix)");
+      assertEq(result.body.sample.map((r: any) => r.id), ["repro-unreachable"], "vcc-39: [bug repro] http_unreachable sample is exactly repro-unreachable");
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
