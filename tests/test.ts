@@ -41477,3 +41477,28 @@ runSerial(async () => {
     failures.push("opplevelser-experiences-canonical-groups-lookup: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: gårdssalg's
+// second (lower-bar) verification line — mirrors RFB's own second line
+// (lokal-agent-verifier.ts / lokal-agent-verifier-second-line.test.ts) via
+// computeGardssalgSecondLineVerification/isGardssalgSecondLineVerified
+// (routes/opplevelser.ts) + POST /admin/gardssalg-second-line-verify, gated
+// behind GS_SECOND_LINE_VERIFICATION_ENABLED (default OFF). Own dedicated
+// in-memory-db harness (mirrors the sibling gårdssalg route test files' own
+// harness). Tail position is the convention for a new registration, not
+// load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-28-gardssalg-kildebredde-wiring: gårdssalg second verification line ──");
+  try {
+    const { runOpplevelserGardssalgSecondLineTests } = require("../src/routes/opplevelser-gardssalg-second-line.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-second-line.test");
+    const gsl = await runOpplevelserGardssalgSecondLineTests(false);
+    passed += gsl.passed;
+    failed += gsl.failed;
+    for (const f of gsl.failures) failures.push("opplevelser-gardssalg-second-line: " + f);
+    console.log(`  opplevelser-gardssalg-second-line: ${gsl.passed} passed, ${gsl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-gardssalg-second-line: unexpected error: " + String(err?.message || err));
+  }
+});

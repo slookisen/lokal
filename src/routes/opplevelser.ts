@@ -699,7 +699,7 @@ import { getDb as getExperiencesDbHandle } from "../database/db-factory";
 // shared LLM-judge contact gate for the gardssalg-autosvar-apply call site
 // (applyGardssalgProviderContact's own gate call lives inside
 // experience-store.ts and needs no separate import here).
-import { gateContactCandidates } from "../services/contact-candidate-judge";
+import { gateContactCandidates, classifyContactCandidateDefect } from "../services/contact-candidate-judge";
 // dev-request 2026-08-23-opplevagent-drikke-selvforsyning-speiling, item 3 —
 // LLM-judge tier for the org.nr review queue's mid-confidence rows (name+
 // place evidence, short of the exact-match auto-write bar). A SEPARATE
@@ -2878,6 +2878,63 @@ export function isHjemmesideVerified(fieldProvenanceRaw: string | null): boolean
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
     const entry = (parsed as Record<string, unknown>).hjemmeside_verification as
       | HjemmesideVerificationEntry
+      | undefined;
+    if (!entry || typeof entry !== "object") return false;
+    return entry.verified === true;
+  } catch {
+    return false; // malformed existing JSON -> fail closed, never treat as verified
+  }
+}
+
+// dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: the gårdssalg
+// mirror of RFB's second (lower-bar) verification line
+// (lokal-agent-verifier.ts's `verified_second_line` DB columns) — but
+// gårdssalg has no equivalent columns, so this follows isHjemmesideVerified's
+// OWN established pattern exactly instead of adding a migration: a SECOND,
+// separate field_provenance JSON key (`second_line_verification`, never
+// touching `hjemmeside_verification` — the two stamps answer different
+// questions: "is the STORED hjemmeside itself confirmed to belong to this
+// producer" vs. "does 2.linje evidence (an owner-plausible, provenance-backed
+// email + a corroborating identity source + an LLM identity judge) let this
+// row pass the outreach-readiness gate WITHOUT a verified hjemmeside at
+// all"). Written ONLY by POST /admin/gardssalg-second-line-verify below.
+// That route's judge-gate call is an async network round-trip, so — unlike
+// applyGardssalgWebsiteVerification()'s synchronous db.transaction() write
+// for hjemmeside_verification, which has no I/O gap to race — the write here
+// re-reads field_provenance fresh from the DB immediately before merging,
+// after the await has already resolved, so a concurrent writer touching this
+// row during the await window is never clobbered. Same read-fresh-before-
+// merge discipline applyGardssalgSetContactEmail() (experience-store.ts)
+// uses, applied here because this route's shape (an async gate) differs from
+// applyGardssalgWebsiteVerification()'s.
+interface GardssalgSecondLineVerificationEntry {
+  verified?: unknown;
+  at?: unknown;
+  sources?: unknown;
+  judge_reason?: unknown;
+}
+
+/**
+ * Fail-closed gate: true only when field_provenance.second_line_verification
+ * exists and verified === true. Missing field_provenance, missing/malformed
+ * second_line_verification, malformed JSON, or verified !== true -> false.
+ * Mirrors isHjemmesideVerified's exact shape/fail-closed contract (see that
+ * function's own doc comment) — any ambiguity resolves to "not verified",
+ * never to "assume verified". This is what makes
+ * GS_SECOND_LINE_VERIFICATION_ENABLED=off byte-identical to before this PR:
+ * with the flag off, POST /admin/gardssalg-second-line-verify never writes
+ * verified:true (see that route's own doc comment), so this reader always
+ * returns false and computeGardssalgReadinessTier's new `verified_second_line`
+ * input is always false too — the readiness-tier computation itself needs no
+ * separate flag check.
+ */
+export function isGardssalgSecondLineVerified(fieldProvenanceRaw: string | null): boolean {
+  if (!fieldProvenanceRaw) return false;
+  try {
+    const parsed = JSON.parse(fieldProvenanceRaw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const entry = (parsed as Record<string, unknown>).second_line_verification as
+      | GardssalgSecondLineVerificationEntry
       | undefined;
     if (!entry || typeof entry !== "object") return false;
     return entry.verified === true;
@@ -13188,6 +13245,196 @@ import {
   type GardssalgSizeFlag,
 } from "../services/gardssalg-outreach-size-gate";
 
+// dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2 — the gårdssalg
+// mirror of RFB's second (lower-bar) verification line. Reused, NOT forked:
+//   - computeSecondLineIdentitySources: fully generic (website_ok/
+//     field_provenance/brreg/producer_name), already reusable as-is — see
+//     computeGardssalgSecondLineVerification's own doc comment below for
+//     exactly which of its four source classes gårdssalg's data can and
+//     cannot light up today.
+//   - judgeSecondLineProfile: the whole-profile LLM identity judge — its
+//     signature (businessName/city/about/products/email/acceptedSources/
+//     brregName) is already fully generic, reused as-is.
+//   - coerceProvenanceToArrayShape: the SAME legacy-shape coercion
+//     computeSecondLineIdentitySources itself uses internally, reused here
+//     directly (not hand-rolled) to check the email's OWN provenance record
+//     (see email_has_provenance below) — confirms gårdssalg's
+//     field_provenance.epost = {source_url, fetched_at} single-record shape
+//     (experience-store.ts) is exactly the "legacy single-record shape"
+//     coerceProvenanceToArrayShape already wraps into an array, same as
+//     isHjemmesideVerified/applyGardssalgProviderWebsite's own field_provenance
+//     reads elsewhere in this file.
+import { computeSecondLineIdentitySources } from "../agents/lokal-agent-verifier";
+import { judgeSecondLineProfile, type SecondLineProfileJudgeVerdict } from "../services/second-line-profile-judge";
+import { coerceProvenanceToArrayShape } from "../services/cross-source-validator";
+
+export interface GardssalgSecondLineGateResult {
+  passes: boolean;
+  reasons: {
+    brreg_ok: boolean;
+    email_present: boolean;
+    email_not_junk: boolean;
+    email_not_umbrella: boolean;
+    email_has_provenance: boolean;
+    has_accepted_source: boolean;
+    judge_approved: boolean;
+  };
+  sources: string[];
+  judge_reason?: string;
+}
+
+/**
+ * computeGardssalgSecondLineVerification — the gårdssalg composition of
+ * RFB's computeSecondLineVerification (lokal-agent-verifier.ts), for dev-
+ * request 2026-08-28-gardssalg-kildebredde-wiring's Grep 2. ALL of the
+ * following must hold for `passes: true`:
+ *
+ *   1. brreg_ok — the dev-request's OWN instruction for the gårdssalg
+ *      equivalent of RFB's `gate_reasons.no_wrong_fit && gate_reasons.
+ *      brreg_active`: `brreg_verified === true` AND terminal_status is
+ *      NOT "krever_eier"/"dod_kilde" (those already mean konkurs/dead-source
+ *      per computeGardssalgReadinessTier below, and must disqualify the
+ *      second line exactly like RFB's brreg_konkurs/brreg_inactive
+ *      disqualify it there). Gårdssalg has no NACE-blacklist concept in this
+ *      pipeline (RFB's `no_wrong_fit`) — not invented here.
+ *   2. an email is present, is not junk (classifyContactCandidateDefect,
+ *      reused from contact-candidate-judge.ts, same as RFB) and is not
+ *      routed to a known umbrella/trade-association inbox — reused from
+ *      isUmbrellaContactEmail (experience-store.ts's OWN existing paraply
+ *      guard, the gårdssalg-specific equivalent of RFB's
+ *      isParaplyRoutedEmail/getAffiliatedUmbrellaDomains: a curated static
+ *      domain deny-list already established by dev-request 2026-08-10-veien-
+ *      til-pool-…, AK2, and already used elsewhere in this file — see
+ *      isUmbrellaContactEmail's own doc comment. Gårdssalg's
+ *      experience_providers has no agent_affiliations-equivalent schema
+ *      table, so there is no schema-based umbrella signal to add here —
+ *      documented, not silently assumed to exist).
+ *   3. email_has_provenance — the dev-request's OWN wording for this slice
+ *      is "eier-plausibel e-post MED PROVENANCE" (unlike RFB's mirror,
+ *      which never separately requires this): field_provenance.epost must
+ *      itself carry a real record with a non-blank source_url — a bare
+ *      typed-in email with no documented source never passes. Checked via
+ *      coerceProvenanceToArrayShape, the SAME coercion
+ *      computeSecondLineIdentitySources uses internally.
+ *   4. computeSecondLineIdentitySources(...) returns ≥1 accepted source.
+ *      `website_ok` is ALWAYS passed as `false` here — deliberately: this
+ *      route never does a fresh live probe of `hjemmeside` (unlike RFB's
+ *      batch loop, which has a headProbe result in hand), and the ONE
+ *      existing gårdssalg signal about a stored `hjemmeside` — the
+ *      hjemmeside_verification stamp — is by construction NOT verified:true
+ *      here (that is exactly the gate this whole route only ever runs
+ *      behind, per "2.linje evalueres KUN når website_verified er false"),
+ *      so treating an unconfirmed/possibly-wrong-entity site as identity
+ *      evidence would be exactly the risk the whole first-line gate exists
+ *      to catch. `brreg` is ALWAYS passed as `null` — gårdssalg's
+ *      experience_providers stores brreg_verified/brreg_active as booleans
+ *      only (database/init-experices.ts), never a fetched Brreg `navn`, so
+ *      `brreg_name_match` can never fire here (no live Brreg lookup is added
+ *      in this slice — out of scope, would add a new outbound network call
+ *      to an admin batch route). In practice this leaves gårdssalg's
+ *      reachable identity sources to `hanen_no`/`bondensmarked_no` (any
+ *      field_provenance record whose source_url resolves to those hosts,
+ *      independent of source_type — gårdssalg's provenance writers never
+ *      set source_type at all, so `facebook_official_page` cannot fire
+ *      either today) — narrower than RFB's four classes, but every source
+ *      that CAN fire is real, evidenced data, never fabricated.
+ *   5. judgeSecondLineProfile approves (whole-profile identity reasoning;
+ *      fail-closed). Per the dev-request's own critical instruction, the
+ *      "≥2 signals (name+place OR name+org-nr)" STRENGTH requirement is
+ *      NOT re-implemented as a second deterministic gate here — mirroring
+ *      RFB's computeSecondLineIdentitySources doc comment exactly, that
+ *      judgment is left entirely to this judge's identity-reasoning rubric.
+ *      Only ever called once checks 1-4 above already hold (cost control,
+ *      same ordering RFB's own composition uses).
+ *
+ * `judgeFn` is injectable purely for test isolation (mirrors RFB's own
+ * `judgeFn` param) — defaults to the real judgeSecondLineProfile.
+ */
+export async function computeGardssalgSecondLineVerification(input: {
+  producer_name: string | null;
+  city: string | null;
+  about: string | null;
+  products: unknown[];
+  email: string | null;
+  field_provenance: Record<string, unknown>;
+  brreg_verified: boolean;
+  terminal_status: "krever_eier" | "dod_kilde" | null;
+  judgeFn?: (params: {
+    businessName: string;
+    city: string | null;
+    about: string | null;
+    products: unknown[];
+    email: string;
+    acceptedSources: readonly string[];
+    brregName?: string | null;
+  }) => Promise<SecondLineProfileJudgeVerdict>;
+}): Promise<GardssalgSecondLineGateResult> {
+  const brreg_ok =
+    input.brreg_verified === true &&
+    input.terminal_status !== "krever_eier" &&
+    input.terminal_status !== "dod_kilde";
+
+  const email = (input.email ?? "").trim() || null;
+  const email_present = !!email;
+  const email_not_junk = email_present && !classifyContactCandidateDefect("email", email!).defective;
+  const email_not_umbrella = email_present && !isUmbrellaContactEmail(email);
+
+  let coercedProv: Record<string, unknown[]> = {};
+  try {
+    coercedProv = coerceProvenanceToArrayShape(input.field_provenance ?? {});
+  } catch {
+    coercedProv = {};
+  }
+  const epostRecords = coercedProv.epost ?? [];
+  const email_has_provenance = epostRecords.some((rec) => {
+    const r = rec as Partial<{ source_url: unknown }> | null | undefined;
+    return !!r && typeof r === "object" && typeof r.source_url === "string" && r.source_url.trim() !== "";
+  });
+
+  const sources = computeSecondLineIdentitySources({
+    website_ok: false,
+    field_provenance: input.field_provenance,
+    brreg: null,
+    producer_name: input.producer_name,
+  });
+  const has_accepted_source = sources.length > 0;
+
+  const deterministicOk =
+    brreg_ok && email_present && email_not_junk && email_not_umbrella && email_has_provenance && has_accepted_source;
+
+  let judge_approved = false;
+  let judge_reason: string | undefined;
+  if (deterministicOk) {
+    const judgeFn = input.judgeFn ?? judgeSecondLineProfile;
+    const verdict = await judgeFn({
+      businessName: input.producer_name || "Ukjent produsent",
+      city: input.city,
+      about: input.about,
+      products: input.products,
+      email: email!,
+      acceptedSources: sources,
+      brregName: null,
+    });
+    judge_approved = verdict.approved;
+    judge_reason = verdict.reason;
+  }
+
+  return {
+    passes: deterministicOk && judge_approved,
+    reasons: {
+      brreg_ok,
+      email_present,
+      email_not_junk,
+      email_not_umbrella,
+      email_has_provenance,
+      has_accepted_source,
+      judge_approved,
+    },
+    sources,
+    judge_reason,
+  };
+}
+
 function computeBookingStatus(
   bookingLive: number | null,
   catalogHidden: number | null,
@@ -13249,6 +13496,12 @@ export function computeGardssalgReadinessTier(input: {
   // means "no terminal status", falls through to the existing checks
   // unchanged.
   terminal_status?: "krever_eier" | "dod_kilde" | null;
+  // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: the
+  // GS_SECOND_LINE_VERIFICATION_ENABLED-gated 2.linje stamp (field_provenance.
+  // second_line_verification, isGardssalgSecondLineVerified below). Optional
+  // and additive — omitted (undefined) behaves exactly like `false`, so every
+  // OTHER caller of this function keeps its current behavior unchanged.
+  verified_second_line?: boolean;
 }): GardssalgReadinessTier {
   if (input.terminal_status) return input.terminal_status;
   if (!input.has_email && !input.has_phone) return "unreachable";
@@ -13269,7 +13522,15 @@ export function computeGardssalgReadinessTier(input: {
   //     order Daniel specified: findable -> verified -> conflict-free.
   if (input.catalog_hidden) return "skjult";
   if (!input.is_searchable) return "ikke_soekbar";
-  if (!input.website_verified) return "nettsted_uverifisert";
+  // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: a row can
+  // ALSO clear this gate via `verified_second_line` — Grep 2's 2.linje
+  // outreach-readiness path (mirrors RFB: 2.linje only ever matters here
+  // because it is the ONLY thing changing the outcome when website_verified
+  // is already false — a website_verified:true row never reaches this
+  // condition at all, preserving 1.linje priority unconditionally). This is
+  // the ONE changed line in this whole function, per the dev-request's own
+  // "minimal diff" instruction.
+  if (!input.website_verified && !input.verified_second_line) return "nettsted_uverifisert";
   if (input.has_duplicate_conflict) return "dublettkonflikt";
   return "outreach_ready";
 }
@@ -13306,6 +13567,11 @@ function computeGardssalgReadinessRows(
   has_phone: boolean;
   is_searchable: boolean;
   website_verified: boolean;
+  // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: surfaced for
+  // the SAME reason website_verified is — an operator/reviewer looking at a
+  // row landing in outreach_ready despite website_verified:false needs to see
+  // WHY without a separate field_provenance lookup.
+  verified_second_line: boolean;
   has_duplicate_conflict: boolean;
   name_token_conflict_candidate: boolean;
   booking_status: OutreachBookingStatus;
@@ -13445,6 +13711,16 @@ function computeGardssalgReadinessRows(
     // predicate for whether a row can ever surface in /sok search.
     const is_searchable = !catalog_hidden && present(p.slug);
     const website_verified = isHjemmesideVerified(p.field_provenance);
+    // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: a pure,
+    // synchronous field_provenance JSON read — same cost class as
+    // website_verified above (no LLM call happens here; the judge only ever
+    // runs inside POST /admin/gardssalg-second-line-verify, which is what the
+    // GS_SECOND_LINE_VERIFICATION_ENABLED flag actually gates). Read
+    // UNCONDITIONALLY, with no flag check here: when the flag is off, no
+    // code path ever writes second_line_verification.verified=true (see that
+    // route's own doc comment), so this always reads false and the
+    // readiness-tier computation stays byte-identical to before this PR.
+    const verified_second_line = isGardssalgSecondLineVerified(p.field_provenance);
     const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
     const name_token_conflict_candidate = nameTokenConflictCandidateIds.has(p.id);
     const brreg_verified = p.brreg_verified === 1;
@@ -13464,6 +13740,7 @@ function computeGardssalgReadinessRows(
       website_verified,
       has_duplicate_conflict,
       terminal_status,
+      verified_second_line,
     });
 
     return {
@@ -13482,6 +13759,7 @@ function computeGardssalgReadinessRows(
       has_phone,
       is_searchable,
       website_verified,
+      verified_second_line,
       has_duplicate_conflict,
       name_token_conflict_candidate,
       booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
@@ -13561,6 +13839,252 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
   }
 
   res.json({ providers, summary });
+});
+
+// ─── POST /admin/gardssalg-second-line-verify (admin) ──────────────────────
+//
+// dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: the write/
+// stamping lever for computeGardssalgSecondLineVerification above — mirrors
+// the auth/shape conventions of POST /admin/gardssalg-website-review-approve
+// above and the batch-endpoint conventions in admin-rfb-website-discovery.ts
+// (bounded providerIds array, per-id outcome report, nothing silently
+// dropped — same "never discard silently" precedent as Grep 1's
+// candidate_evidence_failed).
+//
+// Feature-gated behind GS_SECOND_LINE_VERIFICATION_ENABLED, read FRESH from
+// process.env on EVERY call (never cached/module-level — mirrors RFB's
+// RFB_SECOND_LINE_VERIFICATION_ENABLED contract in lokal-agent-verifier.ts
+// exactly, so toggling never needs a redeploy). Not exactly "true" -> the
+// route is a pure no-op: 200 {enabled:false}, zero reads/writes beyond the
+// flag check itself. This — together with isGardssalgSecondLineVerified
+// always reading false while no write here ever happens — is what makes
+// GS_SECOND_LINE_VERIFICATION_ENABLED=off byte-identical to before this PR
+// (the rollback plan: flipping the flag off restores prior behavior exactly).
+//
+// Per id, in order:
+//   1. not found -> "not_found".
+//   2. website_verified already true (isHjemmesideVerified) -> 1.linje
+//      priority: 2.linje is never even attempted -> "already_website_verified".
+//   3. terminal_status krever_eier/dod_kilde -> konkurs/slettet
+//      disqualifies ALWAYS, reported (never silently dropped) ->
+//      "disqualified_terminal".
+//   4. epost currently hard-bounced/complained (email_bounces, RFB db,
+//      bounce_type IN ('hard','complaint') — the SAME vertical-agnostic
+//      table/predicate GET /admin/gardssalg-outreach-candidates already
+//      reads above; gårdssalg has no separate hard-bounce/re-park mechanism
+//      of its own, and this route reuses the existing one rather than
+//      inventing a new column/table) -> never verified/promoted here ->
+//      "disqualified_hard_bounced".
+//   5. computeGardssalgSecondLineVerification runs (an async judge-API call).
+//      passes:false -> "gate_failed" (with reasons/sources/judge_reason, so a
+//      caller can see exactly why — never a bare rejection). passes:true ->
+//      field_provenance is re-read FRESH from the DB right here (after the
+//      await, not from the pre-await snapshot read at the top of this loop
+//      iteration) and second_line_verification is merged into that fresh
+//      read — {verified:true, at, sources, judge_reason} — then written back,
+//      never clobbering other keys or a concurrent writer's changes made
+//      during the await window. This is the read-fresh-before-merge
+//      discipline applyGardssalgSetContactEmail() (experience-store.ts) uses,
+//      not applyGardssalgWebsiteVerification()'s synchronous-transaction
+//      approach — that one has no I/O gap to race, this route's async judge
+//      call does -> "verified".
+//
+// Never wired into any claim-link/magic-link generation path — "aldri
+// claim-lenker på 2.linje-evidens alene" — this route only stamps
+// field_provenance and returns a report; it never touches gardssalg-claim.ts
+// or any magic-link code. Also never wired into a cron/scheduled sweep —
+// exposing this endpoint + tests is the full scope of this slice (mirrors
+// how Grep 1 shipped the intake endpoint without turning on a live cohort).
+const GS_SECOND_LINE_VERIFY_MAX_IDS = 48;
+
+interface GardssalgSecondLineVerifyResultItem {
+  provider_id: string;
+  outcome:
+    | "verified"
+    | "not_found"
+    | "already_website_verified"
+    | "disqualified_terminal"
+    | "disqualified_hard_bounced"
+    | "gate_failed";
+  detail?: string;
+  reasons?: GardssalgSecondLineGateResult["reasons"];
+  sources?: string[];
+  judge_reason?: string;
+}
+
+router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Request, res: Response) => {
+  // Read FRESH on every call — never cached/module-level. See this route's
+  // own doc comment above for the full flag-off no-op contract.
+  const enabled = process.env.GS_SECOND_LINE_VERIFICATION_ENABLED === "true";
+  if (!enabled) {
+    res.json({ enabled: false });
+    return;
+  }
+
+  const body = (req.body ?? {}) as { providerIds?: unknown };
+  if (!Array.isArray(body.providerIds) || body.providerIds.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'providerIds' array" });
+    return;
+  }
+  const ids = (body.providerIds as unknown[])
+    .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+    .map((v) => v.trim());
+  if (ids.length > GS_SECOND_LINE_VERIFY_MAX_IDS) {
+    res.status(400).json({ error: `Too many providerIds (max ${GS_SECOND_LINE_VERIFY_MAX_IDS} per call)` });
+    return;
+  }
+
+  const expDb = getExpDb("experiences");
+  const rfbDb = getRfbDb();
+  const checkedAt = new Date().toISOString();
+
+  // Same table/predicate GET /admin/gardssalg-outreach-candidates' own
+  // isHardBounced already reads (~L14198 area) — reused verbatim, not
+  // reimplemented as a new mechanism.
+  const isEmailHardBounced = (email: string): boolean => {
+    const row = rfbDb
+      .prepare(
+        `SELECT 1 FROM email_bounces
+          WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint')
+          LIMIT 1`,
+      )
+      .get(email);
+    return row !== undefined;
+  };
+
+  const results: GardssalgSecondLineVerifyResultItem[] = [];
+
+  for (const id of ids) {
+    const row = expDb
+      .prepare(
+        `SELECT id, navn, kommune, epost, hjemmeside, about_text, products, field_provenance,
+                brreg_verified, terminal_status
+           FROM experience_providers WHERE id = ?`,
+      )
+      .get(id) as
+      | {
+          id: string;
+          navn: string | null;
+          kommune: string | null;
+          epost: string | null;
+          hjemmeside: string | null;
+          about_text: string | null;
+          products: string | null;
+          field_provenance: string | null;
+          brreg_verified: number | null;
+          terminal_status: string | null;
+        }
+      | undefined;
+
+    if (!row) {
+      results.push({ provider_id: id, outcome: "not_found" });
+      continue;
+    }
+
+    if (isHjemmesideVerified(row.field_provenance)) {
+      results.push({ provider_id: id, outcome: "already_website_verified" });
+      continue;
+    }
+
+    const terminal_status =
+      row.terminal_status === "krever_eier" || row.terminal_status === "dod_kilde" ? row.terminal_status : null;
+    if (terminal_status) {
+      results.push({ provider_id: id, outcome: "disqualified_terminal", detail: terminal_status });
+      continue;
+    }
+
+    const email = (row.epost ?? "").trim();
+    if (email && isEmailHardBounced(email)) {
+      results.push({ provider_id: id, outcome: "disqualified_hard_bounced" });
+      continue;
+    }
+
+    let fieldProv: Record<string, unknown> = {};
+    if (row.field_provenance) {
+      try {
+        const parsed = JSON.parse(row.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          fieldProv = parsed as Record<string, unknown>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty, never clobber/throw */
+      }
+    }
+    let products: unknown[] = [];
+    if (row.products) {
+      try {
+        const parsedProducts = JSON.parse(row.products);
+        if (Array.isArray(parsedProducts)) products = parsedProducts;
+      } catch {
+        /* malformed -> [] */
+      }
+    }
+
+    const gate = await computeGardssalgSecondLineVerification({
+      producer_name: row.navn,
+      city: row.kommune,
+      about: row.about_text,
+      products,
+      email: row.epost,
+      field_provenance: fieldProv,
+      brreg_verified: row.brreg_verified === 1,
+      terminal_status,
+    });
+
+    if (!gate.passes) {
+      results.push({
+        provider_id: id,
+        outcome: "gate_failed",
+        reasons: gate.reasons,
+        sources: gate.sources,
+        judge_reason: gate.judge_reason,
+      });
+      continue;
+    }
+
+    // Re-read field_provenance FRESH from the DB, immediately before merging
+    // and writing. `fieldProv` above (parsed from the row fetched at the top
+    // of this loop iteration) is fine as a READ-ONLY input to the gate call —
+    // but computeGardssalgSecondLineVerification just above made a network
+    // round-trip to the judge API, so that snapshot may now be stale: a
+    // concurrent writer (a content-refresh sweep, applyGardssalgWebsiteVerification,
+    // a manual admin edit) could have mutated this row's field_provenance
+    // during the await window. Writing back into the stale snapshot would
+    // silently clobber whatever that writer set. This mirrors the discipline
+    // applyGardssalgSetContactEmail (experience-store.ts) uses — always
+    // re-read right before merge/write, never reuse a pre-await snapshot for
+    // the write. (applyGardssalgWebsiteVerification avoids the same class of
+    // bug differently, via a synchronous db.transaction with no I/O gap
+    // inside it; this route's judge call is async, so wrapping the await in
+    // a transaction isn't the right fix here — the fresh re-read is.)
+    const freshRow = expDb
+      .prepare(`SELECT field_provenance FROM experience_providers WHERE id = ?`)
+      .get(id) as { field_provenance: string | null } | undefined;
+    let freshFieldProv: Record<string, unknown> = {};
+    if (freshRow?.field_provenance) {
+      try {
+        const parsed = JSON.parse(freshRow.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          freshFieldProv = parsed as Record<string, unknown>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty, never clobber/throw */
+      }
+    }
+    freshFieldProv.second_line_verification = {
+      verified: true,
+      at: checkedAt,
+      sources: gate.sources,
+      judge_reason: gate.judge_reason,
+    };
+    expDb
+      .prepare(`UPDATE experience_providers SET field_provenance = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(JSON.stringify(freshFieldProv), id);
+
+    results.push({ provider_id: id, outcome: "verified", sources: gate.sources, judge_reason: gate.judge_reason });
+  }
+
+  res.json({ enabled: true, results });
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-outreach-preflight ───────────────
