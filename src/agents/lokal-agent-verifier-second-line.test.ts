@@ -143,6 +143,33 @@ export function runLokalAgentVerifierSecondLineTests(
       assertTrue(
         computeSecondLineIdentitySources({
           website_ok: false,
+          field_provenance: { address: [{ value: "x", source_type: "directory_listing", source_url: "https://1881.no/foretak/testgard", fetched_at: "2026-08-01T00:00:00Z" }] },
+          brreg: null,
+          producer_name: "Testgård",
+        }).includes("1881_no"),
+        "a-14b: source_url host 1881.no -> detected (dev-request 2026-08-28-gardssalg-kildebredde-wiring Grep 2 gap fix)",
+      );
+      assertTrue(
+        computeSecondLineIdentitySources({
+          website_ok: false,
+          field_provenance: { phone: { value: "x", source_type: "directory_listing", source_url: "https://siderklynga.no/medlemmer/testgard", fetched_at: "2026-08-01T00:00:00Z" } },
+          brreg: null,
+          producer_name: "Testgård",
+        }).includes("siderklynga_no"),
+        "a-14c: single-record (non-array) legacy provenance shape with siderklynga.no source_url -> also detected",
+      );
+      assertTrue(
+        !computeSecondLineIdentitySources({
+          website_ok: false,
+          field_provenance: { address: [{ value: "x", source_type: "directory_listing", source_url: "https://proff.no/foretak/testgard", fetched_at: "2026-08-01T00:00:00Z" }] },
+          brreg: null,
+          producer_name: "Testgård",
+        }).length,
+        "a-14d: source_url host proff.no (NOT in the accepted list) -> no source added, no false-positive widening",
+      );
+      assertTrue(
+        computeSecondLineIdentitySources({
+          website_ok: false,
           field_provenance: {},
           brreg: { is_active: true, is_konkurs: false, navn: "Testgård AS" },
           producer_name: "Testgård",
