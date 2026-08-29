@@ -46,6 +46,12 @@ import {
   classifyGardssalgFieldDefect,
   type GardssalgDefectType,
   type GardssalgQualityFieldName,
+  // dev-request 2026-08-29-gardssalg-set-address: the `adresse` counterpart
+  // to classifyGardssalgFieldDefect above — see its own doc comment
+  // (gardssalg-quality-update.ts) for why `adresse` is deliberately kept out
+  // of the GardssalgQualityFieldName closed union rather than widened into
+  // it.
+  classifyGardssalgAddressDefect,
 } from "./gardssalg-quality-update";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
 // reuse the same quality-bar predicate the homepage-content extractor already
@@ -5596,6 +5602,149 @@ export function applyGardssalgSetContentField(
       id: uuid(),
       provider_id: providerId,
       field_name: field,
+      old_value: oldValue,
+      new_value: trimmed,
+      source_url: source,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: trimmed };
+}
+
+export type GardssalgSetAddressResult =
+  | { ok: true; old_value: string | null; new_value: string | null }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "owner_locked" }
+  | { ok: false; reason: "value_required" }
+  | { ok: false; reason: "defective_value"; defect_type: GardssalgDefectType | null };
+
+/**
+ * Write (or, with `value: null`, CLEAR) a gårdssalg provider's `adresse` —
+ * dev-request 2026-08-29-gardssalg-set-address, the missing third sibling of
+ * applyGardssalgSetContentField/applyGardssalgSetProducerType above. Backs
+ * POST /admin/gardssalg-set-address.
+ *
+ * The gap this closes: the only other write path onto `adresse` is
+ * applyGardssalgProviderAddress (Brreg address-enrichment), which is
+ * FILL-ONLY (never touches a row whose adresse is already non-blank) — so an
+ * operator who spots a WRONG street address (a stale Brreg registration
+ * address, a typo, a producer's own correction) had no lever to fix it.
+ * `adresse` is deliberately the ONLY column this function writes —
+ * postnummer/poststed/fylke/kommune/lat/lon are left untouched, same as
+ * applyGardssalgProviderAddress's own per-field write discipline (each of
+ * its three fields is set independently, never bundled), and the public
+ * JSON-LD PostalAddress only ever reads `adresse` as streetAddress
+ * (routes/experiences-seo.ts) — locality/region come from poststed/kommune/
+ * fylke, none of which this endpoint's contract touches.
+ *
+ * Structurally mirrors applyGardssalgSetContentField's gate order EXACTLY
+ * (same three gates, same order, same fail-closed discipline: a rejected
+ * value leaves neither a column change nor an audit row behind), with one
+ * addition for the null-clear case:
+ *   1. Owner-lock (isGardssalgFieldOwnerLocked, re-read fresh from the row).
+ *      `adresse` is NOT one of the five claim-portal-editable fields in
+ *      GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS (the claim portal never lets an
+ *      owner edit their own street address), so for content_source='claim'
+ *      rows the helper's own fallback applies: always locked, unconditionally
+ *      — same as org_nr/epost/telefon/postnummer/poststed, per that helper's
+ *      own doc comment. No new lock key invented here.
+ *   2. `value === null` skips gates 2-3 entirely and clears the column — this
+ *      IS the rollback path for this endpoint, same "null clears" discipline
+ *      as gardssalg-set-producer-type/-terminal-status/-org-nr/-hjemmeside.
+ *      Otherwise:
+ *   2. Non-blank value, checked HERE and not only in the route — same
+ *      defense-in-depth reasoning as applyGardssalgSetContentField's own
+ *      gate 2 (classifyGardssalgAddressDefect reports blank as NOT defective
+ *      on purpose, so a direct caller passing "   " must not blank a good
+ *      address while still writing an audit row asserting the change).
+ *   3. Objective defect (classifyGardssalgAddressDefect, gardssalg-quality-
+ *      update.ts) on the SUPPLIED value.
+ *
+ * field_provenance.adresse is merged (read-modify-write, preserving every
+ * other field's entry — same recipe applyGardssalgSetContentField and
+ * applyGardssalgProviderAddress both use) on EVERY successful write,
+ * INCLUDING a null-clear: `adresse` already has an established provenance
+ * convention (applyGardssalgProviderAddress stamps field_provenance.adresse
+ * when it fills a blank address from Brreg), so an admin correction — set or
+ * clear — records the same {source_url, fetched_at} shape rather than
+ * leaving the column's provenance silently stale.
+ *
+ * Rollback needs no new wiring: `adresse` is already in
+ * GARDSSALG_ROLLBACKABLE_FIELDS (added when applyGardssalgProviderAddress
+ * shipped) and the single audit row written below is exactly the shape
+ * planGardssalgContentRollback already reads.
+ */
+export function applyGardssalgSetAddress(
+  providerId: string,
+  value: string | null,
+  source: string
+): GardssalgSetAddressResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, adresse, content_source, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; adresse: string | null; content_source: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // Gate 1 — owner lock, on the FRESH row (see doc comment above).
+  if (isGardssalgFieldOwnerLocked(row, "adresse")) return { ok: false, reason: "owner_locked" };
+
+  let trimmed: string | null;
+  if (value === null) {
+    // null clears the column — no defect classification on a clear (there is
+    // nothing to classify).
+    trimmed = null;
+  } else {
+    const t = value.trim();
+    // Gate 2 — non-blank.
+    if (!t) return { ok: false, reason: "value_required" };
+    // Gate 3 — objective defect on the supplied value. Returns before any
+    // write, so a rejected value leaves neither a column change nor an audit
+    // row behind.
+    const defect = classifyGardssalgAddressDefect(t);
+    if (defect.defective) {
+      return { ok: false, reason: "defective_value", defect_type: defect.type };
+    }
+    trimmed = t;
+  }
+
+  const oldValue = row.adresse;
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  // Same parse-guard as applyGardssalgSetContentField above: malformed
+  // existing JSON is treated as {} rather than clobbering the write. This
+  // preserves any existing `owner_locks` object untouched.
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.adresse = { source_url: source, fetched_at: new Date().toISOString() };
+  const provenanceJson = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET adresse = @value, field_provenance = @field_provenance WHERE id = @id`
+    ).run({ id: providerId, value: trimmed, field_provenance: provenanceJson });
+    // Exactly ONE audit row, same shape every other gårdssalg writer uses —
+    // this is what makes the write reversible through the EXISTING POST
+    // /admin/gardssalg-content-rollback with zero changes there (`adresse` is
+    // already in GARDSSALG_ROLLBACKABLE_FIELDS).
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'adresse', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
       old_value: oldValue,
       new_value: trimmed,
       source_url: source,
