@@ -59,6 +59,7 @@ import gardssalgClaimRoutes from "./routes/gardssalg-claim";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
+import adminVerifierClaimCountsRoutes from "./routes/admin-verifier-claim-counts";
 import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminContactWriteGuardAuditRoutes from "./routes/admin-contact-write-guard-audit";
 import adminContactWriteGuardRetroSweepRoutes from "./routes/admin-contact-write-guard-retro-sweep";
@@ -699,6 +700,10 @@ app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRo
 // classify the review_required cohort into auto-fixable/manual-review/
 // circular-scramble buckets; dry-run by default, apply:true writes.
 app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoherenceSweepRoutes);
+// dev-request 2026-08-29-verifier-claim-kind-katalog-gap: read-only claim-kind
+// count+sample endpoint so platform-verifier can verify claim kinds that were
+// previously silently unverifiable (typed allowlist, see the route file).
+app.use("/admin/verifier/claim-counts", adminLimiter, adminVerifierClaimCountsRoutes);
 // dev-request 2026-07-16-wrong-entity-opprydding-rfb: catalog-wide retro-sweep
 // for MORE wrong-entity-contamination candidates using cheap DB-only
 // detectors (email-domain vs website-domain mismatch, duplicate boilerplate
