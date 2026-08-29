@@ -130,6 +130,16 @@ import {
   // dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply, Grep 3a
   // — explicit terminal-status write (krever_eier / dod_kilde / null-clear).
   applyGardssalgSetTerminalStatus,
+  // dev-request 2026-08-29-drikkeliste-remapping-og-dodkilde, §4a pieces A/B
+  // — the two small new write primitives this batch needed and no existing
+  // route covered: a direct (overwriting, non-fill-only) org_nr correction,
+  // and a direct (overwriting/nulling) hjemmeside correction. Both back
+  // POST /admin/gardssalg-set-org-nr / POST /admin/gardssalg-set-hjemmeside
+  // below, and are also called directly by the orchestrating
+  // POST /admin/gardssalg-drikkeliste-remediation route.
+  applyGardssalgSetOrgNr,
+  type GardssalgSetOrgNrResult,
+  applyGardssalgSetHjemmeside,
   // Grep 3c — manual producer_type OVERRIDE (unlike the fill-only
   // applyGardssalgProducerType below in this file, this one can correct an
   // already-set, wrong classification).
@@ -400,6 +410,14 @@ import {
   GARDSSALG_PROVIDER_MERGE_MAX_PAIRS,
   type GardssalgProviderMergeResultItem,
 } from "../services/gardssalg-provider-merge";
+// dev-request 2026-08-29-drikkeliste-remapping-og-dodkilde — orchestrates the
+// §4a-§4e catalog-cleanup batch, backs POST
+// /admin/gardssalg-drikkeliste-remediation below. See that module's own doc
+// comment for the full design; it takes a `callBackfill` DI callback (bound
+// to callGardssalgAdminRouteInProcess, defined further down this file) so it
+// never has to import the express router itself (would be circular — this
+// route file already imports FROM the service module).
+import { runGardssalgDrikkelisteRemediation } from "../services/gardssalg-drikkeliste-remediation";
 // dev-request 2026-08-25-experiences-retro-opprydding-boilerplate-innhold,
 // spec-punkt 2 — provider-level canonicalization for the NON-gårdssalg
 // (museum/attraction/venue) scope the audit above never scans. Backs GET
@@ -9362,6 +9380,177 @@ router.post("/admin/gardssalg-set-terminal-status", requireAdmin, (req: Request,
     old_value: result.old_value,
     new_value: result.new_value,
   });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-org-nr (admin) ───────────────
+//
+// dev-request 2026-08-29-drikkeliste-remapping-og-dodkilde, §4a piece A —
+// the missing "the existing org_nr is WRONG, replace it" write path. The
+// existing POST /admin/gardssalg-orgnr-backfill is fill-only (refuses to
+// touch a row whose org_nr is already non-blank) and no other route writes
+// this column directly. Same shape as POST /admin/gardssalg-set-terminal-
+// status above.
+//
+// Body: { provider_id: string, org_nr: string | null, reason: string,
+// source_url?: string }. `org_nr: null` CLEARS the column (rollback path);
+// a non-null value must be exactly 9 digits.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-org-nr", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    org_nr?: unknown;
+    reason?: unknown;
+    source_url?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const rawOrgNr = body.org_nr;
+  if (rawOrgNr !== null && typeof rawOrgNr !== "string") {
+    res.status(400).json({ error: "invalid_org_nr" });
+    return;
+  }
+  const orgNr = rawOrgNr === null ? null : (rawOrgNr as string);
+
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!reason) {
+    res.status(400).json({ error: "reason_required" });
+    return;
+  }
+
+  const sourceUrl = typeof body.source_url === "string" ? body.source_url.trim() : "";
+
+  const result: GardssalgSetOrgNrResult = applyGardssalgSetOrgNr(providerId, orgNr, reason, sourceUrl || undefined);
+
+  if (!result.ok) {
+    if (result.reason === "provider_not_found") {
+      res.status(404).json({ error: "provider_not_found" });
+      return;
+    }
+    if (result.reason === "invalid_format") {
+      res.status(400).json({ error: "invalid_org_nr_format" });
+      return;
+    }
+    res.status(409).json({ error: "org_nr_conflict", conflicting_provider_id: result.conflicting_provider_id });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "org_nr",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-hjemmeside (admin) ───────────
+//
+// dev-request 2026-08-29-drikkeliste-remapping-og-dodkilde, §4a piece B —
+// the missing "the existing hjemmeside is WRONG, replace or clear it"
+// write path. POST /admin/gardssalg-website-verification-remediation only
+// ever fills a BLANK hjemmeside from a previously-discovered evidence_url
+// candidate; POST /admin/gardssalg-set-content-field's GARDSSALG_QUALITY_
+// FIELDS never included hjemmeside. Both checked exhaustively before this
+// route was added. Same shape as POST /admin/gardssalg-set-terminal-status
+// above.
+//
+// Body: { provider_id: string, hjemmeside: string | null, reason: string,
+// source_url?: string }. `hjemmeside: null` CLEARS the column (the "dead
+// site" / rollback path).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-hjemmeside", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    hjemmeside?: unknown;
+    reason?: unknown;
+    source_url?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const rawHjemmeside = body.hjemmeside;
+  if (rawHjemmeside !== null && (typeof rawHjemmeside !== "string" || !rawHjemmeside.trim())) {
+    res.status(400).json({ error: "invalid_hjemmeside" });
+    return;
+  }
+  const hjemmeside = rawHjemmeside === null ? null : (rawHjemmeside as string);
+
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!reason) {
+    res.status(400).json({ error: "reason_required" });
+    return;
+  }
+
+  const sourceUrl = typeof body.source_url === "string" ? body.source_url.trim() : "";
+
+  const result = applyGardssalgSetHjemmeside(providerId, hjemmeside, reason, sourceUrl || undefined);
+
+  if (!result.ok) {
+    res.status(404).json({ error: "provider_not_found" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "hjemmeside",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-drikkeliste-remediation (admin) ──
+//
+// dev-request 2026-08-29-drikkeliste-remapping-og-dodkilde. Executes the
+// full §4a-§4e data-quality cleanup batch (64 rows: holding/empty-entity
+// re-mapping, dod_kilde terminal-marking, leftover duplicate-pair merges,
+// wrong/dead website corrections, missing org.nr backfills) against the
+// LIVE experience_providers catalog. See
+// services/gardssalg-drikkeliste-remediation.ts for the full design — this
+// route is a thin HTTP wrapper: it resolves the experiences db, wires the
+// §4e sub-step's org.nr-backfill call through callGardssalgAdminRouteInProcess
+// (below), and returns the module's report verbatim.
+//
+// apply: dry-run by DEFAULT (same convention as every other admin write
+// route in this file). No row is ever hard-deleted; every write goes
+// through the SAME gardssalg_content_audit trail every other write in this
+// vertical already uses, so POST /admin/gardssalg-content-rollback (by
+// batch_id) reverses everything except the twin_link audit-only note (which
+// never changed a column to begin with) and merge outcomes (already
+// rollback-eligible via that route's existing "provider" entity_type).
+//
+// Body: { apply?: boolean, batch_id?: string }.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-drikkeliste-remediation", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : undefined;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const report = await runGardssalgDrikkelisteRemediation(expDb, {
+      apply,
+      batchId,
+      callBackfill: (providerIds, applyFlag) =>
+        callGardssalgAdminRouteInProcess("/admin/gardssalg-orgnr-backfill", { providerIds, apply: applyFlag }),
+    });
+    res.json(report);
+  } catch (err) {
+    console.error("[gardssalg-drikkeliste-remediation] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-set-producer-type (admin) ────────
