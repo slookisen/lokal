@@ -1566,6 +1566,209 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         }
       }
 
+      // ═══ kildebredde Grep 1 (dev-request 2026-08-28-gardssalg-
+      //     kildebredde-wiring): external-candidate intake (`candidates`
+      //     param on POST /admin/gardssalg-website-discovery), mirroring
+      //     admin-rfb-website-discovery.ts's own `candidates` intake. ═══
+      {
+        insertProvider.run({ id: "wd-cand-ok", navn: "Kandidat Ysteri", org_nr: "944900001", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-cand-fail", navn: "Kandidat Feil Gard", org_nr: "944900002", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-cand-excluded", navn: "Kandidat Hanen Gard", org_nr: "944900003", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-cand-invalid", navn: "Kandidat Ugyldig Gard", org_nr: "944900004", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-cand-locked", navn: "Kandidat Krav Gard", org_nr: "944900005", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: "manual", producer_type: "sideri" });
+        insertProvider.run({ id: "wd-cand-has", navn: "Kandidat Har Nettside", org_nr: "944900006", kommune: "Voss", poststed: null, hjemmeside: "https://alt-har-nettside.no", catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-cand-blocked", navn: "Kandidat Blokkert Gard", org_nr: "944900007", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+
+        const prevFetchCand = globalThis.fetch;
+        globalThis.fetch = withSelfReferencingFetch((async (url: string | URL | Request) => {
+          const u = String(url);
+          const mk = (html: string) => ({ ok: true, status: 200, url: u, text: async () => html } as unknown as Response);
+          if (u.startsWith("https://kandidat-ysteri-butikk.no")) {
+            return mk("<html><body>Kandidat Ysteri i Voss — org.nr 944 900 001</body></html>");
+          }
+          if (u.startsWith("https://kandidat-feil-gard.no")) {
+            // Reachable, self-referencing, but carries NO ownership evidence
+            // for this provider at all — a genuine evidence-check failure,
+            // not a pre-fetch exclusion or a fetch error.
+            return mk("<html><body>Helt urelatert innhold — ingen treff her.</body></html>");
+          }
+          return { ok: false, status: 404, url: u, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch);
+
+        try {
+          // ── cand-1: auth still required, and 400s on malformed/oversized
+          //    input before any DB/fetch work happens. ────────────────────
+          {
+            const noAuth = await callRoute(opplevelserRouter, { body: { candidates: [{ providerId: "wd-cand-ok", url: "https://x.no" }] } });
+            assertEq(noAuth.status, 403, "cand-1a: no admin key -> 403");
+
+            const tooMany = Array.from({ length: 49 }, (_, i) => ({ providerId: `x-${i}`, url: `https://x-${i}.no` }));
+            const overCap = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { candidates: tooMany } });
+            assertEq(overCap.status, 400, "cand-1b: more than GS_WD_HARD_CAP (48) candidates -> 400");
+
+            const malformed = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { candidates: [{ providerId: "x" }] } });
+            assertEq(malformed.status, 400, "cand-1c: item missing url -> 400 (whole call poisoned)");
+
+            const empty = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { candidates: [] } });
+            assertEq(empty.status, 400, "cand-1d: empty candidates array -> 400");
+
+            const notArray = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { candidates: "not-an-array" } });
+            assertEq(notArray.status, 400, "cand-1e: non-array candidates -> 400");
+          }
+
+          // ── cand-2: mutual exclusivity with providerIds/limit -> 400,
+          //    same error-shape convention as the RFB mirror. ─────────────
+          {
+            const withProviderIds = await callRoute(opplevelserRouter, {
+              headers: adminHeaders,
+              body: { candidates: [{ providerId: "wd-cand-ok", url: "https://x.no" }], providerIds: ["wd-cand-ok"] },
+            });
+            assertEq(withProviderIds.status, 400, "cand-2a: candidates + providerIds combined -> 400");
+
+            const withLimit = await callRoute(opplevelserRouter, {
+              headers: adminHeaders,
+              body: { candidates: [{ providerId: "wd-cand-ok", url: "https://x.no" }], limit: 5 },
+            });
+            assertEq(withLimit.status, 400, "cand-2b: candidates + limit combined -> 400");
+          }
+
+          // ── cand-3: DRY-RUN (default) — evaluated, but nothing written to
+          //    the queue for EITHER outcome. ────────────────────────────────
+          {
+            const r = await callRoute(opplevelserRouter, {
+              headers: adminHeaders,
+              body: {
+                candidates: [
+                  { providerId: "wd-cand-ok", url: "https://kandidat-ysteri-butikk.no/om-oss" },
+                  { providerId: "wd-cand-fail", url: "https://kandidat-feil-gard.no" },
+                ],
+              },
+            });
+            assertEq(r.status, 200, "cand-3a: 200");
+            assertEq(r.body.mode, "external_candidates", "cand-3b: response mode is external_candidates");
+            assertEq(r.body.dry_run, true, "cand-3c: dry-run is the default");
+            assertEq(r.body.proposed_count, 1, "cand-3d: exactly one verified proposal");
+            assertEq(r.body.proposed[0]?.provider_id, "wd-cand-ok", "cand-3e: the verified one is wd-cand-ok");
+            assertEq(r.body.proposed[0]?.candidate_url, "https://kandidat-ysteri-butikk.no", "cand-3f: candidate_url reduced to origin (path dropped)");
+            assertEq(r.body.evidence_failed_count, 1, "cand-3g: exactly one evidence-failed candidate");
+            const failedItem = (r.body.evidence_failed as any[])[0];
+            assertEq(failedItem?.provider_id, "wd-cand-fail", "cand-3h: the failed one is wd-cand-fail");
+            assertEq(failedItem?.reason, "no_candidate_verified", "cand-3i: failure reason reported");
+            assertEq(failedItem?.queued, false, "cand-3j: dry-run reports queued:false");
+            const qOk = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-cand-ok'`).get() as any).c;
+            assertEq(qOk, 0, "cand-3k: dry-run wrote NOTHING for the verified candidate");
+            const qFail = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-cand-fail'`).get() as any).c;
+            assertEq(qFail, 0, "cand-3l: dry-run wrote NOTHING for the failed candidate either");
+            const stamped = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers WHERE id IN ('wd-cand-ok','wd-cand-fail') AND website_discovery_attempted_at IS NOT NULL`).get() as any).c;
+            assertEq(stamped, 0, "cand-3m: dry-run stamped NOTHING");
+          }
+
+          // ── cand-4: APPLY — verified candidate queued with the SAME reason
+          //    tier-1/2 already uses; the never-silently-dropped invariant —
+          //    a failed-evidence candidate is ALSO queued, under its own
+          //    distinguishable reason (candidate_evidence_failed). ─────────
+          {
+            const r = await callRoute(opplevelserRouter, {
+              headers: adminHeaders,
+              body: {
+                candidates: [
+                  { providerId: "wd-cand-ok", url: "https://kandidat-ysteri-butikk.no/om-oss" },
+                  { providerId: "wd-cand-fail", url: "https://kandidat-feil-gard.no" },
+                ],
+                apply: true,
+              },
+            });
+            assertEq(r.body.dry_run, false, "cand-4a: apply mode");
+            assertEq(r.body.proposed_count, 1, "cand-4b: same single verified proposal");
+
+            const qOk = expDb.prepare(`SELECT * FROM gardssalg_website_review_queue WHERE provider_id='wd-cand-ok'`).get() as any;
+            assertTrue(!!qOk, "cand-4c: verified candidate parked in the review queue");
+            assertEq(qOk?.candidate_url, "https://kandidat-ysteri-butikk.no", "cand-4d: queued candidate_url is the final origin");
+            assertEq(qOk?.reason, "website_discovery_candidate", "cand-4e: verified-candidate queue reason is the SAME one tier-1/2 already uses — no new write path invented");
+            assertEq(qOk?.confidence, 1.0, "cand-4f: org.nr evidence -> confidence 1.0");
+
+            // The never-silently-dropped invariant: a candidate whose
+            // evidence check FAILS still lands in the SAME queue table,
+            // never dropped, under a reason that lets a reviewer tell it
+            // apart from a verified tier-1/2/candidate proposal.
+            const qFail = expDb.prepare(`SELECT * FROM gardssalg_website_review_queue WHERE provider_id='wd-cand-fail'`).get() as any;
+            assertTrue(!!qFail, "cand-4g: never-silently-dropped invariant — the failed-evidence candidate IS queued, not discarded");
+            assertEq(qFail?.reason, "candidate_evidence_failed", "cand-4h: failed-evidence queue row carries the new, distinguishable reason");
+            assertEq(qFail?.candidate_url, "https://kandidat-feil-gard.no", "cand-4i: queued candidate_url is the caller-proposed url (never verified, so no origin normalization)");
+            assertEq(qFail?.final_url, null, "cand-4j: no final_url for a candidate that was never verified");
+            assertEq(qFail?.confidence, null, "cand-4k: no confidence for a candidate that was never verified");
+
+            const hjOk = (expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-cand-ok'`).get() as any).hjemmeside;
+            assertEq(hjOk, null, "cand-4l: candidate intake NEVER writes hjemmeside directly — same fill-only-via-approve discipline as tier-1/2");
+
+            const stamped = expDb.prepare(`SELECT id FROM experience_providers WHERE id IN ('wd-cand-ok','wd-cand-fail') AND website_discovery_attempted_at IS NOT NULL ORDER BY id`).all() as any[];
+            assertEq(stamped.length, 2, "cand-4m: BOTH processed candidates stamped (anti-starvation, incl. the failure) — same convention as tier-1/2");
+          }
+
+          // ── cand-5: a candidate host excluded PRE-FETCH (curated directory
+          //    host) is ALSO queued as candidate_evidence_failed — the
+          //    invariant holds regardless of WHICH pipeline stage rejected
+          //    the candidate. ────────────────────────────────────────────
+          {
+            const r = await callRoute(opplevelserRouter, {
+              headers: adminHeaders,
+              body: { candidates: [{ providerId: "wd-cand-excluded", url: "https://hanen.no/medlem/kandidat" }], apply: true },
+            });
+            assertEq(r.body.proposed_count, 0, "cand-5a: nothing proposed for a curated-directory host");
+            assertEq(r.body.evidence_failed_count, 1, "cand-5b: reported as evidence-failed");
+            assertEq(r.body.evidence_failed[0]?.reason, "blocklisted_directory_domain", "cand-5c: pre-fetch exclusion reason surfaced");
+            const q = expDb.prepare(`SELECT reason FROM gardssalg_website_review_queue WHERE provider_id='wd-cand-excluded'`).get() as any;
+            assertTrue(!!q, "cand-5d: still queued, never silently dropped");
+            assertEq(q?.reason, "candidate_evidence_failed", "cand-5e: queued under the failed-evidence reason");
+          }
+
+          // ── cand-6: a structurally invalid candidate url is ALSO never
+          //    silently dropped. ────────────────────────────────────────────
+          {
+            const r = await callRoute(opplevelserRouter, {
+              headers: adminHeaders,
+              body: { candidates: [{ providerId: "wd-cand-invalid", url: "https://" }], apply: true },
+            });
+            assertEq(r.body.proposed_count, 0, "cand-6a: nothing proposed for an unparseable url");
+            assertEq(r.body.evidence_failed[0]?.reason, "invalid_candidate_url", "cand-6b: invalid-url reason surfaced");
+            const q = expDb.prepare(`SELECT reason FROM gardssalg_website_review_queue WHERE provider_id='wd-cand-invalid'`).get() as any;
+            assertTrue(!!q, "cand-6c: still queued, never silently dropped");
+            assertEq(q?.reason, "candidate_evidence_failed", "cand-6d: queued under the failed-evidence reason");
+          }
+
+          // ── cand-7: locked / already-has-website / not-found / duplicate /
+          //    blocklisted candidates reuse the SAME response buckets
+          //    tier-1/2 already reports, and are NEVER queued (only a FAILED
+          //    EVIDENCE CHECK is queued — these never reach evidence
+          //    checking at all). ─────────────────────────────────────────
+          {
+            blocklistSvc.addManualEntry({ identifierType: "org_nr", identifierValue: "944900007" });
+            const r = await callRoute(opplevelserRouter, {
+              headers: adminHeaders,
+              body: {
+                candidates: [
+                  { providerId: "wd-cand-locked", url: "https://kandidat-krav-gard.no" },
+                  { providerId: "wd-cand-has", url: "https://kandidat-har-nettside.no" },
+                  { providerId: "finnes-ikke-cand", url: "https://x.no" },
+                  { providerId: "wd-cand-blocked", url: "https://kandidat-blokkert-gard.no" },
+                  { providerId: "wd-cand-blocked", url: "https://kandidat-blokkert-gard-2.no" },
+                ],
+                apply: true,
+              },
+            });
+            assertTrue((r.body.skipped_locked as any[]).some((x) => x.provider_id === "wd-cand-locked"), "cand-7a: manual/claim-locked candidate reported in skipped_locked");
+            assertTrue((r.body.already_has_website as any[]).some((x) => x.provider_id === "wd-cand-has"), "cand-7b: already-has-website candidate reported");
+            assertTrue((r.body.not_found as any[]).includes("finnes-ikke-cand"), "cand-7c: unknown provider id reported not_found");
+            assertTrue((r.body.rejected_blocklisted as any[]).some((x) => x.provider_id === "wd-cand-blocked"), "cand-7d: blocklisted candidate reported");
+            assertTrue((r.body.rejected_request as any[]).some((x) => x.provider_id === "wd-cand-blocked" && x.reason === "duplicate_provider_in_request"), "cand-7e: repeat provider_id within one call reported as duplicate, second occurrence never evaluated");
+            assertEq((expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id IN ('wd-cand-locked','wd-cand-has','finnes-ikke-cand','wd-cand-blocked')`).get() as any).c, 0,
+              "cand-7f: none of locked/already-has-website/not-found/blocklisted/duplicate ever reach the queue");
+          }
+        } finally {
+          globalThis.fetch = prevFetchCand;
+        }
+      }
+
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-website-discovery: unexpected error: " + String(err?.stack || err?.message || err));
