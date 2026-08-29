@@ -1214,6 +1214,45 @@ console.log("── admin-outreach-candidates (mode=second oldest-contacted-firs
   console.log(`  admin-outreach-candidates-mode2-ordering: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-08-29-outreach-max-touch-vern: mode=second exclusion +
+// admin lever (Part A) ──────────────────────────────────────────────────
+console.log("── admin-outreach-candidates (max-touch-vern: mode=second exclusion + admin lever) ──");
+{
+  const { runAdminOutreachCandidatesMaxTouchVernTests } =
+    require("../src/routes/admin-outreach-candidates-max-touch-vern.test") as
+      typeof import("../src/routes/admin-outreach-candidates-max-touch-vern.test");
+  const r = runAdminOutreachCandidatesMaxTouchVernTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-max-touch-vern: " + f);
+  console.log(`  admin-outreach-candidates-max-touch-vern: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── dev-request 2026-08-29-outreach-max-touch-vern: send-time invariant on
+// /threads/:id/send and /compose (Part B). Async (the routes under test are
+// `async` handlers) — registered via runSerial() so it is automatically
+// folded into _serialChain and counted in the final summary, without hand-
+// threading a new promise into every later checkpoint's await-list (see
+// runSerial's own doc comment above and its "Tail position is the
+// convention for a new registration, not load-bearing" usages near the end
+// of this file).
+runSerial(async () => {
+  console.log("── crm (max-touch-vern send guard) ──");
+  try {
+    const { runCrmMaxTouchVernSendGuardTests } =
+      require("../src/routes/crm-max-touch-vern-send-guard.test") as
+        typeof import("../src/routes/crm-max-touch-vern-send-guard.test");
+    const r = await runCrmMaxTouchVernSendGuardTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("crm-max-touch-vern-send-guard: " + f);
+    console.log(`  crm-max-touch-vern-send-guard: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("crm-max-touch-vern-send-guard: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── 2026-07-15 gate-integrity fixes (dedupe tiebreak parity + defense-in-depth
 // re-verification) for GET /admin/outreach-candidates ──
 console.log("── admin-outreach-candidates (gate-integrity: dedupe tiebreak parity + re-verification) ──");
@@ -24456,6 +24495,19 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       original_agent_name TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(identifier_type, identifier_value)
+    );
+
+    -- dev-request 2026-08-29-outreach-max-touch-vern: the L1 knob table
+    -- (mirrors init.ts) — mode=second reads it unconditionally via
+    -- getOutreachMaxTouchVernConfig(), so this minimal schema needs it too,
+    -- same as every other table this hand-rolled fixture mirrors.
+    CREATE TABLE outreach_max_touch_vern_config (
+      id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      threshold INTEGER NOT NULL DEFAULT 3,
+      updated_at TEXT,
+      updated_by TEXT,
+      note TEXT
     );
 
     -- outreach_ready_pool VIEW (mirrors production definition)

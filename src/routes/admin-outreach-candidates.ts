@@ -41,6 +41,12 @@ import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { dedupeByEmail } from "../services/marketing-dedupe";
+import {
+  getOutreachMaxTouchVernConfig,
+  getMaxTouchStatusForEmail,
+  OUTREACH_MAX_TOUCH_VERN_DEFAULT_ENABLED,
+  OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD,
+} from "../services/outreach-max-touch-vern";
 
 const router = Router();
 
@@ -526,6 +532,43 @@ router.get("/", (req: Request, res: Response) => {
     let inferenceOnlyCount = 0;
     // Step 2b belt-and-suspenders counter
     let recentCrmSendCount = 0;
+    // dev-request 2026-08-29-outreach-max-touch-vern counter + detail list
+    let maxTouchSuppressedCount = 0;
+    const maxTouchSuppressedList: Array<{
+      agent_id: string;
+      email: string;
+      send_count: number;
+      last_sent_at: string | null;
+      threshold: number;
+    }> = [];
+
+    // ── dev-request 2026-08-29-outreach-max-touch-vern ────────────────────────
+    // Never send new cold outreach to an address that already has >= threshold
+    // prior outreach_sent_log rows (ANY vertical) AND zero inbound messages
+    // EVER. Address-based, not mode-based (services/outreach-max-touch-vern.ts)
+    // — mode=first rows are guaranteed 0 prior sends by construction
+    // (outreach_ready_pool VIEW already excludes any sent_log agent), so BOTH
+    // the config read and the per-row check are scoped to mode=second: this
+    // changes nothing about mode=first's result set OR its query surface (a
+    // literal "do not touch mode=first", not just a behaviorally-inert no-op).
+    // Config read once — a live admin change (GET/POST /admin/outreach-max-
+    // touch-vern) takes effect on the very next request, no restart.
+    // The mode=first placeholder is purely cosmetic (the response's own
+    // max_touch_suppressed.enabled/threshold fields) — mode=first never
+    // computes a per-row suppressedForMaxTouch, so this value is never
+    // actually enforced; it exists only so a mode=first caller sees a
+    // sane, JSON-safe default rather than an unread DB config.
+    const maxTouchConfig =
+      mode === "second"
+        ? getOutreachMaxTouchVernConfig(db)
+        : {
+            enabled: OUTREACH_MAX_TOUCH_VERN_DEFAULT_ENABLED,
+            threshold: OUTREACH_MAX_TOUCH_VERN_DEFAULT_THRESHOLD,
+            updated_at: null,
+            updated_by: null,
+            note: null,
+            is_default: true,
+          };
 
     for (const row of rows) {
       let isContactedOrCooldown = false;
@@ -574,6 +617,21 @@ router.get("/", (req: Request, res: Response) => {
       // agent_id/outreach_sent_log; catches a producer we already emailed even if
       // that send's agent_id link is broken/missing.
       const suppressedForRecentCrmSend = recentlyEmailedAddresses.has(row.email.trim().toLowerCase());
+      // dev-request 2026-08-29-outreach-max-touch-vern — address-based, so
+      // only computed where it can ever fire (mode=second; mode=first is
+      // guaranteed 0 prior sends, see the comment on maxTouchConfig above).
+      const maxTouchStatus =
+        mode === "second" ? getMaxTouchStatusForEmail(db, row.email, maxTouchConfig) : null;
+      const suppressedForMaxTouch = maxTouchStatus?.suppressed ?? false;
+      if (suppressedForMaxTouch && maxTouchStatus) {
+        maxTouchSuppressedList.push({
+          agent_id: row.agent_id,
+          email: row.email,
+          send_count: maxTouchStatus.send_count,
+          last_sent_at: maxTouchStatus.last_sent_at,
+          threshold: maxTouchStatus.threshold,
+        });
+      }
       // steg 4 / 4e — see the map construction above.
       const crossPlatformHit = crossPlatformSuppressors.get(row.email.trim().toLowerCase());
       const suppressedForCrossPlatform = crossPlatformHit !== undefined;
@@ -595,6 +653,7 @@ router.get("/", (req: Request, res: Response) => {
       if (suppressedForWebsiteUnverified) websiteUnverifiedCount++;
       if (suppressedForInferenceOnly) inferenceOnlyCount++;
       if (suppressedForRecentCrmSend) recentCrmSendCount++;
+      if (suppressedForMaxTouch) maxTouchSuppressedCount++;
 
       if (
         !suppressedForContacted &&
@@ -606,7 +665,8 @@ router.get("/", (req: Request, res: Response) => {
         !suppressedForWebsiteUnverified &&
         !suppressedForInferenceOnly &&
         !suppressedForRecentCrmSend &&
-        !suppressedForCrossPlatform
+        !suppressedForCrossPlatform &&
+        !suppressedForMaxTouch
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -727,6 +787,8 @@ router.get("/", (req: Request, res: Response) => {
         inference_only: inferenceOnlyCount,
         // Step 2b: belt-and-suspenders recipient-email match (agent_id-independent)
         recent_crm_send_email_match: recentCrmSendCount,
+        // dev-request 2026-08-29-outreach-max-touch-vern
+        max_touch_suppressed: maxTouchSuppressedCount,
         // steg 4 / 4e: skipped because ANOTHER platform mailed this address
         // inside the window. Overlaps with contacted_or_cooldown in mode=second
         // (where lastSentFor already reads every vertical) — the counters are
@@ -761,6 +823,30 @@ router.get("/", (req: Request, res: Response) => {
           "Skipped because another platform cold-mailed this address inside the cooldown window. " +
           "The cooldown is cross-platform on purpose: both platforms send from the same address, so " +
           "the recipient sees one sender. These are not lost — they become eligible when the window passes.",
+      },
+      // dev-request 2026-08-29-outreach-max-touch-vern: surfaced explicitly,
+      // never silently dropped — an address hitting suppressed_counts.
+      // max_touch_suppressed must be visible HERE with its reason, not just
+      // absent from `candidates`. Bounded at 100, same truncation convention
+      // as cross_platform_cooldown above.
+      max_touch_suppressed: {
+        enabled: maxTouchConfig.enabled,
+        threshold: maxTouchConfig.threshold,
+        count: maxTouchSuppressedList.length,
+        truncated: maxTouchSuppressedList.length > 100,
+        producers: maxTouchSuppressedList.slice(0, 100).map((p) => ({
+          agent_id: p.agent_id,
+          email: p.email,
+          reason: "max_touch_suppressed",
+          send_count: p.send_count,
+          threshold: p.threshold,
+          last_sent_at: p.last_sent_at,
+        })),
+        note:
+          "Excluded because this address already has >= threshold prior outreach_sent_log rows " +
+          "(any vertical) and has NEVER sent an inbound reply. An inbound reply lifts the suppression " +
+          "without resetting the send-count history. Threshold/on-off are admin-configurable, no " +
+          "deploy needed — GET/POST /admin/outreach-max-touch-vern.",
       },
     });
   } catch (err: any) {

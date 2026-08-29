@@ -19,6 +19,7 @@ import {
 import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
+import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
 // admin-affiliations.ts / admin-hanen.ts: ADMIN_KEY primary,
@@ -122,6 +123,46 @@ const DUPLICATE_SEND_WINDOW_SECONDS = 30;
 // content beyond the prefix and is NOT rejected — only an exact,
 // nothing-else match is.
 const REPLY_PREFIX_ONLY_SUBJECT = /^(re|sv):$/i;
+
+// ─── Max-touch-vern send-time invariant (dev-request 2026-08-29-outreach-
+// max-touch-vern) ────────────────────────────────────────────────────────
+// "Can't cause spam" — same philosophy as the branding lint above and the
+// Hard cooldown invariant below, checked UNCONDITIONALLY on every send
+// through this file, regardless of intent (resend_send/gmail_draft),
+// createdBy (claude/daniel), or force. This is deliberately NOT scoped the
+// way the hard-cooldown/daily-cap checks further down are (resend_send +
+// claude-only + !force): force=true and createdBy='daniel' bypass the
+// COOLDOWN (a human overriding a heuristic timer), but max-touch-vern is a
+// hard fact about the address — >= threshold sends, zero replies, ever —
+// that no caller-supplied flag changes. There is no override.
+//
+// Address-based (services/outreach-max-touch-vern.ts): reads
+// outreach_sent_log (any vertical, cross-platform by design — same reasoning
+// as the cooldown invariant) and crm_messages for an inbound EVER, not
+// windowed. A reply lifts suppression without touching the send-count log —
+// getMaxTouchStatusForEmail() never writes anything, only reads.
+//
+// Returns the refusal payload (caller sends it as-is with res.status(429))
+// or null when the address is clear to send to.
+function checkMaxTouchVern(db: ReturnType<typeof getDb>, toEmail: string): Record<string, unknown> | null {
+  const config = getOutreachMaxTouchVernConfig(db);
+  const status = getMaxTouchStatusForEmail(db, toEmail, config);
+  if (!status.suppressed) return null;
+  return {
+    success: false,
+    error: "max_touch_suppressed",
+    reason:
+      `refusing to send to ${toEmail}: ${status.send_count} prior outreach_sent_log send(s) ` +
+      `(any vertical) with ZERO inbound reply ever, meeting or exceeding the max-touch-vern ` +
+      `threshold (${status.threshold}). This is a hard invariant, not a bypassable cooldown — ` +
+      `force/createdBy do not override it. An inbound reply from this address lifts the ` +
+      `suppression (the send-count log itself is never reset).`,
+    to: toEmail,
+    send_count: status.send_count,
+    threshold: status.threshold,
+    last_sent_at: status.last_sent_at,
+  };
+}
 
 const sendSchema = z
   .object({
@@ -337,6 +378,18 @@ router.post("/threads/:id/send", async (req, res) => {
     });
   }
 
+  // ─── Max-touch-vern (dev-request 2026-08-29-outreach-max-touch-vern) ────
+  // Unconditional — see checkMaxTouchVern() above. Checked against EVERY
+  // recipient in toEmails; the first suppressed address refuses the whole
+  // send (a reply on this thread is not, by itself, proof the OTHER
+  // recipients on a multi-recipient send have ever replied).
+  for (const addr of toEmails) {
+    const maxTouchRefusal = checkMaxTouchVern(db, addr);
+    if (maxTouchRefusal) {
+      return res.status(429).json(maxTouchRefusal);
+    }
+  }
+
   // ─── Double-send guard ────────────────────────────────────────
   // Hard reject on a byte-identical subject+body sent to this same thread
   // within DUPLICATE_SEND_WINDOW_SECONDS. See
@@ -547,6 +600,18 @@ router.post("/compose", async (req, res) => {
   let capReservedToday: string | null = null;
 
   try {
+    // ─── Max-touch-vern (dev-request 2026-08-29-outreach-max-touch-vern) ────
+    // Unconditional — checked BEFORE the kill-switch/rate-limit/daily-cap
+    // blocks below, and deliberately outside the `intent === 'resend_send' &&
+    // createdBy === 'claude' && !force` guard those use: this is a hard fact
+    // about the address (>= threshold sends, zero replies, ever), not a
+    // bypassable cooldown — force/daniel do not override it. See
+    // checkMaxTouchVern() above for the full rationale.
+    const maxTouchRefusal = checkMaxTouchVern(getDb(), to);
+    if (maxTouchRefusal) {
+      return res.status(429).json(maxTouchRefusal);
+    }
+
     // ─── Global outreach kill-switch (P0-2026-07-11) ────────────
     // When OUTREACH_PAUSED=true, block the automated cold-outreach channel
     // (claude-actor resend_send). Daniel's manual sends (createdBy='daniel') and
