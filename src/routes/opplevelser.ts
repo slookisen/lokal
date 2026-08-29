@@ -13635,17 +13635,27 @@ export interface GardssalgSecondLineGateResult {
  *      behind, per "2.linje evalueres KUN når website_verified er false"),
  *      so treating an unconfirmed/possibly-wrong-entity site as identity
  *      evidence would be exactly the risk the whole first-line gate exists
- *      to catch. `brreg` is ALWAYS passed as `null` — gårdssalg's
- *      experience_providers stores brreg_verified/brreg_active as booleans
- *      only (database/init-experices.ts), never a fetched Brreg `navn`, so
- *      `brreg_name_match` can never fire here (no live Brreg lookup is added
- *      in this slice — out of scope, would add a new outbound network call
- *      to an admin batch route). In practice this leaves gårdssalg's
- *      reachable identity sources to `hanen_no`/`bondensmarked_no` (any
- *      field_provenance record whose source_url resolves to those hosts,
- *      independent of source_type — gårdssalg's provenance writers never
- *      set source_type at all, so `facebook_official_page` cannot fire
- *      either today) — narrower than RFB's four classes, but every source
+ *      to catch. `brreg` is `null` unless `input.org_nr` is a non-empty
+ *      string, in which case a live Brreg lookup by org-nr is made first
+ *      (`input.brregLookupFn ?? verifyOrgNumber`, mirroring `judgeFn`'s own
+ *      injectable-for-tests pattern) — dev-request 2026-08-29-gs-brreg-name-
+ *      match-wiring, closing the gap found by 2026-08-29-gs-second-line-
+ *      kildeklasse-bredde's AC4 sweep (78/91 candidate rows failing the gate
+ *      SOLELY for lack of ANY accepted source, despite having an
+ *      authoritative Brreg org-nr). The lookup is wrapped in try/catch and
+ *      never allowed to throw out of this function — any error, rejection,
+ *      or an `exists:false` result falls back to `brreg: null`, i.e. at
+ *      least as safe as the old hardcoded `null` for every row where org_nr
+ *      is missing or the lookup fails. When it succeeds, this lets
+ *      `computeSecondLineIdentitySources`'s existing (already-tested,
+ *      RFB-side) `brreg_name_match` branch fire for gårdssalg too — exactly
+ *      as it already does for RFB, no new source class invented. In
+ *      practice this adds `brreg_name_match` to gårdssalg's previously
+ *      `hanen_no`/`bondensmarked_no`/`1881_no`/`siderklynga_no`-only
+ *      reachable identity sources (any field_provenance record whose
+ *      source_url resolves to those hosts, independent of source_type —
+ *      gårdssalg's provenance writers never set source_type at all, so
+ *      `facebook_official_page` cannot fire either today) — every source
  *      that CAN fire is real, evidenced data, never fabricated.
  *   5. judgeSecondLineProfile approves (whole-profile identity reasoning;
  *      fail-closed). Per the dev-request's own critical instruction, the
@@ -13657,7 +13667,8 @@ export interface GardssalgSecondLineGateResult {
  *      same ordering RFB's own composition uses).
  *
  * `judgeFn` is injectable purely for test isolation (mirrors RFB's own
- * `judgeFn` param) — defaults to the real judgeSecondLineProfile.
+ * `judgeFn` param) — defaults to the real judgeSecondLineProfile. `brregLookupFn`
+ * is injectable the same way (defaults to the real `verifyOrgNumber`).
  */
 export async function computeGardssalgSecondLineVerification(input: {
   producer_name: string | null;
@@ -13668,6 +13679,8 @@ export async function computeGardssalgSecondLineVerification(input: {
   field_provenance: Record<string, unknown>;
   brreg_verified: boolean;
   terminal_status: "krever_eier" | "dod_kilde" | null;
+  org_nr?: string | null;
+  brregLookupFn?: (orgNr: string) => Promise<{ exists: boolean; active: boolean; name: string | null }>;
   judgeFn?: (params: {
     businessName: string;
     city: string | null;
@@ -13700,10 +13713,24 @@ export async function computeGardssalgSecondLineVerification(input: {
     return !!r && typeof r === "object" && typeof r.source_url === "string" && r.source_url.trim() !== "";
   });
 
+  let brreg: { is_active: boolean; is_konkurs: boolean; navn?: string | null } | null = null;
+  const orgNr = (input.org_nr ?? "").trim();
+  if (orgNr) {
+    try {
+      const lookupFn = input.brregLookupFn ?? verifyOrgNumber;
+      const result = await lookupFn(orgNr);
+      if (result && result.exists) {
+        brreg = { is_active: result.active, is_konkurs: !result.active, navn: result.name };
+      }
+    } catch {
+      brreg = null;
+    }
+  }
+
   const sources = computeSecondLineIdentitySources({
     website_ok: false,
     field_provenance: input.field_provenance,
-    brreg: null,
+    brreg,
     producer_name: input.producer_name,
   });
   const has_accepted_source = sources.length > 0;
@@ -14267,7 +14294,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
     const row = expDb
       .prepare(
         `SELECT id, navn, kommune, epost, hjemmeside, about_text, products, field_provenance,
-                brreg_verified, terminal_status
+                brreg_verified, terminal_status, org_nr
            FROM experience_providers WHERE id = ?`,
       )
       .get(id) as
@@ -14282,6 +14309,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
           field_provenance: string | null;
           brreg_verified: number | null;
           terminal_status: string | null;
+          org_nr: string | null;
         }
       | undefined;
 
@@ -14338,6 +14366,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
       field_provenance: fieldProv,
       brreg_verified: row.brreg_verified === 1,
       terminal_status,
+      org_nr: row.org_nr,
     });
 
     if (!gate.passes) {

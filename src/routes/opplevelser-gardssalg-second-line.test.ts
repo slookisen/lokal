@@ -275,6 +275,103 @@ export function runOpplevelserGardssalgSecondLineTests(
         });
         assertTrue(!r.passes, "a-35: malformed (null) field_provenance -> fails, never throws");
       }
+
+      // ── org_nr / brregLookupFn wiring (dev-request 2026-08-29-gs-brreg-
+      // name-match-wiring) — no hanen.no/bondensmarked.no/etc provenance
+      // in these fixtures, so brreg_name_match is the ONLY possible source,
+      // isolating exactly what these new fields control.
+      const noSourceProvenance = {
+        epost: { source_url: "https://testgard.no/kontakt", fetched_at: "2026-08-01T00:00:00Z" },
+      };
+      {
+        // org_nr set + injected brregLookupFn resolving to a near-exact-match
+        // name -> brreg_name_match fires via the real scoreNameMatch, exactly
+        // as it already does for RFB.
+        let lookupOrgNr: string | null = null;
+        let lookupCalls = 0;
+        const r = await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          org_nr: "912345678",
+          field_provenance: noSourceProvenance,
+          brregLookupFn: async (orgNr: string) => {
+            lookupCalls++;
+            lookupOrgNr = orgNr;
+            return { exists: true, active: true, name: "Testgård" };
+          },
+          judgeFn: async () => ({ approved: true }),
+        });
+        assertEq(lookupCalls, 1, "a-36: brregLookupFn called exactly once");
+        assertEq(lookupOrgNr, "912345678", "a-37: brregLookupFn called with input.org_nr");
+        assertTrue(r.sources.includes("brreg_name_match"), "a-38: brreg_name_match fires on a high-scoring Brreg name match");
+        assertTrue(r.passes, "a-39: brreg_name_match alone satisfies has_accepted_source -> gate passes");
+      }
+      {
+        // Same setup, but the Brreg name is clearly a different business ->
+        // scoreNameMatch scores well below 0.8 -> brreg_name_match must NOT
+        // fire, and with no other source available the gate fails.
+        const r = await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          org_nr: "912345678",
+          field_provenance: noSourceProvenance,
+          brregLookupFn: async () => ({ exists: true, active: true, name: "Helt Forskjellig Bedrift Holding AS" }),
+          judgeFn: async () => ({ approved: true }),
+        });
+        assertTrue(!r.sources.includes("brreg_name_match"), "a-40: clearly different Brreg name -> brreg_name_match does not fire");
+        assertTrue(!r.reasons.has_accepted_source, "a-41: no other source available -> has_accepted_source=false");
+        assertTrue(!r.passes, "a-42: -> gate fails");
+      }
+      {
+        // brregLookupFn rejects -> must never escape the function; behaves
+        // exactly as if brreg:null had been passed (today's hardcoded
+        // behavior), never crashes, judge never reached (zero sources).
+        let judgeCalled = false;
+        let threw = false;
+        let r: Awaited<ReturnType<typeof computeGardssalgSecondLineVerification>> | undefined;
+        try {
+          r = await computeGardssalgSecondLineVerification({
+            ...baseInput,
+            org_nr: "912345678",
+            field_provenance: noSourceProvenance,
+            brregLookupFn: async () => {
+              throw new Error("brreg lookup failed");
+            },
+            judgeFn: async () => {
+              judgeCalled = true;
+              return { approved: true };
+            },
+          });
+        } catch {
+          threw = true;
+        }
+        assertTrue(!threw, "a-43: brregLookupFn rejecting never throws out of computeGardssalgSecondLineVerification");
+        assertTrue(!!r && !r.sources.includes("brreg_name_match"), "a-44: falls back to brreg:null -> brreg_name_match never fires");
+        assertTrue(!!r && !r.passes, "a-45: falls back to brreg:null -> gate fails cleanly (no accepted source)");
+        assertTrue(!judgeCalled, "a-46: zero accepted sources -> judge never called");
+      }
+      {
+        // org_nr null/empty -> brregLookupFn is NEVER called (no network call
+        // at all when org_nr is missing, matching today's byte-identical
+        // no-lookup behavior).
+        let lookupCalled = false;
+        const mockLookup = async () => {
+          lookupCalled = true;
+          return { exists: true, active: true, name: "Testgård" };
+        };
+        await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          org_nr: null,
+          brregLookupFn: mockLookup,
+          judgeFn: async () => ({ approved: true }),
+        });
+        assertTrue(!lookupCalled, "a-47: org_nr=null -> brregLookupFn never called");
+        await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          org_nr: "",
+          brregLookupFn: mockLookup,
+          judgeFn: async () => ({ approved: true }),
+        });
+        assertTrue(!lookupCalled, "a-48: org_nr='' -> brregLookupFn never called");
+      }
     } catch (err: any) {
       failed++;
       failures.push("second-line (section A): unexpected error: " + String(err?.stack || err?.message || err));
