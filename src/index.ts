@@ -47,6 +47,7 @@ import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
+import adminOutreachMaxTouchVernRoutes from "./routes/admin-outreach-max-touch-vern";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { runDispatchTick } from "./routes/admin-loop-dispatch";
@@ -672,6 +673,14 @@ app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 // orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
 app.use("/admin/outreach-candidates", adminLimiter, adminOutreachCandidatesRoutes);
 app.use("/admin/outreach-sent-log", adminLimiter, adminOutreachCandidatesRoutes);
+// GET/POST /admin/outreach-max-touch-vern (dev-request 2026-08-29-outreach-
+// max-touch-vern) — the L1 knob (enabled/threshold) behind max-touch-vern,
+// read by BOTH the mode=second exclusion above (admin-outreach-candidates.ts)
+// and the send-time invariant in crm.ts. Its own top-level path, matching
+// /admin/enrichment-write-pause's sibling-lever mount just above rather than
+// nesting under /admin/outreach-candidates: the knob is read by crm.ts too,
+// not scoped to the candidates gate alone.
+app.use("/admin/outreach-max-touch-vern", adminLimiter, adminOutreachMaxTouchVernRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
 // P1 server-migration: deterministic loop watchdog — liveness from the
 // run-ledger; ?alert=1 emails when a watcher is silent.

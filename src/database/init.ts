@@ -4261,6 +4261,48 @@ function initSchema(db: Database.Database): void {
     );
   } catch { /* index already created */ }
 
+  // ─── outreach_max_touch_vern_config (dev-request 2026-08-29-outreach-max-
+  // touch-vern) ───────────────────────────────────────────────────────────
+  // Single-row (id='singleton') L1 knob for max-touch-vern: never send new
+  // cold outreach to an address that already has >= threshold prior
+  // outreach_sent_log rows (any vertical) AND zero inbound messages ever.
+  // `threshold` (default 3) and `enabled` (the whole gate's off switch) —
+  // same DB-backed-admin-lever shape as gardssalg_outreach_size_gate_config
+  // (services/gardssalg-outreach-size-gate.ts, database/init-experiences.ts),
+  // just on THIS (main) db rather than the experiences db, because the
+  // surfaces being gated — admin-outreach-candidates.ts's mode=second and
+  // crm.ts's send routes — already read outreach_sent_log/crm_messages here.
+  // Deliberately DB-backed rather than a repo-tracked config file: the
+  // Dockerfile COPYs only src/, tsconfig.json, openapi.yaml, verticals/,
+  // mcp-server*/ into the image, so a new config/*.yaml would need a
+  // rebuild+redeploy before an edit ever reached the running container —
+  // exactly the "uten deploy" property this knob exists to have. Written via
+  // an authenticated admin endpoint (GET/POST /admin/outreach-max-touch-vern,
+  // routes/admin-outreach-max-touch-vern.ts).
+  //
+  // Unlike the size-gate, this ships enabled:1 (true) from the CREATE TABLE
+  // default AND from services/outreach-max-touch-vern.ts's documented
+  // fallback for an absent row: Daniel's live order that produced this
+  // dev-request (99 addresses found stuck in repeat-send, zero reply) IS the
+  // on-decision — a knob defaulted off would silently not do the one thing
+  // it was built for. Absence of the singleton row (fresh DB, never
+  // configured) is NOT an error — getOutreachMaxTouchVernConfig() falls back
+  // to (enabled:true, threshold:3) rather than requiring a seed row here.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outreach_max_touch_vern_config (
+        id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        threshold INTEGER NOT NULL DEFAULT 3,
+        updated_at TEXT,
+        updated_by TEXT,
+        note TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration outreach_max_touch_vern_config failed:", err);
+  }
+
 }
 
 export function closeDb(): void {
