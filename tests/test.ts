@@ -31569,6 +31569,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gspt.failures) failures.push("opplevelser-gardssalg-set-producer-type: " + f);
     console.log(`  opplevelser-gardssalg-set-producer-type: ${gspt.passed} passed, ${gspt.failed} failed`);
 
+    // dev-request 2026-08-29-gardssalg-set-address: the third sibling of the
+    // two suites just above — the missing "apply a caller-supplied, CORRECTED
+    // street address" write path. The only other writer of `adresse`
+    // (applyGardssalgProviderAddress, Brreg address-enrichment) is FILL-ONLY,
+    // so a wrong address had no write path. Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-set-address: caller-supplied street-address write ──");
+    const { runOpplevelserGardssalgSetAddressTests } = require("../src/routes/opplevelser-gardssalg-set-address.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-address.test");
+    const gsa = await runOpplevelserGardssalgSetAddressTests({ log: false });
+    passed += gsa.passed;
+    failed += gsa.failed;
+    for (const f of gsa.failures) failures.push("opplevelser-gardssalg-set-address: " + f);
+    console.log(`  opplevelser-gardssalg-set-address: ${gsa.passed} passed, ${gsa.failed} failed`);
+
     // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A:
     // persist the force-approval from gardssalg-set-contact-email above (a
     // field_provenance.contact_email_domain_override stamp, scoped to the

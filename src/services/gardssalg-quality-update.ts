@@ -268,6 +268,36 @@ export function classifyGardssalgFieldDefect(
   return { defective: false, type: null };
 }
 
+// ── B′. Address defect classifier (dev-request 2026-08-29-gardssalg-set-
+// address) ───────────────────────────────────────────────────────────────
+//
+// A companion to classifyGardssalgFieldDefect above for `adresse` — which is
+// deliberately NOT a member of GardssalgQualityFieldName/GARDSSALG_QUALITY_
+// FIELDS (it never participates in the quality-REPLACEMENT margin logic (C)
+// or the anti-churn gate (D); POST /admin/gardssalg-set-address is a plain
+// manual-correction lever, not a "richer candidate" judgment, so widening
+// the closed union just to reach this check would also widen POST
+// /admin/gardssalg-set-content-field's own `field` vocabulary — out of
+// scope). Reuses this module's placeholder-marker vocabulary
+// (GARDSSALG_PLACEHOLDER_MARKERS) and the mangled-encoding check rather than
+// re-deriving either; drops every category that makes no sense for a short
+// address string — UI-chrome/CSS-leakage, mid-sentence truncation,
+// wrong-language, cookie-notice, duplicate-of-other-provider — a street
+// address is never scraped prose, so none of those failure modes apply.
+const GARDSSALG_ADDRESS_MIN_CHARS = 4;
+
+export function classifyGardssalgAddressDefect(rawValue: string | null | undefined): GardssalgDefectVerdict {
+  const trimmed = (rawValue ?? "").trim();
+  if (!trimmed) return { defective: false, type: null }; // blank -> the caller's own value_required gate, not this classifier's job
+  if (trimmed.includes("�")) return { defective: true, type: "mangled_encoding" };
+  const lower = trimmed.toLowerCase();
+  if (GARDSSALG_PLACEHOLDER_MARKERS.some((m) => lower.includes(m))) {
+    return { defective: true, type: "placeholder" };
+  }
+  if (trimmed.length < GARDSSALG_ADDRESS_MIN_CHARS) return { defective: true, type: "too_short" };
+  return { defective: false, type: null };
+}
+
 // ── C. Margin proxy (info-point coverage) ───────────────────────────────
 //
 // "Candidate covers MORE of the field's information points than the

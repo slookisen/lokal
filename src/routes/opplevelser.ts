@@ -144,6 +144,11 @@ import {
   // applyGardssalgProducerType below in this file, this one can correct an
   // already-set, wrong classification).
   applyGardssalgSetProducerType,
+  // dev-request 2026-08-29-gardssalg-set-address — the missing third sibling
+  // of applyGardssalgSetContentField/applyGardssalgSetProducerType above: a
+  // manual, overwriting/nulling correction lever for `adresse` (the only
+  // other writer, applyGardssalgProviderAddress, is fill-only).
+  applyGardssalgSetAddress,
   // dev-request 2026-08-16-opplevagent-outreach-rutine, spec point 6
   // ("Autosvar-regelen") — the review queue for autosvar candidates whose
   // candidate email's domain does NOT (or cannot be shown to) agree with the
@@ -9622,6 +9627,113 @@ router.post("/admin/gardssalg-set-producer-type", requireAdmin, (req: Request, r
     success: true,
     provider_id: providerId,
     field: "producer_type",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-address (admin) ──────────────
+//
+// dev-request 2026-08-29-gardssalg-set-address. Daniel, live session
+// 2026-08-29 ("ja") — the missing third sibling of gardssalg-set-content-
+// field/gardssalg-set-producer-type above: a write path for `adresse` that
+// carries a CALLER-SUPPLIED, corrected street address. The only other writer
+// of this column, applyGardssalgProviderAddress (Brreg address-enrichment,
+// above), is FILL-ONLY — it refuses to touch a row whose adresse is already
+// non-blank — so there was no way to correct a wrong one (a stale Brreg
+// registration address, a typo, a producer's own correction).
+//
+// Body: { provider_id: string, value: string | null, source: string }.
+// `source` is free-text provenance (a CRM thread ref, a prompt/run id, a
+// producer email), stored verbatim in field_provenance.adresse.source_url
+// and on the audit row — same "always capture a provenance string"
+// discipline as gardssalg-set-content-field.
+//
+// `value: null` CLEARS the column — this IS the rollback path for this
+// endpoint, same "null clears" discipline as gardssalg-set-producer-type/
+// -terminal-status/-org-nr/-hjemmeside above.
+//
+// Only `adresse` is written — postnummer/poststed/fylke/kommune/lat/lon are
+// deliberately left untouched (see applyGardssalgSetAddress's own doc
+// comment, experience-store.ts, for why this matches the existing
+// address-enrichment write path's per-field discipline and the public
+// JSON-LD PostalAddress's actual column usage).
+//
+// No `force` parameter, by design: same reasoning as gardssalg-set-content-
+// field — the two gates (owner-lock, then the objective-defect classifier)
+// are the entire point of routing corrections through this endpoint rather
+// than raw SQL.
+//
+// Rollback: no new lever — `adresse` is already in
+// GARDSSALG_ROLLBACKABLE_FIELDS (added when applyGardssalgProviderAddress
+// shipped), and the audit row this writes is exactly what POST
+// /admin/gardssalg-content-rollback already reads.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-address", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    value?: unknown;
+    source?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const rawValue = body.value;
+  if (rawValue !== null && typeof rawValue !== "string") {
+    res.status(400).json({ error: "value_required" });
+    return;
+  }
+  // Blank/whitespace-only gets the SAME "value_required" code as a missing
+  // value (not "defective_value") — same split as gardssalg-set-content-
+  // field's own route-level check, trim-then-check.
+  if (typeof rawValue === "string" && !rawValue.trim()) {
+    res.status(400).json({ error: "value_required" });
+    return;
+  }
+  const value = rawValue === null ? null : (rawValue as string).trim();
+
+  const source = typeof body.source === "string" ? body.source.trim() : "";
+  if (!source) {
+    res.status(400).json({ error: "source_required" });
+    return;
+  }
+
+  const result = applyGardssalgSetAddress(providerId, value, source);
+
+  if (!result.ok) {
+    if (result.reason === "provider_not_found") {
+      res.status(404).json({ error: "provider_not_found" });
+      return;
+    }
+    if (result.reason === "owner_locked") {
+      // 409, not 403: the request is authorized, it is the row's STATE (an
+      // owner edited this field, or the row is content_source='manual') that
+      // conflicts with the write.
+      res.status(409).json({ error: "owner_locked" });
+      return;
+    }
+    if (result.reason === "value_required") {
+      // Unreachable over HTTP — the blank check above already returned this
+      // exact 400. Mapped anyway so the service's own blank guard (defense in
+      // depth for direct callers) can never surface as a 400 defective_value
+      // with a null defect_type; the wire contract stays byte-for-byte what
+      // the earlier check produces.
+      res.status(400).json({ error: "value_required" });
+      return;
+    }
+    res.status(400).json({ error: "defective_value", defect_type: result.defect_type });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "adresse",
     old_value: result.old_value,
     new_value: result.new_value,
   });
