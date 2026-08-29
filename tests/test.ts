@@ -31487,6 +31487,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gsts.failures) failures.push("opplevelser-gardssalg-set-terminal-status: " + f);
     console.log(`  opplevelser-gardssalg-set-terminal-status: ${gsts.passed} passed, ${gsts.failed} failed`);
 
+    // dev-request 2026-08-29-drikkeliste-remapping-og-dodkilde: §4a-§4e
+    // drink-producer catalog data-quality remediation batch — the two new
+    // small write primitives (applyGardssalgSetOrgNr/applyGardssalgSetHjemmeside),
+    // their POST /admin/gardssalg-set-org-nr / -set-hjemmeside routes, and
+    // the orchestrating POST /admin/gardssalg-drikkeliste-remediation route.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-drikkeliste-remediation: §4a-§4e catalog cleanup batch ──");
+    const { runOpplevelserGardssalgDrikkelisteRemediationTests } = require("../src/routes/opplevelser-gardssalg-drikkeliste-remediation.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-drikkeliste-remediation.test");
+    const gdr = await runOpplevelserGardssalgDrikkelisteRemediationTests({ log: false });
+    passed += gdr.passed;
+    failed += gdr.failed;
+    for (const f of gdr.failures) failures.push("opplevelser-gardssalg-drikkeliste-remediation: " + f);
+    console.log(`  opplevelser-gardssalg-drikkeliste-remediation: ${gdr.passed} passed, ${gdr.failed} failed`);
+
     // Grep 3c (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply
     // follow-on): manual producer_type OVERRIDE lever — the existing
     // gardssalg-producer-type-classify route above is fill-only and refuses

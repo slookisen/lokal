@@ -5732,6 +5732,143 @@ export function applyGardssalgSetTerminalStatus(
   return { ok: true, old_value: oldValue, new_value: terminalStatus };
 }
 
+export type GardssalgSetOrgNrResult =
+  | { ok: true; old_value: string | null; new_value: string | null }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "invalid_format" }
+  | { ok: false; reason: "org_nr_conflict"; conflicting_provider_id: string };
+
+/**
+ * Directly CORRECT (overwrite) a gårdssalg provider's `org_nr` — dev-request
+ * 2026-08-29-drikkeliste-remapping-og-dodkilde, §4a piece A. Structurally
+ * mirrors applyGardssalgSetTerminalStatus above byte-for-byte (pre-write
+ * old_value snapshot, one gardssalg_content_audit row, all inside a single
+ * transaction) — the ONE genuine difference from that function is the
+ * UNIQUE-column conflict check below, since org_nr (unlike terminal_status)
+ * carries a UNIQUE index on experience_providers.
+ *
+ * Deliberately NOT the same lever as applyGardssalgProviderOrgnr
+ * (org_nr-backfill's fill-only writer, above) — that one refuses to touch a
+ * row whose org_nr is already non-blank ("fill-only"). This one is the
+ * missing "the existing value is WRONG, replace it" path the §4a batch
+ * needs for the rows where the target operating org.nr does not already
+ * exist as its own separate catalog row (the "in-place correction" branch —
+ * when a separate row DOES already exist at the target org.nr, the caller
+ * should use the merge lever, gardssalg-provider-merge.ts, instead; this
+ * function's own conflict guard below is the safety net for that boundary,
+ * not the primary way it's meant to be enforced).
+ *
+ * `orgNr: null` CLEARS the column — same "null clears" rollback convention
+ * as applyGardssalgSetTerminalStatus's own terminalStatus:null path. A
+ * non-null value must be exactly 9 digits (`/^\d{9}$/`, the same format gate
+ * used throughout this file, e.g. getGardssalgOrgnrWriteBlocker above) —
+ * anything else is rejected before it ever reaches the UNIQUE-indexed
+ * column.
+ */
+export function applyGardssalgSetOrgNr(
+  providerId: string,
+  orgNr: string | null,
+  reason: string,
+  sourceUrl?: string
+): GardssalgSetOrgNrResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, org_nr FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; org_nr: string | null } | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  const cleanOrgNr = orgNr === null ? null : orgNr.trim();
+  if (cleanOrgNr !== null && !/^\d{9}$/.test(cleanOrgNr)) {
+    return { ok: false, reason: "invalid_format" };
+  }
+  if (cleanOrgNr !== null) {
+    const conflict = db
+      .prepare(`SELECT id FROM experience_providers WHERE org_nr = ? AND id != ?`)
+      .get(cleanOrgNr, providerId) as { id: string } | undefined;
+    if (conflict) return { ok: false, reason: "org_nr_conflict", conflicting_provider_id: conflict.id };
+  }
+
+  const oldValue = row.org_nr;
+  const provenance = sourceUrl && sourceUrl.trim() ? sourceUrl.trim() : reason;
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET org_nr = @org_nr WHERE id = @id`
+    ).run({ id: providerId, org_nr: cleanOrgNr });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'org_nr', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: cleanOrgNr,
+      source_url: provenance,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: cleanOrgNr };
+}
+
+export type GardssalgSetHjemmesideResult =
+  | { ok: true; old_value: string | null; new_value: string | null }
+  | { ok: false; reason: "provider_not_found" };
+
+/**
+ * Directly CORRECT (or, with `hjemmeside: null`, CLEAR) a gårdssalg
+ * provider's `hjemmeside` — dev-request
+ * 2026-08-29-drikkeliste-remapping-og-dodkilde, §4a piece B. Structurally
+ * mirrors applyGardssalgSetTerminalStatus/applyGardssalgSetOrgNr above.
+ *
+ * Deliberately NOT applyGardssalgProviderWebsite (fill-only, only ever
+ * writes when the column is CURRENTLY BLANK) and NOT
+ * applyGardssalgSetContentField (GARDSSALG_QUALITY_FIELDS covers
+ * about_text/visit_text/opening_hours_text only, never hjemmeside) — both
+ * checked exhaustively against this checkout before adding this function;
+ * neither can overwrite an already-set wrong URL or null one out on a
+ * caller-supplied value. `hjemmeside: null` is the rollback/"dead site"
+ * path (§4d's "null it" rows) — same "null clears" convention as
+ * applyGardssalgSetTerminalStatus/applyGardssalgSetOrgNr above.
+ */
+export function applyGardssalgSetHjemmeside(
+  providerId: string,
+  hjemmeside: string | null,
+  reason: string,
+  sourceUrl?: string
+): GardssalgSetHjemmesideResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, hjemmeside FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; hjemmeside: string | null } | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  const oldValue = row.hjemmeside;
+  const newValue = hjemmeside === null ? null : hjemmeside.trim();
+  const provenance = sourceUrl && sourceUrl.trim() ? sourceUrl.trim() : reason;
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET hjemmeside = @hjemmeside WHERE id = @id`
+    ).run({ id: providerId, hjemmeside: newValue });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'hjemmeside', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: newValue,
+      source_url: provenance,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: newValue };
+}
+
 export type GardssalgAutosvarReviewQueueEntry = {
   provider_id: string;
   provider_name?: string | null;
