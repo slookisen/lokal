@@ -5271,8 +5271,50 @@ async function tryGardssalgCandidateHosts(
   return null;
 }
 
+// ─── candidate-URL host parser (kildebredde Grep 1, dev-request 2026-08-28-
+// gardssalg-kildebredde-wiring) — strict `new URL()`-based parse (unlike
+// hostFromUrlLike's lenient best-effort strip, used elsewhere in this route
+// for the FINAL-host re-check after a fetch/redirect), mirroring
+// rfbWdHostFromUrl (admin-rfb-website-discovery.ts) exactly: a candidate
+// proposed via the new `candidates` intake is caller-supplied, arbitrary
+// text — this is the one place in the pipeline where a genuinely malformed
+// string must be caught and reported (invalid_candidate_url) rather than
+// silently coerced into some host string.
+function gsWdHostFromCandidateUrl(raw: string): string | null {
+  try {
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return u.hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+}
+
+// External-candidate intake item shape (kildebredde Grep 1) — mirrors RFB's
+// RfbWdExternalCandidate ({agentId,url}) 1:1, adapted to this vertical's own
+// id field (gårdssalg providers are addressed by provider_id everywhere else
+// in this route, never agentId).
+interface GsWdExternalCandidate {
+  providerId: string;
+  url: string;
+}
+
+function parseGsWdExternalCandidates(raw: unknown): GsWdExternalCandidate[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: GsWdExternalCandidate[] = [];
+  for (const item of raw) {
+    const o = item as { providerId?: unknown; url?: unknown };
+    const providerId = typeof o?.providerId === "string" ? o.providerId.trim() : "";
+    const url = typeof o?.url === "string" ? o.url.trim() : "";
+    // malformed item poisons the whole call — 400, never a silent partial
+    // run (same convention as RFB's parseExternalCandidates).
+    if (!providerId || !url) return null;
+    out.push({ providerId, url });
+  }
+  return out;
+}
+
 router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown; candidates?: unknown };
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -5287,6 +5329,213 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
   const alreadyHasWebsite: Array<{ provider_id: string; navn: string }> = [];
   const notFound: string[] = [];
   let targets: Array<{ id: string; navn: string; org_nr: string | null; kommune: string | null; poststed: string | null; content_source: string | null; producer_type: string | null }> = [];
+
+  // ─── External-candidate intake (kildebredde Grep 1, dev-request
+  // 2026-08-28-gardssalg-kildebredde-wiring): a caller (web-search
+  // session/routine) proposes a SPECIFIC url for a SPECIFIC gårdssalg
+  // provider instead of relying on this route's own name-guessed (tier 1) /
+  // search-derived (tier 2) candidate hosts. Mirrors POST
+  // /rfb-website-discovery's own `candidates` intake
+  // (admin-rfb-website-discovery.ts) — same mutual-exclusivity-with-other-
+  // selection-params contract, same per-item shape (this vertical's own
+  // provider_id in place of agentId), same hard cap (GS_WD_HARD_CAP,
+  // unchanged). The proposed url goes through the EXACT SAME pipeline
+  // tier 1/2 already use (tryGardssalgCandidateHosts: pre-fetch exclusion,
+  // SSRF-guarded fetch, final-host re-check, fetch-integrity re-check,
+  // gardssalgWebsiteEvidenceMatch) — nothing about verification is
+  // duplicated or re-derived here.
+  //
+  // The ONE deliberate divergence from both the RFB mirror and this route's
+  // own tier-1/2 loop: today, a candidate that fails to verify (excluded
+  // host, unreachable, no evidence match) is reported in the response but
+  // NEVER written anywhere — tier-1/2's own name-guessed/search-derived
+  // hosts are cheap to just drop. A candidate proposed through THIS intake
+  // was hand-picked by a caller, so a failed-evidence outcome must still
+  // surface for human review rather than vanish: it is upserted into the
+  // SAME gardssalg_website_review_queue (never a new table/write path) with
+  // a distinguishing reason, `candidate_evidence_failed`, so a reviewer can
+  // see it and a caller can never mistake "not queued" for "nothing was
+  // proposed here". Both this and the verified-proposal write below respect
+  // the SAME apply/dry-run gate as tier-1/2 (dry-run fetches but writes
+  // nothing) — one write discipline for the whole route, no new one invented.
+  if (body.candidates !== undefined) {
+    if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+      res.status(400).json({ error: "candidates og providerIds kan ikke kombineres i samme kall" });
+      return;
+    }
+    if (body.limit !== undefined) {
+      res.status(400).json({ error: "candidates og limit kan ikke kombineres i samme kall" });
+      return;
+    }
+    const candidates = parseGsWdExternalCandidates(body.candidates);
+    if (candidates === null || candidates.length === 0) {
+      res.status(400).json({ error: "candidates må være en ikke-tom array av {providerId, url}" });
+      return;
+    }
+    if (candidates.length > GS_WD_HARD_CAP) {
+      res.status(400).json({ error: `Too many candidates (max ${GS_WD_HARD_CAP} per call)` });
+      return;
+    }
+
+    const hostCountsExt = gardssalgSharedHostCounts();
+    const proposedExt: Array<{
+      provider_id: string;
+      navn: string;
+      candidate_url: string;
+      final_url: string;
+      evidence: { org_nr_found: boolean; name_found: boolean; place_found: boolean; verified: boolean };
+      confidence: number;
+    }> = [];
+    const evidenceFailedExt: Array<{
+      provider_id: string;
+      navn: string;
+      candidate_url: string;
+      reason: string;
+      tried: string[];
+      excluded: Array<{ host: string; reason: string }>;
+      queued: boolean;
+    }> = [];
+    const rejectedBlocklistedExt: Array<{ provider_id: string; navn: string; matched_by?: string; matched_value?: string }> = [];
+    const rejectedRequestExt: Array<{ provider_id: string; reason: string }> = [];
+    const seenProviderIdsExt = new Set<string>();
+    const processedIdsExt: string[] = [];
+
+    for (const c of candidates) {
+      if (seenProviderIdsExt.has(c.providerId)) {
+        rejectedRequestExt.push({ provider_id: c.providerId, reason: "duplicate_provider_in_request" });
+        continue;
+      }
+      seenProviderIdsExt.add(c.providerId);
+
+      const t = getGardssalgWebsiteDiscoveryTarget(c.providerId);
+      if (!t) {
+        notFound.push(c.providerId);
+        continue;
+      }
+      if (t.content_source === "manual" || t.content_source === "claim") {
+        skippedLocked.push({ provider_id: t.id, navn: t.navn });
+        continue;
+      }
+      if (t.hjemmeside && t.hjemmeside.trim() !== "") {
+        alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
+        continue;
+      }
+
+      // Anti-starvation stamp applies to every row that reaches this point
+      // (same convention as tier-1/2's own `processedIds`, including rows
+      // rejected just below by the blocklist gate) — never to locked/
+      // already-has-website/not_found rows, which this route never spends
+      // discovery effort on in the first place.
+      processedIdsExt.push(t.id);
+      const blockCheck = isBlocked({ orgNr: t.org_nr ?? undefined, name: t.navn });
+      if (blockCheck.blocked) {
+        rejectedBlocklistedExt.push({ provider_id: t.id, navn: t.navn, matched_by: blockCheck.matchedBy, matched_value: blockCheck.matchedValue });
+        continue;
+      }
+
+      const tried: string[] = [];
+      const excludedHere: Array<{ host: string; reason: string }> = [];
+      const host = gsWdHostFromCandidateUrl(c.url);
+      const hit = host ? await tryGardssalgCandidateHosts([host], hostCountsExt, t, tried, excludedHere) : null;
+
+      if (hit) {
+        let finalOrigin: string;
+        try {
+          const u = new URL(hit.finalUrl);
+          finalOrigin = `${u.protocol}//${u.host.toLowerCase()}`;
+        } catch {
+          finalOrigin = `https://${hit.host}`;
+        }
+        const confidence = hit.evidence.org_nr_found
+          ? 1.0
+          : hit.evidence.phone_found
+            ? 0.95
+            : hit.evidence.address_found
+              ? 0.92
+              : 0.9;
+        proposedExt.push({
+          provider_id: t.id,
+          navn: t.navn,
+          candidate_url: finalOrigin,
+          final_url: hit.finalUrl,
+          evidence: hit.evidence,
+          confidence,
+        });
+        if (!dryRun) {
+          try {
+            upsertGardssalgWebsiteReviewQueue({
+              provider_id: t.id,
+              provider_name: t.navn,
+              candidate_url: finalOrigin,
+              final_url: hit.finalUrl,
+              evidence: JSON.stringify(hit.evidence),
+              confidence,
+              reason: "website_discovery_candidate",
+              batch_id: batchTag,
+            });
+          } catch {
+            /* queue is best-effort; the run itself must not fail on it */
+          }
+        }
+      } else {
+        // Never silently discarded (Grep 1, item 5): unlike tier-1/2's own
+        // dropped guesses, a caller-proposed candidate that fails to verify
+        // — for ANY reason (malformed url, pre-fetch exclusion, unreachable,
+        // fetch-contaminated, or evidence simply not found on the page) —
+        // still lands in the review queue under its own distinguishable
+        // reason, so nobody mistakes it for a verified tier-1/2 proposal and
+        // a human reviewer can still see and act on it.
+        const reason = !host ? "invalid_candidate_url" : excludedHere.length > 0 ? excludedHere[0].reason : "no_candidate_verified";
+        evidenceFailedExt.push({
+          provider_id: t.id,
+          navn: t.navn,
+          candidate_url: c.url,
+          reason,
+          tried,
+          excluded: excludedHere,
+          queued: !dryRun,
+        });
+        if (!dryRun) {
+          try {
+            upsertGardssalgWebsiteReviewQueue({
+              provider_id: t.id,
+              provider_name: t.navn,
+              candidate_url: c.url,
+              final_url: null,
+              evidence: JSON.stringify({ reason, tried, excluded: excludedHere }),
+              confidence: null,
+              reason: "candidate_evidence_failed",
+              batch_id: batchTag,
+            });
+          } catch {
+            /* queue is best-effort; the run itself must not fail on it */
+          }
+        }
+      }
+    }
+
+    if (!dryRun && processedIdsExt.length > 0) stampGardssalgWebsiteDiscoveryAttempt(processedIdsExt);
+
+    res.json({
+      success: true,
+      mode: "external_candidates",
+      dry_run: dryRun,
+      batch_tag: batchTag,
+      scanned: seenProviderIdsExt.size,
+      proposed_count: proposedExt.length,
+      proposed: proposedExt,
+      evidence_failed_count: evidenceFailedExt.length,
+      evidence_failed: evidenceFailedExt,
+      skipped_locked: skippedLocked,
+      already_has_website: alreadyHasWebsite,
+      not_found: notFound,
+      rejected_blocklisted_count: rejectedBlocklistedExt.length,
+      rejected_blocklisted: rejectedBlocklistedExt,
+      rejected_request: rejectedRequestExt,
+      queue_size: listGardssalgWebsiteReviewQueue().length,
+    });
+    return;
+  }
 
   if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
     const ids = (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim());
