@@ -100,6 +100,14 @@ import {
   applyGardssalgProviderContact,
   GS_CB_HARD_CAP,
   type GardssalgContactBackfillTarget,
+  type GardssalgContactEmailFlaggedForReview,
+  // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 3 — 1881/
+  // bransjeliste contact-candidate intake below runs every phone candidate
+  // through this SAME deterministic normalizer BEFORE it ever reaches the
+  // LLM judge (FUNN m0e-dommer-avviser-gyldige-telefonnumre, 2026-08-27: the
+  // judge gave self-contradictory rejections on unnormalised, validly-shaped
+  // numbers).
+  normaliseNorwegianPhone,
   // dev-request 2026-08-16-gardssalg-set-contact-email — the missing
   // "correct an already-filled stale contact" path (contact-backfill above
   // is fill-only; this is not).
@@ -14082,6 +14090,256 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
       .run(JSON.stringify(freshFieldProv), id);
 
     results.push({ provider_id: id, outcome: "verified", sources: gate.sources, judge_reason: gate.judge_reason });
+  }
+
+  res.json({ enabled: true, results });
+});
+
+// ─── POST /admin/gardssalg-kildeklasse-contact-intake (admin) ──────────────
+//
+// dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 3: 1881.no
+// business listings and bransje-/medlemslister (siderklynga.no, hanen.no) as
+// an APPROVED contact-candidate kildeklasse. A caller (a session/routine
+// that has already fetched a 1881/siderklynga/hanen page — this route never
+// fetches anything itself) proposes an epost and/or telefon candidate for a
+// SPECIFIC provider, carrying the exact page URL it came from as provenance.
+//
+// Reuses, does NOT reinvent, the exact evidence-gate + write pipeline Grep 1
+// (candidates-intake, #737) and the pre-existing contact writers already
+// established:
+//   - applyGardssalgProviderContact (experience-store.ts) — the SAME
+//     fill-only + lock-respecting + write-time domain-gate (Skive C(a)) +
+//     shared LLM-judge (gateContactCandidates/judgeContactCandidate,
+//     contact-candidate-judge.ts) contact writer POST
+//     /admin/gardssalg-contact-extraction and POST
+//     /admin/gardssalg-contact-backfill already funnel through. NOT a new
+//     write path — the third caller of an existing one. Grep 3 extends that
+//     function with one new, purely additive, optional 6th parameter
+//     (`sourceType`) so a kildeklasse-sourced write's field_provenance
+//     record carries `source_type` alongside the existing `source_url` +
+//     `fetched_at` — see that function's own doc comment.
+//   - isBlocked (blocklist-service.ts) + getGardssalgWebsiteDiscoveryTarget
+//     (experience-store.ts) for the same not_found/locked/blocklisted
+//     pre-checks Grep 1's own candidates loop already does, so a rejected
+//     candidate is always reported with a specific reason — never silently
+//     dropped (same "never silently discarded" precedent Grep 1 set for
+//     `candidate_evidence_failed`).
+//
+// "Egen side vinner ved avvik" (rule from 2026-08-23, restated in this dev-
+// request's own spec): NOT implemented as a separate conflict-detector —
+// applyGardssalgProviderContact's FILL-ONLY discipline makes a literal
+// conflict structurally impossible for epost/telefon written through this
+// route: a field already carrying a value (whether it came from the
+// producer's own verified hjemmeside or anywhere else) is NEVER overwritten
+// by a kildeklasse candidate, and for epost specifically the SAME write-time
+// domain gate that already protects the other two writer routes also
+// withholds (flags for review, never writes) a candidate whose domain
+// disagrees with an established hjemmeside — verified or not. Telefon has no
+// domain concept to disagree on (same as every other telefon writer in this
+// file); fill-only alone is what prevents an overwrite there.
+//
+// Deterministic phone validation BEFORE the LLM judge (FUNN
+// m0e-dommer-avviser-gyldige-telefonnumre, 2026-08-27 — the judge gave
+// self-contradictory rejections on validly-shaped but unnormalised numbers):
+// every telefon candidate is run through normaliseNorwegianPhone() FIRST. A
+// candidate that does not reduce to a valid 8-digit Norwegian number is
+// rejected right here — `deterministic_invalid_format` — and NEVER reaches
+// gateContactCandidates/judgeContactCandidate at all (no Anthropic call is
+// made for it). Only a normalised 8-digit string is ever handed to the
+// judge, same convention extractGardssalgContactPhone already uses for
+// every OTHER phone writer in this file.
+//
+// proff.no / gulesider.no are NEVER a valid `sourceType` here and this route
+// never fetches ANY url — proff data may only ever ride along as free text
+// inside a candidate's optional `sourceContext` (a secondary/snippet signal
+// for the judge to read), never as the recorded source-of-record. See this
+// dev-request's own non-goals.
+//
+// `sourceUrl` must itself resolve (via hostFromUrlLike + registrableDomain,
+// the SAME helpers the domain gate above uses) to the registrable domain the
+// declared `sourceType` claims — `invalid_source_url` otherwise. This is a
+// provenance-integrity check ADDED in this slice (not explicitly spelled out
+// in the dev-request text) so a caller cannot mislabel an arbitrary URL as
+// "1881" — flagged here for reviewer attention as a judgment call, not a
+// literal spec requirement.
+//
+// Feature-gated behind its OWN flag, GS_KILDEKLASSE_CONTACT_ENABLED (default
+// off, read FRESH from process.env every call — same never-cached contract
+// as GS_SECOND_LINE_VERIFICATION_ENABLED above). Deliberately a SIBLING flag,
+// not a shared one: this route is a new CANDIDATE-INTAKE source (closer in
+// shape to Grep 1's candidates-intake, which shipped with no flag at all,
+// than to Grep 2's readiness-tier POLICY change), or­thogonal to whether
+// 2.linje verification is separately turned on — a reviewer may well want to
+// exercise 1881-adoption without simultaneously flipping outreach-readiness
+// promotion, and vice versa. Flag off -> pure {enabled:false} no-op, zero
+// reads/writes beyond the flag check itself (mirrors Grep 2's exact
+// contract).
+const GS_KILDEKLASSE_CONTACT_MAX_CANDIDATES = 48; // same bound as GS_WD_HARD_CAP / GS_SECOND_LINE_VERIFY_MAX_IDS
+
+const GS_KILDEKLASSE_SOURCE_TYPES = ["1881", "siderklynga", "hanen"] as const;
+type GsKildeklasseSourceType = (typeof GS_KILDEKLASSE_SOURCE_TYPES)[number];
+
+// Registrable domain each sourceType's sourceUrl must resolve to — see the
+// route's own doc comment ("provenance-integrity check").
+const GS_KILDEKLASSE_SOURCE_HOSTS: Record<GsKildeklasseSourceType, string> = {
+  "1881": "1881.no",
+  siderklynga: "siderklynga.no",
+  hanen: "hanen.no",
+};
+
+interface GsKildeklasseContactCandidate {
+  providerId: string;
+  sourceType: GsKildeklasseSourceType;
+  sourceUrl: string;
+  email?: string;
+  phone?: string;
+  sourceContext?: string;
+}
+
+function parseGsKildeklasseContactCandidates(raw: unknown): GsKildeklasseContactCandidate[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: GsKildeklasseContactCandidate[] = [];
+  for (const item of raw) {
+    const o = item as Record<string, unknown>;
+    const providerId = typeof o?.providerId === "string" ? o.providerId.trim() : "";
+    const sourceTypeRaw = typeof o?.sourceType === "string" ? o.sourceType.trim() : "";
+    const sourceUrl = typeof o?.sourceUrl === "string" ? o.sourceUrl.trim() : "";
+    const email = typeof o?.email === "string" ? o.email.trim() : "";
+    const phone = typeof o?.phone === "string" ? o.phone.trim() : "";
+    const sourceContext = typeof o?.sourceContext === "string" ? o.sourceContext : "";
+    // malformed item poisons the whole call — 400, never a silent partial
+    // run (same convention as Grep 1's parseGsWdExternalCandidates).
+    if (!providerId || !sourceUrl) return null;
+    if (!(GS_KILDEKLASSE_SOURCE_TYPES as readonly string[]).includes(sourceTypeRaw)) return null;
+    if (!email && !phone) return null; // must carry at least one contact field
+    out.push({
+      providerId,
+      sourceType: sourceTypeRaw as GsKildeklasseSourceType,
+      sourceUrl,
+      email: email || undefined,
+      phone: phone || undefined,
+      sourceContext: sourceContext || undefined,
+    });
+  }
+  return out;
+}
+
+router.post("/admin/gardssalg-kildeklasse-contact-intake", requireAdmin, async (req: Request, res: Response) => {
+  // Read FRESH on every call — never cached/module-level. See this route's
+  // own doc comment above for the full flag-off no-op contract.
+  const enabled = process.env.GS_KILDEKLASSE_CONTACT_ENABLED === "true";
+  if (!enabled) {
+    res.json({ enabled: false });
+    return;
+  }
+
+  const body = (req.body ?? {}) as { candidates?: unknown };
+  const candidates = parseGsKildeklasseContactCandidates(body.candidates);
+  if (candidates === null || candidates.length === 0) {
+    res.status(400).json({
+      error: "candidates må være en ikke-tom array av {providerId, sourceType, sourceUrl, email?, phone?}",
+    });
+    return;
+  }
+  if (candidates.length > GS_KILDEKLASSE_CONTACT_MAX_CANDIDATES) {
+    res.status(400).json({ error: `Too many candidates (max ${GS_KILDEKLASSE_CONTACT_MAX_CANDIDATES} per call)` });
+    return;
+  }
+
+  const results: Array<{
+    provider_id: string;
+    source_type?: GsKildeklasseSourceType;
+    outcome: string;
+    detail?: string;
+    matched_by?: string;
+    matched_value?: string;
+    written?: string[];
+    phone_rejected_reason?: string;
+    epost_flagged_for_review?: GardssalgContactEmailFlaggedForReview;
+    contact_gate_rejected?: { epost?: string; telefon?: string };
+  }> = [];
+  const seenProviderIds = new Set<string>();
+
+  for (const c of candidates) {
+    if (seenProviderIds.has(c.providerId)) {
+      results.push({ provider_id: c.providerId, source_type: c.sourceType, outcome: "duplicate_provider_in_request" });
+      continue;
+    }
+    seenProviderIds.add(c.providerId);
+
+    const expectedHost = GS_KILDEKLASSE_SOURCE_HOSTS[c.sourceType];
+    const sourceHost = hostFromUrlLike(c.sourceUrl);
+    const sourceRoot = sourceHost ? registrableDomain(sourceHost) : null;
+    if (sourceRoot !== expectedHost) {
+      results.push({
+        provider_id: c.providerId,
+        source_type: c.sourceType,
+        outcome: "invalid_source_url",
+        detail: `sourceUrl must resolve to ${expectedHost} for sourceType "${c.sourceType}"`,
+      });
+      continue;
+    }
+
+    const t = getGardssalgWebsiteDiscoveryTarget(c.providerId);
+    if (!t) {
+      results.push({ provider_id: c.providerId, source_type: c.sourceType, outcome: "not_found" });
+      continue;
+    }
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      results.push({ provider_id: c.providerId, source_type: c.sourceType, outcome: "locked" });
+      continue;
+    }
+    const blockCheck = isBlocked({ orgNr: t.org_nr ?? undefined, name: t.navn });
+    if (blockCheck.blocked) {
+      results.push({
+        provider_id: c.providerId,
+        source_type: c.sourceType,
+        outcome: "blocklisted",
+        matched_by: blockCheck.matchedBy,
+        matched_value: blockCheck.matchedValue,
+      });
+      continue;
+    }
+
+    // ── deterministic phone validation BEFORE the LLM judge ─────────────
+    // See this route's own doc comment. A candidate that fails normalisation
+    // is rejected right here and NEVER built into the `candidate` object
+    // handed to applyGardssalgProviderContact (i.e. it never reaches
+    // gateContactCandidates/judgeContactCandidate — no Anthropic call for it
+    // at all), unlike an email candidate (which has no equivalent
+    // deterministic format normaliser and is left entirely to the shared
+    // backstop classifier + LLM judge, same as every other contact writer).
+    let normalizedPhone: string | null = null;
+    let phoneRejectedReason: string | undefined;
+    if (c.phone) {
+      normalizedPhone = normaliseNorwegianPhone(c.phone);
+      if (!normalizedPhone) {
+        phoneRejectedReason = "deterministic_invalid_format: does not reduce to a valid 8-digit Norwegian number";
+      }
+    }
+
+    const gateSourceContext =
+      `Kandidat funnet via kildeklasse "${c.sourceType}" (${c.sourceUrl}).` +
+      (c.sourceContext ? ` ${c.sourceContext}` : "");
+
+    const { written, epostFlaggedForReview, contactGateRejected } = await applyGardssalgProviderContact(
+      c.providerId,
+      { epost: c.email ?? null, telefon: normalizedPhone, epostSource: c.sourceType },
+      c.sourceUrl,
+      undefined,
+      { businessName: t.navn, sourceContext: gateSourceContext },
+      c.sourceType,
+    );
+
+    results.push({
+      provider_id: c.providerId,
+      source_type: c.sourceType,
+      outcome: written.length > 0 ? "written" : "no_change",
+      written,
+      ...(phoneRejectedReason ? { phone_rejected_reason: phoneRejectedReason } : {}),
+      ...(epostFlaggedForReview ? { epost_flagged_for_review: epostFlaggedForReview } : {}),
+      ...(contactGateRejected ? { contact_gate_rejected: contactGateRejected } : {}),
+    });
   }
 
   res.json({ enabled: true, results });
