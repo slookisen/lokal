@@ -4080,14 +4080,24 @@ export function applyGardssalgProviderContent(
   // still corrupted) and only needs the audit/lock machinery below, not a
   // second opinion from a length-based heuristic that doesn't apply here.
   const forceSet = new Set(forceFields ?? []);
-  // Sub-slice 3i per-field owner-lock guard: only meaningful for
-  // content_source='claim' rows (isGardssalgFieldOwnerLocked always returns
-  // false for any other content_source, including the enrichment-derived
-  // rows this function otherwise handles) — reuses the SAME already-shipped,
-  // already-reviewed helper the hjemmeside pilot (3c) and the rollback
-  // writers (3b) already gate on. No new policy logic here, only wiring.
-  const isFieldOwnerLocked = (fieldName: string): boolean =>
-    row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, fieldName);
+  // Sub-slice 3i per-field owner-lock guard — reuses the SAME already-
+  // shipped helper the hjemmeside pilot (3c) and the rollback writers (3b)
+  // already gate on. No `row.content_source === "claim" &&` prefix here
+  // (removed dev-request 2026-08-29-gardssalg-products-write-and-field-
+  // lock, Part B): isGardssalgFieldOwnerLocked now decides field-vs-
+  // content_source dispatch INTERNALLY (see its own doc comment, layer A vs
+  // layer B) — an outer content_source==='claim' guard here would silently
+  // re-introduce the exact bug that restructure fixed, by never even
+  // calling the function for a non-claim row, so an admin-set lock
+  // (gardssalg-set-field-lock) on the enrichment-derived/null-content_source
+  // rows most gårdssalg providers actually have would be written and then
+  // ignored right here. Behaviorally identical to the old guard for every
+  // pre-existing case: 'manual' rows already bailed the whole function
+  // above (line ~4043) before reaching this closure, and prior to the admin
+  // lock endpoint existing, owner_locks was only ever populated on
+  // content_source='claim' rows anyway — so this is a strict widening, not
+  // a behavior change, for any row that predates Part B.
+  const isFieldOwnerLocked = (fieldName: string): boolean => isGardssalgFieldOwnerLocked(row, fieldName);
 
   if (!isFieldOwnerLocked("about_text")) {
     if (forceSet.has("about_text") && candidate.about_text?.trim()) {
@@ -4380,7 +4390,14 @@ export function applyGardssalgRetroScanNull(
   for (const f of fields) {
     const current = oldValues[f];
     if (current === null || current === undefined || String(current).trim() === "") continue; // already blank — nothing to null
-    if (row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, f)) continue; // owner-locked — never null a field the owner explicitly locked
+    // No `row.content_source === "claim" &&` prefix here (removed dev-request
+    // 2026-08-29-gardssalg-products-write-and-field-lock, Part B) — same
+    // reasoning as applyGardssalgProviderContent's isFieldOwnerLocked
+    // closure above: isGardssalgFieldOwnerLocked now dispatches on
+    // content_source internally, and 'manual' rows already bailed the whole
+    // function at the top (no behavior change there); this is a strict
+    // widening that lets an admin-set lock protect a non-claim row too.
+    if (isGardssalgFieldOwnerLocked(row, f)) continue; // owner-locked — never null a field the owner (or an admin) explicitly locked
     sets.push(`${f} = NULL`);
     written.push(f);
   }
@@ -5612,6 +5629,175 @@ export function applyGardssalgSetContentField(
   return { ok: true, old_value: oldValue, new_value: trimmed };
 }
 
+export type GardssalgProductsDefectType = "blank_item" | "invalid_item_type" | "item_too_long" | "too_many_items";
+
+export type GardssalgSetProductsResult =
+  | { ok: true; old_value: string | null; new_value: string }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "owner_locked" }
+  | { ok: false; reason: "value_required" }
+  | { ok: false; reason: "defective_value"; defect_type: GardssalgProductsDefectType | null };
+
+// Sane bounds for an admin-supplied products list. MAX_ITEMS mirrors the
+// ceiling the owner-claim path's own sanitizeProducts (gardssalg-claim.ts,
+// MAX_PRODUCTS) already enforces — reused here as "sane item count" so the
+// two live `products` writers agree on what "too many" means, rather than
+// inventing a second number. MAX_ITEM_LEN is deliberately larger than the
+// claim path's 100-char truncation ceiling: the claim path SILENTLY
+// TRUNCATES an overlong item (a producer typing too much in one box is an
+// ordinary mistake worth smoothing over); THIS endpoint instead REJECTS an
+// overlong item outright (defective_value) — an admin-authored list this
+// malformed is worth failing closed on, same discipline as
+// applyGardssalgSetContentField's own Gate 3.
+const GARDSSALG_PRODUCTS_MAX_ITEMS = 50;
+const GARDSSALG_PRODUCTS_MAX_ITEM_LEN = 200;
+
+/**
+ * Write (OVERWRITE) a gårdssalg provider's `products` column — Part A,
+ * dev-request 2026-08-29-gardssalg-products-write-and-field-lock. This is
+ * the write path applyGardssalgSetContentField's own doc comment explicitly
+ * calls out as deliberately NOT covered by that endpoint ("products is NOT
+ * accepted: classifyGardssalgFieldDefect has no vocabulary for it" —
+ * GardssalgQualityFieldName stays a closed 3-member union; `products` is not
+ * added to it). Live case that surfaced the gap: Anikonic Cider's public
+ * "Produkter" list read "Frukt, Urter" (raw ingredients bought in, not
+ * grown) with no admin lever to correct it to what they actually sell.
+ *
+ * `products` is stored as a JSON-array-of-strings TEXT column (see
+ * init-experiences.ts's own column comment). Every existing reader
+ * (scanGardssalgProviderRowForMojibake above, the produsent page renderer)
+ * JSON.parses it and falls back to treating a malformed value as a single-
+ * item array. This endpoint's `items` parameter is therefore taken as an
+ * ARRAY OF STRINGS — NOT a delimited string an implementer would then split
+ * — because that is the SAME shape the owner-claim write path
+ * (updateClaimedProviderProfile/sanitizeProducts, gardssalg-claim.ts)
+ * already accepts for this exact column: both live `products` writers agree
+ * on one wire shape instead of inventing a second convention that a reader
+ * would need to reconcile with the first. Unlike that owner path (which
+ * silently trims/dedupes/drops blanks — appropriate for a producer typing
+ * into a form), THIS endpoint fails closed on a malformed item (blank,
+ * wrong type, too long) or too many items — an admin-typed value gets the
+ * same objective gate as a scraped one, same discipline as
+ * applyGardssalgSetContentField's Gate 3 doc comment: no silent
+ * normalization that could mask a caller's mistake.
+ *
+ * Gates, same order/discipline as applyGardssalgSetContentField:
+ *   1. Owner-lock (isGardssalgFieldOwnerLocked) on the FRESH row. `products`
+ *      is already in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS (claim-portal
+ *      editable), so this needs no new eligibility wiring.
+ *   2. Shape/non-empty: must be a non-empty array. An empty/missing array is
+ *      "value_required", not "defective_value" — mirrors the blank-string
+ *      gate on the scalar content fields (blanking is fill-only's job, not
+ *      this endpoint's).
+ *   3. Per-item objective defect (non-string, blank after trim, or over the
+ *      sane length ceiling) and a sane total item count. A rejected value
+ *      leaves neither a column change nor an audit row behind — fail
+ *      closed, same as every other gate 3 in this file.
+ *
+ * field_provenance.products is merged (read-modify-write, preserving every
+ * other field's entry — same recipe as applyGardssalgSetContentField),
+ * INCLUDING any existing owner_locks object, which gate 1 already refused to
+ * write past for THIS field.
+ *
+ * Rollback needs no new wiring: `products` is already in
+ * GARDSSALG_ROLLBACKABLE_FIELDS (slice 5c, 2026-07-19) and the single audit
+ * row written below is exactly the shape planGardssalgContentRollback reads.
+ */
+export function applyGardssalgSetProducts(
+  providerId: string,
+  items: unknown,
+  source: string
+): GardssalgSetProductsResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, products, content_source, field_provenance FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | { id: string; products: string | null; content_source: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // Gate 1 — owner lock, on the FRESH row (see doc comment above).
+  if (isGardssalgFieldOwnerLocked(row, "products")) return { ok: false, reason: "owner_locked" };
+
+  // Gate 2 — shape + non-empty. Mirrors applyGardssalgSetContentField's Gate
+  // 2 (blank-string check) for the array shape: an empty/missing list is
+  // "nothing to write", not an objective defect.
+  if (!Array.isArray(items) || items.length === 0) return { ok: false, reason: "value_required" };
+
+  // Gate 3 — per-item objective defect + sane total count. Returns before
+  // any write, so a rejected value leaves neither a column change nor an
+  // audit row behind.
+  if (items.length > GARDSSALG_PRODUCTS_MAX_ITEMS) {
+    return { ok: false, reason: "defective_value", defect_type: "too_many_items" };
+  }
+  const normalized: string[] = [];
+  for (const raw of items) {
+    if (typeof raw !== "string") {
+      return { ok: false, reason: "defective_value", defect_type: "invalid_item_type" };
+    }
+    const t = raw.trim();
+    if (!t) return { ok: false, reason: "defective_value", defect_type: "blank_item" };
+    if (t.length > GARDSSALG_PRODUCTS_MAX_ITEM_LEN) {
+      return { ok: false, reason: "defective_value", defect_type: "item_too_long" };
+    }
+    normalized.push(t);
+  }
+  // Belt-and-braces: every raw item was non-blank after trim (checked
+  // above), so normalized can only end up empty if `items` itself was empty
+  // — already refused by Gate 2. Kept anyway as the same fail-closed
+  // discipline as every other gate in this file (never trust a derived
+  // invariant silently).
+  if (normalized.length === 0) return { ok: false, reason: "value_required" };
+
+  const oldValue = row.products;
+  const newValue = JSON.stringify(normalized);
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  // Same parse-guard as applyGardssalgSetContentField above: malformed
+  // existing JSON is treated as {} rather than clobbering the write. This
+  // preserves any existing `owner_locks` object untouched — gate 1 already
+  // refused every row where the lock applies to THIS field.
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.products = { source_url: source, fetched_at: new Date().toISOString() };
+  const provenanceJson = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET products = @value, field_provenance = @field_provenance WHERE id = @id`
+    ).run({ id: providerId, value: newValue, field_provenance: provenanceJson });
+    // Exactly ONE audit row, same shape every other gårdssalg writer uses —
+    // this is what makes the write reversible through the EXISTING POST
+    // /admin/gardssalg-content-rollback with zero changes there (`products`
+    // is already in GARDSSALG_ROLLBACKABLE_FIELDS).
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'products', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: newValue,
+      source_url: source,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: newValue };
+}
+
 export type GardssalgSetAddressResult =
   | { ok: true; old_value: string | null; new_value: string | null }
   | { ok: false; reason: "provider_not_found" }
@@ -5761,7 +5947,8 @@ export type GardssalgSetTerminalStatusResult =
 
 export type GardssalgSetProducerTypeResult =
   | { ok: true; old_value: string | null; new_value: string | null }
-  | { ok: false; reason: "provider_not_found" };
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "owner_locked" };
 
 /**
  * Manually OVERRIDE a gårdssalg provider's `producer_type` — Grep 3c
@@ -5785,6 +5972,17 @@ export type GardssalgSetProducerTypeResult =
  * DRINK_PRODUCER_TYPES/NON_DRINK_PRODUCER_TYPES vocabulary is the HTTP
  * handler's job (same division of labor as applyGardssalgSetTerminalStatus's
  * caller) — this function trusts its typed parameter.
+ *
+ * Owner-lock gate (added dev-request 2026-08-29-gardssalg-products-write-
+ * and-field-lock, Part B): this function previously had NO lock gate at
+ * all — it unconditionally overwrote producer_type, with no way for an
+ * admin-set (or, in principle, owner-set) lock to protect a prior manual
+ * classification from a later override call. Re-read fresh from the row,
+ * same discipline as applyGardssalgSetContentField's own Gate 1.
+ * `producer_type` was added to GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS as part
+ * of this same change — see that set's own doc comment for the one real
+ * (but untested, so safely made) behavior change this causes for
+ * content_source='claim' rows.
  */
 export function applyGardssalgSetProducerType(
   providerId: string,
@@ -5794,9 +5992,14 @@ export function applyGardssalgSetProducerType(
 ): GardssalgSetProducerTypeResult {
   const db = getDb(VERTICAL);
   const row = db
-    .prepare(`SELECT id, producer_type FROM experience_providers WHERE id = ?`)
-    .get(providerId) as { id: string; producer_type: string | null } | undefined;
+    .prepare(`SELECT id, producer_type, content_source, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; producer_type: string | null; content_source: string | null; field_provenance: string | null }
+    | undefined;
   if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // Gate — owner lock, on the FRESH row (see doc comment above).
+  if (isGardssalgFieldOwnerLocked(row, "producer_type")) return { ok: false, reason: "owner_locked" };
 
   const oldValue = row.producer_type;
   const provenance = sourceUrl && sourceUrl.trim() ? sourceUrl.trim() : reason;
@@ -8375,7 +8578,15 @@ export function applyGardssalgProviderWebsite(
     | undefined;
   if (!row) return [];
   if (row.content_source === "manual") return [];
-  if (row.content_source === "claim" && isGardssalgFieldOwnerLocked(row, "hjemmeside")) return [];
+  // No `row.content_source === "claim" &&` prefix here (removed dev-request
+  // 2026-08-29-gardssalg-products-write-and-field-lock, Part B) — same
+  // reasoning as the two call sites above. `hjemmeside` is not in the new
+  // admin gardssalg-set-field-lock endpoint's lockable vocabulary, so this
+  // is a no-op today (owner_locks.hjemmeside can currently only be set by
+  // the claim portal, which only ever runs on content_source='claim' rows)
+  // — kept consistent with the other two call sites anyway, so a future
+  // write path never has to remember to also fix this one.
+  if (isGardssalgFieldOwnerLocked(row, "hjemmeside")) return [];
 
   const cleanUrl = (url || "").trim();
   if (cleanUrl.length === 0 || cleanUrl.length > 2048) return [];
@@ -8579,72 +8790,281 @@ export type GardssalgRollbackSkip = {
 // allow-list also covers (booking_live is claim-editable but is a consent
 // toggle with no rollback candidate, so it's excluded here on purpose — see
 // CLAIM_EDITABLE_FIELDS in gardssalg-claim.ts, which is the source of truth
-// this list is drawn from). Only these five fields ever get a per-field
-// owner_locks lookup in isGardssalgFieldOwnerLocked below.
+// this list is drawn from), PLUS `producer_type` — added dev-request
+// 2026-08-29-gardssalg-products-write-and-field-lock, Part B.
+// `producer_type` is NOT claim-portal-editable (an owner never sets it via
+// the claim flow), but it IS one of the five fields the new admin
+// gardssalg-set-field-lock lever can lock (see GARDSSALG_LOCKABLE_FIELDS
+// below), and THIS is the set isGardssalgFieldOwnerLocked consults to decide
+// whether a field gets a per-field owner_locks lookup at all — so it has to
+// be here too, or an admin-set producer_type lock would never be honored.
+// Real (but harmless, and unpinned by any existing test) behavior change
+// this causes: on a content_source='claim' row, producer_type used to be
+// unconditionally locked (the "any other fieldName" branch in rule 2 below);
+// it is now locked IFF field_provenance.owner_locks.producer_type is
+// present, same as the other five fields. Checked before shipping — no
+// existing test asserts the old always-locked behavior for this specific
+// (field, content_source) combination.
 const GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS = new Set([
   "about_text",
   "visit_text",
   "opening_hours_text",
   "products",
   "hjemmeside",
+  "producer_type",
 ]);
 
+// The exact 5-field "lockable vocabulary" the new admin gardssalg-set-
+// field-lock endpoint (dev-request 2026-08-29-gardssalg-products-write-and-
+// field-lock, Part B) accepts in its `field` body param — precisely the
+// fields that have a CALLER-SUPPLIED write path today: the three
+// applyGardssalgSetContentField fields, plus applyGardssalgSetProducerType
+// and applyGardssalgSetProducts. Deliberately a DIFFERENT set from
+// GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS above, even though membership
+// happens to differ by only one field today (hjemmeside is owner-lock-
+// eligible — a claim-portal field — but is NOT in this admin lock
+// vocabulary, since it is not one of the five fields the dev-request itself
+// names, despite also having an admin write path via gardssalg-set-
+// hjemmeside): that set answers "which fields does isGardssalgFieldOwnerLocked
+// ever check a per-field lock for" (a READ-side concern, keyed to the
+// claim-portal's own field list); this one answers "which fields is an
+// admin allowed to WRITE a lock onto" (a request-validation concern, keyed
+// to the dev-request's explicit scope). Every field in THIS set is also in
+// that one — a lock this endpoint can write is always a lock
+// isGardssalgFieldOwnerLocked will actually honor.
+export type GardssalgLockableField =
+  | "about_text"
+  | "visit_text"
+  | "opening_hours_text"
+  | "producer_type"
+  | "products";
+export const GARDSSALG_LOCKABLE_FIELDS: readonly GardssalgLockableField[] = [
+  "about_text",
+  "visit_text",
+  "opening_hours_text",
+  "producer_type",
+  "products",
+];
+
 /**
- * Per-field owner-lock policy for gårdssalg rollback writes (dev-request
- * 2026-08-03-gardssalg-owner-lock-rollback). Prior to this, both rollback
- * functions gated on the WHOLE ROW: content_source 'manual' or 'claim' froze
- * every field. PR #472 (commit 5410fd9) added an ADDITIVE per-field stamp —
- * field_provenance.owner_locks.<field> = {locked_at} — written by the claim
- * portal (updateClaimedProviderProfile, gardssalg-claim.ts) whenever an
- * owner edits one of CLAIM_EDITABLE_FIELDS. This helper consults that stamp
- * to narrow the freeze from row-level to field-level, but ONLY for
- * content_source='claim' rows and ONLY for the five claim-editable,
- * rollback-eligible fields:
+ * Per-field owner-lock policy for every gårdssalg write path that reads it
+ * (rollback, applyGardssalgSetContentField/-SetProducerType/-SetProducts,
+ * the content-refresh per-field skip, the hjemmeside-refresh skip). Two
+ * layers, checked in this order:
  *
- *   1. content_source === 'manual' -> always locked, unconditionally. Manual
- *      rows never consult owner_locks (a claim-portal-only concept) — the
- *      full-row freeze for manual rows is unchanged.
- *   2. content_source === 'claim':
- *      - fieldName in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS -> locked IFF
- *        field_provenance.owner_locks.<fieldName> is present (the owner
- *        touched THIS field via the portal); if absent, the owner never
- *        touched it and rollback may proceed.
- *      - any other fieldName (org_nr, epost, telefon, adresse, postnummer,
- *        poststed — fields owner_locks can never contain, since the claim
- *        portal doesn't expose them) -> always locked, unconditionally, same
- *        as today's row-level behavior. No change for these fields.
- *   3. any other content_source (null, enrichment-derived, etc.) -> not
- *      locked, same as today's existing behavior.
+ *   A. FIELD-LEVEL, content_source-INDEPENDENT (added dev-request
+ *      2026-08-29-gardssalg-products-write-and-field-lock, Part B): if
+ *      fieldName is in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS and
+ *      field_provenance.owner_locks.<fieldName> is present, the field is
+ *      locked — REGARDLESS of the row's content_source. This is what makes
+ *      the new admin gardssalg-set-field-lock endpoint's write actually
+ *      protect anything: before this layer existed, owner_locks was only
+ *      ever CONSULTED for content_source='claim' rows (layer B below), so an
+ *      admin-set lock on any other content_source (null, enrichment-derived,
+ *      'provider_site', etc — most rows, including live production ones)
+ *      had ZERO effect anywhere this function gates — the lock would be
+ *      written and then silently ignored by every caller. If no lock is
+ *      present here, control falls through unchanged to layer B.
+ *   B. ROW-LEVEL / content_source-based (dev-request 2026-08-03-gardssalg-
+ *      owner-lock-rollback, PR #472 — pre-existing, UNCHANGED by this
+ *      restructure):
+ *      1. content_source === 'manual' -> always locked, unconditionally.
+ *         Manual rows never consult owner_locks for this — the full-row
+ *         freeze for manual rows is unchanged (and, since layer A already
+ *         returned true if a lock were present, this branch is only ever
+ *         reached with no lock present anyway — same outcome either way).
+ *      2. content_source === 'claim':
+ *         - fieldName in GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS -> locked IFF
+ *           field_provenance.owner_locks.<fieldName> is present. Layer A
+ *           already performed exactly this lookup and would have returned
+ *           true if it found one — reaching this branch means it did NOT,
+ *           so the owner (or admin) never touched this field -> not locked.
+ *         - any other fieldName (org_nr, epost, telefon, adresse,
+ *           postnummer, poststed — fields owner_locks can never contain,
+ *           since neither the claim portal nor the lock endpoint exposes
+ *           them) -> always locked, unconditionally, same as before.
+ *      3. any other content_source (null, enrichment-derived, etc.) -> not
+ *         locked by row-level rules — an owner_locks entry for THIS field,
+ *         if any, was already handled by layer A above.
+ *
+ * Net effect vs. the pre-restructure function: IDENTICAL behavior for every
+ * (row, field) combination this function was ever called with before this
+ * change (content_source='manual' rows: always true, unaffected by
+ * owner_locks either way; content_source='claim' rows: same lookup, just
+ * performed once instead of duplicated across two branches; any other
+ * content_source with NO owner_locks entry: false, as before) — the ONLY
+ * new case is a non-manual, non-claim row WITH an owner_locks entry for an
+ * eligible field, which used to fall through to `return false` and now
+ * correctly returns `true`. See src/services/gardssalg-claim.test.ts
+ * (~line 1163+) and src/routes/opplevelser-brreg-website-discovery.test.ts
+ * (~line 348+) for the existing coverage this preserves, and
+ * opplevelser-gardssalg-owner-lock-content-refresh.test.ts /
+ * opplevelser-gardssalg-owner-lock-retro-scan.test.ts for the new coverage.
  *
  * field_provenance is read defensively (same JSON-parse-with-try-catch
  * recipe used throughout this file, e.g. applyGardssalgProviderWebsite
  * above) — malformed JSON is treated as "no owner_locks" rather than
  * thrown.
  */
+function gardssalgFieldHasOwnerLock(
+  providerRow: { field_provenance?: string | null },
+  fieldName: string
+): boolean {
+  if (!providerRow.field_provenance) return false;
+  try {
+    const parsed = JSON.parse(providerRow.field_provenance);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const ol = (parsed as Record<string, unknown>).owner_locks;
+      if (ol && typeof ol === "object" && !Array.isArray(ol)) {
+        return Object.prototype.hasOwnProperty.call(ol, fieldName);
+      }
+    }
+  } catch {
+    /* malformed existing JSON -> treat as no owner_locks rather than throw */
+  }
+  return false;
+}
+
 export function isGardssalgFieldOwnerLocked(
   providerRow: { content_source: string | null; field_provenance?: string | null },
   fieldName: string
 ): boolean {
+  // Layer A — field-level, content_source-independent. See doc comment.
+  if (
+    GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS.has(fieldName) &&
+    gardssalgFieldHasOwnerLock(providerRow, fieldName)
+  ) {
+    return true;
+  }
+
+  // Layer B — row-level / content_source-based, unchanged from before this
+  // restructure.
   if (providerRow.content_source === "manual") return true;
   if (providerRow.content_source === "claim") {
     if (!GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS.has(fieldName)) return true;
-    let ownerLocks: Record<string, unknown> | undefined;
-    if (providerRow.field_provenance) {
-      try {
-        const parsed = JSON.parse(providerRow.field_provenance);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          const ol = (parsed as Record<string, unknown>).owner_locks;
-          if (ol && typeof ol === "object" && !Array.isArray(ol)) {
-            ownerLocks = ol as Record<string, unknown>;
-          }
-        }
-      } catch {
-        /* malformed existing JSON -> treat as no owner_locks rather than throw */
-      }
-    }
-    return Boolean(ownerLocks && Object.prototype.hasOwnProperty.call(ownerLocks, fieldName));
+    // Layer A already checked owner_locks.<fieldName> and found nothing
+    // (otherwise this line would be unreachable) -> not locked.
+    return false;
   }
   return false;
+}
+
+const GARDSSALG_LOCK_CHANGED_BY = "admin";
+
+export type GardssalgFieldLockResult =
+  | { ok: true; field: GardssalgLockableField; locked: boolean }
+  | { ok: false; reason: "provider_not_found" };
+
+/**
+ * Admin-originated field lock/unlock — Part B, dev-request 2026-08-29-
+ * gardssalg-products-write-and-field-lock. Backs POST /admin/gardssalg-set-
+ * field-lock (routes/opplevelser.ts). `lock: true` writes, `lock: false`
+ * clears, field_provenance.owner_locks.<field> — the EXACT SAME structure
+ * the owner-claim flow already writes (updateClaimedProviderProfile,
+ * gardssalg-claim.ts) and the SAME structure isGardssalgFieldOwnerLocked
+ * (above) now honors REGARDLESS of content_source (see that function's own
+ * doc comment, layer A, for why that fix was necessary). Consequence: this
+ * lever needs NO new gate wiring anywhere — every existing write path
+ * (applyGardssalgSetContentField, applyGardssalgSetProducerType,
+ * applyGardssalgSetProducts) and the automated content-refresh/hjemmeside-
+ * refresh per-field skip checks pick up an admin-set lock for free, because
+ * they already call isGardssalgFieldOwnerLocked.
+ *
+ * Distinguishable from an owner-claim-set lock (which stamps ONLY
+ * `{locked_at}` — no `locked_by` — see updateClaimedProviderProfile) via a
+ * `locked_by: "admin"` marker added to the SAME lock object, per the
+ * dev-request's own recommendation: reuse the existing structure and add a
+ * distinguishing attribute, rather than invent a second parallel gate that
+ * content-refresh would then need to learn about separately.
+ *
+ * Audit: ONE gardssalg_content_audit row per call. field_name is
+ * `<field>_lock` — a SYNTHETIC marker, deliberately NOT the bare field
+ * name. This is load-bearing, not cosmetic: GARDSSALG_ROLLBACKABLE_FIELDS /
+ * planGardssalgContentRollback (below) key their "most recent audit row for
+ * this (provider_id, field_name)" lookup off field_name alone, and
+ * old_value/new_value on a lock/unlock audit row encode LOCK STATE, not the
+ * field's actual content. Writing field_name='about_text' here would poison
+ * the NEXT about_text rollback lookup — its `ORDER BY rowid DESC LIMIT 1`
+ * would pick up THIS row and try to restore the about_text COLUMN to a
+ * lock-state JSON blob. The `_lock`-suffixed name is never a member of
+ * GARDSSALG_ROLLBACKABLE_FIELDS, so a rollback request naming it directly is
+ * refused as "unknown_field", and a plain provider-wide rollback preview's
+ * per-field scan (resolveGardssalgRollbackTargets's `SELECT DISTINCT
+ * field_name` branch) picks it up as its own inert, never-rollbackable
+ * pseudo-field — it can never collide with the real field's own audit
+ * trail. old_value/new_value on this synthetic row still carry real
+ * information (the actual prior/new lock object, JSON-stringified, or null
+ * when there was/is none) — it's a genuine audit row, just one the rollback
+ * planner is structurally unable to misinterpret as a content change.
+ */
+export function applyGardssalgFieldLock(
+  providerId: string,
+  field: GardssalgLockableField,
+  lock: boolean,
+  source: string
+): GardssalgFieldLockResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; field_provenance: string | null } | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // ── field_provenance.owner_locks merge (read-modify-write, preserves
+  // every other field's entry AND every other key field_provenance already
+  // holds) — same recipe as applyGardssalgSetContentField above, reused here
+  // rather than re-derived.
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  const existingOwnerLocks = provenance.owner_locks;
+  const ownerLocks: Record<string, unknown> =
+    existingOwnerLocks && typeof existingOwnerLocks === "object" && !Array.isArray(existingOwnerLocks)
+      ? { ...(existingOwnerLocks as Record<string, unknown>) }
+      : {};
+  const priorEntry = Object.prototype.hasOwnProperty.call(ownerLocks, field) ? ownerLocks[field] : null;
+
+  const applyWithAudit = db.transaction(() => {
+    let newEntry: Record<string, unknown> | null = null;
+    if (lock) {
+      newEntry = {
+        locked_at: new Date().toISOString(),
+        locked_by: GARDSSALG_LOCK_CHANGED_BY,
+        source_url: source && source.trim() ? source.trim() : null,
+      };
+      ownerLocks[field] = newEntry;
+    } else {
+      delete ownerLocks[field];
+    }
+    provenance.owner_locks = ownerLocks;
+    db.prepare(`UPDATE experience_providers SET field_provenance = @field_provenance WHERE id = @id`).run({
+      id: providerId,
+      field_provenance: JSON.stringify(provenance),
+    });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, NULL, @changed_by, datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      field_name: `${field}_lock`,
+      old_value: priorEntry === null ? null : JSON.stringify(priorEntry),
+      new_value: newEntry === null ? null : JSON.stringify(newEntry),
+      source_url: source && source.trim() ? source.trim() : null,
+      changed_by: GARDSSALG_LOCK_CHANGED_BY,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, field, locked: lock };
 }
 
 // Resolve the (provider_id, field_name) pairs a rollback request targets:

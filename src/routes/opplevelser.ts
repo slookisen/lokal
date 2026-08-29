@@ -149,6 +149,18 @@ import {
   // manual, overwriting/nulling correction lever for `adresse` (the only
   // other writer, applyGardssalgProviderAddress, is fill-only).
   applyGardssalgSetAddress,
+  // dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part A —
+  // the `products` write path applyGardssalgSetContentField's own doc
+  // comment explicitly excludes (no defect vocabulary exists for it there).
+  applyGardssalgSetProducts,
+  // dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part B —
+  // admin-originated field lock/unlock, writing/clearing the SAME
+  // field_provenance.owner_locks.<field> structure the owner-claim flow
+  // already writes (now honored regardless of content_source — see
+  // isGardssalgFieldOwnerLocked's own doc comment).
+  applyGardssalgFieldLock,
+  GARDSSALG_LOCKABLE_FIELDS,
+  type GardssalgLockableField,
   // dev-request 2026-08-16-opplevagent-outreach-rutine, spec point 6
   // ("Autosvar-regelen") — the review queue for autosvar candidates whose
   // candidate email's domain does NOT (or cannot be shown to) agree with the
@@ -3938,19 +3950,25 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // perfelt-laas): predict, from THIS target's own row snapshot (t — the
     // same snapshot applyGardssalgProviderContent's own fresh DB read will
     // agree with, barring a concurrent edit), which of this run's candidate
-    // fields are owner-locked. Only meaningful for content_source='claim'
-    // rows (isGardssalgFieldOwnerLocked always returns false for any other
-    // content_source). Reused by BOTH branches below: dry-run needs it to
-    // keep the preview honest (dry-run never calls
+    // fields are owner-locked. Reused by BOTH branches below: dry-run needs
+    // it to keep the preview honest (dry-run never calls
     // applyGardssalgProviderContent, so nothing else would catch this);
     // apply uses it only to populate the owner_field_locked report — the
     // actual gating decision for apply is made by
     // applyGardssalgProviderContent's own per-field guard, not by this
     // prediction.
-    const lockedCandidateFields =
-      t.content_source === "claim"
-        ? wouldWrite.filter((f) => isGardssalgFieldOwnerLocked(t, f))
-        : [];
+    //
+    // No `t.content_source === "claim" ?` guard here any more (removed
+    // dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part
+    // B): isGardssalgFieldOwnerLocked now dispatches on content_source
+    // internally (see its own doc comment). Keeping this outer guard would
+    // make the dry-run PREVIEW disagree with what apply now actually does —
+    // an admin-locked field on a non-claim row would be predicted as
+    // "would write" here while applyGardssalgProviderContent's own (already
+    // widened) per-field guard silently skips it, which is exactly the
+    // "dry-run no longer proposes changing a locked field" acceptance
+    // criterion this dev-request's Part B needs to hold.
+    const lockedCandidateFields = wouldWrite.filter((f) => isGardssalgFieldOwnerLocked(t, f));
 
     if (dryRun) {
       const writableFields = wouldWrite.filter((f) => !lockedCandidateFields.includes(f));
@@ -4297,18 +4315,22 @@ router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, re
     // perfelt-laas): predict, from THIS target's own row snapshot (t — the
     // same snapshot applyGardssalgRetroScanNull's own fresh DB read will
     // agree with, barring a concurrent edit), which of this run's candidate
-    // null fields are owner-locked. Only meaningful for content_source=
-    // 'claim' rows (isGardssalgFieldOwnerLocked always returns false for any
-    // other content_source). Reused by BOTH branches below: dry-run needs it
-    // to keep the preview honest (dry-run never calls
+    // null fields are owner-locked. Reused by BOTH branches below: dry-run
+    // needs it to keep the preview honest (dry-run never calls
     // applyGardssalgRetroScanNull, so nothing else would catch this); apply
     // uses it only to populate the owner_field_locked report — the actual
     // gating decision for apply is made by applyGardssalgRetroScanNull's own
     // per-field guard, not by this prediction.
-    const lockedCandidateFields =
-      t.content_source === "claim"
-        ? wouldNullFields.filter((f) => isGardssalgFieldOwnerLocked(t, f))
-        : [];
+    //
+    // No `t.content_source === "claim" ?` guard here any more (removed
+    // dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part
+    // B) — same reasoning as the content-refresh dry-run prediction above:
+    // isGardssalgFieldOwnerLocked now dispatches on content_source
+    // internally, and keeping an outer guard here would make this preview
+    // disagree with what applyGardssalgRetroScanNull's own (already
+    // widened) per-field guard actually does for an admin-locked, non-claim
+    // row.
+    const lockedCandidateFields = wouldNullFields.filter((f) => isGardssalgFieldOwnerLocked(t, f));
     const writableFields = wouldNullFields.filter((f) => !lockedCandidateFields.includes(f));
 
     if (writableFields.length === 0) {
@@ -9619,6 +9641,15 @@ router.post("/admin/gardssalg-set-producer-type", requireAdmin, (req: Request, r
   const result = applyGardssalgSetProducerType(providerId, producerType, reason, sourceUrl || undefined);
 
   if (!result.ok) {
+    if (result.reason === "owner_locked") {
+      // 409, not 404 — added dev-request 2026-08-29-gardssalg-products-
+      // write-and-field-lock, Part B: this route previously had no lock gate
+      // at all (applyGardssalgSetProducerType unconditionally overwrote).
+      // Same "authorized request, but the row's STATE conflicts" reasoning
+      // as gardssalg-set-content-field/-set-address's own 409.
+      res.status(409).json({ error: "owner_locked" });
+      return;
+    }
     res.status(404).json({ error: "provider_not_found" });
     return;
   }
@@ -9736,6 +9767,193 @@ router.post("/admin/gardssalg-set-address", requireAdmin, (req: Request, res: Re
     field: "adresse",
     old_value: result.old_value,
     new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-products (admin) ────────────
+//
+// dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part A —
+// the missing `products` write path applyGardssalgSetContentField's own doc
+// comment explicitly excludes (no defect vocabulary exists for `products` in
+// GardssalgQualityFieldName, and that union is deliberately not widened to
+// add it). Live case: Anikonic Cider's public "Produkter" list read "Frukt,
+// Urter" (raw ingredients bought in, not grown) with no admin lever to
+// correct it to what they actually sell.
+//
+// Body: { provider_id: string, value: string[], source: string }. `value` is
+// a JSON ARRAY of product-name strings — the SAME shape the `products`
+// column is stored as (JSON array of strings, see init-experiences.ts) and
+// the SAME shape the owner-claim write path already accepts for this exact
+// column (sanitizeProducts, gardssalg-claim.ts), chosen over a delimited
+// string so the two live `products` writers agree on one wire shape rather
+// than a reader having to reconcile two conventions. Unlike the claim path
+// (which silently trims/dedupes/drops blanks — appropriate for a producer
+// typing into a form), this endpoint fails closed on a malformed item — see
+// applyGardssalgSetProducts's own doc comment (experience-store.ts) for the
+// full gate list and defect vocabulary.
+//
+// Rollback: no new lever — `products` is already in
+// GARDSSALG_ROLLBACKABLE_FIELDS, and the audit row this writes is exactly
+// what POST /admin/gardssalg-content-rollback already reads.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-products", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    value?: unknown;
+    source?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const rawValue = body.value;
+  // Route-level shape check mirrors gardssalg-set-content-field's own
+  // blank-value split: "you sent nothing usable" gets value_required here;
+  // a well-shaped-but-defective item is left to the service's Gate 3, which
+  // maps to defective_value below.
+  if (!Array.isArray(rawValue) || rawValue.length === 0) {
+    res.status(400).json({ error: "value_required" });
+    return;
+  }
+
+  const source = typeof body.source === "string" ? body.source.trim() : "";
+  if (!source) {
+    res.status(400).json({ error: "source_required" });
+    return;
+  }
+
+  const result = applyGardssalgSetProducts(providerId, rawValue, source);
+
+  if (!result.ok) {
+    if (result.reason === "provider_not_found") {
+      res.status(404).json({ error: "provider_not_found" });
+      return;
+    }
+    if (result.reason === "owner_locked") {
+      // 409, not 403: the request is authorized, it is the row's STATE (an
+      // owner edited this field, or the row is content_source='manual', or
+      // an admin locked it via gardssalg-set-field-lock) that conflicts with
+      // the write.
+      res.status(409).json({ error: "owner_locked" });
+      return;
+    }
+    if (result.reason === "value_required") {
+      // Unreachable over HTTP — the shape check above already returned this
+      // exact 400. Mapped anyway so the service's own guard (defense in
+      // depth for direct, non-HTTP callers) can never surface as a 400
+      // defective_value with a null defect_type; the wire contract stays
+      // byte-for-byte what the earlier check produces.
+      res.status(400).json({ error: "value_required" });
+      return;
+    }
+    res.status(400).json({ error: "defective_value", defect_type: result.defect_type });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "products",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-field-lock (admin) ──────────
+//
+// dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part B —
+// the missing ADMIN-facing write side of the owner-lock structure
+// (field_provenance.owner_locks.<field>) that isGardssalgFieldOwnerLocked
+// already reads and every gårdssalg content writer already gates on. Before
+// this endpoint, owner_locks was populated ONLY by the owner-claim flow
+// (updateClaimedProviderProfile, gardssalg-claim.ts) — there was no lever
+// for CS/admin to lock a field themselves after a manual correction, so
+// anything written today (about_text, producer_type, a `products` fix via
+// the endpoint above) was defenseless against a future automated
+// content-refresh overwrite.
+//
+// ONE endpoint with a `lock: true|false` body field (implementer's call —
+// the dev-request left one-endpoint-vs-two open), rather than two separate
+// gardssalg-lock-field/gardssalg-unlock-field routes: lock and unlock are
+// the exact same read-modify-write on the exact same structure, differing
+// only in whether the per-field entry is set or deleted, so one endpoint
+// avoids duplicating that logic (and its own tests) twice.
+//
+// Body: { provider_id: string, field: one of GARDSSALG_LOCKABLE_FIELDS —
+// about_text/visit_text/opening_hours_text/producer_type/products, EXACTLY
+// the fields the dev-request names as the "lockable vocabulary" (the fields
+// with a caller-supplied write path today), lock: boolean, source?: string
+// (free-text provenance, e.g. a CRM thread ref — stored verbatim on the lock
+// object and the audit row when given; not required, since some locks are
+// simply "CS just verified this by hand", not evidenced by a URL) }.
+//
+// The written lock entry carries `locked_by: "admin"` (an owner-claim-set
+// lock only ever stamps `{locked_at}`, no `locked_by` — see
+// updateClaimedProviderProfile, gardssalg-claim.ts), so the two remain
+// distinguishable in any future read/audit. See applyGardssalgFieldLock's
+// own doc comment (experience-store.ts) for why this reuses
+// field_provenance.owner_locks rather than a second parallel structure, and
+// for the synthetic `<field>_lock` audit field_name this write uses (NOT the
+// bare field name — load-bearing, not cosmetic: see that doc comment).
+//
+// This endpoint alone does not gate anything by itself — see
+// isGardssalgFieldOwnerLocked's own doc comment (experience-store.ts) for
+// the restructure that makes an admin-set lock here actually protect the
+// field regardless of the row's content_source. No rollback lever is added
+// here beyond the endpoint's own inverse call (lock: false undoes lock:
+// true and vice versa) — an admin lock/unlock is itself already reversible
+// by calling this same endpoint again, so no new machinery was needed.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-field-lock", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    field?: unknown;
+    lock?: unknown;
+    source?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const rawField = typeof body.field === "string" ? body.field.trim() : "";
+  if (!rawField) {
+    res.status(400).json({ error: "field_required" });
+    return;
+  }
+  if (!(GARDSSALG_LOCKABLE_FIELDS as readonly string[]).includes(rawField)) {
+    res.status(400).json({ error: "invalid_field" });
+    return;
+  }
+  const field = rawField as GardssalgLockableField;
+
+  if (typeof body.lock !== "boolean") {
+    res.status(400).json({ error: "lock_required" });
+    return;
+  }
+  const lock = body.lock;
+
+  const source = typeof body.source === "string" ? body.source.trim() : "";
+
+  const result = applyGardssalgFieldLock(providerId, field, lock, source);
+
+  if (!result.ok) {
+    res.status(404).json({ error: "provider_not_found" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field,
+    locked: result.locked,
   });
 });
 

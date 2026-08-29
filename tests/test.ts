@@ -41608,3 +41608,70 @@ runSerial(async () => {
     failures.push("opplevelser-gardssalg-kildeklasse-contact: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part A —
+// the missing `products` write path (gardssalg-set-content-field explicitly
+// rejects field:"products" — no defect vocabulary exists for it there).
+// Own dedicated in-memory-db harness (mirrors the sibling gårdssalg route
+// test files' own harness). Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-29-gardssalg-products-write-and-field-lock: products write path (Part A) ──");
+  try {
+    const { runOpplevelserGardssalgSetProductsTests } = require("../src/routes/opplevelser-gardssalg-set-products.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-products.test");
+    const gsp = await runOpplevelserGardssalgSetProductsTests({ log: false });
+    passed += gsp.passed;
+    failed += gsp.failed;
+    for (const f of gsp.failures) failures.push("opplevelser-gardssalg-set-products: " + f);
+    console.log(`  opplevelser-gardssalg-set-products: ${gsp.passed} passed, ${gsp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-gardssalg-set-products: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part B —
+// the missing ADMIN-facing field lock/unlock lever (writes/clears
+// field_provenance.owner_locks.<field> with a locked_by:"admin" marker),
+// plus the cross-cutting proof that a lock it sets is actually honored by
+// the existing gardssalg-set-content-field / gardssalg-set-producer-type
+// write gates end-to-end over real HTTP. Own dedicated in-memory-db harness.
+// Tail position is the convention for a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-29-gardssalg-products-write-and-field-lock: admin field lock/unlock (Part B) ──");
+  try {
+    const { runOpplevelserGardssalgSetFieldLockTests } = require("../src/routes/opplevelser-gardssalg-set-field-lock.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-field-lock.test");
+    const gsfl = await runOpplevelserGardssalgSetFieldLockTests({ log: false });
+    passed += gsfl.passed;
+    failed += gsfl.failed;
+    for (const f of gsfl.failures) failures.push("opplevelser-gardssalg-set-field-lock: " + f);
+    console.log(`  opplevelser-gardssalg-set-field-lock: ${gsfl.passed} passed, ${gsfl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-gardssalg-set-field-lock: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-08-29-gardssalg-products-write-and-field-lock — direct
+// unit coverage for the isGardssalgFieldOwnerLocked restructure itself (a
+// PURE function, no DB): an owner_locks.<field> entry is now honored
+// regardless of content_source, while every pre-existing 'manual'/'claim'
+// behavior is preserved byte-for-byte. Tail position is the convention for
+// a new registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-08-29-gardssalg-products-write-and-field-lock: isGardssalgFieldOwnerLocked broadening (unit) ──");
+  try {
+    const { runGardssalgOwnerLockBroadeningTests } = require("../src/services/gardssalg-owner-lock-broadening.test") as
+      typeof import("../src/services/gardssalg-owner-lock-broadening.test");
+    const golb = await runGardssalgOwnerLockBroadeningTests({ log: false });
+    passed += golb.passed;
+    failed += golb.failed;
+    for (const f of golb.failures) failures.push("gardssalg-owner-lock-broadening: " + f);
+    console.log(`  gardssalg-owner-lock-broadening: ${golb.passed} passed, ${golb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-lock-broadening: unexpected error: " + String(err?.message || err));
+  }
+});
