@@ -90,6 +90,20 @@ const VERIFIED_PROVENANCE = JSON.stringify({
   hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-08-09T00:00:00.000Z" },
 });
 
+// dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall: same
+// shape as VERIFIED_PROVENANCE, PLUS the field_provenance.antall_ansatte
+// stamp applyGardssalgBrregVerified/applyGardssalgBrregEmployeesRefresh now
+// write whenever Brreg was actually consulted about antall_ansatte — figure
+// or not. This is the "Brreg-consulted" signal the size-gate's null-split
+// reads (isGardssalgAntallAnsatteBrregConsulted, ./opplevelser.ts).
+const BRREG_CONSULTED_NO_FIGURE_PROVENANCE = JSON.stringify({
+  hjemmeside_verification: { verified: true, classification: "verified", checked_at: "2026-08-09T00:00:00.000Z" },
+  antall_ansatte: {
+    source_url: "https://data.brreg.no/enhetsregisteret/api/enheter/666000111",
+    fetched_at: "2026-08-29T06:00:00.000Z",
+  },
+});
+
 export function runOpplevelserGardssalgOutreachSizeGateTests(
   opts: { log?: boolean } = {},
 ): Promise<TestSummary> {
@@ -199,6 +213,24 @@ export function runOpplevelserGardssalgOutreachSizeGateTests(
         brreg_verified: 1, antall_ansatte: null,
       });
 
+      // ── dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall
+      // fixture: otherwise outreach_ready, antall_ansatte null, but Brreg WAS
+      // consulted (field_provenance.antall_ansatte stamp present — the
+      // register itself has no figure). Unlike prov-unmeasured above (never
+      // consulted), this row must tier "liten" with size_flag_reason
+      // "no_registered_figure" — the measured-trigger shape (Ægir Bryggeri
+      // AS) named in the dev-request.
+      insertProvider.run({
+        id: "prov-brreg-consulted-nofigure", navn: "Ægir-Type Bryggeri AS", org_nr: "666000111", kommune: "Flåm",
+        rfb_seed_source: "rfb-seed", producer_type: null,
+        epost: "post@aegirtypefixture.no", telefon: null, hjemmeside: "https://aegirtypefixture.no",
+        about_text: "Om bryggeriet.", visit_text: null, opening_hours_text: null,
+        products: "Øl", content_source: "provider_site",
+        booking_live: 0, catalog_hidden: 0, slug: "aegir-type-bryggeri",
+        field_provenance: BRREG_CONSULTED_NO_FIGURE_PROVENANCE,
+        brreg_verified: 1, antall_ansatte: null,
+      });
+
       // ── "liten" fixture: otherwise outreach_ready, antall_ansatte well
       // under the default threshold — must stay go:true (the gate excludes,
       // never approves, but must also never BLOCK a legitimately small row).
@@ -260,6 +292,51 @@ export function runOpplevelserGardssalgOutreachSizeGateTests(
 
       const litenRow = (readiness1.body.providers as any[]).find((r) => r.name === "Liten Gård AS");
       assertEq(litenRow?.size_flag, "liten", "sanity: 5 < 25 -> 'liten'");
+
+      // ══ dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall:
+      // Brreg-consulted null -> "liten" with a visible rule-reason; a
+      // never-consulted null row (prov-unmeasured, AK2) stays "ukjent" with
+      // NO rule-reason — tested both directions, per AC2. ═══════════════════
+      const consultedRow = (readiness1.body.providers as any[]).find((r) => r.name === "Ægir-Type Bryggeri AS");
+      assertTrue(!!consultedRow, "2026-08-30 a: Brreg-consulted-no-figure row present in readiness");
+      assertEq(consultedRow?.antall_ansatte, null, "2026-08-30 b: antall_ansatte stays null — no figure is invented");
+      assertEq(consultedRow?.size_flag, "liten", "2026-08-30 c: Brreg-consulted + null -> 'liten', not 'ukjent'");
+      assertEq(
+        consultedRow?.size_flag_reason,
+        "no_registered_figure",
+        "2026-08-30 d: the new rule's reason is visible on the row, never silent",
+      );
+      assertEq(
+        unmeasuredRow?.size_flag_reason,
+        null,
+        "2026-08-30 e: a null row WITHOUT the Brreg-consulted signal carries no rule-reason and stays 'ukjent' — never cleared (AC2, direction 1)",
+      );
+      assertEq(
+        macksRow?.size_flag_reason,
+        null,
+        "2026-08-30 f: an ordinary 'stor' row (real registered figure) carries no rule-reason — regression guard",
+      );
+      assertEq(
+        litenRow?.size_flag_reason,
+        null,
+        "2026-08-30 g: an ordinary 'liten' row (real registered figure, not this rule) carries no rule-reason — the new rule only ever fires on a NULL figure",
+      );
+
+      // Preflight/eligibility: the reclassified row behaves exactly like any
+      // other outreach_ready 'liten' row — go:true, never blocked by the
+      // size gate (AC1: counts eligible, other gates unchanged; the size
+      // gate itself has never blocked 'liten' or 'ukjent', only 'stor' —
+      // this reclassification changes the LABEL/reason, not the gate's
+      // go/no-go behavior for this row).
+      const preflightConsulted = await callRoute(opplevelserRouter, {
+        method: "POST", url: "/admin/gardssalg-outreach-preflight", headers: auth,
+        body: { provider_ids: ["prov-brreg-consulted-nofigure"] },
+      });
+      assertEq(
+        preflightConsulted.body.results[0],
+        { provider_id: "prov-brreg-consulted-nofigure", name: "Ægir-Type Bryggeri AS", go: true, reason: null },
+        "2026-08-30 h: Brreg-consulted-no-figure row is go:true when otherwise outreach_ready",
+      );
 
       // ══ AK3: preflight + pilot-send block Macks, even with apply:true ═══
       const preflightMacks = await callRoute(opplevelserRouter, {
@@ -514,6 +591,70 @@ export function runOpplevelserGardssalgOutreachSizeGateTests(
       assertEq(sizeGateSvc.computeGardssalgSizeFlag(25, 25), "stor", "(i) c: boundary is inclusive (>=)");
       assertEq(sizeGateSvc.computeGardssalgSizeFlag(null, 25), "ukjent", "(i) d: null -> ukjent");
       assertEq(sizeGateSvc.computeGardssalgSizeFlag(undefined, 25), "ukjent", "(i) e: undefined -> ukjent");
+
+      // dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall:
+      // the new optional 3rd argument, at the pure-function level. Omitting
+      // it (i) d/e above is byte-identical to passing false — the original
+      // fail-safe default is untouched.
+      assertEq(
+        sizeGateSvc.computeGardssalgSizeFlag(null, 25, false),
+        "ukjent",
+        "(i) f: null + brregConsultedNoFigure:false -> ukjent (explicit false, same as omitted)",
+      );
+      assertEq(
+        sizeGateSvc.computeGardssalgSizeFlag(undefined, 25, false),
+        "ukjent",
+        "(i) g: undefined + brregConsultedNoFigure:false -> ukjent",
+      );
+      assertEq(
+        sizeGateSvc.computeGardssalgSizeFlag(null, 25, true),
+        "liten",
+        "(i) h: null + brregConsultedNoFigure:true -> liten (the new rule)",
+      );
+      assertEq(
+        sizeGateSvc.computeGardssalgSizeFlag(undefined, 25, true),
+        "liten",
+        "(i) i: undefined + brregConsultedNoFigure:true -> liten (same rule, undefined treated like null)",
+      );
+      assertEq(
+        sizeGateSvc.computeGardssalgSizeFlag(119, 25, true),
+        "stor",
+        "(i) j: a REAL registered figure >= threshold is unaffected by brregConsultedNoFigure:true — the new arg is only ever consulted on the null/undefined branch",
+      );
+      assertEq(
+        sizeGateSvc.computeGardssalgSizeFlag(22, 25, true),
+        "liten",
+        "(i) k: a REAL registered figure < threshold is unaffected by brregConsultedNoFigure:true (already 'liten' on its own merits)",
+      );
+
+      // isGardssalgAntallAnsatteBrregConsulted — fail-closed reader, same
+      // contract as isHjemmesideVerified/isGardssalgSecondLineVerified.
+      const opplevelserMod = require("./opplevelser") as typeof import("./opplevelser");
+      assertEq(
+        opplevelserMod.isGardssalgAntallAnsatteBrregConsulted(null),
+        false,
+        "(i) l: null field_provenance -> not consulted (fail-closed)",
+      );
+      assertEq(
+        opplevelserMod.isGardssalgAntallAnsatteBrregConsulted("not json"),
+        false,
+        "(i) m: malformed JSON -> not consulted (fail-closed)",
+      );
+      assertEq(
+        opplevelserMod.isGardssalgAntallAnsatteBrregConsulted(VERIFIED_PROVENANCE),
+        false,
+        "(i) n: field_provenance present but with no antall_ansatte key -> not consulted",
+      );
+      assertEq(
+        opplevelserMod.isGardssalgAntallAnsatteBrregConsulted(JSON.stringify({ antall_ansatte: { source_url: "x" } })),
+        false,
+        "(i) o: antall_ansatte entry present but missing fetched_at -> not consulted (fail-closed)",
+      );
+      assertEq(
+        opplevelserMod.isGardssalgAntallAnsatteBrregConsulted(BRREG_CONSULTED_NO_FIGURE_PROVENANCE),
+        true,
+        "(i) p: a genuine antall_ansatte {source_url, fetched_at} stamp -> consulted",
+      );
 
       // ══ (j) POST size-gate: `note` is only touched when the caller sends
       // it — omitting it from a later apply must NOT wipe a previously-set

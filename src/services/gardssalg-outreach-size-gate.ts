@@ -39,19 +39,42 @@ import type Database from "better-sqlite3";
 
 export type GardssalgSizeFlag = "stor" | "liten" | "ukjent";
 
+// dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall: the
+// one visible rule-reason this slice adds. Surfaced alongside `size_flag`
+// (never silently) the same way `large_company_excluded` is surfaced
+// alongside a preflight no-go — see routes/opplevelser.ts's
+// computeGardssalgReadinessRows / isGardssalgAntallAnsatteBrregConsulted.
+export type GardssalgSizeFlagReason = "no_registered_figure" | null;
+
 /**
  * Pure classifier: antall_ansatte >= threshold => "stor", < threshold =>
- * "liten", null/undefined (Brreg has no registered figure for this org, or
- * it was never fetched) => "ukjent" — NEVER "liten". Callers must never
- * treat "ukjent" as a pass; it is deliberately the same "not cleared"
- * outcome as "stor" is a "not cleared" outcome, just for a different reason
- * (dev-request Skive 1, krav 5: "Gaten utelukker, den godkjenner aldri").
+ * "liten". null/undefined (no registered figure on the row) splits in two:
+ *
+ *   - Brreg was never consulted for this row (brregConsultedNoFigure not
+ *     passed / false) => "ukjent", exactly as before this slice — the
+ *     original fail-safe (dev-request Skive 1, krav 5: "Gaten utelukker,
+ *     den godkjenner aldri") is completely unchanged for this case.
+ *   - Brreg WAS consulted (brregConsultedNoFigure: true — see
+ *     isGardssalgAntallAnsatteBrregConsulted, routes/opplevelser.ts) and the
+ *     register itself has no employee figure => "liten". Daniel's call,
+ *     2026-08-30 (dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-
+ *     registrert-tall, §5.1 alternativ b): an org with no Aa-melding-derived
+ *     employee count in Brreg is, in practice, a small operation — verified
+ *     small producers like Ægir Bryggeri must not be stuck behind "ukjent"
+ *     forever just because Brreg itself has nothing to report.
+ *
+ * The third parameter is OPTIONAL and additive: every pre-existing call site
+ * (2-arg) keeps its exact original behavior — antallAnsatte null/undefined
+ * with no third arg is still "ukjent", never "liten".
  */
 export function computeGardssalgSizeFlag(
   antallAnsatte: number | null | undefined,
   threshold: number,
+  brregConsultedNoFigure?: boolean,
 ): GardssalgSizeFlag {
-  if (antallAnsatte === null || antallAnsatte === undefined) return "ukjent";
+  if (antallAnsatte === null || antallAnsatte === undefined) {
+    return brregConsultedNoFigure ? "liten" : "ukjent";
+  }
   return antallAnsatte >= threshold ? "stor" : "liten";
 }
 
