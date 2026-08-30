@@ -561,6 +561,27 @@ export function runOpplevelserGardssalgSecondLineTests(
         assertEq(tier, "outreach_ready", "c-1g: readiness_tier promoted to outreach_ready via verified_second_line");
       }
 
+      // c-1h: same pass, but for a row with NO website at all (hjemmeside:
+      // null) -- the population `verified_second_line` exists FOR. Before
+      // dev-request 2026-08-29-gs-second-line-kildeklasse-bredde's fix,
+      // computeGardssalgReadinessTier's `!has_website` check fired
+      // unconditionally BEFORE the verified_second_line check further down,
+      // so this row was dead-ended at "no_website" and could never reach
+      // outreach_ready no matter how thoroughly it was second-line verified.
+      seedProvider("c1h", { hjemmeside: null });
+      {
+        const tierBefore = await getReadinessTier("c1h");
+        assertEq(tierBefore, "no_website", "c-1h-0: c1h (no hjemmeside, not yet second-line verified) starts at no_website");
+        judgeVerdictText = "GODKJENN\nIdentitet bekreftet.";
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { providerIds: ["c1h"] } });
+        const item = r.body.results.find((x: any) => x.provider_id === "c1h");
+        assertEq(item.outcome, "verified", "c-1h-1: outcome=verified (no website is not itself a disqualifier for second-line verification)");
+        const prov = readFieldProvenance("c1h") as any;
+        assertEq(prov.second_line_verification?.verified, true, "c-1h-2: field_provenance.second_line_verification.verified=true");
+        const tierAfter = await getReadinessTier("c1h");
+        assertEq(tierAfter, "outreach_ready", "c-1h-3: readiness_tier promoted to outreach_ready even with no hjemmeside -- verified_second_line is no longer dead code for the no-website population");
+      }
+
       // c-2: judge rejects -> gate_failed, no stamp, tier unchanged.
       seedProvider("c2");
       {
