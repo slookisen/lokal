@@ -14059,7 +14059,16 @@ export function computeGardssalgReadinessTier(input: {
 }): GardssalgReadinessTier {
   if (input.terminal_status) return input.terminal_status;
   if (!input.has_email && !input.has_phone) return "unreachable";
-  if (!input.has_website) return "no_website";
+  // dev-request 2026-08-29-gs-second-line-kildeklasse-bredde (FUNN gs-second-
+  // line-stempel-inert-for-radene-uten-nettsted): this check used to fire
+  // unconditionally on a missing website, which made `verified_second_line`
+  // dead code for EXACTLY its target population (rows with no website at
+  // all) -- a 2.linje-verified row with no `hjemmeside` was dead-ended here
+  // and never reached the verified_second_line check further down. A row
+  // that is second-line verified has no first-line website to be "missing"
+  // in the first place, so it must be allowed to continue into the ordinary
+  // content-completeness checks below, same as a website-having row would.
+  if (!input.has_website && !input.verified_second_line) return "no_website";
   // krav 2 (dev-request 2026-08-07-outreach-pool-krav123-og-pilot): content-
   // completeness is about_text + products + brreg_verified. Opening
   // hours/visit text (krav 3) are explicitly NOT part of this gate anymore.
