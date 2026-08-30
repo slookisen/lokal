@@ -372,6 +372,42 @@ export function runOpplevelserGardssalgSecondLineTests(
         });
         assertTrue(!lookupCalled, "a-48: org_nr='' -> brregLookupFn never called");
       }
+
+      // ── evidence plumbing (Del D, dev-request 2026-08-29-gs-second-line-
+      // kildeklasse-bredde) — proves computeGardssalgSecondLineVerification's
+      // own `input.evidence` reaches the judge call's `params.evidence`
+      // unchanged, at the unit level (no network/prompt text involved here —
+      // that end-to-end proof is Section C's c-15 below).
+      {
+        const evidenceIn = [
+          { source_url: "https://hanen.no/produsent/testgard", content_excerpt: "Gården Testgård selger sider og eplemost." },
+        ];
+        let capturedEvidence: unknown;
+        const r = await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          evidence: evidenceIn,
+          judgeFn: async (params) => {
+            capturedEvidence = params.evidence;
+            return { approved: true };
+          },
+        });
+        assertEq(capturedEvidence, evidenceIn, "a-49: input.evidence reaches judgeFn's params.evidence unchanged");
+        assertTrue(r.passes, "a-50: evidence present + judge-approve -> passes (unchanged gate contract)");
+      }
+      {
+        // Absent evidence -> judgeFn receives params.evidence === undefined
+        // (regression proof: today's callers, which never set evidence,
+        // must see byte-identical params).
+        let capturedEvidence: unknown = "sentinel-not-overwritten";
+        await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          judgeFn: async (params) => {
+            capturedEvidence = params.evidence;
+            return { approved: true };
+          },
+        });
+        assertEq(capturedEvidence, undefined, "a-51: no input.evidence -> judgeFn's params.evidence is undefined");
+      }
     } catch (err: any) {
       failed++;
       failures.push("second-line (section A): unexpected error: " + String(err?.stack || err?.message || err));
@@ -738,6 +774,51 @@ export function runOpplevelserGardssalgSecondLineTests(
           "c-14c: lost-update regression — the concurrent writer's key survives the route's write (fresh re-read, not a stale pre-await snapshot)",
         );
         assertEq(concurrentWriteFn, null, "c-14d: concurrentWriteFn hook fired exactly once and cleared itself");
+      }
+
+      // c-15: Del D end-to-end — a per-id `evidence` body field really
+      // reaches the judge PROMPT sent to the Anthropic API (not just the
+      // unit-level plumbing proven in Section A's a-49). Captures the
+      // mocked fetch's own `init.body` and inspects the actual message
+      // content sent to /v1/messages.
+      seedProvider("c15");
+      {
+        let capturedInitBody: any = null;
+        const prevFetchForC15 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            judgeCallCount++;
+            capturedInitBody = init?.body;
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: judgeVerdictText }] }),
+            } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        const excerpt = "Gården c15-testgard selger sider og eplemost, org.nr 999999999.";
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: {
+            providerIds: ["c15"],
+            evidence: {
+              c15: [{ source_url: "https://hanen.no/produsent/c15", content_excerpt: excerpt }],
+            },
+          },
+        });
+        const item = r.body.results.find((x: any) => x.provider_id === "c15");
+        assertEq(item.outcome, "verified", "c-15a: c15 verifies with evidence supplied");
+        const parsedBody = JSON.parse(capturedInitBody);
+        const promptText = parsedBody.messages[0].content;
+        assertTrue(
+          typeof promptText === "string" && promptText.includes(excerpt),
+          "c-15b: the prompt text sent to the Anthropic API contains the evidence content_excerpt",
+        );
+
+        globalThis.fetch = prevFetchForC15;
       }
     } catch (err: any) {
       failed++;

@@ -13882,7 +13882,14 @@ export interface GardssalgSecondLineGateResult {
  *      RFB's computeSecondLineIdentitySources doc comment exactly, that
  *      judgment is left entirely to this judge's identity-reasoning rubric.
  *      Only ever called once checks 1-4 above already hold (cost control,
- *      same ordering RFB's own composition uses).
+ *      same ordering RFB's own composition uses). Optional `input.evidence`
+ *      — Del D (dev-request 2026-08-29-gs-second-line-kildeklasse-bredde):
+ *      caller-fetched {source_url, content_excerpt} pairs for the
+ *      corroborating source(s) above, passed straight through to the judge
+ *      as extra corroboration context. This function still fetches nothing
+ *      itself — evidence, when present, was already fetched by the caller
+ *      (the route below). Absent/empty evidence leaves the judge call byte-
+ *      identical to before Del D.
  *
  * `judgeFn` is injectable purely for test isolation (mirrors RFB's own
  * `judgeFn` param) — defaults to the real judgeSecondLineProfile. `brregLookupFn`
@@ -13898,6 +13905,7 @@ export async function computeGardssalgSecondLineVerification(input: {
   brreg_verified: boolean;
   terminal_status: "krever_eier" | "dod_kilde" | null;
   org_nr?: string | null;
+  evidence?: readonly { source_url: string; content_excerpt: string }[];
   brregLookupFn?: (orgNr: string) => Promise<{ exists: boolean; active: boolean; name: string | null }>;
   judgeFn?: (params: {
     businessName: string;
@@ -13907,6 +13915,7 @@ export async function computeGardssalgSecondLineVerification(input: {
     email: string;
     acceptedSources: readonly string[];
     brregName?: string | null;
+    evidence?: readonly { source_url: string; content_excerpt: string }[];
   }) => Promise<SecondLineProfileJudgeVerdict>;
 }): Promise<GardssalgSecondLineGateResult> {
   const brreg_ok =
@@ -13968,6 +13977,7 @@ export async function computeGardssalgSecondLineVerification(input: {
       email: email!,
       acceptedSources: sources,
       brregName: null,
+      evidence: input.evidence,
     });
     judge_approved = verdict.approved;
     judge_reason = verdict.reason;
@@ -14414,6 +14424,14 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
 // dropped — same "never discard silently" precedent as Grep 1's
 // candidate_evidence_failed).
 //
+// Optional per-id `evidence` body field (Del D, dev-request 2026-08-29-gs-
+// second-line-kildeklasse-bredde): a map of providerId -> array of
+// {source_url, content_excerpt} the CALLER already fetched — this route
+// still fetches nothing itself, it only threads the sanitized array through
+// to computeGardssalgSecondLineVerification/judgeSecondLineProfile as extra
+// corroboration context for the judge. Missing/malformed evidence is never
+// an error — see the sanitization step below.
+//
 // Feature-gated behind GS_SECOND_LINE_VERIFICATION_ENABLED, read FRESH from
 // process.env on EVERY call (never cached/module-level — mirrors RFB's
 // RFB_SECOND_LINE_VERIFICATION_ENABLED contract in lokal-agent-verifier.ts
@@ -14484,7 +14502,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
     return;
   }
 
-  const body = (req.body ?? {}) as { providerIds?: unknown };
+  const body = (req.body ?? {}) as { providerIds?: unknown; evidence?: unknown };
   if (!Array.isArray(body.providerIds) || body.providerIds.length === 0) {
     res.status(400).json({ error: "Body must contain a non-empty 'providerIds' array" });
     return;
@@ -14496,6 +14514,41 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
     res.status(400).json({ error: `Too many providerIds (max ${GS_SECOND_LINE_VERIFY_MAX_IDS} per call)` });
     return;
   }
+
+  // Optional per-id evidence (Del D). Never throws on malformed input — this
+  // is optional corroboration, not a required-and-accounted-for candidate
+  // list (unlike Grep-1/Grep-3's candidate arrays elsewhere in this file),
+  // so bad items are dropped silently rather than error-reported per item.
+  // Caps (5 items / 2000 chars per excerpt) mirror
+  // SECOND_LINE_JUDGE_EVIDENCE_MAX_ITEMS / SECOND_LINE_JUDGE_EVIDENCE_EXCERPT_CHAR_CAP
+  // in second-line-profile-judge.ts, duplicated as literals here rather than
+  // imported — this file already doesn't import that module's other tiny
+  // caps (SECOND_LINE_JUDGE_ABOUT_CHAR_CAP/SECOND_LINE_JUDGE_PRODUCTS_CHAR_CAP
+  // are module-private there), so this keeps the same precedent.
+  const evidenceRawById: Record<string, unknown> =
+    body.evidence && typeof body.evidence === "object" && !Array.isArray(body.evidence)
+      ? (body.evidence as Record<string, unknown>)
+      : {};
+  const sanitizeEvidenceForId = (id: string): { source_url: string; content_excerpt: string }[] | undefined => {
+    const raw = evidenceRawById[id];
+    if (!Array.isArray(raw)) return undefined;
+    const cleaned = raw
+      .filter(
+        (item): item is { source_url: string; content_excerpt: string } =>
+          !!item &&
+          typeof item === "object" &&
+          typeof (item as Record<string, unknown>).source_url === "string" &&
+          ((item as Record<string, unknown>).source_url as string).trim() !== "" &&
+          typeof (item as Record<string, unknown>).content_excerpt === "string" &&
+          ((item as Record<string, unknown>).content_excerpt as string).trim() !== "",
+      )
+      .slice(0, 5)
+      .map((item) => ({
+        source_url: item.source_url.trim(),
+        content_excerpt: item.content_excerpt.trim().slice(0, 2000),
+      }));
+    return cleaned.length > 0 ? cleaned : undefined;
+  };
 
   const expDb = getExpDb("experiences");
   const rfbDb = getRfbDb();
@@ -14594,6 +14647,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
       brreg_verified: row.brreg_verified === 1,
       terminal_status,
       org_nr: row.org_nr,
+      evidence: sanitizeEvidenceForId(id),
     });
 
     if (!gate.passes) {
