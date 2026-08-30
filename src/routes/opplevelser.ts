@@ -13888,8 +13888,13 @@ export interface GardssalgSecondLineGateResult {
  *      corroborating source(s) above, passed straight through to the judge
  *      as extra corroboration context. This function still fetches nothing
  *      itself — evidence, when present, was already fetched by the caller
- *      (the route below). Absent/empty evidence leaves the judge call byte-
- *      identical to before Del D.
+ *      (the route below). Absent/empty evidence leaves the judge's rendered
+ *      PROMPT (not just this call's params shape) byte-identical to before
+ *      Del D — see judgeSecondLineProfile's own evidenceBlockFor doc comment
+ *      in second-line-profile-judge.ts for how that's enforced (round-2
+ *      review fix-up: an earlier version of this PR left the prompt block
+ *      and its extra approval criterion unconditional, which was NOT
+ *      byte-identical — fixed before merge).
  *
  * `judgeFn` is injectable purely for test isolation (mirrors RFB's own
  * `judgeFn` param) — defaults to the real judgeSecondLineProfile. `brregLookupFn`
@@ -14432,6 +14437,13 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
 // corroboration context for the judge. Missing/malformed evidence is never
 // an error — see the sanitization step below.
 //
+// Residual risk (documented, non-blocking, round-2 review): `content_excerpt`
+// is caller-supplied free text that reaches judgeSecondLineProfile's LLM
+// prompt verbatim/unescaped — a theoretical prompt-injection surface. Treated
+// as acceptable because this whole route sits behind requireAdmin — anyone
+// holding the admin key already has direct DB write access to this same
+// producer data, i.e. no new trust boundary is crossed.
+//
 // Feature-gated behind GS_SECOND_LINE_VERIFICATION_ENABLED, read FRESH from
 // process.env on EVERY call (never cached/module-level — mirrors RFB's
 // RFB_SECOND_LINE_VERIFICATION_ENABLED contract in lokal-agent-verifier.ts
@@ -14519,12 +14531,15 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
   // is optional corroboration, not a required-and-accounted-for candidate
   // list (unlike Grep-1/Grep-3's candidate arrays elsewhere in this file),
   // so bad items are dropped silently rather than error-reported per item.
-  // Caps (5 items / 2000 chars per excerpt) mirror
-  // SECOND_LINE_JUDGE_EVIDENCE_MAX_ITEMS / SECOND_LINE_JUDGE_EVIDENCE_EXCERPT_CHAR_CAP
-  // in second-line-profile-judge.ts, duplicated as literals here rather than
-  // imported — this file already doesn't import that module's other tiny
-  // caps (SECOND_LINE_JUDGE_ABOUT_CHAR_CAP/SECOND_LINE_JUDGE_PRODUCTS_CHAR_CAP
-  // are module-private there), so this keeps the same precedent.
+  // Caps (5 items / 2000 chars per excerpt / 500 chars per source_url) mirror
+  // SECOND_LINE_JUDGE_EVIDENCE_MAX_ITEMS / SECOND_LINE_JUDGE_EVIDENCE_EXCERPT_CHAR_CAP /
+  // SECOND_LINE_JUDGE_EVIDENCE_SOURCE_URL_CHAR_CAP in second-line-profile-judge.ts,
+  // duplicated as literals here rather than imported — this file already
+  // doesn't import that module's other tiny caps
+  // (SECOND_LINE_JUDGE_ABOUT_CHAR_CAP/SECOND_LINE_JUDGE_PRODUCTS_CHAR_CAP are
+  // module-private there), so this keeps the same precedent. source_url gets
+  // a cap too (not just .trim()) — round-2 fix-up: an uncapped caller-
+  // supplied URL had no size bound before this.
   const evidenceRawById: Record<string, unknown> =
     body.evidence && typeof body.evidence === "object" && !Array.isArray(body.evidence)
       ? (body.evidence as Record<string, unknown>)
@@ -14544,7 +14559,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
       )
       .slice(0, 5)
       .map((item) => ({
-        source_url: item.source_url.trim(),
+        source_url: item.source_url.trim().slice(0, 500),
         content_excerpt: item.content_excerpt.trim().slice(0, 2000),
       }));
     return cleaned.length > 0 ? cleaned : undefined;
