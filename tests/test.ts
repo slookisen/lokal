@@ -31554,6 +31554,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gdr.failures) failures.push("opplevelser-gardssalg-drikkeliste-remediation: " + f);
     console.log(`  opplevelser-gardssalg-drikkeliste-remediation: ${gdr.passed} passed, ${gdr.failed} failed`);
 
+    // dev-request 2026-08-30-drikkeliste-remediering-runde-2: follow-up
+    // closing the three gaps round 1 above left open — Del A (terminal-mark +
+    // twin_link for the 15 holding rows the org_nr-conflict merge gate
+    // correctly rejected), Del B (provider_id-based lookup for the 10 rows
+    // round 1 left unresolved due to name ambiguity), Del C (two vetoed
+    // org.nr backfills: a postal-code data-input fix, and a brreg_slettet
+    // terminal-mark). Same in-memory-DB pattern, own fixtures/file — kept
+    // separate from round 1's test file above rather than growing that file
+    // further, since round 2 needs its own fixture set for the newly-added
+    // mechanisms without disturbing round 1's already-large coverage.
+    console.log("\n── opplevelser-gardssalg-drikkeliste-remediation-runde2: Del A/B/C follow-up ──");
+    const { runOpplevelserGardssalgDrikkelisteRemediationRunde2Tests } = require("../src/routes/opplevelser-gardssalg-drikkeliste-remediation-runde2.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-drikkeliste-remediation-runde2.test");
+    const gdr2 = await runOpplevelserGardssalgDrikkelisteRemediationRunde2Tests({ log: false });
+    passed += gdr2.passed;
+    failed += gdr2.failed;
+    for (const f of gdr2.failures) failures.push("opplevelser-gardssalg-drikkeliste-remediation-runde2: " + f);
+    console.log(`  opplevelser-gardssalg-drikkeliste-remediation-runde2: ${gdr2.passed} passed, ${gdr2.failed} failed`);
+
     // Grep 3c (dev-request 2026-08-19-kursjustering-drikkefunnel-llm-og-supply
     // follow-on): manual producer_type OVERRIDE lever — the existing
     // gardssalg-producer-type-classify route above is fill-only and refuses

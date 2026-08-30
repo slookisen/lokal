@@ -316,31 +316,33 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
       // Orchestrator fixtures — the §4a-§4e catalog-cleanup batch itself.
       // ══════════════════════════════════════════════════════════════════
 
-      // (d) §4a merge-vs-in-place-correction branching ─────────────────────
-      // d-conflict: Njot -> Aga Sideri — TARGET row already exists, but BOTH
-      // sides already carry their OWN distinct, populated org.nr (exactly
-      // as the report states them). The merge lever's own fail-closed guard
-      // (gardssalg-provider-merge.ts's evaluatePair: two distinct non-blank
-      // org.nr values is treated as positive proof of two separate
-      // companies) correctly REJECTS this pair — this module calls the
-      // existing primitive as instructed and reports that rejection
-      // verbatim, rather than working around a safety guard the rest of
-      // the codebase relies on. See the final report for why this affects
-      // most "operating row exists" §4a items with two already-populated
-      // org numbers, not just this one.
+      // (d) round-2 GS_ROUND2_TERMINAL_ITEMS: terminal-mark + twin_link,
+      // NOT a merge — dev-request 2026-08-30-drikkeliste-remediering-
+      // runde-2, Del A. These three fixtures moved out of §4a's own plain
+      // merge path in round 2: round 1's real apply run found every one of
+      // them rejected by the merge lever's own org_nr-conflict guard (both
+      // sides already carry their own, different, populated org.nr — the
+      // guard was RIGHT to refuse a merge there). Daniel's round-2 decision
+      // for this named cohort: never merge — terminal-mark the holding/
+      // dead-source row and twin_link it to the operating row instead. The
+      // underlying merge-lever guard itself (org_nr_konflikt_ulike_org_nr)
+      // is untouched and stays covered by
+      // opplevelser-gardssalg-provider-dedup-merge.test.ts's own unit tests.
+      //
+      // d-njot: Njot -> Aga Sideri, BOTH rows present -> full happy path
+      // (terminal-mark the holding AND twin_link to the operating row).
       mkProvider({ id: "njot", navn: "Njot", org_nr: "928791432", created_at: "2026-01-01 00:00:00" });
       mkProvider({ id: "aga-sideri", navn: "Aga Sideri", org_nr: "933780929", created_at: "2026-01-01 00:00:00" });
-      // d1: Svalbard Distillery -> Svalbard Bryggeri AS — TARGET row already
-      // exists AND the source row's own org.nr is genuinely blank (the
-      // report gives no org.nr for this source, only a name) -> the merge
-      // succeeds cleanly (no org_nr conflict possible when one side is
-      // blank). This is the real "target row exists -> merge succeeds"
-      // demonstration.
+      // d-svalbard: Svalbard Distillery -> Svalbard Bryggeri AS, BOTH rows
+      // present -> a second full happy-path demonstration (source resolved
+      // by NAME only here, since this item's own selector carries no orgNr).
       mkProvider({ id: "svalbard-distillery", navn: "Svalbard Distillery", org_nr: null, created_at: "2026-01-01 00:00:00" });
       mkProvider({ id: "svalbard-bryggeri", navn: "Svalbard Bryggeri AS", org_nr: "919176547", created_at: "2026-01-01 00:00:00" });
-      // d2: Guajiro Holding — TARGET row does NOT exist -> in-place correction branch.
+      // d-guajiro: Guajiro Holding — the OPERATING row ("Guajiro Gårdsdrift")
+      // is deliberately NOT seeded, to prove the terminal-mark half still
+      // fires independently even when the twin_link half can't resolve
+      // (reported honestly as unresolved/operating_not_found, never guessed).
       mkProvider({ id: "guajiro-holding", navn: "Guajiro Holding", org_nr: "924944870", created_at: "2026-01-01 00:00:00" });
-      // (No "Guajiro Gårdsdrift" row seeded — that's the point of this fixture.)
 
       // (e) Fjellbryggeriet DA ×2 -> AS (no AS row seeded).
       mkProvider({ id: "fjell-da-1", navn: "Fjellbryggeriet DA", org_nr: "995720329", created_at: "2026-01-01 00:00:00" });
@@ -384,12 +386,29 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
 
       // (l) §4d fixtures.
       mkProvider({ id: "myken", navn: "Myken Destilleri", hjemmeside: "https://wrong-myken.example", created_at: "2026-01-01 00:00:00" });
-      mkProvider({ id: "marlobobo-row", navn: "Marlobobo Gard", hjemmeside: "https://marlobobo.no/old", created_at: "2026-01-01 00:00:00" });
+      // id matches the round-2 GS_4D_ITEMS marlobobo entry's hardcoded
+      // providerId (Del B) — that item now resolves by id rather than by
+      // website substring, so the fixture id must match for this test to
+      // exercise it at all.
+      mkProvider({
+        id: "b66d6bf7-67c8-4726-b765-f5a35fdab622", navn: "Marlobobo Gard",
+        hjemmeside: "https://marlobobo.no/old", created_at: "2026-01-01 00:00:00",
+      });
 
       // (m) §4e fixtures.
-      mkProvider({ id: "killi", navn: "Killi Mikrobryggeri", org_nr: null, postnummer: "9050", poststed: "Storsteinnes", created_at: "2026-01-01 00:00:00" });
+      // id matches the round-2 GS_4E_ITEMS killi-mikrobryggeri entry's
+      // hardcoded providerId (Del B) — resolves by id, not by name, now.
+      mkProvider({
+        id: "8abf2877-a5c0-4acb-8089-5105d627aa90", navn: "Killi Mikrobryggeri",
+        org_nr: null, postnummer: "9050", poststed: "Storsteinnes", created_at: "2026-01-01 00:00:00",
+      });
       mkProvider({ id: "fossmoen", navn: "Fossmoen Frukt", org_nr: null, postnummer: "5300", poststed: "Kleppestø", created_at: "2026-01-01 00:00:00" });
-      mkProvider({ id: "hunsfos", navn: "Hunsfos Bryggeri", org_nr: null, postnummer: "9999", poststed: null, created_at: "2026-01-01 00:00:00" });
+      // id matches the round-2 GS_4E_ITEMS hunsfos-bryggeri entry's
+      // hardcoded providerId (Del B) — same reason as Killi above.
+      mkProvider({
+        id: "1c43bbdb-0434-468f-9bb6-dab89e76ad16", navn: "Hunsfos Bryggeri",
+        org_nr: null, postnummer: "9999", poststed: null, created_at: "2026-01-01 00:00:00",
+      });
       mkProvider({ id: "hardanger-hand-4e", navn: "Hardanger Handbryggeri Butikk", org_nr: null, created_at: "2026-01-01 00:00:00" });
 
       // (o) untouched-row control fixture — unrelated to every list.
@@ -468,30 +487,37 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
       function findResult(body: any, key: string): any {
         return (body.results as any[]).find((r) => r.key === key);
       }
+      function findResultByMethod(body: any, key: string, method: string): any {
+        return (body.results as any[]).find((r) => r.key === key && r.method === method);
+      }
 
-      // (d-conflict) org_nr-conflict guard fires as designed — reported, not bypassed.
-      const dryNjot = findResult(dryRes.body, "njot-aga-sideri");
-      assertEq(dryNjot.method, "merge", "dc1: Njot (target exists) is attempted via the merge lever, as instructed");
-      assertEq(dryNjot.outcome, "rejected", "dc2: Njot/Aga Sideri — both sides have distinct populated org.nr -> merge lever's own fail-closed guard rejects it");
-      assertEq(dryNjot.reason, "org_nr_konflikt_ulike_org_nr", "dc3: rejection reason is the merge lever's own guard, verbatim");
-      assertEq(dryNjot.remove_id, "njot", "dc4: Njot is remove_id");
-      assertEq(dryNjot.keep_id, "aga-sideri", "dc5: Aga Sideri is keep_id");
-      assertEq(getRow("njot").merged_into, null, "dc6: dry-run performed ZERO writes on Njot");
+      // (d-njot) round-2 terminal+twin_link, full happy path — dry-run shape.
+      const dryNjotTerm = findResultByMethod(dryRes.body, "njot-aga-sideri", "terminal_status");
+      const dryNjotTwin = findResultByMethod(dryRes.body, "njot-aga-sideri", "twin_link");
+      assertEq(dryNjotTerm.outcome, "would_terminal_mark", "dc1: Njot (holding) would be terminal-marked, NOT merged");
+      assertEq(dryNjotTerm.new_value, "dod_kilde", "dc2: would-be new_value is dod_kilde");
+      assertTrue(String(dryNjotTerm.reason).includes("holding_drift_i_annet_orgnr"), "dc3: reason embeds the round-2 evidence class");
+      assertEq(dryNjotTwin.outcome, "would_twin_link", "dc4: Njot would also be twin_linked to Aga Sideri");
+      assertEq(dryNjotTwin.new_value, "aga-sideri", "dc5: twin_link points at the operating row's id");
+      assertEq(getRow("njot").merged_into, null, "dc6: dry-run performed ZERO writes on Njot (and it is never merged under round 2 either)");
 
-      // (d) merge-vs-in-place branching, dry-run shape (the successful-merge case).
-      const drySvalbard = findResult(dryRes.body, "svalbard-distillery");
-      assertEq(drySvalbard.method, "merge", "d1: Svalbard Distillery (target exists, source org_nr blank) previews as merge");
-      assertEq(drySvalbard.outcome, "would_merge", "d2: Svalbard dry-run outcome would_merge — no org_nr conflict possible when one side is blank");
-      assertEq(drySvalbard.remove_id, "svalbard-distillery", "d3: Svalbard Distillery is remove_id");
-      assertEq(drySvalbard.keep_id, "svalbard-bryggeri", "d4: Svalbard Bryggeri AS is keep_id");
+      // (d-svalbard) round-2 terminal+twin_link, second full happy-path demonstration.
+      const drySvalbardTerm = findResultByMethod(dryRes.body, "svalbard-distillery", "terminal_status");
+      const drySvalbardTwin = findResultByMethod(dryRes.body, "svalbard-distillery", "twin_link");
+      assertEq(drySvalbardTerm.outcome, "would_terminal_mark", "d1: Svalbard Distillery would be terminal-marked, NOT merged");
+      assertEq(drySvalbardTwin.outcome, "would_twin_link", "d2: Svalbard Distillery would twin_link to Svalbard Bryggeri AS");
+      assertEq(drySvalbardTwin.new_value, "svalbard-bryggeri", "d3: twin_link points at Svalbard Bryggeri AS's id");
       assertEq(getRow("svalbard-distillery").merged_into, null, "d5: dry-run performed ZERO writes on Svalbard Distillery");
 
-      const dryGuajiro = findResult(dryRes.body, "guajiro-holding");
-      assertEq(dryGuajiro.method, "org_nr_correction", "d6: Guajiro Holding (no target row) previews as org_nr_correction");
-      assertEq(dryGuajiro.outcome, "would_correct_org_nr", "d7: Guajiro Holding dry-run outcome would_correct_org_nr");
-      assertEq(dryGuajiro.old_value, "924944870", "d8: old_value is Guajiro Holding's current org_nr");
-      assertEq(dryGuajiro.new_value, "932165422", "d9: new_value is the target operating org_nr");
-      assertEq(getRow("guajiro-holding").org_nr, "924944870", "d10: dry-run performed ZERO writes on Guajiro Holding");
+      // (d-guajiro) round-2 terminal-mark fires even though the operating row
+      // ("Guajiro Gårdsdrift") is absent — the twin_link half honestly
+      // reports unresolved rather than guessing a target.
+      const dryGuajiroTerm = findResultByMethod(dryRes.body, "guajiro-holding", "terminal_status");
+      const dryGuajiroTwin = findResultByMethod(dryRes.body, "guajiro-holding", "twin_link");
+      assertEq(dryGuajiroTerm.outcome, "would_terminal_mark", "d6: Guajiro Holding (operating row absent) still previews a terminal-mark");
+      assertEq(dryGuajiroTwin.outcome, "unresolved", "d7: Guajiro Holding's twin_link half is unresolved — operating row not found");
+      assertEq(dryGuajiroTwin.reason, "operating_not_found", "d8: reason names exactly why, not a guess");
+      assertEq(getRow("guajiro-holding").org_nr, "924944870", "d10: dry-run performed ZERO writes on Guajiro Holding (org_nr untouched — never merged/corrected under round 2)");
 
       // (e) Fjellbryggeriet ×2, dry-run: virtual overlay reproduces the
       // sequential correct-then-merge branching WITHOUT any real writes.
@@ -541,16 +567,25 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
       assertEq(dryGrana.method, "merge", "k1: Grana Bryggeri duplicate pair previews as merge");
       assertEq(dryGrana.keep_id, "grana-1", "k2: the more-complete row (org_nr+epost+hjemmeside) is the keep survivor");
       assertEq(dryGrana.remove_id, "grana-2", "k3: the blanker row is the remove");
+      // Round 2 Del B gave this item a hardcoded providerIds pair (the live
+      // prod ids of the two leftover rows) — this test's in-memory DB has no
+      // rows at those exact ids, so it now reports provider_id_not_found
+      // rather than the old by-design ambiguity refusal (which no longer
+      // even runs once providerIds is supplied — see processGs4cItem). The
+      // NEW providerIds-resolves-the-pair happy path is covered by the
+      // round-2 test file instead (fresh fixtures seeded at those exact ids).
       const dryFjellLeftover = findResult(dryRes.body, "fjellbryggeriet-leftover-pair");
-      assertEq(dryFjellLeftover.outcome, "unresolved", "k4: Fjellbryggeriet leftover pair is unresolved BY DESIGN");
-      assertEq(dryFjellLeftover.reason, "ambiguous_name_collision_with_4a_fjellbryggeriet_by_design", "k5: reason names the deliberate refusal");
+      assertEq(dryFjellLeftover.outcome, "unresolved", "k4: Fjellbryggeriet leftover pair — providerIds pair not present in THIS test's fixtures");
+      assertEq(dryFjellLeftover.reason, "provider_id_not_found", "k5: reason names exactly why (not the old by-design refusal, which providerIds now bypasses)");
 
       // (l) §4d dry-run.
       const dryMyken = findResult(dryRes.body, "myken-destilleri");
       assertEq(dryMyken.outcome, "would_correct_hjemmeside", "l1: Myken Destilleri would be corrected");
       assertEq(dryMyken.new_value, "https://mykendistillery.com", "l2: corrects to the report's stated value");
+      // Round 2 Del B: resolved by providerId now, not the website
+      // substring lookup this item originally used (see its own comment).
       const dryMarlobobo = findResult(dryRes.body, "marlobobo");
-      assertEq(dryMarlobobo.outcome, "would_correct_hjemmeside", "l3: Marlobobo (resolved by website substring) would be corrected");
+      assertEq(dryMarlobobo.outcome, "would_correct_hjemmeside", "l3: Marlobobo (resolved by providerId) would be corrected");
       assertEq(dryMarlobobo.new_value, null, "l4: nulled (dead site)");
 
       // (m) §4e dry-run cross-check.
@@ -563,10 +598,18 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
       assertEq(dryFossmoen.expected_value, "986427538", "m5: AND the report's expected value, both shown");
       const dryHunsfos = findResult(dryRes.body, "hunsfos-bryggeri");
       assertEq(dryHunsfos.outcome, "backfilled_vetoed", "m6: Hunsfos — postal corroboration fails -> vetoed, never auto-written");
+      // Round 2 Del C part 2 added a THIRD "telemark-bryggeri" entry
+      // (category 4a, GS_ROUND2_TERMINAL_ITEMS — terminal-mark only, no
+      // twin_link, since there is no operating row) alongside round 1's
+      // existing §4b (terminal-mark) and §4e (org.nr backfill attempt)
+      // entries for the SAME row — all three independent, all three fire.
       const dryTelemarkB = (dryRes.body.results as any[]).filter((r) => r.key === "telemark-bryggeri");
-      assertEq(dryTelemarkB.length, 2, "m7: Telemark Bryggeri appears once for §4b and once for §4e — independent fields");
+      assertEq(dryTelemarkB.length, 3, "m7: Telemark Bryggeri appears for round-2's §4a terminal-mark, §4b, AND §4e — independent, all three fire");
+      const dryTelemark4aRound2 = dryTelemarkB.find((r) => r.category === "4a");
       const dryTelemark4b = dryTelemarkB.find((r) => r.category === "4b");
       const dryTelemark4e = dryTelemarkB.find((r) => r.category === "4e");
+      assertEq(dryTelemark4aRound2.outcome, "would_terminal_mark", "m7b: round-2 §4a side would terminal-mark (evidence class brreg_slettet)");
+      assertTrue(String(dryTelemark4aRound2.reason).includes("brreg_slettet"), "m7c: reason embeds the round-2 evidence class");
       assertEq(dryTelemark4b.outcome, "would_terminal_mark", "m8: §4b side would terminal-mark");
       assertEq(dryTelemark4e.outcome, "would_backfill_match", "m9: §4e side would backfill org.nr — both fire independently");
 
@@ -580,8 +623,15 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
       // (d-conflict / d) merge-vs-in-place, applied.
       assertEq(getRow("njot").merged_into, null, "dc7: Njot still NOT merged under apply — the guard applies at apply-time too, not just preview");
       assertEq(getRow("njot").org_nr, "928791432", "dc8: Njot's own org_nr untouched by the rejected merge attempt");
-      assertEq(getRow("svalbard-distillery").merged_into, "svalbard-bryggeri", "d11: Svalbard Distillery actually merged into Svalbard Bryggeri AS");
-      assertEq(getRow("guajiro-holding").org_nr, "932165422", "d12: Guajiro Holding's org_nr actually corrected in place");
+      // (d) round-2 terminal+twin_link, applied: NEVER merged (org_nr/
+      // merged_into untouched), terminal-marked + twin-linked instead.
+      assertEq(getRow("njot").terminal_status, "dod_kilde", "d11a: Njot actually terminal-marked");
+      assertEq(getRow("njot").merged_into, null, "d11b: Njot never merged");
+      assertEq(getAuditRows("njot").filter((r: any) => r.field_name === "twin_link").length, 1, "d11c: exactly one twin_link audit row on Njot");
+      assertEq(getRow("svalbard-distillery").terminal_status, "dod_kilde", "d11: Svalbard Distillery actually terminal-marked (not merged)");
+      assertEq(getRow("svalbard-distillery").merged_into, null, "d11d: Svalbard Distillery never merged into Svalbard Bryggeri AS");
+      assertEq(getRow("guajiro-holding").terminal_status, "dod_kilde", "d12: Guajiro Holding actually terminal-marked despite the missing operating row");
+      assertEq(getRow("guajiro-holding").org_nr, "924944870", "d12b: Guajiro Holding's org_nr untouched (never corrected/merged under round 2)");
 
       // (e) Fjellbryggeriet ×2, applied: real DB state now matches the
       // dry-run's virtual-overlay prediction exactly.
@@ -610,12 +660,12 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
 
       // (l) §4d, applied.
       assertEq(getRow("myken").hjemmeside, "https://mykendistillery.com", "l5: Myken Destilleri hjemmeside actually corrected");
-      assertEq(getRow("marlobobo-row").hjemmeside, null, "l6: Marlobobo hjemmeside actually nulled");
+      assertEq(getRow("b66d6bf7-67c8-4726-b765-f5a35fdab622").hjemmeside, null, "l6: Marlobobo hjemmeside actually nulled");
 
       // (m) §4e, applied.
-      assertEq(getRow("killi").org_nr, "924960884", "m10: Killi org_nr actually backfilled to the matching value");
+      assertEq(getRow("8abf2877-a5c0-4acb-8089-5105d627aa90").org_nr, "924960884", "m10: Killi org_nr actually backfilled to the matching value");
       assertEq(getRow("fossmoen").org_nr, "986427599", "m11: Fossmoen — the ROUTE'S resolved value is what's written (mismatch is reported, not silently overridden by the report's expectation)");
-      assertEq(getRow("hunsfos").org_nr, null, "m12: Hunsfos — vetoed candidate is never auto-written");
+      assertEq(getRow("1c43bbdb-0434-468f-9bb6-dab89e76ad16").org_nr, null, "m12: Hunsfos — vetoed candidate is never auto-written");
       assertEq(getRow("telemark-bryggeri").terminal_status, "dod_kilde", "m13: Telemark Bryggeri §4b side applied");
       assertEq(getRow("telemark-bryggeri").org_nr, "987141662", "m14: Telemark Bryggeri §4e side ALSO applied — same row, independent fields");
 
@@ -644,6 +694,7 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
       // (n) idempotency — a second full apply run performs no further
       // incorrect/duplicate writes on rows already resolved.
       // ══════════════════════════════════════════════════════════════════
+      const audit_njot_before = getAuditRows("njot").length;
       const audit_svalbard_before = getAuditRows("svalbard-distillery").length;
       const audit_guajiro_before = getAuditRows("guajiro-holding").length;
       const audit_skifjorden_before = getAuditRows("skifjorden-coop").length;
@@ -652,23 +703,28 @@ export function runOpplevelserGardssalgDrikkelisteRemediationTests(
       const applyRes2 = await callRoute(opplevelserRouter, { headers: auth, body: { apply: true, batch_id: "test-batch-2" } });
       assertEq(applyRes2.status, 200, "n1: second apply -> 200 (no crash)");
 
-      // Svalbard: on a rerun, name-based source resolution naturally excludes
-      // the now-already-merged row (findByNameContains's default
-      // merged_into IS NULL filter) -> unresolved, not re-found/re-merged.
-      // Either way the key idempotency property holds: zero further writes.
-      const svalbardResult2 = findResult(applyRes2.body, "svalbard-distillery");
-      assertEq(svalbardResult2.outcome, "unresolved", "n2: second apply on Svalbard -> unresolved (already-merged row excluded from name lookup), not re-merged");
-      assertEq(getAuditRows("svalbard-distillery").length, audit_svalbard_before, "n3: no new audit rows for Svalbard on the second apply");
-      assertEq(getRow("svalbard-distillery").merged_into, "svalbard-bryggeri", "n4: Svalbard's merged_into unchanged by the second apply");
+      // Round-2 terminal+twin_link idempotency: a second apply against an
+      // already-terminal-marked, already-twin_linked row makes ZERO further
+      // writes (both guards — the terminal_status pre-check and
+      // twinLinkAlreadyRecorded — fire).
+      const njotTerm2 = findResultByMethod(applyRes2.body, "njot-aga-sideri", "terminal_status");
+      const njotTwin2 = findResultByMethod(applyRes2.body, "njot-aga-sideri", "twin_link");
+      assertEq(njotTerm2.outcome, "already_terminal", "n2njot: second apply on Njot -> already_terminal, not re-written");
+      assertEq(njotTwin2.outcome, "already_twin_linked", "n2njotb: second apply on Njot -> already_twin_linked, not re-inserted");
+      assertEq(getAuditRows("njot").length, audit_njot_before, "n2njotc: zero new audit rows for Njot on the second apply");
 
-      // Guajiro: org.nr-selector no longer matches (org.nr changed), name
-      // fallback finds the SAME (now self-corrected) row as its own target
-      // -> reported unresolved, zero further writes — the key idempotency
-      // property (never re-corrects/never mis-corrects on a rerun).
-      const guajiroResult2 = findResult(applyRes2.body, "guajiro-holding");
-      assertTrue(guajiroResult2.outcome !== "org_nr_corrected", "n5: second apply never re-writes Guajiro Holding's org_nr");
+      // Svalbard: same idempotency shape as Njot above.
+      const svalbardResult2 = findResultByMethod(applyRes2.body, "svalbard-distillery", "terminal_status");
+      assertEq(svalbardResult2.outcome, "already_terminal", "n2: second apply on Svalbard -> already_terminal, not re-written");
+      assertEq(getAuditRows("svalbard-distillery").length, audit_svalbard_before, "n3: no new audit rows for Svalbard on the second apply");
+      assertEq(getRow("svalbard-distillery").merged_into, null, "n4: Svalbard is still never merged");
+
+      // Guajiro: terminal-mark idempotent; twin_link half still honestly
+      // unresolved (operating row still absent) both times — zero writes.
+      const guajiroResult2 = findResultByMethod(applyRes2.body, "guajiro-holding", "terminal_status");
+      assertEq(guajiroResult2.outcome, "already_terminal", "n5: second apply on Guajiro Holding -> already_terminal, not re-written");
       assertEq(getAuditRows("guajiro-holding").length, audit_guajiro_before, "n6: no new audit rows for Guajiro Holding on the second apply");
-      assertEq(getRow("guajiro-holding").org_nr, "932165422", "n7: Guajiro Holding's org_nr unchanged by the second apply");
+      assertEq(getRow("guajiro-holding").org_nr, "924944870", "n7: Guajiro Holding's org_nr unchanged by the second apply (never corrected/merged)");
 
       // Skifjorden: twin-link dedup guard prevents duplicate audit rows.
       const twinResult2 = findResult(applyRes2.body, "skifjorden-twin-link");
