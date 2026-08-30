@@ -1,5 +1,20 @@
 // ─── Gårdssalg drikkeliste §4a–§4e data-quality remediation batch ──────────
 //
+// ROUND 2 (dev-request 2026-08-30-drikkeliste-remediering-runde-2,
+// daniel_authorized) EXTENDS this same module/lever rather than duplicating
+// it — three follow-on additions, each near its closest §4a-§4e relative:
+//   Del A — GS_ROUND2_TERMINAL_ITEMS / processGsRound2TerminalItem, just
+//     below processGs4aItem: terminal-mark + twin_link (no merge) for the 15
+//     holding rows §4a's own org_nr-conflict guard correctly rejected.
+//   Del B — a `providerId` field added to every §4a/§4c/§4d/§4e item/
+//     selector shape, checked before the existing name/website/org.nr
+//     lookup, for the 10 rows round 1 left unresolved on name ambiguity
+//     alone.
+//   Del C — GS_ROUND2_POSTAL_PREFILL_ITEMS (just above the orchestrator, near
+//     §4e) plus a 16th GS_ROUND2_TERMINAL_ITEMS entry (Telemark Bryggeri).
+// See each section's own doc comment for the detail. Nothing below this
+// paragraph, and no round-1 row/write, changes because of round 2.
+//
 // dev-request 2026-08-29-drikkeliste-remapping-og-dodkilde. A 306-row
 // source-breadth review of the drink-producer catalog found 64 rows that
 // are not operative producers (holdings, bankrupt entities, hobby
@@ -56,6 +71,7 @@ import {
   applyGardssalgSetTerminalStatus,
   applyGardssalgSetOrgNr,
   applyGardssalgSetHjemmeside,
+  applyGardssalgProviderAddress,
 } from "./experience-store";
 import {
   previewGardssalgProviderMergePair,
@@ -227,10 +243,25 @@ interface Ctx {
 interface Gs4aSourceSelector {
   orgNr?: string;
   nameHint?: string;
+  /**
+   * Round-2 addition (dev-request 2026-08-30-drikkeliste-remediering-runde-2,
+   * Del B): an explicit provider_id, checked BEFORE orgNr/nameHint when
+   * present. Round 1's name-only lookup left 10 rows unresolved purely
+   * because a bare name hint was ambiguous (multiple candidates) or the
+   * expected row-count didn't match — an id sidesteps that ambiguity
+   * entirely (still gated by the SAME claimed/merged_into checks every other
+   * resolution path here already enforces, so it's still not a raw trust of
+   * caller input). Never invented/guessed in this file's own data — every
+   * value that appears here was cross-checked against a live read-only
+   * catalog lookup at authoring time; see the item's own comment for how.
+   */
+  providerId?: string;
 }
 interface Gs4aTarget {
   orgNr?: string;
   nameHint?: string;
+  /** Round-2 addition — see Gs4aSourceSelector.providerId's doc comment; same semantics for a target row. */
+  providerId?: string;
 }
 interface Gs4aItem {
   key: string;
@@ -242,61 +273,47 @@ interface Gs4aItem {
 }
 
 export const GS_4A_ITEMS: Gs4aItem[] = [
-  {
-    key: "simple-spotting",
-    label: "Simple Spotting → Fjording AS (holding)",
-    sources: [{ orgNr: "913665406", nameHint: "Simple Spotting" }],
-    target: { orgNr: "819708312", nameHint: "Fjording" },
-    note: "§4a holding: Simple Spotting 913665406 → Fjording AS 819708312",
-  },
+  // NB: 15 keys formerly listed here (simple-spotting, svalbard-distillery,
+  // geir-bakken, erik-juel-karlsen-eid, ale-mates, tradish-holding,
+  // guajiro-holding, lutlaget-jaastad, monkey-businessmen, ringnes-norge,
+  // arcus-loiten, arcus-oplandske, arcus-siemers, arcus-lysholm,
+  // njot-aga-sideri) moved to GS_ROUND2_TERMINAL_ITEMS below — round-2
+  // dev-request 2026-08-30-drikkeliste-remediering-runde-2, Del A. Round 1's
+  // real apply run found every one of these 15 rejected by the merge lever's
+  // own org_nr-conflict guard (both the holding and the operating company
+  // legitimately carry their own, different, already-populated org.nr — the
+  // guard is right to refuse a MERGE there). Daniel's decision for exactly
+  // this named cohort (daniel-responses/2026-08-30-go-ukjent-ansatte-regel-
+  // og-4a-terminal-twin.md): never merge them — terminal-mark the holding row
+  // instead and twin_link it to the operating row. See GS_ROUND2_TERMINAL_ITEMS
+  // for the new mechanism; this array keeps every OTHER §4a item unchanged.
   {
     key: "frewi-wilsgard",
     label: "Frewi → Wilsgård (dup with Wilsgård row)",
-    sources: [{ orgNr: "989274511", nameHint: "Frewi" }],
+    sources: [
+      // Round 2 Del B: unambiguous live lookup (single "Frewi" name match) —
+      // see PR description for confidence/resolution notes. Target stays
+      // name-only: three "Wilsgård"-named rows exist live and none can be
+      // confidently picked as "the" operating structure without further
+      // Brreg/proff research — deliberately left unresolved (gap), not guessed.
+      { orgNr: "989274511", nameHint: "Frewi", providerId: "cd0bd5ad-4a6c-4d70-8bc6-52e6c4df8959" },
+    ],
     target: { nameHint: "Wilsgård" },
     note: "§4a dup: Frewi 989274511 → Wilsgård structure (dup with Wilsgård row)",
   },
   {
-    key: "svalbard-distillery",
-    label: "Svalbard Distillery row → Svalbard Bryggeri AS",
-    sources: [{ nameHint: "Svalbard Distillery" }],
-    target: { orgNr: "919176547", nameHint: "Svalbard Bryggeri" },
-    note: "§4a: Svalbard Distillery row → Svalbard Bryggeri AS 919176547",
-  },
-  {
     key: "geiranger",
     label: "Geiranger row → Geiranger Brenneri",
-    sources: [{ nameHint: "Geiranger" }],
+    sources: [
+      // Round 2 Del B: the bare name "Geiranger" matches 16 unrelated tourism
+      // rows live — resolved instead via providerId, cross-checked against
+      // the live gårdssalg-provider-dedup-audit grouping (this row shares an
+      // org_nr-conflict dedup group with the target "Geiranger Brenneri",
+      // the only "Geiranger"-named row that is a drink producer).
+      { nameHint: "Geiranger", providerId: "cde95a67-283c-4520-803c-b998eb009cb7" },
+    ],
     target: { orgNr: "929225236", nameHint: "Geiranger Brenneri" },
     note: "§4a: Geiranger row → Geiranger Brenneri 929225236",
-  },
-  {
-    key: "geir-bakken",
-    label: "Geir Bakken → Larvik Mikrobryggeri (person-holding)",
-    sources: [{ orgNr: "988986208", nameHint: "Geir Bakken" }],
-    target: { orgNr: "996692132", nameHint: "Larvik Mikrobryggeri" },
-    note: "§4a person-holding: Geir Bakken 988986208 → Larvik Mikrobryggeri 996692132",
-  },
-  {
-    key: "erik-juel-karlsen-eid",
-    label: "Erik Juel Karlsen Eid → Norumbryggeriet AS",
-    sources: [{ orgNr: "992114231", nameHint: "Erik Juel Karlsen" }],
-    target: { orgNr: "915132782", nameHint: "Norumbryggeriet" },
-    note: "§4a: Erik Juel Karlsen Eid 992114231 → Norumbryggeriet AS 915132782",
-  },
-  {
-    key: "ale-mates",
-    label: "Ale Mates → Qvart & Homborsund (operating row exists)",
-    sources: [{ orgNr: "918786309", nameHint: "Ale Mates" }],
-    target: { orgNr: "918844201", nameHint: "Qvart & Homborsund" },
-    note: "§4a: Ale Mates 918786309 → Qvart & Homborsund 918844201 (operating row exists)",
-  },
-  {
-    key: "tradish-holding",
-    label: "Tradish Holding → Tradish Brewing (operating row exists)",
-    sources: [{ orgNr: "935230187", nameHint: "Tradish Holding" }],
-    target: { orgNr: "935448239", nameHint: "Tradish Brewing" },
-    note: "§4a: Tradish Holding 935230187 → Tradish Brewing 935448239 (operating row exists)",
   },
   {
     key: "fjellbryggeriet-da-as",
@@ -311,64 +328,6 @@ export const GS_4A_ITEMS: Gs4aItem[] = [
       "(operation moved to Tuddal 2015; cf. Tuddal Høyfjellshotel 970951113)",
   },
   {
-    key: "guajiro-holding",
-    label: "Guajiro Holding → Guajiro Gårdsdrift (operating row exists)",
-    sources: [{ orgNr: "924944870", nameHint: "Guajiro Holding" }],
-    target: { orgNr: "932165422", nameHint: "Guajiro Gårdsdrift" },
-    note: "§4a: Guajiro Holding 924944870 → Guajiro Gårdsdrift 932165422 (operating row exists)",
-  },
-  {
-    key: "lutlaget-jaastad",
-    label: "Lutlaget Jaastad → Jaastad Sideri (operating row exists)",
-    sources: [{ orgNr: "932568047", nameHint: "Lutlaget Jaastad" }],
-    target: { orgNr: "932849429", nameHint: "Jaastad Sideri" },
-    note: "§4a: Lutlaget Jaastad 932568047 → Jaastad Sideri 932849429 (operating row exists)",
-  },
-  {
-    key: "monkey-businessmen",
-    label: "Monkey Businessmen → Monkey Brew AS",
-    sources: [{ orgNr: "914918227", nameHint: "Monkey Businessmen" }],
-    target: { orgNr: "917417997", nameHint: "Monkey Brew" },
-    note: "§4a: Monkey Businessmen 914918227 → Monkey Brew AS 917417997",
-  },
-  {
-    key: "ringnes-norge",
-    label: "Ringnes Norge → Ringnes AS (data remap only — outreach-pool inclusion untouched)",
-    sources: [{ orgNr: "989668137", nameHint: "Ringnes Norge" }],
-    target: { orgNr: "914670705", nameHint: "Ringnes AS" },
-    note:
-      "§4a storkonsern (DATA REMAP ONLY — whether this row stays in the outreach pool afterward " +
-      "is a separate, still-open Daniel decision, untouched here): Ringnes Norge 989668137 → Ringnes AS 914670705",
-  },
-  {
-    key: "arcus-loiten",
-    label: "Løiten → Arcus Norway (data remap only)",
-    sources: [{ orgNr: "981940776", nameHint: "Løiten" }],
-    target: { orgNr: "975381722", nameHint: "Arcus Norway" },
-    note: "§4a storkonsern (DATA REMAP ONLY): Løiten 981940776 → Arcus Norway 975381722",
-  },
-  {
-    key: "arcus-oplandske",
-    label: "Oplandske → Arcus Norway (data remap only)",
-    sources: [{ orgNr: "981995880", nameHint: "Oplandske" }],
-    target: { orgNr: "975381722", nameHint: "Arcus Norway" },
-    note: "§4a storkonsern (DATA REMAP ONLY): Oplandske 981995880 → Arcus Norway 975381722",
-  },
-  {
-    key: "arcus-siemers",
-    label: "Siemers → Arcus Norway (data remap only)",
-    sources: [{ orgNr: "981995856", nameHint: "Siemers" }],
-    target: { orgNr: "975381722", nameHint: "Arcus Norway" },
-    note: "§4a storkonsern (DATA REMAP ONLY): Siemers 981995856 → Arcus Norway 975381722",
-  },
-  {
-    key: "arcus-lysholm",
-    label: "Lysholm → Arcus Norway (data remap only)",
-    sources: [{ orgNr: "881995832", nameHint: "Lysholm" }],
-    target: { orgNr: "975381722", nameHint: "Arcus Norway" },
-    note: "§4a storkonsern (DATA REMAP ONLY): Lysholm 881995832 → Arcus Norway 975381722",
-  },
-  {
     key: "lundetangen",
     label: "Lundetangen → unresolvable target (terminal-mark, not a guess)",
     sources: [{ orgNr: "966488948", nameHint: "Lundetangen" }],
@@ -376,13 +335,6 @@ export const GS_4A_ITEMS: Gs4aItem[] = [
     note:
       "§4a historisk_merke_uten_kjent_org: Lundetangen 966488948 — brand brewed at a different, " +
       "unresolvable org.nr; no concrete target row found, terminal-marking rather than guessing",
-  },
-  {
-    key: "njot-aga-sideri",
-    label: "Njot → Aga Sideri",
-    sources: [{ orgNr: "928791432", nameHint: "Njot" }],
-    target: { orgNr: "933780929", nameHint: "Aga Sideri" },
-    note: "§4a: Njot 928791432 → Aga Sideri 933780929",
   },
   {
     key: "skifjorden-twin-link",
@@ -423,6 +375,20 @@ function resolveGs4aSource(
   const excludeByTargetHint = (rows: ProviderSnapshot[]): ProviderSnapshot[] =>
     excludeNameHint ? rows.filter((r) => !r.navn.toLowerCase().includes(excludeNameHint.toLowerCase())) : rows;
 
+  // Round-2 Del B: an explicit provider_id wins outright — no ambiguity is
+  // even possible, since a primary-key lookup can only ever find zero or one
+  // row. Still respects the SAME claimed/merged_into discipline every other
+  // branch below enforces (never re-claims a row another item already used
+  // this run; never resolves onto an already-merged/dead row unless the
+  // caller explicitly wants that — no caller here does).
+  if (sel.providerId) {
+    const row = findById(db, sel.providerId);
+    if (!row) return { row: null, reason: "provider_id_not_found" };
+    if (row.merged_into !== null) return { row: null, reason: "provider_id_already_merged" };
+    if (claimed.has(row.id)) return { row: null, reason: "provider_id_already_claimed" };
+    return { row, reason: null };
+  }
+
   if (sel.orgNr) {
     const row = findByOrgNr(db, sel.orgNr);
     if (row && !claimed.has(row.id)) return { row, reason: null };
@@ -441,6 +407,12 @@ function resolveGs4aSource(
 /** Resolves a §4a/§4c target: real DB row by org.nr (checking the virtual overlay first — see Ctx.virtualOrgNrMap), else by name (unambiguous only). */
 function resolveGs4aTarget(db: Database.Database, target: Gs4aTarget | undefined, ctx: Ctx): ProviderSnapshot | null {
   if (!target) return null;
+  // Round-2 Del B: same providerId-wins-outright rule as resolveGs4aSource
+  // above (see its doc comment) — not currently exercised by any live §4a
+  // item (every Del B target ambiguity turned out resolvable via the
+  // EXISTING orgNr path instead, see PR description), but the mechanism
+  // itself must accept one, so it is wired symmetrically with the source side.
+  if (target.providerId) return findById(db, target.providerId);
   if (target.orgNr) {
     const virtualId = ctx.virtualOrgNrMap.get(target.orgNr);
     if (virtualId) {
@@ -648,6 +620,288 @@ function processGs4aItem(db: Database.Database, item: Gs4aItem, ctx: Ctx): GsDri
   return results;
 }
 
+// ── §4a round 2 — holding terminal-mark + twin_link (no merge) ──────────────
+//
+// dev-request 2026-08-30-drikkeliste-remediering-runde-2, Del A + Del C part
+// 2 (daniel_authorized: daniel-responses/2026-08-30-go-ukjent-ansatte-regel-
+// og-4a-terminal-twin.md). Covers exactly the rows round 1's own §4a merge
+// attempt correctly REJECTED via the org_nr-conflict guard (both source and
+// target already carry their own, different, populated org.nr — the guard
+// was right to refuse a merge) plus one §4b/§4e row with no operating
+// counterpart at all (Telemark Bryggeri — org.nr slettet, nothing to twin to).
+// Daniel's decided end-state for this named cohort: never merge — terminal-
+// mark the holding/dead-source row (dod_kilde, evidence class embedded in
+// `reason` exactly like §4b's `evidence_class=` convention) and, when an
+// operating row exists, twin_link the holding row to it (reusing
+// insertTwinLinkAudit/twinLinkAlreadyRecorded byte-for-byte — the SAME
+// mechanic §4a's own Skifjorden `twin_link` special already uses, just
+// ONE-directional here per Daniel's spec, not the mutual link Skifjorden
+// gets — Skifjorden keeps BOTH rows as independent, currently-operating
+// entities; a holding row has nothing of its own left to point back at).
+// `operating` is intentionally optional — Telemark Bryggeri (no operating
+// row exists at all) gets ONLY the terminal-mark, no twin_link attempt.
+//
+// This is a NEW action path for exactly this named cohort, not a change to
+// the org_nr-conflict merge gate itself (untouched, still guards every other
+// §4a/§4c merge exactly as before) — see this module's own top-of-file doc
+// comment and the dev-request's own "Non-goals".
+
+export type GsRound2TerminalEvidenceClass = "holding_drift_i_annet_orgnr" | "brreg_slettet";
+
+interface GsRound2TerminalItem {
+  key: string;
+  label: string;
+  source: Gs4aSourceSelector;
+  /** Omitted when there is no operating row to twin_link to (Telemark Bryggeri — org.nr slettet). */
+  operating?: Gs4aTarget;
+  evidenceClass: GsRound2TerminalEvidenceClass;
+  note: string;
+}
+
+/**
+ * The 15 Del A holding rows + Telemark Bryggeri (Del C part 2). Every
+ * source/operating selector here is the SAME {orgNr, nameHint} shape §4a
+ * already uses, resolved via the SAME resolveGs4aSource/resolveGs4aTarget
+ * helpers (org.nr is UNIQUE-indexed in the live catalog, so an orgNr-bearing
+ * selector resolves deterministically to exactly one row — this is why every
+ * pair below is expressed by org.nr rather than a hardcoded provider_id: it
+ * is exactly as unambiguous, and it re-resolves correctly against the LIVE
+ * catalog at call time the same way the rest of this file already does,
+ * rather than trusting a point-in-time id snapshot). Every org.nr pair here
+ * was cross-checked against the live catalog (gardssalg-provider-dedup-audit
+ * and gardssalg-provider-lookup, both read-only) at authoring time — see the
+ * PR description for per-row confidence notes.
+ */
+export const GS_ROUND2_TERMINAL_ITEMS: GsRound2TerminalItem[] = [
+  {
+    key: "simple-spotting",
+    label: "Simple Spotting (holding) — terminal-mark, twin_link → Fjording AS",
+    source: { orgNr: "913665406", nameHint: "Simple Spotting" },
+    operating: { orgNr: "819708312", nameHint: "Fjording" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Simple Spotting 913665406, operativ drift i Fjording AS 819708312",
+  },
+  {
+    key: "svalbard-distillery",
+    label: "Svalbard Distillery (holding) — terminal-mark, twin_link → Svalbard Bryggeri AS",
+    source: { nameHint: "Svalbard Distillery" },
+    operating: { orgNr: "919176547", nameHint: "Svalbard Bryggeri" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Svalbard Distillery, operativ drift i Svalbard Bryggeri AS 919176547",
+  },
+  {
+    key: "geir-bakken",
+    label: "Geir Bakken (person-holding) — terminal-mark, twin_link → Larvik Mikrobryggeri",
+    source: { orgNr: "988986208", nameHint: "Geir Bakken" },
+    operating: { orgNr: "996692132", nameHint: "Larvik Mikrobryggeri" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr (personlig holding): Geir Bakken 988986208, operativ drift i Larvik Mikrobryggeri 996692132",
+  },
+  {
+    key: "erik-juel-karlsen-eid",
+    label: "Erik Juel Karlsen Eid (holding) — terminal-mark, twin_link → Norumbryggeriet AS",
+    source: { orgNr: "992114231", nameHint: "Erik Juel Karlsen" },
+    operating: { orgNr: "915132782", nameHint: "Norumbryggeriet" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Erik Juel Karlsen Eid 992114231, operativ drift i Norumbryggeriet AS 915132782",
+  },
+  {
+    key: "ale-mates",
+    label: "Ale Mates (holding) — terminal-mark, twin_link → Qvart & Homborsund",
+    source: { orgNr: "918786309", nameHint: "Ale Mates" },
+    operating: { orgNr: "918844201", nameHint: "Qvart & Homborsund" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Ale Mates 918786309, operativ drift i Qvart & Homborsund 918844201",
+  },
+  {
+    key: "tradish-holding",
+    label: "Tradish Holding — terminal-mark, twin_link → Tradish Brewing",
+    source: { orgNr: "935230187", nameHint: "Tradish Holding" },
+    operating: { orgNr: "935448239", nameHint: "Tradish Brewing" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Tradish Holding 935230187, operativ drift i Tradish Brewing 935448239",
+  },
+  {
+    key: "guajiro-holding",
+    label: "Guajiro Holding — terminal-mark, twin_link → Guajiro Gårdsdrift",
+    source: { orgNr: "924944870", nameHint: "Guajiro Holding" },
+    operating: { orgNr: "932165422", nameHint: "Guajiro Gårdsdrift" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Guajiro Holding 924944870, operativ drift i Guajiro Gårdsdrift 932165422",
+  },
+  {
+    key: "lutlaget-jaastad",
+    label: "Lutlaget Jaastad — terminal-mark, twin_link → Jaastad Sideri",
+    source: { orgNr: "932568047", nameHint: "Lutlaget Jaastad" },
+    operating: { orgNr: "932849429", nameHint: "Jaastad Sideri" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Lutlaget Jaastad 932568047, operativ drift i Jaastad Sideri 932849429",
+  },
+  {
+    key: "monkey-businessmen",
+    label: "Monkey Businessmen — terminal-mark, twin_link → Monkey Brew AS",
+    source: { orgNr: "914918227", nameHint: "Monkey Businessmen" },
+    operating: { orgNr: "917417997", nameHint: "Monkey Brew" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Monkey Businessmen 914918227, operativ drift i Monkey Brew AS 917417997",
+  },
+  {
+    key: "ringnes-norge",
+    label: "Ringnes Norge — terminal-mark, twin_link → Ringnes AS (data remap only — outreach-pool inclusion untouched)",
+    source: { orgNr: "989668137", nameHint: "Ringnes Norge" },
+    operating: { orgNr: "914670705", nameHint: "Ringnes AS" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note:
+      "holding drift i annet org.nr (storkonsern, DATA REMAP ONLY — outreach-pool inclusion is a separate, " +
+      "still-open Daniel decision, untouched here): Ringnes Norge 989668137, operativ drift i Ringnes AS 914670705",
+  },
+  {
+    key: "arcus-loiten",
+    label: "Løiten — terminal-mark, twin_link → Arcus Norway",
+    source: { orgNr: "981940776", nameHint: "Løiten" },
+    operating: { orgNr: "975381722", nameHint: "Arcus Norway" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr (storkonsern): Løiten 981940776, operativ drift i Arcus Norway 975381722",
+  },
+  {
+    key: "arcus-oplandske",
+    label: "Oplandske — terminal-mark, twin_link → Arcus Norway",
+    source: { orgNr: "981995880", nameHint: "Oplandske" },
+    operating: { orgNr: "975381722", nameHint: "Arcus Norway" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr (storkonsern): Oplandske 981995880, operativ drift i Arcus Norway 975381722",
+  },
+  {
+    key: "arcus-siemers",
+    label: "Siemers — terminal-mark, twin_link → Arcus Norway",
+    source: { orgNr: "981995856", nameHint: "Siemers" },
+    operating: { orgNr: "975381722", nameHint: "Arcus Norway" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr (storkonsern): Siemers 981995856, operativ drift i Arcus Norway 975381722",
+  },
+  {
+    key: "arcus-lysholm",
+    label: "Lysholm — terminal-mark, twin_link → Arcus Norway",
+    source: { orgNr: "881995832", nameHint: "Lysholm" },
+    operating: { orgNr: "975381722", nameHint: "Arcus Norway" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr (storkonsern): Lysholm 881995832, operativ drift i Arcus Norway 975381722",
+  },
+  {
+    key: "njot-aga-sideri",
+    label: "Njot — terminal-mark, twin_link → Aga Sideri",
+    source: { orgNr: "928791432", nameHint: "Njot" },
+    operating: { orgNr: "933780929", nameHint: "Aga Sideri" },
+    evidenceClass: "holding_drift_i_annet_orgnr",
+    note: "holding drift i annet org.nr: Njot 928791432, operativ drift i Aga Sideri 933780929",
+  },
+  {
+    // Del C part 2 — NOT a §4a holding at all (no operating row exists to
+    // twin_link to); reuses this SAME terminal mechanism per the dev-
+    // request's own instruction ("same shape, different evidence class, no
+    // twin_link"). org.nr 987141662 was deleted (slettet) in 2024 per fresh
+    // Brreg research — this is the correct end-state, NOT a backfill target
+    // (the independent §4e attempt for this same row, GS_4E_ITEMS below,
+    // is expected to find no_brreg_candidate/backfilled_vetoed, which is
+    // itself the correct, honestly-reported outcome, not a bug).
+    key: "telemark-bryggeri",
+    label: "Telemark Bryggeri AS — org.nr slettet 2024, terminal-mark (no operating row / no twin_link)",
+    source: { orgNr: "987141662", nameHint: "Telemark Bryggeri AS" },
+    evidenceClass: "brreg_slettet",
+    note: "org.nr 987141662 slettet i Brønnøysundregistrene 2024 — ingen Brreg-kandidat, ingen operativ rad å twin_linke til",
+  },
+];
+
+function processGsRound2TerminalItem(db: Database.Database, item: GsRound2TerminalItem, ctx: Ctx): GsDrikkelisteRowResult[] {
+  const results: GsDrikkelisteRowResult[] = [];
+
+  const { row: sourceRow, reason: unresolvedReason } = resolveGs4aSource(db, item.source, ctx.claimed, item.operating?.nameHint);
+  if (!sourceRow) {
+    results.push({
+      category: "4a",
+      key: item.key,
+      label: item.label,
+      method: "none",
+      outcome: "unresolved",
+      reason: unresolvedReason ?? "source_not_found",
+    });
+    return results;
+  }
+  ctx.claimed.add(sourceRow.id);
+
+  const evidenceReason = `§4a round2 evidence_class=${item.evidenceClass}: ${item.label} — ${item.note}`;
+
+  if (sourceRow.terminal_status === "dod_kilde") {
+    results.push({
+      category: "4a",
+      key: item.key,
+      label: item.label,
+      method: "terminal_status",
+      provider_id: sourceRow.id,
+      outcome: "already_terminal",
+      reason: evidenceReason,
+    });
+  } else if (ctx.apply) {
+    const r = applyGardssalgSetTerminalStatus(sourceRow.id, "dod_kilde", evidenceReason, undefined);
+    results.push({
+      category: "4a",
+      key: item.key,
+      label: item.label,
+      method: "terminal_status",
+      provider_id: sourceRow.id,
+      outcome: r.ok ? "terminal_marked" : "error",
+      old_value: r.ok ? r.old_value : undefined,
+      new_value: r.ok ? r.new_value : undefined,
+      reason: r.ok ? evidenceReason : r.reason,
+    });
+  } else {
+    results.push({
+      category: "4a",
+      key: item.key,
+      label: item.label,
+      method: "terminal_status",
+      provider_id: sourceRow.id,
+      outcome: "would_terminal_mark",
+      old_value: sourceRow.terminal_status,
+      new_value: "dod_kilde",
+      reason: evidenceReason,
+    });
+  }
+
+  if (!item.operating) return results;
+
+  const operatingRow = resolveGs4aTarget(db, item.operating, ctx);
+  if (!operatingRow) {
+    results.push({
+      category: "4a",
+      key: item.key,
+      label: item.label,
+      method: "twin_link",
+      provider_id: sourceRow.id,
+      outcome: "unresolved",
+      reason: "operating_not_found",
+    });
+    return results;
+  }
+
+  const alreadyLinked = twinLinkAlreadyRecorded(db, sourceRow.id, operatingRow.id);
+  if (ctx.apply && !alreadyLinked) {
+    insertTwinLinkAudit(db, sourceRow.id, operatingRow.id, ctx.batchId, evidenceReason);
+  }
+  results.push({
+    category: "4a",
+    key: item.key,
+    label: item.label,
+    method: "twin_link",
+    provider_id: sourceRow.id,
+    new_value: operatingRow.id,
+    outcome: alreadyLinked ? "already_twin_linked" : ctx.apply ? "twin_linked" : "would_twin_link",
+    reason: evidenceReason,
+  });
+
+  return results;
+}
+
 // ── §4b — dod_kilde terminal-mark ────────────────────────────────────────
 
 type Gs4bCategory =
@@ -815,6 +1069,17 @@ interface Gs4cItem {
   label: string;
   nameHint: string;
   ambiguousByDesign?: boolean;
+  /**
+   * Round-2 addition (dev-request 2026-08-30-drikkeliste-remediering-runde-2,
+   * Del B): an explicit provider_id PAIR, checked before the name-based
+   * lookup (and before the ambiguousByDesign short-circuit — a pair given
+   * here means the ambiguity IS now resolved, so the by-design refusal no
+   * longer applies). Which of the two survives is still decided by
+   * pickSurvivor below exactly as for a name-resolved pair — providerIds
+   * only replaces HOW the two candidate rows are found, never the
+   * survivorship rule itself.
+   */
+  providerIds?: [string, string];
   note: string;
 }
 
@@ -832,13 +1097,28 @@ export const GS_4C_ITEMS: Gs4cItem[] = [
     nameHint: "Sognefjord Bryggeri",
     note: "§4c duplicate pair",
   },
-  { key: "druehagen", label: "Druehagen (duplicate pair)", nameHint: "Druehagen", note: "§4c duplicate pair" },
+  {
+    key: "druehagen",
+    label: "Druehagen (duplicate pair)",
+    nameHint: "Druehagen",
+    // Round 2 Del B: exactly 2 live name matches today (Druehagen Gård /
+    // Druehagen Drift) — resolved via providerIds for certainty even though
+    // the plain name lookup below would independently agree.
+    providerIds: ["59a17ff7-d786-4743-bb4f-56853d09233f", "f38c3280-25c3-4ed3-932b-0fc913a8bc9c"],
+    note: "§4c duplicate pair",
+  },
   { key: "torst", label: "Tørst (duplicate pair)", nameHint: "Tørst", note: "§4c duplicate pair" },
   {
     key: "fjellbryggeriet-leftover-pair",
     label: "Fjellbryggeriet leftover duplicate pair (DIFFERENT from the §4a DA→AS remap)",
     nameHint: "Fjellbryggeriet",
     ambiguousByDesign: true,
+    // Round 2 Del B: the two rows left over after §4a's own Fjellbryggeriet
+    // DA→AS merge already landed are now unambiguously identifiable live
+    // (32fd77ac is that merge's own survivor — org_nr 916476450 — with a
+    // second, still-separate blank-org_nr duplicate, 7d2bfb81) — providerIds
+    // overrides the ambiguousByDesign refusal above.
+    providerIds: ["7d2bfb81-41fc-41cb-b815-1f960e57c3fb", "32fd77ac-d490-4873-bbe7-650a64ae54f4"],
     note:
       "§4c leftover duplicate ROW pair, DIFFERENT from §4a's Fjellbryggeriet DA→AS holding remap — the name " +
       "collision makes which two rows this refers to genuinely ambiguous; reported unresolved BY DESIGN rather " +
@@ -847,6 +1127,47 @@ export const GS_4C_ITEMS: Gs4cItem[] = [
 ];
 
 function processGs4cItem(db: Database.Database, item: Gs4cItem, ctx: Ctx): GsDrikkelisteRowResult {
+  if (item.providerIds) {
+    const [idA, idB] = item.providerIds;
+    const rowA = findById(db, idA);
+    const rowB = findById(db, idB);
+    if (!rowA || !rowB) {
+      return {
+        category: "4c",
+        key: item.key,
+        label: item.label,
+        method: "none",
+        outcome: "unresolved",
+        reason: "provider_id_not_found",
+      };
+    }
+    if (ctx.claimed.has(rowA.id) || ctx.claimed.has(rowB.id)) {
+      return {
+        category: "4c",
+        key: item.key,
+        label: item.label,
+        method: "none",
+        outcome: "unresolved",
+        reason: "provider_id_already_claimed",
+      };
+    }
+    const { keep, remove } = pickSurvivor(rowA, rowB);
+    ctx.claimed.add(remove.id);
+    ctx.claimed.add(keep.id);
+    const mergeResult = ctx.apply
+      ? applyGardssalgProviderMergePair(db, remove.id, keep.id, item.note, ctx.batchId)
+      : previewGardssalgProviderMergePair(db, remove.id, keep.id);
+    return {
+      category: "4c",
+      key: item.key,
+      label: item.label,
+      method: "merge",
+      remove_id: remove.id,
+      keep_id: keep.id,
+      outcome: mergeResult.outcome,
+      reason: mergeResult.reason ?? item.note,
+    };
+  }
   if (item.ambiguousByDesign) {
     return {
       category: "4c",
@@ -895,6 +1216,12 @@ interface Gs4dItem {
   resolveBy: "name" | "website";
   hint: string;
   newValue: string | null;
+  /**
+   * Round-2 addition (dev-request 2026-08-30-drikkeliste-remediering-runde-2,
+   * Del B): explicit provider_id, checked before the resolveBy/hint lookup.
+   * Same rationale as Gs4aSourceSelector.providerId above.
+   */
+  providerId?: string;
   note: string;
 }
 
@@ -928,6 +1255,12 @@ export const GS_4D_ITEMS: Gs4dItem[] = [
     label: "Ulvik Frukt & Cideri",
     resolveBy: "name",
     hint: "Ulvik Frukt",
+    // Round 2 Del B: "Ulvik Frukt" name-matches 3 live rows — resolved via
+    // providerId instead, cross-checked against the WRONG stored site itself
+    // (a providers/by-hjemmeside lookup for "aldesider.no" returns exactly
+    // this one row) — the strongest possible confirmation for this specific
+    // correction (the row IS the one carrying the wrong site to be nulled).
+    providerId: "5fda0eed-f7ba-4653-b663-0f33345ce942",
     newValue: null,
     note: "§4d: stored aldesider.no belongs to a different producer — null it",
   },
@@ -952,6 +1285,14 @@ export const GS_4D_ITEMS: Gs4dItem[] = [
     label: "Marlobobo.no",
     resolveBy: "website",
     hint: "marlobobo.no",
+    // Round 2 Del B: the live row's hjemmeside no longer contains
+    // "marlobobo" at all (by-hjemmeside now returns zero matches — likely
+    // already partially cleared or reformatted since the report was
+    // written), so the website-substring lookup this item was designed
+    // around no longer finds it. It IS still the sole live name match for
+    // "Marlobobo" catalog-wide ("Marlobobos") — resolved via providerId on
+    // that basis.
+    providerId: "b66d6bf7-67c8-4726-b765-f5a35fdab622",
     newValue: null,
     note: "§4d dead site (expired): funnet død — null it",
   },
@@ -976,18 +1317,33 @@ export const GS_4D_ITEMS: Gs4dItem[] = [
 ];
 
 function processGs4dItemWithCtx(db: Database.Database, item: Gs4dItem, ctx: Ctx): GsDrikkelisteRowResult {
-  const candidates = item.resolveBy === "name" ? findByNameContains(db, item.hint, {}) : findByWebsiteContains(db, item.hint);
-  if (candidates.length !== 1) {
-    return {
-      category: "4d",
-      key: item.key,
-      label: item.label,
-      method: "none",
-      outcome: "unresolved",
-      reason: `expected_1_row_found_${candidates.length}`,
-    };
+  let row: ProviderSnapshot | null;
+  if (item.providerId) {
+    row = findById(db, item.providerId);
+    if (!row) {
+      return {
+        category: "4d",
+        key: item.key,
+        label: item.label,
+        method: "none",
+        outcome: "unresolved",
+        reason: "provider_id_not_found",
+      };
+    }
+  } else {
+    const candidates = item.resolveBy === "name" ? findByNameContains(db, item.hint, {}) : findByWebsiteContains(db, item.hint);
+    if (candidates.length !== 1) {
+      return {
+        category: "4d",
+        key: item.key,
+        label: item.label,
+        method: "none",
+        outcome: "unresolved",
+        reason: `expected_1_row_found_${candidates.length}`,
+      };
+    }
+    row = candidates[0];
   }
-  const row = candidates[0];
   if (ctx.apply) {
     const r = applyGardssalgSetHjemmeside(row.id, item.newValue, item.note, undefined);
     return {
@@ -1022,18 +1378,51 @@ interface Gs4eItem {
   label: string;
   nameHint: string;
   expectedOrgNr: string;
+  /**
+   * Round-2 addition (dev-request 2026-08-30-drikkeliste-remediering-runde-2,
+   * Del B): explicit provider_id, checked before the exact-1-name-match
+   * lookup. Same rationale as Gs4aSourceSelector.providerId above.
+   */
+  providerId?: string;
   note: string;
 }
 
 export const GS_4E_ITEMS: Gs4eItem[] = [
-  { key: "killi-mikrobryggeri", label: "Killi Mikrobryggeri", nameHint: "Killi Mikrobryggeri", expectedOrgNr: "924960884", note: "§4e" },
+  {
+    key: "killi-mikrobryggeri",
+    label: "Killi Mikrobryggeri",
+    nameHint: "Killi Mikrobryggeri",
+    expectedOrgNr: "924960884",
+    // Round 2 Del B: "Killi Mikrobryggeri" name-matches 2 live rows (round 1
+    // expected exactly 1). The other match already carries org_nr 924960884
+    // (this item's own expected value) — this row is its blank-org_nr
+    // duplicate in the SAME live dedup-audit group, so it is the one
+    // genuinely missing the backfill.
+    providerId: "8abf2877-a5c0-4acb-8089-5105d627aa90",
+    note: "§4e",
+  },
   { key: "fossmoen-frukt", label: "Fossmoen Frukt", nameHint: "Fossmoen Frukt", expectedOrgNr: "986427538", note: "§4e" },
-  { key: "hunsfos-bryggeri", label: "Hunsfos Bryggeri", nameHint: "Hunsfos Bryggeri", expectedOrgNr: "913052803", note: "§4e" },
+  {
+    key: "hunsfos-bryggeri",
+    label: "Hunsfos Bryggeri",
+    nameHint: "Hunsfos Bryggeri",
+    expectedOrgNr: "913052803",
+    // Round 2 Del B: same shape as Killi above — 2 live name matches, the
+    // sibling row already carries this item's expected org_nr.
+    providerId: "1c43bbdb-0434-468f-9bb6-dab89e76ad16",
+    note: "§4e",
+  },
   {
     key: "trondhjem-mikrobryggeri",
     label: "Trondhjem Mikrobryggeri",
     nameHint: "Trondhjem Mikrobryggeri",
     expectedOrgNr: "979740360",
+    // Round 2 Del B: 4 live name matches (round 1 expected exactly 1). Two
+    // are excluded from the live dedup-audit's grouping entirely (distinct
+    // spelling/legal-form variants, recognised as separate entities); of the
+    // remaining two, one already carries this item's expected org_nr and the
+    // other is its blank-org_nr dedup-grouped duplicate — that one is this id.
+    providerId: "0995b7f3-8fc7-4ff1-9b0b-612e5fa31ed2",
     note: "§4e",
   },
   {
@@ -1060,19 +1449,35 @@ async function processGs4eItem(
   item: Gs4eItem,
   ctx: { apply: boolean; callBackfill: GardssalgOrgnrBackfillCaller },
 ): Promise<GsDrikkelisteRowResult> {
-  const candidates = findByNameContains(db, item.nameHint, {});
-  if (candidates.length !== 1) {
-    return {
-      category: "4e",
-      key: item.key,
-      label: item.label,
-      method: "none",
-      outcome: "unresolved",
-      expected_value: item.expectedOrgNr,
-      reason: `expected_1_row_found_${candidates.length}`,
-    };
+  let row: ProviderSnapshot | null;
+  if (item.providerId) {
+    row = findById(db, item.providerId);
+    if (!row) {
+      return {
+        category: "4e",
+        key: item.key,
+        label: item.label,
+        method: "none",
+        outcome: "unresolved",
+        expected_value: item.expectedOrgNr,
+        reason: "provider_id_not_found",
+      };
+    }
+  } else {
+    const candidates = findByNameContains(db, item.nameHint, {});
+    if (candidates.length !== 1) {
+      return {
+        category: "4e",
+        key: item.key,
+        label: item.label,
+        method: "none",
+        outcome: "unresolved",
+        expected_value: item.expectedOrgNr,
+        reason: `expected_1_row_found_${candidates.length}`,
+      };
+    }
+    row = candidates[0];
   }
-  const row = candidates[0];
   if (row.org_nr && row.org_nr.trim()) {
     return {
       category: "4e",
@@ -1130,6 +1535,106 @@ async function processGs4eItem(
   };
 }
 
+// ── §4e round 2 — postal-code data-input fix for a previously-vetoed backfill ─
+//
+// dev-request 2026-08-30-drikkeliste-remediering-runde-2, Del C part 1
+// (daniel_authorized). §4e's org.nr-backfill route (POST /admin/gardssalg-
+// orgnr-backfill) vetoes any candidate that fails gardssalgOrgnrPostalCorroborated
+// (experience-store.ts) — that gate compares the PROVIDER ROW'S OWN stored
+// postnummer/poststed against the Brreg candidate's postal fields, never a
+// caller-supplied value, so a row with a blank postnummer/poststed can never
+// pass it (per Daniel's "ved tvil: ikke skriv" — there being nothing to
+// corroborate against is treated as no corroboration, not a free pass). This
+// confirms the fix Daniel authorized IS a data-input fix, not a gate-logic
+// change: hardanger-handbryggeri's postnummer/poststed are blank live today
+// (its queued org_nr-review-queue entry was vetoed with reason
+// "heuristic_name_requires_postal_match" — nothing to corroborate against),
+// but fresh Brreg/proff research (2026-08-29) found its real forretnings-
+// adresse (Børve, 5773 Hovland) — supplying THAT via the EXISTING fill-only
+// address writer (applyGardssalgProviderAddress, experience-store.ts — the
+// SAME lever §3's address-enrichment slice already uses; no new writer) gives
+// the gate real data to check the next time §4e's backfill call runs for
+// this row. Whether that then actually lands on the report's expected
+// org.nr (915218857) is for §4e's own existing cross-check (GS_4E_ITEMS'
+// hardanger-handbryggeri entry, unchanged) to report — this step's only job
+// is supplying the correct postal input, never re-deciding what counts as a
+// match.
+//
+// Fill-only (applyGardssalgProviderAddress only ever writes a currently-BLANK
+// field) — idempotent by construction: a second run against an
+// already-filled row writes nothing further.
+
+interface GsRound2PostalPrefillItem {
+  key: string;
+  label: string;
+  providerId: string;
+  adresse?: string;
+  postnummer: string;
+  poststed: string;
+  note: string;
+}
+
+export const GS_ROUND2_POSTAL_PREFILL_ITEMS: GsRound2PostalPrefillItem[] = [
+  {
+    key: "hardanger-handbryggeri-postal",
+    label: "Hardanger Handbryggeri — postal data-input fix for the vetoed §4e backfill",
+    providerId: "8c2e422c-2d40-45c2-ba61-588faac2755a",
+    adresse: "Børve",
+    postnummer: "5773",
+    poststed: "Hovland",
+    note:
+      "round2 Del C: forretningsadresse Børve, 5773 Hovland per fresh Brreg/proff research 2026-08-29 — " +
+      "supplies the postal-corroboration gate's missing input for the org.nr 915218857 backfill",
+  },
+];
+
+function processGsRound2PostalPrefillItem(
+  db: Database.Database,
+  item: GsRound2PostalPrefillItem,
+  ctx: { apply: boolean; batchId: string },
+): GsDrikkelisteRowResult {
+  const row = findById(db, item.providerId);
+  if (!row) {
+    return {
+      category: "4e",
+      key: item.key,
+      label: item.label,
+      method: "none",
+      outcome: "unresolved",
+      reason: "provider_id_not_found",
+    };
+  }
+  const evidenceUrl = `${GS_DRIKKELISTE_REMEDIATION_MARKER}#round2-postal-prefill`;
+  if (!ctx.apply) {
+    return {
+      category: "4e",
+      key: item.key,
+      label: item.label,
+      method: "none",
+      provider_id: row.id,
+      outcome: "would_postal_prefill",
+      new_value: `${item.adresse ?? ""}, ${item.postnummer} ${item.poststed}`.trim(),
+      reason: item.note,
+    };
+  }
+  const written = applyGardssalgProviderAddress(
+    item.providerId,
+    { adresse: item.adresse, postnummer: item.postnummer, poststed: item.poststed },
+    evidenceUrl,
+    ctx.batchId,
+  );
+  return {
+    category: "4e",
+    key: item.key,
+    label: item.label,
+    method: "none",
+    provider_id: item.providerId,
+    outcome: written.length > 0 ? "postal_prefilled" : "already_filled",
+    new_value: written.length > 0 ? written.join(",") : undefined,
+    reason: item.note,
+  };
+}
+
 // ── Top-level orchestrator ───────────────────────────────────────────────
 
 export interface GardssalgDrikkelisteRemediationReport {
@@ -1165,9 +1670,20 @@ export async function runGardssalgDrikkelisteRemediation(
 
   const results: GsDrikkelisteRowResult[] = [];
   for (const item of GS_4A_ITEMS) results.push(...processGs4aItem(db, item, ctx));
+  // Round 2 Del A + Del C part 2 — runs right after §4a proper (same
+  // category, same "holding/dead-source, terminal-mark instead of merge"
+  // shape) and BEFORE §4b, so Telemark Bryggeri's §4b entry below sees an
+  // already-terminal row on the very same run (already_terminal, no
+  // duplicate write) rather than racing it — both entries targeting the
+  // same row is intentional (see GS_ROUND2_TERMINAL_ITEMS' own doc comment).
+  for (const item of GS_ROUND2_TERMINAL_ITEMS) results.push(...processGsRound2TerminalItem(db, item, ctx));
   for (const item of GS_4B_ITEMS) results.push(processGs4bItem(db, item, ctx));
   for (const item of GS_4C_ITEMS) results.push(processGs4cItem(db, item, ctx));
   for (const item of GS_4D_ITEMS) results.push(processGs4dItemWithCtx(db, item, ctx));
+  // Round 2 Del C part 1 — runs BEFORE §4e proper so hardanger-handbryggeri's
+  // postal fields are already filled (under apply) by the time §4e's own
+  // backfill call for that same row runs later in this loop.
+  for (const item of GS_ROUND2_POSTAL_PREFILL_ITEMS) results.push(processGsRound2PostalPrefillItem(db, item, ctx));
   for (const item of GS_4E_ITEMS) results.push(await processGs4eItem(db, item, { apply, callBackfill: opts.callBackfill }));
 
   const afterCount = (db.prepare(`SELECT COUNT(*) AS n FROM experience_providers`).get() as { n: number }).n;
