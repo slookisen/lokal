@@ -8348,6 +8348,24 @@ export function applyGardssalgBrregVerified(
  * manual/claim-lås som alle andre skriveveier i denne fila. Samme
  * transaksjon+audit+field_provenance-mønster som naboen over — bare
  * begrenset til én kolonne.
+ *
+ * dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall: FØR
+ * denne endringen var et Brreg-svar med `antallAnsatte === null` et RENT
+ * no-op her — ingen kolonne, ingen audit-rad, ingen field_provenance-stempel
+ * — så et ekte Brreg-oppslag som kom tomt hjem etterlot seg null spor i
+ * databasen (målt: Ægir Bryggeri AS' refresh 29.8, batch
+ * brreg-verify-20260829-…, se dev-requestens §-referanse). Størrelsesgatens
+ * nye null-splitt trenger nettopp et «Brreg ble faktisk spurt»-signal for å
+ * skille dette fra «aldri konsultert» — så denne grenen stempler NÅ
+ * field_provenance.antall_ansatte (samme nøkkel, samme {source_url,
+ * fetched_at}-form som applyGardssalgBrregVerified over ALLEREDE stempler
+ * ubetinget på førstegangsverifisering) selv når figuren er null, UTEN å
+ * skrive til antall_ansatte-kolonnen (den er og blir null — ingen endring i
+ * "hva vi vet") og UTEN en audit-rad (ingen kolonneverdi endret seg — samme
+ * asymmetri som naboen over allerede har mellom field_provenance-stempling
+ * og audit/`written`, som kun sporer faktiske kolonneendringer). Returnerer
+ * fortsatt `[]` — kontrakten "tomt array = ingen kolonne skrevet" er
+ * uendret; kun DB-raden er beriket.
  */
 export function applyGardssalgBrregEmployeesRefresh(
   providerId: string,
@@ -8374,7 +8392,31 @@ export function applyGardssalgBrregEmployeesRefresh(
   if (row.content_source === "manual" || row.content_source === "claim") return [];
   if (row.brreg_verified !== 1) return [];
   if (row.antall_ansatte !== null && row.antall_ansatte !== undefined) return [];
-  if (antallAnsatte === null || antallAnsatte === undefined) return [];
+
+  if (antallAnsatte === null || antallAnsatte === undefined) {
+    // Brreg WAS consulted (this function only ever runs a real verifyFn
+    // call before reaching here — see the route caller) and genuinely has
+    // no figure for this org. Stamp the consulted signal so the size-gate's
+    // null-split can tell this apart from "never consulted" — see this
+    // function's own doc comment above. antall_ansatte itself stays NULL;
+    // no audit row (no column value changed).
+    let noFigureProvenance: Record<string, { source_url: string; fetched_at: string }> = {};
+    if (row.field_provenance) {
+      try {
+        const parsed = JSON.parse(row.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          noFigureProvenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty rather than clobber the write */
+      }
+    }
+    noFigureProvenance["antall_ansatte"] = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+    db.prepare(
+      `UPDATE experience_providers SET field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`,
+    ).run({ id: providerId, field_provenance: JSON.stringify(noFigureProvenance) });
+    return [];
+  }
 
   let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
   if (row.field_provenance) {

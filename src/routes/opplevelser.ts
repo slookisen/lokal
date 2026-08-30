@@ -2986,6 +2986,40 @@ export function isGardssalgSecondLineVerified(fieldProvenanceRaw: string | null)
   }
 }
 
+/**
+ * dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall: the
+ * "Brreg-consulted" signal the size-gate's null-classification split needs
+ * to tell "never consulted" (case a — stays "ukjent") apart from "Brreg WAS
+ * asked and the register has no figure" (case b — classifies "liten"). This
+ * REUSES the existing field_provenance.antall_ansatte stamp rather than a
+ * new column: applyGardssalgBrregVerified (first-time verify) already
+ * writes it unconditionally whenever a Brreg response was received, figure
+ * or not — see that function's own doc comment. applyGardssalgBrreg
+ * EmployeesRefresh (the already-verified-row refresh path) previously did
+ * NOT write it on a null figure (a pure no-op) — this dev-request's PR
+ * closed that gap in experience-store.ts so a genuine refresh that comes
+ * back empty is no longer invisible to the classifier. Fail-closed, same
+ * shape/contract as isHjemmesideVerified/isGardssalgSecondLineVerified
+ * above: any ambiguity (missing field_provenance, malformed JSON, missing/
+ * malformed entry, no fetched_at) resolves to "not consulted", never to
+ * "assume consulted" — a row can only ever be reclassified off the
+ * fail-safe "ukjent" default by a POSITIVELY confirmed Brreg response.
+ */
+export function isGardssalgAntallAnsatteBrregConsulted(fieldProvenanceRaw: string | null): boolean {
+  if (!fieldProvenanceRaw) return false;
+  try {
+    const parsed = JSON.parse(fieldProvenanceRaw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const entry = (parsed as Record<string, unknown>).antall_ansatte as
+      | { source_url?: unknown; fetched_at?: unknown }
+      | undefined;
+    if (!entry || typeof entry !== "object") return false;
+    return typeof entry.fetched_at === "string" && entry.fetched_at.length > 0;
+  } catch {
+    return false; // malformed existing JSON -> fail closed, never treat as consulted
+  }
+}
+
 // dev-request 2026-08-24-evidence-url-verifisering-gate: `experiences.
 // evidence_url` (the citation a specific EXPERIENCE row carries — "this
 // is where we found proof this experience/supplier is real") had the exact
@@ -13770,6 +13804,7 @@ import {
   getGardssalgSizeGateConfig,
   setGardssalgSizeGateConfig,
   type GardssalgSizeFlag,
+  type GardssalgSizeFlagReason,
 } from "../services/gardssalg-outreach-size-gate";
 
 // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2 — the gårdssalg
@@ -14169,6 +14204,13 @@ function computeGardssalgReadinessRows(
   // signal on every row, always, even when the gate itself is toggled off.
   antall_ansatte: number | null;
   size_flag: GardssalgSizeFlag;
+  // dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall:
+  // WHICH rule cleared a null-antall_ansatte row to "liten" — never silent,
+  // same disclosure discipline as large_company_excluded/max_touch_
+  // suppressed elsewhere in this vertical. null whenever size_flag isn't
+  // "liten"-via-this-rule (includes every "stor"/"ukjent" row, and every
+  // ordinary "liten" row cleared by an actual registered figure).
+  size_flag_reason: GardssalgSizeFlagReason;
 }> {
   let rows: Array<{
     id: string;
@@ -14302,7 +14344,17 @@ function computeGardssalgReadinessRows(
     const has_duplicate_conflict = duplicateConflictProducerIds.has(p.id);
     const name_token_conflict_candidate = nameTokenConflictCandidateIds.has(p.id);
     const brreg_verified = p.brreg_verified === 1;
-    const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold);
+    // dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall:
+    // read the Brreg-consulted signal from field_provenance BEFORE
+    // classifying, so a null antall_ansatte with a confirmed empty Brreg
+    // response clears to "liten" instead of the fail-safe "ukjent" — see
+    // isGardssalgAntallAnsatteBrregConsulted's own doc comment. Irrelevant
+    // (never read) whenever antall_ansatte already holds a registered
+    // figure — those rows are byte-identical to before this dev-request.
+    const antallAnsatteBrregConsulted =
+      p.antall_ansatte === null && isGardssalgAntallAnsatteBrregConsulted(p.field_provenance);
+    const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold, antallAnsatteBrregConsulted);
+    const size_flag_reason: GardssalgSizeFlagReason = antallAnsatteBrregConsulted ? "no_registered_figure" : null;
     const terminal_status =
       p.terminal_status === "krever_eier" || p.terminal_status === "dod_kilde" ? p.terminal_status : null;
 
@@ -14371,6 +14423,7 @@ function computeGardssalgReadinessRows(
       epost: p.epost,
       antall_ansatte: p.antall_ansatte,
       size_flag,
+      size_flag_reason,
     };
   });
 }

@@ -286,6 +286,15 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
           exists: true, active: true, name: "FERSK MED FLAGG AS",
           nace: ["11.050"], registrertDato: "2018-01-01", slettetDato: null, flag: null, employees: 30,
         },
+        // dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall:
+        // the Ægir-shape refresh answer — org exists/active, Brreg has NO
+        // registered employee figure at all (employees explicitly null, not
+        // just omitted — mirrors verifyOrgNumber()'s real return shape for
+        // an org with no Aa-melding-derived count).
+        "666777888": {
+          exists: true, active: true, name: "ÆGIR-TYPE BRYGGERI AS",
+          nace: ["11.050"], registrertDato: "2019-01-01", slettetDato: null, flag: null, employees: null,
+        },
       };
       const calls: string[] = [];
       expStore.__setGardssalgBrregVerifyForTesting(async (orgNr: string) => {
@@ -425,6 +434,22 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
         brreg_active: 0,
         field_provenance: null,
       });
+      // dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-registrert-tall
+      // (AK16 below): already-verified, antall_ansatte still NULL — exactly
+      // the Ægir Bryggeri shape, where Brreg is consulted via refreshEmployees
+      // but genuinely has no employee figure to report.
+      insertProvider.run({
+        id: "bv-refresh-nofigure",
+        navn: "Ægir-Type Refresh AS",
+        org_nr: "666777888",
+        kommune: "Flåm",
+        rfb_seed_source: "rfb-seed",
+        producer_type: null,
+        content_source: null,
+        brreg_verified: 1,
+        brreg_active: 1,
+        field_provenance: null,
+      });
       insertProvider.run({
         id: "bv-locked-done",
         navn: "Låst Og Ferdig",
@@ -549,6 +574,102 @@ export function runOpplevelserGardssalgBrregVerifyTests(opts: { log?: boolean } 
         .prepare(`SELECT antall_ansatte FROM experience_providers WHERE id = 'bv-locked-done'`)
         .get() as { antall_ansatte: number | null };
       assertEq(lockedDoneRow.antall_ansatte, null, "(g) AK15: locked row's antall_ansatte never written");
+
+      // ── AK16 (dev-request 2026-08-30-stoerrelsesgate-ukjent-uten-
+      // registrert-tall): a refreshEmployees run where Brreg genuinely has
+      // NO figure (the Ægir Bryggeri shape) must no longer be a pure no-op —
+      // it must persist a "Brreg was consulted" signal via
+      // field_provenance.antall_ansatte, so the size-gate's null-split can
+      // classify it "liten" later. antall_ansatte itself stays NULL and NO
+      // audit row is written (no column value changed) — same contract as
+      // before this dev-request, just no longer silent about the consult.
+      const auditCountBeforeRefresh = (
+        expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = 'bv-refresh-nofigure'`).get() as {
+          n: number;
+        }
+      ).n;
+      const refreshNoFigure = await callRoute(opplevelserRouter, {
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["bv-refresh-nofigure"], refreshEmployees: true, apply: true },
+      });
+      assertEq(
+        (refreshNoFigure.body.employees_refreshed as Array<{ provider_id: string; antall_ansatte: number | null; fields_written: string[] }>)
+          .find((r) => r.provider_id === "bv-refresh-nofigure"),
+        { provider_id: "bv-refresh-nofigure", navn: "Ægir-Type Refresh AS", org_nr: "666777888", brreg_name: "ÆGIR-TYPE BRYGGERI AS", antall_ansatte: null, fields_written: [] },
+        "(g) AK16 a: employees_refreshed reports antall_ansatte:null, fields_written:[] — the column-write contract is UNCHANGED",
+      );
+      const noFigureRowAfter = expDb
+        .prepare(`SELECT antall_ansatte, field_provenance FROM experience_providers WHERE id = 'bv-refresh-nofigure'`)
+        .get() as { antall_ansatte: number | null; field_provenance: string | null };
+      assertEq(noFigureRowAfter.antall_ansatte, null, "(g) AK16 b: antall_ansatte column stays NULL — no figure was invented");
+      assertTrue(!!noFigureRowAfter.field_provenance, "(g) AK16 c: field_provenance is no longer null — the consult is now recorded");
+      const noFigureProvenanceParsed = JSON.parse(noFigureRowAfter.field_provenance ?? "{}");
+      assertTrue(
+        typeof noFigureProvenanceParsed?.antall_ansatte?.fetched_at === "string" &&
+          noFigureProvenanceParsed.antall_ansatte.fetched_at.length > 0,
+        "(g) AK16 d: field_provenance.antall_ansatte.fetched_at is stamped — this is the size-gate's Brreg-consulted signal",
+      );
+      assertEq(
+        noFigureProvenanceParsed?.antall_ansatte?.source_url,
+        "https://data.brreg.no/enhetsregisteret/api/enheter/666777888",
+        "(g) AK16 e: field_provenance.antall_ansatte.source_url is the actual Brreg evidence URL",
+      );
+      const auditCountAfterRefresh = (
+        expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = 'bv-refresh-nofigure'`).get() as {
+          n: number;
+        }
+      ).n;
+      assertEq(
+        auditCountAfterRefresh,
+        auditCountBeforeRefresh,
+        "(g) AK16 f: NO audit row written — no column value changed, only field_provenance (same asymmetry the neighboring function already has)",
+      );
+
+      // Direct store-function call (mirrors AK13's own-function-level proof
+      // style): the same no-figure refresh is idempotent — calling it twice
+      // never writes a second audit row and never touches the antall_ansatte
+      // column.
+      const secondNoFigureWritten = expStore.applyGardssalgBrregEmployeesRefresh(
+        "bv-refresh-nofigure",
+        "https://data.brreg.no/enhetsregisteret/api/enheter/666777888",
+        "test-batch-2",
+        null,
+      );
+      assertEq(secondNoFigureWritten, [], "(g) AK16 g: a second no-figure refresh still returns [] (idempotent, no column write)");
+      const auditCountAfterSecondRefresh = (
+        expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_content_audit WHERE provider_id = 'bv-refresh-nofigure'`).get() as {
+          n: number;
+        }
+      ).n;
+      assertEq(auditCountAfterSecondRefresh, auditCountBeforeRefresh, "(g) AK16 h: still no audit row after a second no-figure refresh");
+      const noFigureRowUnchanged = expDb
+        .prepare(`SELECT antall_ansatte FROM experience_providers WHERE id = 'bv-refresh-nofigure'`)
+        .get() as { antall_ansatte: number | null };
+      assertEq(noFigureRowUnchanged.antall_ansatte, null, "(g) AK16 i: antall_ansatte still NULL after a second no-figure refresh");
+
+      // A row that is NEVER routed through the refresh path at all (e.g.
+      // brreg_verified !== 1, or locked) must NOT gain the consulted
+      // signal — proven directly against the store function, same
+      // early-return checks as before this dev-request.
+      const neverVerifiedNoFigureWritten = expStore.applyGardssalgBrregEmployeesRefresh(
+        "bv-noorg",
+        "https://data.brreg.no/enhetsregisteret/api/enheter/913936507",
+        "test-batch-3",
+        null,
+      );
+      assertEq(
+        neverVerifiedNoFigureWritten,
+        [],
+        "(g) AK16 j: an unverified row is still a pure no-op for the refresh path (brreg_verified !== 1 gate unchanged)",
+      );
+      const neverVerifiedRow = expDb
+        .prepare(`SELECT field_provenance FROM experience_providers WHERE id = 'bv-noorg'`)
+        .get() as { field_provenance: string | null };
+      assertEq(
+        neverVerifiedRow.field_provenance,
+        null,
+        "(g) AK16 k: an unverified row's field_provenance stays untouched — the new consulted-stamp only ever fires on the refresh path's normal candidates",
+      );
 
       expStore.__setGardssalgBrregVerifyForTesting(null);
       return { passed, failed, failures };
