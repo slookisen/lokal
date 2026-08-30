@@ -50,6 +50,16 @@ const SECOND_LINE_JUDGE_REJECT_TOKEN = "AVVIS";
 // model, not the whole prompt.
 const SECOND_LINE_JUDGE_ABOUT_CHAR_CAP = 4000;
 const SECOND_LINE_JUDGE_PRODUCTS_CHAR_CAP = 1000;
+// Del D (dev-request 2026-08-29-gs-second-line-kildeklasse-bredde): caps for
+// the OPTIONAL caller-fetched evidence block below. This module still never
+// fetches anything itself — evidence, when present, was already fetched by
+// the caller (see this file's header comment) and is only rendered here.
+const SECOND_LINE_JUDGE_EVIDENCE_MAX_ITEMS = 5;
+const SECOND_LINE_JUDGE_EVIDENCE_EXCERPT_CHAR_CAP = 2000;
+// Round-2 review fix-up: source_url had no cap at all (only .trim()) —
+// mirrors the route's own 500-char source_url cap (src/routes/opplevelser.ts,
+// sanitizeEvidenceForId) for defense-in-depth at this module's boundary too.
+const SECOND_LINE_JUDGE_EVIDENCE_SOURCE_URL_CHAR_CAP = 500;
 
 /** Human-readable Norwegian label for each accepted-source key
  *  computeSecondLineIdentitySources (lokal-agent-verifier.ts) can produce —
@@ -85,6 +95,40 @@ function stringifyProducts(products: unknown[]): string {
   return parts.join(", ").slice(0, SECOND_LINE_JUDGE_PRODUCTS_CHAR_CAP);
 }
 
+/** Sanitizes the (optional) caller-fetched evidence for rendering — at most
+ *  SECOND_LINE_JUDGE_EVIDENCE_MAX_ITEMS items, each source_url capped at
+ *  SECOND_LINE_JUDGE_EVIDENCE_SOURCE_URL_CHAR_CAP chars and each excerpt
+ *  trimmed and capped at SECOND_LINE_JUDGE_EVIDENCE_EXCERPT_CHAR_CAP chars.
+ *  Items whose excerpt is empty/whitespace-only after trimming are dropped —
+ *  defense-in-depth mirroring the route's own sanitizeEvidenceForId, since
+ *  this is a module boundary other callers could reach directly. Returns []
+ *  for missing/empty input. */
+function sanitizedEvidenceItems(
+  evidence?: readonly { source_url: string; content_excerpt: string }[],
+): { source_url: string; content_excerpt: string }[] {
+  if (!evidence || evidence.length === 0) return [];
+  return evidence
+    .slice(0, SECOND_LINE_JUDGE_EVIDENCE_MAX_ITEMS)
+    .map((e) => ({
+      source_url: (e.source_url || "").trim().slice(0, SECOND_LINE_JUDGE_EVIDENCE_SOURCE_URL_CHAR_CAP),
+      content_excerpt: (e.content_excerpt || "").trim().slice(0, SECOND_LINE_JUDGE_EVIDENCE_EXCERPT_CHAR_CAP),
+    }))
+    .filter((e) => e.content_excerpt.length > 0);
+}
+
+/** Renders the caller-fetched evidence block for the prompt, INCLUDING its
+ *  own leading/trailing blank lines — empty ONLY when `items` is empty. The
+ *  caller (judgeSecondLineProfile) splices this in as-is; when it is the
+ *  empty string, the surrounding template collapses back to exactly the
+ *  pre-Del-D prompt text (no "Fremlagt kildeinnhold" label, no trace of this
+ *  block at all) — this, not a fallback placeholder line, is what keeps the
+ *  no-evidence path byte-identical to before Del D. */
+function evidenceBlockFor(items: readonly { source_url: string; content_excerpt: string }[]): string {
+  if (items.length === 0) return "";
+  const lines = items.map((e) => `- ${e.source_url}: "${e.content_excerpt}"`).join("\n");
+  return `\nFremlagt kildeinnhold (hentet av kalleren fra kilden(e) over, til direkte kontroll):\n${lines}\n`;
+}
+
 /**
  * judgeSecondLineProfile — the whole-profile LLM judge behind RFB's second
  * verification line. Direct fetch to https://api.anthropic.com/v1/messages,
@@ -100,6 +144,7 @@ export async function judgeSecondLineProfile(params: {
   email: string;
   acceptedSources: readonly string[];
   brregName?: string | null;
+  evidence?: readonly { source_url: string; content_excerpt: string }[];
 }): Promise<SecondLineProfileJudgeVerdict> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -109,6 +154,14 @@ export async function judgeSecondLineProfile(params: {
   const aboutCapped = (params.about || "").trim().slice(0, SECOND_LINE_JUDGE_ABOUT_CHAR_CAP);
   const productsText = stringifyProducts(params.products);
   const sourceText = sourceLabelsFor(params.acceptedSources);
+  const evidenceItems = sanitizedEvidenceItems(params.evidence);
+  const evidenceBlock = evidenceBlockFor(evidenceItems);
+  // Criterion 5 only exists when there is real evidence to weigh — absent it,
+  // the numbered list must stay 1-4, exactly as it read before Del D.
+  const evidenceCriterion =
+    evidenceItems.length > 0
+      ? "5. Dersom kildeinnhold er fremlagt over: vurder om DET innholdet faktisk nevner/støtter denne produsenten, stedet eller organisasjonsnummeret — ikke bare at kildeklassen i seg selv utløste vurderingen.\n"
+      : "";
 
   const prompt = `Du er en identitetsdommer for en norsk markedsplattform som kobler forbrukere direkte med lokale matprodusenter (Rett fra Bonden). Denne produsenten besto IKKE plattformens ordinære (førstelinje) verifisering — vanligvis fordi produsenten ikke har en egen, fungerende nettside — og vurderes nå for en LAVERE terskel ("andrelinje") som krever at du BEKREFTER at bevisene faktisk identifiserer DENNE SPESIFIKKE produsenten, ikke en generisk beskrivelse og ikke en annen virksomhet.
 
@@ -122,13 +175,13 @@ Produkter:
 ${productsText}
 
 Korroborerende kilde(r) som utløste denne vurderingen: ${sourceText}
-
+${evidenceBlock}
 Godkjenn KUN hvis ALT av følgende stemmer:
 1. Om-teksten/produktene beskriver en KONKRET, spesifikk matprodusent (gård, bryggeri, ysteri, etc.) — ikke en generisk bransjebeskrivelse, en paraplyorganisasjon/bransjeforening sine mange medlemmer omtalt samlet, eller en helt annen type virksomhet.
 2. Bevisene knytter navnet TYDELIG til produsentnavnet og/eller stedet ovenfor — enten navn+sted (byen/stedet stemmer med det som er beskrevet) eller navn+organisasjonsnummer (Brreg-treffet gjelder faktisk denne virksomheten, ikke bare et likelydende navn).
 3. E-postadressen fremstår som en rimelig kontaktadresse for AKKURAT denne produsenten (ikke åpenbart en helt annen virksomhets eller en paraplyorganisasjons adresse).
 4. Det er ingen tegn til at bevisene faktisk beskriver en ANNEN produsent som tilfeldigvis har et lignende navn eller sted.
-
+${evidenceCriterion}
 Ved minste tvil om identiteten — eller om bevisgrunnlaget er for tynt/generisk til å faktisk bekrefte at dette er DENNE produsenten — svar ${SECOND_LINE_JUDGE_REJECT_TOKEN}.
 
 Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:

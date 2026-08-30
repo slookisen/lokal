@@ -372,6 +372,47 @@ export function runOpplevelserGardssalgSecondLineTests(
         });
         assertTrue(!lookupCalled, "a-48: org_nr='' -> brregLookupFn never called");
       }
+
+      // ── evidence plumbing (Del D, dev-request 2026-08-29-gs-second-line-
+      // kildeklasse-bredde) — proves computeGardssalgSecondLineVerification's
+      // own `input.evidence` reaches the judge call's `params.evidence`
+      // unchanged, at the unit level (no network/prompt text involved here —
+      // that end-to-end proof is Section C's c-15 below).
+      {
+        const evidenceIn = [
+          { source_url: "https://hanen.no/produsent/testgard", content_excerpt: "Gården Testgård selger sider og eplemost." },
+        ];
+        let capturedEvidence: unknown;
+        const r = await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          evidence: evidenceIn,
+          judgeFn: async (params) => {
+            capturedEvidence = params.evidence;
+            return { approved: true };
+          },
+        });
+        assertEq(capturedEvidence, evidenceIn, "a-49: input.evidence reaches judgeFn's params.evidence unchanged");
+        assertTrue(r.passes, "a-50: evidence present + judge-approve -> passes (unchanged gate contract)");
+      }
+      {
+        // Absent evidence -> judgeFn receives params.evidence === undefined.
+        // This only proves the PLUMBING (params shape) is unchanged for
+        // today's callers, who never set evidence — it does NOT by itself
+        // prove the rendered PROMPT text is unchanged (a mocked judgeFn
+        // never renders a prompt at all). Section C's c-16 below is the
+        // actual regression test for the prompt text itself, captured via
+        // the mocked fetch's `init.body` on a real (non-injected) judge
+        // call.
+        let capturedEvidence: unknown = "sentinel-not-overwritten";
+        await computeGardssalgSecondLineVerification({
+          ...baseInput,
+          judgeFn: async (params) => {
+            capturedEvidence = params.evidence;
+            return { approved: true };
+          },
+        });
+        assertEq(capturedEvidence, undefined, "a-51: no input.evidence -> judgeFn's params.evidence is undefined");
+      }
     } catch (err: any) {
       failed++;
       failures.push("second-line (section A): unexpected error: " + String(err?.stack || err?.message || err));
@@ -738,6 +779,186 @@ export function runOpplevelserGardssalgSecondLineTests(
           "c-14c: lost-update regression — the concurrent writer's key survives the route's write (fresh re-read, not a stale pre-await snapshot)",
         );
         assertEq(concurrentWriteFn, null, "c-14d: concurrentWriteFn hook fired exactly once and cleared itself");
+      }
+
+      // c-15: Del D end-to-end — a per-id `evidence` body field really
+      // reaches the judge PROMPT sent to the Anthropic API (not just the
+      // unit-level plumbing proven in Section A's a-49). Captures the
+      // mocked fetch's own `init.body` and inspects the actual message
+      // content sent to /v1/messages.
+      seedProvider("c15");
+      {
+        let capturedInitBody: any = null;
+        const prevFetchForC15 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            judgeCallCount++;
+            capturedInitBody = init?.body;
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: judgeVerdictText }] }),
+            } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        const excerpt = "Gården c15-testgard selger sider og eplemost, org.nr 999999999.";
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: {
+            providerIds: ["c15"],
+            evidence: {
+              c15: [{ source_url: "https://hanen.no/produsent/c15", content_excerpt: excerpt }],
+            },
+          },
+        });
+        const item = r.body.results.find((x: any) => x.provider_id === "c15");
+        assertEq(item.outcome, "verified", "c-15a: c15 verifies with evidence supplied");
+        const parsedBody = JSON.parse(capturedInitBody);
+        const promptText = parsedBody.messages[0].content;
+        assertTrue(
+          typeof promptText === "string" && promptText.includes(excerpt),
+          "c-15b: the prompt text sent to the Anthropic API contains the evidence content_excerpt",
+        );
+
+        globalThis.fetch = prevFetchForC15;
+      }
+
+      // c-16: round-2 review fix-up — the no-evidence path's PROMPT (not
+      // just the plumbing a-51 already covers) must carry zero trace of the
+      // "Fremlagt kildeinnhold" block or its criterion-5 line when no
+      // `evidence` body field is sent at all. This is the direct regression
+      // test the reviewer asked for: BLOCKING finding 1 was exactly that an
+      // earlier version of this PR inserted both unconditionally.
+      seedProvider("c16");
+      {
+        let capturedInitBody: any = null;
+        const prevFetchForC16 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            judgeCallCount++;
+            capturedInitBody = init?.body;
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: judgeVerdictText }] }),
+            } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { providerIds: ["c16"] }, // no `evidence` field at all
+        });
+        const item = r.body.results.find((x: any) => x.provider_id === "c16");
+        assertEq(item.outcome, "verified", "c-16a: c16 verifies with no evidence supplied (unchanged gate contract)");
+        const parsedBody = JSON.parse(capturedInitBody);
+        const promptText = parsedBody.messages[0].content as string;
+        assertTrue(
+          !promptText.includes("Fremlagt kildeinnhold"),
+          "c-16b: no-evidence prompt contains NO 'Fremlagt kildeinnhold' block",
+        );
+        assertTrue(
+          !promptText.includes("Dersom kildeinnhold er fremlagt"),
+          "c-16c: no-evidence prompt contains NO criterion-5 line",
+        );
+        assertTrue(
+          promptText.trim().endsWith("Ved minste tvil, svar AVVIS."),
+          "c-16d: no-evidence prompt ends exactly where the pre-Del-D prompt ended (nothing appended after criterion 4's blank line)",
+        );
+
+        globalThis.fetch = prevFetchForC16;
+      }
+
+      // c-17..c-20: round-2 review fix-up (test coverage gap, finding 3) —
+      // the route's sanitizeEvidenceForId defensive branches had zero
+      // coverage before this: body.evidence as an array, a null item, a
+      // non-string source_url, more than 5 items, and a whitespace-only
+      // excerpt. Each is asserted through the real route (the sanitizer is
+      // a private closure, not exported) by inspecting the actual prompt
+      // text sent to the mocked Anthropic API.
+      async function captureC1x(id: string, body: Record<string, unknown>): Promise<string> {
+        let capturedInitBody: any = null;
+        const prevFetch = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            judgeCallCount++;
+            capturedInitBody = init?.body;
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: judgeVerdictText }] }),
+            } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { providerIds: [id], ...body } });
+        globalThis.fetch = prevFetch;
+        const item = r.body.results.find((x: any) => x.provider_id === id);
+        assertEq(item.outcome, "verified", `${id}: verifies (judge is stubbed to approve regardless)`);
+        return (JSON.parse(capturedInitBody).messages[0].content as string);
+      }
+
+      // c-17: body.evidence is an ARRAY, not an object map -> treated as
+      // wholly absent (not a crash, not a partial/garbled read) for every id
+      // in the batch.
+      seedProvider("c17");
+      {
+        const promptText = await captureC1x("c17", { evidence: [{ source_url: "https://x.no", content_excerpt: "should be ignored" }] });
+        assertTrue(!promptText.includes("Fremlagt kildeinnhold"), "c-17: body.evidence as an array -> treated as absent (no evidence block in prompt)");
+      }
+
+      // c-18: a null item in the array is dropped; a numeric source_url item
+      // is dropped; a whitespace-only content_excerpt item is dropped; the
+      // one well-formed item among them still comes through.
+      seedProvider("c18");
+      {
+        const promptText = await captureC1x("c18", {
+          evidence: {
+            c18: [
+              null,
+              { source_url: 12345, content_excerpt: "numeric source_url, must be dropped" },
+              { source_url: "https://whitespace.no", content_excerpt: "   " },
+              { source_url: "https://c18-valid.no", content_excerpt: "c18-valid-marker" },
+            ],
+          },
+        });
+        assertTrue(promptText.includes("c18-valid-marker"), "c-18a: the one well-formed item survives sanitization");
+        assertTrue(!promptText.includes("numeric source_url"), "c-18b: item with a numeric source_url is dropped");
+        assertTrue(!promptText.includes("https://whitespace.no"), "c-18c: item with a whitespace-only content_excerpt is dropped");
+      }
+
+      // c-19: more than 5 items in one id's array -> truncated to the first
+      // 5; the 6th (and beyond) never reaches the prompt.
+      seedProvider("c19");
+      {
+        const items = [1, 2, 3, 4, 5, 6].map((n) => ({ source_url: `https://c19-${n}.no`, content_excerpt: `c19-marker-${n}` }));
+        const promptText = await captureC1x("c19", { evidence: { c19: items } });
+        for (const n of [1, 2, 3, 4, 5]) {
+          assertTrue(promptText.includes(`c19-marker-${n}`), `c-19a: item ${n} (within the first 5) reaches the prompt`);
+        }
+        assertTrue(!promptText.includes("c19-marker-6"), "c-19b: the 6th item is truncated, never reaches the prompt");
+      }
+
+      // c-20: a non-string content_excerpt is dropped just like a non-string
+      // source_url (c-18b already covers the source_url side).
+      seedProvider("cz20");
+      {
+        const promptText = await captureC1x("cz20", {
+          evidence: {
+            cz20: [
+              { source_url: "https://cz20-a.no", content_excerpt: 42 },
+              { source_url: "https://cz20-b.no", content_excerpt: "cz20-valid-marker" },
+            ],
+          },
+        });
+        assertTrue(promptText.includes("cz20-valid-marker"), "c-20a: the well-formed item survives");
+        assertTrue(!promptText.includes("https://cz20-a.no"), "c-20b: item with a non-string content_excerpt is dropped");
       }
     } catch (err: any) {
       failed++;
