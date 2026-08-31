@@ -31603,6 +31603,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gsa.failures) failures.push("opplevelser-gardssalg-set-address: " + f);
     console.log(`  opplevelser-gardssalg-set-address: ${gsa.passed} passed, ${gsa.failed} failed`);
 
+    // dev-request 2026-08-30-gardssalg-set-provider-navn-endepunkt: the
+    // fourth sibling of the three suites just above — `navn` (display name)
+    // had NO write path anywhere in the codebase, only ever set at row
+    // INSERT. Live case: Anikonic ("Anikonic Cider" for a fruit-wine
+    // producer). Same in-memory-DB pattern, runs sequentially in this block.
+    console.log("\n── opplevelser-gardssalg-set-provider-name: caller-supplied display-name write ──");
+    const { runOpplevelserGardssalgSetProviderNameTests } = require("../src/routes/opplevelser-gardssalg-set-provider-name.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-set-provider-name.test");
+    const gspn = await runOpplevelserGardssalgSetProviderNameTests({ log: false });
+    passed += gspn.passed;
+    failed += gspn.failed;
+    for (const f of gspn.failures) failures.push("opplevelser-gardssalg-set-provider-name: " + f);
+    console.log(`  opplevelser-gardssalg-set-provider-name: ${gspn.passed} passed, ${gspn.failed} failed`);
+
     // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive A:
     // persist the force-approval from gardssalg-set-contact-email above (a
     // field_provenance.contact_email_domain_override stamp, scoped to the
