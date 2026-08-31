@@ -5,9 +5,29 @@
 // that today are silently unverifiable (no query behind them at all).
 //
 //   GET /admin/verifier/claim-counts?kind=<kind>&since=<ISO-8601>&until=<ISO-8601>
+//   GET /admin/verifier/claim-counts?kind=<kind>&mode=snapshot
 //
 // `kind` is a TYPED ALLOWLIST (switch statement below), never passthrough
 // SQL built from the query string. Unknown kind -> 400.
+//
+// `mode` (optional, default "delta"):
+//   - "delta" (default, omitted == this): unchanged from the original
+//     endpoint — since/until are REQUIRED and every kind's WHERE fragment
+//     filters on its timestamp column being inside [since, until], via
+//     `datetime(col) BETWEEN datetime(?) AND datetime(?)`. This is the
+//     original behavior verbatim; nothing about it changed for this mode.
+//   - "snapshot": counts agents CURRENTLY in the given state — no time
+//     filter at all. since/until are not required and, if supplied
+//     anyway, are ignored (not parsed, not bound, not echoed). Added by
+//     dev-request 2026-08-31-lokal-agent-verifier-claim-counts-snapshot-
+//     delta-mismatch (see A2A repo): for most kinds, "claimed" values the
+//     lokal-agent-verifier routine reports are CURRENT-STATE snapshots,
+//     but the old delta-only endpoint filtered on a last-write timestamp
+//     that predates the routine's narrow run window, so it returned 0 even
+//     when the true current count was nonzero. See KIND_SPEC below — the
+//     same `condition` fragment backs both modes; snapshot mode just
+//     drops the time filter.
+//   - any other value -> 400.
 //
 // Auth: X-Admin-Key, same convention as every other admin-*.ts file in this
 // codebase — inline getAdminKey()/requireAdmin(), duplicated per file by
@@ -80,8 +100,8 @@ function requireAdmin(req: Request, res: Response): boolean {
 // space-separated, no-ms, no-Z, UTC "YYYY-MM-DD HH:MM:SS" form for the JSON
 // response echo (see the response payload below) and as the value bound
 // into the query. The DB-side comparison itself does not depend on this
-// normalization being exact — every BETWEEN in whereForKind() wraps both
-// sides in SQLite's datetime(...), which re-parses this string the same way
+// normalization being exact — every delta-mode BETWEEN built in buildQuery()
+// wraps both sides in SQLite's datetime(...), which re-parses this string the same way
 // it parses each column's own value (space-separated or JS-ISO), so both
 // sides land in the same canonical form before comparing regardless. See the
 // file-header footgun comment. Returns null for missing/non-string/
@@ -104,49 +124,98 @@ const KNOWN_KINDS = [
 ] as const;
 type ClaimKind = (typeof KNOWN_KINDS)[number];
 
-// Typed allowlist: each kind maps to ITS OWN fixed WHERE fragment against
-// agent_knowledge (aliased k, joined to agents aliased a). `kind` only ever
-// selects one of these literal strings via switch — nothing derived from
-// the query string reaches SQL. Each fragment takes exactly two `?`
-// placeholders (since, until, in that order).
+const KNOWN_MODES = ["delta", "snapshot"] as const;
+type ClaimMode = (typeof KNOWN_MODES)[number];
+
+// Typed allowlist: each kind maps to ITS OWN fixed status/condition
+// fragment plus the timestamp column its delta-mode window filters on,
+// against agent_knowledge (aliased k, joined to agents aliased a). `kind`
+// only ever selects one of these literal entries via KIND_SPEC[kind] —
+// nothing derived from the query string reaches SQL.
 //
-// Every BETWEEN wraps BOTH the column and the bound placeholder in SQLite's
-// datetime(...) — see the file-header footgun comment for why: it lets the
-// comparison work uniformly whether the column's actual value is
-// space-separated (datetime('now')) or JS-ISO ('T'/ms/'Z'), without needing
-// to know which format any given row is in.
-function whereForKind(kind: ClaimKind): string {
-  switch (kind) {
-    case "agents_verified":
-      return `k.verification_status = 'verified' AND datetime(k.last_verified_at) BETWEEN datetime(?) AND datetime(?)`;
-    case "agents_review_required":
-      // updated_at imprecision — see file-header comment. Not a bug.
-      return `k.verification_status = 'review_required' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
-    case "agents_pending_verify":
-      // updated_at imprecision — see file-header comment. Not a bug.
-      return `k.verification_status = 'pending_verify' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
-    case "agents_data_insufficient":
-      // updated_at imprecision — see file-header comment. Not a bug.
-      return `k.verification_status = 'data_insufficient' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
-    case "http_unreachable":
-      return `datetime(k.homepage_unreachable_since) BETWEEN datetime(?) AND datetime(?)`;
-    case "brreg_inactive_flagged":
-      // updated_at imprecision — see file-header comment. Not a bug.
-      return `json_extract(k.verification_review_reason,'$.terminal_reason') = 'brreg_inactive' AND datetime(k.updated_at) BETWEEN datetime(?) AND datetime(?)`;
-    case "agents_domain_incoherent":
-      // Real enum values written by stampParking() in admin-domain-coherence.ts
-      // — confirmed by reading that file, not invented.
-      return `k.domain_reconciliation_outcome IN ('circular_scramble_candidate','manual_review_needed') AND datetime(k.domain_reconciliation_checked_at) BETWEEN datetime(?) AND datetime(?)`;
+// `condition` is the state-only part of the WHERE clause (no time filter)
+// — this is exactly what mode=snapshot uses standalone ("currently in this
+// state"). mode=delta additionally ANDs a datetime(...) BETWEEN over
+// `timeColumn`, taking exactly two `?` placeholders (since, until, in that
+// order) — see buildQuery() below. Every BETWEEN wraps BOTH the column and
+// the bound placeholder in SQLite's datetime(...) — see the file-header
+// footgun comment for why: it lets the comparison work uniformly whether
+// the column's actual value is space-separated (datetime('now')) or
+// JS-ISO ('T'/ms/'Z'), without needing to know which format any given row
+// is in.
+const KIND_SPEC: Record<ClaimKind, { condition: string; timeColumn: string }> = {
+  agents_verified: {
+    condition: `k.verification_status = 'verified'`,
+    timeColumn: `k.last_verified_at`,
+  },
+  agents_review_required: {
+    // updated_at imprecision — see file-header comment. Not a bug.
+    condition: `k.verification_status = 'review_required'`,
+    timeColumn: `k.updated_at`,
+  },
+  agents_pending_verify: {
+    // updated_at imprecision — see file-header comment. Not a bug.
+    condition: `k.verification_status = 'pending_verify'`,
+    timeColumn: `k.updated_at`,
+  },
+  agents_data_insufficient: {
+    // updated_at imprecision — see file-header comment. Not a bug.
+    condition: `k.verification_status = 'data_insufficient'`,
+    timeColumn: `k.updated_at`,
+  },
+  http_unreachable: {
+    // NULL means "currently reachable" (cleared on a successful fetch —
+    // see admin-knowledge.ts / marketplace.ts); IS NOT NULL is the
+    // "currently in this state" condition mode=snapshot needs. Harmless
+    // in mode=delta too: datetime(NULL) BETWEEN ... is already NULL
+    // (falsy), so ANDing this in changes no delta-mode result — same rows
+    // matched before this fragment existed.
+    condition: `k.homepage_unreachable_since IS NOT NULL`,
+    timeColumn: `k.homepage_unreachable_since`,
+  },
+  brreg_inactive_flagged: {
+    // updated_at imprecision — see file-header comment. Not a bug.
+    condition: `json_extract(k.verification_review_reason,'$.terminal_reason') = 'brreg_inactive'`,
+    timeColumn: `k.updated_at`,
+  },
+  agents_domain_incoherent: {
+    // Real enum values written by stampParking() in admin-domain-coherence.ts
+    // — confirmed by reading that file, not invented.
+    condition: `k.domain_reconciliation_outcome IN ('circular_scramble_candidate','manual_review_needed')`,
+    timeColumn: `k.domain_reconciliation_checked_at`,
+  },
+};
+
+// Builds the WHERE fragment (state condition, plus a delta-mode time
+// filter) AND the exact bind-params array to spread into `.get(...params)`/
+// `.all(...params)` — snapshot-mode fragments take 0 placeholders,
+// delta-mode fragments take 2 (since, until), so the params array must
+// match whatever fragment is actually returned.
+function buildQuery(
+  kind: ClaimKind,
+  mode: ClaimMode,
+  since: string | null,
+  until: string | null,
+): { where: string; params: unknown[] } {
+  const spec = KIND_SPEC[kind];
+  if (mode === "snapshot") {
+    return { where: spec.condition, params: [] };
   }
+  return {
+    where: `${spec.condition} AND datetime(${spec.timeColumn}) BETWEEN datetime(?) AND datetime(?)`,
+    params: [since, until],
+  };
 }
 
-// GET /admin/verifier/claim-counts?kind=<kind>&since=<ISO-8601>&until=<ISO-8601>
+// GET /admin/verifier/claim-counts?kind=<kind>&since=<ISO-8601>&until=<ISO-8601>[&mode=delta|snapshot]
 //
-// Returns the count of agents matching `kind` within [since, until]
-// (inclusive both ends — plain SQL BETWEEN semantics), plus up to 5 sample
-// rows for the verifier to spot-check evidence against. Only agents.is_active
-// = 1 rows are counted, matching the /api/marketplace/admin/agents/dump
-// convention in marketplace.ts.
+// mode=delta (default/omitted): returns the count of agents matching `kind`
+// within [since, until] (inclusive both ends — plain SQL BETWEEN
+// semantics). mode=snapshot: returns the count of agents CURRENTLY
+// matching `kind`, no time window (since/until in the response are null).
+// Either way, up to 5 sample rows come back for the verifier to spot-check
+// evidence against. Only agents.is_active = 1 rows are counted, matching
+// the /api/marketplace/admin/agents/dump convention in marketplace.ts.
 router.get("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -157,20 +226,40 @@ router.get("/", (req: Request, res: Response) => {
   }
   const kind = kindRaw as ClaimKind;
 
-  const since = parseSinceUntil(req.query.since);
-  if (since === null) {
-    res.status(400).json({ success: false, error: "since is required and must be a parseable ISO-8601 timestamp" });
+  // mode: optional, defaults to "delta" (== the original, unchanged
+  // behavior) when omitted from the query string entirely. Any other
+  // value (not "delta", not "snapshot") -> 400, same pattern as the
+  // unknown-kind 400 above.
+  const modeRaw = req.query.mode === undefined ? "delta" : String(req.query.mode);
+  if (!(KNOWN_MODES as readonly string[]).includes(modeRaw)) {
+    res.status(400).json({ success: false, error: `unknown mode: ${modeRaw}` });
     return;
   }
-  const until = parseSinceUntil(req.query.until);
-  if (until === null) {
-    res.status(400).json({ success: false, error: "until is required and must be a parseable ISO-8601 timestamp" });
-    return;
+  const mode = modeRaw as ClaimMode;
+
+  // mode=delta (default): since/until are REQUIRED, exactly as before this
+  // change — this branch is untouched from the original endpoint so every
+  // pre-existing 400 test for missing/malformed since/until still hits it.
+  // mode=snapshot: since/until are NOT parsed or required at all; any
+  // caller-supplied values are ignored (see buildQuery()/response below).
+  let since: string | null = null;
+  let until: string | null = null;
+  if (mode === "delta") {
+    since = parseSinceUntil(req.query.since);
+    if (since === null) {
+      res.status(400).json({ success: false, error: "since is required and must be a parseable ISO-8601 timestamp" });
+      return;
+    }
+    until = parseSinceUntil(req.query.until);
+    if (until === null) {
+      res.status(400).json({ success: false, error: "until is required and must be a parseable ISO-8601 timestamp" });
+      return;
+    }
   }
 
   try {
     const db = getDb();
-    const where = whereForKind(kind);
+    const { where, params } = buildQuery(kind, mode, since, until);
 
     const countRow = db
       .prepare(
@@ -179,7 +268,7 @@ router.get("/", (req: Request, res: Response) => {
            INNER JOIN agents a ON a.id = k.agent_id
           WHERE a.is_active = 1 AND ${where}`
       )
-      .get(since, until) as { c: number } | undefined;
+      .get(...params) as { c: number } | undefined;
 
     const sampleRows = db
       .prepare(
@@ -190,17 +279,20 @@ router.get("/", (req: Request, res: Response) => {
           ORDER BY a.id
           LIMIT 5`
       )
-      .all(since, until) as Array<{ id: string; name: string }>;
+      .all(...params) as Array<{ id: string; name: string }>;
 
     res.json({
       success: true,
       kind,
+      mode,
       count: countRow?.c ?? 0,
       // Echo the NORMALIZED (DB-comparable) since/until actually used in the
       // BETWEEN clause, not the raw query string — this is what the count
       // and sample above were computed against, so a verifier reading this
       // response back can't be misled by a raw ISO string that looks
-      // different from what the SQL actually compared.
+      // different from what the SQL actually compared. In mode=snapshot no
+      // window was used at all, so these are null rather than an invented
+      // or misleadingly-echoed value.
       since,
       until,
       sample: sampleRows,
