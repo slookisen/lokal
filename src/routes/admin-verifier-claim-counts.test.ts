@@ -460,6 +460,141 @@ export function runAdminVerifierClaimCountsTests(
       result = await get(`kind=http_unreachable&since=${REPRO_DAY_SINCE_ISO}&until=${REPRO_DAY_UNTIL_ISO}`);
       assertEq(result.body.count, 1, "vcc-38: [bug repro] http_unreachable same-day JS-ISO homepage_unreachable_since is counted (was silently 0 before the datetime() fix)");
       assertEq(result.body.sample.map((r: any) => r.id), ["repro-unreachable"], "vcc-39: [bug repro] http_unreachable sample is exactly repro-unreachable");
+
+      // ── mode=snapshot (dev-request 2026-08-31-lokal-agent-verifier-claim-
+      // counts-snapshot-delta-mismatch) — added coverage below. All fixtures
+      // above stay untouched; new rows here are seeded with timestamps
+      // clearly OUTSIDE SINCE_ISO/UNTIL_ISO to prove snapshot mode counts
+      // them anyway (no time filter) while delta mode for that same window
+      // still excludes them (delta mode unaffected by this change). ────────
+
+      const SNAP_OLD_JS = "2020-01-01T00:00:00.000Z"; // well before SINCE_ISO
+      const SNAP_OLD_DB = "2020-01-01 00:00:00";
+
+      // agents_review_required: one more currently-review_required row,
+      // updated long before the SINCE_ISO/UNTIL_ISO delta window.
+      seed("rr-snap-old", { verificationStatus: "review_required", updatedAt: SNAP_OLD_JS });
+
+      // http_unreachable: one more currently-unreachable row, flagged long
+      // before the delta window.
+      seed("hu-snap-old", { homepageUnreachableSince: SNAP_OLD_JS });
+
+      // agents_verified: one more currently-verified row, last verified
+      // long before the delta window.
+      seed("v-snap-old", { verificationStatus: "verified", lastVerifiedAt: SNAP_OLD_JS });
+
+      // -- agents_review_required: snapshot counts the old row too --
+      result = await get(`kind=agents_review_required&mode=snapshot`);
+      assertEq(result.status, 200, "vcc-40: agents_review_required mode=snapshot -> 200");
+      assertEq(result.body.mode, "snapshot", "vcc-41: agents_review_required mode=snapshot echoes mode:snapshot");
+      assertEq(result.body.since, null, "vcc-42: agents_review_required mode=snapshot since is null");
+      assertEq(result.body.until, null, "vcc-43: agents_review_required mode=snapshot until is null");
+      // rr-in-js, rr-in-db (in the delta window), rr-snap-old (outside it) —
+      // rr-before and rr-wrongstatus still excluded (before = wrong status
+      // now? no, rr-before IS review_required but that's irrelevant in
+      // snapshot mode too, it's simply also currently review_required).
+      assertEq(
+        result.body.sample.map((r: any) => r.id).sort(),
+        ["rr-before", "rr-in-db", "rr-in-js", "rr-snap-old"],
+        "vcc-44: agents_review_required mode=snapshot counts every currently review_required row regardless of updated_at, including the one clearly outside the delta window",
+      );
+      assertEq(result.body.count, 4, "vcc-45: agents_review_required mode=snapshot count = 4 (no time filter applied)");
+
+      // Delta mode for the same original window still excludes rr-snap-old
+      // (proving delta mode is unaffected by adding snapshot mode).
+      result = await get(`kind=agents_review_required&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
+      assertEq(result.body.count, 2, "vcc-46: agents_review_required mode=delta (same window as before) is still count = 2 — unaffected by the new snap-old fixture");
+      assertTrue(
+        !result.body.sample.map((r: any) => r.id).includes("rr-snap-old"),
+        "vcc-47: agents_review_required mode=delta still excludes the out-of-window rr-snap-old row",
+      );
+
+      // -- http_unreachable: snapshot counts the old row too --
+      result = await get(`kind=http_unreachable&mode=snapshot`);
+      assertEq(result.body.mode, "snapshot", "vcc-48: http_unreachable mode=snapshot echoes mode:snapshot");
+      assertEq(result.body.since, null, "vcc-49: http_unreachable mode=snapshot since is null");
+      assertEq(result.body.until, null, "vcc-50: http_unreachable mode=snapshot until is null");
+      assertEq(
+        result.body.sample.map((r: any) => r.id).sort(),
+        ["hu-before", "hu-in", "hu-snap-old", "repro-unreachable"],
+        "vcc-51: http_unreachable mode=snapshot counts every row with a non-null homepage_unreachable_since regardless of when it was set (hu-null correctly still excluded)",
+      );
+      assertEq(result.body.count, 4, "vcc-52: http_unreachable mode=snapshot count = 4");
+
+      // Delta mode for the original window still excludes hu-snap-old.
+      result = await get(`kind=http_unreachable&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
+      assertEq(result.body.count, 1, "vcc-53: http_unreachable mode=delta (same window as before) is still count = 1 — unaffected by the new snap-old fixture");
+
+      // -- agents_verified: snapshot mode = "currently verified in total",
+      // a well-defined query in its own right (not a special case). Every
+      // active agent whose verification_status = 'verified' anywhere in
+      // the whole fixture set counts, regardless of last_verified_at:
+      // v-in, v-since-boundary, v-until-boundary, v-before, v-after (5) +
+      // rr-wrongstatus, pv-wrongstatus, di-wrongstatus (3 — each seeded
+      // with verificationStatus 'verified' as the "wrong status" fixture
+      // for a *different* kind's delta test, but they ARE verified) +
+      // cap-1..cap-7 (7) + repro-verified (1) + v-snap-old (1) = 17.
+      // v-inactive (is_active=0) is still excluded. This total exceeds the
+      // 5-row sample cap, so it's asserted via `count` (which reflects
+      // every matching row) rather than `sample` (which only ever shows
+      // the first 5 by a.id) — proving v-snap-old/v-before/v-after are
+      // counted while v-inactive is still excluded. --
+      result = await get(`kind=agents_verified&mode=snapshot`);
+      assertEq(result.body.mode, "snapshot", "vcc-54: agents_verified mode=snapshot echoes mode:snapshot");
+      assertEq(result.body.since, null, "vcc-55: agents_verified mode=snapshot since is null");
+      assertEq(result.body.until, null, "vcc-56: agents_verified mode=snapshot until is null");
+      assertEq(
+        result.body.count,
+        17,
+        "vcc-57: agents_verified mode=snapshot count = 17 — every currently-verified active agent in the whole fixture set, including v-snap-old/v-before/v-after (outside any time window), excluding only v-inactive (is_active=0)",
+      );
+      assertEq(result.body.sample.length, 5, "vcc-58: agents_verified mode=snapshot sample still caps at 5 like delta mode");
+
+      // Delta mode for the original window still excludes v-snap-old.
+      result = await get(`kind=agents_verified&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
+      assertEq(result.body.count, 3, "vcc-60: agents_verified mode=delta (same window as before) is still count = 3 — unaffected by the new snap-old fixture");
+
+      // -- mode=snapshot works with since/until entirely OMITTED, and also
+      // tolerates them being supplied-but-ignored --
+      result = await get(`kind=agents_verified&mode=snapshot`);
+      assertEq(result.status, 200, "vcc-61: mode=snapshot with since/until omitted entirely -> 200, not 400");
+      const snapshotIgnoredExtras = await get(
+        `kind=agents_verified&mode=snapshot&since=not-a-date&until=also-not-a-date`,
+      );
+      assertEq(snapshotIgnoredExtras.status, 200, "vcc-62: mode=snapshot with garbage since/until supplied anyway -> still 200 (ignored, not parsed/required)");
+      assertEq(snapshotIgnoredExtras.body.since, null, "vcc-63: mode=snapshot ignores a supplied since — response since is still null");
+      assertEq(snapshotIgnoredExtras.body.until, null, "vcc-64: mode=snapshot ignores a supplied until — response until is still null");
+      assertEq(
+        snapshotIgnoredExtras.body.count,
+        result.body.count,
+        "vcc-65: mode=snapshot count is identical whether since/until are omitted or supplied-with-garbage — proves they're truly ignored",
+      );
+
+      // -- default (mode omitted) and explicit mode=delta are byte-identical
+      // to each other and to today's behavior on count/sample --
+      const modeOmitted = await get(`kind=agents_verified&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
+      const modeDeltaExplicit = await get(`kind=agents_verified&mode=delta&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
+      assertEq(modeOmitted.body.mode, "delta", "vcc-66: mode omitted -> response mode is 'delta'");
+      assertEq(modeDeltaExplicit.body.mode, "delta", "vcc-67: explicit mode=delta -> response mode is 'delta'");
+      assertEq(
+        { ...modeOmitted.body, mode: undefined },
+        { ...modeDeltaExplicit.body, mode: undefined },
+        "vcc-68: mode omitted and explicit mode=delta are identical on every field but mode itself (count/since/until/sample/kind/success)",
+      );
+
+      // -- invalid mode -> 400, naming the bad value (same pattern as
+      // unknown kind) --
+      result = await get(`kind=agents_verified&mode=bogus&since=${SINCE_ISO}&until=${UNTIL_ISO}`);
+      assertEq(result.status, 400, "vcc-69: mode=bogus -> 400");
+      assertEq(result.body.success, false, "vcc-70: mode=bogus body.success is false");
+      assertEq(result.body.error, "unknown mode: bogus", "vcc-71: mode=bogus error message names the bad value");
+
+      // Also invalid even without since/until present (mode is validated
+      // before since/until are required) — reuses SNAP_OLD_DB/JS vars? no,
+      // just asserts the 400 still fires with none of since/until supplied.
+      result = await get(`kind=agents_verified&mode=bogus`);
+      assertEq(result.status, 400, "vcc-72: mode=bogus with since/until omitted entirely still -> 400 naming the bad mode (mode validated before since/until)");
+      assertEq(result.body.error, "unknown mode: bogus", "vcc-73: mode=bogus (since/until omitted) error message still names the bad value");
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
