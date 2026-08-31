@@ -358,7 +358,17 @@ Ved minste tvil, svar ${CONTACT_JUDGE_REJECT_TOKEN}.`;
   }
 
   if (!response.ok) {
-    return { approved: false, reason: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+    let bodySnippet = "";
+    try {
+      bodySnippet = (await response.text()).slice(0, 300);
+    } catch {
+      bodySnippet = "(kunne ikke lese respons-body)";
+    }
+    console.error(`[judgeContactCandidate] non-ok response: status=${response.status} body=${bodySnippet}`);
+    return {
+      approved: false,
+      reason: `dommer-API svarte status ${response.status} — avvist fail-closed — ${bodySnippet}`,
+    };
   }
 
   let result: any;
