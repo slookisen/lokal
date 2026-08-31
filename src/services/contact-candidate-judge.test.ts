@@ -174,11 +174,45 @@ export function runContactCandidateJudgeTests(
           assertEq(v.approved, false, "b-2: fetch throw (network failure) -> approved:false, not re-thrown");
         }
 
-        // ── b-3: non-200 response -> approved:false. ───────────────────────
+        // ── b-3: non-200 response -> approved:false. Mock has no .text() at
+        //    all (simulates a body-read failure) — proves the diagnostic
+        //    capture is wrapped in try/catch and never crashes the caller. ──
         globalThis.fetch = (async () => ({ ok: false, status: 500, json: async () => ({ error: "boom" }) })) as unknown as typeof fetch;
         {
           const v = await judgeContactCandidate({ fieldType: "phone", candidate: CANDIDATE, sourceContext: CONTEXT, businessName: BUSINESS });
           assertEq(v.approved, false, "b-3: non-200 response -> approved:false");
+        }
+
+        // ── b-3b: non-200 response WITH a readable body -> the actual
+        //    Anthropic error body is surfaced in `reason` (2026-08-31
+        //    diagnostics slice, dev-request
+        //    2026-08-31-llm-judge-api-400-diagnostics) instead of being
+        //    silently discarded — this is what lets an operator tell "model
+        //    not found" apart from "invalid auth" apart from "rate limited"
+        //    without needing separate server-log access. ────────────────────
+        globalThis.fetch = (async () => ({
+          ok: false,
+          status: 400,
+          text: async () => '{"type":"error","error":{"type":"not_found_error","message":"model: claude-haiku-4-5"}}',
+          json: async () => ({ error: "unused in this path" }),
+        })) as unknown as typeof fetch;
+        {
+          const v = await judgeContactCandidate({ fieldType: "phone", candidate: CANDIDATE, sourceContext: CONTEXT, businessName: BUSINESS });
+          assertEq(v.approved, false, "b-3b: non-200 with body -> approved:false");
+          assertTrue(v.reason.includes("not_found_error"), "b-3b: reason surfaces the actual Anthropic error body, not just the bare status code");
+        }
+
+        // ── b-3c: a .text() call that itself throws -> fail-closed cleanly,
+        //    never re-thrown to the caller. ─────────────────────────────────
+        globalThis.fetch = (async () => ({
+          ok: false,
+          status: 429,
+          text: async () => { throw new Error("body already consumed"); },
+          json: async () => ({ error: "unused in this path" }),
+        })) as unknown as typeof fetch;
+        {
+          const v = await judgeContactCandidate({ fieldType: "phone", candidate: CANDIDATE, sourceContext: CONTEXT, businessName: BUSINESS });
+          assertEq(v.approved, false, "b-3c: .text() throw -> approved:false, not re-thrown");
         }
 
         // ── b-4: unparseable JSON body -> approved:false. ──────────────────
