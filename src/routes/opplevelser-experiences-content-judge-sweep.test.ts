@@ -409,6 +409,11 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
         assertEq(mismatch.verification_status, "needs_review", "cjs-6a: MISMATCH row flipped to needs_review");
         assertTrue(!!mismatch.admission_verdict?.startsWith("mismatch:"), "cjs-6b: MISMATCH row stamped 'mismatch: <reasoning>'");
         assertTrue(!!mismatch.admission_checked_at, "cjs-6c: MISMATCH row's admission_checked_at stamped");
+        assertEq(
+          byId.get("cjs-mismatch")?.verification_status,
+          "needs_review",
+          "cjs-6d: apply-mode response for the MISMATCH row reports POST-write verification_status ('needs_review'), not the stale pre-write SELECT value ('verified') — must agree with its own action_taken text",
+        );
 
         const judgefail = snapshot("cjs-judgefail")!;
         assertEq(judgefail.verification_status, "pending_verify", "cjs-7a: judge-failure row's status untouched (no MISMATCH verdict was rendered)");

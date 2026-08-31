@@ -23432,7 +23432,8 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         id: row.id,
         verdict: outcome.verdict,
         reason: outcome.reason,
-        verification_status: row.verification_status,
+        verification_status:
+          applyMode && outcome.verdict === "MISMATCH" ? "needs_review" : row.verification_status,
         description_nulled: descriptionNulled,
         ...(dryRun
           ? { would_be_action: `[dry-run] ${actionText}${descText}` }
