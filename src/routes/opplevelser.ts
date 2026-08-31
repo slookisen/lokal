@@ -23230,9 +23230,29 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
 // `apply` must be exactly boolean `true` to write anything; anything else
 // (absent, false, or any other value) is a dry-run. Response:
 // { success, dry_run, batch_id, scanned, counts:{match,mismatch,unresolved,
-// description_nulled}, results:[{id,verdict,reason,description_nulled,
-// would_be_action|action_taken}], remaining }. `remaining` = rows still
-// eligible by the same WHERE clause past this call's `limit` cap.
+// description_nulled,published_in_sample}, results:[{id,verdict,reason,
+// verification_status,description_nulled,would_be_action|action_taken}],
+// remaining }. `remaining` = rows still eligible by the same WHERE clause
+// past this call's `limit` cap.
+//
+// `sample` (optional, "queue" | "random", body or query — query wins,
+// mirrors `limit` above): dev-request 2026-08-31-content-judge-sweep-sampling.
+// Default/"queue" is the exact pre-existing ordering (never-checked-first,
+// then oldest-checked-first) — byte-identical behavior when this param is
+// absent. "random" swaps the ORDER BY to RANDOM() so repeated DRY-RUN calls
+// can pull a broader, non-head-of-queue sample for human (Daniel) evidence-
+// gathering, since dry-run never advances admission_checked_at and the
+// default ordering would otherwise always return the exact same N rows.
+// "random" is REJECTED (400, before any SELECT/write) when combined with
+// apply:true — real apply-mode sweeps must stay deterministic oldest-first
+// forever; random sampling is dry-run-only, evidence-gathering-only.
+//
+// `published_in_sample` / per-row `verification_status`: the human decision
+// this endpoint feeds cares about the share of PUBLISHED rows, not the
+// (much larger) published+unpublished qualifying pool — so the response
+// surfaces the raw verification_status per row and a same-batch published
+// count, using the SAME PUBLISH_GATE_SQL predicate /discover and the public
+// by-id/slug reads use (reused, not re-stated — see experience-store.ts).
 const SWEEP_DEFAULT_LIMIT = 50;
 const SWEEP_MAX_LIMIT = 50;
 const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL";
@@ -23247,11 +23267,12 @@ type ContentJudgeSweepRow = {
   evidence_url: string | null;
   content_field_evidence: string | null;
   admission_checked_at: string | null;
+  verification_status: string;
 };
 
 router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: Request, res: Response) => {
   try {
-    const body = (req.body ?? {}) as { apply?: unknown; limit?: unknown };
+    const body = (req.body ?? {}) as { apply?: unknown; limit?: unknown; sample?: unknown };
     const applyMode = body.apply === true;
     const dryRun = !applyMode;
 
@@ -23273,27 +23294,56 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     if (requestedLimit <= 0) requestedLimit = SWEEP_DEFAULT_LIMIT;
     const limit = Math.min(SWEEP_MAX_LIMIT, requestedLimit);
 
+    // `sample`: same query-takes-precedence-over-body convention as `limit`
+    // above. Anything other than exactly "random" (absent, "queue", or any
+    // other value) is the pre-existing default ordering.
+    const rawQuerySample = typeof req.query.sample === "string" ? req.query.sample : undefined;
+    const rawSample = rawQuerySample !== undefined ? rawQuerySample : body.sample;
+    const sampleMode: "queue" | "random" = rawSample === "random" ? "random" : "queue";
+
+    if (sampleMode === "random" && applyMode) {
+      res.status(400).json({
+        error: "sample:'random' cannot be combined with apply:true — random sampling is dry-run-only, evidence-gathering-only; apply-mode sweeps must stay deterministic oldest-first",
+      });
+      return;
+    }
+
     const expDb = getExpDb("experiences");
 
     const totalEligible = (
       expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE}`).get() as { n: number }
     ).n;
 
+    const sweepOrderBy =
+      sampleMode === "random" ? "RANDOM()" : "admission_checked_at IS NULL DESC, admission_checked_at ASC";
+
     const rows = expDb
       .prepare(
-        `SELECT id, title, description, category, price_band, price_from, evidence_url, content_field_evidence, admission_checked_at
+        `SELECT id, title, description, category, price_band, price_from, evidence_url, content_field_evidence, admission_checked_at, verification_status
            FROM experiences
           WHERE ${SWEEP_ELIGIBLE_WHERE}
-          ORDER BY admission_checked_at IS NULL DESC, admission_checked_at ASC
+          ORDER BY ${sweepOrderBy}
           LIMIT ?`,
       )
       .all(limit) as ContentJudgeSweepRow[];
 
-    const counts = { match: 0, mismatch: 0, unresolved: 0, description_nulled: 0 };
+    // Per-row publish check — the EXACT PUBLISH_GATE_SQL predicate /discover
+    // and the public by-id/slug reads use, reused (not re-stated) so
+    // `published_in_sample` below can never drift from what the public
+    // surfaces actually serve. One indexed point-lookup per sampled row
+    // (≤ SWEEP_MAX_LIMIT), dwarfed by the fetch+judge cost per row.
+    const publishedCheckStmt = expDb.prepare(
+      `SELECT 1 FROM experiences e
+        LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.id = ? AND ${PUBLISH_GATE_SQL}`,
+    );
+
+    const counts = { match: 0, mismatch: 0, unresolved: 0, description_nulled: 0, published_in_sample: 0 };
     const results: Array<{
       id: string;
       verdict: "MATCH" | "MISMATCH" | "unresolved";
       reason: string;
+      verification_status: string;
       description_nulled: boolean;
       would_be_action?: string;
       action_taken?: string;
@@ -23350,6 +23400,12 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         outcome.verdict === "MATCH" ? "match" : outcome.verdict === "MISMATCH" ? "mismatch" : "unresolved";
       counts[verdictKey]++;
 
+      // Publish status is read BEFORE any write this same iteration makes
+      // (a MISMATCH row's apply-mode status flip must not retroactively
+      // change what THIS sampled batch's published_in_sample reports —
+      // it counts what was actually served at sample time).
+      if (publishedCheckStmt.get(row.id)) counts.published_in_sample++;
+
       let descriptionNulled = false;
       if (applyMode) {
         if (outcome.verdict === "MISMATCH") {
@@ -23376,6 +23432,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         id: row.id,
         verdict: outcome.verdict,
         reason: outcome.reason,
+        verification_status: row.verification_status,
         description_nulled: descriptionNulled,
         ...(dryRun
           ? { would_be_action: `[dry-run] ${actionText}${descText}` }

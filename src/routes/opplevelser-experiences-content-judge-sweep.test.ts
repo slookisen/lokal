@@ -47,6 +47,15 @@
  *       the ordering.
  *   (g) `limit` param (body and query) is honored when under the cap and
  *       clamped to the cap when over it.
+ *   (h) dev-request 2026-08-31-content-judge-sweep-sampling: sample omitted
+ *       and sample:"queue" explicit are byte-identical, and both carry the
+ *       new `verification_status` per-row field + `counts.published_in_sample`
+ *       (reusing PUBLISH_GATE_SQL — see experience-store.ts) alongside the
+ *       pre-existing fields, unmodified.
+ *   (i) sample:"random": the row-selection SELECT's ORDER BY actually swaps
+ *       to RANDOM() (asserted on SQL mechanism via a db.prepare() spy, never
+ *       on probabilistic output difference); sample:"random" combined with
+ *       apply:true is rejected 400 BEFORE any SELECT or write runs.
  */
 
 export interface TestSummary {
@@ -335,6 +344,39 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
         assertTrue(allUnchanged, "cjs-2o: dry-run wrote NOTHING — every row's verification_status/admission_verdict/admission_checked_at/description unchanged");
       }
 
+      // ── (h) sampling additive fields: verification_status per row +
+      //      counts.published_in_sample, reusing PUBLISH_GATE_SQL; and
+      //      explicit sample:"queue" is byte-identical to sample omitted ──
+      {
+        // Of the 6 eligible rows in this cohort: cjs-match, cjs-mismatch,
+        // cjs-boilerplate, cjs-ownsummary are verification_status='verified'
+        // with confidence='high' and no provider_id (PUBLISH_GATE_SQL's
+        // provider clause passes on NULL provider) -> published. cjs-judgefail
+        // and cjs-fetchfail are 'pending_verify' -> not published.
+        assertEq(
+          dryRunBody1.counts.published_in_sample,
+          4,
+          "cjs-h1: published_in_sample counts the verified rows in this batch (cjs-match/cjs-mismatch/cjs-boilerplate/cjs-ownsummary), excluding the 2 pending_verify rows",
+        );
+
+        const byId = new Map<string, any>((dryRunBody1.results as any[]).map((x) => [x.id, x]));
+        assertEq(byId.get("cjs-match")?.verification_status, "verified", "cjs-h2: cjs-match result carries verification_status='verified'");
+        assertEq(byId.get("cjs-mismatch")?.verification_status, "verified", "cjs-h3: cjs-mismatch result carries verification_status='verified' (still verified pre-apply)");
+        assertEq(byId.get("cjs-judgefail")?.verification_status, "pending_verify", "cjs-h4: cjs-judgefail result carries verification_status='pending_verify'");
+        assertEq(byId.get("cjs-fetchfail")?.verification_status, "pending_verify", "cjs-h5: cjs-fetchfail result carries verification_status='pending_verify'");
+        assertEq(byId.get("cjs-boilerplate")?.verification_status, "verified", "cjs-h6: cjs-boilerplate result carries verification_status='verified'");
+        assertEq(byId.get("cjs-ownsummary")?.verification_status, "verified", "cjs-h7: cjs-ownsummary result carries verification_status='verified'");
+
+        // sample:"queue" explicit == sample omitted (both are the default,
+        // unchanged ordering) — byte-identical response, including the new
+        // fields, no regression on any pre-existing field.
+        const rExplicitQueue = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample: "queue" } });
+        assertEq(rExplicitQueue.body.scanned, dryRunBody1.scanned, "cjs-h8: explicit sample:'queue' scanned identical to default (sample omitted)");
+        assertEq(rExplicitQueue.body.counts, dryRunBody1.counts, "cjs-h9: explicit sample:'queue' counts (incl. published_in_sample) identical to default");
+        assertEq(rExplicitQueue.body.results, dryRunBody1.results, "cjs-h10: explicit sample:'queue' results byte-identical to default (same ordering, same fields, incl. verification_status)");
+        assertEq(rExplicitQueue.body.remaining, dryRunBody1.remaining, "cjs-h11: explicit sample:'queue' remaining identical to default");
+      }
+
       // ── re-run the identical dry-run call: byte-identical report ────────
       {
         const r2 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: {} });
@@ -437,6 +479,79 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
 
         const r3 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: false, limit: 999 } });
         assertEq(r3.body.scanned, 50, "cjs-13c: an over-cap limit clamps to SWEEP_MAX_LIMIT (50), never processes more");
+      }
+
+      // ── (i) sample:"random" — ORDER BY RANDOM() mechanism, and the
+      //      apply:true+sample:"random" 400 guard (no SELECT/write) ────────
+      {
+        const preparedSql: string[] = [];
+        const originalPrepare = expDb.prepare.bind(expDb);
+        (expDb as any).prepare = (sql: string, ...rest: any[]) => {
+          preparedSql.push(sql);
+          return originalPrepare(sql, ...rest);
+        };
+
+        try {
+          // (i-1) sample:"random" + apply:true -> 400, BEFORE any db.prepare()
+          // call at all (the guard returns before getExpDb/SELECT/write), and
+          // before any evidence-page fetch or judge call.
+          const pageFetchesBefore = pageFetches;
+          const judgeCallsBefore = judgeCalls;
+          const rBlocked = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { sample: "random", apply: true },
+          });
+          assertEq(rBlocked.status, 400, "cjs-i1: sample:'random' + apply:true -> 400");
+          assertTrue(
+            typeof rBlocked.body?.error === "string" && rBlocked.body.error.length > 0,
+            "cjs-i2: 400 response carries a non-empty JSON { error } message",
+          );
+          assertEq(preparedSql.length, 0, "cjs-i3: the guard returns BEFORE any db.prepare() call — zero SELECT, zero write");
+          assertEq(pageFetches, pageFetchesBefore, "cjs-i4: no evidence-page fetch happened (no rows were ever selected)");
+          assertEq(judgeCalls, judgeCallsBefore, "cjs-i5: no judge call happened");
+
+          // (i-2) sample:"random" alone (dry-run, apply absent) -> 200, and
+          // the row-selection SELECT's ORDER BY is actually RANDOM() — this
+          // is a mechanism assertion on the SQL text itself (via the
+          // db.prepare() spy above), never on two calls happening to return
+          // different rows, which would be flaky.
+          preparedSql.length = 0;
+          const rRandom = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample: "random" } });
+          assertEq(rRandom.status, 200, "cjs-i6: sample:'random' dry-run -> 200");
+          assertEq(rRandom.body.dry_run, true, "cjs-i7: sample:'random' dry-run still reports dry_run:true (apply absent)");
+          const selectSqlRandom = preparedSql.find((s) => /FROM experiences\b/.test(s) && /ORDER BY/.test(s));
+          assertTrue(!!selectSqlRandom, "cjs-i8: a row-selection SELECT (with an ORDER BY) ran");
+          assertTrue(
+            !!selectSqlRandom && /ORDER BY RANDOM\(\)/.test(selectSqlRandom),
+            "cjs-i9: sample:'random' swaps the ORDER BY clause to RANDOM()",
+          );
+          assertTrue(
+            !!selectSqlRandom && !/admission_checked_at IS NULL/.test(selectSqlRandom),
+            "cjs-i10: the default admission_checked_at ordering is NOT present when sample:'random' is set",
+          );
+          assertTrue(
+            !!selectSqlRandom &&
+              /LIMIT \?/.test(selectSqlRandom) &&
+              /evidence_url IS NOT NULL AND canonical_id IS NULL/.test(selectSqlRandom) &&
+              /verification_status/.test(selectSqlRandom),
+            "cjs-i11: only the ORDER BY changed — columns/WHERE/LIMIT of the SELECT are untouched",
+          );
+
+          // sample:"queue" explicit still uses the ORIGINAL ordering (never
+          // RANDOM()), confirming the swap is genuinely conditional on the
+          // param rather than a permanent regression.
+          preparedSql.length = 0;
+          const rQueueAgain = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { sample: "queue" } });
+          assertEq(rQueueAgain.status, 200, "cjs-i12: sample:'queue' dry-run -> 200");
+          const selectSqlQueue = preparedSql.find((s) => /FROM experiences\b/.test(s) && /ORDER BY/.test(s));
+          assertTrue(
+            !!selectSqlQueue && /admission_checked_at IS NULL DESC, admission_checked_at ASC/.test(selectSqlQueue),
+            "cjs-i13: sample:'queue' keeps the original admission_checked_at ordering",
+          );
+          assertTrue(!!selectSqlQueue && !/RANDOM\(\)/.test(selectSqlQueue), "cjs-i14: sample:'queue' never uses RANDOM()");
+        } finally {
+          (expDb as any).prepare = originalPrepare;
+        }
       }
     } catch (err: any) {
       failed++;
