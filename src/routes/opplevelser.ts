@@ -149,6 +149,9 @@ import {
   // manual, overwriting/nulling correction lever for `adresse` (the only
   // other writer, applyGardssalgProviderAddress, is fill-only).
   applyGardssalgSetAddress,
+  // dev-request 2026-08-30-gardssalg-set-provider-navn-endepunkt — the
+  // `navn` write path, the last gårdssalg field with no update lever.
+  applyGardssalgSetProviderName,
   // dev-request 2026-08-29-gardssalg-products-write-and-field-lock, Part A —
   // the `products` write path applyGardssalgSetContentField's own doc
   // comment explicitly excludes (no defect vocabulary exists for it there).
@@ -9799,6 +9802,92 @@ router.post("/admin/gardssalg-set-address", requireAdmin, (req: Request, res: Re
     success: true,
     provider_id: providerId,
     field: "adresse",
+    old_value: result.old_value,
+    new_value: result.new_value,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-set-provider-name (admin) ───────
+//
+// dev-request 2026-08-30-gardssalg-set-provider-navn-endepunkt. Motivating
+// case: Anikonic (thread crm-1a04801578a5f4fc) corrected that they produce
+// fruit wine, not cider — but the producer's DISPLAY NAME itself was
+// "Anikonic Cider" (h1/page-title), not just the about/product text. Every
+// other gårdssalg admin write path (content-field, producer-type, address,
+// products) already lets an admin write a caller-supplied correction;
+// `navn` was the one column with no update path anywhere in the codebase —
+// see applyGardssalgSetProviderName's own doc comment (experience-store.ts)
+// for the full gate list and rollback story.
+//
+// Body: { provider_id: string, value: string, source: string }. Writes
+// ONLY `navn` — `slug` (the profile URL) is deliberately left untouched, so
+// a name correction never breaks an already-shared/indexed profile link
+// (dev-request confirm-understanding gate, Daniel, live session 2026-08-30).
+//
+// No `value: null` clear path (unlike gardssalg-set-address just above) —
+// a provider with no name is not a valid state; see the doc comment on
+// applyGardssalgSetProviderName for why. No objective-defect classifier
+// either — same reasoning gardssalg-set-content-field applies to why
+// `products` has none: there is no automatable "is this a valid business
+// name" check, the caller-supplied correction (a human/LLM reading the
+// producer's own email) IS the judgment.
+//
+// Rollback: no new lever — `navn` is now in GARDSSALG_ROLLBACKABLE_FIELDS
+// (experience-store.ts), and the audit row this writes is exactly what
+// POST /admin/gardssalg-content-rollback already reads.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/gardssalg-set-provider-name", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    value?: unknown;
+    source?: unknown;
+  };
+
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    res.status(400).json({ error: "provider_id_required" });
+    return;
+  }
+
+  const rawValue = body.value;
+  if (typeof rawValue !== "string" || !rawValue.trim()) {
+    res.status(400).json({ error: "value_required" });
+    return;
+  }
+  const value = rawValue.trim();
+
+  const source = typeof body.source === "string" ? body.source.trim() : "";
+  if (!source) {
+    res.status(400).json({ error: "source_required" });
+    return;
+  }
+
+  const result = applyGardssalgSetProviderName(providerId, value, source);
+
+  if (!result.ok) {
+    if (result.reason === "provider_not_found") {
+      res.status(404).json({ error: "provider_not_found" });
+      return;
+    }
+    if (result.reason === "owner_locked") {
+      // 409, not 403 — same "authorized request, but the row's STATE
+      // conflicts with the write" reasoning as every other gårdssalg
+      // set-* endpoint's 409.
+      res.status(409).json({ error: "owner_locked" });
+      return;
+    }
+    // Unreachable over HTTP — the blank check above already returned this
+    // exact 400. Mapped anyway so the service's own blank guard (defense in
+    // depth for direct callers) can never surface as an uncaught 500.
+    res.status(400).json({ error: "value_required" });
+    return;
+  }
+
+  res.json({
+    success: true,
+    provider_id: providerId,
+    field: "navn",
     old_value: result.old_value,
     new_value: result.new_value,
   });

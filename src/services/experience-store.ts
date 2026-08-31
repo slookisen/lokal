@@ -5941,6 +5941,113 @@ export function applyGardssalgSetAddress(
   return { ok: true, old_value: oldValue, new_value: trimmed };
 }
 
+export type GardssalgSetProviderNameResult =
+  | { ok: true; old_value: string | null; new_value: string }
+  | { ok: false; reason: "provider_not_found" }
+  | { ok: false; reason: "owner_locked" }
+  | { ok: false; reason: "value_required" };
+
+/**
+ * Write a gårdssalg provider's display name (`navn` — drives h1/page-title/
+ * og:description and the public card, NOT `slug`/the URL) — dev-request
+ * 2026-08-30-gardssalg-set-provider-navn-endepunkt. Motivating case: a
+ * producer corrects a wrong product-type baked into their own name (e.g.
+ * "Anikonic Cider" for a fruit-wine producer, not a cidery) — every other
+ * gårdssalg admin write path (content-field, producer-type, address,
+ * products) already lets CS/admin write a caller-supplied correction; `navn`
+ * was the one column with NO update path anywhere in this file — only ever
+ * set once, at row INSERT (seeding).
+ *
+ * Structurally mirrors applyGardssalgSetAddress above: owner-lock gate on a
+ * FRESH row read, one gardssalg_content_audit row, single transaction. Two
+ * differences from that sibling, both deliberate:
+ *   - No `value: null` clear path — a provider without a name isn't a valid
+ *     state to write into, unlike an address (which can legitimately be
+ *     unknown). `navn` is NOT NULL by convention even though the column
+ *     itself has no DB-level constraint (see the CREATE TABLE fixtures in
+ *     the test suite) — every row is seeded with one.
+ *   - No objective-defect classifier — `classifyGardssalgAddressDefect` has
+ *     no name-shaped analogue, and unlike `products` (excluded from
+ *     gardssalg-set-content-field for exactly this "no defect vocabulary"
+ *     reason), a name correction is itself the human/LLM-verified judgment;
+ *     there is nothing further to classify automatically.
+ *
+ * `navn` is deliberately NOT added to GARDSSALG_OWNER_LOCK_ELIGIBLE_FIELDS —
+ * same reasoning as `adresse` (also absent from that set): it falls under
+ * layer B's "any other fieldName" rule inside isGardssalgFieldOwnerLocked,
+ * i.e. still fully protected on content_source='manual'/'claim' rows, just
+ * without the extra per-field owner_locks lookup those five specific fields
+ * get. `navn` IS added to GARDSSALG_ROLLBACKABLE_FIELDS (see that set), so
+ * the existing POST /admin/gardssalg-content-rollback needs no changes to
+ * cover this write.
+ *
+ * `slug` is intentionally left untouched by this function — see the dev-
+ * request's confirm-understanding gate (Daniel, live session, 2026-08-30):
+ * regenerating the slug on a name change would break already-shared/
+ * indexed profile URLs, so the URL stays stable and only the display name
+ * changes. A slug-refresh lever, if ever wanted, is a separate dev-request.
+ */
+export function applyGardssalgSetProviderName(
+  providerId: string,
+  value: string,
+  source: string
+): GardssalgSetProviderNameResult {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, navn, content_source, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; navn: string | null; content_source: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "provider_not_found" };
+
+  // Gate 1 — owner lock, on the FRESH row (see doc comment above).
+  if (isGardssalgFieldOwnerLocked(row, "navn")) return { ok: false, reason: "owner_locked" };
+
+  const trimmed = value.trim();
+  // Gate 2 — non-blank.
+  if (!trimmed) return { ok: false, reason: "value_required" };
+
+  const oldValue = row.navn;
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  // Same parse-guard as applyGardssalgSetAddress above: malformed existing
+  // JSON is treated as {} rather than clobbering the write. This preserves
+  // any existing `owner_locks` object untouched.
+  let provenance: Record<string, unknown> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.navn = { source_url: source, fetched_at: new Date().toISOString() };
+  const provenanceJson = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET navn = @value, field_provenance = @field_provenance WHERE id = @id`
+    ).run({ id: providerId, value: trimmed, field_provenance: provenanceJson });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'navn', @old_value, @new_value, @source_url, NULL, 'admin', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: oldValue,
+      new_value: trimmed,
+      source_url: source,
+    });
+  });
+  applyWithAudit();
+
+  return { ok: true, old_value: oldValue, new_value: trimmed };
+}
+
 export type GardssalgSetTerminalStatusResult =
   | { ok: true; old_value: string | null; new_value: string | null }
   | { ok: false; reason: "provider_not_found" };
@@ -8789,6 +8896,11 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // BOTH the keep_id and remove_id rows it touched, so a single batch_id
   // rollback call undoes an entire merge.
   "merged_into",
+  // dev-request 2026-08-30-gardssalg-set-provider-navn-endepunkt —
+  // applyGardssalgSetProviderName writes the same gardssalg_content_audit
+  // shape as every other field here, so the existing rollback lever covers
+  // it with zero other changes.
+  "navn",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
