@@ -1,0 +1,280 @@
+// ─── POST /admin/agents/pending-verify-unpark ────────────────────────────────
+//
+// dev-requests/2026-09-01-rfb-pending-verify-unpark-lever.md. A targeted admin
+// lever to release individual `pending_verify` rows from the 30-day parking
+// mechanism (`pending_verify_parked_since`, stamped in applyVerifierOutcome —
+// src/agents/lokal-agent-verifier.ts:862-872 — after 3 consecutive no-progress
+// re-verify sweeps, and excluded from pickPendingVerifyBatch's selection there
+// at lines 460-480) BEFORE the 30-day backoff naturally expires.
+//
+// Problem this closes: the only existing escape from parking is the
+// all-or-nothing env flag PENDING_VERIFY_PARKING_DISABLED=true, which requires
+// a deploy and unparks EVERY parked row regardless of whether any of them
+// received new data. That defeats the point of parking (it exists to stop the
+// sweep wasting cycles on rows proven unresolvable by re-verification alone —
+// see the dev-request's measured 793/962 pending_verify rows parked,
+// 0 naturally expired). This route mirrors the analogous, already-shipped
+// lever for the geocode worker's own parking mechanism — unparkAgentsGeocode
+// (src/services/agents-geocode-worker.ts:692) and its route
+// POST /admin/agents/geocode-batch's `unpark` flag (src/routes/marketplace.ts,
+// ~line 7223) — same dry-run-by-default / count-then-write shape, adapted to
+// this mechanism's own eligibility rule.
+//
+// Freshness filter (the actual point of this route, not just "unpark
+// everything early"): a parked row is only unparked in COHORT mode (no
+// `agentIds` — an admin-picked limit/batch) when it has demonstrably received
+// NEW data since it was parked:
+//   agent_knowledge.updated_at > agent_knowledge.pending_verify_parked_since
+// Without this filter, an early bulk unpark is just a second round of wasted
+// sweep cycles on the exact same unresolvable rows parking was built to
+// protect against. `updated_at` is a real, regularly-bumped column (confirmed
+// write site: src/routes/admin-rfb-contact-extraction.ts:357, and the
+// column's own DEFAULT (datetime('now')) in src/database/init.ts) — a row
+// that received a freshly-scraped email, a corrected website, or any other
+// enrichment write after being parked will show a newer `updated_at` than its
+// `pending_verify_parked_since` stamp.
+//
+// `agentIds` mode (explicit admin selection) OVERRIDES the freshness filter —
+// the admin is being explicit, so a stale/unresolvable row named by id is
+// still force-unparked — but every requested id's freshness state is still
+// reported per-row (`freshnessMet: false` for a forced stale row) so the
+// caller can see exactly which ones were force-unparked without fresh data
+// backing the decision.
+//
+// Effect per unparked row (touches NO other column):
+//   pending_verify_parked_since     = NULL
+//   pending_verify_no_progress_count = 0
+// NULL trivially satisfies pickPendingVerifyBatch's own exclusion clause
+// (`k.pending_verify_parked_since IS NULL OR k.pending_verify_parked_since
+// <= datetime('now','-30 days')`), so an unparked row is immediately
+// selectable again by the next sweep — same effect a natural 30-day expiry
+// would have produced, just early and only for rows that earned it.
+//
+// Eligibility gate common to both modes: a row is only ever a candidate if it
+// is CURRENTLY parked (`pending_verify_parked_since IS NOT NULL`) — there is
+// nothing to unpark otherwise.
+//
+// Response semantics: `dryRun` (apply omitted or not === true) never writes —
+// `candidates`/`unparked` report what WOULD happen (mirrors
+// unparkAgentsGeocode(dryRun)'s "count without writing" convention) and every
+// row's `applied` is false. Under `apply: true`, the same rows are actually
+// written and their `applied` flips to true. `candidates` and `unparked` are
+// deliberately two different numbers: `candidates` is how many rows are
+// eligible to be unparked (post freshness-filter in cohort mode; post
+// currently-parked-check in agentIds mode, freshness override notwithstanding);
+// `unparked` is how many rows this call actually did (or, in dry-run, would)
+// write — 0 whenever dryRun is true.
+//
+// Auth: X-Admin-Key header, LOCAL requireAdmin() — this codebase's convention
+// is every admin route file redefines this locally rather than importing a
+// shared helper (verified against admin-rfb-contact-extraction.ts,
+// admin-rfb-website-discovery.ts, admin-agents-contact-email-write.ts).
+//
+// DB access: getDb() + prepared statements only. `agentIds` are never
+// interpolated into SQL text — a dynamically-built `IN (?,?,...)`
+// placeholder list is used, matching admin-rfb-contact-extraction.ts's
+// selectRfbCxTargetsByIds convention.
+//
+// Non-goals: this route does not touch verification_status, does not re-run
+// verification itself, and does not change the parking mechanism's write
+// site (lokal-agent-verifier.ts) or the 30-day threshold — it only clears the
+// two parking columns early, on a per-row basis, for rows that earned it.
+
+import { Router, Request, Response } from "express";
+import { getDb } from "../database/init";
+
+function getAdminKey(): string {
+  return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+}
+
+function requireAdmin(req: Request, res: Response): boolean {
+  const expected = getAdminKey();
+  if (!expected) {
+    res.status(503).json({ error: "Admin not configured" });
+    return false;
+  }
+  const provided = (req.headers["x-admin-key"] as string) || "";
+  if (provided !== expected) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return false;
+  }
+  return true;
+}
+
+// Manual admin lever, not a background worker — bounded but generous, since
+// (unlike the geocode/contact-extraction levers) this route makes no live
+// network calls, only DB reads/writes.
+export const PENDING_VERIFY_UNPARK_DEFAULT_LIMIT = 100;
+export const PENDING_VERIFY_UNPARK_HARD_CAP = 500;
+
+interface UnparkCandidateRow {
+  agent_id: string;
+  agent_name: string | null;
+  was_parked: 0 | 1;
+  freshness_met: 0 | 1;
+}
+
+// agentIds mode: look up EVERY requested id (whether or not it turns out to
+// be parked/fresh) in one query, so the route can report a definite state for
+// every id the admin named — including ones that don't exist or aren't
+// currently parked at all.
+function selectAgentIdsCandidates(db: ReturnType<typeof getDb>, ids: string[]): UnparkCandidateRow[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return db
+    .prepare(
+      `SELECT a.id AS agent_id, a.name AS agent_name,
+              CASE WHEN k.pending_verify_parked_since IS NOT NULL THEN 1 ELSE 0 END AS was_parked,
+              CASE WHEN k.pending_verify_parked_since IS NOT NULL
+                        AND k.updated_at > k.pending_verify_parked_since THEN 1 ELSE 0 END AS freshness_met
+         FROM agents a
+         JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id IN (${placeholders})`
+    )
+    .all(...ids) as UnparkCandidateRow[];
+}
+
+// Cohort mode: the freshness filter is applied IN SQL (not re-derived in JS
+// from the two datetime strings) — both columns are written as SQL-native
+// datetime('now') text, and lokal-agent-verifier.ts's own parking-stamp
+// comment (line ~853-862) documents why a JS-side Date.parse of that format
+// is timezone-unsafe. Oldest-parked-first ordering mirrors
+// pickPendingVerifyBatch's own oldest-first convention.
+function selectCohortCandidates(db: ReturnType<typeof getDb>, limit: number): UnparkCandidateRow[] {
+  return db
+    .prepare(
+      `SELECT a.id AS agent_id, a.name AS agent_name, 1 AS was_parked, 1 AS freshness_met
+         FROM agents a
+         JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE k.pending_verify_parked_since IS NOT NULL
+          AND k.updated_at > k.pending_verify_parked_since
+        ORDER BY k.pending_verify_parked_since ASC
+        LIMIT ?`
+    )
+    .all(limit) as UnparkCandidateRow[];
+}
+
+// Touches ONLY the two parking columns, on exactly the ids handed in — the
+// caller has already decided (via the freshness/parked eligibility checks
+// above) which ids belong here.
+function unparkRows(db: ReturnType<typeof getDb>, ids: string[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => "?").join(",");
+  db.prepare(
+    `UPDATE agent_knowledge
+        SET pending_verify_parked_since = NULL,
+            pending_verify_no_progress_count = 0
+      WHERE agent_id IN (${placeholders})`
+  ).run(...ids);
+}
+
+interface ResultRow {
+  agentId: string;
+  agentName?: string | null;
+  wasEligible: boolean;
+  freshnessMet: boolean;
+  applied: boolean;
+}
+
+const router = Router();
+
+router.post("/agents/pending-verify-unpark", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; apply?: unknown };
+
+  // Loose-but-explicit truthy check, same convention as
+  // admin-rfb-contact-extraction.ts's `apply` handling (this route's body
+  // shape — `apply`, not geocode-batch's `dry_run` — mirrors that sibling,
+  // per the dev-request's own spec). Dry-run is the default: only an
+  // explicit truthy `apply` writes anything.
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  const dryRun = !apply;
+
+  const db = getDb();
+
+  const rawIds = Array.isArray(body.agentIds)
+    ? (body.agentIds as unknown[])
+        .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+        .map((v) => v.trim())
+    : [];
+  // De-duped, order-preserved — a duplicate id in the request must still
+  // produce exactly one row in the response.
+  const ids = Array.from(new Set(rawIds));
+
+  let mode: "agentIds" | "cohort";
+  let limit: number | undefined;
+  const rows: ResultRow[] = [];
+
+  if (ids.length > 0) {
+    mode = "agentIds";
+    if (ids.length > PENDING_VERIFY_UNPARK_HARD_CAP) {
+      res.status(400).json({ error: `Too many agentIds (max ${PENDING_VERIFY_UNPARK_HARD_CAP} per call)` });
+      return;
+    }
+    const found = selectAgentIdsCandidates(db, ids);
+    const byId = new Map(found.map((r) => [r.agent_id, r]));
+    for (const id of ids) {
+      const r = byId.get(id);
+      if (!r) {
+        // Unknown id (no agents row, or no agent_knowledge row) — reported,
+        // never silently dropped, mirroring the sibling routes' agentIds
+        // handling of ids that don't resolve to a real target.
+        rows.push({ agentId: id, wasEligible: false, freshnessMet: false, applied: false });
+        continue;
+      }
+      rows.push({
+        agentId: id,
+        agentName: r.agent_name,
+        wasEligible: r.was_parked === 1,
+        // freshnessMet is only meaningful once wasEligible — a never-parked
+        // row simply reports false here rather than an undefined comparison.
+        freshnessMet: r.was_parked === 1 && r.freshness_met === 1,
+        applied: false,
+      });
+    }
+  } else {
+    mode = "cohort";
+    const rawLimit =
+      typeof body.limit === "number" && Number.isFinite(body.limit) ? Math.floor(body.limit) : PENDING_VERIFY_UNPARK_DEFAULT_LIMIT;
+    limit = Math.max(1, Math.min(PENDING_VERIFY_UNPARK_HARD_CAP, rawLimit));
+    const found = selectCohortCandidates(db, limit);
+    for (const r of found) {
+      rows.push({ agentId: r.agent_id, agentName: r.agent_name, wasEligible: true, freshnessMet: true, applied: false });
+    }
+  }
+
+  // Eligible = "would be unparked": in cohort mode this is every row (the
+  // query already applied the freshness filter); in agentIds mode it is
+  // every currently-parked requested id, freshness override included — a
+  // stale-but-explicitly-named row is still eligible, just reported with
+  // freshnessMet:false.
+  const eligibleIds = rows.filter((r) => r.wasEligible).map((r) => r.agentId);
+  const candidates = eligibleIds.length;
+  let unparked = 0;
+
+  if (apply) {
+    if (eligibleIds.length > 0) unparkRows(db, eligibleIds);
+    for (const r of rows) {
+      if (r.wasEligible) r.applied = true;
+    }
+    unparked = eligibleIds.length;
+  } else {
+    // Dry-run preview: reports how many WOULD be unparked, writes nothing —
+    // mirrors unparkAgentsGeocode(dryRun)'s "count without writing" shape.
+    unparked = candidates;
+  }
+
+  res.json({
+    success: true,
+    dryRun,
+    mode,
+    ...(limit !== undefined ? { limit } : {}),
+    candidates,
+    unparked,
+    rows,
+  });
+});
+
+export default router;
