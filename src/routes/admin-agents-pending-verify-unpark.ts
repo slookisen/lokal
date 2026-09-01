@@ -54,7 +54,7 @@
 // is CURRENTLY parked (`pending_verify_parked_since IS NOT NULL`) — there is
 // nothing to unpark otherwise.
 //
-// Response semantics: `dryRun` (apply omitted or not === true) never writes —
+// Response semantics: `dry_run` (apply omitted or not === true) never writes —
 // `candidates`/`unparked` report what WOULD happen (mirrors
 // unparkAgentsGeocode(dryRun)'s "count without writing" convention) and every
 // row's `applied` is false. Under `apply: true`, the same rows are actually
@@ -99,6 +99,36 @@ function requireAdmin(req: Request, res: Response): boolean {
     return false;
   }
   return true;
+}
+
+// Strict boolean parse for `apply` (review fix, orch-pr-20260901-1) — same
+// fail-CLOSED pattern as parseDryRunFlag in
+// src/services/agents-geocode-worker.ts (added after a past incident on this
+// route's sibling geocode-unpark lever, where a loose truthy check on a
+// prod-mutation switch silently misinterpreted a stringified/typo'd value).
+// This route's `apply` is NOT a drop-in reuse of that helper: the field name
+// differs (`apply` vs `dry_run`), and — critically — the DEFAULT semantics
+// are the inverse of each other (parseDryRunFlag's absent-value default is
+// dryRun:false i.e. "would write"; this route's absent-value default must
+// stay apply:false i.e. "dry-run", per the dev-request's own "dry-run unless
+// apply === true" spec and every existing test in this file). Reusing
+// parseDryRunFlag verbatim against this route's `apply` field would flip
+// that default and silently turn a dry-run-by-default lever into a
+// write-by-default one — so the STRICT-BOOLEAN pattern is reproduced here
+// against this route's own field/default rather than importing the helper.
+// Anything present but not a real boolean (a stringified "true", a "1") is
+// now REJECTED (400) rather than loosely coerced, so a malformed request
+// fails closed/loud instead of silently doing (or silently NOT doing) a bulk
+// write.
+function parseApplyFlag(raw: unknown): { ok: true; apply: boolean } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, apply: false };
+  if (typeof raw === "boolean") return { ok: true, apply: raw };
+  return {
+    ok: false,
+    error:
+      `apply må være en boolsk verdi (true/false uten anførselstegn) — fikk ${JSON.stringify(raw)}. ` +
+      `Avvist i stedet for tolket: en feilskrevet apply-verdi ville ellers ha blitt tolket løst.`,
+  };
 }
 
 // Manual admin lever, not a background worker — bounded but generous, since
@@ -183,13 +213,16 @@ router.post("/agents/pending-verify-unpark", (req: Request, res: Response) => {
 
   const body = (req.body ?? {}) as { agentIds?: unknown; limit?: unknown; apply?: unknown };
 
-  // Loose-but-explicit truthy check, same convention as
-  // admin-rfb-contact-extraction.ts's `apply` handling (this route's body
-  // shape — `apply`, not geocode-batch's `dry_run` — mirrors that sibling,
-  // per the dev-request's own spec). Dry-run is the default: only an
-  // explicit truthy `apply` writes anything.
-  const apply =
-    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+  // Strict boolean parse (see parseApplyFlag above) — dry-run is the
+  // default: only an explicit boolean `apply: true` writes anything; any
+  // other truthy-looking-but-not-boolean value is rejected rather than
+  // guessed at.
+  const parsedApply = parseApplyFlag(body.apply);
+  if (!parsedApply.ok) {
+    res.status(400).json({ error: parsedApply.error });
+    return;
+  }
+  const apply = parsedApply.apply;
   const dryRun = !apply;
 
   const db = getDb();
@@ -268,7 +301,13 @@ router.post("/agents/pending-verify-unpark", (req: Request, res: Response) => {
 
   res.json({
     success: true,
-    dryRun,
+    // Renamed from `dryRun` to `dry_run` (review fix, orch-pr-20260901-1) to
+    // match this route's own admin-lever family — admin-rfb-contact-
+    // extraction.ts and POST /admin/agents/geocode-batch (marketplace.ts)
+    // both report `dry_run` (snake_case); this was the only one of the three
+    // using camelCase. Purely cosmetic — request-body shape (`apply`) is
+    // unchanged, only this response field's name.
+    dry_run: dryRun,
     mode,
     ...(limit !== undefined ? { limit } : {}),
     candidates,

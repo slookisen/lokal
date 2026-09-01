@@ -198,7 +198,7 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
       const id = insertAgent({ parkedSince: "2026-08-01 00:00:00", updatedAt: "2026-08-15 00:00:00" });
       const r = await callUnpark({ agentIds: [id] });
       assertEq(r.status, 200, "b1: 200");
-      assertEq(r.body.dryRun, true, "b2: dryRun true by default");
+      assertEq(r.body.dry_run, true, "b2: dry_run true by default");
       assertEq(r.body.candidates, 1, "b3: candidates=1");
       assertEq(r.body.unparked, 1, "b4: unparked=1 (preview count)");
       const row = r.body.rows.find((x: any) => x.agentId === id);
@@ -222,7 +222,7 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
       const r = await callUnpark({ agentIds: [id], apply: true });
       assertEq(r.status, 200, "c1: 200");
-      assertEq(r.body.dryRun, false, "c2: dryRun false");
+      assertEq(r.body.dry_run, false, "c2: dry_run false");
       assertEq(r.body.unparked, 1, "c3: unparked=1");
       const row = r.body.rows.find((x: any) => x.agentId === id);
       assertEq(row?.applied, true, "c4: applied true");
@@ -250,6 +250,33 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
 
       assertEq(knowledgeRow(staleId).pending_verify_parked_since, "2026-08-01 00:00:00", "d6: AC3 — stale row's parked_since UNTOUCHED");
       assertEq(knowledgeRow(freshId).pending_verify_parked_since, null, "d7: fresh row's parked_since cleared");
+    }
+
+    // ── (d2) Defect-2 regression: updated_at EXACTLY EQUAL to parked_since is
+    // NOT fresh (mutation-test guard: flipping the freshness comparison from
+    // `>` to `>=` in either selectCohortCandidates or
+    // selectAgentIdsCandidates must be caught here — a write racing exactly
+    // with the parking stamp is not "genuinely new" evidence; strict `>` is
+    // the intended semantics). ──
+    {
+      const equalId = insertAgent({ parkedSince: "2026-08-05 00:00:00", updatedAt: "2026-08-05 00:00:00" });
+
+      // cohort mode: an exactly-equal row must NOT be a candidate at all.
+      const cohortR = await callUnpark({ apply: true, limit: 500 });
+      const cohortRow = cohortR.body.rows.find((x: any) => x.agentId === equalId);
+      assertEq(cohortRow, undefined, "d2-1: exactly-equal updated_at/parked_since row is NOT a cohort candidate");
+      assertEq(
+        knowledgeRow(equalId).pending_verify_parked_since,
+        "2026-08-05 00:00:00",
+        "d2-2: exactly-equal row's parked_since UNTOUCHED by cohort apply",
+      );
+
+      // agentIds mode: still eligible (currently parked) but freshnessMet
+      // must be false — only a force-unpark, never a freshness-earned one.
+      const idsR = await callUnpark({ agentIds: [equalId] }); // dry-run, so no state changes from this call
+      const idsRow = idsR.body.rows.find((x: any) => x.agentId === equalId);
+      assertEq(idsRow?.wasEligible, true, "d2-3: exactly-equal row still wasEligible (currently parked)");
+      assertEq(idsRow?.freshnessMet, false, "d2-4: exactly-equal row reports freshnessMet:false — NOT >=");
     }
 
     // ── (e) agentIds mode force-unparks a stale row, reports freshnessMet:false ──
