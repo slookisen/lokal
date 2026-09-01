@@ -249,12 +249,21 @@ export async function probeAgentUrl(
 }
 
 
-// Brreg lookup — placeholder. Real implementation uses
-// https://data.brreg.no/enhetsregisteret/api/enheter?navn=<name>
-// We don't make the call from inside the verifier core today because
-// Brreg rate-limits and the wired implementation belongs in
-// rfb-contact-verifier — for this MVP we just consume what the caller
-// hands us.
+// Brreg lookup. dev-request 2026-09-01-rfb-verifier-brreglookup-aldri-koblet:
+// a real lookup (resolveBrregLookup, below) now runs per candidate row via
+// https://data.brreg.no/enhetsregisteret/api/enheter?navn=<name> — both
+// production callers (src/scripts/run-verifier.ts,
+// src/routes/admin-run-verifier.ts) wire it in as the default brregLookup.
+// The call is wrapped fail-closed (any error/ambiguous-hit/not-found falls
+// back to null, never throws into the batch loop) and Brreg's own 15s-per-
+// call timeout (REQUEST_TIMEOUT_MS in brreg-client.ts) bounds the worst case
+// per row. This trades some added latency and Brreg rate-limit exposure —
+// runVerifierBatch's loop below calls brregLookup unconditionally for every
+// candidate row, not just ones that need it — for closing the
+// brreg_name_match gap this dev-request identified. Further scoping (e.g.
+// skipping the lookup for rows that already have another accepted identity
+// source) is a reasonable future optimisation if batch latency becomes a
+// problem in practice; not needed for this fix.
 export type BrregFn = (name: string, city: string | null) => Promise<BrregLookupResult | null>;
 
 // Compute kvalitets-gate from observed signals. Pure function for testability.
@@ -1494,6 +1503,51 @@ export async function checkFreshBrregDeathEvidence(
   if (verified.flag === "bankrupt") return "brreg_konkurs";
   if (verified.flag === "dissolved") return "brreg_inactive";
   return null;
+}
+
+/**
+ * resolveBrregLookup — the real BrregFn implementation for runVerifierBatch's
+ * opts.brregLookup (dev-request 2026-09-01-rfb-verifier-brreglookup-aldri-koblet:
+ * no production caller ever wired this in, so `brreg` was always null and
+ * brreg_name_match could never fire — see that dev-request for the full
+ * incident). Mirrors checkFreshBrregDeathEvidence's own search-then-verify
+ * shape: a name search via findOrgnumberByName (no postal code — this file's
+ * callers only ever have a free-text city, same rationale as
+ * checkFreshBrregDeathEvidence documents for itself above), then a direct
+ * verifyOrgNumber on the hit's org-nr. Never throws (wrapped in try/catch);
+ * any error, missing hit, or exists:false result falls back to null — i.e.
+ * at least as safe as the old hardcoded null this replaces.
+ *
+ * Ambiguity guard (CHANGES-REQUESTED finding 1, PR #758): findOrgnumberByName's
+ * own doc comment (brreg-client.ts, BrregHit.exact_ties) requires a caller
+ * writing identity keys to treat `exact_ties > 1` as ambiguous and refuse to
+ * auto-write — e.g. "SOLBAKKEN GARD" (ENK) vs "SOLBAKKEN GARD AS" both score
+ * 1.0 exact-match, and blindly trusting `hit` in that case can resolve to the
+ * WRONG entity (a dissolved ENK when the live AS was meant, or vice versa).
+ * Since this result feeds computeKvalitetsGate's brreg_konkurs/brreg_inactive
+ * permanent disqualifier, an ambiguous hit is treated as no confident match
+ * at all — verifyOrgNumber is never called on it.
+ */
+export async function resolveBrregLookup(
+  name: string,
+  _city: string | null,
+  fetchImpl: typeof fetch = fetch,
+): Promise<BrregLookupResult | null> {
+  try {
+    const hit = await findOrgnumberByName(name, null, fetchImpl).catch(() => null);
+    if (!hit) return null;
+    if (hit.exact_ties && hit.exact_ties > 1) return null;
+    const verified = await verifyOrgNumber(hit.orgnumber, fetchImpl).catch(() => null);
+    if (!verified || !verified.exists) return null;
+    return {
+      is_active: verified.active,
+      is_konkurs: verified.flag === "bankrupt",
+      naering: verified.nace[0] ?? null,
+      navn: verified.name,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // Main loop. Caller (Fly Machine job, test, or manual) provides a

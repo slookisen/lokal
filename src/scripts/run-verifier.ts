@@ -8,7 +8,7 @@
 // so this script runs 24×/day but skips 15 of those (outside window).
 // Set FORCE_RUN=1 to bypass for manual ad-hoc testing.
 
-import { runVerifierBatch, buildRunEnvelope } from "../agents/lokal-agent-verifier";
+import { runVerifierBatch, buildRunEnvelope, resolveBrregLookup } from "../agents/lokal-agent-verifier";
 
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const BASE = process.env.BASE_URL || "http://localhost:3000";
@@ -32,7 +32,7 @@ async function main(): Promise<number> {
   let errorCount = 0;
 
   try {
-    batchResult = await runVerifierBatch({ batchSize: BATCH_SIZE });
+    batchResult = await runVerifierBatch({ batchSize: BATCH_SIZE, brregLookup: resolveBrregLookup });
     console.log(`[verifier-runner] Run ID: ${batchResult.run_id}`);
     console.log(`[verifier-runner] Processed ${batchResult.results.length} agents`);
   } catch (err: any) {

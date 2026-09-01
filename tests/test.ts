@@ -41276,6 +41276,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-01-rfb-verifier-brreglookup-aldri-koblet: neither
+// production caller (src/scripts/run-verifier.ts, src/routes/admin-run-
+// verifier.ts) ever passed opts.brregLookup into runVerifierBatch, so
+// `brreg` was always null in production and brreg_name_match could never
+// fire. Covers the new resolveBrregLookup — now wired into both callers as
+// the default — in isolation. Pure unit tests, no DB, fetch-mocked (never
+// real network). Tail position mirrors this file's own new-registration
+// convention, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-01-rfb-verifier-brreglookup-aldri-koblet: resolveBrregLookup wiring ──");
+  try {
+    const { runLokalAgentVerifierBrregLookupWiringTests } = require("../src/agents/lokal-agent-verifier-brreglookup-wiring.test") as
+      typeof import("../src/agents/lokal-agent-verifier-brreglookup-wiring.test");
+    const blw = await runLokalAgentVerifierBrregLookupWiringTests({ log: false });
+    passed += blw.passed;
+    failed += blw.failed;
+    for (const f of blw.failures) failures.push("lokal-agent-verifier-brreglookup-wiring: " + f);
+    console.log(`  lokal-agent-verifier-brreglookup-wiring: ${blw.passed} passed, ${blw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-brreglookup-wiring: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-23-rfb-andrelinje-verifisering-lav-terskel (fix-up,
 // code-review CHANGES-REQUESTED on 36580f2b): verified_second_line=1 must
 // NOT be commerce-eligible — cart-service.isProducerEligible() and the
