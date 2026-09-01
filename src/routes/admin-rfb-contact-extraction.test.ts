@@ -47,6 +47,17 @@
  *       always carries changed_by='system' (never a custom string) — the
  *       hard CHECK constraint in src/database/init.ts would otherwise reject
  *       the insert outright.
+ *   (r) AC4 — fill-only: a row whose agent_knowledge.email is already
+ *       non-empty is NEVER overwritten (agents.contact_email still gets its
+ *       normal write); a sibling row with no pre-existing value still gets
+ *       filled in the SAME apply call.
+ *
+ * dev-request (agent_knowledge.email column fix): (b)/(c)/(i)/(j)/(n) above
+ * were extended with DB-level assertions against agent_knowledge.email +
+ * field_provenance to prove AC1 (populated on write), AC2 (non-empty
+ * source_url in field_provenance.email), and AC3 (curated/locked rows never
+ * touch agent_knowledge.email either) — not just the existing
+ * agents.contact_email assertions.
  *
  * globalThis.fetch is mocked directly, keyed on exact URL (same convention
  * as admin-rfb-website-discovery.test.ts). This file is intentionally NOT
@@ -228,6 +239,7 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       role?: string;
       verticalId?: string | null;
       createdAt?: string;
+      knowledgeEmail?: string | null;
     }): void {
       testDb.prepare(
         `INSERT INTO agents (
@@ -240,16 +252,25 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
         o.createdAt ?? "2026-01-01 00:00:00",
       );
       testDb.prepare(
-        `INSERT INTO agent_knowledge (agent_id, website, field_provenance, curated_fields, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO agent_knowledge (agent_id, website, field_provenance, curated_fields, email, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       ).run(
-        o.id, o.website, o.fieldProvenance ?? "{}", o.curatedFields ?? "{}", new Date().toISOString(),
+        o.id, o.website, o.fieldProvenance ?? "{}", o.curatedFields ?? "{}", o.knowledgeEmail ?? null, new Date().toISOString(),
       );
     }
 
     function contactEmailOf(id: string): string {
       const row = testDb.prepare("SELECT contact_email FROM agents WHERE id = ?").get(id) as { contact_email: string };
       return row.contact_email;
+    }
+    function knowledgeEmailOf(id: string): string | null {
+      const row = testDb.prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(id) as { email: string | null };
+      return row.email;
+    }
+    function fieldProvenanceOf(id: string): Record<string, any> {
+      const row = testDb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(id) as
+        { field_provenance: string | null };
+      return row.field_provenance ? JSON.parse(row.field_provenance) : {};
     }
     function auditRowsFor(id: string): any[] {
       return testDb.prepare("SELECT * FROM agent_knowledge_audit WHERE agent_id = ? ORDER BY changed_at").all(id);
@@ -281,6 +302,7 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(item.email_source, "mailto", "b6: source is mailto");
       assertEq(contactEmailOf("cx-mailto"), "", "b7: dry-run wrote NOTHING to the DB");
       assertEq(auditRowsFor("cx-mailto").length, 0, "b8: dry-run wrote no audit row");
+      assertEq(knowledgeEmailOf("cx-mailto"), null, "b9: dry-run also wrote nothing to agent_knowledge.email");
     }
 
     // ── (c) apply actually writes + exactly one audit row ───────────────────
@@ -298,6 +320,20 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(audit[0].new_value, "kontakt@fjelldal.no", "c8: audit records the new value");
       assertTrue(String(audit[0].notes || "").includes("https://fjelldal.no"), "c9: audit notes carry the source URL");
       assertTrue(String(audit[0].notes || "").startsWith("rfb-contact-extraction "), "c9b: notes carry the route's identifying prefix");
+
+      // AC1/AC2: the funnel gates (lokal-agent-verifier.ts's
+      // pickPendingVerifyBatch, admin-outreach-candidates.ts) read
+      // agent_knowledge.email, NOT agents.contact_email — so a write that
+      // only touched the latter (the pre-fix bug) would never surface here.
+      // Reverting just the new agent_knowledge UPDATE statement makes c10
+      // fail (knowledgeEmailOf stays null) while c4 above still passes —
+      // mutation-proof for exactly the bug this fix targets.
+      assertEq(knowledgeEmailOf("cx-mailto"), "kontakt@fjelldal.no", "c10 (AC1): agent_knowledge.email was ALSO populated — the column both funnel gates actually read");
+      const prov = fieldProvenanceOf("cx-mailto");
+      assertTrue(Array.isArray(prov.email) && prov.email.length === 1, "c11 (AC2): field_provenance.email has exactly one entry");
+      assertEq(prov.email[0].source_url, "https://fjelldal.no", "c12 (AC2): field_provenance.email[0].source_url is non-empty and matches the scraped page");
+      assertTrue(typeof prov.email[0].source_type === "string" && prov.email[0].source_type.length > 0, "c13 (AC2): field_provenance.email[0].source_type is set");
+      assertEq(prov.email[0].value, "kontakt@fjelldal.no", "c14: field_provenance.email[0].value matches the written address");
     }
 
     // ── (d) same-domain text hit (no mailto) on the front page ──────────────
@@ -388,6 +424,7 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(item.outcome, "skippedCurated", "i1: skippedCurated");
       assertEq(fetchCalls.length, fetchesBefore, "i2: never fetched — locked before any network call");
       assertEq(contactEmailOf("cx-curated"), "", "i3: nothing written");
+      assertEq(knowledgeEmailOf("cx-curated"), null, "i4 (AC3): agent_knowledge.email also untouched by a curated-locked row");
     }
 
     // ── (j) claimed_at row-lock — skipped BEFORE any fetch ───────────────────
@@ -400,6 +437,7 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(item.outcome, "skippedLocked", "j1: skippedLocked");
       assertEq(fetchCalls.length, fetchesBefore, "j2: never fetched — locked before any network call");
       assertEq(contactEmailOf("cx-claimed"), "", "j3: nothing written");
+      assertEq(knowledgeEmailOf("cx-claimed"), null, "j4 (AC3): agent_knowledge.email also untouched by a claimed-locked row");
     }
 
     // ── (k) aggregator/directory host excluded BEFORE any fetch ─────────────
@@ -466,6 +504,46 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(item.outcome, "written", "n2: outcome written");
       assertEq(contactEmailOf("cx-dnsdead"), "ny@dodadressegard.no", "n3: dead address was REPLACED with the newly corroborated one");
       assertEq(item.old_value, "gammel@dod-domene-xyz.no", "n4: old (dead) value is reported for reversibility");
+      assertEq(knowledgeEmailOf("cx-dnsdead"), "ny@dodadressegard.no", "n5 (AC1): agent_knowledge.email was ALSO filled (it started empty on this fixture)");
+    }
+
+    // ── (r) AC4 — fill-only: a row whose agent_knowledge.email is ALREADY
+    // non-empty is NEVER overwritten by this route, even though
+    // agents.contact_email still gets its normal fill-or-replace write. Two
+    // sibling rows in the SAME apply call, one with a pre-existing
+    // agent_knowledge.email and one without, to regression-guard that the
+    // fill-only guard is scoped to the row that actually has a value and
+    // does not accidentally suppress the write for its neighbour. ─────────
+    {
+      insertAgent({
+        id: "cx-fillonly-preexisting",
+        name: "Alt Utfylt Gard",
+        website: "https://altutfyltgard.no",
+        knowledgeEmail: "eksisterende@annendomene.no",
+      });
+      fixtures.set(
+        "https://altutfyltgard.no",
+        htmlResponse('<a href="mailto:ny-funnet@altutfyltgard.no">Kontakt</a>', { finalUrl: "https://altutfyltgard.no" }),
+      );
+
+      insertAgent({ id: "cx-fillonly-empty", name: "Tomt Felt Gard", website: "https://tomtfeltgard.no" });
+      fixtures.set(
+        "https://tomtfeltgard.no",
+        htmlResponse('<a href="mailto:post@tomtfeltgard.no">Kontakt</a>', { finalUrl: "https://tomtfeltgard.no" }),
+      );
+
+      const r = await callExtraction({ agentIds: ["cx-fillonly-preexisting", "cx-fillonly-empty"], apply: true });
+
+      const preexisting = r.body.results.find((x: any) => x.agent_id === "cx-fillonly-preexisting");
+      assertEq(preexisting.outcome, "written", "r1: outcome still 'written' — the row-level lock only, never a per-column guard, changes the reported outcome");
+      assertEq(contactEmailOf("cx-fillonly-preexisting"), "ny-funnet@altutfyltgard.no", "r2: agents.contact_email STILL gets its normal fill-or-replace write");
+      assertEq(knowledgeEmailOf("cx-fillonly-preexisting"), "eksisterende@annendomene.no", "r3 (AC4): agent_knowledge.email is UNCHANGED — fill-only never overwrites a pre-existing value, even a differing one");
+      const preexistingProv = fieldProvenanceOf("cx-fillonly-preexisting");
+      assertTrue(!preexistingProv.email, "r4 (AC4): no field_provenance.email entry was added for a row that was never actually filled");
+
+      const empty = r.body.results.find((x: any) => x.agent_id === "cx-fillonly-empty");
+      assertEq(empty.outcome, "written", "r5: sibling row (no pre-existing agent_knowledge.email) still writes normally");
+      assertEq(knowledgeEmailOf("cx-fillonly-empty"), "post@tomtfeltgard.no", "r6: sibling row's agent_knowledge.email WAS filled — the fill-only guard did not leak onto it");
     }
 
     // ── (o) regression guard: audit changed_by is ALWAYS 'system' ───────────
