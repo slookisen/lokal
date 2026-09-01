@@ -268,6 +268,14 @@ export type AgentsGeocodeResult = {
   /** Rows where every lookup missed — stamped, retried much later. */
   no_match: number;
   /**
+   * Rows where Tier A was SKIPPED because the postnummer embedded in the
+   * free-text `address` disagrees with the separately-stored `postal_code` —
+   * see extractEmbeddedPostnummer()'s header. Tier B/C still ran if
+   * applicable (they never read postal_code); this counts every row the
+   * guard refused to hand to Kartverket, whatever those tiers did afterward.
+   */
+  postal_mismatch: number;
+  /**
    * Rows whose attempt counter reached AGENTS_GEOCODE_MAX_ATTEMPTS during this
    * tick and are therefore now PARKED (no longer selected). Logged per tick so
    * "the queue stopped shrinking" is always attributable to something named.
@@ -294,6 +302,64 @@ type CandidateRow = {
   postal_code: string | null;
   geocode_attempts: number | null;
 };
+
+// ── Tier A coherence guard — postal_code vs. the postnummer already ─
+// embedded in the free-text address ──────────────────────────────────
+//
+// agent_knowledge.address and agent_knowledge.postal_code are two
+// independently-editable columns, and nothing enforces that they agree.
+// Tier A's Kartverket query is literally `${address} ${postal} ${city}` —
+// if the address text already carries its own postnummer and it is a
+// DIFFERENT one from the stored postal_code, that query names two
+// contradictory postnummer for the same lookup, which risks a confidently
+// wrong address-tier hit near the wrong one's area.
+//
+// Reproduced live: Myrvang Gård has address "Sundliveien 416, 9360 Bardu"
+// (its own text says 9360) but postal_code "9107" — a different value.
+// This is exactly the failure class agents-postal-backfill.ts's header
+// calls "the one rule that outranks yield": never guess, never overwrite
+// with an uncorroborated value. A precise-looking but WRONG coordinate is
+// worse than no coordinate at all.
+//
+// extractEmbeddedPostnummer() is deliberately conservative — it is the
+// only thing standing between a false positive here and wrongly blocking a
+// perfectly good geocode, so "no signal" always beats "guessed signal".
+/**
+ * Extract the postnummer already embedded in a free-text Norwegian address,
+ * i.e. the LAST standalone 4-digit token, but only when it looks like it is
+ * actually followed by a poststed rather than being a bare trailing house
+ * number.
+ *
+ * Norwegian street addresses conventionally end
+ * "<street> <housenumber>[,] <postnummer> <poststed>", so the LAST 4-digit
+ * token — not the first, in case a 4-digit house number precedes it — is the
+ * address's own postnummer, PROVIDED something that looks like a place name
+ * follows it. Returns null (inconclusive — never blocks anything) when there
+ * is no standalone 4-digit token at all, or when the last one has nothing
+ * but more digits (or nothing) after it.
+ *
+ *   "Sundliveien 416, 9360 Bardu"  -> "9360" (416 is 3 digits, skipped)
+ *   "Storgata 12, 0155 Oslo"       -> "0155" (leading zero preserved)
+ *   "Storgata 12B"                 -> null   (no 4-digit token at all)
+ *   "Ringveien 1024"               -> null   (bare house number, nothing follows)
+ */
+export function extractEmbeddedPostnummer(address: string | null | undefined): string | null {
+  if (!address) return null;
+  const FOUR_DIGIT_TOKEN = /\b(\d{4})\b/g;
+  let match: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((match = FOUR_DIGIT_TOKEN.exec(address))) {
+    last = match;
+  }
+  if (!last) return null;
+  const tail = address.slice(last.index + last[0].length);
+  // Must be followed by whitespace/comma and then a NON-EMPTY run that is
+  // not itself more digits — i.e. something that could be a place name.
+  // A bare trailing house number ("...1024") has no such tail and must not
+  // be misread as a postnummer.
+  if (!/^[,\s]+[^\d\s]/.test(tail)) return null;
+  return last[1];
+}
 
 // ── Tier C — the place suffix in the producer's own name ────────────
 
@@ -653,6 +719,7 @@ function emptyStats(dryRun: boolean): AgentsGeocodeResult {
     centroid_precision: 0,
     name_suffix_precision: 0,
     no_match: 0,
+    postal_mismatch: 0,
     parked_now: 0,
     skipped_no_upgrade: 0,
     errors: 0,
@@ -753,8 +820,18 @@ async function runAgentsGeocodeTick(
 
       let wrote = false;
 
+      // ── Coherence guard — see extractEmbeddedPostnummer()'s header ──
+      // A non-null postnummer embedded in the address text that DISAGREES
+      // with the stored postal_code skips the Tier-A Kartverket call for
+      // this tick only. Tier B/C below are untouched — they never read
+      // postal_code — and still run normally if the row has no position at
+      // all; the outcome is recorded at the bottom, in the same place a
+      // no_match would be, only if nothing else ends up writing a position.
+      const embeddedPostal = address ? extractEmbeddedPostnummer(address) : null;
+      const postalMismatch = embeddedPostal !== null && postal !== "" && embeddedPostal !== postal;
+
       // ── Tier A — real street address via the Kartverket adresse ladder ──
-      if (address && postal) {
+      if (address && postal && !postalMismatch) {
         // budgetedFetch wraps the seam EVERY step of geocodeOne's 4-step retry
         // ladder goes through, so all of them draw from the shared 2 req/s
         // ceiling. Wrapping here rather than estimating "1 request per row" is
@@ -812,9 +889,18 @@ async function runAgentsGeocodeTick(
       }
 
       // ── Nothing resolved — stamp anyway so the row rotates out ──────
+      // A postal-mismatch row that Tier B/C could not rescue either is
+      // stamped with its own outcome instead of a generic "no_match", so ops
+      // can tell "the API missed" apart from "we refused to ask the API a
+      // self-contradictory question".
       if (!wrote) {
-        stats.no_match++;
-        recordAttemptOnly(row, "no_match");
+        if (postalMismatch) {
+          stats.postal_mismatch++;
+          recordAttemptOnly(row, "postal_mismatch");
+        } else {
+          stats.no_match++;
+          recordAttemptOnly(row, "no_match");
+        }
       }
     } catch (err) {
       stats.errors++;
@@ -983,7 +1069,7 @@ export function startAgentsGeocodeWorker(
         `[agents-geocode] tick processed=${r.processed} ` +
         `address=${r.address_precision} (high=${r.address_high} medium=${r.address_medium} low=${r.address_low}) ` +
         `centroid=${r.centroid_precision} (name_suffix=${r.name_suffix_precision}) ` +
-        `no_match=${r.no_match} skipped_no_upgrade=${r.skipped_no_upgrade} ` +
+        `no_match=${r.no_match} postal_mismatch=${r.postal_mismatch} skipped_no_upgrade=${r.skipped_no_upgrade} ` +
         `parked_now=${r.parked_now} errors=${r.errors} duration_ms=${r.duration_ms}`
       );
     },

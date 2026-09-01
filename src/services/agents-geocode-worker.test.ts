@@ -19,6 +19,9 @@
  *   w8-w10  no coordinates at all → city-centroid tier, honestly tagged 'city'
  *   w11-w13 never downgrade: an existing 'address' row is not even selected
  *   w14-w16 idempotent re-run changes nothing
+ *   pm1-pm11 postal-mismatch coherence guard: address-embedded postnummer vs.
+ *           the separately-stored postal_code (agents-geocode-worker
+ *           postal-mismatch-guard slice)
  *   m1-m4   migration: columns present, idempotent, existing rows default NULL
  *   r1-r4   rotation: two successive batches pick DISJOINT rows
  *   d1-d5   dry run: reports the same changes, writes NOTHING
@@ -90,9 +93,14 @@ export function runAgentsGeocodeWorkerTests(opts: { log?: boolean } = {}): Promi
     // Kartverket adresse-API: every address resolves EXCEPT the one that is
     // deliberately unresolvable ("Ingenveien"), so the "miss" path is real.
     let addressCalls = 0;
+    // Every URL the Kartverket adresse-API mock was hit with, in order — lets
+    // the postal-mismatch guard tests (pm*) assert a NEGATIVE ("this address
+    // was never queried") rather than just counting calls.
+    const addressUrls: string[] = [];
     const fetchImpl = (async (input: any) => {
       addressCalls++;
       const url = decodeURIComponent(String(input));
+      addressUrls.push(url);
       const body = /ingenveien/i.test(url) ? ADDRESS_EMPTY : ADDRESS_HIT;
       return { ok: true, status: 200, json: async () => body } as unknown as Response;
     }) as unknown as typeof fetch;
@@ -225,6 +233,70 @@ export function runAgentsGeocodeWorkerTests(opts: { log?: boolean } = {}): Promi
           "w16: …and a city-precision row is not re-placed either (it has coordinates now)");
         assertTrue(addressCalls >= callsBefore,
           "w16b: sanity — the injected Kartverket seam is the only address source used");
+      }
+
+      // ── pm1-pm11: postal-mismatch coherence guard ─────────────────
+      {
+        // pm1-pm4: the pure extraction helper, direct.
+        assertEq(worker.extractEmbeddedPostnummer("Sundliveien 416, 9360 Bardu"), "9360",
+          "pm1: extractEmbeddedPostnummer finds the LAST 4-digit token (416 is 3 digits, skipped)");
+        assertEq(worker.extractEmbeddedPostnummer("Storgata 12, 0155 Oslo"), "0155",
+          "pm2: …and preserves a leading zero as a string, not a parsed number");
+        assertEq(worker.extractEmbeddedPostnummer("Storgata 12B"), null,
+          "pm3: no 4-digit token at all → null (inconclusive — must never block a good address)");
+        assertEq(worker.extractEmbeddedPostnummer("Ringveien 1024"), null,
+          "pm4: a bare trailing house number with nothing after it → null, not guessed as a postnummer");
+
+        // pm5: embedded postnummer AGREES with postal_code → Tier A runs
+        // exactly as before. Regression guard against over-blocking.
+        seed({
+          id: "pm-match", name: "Enighet Gård", city: "Trondheim",
+          address: "Kongens gate 5, 7011 Trondheim", postal_code: "7011",
+        });
+        const urlsBeforeMatch = addressUrls.length;
+        await worker.agentsGeocodeTick(50, deps);
+        const matchRow = rowOf("pm-match");
+        assertEq(matchRow.geo_precision, "address",
+          "pm5: a matching embedded postnummer does not block Tier A — the row still geocodes to 'address'");
+        assertTrue(addressUrls.length > urlsBeforeMatch,
+          "pm5b: …and the Kartverket adresse API WAS called for this row");
+
+        // pm6-pm10: embedded postnummer DISAGREES with postal_code → Tier A
+        // is skipped entirely. The exact Myrvang Gård shape from the
+        // dev-request: address says 9360, postal_code says a different 9107.
+        // No city and no name-dash suffix, so Tier B/C cannot rescue it
+        // either — this row must end up stamped postal_mismatch.
+        seed({
+          id: "pm-mismatch", name: "Myrvang Gård",
+          address: "Sundliveien 416, 9360 Bardu", postal_code: "9107",
+        });
+        const urlsBeforeMismatch = addressUrls.length;
+        const rMismatch = await worker.agentsGeocodeTick(50, deps);
+        const mismatchRow = rowOf("pm-mismatch");
+        const newUrls = addressUrls.slice(urlsBeforeMismatch);
+
+        assertTrue(!newUrls.some((u) => /sundliveien|bardu|9360/i.test(u)),
+          `pm6: the Kartverket adresse API is NEVER called for a postal-mismatch row (queried: ${JSON.stringify(newUrls)})`);
+        assertEq(mismatchRow.lat, null,
+          "pm7: …no coordinate is written (nothing to fall back to — never a guess)");
+        assertEq(mismatchRow.geo_precision, null, "pm7b: …and no precision is claimed");
+        assertEq(mismatchRow.geocode_outcome, "postal_mismatch",
+          "pm8: …the row is stamped with the new postal_mismatch outcome");
+        assertTrue(rMismatch.postal_mismatch >= 1,
+          `pm9: …and stats.postal_mismatch increments (got ${rMismatch.postal_mismatch})`);
+        assertTrue(!!mismatchRow.geocode_attempted_at,
+          "pm10: …the attempt IS stamped, so the row still rotates out of the queue head instead of looping forever");
+
+        // pm11: no extractable postnummer at all → Tier A runs UNCHANGED
+        // (fail-open on an inconclusive extraction — the guard must never
+        // manufacture a block out of a false negative).
+        seed({
+          id: "pm-inconclusive", name: "Uklar Gård", city: "Trondheim",
+          address: "Storgata 12B", postal_code: "7011",
+        });
+        await worker.agentsGeocodeTick(50, deps);
+        assertEq(rowOf("pm-inconclusive").geo_precision, "address",
+          "pm11: an address with no extractable postnummer at all is not blocked — Tier A runs exactly as before");
       }
 
       // ── r1-r4: rotation — successive batches pick disjoint rows ──
