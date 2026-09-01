@@ -15929,9 +15929,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
 // ─── POST /api/opplevelser/admin/gardssalg-outreach-pilot-send ─────────────
 //
 // dev-request 2026-08-07-outreach-pool-krav123-og-pilot, AC4: the pilot
-// send-mechanic. Sends to 1-4 caller-selected provider_ids per call (hard
-// upper bound of 4 until Daniel raises it explicitly — NOT a rigid "must be
-// exactly 4" requirement, which would itself be the kind of false-blocking
+// send-mechanic. Sends to 1-12 caller-selected provider_ids per call (hard
+// upper bound of 12, raised 2026-09-01 per dev-request
+// 2026-09-01-outreach-pilot-send-batch-cap-4 — NOT a rigid "must be
+// exactly 12" requirement, which would itself be the kind of false-blocking
 // complexity the dev-request explicitly warns against on a still-small pilot
 // pool). Every id is preflight-gated through computeGardssalgOutreachPreflight
 // just above (single source of truth — never a forked GO/NO-GO copy), then
@@ -15962,7 +15963,12 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
 // operator invoking it with apply:true against real recipients is what the
 // dev-request's own non-goals section is trusting to stay Daniel-gated at
 // the ORCHESTRATION layer, not enforced in code here.
-const MAX_GARDSSALG_OUTREACH_PILOT_BATCH = 4;
+// Request-size guard only — NOT a volume control. daily_cap, cooldown,
+// max-touch, size-gate, and preflight are what actually govern how many
+// emails go out; this just bounds a single HTTP request's provider_ids
+// array. Set well above today's daily_cap (6) so it doesn't need moving
+// again the next time the cap is raised.
+const MAX_GARDSSALG_OUTREACH_PILOT_BATCH = 12;
 
 router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { provider_ids?: unknown; is_test?: unknown; apply?: unknown; template?: unknown };
