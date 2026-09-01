@@ -13,7 +13,7 @@
 // All endpoints require X-Admin-Key.
 
 import { Router, Request, Response } from "express";
-import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch, pickBatchBiased } from "../agents/lokal-agent-verifier";
+import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch, pickBatchBiased, resolveBrregLookup } from "../agents/lokal-agent-verifier";
 import { recordRun, acquireLock } from "../services/run-ledger";
 
 const router = Router();
@@ -155,10 +155,10 @@ export async function runVerifierTick(opts: {
 
   const batchResult = await runVerifierBatch(
     reprocessReviewQueue
-      ? { batchSize, pickFn: pickReviewQueueBatch }
+      ? { batchSize, pickFn: pickReviewQueueBatch, brregLookup: resolveBrregLookup }
       : biasGrowth
-        ? { batchSize, pickFn: pickBatchBiased }
-        : { batchSize }
+        ? { batchSize, pickFn: pickBatchBiased, brregLookup: resolveBrregLookup }
+        : { batchSize, brregLookup: resolveBrregLookup }
   );
   const results = batchResult.results;
 

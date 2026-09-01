@@ -1496,6 +1496,40 @@ export async function checkFreshBrregDeathEvidence(
   return null;
 }
 
+/**
+ * resolveBrregLookup — the real BrregFn implementation for runVerifierBatch's
+ * opts.brregLookup (dev-request 2026-09-01-rfb-verifier-brreglookup-aldri-koblet:
+ * no production caller ever wired this in, so `brreg` was always null and
+ * brreg_name_match could never fire — see that dev-request for the full
+ * incident). Mirrors checkFreshBrregDeathEvidence's own search-then-verify
+ * shape: a name search via findOrgnumberByName (no postal code — this file's
+ * callers only ever have a free-text city, same rationale as
+ * checkFreshBrregDeathEvidence documents for itself above), then a direct
+ * verifyOrgNumber on the hit's org-nr. Never throws (wrapped in try/catch);
+ * any error, missing hit, or exists:false result falls back to null — i.e.
+ * at least as safe as the old hardcoded null this replaces.
+ */
+export async function resolveBrregLookup(
+  name: string,
+  _city: string | null,
+  fetchImpl: typeof fetch = fetch,
+): Promise<BrregLookupResult | null> {
+  try {
+    const hit = await findOrgnumberByName(name, null, fetchImpl).catch(() => null);
+    if (!hit) return null;
+    const verified = await verifyOrgNumber(hit.orgnumber, fetchImpl).catch(() => null);
+    if (!verified || !verified.exists) return null;
+    return {
+      is_active: verified.active,
+      is_konkurs: verified.flag === "bankrupt",
+      naering: verified.nace[0] ?? null,
+      navn: verified.name,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Main loop. Caller (Fly Machine job, test, or manual) provides a
 // brregLookup function (or null to skip Brreg).
 export async function runVerifierBatch(opts: {
