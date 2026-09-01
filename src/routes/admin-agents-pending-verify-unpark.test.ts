@@ -193,6 +193,22 @@ export async function runAdminAgentsPendingVerifyUnparkTests(opts: { log?: boole
       assertEq(r2.status, 403, "a2: POST with wrong X-Admin-Key -> 403");
     }
 
+    // ── (a2) parseApplyFlag rejects non-boolean `apply` -> 400 (review fix,
+    // orch-pr-20260901-1 round 2 — flagged as missing coverage: verified by
+    // hand outside the suite but not asserted here). Strict boolean-only
+    // parse: a truthy-looking-but-not-boolean value must be REJECTED, not
+    // loosely coerced — same fail-closed behaviour as the string/number cases
+    // parseApplyFlag exists to guard against. ──
+    {
+      const rStr = await callUnpark({ apply: "true" });
+      assertEq(rStr.status, 400, 'a3: apply:"true" (string) -> 400');
+      assertTrue(typeof rStr.body?.error === "string" && rStr.body.error.length > 0, "a4: apply:\"true\" response carries an error message");
+
+      const rNum = await callUnpark({ apply: 1 });
+      assertEq(rNum.status, 400, "a5: apply:1 (number) -> 400");
+      assertTrue(typeof rNum.body?.error === "string" && rNum.body.error.length > 0, "a6: apply:1 response carries an error message");
+    }
+
     // ── (b) AC1 — dry-run on a fresh parked row writes nothing ─────────────
     {
       const id = insertAgent({ parkedSince: "2026-08-01 00:00:00", updatedAt: "2026-08-15 00:00:00" });

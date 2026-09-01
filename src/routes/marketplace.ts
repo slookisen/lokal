@@ -2794,16 +2794,46 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             const mergedProv = mergeFieldProvenance(existingProv, incomingProv);
             const provJson = JSON.stringify(mergedProv);
 
-            // Single transactional write: column updates + provenance.
+            // Review finding (2nd round, orch-pr-20260901-1): don't stamp
+            // field_provenance/updated_at on a call that writes nothing new.
+            // writeAddr/writePhone are fill-empty-only (see above), so on any
+            // repeat call for an agent that already has address+phone both
+            // are false — but mergeFieldProvenance's dedupKey (source_type +
+            // value, no timestamp) means a repeated Google/BRREG answer with
+            // the SAME value also produces no new provenance entry. Compare
+            // against the canonical re-merge of the existing provenance alone
+            // (mergeFieldProvenance(existingProv, {})) rather than the raw
+            // stored string, so a legacy/unnormalised on-disk shape doesn't
+            // read as "changed" by shape alone. Mirrors the "only stamp
+            // updated_at on a genuine write" discipline of applyEnrichWrite
+            // (src/services/search-enrich-sweep.ts) / applyRfbCxWrite
+            // (admin-rfb-contact-extraction.ts) — a real column write (writeAddr
+            // / writePhone) is always a genuine change and is never gated by
+            // this comparison.
+            const provenanceChanged =
+              JSON.stringify(mergeFieldProvenance(existingProv, {})) !== provJson;
+
+            // Single transactional write: column updates + provenance. Only
+            // touches field_provenance/updated_at when a real column write
+            // happened OR the merged provenance actually differs from what's
+            // already stored — a pure re-confirmation of already-known,
+            // already-recorded data is a true no-op and must not bump
+            // updated_at (downstream freshness filters, e.g. the
+            // pending-verify-unpark lever, key off updated_at meaning "this
+            // row's content genuinely changed").
             const tx = db.transaction(() => {
               const sets: string[] = [];
               const params: any[] = [];
               if (writeAddr) { sets.push("address = ?"); params.push(gAddrRaw); }
               if (writePhone) { sets.push("phone = ?"); params.push(gPhone); }
-              sets.push("field_provenance = ?"); params.push(provJson);
-              sets.push("updated_at = ?"); params.push(nowIso);
-              params.push(agentId);
-              db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
+              if (writeAddr || writePhone || provenanceChanged) {
+                sets.push("field_provenance = ?"); params.push(provJson);
+                sets.push("updated_at = ?"); params.push(nowIso);
+              }
+              if (sets.length > 0) {
+                params.push(agentId);
+                db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
+              }
             });
             tx();
             addressWritten = writeAddr;
