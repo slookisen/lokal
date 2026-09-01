@@ -19,8 +19,8 @@
  *
  * Covers:
  *   (a) auth: missing/wrong X-Admin-Key -> 403
- *   (b) batch-size guard: 0 provider_ids -> 400; 5 -> 400; 4 -> accepted
- *       (200, one result per id) — 1..4 is valid, only 0 and >4 rejected
+ *   (b) batch-size guard: 0 provider_ids -> 400; 13 -> 400; 12 -> accepted
+ *       (200, one result per id) — 1..12 is valid, only 0 and >12 rejected
  *   (c) preflight NO-GO -> skipped/preflight_no_go, zero send attempts
  *   (d) blocklist skip -> skipped/blocklisted (real agent_blocklist row via
  *       blocklist-service.addManualEntry, not a stub — isBlocked() reads
@@ -277,6 +277,23 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
         hjemmeside: "https://kilo-gard.example.no", epost: "post@fixture-kilo.no",
         slug: "kilo-gard", field_provenance: VERIFIED_STAMP,
       });
+      // Used only by block (b) — padding the batch-size guard's accepted
+      // boundary out to 12 distinct, unblocked, un-cooled-down GO-tier rows.
+      insertGo.run({
+        id: "prov-lima", navn: "Lima Gård",
+        hjemmeside: "https://lima-gard.example.no", epost: "post@fixture-lima.no",
+        slug: "lima-gard", field_provenance: VERIFIED_STAMP,
+      });
+      insertGo.run({
+        id: "prov-mike", navn: "Mike Gård",
+        hjemmeside: "https://mike-gard.example.no", epost: "post@fixture-mike.no",
+        slug: "mike-gard", field_provenance: VERIFIED_STAMP,
+      });
+      insertGo.run({
+        id: "prov-november", navn: "November Gård",
+        hjemmeside: "https://november-gard.example.no", epost: "post@fixture-november.no",
+        slug: "november-gard", field_provenance: VERIFIED_STAMP,
+      });
 
       // NO-GO tier: needs_enrichment (no about_text/products/brreg_verified).
       expDb
@@ -304,21 +321,27 @@ export function runOpplevelserGardssalgOutreachPilotSendTests(
       const zeroIds = await callRoute(opplevelserRouter, { headers: auth, body: { provider_ids: [] } });
       assertEq(zeroIds.status, 400, "b1: 0 provider_ids -> 400");
 
-      const fiveIds = await callRoute(opplevelserRouter, {
-        headers: auth, body: { provider_ids: ["a", "b", "c", "d", "e"] },
-      });
-      assertEq(fiveIds.status, 400, "b2: 5 provider_ids -> 400");
-
-      const fourIds = await callRoute(opplevelserRouter, {
+      const thirteenIds = await callRoute(opplevelserRouter, {
         headers: auth,
-        body: { provider_ids: ["prov-alpha", "prov-beta", "prov-gamma", "prov-delta"] },
+        body: { provider_ids: ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"] },
       });
-      assertEq(fourIds.status, 200, "b3: 4 provider_ids -> 200 (accepted, proceeds to processing)");
-      assertEq(fourIds.body.results?.length, 4, "b4: one result per requested id");
-      assertEq(fourIds.body.dry_run, true, "b5: apply absent -> dry_run true");
+      assertEq(thirteenIds.status, 400, "b2: 13 provider_ids -> 400");
+
+      const twelveIds = await callRoute(opplevelserRouter, {
+        headers: auth,
+        body: {
+          provider_ids: [
+            "prov-alpha", "prov-beta", "prov-gamma", "prov-delta", "prov-foxtrot", "prov-hotel",
+            "prov-india", "prov-juliett", "prov-kilo", "prov-lima", "prov-mike", "prov-november",
+          ],
+        },
+      });
+      assertEq(twelveIds.status, 200, "b3: 12 provider_ids -> 200 (accepted, proceeds to processing)");
+      assertEq(twelveIds.body.results?.length, 12, "b4: one result per requested id");
+      assertEq(twelveIds.body.dry_run, true, "b5: apply absent -> dry_run true");
       assertTrue(
-        (fourIds.body.results as any[]).every((r) => r.status === "would_send"),
-        "b6: all 4 GO-tier, unblocked, un-cooled-down rows report would_send in dry-run",
+        (twelveIds.body.results as any[]).every((r) => r.status === "would_send"),
+        "b6: all 12 GO-tier, unblocked, un-cooled-down rows report would_send in dry-run",
       );
       assertEq(sent.length, 0, "b7: dry-run sent no email");
 
