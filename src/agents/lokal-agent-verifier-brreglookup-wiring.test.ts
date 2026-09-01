@@ -227,6 +227,40 @@ export function runLokalAgentVerifierBrregLookupWiringTests(
         const r = await resolveBrregLookup("Uten Naering 6", null, fx);
         assertEq(r, { is_active: true, is_konkurs: false, naering: null, navn: "Uten Naering 6 AS" }, "6: no naeringskode1 -> naering:null");
       }
+
+      // ── 7: findOrgnumberByName returns an ambiguous hit (exact_ties > 1,
+      // e.g. "SOLBAKKEN GARD" (ENK) vs "SOLBAKKEN GARD AS" both scoring 1.0)
+      // -> resolveBrregLookup treats it as no confident match: returns null
+      // and NEVER calls verifyOrgNumber on the ambiguous hit (CHANGES-
+      // REQUESTED finding 1, PR #758).
+      {
+        let detailCalls = 0;
+        const fx = buildFetch({
+          bySearchName: { "Solbakken Gård 7": { orgNr: "911111107", navn: "Solbakken Gård 7 AS" } },
+          byOrgNr: { "911111107": activeDetail("911111107", "Solbakken Gård 7 AS") },
+          onDetailCall: () => detailCalls++,
+        });
+        // Wrap the search leg so the returned hit carries exact_ties: 2,
+        // mirroring the real ambiguous-collision shape (two 1.0-scoring
+        // hits) without needing a second fixture entity in the response.
+        const ambiguousFetch = (async (url: string | URL | Request) => {
+          const u = String(url);
+          if (/[?&]navn=/.test(u)) {
+            return jsonResponse(200, {
+              _embedded: {
+                enheter: [
+                  searchHit("911111107", "Solbakken Gård 7 AS"),
+                  searchHit("911111108", "Solbakken Gård 7"),
+                ],
+              },
+            });
+          }
+          return fx(url as any);
+        }) as unknown as typeof fetch;
+        const r = await resolveBrregLookup("Solbakken Gård 7", null, ambiguousFetch);
+        assertEq(r, null, "7: exact_ties > 1 (ambiguous hit) -> resolveBrregLookup returns null");
+        assertEq(detailCalls, 0, "7b: ambiguous hit -> verifyOrgNumber is never invoked");
+      }
     } catch (err: any) {
       failed++;
       failures.push("resolveBrregLookup: unexpected error: " + String(err?.stack || err?.message || err));
