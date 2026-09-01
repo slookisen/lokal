@@ -45,9 +45,30 @@
 // CHECK(changed_by IN ('owner','admin','system')) constraint
 // (src/database/init.ts) — this route writes changed_by:'system' (matching
 // every other automated writer in the codebase) and puts the actual source
-// URL + batch id in `notes` instead. Never writes `field_provenance` (that's
-// the experience_providers/gårdssalg convention, not agents/agent_knowledge's
-// — the DNS-check flag is read here as a cohort filter ONLY, never written).
+// URL + batch id in `notes` instead. The DNS-check flag
+// (field_provenance.contact_email_dns_check) is read here as a cohort
+// filter ONLY, never written.
+//
+// agent_knowledge.email — the column BOTH funnel gates actually read
+// (pickPendingVerifyBatch / lokal-agent-verifier.ts's `k.email AS email`,
+// and admin-outreach-candidates.ts's `k.email IS NOT NULL AND k.email !=
+// ''`) — was, before this fix, never written by this route at all: only
+// agents.contact_email was written, so a found+written address never
+// reached either gate. applyRfbCxWrite now ALSO writes agent_knowledge.email
+// (+ a field_provenance["email"] entry, source_type:"rfb_contact_extraction",
+// source_url: the page the address was scraped from — merged via the SAME
+// mergeFieldProvenance every other admin write path uses) whenever a write
+// happens. Semantics deliberately differ per column:
+//   - agents.contact_email: fill-OR-replace-if-DNS-flagged-dead (unchanged
+//     from before this fix — the cohort itself is scoped to blank-or-dead).
+//   - agent_knowledge.email: FILL-ONLY. A row can enter this cohort solely
+//     because its agents.contact_email is dead/blank while its
+//     agent_knowledge.email already carries a perfectly good, unrelated
+//     value (that column has its own, independent history — e.g. written by
+//     POST /admin/agents/register or PUT /admin/knowledge) — so this route
+//     must never clobber an existing agent_knowledge.email, only fill a
+//     genuinely empty one. Checked from the SAME fresh in-transaction
+//     snapshot as the claimed_at/curated_fields re-check below.
 //
 // Auth: X-Admin-Key header, LOCAL requireAdmin() — this codebase's
 // convention is every admin route file redefines this locally rather than
@@ -73,6 +94,16 @@ import {
   isSyntacticallyValidEmail,
   isContactEmailCurated,
 } from "./admin-agents-contact-email-write";
+// dev-request: agent_knowledge.email column write. The two funnel gates
+// (pickPendingVerifyBatch / lokal-agent-verifier.ts, and the outreach
+// candidate selector / admin-outreach-candidates.ts) both read
+// agent_knowledge.email, NOT agents.contact_email — this route previously
+// wrote only the latter, so a found+written address never actually reached
+// either gate. mergeFieldProvenance is the SAME field_provenance merge
+// every other admin write path in this codebase uses (see admin-agents.ts's
+// POST /register contact-field write for the closest sibling pattern) —
+// reused here rather than reinvented.
+import { mergeFieldProvenance } from "./admin-knowledge";
 import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain, gardssalgPageText } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
 import { hostFromUrlLike } from "../services/cross-source-validator";
@@ -254,13 +285,20 @@ interface ResultItem {
   detail?: string;
 }
 
+// source_type recorded on the agent_knowledge.email field_provenance entry
+// this route writes — identifies this route as the source, distinct from
+// "agent_registration" (POST /register) / "website_homepage" (PUT
+// /admin/knowledge) which write the SAME column via other paths.
+const RFB_CX_PROVENANCE_SOURCE_TYPE = "rfb_contact_extraction";
+
 /**
- * Writes ONE agent's contact_email. Re-reads claimed_at + curated_fields
- * from a FRESH snapshot immediately before writing, inside its own
- * transaction — mirrors admin-agents-contact-email-write.ts's
- * applyContactEmail exactly, including the race-caught re-check (a row
- * locked/curated between this batch's scan and this row's write is left
- * alone).
+ * Writes ONE agent's contact_email (agents table) AND, fill-only,
+ * agent_knowledge.email (+ field_provenance). Re-reads claimed_at,
+ * curated_fields AND the current agent_knowledge.email from a FRESH
+ * snapshot immediately before writing, inside its own transaction — mirrors
+ * admin-agents-contact-email-write.ts's applyContactEmail exactly, including
+ * the race-caught re-check (a row locked/curated between this batch's scan
+ * and this row's write is left alone).
  */
 function applyRfbCxWrite(
   db: ReturnType<typeof getDb>,
@@ -272,11 +310,19 @@ function applyRfbCxWrite(
   const tx = db.transaction((): { outcome: "written" | "skippedLocked" | "skippedCurated"; oldValue?: string | null } => {
     const cur = db
       .prepare(
-        `SELECT a.claimed_at AS claimed_at, a.contact_email AS contact_email, k.curated_fields AS curated_fields
+        `SELECT a.claimed_at AS claimed_at, a.contact_email AS contact_email,
+                k.curated_fields AS curated_fields, k.email AS knowledge_email,
+                k.field_provenance AS field_provenance
            FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE a.id = ?`,
       )
-      .get(agentId) as { claimed_at: string | null; contact_email: string | null; curated_fields: string | null } | undefined;
+      .get(agentId) as {
+        claimed_at: string | null;
+        contact_email: string | null;
+        curated_fields: string | null;
+        knowledge_email: string | null;
+        field_provenance: string | null;
+      } | undefined;
 
     if (!cur) return { outcome: "skippedLocked" }; // vanished mid-batch — treat as untouchable, never write
     if (cur.claimed_at) return { outcome: "skippedLocked", oldValue: cur.contact_email };
@@ -288,6 +334,33 @@ function applyRfbCxWrite(
          (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
        VALUES (?, ?, 'contact_email', ?, ?, 'system', NULL, datetime('now'), ?)`,
     ).run(randomUUID(), agentId, cur.contact_email, newEmail, `rfb-contact-extraction ${sourceUrl} batch:${batchId}`);
+
+    // agent_knowledge.email — FILL-ONLY (see header comment). A row already
+    // carrying a non-empty value here keeps it untouched; only a genuinely
+    // empty/blank value gets filled with the address this route just
+    // corroborated, alongside a field_provenance entry recording where it
+    // came from.
+    if (!cur.knowledge_email || !cur.knowledge_email.trim()) {
+      const nowIso = new Date().toISOString();
+      let existingProv: Record<string, unknown> = {};
+      if (cur.field_provenance) {
+        try {
+          const parsed = JSON.parse(cur.field_provenance);
+          if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+        } catch {
+          /* tolerate junk, mirrors every other mergeFieldProvenance call site */
+        }
+      }
+      const mergedProv = mergeFieldProvenance(existingProv, {
+        email: [{ value: newEmail, source_type: RFB_CX_PROVENANCE_SOURCE_TYPE, source_url: sourceUrl, fetched_at: nowIso }],
+      });
+      db.prepare(`UPDATE agent_knowledge SET email = ?, field_provenance = ?, updated_at = ? WHERE agent_id = ?`).run(
+        newEmail,
+        JSON.stringify(mergedProv),
+        nowIso,
+        agentId,
+      );
+    }
 
     return { outcome: "written", oldValue: cur.contact_email };
   });
