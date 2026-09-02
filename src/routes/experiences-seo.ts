@@ -39,7 +39,8 @@ import { generalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, looksTruncatedMidWord } from "../services/description-quality";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
-import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
+import { htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
+import { getPublishedProfileTranslations } from "../services/profile-translations";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import {
   listCategories,
@@ -295,21 +296,111 @@ function brandInner(variant: "light" | "dark" = "light"): string {
 // ─────────────────────────────────────────────────────────────
 type OaNavActive = "hjem" | "opplevelser" | "kategorier" | "gardssalg" | "tilbydere";
 
-function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang } = {}): string {
-  const lang: Lang = opts.lang === "en" ? "en" : "no";
+// ─────────────────────────────────────────────────────────────
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: language
+// switcher on every opplevagent page + EN/SV chrome labels for the two
+// profile pages (experience detail, gårdssalg producer). ALL of it is behind
+// OPPLEVAGENT_LANG_SWITCHER_ENABLED (read fresh per request): with the flag
+// off, the only pages that pass `lang` into oaSiteNav()/oaSiteFooter() are the
+// two that already did (landing, MCP guide), and every NO-canonical page
+// renders exactly as before. Translated BODY text is a separate flag
+// (PROFILE_TRANSLATIONS_SERVE_ENABLED, see services/profile-translations.ts).
+// ─────────────────────────────────────────────────────────────
+export function isOpplevagentLangSwitcherEnabled(): boolean {
+  return process.env.OPPLEVAGENT_LANG_SWITCHER_ENABLED === "true";
+}
+
+/** Locales the opplevagent switcher offers right now (sv only when enabled). */
+function oaSwitcherLangs(): Lang[] {
+  return isSvLocaleEnabled() ? ["no", "en", "sv"] : ["no", "en"];
+}
+
+/** hreflang <link> block for a NO-canonical path (e.g. "/opplevelse/foo"). */
+function oaHreflangLinks(url: string, noPath: string): string {
+  const lines = [
+    `<link rel="alternate" hreflang="nb" href="${url}${noPath === "/" ? "" : noPath}">`,
+    `<link rel="alternate" hreflang="en" href="${url}${localizedPath(noPath, "en")}">`,
+  ];
+  if (isSvLocaleEnabled()) lines.push(`<link rel="alternate" hreflang="sv" href="${url}${localizedPath(noPath, "sv")}">`);
+  lines.push(`<link rel="alternate" hreflang="x-default" href="${url}${noPath === "/" ? "" : noPath}">`);
+  return lines.join("\n");
+}
+
+/** Chrome labels for the two profile pages. `no` is byte-for-byte the
+ *  pre-existing inline copy; en/sv are used only when the switcher flag is on. */
+function oaProfileLabels(lang: Lang) {
+  const no = {
+    skip: "Hopp til innhold", crumbs: "Brødsmuler", crumbsGs: "Brødsmulesti", home: "Forsiden",
+    factsCaption: "Fakta om opplevelsen",
+    fCategory: "Kategori", fFylke: "Fylke", fKommune: "Kommune", fIndoor: "Inne / ute", fSeason: "Sesong", fDuration: "Varighet",
+    fGroup: "Gruppe", fPrice: "Pris", fLanguages: "Språk", fAccess: "Tilgjengelighet", fMeeting: "Oppmøte",
+    approx: "ca.", min: "min", persons: "personer", upTo: "inntil", from: "fra", perPerson: " pr. person", perGroup: " pr. gruppe", kr: "kr",
+    booking: "Bestilling", provider: "Tilbyder", place: "Sted",
+    ctaBook: "Book / les mer hos tilbyder →", ctaSite: "Besøk tilbyderens nettside →", ctaSoft: "Bestilling skjer hos tilbyder. Kontaktinfo kommer.",
+    phone: "Telefon", provVerified: "✓ Verifisert mot Brønnøysundregistrene", provPending: "Tilbyder under verifisering.",
+    provAll: "Alle opplevelser fra denne tilbyderen →", provUnmatched: "Tilbyder er ikke matchet ennå.",
+    gsKicker: "Gårdssalg &amp; smaking", gsCrumb: "Gårdssalg og smaking", gsAbout: "Om produsenten", gsVisit: "Besøket", gsPractical: "Praktisk info",
+    gsReserve: "Reserver", gsAddress: "Adresse", gsHours: "Åpningstider", gsSite: "Nettside", gsEmail: "E-post",
+    gsMeta: (navn: string, sted: string) => `Besøk ${navn}${sted ? " i " + sted : ""} — book en smaking eller omvisning direkte hos produsenten på Opplevagent.`,
+  };
+  const en: typeof no = {
+    skip: "Skip to content", crumbs: "Breadcrumbs", crumbsGs: "Breadcrumbs", home: "Home",
+    factsCaption: "Facts about the experience",
+    fCategory: "Category", fFylke: "County", fKommune: "Municipality", fIndoor: "Indoor / outdoor", fSeason: "Season", fDuration: "Duration",
+    fGroup: "Group size", fPrice: "Price", fLanguages: "Languages", fAccess: "Accessibility", fMeeting: "Meeting point",
+    approx: "approx.", min: "min", persons: "people", upTo: "up to", from: "from", perPerson: " per person", perGroup: " per group", kr: "NOK",
+    booking: "Booking", provider: "Provider", place: "Location",
+    ctaBook: "Book / read more at the provider →", ctaSite: "Visit the provider's website →", ctaSoft: "Booking is handled by the provider. Contact details coming.",
+    phone: "Phone", provVerified: "✓ Verified against the Norwegian business registry", provPending: "Provider verification pending.",
+    provAll: "All experiences from this provider →", provUnmatched: "Provider not matched yet.",
+    gsKicker: "Farm sales &amp; tasting", gsCrumb: "Farm sales and tasting", gsAbout: "About the producer", gsVisit: "The visit", gsPractical: "Practical information",
+    gsReserve: "Reserve", gsAddress: "Address", gsHours: "Opening hours", gsSite: "Website", gsEmail: "Email",
+    gsMeta: (navn: string, sted: string) => `Visit ${navn}${sted ? " in " + sted : ""} — book a tasting or tour directly with the producer on Opplevagent.`,
+  };
+  const sv: typeof no = {
+    skip: "Hoppa till innehållet", crumbs: "Brödsmulor", crumbsGs: "Brödsmulor", home: "Startsidan",
+    factsCaption: "Fakta om upplevelsen",
+    fCategory: "Kategori", fFylke: "Fylke", fKommune: "Kommun", fIndoor: "Inne / ute", fSeason: "Säsong", fDuration: "Varaktighet",
+    fGroup: "Gruppstorlek", fPrice: "Pris", fLanguages: "Språk", fAccess: "Tillgänglighet", fMeeting: "Mötesplats",
+    approx: "ca", min: "min", persons: "personer", upTo: "upp till", from: "från", perPerson: " per person", perGroup: " per grupp", kr: "NOK",
+    booking: "Bokning", provider: "Arrangör", place: "Plats",
+    ctaBook: "Boka / läs mer hos arrangören →", ctaSite: "Besök arrangörens webbplats →", ctaSoft: "Bokning sker hos arrangören. Kontaktuppgifter kommer.",
+    phone: "Telefon", provVerified: "✓ Verifierad mot Brønnøysundregistrene", provPending: "Arrangören verifieras.",
+    provAll: "Alla upplevelser från denna arrangör →", provUnmatched: "Arrangören är inte matchad ännu.",
+    gsKicker: "Gårdsförsäljning &amp; provsmakning", gsCrumb: "Gårdsförsäljning och provsmakning", gsAbout: "Om producenten", gsVisit: "Besöket", gsPractical: "Praktisk information",
+    gsReserve: "Reservera", gsAddress: "Adress", gsHours: "Öppettider", gsSite: "Webbplats", gsEmail: "E-post",
+    gsMeta: (navn: string, sted: string) => `Besök ${navn}${sted ? " i " + sted : ""} — boka en provsmakning eller visning direkt hos producenten på Opplevagent.`,
+  };
+  if (lang === "en") return en;
+  if (lang === "sv") return sv;
+  return no;
+}
+
+function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang; path?: string; switcher?: boolean } = {}): string {
+  const lang: Lang = opts.lang === "en" || opts.lang === "sv" ? opts.lang : "no";
   const S = homeStrings(lang);
-  const navGardssalg = lang === "en" ? "Farm sales" : "Gårdssalg";
+  const navGardssalg = lang === "en" ? "Farm sales" : lang === "sv" ? "Gårdsförsäljning" : "Gårdssalg";
   // Anchor links must stay on the visitor's language: the EN landing page
   // lives at /en, so a hardcoded "/#kategorier" would bounce EN visitors to
   // the Norwegian front page.
-  const langPrefix = lang === "en" ? "/en" : "/";
+  const langPrefix = lang === "no" ? "/" : `/${lang}`;
   const cur = (k: OaNavActive) => (opts.active === k ? ' aria-current="page"' : "");
-  // The NO/EN toggle is only rendered when the calling page is genuinely
-  // bilingual (the landing page passes `lang`; browse pages are NO-canonical
-  // and pass none) — same behavior the landing page had before this helper.
-  const langToggle = opts.lang !== undefined
-    ? `
-      <a class="lang-toggle" href="${lang === "en" ? "/" : "/en"}" hreflang="${lang === "en" ? "nb" : "en"}" aria-label="${lang === "en" ? "Bytt til norsk" : "Switch to English"}" style="border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 11px;font-size:.8rem;font-weight:600;color:var(--ink-soft)">${lang === "en" ? "NO" : "EN"}</a>`
+  // The language switcher is rendered when the calling page is genuinely
+  // multilingual (the landing page passes `lang`; browse pages are
+  // NO-canonical and pass none) OR when the caller asks for it explicitly
+  // (`switcher: true`, only ever passed while OPPLEVAGENT_LANG_SWITCHER_ENABLED).
+  // Links preserve the current page (localizedPath of the NO-canonical
+  // `path`) instead of always bouncing to the front page.
+  const showSwitcher = opts.switcher ?? opts.lang !== undefined;
+  const noPath = opts.path || "/";
+  const switchLabel: Record<Lang, string> = { no: "NO", en: "EN", sv: "SV" };
+  const switchAria: Record<Lang, string> = { no: "Bytt til norsk", en: "Switch to English", sv: "Byt till svenska" };
+  const langToggle = showSwitcher
+    ? oaSwitcherLangs()
+        .filter((l) => l !== lang)
+        .map((l) => `
+      <a class="lang-toggle" href="${localizedPath(noPath, l)}" hreflang="${htmlLangAttr(l)}" aria-label="${switchAria[l]}" style="border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 11px;font-size:.8rem;font-weight:600;color:var(--ink-soft)">${switchLabel[l]}</a>`)
+        .join("")
     : "";
   return `<header class="site-nav">
   <div class="nav-inner">
@@ -333,10 +424,10 @@ function oaSiteNav(opts: { active?: OaNavActive; lang?: Lang } = {}): string {
 }
 
 function oaSiteFooter(opts: { lang?: Lang } = {}): string {
-  const lang: Lang = opts.lang === "en" ? "en" : "no";
+  const lang: Lang = opts.lang === "en" || opts.lang === "sv" ? opts.lang : "no";
   const S = homeStrings(lang);
   // Same lang-aware anchor prefix as oaSiteNav — EN anchors live under /en.
-  const langPrefix = lang === "en" ? "/en" : "/";
+  const langPrefix = lang === "no" ? "/" : `/${lang}`;
   const year = new Date().getFullYear();
   return `<footer class="site-footer" role="contentinfo">
   <div class="footer-grid">
@@ -355,8 +446,8 @@ function oaSiteFooter(opts: { lang?: Lang } = {}): string {
            the page itself is Norwegian, so an EN footer link would promise a
            translation that does not exist (same honesty rule the rest of this
            file follows for language). -->
-      ${lang === "en" ? "" : `<a href="/slik-fungerer-det">Slik fungerer det</a>`}
-      <a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
+      ${lang !== "no" ? "" : `<a href="/slik-fungerer-det">Slik fungerer det</a>`}
+      <a href="/kontakt">${lang === "en" ? "Contact us" : lang === "sv" ? "Kontakta oss" : "Kontakt oss"}</a>
     </div>
     <div class="footer-col">
       <h4>${S.footAgents}</h4>
@@ -1542,7 +1633,57 @@ export function homeStrings(lang: Lang) {
     endpointsAria: "Endpoints for agents", codeAria: "Examples of agent calls", codeCmt1: "# message/send &mdash; natural language", codeCmt2: "«what can we do in Tromsø this winter?»",
     footTagline: "Curated marketplace for Norwegian experiences and activities &mdash; searchable for humans and AI agents.", footExplore: "Explore", footAgents: "For agents", footPrivacy: "Privacy", footTerms: "Terms", footVerified: "Providers verified against the Norwegian business registry",
   };
-  return lang === "en" ? en : no;
+  // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: Swedish
+  // landing-page chrome. Only reachable when SV_LOCALE_ENABLED === "true"
+  // (src/i18n/t.ts detectLangFromPath) — with the flag off no request ever
+  // carries lang === "sv", so this object is inert. Keep in sync with `no`.
+  const sv: typeof no = {
+    metaTitle: "Opplevagent — norska upplevelser, handplockade och verifierade",
+    metaDesc: "Handplockade norska upplevelser och aktiviteter — valsafari, trädkojor, guidade turer, mat och mer. Alla arrangörer är verifierade mot Brønnøysundregistrene, och katalogen är sökbar för AI-agenter.",
+    ogTitle: "Opplevagent — norska upplevelser, sökbara för AI-agenter",
+    ogImageAlt: "Opplevagent — marknadsplats för norska upplevelser",
+    skip: "Hoppa till huvudinnehållet",
+    brandAria: "Opplevagent startsida",
+    navAria: "Huvudnavigering",
+    navAll: "Alla upplevelser", navCategories: "Kategorier", navHow: "Så fungerar det", navAgents: "För AI-agenter", navExplore: "Utforska",
+    navProviders: "För arrangörer",
+    heroPill: "A2A-marknadsplats för norska upplevelser",
+    heroH1: "Vad ska vi hitta på ", heroAccent: "i dag?",
+    heroSub: "Från valsafari och trädkojor till fjällturer, matupplevelser och lasertag &mdash; handplockade norska upplevelser, samlade på ett ställe.",
+    searchAria: "Hitta upplevelser", searchLabel: "Beskriv vad du vill göra, eller skriv en plats", searchPlaceholder: "Sök: valsafari, Oslo, mat …", searchBtn: "Hitta upplevelser",
+    hintPre: "Sök på plats, kategori eller aktivitet &mdash; eller ", hintLink: "bläddra bland alla upplevelser", hintPost: ".",
+    hintRoutePre: "\u{1F697} Ska du ut och köra? Skriv ", hintRouteLink: "«Oslo till Bergen»", hintRoutePost: " i sökfältet, så hittar vi stopp längs vägen &mdash; eller planera ", hintRouteLink2: "hela resrutten", hintRoutePost2: ".",
+    quickAria: "Snabbsök", qNature: "Ute i naturen", qAll: "Alla upplevelser",
+    nearMeBtn: "Nära mig", nearMeRadiusLabel: "Sökradie", nearMeLoading: "Hämtar position…", nearMeDenied: "Position nekad",
+    trustAria: "Förtroende och datakällor", trustBrreg: "Arrangörer verifierade mot Brønnøysundregistrene", trustFresh: "Innehåll uppdateras löpande", trustMachine: "Maskinläsbart för AI-agenter",
+    counterAria: "Opplevagent i siffror",
+    counterPageviews: "Sidvisningar", counterRealVisitors: "Riktiga besökare", counterAiSearch: "AI-sökningar", counterCrawlers: "Sökrobotar &amp; bottar",
+    counterExperiences: "Upplevelser", counterProviders: "Arrangörer", counterMunicipalities: "Kommuner",
+    counterAiExplain: "AI-sökning: en människa frågade ChatGPT, Claude eller Perplexity, och assistenten hämtade information från oss i realtid. Sökrobotar: automatisk indexering och skrapning.",
+    counterNoteShort: "AI-sökning = en assistent hämtade svar från oss i realtid.",
+    counterWindowPre: "Senaste", counterWindowPost: "dagarna",
+    counterSincePre: "Siffror sedan",
+    networkLabel: "En del av A2A-nätverket:", networkTagline: "Byggt för både människor och AI-agenter",
+    drikkeKicker: "Nytt", drikkeTitle: "Besök lokala dryckesproducenter",
+    drikkeIntro: "Bryggerier, cidermakare, mjödbryggerier och destillerier öppnar dörrarna för provsmakning och visning &mdash; boka besöket direkt hos producenten, verifierad mot Brønnøysundregistrene.",
+    drikkeIntroBrowse: "Bryggerier, cidermakare, mjödbryggerier och destillerier i hela landet &mdash; se vilka som finns där du är, vad de erbjuder och hur du tar kontakt. Alla verifierade mot Brønnøysundregistrene.",
+    drikkeCta: "Utforska dryckesställen", drikkeAria: "Dryckesproducenter efter typ", drikkeChipCountAria: "producenter",
+    drikkeCtaBrowse: "Se alla dryckesproducenter", drikkeCtaLive: "Boka besök &amp; provsmakning",
+    catKicker: "Utforska", catTitle: "Upplevelser efter kategori", catIntro: "Bläddra bland kategorierna &mdash; eller låt en AI-agent filtrera på väder, säsong, pris och gruppstorlek åt dig.", catAria: "Kategorier", catCount: "upplevelser", catSoon: "Kommer snart", catNote: "Exempelkategorier &mdash; nya upplevelser publiceras löpande.",
+    fylkeKicker: "Platser", fylkeTitle: "Utforska efter fylke", fylkeIntro: "Se var upplevelserna finns &mdash; välj ett fylke för en fullständig översikt.", fylkeAria: "Fylken",
+    kommuneTitle: "Populära kommuner", kommuneAria: "Populära kommuner",
+    howKicker: "Förtroendemodell", howTitle: "Så fungerar det", howSub: "Handplockat, verifierat och kompletterat &mdash; tre steg som skiljer Opplevagent från en vanlig katalog.",
+    srcLabel: "Källa:",
+    s1t: "Handplockat urval", s1b: "Vi samlar in upplevelser löpande från utvalda källor &mdash; inte en öppen annonsmarknad, utan riktiga norska arrangörer som vi har valt ut.", s1src: "utvalda arrangörskällor",
+    s2t: "Verifierad arrangör", s2bPre: "Varje arrangör kontrolleras mot Brønnøysundregistrene för att bekräfta att det finns ett ", s2bStrong: "aktivt företag", s2bPost: " bakom upplevelsen.", s2src: "Brønnøysundregistrene (Brreg)",
+    s3t: "Kompletterat med detaljer", s3b: "Vi hämtar detaljer från arrangörens egen webbplats, så att beskrivningar, varaktighet och praktisk information blir korrekta och uppdaterade.", s3src: "arrangörens egen webbplats",
+    agentsKicker: "För AI-agenter", agentsTitle: "Byggt för att frågas av agenter", agentsBody: "Opplevagent exponerar öppna, maskinläsbara ytor enligt A2A-protokollet. Agenter kan upptäcka utbudet, läsa kontraktet och köra intentsökningar &mdash; utan skrapning.",
+    endpointsAria: "Endpoints för agenter", codeAria: "Exempel på agentanrop", codeCmt1: "# message/send &mdash; naturligt språk", codeCmt2: "«vad kan vi göra i Tromsø i vinter?»",
+    footTagline: "Norska upplevelser och aktiviteter, handplockade och verifierade &mdash; sökbara för människor och AI-agenter.", footExplore: "Utforska", footAgents: "För agenter", footPrivacy: "Integritet", footTerms: "Villkor", footVerified: "Arrangörer verifierade mot Brønnøysundregistrene",
+  };
+  if (lang === "en") return en;
+  if (lang === "sv") return sv;
+  return no;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -3096,7 +3237,21 @@ function renderOpplevelseDetail(
 ): string {
   if (!exp) return "";
   const slug = exp.slug || "";
-  const canonical = `${url}/opplevelse/${encodeURIComponent(slug)}`;
+  // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent:
+  //   uiLang — chrome/labels language; follows req.lang ONLY while
+  //            OPPLEVAGENT_LANG_SWITCHER_ENABLED (flag off → "no", i.e. the
+  //            page's pre-existing Norwegian labels, byte-identical).
+  //   tr     — PUBLISHED, reviewed+verified translations of title/description/
+  //            meeting_point for this row; {} unless
+  //            PROFILE_TRANSLATIONS_SERVE_ENABLED === "true".
+  const switcherOn = isOpplevagentLangSwitcherEnabled();
+  const uiLang: Lang = switcherOn ? lang : "no";
+  const L = oaProfileLabels(uiLang);
+  const noPath = `/opplevelse/${encodeURIComponent(slug)}`;
+  const tr = lang !== "no"
+    ? getPublishedProfileTranslations(getExpDbForReise("experiences"), "opplevagent", "experience", String(exp.id), lang)
+    : {};
+  const canonical = `${url}${switcherOn ? localizedPath(noPath, lang) : noPath}`;
   const cat = exp.category || null;
   const place = [exp.kommune, exp.fylke].filter(Boolean).join(", ");
   const provName = provider ? String(provider.navn || "") : "";
@@ -3119,6 +3274,11 @@ function renderOpplevelseDetail(
     console.log(`[description-guard] suppressed junk description (opplevelse detail) for ${exp.id} (${exp.title})`);
     safeExpDescription = "";
   }
+  // Translated body text (only when a published translation exists for the
+  // exact field; the Norwegian value is the fallback, never overwritten).
+  if (safeExpDescription && tr.description) safeExpDescription = tr.description;
+  const displayTitle = lang === "no" ? (exp.title_no || exp.title) : (tr.title || exp.title);
+  const displayMeetingPoint = exp.meeting_point ? (tr.meeting_point || exp.meeting_point) : exp.meeting_point;
 
   // Meta description: own summary if present, else a generated one.
   const metaDescRaw = safeExpDescription
@@ -3139,32 +3299,32 @@ function renderOpplevelseDetail(
 
   // Facts table.
   const facts: Array<[string, string]> = [];
-  if (cat) facts.push(["Kategori", `<a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>`]);
-  if (exp.fylke) facts.push(["Fylke", `<a href="/fylke/${encodeURIComponent(exp.fylke)}">${escapeHtml(exp.fylke)}</a>`]);
-  if (exp.kommune) facts.push(["Kommune", `<a href="/kommune/${encodeURIComponent(exp.kommune)}">${escapeHtml(exp.kommune)}</a>`]);
-  if (exp.indoor_outdoor) facts.push(["Inne / ute", escapeHtml(ioLabel(exp.indoor_outdoor))]);
-  if ((exp.season || []).length) facts.push(["Sesong", escapeHtml((exp.season || []).map(seasonLabel).join(", "))]);
+  if (cat) facts.push([L.fCategory, `<a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>`]);
+  if (exp.fylke) facts.push([L.fFylke, `<a href="/fylke/${encodeURIComponent(exp.fylke)}">${escapeHtml(exp.fylke)}</a>`]);
+  if (exp.kommune) facts.push([L.fKommune, `<a href="/kommune/${encodeURIComponent(exp.kommune)}">${escapeHtml(exp.kommune)}</a>`]);
+  if (exp.indoor_outdoor) facts.push([L.fIndoor, escapeHtml(ioLabel(exp.indoor_outdoor))]);
+  if ((exp.season || []).length) facts.push([L.fSeason, escapeHtml((exp.season || []).map(seasonLabel).join(", "))]);
   if (exp.duration_min || exp.duration_max) {
     const d = exp.duration_min && exp.duration_max && exp.duration_min !== exp.duration_max
-      ? `${exp.duration_min}–${exp.duration_max} min`
-      : `ca. ${exp.duration_min || exp.duration_max} min`;
-    facts.push(["Varighet", escapeHtml(d)]);
+      ? `${exp.duration_min}–${exp.duration_max} ${L.min}`
+      : `${L.approx} ${exp.duration_min || exp.duration_max} ${L.min}`;
+    facts.push([L.fDuration, escapeHtml(d)]);
   }
   if (exp.group_min || exp.group_max) {
-    const g = exp.group_min && exp.group_max ? `${exp.group_min}–${exp.group_max} personer`
-      : exp.group_max ? `inntil ${exp.group_max} personer` : `fra ${exp.group_min} personer`;
-    facts.push(["Gruppe", escapeHtml(g)]);
+    const g = exp.group_min && exp.group_max ? `${exp.group_min}–${exp.group_max} ${L.persons}`
+      : exp.group_max ? `${L.upTo} ${exp.group_max} ${L.persons}` : `${L.from} ${exp.group_min} ${L.persons}`;
+    facts.push([L.fGroup, escapeHtml(g)]);
   }
   if (exp.price_from || exp.price_band) {
-    const unit = exp.price_unit === "per_person" ? " pr. person" : exp.price_unit === "per_group" ? " pr. gruppe" : "";
+    const unit = exp.price_unit === "per_person" ? L.perPerson : exp.price_unit === "per_group" ? L.perGroup : "";
     const pr = exp.price_from
-      ? `fra ${exp.price_from} kr${unit}`
+      ? `${L.from} ${exp.price_from} ${L.kr}${unit}`
       : (PRICE_BAND_LABELS[String(exp.price_band)] || String(exp.price_band));
-    facts.push(["Pris", escapeHtml(pr)]);
+    facts.push([L.fPrice, escapeHtml(pr)]);
   }
-  if ((exp.languages || []).length) facts.push(["Språk", escapeHtml((exp.languages || []).join(", "))]);
-  if ((exp.accessibility || []).length) facts.push(["Tilgjengelighet", escapeHtml((exp.accessibility || []).join(", "))]);
-  if (exp.meeting_point) facts.push(["Oppmøte", escapeHtml(exp.meeting_point)]);
+  if ((exp.languages || []).length) facts.push([L.fLanguages, escapeHtml((exp.languages || []).join(", "))]);
+  if ((exp.accessibility || []).length) facts.push([L.fAccess, escapeHtml((exp.accessibility || []).join(", "))]);
+  if (displayMeetingPoint) facts.push([L.fMeeting, escapeHtml(displayMeetingPoint)]);
   const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
 
   // Hero media — real photo when the row has one (enrichment-gated), else a
@@ -3181,23 +3341,23 @@ function renderOpplevelseDetail(
   const bookingUrl = safeHttpUrl(exp.booking_url);
   let cta = "";
   if (bookingUrl) {
-    cta = `<a class="cta" href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener nofollow">Book / les mer hos tilbyder →</a>`;
+    cta = `<a class="cta" href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener nofollow">${L.ctaBook}</a>`;
   } else if (provSite) {
-    cta = `<a class="cta" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Besøk tilbyderens nettside →</a>`;
+    cta = `<a class="cta" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">${L.ctaSite}</a>`;
   } else {
-    cta = `<p class="cta-soft">Bestilling skjer hos tilbyder. Kontaktinfo kommer.</p>`;
+    cta = `<p class="cta-soft">${L.ctaSoft}</p>`;
   }
   // Phone — rendered only when the provider has one on file (no fabrication).
   const phoneBlock = provTel
-    ? `<p class="prov-phone">Telefon: <a href="tel:${escapeHtml(provTel.replace(/\s+/g, ""))}">${escapeHtml(provTel)}</a></p>`
+    ? `<p class="prov-phone">${L.phone}: <a href="tel:${escapeHtml(provTel.replace(/\s+/g, ""))}">${escapeHtml(provTel)}</a></p>`
     : "";
 
   // Provider card.
   const provInner = provName
     ? `<p class="prov-name">${provSite ? `<a href="${escapeHtml(provSite)}" target="_blank" rel="noopener">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
-       ${brregVerified ? `<p class="prov-verified">✓ Verifisert mot Brønnøysundregistrene${orgNr ? ` · org.nr ${escapeHtml(orgNr)}` : ""}</p>` : `<p class="prov-soft">Tilbyder under verifisering.</p>`}
-       <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.slug || provider!.id))}">Alle opplevelser fra denne tilbyderen →</a></p>`
-    : `<p class="prov-soft">Tilbyder er ikke matchet ennå.</p>`;
+       ${brregVerified ? `<p class="prov-verified">${L.provVerified}${orgNr ? ` · org.nr ${escapeHtml(orgNr)}` : ""}</p>` : `<p class="prov-soft">${L.provPending}</p>`}
+       <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.slug || provider!.id))}">${L.provAll}</a></p>`
+    : `<p class="prov-soft">${L.provUnmatched}</p>`;
 
   // Map block — coords from experience, else provider; graceful no-geo fallback.
   // arbeidspunkt 5: when a real point exists, render a real Leaflet mini-map
@@ -3300,9 +3460,9 @@ function renderOpplevelseDetail(
 
   // Build SEO title ≤70 chars: cascade full (with place) → without place → truncated
   // (BRAND/MAX_TITLE/seoPageTitle are module-scope, defined above this function.)
-  const titleWithPlace = `${exp.title}${place ? " – " + place : ""}`;
+  const titleWithPlace = `${displayTitle}${place ? " – " + place : ""}`;
   const title = seoPageTitle(
-    titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : exp.title
+    titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : displayTitle
   );
 
   // Per-page branded og:image (dev-request
@@ -3314,7 +3474,7 @@ function renderOpplevelseDetail(
   const ogImageAlt = `${exp.title}${cat ? " — " + catLabel(cat) : ""} | Opplevagent`;
 
   return `<!doctype html>
-<html lang="nb">
+<html lang="${htmlLangAttr(uiLang)}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3322,14 +3482,14 @@ function renderOpplevelseDetail(
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
 <meta name="theme-color" content="#0e3c36">
-<link rel="canonical" href="${canonical}">
+<link rel="canonical" href="${canonical}">${switcherOn ? "\n" + oaHreflangLinks(url, noPath) : ""}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 ${pwaHeadTags({ includeThemeColor: false })}
-<meta property="og:title" content="${escapeHtml(exp.title)}">
+<meta property="og:title" content="${escapeHtml(switcherOn ? displayTitle : exp.title)}">
 <meta property="og:description" content="${escapeHtml(metaDesc)}">
 <meta property="og:type" content="website">
 <meta property="og:url" content="${canonical}">
-<meta property="og:locale" content="nb_NO">
+<meta property="og:locale" content="${ogLocale(uiLang)}">
 <meta property="og:site_name" content="Opplevagent">
 <meta property="og:image" content="${escapeHtml(ogImage)}">
 <meta property="og:image:width" content="1200">
@@ -3439,14 +3599,14 @@ ${OA_CHROME_CSS}
 ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
-<a class="skip-link" href="#main">Hopp til innhold</a>
-${oaSiteNav({ lang })}
+<a class="skip-link" href="#main">${L.skip}</a>
+${oaSiteNav({ lang, path: noPath, switcher: switcherOn || undefined })}
 <main id="main" class="container">
-  <nav class="breadcrumb" aria-label="Brødsmuler">
-    <a href="/">Forsiden</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(exp.title)}
+  <nav class="breadcrumb" aria-label="${L.crumbs}">
+    <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(switcherOn ? displayTitle : exp.title)}
   </nav>
   <header class="head">
-    <h1>${escapeHtml(lang === "no" ? (exp.title_no || exp.title) : exp.title)}</h1>
+    <h1>${escapeHtml(displayTitle)}</h1>
     ${place ? `<p class="place"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.3" fill="currentColor"/></svg>${escapeHtml(place)}</p>` : ""}
     <div class="badges">${badges.join("")}</div>
   </header>
@@ -3454,13 +3614,13 @@ ${oaSiteNav({ lang })}
     <article>
       ${heroMedia}
       ${descBlock}
-      <table class="facts"><caption class="skip-link">Fakta om opplevelsen</caption><tbody>${factsRows}</tbody></table>
+      <table class="facts"><caption class="skip-link">${L.factsCaption}</caption><tbody>${factsRows}</tbody></table>
       ${evBlock}
     </article>
     <aside class="aside">
-      <div class="card"><h2>Bestilling</h2>${cta}${phoneBlock}</div>
-      <div class="card"><h2>Tilbyder</h2>${provInner}</div>
-      <div class="card"><h2>Sted</h2>${mapBlock}</div>
+      <div class="card"><h2>${L.booking}</h2>${cta}${phoneBlock}</div>
+      <div class="card"><h2>${L.provider}</h2>${provInner}</div>
+      <div class="card"><h2>${L.place}</h2>${mapBlock}</div>
     </aside>
   </div>
   ${relBlock}
@@ -5304,7 +5464,20 @@ router.get(
     if (!provider) return next();
 
     const url = baseUrl();
-    const canonical = `${url}/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`;
+    // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: same
+    // two-flag model as renderOpplevelseDetail() — chrome labels follow
+    // req.lang only while OPPLEVAGENT_LANG_SWITCHER_ENABLED, translated body
+    // fields only while PROFILE_TRANSLATIONS_SERVE_ENABLED (and only the
+    // fields that actually have a published translation).
+    const lang: Lang = req.lang;
+    const switcherOn = isOpplevagentLangSwitcherEnabled();
+    const uiLang: Lang = switcherOn ? lang : "no";
+    const L = oaProfileLabels(uiLang);
+    const noPath = `/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`;
+    const tr = lang !== "no"
+      ? getPublishedProfileTranslations(getExpDbForReise("experiences"), "opplevagent", "provider", String(provider.id), lang)
+      : {};
+    const canonical = `${url}${switcherOn ? localizedPath(noPath, lang) : noPath}`;
     const bookHref = `/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
     // "Lenk til oss" aside-card (dev-request 2026-07-12-opplevagent-lenkeplan,
     // item 1) — reuses the same absolute `url` computed above (not
@@ -5339,7 +5512,7 @@ router.get(
     // not silently render as exact.
     const geoApprox = isApproxGardssalgConfidence(provider.geocode_confidence);
 
-    const metaDesc = `Besøk ${provider.navn}${sted ? " i " + sted : ""} — book en smaking eller omvisning direkte hos produsenten på Opplevagent.`;
+    const metaDesc = L.gsMeta(provider.navn, sted || "");
 
     // Hero — themed by drink-type color-coding (2026-06-29 UI spec, shared
     // DRINK_TYPE_META also used by drinkBadge()); falls back to the plain
@@ -5364,7 +5537,7 @@ router.get(
       && !isJunkDescription(provider.about_text)
       && !looksTruncatedMidWord(provider.about_text);
     const aboutBody = hasRealAbout
-      ? `<p>${escapeHtml(provider.about_text as string)}</p>`
+      ? `<p>${escapeHtml(tr.about_text || (provider.about_text as string))}</p>`
       : site
       ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
       : `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Utfyllende presentasjon publiseres fortløpende.</p>`;
@@ -5379,7 +5552,7 @@ router.get(
       && !isJunkDescription(provider.visit_text)
       && !looksTruncatedMidWord(provider.visit_text);
     const visitBody = hasRealVisit
-      ? `<p>${escapeHtml(provider.visit_text as string)}</p>`
+      ? `<p>${escapeHtml(tr.visit_text || (provider.visit_text as string))}</p>`
       : visitCopy
       ? `<p>Et besøk hos ${escapeHtml(provider.navn)} inkluderer typisk ${visitCopy}. Nøyaktig program avtales ved reservasjon.</p>`
       : `<p>Detaljer om hva besøket hos ${escapeHtml(provider.navn)} inneholder, publiseres fortløpende. Book et besøk for å avtale program direkte med produsenten.</p>`;
@@ -5388,15 +5561,15 @@ router.get(
     // pris/kapasitet are NOT yet columns on experience_providers (see comment
     // above the route) so they are intentionally omitted rather than guessed.
     const facts: Array<[string, string]> = [];
-    if (sted) facts.push(["Sted", escapeHtml(sted)]);
-    if (provider.adresse) facts.push(["Adresse", escapeHtml(provider.adresse)]);
+    if (sted) facts.push([L.place, escapeHtml(sted)]);
+    if (provider.adresse) facts.push([L.gsAddress, escapeHtml(provider.adresse)]);
     if (
       provider.opening_hours_text && provider.opening_hours_text.trim()
       && !isJunkDescription(provider.opening_hours_text)
       && !looksTruncatedMidWord(provider.opening_hours_text)
-    ) facts.push(["Åpningstider", escapeHtml(provider.opening_hours_text)]);
-    if (site) facts.push(["Nettside", `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
-    if (isDisplayablePhone(provider.telefon)) facts.push(["Telefon", `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
+    ) facts.push([L.gsHours, escapeHtml(tr.opening_hours_text || provider.opening_hours_text)]);
+    if (site) facts.push([L.gsSite, `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
+    if (isDisplayablePhone(provider.telefon)) facts.push([L.phone, `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
     // epostUnderReview: Skive C(b)/AC4 — a flagged (domain-deviating) address
     // is published NOWHERE on this page until a human resolves it: not in the
     // visible fact row here, and not in the JSON-LD `email` further down (the
@@ -5404,7 +5577,7 @@ router.get(
     // the two would fix nothing). telefon is untouched — this gate is
     // email-only.
     const epostUnderReview = isGardssalgContactEmailFlaggedForReview(provider.field_provenance, provider.epost);
-    if (provider.epost && !epostUnderReview) facts.push(["E-post", `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    if (provider.epost && !epostUnderReview) facts.push([L.gsEmail, `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
       ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
@@ -5534,20 +5707,20 @@ router.get(
     const ogImageAlt = `${provider.navn} — Gårdssalg og smaking | Opplevagent`;
 
     const html = `<!doctype html>
-<html lang="nb">
+<html lang="${htmlLangAttr(uiLang)}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(provider.navn)}${sted ? " – " + escapeHtml(sted) : ""} | Opplevagent</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <meta name="robots" content="${provider.catalog_hidden === 1 ? "noindex, nofollow" : "index, follow, max-snippet:-1, max-image-preview:large"}">
-<link rel="canonical" href="${canonical}">
+<link rel="canonical" href="${canonical}">${switcherOn ? "\n" + oaHreflangLinks(url, noPath) : ""}
 ${pwaHeadTags()}
 <meta property="og:title" content="${escapeHtml(provider.navn)} | Opplevagent">
 <meta property="og:description" content="${escapeHtml(metaDesc)}">
 <meta property="og:type" content="website">
 <meta property="og:url" content="${canonical}">
-<meta property="og:locale" content="nb_NO">
+<meta property="og:locale" content="${ogLocale(uiLang)}">
 <meta property="og:site_name" content="Opplevagent">
 <meta property="og:image" content="${escapeHtml(ogImage)}">
 <meta property="og:image:width" content="1200">
@@ -5597,43 +5770,43 @@ ${lat !== null && lon !== null ? `<style>${MINI_MAP_CSS}</style>` : ""}
 </head>
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
-${oaSiteNav({ active: "gardssalg" })}
+${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: true }) : oaSiteNav({ active: "gardssalg" })}
 <header class="produsent-hero">
   <div class="container">
-    <div class="hero-kicker">Gårdssalg &amp; smaking</div>
+    <div class="hero-kicker">${L.gsKicker}</div>
     <h1>${escapeHtml(provider.navn)}</h1>
     ${sted ? `<p class="hero-sted">${escapeHtml(sted)}</p>` : ""}
     ${badge}
   </div>
 </header>
 <main id="main" class="container">
-  <nav class="breadcrumb" aria-label="Brødsmulesti">
-    <a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a> · ${escapeHtml(provider.navn)}
+  <nav class="breadcrumb" aria-label="${L.crumbsGs}">
+    <a href="${localizedPath("/", uiLang) || "/"}">${L.home}</a> · <a href="/kategori/gardssalg">${L.gsCrumb}</a> · ${escapeHtml(provider.navn)}
   </nav>
   <div class="produsent-layout">
     <article>
       <div class="info-card">
-        <h2>Om produsenten</h2>
+        <h2>${L.gsAbout}</h2>
         ${aboutBody}
       </div>
       <div class="info-card">
-        <h2>Besøket</h2>
+        <h2>${L.gsVisit}</h2>
         ${visitBody}
       </div>
       ${productsBlock}
       <div class="info-card">
-        <h2>Praktisk info</h2>
+        <h2>${L.gsPractical}</h2>
         ${factsBlock}
       </div>
     </article>
     <aside>
       <div class="aside-card">
-        <h2>Reserver</h2>
+        <h2>${L.gsReserve}</h2>
         ${bookingPaused ? `<p class="reserve-notice">${BOOKING_NOT_ACTIVATED_MSG}${isClaimed ? "" : ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`}</p>` : ""}
         <a id="reserve-cta" class="${bookingPaused ? "reserve-cta-paused" : "reserve-cta"}" href="${bookHref}">${bookingPaused ? "Meld interesse" : "Reserver besøk"}</a>
       </div>
       <div class="aside-card">
-        <h2>Sted</h2>
+        <h2>${L.place}</h2>
         ${mapBlock}
       </div>
       ${isClaimed ? `<div class="aside-card">
@@ -5655,7 +5828,7 @@ ${oaSiteNav({ active: "gardssalg" })}
   </div>
   <p class="legal-note" style="font-size:.78rem;color:#7a7163;margin-top:24px;padding-top:16px;border-top:1px solid #e4ded0">Vi formidler besøket og smakingen hos produsenten. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
 </main>
-${oaSiteFooter({})}
+${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
 <script>
 (function () {
   // dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: swap

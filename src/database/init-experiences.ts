@@ -19,6 +19,7 @@
 // boot doesn't crash a re-deploy (jf. dental Appendix C #2).
 
 import Database from "better-sqlite3";
+import { ensureProfileTranslationsSchema } from "../services/profile-translations";
 
 export function initExperiencesSchema(db: Database.Database): void {
   // experience_providers — one row per provider (organisasjon), Brreg-verified
@@ -1703,6 +1704,18 @@ export function initExperiencesSchema(db: Database.Database): void {
   ];
   for (const stmt of priceFreshnessCols) {
     try { db.exec(stmt); } catch { /* already present */ }
+  }
+
+  // dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: the
+  // profile_translations / profile_translation_audit tables (EN/SV
+  // translations of experience + gårdssalg-provider prose, staged
+  // draft→reviewed→verified→published, never written into the Norwegian
+  // source columns). Same shape in the rfb DB (init.ts). Idempotent
+  // CREATE IF NOT EXISTS — see src/services/profile-translations.ts.
+  try {
+    ensureProfileTranslationsSchema(db);
+  } catch (e) {
+    console.error("[experiences] profile_translations schema failed:", e);
   }
 
   console.log("[experiences] schema initialized");

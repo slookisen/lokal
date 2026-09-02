@@ -41755,3 +41755,27 @@ runSerial(async () => {
     failures.push("admin-verifier-claim-counts: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent — the
+// EN/SV profile-translation rullebånd (src/services/profile-translations.ts +
+// src/routes/admin-profile-translations.ts + the sv locale in src/i18n/t.ts):
+// pure verify/plan/i18n units, the staged store against a :memory: rfb db with
+// an injected fetch playing translator+reviewer, the admin route incl. the
+// flag-OFF no-op proof, and opplevagent source collection against a :memory:
+// experiences db. Tail position is the convention for a new registration,
+// not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent: profile-translations ──");
+  try {
+    const { runProfileTranslationsTests } = require("../src/services/profile-translations.test") as
+      typeof import("../src/services/profile-translations.test");
+    const pt = await runProfileTranslationsTests({ log: false });
+    passed += pt.passed;
+    failed += pt.failed;
+    for (const f of pt.failures) failures.push("profile-translations: " + f);
+    console.log(`  profile-translations: ${pt.passed} passed, ${pt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-translations: unexpected error: " + String(err?.message || err));
+  }
+});
