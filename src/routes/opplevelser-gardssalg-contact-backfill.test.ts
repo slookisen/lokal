@@ -141,6 +141,9 @@ export function runOpplevelserGardssalgContactBackfillTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -194,6 +197,7 @@ export function runOpplevelserGardssalgContactBackfillTests(
       const expDb = dbFactory.getDb("experiences");
 
       const store = require("../services/experience-store") as typeof import("../services/experience-store");
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
       const brregClient = require("../services/brreg-client") as typeof import("../services/brreg-client");
@@ -983,6 +987,7 @@ export function runOpplevelserGardssalgContactBackfillTests(
         // rather than each carrying its own copy.
       }
     } finally {
+      if (restoreMainDb) restoreMainDb();
       globalThis.fetch = prevFetch;
       if (prevAnthropicKey === undefined) {
         delete process.env.ANTHROPIC_API_KEY;

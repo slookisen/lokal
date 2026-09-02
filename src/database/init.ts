@@ -61,12 +61,31 @@ export function __pinInMemoryDbForTesting(): () => void {
   initSchema(pinned);
   db = pinned;
   return () => {
+    // Re-entrancy-safe: only put `prev` back if the singleton is STILL our
+    // pinned handle. If another block pinned/injected after us (top-level
+    // harness blocks in tests/test.ts run concurrently unless chained), a
+    // blind `db = prev` would clobber their handle — and closing ours while
+    // they hold it as THEIR `prev` would leave them restoring to a closed DB.
+    // So when we are no longer current we neither restore nor close (an
+    // in-memory handle leaking for the remainder of the process is harmless).
+    if (db !== pinned) return;
     db = prev;
     try { pinned.close(); } catch { /* already closed */ }
   };
 }
 
+// Test-only: make getDb() ITSELF throw on its next invocations (until reset
+// with null). Needed to prove a guard receives the ACCESSOR as a thunk rather
+// than an eagerly-evaluated handle — a handle whose prepare() throws cannot
+// tell the two apart, because by then getDb() has already returned. Never
+// call from production code.
+let dbAccessorFailureForTesting: Error | null = null;
+export function __setDbAccessorFailureForTesting(err: Error | null): void {
+  dbAccessorFailureForTesting = err;
+}
+
 export function getDb(): Database.Database {
+  if (dbAccessorFailureForTesting) throw dbAccessorFailureForTesting;
   if (!db) {
     // Ensure data directory exists
     const dir = path.dirname(DB_PATH);

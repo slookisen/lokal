@@ -24,6 +24,18 @@
  *   (d) pause cleared (explicit cleared_by)  -> apply goes through again.
  *   (e) FAIL-CLOSED: the main-db handle throws inside the guard -> 423 with
  *       fail_closed:true and no write, even with no pause set.
+ *   (f) FAIL-CLOSED, accessor form: getDb() ITSELF throws when invoked
+ *       (__setDbAccessorFailureForTesting) -> still 423 fail_closed:true.
+ *       This is the thunk-vs-eager distinction: an eager `getRfbDb()` in the
+ *       helper evaluates before the fence's try and dies as a 500 — (e)
+ *       alone cannot tell the two apart (PR #765 review finding 3).
+ *   (g) For the seven routine-called routes added in PR #765 review round 2
+ *       (website-verification-remediation, website-discovery,
+ *       listing-homepage-discovery, brreg-website-discovery,
+ *       orgnr-backfill, contact-backfill, website-review-approve) the 423
+ *       fires BEFORE any outbound fetch: globalThis.fetch, the Brreg stub and
+ *       the gårdssalg website-search stub are counted across (a) and must
+ *       all read ZERO calls.
  *
  * Harness copied from opplevelser-gardssalg-set-contact-phone.test.ts
  * (EXPERIENCES_DB_PATH=":memory:", require-cache purge, fake req/res +
@@ -124,6 +136,18 @@ function gatedRoutes(hjemmeside: string): GatedRoute[] {
     { path: "/admin/experiences-provider-dedup-merge", flag: "apply (true/1/'1'/'true' body)", applyBody: { pairs, apply: true }, dryRunBody: { pairs } },
     { path: "/admin/gardssalg-provider-dedup-merge", flag: "apply (true/1/'1'/'true' body)", applyBody: { pairs, apply: true }, dryRunBody: { pairs } },
     { path: "/admin/providers/hjemmeside-write", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { items: [{ provider_id: HJEMMESIDE_PROVIDER_ID, hjemmeside }], apply: true }, dryRunBody: { items: [{ provider_id: HJEMMESIDE_PROVIDER_ID, hjemmeside }] } },
+    // ── PR #765 review round 2: the routine-called routes that were missed ──
+    // Every body below targets a provider id that does not exist, so the
+    // ungated (cleared / rfb-only) apply completes as a 200 with an empty
+    // target set and NO outbound fetch — and the gated apply must 423 before
+    // the target lookup even runs (proven by the zero-network assertion).
+    { path: "/admin/gardssalg-website-verification-remediation", flag: "apply (true/1/'1'/'true' body)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
+    { path: "/admin/gardssalg-website-discovery", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
+    { path: "/admin/listing-homepage-discovery", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
+    { path: "/admin/brreg-website-discovery", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
+    { path: "/admin/gardssalg-orgnr-backfill", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
+    { path: "/admin/gardssalg-contact-backfill", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { providerIds: ["wpg-nope"], apply: true }, dryRunBody: { providerIds: ["wpg-nope"] } },
+    { path: "/admin/gardssalg-website-review-approve", flag: "apply (true/1/'1'/'true' body or ?apply=)", applyBody: { approvals: [{ provider_id: "wpg-nope", url: "https://wpg-nope.no" }], apply: true }, dryRunBody: { approvals: [{ provider_id: "wpg-nope", url: "https://wpg-nope.no" }] } },
   ];
 }
 
@@ -180,12 +204,20 @@ export function runOpplevelserWritePauseGateTests(
     const initMod = require("../database/init") as typeof import("../database/init");
     const prevMainDb = initMod.__peekDbForTesting();
     let expBrreg: typeof import("../services/experience-brreg") | null = null;
+    let expStore: typeof import("../services/experience-store") | null = null;
+    // Network-call counters (finding 2 / case (g)): every outbound seam the
+    // seven new routes could reach — counted, never let out of the process.
+    const prevGlobalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    let brregCalls = 0;
+    let websiteSearchCalls = 0;
 
     try {
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
       expBrreg = require("../services/experience-brreg") as typeof import("../services/experience-brreg");
+      expStore = require("../services/experience-store") as typeof import("../services/experience-store");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
       const svc = require("../services/enrichment-write-pause") as typeof import("../services/enrichment-write-pause");
 
@@ -203,11 +235,27 @@ export function runOpplevelserWritePauseGateTests(
 
       // Brreg stub — every name is "unverified", so bulk-load never leaves
       // the process (no network in the suite).
-      expBrreg.__setBrregFetchForTesting(async () => ({
-        ok: true,
-        status: 200,
-        json: async () => ({ _embedded: { enheter: [] } }),
-      }) as any);
+      expBrreg.__setBrregFetchForTesting(async () => {
+        brregCalls++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ _embedded: { enheter: [] } }),
+        } as any;
+      });
+      // gårdssalg website-discovery's tier-2 search seam — counted; returns
+      // nothing so no candidate host is ever fetched even if reached.
+      expStore.__setGardssalgWebsiteSearchForTesting(async () => {
+        websiteSearchCalls++;
+        return [];
+      });
+      // globalThis.fetch — counted, then delegated (so any block that
+      // legitimately needs it elsewhere in the suite is unaffected).
+      globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+        fetchCalls++;
+        return prevGlobalFetch(...args);
+      }) as typeof fetch;
+      const networkCalls = () => fetchCalls + brregCalls + websiteSearchCalls;
 
       // ── Fixture on the experiences db for the real-write read-back ──────
       expDb.prepare(
@@ -244,6 +292,11 @@ export function runOpplevelserWritePauseGateTests(
         assertEq(totalChanges() - before, 0, `wpg-a6 ${r.path}: ZERO rows changed on experiences.db across the blocked call`);
       }
       assertEq(hjemmesideOf(), null, "wpg-a7: hjemmeside-write read-back — the fixture's hjemmeside is STILL NULL after the blocked apply");
+      // (g) the 423 fired BEFORE any outbound call on every gated route —
+      // the seven round-2 routes all do live fetches (Brreg / site crawl /
+      // web search) on their apply path when given a real target.
+      assertEq(networkCalls(), 0, "wpg-a8: ZERO outbound calls (globalThis.fetch + Brreg stub + website-search stub) across all blocked applies");
+      assertEq({ fetchCalls, brregCalls, websiteSearchCalls }, { fetchCalls: 0, brregCalls: 0, websiteSearchCalls: 0 }, "wpg-a9: ...each seam individually untouched");
 
       // ══ (b) same pause + dry-run -> normal 200, never blocked ═════════════
       for (const r of gatedRoutes("https://pausegard.no")) {
@@ -313,14 +366,47 @@ export function runOpplevelserWritePauseGateTests(
       } finally {
         initMod.__setDbForTesting(mainDb as any);
       }
+
+      // ══ (f) FAIL-CLOSED, accessor form: getDb() ITSELF throws ═════════════
+      // (e) above only makes the HANDLE's prepare() throw — by then getDb()
+      // has already returned, so an eager `enrichmentWritePauseBlock(
+      // getRfbDb(), …)` would pass (e) just the same. Here the ACCESSOR
+      // throws when invoked: only a helper that hands the fence the THUNK
+      // (`getRfbDb`, not `getRfbDb()`) can turn that into a 423 fail_closed
+      // rather than an unhandled 500 (PR #765 review finding 3). Mutation
+      // check: switch the helper to `getRfbDb()` — wpg-f1/f5 must fail.
+      initMod.__setDbAccessorFailureForTesting(new Error("simulated: getDb() itself is unavailable"));
+      try {
+        const before = totalChanges();
+        const res = await callRoute(opplevelserRouter, {
+          url: "/admin/providers/hjemmeside-write",
+          headers: auth,
+          body: { items: [{ provider_id: HJEMMESIDE_PROVIDER_ID, hjemmeside: "https://pausegard4.no" }], apply: true },
+        });
+        assertEq(res.status, 423, "wpg-f1: a THROWING getDb() accessor REJECTS the apply as 423 (thunk reaches the fence's try), never a 500");
+        assertEq(res.body?.paused, true, "wpg-f2: ...as a paused body");
+        assertEq(res.body?.fail_closed, true, "wpg-f3: ...flagged fail_closed:true");
+        assertEq(totalChanges() - before, 0, "wpg-f4: zero rows changed on experiences.db");
+        const res2 = await callRoute(opplevelserRouter, { url: "/admin/gardssalg-orgnr-backfill", headers: auth, body: { providerIds: ["wpg-nope"], apply: true } });
+        assertEq(res2.status, 423, "wpg-f5: a round-2 route (gardssalg-orgnr-backfill) fails closed on the throwing accessor too");
+        assertEq(res2.body?.fail_closed, true, "wpg-f6: ...and says so");
+        const dry = await callRoute(opplevelserRouter, { url: "/admin/gardssalg-orgnr-backfill", headers: auth, body: { providerIds: ["wpg-nope"] } });
+        assertEq(dry.status, 200, "wpg-f7: its dry-run never invokes the accessor, so it still completes (200)");
+      } finally {
+        initMod.__setDbAccessorFailureForTesting(null);
+      }
+      assertEq(hjemmesideOf(), "https://pausegard2.no", "wpg-f8: hjemmeside unchanged by the accessor-throw calls (read-back)");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-write-pause-gate: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      globalThis.fetch = prevGlobalFetch;
       try { expBrreg?.__setBrregFetchForTesting(null); } catch { /* best-effort */ }
-      if (prevMainDb) {
-        try { initMod.__setDbForTesting(prevMainDb); } catch { /* best-effort */ }
-      }
+      try { expStore?.__setGardssalgWebsiteSearchForTesting(null); } catch { /* best-effort */ }
+      try { initMod.__setDbAccessorFailureForTesting(null); } catch { /* best-effort */ }
+      // Restore UNCONDITIONALLY (prev may be null = "nothing opened yet"):
+      // the singleton must never be left pointing at this test's handle.
+      try { initMod.__setDbForTesting(prevMainDb as any); } catch { /* best-effort */ }
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

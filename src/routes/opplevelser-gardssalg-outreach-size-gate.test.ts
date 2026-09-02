@@ -111,6 +111,9 @@ export function runOpplevelserGardssalgOutreachSizeGateTests(
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  // Main-db pin: the apply route under test reads enrichment_write_pause off
+  // the MAIN db singleton (fail-closed) — see __pinInMemoryDbForTesting.
+  let restoreMainDb: (() => void) | null = null;
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -269,6 +272,7 @@ export function runOpplevelserGardssalgOutreachSizeGateTests(
         brreg_verified: 1, antall_ansatte: 22,
       });
 
+      restoreMainDb = (require("../database/init") as typeof import("../database/init")).__pinInMemoryDbForTesting();
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
       const auth = { "x-admin-key": testKey };
 
@@ -767,6 +771,7 @@ export function runOpplevelserGardssalgOutreachSizeGateTests(
           String(err?.stack || err?.message || err),
       );
     } finally {
+      if (restoreMainDb) restoreMainDb();
       if (emailSvc) {
         emailSvc.isConfigured = origConfigured;
         emailSvc.transporter = origTransporter;

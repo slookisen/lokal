@@ -17765,6 +17765,24 @@ console.log("\n── experiences scaffold: experience-store ──");
 // unverified-without-evidence skipped, idempotent re-run inserts 0.
 console.log("\n── orch-pr-18: POST /api/opplevelser/admin/bulk-load ──");
 
+// Resolver handles for two blocks declared FURTHER DOWN this file, hoisted so
+// that orch-pr-18 (below) can genuinely await them. Before this hoist, both
+// `await _orchPr...Promise` lines at the top of the orch-pr-18 IIFE were TDZ
+// ReferenceErrors silently swallowed by their own `catch { /* upstream */ }`,
+// so orch-pr-18 actually started at module-load time, unordered relative to
+// every other __setDbForTesting() caller in the file — and its bulk-load
+// requests (now gated on the MAIN db's enrichment_write_pause, fail-closed)
+// non-deterministically saw a foreign, partial-schema singleton ("no such
+// table: enrichment_write_pause" → 423 → bl-4a..4d; PR #765 review finding
+// 1). The IIFEs that RESOLVE these are unchanged and stay where they were
+// (cart MVP ≈ line 25300, prune-dead-urls ≈ line 27080).
+let _orchPr20260614_6Resolve: () => void = () => {};
+const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_6Resolve = r; });
+let _orchPr9PruneDeadUrlsResolve: () => void = () => {};
+const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
+  _orchPr9PruneDeadUrlsResolve = r;
+});
+
 let _orchPr18BulkLoadResolve: () => void = () => {};
 const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   _orchPr18BulkLoadResolve = r;
@@ -17778,6 +17796,10 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   const prevPathExp18 = process.env.EXPERIENCES_DB_PATH;
   let server18: import("http").Server | null = null;
   let prevRfbDb18: unknown = null;
+  // The handle this block pins (hoisted so the finally can check the
+  // singleton is STILL ours before putting prevRfbDb18 back — never a blind
+  // restore over a sibling block's handle; PR #765 review finding 1b).
+  let rfbDb18Handle: unknown = null;
   // Admission-gate stub bookkeeping (see the stub block inside the try) —
   // hoisted out of the try so the finally can restore them.
   let prevFetch18: typeof globalThis.fetch | null = null;
@@ -17821,6 +17843,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     const RfbDatabase18 = require("better-sqlite3") as typeof import("better-sqlite3");
     prevRfbDb18 = initMod18.__peekDbForTesting();
     const rfbDb18 = new RfbDatabase18(":memory:");
+    rfbDb18Handle = rfbDb18;
     initMod18.__setDbForTesting(rfbDb18 as any);
     initMod18.__initSchemaForTesting(rfbDb18 as any);
     const blocklistSvc18 = require("../src/services/blocklist-service") as typeof import("../src/services/blocklist-service");
@@ -18348,17 +18371,12 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       // Skive D this IIFE never touched that singleton (only dbFactory18's
       // own separate "experiences" cache, which is NOT part of that
       // hazard), so it was never exposed to it; pinning rfbDb18 above (for
-      // agent_blocklist) newly exposes it — and this IIFE's own intended
-      // prerequisite gate (the two `await _orchPr...Promise` lines at the
-      // very top of this IIFE) turns out to be a no-op here: both promises
-      // are declared with `const` FURTHER DOWN this file (after this IIFE),
-      // so referencing them this early is a TDZ ReferenceError that gets
-      // silently swallowed by their own `catch { /* upstream */ }` — this
-      // IIFE actually starts unordered relative to virtually everything
-      // else (confirmed empirically; pre-existing, not introduced by this
-      // PR, and out of scope to fix broadly here — the file's own header
-      // documents a prior attempt at a full ad-hoc-family barrier tripping
-      // a DIFFERENT unrelated race elsewhere in the suite).
+      // agent_blocklist) newly exposes it. (Historical note: this IIFE's
+      // two `await _orchPr...Promise` prerequisite lines used to be TDZ
+      // no-ops because both promises were declared FURTHER DOWN the file;
+      // since PR #765 review finding 1 their declarations are hoisted above
+      // this block, so this IIFE now genuinely runs after prune-dead-urls.
+      // The re-pin-before-dispatch discipline below is kept regardless.)
       //
       // bulkReq()'s own HTTP round trip has multiple await points between
       // "addManualEntry() wrote to rfbDb18" and "the route handler's
@@ -18494,8 +18512,11 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
     else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
     try {
-      if (prevRfbDb18) {
-        (require("../src/database/init") as typeof import("../src/database/init")).__setDbForTesting(prevRfbDb18 as any);
+      const initFin18 = require("../src/database/init") as typeof import("../src/database/init");
+      // Re-entrancy-safe: only restore if the singleton is still OUR handle
+      // (same rule __pinInMemoryDbForTesting's restore follows).
+      if (prevRfbDb18 && initFin18.__peekDbForTesting() === rfbDb18Handle) {
+        initFin18.__setDbForTesting(prevRfbDb18 as any);
       }
     } catch {
       // best-effort cleanup
@@ -18775,6 +18796,21 @@ console.log("\n── orch-pr-titleno: POST /api/opplevelser/admin/experiences-t
 let _titleNoBackfillResolve: () => void = () => {};
 const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
   _titleNoBackfillResolve = r;
+});
+// gardssalg-content-refresh's resolver, hoisted next to title-no-backfill's
+// (its IIFE stays where it is, ≈ line 30030). Both blocks pin the MAIN db
+// singleton AND swap the experiences db-factory singleton, so every
+// downstream "full branch set" Deps list (_orchPr21SentLogActorDeps,
+// _adminAgentsRegisterDeps, _oaHomeCountersDeps, _tasksPruneAsyncDeps) must
+// be able to wait on BOTH — the oa-home-counters block (which hosts
+// opplevelser-discover-geo and the big sibling-test run) used to wait only
+// on dedup-backfill, so once gardssalg-content-refresh was serialised after
+// title-no-backfill it slid into that block's window and both sides saw each
+// other's db-factory reset ("database connection is not open" /
+// discover-geo reading 0 rows; PR #765 review finding 1 follow-through).
+let _gardssalgContentRefreshResolve: () => void = () => {};
+const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => {
+  _gardssalgContentRefreshResolve = r;
 });
 
 (async () => {
@@ -25310,8 +25346,9 @@ const _orchPr14ProductIdPromise: Promise<void> = new Promise<void>(r => { _orchP
 // ── orch-pr-20260614-6: Phase 1 cart MVP ────────────────────────────────────
 console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
 
-let _orchPr20260614_6Resolve: () => void = () => {};
-const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_6Resolve = r; });
+// _orchPr20260614_6Resolve / _orchPr20260614_6Promise are declared ABOVE the
+// orch-pr-18 bulk-load block (grep "hoisted so that orch-pr-18") so that
+// block's `await _orchPr20260614_6Promise` is a real await.
 
 (async () => {
   // Wait for Phase 0 to finish so we know __setDbForTesting works
@@ -27072,10 +27109,9 @@ console.log("\n── orch-pr-27: isDirectoryOrAggregatorHost matcher ──");
 // ── orch-pr-9: prune-dead-urls endpoint ──────────────────────────────────────
 console.log("\n── orch-pr-9: POST /admin/prune-dead-urls ──");
 
-let _orchPr9PruneDeadUrlsResolve: () => void = () => {};
-const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
-  _orchPr9PruneDeadUrlsResolve = r;
-});
+// _orchPr9PruneDeadUrlsResolve / _orchPr9PruneDeadUrlsPromise are declared
+// ABOVE the orch-pr-18 bulk-load block (grep "hoisted so that orch-pr-18") so
+// that block's `await _orchPr9PruneDeadUrlsPromise` is a real await.
 
 (async () => {
   // Wait for all prior DB-mutating IIFEs to complete
@@ -27369,6 +27405,8 @@ const _orchPr21SentLogActorDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -27796,6 +27834,8 @@ const _adminAgentsRegisterDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -30012,16 +30052,24 @@ console.log("\n── gardssalg-content-enrichment: summarizeVisit / extractOpen
 // is covered independently by the pure-function block above.
 console.log("\n── gardssalg-content-refresh: POST /api/opplevelser/admin/gardssalg-content-refresh ──");
 
-let _gardssalgContentRefreshResolve: () => void = () => {};
-const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => {
-  _gardssalgContentRefreshResolve = r;
-});
+// _gardssalgContentRefreshResolve / _gardssalgContentRefreshPromise are
+// declared next to the title-no-backfill resolver (grep "hoisted next to") so
+// the "full branch set" Deps lists declared between there and here can wait
+// on this block too. The IIFE below resolves it; unchanged.
 
 (async () => {
   // Serialize after the prior DB-mutating async block (also swaps the
   // experiences db-factory singleton) — same reasoning as that block's own
   // "Run after the prior DB-mutating IIFE" comment.
   try { await _orchPrDedupBackfillEndpointPromise; } catch { /* upstream */ }
+  // ALSO after title-no-backfill: both that block and this one pin the MAIN
+  // db singleton via __pinInMemoryDbForTesting() for a gated route, and both
+  // used to await only dedup-backfill — i.e. they ran CONCURRENTLY, pinning /
+  // restoring the same singleton interleaved (A pins, B pins with prev = A's
+  // handle, A restores + closes, B restores to A's CLOSED handle → "database
+  // connection is not open" in whichever block ran next; PR #765 review
+  // finding 1). Chain: dedup-backfill → title-no-backfill → this block.
+  try { await _titleNoBackfillPromise; } catch { /* upstream */ }
 
   const prevPathGCR = process.env.EXPERIENCES_DB_PATH;
   let serverGCR: import("http").Server | null = null;
@@ -30351,6 +30399,8 @@ const _oaHomeCountersDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -32188,6 +32238,8 @@ const _tasksPruneAsyncDeps: Promise<unknown>[] = [
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
   _orchPrDedupBackfillEndpointPromise,
+  _titleNoBackfillPromise,
+  _gardssalgContentRefreshPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -32850,7 +32902,8 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     _pr106Promise, _pr110Promise, _pr125Promise, _seoDentalPromise, _platformVerifierPromise,
     _orchPr20260614_2Promise, _orchPr20260614Promise, _orchPr20260614_5Promise,
     _orchPr20260614_6Promise, _orchPr14ProductIdPromise, _orchPr9PruneDeadUrlsPromise,
-    _orchPr18BulkLoadPromise, _orchPrDedupBackfillEndpointPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
+    _orchPr18BulkLoadPromise, _orchPrDedupBackfillEndpointPromise, _titleNoBackfillPromise,
+    _gardssalgContentRefreshPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
     _orchPr20BmEventsPromise, _orchPr21SentLogActorPromise, _adminDbTableSizesPromise,
     _contactClickTrackingPromise, _homepageProvenanceEmailBackfillPromise,
     _agentKnowledgeGetAuthPromise, _oaHomeCountersPromise, _tasksPruneAsyncPromise,
