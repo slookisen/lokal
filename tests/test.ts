@@ -41820,3 +41820,25 @@ runSerial(async () => {
     failures.push("profile-translations: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel GO #1
+// — the in-process profile-translation worker (src/services/profile-
+// translations-worker.ts): config/mode units, intensive concurrency +
+// platform interleave, steady hourly budget, infra backoff, and the run lock
+// shared with the admin route. Tail position is the convention for a new
+// registration, not load-bearing.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-02-flerspraklige-profiler (GO #1): profile-translations-worker ──");
+  try {
+    const { runProfileTranslationsWorkerTests } = require("../src/services/profile-translations-worker.test") as
+      typeof import("../src/services/profile-translations-worker.test");
+    const pw = await runProfileTranslationsWorkerTests({ log: false });
+    passed += pw.passed;
+    failed += pw.failed;
+    for (const f of pw.failures) failures.push("profile-translations-worker: " + f);
+    console.log(`  profile-translations-worker: ${pw.passed} passed, ${pw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("profile-translations-worker: unexpected error: " + String(err?.message || err));
+  }
+});
