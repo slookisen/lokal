@@ -28,7 +28,7 @@ export async function runProfileTranslationsWorkerTests(opts: { log?: boolean } 
   const envKeys = [
     "PROFILE_TRANSLATIONS_ENABLED", "PROFILE_TRANSLATIONS_WORKER_ENABLED", "PROFILE_TRANSLATIONS_WORKER_INTENSIVE_UNTIL",
     "PROFILE_TRANSLATIONS_WORKER_INTENSIVE_CONCURRENCY", "PROFILE_TRANSLATIONS_WORKER_STEADY_ITEMS_PER_HOUR",
-    "PROFILE_TRANSLATIONS_WORKER_PLATFORMS", "ANTHROPIC_API_KEY", "ADMIN_KEY",
+    "PROFILE_TRANSLATIONS_WORKER_PLATFORMS", "PROFILE_TRANSLATIONS_WORKER_LANG_PRIORITY", "ANTHROPIC_API_KEY", "ADMIN_KEY",
   ];
   const prev: Record<string, string | undefined> = {};
   for (const k of envKeys) prev[k] = process.env[k];
@@ -54,6 +54,12 @@ export async function runProfileTranslationsWorkerTests(opts: { log?: boolean } 
     process.env.PROFILE_TRANSLATIONS_WORKER_INTENSIVE_UNTIL = "not-a-date";
     eq(w.readWorkerConfig().intensiveUntil, null, "A5 invalid until → null (steady)");
     delete process.env.PROFILE_TRANSLATIONS_WORKER_PLATFORMS;
+    eq(w.readWorkerConfig().langPriority, ["en", "sv"], "A6 default language priority en,sv");
+    process.env.PROFILE_TRANSLATIONS_WORKER_LANG_PRIORITY = "sv,en,de,sv";
+    eq(w.readWorkerConfig().langPriority, ["sv", "en"], "A7 priority parsed, unknown dropped, de-duplicated");
+    process.env.PROFILE_TRANSLATIONS_WORKER_LANG_PRIORITY = "en";
+    eq(w.readWorkerConfig().langPriority, ["en"], "A8 single language = only that language");
+    delete process.env.PROFILE_TRANSLATIONS_WORKER_LANG_PRIORITY;
 
     // ── B. ticks against :memory: rfb db ──
     const initMod = require("../database/init") as typeof import("../database/init");
@@ -98,6 +104,19 @@ export async function runProfileTranslationsWorkerTests(opts: { log?: boolean } 
       process.env.ANTHROPIC_API_KEY = "k";
       let r = await w.workerTick({ fetchImpl: fakeFetch as any, dbFor });
       eq([r.mode, r.processed, concurrent.calls], ["pipeline_off", 0, 0], "B1 pipeline flag off → no-op, no fetch");
+
+      // B2a: planning order — every en item (both platforms, interleaved) before any sv item
+      {
+        const planned = w.planInterleaved(["rfb", "opplevagent"], 10, dbFor as any, ["en", "sv"]);
+        const langs = planned.map((p) => p.item.lang);
+        const firstSv = langs.indexOf("sv");
+        const lastEn = langs.lastIndexOf("en");
+        ok(planned.length === 10 && firstSv === 5 && lastEn === 4, "B2a all 5 en items precede all sv items", langs);
+        eq(planned.slice(0, 2).map((p) => p.platform), ["rfb", "opplevagent"], "B2b platforms interleaved within the en block");
+        const enOnly = w.planInterleaved(["rfb", "opplevagent"], 10, dbFor as any, ["en"]);
+        ok(enOnly.length === 5 && enOnly.every((p) => p.item.lang === "en"), "B2c priority list without sv never plans sv");
+        w.__resetWorkerStateForTesting();
+      }
 
       // B2: intensive mode processes with concurrency and interleaves platforms
       process.env.PROFILE_TRANSLATIONS_ENABLED = "true";

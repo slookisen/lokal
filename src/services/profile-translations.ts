@@ -502,6 +502,17 @@ export interface VerifyResult {
   failed: string[];
 }
 
+/** Lowercase Norwegian function words that can never be a word of the
+ *  target language. Deliberately short and unambiguous — "i" is fine because
+ *  English "I" is always capitalised; "med"/"på"/"i" are left out of the
+ *  Swedish list because Swedish uses them too. */
+export const NORWEGIAN_STOPWORDS_NOT_ENGLISH = new Set([
+  "i", "og", "til", "fra", "ved", "hos", "med", "av", "om", "eller", "som", "det", "den", "er", "har", "ikke", "også", "når", "hvor", "hva",
+]);
+export const NORWEGIAN_STOPWORDS_NOT_SWEDISH = new Set([
+  "og", "til", "fra", "ved", "hos", "ikke", "også", "når", "hvor", "hva", "hvordan", "noen", "mye", "bare", "nå",
+]);
+
 const URL_RE = /https?:\/\/[^\s<>"')\]]+/gi;
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 const DIGIT_RUN_RE = /\d+/g;
@@ -560,9 +571,16 @@ export function verifyTranslationDeterministic(
   const missingEmails = srcEmails.filter((e) => !outLower.includes(e));
   checks.push({ name: "emails_preserved", ok: missingEmails.length === 0, detail: missingEmails.slice(0, 3).join(" ") || undefined });
 
+  // Norwegian and Swedish are close enough that a short title can be
+  // letter-for-letter identical in both ("Lysefjorden fjordcruise med
+  // elektrisk katamaran", "Norsk Oljemuseum i Stavanger" — both rejected live
+  // 2026-09-02 as verbatim copies although the Swedish IS that text). For sv
+  // an identical output is therefore accepted up to 8 words; English never
+  // shares a whole sentence with Norwegian, so the 4-word rule stays there.
   const srcWords = src.split(/\s+/).filter(Boolean);
   const identical = src.replace(/\s+/g, " ").toLowerCase() === out.replace(/\s+/g, " ").toLowerCase();
-  const identicalOk = !identical || srcWords.length < 4 || opts.alreadyTargetLanguage === true;
+  const identicalWordCap = lang === "sv" ? 8 : 4;
+  const identicalOk = !identical || srcWords.length <= identicalWordCap || opts.alreadyTargetLanguage === true;
   checks.push({ name: "not_verbatim_copy", ok: identicalOk });
 
   // Un-translated Norwegian: any word carrying æ/ø (and, for English, å) in
@@ -582,6 +600,17 @@ export function verifyTranslationDeterministic(
     .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()));
   const leakedUnique = Array.from(new Set(leaked));
   checks.push({ name: "no_untranslated_norwegian", ok: leakedUnique.length === 0, detail: leakedUnique.slice(0, 5).join(",") || undefined });
+
+  // Un-translated Norwegian function words (no æ/ø/å, so the check above
+  // cannot see them): "Nordlandsmuseet i Bodø" left as-is in English, "og"/
+  // "til"/"fra" in Swedish. Exact lowercase tokens only; every listed word is
+  // impossible as a word of the target language (English "I" is always
+  // capitalised; Swedish has "och/till/från/vid/inte/också"). Tokens that occur
+  // verbatim in the entity name are proper-noun parts and are allowed.
+  const stopwords = lang === "sv" ? NORWEGIAN_STOPWORDS_NOT_SWEDISH : NORWEGIAN_STOPWORDS_NOT_ENGLISH;
+  const nameTokens = new Set(String(opts.entityName || "").split(splitRe).filter(Boolean));
+  const leakedStop = Array.from(new Set(out.split(splitRe).filter((w) => stopwords.has(w) && !nameTokens.has(w))));
+  checks.push({ name: "no_norwegian_stopwords", ok: leakedStop.length === 0, detail: leakedStop.slice(0, 5).join(",") || undefined });
 
   if (kind === "title") {
     checks.push({ name: "title_single_line", ok: !/\n/.test(out) && out.length <= 300 });
