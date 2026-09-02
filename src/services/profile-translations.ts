@@ -527,6 +527,18 @@ const ORDINAL_WORDS: Record<TranslationTargetLang, string[]> = {
  * as an ordinal ("6. generasjon") and the translation spells that ordinal out
  * ("sixth generation" / "sjätte generationen"). Everything else stays strict.
  */
+/**
+ * "1600-tallet" is idiomatically "the 1600s" or "the 17th century" in English;
+ * tolerate either. Swedish keeps "1600-talet", so nothing to tolerate there.
+ */
+export function centurySpelledOut(src: string, out: string, digits: string, lang: TranslationTargetLang): boolean {
+  if (!/^\d{2}00$/.test(digits) || !new RegExp(`\\b${digits}-tallet\\b`, "i").test(src)) return false;
+  if (lang !== "en") return false;
+  const century = Number(digits.slice(0, 2)) + 1;
+  const suffix = century % 10 === 1 && century !== 11 ? "st" : century % 10 === 2 && century !== 12 ? "nd" : century % 10 === 3 && century !== 13 ? "rd" : "th";
+  return new RegExp(`\\b${digits}s\\b`).test(out) || new RegExp(`\\b${century}${suffix}[ -]century\\b`, "i").test(out);
+}
+
 export function ordinalSpelledOut(src: string, out: string, digits: string, lang: TranslationTargetLang): boolean {
   const n = Number(digits);
   if (!Number.isInteger(n) || n < 1 || n > 20) return false;
@@ -559,7 +571,7 @@ export function verifyTranslationDeterministic(
   source: string,
   translated: string,
   lang: TranslationTargetLang,
-  opts: { kind?: TranslationFieldKind; alreadyTargetLanguage?: boolean; entityName?: string | null } = {},
+  opts: { kind?: TranslationFieldKind; alreadyTargetLanguage?: boolean; entityName?: string | null; keptTerms?: string[] | null } = {},
 ): VerifyResult {
   const src = cleanSource(source);
   const out = cleanSource(translated);
@@ -578,7 +590,7 @@ export function verifyTranslationDeterministic(
 
   const srcDigits = multiset(src.match(DIGIT_RUN_RE) || []);
   const outDigits = multiset(out.match(DIGIT_RUN_RE) || []);
-  const missingDigits = multisetDiff(srcDigits, outDigits).filter((d) => !ordinalSpelledOut(src, out, d, lang));
+  const missingDigits = multisetDiff(srcDigits, outDigits).filter((d) => !ordinalSpelledOut(src, out, d, lang) && !centurySpelledOut(src, out, d, lang));
   checks.push({ name: "digits_preserved", ok: missingDigits.length === 0, detail: missingDigits.slice(0, 5).join(",") || undefined });
 
   const srcUrls = (src.match(URL_RE) || []).map((u) => u.replace(/[.,;:]+$/, ""));
@@ -612,11 +624,27 @@ export function verifyTranslationDeterministic(
   const nordicRe = lang === "sv" ? /[æøÆØ]/ : /[æøåÆØÅ]/;
   const splitRe = /[\s.,;:!?()"'«»–—/]+/;
   const srcCapitalized = new Set(src.split(splitRe).filter((w) => w && /^[A-ZÆØÅ]/.test(w)));
+  // Proper nouns also survive with a Norwegian suffix or genitive in the
+  // source ("Tromsø-fjordene" → "Tromsø Fjords", "Jærens" → "Jæren's"): a
+  // capitalised output word that is a prefix (≥ 4 chars) of a capitalised
+  // source token — hyphen-split as well — is a preserved name.
+  const srcCapitalizedParts = Array.from(new Set(src.split(/[\s.,;:!?()"'«»–—/-]+/).filter((w) => w && /^[A-ZÆØÅ]/.test(w))));
+  const isNamePrefix = (w: string): boolean => /^[A-ZÆØÅ]/.test(w) && w.length >= 4 && srcCapitalizedParts.some((t) => t.startsWith(w));
   const nameWords = new Set(String(opts.entityName || "").toLowerCase().split(splitRe).filter(Boolean));
+  // Terms the translator declared it kept on purpose (dish names, "mål") are
+  // tolerated only when they really occur in the source; the LLM reviewer is
+  // shown the same list and judges whether keeping them was right.
+  const srcLowerWords = new Set(src.toLowerCase().split(splitRe).filter(Boolean));
+  const keptTerms = new Set(
+    (Array.isArray(opts.keptTerms) ? opts.keptTerms : [])
+      .slice(0, 8)
+      .map((t) => String(t).toLowerCase().trim())
+      .filter((t) => t && srcLowerWords.has(t)),
+  );
   const leaked = out
     .split(splitRe)
     .filter((w) => w && nordicRe.test(w))
-    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()));
+    .filter((w) => !srcCapitalized.has(w) && !nameWords.has(w.toLowerCase()) && !keptTerms.has(w.toLowerCase()) && !isNamePrefix(w));
   const leakedUnique = Array.from(new Set(leaked));
   checks.push({ name: "no_untranslated_norwegian", ok: leakedUnique.length === 0, detail: leakedUnique.slice(0, 5).join(",") || undefined });
 
@@ -628,7 +656,20 @@ export function verifyTranslationDeterministic(
   // verbatim in the entity name are proper-noun parts and are allowed.
   const stopwords = lang === "sv" ? NORWEGIAN_STOPWORDS_NOT_SWEDISH : NORWEGIAN_STOPWORDS_NOT_ENGLISH;
   const nameTokens = new Set(String(opts.entityName || "").split(splitRe).filter(Boolean));
-  const leakedStop = Array.from(new Set(out.split(splitRe).filter((w) => stopwords.has(w) && !nameTokens.has(w))));
+  // "Sogn og Fjordane", "Smak av Nordhordland", "Smaker fra Stjørdalsføret": a
+  // conjunction/preposition sandwiched in a capitalised phrase that the source
+  // contains verbatim is part of a name. Only og/av/fra qualify — locative "i"
+  // ("Nordlandsmuseet i Bodø") is a description, not a name, and stays strict.
+  const NAME_PHRASE_WORDS = new Set(["og", "av", "fra"]);
+  const outTokens = out.split(/\s+/).map((w) => w.replace(/^[^\wÆØÅæøå]+|[^\wÆØÅæøå]+$/g, "")).filter(Boolean);
+  const srcFlat = " " + src.split(/\s+/).map((w) => w.replace(/^[^\wÆØÅæøå]+|[^\wÆØÅæøå]+$/g, "")).filter(Boolean).join(" ") + " ";
+  const inNamePhrase = (i: number): boolean => {
+    if (i < 1 || i >= outTokens.length - 1 || !NAME_PHRASE_WORDS.has(outTokens[i])) return false;
+    const prev = outTokens[i - 1];
+    const next = outTokens[i + 1];
+    return /^[A-ZÆØÅ]/.test(prev) && /^[A-ZÆØÅ]/.test(next) && srcFlat.includes(` ${prev} ${outTokens[i]} ${next} `);
+  };
+  const leakedStop = Array.from(new Set(outTokens.filter((w, i) => stopwords.has(w) && !nameTokens.has(w) && !inNamePhrase(i))));
   checks.push({ name: "no_norwegian_stopwords", ok: leakedStop.length === 0, detail: leakedStop.slice(0, 5).join(",") || undefined });
 
   if (kind === "title") {
@@ -793,9 +834,10 @@ Rules — all of them are mandatory:
 ${glossaryText(lang)}
 6. If the source text is ALREADY written in ${LANG_NAMES[lang]}, return it with only obvious typos fixed and set "already_target_language" to true.
 7. Never invent content to fill gaps. If the source is truncated or unclear, translate exactly what is there and mention it in "notes".
+8. Some Norwegian words may be kept deliberately: names of dishes and products with no ${LANG_NAMES[lang]} equivalent (rømmegrøt, pinnekjøtt, lefse) and the land unit "mål". Keep such a word as written, add a short gloss in parentheses on first use (e.g. "rømmegrøt (sour cream porridge)", "90 mål (about 9 hectares)"), and list every kept word in "kept_terms". Ordinary Norwegian words are never kept.
 
 Respond with ONE JSON object and nothing else:
-{"translation": "<the ${LANG_NAMES[lang]} text>", "already_target_language": false, "notes": "<short translator notes, or empty string>"}`;
+{"translation": "<the ${LANG_NAMES[lang]} text>", "already_target_language": false, "kept_terms": ["<Norwegian words you deliberately kept, or empty>"], "notes": "<short translator notes, or empty string>"}`;
 }
 
 export function buildTranslatorUserPrompt(
@@ -835,13 +877,15 @@ Respond with ONE JSON object and nothing else:
 {"verdict": "APPROVE" | "REVISE" | "REJECT", "fidelity": 1-5, "fluency": 1-5, "issues": [{"type": "meaning|omission|addition|number|terminology|grammar|style|untranslated|format", "severity": "minor|major", "detail": "<what and where>"}], "summary": "<one sentence>"}`;
 }
 
-export function buildReviewerUserPrompt(platform: TranslationPlatform, item: SourceItem, lang: TranslationTargetLang, translation: string): string {
+export function buildReviewerUserPrompt(platform: TranslationPlatform, item: SourceItem, lang: TranslationTargetLang, translation: string, keptTerms?: string[] | null): string {
+  const kept = Array.isArray(keptTerms) ? keptTerms.filter(Boolean) : [];
   return [
     `Platform: ${PLATFORM_CONTEXT[platform]}`,
     `Business / experience name: ${item.entity_name || "(unknown)"}`,
     `Field: ${item.field} — ${FIELD_CONTEXT[item.field] || "profile text"}`,
     `Glossary the translator was told to use:`,
     glossaryText(lang),
+    kept.length ? `Norwegian words the translator says it kept on purpose (judge whether that is right — only dish/product names and the unit "mål" qualify, and each needs a gloss): ${kept.join(", ")}` : "",
     "",
     "Source (Norwegian):",
     "<<<",
@@ -965,17 +1009,18 @@ export async function processTranslationItem(
     const translation = cleanSource(tr.json?.translation);
     const alreadyTarget = tr.json?.already_target_language === true;
     const notes = String(tr.json?.notes ?? "").slice(0, 1000);
+    const keptTerms: string[] = Array.isArray(tr.json?.kept_terms) ? tr.json.kept_terms.map((t: unknown) => String(t).trim()).filter((t: string) => t && t.length <= 40).slice(0, 8) : [];
     if (!translation) {
       row = setStatus(db, row, "draft", { attempts: attemptsNow, translator_model: tr.model, translator_notes: "translate failed: empty translation", batch_id: batchId }, "pipeline", "translate failed: empty translation", batchId);
       return { ...base, outcome: "translate_failed", status: row.status, attempts: row.attempts, reason: "empty translation", review: lastReview, verify: null, usage };
     }
-    row = setStatus(db, row, "draft", { attempts: attemptsNow, translated_text: translation, translator_model: tr.model, translator_notes: (alreadyTarget ? "[already_target_language] " : "") + notes, batch_id: batchId }, "pipeline", `translated (attempt ${attemptsNow})`, batchId);
+    row = setStatus(db, row, "draft", { attempts: attemptsNow, translated_text: translation, translator_model: tr.model, translator_notes: (alreadyTarget ? "[already_target_language] " : "") + (keptTerms.length ? `[kept: ${keptTerms.join(", ")}] ` : "") + notes, batch_id: batchId }, "pipeline", `translated (attempt ${attemptsNow})`, batchId);
 
     // ── independent review ──
     const rv = await callClaudeJson(deps, {
       model: rModel,
       system: buildReviewerSystemPrompt(lang),
-      user: buildReviewerUserPrompt(platform, item, lang, translation),
+      user: buildReviewerUserPrompt(platform, item, lang, translation, keptTerms),
       maxTokens: 2048,
     });
     addUsage(usage, rv);
@@ -993,7 +1038,7 @@ export async function processTranslationItem(
 
     if (reviewAccepts(verdict)) {
       // ── deterministic verify ──
-      const vr = verifyTranslationDeterministic(item.text, translation, lang, { kind: item.kind, alreadyTargetLanguage: alreadyTarget, entityName: item.entity_name });
+      const vr = verifyTranslationDeterministic(item.text, translation, lang, { kind: item.kind, alreadyTargetLanguage: alreadyTarget, entityName: item.entity_name, keptTerms });
       if (vr.ok) {
         row = setStatus(db, row, "verified", { verify_json: JSON.stringify(vr), verified_at: nowIso(), reject_reason: null }, "pipeline", "verified", batchId);
         return { ...base, outcome: "verified", status: row.status, attempts: row.attempts, review: verdict, verify: vr, usage };
